@@ -68,12 +68,15 @@ Prefer maintained upstream packages, images, and APIs. Preserve licenses and not
 | Talos, Kubernetes, Flux | Target operations foundation | Reuse declarative host/cluster operations and platform release reconciliation. Contabo bootstrap and maintenance remain unverified. |
 | OpenEBS LocalPV LVM | Local-volume candidate | Prove hard volume sizes, expansion, persistence across upgrades, and node-loss rebuild. |
 | Neon proxy | Evaluation candidate, not preferred or selected | Evaluate existing native/HTTP/WS protocol handling and wake integration against both technical and maintenance criteria. |
+| [Xata OSS](https://github.com/xataio/xata) | Evaluation candidate for gateway and sleep/wake | Inspect its SQL gateway, CNPG scale-to-zero plugin, and management services for bounded reuse before implementing equivalent capabilities. |
 | Neon serverless driver | Optional client integration | Test only against the protocols actually supplied by the selected gateway. |
 | Supabase postgres-meta | Optional private administration tooling | Reuse metadata, SQL administration, and type generation behind our authorization and routing. |
 | Supabase Studio | Optional selected-database workbench | Prefer narrow integration before a persistent fork. It is not a prerequisite for the pilot or a ready-made multi-project SaaS console. |
 | PostgREST | Optional database REST/RPC API | Preserve grants, RLS, and JWT role boundaries; keep it separate from the management API. |
 
-### Gateway maintenance gate
+### Gateway and component reuse gate
+
+Xata OSS is [Apache-2.0 licensed](https://github.com/xataio/xata/blob/main/LICENSE) and builds on CloudNativePG. Evaluate the actual component boundaries, dependencies, maintenance, and fit with Cloudflare as the authoritative control plane. Copy or adapt a component only after its license notices, integration cost, and tenant isolation pass the relevant M5/M6 acceptance checks. [Xata explicitly advises against using its OSS release unchanged for a public Postgres service](https://github.com/xataio/xata#readme), because some protections for adversarial multi-tenancy remain closed-source; do not assume its gateway is safe for unrelated customers without resolving that gap.
 
 The public Neon proxy history shows very limited recent activity, including a functional [authentication fix on 2026-05-25](https://github.com/neondatabase/neon/commit/8f60b04da47ffefe0e52bda2440134b42874eb75). This is a maintenance concern, not evidence that the repository is officially discontinued or that a specific vulnerability exists.
 
