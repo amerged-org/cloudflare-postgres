@@ -232,7 +232,7 @@ Test concurrent reservations, duplicated grants/events, period rollover, revisio
 
 M1 has a [live single-node infrastructure checkpoint](docs/evidence/m1-2026-09-28.md). Talos boot, node restart, Kubernetes networking, bounded local volumes, and a CloudNativePG SQL transaction with verified TLS and post-reboot readback were observed. R2 backup, independent restore, and production topology gates remain open.
 
-M3 has a [deployed Dev control API checkpoint](docs/evidence/m3-control-api-dev-2026-09-27.md): organization bootstrap, paginated recovery listing, and a D1-backed pending project with a queued operation. This is durable intent only; it is not database provisioning or a completed M3 API.
+M3 has a [deployed Dev control API checkpoint](docs/evidence/m3-control-api-dev-2026-09-28.md): organization bootstrap, paginated recovery listing, region registration with a scoped token, and a D1-backed pending project with a queued operation. This is durable intent only; it is not regional execution, database provisioning, or a completed M3 API.
 
 ### Operational acceptance evidence
 
