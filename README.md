@@ -8,7 +8,7 @@ An independent, open-source PostgreSQL platform with a Cloudflare management lay
 
 **Documentation and repository foundation only.** No working database platform, deployment automation, or production service has been implemented. Candidate components have not been validated together.
 
-The first implementation steps are infrastructure/recovery proofs and an early ohmyho.st development pilot using one always-on database over native PostgreSQL. Gateway selection follows technical and maintenance evaluation. Sleep/wake and bounded automatic compute scaling remain v1 requirements after that baseline.
+The first implementation steps are infrastructure/recovery proofs and an early generic pilot using one always-on database over native PostgreSQL. Adopter-specific adapters and migration TODOs belong in their own repositories. Gateway selection follows technical and maintenance evaluation. Sleep/wake and bounded automatic compute scaling remain v1 requirements after that baseline.
 
 ## Self-hosting model
 
@@ -20,7 +20,7 @@ The planned control-state mapping uses Workers for APIs, D1 for canonical manage
 
 ```mermaid
 flowchart TB
-    Adopters["Adopters and ohmyho.st"] --> API["Cloudflare Workers: management, usage and budget APIs"]
+    Adopters["Independent adopters"] --> API["Cloudflare Workers: management, usage and budget APIs"]
     API --> State["D1: authoritative control state"]
     API --> Coordination["Durable Objects: coordination"]
     Coordination --> Controller["Contabo regional controller"]
@@ -46,9 +46,13 @@ Native PostgreSQL uses regional TCP endpoints. Ordinary Workers HTTP ingress is 
 - Physical backups, WAL archiving, point-in-time recovery, retention, and safe deletion.
 - Repeatable maintenance, tenant isolation, monitoring, and recovery procedures.
 
-Budget APIs remain in v1; payment processing, subscriptions, invoicing, and a retail pricing catalog are deferred with the hosted offering. ohmyho.st retains its own whole-project wallet and customer billing and assigns the database allowance through the integration API.
+Budget APIs remain in v1; payment processing, subscriptions, invoicing, and a retail pricing catalog are deferred with the hosted offering. Each integrator retains its own aggregate wallet and customer billing and assigns the database allowance through the same generic API.
 
 Short reconnects during resizing are accepted. Branching is deferred. Supabase Auth, Storage, Realtime, and Functions remain outside scope. HTTP/WebSocket access, PostgREST, postgres-meta, and a Studio-derived workbench are optional follow-on integrations after the native pilot.
+
+## Development discipline
+
+Use the [bounded TDD policy](PLAN.md#10-bounded-tdd-and-verification-discipline): at most three new or expanded top-level tests per fix, each red first; targeted test files during iteration; one final full gate; and mandatory stop/report limits. Do not generate test matrices or speculative suites. Consumer-specific defaults, adapters, and compatibility TODOs belong in consumer repositories.
 
 ## Project documents
 

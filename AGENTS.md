@@ -1,7 +1,7 @@
 # cloudflare-postgres
 Build an independent PostgreSQL platform with Apache-2.0-licensed first-party code.
 Deliver the open-source solution first; hosted SaaS and reselling come later.
-Treat ohmyho.st as the first ordinary API adopter, never as a privileged runtime case.
+Keep APIs, defaults, and execution paths generic; consumer adapters belong in consumer repositories.
 Run management APIs and authoritative control state in the adopter's Cloudflare account.
 Run real PostgreSQL on Contabo infrastructure with persistent local storage.
 Use CloudNativePG for database lifecycle, replication, failover, and resource changes.
@@ -21,5 +21,5 @@ Deliver physical backups, WAL archiving, tested point-in-time recovery, and safe
 Defer database branching until after the initial open-source production release.
 Document tenant isolation guarantees and enforce identity, network, compute, and storage limits.
 Keep regional operation independent of continuous management access within authorized limits.
-Automate staged updates, monitoring, recovery drills, and secure credential rotation.
+Follow PLAN.md bounded red-first TDD, targeted test runs, one final full gate, and mandatory stop limits.
 Maintain PLAN.md as canonical scope and roadmap; distinguish proposals from verified behavior.

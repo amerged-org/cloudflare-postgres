@@ -6,7 +6,7 @@ This file is the canonical scope and roadmap. README.md summarizes it; AGENTS.md
 
 ## 1. Product scope and decisions
 
-Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. ohmyho.st is our first adopter and integration customer, using ordinary APIs without privileged runtime exceptions.
+Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.
 
 ### Open-source v1
 
@@ -19,7 +19,7 @@ Build an independent, Apache-2.0-licensed open-source PostgreSQL management plat
 - Physical backups, WAL archiving, point-in-time recovery, retention, and safe backup deletion.
 - Tenant isolation, repeatable server maintenance, monitoring, and recovery procedures.
 
-Budget management and enforcement are part of v1. Payment processing, subscriptions, invoices, checkout, and a platform-owned retail pricing catalog are not. ohmyho.st remains responsible for its own customer billing and whole-project wallet; this platform reports database usage and enforces the database allowance assigned through its APIs.
+Budget management and enforcement are part of v1. Payment processing, subscriptions, invoices, checkout, and a platform-owned retail pricing catalog are not. Integrators retain their customer billing and aggregate wallets; this platform reports database usage and enforces the scoped allowance assigned through its generic APIs.
 
 Short reconnects during resizing are accepted. This does not permit routine cold-start requests to exceed the customer's timeout or allow uncertain writes to be replayed.
 
@@ -37,29 +37,24 @@ Native PostgreSQL is the first integration path. HTTP/WebSocket SQL, PostgREST, 
 
 Cloudflare placement of control state is a user decision. The D1/Durable Objects/R2/Secrets mapping below is the selected design assumption to validate before management implementation. Talos on Contabo, the exact local-volume integration, gateway implementation, isolation runtime, and production failure-domain guarantees still require their stated evidence. No servers have been ordered and no production data has been migrated.
 
-## 2. First customer and early acceptance path
+## 2. Generic product boundary and early acceptance path
 
-Move the first real ohmyho.st development integration ahead of the full gateway, serverless lifecycle, and developer workbench. Start with one disposable, always-on CNPG database environment over native PostgreSQL/TLS, with backup and independent restore. Use a scoped development adapter or harness through the ordinary project flow; do not add behavior keyed to a test customer or project ID.
+Build reusable PostgreSQL management software, not a custom backend for a named adopter. Domain models, defaults, quotas, budget units, error contracts, routes, and execution paths must remain customer-independent. Do not encode consumer-specific plan names, driver versions, timeout constants, billing conventions, identifiers, or polling schedules in the platform.
 
-This pilot establishes a working database path and an always-on performance baseline. It does not remove sleep/wake or autoscaling from v1. Public gateway and full serverless acceptance follow as separate work packages.
+Run an early native PostgreSQL pilot ahead of the full gateway, serverless lifecycle, and workbench. Start with one disposable, always-on CNPG environment over verified TLS, with ordinary scoped roles, transactions, backup, and independent restore. Use generic public interfaces and a small representative workload; an early adopter may exercise the same path. The pilot is an operational baseline, not an exemption from v1 sleep/wake or autoscaling.
 
-### Current ohmyho.st acceptance profile
+### Platform versus consumer responsibilities
 
-This is an integration profile verified against source on 2026-09-27, not a universal product API or an assertion about every live deployment. Reverify it before implementation; keep private source and credentials out of this public repository.
+| Capability | Generic platform responsibility | Consumer responsibility |
+|---|---|---|
+| Lifecycle | Versioned create/observe/delete operations, stable identities, safe handling of uncertain outcomes. | Map local project/environment identities and reconcile the platform's operations. |
+| PostgreSQL access | Document native/direct/pooled endpoints, TLS, role boundaries, transaction semantics, and supported connection behavior. | Configure its drivers, migration tools, application pools, cancellation, and reconnect handling. |
+| Resource policy | Publish supported size ranges, idle policy, scaling limits, and observed state. | Map its service plans into supported configuration without asking for named-plan exceptions. |
+| Timeouts and recovery | Declare measured startup, interruption, and recovery behavior and supported configuration. | Reconcile its client deadlines and recovery requirements with that contract. |
+| Usage | Offer documented units, time windows, granularity, freshness, revisions, and completeness. | Map those facts into its own usage model and choose an appropriate polling cadence. |
+| Budgets | Authorize and enforce scoped limits/allowances with explicit units and stop/resume behavior. | Allocate its database allowance from any wider wallet and provide authorized conversion policy where required. |
 
-| Area | Required integration behavior and current reference |
-|---|---|
-| Project lifecycle | Create, observe, and delete a database environment; track uncertain outcomes and provider operations without duplicating resources. |
-| SQL identity | Separate runtime, migration, and read-only roles; credentials and direct/pooled connection paths; role revocation and rotation. |
-| Driver and transactions | Ordinary `pg` 8.22.0 over TCP with verified TLS; single queries, batches, interactive transactions, cancellation, rollback, and migration compatibility. |
-| Existing time budgets | Connection/pool acquisition: 10 seconds; server statement limit: 10 seconds; client query limit: 12 seconds. Measure the whole path, not just Pod startup. |
-| Compute configuration | Fixed-size reference profiles plus idle-suspend configuration and observed operation status. Current suspend defaults are 60 seconds for Free/Standard and 300 seconds for Performance; the new platform still requires bounded automatic compute scaling. |
-| Environment isolation | Preserve the customer's shared-versus-isolated environment choice. Each independently managed environment must retain separate lifecycle, credentials, restore, and usage attribution. |
-| Usage export | The current integration polls every 15 minutes and consumes completed hourly buckets. Polling frequency is not measurement resolution; report late observations and corrections explicitly. |
-| Recovery history | The existing provisioning request asks for seven days of history. The pilot must prove actual restore and retention rather than treating a configured value as recovery evidence. |
-| Budget integration | ohmyho.st currently exposes `GET/PUT /v1/projects/{project_id}/credit-budget` in its own Control API. It does not forward this to a Neon spending-limit endpoint. The new adapter will assign a database-specific budget or allowance through this platform's API. |
-
-ohmyho.st's current project budget covers all of its billable resources, not only PostgreSQL. Never copy its full wallet balance into a database budget without explicit allocation. Existing local enforcement and credential sweeps are not proof of immediate provider suspension or zero overshoot.
+Consumer-specific compatibility snapshots and TODOs belong in the consumer's PLAN.md. In particular, ohmyho.st owns its PGCF adapter, Neon-specific registration removal, timeout/profile mapping, usage ingestion, wallet allocation, and migration tasks. Do not make those private implementation details universal platform requirements or an upstream release dependency. A missing shared capability may be proposed here only with a general use case, rather than an adopter-specific branch.
 
 ## 3. Reuse strategy and adoption gates
 
@@ -204,13 +199,13 @@ Provide a versioned, tenant-scoped usage API and machine-readable export, indepe
 
 Record successful allocations and lifecycle transitions near resources, with durable checkpoints. Report allocated CPU-time, RAM-time, data-volume storage-time, backup/WAL storage-time, and measured transfer where available. Separate primary, replica, and platform overhead attribution; operational CPU utilization is not allocated CPU-time.
 
-Deduplicate repeated delivery, preserve original evidence, and expose corrections. Test hourly aggregation and 15-minute polling for ohmyho.st without making that its only supported query pattern. No price, invoice, or monthly charge is fabricated from incomplete facts.
+Deduplicate repeated delivery, preserve original evidence, and expose corrections. Verify the documented aggregation, query-window, and correction contract; individual consumers choose and test their own polling cadence. No price, invoice, or monthly charge is fabricated from incomplete facts.
 
 ### Budget management and enforcement
 
 Provide ordinary authenticated APIs to set/read/update a scoped project or database budget, inspect usage and remaining allowance, receive threshold/exhaustion events, and resume after an authorized allowance change. Keep hard enforcement and advisory reporting distinguishable.
 
-Budget-unit semantics must be explicit. Resource-unit limits can be evaluated directly; integrator-defined usage-credit limits require an operator-authorized, versioned conversion/allocation policy. This is enforcement configuration, not a platform-owned retail price catalog. ohmyho.st owns its customer prices and whole-project wallet and assigns only the intended database allowance. Untrusted application callers cannot grant themselves budget authority.
+Budget-unit semantics must be explicit. Resource-unit limits can be evaluated directly; integrator-defined usage-credit limits require an operator-authorized, versioned conversion/allocation policy. This is enforcement configuration, not a platform-owned retail price catalog. The integrator owns its customer prices and aggregate wallet and assigns only the intended database allowance. Untrusted application callers cannot grant themselves budget authority.
 
 Track granted, consumed, and reserved allowance separately. Reserve or lease bounded execution authority before budget-consuming work; reconcile actual usage and release unused reservations with stable identities. Define the maximum enforcement delay/overshoot and the behavior of running sessions, new connections, wake, and resize. A delayed usage API alone cannot implement a hard cap.
 
@@ -224,24 +219,24 @@ Test concurrent reservations, duplicated grants/events, period rollover, revisio
 |---|---|---|
 | **M0 — Repository foundation: complete** | Apache-2.0, project guidance, canonical roadmap, component inventory. | Initial public commit `b7d790d`; documentation changes remain distinct from runtime progress. |
 | **M1 — Infrastructure and control-state feasibility** | Talos/Contabo/volumes/CNPG/R2 proofs; validate the Cloudflare state, secret, and recovery design. | Unattended boot, persistent/enforced storage, database/backup recovery, benchmark baseline, and control-state design ready before M3. |
-| **M2 — Early ohmyho.st development pilot** | One disposable always-on native PostgreSQL environment through an ordinary development integration, without a custom gateway or workbench dependency. | Actual application queries/transactions/migrations, scoped roles, basic lifecycle, usage export, backup, and independent restore. This is not a production migration. |
+| **M2 — Early generic PostgreSQL pilot** | One disposable always-on environment through the ordinary platform interface, without a custom gateway or workbench dependency. | Representative application queries/transactions/migrations, scoped roles, lifecycle, usage, backup, and independent restore; adopter-specific integration remains in its own repository. |
 | **M3 — Cloudflare management, usage, and budget APIs** | D1-backed authority, scoped API/SDK, operation tracking, usage ingestion/query, budget policy/reservations, and regional protocol. | Authorization, idempotency, concurrent updates/reservations, correction/replay, stop/resume commands, and recovery reconciliation. |
 | **M4 — Secure fleet operations** | Provisioning, staged updates, replacement, isolation decision, and observability. | Node maintenance/failure, disk-full containment, cross-tenant tests, credential/key recovery, and restore onto fresh infrastructure. |
 | **M5 — Gateway and connection ownership** | Select a maintainable native gateway, validate endpoint failover, and set pool/queue limits. | Maintainer/update ownership, authentication/invalidation, cancellation, direct/pooled semantics, gateway/node/network failures, and client reconnect behavior. |
 | **M6 — Serverless lifecycle** | Automatic sleep/wake, manual resize, bounded automatic compute scaling, and end-to-end budget enforcement. | Cold-request deadlines, concurrent wake, long transactions, cooldowns, capacity exhaustion, allowance exhaustion, and management-outage behavior. |
 | **M7 — Developer experience and integration qualification** | Complete API/CLI docs and usage/budget examples; evaluate optional HTTP/WS, Data API, and workbench integrations. | Repeatable installation and operator workflows; any shipped optional interface has its own compatibility/security evidence. No hosted billing dependency. |
-| **M8 — Open-source production readiness** | Rehearsed operational release and staged ohmyho.st rollout after dev acceptance. | Sustained workloads, full recovery and upgrade drills, measured service limits, migration/cutover rehearsal, and independently usable installation documentation. |
+| **M8 — Open-source production readiness** | Rehearsed operational release usable by independent adopters. | Sustained workloads, recovery and upgrade evidence, measured service limits, generic migration guidance, and repeatable installation documentation; consumer rollouts are separately owned. |
 
-### Measurement and acceptance matrix
+### Operational acceptance evidence
 
-Publish the workload, versions, topology, sample counts, and pass/fail thresholds before each implementation acceptance run. These are operational measurements; a pricing or break-even study is not required.
+Publish the workload, versions, topology, sample counts, and pass/fail thresholds before each implementation acceptance run. These are operational measurements; a pricing or break-even study is not required. The table lists milestone evidence areas, not instructions to generate test matrices or permutations: select only the concrete cases needed for the current change, subject to section 10.
 
 | Test | Measure | Acceptance rule |
 |---|---|---|
 | Talos bootstrap | Provision-to-ready duration, failed/repeated boots, operator interventions. | Reproducible authenticated bootstrap without manual console fixes; failed attempts recover without duplicate resources. |
 | Disk and competing tenants | Durable write/read latency, throughput, p95/p99 under realistic concurrent workloads. | Meet the declared workload target without cross-tenant disk exhaustion or loss of durability. |
 | Database density | Idle/active memory, reserved CPU, connection counts, and recovery headroom. | Demonstrate a safe capacity envelope, including a node failure/maintenance case; do not derive density from nominal RAM alone. |
-| Native and cold access | Connection-ready and end-to-end query p50/p95/p99, maxima, and timeout/error counts. | Meet the customer's actual deadline; for the current ohmyho.st profile preserve headroom within 10-second connection and 12-second query limits. |
+| Native and cold access | Connection-ready and end-to-end query p50/p95/p99, maxima, and timeout/error counts. | Meet the declared platform latency target and configured deadline behavior; consumers validate their own client timeout budgets separately. |
 | Resize and maintenance | Drain duration, reconnect window, failed/uncertain transactions, replica catch-up. | Bound interruption and prove correct error handling without blind write replay. |
 | Recovery and retention | Recoverable timestamps, recovered content, restore time, archive continuity, deleted objects. | Prove the declared history window, safe deletion, and recovery on a fresh cluster with distinct archive identity. |
 | Usage and budgets | Coverage, freshness, duplicate/correction handling, reservation accuracy, enforcement delay. | Reproducible reporting, no double consumption, bounded stop behavior, and explicit gaps rather than invented usage. |
@@ -250,9 +245,38 @@ Publish the workload, versions, topology, sample counts, and pass/fail threshold
 ## 9. Decisions to deepen before implementation and release
 
 - Before M1/M3: finalize Cloudflare schema and retention, backup/key custody, management auth, and the state/operation/allowance reconciliation model.
-- Before M2: reverify the current ohmyho.st adapter contract and define the disposable dev migration/restore procedure.
+- Before M2: define the generic native-PostgreSQL pilot contract and disposable migration/restore procedure; track consumer adapter work in the consumer repository.
 - Before M4/M5: approve the tenant isolation guarantee, maintenance responsibility, gateway choice and native endpoint failover design.
 - Before M6: freeze sleep eligibility, cold-start/reconnect deadlines, scaling thresholds, budget units/periods, enforcement bounds, and disconnected-region policy.
 - Before M8: verify replica topology, synchronous-commit behavior, actual failure domains, recovery objectives, installed-version support, and safe capacity reserves.
 
 Implementation assumptions must be resolved with evidence, not advertised as existing guarantees. Hosted SaaS/reselling and branching require later plans; neither is a gate for this open-source delivery.
+
+## 10. Bounded TDD and verification discipline
+
+Use test-driven development for concrete behavior changes: identify the intended behavior or observed defect, demonstrate a meaningful failing test, implement the smallest complete correction, and check the affected behavior again. Keep the task scope fixed; tests are evidence for that change, not a reason to build additional features or infrastructure.
+
+### Test budget and red-first proof
+
+- Add or materially expand **at most three top-level tests per fix**, each failing first for the intended missing behavior or defect before the implementation change. Preserve the red/green result in the work report; a harness/setup failure is not the required red proof.
+- The limit applies across files, packages, agents, and commits for the same fix. Count independently reported test cases; nesting, a new describe block, parameter rows, loops, renaming, or splitting a fix must not hide extra cases or reset the limit.
+- Never generate test matrices, permutations, or speculative edge-case suites. Prefer the observed failing example and the smallest necessary regression; reuse existing coverage without weakening valid tests.
+- Define the current task's test-count baseline before iteration. Do not grow the task into unrelated cleanup or split it into artificial fixes to evade its limits.
+
+### Iteration and one final gate
+
+During iteration, run only explicitly named test files in packages changed by the task, for example `pnpm vitest run <path>`. Do not use unfiltered package-wide or repository-wide test discovery. Rebuild affected artifacts when needed to avoid testing stale outputs; this does not authorize a broader test suite.
+
+After freezing the final candidate, run the full gate **exactly once**: format, lint, typecheck, Vitest, and `test:node`. Use the repository's canonical commands (`pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm vitest run`, `pnpm test:node`) once the runtime/tooling scaffold exists. Do not run the full gate during iteration, repeat it for reassurance, or silently change the candidate and restart a broad verification loop. If the final gate fails, stop and report the result and required next step.
+
+Documentation-only work checks the edited documents, links, and diff; do not invent runtime tests or package tooling just to test prose. This documentation-only repository has no executable full gate yet; record that fact rather than claiming a test pass.
+
+### Mandatory stop conditions
+
+Stop and report instead of widening the change when any of the following occurs:
+
+- The same test remains red after **two fix attempts**. An attempt is an implementation correction followed by checking the same failure; renaming the test/task or creating a commit does not reset the count.
+- Any test/check run takes **more than 10 minutes**. Monitor elapsed wall time and stop the running invocation at that bound; do not keep it running in the background to evade the limit.
+- The test count grows by **more than a few dozen** relative to the current task's baseline. This is a guard against accumulated/generated cases, not a cap on the pre-existing tests executed by the expressly allowed final full gate; the per-fix three-test cap still applies.
+
+The stop report states the failing behavior or run, attempts, elapsed time, test-count change, evidence, and smallest proposed next step. Do not weaken assertions, mark a failed run green, or broaden implementation scope to finish the gate.
