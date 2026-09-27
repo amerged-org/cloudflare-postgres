@@ -123,6 +123,52 @@ it("recovers organization access after a committed bootstrap response is lost", 
   expect(created.status).toBe(202);
 });
 
+it("pages through every organization without skipping equal creation timestamps", async () => {
+  const createdAt = "9999-01-01T00:00:00.000Z";
+  const ids = [
+    "00000000-0000-4000-8000-000000000001",
+    "00000000-0000-4000-8000-000000000002",
+    "00000000-0000-4000-8000-000000000003",
+  ];
+  await env.DB.batch(
+    ids.map((id) =>
+      env.DB.prepare(
+        "INSERT INTO organizations (id, name, created_at) VALUES (?, ?, ?)",
+      ).bind(id, id, createdAt),
+    ),
+  );
+  const headers = { authorization: "Bearer test-installation-token" };
+
+  const first = await call("/v1/organizations?limit=2", { headers });
+  expect(first.status).toBe(200);
+  const firstBody = (await first.json()) as {
+    organizations: Array<{ id: string }>;
+    nextCursor: string | null;
+  };
+  expect(firstBody.organizations.map(({ id }) => id)).toEqual([ids[2], ids[1]]);
+  expect(firstBody.nextCursor).toEqual(expect.any(String));
+
+  const second = await call(
+    `/v1/organizations?cursor=${encodeURIComponent(firstBody.nextCursor!)}`,
+    { headers },
+  );
+  expect(second.status).toBe(200);
+  const secondBody = (await second.json()) as typeof firstBody;
+  expect(secondBody.organizations[0]?.id).toBe(ids[0]);
+  expect(
+    secondBody.organizations.some(({ id }) => id === ids[1] || id === ids[2]),
+  ).toBe(false);
+  expect(secondBody.nextCursor).toBeNull();
+});
+
+it("rejects an invalid organization page cursor", async () => {
+  const response = await call("/v1/organizations?cursor=not-a-cursor", {
+    headers: { authorization: "Bearer test-installation-token" },
+  });
+  expect(response.status).toBe(400);
+  expect(await response.json()).toEqual({ error: { code: "invalid_request" } });
+});
+
 it("creates a pending project and queued operation, then restricts both reads to its organization", async () => {
   const first = await bootstrap("Projects owner");
   const other = await bootstrap("Other owner");

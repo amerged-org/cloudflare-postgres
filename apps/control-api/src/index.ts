@@ -13,6 +13,11 @@ interface OrganizationRow {
   created_at: string;
 }
 
+interface OrganizationCursor {
+  createdAt: string;
+  id: string;
+}
+
 interface ProjectRow {
   id: string;
   organization_id: string;
@@ -217,22 +222,90 @@ async function bootstrapOrganization(
   );
 }
 
+function encodeOrganizationCursor(row: OrganizationRow): string {
+  return btoa(JSON.stringify({ createdAt: row.created_at, id: row.id }))
+    .replaceAll("+", "-")
+    .replaceAll("/", "_")
+    .replaceAll("=", "");
+}
+
+function decodeOrganizationCursor(value: string): OrganizationCursor | null {
+  if (value.length > 256 || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  try {
+    const parsed: unknown = JSON.parse(
+      atob(value.replaceAll("-", "+").replaceAll("_", "/")),
+    );
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed))
+      return null;
+    const keys = Object.keys(parsed);
+    if (
+      keys.length !== 2 ||
+      !keys.includes("createdAt") ||
+      !keys.includes("id")
+    )
+      return null;
+    const { createdAt, id } = parsed as Record<string, unknown>;
+    if (
+      typeof createdAt !== "string" ||
+      typeof id !== "string" ||
+      !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(id) ||
+      new Date(createdAt).toISOString() !== createdAt
+    ) {
+      return null;
+    }
+    return { createdAt, id };
+  } catch {
+    return null;
+  }
+}
+
 async function listOrganizations(
   request: Request,
   env: Env,
 ): Promise<Response> {
   const auth = await authorizedInstallation(request, env);
   if (auth) return auth;
-  const result = await env.DB.prepare(
-    "SELECT id, name, created_at FROM organizations ORDER BY created_at DESC, id DESC LIMIT 1000",
-  ).all<OrganizationRow>();
+  const query = new URL(request.url).searchParams;
+  if (
+    Array.from(query.keys()).some(
+      (key) => key !== "limit" && key !== "cursor",
+    ) ||
+    query.getAll("limit").length > 1 ||
+    query.getAll("cursor").length > 1
+  ) {
+    return error(400, "invalid_request");
+  }
+  const limitText = query.get("limit");
+  if (limitText !== null && !/^[1-9][0-9]{0,3}$/.test(limitText))
+    return error(400, "invalid_request");
+  const limit = limitText === null ? 1000 : Number(limitText);
+  if (limit > 1000) return error(400, "invalid_request");
+  const cursorText = query.get("cursor");
+  const cursor =
+    cursorText === null ? null : decodeOrganizationCursor(cursorText);
+  if (cursorText !== null && cursor === null)
+    return error(400, "invalid_request");
+
+  const statement = cursor
+    ? env.DB.prepare(
+        "SELECT id, name, created_at FROM organizations WHERE created_at < ? OR (created_at = ? AND id < ?) ORDER BY created_at DESC, id DESC LIMIT ?",
+      ).bind(cursor.createdAt, cursor.createdAt, cursor.id, limit + 1)
+    : env.DB.prepare(
+        "SELECT id, name, created_at FROM organizations ORDER BY created_at DESC, id DESC LIMIT ?",
+      ).bind(limit + 1);
+  const result = await statement.all<OrganizationRow>();
+  const page = result.results.slice(0, limit);
   return json(
     {
-      organizations: result.results.map((row) => ({
+      organizations: page.map((row) => ({
         id: row.id,
         name: row.name,
         createdAt: row.created_at,
       })),
+      nextCursor:
+        result.results.length > limit
+          ? encodeOrganizationCursor(page[page.length - 1]!)
+          : null,
     },
     200,
   );

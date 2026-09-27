@@ -9,25 +9,45 @@ paths:
   /v1/organizations:
     get:
       operationId: listOrganizations
-      summary: List recent organizations for installation recovery
+      summary: Page through organizations for installation recovery
       description: >-
-        Installation-token-only list of the latest 1000 organizations, newest first.
-        An operator can find an organization after losing the bootstrap response.
+        Installation-token-only list, newest first by creation time and ID.
+        Follow nextCursor until it is null to reach older organizations after a
+        lost bootstrap response. The cursor advances by creation time and ID;
+        concurrent creations or deletions can change later pages.
       security:
         - installationToken: []
+      parameters:
+        - name: limit
+          in: query
+          description: Page size; defaults to 1000.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+        - name: cursor
+          in: query
+          description: Opaque nextCursor value returned by the preceding page.
+          schema:
+            type: string
       responses:
         "200":
-          description: Recent organizations
+          description: One organization page
           content:
             application/json:
               schema:
                 type: object
-                required: [organizations]
+                required: [organizations, nextCursor]
                 properties:
                   organizations:
                     type: array
                     items:
                       $ref: "#/components/schemas/Organization"
+                  nextCursor:
+                    type: [string, "null"]
+                    description: Pass this as cursor to fetch the next page, if present.
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "503":
@@ -234,7 +254,7 @@ components:
         format: uuid
   responses:
     InvalidRequest:
-      description: Invalid JSON body or idempotency key
+      description: Invalid request body, query parameter, or idempotency key
       content:
         application/json:
           schema:
