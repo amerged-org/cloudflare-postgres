@@ -232,7 +232,7 @@ Test concurrent reservations, duplicated grants/events, period rollover, revisio
 
 M1 has a [partial live infrastructure checkpoint](docs/evidence/m1-2026-09-27.md). Its Talos, PostgreSQL, backup, and recovery gates remain open.
 
-M3 has a [local control API first slice](apps/control-api/README.md): organization bootstrap and a D1-backed pending project with a queued operation. This is durable intent only; it is not database provisioning or a completed M3 API.
+M3 has a [deployed Dev control API checkpoint](docs/evidence/m3-control-api-dev-2026-09-27.md): organization bootstrap and a D1-backed pending project with a queued operation. This is durable intent only; it is not database provisioning or a completed M3 API.
 
 ### Operational acceptance evidence
 
