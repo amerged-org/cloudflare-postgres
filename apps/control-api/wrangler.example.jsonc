@@ -1,0 +1,16 @@
+{
+  "name": "cloudflare-postgres-control-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-27",
+  "secrets": {
+    "required": ["INSTALLATION_BOOTSTRAP_TOKEN"],
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "control-api",
+      "database_id": "REPLACE_WITH_YOUR_D1_DATABASE_ID",
+      "migrations_dir": "migrations",
+    },
+  ],
+}

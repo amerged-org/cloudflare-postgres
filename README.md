@@ -6,7 +6,7 @@ An independent, open-source PostgreSQL platform with a Cloudflare management lay
 
 ## Development status
 
-**Documentation and repository foundation only.** No working database platform, deployment automation, or production service has been implemented. Candidate components have not been validated together.
+**Early development.** The [control API first slice](apps/control-api/README.md) now implements authenticated organization bootstrap and D1-backed project intent with a queued operation. Local Worker tests pass. It has not provisioned PostgreSQL, and the regional controller, gateway, backup integration, and production service remain unimplemented. Candidate infrastructure components have not been validated together.
 
 The first implementation steps are infrastructure/recovery proofs and an early generic pilot using one always-on database over native PostgreSQL. Adopter-specific adapters and migration TODOs belong in their own repositories. Gateway selection follows technical and maintenance evaluation. Sleep/wake and bounded automatic compute scaling remain v1 requirements after that baseline.
 

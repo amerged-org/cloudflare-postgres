@@ -1,0 +1,332 @@
+openapi: 3.1.0
+info:
+  title: Cloudflare Postgres Control API
+  version: 0.1.0
+  description: >-
+    First management slice. A created project is pending and its operation is
+    queued; this API does not provision PostgreSQL.
+paths:
+  /v1/organizations:
+    get:
+      operationId: listOrganizations
+      summary: List recent organizations for installation recovery
+      description: >-
+        Installation-token-only list of the latest 1000 organizations, newest first.
+        An operator can find an organization after losing the bootstrap response.
+      security:
+        - installationToken: []
+      responses:
+        "200":
+          description: Recent organizations
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [organizations]
+                properties:
+                  organizations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Organization"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Installation bootstrap secret is unconfigured
+    post:
+      operationId: bootstrapOrganization
+      summary: Create an organization and reveal its scoped API token once
+      security:
+        - installationToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NameInput"
+      responses:
+        "201":
+          description: Organization created; save the returned token now
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [organization, apiToken, scopes]
+                properties:
+                  organization:
+                    $ref: "#/components/schemas/Organization"
+                  apiToken:
+                    type: string
+                    pattern: "^cporg_[A-Za-z0-9_-]+$"
+                  scopes:
+                    type: array
+                    items:
+                      type: string
+                      enum: [projects:read, projects:write, operations:read]
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Installation bootstrap secret is unconfigured
+  /v1/organizations/{organizationId}/tokens/reissue:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    post:
+      operationId: reissueOrganizationToken
+      summary: Reissue a lost organization token
+      description: >-
+        Installation-token-only recovery operation. Revokes every previously active
+        token for this organization and reveals the replacement token once.
+      security:
+        - installationToken: []
+      responses:
+        "201":
+          description: Previous tokens revoked; replacement token issued
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [organization, apiToken, scopes]
+                properties:
+                  organization:
+                    $ref: "#/components/schemas/Organization"
+                  apiToken:
+                    type: string
+                    pattern: "^cporg_[A-Za-z0-9_-]+$"
+                  scopes:
+                    type: array
+                    items:
+                      type: string
+                      enum: [projects:read, projects:write, operations:read]
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: Installation bootstrap secret is unconfigured
+  /v1/organizations/{organizationId}/projects:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    post:
+      operationId: createProject
+      summary: Record a pending project and queued operation
+      security:
+        - organizationToken: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+            pattern: "^[A-Za-z0-9._~-]+$"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NameInput"
+      responses:
+        "202":
+          description: Intent recorded; the same key and request preserve both IDs
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [project, operation]
+                properties:
+                  project:
+                    $ref: "#/components/schemas/Project"
+                  operation:
+                    $ref: "#/components/schemas/Operation"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Idempotency key already used with another request
+  /v1/organizations/{organizationId}/projects/{projectId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: projectId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getProject
+      summary: Read a project in the authorized organization
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Project state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [project]
+                properties:
+                  project:
+                    $ref: "#/components/schemas/Project"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/organizations/{organizationId}/operations/{operationId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: operationId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getOperation
+      summary: Read a queued operation in the authorized organization
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Operation state
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [operation]
+                properties:
+                  operation:
+                    $ref: "#/components/schemas/Operation"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+components:
+  securitySchemes:
+    installationToken:
+      type: http
+      scheme: bearer
+      description: Worker Secret configured by the installation operator.
+    organizationToken:
+      type: http
+      scheme: bearer
+      description: >-
+        Token issued once at organization bootstrap with projects:read,
+        projects:write, and operations:read scopes.
+  parameters:
+    OrganizationId:
+      name: organizationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+  responses:
+    InvalidRequest:
+      description: Invalid JSON body or idempotency key
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unauthorized:
+      description: Missing or invalid bearer token
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Token lacks the required scope
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: Resource absent or belongs to another organization
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    NameInput:
+      type: object
+      additionalProperties: false
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+          description: Trimmed name without control characters.
+    Organization:
+      type: object
+      required: [id, name, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+    Project:
+      type: object
+      required: [id, organizationId, name, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        status:
+          type: string
+          enum: [pending]
+        createdAt:
+          type: string
+          format: date-time
+    Operation:
+      type: object
+      required: [id, organizationId, projectId, kind, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        projectId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum: [project.create]
+        status:
+          type: string
+          enum: [queued]
+        createdAt:
+          type: string
+          format: date-time
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code]
+          properties:
+            code:
+              type: string

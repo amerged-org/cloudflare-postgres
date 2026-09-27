@@ -1,0 +1,23 @@
+# Control API first slice
+
+This Worker implements a small, generic `/v1` management API backed by one D1 database. It records organizations, scoped API tokens, projects, idempotency identities, and operations. Project creation records intent only: the project remains `pending` and its operation remains `queued` until a separate regional controller is implemented and reconciles it. This slice does not provision PostgreSQL.
+
+## Operator setup
+
+Create a D1 database in the adopter's Cloudflare account, copy `wrangler.example.jsonc` to `wrangler.jsonc` in this directory, and set its database name and ID to that database. `wrangler.jsonc` is ignored by Git. From this directory, apply the migration with `pnpm exec wrangler d1 migrations apply DB --remote --config wrangler.jsonc` before serving requests. Configure a high-entropy `INSTALLATION_BOOTSTRAP_TOKEN` as a Worker Secret for this Worker, for example with `pnpm exec wrangler secret put INSTALLATION_BOOTSTRAP_TOKEN --config wrangler.jsonc`. The example configuration contains no account ID or secret. Keep all Worker configuration and any local development secret files in this directory; a parent directory's operator credentials are outside the Worker's configuration boundary. See Cloudflare's [D1 migrations](https://developers.cloudflare.com/d1/reference/migrations/) and [Worker Secrets](https://developers.cloudflare.com/workers/configuration/secrets/) documentation for operator details.
+
+The separate `wrangler.test.jsonc` binds a disposable local D1 database. Its fixed ID and installation token are test fixtures only. Tests apply the real migration in Miniflare through Cloudflare's Vitest plugin. Run the focused tests with `pnpm exec vitest run test/api.test.ts` from this directory.
+
+## API behavior
+
+Send `POST /v1/organizations` with `Authorization: Bearer <installation bootstrap token>` and JSON `{ "name": "..." }`. A successful response creates an organization and returns a random `cporg_...` API token with `projects:read`, `projects:write`, and `operations:read` scopes. D1 stores only its SHA-256 digest. The token is returned in this response only; store it securely at creation. The installation token is for organization bootstrap, not ordinary organization requests.
+
+If the bootstrap response is lost after the database commits, use the installation token to call `GET /v1/organizations` and find the new organization among the latest 1000 results. Then call `POST /v1/organizations/{organizationId}/tokens/reissue`. The response reveals a replacement token once and revokes every previously active token for that organization. A repeated reissue creates another replacement and invalidates the previous one; keep the final successful response. These installation routes never accept an ordinary organization token.
+
+JSON bodies are limited to 4096 UTF-8 bytes, including when the caller omits `Content-Length`. Oversized or invalid bodies return `400 invalid_request` without buffering the full request.
+
+Send `POST /v1/organizations/{organizationId}/projects` with the organization token, JSON `{ "name": "..." }`, and an `Idempotency-Key` of 1–128 ASCII letters, digits, `.`, `_`, `~`, or `-`. A successful `202` response contains a `pending` project and a `queued` `project.create` operation. The same key and same request within an organization return the same IDs. Reusing the key with a different name returns `409 idempotency_conflict`. Idempotency records currently have no expiry. D1 inserts the project, operation, and idempotency identity in one atomic batch, so a failed insert does not leave an orphan project or operation.
+
+Use the organization token to read `GET /v1/organizations/{organizationId}/projects/{projectId}` and `GET /v1/organizations/{organizationId}/operations/{operationId}`. Token lookup and resource reads use the D1 primary. Missing or invalid tokens return `401`; a valid token for another organization receives `404`. All API responses set `Cache-Control: no-store`. The [OpenAPI contract](openapi.yaml) records request and response shapes.
+
+The current slice has no project execution, token rotation API, idempotency archival, rate limiting, or regional reconciliation. It is development groundwork for the later control-plane milestone, not an operational PostgreSQL service.

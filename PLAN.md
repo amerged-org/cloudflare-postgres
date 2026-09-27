@@ -1,6 +1,6 @@
 # cloudflare-postgres — Open-source implementation plan
 
-Status: revised approved direction, 2026-09-27. M0 (repository foundation) is complete. All runtime, infrastructure, integration, and operational acceptance work remains pending.
+Status: revised approved direction, 2026-09-27. M0 is complete, M1 has partial live infrastructure evidence, and a local control API slice has source and focused tests. Regional provisioning and operational acceptance remain pending.
 
 This file is the canonical scope and roadmap. README.md summarizes it; AGENTS.md is the 25-line contributor brief; THIRD_PARTY.md records component provenance and adoption status. A documented target is not evidence of implemented behavior.
 
@@ -229,6 +229,10 @@ Test concurrent reservations, duplicated grants/events, period rollover, revisio
 | **M6 — Serverless lifecycle** | Automatic sleep/wake, manual resize, bounded automatic compute scaling, and end-to-end budget enforcement. | Cold-request deadlines, concurrent wake, long transactions, cooldowns, capacity exhaustion, allowance exhaustion, and management-outage behavior. |
 | **M7 — Developer experience and integration qualification** | Complete API/CLI docs and usage/budget examples; evaluate optional HTTP/WS, Data API, and workbench integrations. | Repeatable installation and operator workflows; any shipped optional interface has its own compatibility/security evidence. No hosted billing dependency. |
 | **M8 — Open-source production readiness** | Rehearsed operational release usable by independent adopters. | Sustained workloads, recovery and upgrade evidence, measured service limits, generic migration guidance, and repeatable installation documentation; consumer rollouts are separately owned. |
+
+M1 has a [partial live infrastructure checkpoint](docs/evidence/m1-2026-09-27.md). Its Talos, PostgreSQL, backup, and recovery gates remain open.
+
+M3 has a [local control API first slice](apps/control-api/README.md): organization bootstrap and a D1-backed pending project with a queued operation. This is durable intent only; it is not database provisioning or a completed M3 API.
 
 ### Operational acceptance evidence
 

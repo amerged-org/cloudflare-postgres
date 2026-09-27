@@ -2,7 +2,7 @@
 
 Reviewed: 2026-09-27. Scope follows the open-source-first revision in [PLAN.md](PLAN.md); hosted billing and reselling are deferred, while usage reporting and budget APIs remain in v1.
 
-**This is a planning inventory. No third-party source code, binaries, container images, or dependencies are bundled in the initial repository.** No implementation versions have been selected or pinned. The links below identify the upstream projects and license evidence reviewed for the approved architecture; they are not a dependency lockfile.
+**This is an infrastructure-component planning inventory.** No database/operator component source, binary, or container image is vendored in this repository. The control API now uses Cloudflare Worker development dependencies recorded in [package.json](apps/control-api/package.json) and the root pnpm lockfile; the infrastructure candidates below are not integrated or version-pinned. The links identify upstream projects and license evidence, not an infrastructure dependency lockfile.
 
 The repository's [Apache License 2.0](LICENSE) applies to original project work. Upstream components retain their own licenses, copyright statements, notices, and any source-availability obligations. Recheck the exact selected release and its dependencies before integration or redistribution.
 
