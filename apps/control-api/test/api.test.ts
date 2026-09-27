@@ -250,7 +250,7 @@ it("recovers organization access after a committed bootstrap response is lost", 
       body: JSON.stringify({ name: "Recovered project" }),
     },
   );
-  expect(created.status).toBe(202);
+  expect(created.status).toBe(201);
 });
 
 it("pages through every organization without skipping equal creation timestamps", async () => {
@@ -299,7 +299,7 @@ it("rejects an invalid organization page cursor", async () => {
   expect(await response.json()).toEqual({ error: { code: "invalid_request" } });
 });
 
-it("creates a pending project and queued operation, then restricts both reads to its organization", async () => {
+it("creates an active logical project and completed audit operation, then restricts both reads to its organization", async () => {
   const first = await bootstrap("Projects owner");
   const other = await bootstrap("Other owner");
   const created = await call(
@@ -314,13 +314,20 @@ it("creates a pending project and queued operation, then restricts both reads to
       body: JSON.stringify({ name: "Project A" }),
     },
   );
-  expect(created.status).toBe(202);
+  expect(created.status).toBe(201);
   const body = (await created.json()) as {
-    project: { id: string; status: string };
-    operation: { id: string; status: string };
+    project: { id: string; status: string; createdAt: string };
+    operation: {
+      id: string;
+      status: string;
+      observedAt: string;
+      resultCode: string;
+    };
   };
-  expect(body.project.status).toBe("pending");
-  expect(body.operation.status).toBe("queued");
+  expect(body.project.status).toBe("active");
+  expect(body.operation.status).toBe("succeeded");
+  expect(body.operation.observedAt).toBe(body.project.createdAt);
+  expect(body.operation.resultCode).toBe("logical_container_created");
 
   const project = await call(
     `/v1/organizations/${first.organization.id}/projects/${body.project.id}`,
@@ -385,15 +392,18 @@ it("replays an identical project request and rejects a changed request under the
     headers,
     body: JSON.stringify({ name: "First project" }),
   });
-  expect(first.status).toBe(202);
-  const firstBody = await first.json();
+  expect(first.status).toBe(201);
+  const firstBody = (await first.json()) as {
+    project: { id: string };
+    operation: { id: string };
+  };
 
   const replay = await call(path, {
     method: "POST",
     headers,
     body: JSON.stringify({ name: "First project" }),
   });
-  expect(replay.status).toBe(202);
+  expect(replay.status).toBe(201);
   expect(await replay.json()).toEqual(firstBody);
 
   const changed = await call(path, {
@@ -408,4 +418,43 @@ it("replays an identical project request and rejects a changed request under the
     .bind(organization.id)
     .first<{ count: number }>();
   expect(count?.count).toBe(1);
+
+  // Migration 0004 leaves a legacy pending/queued pair with two operations
+  // unchanged. Its idempotent replay must not report completed creation.
+  await env.DB.batch([
+    env.DB.prepare("UPDATE projects SET status = 'pending' WHERE id = ?").bind(
+      firstBody.project.id,
+    ),
+    env.DB.prepare(
+      "UPDATE operations SET status = 'queued', observed_at = NULL, result_code = NULL WHERE id = ?",
+    ).bind(firstBody.operation.id),
+    env.DB.prepare(
+      "INSERT INTO operations (id, organization_id, project_id, kind, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+    ).bind(
+      crypto.randomUUID(),
+      organization.id,
+      firstBody.project.id,
+      "project.create",
+      "queued",
+      new Date().toISOString(),
+    ),
+  ]);
+  const unmatchedReplay = await call(path, {
+    method: "POST",
+    headers,
+    body: JSON.stringify({ name: "First project" }),
+  });
+  expect(unmatchedReplay.status).toBe(202);
+  const unmatchedBody = (await unmatchedReplay.json()) as {
+    project: { id: string; status: string };
+    operation: { id: string; status: string };
+  };
+  expect(unmatchedBody.project).toMatchObject({
+    id: firstBody.project.id,
+    status: "pending",
+  });
+  expect(unmatchedBody.operation).toMatchObject({
+    id: firstBody.operation.id,
+    status: "queued",
+  });
 });

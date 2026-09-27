@@ -40,6 +40,8 @@ interface OperationRow {
   kind: string;
   status: string;
   created_at: string;
+  observed_at: string | null;
+  result_code: string | null;
 }
 
 interface IdempotencyRow {
@@ -561,6 +563,8 @@ function operationFromRow(row: OperationRow) {
     kind: row.kind,
     status: row.status,
     createdAt: row.created_at,
+    observedAt: row.observed_at,
+    resultCode: row.result_code,
   };
 }
 
@@ -581,12 +585,19 @@ async function projectAndOperation(
       .first<OperationRow>(),
   ]);
   if (!project || !operation) return error(500, "state_inconsistent");
+  const status =
+    project.status === "active" && operation.status === "succeeded"
+      ? 201
+      : project.status === "pending" && operation.status === "queued"
+        ? 202
+        : null;
+  if (status === null) return error(500, "state_inconsistent");
   return json(
     {
       project: projectFromRow(project),
       operation: operationFromRow(operation),
     },
-    202,
+    status,
   );
 }
 
@@ -643,16 +654,18 @@ async function createProject(
     await env.DB.batch([
       env.DB.prepare(
         "INSERT INTO projects (id, organization_id, name, status, created_at) VALUES (?, ?, ?, ?, ?)",
-      ).bind(projectId, organizationId, name, "pending", createdAt),
+      ).bind(projectId, organizationId, name, "active", createdAt),
       env.DB.prepare(
-        "INSERT INTO operations (id, organization_id, project_id, kind, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        "INSERT INTO operations (id, organization_id, project_id, kind, status, created_at, observed_at, result_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
       ).bind(
         operationId,
         organizationId,
         projectId,
         "project.create",
-        "queued",
+        "succeeded",
         createdAt,
+        createdAt,
+        "logical_container_created",
       ),
       env.DB.prepare(
         "INSERT INTO idempotency_requests (organization_id, idempotency_key, request_hash, project_id, operation_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
@@ -684,7 +697,7 @@ async function createProject(
         id: projectId,
         organization_id: organizationId,
         name,
-        status: "pending",
+        status: "active",
         created_at: createdAt,
       }),
       operation: operationFromRow({
@@ -692,11 +705,13 @@ async function createProject(
         organization_id: organizationId,
         project_id: projectId,
         kind: "project.create",
-        status: "queued",
+        status: "succeeded",
         created_at: createdAt,
+        observed_at: createdAt,
+        result_code: "logical_container_created",
       }),
     },
-    202,
+    201,
   );
 }
 

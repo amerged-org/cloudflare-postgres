@@ -3,9 +3,10 @@ info:
   title: Cloudflare Postgres Control API
   version: 0.1.0
   description: >-
-    First management slice. A created project is pending and its operation is
-    queued. Region registration issues a scoped executor token, but no regional
-    operation claims or PostgreSQL provisioning are implemented.
+    First management slice. Projects are global logical containers created
+    immediately; an active project does not contain a database or connection
+    endpoint. Region registration issues a scoped executor token, but no
+    regional operation claims or PostgreSQL provisioning are implemented.
 paths:
   /v1/regions:
     get:
@@ -257,7 +258,10 @@ paths:
       - $ref: "#/components/parameters/OrganizationId"
     post:
       operationId: createProject
-      summary: Record a pending project and queued operation
+      summary: Create a logical project and completed audit operation
+      description: >-
+        Creates a global logical container in D1. No region, PostgreSQL
+        cluster, database, credential, or connection endpoint is provisioned.
       security:
         - organizationToken: []
       parameters:
@@ -276,8 +280,22 @@ paths:
             schema:
               $ref: "#/components/schemas/NameInput"
       responses:
+        "201":
+          description: Logical project created; the same key and request preserve both IDs
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [project, operation]
+                properties:
+                  project:
+                    $ref: "#/components/schemas/Project"
+                  operation:
+                    $ref: "#/components/schemas/Operation"
         "202":
-          description: Intent recorded; the same key and request preserve both IDs
+          description: >-
+            An unmatched legacy project remains pending with a queued operation.
+            Its IDs are preserved and operator review is required.
           content:
             application/json:
               schema:
@@ -340,7 +358,7 @@ paths:
           format: uuid
     get:
       operationId: getOperation
-      summary: Read a queued operation in the authorized organization
+      summary: Read an audit operation in the authorized organization
       security:
         - organizationToken: []
       responses:
@@ -481,13 +499,26 @@ components:
           type: string
         status:
           type: string
-          enum: [pending]
+          enum: [active, pending]
+          description: >-
+            Active means the logical container exists, not that a database is
+            provisioned. Pending is reserved for unmatched legacy records.
         createdAt:
           type: string
           format: date-time
     Operation:
       type: object
-      required: [id, organizationId, projectId, kind, status, createdAt]
+      required:
+        [
+          id,
+          organizationId,
+          projectId,
+          kind,
+          status,
+          createdAt,
+          observedAt,
+          resultCode,
+        ]
       properties:
         id:
           type: string
@@ -503,10 +534,19 @@ components:
           enum: [project.create]
         status:
           type: string
-          enum: [queued]
+          enum: [succeeded, queued]
+          description: New project.create operations succeed in the D1 create batch.
         createdAt:
           type: string
           format: date-time
+        observedAt:
+          type: [string, "null"]
+          format: date-time
+          description: Time the logical project creation was observed as complete.
+        resultCode:
+          type: [string, "null"]
+          enum: [logical_container_created, null]
+          description: Null only for unmatched legacy operations.
     Error:
       type: object
       required: [error]
