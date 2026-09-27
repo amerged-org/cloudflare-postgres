@@ -1,6 +1,6 @@
 # Third-party component inventory
 
-Reviewed: 2026-09-27.
+Reviewed: 2026-09-27. Scope follows the open-source-first revision in [PLAN.md](PLAN.md); hosted billing and reselling are deferred, while usage reporting and budget APIs remain in v1.
 
 **This is a planning inventory. No third-party source code, binaries, container images, or dependencies are bundled in the initial repository.** No implementation versions have been selected or pinned. The links below identify the upstream projects and license evidence reviewed for the approved architecture; they are not a dependency lockfile.
 
@@ -15,13 +15,19 @@ Every component in this table is **not integrated**. A planned role expresses an
 | [PostgreSQL](https://www.postgresql.org/) | [PostgreSQL License](https://www.postgresql.org/about/licence/) | Ordinary PostgreSQL engine; supported versions and extensions will be pinned and tested. |
 | [CloudNativePG](https://github.com/cloudnative-pg/cloudnative-pg) | [Apache-2.0](https://github.com/cloudnative-pg/cloudnative-pg/blob/main/LICENSE) | Core operator for database lifecycle, replication, failover, roles, resizing, hibernation, and recovery integration. |
 | [PgBouncer](https://github.com/pgbouncer/pgbouncer) | [ISC](https://github.com/pgbouncer/pgbouncer/blob/master/COPYRIGHT) | Default pooling through CNPG Pooler resources. Upstream COPYRIGHT identifies ISC even when automated repository detection reports NOASSERTION. |
-| [Supabase postgres-meta](https://github.com/supabase/postgres-meta) | [Apache-2.0](https://github.com/supabase/postgres-meta/blob/master/LICENSE) | Private metadata, schema administration, SQL tooling, and type generation behind our authorization and routing. Not a public standalone security boundary. |
-| [Supabase Studio](https://github.com/supabase/supabase/tree/master/apps/studio) | [Apache-2.0 monorepo license](https://github.com/supabase/supabase/blob/master/LICENSE) | Adapt its selected-database workbench. Multi-project SaaS management and billing require our product layer. Review package-level assets and dependencies when selecting code. |
+| [Supabase postgres-meta](https://github.com/supabase/postgres-meta) | [Apache-2.0](https://github.com/supabase/postgres-meta/blob/master/LICENSE) | Optional private metadata, schema administration, SQL tooling, and type generation after the native pilot. Keep it behind our authorization and routing; it is not a standalone security boundary. |
+| [Supabase Studio](https://github.com/supabase/supabase/tree/master/apps/studio) | [Apache-2.0 monorepo license](https://github.com/supabase/supabase/blob/master/LICENSE) | Optional selected-database workbench after the native pilot. Prefer narrow integration before committing to a persistent fork. Hosted account/billing UI is later scope. Review package-level assets and dependencies when selecting code. |
 | [PostgREST](https://github.com/PostgREST/postgrest) | [MIT](https://github.com/PostgREST/postgrest/blob/main/LICENSE) | Optional per-database REST/RPC API; preserve PostgreSQL grants, RLS, and JWT role boundaries. Not the platform management API. |
-| [Neon proxy](https://github.com/neondatabase/neon/tree/main/proxy) | [Apache-2.0 core repository license](https://github.com/neondatabase/neon/blob/main/LICENSE) | Preferred gateway adaptation candidate for native PostgreSQL, WebSocket, HTTP SQL, access control, and compute wake integration. Production backend adaptation remains a feasibility gate. |
-| [Neon serverless driver](https://github.com/neondatabase/serverless) | [MIT](https://github.com/neondatabase/serverless/blob/main/LICENSE) | Reuse as a supported client after proving our gateway's corresponding HTTP/WS contracts. |
-| [Barman Cloud CNPG-I plugin](https://github.com/cloudnative-pg/plugin-barman-cloud) | [Apache-2.0](https://github.com/cloudnative-pg/plugin-barman-cloud/blob/main/LICENSE) | CNPG integration for physical backup, WAL archival, and recovery. Full R2 restore compatibility must be tested. |
+| [Neon proxy](https://github.com/neondatabase/neon/tree/main/proxy) | [Apache-2.0 core repository license](https://github.com/neondatabase/neon/blob/main/LICENSE) | Evaluation candidate, not preferred or selected. Require a production adapter plus explicit maintainer, security-update process, protocol acceptance, and bounded patch surface. |
+| [Neon serverless driver](https://github.com/neondatabase/serverless) | [MIT](https://github.com/neondatabase/serverless/blob/main/LICENSE) | Optional supported client after proving the selected gateway's HTTP/WS contracts; not needed for the native ohmyho.st pilot. |
+| [Barman Cloud CNPG-I plugin](https://github.com/cloudnative-pg/plugin-barman-cloud) | [Apache-2.0](https://github.com/cloudnative-pg/plugin-barman-cloud/blob/main/LICENSE) | CNPG integration for physical backup, WAL archival, and recovery. Test R2 restore, retention, deletion, and distinct source/target archive identities. |
 | [Barman / barman-cloud](https://github.com/EnterpriseDB/barman) | [GPL-3.0 license text](https://github.com/EnterpriseDB/barman/blob/REL_3_X_master/LICENSE); declaration discrepancy below | Backup/recovery tooling used with the plugin; separately licensed and not relicensed by this repository. |
+
+### Maintenance and compatibility evidence
+
+The Neon proxy has very limited recent public activity, including a functional [authentication fix on 2026-05-25](https://github.com/neondatabase/neon/commit/8f60b04da47ffefe0e52bda2440134b42874eb75). This justifies the maintenance gate; it is not evidence that the project is officially discontinued.
+
+The original R2 restore reporter in [Barman plugin issue #411](https://github.com/cloudnative-pg/plugin-barman-cloud/issues/411#issuecomment-3572945793) resolved the failure as a naming/archive conflict. Other comments describe retention/deletion issues with other S3 systems. Validate every offered backup operation on pinned versions rather than labeling all R2 restore paths broken.
 
 ### Barman declaration discrepancy
 
@@ -39,7 +45,7 @@ All entries remain **not integrated**. Contabo/Talos bootstrap, local storage, a
 | [OpenEBS LocalPV LVM](https://github.com/openebs/lvm-localpv) | [Apache-2.0](https://github.com/openebs/lvm-localpv/blob/develop/LICENSE) | Candidate for hard-sized local volumes and expansion; Talos compatibility and node-loss recovery must be proven. |
 | [Cilium](https://github.com/cilium/cilium) | [Apache-2.0 LICENSE](https://github.com/cilium/cilium/blob/main/LICENSE); [BPF licensing distinction](https://github.com/cilium/cilium#license) | Pod network isolation. User-space code is Apache-2.0; BPF templates use `(GPL-2.0-only OR BSD-2-Clause)`. Keep host-firewall ownership with the chosen Talos policy. |
 | [cert-manager](https://github.com/cert-manager/cert-manager) | [Apache-2.0](https://github.com/cert-manager/cert-manager/blob/master/LICENSE) | External certificate lifecycle; distinct from CNPG internal PKI. |
-| [Prometheus](https://github.com/prometheus/prometheus) | [Apache-2.0](https://github.com/prometheus/prometheus/blob/main/LICENSE) | Operational metrics; not the authoritative customer billing ledger. |
+| [Prometheus](https://github.com/prometheus/prometheus) | [Apache-2.0](https://github.com/prometheus/prometheus/blob/main/LICENSE) | Operational metrics; authoritative usage observations and budget reservations follow the D1-backed product contract. |
 | [Alertmanager](https://github.com/prometheus/alertmanager) | [Apache-2.0](https://github.com/prometheus/alertmanager/blob/main/LICENSE) | Alert routing, grouping, and incident notifications. |
 | [OpenTelemetry Collector](https://github.com/open-telemetry/opentelemetry-collector) | [Apache-2.0](https://github.com/open-telemetry/opentelemetry-collector/blob/main/LICENSE) | Telemetry collection and export. Select only required receivers/processors/exporters. |
 | [OpenTelemetry Collector Contrib](https://github.com/open-telemetry/opentelemetry-collector-contrib) | [Apache-2.0](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/LICENSE) | Optional collector components if needed; inspect their transitive dependencies individually. |
@@ -55,8 +61,8 @@ These entries are **not selected for the default v1 stack and not integrated**.
 | [Neon storage engine](https://github.com/neondatabase/neon) | [Apache-2.0](https://github.com/neondatabase/neon/blob/main/LICENSE) | Excluded from CNPG v1. Its patched PostgreSQL, pageservers, and safekeepers form a different storage architecture. Reconsider separately for later branching requirements. |
 | [Neon autoscaling / NeonVM](https://github.com/neondatabase/autoscaling) | [Apache-2.0](https://github.com/neondatabase/autoscaling/blob/main/LICENSE) | Excluded from v1; its virtualization and scheduling stack is unnecessary for the accepted reconnect-based scaling contract. |
 | [pg_graphql](https://github.com/supabase/pg_graphql) | [Apache-2.0](https://github.com/supabase/pg_graphql/blob/master/LICENSE) | Optional future extension if GraphQL enters scope; not an initial acceptance requirement. |
-| [OpenMeter](https://github.com/openmeterio/openmeter) | [Apache-2.0](https://github.com/openmeterio/openmeter/blob/main/LICENSE) | Optional metering/billing integration if operating its dependencies is justified. Infrastructure facts and budget enforcement remain our responsibility. |
-| [OpenCost](https://github.com/opencost/opencost) | [Apache-2.0](https://github.com/opencost/opencost/blob/develop/LICENSE) | Optional internal infrastructure cost and margin attribution, not customer invoice authority. |
+| [OpenMeter](https://github.com/openmeterio/openmeter) | [Apache-2.0](https://github.com/openmeterio/openmeter/blob/main/LICENSE) | Unselected future hosted-service option. No v1 dependency or implementation work is required for usage reporting and budget enforcement. |
+| [OpenCost](https://github.com/opencost/opencost) | [Apache-2.0](https://github.com/opencost/opencost/blob/develop/LICENSE) | Unselected future option. No cost/margin study or v1 adoption task is included in this revision. |
 | [Omni](https://github.com/siderolabs/omni) | [Business Source License 1.1 / BUSL-1.1](https://github.com/siderolabs/omni/blob/main/LICENSE) | Excluded from the default open-source stack. Its production and business-dependent use conditions require a separate licensing decision. |
 
 ## Adoption and provenance rules
@@ -69,4 +75,4 @@ These entries are **not selected for the default v1 stack and not integrated**.
 6. Do not copy private ohmyho.st source or configuration into this public repository without an explicit provenance and publication review. The approved architecture can be implemented independently.
 7. Replace moving-branch evidence with pinned-release references when adopting a component, and revisit licensing when upgrading.
 
-Cloudflare and Contabo are deployment/service providers, not bundled open-source components. Their service terms and operational capabilities are separate from the licenses above.
+Cloudflare and Contabo are deployment/service providers, not bundled open-source components. Their service terms and operational capabilities are separate from the licenses above. V1 self-hosting requires the adopter's own Cloudflare account; Workers, D1, Durable Objects, R2, and secret bindings are managed-service dependencies, not Apache-licensed software shipped by this repository.
