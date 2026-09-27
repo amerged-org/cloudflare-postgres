@@ -1,2 +1,9 @@
 # Local environment values and credentials
-.env.local
+.env*
+.dev.vars*
+
+# Local development and build output
+.wrangler/
+node_modules/
+dist/
+coverage/
