@@ -4,8 +4,136 @@ info:
   version: 0.1.0
   description: >-
     First management slice. A created project is pending and its operation is
-    queued; this API does not provision PostgreSQL.
+    queued. Region registration issues a scoped executor token, but no regional
+    operation claims or PostgreSQL provisioning are implemented.
 paths:
+  /v1/regions:
+    get:
+      operationId: listRegions
+      summary: Page through registered regions for installation recovery
+      description: >-
+        Installation-token-only list, newest first by creation time and ID.
+        Follow nextCursor until null. Region names are unique with exact,
+        case-sensitive matching. Tokens are never returned by this route.
+      security:
+        - installationToken: []
+      parameters:
+        - name: limit
+          in: query
+          description: Page size; defaults to 1000.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+        - name: cursor
+          in: query
+          description: Opaque nextCursor from the preceding page.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One region page
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [regions, nextCursor]
+                properties:
+                  regions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Region"
+                  nextCursor:
+                    type: [string, "null"]
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Installation bootstrap secret is unconfigured
+    post:
+      operationId: registerRegion
+      summary: Register a region and reveal its executor token once
+      description: >-
+        Registration records identity only. The region remains registered and
+        cannot yet claim operations or serve PostgreSQL connections. A region
+        name must be unique under exact, case-sensitive matching.
+      security:
+        - installationToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/NameInput"
+      responses:
+        "201":
+          description: Region registered; save the returned token securely
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegionTokenResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Region name already registered (region_name_conflict)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Installation bootstrap secret is unconfigured
+  /v1/regions/{regionId}:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+    get:
+      operationId: getRegion
+      summary: Read region registration without its token
+      security:
+        - installationToken: []
+      responses:
+        "200":
+          description: Registered region
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [region]
+                properties:
+                  region:
+                    $ref: "#/components/schemas/Region"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: Installation bootstrap secret is unconfigured
+  /v1/regions/{regionId}/tokens/reissue:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+    post:
+      operationId: reissueRegionToken
+      summary: Reissue a lost region executor token
+      description: >-
+        Installation-token-only recovery operation. Revokes every previously
+        active token for this region and reveals the replacement once.
+      security:
+        - installationToken: []
+      responses:
+        "201":
+          description: Previous token revoked; replacement token issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegionTokenResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: Installation bootstrap secret is unconfigured
   /v1/organizations:
     get:
       operationId: listOrganizations
@@ -245,6 +373,13 @@ components:
         Token issued once at organization bootstrap with projects:read,
         projects:write, and operations:read scopes.
   parameters:
+    RegionId:
+      name: regionId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
     OrganizationId:
       name: organizationId
       in: path
@@ -272,12 +407,44 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     NotFound:
-      description: Resource absent or belongs to another organization
+      description: Resource absent or inaccessible to caller
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    Region:
+      type: object
+      required: [id, name, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        status:
+          type: string
+          enum: [registered, active, disabled]
+          description: Only registered is produced by the current API slice.
+        createdAt:
+          type: string
+          format: date-time
+    RegionTokenResponse:
+      type: object
+      required: [region, apiToken, scopes]
+      properties:
+        region:
+          $ref: "#/components/schemas/Region"
+        apiToken:
+          type: string
+          pattern: "^cprgn_[A-Za-z0-9_-]+$"
+        scopes:
+          type: array
+          items:
+            type: string
+            enum: [operations:claim, operations:report]
+          minItems: 2
+          maxItems: 2
     NameInput:
       type: object
       additionalProperties: false

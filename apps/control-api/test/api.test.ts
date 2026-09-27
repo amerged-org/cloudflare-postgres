@@ -48,6 +48,136 @@ it("requires installation authorization and reveals an organization token only a
   expect(stored?.token_hash).not.toBe(apiToken);
 });
 
+it("requires installation authorization for region registration and recovery", async () => {
+  const deniedCreate = await call("/v1/regions", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ name: "North region" }),
+  });
+  expect(deniedCreate.status).toBe(401);
+
+  const deniedList = await call("/v1/regions");
+  expect(deniedList.status).toBe(401);
+
+  const deniedRead = await call(
+    "/v1/regions/00000000-0000-4000-8000-000000000001",
+  );
+  expect(deniedRead.status).toBe(401);
+
+  const deniedReissue = await call(
+    "/v1/regions/00000000-0000-4000-8000-000000000001/tokens/reissue",
+    { method: "POST" },
+  );
+  expect(deniedReissue.status).toBe(401);
+});
+
+it("registers an opaque region and stores only its scoped token digest", async () => {
+  const headers = {
+    authorization: "Bearer test-installation-token",
+  };
+  const created = await call("/v1/regions", {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({ name: "North region" }),
+  });
+  expect(created.status).toBe(201);
+  const body = (await created.json()) as {
+    region: { id: string; name: string; status: string };
+    apiToken: string;
+    scopes: string[];
+  };
+  expect(body.region.id).toMatch(/^[0-9a-f-]{36}$/);
+  expect(body.region.name).toBe("North region");
+  expect(body.region.status).toBe("registered");
+  expect(body.apiToken).toMatch(/^cprgn_[A-Za-z0-9_-]+$/);
+  expect(body.scopes).toEqual(["operations:claim", "operations:report"]);
+
+  const stored = await env.DB.prepare(
+    "SELECT token_hash, scopes FROM region_tokens WHERE region_id = ? AND revoked_at IS NULL",
+  )
+    .bind(body.region.id)
+    .first<{ token_hash: string; scopes: string }>();
+  expect(stored?.token_hash).toMatch(/^[0-9a-f]{64}$/);
+  expect(stored?.token_hash).not.toBe(body.apiToken);
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(body.apiToken),
+  );
+  const expectedHash = Array.from(new Uint8Array(digest), (byte) =>
+    byte.toString(16).padStart(2, "0"),
+  ).join("");
+  expect(stored?.token_hash).toBe(expectedHash);
+  expect(stored?.scopes).toBe(body.scopes.join(" "));
+
+  const duplicate = await call("/v1/regions", {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({ name: "North region" }),
+  });
+  expect(duplicate.status).toBe(409);
+  expect(await duplicate.json()).toEqual({
+    error: { code: "region_name_conflict" },
+  });
+
+  const listed = await call("/v1/regions", { headers });
+  expect(listed.status).toBe(200);
+  const listBody = (await listed.json()) as {
+    regions: Array<{ id: string; name: string }>;
+  };
+  expect(
+    listBody.regions
+      .filter((region) => region.name === body.region.name)
+      .map((region) => region.id),
+  ).toEqual([body.region.id]);
+  expect(JSON.stringify(listBody)).not.toContain(body.apiToken);
+
+  const read = await call(`/v1/regions/${body.region.id}`, { headers });
+  expect(read.status).toBe(200);
+  expect(await read.json()).toEqual({ region: body.region });
+});
+
+it("reissues a lost region token and revokes its predecessor", async () => {
+  const headers = {
+    authorization: "Bearer test-installation-token",
+  };
+  const created = await call("/v1/regions", {
+    method: "POST",
+    headers: { ...headers, "content-type": "application/json" },
+    body: JSON.stringify({ name: "Recovery region" }),
+  });
+  expect(created.status).toBe(201);
+  const first = (await created.json()) as {
+    region: { id: string };
+    apiToken: string;
+  };
+
+  const reissued = await call(`/v1/regions/${first.region.id}/tokens/reissue`, {
+    method: "POST",
+    headers,
+  });
+  expect(reissued.status).toBe(201);
+  const second = (await reissued.json()) as {
+    region: { id: string };
+    apiToken: string;
+  };
+  expect(second.region.id).toBe(first.region.id);
+  expect(second.apiToken).toMatch(/^cprgn_[A-Za-z0-9_-]+$/);
+  expect(second.apiToken).not.toBe(first.apiToken);
+
+  const active = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM region_tokens WHERE region_id = ? AND revoked_at IS NULL",
+  )
+    .bind(first.region.id)
+    .first<{ count: number }>();
+  expect(active?.count).toBe(1);
+  const revoked = await env.DB.prepare(
+    "SELECT COUNT(*) AS count FROM region_tokens WHERE region_id = ? AND revoked_at IS NOT NULL",
+  )
+    .bind(first.region.id)
+    .first<{ count: number }>();
+  expect(revoked?.count).toBe(1);
+});
+
 it("stops reading an oversized JSON body when no Content-Length is supplied", async () => {
   let bytesProduced = 0;
   const body = new ReadableStream<Uint8Array>(

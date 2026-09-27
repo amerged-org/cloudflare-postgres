@@ -13,7 +13,14 @@ interface OrganizationRow {
   created_at: string;
 }
 
-interface OrganizationCursor {
+interface RegionRow {
+  id: string;
+  name: string;
+  status: string;
+  created_at: string;
+}
+
+interface CreatedIdCursor {
   createdAt: string;
   id: string;
 }
@@ -46,6 +53,8 @@ const tokenScopes: readonly Scope[] = [
   "projects:write",
   "operations:read",
 ];
+
+const regionTokenScopes = ["operations:claim", "operations:report"] as const;
 
 function json(body: unknown, status: number): Response {
   return Response.json(body, {
@@ -94,13 +103,13 @@ async function matchesSecret(
   return difference === 0;
 }
 
-function newApiToken(): string {
+function newApiToken(prefix: "cporg" | "cprgn" = "cporg"): string {
   const random = crypto.getRandomValues(new Uint8Array(32));
   const base64 = btoa(String.fromCharCode(...random))
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replaceAll("=", "");
-  return `cporg_${base64}`;
+  return `${prefix}_${base64}`;
 }
 
 async function readBoundedText(
@@ -222,14 +231,17 @@ async function bootstrapOrganization(
   );
 }
 
-function encodeOrganizationCursor(row: OrganizationRow): string {
+function encodeCreatedIdCursor(row: {
+  created_at: string;
+  id: string;
+}): string {
   return btoa(JSON.stringify({ createdAt: row.created_at, id: row.id }))
     .replaceAll("+", "-")
     .replaceAll("/", "_")
     .replaceAll("=", "");
 }
 
-function decodeOrganizationCursor(value: string): OrganizationCursor | null {
+function decodeCreatedIdCursor(value: string): CreatedIdCursor | null {
   if (value.length > 256 || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
   try {
     const parsed: unknown = JSON.parse(
@@ -281,8 +293,7 @@ async function listOrganizations(
   const limit = limitText === null ? 1000 : Number(limitText);
   if (limit > 1000) return error(400, "invalid_request");
   const cursorText = query.get("cursor");
-  const cursor =
-    cursorText === null ? null : decodeOrganizationCursor(cursorText);
+  const cursor = cursorText === null ? null : decodeCreatedIdCursor(cursorText);
   if (cursorText !== null && cursor === null)
     return error(400, "invalid_request");
 
@@ -304,7 +315,7 @@ async function listOrganizations(
       })),
       nextCursor:
         result.results.length > limit
-          ? encodeOrganizationCursor(page[page.length - 1]!)
+          ? encodeCreatedIdCursor(page[page.length - 1]!)
           : null,
     },
     200,
@@ -350,6 +361,163 @@ async function reissueOrganizationToken(
       },
       apiToken: token,
       scopes: tokenScopes,
+    },
+    201,
+  );
+}
+
+function regionFromRow(row: RegionRow) {
+  return {
+    id: row.id,
+    name: row.name,
+    status: row.status,
+    createdAt: row.created_at,
+  };
+}
+
+async function registerRegion(request: Request, env: Env): Promise<Response> {
+  const auth = await authorizedInstallation(request, env);
+  if (auth) return auth;
+  const name = await nameFromJson(request);
+  if (name === null) return error(400, "invalid_request");
+
+  const id = crypto.randomUUID();
+  const token = newApiToken("cprgn");
+  const createdAt = new Date().toISOString();
+  try {
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO regions (id, name, status, created_at) VALUES (?, ?, ?, ?)",
+      ).bind(id, name, "registered", createdAt),
+      env.DB.prepare(
+        "INSERT INTO region_tokens (id, region_id, token_hash, scopes, created_at) VALUES (?, ?, ?, ?, ?)",
+      ).bind(
+        crypto.randomUUID(),
+        id,
+        await sha256(token),
+        regionTokenScopes.join(" "),
+        createdAt,
+      ),
+    ]);
+  } catch {
+    const existing = await env.DB.prepare(
+      "SELECT id FROM regions WHERE name = ?",
+    )
+      .bind(name)
+      .first<{ id: string }>();
+    if (existing) return error(409, "region_name_conflict");
+    return error(500, "write_failed");
+  }
+  return json(
+    {
+      region: regionFromRow({
+        id,
+        name,
+        status: "registered",
+        created_at: createdAt,
+      }),
+      apiToken: token,
+      scopes: regionTokenScopes,
+    },
+    201,
+  );
+}
+
+async function listRegions(request: Request, env: Env): Promise<Response> {
+  const auth = await authorizedInstallation(request, env);
+  if (auth) return auth;
+  const query = new URL(request.url).searchParams;
+  if (
+    Array.from(query.keys()).some(
+      (key) => key !== "limit" && key !== "cursor",
+    ) ||
+    query.getAll("limit").length > 1 ||
+    query.getAll("cursor").length > 1
+  ) {
+    return error(400, "invalid_request");
+  }
+  const limitText = query.get("limit");
+  if (limitText !== null && !/^[1-9][0-9]{0,3}$/.test(limitText))
+    return error(400, "invalid_request");
+  const limit = limitText === null ? 1000 : Number(limitText);
+  if (limit > 1000) return error(400, "invalid_request");
+  const cursorText = query.get("cursor");
+  const cursor = cursorText === null ? null : decodeCreatedIdCursor(cursorText);
+  if (cursorText !== null && cursor === null)
+    return error(400, "invalid_request");
+
+  const statement = cursor
+    ? env.DB.prepare(
+        "SELECT id, name, status, created_at FROM regions WHERE created_at < ? OR (created_at = ? AND id < ?) ORDER BY created_at DESC, id DESC LIMIT ?",
+      ).bind(cursor.createdAt, cursor.createdAt, cursor.id, limit + 1)
+    : env.DB.prepare(
+        "SELECT id, name, status, created_at FROM regions ORDER BY created_at DESC, id DESC LIMIT ?",
+      ).bind(limit + 1);
+  const result = await statement.all<RegionRow>();
+  const page = result.results.slice(0, limit);
+  return json(
+    {
+      regions: page.map(regionFromRow),
+      nextCursor:
+        result.results.length > limit
+          ? encodeCreatedIdCursor(page[page.length - 1]!)
+          : null,
+    },
+    200,
+  );
+}
+
+async function getRegion(
+  request: Request,
+  env: Env,
+  regionId: string,
+): Promise<Response> {
+  const auth = await authorizedInstallation(request, env);
+  if (auth) return auth;
+  const region = await env.DB.prepare(
+    "SELECT id, name, status, created_at FROM regions WHERE id = ?",
+  )
+    .bind(regionId)
+    .first<RegionRow>();
+  if (!region) return error(404, "not_found");
+  return json({ region: regionFromRow(region) }, 200);
+}
+
+async function reissueRegionToken(
+  request: Request,
+  env: Env,
+  regionId: string,
+): Promise<Response> {
+  const auth = await authorizedInstallation(request, env);
+  if (auth) return auth;
+  const region = await env.DB.prepare(
+    "SELECT id, name, status, created_at FROM regions WHERE id = ?",
+  )
+    .bind(regionId)
+    .first<RegionRow>();
+  if (!region) return error(404, "not_found");
+
+  const token = newApiToken("cprgn");
+  const now = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE region_tokens SET revoked_at = ? WHERE region_id = ? AND revoked_at IS NULL",
+    ).bind(now, regionId),
+    env.DB.prepare(
+      "INSERT INTO region_tokens (id, region_id, token_hash, scopes, created_at) VALUES (?, ?, ?, ?, ?)",
+    ).bind(
+      crypto.randomUUID(),
+      regionId,
+      await sha256(token),
+      regionTokenScopes.join(" "),
+      now,
+    ),
+  ]);
+  return json(
+    {
+      region: regionFromRow(region),
+      apiToken: token,
+      scopes: regionTokenScopes,
     },
     201,
   );
@@ -579,6 +747,22 @@ async function getOperation(
 export default {
   async fetch(request, env): Promise<Response> {
     const pathname = new URL(request.url).pathname;
+    if (request.method === "POST" && pathname === "/v1/regions") {
+      return registerRegion(request, env);
+    }
+    if (request.method === "GET" && pathname === "/v1/regions") {
+      return listRegions(request, env);
+    }
+    const regionReissue = /^\/v1\/regions\/([^/]+)\/tokens\/reissue$/.exec(
+      pathname,
+    );
+    if (request.method === "POST" && regionReissue) {
+      return reissueRegionToken(request, env, regionReissue[1]!);
+    }
+    const regionItem = /^\/v1\/regions\/([^/]+)$/.exec(pathname);
+    if (request.method === "GET" && regionItem) {
+      return getRegion(request, env, regionItem[1]!);
+    }
     if (request.method === "POST" && pathname === "/v1/organizations") {
       return bootstrapOrganization(request, env);
     }
