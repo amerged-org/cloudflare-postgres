@@ -1,6 +1,6 @@
 # cloudflare-postgres — Open-source implementation plan
 
-Status: revised approved direction, 2026-09-27. M0 is complete, M1 has partial live infrastructure evidence, and a local control API slice has source and focused tests. Regional provisioning and operational acceptance remain pending.
+Status: revised approved direction, updated 2026-09-28. M0 is complete. M1 has live single-node Talos, Kubernetes, Cilium, and bounded-volume evidence; PostgreSQL and recovery gates remain open. A development control API is deployed, but regional provisioning and operational acceptance remain pending.
 
 This file is the canonical scope and roadmap. README.md summarizes it; AGENTS.md is the 25-line contributor brief; THIRD_PARTY.md records component provenance and adoption status. A documented target is not evidence of implemented behavior.
 
@@ -35,7 +35,7 @@ Native PostgreSQL is the first integration path. HTTP/WebSocket SQL, PostgREST, 
 
 ### Design assumptions to validate
 
-Cloudflare placement of control state is a user decision. The D1/Durable Objects/R2/Secrets mapping below is the selected design assumption to validate before management implementation. Talos on Contabo, the exact local-volume integration, gateway implementation, isolation runtime, and production failure-domain guarantees still require their stated evidence. No servers have been ordered and no production data has been migrated.
+Cloudflare placement of control state is a user decision. The D1/Durable Objects/R2/Secrets mapping below is the selected design assumption; a development Worker, D1 database, and EU R2 bucket have partial live evidence, while coordination and secret recovery remain unproven. Talos, Cilium, and bounded local volumes have one-node lab evidence. Gateway implementation, tenant isolation, recovery, and production failure-domain guarantees still require their stated evidence. No additional servers have been ordered and no production data has been migrated.
 
 ## 2. Generic product boundary and early acceptance path
 
@@ -230,9 +230,9 @@ Test concurrent reservations, duplicated grants/events, period rollover, revisio
 | **M7 — Developer experience and integration qualification** | Complete API/CLI docs and usage/budget examples; evaluate optional HTTP/WS, Data API, and workbench integrations. | Repeatable installation and operator workflows; any shipped optional interface has its own compatibility/security evidence. No hosted billing dependency. |
 | **M8 — Open-source production readiness** | Rehearsed operational release usable by independent adopters. | Sustained workloads, recovery and upgrade evidence, measured service limits, generic migration guidance, and repeatable installation documentation; consumer rollouts are separately owned. |
 
-M1 has a [partial live infrastructure checkpoint](docs/evidence/m1-2026-09-27.md). Its Talos, PostgreSQL, backup, and recovery gates remain open.
+M1 has a [live single-node infrastructure checkpoint](docs/evidence/m1-2026-09-28.md). Talos boot, node restart, Kubernetes networking, and bounded local-volume behavior were observed; PostgreSQL, R2 backup, independent restore, and production topology gates remain open.
 
-M3 has a [deployed Dev control API checkpoint](docs/evidence/m3-control-api-dev-2026-09-27.md): organization bootstrap and a D1-backed pending project with a queued operation. This is durable intent only; it is not database provisioning or a completed M3 API.
+M3 has a [deployed Dev control API checkpoint](docs/evidence/m3-control-api-dev-2026-09-27.md): organization bootstrap, paginated recovery listing, and a D1-backed pending project with a queued operation. This is durable intent only; it is not database provisioning or a completed M3 API.
 
 ### Operational acceptance evidence
 

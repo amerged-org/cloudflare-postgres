@@ -6,7 +6,7 @@ An independent, open-source PostgreSQL platform with a Cloudflare management lay
 
 ## Development status
 
-**Early development.** The [control API first slice](apps/control-api/README.md) now implements authenticated organization bootstrap and D1-backed project intent with a queued operation. Local Worker tests pass. It has not provisioned PostgreSQL, and the regional controller, gateway, backup integration, and production service remain unimplemented. Candidate infrastructure components have not been validated together.
+**Early development.** The [control API first slice](apps/control-api/README.md) is deployed to a development Worker. It implements authenticated organization bootstrap, paginated recovery listing, and D1-backed project intent with a queued operation. The [M1 lab checkpoint](docs/evidence/m1-2026-09-28.md) verifies Talos, Kubernetes, Cilium, bounded local volumes, and installed database operators on one disposable Contabo node. No PostgreSQL environment has been provisioned. The regional controller, gateway, backup/restore path, and production service remain unimplemented.
 
 The first implementation steps are infrastructure/recovery proofs and an early generic pilot using one always-on database over native PostgreSQL. Adopter-specific adapters and migration TODOs belong in their own repositories. Gateway selection follows technical and maintenance evaluation. Sleep/wake and bounded automatic compute scaling remain v1 requirements after that baseline.
 
@@ -62,6 +62,6 @@ Use the [bounded TDD policy](PLAN.md#10-bounded-tdd-and-verification-discipline)
 
 ## License and independence
 
-Original project code and documentation are licensed under [Apache License 2.0](LICENSE). Third-party components retain their own licenses and notices; none are bundled in this documentation-only repository.
+Original project code and documentation are licensed under [Apache License 2.0](LICENSE). Third-party components retain their own licenses and notices; evaluated upstream projects have not been vendored into this repository.
 
 This is an independent project, not an official product of or affiliated with Cloudflare, Contabo, Neon, Supabase, or the CloudNativePG project. Product and project names identify the technologies being evaluated and remain the property of their respective owners.
