@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: Apache-2.0
+# recovery-source reads the source archive; target-archive writes a distinct one.
+# Create both ObjectStores privately from the source example with distinct paths.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: REPLACE_WITH_FRESH_TARGET_NAME
+  namespace: REPLACE_WITH_DATABASE_NAMESPACE
+spec:
+  instances: 1
+  imageName: REPLACE_WITH_COMPATIBLE_POSTGRES_IMAGE_AND_DIGEST
+  enableSuperuserAccess: false
+  storage:
+    storageClass: REPLACE_WITH_VERIFIED_STORAGE_CLASS
+    size: 5Gi
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+  bootstrap:
+    recovery:
+      source: origin
+  plugins:
+    - name: barman-cloud.cloudnative-pg.io
+      isWALArchiver: true
+      parameters:
+        barmanObjectName: target-archive
+        serverName: REPLACE_WITH_DISTINCT_TARGET_SERVER_NAME
+  externalClusters:
+    - name: origin
+      plugin:
+        name: barman-cloud.cloudnative-pg.io
+        parameters:
+          barmanObjectName: recovery-source
+          serverName: REPLACE_WITH_RECORDED_SOURCE_SERVER_NAME

@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: Apache-2.0
+# A stable run-specific name allows uncertain outcomes to be observed safely.
+apiVersion: postgresql.cnpg.io/v1
+kind: Backup
+metadata:
+  name: REPLACE_WITH_UNIQUE_BACKUP_NAME
+  namespace: REPLACE_WITH_DATABASE_NAMESPACE
+spec:
+  cluster:
+    name: REPLACE_WITH_SOURCE_CLUSTER
+  method: plugin
+  pluginConfiguration:
+    name: barman-cloud.cloudnative-pg.io

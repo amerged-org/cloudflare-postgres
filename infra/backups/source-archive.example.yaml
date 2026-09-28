@@ -1,0 +1,33 @@
+# SPDX-License-Identifier: Apache-2.0
+# Fill nonsecret installation values; supply backup-s3 separately and privately.
+apiVersion: barmancloud.cnpg.io/v1
+kind: ObjectStore
+metadata:
+  name: source-archive
+  namespace: REPLACE_WITH_DATABASE_NAMESPACE
+spec:
+  configuration:
+    destinationPath: s3://REPLACE_WITH_BACKUP_BUCKET/REPLACE_WITH_RUN_ID/source
+    endpointURL: https://REPLACE_WITH_ACCOUNT_ID.eu.r2.cloudflarestorage.com
+    s3Credentials:
+      accessKeyId:
+        name: backup-s3
+        key: ACCESS_KEY_ID
+      secretAccessKey:
+        name: backup-s3
+        key: ACCESS_SECRET_KEY
+      region:
+        name: backup-s3
+        key: REGION
+    wal:
+      compression: gzip
+    data:
+      compression: gzip
+  instanceSidecarConfiguration:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
