@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { fields, object } from "./accounting";
+import { fields, object, type AccountingDb } from "./accounting";
 
 export type RoleEnv = Cloudflare.Env & { ROLE_CREDENTIAL_KEYS?: string };
 export interface CredentialContext {
@@ -13,6 +13,53 @@ export interface CredentialContext {
   roleId: string;
   roleName: string;
   credentialRevision: number;
+}
+export interface RoleCredentialIdentity {
+  id: string;
+  organization_id: string;
+  project_id: string;
+  environment_id: string;
+  region_id: string;
+  spec_revision: number;
+  spec_hash: string;
+  cluster_uid: string;
+  name: string;
+}
+export function roleCredentialContext(
+  role: RoleCredentialIdentity,
+  revision: number,
+): CredentialContext {
+  return {
+    organizationId: role.organization_id,
+    projectId: role.project_id,
+    environmentId: role.environment_id,
+    regionId: role.region_id,
+    specRevision: role.spec_revision,
+    specHash: role.spec_hash,
+    clusterUid: role.cluster_uid,
+    roleId: role.id,
+    roleName: role.name,
+    credentialRevision: revision,
+  };
+}
+export async function readRoleCredential(
+  db: AccountingDb,
+  role: RoleCredentialIdentity,
+  revision: number,
+  env: RoleEnv,
+): Promise<string> {
+  const row = await db
+    .prepare(
+      "SELECT encrypted_json FROM role_credentials WHERE role_id = ? AND credential_revision = ?",
+    )
+    .bind(role.id, revision)
+    .first<{ encrypted_json: string }>();
+  if (!row) throw new Error("role_credential_missing");
+  return decryptCredential(
+    env,
+    row.encrypted_json,
+    roleCredentialContext(role, revision),
+  );
 }
 interface EncryptedCredential {
   schemaVersion: 1;

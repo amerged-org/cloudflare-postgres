@@ -56,6 +56,10 @@ rules:
   - apiGroups: [postgresql.cnpg.io]
     resources: [databaseroles]
     verbs: [get, create, patch]
+  # SQL absence/ownership is verified separately; no patch/delete capability.
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [databases]
+    verbs: [get, list, create]
   - apiGroups: [barmancloud.cnpg.io]
     resources: [objectstores]
     verbs: [get, create]

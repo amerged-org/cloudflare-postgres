@@ -1,31 +1,32 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   assertion,
-  bearer,
   body,
   error,
   fields,
   json,
   sha256,
-  uuid,
   type AccountingDb,
-  type JsonObject,
 } from "./accounting";
 import {
-  decryptCredential,
   encryptCredential,
   newPassword,
-  type CredentialContext,
+  readRoleCredential as credential,
+  roleCredentialContext as context,
   type RoleEnv,
 } from "./role-credentials";
-
-interface Actor {
-  kind: "organization" | "region";
-  id: string;
-  ownerId: string;
-  hash: string;
-  scope: string;
-}
+import {
+  actorBindings,
+  actorPredicate,
+  authorize,
+  idempotencyKey,
+  integer,
+  lease,
+  leaseToken,
+  rv,
+  uid,
+  type Actor,
+} from "./execution-auth";
 interface Target {
   organization_id: string;
   project_id: string;
@@ -93,18 +94,6 @@ const joins =
   "JOIN environments e ON e.id = r.environment_id JOIN projects p ON p.id = r.project_id AND p.organization_id = r.organization_id JOIN regions g ON g.id = r.region_id";
 const currentScope =
   "e.organization_id = r.organization_id AND e.project_id = r.project_id AND e.region_id = r.region_id AND e.spec_revision = r.spec_revision AND e.spec_hash = r.spec_hash AND e.status = 'ready' AND json_extract(e.observation_json, '$.clusterUid') = r.cluster_uid AND p.status = 'active' AND g.status <> 'disabled'";
-function integer(
-  value: unknown,
-  minimum = 1,
-  maximum = Number.MAX_SAFE_INTEGER,
-): value is number {
-  return (
-    typeof value === "number" &&
-    Number.isSafeInteger(value) &&
-    value >= minimum &&
-    value <= maximum
-  );
-}
 function identifier(value: unknown): value is string {
   return (
     typeof value === "string" &&
@@ -112,38 +101,6 @@ function identifier(value: unknown): value is string {
     !["app", "postgres", "streaming_replica"].includes(value) &&
     !/^(?:pg_|cnpg_)/.test(value)
   );
-}
-function rv(value: unknown): value is string {
-  return typeof value === "string" && /^[A-Za-z0-9._:-]{1,128}$/.test(value);
-}
-function uid(value: unknown): value is string {
-  return typeof value === "string" && uuid.test(value);
-}
-function lease(
-  input: JsonObject,
-): input is JsonObject & { leaseToken: string; leaseEpoch: number } {
-  return (
-    typeof input.leaseToken === "string" &&
-    /^cplease_[A-Za-z0-9_-]{43}$/.test(input.leaseToken) &&
-    integer(input.leaseEpoch)
-  );
-}
-function leaseToken(): string {
-  return "cplease_" + newPassword();
-}
-function context(role: Role, revision: number): CredentialContext {
-  return {
-    organizationId: role.organization_id,
-    projectId: role.project_id,
-    environmentId: role.environment_id,
-    regionId: role.region_id,
-    specRevision: role.spec_revision,
-    specHash: role.spec_hash,
-    clusterUid: role.cluster_uid,
-    roleId: role.id,
-    roleName: role.name,
-    credentialRevision: revision,
-  };
 }
 function publicRole(role: Role) {
   return {
@@ -172,42 +129,6 @@ function publicOperation(operation: Operation) {
     observedAt: operation.observed_at,
     resultCode: operation.result_code,
   };
-}
-function actorPredicate(actor: Actor): string {
-  return `EXISTS (SELECT 1 FROM ${actor.kind === "organization" ? "api_tokens" : "region_tokens"} t WHERE t.id = ? AND t.token_hash = ? AND t.${actor.kind === "organization" ? "organization_id" : "region_id"} = ? AND t.revoked_at IS NULL AND instr(' ' || t.scopes || ' ', ' ' || ? || ' ') > 0)`;
-}
-function actorBindings(actor: Actor): string[] {
-  return [actor.id, actor.hash, actor.ownerId, actor.scope];
-}
-async function authorize(
-  request: Request,
-  db: AccountingDb,
-  kind: Actor["kind"],
-  ownerId: string,
-  scope: string,
-): Promise<Actor | Response> {
-  const supplied = bearer(request);
-  if (!supplied?.startsWith(kind === "organization" ? "cporg_" : "cprgn_"))
-    return error(401, "unauthorized");
-  const hash = await sha256(supplied);
-  const row = await db
-    .prepare(
-      `SELECT id, ${kind === "organization" ? "organization_id" : "region_id"} AS owner_id, scopes FROM ${kind === "organization" ? "api_tokens" : "region_tokens"} WHERE token_hash = ? AND revoked_at IS NULL`,
-    )
-    .bind(hash)
-    .first<{ id: string; owner_id: string; scopes: string }>();
-  if (!row) return error(401, "unauthorized");
-  if (row.owner_id !== ownerId) return error(404, "not_found");
-  if (!row.scopes.split(" ").includes(scope)) return error(403, "forbidden");
-  if (kind === "region") {
-    const region = await db
-      .prepare("SELECT status FROM regions WHERE id = ?")
-      .bind(ownerId)
-      .first<{ status: string }>();
-    if (!region || region.status === "disabled")
-      return error(409, "region_disabled");
-  }
-  return { kind, id: row.id, ownerId, hash, scope };
 }
 async function target(
   db: AccountingDb,
@@ -258,21 +179,6 @@ async function readOperation(
     .bind(operationId, regionId)
     .first<Operation>();
 }
-async function credential(
-  db: AccountingDb,
-  role: Role,
-  revision: number,
-  env: RoleEnv,
-): Promise<string> {
-  const row = await db
-    .prepare(
-      "SELECT encrypted_json FROM role_credentials WHERE role_id = ? AND credential_revision = ?",
-    )
-    .bind(role.id, revision)
-    .first<{ encrypted_json: string }>();
-  if (!row) throw new Error("role_credential_missing");
-  return decryptCredential(env, row.encrypted_json, context(role, revision));
-}
 function newOperation(role: Role, at: string): Operation {
   return {
     id: crypto.randomUUID(),
@@ -308,10 +214,6 @@ function operationInsert(
       operation.version_token,
       operation.created_at,
     );
-}
-function idempotencyKey(request: Request): string | null {
-  const key = request.headers.get("idempotency-key");
-  return key && /^[A-Za-z0-9._~-]{1,128}$/.test(key) ? key : null;
 }
 async function previousIntent(
   db: AccountingDb,
@@ -628,6 +530,11 @@ async function rotateRole(
           input.expectedCredentialRevision,
           input.expectedCredentialRevision,
         ],
+      ),
+      assertion(
+        db,
+        "NOT EXISTS (SELECT 1 FROM database_operations WHERE owner_role_id = ? AND status IN ('queued', 'running'))",
+        [role.id],
       ),
       db
         .prepare(

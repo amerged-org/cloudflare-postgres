@@ -14,6 +14,10 @@ import { runRoleController } from "./role-controller.ts";
 import { postgresRoleVerifier } from "./role-postgres.ts";
 import { validRoleConfig } from "./role-reconcile.ts";
 import type { RoleConfig } from "./role-types.ts";
+import { DatabaseClient } from "./database-client.ts";
+import { databaseKubernetesFromConfig } from "./database-kubernetes.ts";
+import { runDatabaseController } from "./database-controller.ts";
+import { postgresDatabaseVerifier } from "./database-postgres.ts";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -79,6 +83,15 @@ async function main(): Promise<void> {
   );
   const roleApi = roleKubernetesFromConfig(process.env.PGCF_KUBECONFIG_FILE);
   const roleVerifier = postgresRoleVerifier();
+  const databaseClient = new DatabaseClient(
+    required("PGCF_CONTROL_ORIGIN"),
+    required("PGCF_REGION_ID"),
+    async () => (await readFile(roleTokenFile, "utf8")).trim(),
+  );
+  const databaseApi = databaseKubernetesFromConfig(
+    process.env.PGCF_KUBECONFIG_FILE,
+  );
+  const databaseVerifier = postgresDatabaseVerifier();
   const shutdown = new AbortController();
   process.once("SIGINT", () => shutdown.abort());
   process.once("SIGTERM", () => shutdown.abort());
@@ -173,6 +186,15 @@ async function main(): Promise<void> {
         roleClient,
         config.roleVerifier,
         roleVerifier,
+        controllerOptions,
+      ),
+    );
+    tasks.push(
+      runDatabaseController(
+        databaseApi,
+        databaseClient,
+        config.roleVerifier,
+        databaseVerifier,
         controllerOptions,
       ),
     );

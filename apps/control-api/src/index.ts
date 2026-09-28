@@ -3,6 +3,7 @@ import { usageRoutes } from "./usage";
 import { budgetRoutes, planBudgetCorrection } from "./budgets";
 import { maintenanceRoutes } from "./maintenance";
 import { roleRoutes } from "./roles";
+import { databaseRoutes } from "./databases";
 
 type Env = Cloudflare.Env;
 
@@ -769,6 +770,8 @@ async function getOperation(
 
 export default {
   async fetch(request, env): Promise<Response> {
+    const databaseResponse = await databaseRoutes(request, env);
+    if (databaseResponse) return databaseResponse;
     const roleResponse = await roleRoutes(request, env);
     if (roleResponse) return roleResponse;
     const maintenanceResponse = await maintenanceRoutes(request, env);

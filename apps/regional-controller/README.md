@@ -2,6 +2,16 @@
 
 Apache-2.0 first-party code. This package implements the regional half of the versioned `environment.create` protocol and an optional file-backed usage collector. It initiates HTTPS requests to the adopter's control API; it opens no inbound listener. It creates internal CloudNativePG resources, reports observed readiness, and can deliver provisional observations of owned CPU/RAM requests and data-volume capacity. External PostgreSQL endpoint discovery, gateway routing, sleep, resizing, deletion, restore, and hard runtime budget enforcement remain pending. The default controller also executes the separate restricted login-role and credential-rotation protocol. A separate operator mode adds current allowance supervision and normal CNPG stop reconciliation; it is not enabled by the default controller.
 
+## Owned logical database execution
+
+The default controller adds a separate [owned-database execution lane](../../docs/contracts/owned-databases-v1.md) using the existing `roleVerifier` selection and mounted executor token. It creates only the fixed owned CNPG Database CRD, with a ready restricted same-environment owner and `ensure: present`, `template: template0`, connections enabled and reclaim Retain. It never creates another password or uses an administrative SQL connection.
+
+An exact owned CR resolves a lost create response. If the deterministic resource is absent, complete bounded namespace Database inventory must exclude competing managers and a fresh verified-TLS owner connection to `app` must prove the selected SQL name absent. Existing unmanaged databases are conflicts. Do not repair collisions by changing an owner, dropping data or setting `ensure: absent`. Privileged operators are trusted coordinated writers; a preflight read cannot atomically exclude arbitrary concurrent superuser changes.
+
+Current CNPG application/generation and the original Namespace/Cluster/role/Secret bindings must agree. A fresh connection to the selected database verifies its SQL owner, writable primary and restricted role attributes, then exercises a generated schema/table inside a transaction. Report success only after `ROLLBACK` is acknowledged and resource identities remain stable. Unknown TLS, inventory or SQL outcomes defer without releasing the owner-rotation lock. No persistent probe objects or uncertain committed customer writes are replayed.
+
+The deployment example adds Database get/list/create authority to the trusted regional identity. The installation must still qualify admission, tenant networking, real ownership/migration behavior and native endpoint access. An empty queue or injected verifier fixture does not prove those operational capabilities.
+
 ## Database roles and password rotation
 
 The [role lifecycle contract](../../docs/contracts/database-role-credentials-v1.md) supplies an independent regional role-operation lane beside environment reconciliation and metering. Before updating from earlier controller releases, add this installation-owned selection to `PGCF_REGIONAL_CONFIG_FILE` and mount `PGCF_REGION_TOKEN_FILE`; both are required before any controller task starts:
