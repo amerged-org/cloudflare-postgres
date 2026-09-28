@@ -686,8 +686,6 @@ prometheus-node-exporter:
   prometheus:
     monitor:
       enabled: true
-      additionalLabels:
-        release: pgcf-telemetry
       interval: 45s
       relabelings:
         - targetLabel: pgcf_component
