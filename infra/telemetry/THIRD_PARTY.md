@@ -12,3 +12,5 @@ All entries below are **prepared candidates, not deployed**. First-party integra
 | [node-exporter](https://github.com/prometheus/node_exporter/tree/v1.12.1) | v1.12.1-distroless image | Apache-2.0 | Reuse trusted host metrics; network qualification remains required. |
 
 Licenses were checked at pinned upstream revisions. Digest/platform verification is not a signature, vulnerability or runtime acceptance assertion. Grafana and other disabled optional components are not selected runtime dependencies.
+
+The boundary also configures the existing [Cilium 1.20.2](https://github.com/cilium/cilium/tree/v1.20.2) operator/agent under their Apache-2.0 license. It introduces no Cilium fork/image/version/host-firewall change; the existing platform lock remains authoritative.

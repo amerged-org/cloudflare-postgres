@@ -51,5 +51,19 @@
   ],
   "publisherSignaturesVerified": false,
   "runtimeQualified": false,
-  "tenantToHostIsolationQualified": false
+  "tenantToHostIsolationQualified": false,
+  "managedPodBoundary": {
+    "policy": "pgcf-node-metrics-egress-boundary",
+    "deniedEntities": [
+      "host",
+      "remote-node"
+    ],
+    "deniedPort": "9100/TCP",
+    "protectedNamespace": "pgcf-monitoring",
+    "protectedServiceAccount": "pgcf-telemetry-kube-promet-prometheus",
+    "ciliumVersion": "1.20.2",
+    "changesHostFirewallOrRouting": false,
+    "actualPodSecurityAdmissionPrerequisiteQualified": true,
+    "runtimeDatapathQualified": false
+  }
 }

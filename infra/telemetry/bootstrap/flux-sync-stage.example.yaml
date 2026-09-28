@@ -1,0 +1,30 @@
+# Independent opt-in source: never repoint the existing pgcf-platform source.
+# Stages only: telemetry remains suspended, with no exporter listener created.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: pgcf-telemetry
+  namespace: flux-system
+spec:
+  interval: 30m
+  url: https://github.com/amerged-org/cloudflare-postgres
+  ref:
+    commit: REPLACE_WITH_REVIEWED_COMMIT_SHA
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: pgcf-telemetry
+  namespace: flux-system
+spec:
+  interval: 30m
+  timeout: 5m
+  path: ./infra/telemetry
+  prune: false
+  deletionPolicy: Orphan
+  sourceRef:
+    kind: GitRepository
+    name: pgcf-telemetry
+  dependsOn:
+    - name: pgcf-platform
+      namespace: flux-system

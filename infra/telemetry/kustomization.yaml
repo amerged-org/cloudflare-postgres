@@ -3,6 +3,7 @@ kind: Kustomization
 resources:
   - namespaces.yaml
   - namespace-quota.yaml
+  - boundary
   - source.yaml
   - release.yaml
 configMapGenerator:
