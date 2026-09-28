@@ -1,6 +1,29 @@
 # Regional environment controller
 
-Apache-2.0 first-party code. This package implements the regional half of the versioned `environment.create` protocol and an optional file-backed usage collector. It initiates HTTPS requests to the adopter's control API; it opens no inbound listener. It creates internal CloudNativePG resources, reports observed readiness, and can deliver provisional observations of owned CPU/RAM requests and data-volume capacity. External PostgreSQL endpoint discovery, credential issuance, gateway routing, sleep, resizing, deletion, restore, and hard runtime budget enforcement remain pending. A separate operator mode adds current allowance supervision and normal CNPG stop reconciliation; it is not enabled by the default controller.
+Apache-2.0 first-party code. This package implements the regional half of the versioned `environment.create` protocol and an optional file-backed usage collector. It initiates HTTPS requests to the adopter's control API; it opens no inbound listener. It creates internal CloudNativePG resources, reports observed readiness, and can deliver provisional observations of owned CPU/RAM requests and data-volume capacity. External PostgreSQL endpoint discovery, gateway routing, sleep, resizing, deletion, restore, and hard runtime budget enforcement remain pending. The default controller also executes the separate restricted login-role and credential-rotation protocol. A separate operator mode adds current allowance supervision and normal CNPG stop reconciliation; it is not enabled by the default controller.
+
+## Database roles and password rotation
+
+The [role lifecycle contract](../../docs/contracts/database-role-credentials-v1.md) supplies an independent regional role-operation lane beside environment reconciliation and metering. Before updating from earlier controller releases, add this installation-owned selection to `PGCF_REGIONAL_CONFIG_FILE` and mount `PGCF_REGION_TOKEN_FILE`; both are required before any controller task starts:
+
+```json
+{
+  "roleVerifier": {
+    "verifierNamespace": "pgcf-system",
+    "verifierPodLabels": {
+      "app.kubernetes.io/name": "pgcf-regional-controller"
+    }
+  }
+}
+```
+
+Merge this field into the existing configuration rather than replacing its operator and backup settings. Select labels identifying the actual trusted verifier Pods in your installation. The [deployment example](deploy/example.yaml) includes this selection, DatabaseRole get/create/patch permissions and trusted operator Secret reads. The role client reloads the mounted executor token per request. Kubernetes RBAC cannot limit resource creation by name; admission and the trusted controller identity remain installation boundaries.
+
+Only current leased work for a ready API-managed environment is eligible. The controller derives the namespace, CNPG RW service and role resource names; it refuses foreign ownership and a newer observed credential revision before writes. It creates immutable basic-auth Secrets per credential revision and a stable restricted CNPG DatabaseRole. Lost responses reconcile through matching readback and UID/resource-version guarded rotation. It creates no arbitrary SQL, superuser or caller-selected role memberships.
+
+Success requires CNPG applied/current generation/exact password-Secret version, then fresh password-authenticated TLS login to the derived internal RW service, expected user/database, writable primary and restricted PostgreSQL role attributes. The CA adapter returns only the public `ca.crt` field. Rotation additionally requires the previous password to fail on a separate new connection specifically with SQLSTATE `28P01`. Timeouts, TLS failures and unknown outcomes defer; they do not establish password invalidation or reveal a credential. Identity/version readback surrounds the connection check.
+
+[The maintained driver dependencies](THIRD_PARTY.md) are pinned and retain their licenses. This lifecycle does not automatically grant table permissions/ownership, terminate existing sessions, expose a public endpoint, enable closed regional admission or qualify backups/recovery. Real CNPG application, key recovery, image/runtime, networking and end-to-end pilot verification remain separate evidence.
 
 ## Current allowance supervision and normal stop
 

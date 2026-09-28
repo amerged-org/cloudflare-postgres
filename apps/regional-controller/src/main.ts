@@ -8,6 +8,12 @@ import { UsageJournal } from "./usage-journal.ts";
 import { runMetering } from "./metering.ts";
 import type { UsageIdentity } from "./metering-types.ts";
 import type { RegionalConfig } from "./types.ts";
+import { RoleClient } from "./role-client.ts";
+import { roleKubernetesFromConfig } from "./role-kubernetes.ts";
+import { runRoleController } from "./role-controller.ts";
+import { postgresRoleVerifier } from "./role-postgres.ts";
+import { validRoleConfig } from "./role-reconcile.ts";
+import type { RoleConfig } from "./role-types.ts";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -44,14 +50,15 @@ async function main(): Promise<void> {
   }
   const config = JSON.parse(
     await readFile(required("PGCF_REGIONAL_CONFIG_FILE"), "utf8"),
-  ) as RegionalConfig;
+  ) as RegionalConfig & { roleVerifier: RoleConfig };
   if (
     !config ||
     typeof config !== "object" ||
     typeof config.operatorNamespace !== "string" ||
     !config.operatorPodLabels ||
     typeof config.operatorPodLabels !== "object" ||
-    !Array.isArray(config.allowedBackupSecrets)
+    !Array.isArray(config.allowedBackupSecrets) ||
+    !validRoleConfig(config.roleVerifier)
   ) {
     throw new Error("invalid_regional_configuration");
   }
@@ -64,6 +71,14 @@ async function main(): Promise<void> {
     required("PGCF_REGION_ID"),
     token,
   );
+  const roleTokenFile = required("PGCF_REGION_TOKEN_FILE");
+  const roleClient = new RoleClient(
+    required("PGCF_CONTROL_ORIGIN"),
+    required("PGCF_REGION_ID"),
+    async () => (await readFile(roleTokenFile, "utf8")).trim(),
+  );
+  const roleApi = roleKubernetesFromConfig(process.env.PGCF_KUBECONFIG_FILE);
+  const roleVerifier = postgresRoleVerifier();
   const shutdown = new AbortController();
   process.once("SIGINT", () => shutdown.abort());
   process.once("SIGTERM", () => shutdown.abort());
@@ -72,7 +87,7 @@ async function main(): Promise<void> {
     process.stdout.write(
       `${JSON.stringify({ time: new Date().toISOString(), event })}\n`,
     );
-  // Validate both services before either can create durable state or start work.
+  // Validate all service configuration before any lane creates durable state or starts work.
   const controllerOptions = {
     leaseSeconds: milliseconds("PGCF_LEASE_SECONDS", 90, 30, 300),
     pollMilliseconds: milliseconds(
@@ -152,6 +167,15 @@ async function main(): Promise<void> {
       );
     }
     tasks.push(runController(api, client, config, controllerOptions));
+    tasks.push(
+      runRoleController(
+        roleApi,
+        roleClient,
+        config.roleVerifier,
+        roleVerifier,
+        controllerOptions,
+      ),
+    );
     await Promise.all(tasks);
   } finally {
     shutdown.abort();

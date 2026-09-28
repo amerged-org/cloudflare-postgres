@@ -46,6 +46,16 @@ Use the organization token to read `GET /v1/organizations/{organizationId}/proje
 
 The current slice has no public native endpoint, customer database credentials, environment listing/deletion/resize, runtime usage collector, runtime allowance enforcer, idempotency archival, or rate limiting. A reported ready environment means the regional executor observed PostgreSQL resource readiness; it does not prove backups, restore qualification, credential access, or a production service objective.
 
+## Database roles and credentials
+
+The [role lifecycle contract](../../docs/contracts/database-role-credentials-v1.md) defines tenant-scoped login-role creation, credential disclosure and conditional password rotation. Set the dedicated `ROLE_CREDENTIAL_KEYS` Worker Secret before using it; the keyring contains an active key ID and retained base64url 32-byte AES keys. Do not reuse allowance keys or provider credentials. Missing keys cannot issue a credential operation. Passwords are generated server-side, authenticated-encrypted before D1 persistence and disclosed only after the current revision is verified by the regional executor.
+
+Use the ready environment's `/v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/roles` collection with the existing organization token. `POST` requires `Idempotency-Key` and exactly `{name, connectionLimit}`; its asynchronous response contains metadata and an operation, never a password. `GET /{roleId}` reads metadata; `GET /{roleId}/credentials` requires write scope and returns only the latest applied credential. `POST /{roleId}/rotate` requires an idempotency key and `{expectedCredentialRevision}`. Reserved role names and privileged attributes are not exposed. A login role receives no automatic table privileges or database ownership.
+
+The separate regional `/v1/regions/{regionId}/role-operations` claim/renew/result lane leaves the existing environment-create protocol unchanged. Region executor tokens can receive only bound current leased work; they cannot use the customer credential-disclosure route. Claims contain the exact new and, for rotation, previous password for the trusted executor's fresh TLS checks. Successful results must match current intent and exact CNPG role/Secret application plus connection observations. Historical replay never publishes a newer credential or rolls role state back.
+
+See [provider secret custody](../../docs/operations/provider-secret-custody.md) for Cloudflare/D1/regional responsibility boundaries. Provider secrets existing in the Dev Worker do not establish fleet operations. Public endpoints, role ownership/grants, key recovery and live installation qualification remain distinct gates.
+
 ## Current allowance execution authority
 
 The [current authority and normal-stop contract](../../docs/contracts/runtime-allowance-authority-v1.md) adds `GET /v1/regions/{regionId}/allowance-reservations/{reservationId}/authority` for the ordinary regional executor. It returns a consistent, fresh decision bound to the receipt, environment specification, current policy/account/epoch state and funding. An already funded reservation remains valid at zero free balance; pause, changed epoch/account, expiry or inconsistent evidence cannot be converted into continued authority by replaying its historical receipt.

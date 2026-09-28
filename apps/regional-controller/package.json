@@ -5,7 +5,8 @@
   "type": "module",
   "license": "Apache-2.0",
   "files": [
-    "dist"
+    "dist",
+    "THIRD_PARTY.md"
   ],
   "engines": {
     "node": ">=24.0.0"
@@ -18,11 +19,13 @@
     "start": "node dist/main.js"
   },
   "dependencies": {
-    "@kubernetes/client-node": "2.0.0"
+    "@kubernetes/client-node": "2.0.0",
+    "pg": "8.23.0"
   },
   "devDependencies": {
     "@eslint/js": "9.39.5",
     "@types/node": "24.19.0",
+    "@types/pg": "8.23.1",
     "eslint": "9.39.5",
     "prettier": "3.9.9",
     "typescript": "5.9.3",
