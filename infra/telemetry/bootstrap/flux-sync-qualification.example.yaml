@@ -1,0 +1,90 @@
+# Opt-in core qualification. Apply only a reviewed, commit-pinned source.
+# Rules have their own ordered Kustomization; the core release owns no Rules.
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: pgcf-telemetry
+  namespace: flux-system
+spec:
+  suspend: true
+  interval: 30m
+  timeout: 9m
+  path: ./infra/telemetry-qualification
+  prune: false
+  deletionPolicy: Orphan
+  sourceRef:
+    kind: GitRepository
+    name: pgcf-telemetry
+  dependsOn:
+    - name: pgcf-platform
+      namespace: flux-system
+  healthChecks:
+    - apiVersion: helm.toolkit.fluxcd.io/v2
+      kind: HelmRelease
+      name: pgcf-telemetry
+      namespace: flux-system
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: pgcf-telemetry-kube-promet-operator
+      namespace: pgcf-monitoring
+    - apiVersion: apps/v1
+      kind: StatefulSet
+      name: prometheus-pgcf-telemetry-kube-promet-prometheus
+      namespace: pgcf-monitoring
+    - apiVersion: apps/v1
+      kind: StatefulSet
+      name: alertmanager-pgcf-telemetry-kube-promet-alertmanager
+      namespace: pgcf-monitoring
+    - apiVersion: cert-manager.io/v1
+      kind: Certificate
+      name: pgcf-telemetry-kube-promet-root-cert
+      namespace: pgcf-monitoring
+    - apiVersion: cert-manager.io/v1
+      kind: Certificate
+      name: pgcf-telemetry-kube-promet-admission
+      namespace: pgcf-monitoring
+    - apiVersion: cert-manager.io/v1
+      kind: Issuer
+      name: pgcf-telemetry-kube-promet-self-signed-issuer
+      namespace: pgcf-monitoring
+    - apiVersion: cert-manager.io/v1
+      kind: Issuer
+      name: pgcf-telemetry-kube-promet-root-issuer
+      namespace: pgcf-monitoring
+    - apiVersion: admissionregistration.k8s.io/v1
+      kind: MutatingWebhookConfiguration
+      name: pgcf-telemetry-kube-promet-admission
+    - apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingWebhookConfiguration
+      name: pgcf-telemetry-kube-promet-admission
+  healthCheckExprs:
+    - apiVersion: cert-manager.io/v1
+      kind: Certificate
+      current: >-
+        has(status.conditions) && status.conditions.exists(c,
+          c.type == 'Ready' && c.status == 'True' &&
+          has(c.observedGeneration) && c.observedGeneration == metadata.generation)
+    - apiVersion: cert-manager.io/v1
+      kind: Issuer
+      current: >-
+        has(status.conditions) && status.conditions.exists(c,
+          c.type == 'Ready' && c.status == 'True' &&
+          has(c.observedGeneration) && c.observedGeneration == metadata.generation)
+    - apiVersion: admissionregistration.k8s.io/v1
+      kind: MutatingWebhookConfiguration
+      current: >-
+        size(webhooks) > 0 && webhooks.all(w,
+          has(w.clientConfig.caBundle) && size(w.clientConfig.caBundle) > 0 &&
+          has(w.clientConfig.service) &&
+          w.clientConfig.service.name == 'pgcf-telemetry-kube-promet-operator' &&
+          w.clientConfig.service.namespace == 'pgcf-monitoring' &&
+          w.clientConfig.service.port == 443 && w.failurePolicy == 'Fail')
+    - apiVersion: admissionregistration.k8s.io/v1
+      kind: ValidatingWebhookConfiguration
+      current: >-
+        size(webhooks) > 0 && webhooks.all(w,
+          has(w.clientConfig.caBundle) && size(w.clientConfig.caBundle) > 0 &&
+          has(w.clientConfig.service) &&
+          w.clientConfig.service.name == 'pgcf-telemetry-kube-promet-operator' &&
+          w.clientConfig.service.namespace == 'pgcf-monitoring' &&
+          w.clientConfig.service.port == 443 && w.failurePolicy == 'Fail')

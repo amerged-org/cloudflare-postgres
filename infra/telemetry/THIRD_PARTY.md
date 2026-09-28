@@ -1,6 +1,6 @@
 # Telemetry reuse provenance
 
-All entries below are **prepared candidates, not deployed**. First-party integration files use the repository Apache-2.0 license. Upstream components retain their own Apache-2.0 licenses/notices; no source or binary is vendored here. Exact chart and image identities are recorded in `versions.lock.json`.
+The selected components have a **partial Dev installation, not operational acceptance**; the release is held after failed Rule admission. First-party integration files use the repository Apache-2.0 license. Upstream components retain their own licenses/notices. The [Rules directory](rules/README.md) includes generated upstream Rule configuration, with its Apache-2.0 license, NOTICE and exact provenance preserved. No upstream application binary is vendored. Exact chart and image identities are recorded in `versions.lock.json`.
 
 | Upstream | Pinned selection | License | Reuse decision |
 | --- | --- | --- | --- |

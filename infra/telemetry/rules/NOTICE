@@ -1,0 +1,19 @@
+Upstream default PrometheusRule bundle
+
+This bundle is derived from the Apache-2.0-licensed kube-prometheus-stack
+91.8.0 chart maintained by the Prometheus Community:
+https://github.com/prometheus-community/helm-charts/tree/kube-prometheus-stack-91.8.0/charts/kube-prometheus-stack
+
+The chart's source templates identify the maintained rule groups generated
+from prometheus-operator/kube-prometheus:
+https://github.com/prometheus-operator/kube-prometheus
+
+Each resource retains its upstream chart-template source comment. The
+rule specifications and selector/provenance labels are unchanged. The
+first-party integration changes only app.kubernetes.io/managed-by from
+Helm to kustomize-controller and separates Rule reconciliation from the
+chart release so that admission readiness can be ordered explicitly.
+
+The upstream Apache-2.0 license is reproduced in LICENSE. The chart archive
+contains no separate NOTICE file. See provenance.json for frozen inputs,
+output hashes and the scope of local verification.

@@ -1,0 +1,76 @@
+{
+  "schemaVersion": 1,
+  "preparedOn": "2026-09-28",
+  "status": "prepared_only_not_activated",
+  "chart": {
+    "name": "kube-prometheus-stack",
+    "version": "91.8.0",
+    "appVersion": "v0.94.1",
+    "source": "oci://ghcr.io/prometheus-community/charts/kube-prometheus-stack",
+    "ociManifestDigest": "sha256:31d941e75adc97f244a0c1085098dd1087fc753fe80e8fa4818b56fcc920085f",
+    "archiveSha256": "0c92b02828e58ea590f3a1ce118536a3e98bbfe641b23b42535470fee46c3eff",
+    "sourceURL": "https://github.com/prometheus-community/helm-charts/tree/kube-prometheus-stack-91.8.0/charts/kube-prometheus-stack"
+  },
+  "render": {
+    "sourceRenderer": "native Helm 3.22.0",
+    "productionHelmControllerVersion": "v1.6.4",
+    "productionHelmSdkVersion": "v4.2.4",
+    "productionHelmRenderValidated": false,
+    "productionUpgradeValidated": false,
+    "releaseName": "pgcf-telemetry",
+    "namespace": "pgcf-monitoring",
+    "kubernetesVersion": "1.36.3",
+    "generationOverride": {
+      "defaultRules.create": true
+    },
+    "sourceValuesCommit": "868e6c20ab322a48c4e6279cfc624433f15bc9a7",
+    "sourceValuesSha256": "2a2f379cc90978019fe02c18fef2e4b260fb269405cf2a9aad05cb50766c50f8",
+    "reviewedRenderedManifestSha256": "b0f2435f9a3049e5b56e2a6ce91f7c21e3c227ea6f012d7a0f1c195983c644fa",
+    "expectedIdentityInventorySha256": "4adc91bc4f1b892a8c4a22c0c1bbb7956999627bbc8a71657be5d911c941cd9e"
+  },
+  "modifications": [
+    {
+      "path": "metadata.labels.app.kubernetes.io/managed-by",
+      "from": "Helm",
+      "to": "kustomize-controller",
+      "scope": "every Rule"
+    }
+  ],
+  "verification": {
+    "strictParser": "yaml 2.9.1 with strict=true and uniqueKeys=true; parser errors checked",
+    "ruleCount": 30,
+    "uniqueIdentityCount": 30,
+    "identitiesEqualFrozenInventory": true,
+    "aggregateContractCanonicalization": "UTF-8 JSON; object keys recursively sorted; Rules sorted by apiVersion/kind/namespace/name; excludes only the documented management label",
+    "sourceAggregateContractSha256": "816e03281f062f0081f5ed52bdced1cd5e45dd8715aa51bcc727b555b6286097",
+    "outputAggregateContractSha256": "816e03281f062f0081f5ed52bdced1cd5e45dd8715aa51bcc727b555b6286097",
+    "aggregateSpecsAndOtherLabelsEqual": true,
+    "helmOwnerAnnotationsAbsent": true,
+    "promtoolRerun": false,
+    "runtimeTestsRun": false,
+    "clusterActionsPerformed": false
+  },
+  "license": {
+    "spdx": "Apache-2.0",
+    "sourceURL": "https://raw.githubusercontent.com/prometheus-community/helm-charts/kube-prometheus-stack-91.8.0/LICENSE",
+    "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+    "separateNoticeInChartArchive": false
+  },
+  "outputs": {
+    "default-rules.yaml": {
+      "sha256": "cf0c34239bb691f6ca3cd418636aea282ce81d1ccbe0333a6806f91f1a17368b"
+    },
+    "kustomization.yaml": {
+      "sha256": "4aba8981aa812b5d8d4d173420600157be39defc083dac0193809bb4f3e830b0"
+    },
+    "LICENSE": {
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4"
+    },
+    "NOTICE": {
+      "sha256": "b8d11791866850f28bcf24f2a902b19758d7491d852e2a09287d5f04c855ac78"
+    },
+    "README.md": {
+      "sha256": "816881ae65d330fb2148257e5ff945e761768fefe9efe1dde593f5bec7c13e93"
+    }
+  }
+}
