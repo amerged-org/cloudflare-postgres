@@ -288,8 +288,14 @@ changes only the missing-metrics alert's operands, preserving global settings
 and its existing delay/join/metadata. Two meaningful cases fail first and pass
 after one correction; the frozen isolated canonical/Promtool gate passes exactly
 once in 16.390 seconds. Source review and stopped-candidate hash preservation
-pass. Target-only source promotion, loaded-rule/cleared-alert evidence and
-preserved runtime state remain pending. A separate fresh API-server observation
+pass. One guarded target-only source handoff is Ready in 5.224 seconds while
+preserving all 32 Rule/two PodMonitor UIDs and protected original source specs.
+The loaded same-UID Rule evaluates the correction with zero false alerts;
+Node/boot identity, seven Pod identities and regular-container restart counts, four PVC bindings and
+both SQL markers are preserved in an 18.069-second read-only observation.
+Adopter assets use a separate pinned source and retain a held default. No
+frozen source changes, extra cases or gate reruns follow qualification.
+A separate fresh API-server observation
 measures 32,251 post-filter samples against the 20,000 cap; it requires its own
 capacity correction, not a speculative global change in this candidate.
 

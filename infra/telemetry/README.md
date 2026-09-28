@@ -2,11 +2,12 @@
 
 Status: **core, default Rules and four platform monitoring objects Ready in
 Dev** at source commit `59a6b3c0ef2481287963c54b81e0ef39751bbf0d`. Deployed Helm
-revision two preserves core/CRDs and two bound PVCs; separate same-source Flux
-Kustomizations own all 30 default Rules and the four stateless platform objects.
-Five controller targets and seven selected Rule evaluations pass, but namespace
-attribution causes four incorrect pending PVC-missing alerts. Operational
-acceptance is incomplete. This is a warm one-node feasibility continuation,
+revision two preserves core/CRDs and two bound PVCs. Core/default Rules retain
+their source; a separate pinned target source owns the four stateless platform
+objects after the guarded correction. Five controller targets and seven
+selected Rule evaluations pass, and four false PVC-missing alerts are cleared.
+API-server sample capacity and other namespace-sensitive input coverage keep
+operational acceptance incomplete. This is a warm one-node feasibility continuation,
 not fresh-bootstrap or production acceptance. Actual Alertmanager configuration
 has only the null receiver and no integration. See
 [the platform telemetry evidence](../../docs/evidence/m4-platform-telemetry-2026-09-28.md),
@@ -23,13 +24,17 @@ The root Kustomization contains two namespaces, the main namespace quota, a pinn
 
 The active platform path and its pinned source are unchanged. The independent [stage bootstrap](bootstrap/flux-sync-stage.example.yaml) pins a separate GitRepository/Kustomization and depends on the existing platform. It never repoints that platform source. The core keeps `defaultRules.create: false`; the complete upstream [Rule bundle](rules/README.md) is owned by a separate Flux Kustomization, with every expression and selector preserved. No rule scope is dropped.
 
-The held [platform-target example](bootstrap/flux-sync-targets.example.yaml)
-uses that same pinned telemetry source and depends on both core and default
-Rules readiness. It owns only the two existing Flux/CNPG PodMonitors and two
-platform Rules. Operator/Prometheus health is an apply prerequisite; actual
-target discovery, successful scrapes, emitted series and evaluated Rules must
-still be observed. Preserve original source pins, chart settings, all default
-Rules, network policy and retained storage during this separate operation.
+The historical held [platform-target example](bootstrap/flux-sync-targets.example.yaml)
+uses the shared telemetry source. The corrected
+[target-only example](bootstrap/flux-sync-targets-correction.example.yaml) pins
+its independent source, preserving core/default Rules at their reviewed source.
+Both depend on core/default Rules readiness and own only the two existing
+Flux/CNPG PodMonitors and two platform Rules. An existing writer requires a
+guarded reference handoff preserving its UID/inventory, not blind template apply.
+Explicitly verify protected source revisions and specs; cross-source readiness
+dependencies alone do not establish those pins. Operator/Prometheus health is
+an apply prerequisite; actual scrapes, series and rule evaluation must still be
+observed. Preserve chart settings, all default Rules, network policy and storage.
 
 Use the held [core qualification example](bootstrap/flux-sync-qualification.example.yaml) for an explicitly reviewed activation. Its named health checks wait for the current Helm release, Operator Deployment, generated Prometheus/Alertmanager StatefulSets, both Certificates/Issuers and both injected webhook configurations. Positive Certificate/Issuer conditions must match the resource generation. Webhooks require the expected service, port, namespace, nonempty CA and failure policy. Do not set `wait: true`, which would replace the explicit check list. The held [Rules example](bootstrap/flux-sync-rules.example.yaml) uses the same source and depends on that core Kustomization. [Flux health and dependency checks](https://fluxcd.io/flux/components/kustomize/kustomizations/#health-checks) provide the ordering; actual Rule admission still verifies the serving TLS path.
 
@@ -67,11 +72,13 @@ Flux state uses maintained KSM customResourceState, four exact GVKs and scalar g
 
 Actual volume samples are present for all four bound PVCs, with intrinsic
 namespaces in `exported_namespace` because global honor-label overriding is
-enabled. The current PVC warning incorrectly joins discovery namespaces;
-normalize its operands in the next bounded repair while preserving global
-settings. Do not infer useful input from healthy expression evaluation for
-other namespace-filtered controller/upstream rules. One firing TargetDown and
-one firing scrape-sample-limit alert also remain separately unqualified.
+enabled. The PVC warning now normalizes both operands to the resource namespace;
+the [two-case correction](../../docs/evidence/m4-pvc-alert-namespace-2026-09-28.md)
+clears all four false alerts in Dev while preserving global settings. Do not
+infer useful input from healthy expression evaluation for other namespace-filtered
+controller/upstream rules. The API-server target's 32,251 post-filter samples
+exceed its 20,000 cap; its TargetDown/sample-limit warnings remain a separate
+capacity correction.
 
 Before activation, verify current capacity/limits, API/CEL/PSA admission and generated Pods, cert-manager admission readiness, exact images and resource bounds, the tenant/host network boundary, verified kubelet TLS, named targets/PVC statistics, actual Flux series and useful alert states, null-receiver behavior, sustained cardinality/memory and storage growth. Filesystem/PVC metrics do not measure LVM VG free extents. The platform still needs authoritative capacity observation, recovery/PITR, updates, quorum and node-loss acceptance.
 

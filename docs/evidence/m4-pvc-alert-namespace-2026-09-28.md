@@ -1,8 +1,8 @@
 # M4 PVC alert namespace correction — 2026-09-28
 
-Status: **one-expression correction and two-case proof qualified in source;
-target-only runtime promotion pending**. Core/default Rules and the original
-platform source remain unchanged. Operational acceptance is still incomplete.
+Status: **source and target-only Dev promotion qualified; four false PVC alerts
+cleared**. Core/default Rules and the original platform source remain unchanged.
+API-server sample capacity and broader operational acceptance remain incomplete.
 
 ## Observed defect and bounded correction
 
@@ -45,10 +45,31 @@ UID/resourceVersion/spec guard, then change only its source reference and resume
 the same writer. Explicitly preserve core/default Rules at their old source and
 the original platform pin; cross-source dependencies alone do not prove pins.
 
-Actual retained object identities, the single loaded expression, cleared false
-alerts and preserved Node/database/PVC/SQL state remain the next runtime gates.
-Other namespace-filtered controller/upstream rules still require useful-input
-evidence. Do not infer complete operational coverage from expression health.
+The corrected Rule passes one server-side dry-run with exact spec in 0.453
+seconds. One bounded operation then creates the separate source at
+`c2d3ccb91d512f317ef7e74b3c0b12cedcb3c46c`, holds and switches the same target
+writer, and becomes Ready in 5.224 seconds. Current new-source UID/spec,
+generation/Ready condition, own operation marker and artifact pin are checked
+before resume, during observation and at completion; old sources/dependencies
+are independently fenced. All 32 Rule and two PodMonitor UIDs remain unchanged.
+The sole spec delta is the expected expression. The consumed original activation
+ledger is preserved; a new one-use ledger records this handoff.
+
+A bounded read-only observer completes in 18.069 seconds. The same Rule source
+UID's loaded query matches the correction after whitespace normalization;
+post-handoff evaluation is healthy, retains the delay/metadata and has zero
+alerts. Node UID/boot identity is Ready without pressure. Seven selected Pod UIDs and the
+restart counts of their regular containers remain unchanged, as do four PVC
+UIDs/bindings. PostgreSQL is Ready
+and both SQL markers remain one. This is observed correction/preservation,
+not uninterrupted availability or production recovery evidence.
+
+The [held correction bootstrap](../../infra/telemetry/bootstrap/flux-sync-targets-correction.example.yaml)
+provides the separate pinned source for adopters. Existing writers require the
+documented guarded reference handoff, not replacement or blind apply. Other
+namespace-filtered controller/upstream rules still require useful-input evidence.
+Do not infer complete operational coverage from expression health. There is no
+additional source/test change or full gate rerun after the frozen proof.
 
 ## Separate API-server scrape defect
 
