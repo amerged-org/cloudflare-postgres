@@ -27,6 +27,11 @@ function milliseconds(
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "inspect-platform") {
+    const { runPlatformInspection } = await import("./platform-inspection.ts");
+    process.exitCode = await runPlatformInspection(process.argv.slice(3));
+    return;
+  }
   const config = JSON.parse(
     await readFile(required("PGCF_REGIONAL_CONFIG_FILE"), "utf8"),
   ) as RegionalConfig;

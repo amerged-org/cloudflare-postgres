@@ -18,6 +18,8 @@ The [initial M4 adoption checkpoint](docs/evidence/m4-platform-adoption-2026-09-
 
 The [Barman preflight checkpoint](docs/evidence/m4-barman-preflight-2026-09-28.md) records the prepared compatibility assets and an actual SSA rejection when switching the sidecar-image reference. The bounded workflow stopped after two observation corrections. An explicit field migration is prepared privately and awaits a one-attempt exception; the active overlay is not qualified for promotion.
 
+The [platform inspection checkpoint](docs/evidence/m4-platform-inspection-2026-09-28.md) adds a reusable read-only CLI with redacted JSON, complete bounded lists, current-generation/version/source checks and explicit unverified operational gates. Three new integration cases failed first; one frozen full gate passed all 22 cases. Live inspection correctly reports four Ready releases and suspended Barman. It does not authorize maintenance or qualify database recovery.
+
 The first implementation steps are infrastructure/recovery proofs and an early generic pilot using one always-on database over native PostgreSQL. Adopter-specific adapters and migration TODOs belong in their own repositories. Gateway selection follows technical and maintenance evaluation. Sleep/wake and bounded automatic compute scaling remain v1 requirements after that baseline.
 
 ## Self-hosting model

@@ -52,7 +52,7 @@ const requestOptions: ConfigurationOptions = {
   ],
 };
 
-interface InventoryBudget {
+export interface InventoryBudget {
   remainingRequests: number;
   remainingResources: number;
   deadline: number;
@@ -62,7 +62,7 @@ function object(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-async function inventoryPages(
+export async function inventoryPages(
   fetchPage: (continuation?: string) => Promise<unknown>,
   kind: string,
   apiVersion: string,

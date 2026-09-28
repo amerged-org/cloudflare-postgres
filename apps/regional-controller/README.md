@@ -2,6 +2,29 @@
 
 Apache-2.0 first-party code. This package implements the regional half of the versioned `environment.create` protocol and an optional file-backed usage collector. It initiates HTTPS requests to the adopter's control API; it opens no inbound listener. It creates internal CloudNativePG resources, reports observed readiness, and can deliver provisional observations of owned CPU/RAM requests and data-volume capacity. External PostgreSQL endpoint discovery, credential issuance, gateway routing, sleep, resizing, deletion, restore, allowance supervision, and hard runtime budget enforcement remain pending.
 
+## Read-only platform inspection
+
+Build this package and use an explicitly selected operator kubeconfig/context and reviewed version lock:
+
+```sh
+pnpm --filter @cloudflare-postgres/regional-controller build
+node apps/regional-controller/dist/main.js inspect-platform \
+  --kubeconfig /private/installation/kubeconfig \
+  --context REPLACE_WITH_CONTEXT \
+  --versions-lock infra/platform/versions.lock.json \
+  --expected-source-commit REPLACE_WITH_REVIEWED_40_CHARACTER_COMMIT
+```
+
+`--namespace` defaults to `flux-system`; `--sync-name` defaults to `pgcf-platform`. The command does not require regional API tokens, controller configuration or a metering journal. It selects this mode before controller/meter startup and performs only Nodes and Flux resource reads through the existing official Kubernetes client. The optional [observer RBAC example](deploy/platform-observer.example.yaml) has no Secret or mutation privileges and is not installed automatically; review its namespace and named sync resources for your installation.
+
+One JSON report uses `scope: platform_components` and normalized statuses. Exit **0** means the reported Node conditions/versions, deployed release history, current-generation Flux conditions, configured/fetched source pins and Git/Kustomization commit linkage match this lock. Exit **1** means a reported discrepancy or incomplete/suspended component. Exit **2** means the observation/configuration could not be completed; the error code is generic and does not echo API bodies, credentials, addresses, paths or raw condition messages.
+
+Ready Flux observations require both top-level and Ready-condition generation equality, with suspension/deletion/stalled/reconciling states handled separately. OCI checking uses the manifest digest in the configured reference, fetched artifact revision and HelmRelease attempt linked to current Ready/deployed history; the cached artifact digest is not the manifest identity. OpenEBS's HTTP source remains a repository/version observation, not historical archive-checksum enforcement. Pinned bare digest/commit revisions and tagged/branch revisions are supported.
+
+Lists reuse the collector's existing bounded pagination, stable resourceVersion and duplicate/continuation checks: at most ten pages per list, 32 total requests, 4096 resources and a 30-second observation budget, with a maximum 20-second request deadline. An incomplete or rejected observation cannot become a healthy empty inventory. The output contains aggregate Node counts and allowlisted component names/booleans, not live Node identities, addresses, arbitrary URLs or opaque error/version strings.
+
+This is a point observation, not a maintenance authorization or a transaction across Kubernetes lists. SQL, backup/restore, replication, etcd, spare capacity, tenant isolation, image signatures/runtime images, effective values, Flux binary identity and fresh Node heartbeat/reachability remain explicitly unverified. Prometheus/Alertmanager/OpenTelemetry, lifecycle maintenance and operational recovery qualification remain required work in PLAN.md.
+
 ## Operator configuration
 
 Build with Node.js 24 or newer and `pnpm --filter @cloudflare-postgres/regional-controller build`. The production Dockerfile pins Node 24.21.0; local Node 24.6 executions are provisional tooling evidence and do not establish the pinned image's SQLite/runtime behavior. Supply:
