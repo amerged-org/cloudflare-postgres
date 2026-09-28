@@ -31,6 +31,7 @@ test("durably replays exact minute facts and preserves unknown coverage when its
     attribution: "primary",
     rate: "9007199254740993",
     evidenceHash: "b".repeat(64),
+    continuity: { version: 1, hash: "c".repeat(64) },
   };
   const volume = {
     environmentId: allocation.environmentId,

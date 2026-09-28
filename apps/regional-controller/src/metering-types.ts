@@ -5,6 +5,11 @@ export type MeterMetric =
   "cpu_millicore_ms" | "memory_byte_ms" | "data_storage_byte_ms";
 export type Attribution = "primary" | "replica" | "backup" | "wal" | "platform";
 
+export interface AllocationContinuity {
+  version: 1;
+  hash: string;
+}
+
 export interface Allocation {
   key: string;
   environmentId: string;
@@ -14,6 +19,8 @@ export interface Allocation {
   attribution: Attribution;
   // Exact effective request/capacity units per millisecond, not utilization.
   rate: string;
+  // Optional only when reading checkpoints written before continuity proofs.
+  continuity?: AllocationContinuity;
   evidenceHash: string;
 }
 export interface ObservationIssue {

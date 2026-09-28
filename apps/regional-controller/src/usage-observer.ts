@@ -93,6 +93,32 @@ interface EnvironmentProof {
   specHash: string;
 }
 
+type AllocationOwnership = Pick<
+  RetainedVolumeBinding,
+  | "environmentId"
+  | "regionId"
+  | "specHash"
+  | "namespace"
+  | "namespaceUid"
+  | "clusterUid"
+>;
+type AllocationResource =
+  | {
+      kind: "compute";
+      podName: string;
+      podUid: string;
+      container: string;
+      nodeName: string;
+    }
+  | {
+      kind: "volume";
+      pvcName: string;
+      pvcUid: string;
+      pvName: string;
+      pvUid: string;
+      storageClass: string;
+    };
+
 function key(
   environmentId: string,
   resourceUid: string,
@@ -103,32 +129,75 @@ function key(
 }
 
 function allocation(
-  proof: EnvironmentProof,
-  resourceUid: string,
+  ownership: AllocationOwnership,
+  resource: AllocationResource,
   metric: MeterMetric,
   attribution: Attribution,
   rate: string,
   evidence: unknown,
 ): Allocation {
+  const resourceUid =
+    resource.kind === "compute"
+      ? `${resource.podUid}:${resource.container}`
+      : resource.pvUid;
   return {
-    key: key(proof.environmentId, resourceUid, metric, attribution),
-    environmentId: proof.environmentId,
-    specHash: proof.specHash,
+    key: key(ownership.environmentId, resourceUid, metric, attribution),
+    environmentId: ownership.environmentId,
+    specHash: ownership.specHash,
     resourceUid,
     metric,
     attribution,
     rate,
+    continuity: {
+      version: 1,
+      hash: digest({
+        method: "kubernetes-allocation-continuity/v1",
+        environmentId: ownership.environmentId,
+        regionId: ownership.regionId,
+        namespace: ownership.namespace,
+        namespaceUid: ownership.namespaceUid,
+        clusterUid: ownership.clusterUid,
+        specHash: ownership.specHash,
+        resourceUid,
+        metric,
+        attribution,
+        rate,
+        resource,
+      }),
+    },
     evidenceHash: digest({
       method: "kubernetes-allocation-observation/v1",
-      namespaceUid: proof.namespace.metadata.uid,
-      clusterUid: proof.cluster.metadata.uid,
-      specHash: proof.specHash,
+      namespaceUid: ownership.namespaceUid,
+      clusterUid: ownership.clusterUid,
+      specHash: ownership.specHash,
       metric,
       attribution,
       rate,
       evidence,
     }),
   };
+}
+
+function volumeAllocation(
+  binding: RetainedVolumeBinding,
+  rate: string,
+  evidence: unknown,
+): Allocation {
+  return allocation(
+    binding,
+    {
+      kind: "volume",
+      pvcName: binding.pvcName,
+      pvcUid: binding.pvcUid,
+      pvName: binding.pvName,
+      pvUid: binding.pvUid,
+      storageClass: binding.storageClass,
+    },
+    "data_storage_byte_ms",
+    binding.attribution,
+    rate,
+    evidence,
+  );
 }
 
 function sameOwner(
@@ -370,20 +439,13 @@ export function observeUsage(
         }
         if (!prior || role === "primary") {
           bindings.set(pv.metadata.uid, binding);
-          const observed = allocation(
-            proof,
-            pv.metadata.uid,
-            "data_storage_byte_ms",
-            role,
-            rate,
-            {
-              pvUid: pv.metadata.uid,
-              pvResourceVersion: pv.metadata.resourceVersion,
-              pvcUid: pvc.metadata.uid,
-              storageClass: expectedClass,
-              capacity: actualCapacity,
-            },
-          );
+          const observed = volumeAllocation(binding, rate, {
+            pvUid: pv.metadata.uid,
+            pvResourceVersion: pv.metadata.resourceVersion,
+            pvcUid: pvc.metadata.uid,
+            storageClass: expectedClass,
+            capacity: actualCapacity,
+          });
           if (prior)
             allocations.delete(
               key(
@@ -398,9 +460,11 @@ export function observeUsage(
       }
 
     if (["Succeeded", "Failed"].includes(pod.status?.phase ?? "")) continue;
-    if (!pod.spec?.nodeName && pod.status?.phase === "Pending") continue;
+    const nodeName = pod.spec?.nodeName;
+    if (!nodeName && pod.status?.phase === "Pending") continue;
     if (
-      typeof pod.spec?.nodeName !== "string" ||
+      !pod.spec ||
+      typeof nodeName !== "string" ||
       !["Pending", "Running"].includes(pod.status?.phase ?? "") ||
       !completedInit(pod) ||
       pod.spec.resources !== undefined ||
@@ -455,15 +519,28 @@ export function observeUsage(
           continue;
         }
         const observed = allocation(
-          proof,
-          resourceUid,
+          {
+            environmentId: proof.environmentId,
+            regionId,
+            namespace: proof.namespace.metadata.name,
+            namespaceUid: proof.namespace.metadata.uid!,
+            clusterUid: proof.cluster.metadata.uid!,
+            specHash: proof.specHash,
+          },
+          {
+            kind: "compute",
+            podName: pod.metadata.name,
+            podUid: pod.metadata.uid!,
+            container: container.name,
+            nodeName,
+          },
           metric,
           attribution,
           rate,
           {
             podUid: pod.metadata.uid,
             podResourceVersion: pod.metadata.resourceVersion,
-            nodeName: pod.spec.nodeName,
+            nodeName,
             phase: pod.status?.phase,
             container: container.name,
             requests,
@@ -491,6 +568,58 @@ export function observeUsage(
         environmentId: binding.environmentId,
         metric: "data_storage_byte_ms",
         code: "retained_volume_provenance_invalid",
+      });
+      continue;
+    }
+    const currentPvc = pvcByName.get(`${binding.namespace}/${binding.pvcName}`);
+    if (
+      inventory.namespaces.some(
+        (namespace) =>
+          namespace.metadata.name === binding.namespace &&
+          (namespace.metadata.uid !== binding.namespaceUid ||
+            !sameOwner(
+              namespace,
+              binding.environmentId,
+              binding.regionId,
+              binding.specHash,
+            )),
+      ) ||
+      inventory.clusters.some((cluster) => {
+        if (
+          cluster.metadata.namespace !== binding.namespace ||
+          cluster.metadata.name !== "database"
+        )
+          return false;
+        const storage = cluster.spec?.storage;
+        return (
+          cluster.metadata.uid !== binding.clusterUid ||
+          !sameOwner(
+            cluster,
+            binding.environmentId,
+            binding.regionId,
+            binding.specHash,
+          ) ||
+          !object(storage) ||
+          storage.storageClass !== binding.storageClass
+        );
+      }) ||
+      (currentPvc &&
+        (currentPvc.metadata.uid !== binding.pvcUid ||
+          currentPvc.spec?.volumeName !== binding.pvName ||
+          currentPvc.spec?.storageClassName !== binding.storageClass ||
+          currentPvc.status?.phase !== "Bound"))
+    ) {
+      result.issues.push({
+        key: key(
+          binding.environmentId,
+          binding.pvUid,
+          "data_storage_byte_ms",
+          binding.attribution,
+        ),
+        environmentId: binding.environmentId,
+        metric: "data_storage_byte_ms",
+        attribution: binding.attribution,
+        code: "retained_volume_ownership_changed",
       });
       continue;
     }
@@ -524,26 +653,12 @@ export function observeUsage(
       continue;
     }
     bindings.set(binding.pvUid, binding);
-    const observed: Allocation = {
-      key: key(
-        binding.environmentId,
-        binding.pvUid,
-        "data_storage_byte_ms",
-        binding.attribution,
-      ),
-      environmentId: binding.environmentId,
-      specHash: binding.specHash,
-      resourceUid: binding.pvUid,
-      metric: "data_storage_byte_ms",
-      attribution: binding.attribution,
-      rate,
-      evidenceHash: digest({
-        method: "kubernetes-retained-volume-observation/v1",
-        binding,
-        pvResourceVersion: pv.metadata.resourceVersion,
-        capacity: actualCapacity,
-      }),
-    };
+    const observed = volumeAllocation(binding, rate, {
+      method: "kubernetes-retained-volume-observation/v1",
+      binding,
+      pvResourceVersion: pv.metadata.resourceVersion,
+      capacity: actualCapacity,
+    });
     allocations.set(observed.key, observed);
   }
   result.allocations = [...allocations.values()].sort((a, b) =>

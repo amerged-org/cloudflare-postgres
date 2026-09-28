@@ -14,6 +14,7 @@ import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type {
   Allocation,
+  AllocationContinuity,
   AllocationSnapshot,
   RetainedVolumeBinding,
   UsageFact,
@@ -90,6 +91,28 @@ function privateEntry(path: string, directory = false): void {
   )
     throw new Error("journal_path_not_private");
 }
+function validContinuity(
+  continuity: Allocation["continuity"],
+): continuity is AllocationContinuity {
+  return (
+    continuity?.version === 1 &&
+    typeof continuity.hash === "string" &&
+    hash.test(continuity.hash)
+  );
+}
+function sameAllocation(prior: Allocation, observed: Allocation): boolean {
+  return (
+    prior.key === observed.key &&
+    prior.environmentId === observed.environmentId &&
+    prior.specHash === observed.specHash &&
+    prior.resourceUid === observed.resourceUid &&
+    prior.metric === observed.metric &&
+    prior.attribution === observed.attribution &&
+    prior.rate === observed.rate &&
+    prior.continuity?.version === observed.continuity?.version &&
+    prior.continuity?.hash === observed.continuity?.hash
+  );
+}
 function validAllocation(allocation: Allocation): boolean {
   return (
     typeof allocation.key === "string" &&
@@ -104,6 +127,7 @@ function validAllocation(allocation: Allocation): boolean {
     attributions.has(allocation.attribution) &&
     typeof allocation.rate === "string" &&
     /^(?:0|[1-9][0-9]{0,77})$/.test(allocation.rate) &&
+    validContinuity(allocation.continuity) &&
     hash.test(allocation.evidenceHash)
   );
 }
@@ -468,7 +492,9 @@ export class UsageJournal {
           )
         )
           reason = "observation_issue";
-        else if (JSON.stringify(prior) !== JSON.stringify(observed))
+        else if (!validContinuity(prior.continuity))
+          reason = "allocation_continuity_unproven";
+        else if (!sameAllocation(prior, observed))
           reason = "allocation_changed";
         else if (
           snapshot.observedAt - checkpoint.observed_at >
