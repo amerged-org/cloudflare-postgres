@@ -16,6 +16,7 @@ import type {
   V1Secret,
 } from "@kubernetes/client-node";
 import type { Kubernetes, Resource } from "./types.ts";
+import type { MeteringInventory } from "./metering-types.ts";
 
 const customResources: Record<
   string,
@@ -50,6 +51,74 @@ const requestOptions: ConfigurationOptions = {
     },
   ],
 };
+
+interface InventoryBudget {
+  remainingRequests: number;
+  remainingResources: number;
+  deadline: number;
+}
+
+function object(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function inventoryPages(
+  fetchPage: (continuation?: string) => Promise<unknown>,
+  kind: string,
+  apiVersion: string,
+  budget: InventoryBudget,
+): Promise<Resource[]> {
+  const resources: Resource[] = [];
+  const tokens = new Set<string>();
+  const uids = new Set<string>();
+  let continuation: string | undefined;
+  let resourceVersion: string | undefined;
+  for (let pageIndex = 0; pageIndex < 10; pageIndex += 1) {
+    if (budget.remainingRequests <= 0 || Date.now() >= budget.deadline)
+      throw new Error("metering_inventory_bound_exceeded");
+    budget.remainingRequests -= 1;
+    const page = await fetchPage(continuation);
+    if (
+      !object(page) ||
+      !Array.isArray(page.items) ||
+      !object(page.metadata) ||
+      typeof page.metadata.resourceVersion !== "string" ||
+      page.items.length > 100
+    )
+      throw new Error("metering_inventory_page_invalid");
+    if (
+      resourceVersion !== undefined &&
+      resourceVersion !== page.metadata.resourceVersion
+    )
+      throw new Error("metering_inventory_snapshot_changed");
+    resourceVersion = page.metadata.resourceVersion;
+    budget.remainingResources -= page.items.length;
+    if (budget.remainingResources < 0)
+      throw new Error("metering_inventory_bound_exceeded");
+    for (const item of page.items) {
+      if (
+        !object(item) ||
+        !object(item.metadata) ||
+        typeof item.metadata.name !== "string" ||
+        typeof item.metadata.uid !== "string" ||
+        !item.metadata.uid ||
+        uids.has(item.metadata.uid) ||
+        (item.kind !== undefined && item.kind !== kind) ||
+        (item.apiVersion !== undefined && item.apiVersion !== apiVersion)
+      )
+        throw new Error("metering_inventory_identity_invalid");
+      uids.add(item.metadata.uid);
+      resources.push({ ...item, kind, apiVersion } as unknown as Resource);
+    }
+    const next = page.metadata._continue ?? page.metadata.continue;
+    if (next === undefined || next === "") return resources;
+    if (typeof next !== "string" || next.length > 8192 || tokens.has(next))
+      throw new Error("metering_inventory_continuation_invalid");
+    tokens.add(next);
+    continuation = next;
+  }
+  throw new Error("metering_inventory_bound_exceeded");
+}
 
 export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
   const config = new KubeConfig();
@@ -173,6 +242,98 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
       if (pods.metadata?._continue)
         throw new Error("pod_observation_incomplete");
       return pods.items as unknown as Resource[];
+    },
+    async meteringInventory(regionId): Promise<MeteringInventory> {
+      if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(regionId))
+        throw new Error("metering_region_invalid");
+      const budget: InventoryBudget = {
+        remainingRequests: 128,
+        remainingResources: 5000,
+        deadline: Date.now() + 60_000,
+      };
+      const labelSelector = `app.kubernetes.io/managed-by=cloudflare-postgres,pgcf.io/region-id=${regionId}`;
+      const namespaces = await inventoryPages(
+        (_continue) =>
+          core.listNamespace(
+            { labelSelector, limit: 100, _continue },
+            requestOptions,
+          ),
+        "Namespace",
+        "v1",
+        budget,
+      );
+      if (namespaces.length > 64)
+        throw new Error("metering_namespace_bound_exceeded");
+      const inventory: MeteringInventory = {
+        namespaces,
+        clusters: [],
+        pods: [],
+        pvcs: [],
+        pvs: [],
+      };
+      for (const namespace of namespaces) {
+        // No partial page/namespace is returned as a complete inventory. An SDK
+        // timeout or 410 ends this poll; the durable collector records the gap.
+        const [clusters, pods, pvcs] = await Promise.all([
+          inventoryPages(
+            (_continue) =>
+              custom.listNamespacedCustomObject(
+                {
+                  group: "postgresql.cnpg.io",
+                  version: "v1",
+                  plural: "clusters",
+                  namespace: namespace.metadata.name,
+                  labelSelector,
+                  limit: 100,
+                  _continue,
+                },
+                requestOptions,
+              ),
+            "Cluster",
+            "postgresql.cnpg.io/v1",
+            budget,
+          ),
+          inventoryPages(
+            (_continue) =>
+              core.listNamespacedPod(
+                {
+                  namespace: namespace.metadata.name,
+                  labelSelector:
+                    "cnpg.io/cluster=database,cnpg.io/podRole=instance",
+                  limit: 100,
+                  _continue,
+                },
+                requestOptions,
+              ),
+            "Pod",
+            "v1",
+            budget,
+          ),
+          inventoryPages(
+            (_continue) =>
+              core.listNamespacedPersistentVolumeClaim(
+                { namespace: namespace.metadata.name, limit: 100, _continue },
+                requestOptions,
+              ),
+            "PersistentVolumeClaim",
+            "v1",
+            budget,
+          ),
+        ]);
+        inventory.clusters.push(...clusters);
+        inventory.pods.push(...pods);
+        inventory.pvcs.push(...pvcs);
+      }
+      // Retained volumes can outlive both their PVC and their namespace. The
+      // observer attributes these only through a previously proven UID chain.
+      inventory.pvs = await inventoryPages(
+        (_continue) =>
+          core.listPersistentVolume({ limit: 100, _continue }, requestOptions),
+        "PersistentVolume",
+        "v1",
+        budget,
+      );
+      return inventory;
     },
   };
 }

@@ -3,6 +3,10 @@ import { readFile } from "node:fs/promises";
 import { ControlClient } from "./control-client.ts";
 import { kubernetesFromConfig } from "./kubernetes.ts";
 import { runController } from "./run.ts";
+import { UsageClient } from "./usage-client.ts";
+import { UsageJournal } from "./usage-journal.ts";
+import { runMetering } from "./metering.ts";
+import type { UsageIdentity } from "./metering-types.ts";
 import type { RegionalConfig } from "./types.ts";
 
 function required(name: string): string {
@@ -48,31 +52,97 @@ async function main(): Promise<void> {
   const shutdown = new AbortController();
   process.once("SIGINT", () => shutdown.abort());
   process.once("SIGTERM", () => shutdown.abort());
-  await runController(
-    kubernetesFromConfig(process.env.PGCF_KUBECONFIG_FILE),
-    client,
-    config,
-    {
-      leaseSeconds: milliseconds("PGCF_LEASE_SECONDS", 90, 30, 300),
-      pollMilliseconds: milliseconds(
-        "PGCF_POLL_MILLISECONDS",
-        5_000,
-        1_000,
-        60_000,
+  const api = kubernetesFromConfig(process.env.PGCF_KUBECONFIG_FILE);
+  const log = (event: string) =>
+    process.stdout.write(
+      `${JSON.stringify({ time: new Date().toISOString(), event })}\n`,
+    );
+  // Validate both services before either can create durable state or start work.
+  const controllerOptions = {
+    leaseSeconds: milliseconds("PGCF_LEASE_SECONDS", 90, 30, 300),
+    pollMilliseconds: milliseconds(
+      "PGCF_POLL_MILLISECONDS",
+      5_000,
+      1_000,
+      60_000,
+    ),
+    readinessMilliseconds: milliseconds(
+      "PGCF_READINESS_MILLISECONDS",
+      300_000,
+      30_000,
+      600_000,
+    ),
+    signal: shutdown.signal,
+    log,
+  };
+  const journalPath = process.env.PGCF_USAGE_JOURNAL_PATH;
+  let metering: {
+    identity: UsageIdentity;
+    client: UsageClient;
+    sampleMilliseconds: number;
+    deliveryMilliseconds: number;
+  } | null = null;
+  let journal: UsageJournal | null = null;
+  const tasks: Promise<void>[] = [];
+  if (journalPath) {
+    const sourceEpoch = Number(required("PGCF_USAGE_SOURCE_EPOCH"));
+    if (!Number.isSafeInteger(sourceEpoch) || sourceEpoch < 1)
+      throw new Error("invalid_metering_identity");
+    const identity = {
+      regionId: required("PGCF_REGION_ID"),
+      sourceId: required("PGCF_USAGE_SOURCE_ID"),
+      sourceEpoch,
+    };
+    const meterTokenFile = required("PGCF_METER_TOKEN_FILE");
+    metering = {
+      identity,
+      client: new UsageClient(
+        required("PGCF_CONTROL_ORIGIN"),
+        identity,
+        async () => (await readFile(meterTokenFile, "utf8")).trim(),
       ),
-      readinessMilliseconds: milliseconds(
-        "PGCF_READINESS_MILLISECONDS",
-        300_000,
-        30_000,
-        600_000,
+      sampleMilliseconds: milliseconds(
+        "PGCF_USAGE_SAMPLE_MILLISECONDS",
+        5000,
+        1000,
+        30000,
       ),
-      signal: shutdown.signal,
-      log: (event) =>
-        process.stdout.write(
-          `${JSON.stringify({ time: new Date().toISOString(), event })}\n`,
-        ),
-    },
-  );
+      deliveryMilliseconds: milliseconds(
+        "PGCF_USAGE_DELIVERY_MILLISECONDS",
+        5000,
+        1000,
+        60000,
+      ),
+    };
+  } else if (
+    [
+      "PGCF_USAGE_SOURCE_ID",
+      "PGCF_USAGE_SOURCE_EPOCH",
+      "PGCF_METER_TOKEN_FILE",
+    ].some((name) => process.env[name])
+  ) {
+    throw new Error("incomplete_metering_configuration");
+  }
+  try {
+    if (journalPath && metering) {
+      journal = new UsageJournal(journalPath, metering.identity);
+      tasks.push(
+        runMetering(api, metering.client, journal, {
+          regionId: metering.identity.regionId,
+          sampleMilliseconds: metering.sampleMilliseconds,
+          deliveryMilliseconds: metering.deliveryMilliseconds,
+          signal: shutdown.signal,
+          log,
+        }),
+      );
+    }
+    tasks.push(runController(api, client, config, controllerOptions));
+    await Promise.all(tasks);
+  } finally {
+    shutdown.abort();
+    await Promise.allSettled(tasks);
+    journal?.close();
+  }
 }
 main().catch(() => {
   process.stderr.write("regional_controller_failed\n");

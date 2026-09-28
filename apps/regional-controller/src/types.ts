@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import type { MeteringInventory } from "./metering-types.ts";
 export interface BackupSecretRef {
   namespace: string;
   name: string;
@@ -61,10 +62,17 @@ export interface Resource {
     namespace?: string;
     uid?: string;
     generation?: number;
+    resourceVersion?: string;
     deletionTimestamp?: string;
     labels?: Record<string, string>;
     annotations?: Record<string, string>;
-    ownerReferences?: { uid: string; kind: string; controller?: boolean }[];
+    ownerReferences?: {
+      uid: string;
+      kind: string;
+      name?: string;
+      apiVersion?: string;
+      controller?: boolean;
+    }[];
   };
   spec?: Record<string, unknown>;
   data?: Record<string, string>;
@@ -72,6 +80,11 @@ export interface Resource {
     phase?: string;
     currentPrimary?: string;
     readyInstances?: number;
+    initContainerStatuses?: {
+      name: string;
+      state?: { terminated?: { exitCode?: number } };
+    }[];
+    capacity?: Record<string, string>;
     conditions?: {
       type: string;
       status: string;
@@ -85,6 +98,7 @@ export interface Kubernetes {
   create(resource: Resource): Promise<Resource>;
   readSecret(namespace: string, name: string): Promise<Record<string, string>>;
   listPods(namespace: string, clusterName: string): Promise<Resource[]>;
+  meteringInventory?(regionId: string): Promise<MeteringInventory>;
 }
 
 export interface Observation {
