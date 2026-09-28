@@ -2,6 +2,23 @@
 
 Apache-2.0 first-party code. This package implements the regional half of the versioned `environment.create` protocol and an optional file-backed usage collector. It initiates HTTPS requests to the adopter's control API; it opens no inbound listener. It creates internal CloudNativePG resources, reports observed readiness, and can deliver provisional observations of owned CPU/RAM requests and data-volume capacity. External PostgreSQL endpoint discovery, credential issuance, gateway routing, sleep, resizing, deletion, restore, allowance supervision, and hard runtime budget enforcement remain pending.
 
+## Installation maintenance preparation
+
+The separate [maintenance preparation protocol](../../docs/contracts/maintenance-preparation-v1.md) records an installation-owned Kubernetes upgrade assessment. It does not execute maintenance. Issue a dedicated regional preparer token through the installation API, keep it in a private token file, and fill the identity, selected context and endpoints in [maintenance-config.example.json](deploy/maintenance-config.example.json). Missing recovery, quorum, staging or capacity proof remains a blocker; do not replace absent evidence with successful-looking defaults.
+
+After building this package, set `PGCF_CONTROL_ORIGIN`, `PGCF_REGION_ID` and `PGCF_MAINTENANCE_TOKEN_FILE`, then run:
+
+```sh
+node apps/regional-controller/dist/main.js prepare-maintenance \
+  --config /private/installation/maintenance.json
+```
+
+This mode is selected before normal environment reconciliation and metering. It claims one preparation, reads complete authenticated inventory, checks fresh plan-bound external evidence and reports an assessment under its lease. Pending Jobs are observed on a later claim; the deterministic operation name prevents duplicate creation after a lost response. The SDK path reads no Secret data, patches no Node and deletes no resource. A prerequisite failure creates no Job. Eligible prerequisites permit only the fixed Talos dry-run Job, which requires the existing operator ServiceAccount `pgcf-maintenance-preparer` and a named Secret containing `talosconfig`; neither is created through a customer API.
+
+The operator configuration accepts `evidence.machineIdentity`, `etcd`, `recovery`, `staging`, `capacity` and per-database `switchover`/`volumes` proofs. Ordinary proofs contain `status`, `planHash`, epoch-millisecond `observedAt`/`expiresAt` and `evidenceHash`. Etcd adds explicit member/Node identities and health; capacity adds `scope: sequential-plan`, reservation UUID and reserved Node UIDs. Supplying a JSON certificate is not independent evidence qualification: the installation must obtain and verify the underlying observations and recovery/staging/reservation artifacts. Complete upgrade, rollback and HA qualification remain open.
+
+Exit 0 means no queued work, a pending Job or an eligible assessment; exit 1 means a persisted blocked assessment; exit 2 means deferred/uncertain processing. Inspect the JSON status and durable API resource. Every result keeps `executionSupported: false` and `executionAuthorized: false`.
+
 ## Read-only platform inspection
 
 Build this package and use an explicitly selected operator kubeconfig/context and reviewed version lock:

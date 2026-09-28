@@ -1,6 +1,7 @@
 import { environmentRoutes } from "./environments";
 import { usageRoutes } from "./usage";
 import { budgetRoutes, planBudgetCorrection } from "./budgets";
+import { maintenanceRoutes } from "./maintenance";
 
 type Env = Cloudflare.Env;
 
@@ -767,6 +768,8 @@ async function getOperation(
 
 export default {
   async fetch(request, env): Promise<Response> {
+    const maintenanceResponse = await maintenanceRoutes(request, env);
+    if (maintenanceResponse) return maintenanceResponse;
     try {
       const budgetResponse = await budgetRoutes(request, env);
       if (budgetResponse) return budgetResponse;

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "kubeconfigFile": "/private/installation/kubeconfig",
+  "kubeconfigContext": "REPLACE_WITH_SELECTED_CONTEXT",
+  "namespace": "pgcf-system",
+  "talosconfigSecret": "pgcf-maintenance-talos",
+  "endpoints": ["192.0.2.10"],
+  "targetNodeUid": "REPLACE_WITH_VERIFIED_NODE_UUID",
+  "evidence": {
+    "machineIdentity": null,
+    "etcd": null,
+    "recovery": null,
+    "staging": null,
+    "capacity": null,
+    "databases": []
+  }
+}

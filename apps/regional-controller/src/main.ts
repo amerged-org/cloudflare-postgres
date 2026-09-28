@@ -27,6 +27,11 @@ function milliseconds(
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "prepare-maintenance") {
+    const { runMaintenancePreparation } = await import("./maintenance-cli.ts");
+    process.exitCode = await runMaintenancePreparation(process.argv.slice(3));
+    return;
+  }
   if (process.argv[2] === "inspect-platform") {
     const { runPlatformInspection } = await import("./platform-inspection.ts");
     process.exitCode = await runPlatformInspection(process.argv.slice(3));

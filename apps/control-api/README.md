@@ -46,6 +46,12 @@ Use the organization token to read `GET /v1/organizations/{organizationId}/proje
 
 The current slice has no public native endpoint, customer database credentials, environment listing/deletion/resize, runtime usage collector, runtime allowance enforcer, idempotency archival, or rate limiting. A reported ready environment means the regional executor observed PostgreSQL resource readiness; it does not prove backups, restore qualification, credential access, or a production service objective.
 
+## Installation maintenance preparation
+
+Migration `0008_maintenance_preparation.sql` adds a separate installation-owned maintenance history, regional preparer credentials and fenced preparation leases. The installation token may submit/read an immutable Kubernetes upgrade plan and issue a dedicated `cpmtp_` preparer token. Existing customer, environment, usage and budget credentials receive no host privileges. Exact idempotency/result replay survives uncertain responses, while stale leases and inactive preparer credentials cannot report a result.
+
+The [maintenance preparation contract](../../docs/contracts/maintenance-preparation-v1.md) documents the `/v1/regions/{regionId}/maintenance` routes, plan, assessment and credential boundaries. Results distinguish `blocked` from `eligible` and always report `executionSupported: false` and `executionAuthorized: false`. This is preparation, not an upgrade, drain, reboot or provider order. Complete recovery, staging, quorum and reservation evidence remain required before actual maintenance. These additive routes are documented separately while the stopped OpenAPI/SDK candidate remains held.
+
 ## Region registration
 
 An installation operator sends `POST /v1/regions` with the installation bearer token and JSON `{ "name": "..." }`. Region names are unique under exact, case-sensitive matching; registering an existing name returns `409 region_name_conflict`. The response contains an opaque region UUID, `registered` status, and a random `cprgn_...` executor token with `operations:claim` and `operations:report` scopes. D1 stores only the token's SHA-256 digest. Store the token in the regional controller's secret store, never in a public configuration file.
