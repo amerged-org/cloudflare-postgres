@@ -1,6 +1,17 @@
 # Operational telemetry qualification
 
-Status: **core upgrade and ordered Rules Ready in Dev** at source commit `59a6b3c0ef2481287963c54b81e0ef39751bbf0d`. Deployed Helm revision two preserves the existing core/CRDs and two bound PVCs; a separate same-source Flux Kustomization owns all 30 default Rules. This is a warm one-node feasibility continuation, not fresh-bootstrap, operational or production acceptance. No external alert receiver is configured. See [the ordered bootstrap evidence](../../docs/evidence/m4-telemetry-bootstrap-order-2026-09-28.md) and [the historical install failure](../../docs/evidence/m4-telemetry-install-2026-09-28.md).
+Status: **core, default Rules and four platform monitoring objects Ready in
+Dev** at source commit `59a6b3c0ef2481287963c54b81e0ef39751bbf0d`. Deployed Helm
+revision two preserves core/CRDs and two bound PVCs; separate same-source Flux
+Kustomizations own all 30 default Rules and the four stateless platform objects.
+Five controller targets and seven selected Rule evaluations pass, but namespace
+attribution causes four incorrect pending PVC-missing alerts. Operational
+acceptance is incomplete. This is a warm one-node feasibility continuation,
+not fresh-bootstrap or production acceptance. Actual Alertmanager configuration
+has only the null receiver and no integration. See
+[the platform telemetry evidence](../../docs/evidence/m4-platform-telemetry-2026-09-28.md),
+[the ordered bootstrap evidence](../../docs/evidence/m4-telemetry-bootstrap-order-2026-09-28.md)
+and [the historical install failure](../../docs/evidence/m4-telemetry-install-2026-09-28.md).
 
 Reuse kube-prometheus-stack 91.8.0 / Prometheus Operator v0.94.1, with Prometheus, Alertmanager, kube-state-metrics and node-exporter. The chart archive and OCI manifest are verified; six selected runtime images use verified manifest digests with Linux/amd64 support. `versions.lock.json` records identities. Publisher signatures and runtime image compatibility are not yet qualified.
 
@@ -11,6 +22,14 @@ Flux owns this release and its values. Existing Flux-owned Cilium, OpenEBS and c
 The root Kustomization contains two namespaces, the main namespace quota, a pinned OCIRepository, a values ConfigMap, a suspended HelmRelease and two Cilium policy objects. It does not contain monitoring CRs, so it can be staged before the new chart supplies its ten CRDs. `targets/` contains the CNPG/Flux PodMonitors and platform rules; apply it only after the exact CRDs and Operator are qualified. Reconcile these in separate ordered stages. Existing monitoring installations/CRDs require an ownership review; takeover is disabled, initial CRD installation uses Create, and upgrades skip CRDs until an explicit schema upgrade is reviewed.
 
 The active platform path and its pinned source are unchanged. The independent [stage bootstrap](bootstrap/flux-sync-stage.example.yaml) pins a separate GitRepository/Kustomization and depends on the existing platform. It never repoints that platform source. The core keeps `defaultRules.create: false`; the complete upstream [Rule bundle](rules/README.md) is owned by a separate Flux Kustomization, with every expression and selector preserved. No rule scope is dropped.
+
+The held [platform-target example](bootstrap/flux-sync-targets.example.yaml)
+uses that same pinned telemetry source and depends on both core and default
+Rules readiness. It owns only the two existing Flux/CNPG PodMonitors and two
+platform Rules. Operator/Prometheus health is an apply prerequisite; actual
+target discovery, successful scrapes, emitted series and evaluated Rules must
+still be observed. Preserve original source pins, chart settings, all default
+Rules, network policy and retained storage during this separate operation.
 
 Use the held [core qualification example](bootstrap/flux-sync-qualification.example.yaml) for an explicitly reviewed activation. Its named health checks wait for the current Helm release, Operator Deployment, generated Prometheus/Alertmanager StatefulSets, both Certificates/Issuers and both injected webhook configurations. Positive Certificate/Issuer conditions must match the resource generation. Webhooks require the expected service, port, namespace, nonempty CA and failure policy. Do not set `wait: true`, which would replace the explicit check list. The held [Rules example](bootstrap/flux-sync-rules.example.yaml) uses the same source and depends on that core Kustomization. [Flux health and dependency checks](https://fluxcd.io/flux/components/kustomize/kustomizations/#health-checks) provide the ordering; actual Rule admission still verifies the serving TLS path.
 
@@ -30,6 +49,12 @@ The actual Talos API-server admission configuration enforces baseline by default
 
 ClusterIP and absence of Ingress do not prove tenant isolation. Qualify operator-only Prometheus/Alertmanager/exporter access and the exact allowed scrape paths. Kubelet certificate verification uses the cluster CA; diagnose TLS errors instead of disabling verification. The maintained Operator retains cluster-wide Secret/ConfigMap/workload privileges despite narrow process watch namespaces. Installation and monitoring CR creation remain trusted operator actions. Prometheus and reduced KSM roles have no Secret API access; KSM also has exact read-only Flux/CRD discovery permissions.
 
+The [node-bound serving-TLS checkpoint](../../docs/evidence/m4-kubelet-serving-tls-2026-09-28.md)
+now verifies initial automatic issuance and all three fresh HTTPS kubelet
+scrapes in Dev, preserving Node boot identity, selected Pods, PVCs and SQL
+markers. It does not establish a later renewal, fresh bootstrap, missing
+filesystem statistics, or the remaining namespace/API isolation guarantees.
+
 No SQL exporter, customer connection credentials, tenant workload or dynamic tenant policy is introduced. Prometheus is operational telemetry, not usage authority, an invoice source or budget enforcement. Alertmanager has only a null receiver. Grafana, Ingress, remote-write and OTLP ingestion are disabled. No third-party message is sent. OpenTelemetry tracing/log integration remains later work with its own data boundary.
 
 ## Evidence and remaining qualification
@@ -38,7 +63,15 @@ The pinned chart renders with Kubernetes 1.36.3, including ten CRDs and no hook 
 
 The root and target Kustomizations build separately. Five staging resources passed a server-side dry-run; the quota in the uncreated namespace and monitoring CRD/CEL/generated-Pod admission remain pending. That historical dry-run persisted no objects; the subsequent eight-object live stage is recorded in the boundary checkpoint.
 
-Flux state uses maintained KSM customResourceState, four exact GVKs and scalar generation/readiness/suspension/deletion/reconciliation metrics. Current Ready requires both resource and Ready-condition observed generations to equal positive metadata generation. UID matching avoids mixing recreated objects. Suspended/deleting resources are excluded; missing expected-kind series alerts separately. Individual missing objects, malformed/duplicate conditions, stale exporter watches and source/image identities are not completely proven by these rules. Actual emitted series and alert evaluation remain unqualified.
+Flux state uses maintained KSM customResourceState, four exact GVKs and scalar generation/readiness/suspension/deletion/reconciliation metrics. Current Ready requires both resource and Ready-condition observed generations to equal positive metadata generation. UID matching avoids mixing recreated objects. Suspended/deleting resources are excluded; missing expected-kind series alerts separately. Individual missing objects, malformed/duplicate conditions, stale exporter watches and source/image identities are not completely proven by these rules. Actual UID/generation/Ready series and active/current-Ready recording sets now match one API snapshot of nineteen resources/eighteen active objects. This is not an enduring watch-freshness guarantee.
+
+Actual volume samples are present for all four bound PVCs, with intrinsic
+namespaces in `exported_namespace` because global honor-label overriding is
+enabled. The current PVC warning incorrectly joins discovery namespaces;
+normalize its operands in the next bounded repair while preserving global
+settings. Do not infer useful input from healthy expression evaluation for
+other namespace-filtered controller/upstream rules. One firing TargetDown and
+one firing scrape-sample-limit alert also remain separately unqualified.
 
 Before activation, verify current capacity/limits, API/CEL/PSA admission and generated Pods, cert-manager admission readiness, exact images and resource bounds, the tenant/host network boundary, verified kubelet TLS, named targets/PVC statistics, actual Flux series and useful alert states, null-receiver behavior, sustained cardinality/memory and storage growth. Filesystem/PVC metrics do not measure LVM VG free extents. The platform still needs authoritative capacity observation, recovery/PITR, updates, quorum and node-loss acceptance.
 

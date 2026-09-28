@@ -260,6 +260,29 @@ The [ordered bootstrap checkpoint](docs/evidence/m4-telemetry-bootstrap-order-20
 
 The [serving-TLS correction](docs/evidence/m4-kubelet-serving-tls-2026-09-28.md) verifies the actual native Talos KubeletConfig and qualifies the one-bit serverTLSBootstrap correction in single-node Dev. A pinned upstream automatic approver is reused with a narrow Node/enrollment adaptation, post-SAR revalidation and duplicate-JSON rejection. Exactly three meaningful red-first cases pass after two corrections; the final isolated canonical/Go gate passes once in 131.643 seconds without changing frozen source or stopped SDK candidates. The adapted AMD64/non-root image is authenticated and imported; independently verified private enrollment and a separate commit-pinned Dev source are deployed and Ready. Exact signer authorization passes. One guarded patch returns no-reboot mode; an immediate JSON-stream observer failure is retained and resolved through read-only explicit active/persistent selection, without repeating the write. All 30 documents preserve only the intended change, effective bootstrap is enabled, and the authentic node CSR is automatically approved and signed. Certificate CA/server-purpose/DNS/IP/key checks and all three fresh verified HTTPS kubelet targets pass. Node UID/boot ID, seven selected Pod identities/restart counts, four PVC identities/bindings and both SQL markers are preserved. Later renewal, automated fleet-enrollment maintenance, public image distribution and fresh cold bootstrap remain gates; TLS verification stays enabled. There are no new tests or broad gate reruns for the infrastructure readbacks, and SDK/Barman/R2 stopped work remains untouched.
 
+The [platform telemetry continuation](docs/evidence/m4-platform-telemetry-2026-09-28.md)
+adds a separately owned target stage under the unchanged pinned telemetry source.
+Its two existing PodMonitors and two platform Rules pass admission and become
+Ready after one guarded create in 3.814 seconds, preserving all 30 default Rule
+identities/specs. A completed old Pod is excluded from active target expectations,
+with the initial observer stop retained. Five controller targets are UP with
+exact Pod UID/port binding; seven selected Rules evaluate healthy with source
+UID/metadata checks. Real API comparison binds nineteen Flux generations and
+eighteen active condition generations, matching both recording sets. Four PVCs
+have coherent filesystem values when mapped through `exported_namespace`;
+the initial direct namespace join was an observer error, not absent samples.
+Authenticated running `1m0s`, mapped summaries and raw samples also correct a
+premature inference from rendered Talos `0s`, without another machine change.
+The actual null-only Alertmanager configuration has no integration; its name
+label metadata is accepted after two offline observer corrections, without a
+refetch or notification. A concrete namespace join defect still causes four
+incorrect pending PVC-missing alerts; operational acceptance remains incomplete.
+The next bounded two-case repair must normalize that alert's operands while
+preserving global settings. One firing TargetDown and one firing sample-limit
+alert have separate unresolved causes, and other namespace-filtered rules still
+need useful-input evidence. No new tests, gate reruns, source promotion or
+SDK/Barman/R2 resumption accompanies this checkpoint.
+
 ### Operational acceptance evidence
 
 Publish the workload, versions, topology, sample counts, and pass/fail thresholds before each implementation acceptance run. These are operational measurements; a pricing or break-even study is not required. The table lists milestone evidence areas, not instructions to generate test matrices or permutations: select only the concrete cases needed for the current change, subject to section 10.
