@@ -4,6 +4,13 @@ import { budgetRoutes, planBudgetCorrection } from "./budgets";
 import { maintenanceRoutes } from "./maintenance";
 import { roleRoutes } from "./roles";
 import { databaseRoutes } from "./databases";
+import {
+  executionReads,
+  projectFromRow,
+  operationFromRow,
+  type ProjectRow,
+  type LegacyOperationRow as OperationRow,
+} from "./execution-reads";
 
 type Env = Cloudflare.Env;
 
@@ -30,26 +37,6 @@ interface RegionRow {
 interface CreatedIdCursor {
   createdAt: string;
   id: string;
-}
-
-interface ProjectRow {
-  id: string;
-  organization_id: string;
-  name: string;
-  status: string;
-  created_at: string;
-}
-
-interface OperationRow {
-  id: string;
-  organization_id: string;
-  project_id: string;
-  kind: string;
-  status: string;
-  created_at: string;
-  observed_at: string | null;
-  result_code: string | null;
-  environment_id?: string | null;
 }
 
 interface IdempotencyRow {
@@ -553,30 +540,6 @@ async function authorizedOrganization(
   return null;
 }
 
-function projectFromRow(row: ProjectRow) {
-  return {
-    id: row.id,
-    organizationId: row.organization_id,
-    name: row.name,
-    status: row.status,
-    createdAt: row.created_at,
-  };
-}
-
-function operationFromRow(row: OperationRow) {
-  return {
-    id: row.id,
-    organizationId: row.organization_id,
-    projectId: row.project_id,
-    kind: row.kind,
-    status: row.status,
-    createdAt: row.created_at,
-    observedAt: row.observed_at,
-    resultCode: row.result_code,
-    ...(row.environment_id ? { environmentId: row.environment_id } : {}),
-  };
-}
-
 async function projectAndOperation(
   db: D1Database,
   organizationId: string,
@@ -746,30 +709,10 @@ async function getProject(
   return json({ project: projectFromRow(row) }, 200);
 }
 
-async function getOperation(
-  request: Request,
-  env: Env,
-  organizationId: string,
-  id: string,
-) {
-  const auth = await authorizedOrganization(
-    request,
-    env,
-    organizationId,
-    "operations:read",
-  );
-  if (auth) return auth;
-  const row = await env.DB.prepare(
-    "SELECT * FROM operations WHERE id = ? AND organization_id = ?",
-  )
-    .bind(id, organizationId)
-    .first<OperationRow>();
-  if (!row) return error(404, "not_found");
-  return json({ operation: operationFromRow(row) }, 200);
-}
-
 export default {
   async fetch(request, env): Promise<Response> {
+    const recoveryResponse = await executionReads(request, env);
+    if (recoveryResponse) return recoveryResponse;
     const databaseResponse = await databaseRoutes(request, env);
     if (databaseResponse) return databaseResponse;
     const roleResponse = await roleRoutes(request, env);
@@ -831,11 +774,6 @@ export default {
       /^\/v1\/organizations\/([^/]+)\/projects\/([^/]+)$/.exec(pathname);
     if (request.method === "GET" && projectItem) {
       return getProject(request, env, projectItem[1]!, projectItem[2]!);
-    }
-    const operationItem =
-      /^\/v1\/organizations\/([^/]+)\/operations\/([^/]+)$/.exec(pathname);
-    if (request.method === "GET" && operationItem) {
-      return getOperation(request, env, operationItem[1]!, operationItem[2]!);
     }
     return error(404, "not_found");
   },

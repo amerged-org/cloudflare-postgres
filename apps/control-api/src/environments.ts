@@ -40,7 +40,7 @@ interface ResolvedSpec extends EnvironmentInput {
   profile: Profile;
 }
 
-interface EnvironmentRow {
+export interface EnvironmentRow {
   id: string;
   organization_id: string;
   project_id: string;
@@ -366,7 +366,7 @@ function publicProfile(profile: Profile) {
   };
 }
 
-function publicEnvironment(row: EnvironmentRow) {
+export function publicEnvironment(row: EnvironmentRow) {
   const spec = JSON.parse(row.resolved_spec) as ResolvedSpec;
   return {
     id: row.id,

@@ -263,9 +263,9 @@ paths:
     post:
       operationId: createProject
       summary: Create a logical project and completed audit operation
-      description: >-
-        Creates a global logical container in D1. No region, PostgreSQL
-        cluster, database, credential, or connection endpoint is provisioned.
+      description:
+        Creates a global logical container in D1. No region, PostgreSQL cluster,
+        database, credential, or connection endpoint is provisioned.
       security:
         - organizationToken: []
       parameters:
@@ -276,7 +276,7 @@ paths:
             type: string
             minLength: 1
             maxLength: 128
-            pattern: "^[A-Za-z0-9._~-]+$"
+            pattern: ^[A-Za-z0-9._~-]+$
       requestBody:
         required: true
         content:
@@ -285,26 +285,32 @@ paths:
               $ref: "#/components/schemas/NameInput"
       responses:
         "201":
-          description: Logical project created; the same key and request preserve both IDs
+          description:
+            Logical project created; the same key and request preserve both
+            IDs
           content:
             application/json:
               schema:
                 type: object
-                required: [project, operation]
+                required:
+                  - project
+                  - operation
                 properties:
                   project:
                     $ref: "#/components/schemas/Project"
                   operation:
                     $ref: "#/components/schemas/Operation"
         "202":
-          description: >-
+          description:
             An unmatched legacy project remains pending with a queued operation.
             Its IDs are preserved and operator review is required.
           content:
             application/json:
               schema:
                 type: object
-                required: [project, operation]
+                required:
+                  - project
+                  - operation
                 properties:
                   project:
                     $ref: "#/components/schemas/Project"
@@ -320,6 +326,40 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: Idempotency key already used with another request
+    get:
+      operationId: listProjects
+      summary: Recover projects in the authorized parent
+      description:
+        Requires projects:read. Returns observed metadata and a current operation
+        identifier, never credentials or execution authority. Pages are not a frozen
+        snapshot. Missing or foreign parents return 404; owned empty parents return
+        200. Only one limit and cursor are accepted.
+      security:
+        - organizationToken: []
+      parameters:
+        - $ref: "#/components/parameters/RecoveryLimit"
+        - $ref: "#/components/parameters/RecoveryCursor"
+      responses:
+        "200":
+          description: Bounded observed resource page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecoveryProjectsPage"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description:
+            Ambiguous persisted operation linkage or unavailable recovery
+            read
+        "503":
+          description: Cursor signing key unavailable
   /v1/organizations/{organizationId}/projects/{projectId}:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -362,7 +402,7 @@ paths:
           format: uuid
     get:
       operationId: getOperation
-      summary: Read an audit operation in the authorized organization
+      summary: Recover a project, environment, role or database operation
       security:
         - organizationToken: []
       responses:
@@ -372,16 +412,26 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [operation]
+                required:
+                  - operation
                 properties:
                   operation:
-                    $ref: "#/components/schemas/Operation"
+                    $ref: "#/components/schemas/RecoveryOperation"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "500":
+          description:
+            Ambiguous visible operation identifier or unavailable recovery
+            read
+      description:
+        Requires operations:read. Historical metadata stays readable; query
+        parameters are rejected. Ambiguous visible identifiers return 500 state_inconsistent.
   /v1/regions/{regionId}/catalogs:
     parameters:
       - $ref: "#/components/parameters/RegionId"
@@ -519,14 +569,13 @@ paths:
     post:
       operationId: createEnvironment
       summary: Accept a frozen environment specification for regional execution
-      description: >-
-        Requires projects:write, an active logical project, and admission for
-        the exact requested catalog version. There are no provider/customer
-        defaults. Environment, queued operation, and idempotency identity are
-        inserted atomically with a fresh admission check. Identical retries
-        preserve IDs and return current observed state even after admission
-        closes; changed content under the same organization-wide environment
-        key returns 409. No endpoint or credential is issued.
+      description:
+        Requires projects:write, an active logical project, and admission
+        for the exact requested catalog version. There are no provider/customer defaults.
+        Environment, queued operation, and idempotency identity are inserted atomically
+        with a fresh admission check. Identical retries preserve IDs and return current
+        observed state even after admission closes; changed content under the same organization-wide
+        environment key returns 409. No endpoint or credential is issued.
       security:
         - organizationToken: []
       parameters:
@@ -535,7 +584,7 @@ paths:
           required: true
           schema:
             type: string
-            pattern: "^[A-Za-z0-9._~-]{1,128}$"
+            pattern: ^[A-Za-z0-9._~-]{1,128}$
       requestBody:
         required: true
         content:
@@ -559,6 +608,40 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: Admission closed, project not active, or idempotency conflict
+    get:
+      operationId: listEnvironments
+      summary: Recover environments in the authorized parent
+      description:
+        Requires projects:read. Returns observed metadata and a current operation
+        identifier, never credentials or execution authority. Pages are not a frozen
+        snapshot. Missing or foreign parents return 404; owned empty parents return
+        200. Only one limit and cursor are accepted.
+      security:
+        - organizationToken: []
+      parameters:
+        - $ref: "#/components/parameters/RecoveryLimit"
+        - $ref: "#/components/parameters/RecoveryCursor"
+      responses:
+        "200":
+          description: Bounded observed resource page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecoveryEnvironmentsPage"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description:
+            Ambiguous persisted operation linkage or unavailable recovery
+            read
+        "503":
+          description: Cursor signing key unavailable
   /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -1289,6 +1372,84 @@ paths:
           $ref: "#/components/responses/AccountingConflict"
         "500":
           $ref: "#/components/responses/AccountingUnavailable"
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/roles:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+    get:
+      operationId: listRoles
+      summary: Recover roles in the authorized parent
+      description:
+        Requires projects:read. Returns observed metadata and a current operation
+        identifier, never credentials or execution authority. Pages are not a frozen
+        snapshot. Missing or foreign parents return 404; owned empty parents return
+        200. Only one limit and cursor are accepted.
+      security:
+        - organizationToken: []
+      parameters:
+        - $ref: "#/components/parameters/RecoveryLimit"
+        - $ref: "#/components/parameters/RecoveryCursor"
+      responses:
+        "200":
+          description: Bounded observed resource page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecoveryRolesPage"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description:
+            Ambiguous persisted operation linkage or unavailable recovery
+            read
+        "503":
+          description: Cursor signing key unavailable
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/databases:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+    get:
+      operationId: listDatabases
+      summary: Recover databases in the authorized parent
+      description:
+        Requires projects:read. Returns observed metadata and a current operation
+        identifier, never credentials or execution authority. Pages are not a frozen
+        snapshot. Missing or foreign parents return 404; owned empty parents return
+        200. Only one limit and cursor are accepted.
+      security:
+        - organizationToken: []
+      parameters:
+        - $ref: "#/components/parameters/RecoveryLimit"
+        - $ref: "#/components/parameters/RecoveryCursor"
+      responses:
+        "200":
+          description: Bounded observed resource page
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RecoveryDatabasesPage"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description:
+            Ambiguous persisted operation linkage or unavailable recovery
+            read
+        "503":
+          description: Cursor signing key unavailable
 components:
   securitySchemes:
     usageMeterToken:
@@ -1316,6 +1477,22 @@ components:
       scheme: bearer
       description: Region-scoped executor token with operations:claim and operations:report.
   parameters:
+    RecoveryLimit:
+      name: limit
+      in: query
+      description: Page limit; binds the continuation cursor.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+    RecoveryCursor:
+      name: cursor
+      in: query
+      description: HMAC-protected cursor bound to this collection, parent and limit.
+      schema:
+        type: string
+        maxLength: 2048
     AccountingEnvironmentId:
       name: environmentId
       in: path
@@ -1429,6 +1606,310 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    RecoveryProjectsPage:
+      type: object
+      additionalProperties: false
+      required:
+        - projects
+        - nextCursor
+        - consistency
+        - observedAt
+      properties:
+        projects:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - project
+              - currentOperationId
+            properties:
+              project:
+                $ref: "#/components/schemas/Project"
+              currentOperationId:
+                type:
+                  - string
+                  - "null"
+                format: uuid
+        nextCursor:
+          type:
+            - string
+            - "null"
+        consistency:
+          type: string
+          const: observed-page
+        observedAt:
+          type: string
+          format: date-time
+    RecoveryEnvironmentsPage:
+      type: object
+      additionalProperties: false
+      required:
+        - environments
+        - nextCursor
+        - consistency
+        - observedAt
+      properties:
+        environments:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - environment
+              - currentOperationId
+            properties:
+              environment:
+                $ref: "#/components/schemas/Environment"
+              currentOperationId:
+                type:
+                  - string
+                  - "null"
+                format: uuid
+        nextCursor:
+          type:
+            - string
+            - "null"
+        consistency:
+          type: string
+          const: observed-page
+        observedAt:
+          type: string
+          format: date-time
+    RecoveryRolesPage:
+      type: object
+      additionalProperties: false
+      required:
+        - roles
+        - nextCursor
+        - consistency
+        - observedAt
+      properties:
+        roles:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - role
+              - currentOperationId
+            properties:
+              role:
+                $ref: "#/components/schemas/RecoveryRole"
+              currentOperationId:
+                type:
+                  - string
+                  - "null"
+                format: uuid
+        nextCursor:
+          type:
+            - string
+            - "null"
+        consistency:
+          type: string
+          const: observed-page
+        observedAt:
+          type: string
+          format: date-time
+    RecoveryDatabasesPage:
+      type: object
+      additionalProperties: false
+      required:
+        - databases
+        - nextCursor
+        - consistency
+        - observedAt
+      properties:
+        databases:
+          type: array
+          maxItems: 100
+          items:
+            type: object
+            additionalProperties: false
+            required:
+              - database
+              - currentOperationId
+            properties:
+              database:
+                $ref: "#/components/schemas/RecoveryDatabase"
+              currentOperationId:
+                type:
+                  - string
+                  - "null"
+                format: uuid
+        nextCursor:
+          type:
+            - string
+            - "null"
+        consistency:
+          type: string
+          const: observed-page
+        observedAt:
+          type: string
+          format: date-time
+    RecoveryRole:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - organizationId
+        - projectId
+        - environmentId
+        - regionId
+        - name
+        - status
+        - createdAt
+        - observedAt
+        - connectionLimit
+        - desiredCredentialRevision
+        - appliedCredentialRevision
+      properties:
+        id: &id001
+          type: string
+          format: uuid
+        organizationId: &id002
+          type: string
+          format: uuid
+        projectId: &id003
+          type: string
+          format: uuid
+        environmentId: &id004
+          type: string
+          format: uuid
+        regionId: &id005
+          type: string
+          format: uuid
+        name: &id006
+          type: string
+        status: &id007
+          type: string
+          enum:
+            - pending
+            - applied
+            - failed
+        createdAt: &id008
+          type: string
+          format: date-time
+        observedAt: &id009
+          type:
+            - string
+            - "null"
+          format: date-time
+        connectionLimit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+        desiredCredentialRevision:
+          type: integer
+          minimum: 1
+        appliedCredentialRevision:
+          type: integer
+          minimum: 0
+    RecoveryDatabase:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - organizationId
+        - projectId
+        - environmentId
+        - regionId
+        - name
+        - status
+        - createdAt
+        - observedAt
+        - ownerRoleId
+        - observation
+      properties:
+        id: *id001
+        organizationId: *id002
+        projectId: *id003
+        environmentId: *id004
+        regionId: *id005
+        name: *id006
+        status: *id007
+        createdAt: *id008
+        observedAt: *id009
+        ownerRoleId:
+          type: string
+          format: uuid
+        observation:
+          type:
+            - object
+            - "null"
+          description:
+            Last accepted non-secret database observation; not a current connectivity
+            guarantee.
+    RecoveryOperation:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - organizationId
+        - projectId
+        - kind
+        - status
+        - createdAt
+        - observedAt
+        - resultCode
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        projectId:
+          type: string
+          format: uuid
+        environmentId:
+          type: string
+          format: uuid
+        roleId:
+          type: string
+          format: uuid
+        databaseId:
+          type: string
+          format: uuid
+        ownerRoleId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          enum:
+            - project.create
+            - environment.create
+            - database.role.apply
+            - database.create
+        status:
+          type: string
+          enum:
+            - succeeded
+            - queued
+            - running
+            - applied
+            - failed
+        credentialRevision:
+          type: integer
+          minimum: 1
+        createdAt:
+          type: string
+          format: date-time
+        observedAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        resultCode:
+          type:
+            - string
+            - "null"
+      description:
+        Organization-owned task metadata. Conditional identity fields apply
+        to task kind; credentials, evidence payloads and lease fields are omitted.
     Region:
       type: object
       required: [id, name, status, createdAt]

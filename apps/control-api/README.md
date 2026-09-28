@@ -46,6 +46,12 @@ Use the organization token to read `GET /v1/organizations/{organizationId}/proje
 
 The current slice has no public native endpoint, customer database credentials, environment listing/deletion/resize, runtime usage collector, runtime allowance enforcer, idempotency archival, or rate limiting. A reported ready environment means the regional executor observed PostgreSQL resource readiness; it does not prove backups, restore qualification, credential access, or a production service objective.
 
+## Customer recovery reads
+
+The [recovery-read contract](../../docs/contracts/recovery-reads-v1.md) adds organization-scoped project, project-scoped environment, and environment-scoped role/database collection reads. Each entry contains the existing public resource plus `currentOperationId`; the page returns `nextCursor`, `consistency: observed-page` and `observedAt`. These reads require `projects:read` and do not disclose passwords or full operation status. Page limits default to 50 and are capped at 100; signed cursors bind the collection, parent and limit. Only one `limit` and `cursor` are accepted.
+
+Poll `GET /v1/organizations/{organizationId}/operations/{operationId}` with `operations:read`. It resolves project/environment and separate role/database operation stores, including historical credential revisions, without credentials, lease authority or private evidence. Missing/foreign parents return 404; owned empty lists return 200. Pending/failed resources and disabled-region metadata remain recoverable. Pages report observed control state, not a frozen snapshot or SQL availability. Ambiguous persisted operation identities fail explicitly.
+
 ## Owned logical databases
 
 The [owned-database contract](../../docs/contracts/owned-databases-v1.md) creates a named SQL database under a verified restricted role in the same API-managed environment. Use `/v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/databases`: `POST` requires write scope, `Idempotency-Key` and exactly `{name, ownerRoleId}`. It returns asynchronous database/operation metadata without a password. Read metadata with `GET /{databaseId}`; write-scoped `GET /{databaseId}/credentials` supplies the selected database name and the owner's currently applied credential. It provides no public endpoint.
@@ -96,7 +102,7 @@ Send `POST /v1/organizations/{organizationId}/projects/{projectId}/environments`
 
 The `202` response contains a `pending` environment and a `queued` `environment.create` operation. A conditional D1 batch checks admission again and creates the environment, operation, and request identity atomically. It stores the complete normalized profile snapshot with `specRevision: 1` and SHA-256 of `JSON.stringify(spec)` in its persisted key order. A retry of the same request/key returns the same IDs and current state, including after a newer catalog is published or admission closes. A changed body or project path under the same organization's environment key returns `409 idempotency_conflict`. Environment keys are retained indefinitely in this slice and are separate from the logical-project key namespace.
 
-Read `GET /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}` with `projects:read`, and use the existing organization operation GET to observe its audit state. `pending` means accepted, `provisioning` means a regional lease was claimed, and `ready` or `failed` is a fenced executor observation. The immutable requested configuration survives every transition. A foreign organization's valid token receives `404`. Recover a lost creation response through the same idempotent POST; environment collection listing is not implemented.
+Read `GET /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}` with `projects:read`, and use the existing organization operation GET to observe its audit state. `pending` means accepted, `provisioning` means a regional lease was claimed, and `ready` or `failed` is a fenced executor observation. The immutable requested configuration survives every transition. A foreign organization's valid token receives `404`. Recover a lost creation response through the same idempotent POST or the bounded environment collection read, then poll its current operation identifier.
 
 ## Regional execution protocol
 

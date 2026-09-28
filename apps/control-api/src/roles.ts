@@ -36,7 +36,7 @@ interface Target {
   spec_hash: string;
   observation_json: string;
 }
-interface Role {
+export interface Role {
   id: string;
   organization_id: string;
   project_id: string;
@@ -102,7 +102,7 @@ function identifier(value: unknown): value is string {
     !/^(?:pg_|cnpg_)/.test(value)
   );
 }
-function publicRole(role: Role) {
+export function publicRole(role: Role) {
   return {
     id: role.id,
     organizationId: role.organization_id,
@@ -118,7 +118,19 @@ function publicRole(role: Role) {
     observedAt: role.observed_at,
   };
 }
-function publicOperation(operation: Operation) {
+export function publicOperation(
+  operation: Pick<
+    Operation,
+    | "id"
+    | "role_id"
+    | "credential_revision"
+    | "kind"
+    | "status"
+    | "created_at"
+    | "observed_at"
+    | "result_code"
+  >,
+) {
   return {
     id: operation.id,
     roleId: operation.role_id,

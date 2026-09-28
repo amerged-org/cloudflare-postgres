@@ -47,7 +47,7 @@ interface OwnerProof {
   authenticatedDatabase: string;
   writablePrimary: true;
 }
-interface Database {
+export interface Database {
   id: string;
   organization_id: string;
   project_id: string;
@@ -186,7 +186,7 @@ function ownerProof(owner: Owner): OwnerProof | null {
     writablePrimary: true,
   };
 }
-function publicDatabase(database: Database) {
+export function publicDatabase(database: Database) {
   return {
     id: database.id,
     organizationId: database.organization_id,
@@ -204,7 +204,18 @@ function publicDatabase(database: Database) {
         : (JSON.parse(database.observation_json) as Observation),
   };
 }
-function publicOperation(operation: Operation) {
+export function publicOperation(
+  operation: Pick<
+    Operation,
+    | "id"
+    | "database_id"
+    | "kind"
+    | "status"
+    | "created_at"
+    | "observed_at"
+    | "result_code"
+  >,
+) {
   return {
     id: operation.id,
     databaseId: operation.database_id,
