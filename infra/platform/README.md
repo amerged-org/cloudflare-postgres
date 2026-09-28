@@ -85,6 +85,8 @@ Do not uninstall the imported release as a generic rollback: it owns operator re
 
 ## Verification and promotion
 
+The [CNPG adoption checkpoint](../../docs/evidence/m4-cnpg-adoption-2026-09-28.md) now verifies the compatibility overlay in the existing Dev lab: 19 guarded ownership patches, one same-version activation, current-generation release/Deployment readiness, preserved CA ownership and SQL/Pod state, and successful webhook admission. Four releases are active; Barman remains suspended. This checkpoint supplements the earlier Cilium/OpenEBS and cert-manager evidence; it does not prove a fresh installation or production upgrade/recovery.
+
 All five pinned charts were downloaded from their official sources, their chart/app mappings inspected, and their public values linted and rendered locally against Kubernetes 1.36.3. The OpenEBS render contains only the LVM controller/node workloads and its CSI dependencies; other storage engines and bundled telemetry are disabled. Rendered manifests stay private because upstream templates may generate certificates or keys. No rendered chart output is published here.
 
 The base and selected adoption overlay must build with `kubectl kustomize` before promotion. Compare the parsed compatibility values and post-renderer with the reviewed chart candidate. These offline checks do not prove runtime readiness, CRD upgrade compatibility, Pod Security admission, backup/PITR, drift behavior, or a successful Helm-to-Flux handoff. Prove those in staging before a production rollout. Chart digests establish artifact identity; signature verification, maintenance health gates, storage expansion, and recovery remain separate checks.
