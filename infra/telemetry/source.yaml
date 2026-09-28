@@ -1,0 +1,13 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: pgcf-kube-prometheus-stack
+  namespace: flux-system
+spec:
+  interval: 1h
+  url: oci://ghcr.io/prometheus-community/charts/kube-prometheus-stack
+  ref:
+    digest: sha256:31d941e75adc97f244a0c1085098dd1087fc753fe80e8fa4818b56fcc920085f
+  layerSelector:
+    mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
+    operation: copy

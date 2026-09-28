@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "verifiedOn": "2026-09-28",
+  "status": "prepared_suspended_unapplied",
+  "kubernetesRenderVersion": "1.36.3",
+  "chart": {
+    "name": "kube-prometheus-stack",
+    "version": "91.8.0",
+    "appVersion": "v0.94.1",
+    "source": "oci://ghcr.io/prometheus-community/charts/kube-prometheus-stack",
+    "ociManifestDigest": "sha256:31d941e75adc97f244a0c1085098dd1087fc753fe80e8fa4818b56fcc920085f",
+    "archiveSha256": "0c92b02828e58ea590f3a1ce118536a3e98bbfe641b23b42535470fee46c3eff"
+  },
+  "images": [
+    {
+      "component": "operator",
+      "selectedReference": "quay.io/prometheus-operator/prometheus-operator:v0.94.1",
+      "manifestDigest": "sha256:7c88d4e7bae63bd8d0f8da986054337c23b4472fa8d3c6817f5bc4b8407a2d6a",
+      "linuxAmd64ManifestDigest": "sha256:ee7157809d227e2f9c112b329a9732bca4eb65d4df157ce83111f4debe4646fd"
+    },
+    {
+      "component": "reloader",
+      "selectedReference": "quay.io/prometheus-operator/prometheus-config-reloader:v0.94.1",
+      "manifestDigest": "sha256:06b52bd4dbe3ed6dd5905aadaf8b9987d9da4c31d37bb86deaadae68cee2d26b",
+      "linuxAmd64ManifestDigest": "sha256:ac2f46e50daebc6163d2ba17adbbbc7fe8f51a0000e7961e821dcb9331b3702f"
+    },
+    {
+      "component": "prometheus",
+      "selectedReference": "quay.io/prometheus/prometheus:v3.15.0-distroless",
+      "manifestDigest": "sha256:b2a413d5a03ea6a76782a508d1c7947440bba3b973931a25676e278431891b01",
+      "linuxAmd64ManifestDigest": "sha256:3e84c7d7c1b07a779c0d51ab41982dce05147a6bb49a674e8dec794a7ba25447"
+    },
+    {
+      "component": "alertmanager",
+      "selectedReference": "quay.io/prometheus/alertmanager:v0.34.1",
+      "manifestDigest": "sha256:e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a",
+      "linuxAmd64ManifestDigest": "sha256:84967b9b7ba45e38a9278d3e594305f43d4993c310df3905b51138b816c365f3"
+    },
+    {
+      "component": "kube-state-metrics",
+      "selectedReference": "registry.k8s.io/kube-state-metrics/kube-state-metrics:v2.20.0",
+      "manifestDigest": "sha256:42cfe3723a5f058171c627537fb57a3ea0f26e4380fa18555a95cb1a1b4cfc5b",
+      "linuxAmd64ManifestDigest": "sha256:01171220c7c059afc85034ffe687bfe7249e41c0cc46fbe9a5128503ceee3016"
+    },
+    {
+      "component": "node-exporter",
+      "selectedReference": "quay.io/prometheus/node-exporter:v1.12.1-distroless",
+      "manifestDigest": "sha256:8c9bac11973b94b59be88d6e11fee4429aa743c8846cdc75d65b18db33f6a106",
+      "linuxAmd64ManifestDigest": "sha256:bbfbd533202cfef891c70383ddf6f0c32acece66400ad8091a18bed7aad5db6f"
+    }
+  ],
+  "publisherSignaturesVerified": false,
+  "runtimeQualified": false,
+  "tenantToHostIsolationQualified": false
+}

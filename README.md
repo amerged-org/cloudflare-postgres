@@ -77,3 +77,5 @@ Use the [bounded TDD policy](PLAN.md#10-bounded-tdd-and-verification-discipline)
 Original project code and documentation are licensed under [Apache License 2.0](LICENSE). Third-party components retain their own licenses and notices; evaluated upstream projects have not been vendored into this repository.
 
 This is an independent project, not an official product of or affiliated with Cloudflare, Contabo, Neon, Supabase, or the CloudNativePG project. Product and project names identify the technologies being evaluated and remain the property of their respective owners.
+
+The [prepared telemetry configuration](infra/telemetry/README.md) reuses maintained Prometheus components with pinned chart/images and bounded lab resources. Its release remains suspended and unapplied pending network and runtime qualification; [evidence](docs/evidence/m4-telemetry-preparation-2026-09-28.md) distinguishes preparation from live behavior.

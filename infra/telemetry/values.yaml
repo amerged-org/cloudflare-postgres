@@ -1,0 +1,696 @@
+grafana:
+  enabled: false
+windowsMonitoring:
+  enabled: false
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+defaultRules:
+  create: true
+  rules:
+    etcd: false
+    kubeControllerManager: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+    kubeProxy: false
+    windows: false
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+  namespaces:
+    releaseNamespace: true
+    additional:
+      - pgcf-node-metrics
+  prometheusInstanceNamespaces:
+    - pgcf-monitoring
+  alertmanagerInstanceNamespaces:
+    - pgcf-monitoring
+  prometheusConfigReloader:
+    resources:
+      requests:
+        cpu: 5m
+        memory: 16Mi
+      limits:
+        cpu: 50m
+        memory: 32Mi
+    image:
+      sha: 06b52bd4dbe3ed6dd5905aadaf8b9987d9da4c31d37bb86deaadae68cee2d26b
+  admissionWebhooks:
+    enabled: true
+    patch:
+      enabled: false
+    certManager:
+      enabled: true
+      rootCert:
+        revisionHistoryLimit: 2
+      admissionCert:
+        revisionHistoryLimit: 2
+  image:
+    sha: 7c88d4e7bae63bd8d0f8da986054337c23b4472fa8d3c6817f5bc4b8407a2d6a
+prometheus:
+  ingress:
+    enabled: false
+  service:
+    type: ClusterIP
+  prometheusSpec:
+    replicas: 1
+    scrapeInterval: 45s
+    evaluationInterval: 60s
+    scrapeTimeout: 10s
+    retention: 24h
+    retentionSize: 4GB
+    resources:
+      requests:
+        cpu: 150m
+        memory: 768Mi
+      limits:
+        cpu: 750m
+        memory: 1536Mi
+    serviceMonitorNamespaceSelector:
+      matchExpressions:
+        - key: kubernetes.io/metadata.name
+          operator: In
+          values:
+            - pgcf-monitoring
+            - pgcf-node-metrics
+    podMonitorNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: pgcf-monitoring
+    ruleNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: pgcf-monitoring
+    scrapeConfigNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: pgcf-monitoring
+    serviceMonitorSelector:
+      matchLabels:
+        release: pgcf-telemetry
+    podMonitorSelector:
+      matchLabels:
+        release: pgcf-telemetry
+    ruleSelector:
+      matchLabels:
+        release: pgcf-telemetry
+    scrapeConfigSelector:
+      matchLabels:
+        pgcf.io/scrape-config: disabled
+    arbitraryFSAccessThroughSMs:
+      deny: true
+    overrideHonorLabels: true
+    enforcedSampleLimit: 20000
+    enforcedTargetLimit: 100
+    enforcedLabelLimit: 64
+    enforcedLabelNameLengthLimit: 128
+    enforcedLabelValueLengthLimit: 256
+    remoteWrite: []
+    enableOTLPReceiver: false
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: pgcf-lvm
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 8Gi
+    containers:
+      - name: prometheus
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+              - ALL
+    probeNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: pgcf-monitoring
+    probeSelector:
+      matchLabels:
+        pgcf.io/probe: disabled
+    image:
+      sha: b2a413d5a03ea6a76782a508d1c7947440bba3b973931a25676e278431891b01
+alertmanager:
+  ingress:
+    enabled: false
+  service:
+    type: ClusterIP
+  config:
+    global:
+      resolve_timeout: 5m
+    route:
+      receiver: "null"
+      group_by:
+        - namespace
+        - alertname
+      group_wait: 30s
+      group_interval: 5m
+      repeat_interval: 12h
+    receivers:
+      - name: "null"
+    inhibit_rules: []
+  alertmanagerSpec:
+    replicas: 1
+    retention: 24h
+    resources:
+      requests:
+        cpu: 25m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+    alertmanagerConfigSelector:
+      matchLabels:
+        pgcf.io/alert-config: disabled
+    alertmanagerConfigNamespaceSelector:
+      matchLabels:
+        kubernetes.io/metadata.name: pgcf-monitoring
+    storage:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: pgcf-lvm
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 512Mi
+    containers:
+      - name: alertmanager
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop:
+              - ALL
+    image:
+      sha: e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+kubelet:
+  enabled: true
+  serviceMonitor:
+    https: true
+    tlsConfig:
+      insecureSkipVerify: false
+      ca:
+        configMap:
+          name: kube-root-ca.crt
+          key: ca.crt
+    interval: 45s
+    cAdvisorInterval: 60s
+    sampleLimit: 20000
+kube-state-metrics:
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      cpu: 200m
+      memory: 128Mi
+  collectors:
+    - daemonsets
+    - deployments
+    - nodes
+    - persistentvolumeclaims
+    - persistentvolumes
+    - pods
+    - replicasets
+    - statefulsets
+    - storageclasses
+    - volumeattachments
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  rbac:
+    customResourceState:
+      createClusterRoleRules: true
+    extraRules:
+      - apiGroups:
+          - helm.toolkit.fluxcd.io
+        resources:
+          - helmreleases
+        verbs:
+          - list
+          - watch
+      - apiGroups:
+          - source.toolkit.fluxcd.io
+        resources:
+          - gitrepositories
+          - ocirepositories
+        verbs:
+          - list
+          - watch
+      - apiGroups:
+          - kustomize.toolkit.fluxcd.io
+        resources:
+          - kustomizations
+        verbs:
+          - list
+          - watch
+  customResourceState:
+    enabled: true
+    create: true
+    key: config.yaml
+    config:
+      kind: CustomResourceStateMetrics
+      spec:
+        resources:
+          - groupVersionKind:
+              group: helm.toolkit.fluxcd.io
+              version: v2
+              kind: HelmRelease
+            resourcePlural: helmreleases
+            metricNamePrefix: pgcf_flux
+            labelsFromPath:
+              name:
+                - metadata
+                - name
+              resource_namespace:
+                - metadata
+                - namespace
+              resource_uid:
+                - metadata
+                - uid
+            metrics:
+              - name: resource_generation
+                help: API metadata generation; no zero substitution.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - metadata
+                      - generation
+              - name: observed_generation
+                help: Last terminal generation observed by the Flux controller; missing means
+                  zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - observedGeneration
+                    nilIsZero: true
+              - name: ready_condition
+                help: Ready True is one; False, Unknown or absent is zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Ready]"
+                      - status
+                    nilIsZero: true
+              - name: ready_condition_observed_generation
+                help: Generation observed by the Ready condition; missing means zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Ready]"
+                      - observedGeneration
+                    nilIsZero: true
+              - name: suspended
+                help: Explicit Flux suspension; absent optional flag is zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - spec
+                      - suspend
+                    nilIsZero: true
+              - name: reconciling
+                help: Reconciling True is one; other or absent states are zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Reconciling]"
+                      - status
+                    nilIsZero: true
+              - name: stalled
+                help: Stalled True is one; other or absent states are zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Stalled]"
+                      - status
+                    nilIsZero: true
+              - name: deletion_timestamp
+                help: Deletion timestamp as seconds; absent means zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - metadata
+                      - deletionTimestamp
+                    nilIsZero: true
+          - groupVersionKind:
+              group: source.toolkit.fluxcd.io
+              version: v1
+              kind: GitRepository
+            resourcePlural: gitrepositories
+            metricNamePrefix: pgcf_flux
+            labelsFromPath:
+              name:
+                - metadata
+                - name
+              resource_namespace:
+                - metadata
+                - namespace
+              resource_uid:
+                - metadata
+                - uid
+            metrics:
+              - name: resource_generation
+                help: API metadata generation; no zero substitution.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - metadata
+                      - generation
+              - name: observed_generation
+                help: Last terminal generation observed by the Flux controller; missing means
+                  zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - observedGeneration
+                    nilIsZero: true
+              - name: ready_condition
+                help: Ready True is one; False, Unknown or absent is zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Ready]"
+                      - status
+                    nilIsZero: true
+              - name: ready_condition_observed_generation
+                help: Generation observed by the Ready condition; missing means zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Ready]"
+                      - observedGeneration
+                    nilIsZero: true
+              - name: suspended
+                help: Explicit Flux suspension; absent optional flag is zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - spec
+                      - suspend
+                    nilIsZero: true
+              - name: reconciling
+                help: Reconciling True is one; other or absent states are zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Reconciling]"
+                      - status
+                    nilIsZero: true
+              - name: stalled
+                help: Stalled True is one; other or absent states are zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Stalled]"
+                      - status
+                    nilIsZero: true
+              - name: deletion_timestamp
+                help: Deletion timestamp as seconds; absent means zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - metadata
+                      - deletionTimestamp
+                    nilIsZero: true
+          - groupVersionKind:
+              group: kustomize.toolkit.fluxcd.io
+              version: v1
+              kind: Kustomization
+            resourcePlural: kustomizations
+            metricNamePrefix: pgcf_flux
+            labelsFromPath:
+              name:
+                - metadata
+                - name
+              resource_namespace:
+                - metadata
+                - namespace
+              resource_uid:
+                - metadata
+                - uid
+            metrics:
+              - name: resource_generation
+                help: API metadata generation; no zero substitution.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - metadata
+                      - generation
+              - name: observed_generation
+                help: Last terminal generation observed by the Flux controller; missing means
+                  zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - observedGeneration
+                    nilIsZero: true
+              - name: ready_condition
+                help: Ready True is one; False, Unknown or absent is zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Ready]"
+                      - status
+                    nilIsZero: true
+              - name: ready_condition_observed_generation
+                help: Generation observed by the Ready condition; missing means zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Ready]"
+                      - observedGeneration
+                    nilIsZero: true
+              - name: suspended
+                help: Explicit Flux suspension; absent optional flag is zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - spec
+                      - suspend
+                    nilIsZero: true
+              - name: reconciling
+                help: Reconciling True is one; other or absent states are zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Reconciling]"
+                      - status
+                    nilIsZero: true
+              - name: stalled
+                help: Stalled True is one; other or absent states are zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Stalled]"
+                      - status
+                    nilIsZero: true
+              - name: deletion_timestamp
+                help: Deletion timestamp as seconds; absent means zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - metadata
+                      - deletionTimestamp
+                    nilIsZero: true
+          - groupVersionKind:
+              group: source.toolkit.fluxcd.io
+              version: v1
+              kind: OCIRepository
+            resourcePlural: ocirepositories
+            metricNamePrefix: pgcf_flux
+            labelsFromPath:
+              name:
+                - metadata
+                - name
+              resource_namespace:
+                - metadata
+                - namespace
+              resource_uid:
+                - metadata
+                - uid
+            metrics:
+              - name: resource_generation
+                help: API metadata generation; no zero substitution.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - metadata
+                      - generation
+              - name: observed_generation
+                help: Last terminal generation observed by the Flux controller; missing means
+                  zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - observedGeneration
+                    nilIsZero: true
+              - name: ready_condition
+                help: Ready True is one; False, Unknown or absent is zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Ready]"
+                      - status
+                    nilIsZero: true
+              - name: ready_condition_observed_generation
+                help: Generation observed by the Ready condition; missing means zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Ready]"
+                      - observedGeneration
+                    nilIsZero: true
+              - name: suspended
+                help: Explicit Flux suspension; absent optional flag is zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - spec
+                      - suspend
+                    nilIsZero: true
+              - name: reconciling
+                help: Reconciling True is one; other or absent states are zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Reconciling]"
+                      - status
+                    nilIsZero: true
+              - name: stalled
+                help: Stalled True is one; other or absent states are zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - status
+                      - conditions
+                      - "[type=Stalled]"
+                      - status
+                    nilIsZero: true
+              - name: deletion_timestamp
+                help: Deletion timestamp as seconds; absent means zero.
+                each:
+                  type: Gauge
+                  gauge:
+                    path:
+                      - metadata
+                      - deletionTimestamp
+                    nilIsZero: true
+  image:
+    sha: sha256:42cfe3723a5f058171c627537fb57a3ea0f26e4380fa18555a95cb1a1b4cfc5b
+prometheus-node-exporter:
+  namespaceOverride: pgcf-node-metrics
+  hostNetwork: true
+  hostPID: true
+  hostIPC: false
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      cpu: 100m
+      memory: 64Mi
+  service:
+    type: ClusterIP
+    listenOnAllInterfaces: false
+  securityContext:
+    fsGroup: 65534
+    runAsGroup: 65534
+    runAsNonRoot: true
+    runAsUser: 65534
+    seccompProfile:
+      type: RuntimeDefault
+  containerSecurityContext:
+    allowPrivilegeEscalation: false
+    readOnlyRootFilesystem: true
+    capabilities:
+      drop:
+        - ALL
+  prometheus:
+    monitor:
+      enabled: true
+      additionalLabels:
+        release: pgcf-telemetry
+      interval: 45s
+      relabelings:
+        - targetLabel: pgcf_component
+          replacement: node-exporter
+  image:
+    digest: sha256:8c9bac11973b94b59be88d6e11fee4429aa743c8846cdc75d65b18db33f6a106

@@ -1,0 +1,15 @@
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: pgcf-telemetry-bounds
+  namespace: pgcf-monitoring
+spec:
+  hard:
+    requests.cpu: '1'
+    limits.cpu: '2'
+    requests.memory: 2Gi
+    limits.memory: 3Gi
+    requests.storage: 9Gi
+    persistentvolumeclaims: '2'
+    pods: '12'
