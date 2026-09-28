@@ -1,0 +1,29 @@
+# Disposable 161 GB lab disk only. Size a production node before first install.
+apiVersion: v1alpha1
+kind: VolumeConfig
+name: EPHEMERAL
+provisioning:
+  diskSelector:
+    match: system_disk
+  grow: false
+  minSize: 40GiB
+  maxSize: 40GiB
+mount:
+  secure: true
+---
+apiVersion: v1alpha1
+kind: RawVolumeConfig
+name: pgcf-lvm
+provisioning:
+  diskSelector:
+    match: system_disk
+  grow: false
+  minSize: 96GiB
+  maxSize: 96GiB
+---
+apiVersion: v1alpha1
+kind: LVMVolumeGroupConfig
+name: pgcf
+provisioning:
+  volumeSelector:
+    match: volume.partition_label == "r-pgcf-lvm"

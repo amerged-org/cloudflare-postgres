@@ -1,0 +1,12 @@
+# Apply with --config-patch-control-plane; KubeProxyConfig is control-plane-only.
+apiVersion: v1alpha1
+kind: KubeFlannelCNIConfig
+$patch: delete
+---
+apiVersion: v1alpha1
+kind: KubeProxyConfig
+enabled: false
+---
+apiVersion: v1alpha1
+kind: KubePrismConfig
+port: 7445

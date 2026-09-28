@@ -1,0 +1,23 @@
+# Retain only the LocalPV LVM engine and its bundled CSI snapshot support.
+engines:
+  local:
+    lvm:
+      enabled: true
+    zfs:
+      enabled: false
+    rawfile:
+      enabled: false
+    hostpath:
+      enabled: false
+  replicated:
+    mayastor:
+      enabled: false
+loki:
+  enabled: false
+alloy:
+  enabled: false
+preUpgradeHook:
+  enabled: false
+lvm-localpv:
+  analytics:
+    enabled: false

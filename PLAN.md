@@ -1,6 +1,6 @@
 # cloudflare-postgres — Open-source implementation plan
 
-Status: revised approved direction, updated 2026-09-28. M0 is complete. M1 has live single-node Talos, Kubernetes, Cilium, bounded-volume, and PostgreSQL transaction evidence; backup and recovery gates remain open. A development control API is deployed, but regional provisioning and operational acceptance remain pending.
+Status: revised approved direction, updated 2026-09-28. M0 is complete. M1 has live single-node Talos, Kubernetes, Cilium, bounded-volume, and PostgreSQL transaction evidence; backup and recovery gates remain open. The development control API now includes environment intents and a leased regional protocol, with live closed-admission and authorization checks. The CNPG controller and public Talos/Flux assets are implemented and locally checked; controller deployment and API-to-CNPG qualification remain pending. No catalog or API-managed environment has been created. Lab admission stays closed.
 
 This file is the canonical scope and roadmap. README.md summarizes it; AGENTS.md is the 25-line contributor brief; THIRD_PARTY.md records component provenance and adoption status. A documented target is not evidence of implemented behavior.
 
@@ -47,14 +47,14 @@ Run an early native PostgreSQL pilot ahead of the full gateway, serverless lifec
 
 ### Platform versus consumer responsibilities
 
-| Capability | Generic platform responsibility | Consumer responsibility |
-|---|---|---|
-| Lifecycle | Versioned create/observe/delete operations, stable identities, safe handling of uncertain outcomes. | Map local project/environment identities and reconcile the platform's operations. |
-| PostgreSQL access | Document native/direct/pooled endpoints, TLS, role boundaries, transaction semantics, and supported connection behavior. | Configure its drivers, migration tools, application pools, cancellation, and reconnect handling. |
-| Resource policy | Publish supported size ranges, idle policy, scaling limits, and observed state. | Map its service plans into supported configuration without asking for named-plan exceptions. |
-| Timeouts and recovery | Declare measured startup, interruption, and recovery behavior and supported configuration. | Reconcile its client deadlines and recovery requirements with that contract. |
-| Usage | Offer documented units, time windows, granularity, freshness, revisions, and completeness. | Map those facts into its own usage model and choose an appropriate polling cadence. |
-| Budgets | Authorize and enforce scoped limits/allowances with explicit units and stop/resume behavior. | Allocate its database allowance from any wider wallet and provide authorized conversion policy where required. |
+| Capability            | Generic platform responsibility                                                                                          | Consumer responsibility                                                                                        |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| Lifecycle             | Versioned create/observe/delete operations, stable identities, safe handling of uncertain outcomes.                      | Map local project/environment identities and reconcile the platform's operations.                              |
+| PostgreSQL access     | Document native/direct/pooled endpoints, TLS, role boundaries, transaction semantics, and supported connection behavior. | Configure its drivers, migration tools, application pools, cancellation, and reconnect handling.               |
+| Resource policy       | Publish supported size ranges, idle policy, scaling limits, and observed state.                                          | Map its service plans into supported configuration without asking for named-plan exceptions.                   |
+| Timeouts and recovery | Declare measured startup, interruption, and recovery behavior and supported configuration.                               | Reconcile its client deadlines and recovery requirements with that contract.                                   |
+| Usage                 | Offer documented units, time windows, granularity, freshness, revisions, and completeness.                               | Map those facts into its own usage model and choose an appropriate polling cadence.                            |
+| Budgets               | Authorize and enforce scoped limits/allowances with explicit units and stop/resume behavior.                             | Allocate its database allowance from any wider wallet and provide authorized conversion policy where required. |
 
 Consumer-specific compatibility snapshots and TODOs belong in the consumer's PLAN.md. In particular, ohmyho.st owns its PGCF adapter, Neon-specific registration removal, timeout/profile mapping, usage ingestion, wallet allocation, and migration tasks. Do not make those private implementation details universal platform requirements or an upstream release dependency. A missing shared capability may be proposed here only with a general use case, rather than an adopter-specific branch.
 
@@ -62,19 +62,19 @@ Consumer-specific compatibility snapshots and TODOs belong in the consumer's PLA
 
 Prefer maintained upstream packages, images, and APIs. Preserve licenses and notices, pin releases and artifact digests when integrating, and keep necessary adapters or forks narrow. Apache-2.0 covers first-party work; it does not relicense third-party components. See [THIRD_PARTY.md](THIRD_PARTY.md).
 
-| Component | Planned decision | Reuse and boundary |
-|---|---|---|
-| CloudNativePG | Core operator | Delegate database lifecycle, replication, failover, roles, databases, resource changes, hibernation, and recovery integration. |
-| PgBouncer through CNPG | Default pooling candidate | Reuse pooling; document client/backend budgets and the direct path. Do not implement another pooler. |
-| Barman Cloud plugin and Barman | Backup/recovery tooling | Reuse physical backups and WAL tooling; prove R2 upload, recovery, retention, and deletion independently. |
-| Talos, Kubernetes, Flux | Target operations foundation | Reuse declarative host/cluster operations and platform release reconciliation. Contabo bootstrap and maintenance remain unverified. |
-| OpenEBS LocalPV LVM | Local-volume candidate | Prove hard volume sizes, expansion, persistence across upgrades, and node-loss rebuild. |
-| Neon proxy | Evaluation candidate, not preferred or selected | Evaluate existing native/HTTP/WS protocol handling and wake integration against both technical and maintenance criteria. |
+| Component                                  | Planned decision                                | Reuse and boundary                                                                                                                         |
+| ------------------------------------------ | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| CloudNativePG                              | Core operator                                   | Delegate database lifecycle, replication, failover, roles, databases, resource changes, hibernation, and recovery integration.             |
+| PgBouncer through CNPG                     | Default pooling candidate                       | Reuse pooling; document client/backend budgets and the direct path. Do not implement another pooler.                                       |
+| Barman Cloud plugin and Barman             | Backup/recovery tooling                         | Reuse physical backups and WAL tooling; prove R2 upload, recovery, retention, and deletion independently.                                  |
+| Talos, Kubernetes, Flux                    | Target operations foundation                    | Reuse declarative host/cluster operations and platform release reconciliation. Contabo bootstrap and maintenance remain unverified.        |
+| OpenEBS LocalPV LVM                        | Local-volume candidate                          | Prove hard volume sizes, expansion, persistence across upgrades, and node-loss rebuild.                                                    |
+| Neon proxy                                 | Evaluation candidate, not preferred or selected | Evaluate existing native/HTTP/WS protocol handling and wake integration against both technical and maintenance criteria.                   |
 | [Xata OSS](https://github.com/xataio/xata) | Evaluation candidate for gateway and sleep/wake | Inspect its SQL gateway, CNPG scale-to-zero plugin, and management services for bounded reuse before implementing equivalent capabilities. |
-| Neon serverless driver | Optional client integration | Test only against the protocols actually supplied by the selected gateway. |
-| Supabase postgres-meta | Optional private administration tooling | Reuse metadata, SQL administration, and type generation behind our authorization and routing. |
-| Supabase Studio | Optional selected-database workbench | Prefer narrow integration before a persistent fork. It is not a prerequisite for the pilot or a ready-made multi-project SaaS console. |
-| PostgREST | Optional database REST/RPC API | Preserve grants, RLS, and JWT role boundaries; keep it separate from the management API. |
+| Neon serverless driver                     | Optional client integration                     | Test only against the protocols actually supplied by the selected gateway.                                                                 |
+| Supabase postgres-meta                     | Optional private administration tooling         | Reuse metadata, SQL administration, and type generation behind our authorization and routing.                                              |
+| Supabase Studio                            | Optional selected-database workbench            | Prefer narrow integration before a persistent fork. It is not a prerequisite for the pilot or a ready-made multi-project SaaS console.     |
+| PostgREST                                  | Optional database REST/RPC API                  | Preserve grants, RLS, and JWT role boundaries; keep it separate from the management API.                                                   |
 
 ### Gateway and component reuse gate
 
@@ -92,13 +92,13 @@ Neon's storage engine and NeonVM remain outside CNPG v1. Supavisor is an alterna
 
 ### Authoritative state on Cloudflare
 
-| Responsibility | Selected design assumption |
-|---|---|
-| Management API | Workers expose REST `/v1`, validate identity and scope, and serve generated-client contracts. |
-| Canonical control data | D1 stores organizations, projects, desired state, mappings, operation records, idempotency identities, accepted usage facts, budget policies, and allowance reservations. |
-| Coordination | Durable Objects serialize resource operations and schedule checks. They reconstruct authority from D1 instead of maintaining a competing desired-state database. |
-| Large artifacts | R2 stores database backups/WAL, exports, and archived usage evidence. D1 holds their identities, checksums, status, and references. |
-| Secrets | Worker Secrets hold provider credentials and root/signing/encryption keys. Dynamic credentials are encrypted before D1 persistence with scoped context and key-version metadata; verification-only API tokens are hashed. |
+| Responsibility         | Selected design assumption                                                                                                                                                                                                |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Management API         | Workers expose REST `/v1`, validate identity and scope, and serve generated-client contracts.                                                                                                                             |
+| Canonical control data | D1 stores organizations, projects, desired state, mappings, operation records, idempotency identities, accepted usage facts, budget policies, and allowance reservations.                                                 |
+| Coordination           | Durable Objects serialize resource operations and schedule checks. They reconstruct authority from D1 instead of maintaining a competing desired-state database.                                                          |
+| Large artifacts        | R2 stores database backups/WAL, exports, and archived usage evidence. D1 holds their identities, checksums, status, and references.                                                                                       |
+| Secrets                | Worker Secrets hold provider credentials and root/signing/encryption keys. Dynamic credentials are encrypted before D1 persistence with scoped context and key-version metadata; verification-only API tokens are hashed. |
 
 D1 batches are atomic inside one D1 database. Use primary reads for authorization and resource-changing decisions, with conditional versions and unique operation identities for concurrency. Do not assume a transaction spans D1, a Durable Object, R2, Kubernetes, or Contabo. Persist intentions and results, reconcile uncertain outcomes, and make regional steps idempotent. [D1 batch API](https://developers.cloudflare.com/d1/worker-api/d1-database/), [D1 read consistency](https://developers.cloudflare.com/d1/best-practices/read-replication/), [Durable Object storage](https://developers.cloudflare.com/durable-objects/api/sqlite-storage-api/)
 
@@ -121,12 +121,12 @@ Usage replay is deduplicated after reconnection. Buffer overflow or unrecoverabl
 
 ### Connection ownership
 
-| Layer | Responsibility and limits |
-|---|---|
-| Application `pg.Pool` | Bounds application client concurrency and idle sessions; it does not replace server-side database pooling. |
-| Regional gateway | Authenticates, routes, coordinates wake, and enforces admission. Do not assume it is another pooler; any protocol-specific pooling must have an explicit purpose and budget. |
-| CNPG PgBouncer | Owns backend pooling for the pooled endpoint, with per-environment and fleet-wide connection/queue bounds. |
-| PostgreSQL | Owns sessions, transactions, statement limits, and database connection limits. |
+| Layer                 | Responsibility and limits                                                                                                                                                    |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Application `pg.Pool` | Bounds application client concurrency and idle sessions; it does not replace server-side database pooling.                                                                   |
+| Regional gateway      | Authenticates, routes, coordinates wake, and enforces admission. Do not assume it is another pooler; any protocol-specific pooling must have an explicit purpose and budget. |
+| CNPG PgBouncer        | Owns backend pooling for the pooled endpoint, with per-environment and fleet-wide connection/queue bounds.                                                                   |
+| PostgreSQL            | Owns sessions, transactions, statement limits, and database connection limits.                                                                                               |
 
 The direct endpoint bypasses PgBouncer for migrations and session-dependent operations while retaining appropriate authentication, routing, and admission. Test prepared statements, transaction/session semantics, query cancellation, connection bursts, credential rotation, and error propagation along each offered path. Record how idle application/pooler connections interact with sleep decisions.
 
@@ -148,18 +148,18 @@ Three VMs do not prove three independent physical hosts. Verify placement guaran
 
 ## 6. Server maintenance, bootstrap, and recovery
 
-| Responsibility | Component | Platform coordination |
-|---|---|---|
-| Hardware/hypervisor | Contabo | Provider incident handling and VM replacement. |
-| VM provisioning/networking | Contabo API | Inventory, capacity requests, machine identity, bootstrap, and tracked operations. |
-| Guest OS/kernel/runtime | Talos | Approved images, one-node-at-a-time upgrades, and recovery. |
-| Kubernetes lifecycle | Talos tooling | Supported version progression, quorum checks, and etcd recovery. |
-| Platform components | Flux | Pinned releases, staged promotion, and drift reconciliation. |
-| PostgreSQL | CNPG | Version policy, rolling changes, replication health, and maintenance status. |
-| Backups/WAL/PITR | Barman integration | Retention, freshness, restore drills, and safe deletion. |
-| Pod/host networking | Cilium / Talos firewall | Explicit ownership and default-deny policies without competing host-firewall controllers. |
-| Certificates | CNPG PKI and cert-manager | Renewal, expiry monitoring, and separate trust domains. |
-| Operational telemetry | Prometheus, Alertmanager, OpenTelemetry | Measurements, actionable alerts, and incident evidence. |
+| Responsibility             | Component                               | Platform coordination                                                                     |
+| -------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------- |
+| Hardware/hypervisor        | Contabo                                 | Provider incident handling and VM replacement.                                            |
+| VM provisioning/networking | Contabo API                             | Inventory, capacity requests, machine identity, bootstrap, and tracked operations.        |
+| Guest OS/kernel/runtime    | Talos                                   | Approved images, one-node-at-a-time upgrades, and recovery.                               |
+| Kubernetes lifecycle       | Talos tooling                           | Supported version progression, quorum checks, and etcd recovery.                          |
+| Platform components        | Flux                                    | Pinned releases, staged promotion, and drift reconciliation.                              |
+| PostgreSQL                 | CNPG                                    | Version policy, rolling changes, replication health, and maintenance status.              |
+| Backups/WAL/PITR           | Barman integration                      | Retention, freshness, restore drills, and safe deletion.                                  |
+| Pod/host networking        | Cilium / Talos firewall                 | Explicit ownership and default-deny policies without competing host-firewall controllers. |
+| Certificates               | CNPG PKI and cert-manager               | Renewal, expiry monitoring, and separate trust domains.                                   |
+| Operational telemetry      | Prometheus, Alertmanager, OpenTelemetry | Measurements, actionable alerts, and incident evidence.                                   |
 
 Talos is separately MPL-2.0 licensed. Omni is not required. Flux reconciles Kubernetes workloads; it does not patch the host OS. Regional lifecycle jobs invoke the existing Talos mechanisms and coordinate their database consequences.
 
@@ -220,36 +220,38 @@ Test concurrent reservations, duplicated grants/events, period rollover, revisio
 
 ## 8. Delivery sequence and evidence
 
-| Milestone | Deliverable | Required evidence |
-|---|---|---|
-| **M0 — Repository foundation: complete** | Apache-2.0, project guidance, canonical roadmap, component inventory. | Initial public commit `b7d790d`; documentation changes remain distinct from runtime progress. |
-| **M1 — Infrastructure and control-state feasibility** | Talos/Contabo/volumes/CNPG/R2 proofs; validate the Cloudflare state, secret, and recovery design. | Unattended boot, persistent/enforced storage, database/backup recovery, benchmark baseline, and control-state design ready before M3. |
-| **M2 — Early generic PostgreSQL pilot** | One disposable always-on environment through the ordinary platform interface, without a custom gateway or workbench dependency. | Representative application queries/transactions/migrations, scoped roles, lifecycle, usage, backup, and independent restore; adopter-specific integration remains in its own repository. |
-| **M3 — Cloudflare management, usage, and budget APIs** | D1-backed authority, scoped API/SDK, operation tracking, usage ingestion/query, budget policy/reservations, and regional protocol. | Authorization, idempotency, concurrent updates/reservations, correction/replay, stop/resume commands, and recovery reconciliation. |
-| **M4 — Secure fleet operations** | Provisioning, staged updates, replacement, isolation decision, and observability. | Node maintenance/failure, disk-full containment, cross-tenant tests, credential/key recovery, and restore onto fresh infrastructure. |
-| **M5 — Gateway and connection ownership** | Select a maintainable native gateway, validate endpoint failover, and set pool/queue limits. | Maintainer/update ownership, authentication/invalidation, cancellation, direct/pooled semantics, gateway/node/network failures, and client reconnect behavior. |
-| **M6 — Serverless lifecycle** | Automatic sleep/wake, manual resize, bounded automatic compute scaling, and end-to-end budget enforcement. | Cold-request deadlines, concurrent wake, long transactions, cooldowns, capacity exhaustion, allowance exhaustion, and management-outage behavior. |
-| **M7 — Developer experience and integration qualification** | Complete API/CLI docs and usage/budget examples; evaluate optional HTTP/WS, Data API, and workbench integrations. | Repeatable installation and operator workflows; any shipped optional interface has its own compatibility/security evidence. No hosted billing dependency. |
-| **M8 — Open-source production readiness** | Rehearsed operational release usable by independent adopters. | Sustained workloads, recovery and upgrade evidence, measured service limits, generic migration guidance, and repeatable installation documentation; consumer rollouts are separately owned. |
+| Milestone                                                   | Deliverable                                                                                                                        | Required evidence                                                                                                                                                                           |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **M0 — Repository foundation: complete**                    | Apache-2.0, project guidance, canonical roadmap, component inventory.                                                              | Initial public commit `b7d790d`; documentation changes remain distinct from runtime progress.                                                                                               |
+| **M1 — Infrastructure and control-state feasibility**       | Talos/Contabo/volumes/CNPG/R2 proofs; validate the Cloudflare state, secret, and recovery design.                                  | Unattended boot, persistent/enforced storage, database/backup recovery, benchmark baseline, and control-state design ready before M3.                                                       |
+| **M2 — Early generic PostgreSQL pilot**                     | One disposable always-on environment through the ordinary platform interface, without a custom gateway or workbench dependency.    | Representative application queries/transactions/migrations, scoped roles, lifecycle, usage, backup, and independent restore; adopter-specific integration remains in its own repository.    |
+| **M3 — Cloudflare management, usage, and budget APIs**      | D1-backed authority, scoped API/SDK, operation tracking, usage ingestion/query, budget policy/reservations, and regional protocol. | Authorization, idempotency, concurrent updates/reservations, correction/replay, stop/resume commands, and recovery reconciliation.                                                          |
+| **M4 — Secure fleet operations**                            | Provisioning, staged updates, replacement, isolation decision, and observability.                                                  | Node maintenance/failure, disk-full containment, cross-tenant tests, credential/key recovery, and restore onto fresh infrastructure.                                                        |
+| **M5 — Gateway and connection ownership**                   | Select a maintainable native gateway, validate endpoint failover, and set pool/queue limits.                                       | Maintainer/update ownership, authentication/invalidation, cancellation, direct/pooled semantics, gateway/node/network failures, and client reconnect behavior.                              |
+| **M6 — Serverless lifecycle**                               | Automatic sleep/wake, manual resize, bounded automatic compute scaling, and end-to-end budget enforcement.                         | Cold-request deadlines, concurrent wake, long transactions, cooldowns, capacity exhaustion, allowance exhaustion, and management-outage behavior.                                           |
+| **M7 — Developer experience and integration qualification** | Complete API/CLI docs and usage/budget examples; evaluate optional HTTP/WS, Data API, and workbench integrations.                  | Repeatable installation and operator workflows; any shipped optional interface has its own compatibility/security evidence. No hosted billing dependency.                                   |
+| **M8 — Open-source production readiness**                   | Rehearsed operational release usable by independent adopters.                                                                      | Sustained workloads, recovery and upgrade evidence, measured service limits, generic migration guidance, and repeatable installation documentation; consumer rollouts are separately owned. |
 
 M1 has a [live single-node infrastructure checkpoint](docs/evidence/m1-2026-09-28.md). Talos boot, node restart, Kubernetes networking, bounded local volumes, and a CloudNativePG SQL transaction with verified TLS and post-reboot readback were observed. R2 backup, independent restore, and production topology gates remain open.
 
-M3 has a [deployed Dev control API checkpoint](docs/evidence/m3-logical-projects-2026-09-28.md): organization bootstrap, paginated recovery listing, region registration with a scoped token, and global logical project creation with a completed D1 audit operation. It does not execute regional work or provision databases, and M3 remains incomplete.
+M3 has a [deployed Dev control API foundation checkpoint](docs/evidence/m3-logical-projects-2026-09-28.md): organization bootstrap, paginated recovery listing, region registration with a scoped token, and global logical project creation with a completed D1 audit operation. The newer [environment execution checkpoint](docs/evidence/m3-environment-execution-2026-09-28.md) records implemented immutable catalogs, explicit region admission, idempotent environment intents, fenced regional leases/results, and a CNPG controller that reconciles deterministic internal resources. Migration `0005` and the updated Worker are deployed; live readback verified closed admission, regional claim authorization, and preserved logical-project state. Local Worker/Node tests, package build, and container checks passed, but controller publication/deployment and API-to-CNPG qualification remain pending. No catalog or API-managed environment has been created. A ready observation does not yet supply a usable customer endpoint or credentials. Usage, budgets, recovery, and the rest of M3 remain incomplete; admission stays closed until the region passes qualification.
+
+The public [Talos bootstrap recipe](infra/talos/README.md) and [Flux platform baseline](infra/platform/README.md) record pinned releases and ownership boundaries. They are installation assets, not evidence of unattended provider provisioning, live Flux adoption, staged maintenance, or an independently reproducible production installation. They preserve the existing single-node feasibility scope while M4/M8 acceptance remains open.
 
 ### Operational acceptance evidence
 
 Publish the workload, versions, topology, sample counts, and pass/fail thresholds before each implementation acceptance run. These are operational measurements; a pricing or break-even study is not required. The table lists milestone evidence areas, not instructions to generate test matrices or permutations: select only the concrete cases needed for the current change, subject to section 10.
 
-| Test | Measure | Acceptance rule |
-|---|---|---|
-| Talos bootstrap | Provision-to-ready duration, failed/repeated boots, operator interventions. | Reproducible authenticated bootstrap without manual console fixes; failed attempts recover without duplicate resources. |
-| Disk and competing tenants | Durable write/read latency, throughput, p95/p99 under realistic concurrent workloads. | Meet the declared workload target without cross-tenant disk exhaustion or loss of durability. |
-| Database density | Idle/active memory, reserved CPU, connection counts, and recovery headroom. | Demonstrate a safe capacity envelope, including a node failure/maintenance case; do not derive density from nominal RAM alone. |
-| Native and cold access | Connection-ready and end-to-end query p50/p95/p99, maxima, and timeout/error counts. | Meet the declared platform latency target and configured deadline behavior; consumers validate their own client timeout budgets separately. |
-| Resize and maintenance | Drain duration, reconnect window, failed/uncertain transactions, replica catch-up. | Bound interruption and prove correct error handling without blind write replay. |
-| Recovery and retention | Recoverable timestamps, recovered content, restore time, archive continuity, deleted objects. | Prove the declared history window, safe deletion, and recovery on a fresh cluster with distinct archive identity. |
-| Usage and budgets | Coverage, freshness, duplicate/correction handling, reservation accuracy, enforcement delay. | Reproducible reporting, no double consumption, bounded stop behavior, and explicit gaps rather than invented usage. |
-| Gateway/control outage | New/existing connection behavior, policy validity, usage-buffer recovery, allowance exhaustion. | Demonstrate the documented degraded behavior, failover and reconciliation without granting unlimited authority or deleting data. |
+| Test                       | Measure                                                                                         | Acceptance rule                                                                                                                             |
+| -------------------------- | ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| Talos bootstrap            | Provision-to-ready duration, failed/repeated boots, operator interventions.                     | Reproducible authenticated bootstrap without manual console fixes; failed attempts recover without duplicate resources.                     |
+| Disk and competing tenants | Durable write/read latency, throughput, p95/p99 under realistic concurrent workloads.           | Meet the declared workload target without cross-tenant disk exhaustion or loss of durability.                                               |
+| Database density           | Idle/active memory, reserved CPU, connection counts, and recovery headroom.                     | Demonstrate a safe capacity envelope, including a node failure/maintenance case; do not derive density from nominal RAM alone.              |
+| Native and cold access     | Connection-ready and end-to-end query p50/p95/p99, maxima, and timeout/error counts.            | Meet the declared platform latency target and configured deadline behavior; consumers validate their own client timeout budgets separately. |
+| Resize and maintenance     | Drain duration, reconnect window, failed/uncertain transactions, replica catch-up.              | Bound interruption and prove correct error handling without blind write replay.                                                             |
+| Recovery and retention     | Recoverable timestamps, recovered content, restore time, archive continuity, deleted objects.   | Prove the declared history window, safe deletion, and recovery on a fresh cluster with distinct archive identity.                           |
+| Usage and budgets          | Coverage, freshness, duplicate/correction handling, reservation accuracy, enforcement delay.    | Reproducible reporting, no double consumption, bounded stop behavior, and explicit gaps rather than invented usage.                         |
+| Gateway/control outage     | New/existing connection behavior, policy validity, usage-buffer recovery, allowance exhaustion. | Demonstrate the documented degraded behavior, failover and reconciliation without granting unlimited authority or deleting data.            |
 
 ## 9. Decisions to deepen before implementation and release
 
@@ -278,7 +280,7 @@ During iteration, run only explicitly named test files in packages changed by th
 
 After freezing the final candidate, run the full gate **exactly once**: format, lint, typecheck, Vitest, and `test:node`. Use the repository's canonical commands (`pnpm format:check`, `pnpm lint`, `pnpm typecheck`, `pnpm vitest run`, `pnpm test:node`) once the runtime/tooling scaffold exists. Do not run the full gate during iteration, repeat it for reassurance, or silently change the candidate and restart a broad verification loop. If the final gate fails, stop and report the result and required next step.
 
-Documentation-only work checks the edited documents, links, and diff; do not invent runtime tests or package tooling just to test prose. This documentation-only repository has no executable full gate yet; record that fact rather than claiming a test pass.
+Documentation-only work checks the edited documents, links, and diff; do not invent runtime tests or package tooling just to test prose. The executable workspace gate is for frozen runtime candidates, not a reason to rerun all tests for document edits.
 
 ### Mandatory stop conditions
 

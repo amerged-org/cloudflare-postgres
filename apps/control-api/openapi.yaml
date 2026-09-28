@@ -3,10 +3,11 @@ info:
   title: Cloudflare Postgres Control API
   version: 0.1.0
   description: >-
-    First management slice. Projects are global logical containers created
-    immediately; an active project does not contain a database or connection
-    endpoint. Region registration issues a scoped executor token, but no
-    regional operation claims or PostgreSQL provisioning are implemented.
+    Projects are global logical containers created immediately. Database
+    environments select an explicit admitted region and immutable profile
+    version. Regional executors lease environment.create operations and report
+    observed readiness. Ready does not imply an exposed connection endpoint,
+    customer credentials, or successful backup/recovery qualification.
 paths:
   /v1/regions:
     get:
@@ -56,9 +57,9 @@ paths:
       operationId: registerRegion
       summary: Register a region and reveal its executor token once
       description: >-
-        Registration records identity only. The region remains registered and
-        cannot yet claim operations or serve PostgreSQL connections. A region
-        name must be unique under exact, case-sensitive matching.
+        Registration records identity only. New environment admission is closed
+        until an installation operator explicitly publishes a catalog and opens
+        admission. A region name is unique under exact, case-sensitive matching.
       security:
         - installationToken: []
       requestBody:
@@ -378,6 +379,345 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /v1/regions/{regionId}/catalogs:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+    post:
+      operationId: publishRegionCatalog
+      summary: Publish an immutable regional profile version
+      description: >-
+        Installation-only trusted configuration. The body is bounded to 16384
+        UTF-8 bytes and 16 unique profiles. Versions cannot be replaced or
+        deleted. Publishing does not open admission or prove qualification.
+        The response omits internal storage mapping and backup locations/refs.
+      security:
+        - installationToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [version, profiles]
+              properties:
+                version:
+                  $ref: "#/components/schemas/CatalogVersion"
+                profiles:
+                  type: array
+                  minItems: 1
+                  maxItems: 16
+                  items:
+                    $ref: "#/components/schemas/OperatorProfile"
+      responses:
+        "201":
+          description: Immutable catalog published
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [catalog]
+                properties:
+                  catalog:
+                    $ref: "#/components/schemas/PublicCatalog"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The version already exists (catalog_version_conflict)
+  /v1/regions/{regionId}/admission:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+    get:
+      operationId: getRegionAdmission
+      summary: Read the separately mutable admission policy
+      security:
+        - installationToken: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdmissionResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    put:
+      operationId: setRegionAdmission
+      summary: Explicitly open or close admission for a published version
+      description: >-
+        Opening is an operator action after qualification; this API does not
+        verify backup evidence. Closing prevents new creation but does not revoke
+        already accepted environment operations or alter their frozen specs.
+      security:
+        - installationToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [catalogVersion, acceptingNewEnvironments]
+              properties:
+                catalogVersion:
+                  $ref: "#/components/schemas/CatalogVersion"
+                acceptingNewEnvironments:
+                  type: boolean
+      responses:
+        "200":
+          $ref: "#/components/responses/AdmissionResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: A disabled region cannot be opened
+  /v1/organizations/{organizationId}/regions/{regionId}/catalogs/{catalogVersion}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/RegionId"
+      - name: catalogVersion
+        in: path
+        required: true
+        schema:
+          $ref: "#/components/schemas/CatalogVersion"
+    get:
+      operationId: getPublicRegionCatalog
+      summary: Discover supported profiles without internal configuration
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Public catalog and current admission
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [catalog, admission]
+                properties:
+                  catalog:
+                    $ref: "#/components/schemas/PublicCatalog"
+                  admission:
+                    $ref: "#/components/schemas/Admission"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/organizations/{organizationId}/projects/{projectId}/environments:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      operationId: createEnvironment
+      summary: Accept a frozen environment specification for regional execution
+      description: >-
+        Requires projects:write, an active logical project, and admission for
+        the exact requested catalog version. There are no provider/customer
+        defaults. Environment, queued operation, and idempotency identity are
+        inserted atomically with a fresh admission check. Identical retries
+        preserve IDs and return current observed state even after admission
+        closes; changed content under the same organization-wide environment
+        key returns 409. No endpoint or credential is issued.
+      security:
+        - organizationToken: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: "^[A-Za-z0-9._~-]{1,128}$"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EnvironmentInput"
+      responses:
+        "202":
+          description: Accepted environment and current operation state
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentOperationResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Admission closed, project not active, or idempotency conflict
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - name: environmentId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getEnvironment
+      summary: Observe an environment in its authorized project
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Public environment state without internal routing or secrets
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [environment]
+                properties:
+                  environment:
+                    $ref: "#/components/schemas/Environment"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/regions/{regionId}/operations/claim:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+    post:
+      operationId: claimRegionalOperation
+      summary: Atomically lease one queued or expired environment operation
+      description: >-
+        Requires this region's operations:claim token. The private response
+        includes the complete frozen operator spec; do not expose it to tenants.
+        A claim increments its epoch and returns a random token stored only as a
+        hash. Competing claims cannot receive the same active operation.
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [leaseSeconds]
+              properties:
+                leaseSeconds:
+                  $ref: "#/components/schemas/LeaseSeconds"
+      responses:
+        "200":
+          description: One private execution claim, or null when no work is available
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [claim]
+                properties:
+                  claim:
+                    anyOf:
+                      - $ref: "#/components/schemas/ExecutionClaim"
+                      - type: "null"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/regions/{regionId}/operations/{operationId}/renew:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/OperationId"
+    post:
+      operationId: renewRegionalLease
+      summary: Extend a still-current unexpired execution lease
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [leaseToken, leaseEpoch, leaseSeconds]
+              properties:
+                leaseToken:
+                  $ref: "#/components/schemas/LeaseToken"
+                leaseEpoch:
+                  $ref: "#/components/schemas/LeaseEpoch"
+                leaseSeconds:
+                  $ref: "#/components/schemas/LeaseSeconds"
+      responses:
+        "200":
+          description: Lease renewed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [leaseExpiresAt]
+                properties:
+                  leaseExpiresAt:
+                    type: string
+                    format: date-time
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/LeaseConflict"
+  /v1/regions/{regionId}/operations/{operationId}/result:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/OperationId"
+    post:
+      operationId: reportRegionalResult
+      summary: Atomically publish fenced observed environment status
+      description: >-
+        Requires operations:report. A ready result requires at least the profile's
+        instance count and a cluster UID/generation; the executor is responsible
+        for reading actual CNPG and Pod readiness. D1 does not query Kubernetes.
+        An expired/reassigned lease or another region cannot publish a result.
+        Repeating the exact terminal result with the same lease remains safe
+        after an uncertain response; changed terminal content is rejected.
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExecutionResultInput"
+      responses:
+        "200":
+          description: Observed status recorded or identical terminal result replayed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/EnvironmentOperationResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/LeaseConflict"
 components:
   securitySchemes:
     installationToken:
@@ -390,7 +730,25 @@ components:
       description: >-
         Token issued once at organization bootstrap with projects:read,
         projects:write, and operations:read scopes.
+    regionToken:
+      type: http
+      scheme: bearer
+      description: Region-scoped executor token with operations:claim and operations:report.
   parameters:
+    ProjectId:
+      name: projectId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    OperationId:
+      name: operationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
     RegionId:
       name: regionId
       in: path
@@ -406,6 +764,22 @@ components:
         type: string
         format: uuid
   responses:
+    AdmissionResponse:
+      description: Current admission, closed by default
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [admission]
+            properties:
+              admission:
+                $ref: "#/components/schemas/Admission"
+    LeaseConflict:
+      description: Missing, expired, reassigned, or conflicting execution lease (lease_conflict)
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     InvalidRequest:
       description: Invalid request body, query parameter, or idempotency key
       content:
@@ -531,22 +905,431 @@ components:
           format: uuid
         kind:
           type: string
-          enum: [project.create]
+          enum: [project.create, environment.create]
         status:
           type: string
-          enum: [succeeded, queued]
-          description: New project.create operations succeed in the D1 create batch.
+          enum: [succeeded, queued, running, failed]
+          description: Projects succeed in D1; environments require regional execution.
+        environmentId:
+          type: string
+          format: uuid
+          description: Present only for environment operations.
         createdAt:
           type: string
           format: date-time
         observedAt:
           type: [string, "null"]
           format: date-time
-          description: Time the logical project creation was observed as complete.
+          description: Time the final result was observed.
         resultCode:
           type: [string, "null"]
-          enum: [logical_container_created, null]
-          description: Null only for unmatched legacy operations.
+          enum:
+            [
+              logical_container_created,
+              cnpg_ready,
+              ownership_mismatch,
+              spec_conflict,
+              reconcile_failed,
+              null,
+            ]
+          description: Null while an operation has no final observed result.
+    CatalogVersion:
+      type: string
+      pattern: "^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$"
+    Compute:
+      type: object
+      additionalProperties: false
+      required: [cpuMilli, memoryMiB]
+      properties:
+        cpuMilli:
+          type: integer
+          minimum: 1
+          maximum: 1000000
+        memoryMiB:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+    PublicStorage:
+      type: object
+      additionalProperties: false
+      required: [classId, minGiB, maxGiB, stepGiB]
+      properties:
+        classId:
+          type: string
+          pattern: "^[a-z][a-z0-9_-]{0,63}$"
+        minGiB:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+        maxGiB:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          description: Must be at least minGiB.
+        stepGiB:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          description: Allowed sizes are minGiB plus an integer multiple of stepGiB.
+    OperatorStorage:
+      type: object
+      additionalProperties: false
+      required: [classId, storageClassName, minGiB, maxGiB, stepGiB]
+      properties:
+        classId:
+          $ref: "#/components/schemas/PublicStorage/properties/classId"
+        storageClassName:
+          type: string
+          description: Internal Kubernetes StorageClass; never chosen or returned to tenants.
+          pattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+        minGiB:
+          $ref: "#/components/schemas/PublicStorage/properties/minGiB"
+        maxGiB:
+          $ref: "#/components/schemas/PublicStorage/properties/maxGiB"
+        stepGiB:
+          $ref: "#/components/schemas/PublicStorage/properties/stepGiB"
+    BackupPolicy:
+      type: object
+      additionalProperties: false
+      required: [retentionPolicy]
+      properties:
+        retentionPolicy:
+          type: string
+          pattern: "^[1-9][0-9]{0,3}[dwm]$"
+    OperatorBackupPolicy:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          region,
+          endpointURL,
+          destinationPath,
+          retentionPolicy,
+          credentialSecret,
+        ]
+      properties:
+        region:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9-]{0,62}$"
+          description: Explicit object-store signing region; R2 uses auto. No executor default.
+        endpointURL:
+          type: string
+          format: uri
+          description: HTTPS origin with root pathname, default port, and no credentials, query, or fragment.
+        destinationPath:
+          type: string
+          description: Operator-controlled S3 root; executor appends the immutable environment UUID.
+          pattern: "^s3://[a-z0-9][a-z0-9.-]{1,62}(?:/[A-Za-z0-9/._-]*)?$"
+        retentionPolicy:
+          $ref: "#/components/schemas/BackupPolicy/properties/retentionPolicy"
+        credentialSecret:
+          type: object
+          additionalProperties: false
+          required: [namespace, name, accessKeyIdKey, secretAccessKeyKey]
+          description: Private references only, never credential values; executor applies its local allowlist.
+          properties:
+            namespace:
+              type: string
+              pattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+            name:
+              type: string
+              pattern: "^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+            accessKeyIdKey:
+              type: string
+              pattern: "^[A-Za-z0-9._-]{1,253}$"
+            secretAccessKeyKey:
+              type: string
+              pattern: "^[A-Za-z0-9._-]{1,253}$"
+    PublicProfile:
+      type: object
+      additionalProperties: false
+      required: [id, postgresImage, compute, storage, instances, backup]
+      properties:
+        id:
+          type: string
+          pattern: "^[a-z][a-z0-9_-]{0,63}$"
+        postgresImage:
+          type: string
+          pattern: "^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$"
+        compute:
+          $ref: "#/components/schemas/Compute"
+        storage:
+          $ref: "#/components/schemas/PublicStorage"
+        instances:
+          type: integer
+          minimum: 1
+          maximum: 9
+        backup:
+          $ref: "#/components/schemas/BackupPolicy"
+    OperatorProfile:
+      type: object
+      additionalProperties: false
+      required: [id, postgresImage, compute, storage, instances, backup]
+      properties:
+        id:
+          $ref: "#/components/schemas/PublicProfile/properties/id"
+        postgresImage:
+          $ref: "#/components/schemas/PublicProfile/properties/postgresImage"
+        compute:
+          $ref: "#/components/schemas/Compute"
+        storage:
+          $ref: "#/components/schemas/OperatorStorage"
+        instances:
+          $ref: "#/components/schemas/PublicProfile/properties/instances"
+        backup:
+          $ref: "#/components/schemas/OperatorBackupPolicy"
+    PublicCatalog:
+      type: object
+      required: [regionId, version, profiles, catalogHash, createdAt]
+      properties:
+        regionId:
+          type: string
+          format: uuid
+        version:
+          $ref: "#/components/schemas/CatalogVersion"
+        profiles:
+          type: array
+          items:
+            $ref: "#/components/schemas/PublicProfile"
+        catalogHash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: Digest of complete operator profiles, not of the redacted public representation.
+        createdAt:
+          type: string
+          format: date-time
+    Admission:
+      type: object
+      required: [catalogVersion, acceptingNewEnvironments, updatedAt]
+      properties:
+        catalogVersion:
+          type: [string, "null"]
+          description: Null until the operator selects a published catalog.
+        acceptingNewEnvironments:
+          type: boolean
+        updatedAt:
+          type: [string, "null"]
+          format: date-time
+    EnvironmentInput:
+      type: object
+      additionalProperties: false
+      required: [name, regionId, catalogVersion, profileId, volumeGiB]
+      properties:
+        name:
+          $ref: "#/components/schemas/NameInput/properties/name"
+        regionId:
+          type: string
+          format: uuid
+        catalogVersion:
+          $ref: "#/components/schemas/CatalogVersion"
+        profileId:
+          $ref: "#/components/schemas/PublicProfile/properties/id"
+        volumeGiB:
+          type: integer
+          minimum: 1
+          maximum: 1048576
+          description: Must match the selected profile range and step.
+    PublicResolvedSpec:
+      type: object
+      additionalProperties: false
+      required: [name, regionId, catalogVersion, profileId, volumeGiB, profile]
+      properties:
+        name:
+          $ref: "#/components/schemas/NameInput/properties/name"
+        regionId:
+          type: string
+          format: uuid
+        catalogVersion:
+          $ref: "#/components/schemas/CatalogVersion"
+        profileId:
+          $ref: "#/components/schemas/PublicProfile/properties/id"
+        volumeGiB:
+          $ref: "#/components/schemas/EnvironmentInput/properties/volumeGiB"
+        profile:
+          $ref: "#/components/schemas/PublicProfile"
+    ExecutionSpec:
+      type: object
+      additionalProperties: false
+      required: [name, regionId, catalogVersion, profileId, volumeGiB, profile]
+      properties:
+        name:
+          $ref: "#/components/schemas/NameInput/properties/name"
+        regionId:
+          type: string
+          format: uuid
+        catalogVersion:
+          $ref: "#/components/schemas/CatalogVersion"
+        profileId:
+          $ref: "#/components/schemas/PublicProfile/properties/id"
+        volumeGiB:
+          $ref: "#/components/schemas/EnvironmentInput/properties/volumeGiB"
+        profile:
+          $ref: "#/components/schemas/OperatorProfile"
+    ReadyObservation:
+      type: object
+      additionalProperties: false
+      required: [clusterUid, clusterGeneration, readyInstances]
+      properties:
+        clusterUid:
+          type: string
+          minLength: 1
+          maxLength: 120
+        clusterGeneration:
+          type: integer
+          minimum: 1
+        readyInstances:
+          type: integer
+          minimum: 1
+          maximum: 9
+    Environment:
+      type: object
+      required:
+        [
+          id,
+          organizationId,
+          projectId,
+          regionId,
+          name,
+          status,
+          specRevision,
+          specHash,
+          resolvedSpec,
+          createdAt,
+          observedAt,
+          observation,
+        ]
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        projectId:
+          type: string
+          format: uuid
+        regionId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        status:
+          type: string
+          enum: [pending, provisioning, ready, failed]
+        specRevision:
+          type: integer
+          const: 1
+        specHash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+          description: SHA-256 of JSON.stringify of the complete immutable execution spec, not this redacted view.
+        resolvedSpec:
+          $ref: "#/components/schemas/PublicResolvedSpec"
+        createdAt:
+          type: string
+          format: date-time
+        observedAt:
+          type: [string, "null"]
+          format: date-time
+        observation:
+          anyOf:
+            - $ref: "#/components/schemas/ReadyObservation"
+            - type: "null"
+    EnvironmentOperationResponse:
+      type: object
+      required: [environment, operation]
+      properties:
+        environment:
+          $ref: "#/components/schemas/Environment"
+        operation:
+          $ref: "#/components/schemas/Operation"
+    LeaseSeconds:
+      type: integer
+      minimum: 30
+      maximum: 300
+    LeaseToken:
+      type: string
+      pattern: "^cplease_[A-Za-z0-9_-]{43}$"
+    LeaseEpoch:
+      type: integer
+      minimum: 1
+    ExecutionClaim:
+      type: object
+      required:
+        [
+          operationId,
+          environmentId,
+          regionId,
+          kind,
+          leaseToken,
+          leaseEpoch,
+          leaseExpiresAt,
+          specRevision,
+          specHash,
+          spec,
+        ]
+      properties:
+        operationId:
+          type: string
+          format: uuid
+        environmentId:
+          type: string
+          format: uuid
+        regionId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          const: environment.create
+        leaseToken:
+          $ref: "#/components/schemas/LeaseToken"
+        leaseEpoch:
+          $ref: "#/components/schemas/LeaseEpoch"
+        leaseExpiresAt:
+          type: string
+          format: date-time
+        specRevision:
+          type: integer
+          const: 1
+        specHash:
+          type: string
+          pattern: "^[0-9a-f]{64}$"
+        spec:
+          $ref: "#/components/schemas/ExecutionSpec"
+    ExecutionResultInput:
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required: [leaseToken, leaseEpoch, status, resultCode, observation]
+          properties:
+            leaseToken:
+              $ref: "#/components/schemas/LeaseToken"
+            leaseEpoch:
+              $ref: "#/components/schemas/LeaseEpoch"
+            status:
+              type: string
+              const: ready
+            resultCode:
+              type: string
+              const: cnpg_ready
+            observation:
+              $ref: "#/components/schemas/ReadyObservation"
+        - type: object
+          additionalProperties: false
+          required: [leaseToken, leaseEpoch, status, resultCode, observation]
+          properties:
+            leaseToken:
+              $ref: "#/components/schemas/LeaseToken"
+            leaseEpoch:
+              $ref: "#/components/schemas/LeaseEpoch"
+            status:
+              type: string
+              const: failed
+            resultCode:
+              type: string
+              enum: [ownership_mismatch, spec_conflict, reconcile_failed]
+            observation:
+              type: "null"
     Error:
       type: object
       required: [error]

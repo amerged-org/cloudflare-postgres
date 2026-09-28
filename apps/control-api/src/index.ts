@@ -1,3 +1,5 @@
+import { environmentRoutes } from "./environments";
+
 type Env = Cloudflare.Env;
 
 type Scope = "projects:read" | "projects:write" | "operations:read";
@@ -42,6 +44,7 @@ interface OperationRow {
   created_at: string;
   observed_at: string | null;
   result_code: string | null;
+  environment_id?: string | null;
 }
 
 interface IdempotencyRow {
@@ -565,6 +568,7 @@ function operationFromRow(row: OperationRow) {
     createdAt: row.created_at,
     observedAt: row.observed_at,
     resultCode: row.result_code,
+    ...(row.environment_id ? { environmentId: row.environment_id } : {}),
   };
 }
 
@@ -761,6 +765,8 @@ async function getOperation(
 
 export default {
   async fetch(request, env): Promise<Response> {
+    const environmentResponse = await environmentRoutes(request, env);
+    if (environmentResponse) return environmentResponse;
     const pathname = new URL(request.url).pathname;
     if (request.method === "POST" && pathname === "/v1/regions") {
       return registerRegion(request, env);

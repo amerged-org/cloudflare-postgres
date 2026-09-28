@@ -1,0 +1,99 @@
+{
+  "schemaVersion": 1,
+  "verifiedOn": "2026-09-28",
+  "target": {
+    "talosVersion": "1.14.1",
+    "kubernetesVersion": "1.36.3",
+    "topology": "Single-node feasibility baseline; no availability guarantee."
+  },
+  "flux": {
+    "version": "v2.9.5",
+    "releaseURL": "https://github.com/fluxcd/flux2/releases/tag/v2.9.5",
+    "installManifestURL": "https://github.com/fluxcd/flux2/releases/download/v2.9.5/install.yaml",
+    "installManifestSha256": "cc3dcd743af16215838b6937e1fce83745bf24c0dcc6c59737c59df15429caaf"
+  },
+  "charts": [
+    {
+      "name": "cilium",
+      "chartVersion": "1.20.2",
+      "appVersion": "1.20.2",
+      "source": "oci://quay.io/cilium/charts/cilium",
+      "ociManifestDigest": "sha256:a7c12d330dd96bfcda3bf057b24be8f36566c34868265f930f776dff6f42d838",
+      "archiveSha256": "b2afd87b7f75f875f92a14559f14f59b7babbb479d968e3fd625a20bf30ec20e",
+      "documentationURL": "https://docs.cilium.io/en/stable/installation/k8s-install-helm/",
+      "releaseURL": "https://github.com/cilium/cilium/releases/tag/v1.20.2",
+      "renderedImages": [
+        "quay.io/cilium/cilium-envoy:v1.37.6-1789133542-cbec91f666af0bf742da986d43832932dbb26b82@sha256:af7382699576b9e65e9184efa52eeca0b58aea70ad6e511bf260c91d9f740463",
+        "quay.io/cilium/cilium:v1.20.2@sha256:2939231d0d3e3ebddcd80fffa168b7ddcc78fdf0dc864d1c8c126ff523c54f01",
+        "quay.io/cilium/operator-generic:v1.20.2@sha256:64d8798350e8569b8e7622563fed6e44dce2625f311e4651b774816516c744fc"
+      ]
+    },
+    {
+      "name": "openebs",
+      "chartVersion": "4.6.1",
+      "appVersion": "4.6.1",
+      "source": "https://openebs.github.io/openebs",
+      "indexURL": "https://openebs.github.io/openebs/index.yaml",
+      "archiveURL": "https://openebs.github.io/openebs/openebs-4.6.1.tgz",
+      "archiveSha256": "ac308a4252f67104bb147fc0f22f85f0a172ac65f433a06689c62efd4478633c",
+      "digestEnforcement": "Flux follows this version and the current repository index; this historical archive checksum is operator-verified, not an OCIRepository digest constraint.",
+      "enabledEngine": {
+        "name": "lvm-localpv",
+        "chartVersion": "1.10.1",
+        "appVersion": "1.10.1",
+        "source": "https://openebs.github.io/lvm-localpv",
+        "sourceURL": "https://github.com/openebs/lvm-localpv"
+      },
+      "documentationURL": "https://openebs.io/docs/main/quickstart-guide/installation",
+      "releaseURL": "https://github.com/openebs/openebs/releases/tag/v4.6.1",
+      "renderedImages": [
+        "docker.io/openebs/lvm-driver:1.10.1",
+        "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0",
+        "registry.k8s.io/sig-storage/csi-provisioner:v6.1.0",
+        "registry.k8s.io/sig-storage/csi-resizer:v2.0.0",
+        "registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0",
+        "registry.k8s.io/sig-storage/snapshot-controller:v8.2.0"
+      ]
+    },
+    {
+      "name": "cert-manager",
+      "chartVersion": "v1.21.2",
+      "appVersion": "v1.21.2",
+      "source": "oci://quay.io/jetstack/charts/cert-manager",
+      "ociManifestDigest": "sha256:634dce9c13b56677a2c05e2ab76c312d0be2664022d5dd05815da67e1fd5f610",
+      "archiveSha256": "73a56e1728edd6c99f1f31082618c3259d279a76b7ebd3d4bdc5475c2442d34a",
+      "documentationURL": "https://cert-manager.io/docs/installation/helm/",
+      "releaseURL": "https://github.com/cert-manager/cert-manager/releases/tag/v1.21.2",
+      "renderedImages": [
+        "quay.io/jetstack/cert-manager-cainjector:v1.21.2",
+        "quay.io/jetstack/cert-manager-controller:v1.21.2",
+        "quay.io/jetstack/cert-manager-startupapicheck:v1.21.2",
+        "quay.io/jetstack/cert-manager-webhook:v1.21.2"
+      ]
+    },
+    {
+      "name": "cloudnative-pg",
+      "chartVersion": "0.29.1",
+      "appVersion": "1.30.1",
+      "source": "oci://ghcr.io/cloudnative-pg/charts/cloudnative-pg",
+      "ociManifestDigest": "sha256:3245fa051bb21d0dd9246272f57a2760b4234817a164a3167d2a1e7fb9f63fd9",
+      "archiveSha256": "b53d3991fe84bcf38767e7702cae78666265427a127a26fff168ab4207d2b1df",
+      "documentationURL": "https://github.com/cloudnative-pg/charts/blob/cloudnative-pg-v0.29.1/.github/workflows/release-publish.yml",
+      "releaseURL": "https://github.com/cloudnative-pg/charts/releases/tag/cloudnative-pg-v0.29.1",
+      "renderedImages": ["ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1"]
+    },
+    {
+      "name": "plugin-barman-cloud",
+      "chartVersion": "0.8.0",
+      "appVersion": "v0.15.0",
+      "source": "oci://ghcr.io/cloudnative-pg/charts/plugin-barman-cloud",
+      "ociManifestDigest": "sha256:7c6b954f627ff91e511cb2e91854cfb1b7e96df5d30208494eb5d964da47303e",
+      "archiveSha256": "e9d8e8578d2757761fe5e1a761c762b54ccd02bc27df8ad251812aa2571c4d42",
+      "documentationURL": "https://github.com/cloudnative-pg/charts/blob/plugin-barman-cloud-v0.8.0/.github/workflows/release-publish.yml",
+      "releaseURL": "https://github.com/cloudnative-pg/charts/releases/tag/plugin-barman-cloud-v0.8.0",
+      "renderedImages": ["ghcr.io/cloudnative-pg/plugin-barman-cloud:v0.15.0"],
+      "runtimeSidecarImage": "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.15.0"
+    }
+  ],
+  "verificationScope": "Official chart versions, chart/app mappings, registry manifest digests, archive checksums, offline Helm lint/render and Kustomize build. Container image tag references remain as shipped by the pinned charts except digest defaults already shipped by Cilium; image signature and tag-to-digest verification are not claimed."
+}

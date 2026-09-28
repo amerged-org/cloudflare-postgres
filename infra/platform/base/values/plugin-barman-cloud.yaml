@@ -1,0 +1,9 @@
+replicaCount: 1
+image:
+  tag: v0.15.0
+sidecarImage:
+  tag: v0.15.0
+crds:
+  create: true
+certificate:
+  createClientCertificate: true

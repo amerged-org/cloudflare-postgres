@@ -1,0 +1,36 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespaces.yaml
+  - sources.yaml
+  - releases/cilium.yaml
+  - releases/openebs.yaml
+  - releases/cert-manager.yaml
+  - releases/cloudnative-pg.yaml
+  - releases/plugin-barman-cloud.yaml
+  - storageclass.yaml
+configMapGenerator:
+  - name: pgcf-cilium-values
+    namespace: flux-system
+    files:
+      - values.yaml=values/cilium.yaml
+  - name: pgcf-openebs-values
+    namespace: flux-system
+    files:
+      - values.yaml=values/openebs.yaml
+  - name: pgcf-cert-manager-values
+    namespace: flux-system
+    files:
+      - values.yaml=values/cert-manager.yaml
+  - name: pgcf-cloudnative-pg-values
+    namespace: flux-system
+    files:
+      - values.yaml=values/cloudnative-pg.yaml
+  - name: pgcf-plugin-barman-cloud-values
+    namespace: flux-system
+    files:
+      - values.yaml=values/plugin-barman-cloud.yaml
+generatorOptions:
+  disableNameSuffixHash: true
+  labels:
+    reconcile.fluxcd.io/watch: Enabled

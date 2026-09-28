@@ -1,0 +1,15 @@
+# Only the explicit public build inputs may enter the image build context.
+**
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!LICENSE
+!apps/
+!apps/control-api/
+!apps/control-api/package.json
+!apps/regional-controller/
+!apps/regional-controller/package.json
+!apps/regional-controller/tsconfig.json
+!apps/regional-controller/Dockerfile
+!apps/regional-controller/src/
+!apps/regional-controller/src/**

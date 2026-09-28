@@ -1,0 +1,36 @@
+apiVersion: helm.toolkit.fluxcd.io/v2
+kind: HelmRelease
+metadata:
+  name: plugin-barman-cloud
+  namespace: flux-system
+  labels:
+    kustomize.toolkit.fluxcd.io/prune: disabled
+spec:
+  interval: 30m
+  timeout: 5m
+  releaseName: plugin-barman-cloud
+  targetNamespace: cnpg-system
+  storageNamespace: cnpg-system
+  dependsOn:
+    - name: cloudnative-pg
+      namespace: flux-system
+    - name: cert-manager
+      namespace: flux-system
+  chartRef:
+    kind: OCIRepository
+    name: plugin-barman-cloud-chart
+    namespace: flux-system
+  install:
+    crds: CreateReplace
+    remediation:
+      retries: 0
+  upgrade:
+    crds: CreateReplace
+    remediation:
+      retries: 0
+  driftDetection:
+    mode: enabled
+  valuesFrom:
+    - kind: ConfigMap
+      name: pgcf-plugin-barman-cloud-values
+      valuesKey: values.yaml

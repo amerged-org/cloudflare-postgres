@@ -1,0 +1,15 @@
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: pgcf-lvm
+  labels:
+    kustomize.toolkit.fluxcd.io/prune: disabled
+provisioner: local.csi.openebs.io
+parameters:
+  storage: lvm
+  vgpattern: "^pgcf$"
+  thinProvision: "no"
+  fsType: ext4
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true
+reclaimPolicy: Retain

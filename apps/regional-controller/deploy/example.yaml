@@ -1,0 +1,185 @@
+# SPDX-License-Identifier: Apache-2.0
+# Replace the origin, region, image, and installed operator selector before use.
+# Supply the existing pgcf-region-access Secret separately; do not commit it.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgcf-system
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: regional-controller
+  namespace: pgcf-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgcf-regional-controller
+rules:
+  - apiGroups: [""]
+    resources: [namespaces, resourcequotas, limitranges]
+    verbs: [get, create]
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [list]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [archive-credentials]
+    verbs: [get]
+  # Kubernetes RBAC cannot constrain create by resourceNames. A validating
+  # admission policy must enforce the controller's owned namespace/name prefix
+  # before granting this identity to an untrusted production environment.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [create]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, create]
+  - apiGroups: [cilium.io]
+    resources: [ciliumnetworkpolicies]
+    verbs: [get, create]
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters]
+    verbs: [get, create]
+  - apiGroups: [barmancloud.cnpg.io]
+    resources: [objectstores]
+    verbs: [get, create]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgcf-regional-controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgcf-regional-controller
+subjects:
+  - kind: ServiceAccount
+    name: regional-controller
+    namespace: pgcf-system
+---
+# A separate Role grants access only to the explicitly configured source Secret.
+# Its namespace must already exist and remain accessible only to operators.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pgcf-read-backup-credentials
+  namespace: platform-secrets
+rules:
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [private-backup-credentials]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pgcf-read-backup-credentials
+  namespace: platform-secrets
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pgcf-read-backup-credentials
+subjects:
+  - kind: ServiceAccount
+    name: regional-controller
+    namespace: pgcf-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: regional-controller
+  namespace: pgcf-system
+data:
+  control-origin: https://control.example.invalid
+  region-id: REPLACE_WITH_REGISTERED_REGION_ID
+  config.json: |
+    {
+      "operatorNamespace": "cnpg-system",
+      "operatorPodLabels": { "app.kubernetes.io/name": "cloudnative-pg" },
+      "allowedBackupSecrets": [{
+        "namespace": "platform-secrets",
+        "name": "private-backup-credentials",
+        "accessKeyIdKey": "ACCESS_KEY_ID",
+        "secretAccessKeyKey": "SECRET_ACCESS_KEY"
+      }]
+    }
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: regional-controller
+  namespace: pgcf-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgcf-regional-controller
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pgcf-regional-controller
+    spec:
+      serviceAccountName: regional-controller
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: controller
+          image: registry.example.invalid/cloudflare-postgres/regional-controller:REPLACE_WITH_RELEASE
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          env:
+            - name: PGCF_CONTROL_ORIGIN
+              valueFrom:
+                configMapKeyRef:
+                  name: regional-controller
+                  key: control-origin
+            - name: PGCF_REGION_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: regional-controller
+                  key: region-id
+            - name: PGCF_REGIONAL_CONFIG_FILE
+              value: /etc/pgcf/config.json
+            - name: PGCF_REGION_TOKEN_FILE
+              value: /var/run/pgcf-region/token
+          volumeMounts:
+            - name: configuration
+              mountPath: /etc/pgcf
+              readOnly: true
+            - name: region-access
+              mountPath: /var/run/pgcf-region
+              readOnly: true
+      volumes:
+        - name: configuration
+          configMap:
+            name: regional-controller
+            items:
+              - key: config.json
+                path: config.json
+        - name: region-access
+          secret:
+            secretName: pgcf-region-access
+            defaultMode: 0440
+            items:
+              - key: token
+                path: token

@@ -1,0 +1,21 @@
+# Copy into an ignored local directory and replace every REPLACE_WITH_* value.
+machine:
+  network:
+    interfaces:
+      - deviceSelector:
+          hardwareAddr: REPLACE_WITH_NODE_MAC
+        addresses:
+          - REPLACE_WITH_NODE_IPV4/REPLACE_WITH_PREFIX_LENGTH
+        routes:
+          - network: 0.0.0.0/0
+            gateway: REPLACE_WITH_NODE_GATEWAY
+        dhcp: false
+---
+apiVersion: v1alpha1
+kind: ResolverConfig
+nameservers:
+  - address: 1.1.1.1
+  - address: 1.0.0.1
+hostDNS:
+  enabled: true
+  forwardKubeDNSToHost: true

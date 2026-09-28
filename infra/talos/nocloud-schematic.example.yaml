@@ -1,0 +1,5 @@
+# This schematic contains network bootstrap data only, never cluster secrets.
+# Replace placeholders in an ignored local copy before sending to Image Factory.
+customization:
+  extraKernelArgs:
+    - "ip=REPLACE_WITH_NODE_IPV4::REPLACE_WITH_NODE_GATEWAY:REPLACE_WITH_PREFIX_LENGTH::eth0:off:1.1.1.1:1.0.0.1"

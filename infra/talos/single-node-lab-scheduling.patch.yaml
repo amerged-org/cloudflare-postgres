@@ -1,0 +1,6 @@
+# Makes a single control-plane node schedulable for the disposable M1 lab.
+apiVersion: v1alpha1
+kind: KubeNodeConfig
+taints:
+  node-role.kubernetes.io/control-plane:
+    $patch: delete

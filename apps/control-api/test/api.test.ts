@@ -458,3 +458,484 @@ it("replays an identical project request and rejects a changed request under the
     status: "queued",
   });
 });
+
+const installationHeaders = {
+  authorization: "Bearer test-installation-token",
+  "content-type": "application/json",
+};
+
+const environmentProfile = {
+  id: "standard",
+  postgresImage: `ghcr.io/cloudnative-pg/postgresql@sha256:${"a".repeat(64)}`,
+  compute: { cpuMilli: 500, memoryMiB: 512 },
+  storage: {
+    classId: "local-volume",
+    storageClassName: "private-storage-class",
+    minGiB: 4,
+    maxGiB: 64,
+    stepGiB: 4,
+  },
+  instances: 1,
+  backup: {
+    region: "auto",
+    endpointURL: "https://object-store.example.test",
+    destinationPath: "s3://operator-backups/environments",
+    retentionPolicy: "30d",
+    credentialSecret: {
+      namespace: "platform-secrets",
+      name: "private-backup-credentials",
+      accessKeyIdKey: "ACCESS_KEY_ID",
+      secretAccessKeyKey: "SECRET_ACCESS_KEY",
+    },
+  },
+};
+
+interface TestEnvironment {
+  id: string;
+  status: string;
+  specHash: string;
+  resolvedSpec: { volumeGiB: number; profile: typeof environmentProfile };
+}
+
+interface TestClaim {
+  operationId: string;
+  environmentId: string;
+  regionId: string;
+  leaseToken: string;
+  leaseEpoch: number;
+  leaseExpiresAt: string;
+  specHash: string;
+  spec: { volumeGiB: number; profile: typeof environmentProfile };
+}
+
+async function environmentFixture(label: string) {
+  const owner = await bootstrap(`${label} owner`);
+  const regionResponse = await call("/v1/regions", {
+    method: "POST",
+    headers: installationHeaders,
+    body: JSON.stringify({ name: `${label} region` }),
+  });
+  expect(regionResponse.status).toBe(201);
+  const region = (await regionResponse.json()) as {
+    region: { id: string };
+    apiToken: string;
+  };
+  const projectResponse = await call(
+    `/v1/organizations/${owner.organization.id}/projects`,
+    {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${owner.apiToken}`,
+        "content-type": "application/json",
+        "idempotency-key": "logical-project",
+      },
+      body: JSON.stringify({ name: `${label} project` }),
+    },
+  );
+  expect(projectResponse.status).toBe(201);
+  const { project } = (await projectResponse.json()) as {
+    project: { id: string };
+  };
+  return {
+    owner,
+    regionId: region.region.id,
+    regionHeaders: {
+      authorization: `Bearer ${region.apiToken}`,
+      "content-type": "application/json",
+    },
+    path: `/v1/organizations/${owner.organization.id}/projects/${project.id}/environments`,
+    organizationHeaders: {
+      authorization: `Bearer ${owner.apiToken}`,
+      "content-type": "application/json",
+      "idempotency-key": "environment-request",
+    },
+    input: {
+      name: "Database environment",
+      regionId: region.region.id,
+      catalogVersion: "version-1",
+      profileId: environmentProfile.id,
+      volumeGiB: 8,
+    },
+  };
+}
+
+async function publishAndAdmit(regionId: string) {
+  const published = await call(`/v1/regions/${regionId}/catalogs`, {
+    method: "POST",
+    headers: installationHeaders,
+    body: JSON.stringify({
+      version: "version-1",
+      profiles: [environmentProfile],
+    }),
+  });
+  expect(published.status).toBe(201);
+  const admitted = await call(`/v1/regions/${regionId}/admission`, {
+    method: "PUT",
+    headers: installationHeaders,
+    body: JSON.stringify({
+      catalogVersion: "version-1",
+      acceptingNewEnvironments: true,
+    }),
+  });
+  expect(admitted.status).toBe(200);
+}
+
+it("creates a scoped immutable environment and observes its leased regional execution", async () => {
+  const fixture = await environmentFixture("Environment lifecycle");
+  const closed = await call(fixture.path, {
+    method: "POST",
+    headers: fixture.organizationHeaders,
+    body: JSON.stringify(fixture.input),
+  });
+  expect(closed.status).toBe(409);
+  const backupWithoutRegion: Omit<
+    typeof environmentProfile.backup,
+    "region"
+  > & { region?: string } = { ...environmentProfile.backup };
+  delete backupWithoutRegion.region;
+  const missingBackupRegion = await call(
+    `/v1/regions/${fixture.regionId}/catalogs`,
+    {
+      method: "POST",
+      headers: installationHeaders,
+      body: JSON.stringify({
+        version: "missing-backup-region",
+        profiles: [{ ...environmentProfile, backup: backupWithoutRegion }],
+      }),
+    },
+  );
+  expect(missingBackupRegion.status).toBe(400);
+  const invalidEndpoint = await call(
+    `/v1/regions/${fixture.regionId}/catalogs`,
+    {
+      method: "POST",
+      headers: installationHeaders,
+      body: JSON.stringify({
+        version: "unsupported-endpoint",
+        profiles: [
+          {
+            ...environmentProfile,
+            backup: {
+              ...environmentProfile.backup,
+              endpointURL: "https://object-store.example.test/unsupported",
+            },
+          },
+        ],
+      }),
+    },
+  );
+  expect(invalidEndpoint.status).toBe(400);
+  await publishAndAdmit(fixture.regionId);
+
+  const forbiddenCatalog = await call(
+    `/v1/regions/${fixture.regionId}/catalogs`,
+    {
+      method: "POST",
+      headers: fixture.organizationHeaders,
+      body: JSON.stringify({
+        version: "unauthorized",
+        profiles: [environmentProfile],
+      }),
+    },
+  );
+  expect(forbiddenCatalog.status).toBe(401);
+  const duplicateCatalog = await call(
+    `/v1/regions/${fixture.regionId}/catalogs`,
+    {
+      method: "POST",
+      headers: installationHeaders,
+      body: JSON.stringify({
+        version: "version-1",
+        profiles: [{ ...environmentProfile, instances: 2 }],
+      }),
+    },
+  );
+  expect(duplicateCatalog.status).toBe(409);
+  const catalog = await call(
+    `/v1/organizations/${fixture.owner.organization.id}/regions/${fixture.regionId}/catalogs/version-1`,
+    { headers: fixture.organizationHeaders },
+  );
+  expect(catalog.status).toBe(200);
+  const publicCatalog = JSON.stringify(await catalog.json());
+  expect(publicCatalog).not.toContain(
+    environmentProfile.storage.storageClassName,
+  );
+  expect(publicCatalog).not.toContain(
+    environmentProfile.backup.credentialSecret.name,
+  );
+
+  const created = await call(fixture.path, {
+    method: "POST",
+    headers: fixture.organizationHeaders,
+    body: JSON.stringify(fixture.input),
+  });
+  expect(created.status).toBe(202);
+  const body = (await created.json()) as {
+    environment: TestEnvironment;
+    operation: { id: string; kind: string; status: string };
+  };
+  expect(body.environment.status).toBe("pending");
+  expect(body.operation).toMatchObject({
+    kind: "environment.create",
+    status: "queued",
+  });
+  expect(JSON.stringify(body)).not.toContain(
+    environmentProfile.storage.storageClassName,
+  );
+  expect(JSON.stringify(body)).not.toContain(
+    environmentProfile.backup.credentialSecret.name,
+  );
+  const stored = await env.DB.prepare(
+    "SELECT resolved_spec FROM environments WHERE id = ?",
+  )
+    .bind(body.environment.id)
+    .first<{ resolved_spec: string }>();
+  expect(JSON.parse(stored!.resolved_spec).profile).toEqual(environmentProfile);
+  await expect(
+    env.DB.prepare("UPDATE environments SET resolved_spec = '{}' WHERE id = ?")
+      .bind(body.environment.id)
+      .run(),
+  ).rejects.toThrow();
+
+  const newer = await call(`/v1/regions/${fixture.regionId}/catalogs`, {
+    method: "POST",
+    headers: installationHeaders,
+    body: JSON.stringify({
+      version: "version-2",
+      profiles: [
+        { ...environmentProfile, compute: { cpuMilli: 1000, memoryMiB: 1024 } },
+      ],
+    }),
+  });
+  expect(newer.status).toBe(201);
+  const closedAgain = await call(`/v1/regions/${fixture.regionId}/admission`, {
+    method: "PUT",
+    headers: installationHeaders,
+    body: JSON.stringify({
+      catalogVersion: "version-2",
+      acceptingNewEnvironments: false,
+    }),
+  });
+  expect(closedAgain.status).toBe(200);
+  const replay = await call(fixture.path, {
+    method: "POST",
+    headers: fixture.organizationHeaders,
+    body: JSON.stringify(fixture.input),
+  });
+  expect(replay.status).toBe(202);
+  expect(await replay.json()).toEqual(body);
+  const changed = await call(fixture.path, {
+    method: "POST",
+    headers: fixture.organizationHeaders,
+    body: JSON.stringify({ ...fixture.input, volumeGiB: 12 }),
+  });
+  expect(changed.status).toBe(409);
+  const foreign = await bootstrap("Foreign environment reader");
+  const forbiddenRead = await call(`${fixture.path}/${body.environment.id}`, {
+    headers: { authorization: `Bearer ${foreign.apiToken}` },
+  });
+  expect(forbiddenRead.status).toBe(404);
+
+  const claimed = await call(
+    `/v1/regions/${fixture.regionId}/operations/claim`,
+    {
+      method: "POST",
+      headers: fixture.regionHeaders,
+      body: JSON.stringify({ leaseSeconds: 60 }),
+    },
+  );
+  expect(claimed.status).toBe(200);
+  const { claim } = (await claimed.json()) as { claim: TestClaim };
+  expect(claim).toMatchObject({
+    operationId: body.operation.id,
+    environmentId: body.environment.id,
+    regionId: fixture.regionId,
+    specHash: body.environment.specHash,
+    spec: { volumeGiB: 8, profile: environmentProfile },
+  });
+  const renewed = await call(
+    `/v1/regions/${fixture.regionId}/operations/${claim.operationId}/renew`,
+    {
+      method: "POST",
+      headers: fixture.regionHeaders,
+      body: JSON.stringify({
+        leaseToken: claim.leaseToken,
+        leaseEpoch: claim.leaseEpoch,
+        leaseSeconds: 90,
+      }),
+    },
+  );
+  expect(renewed.status).toBe(200);
+  const resultInput = {
+    leaseToken: claim.leaseToken,
+    leaseEpoch: claim.leaseEpoch,
+    status: "ready",
+    resultCode: "cnpg_ready",
+    observation: {
+      clusterUid: "kubernetes-uid",
+      clusterGeneration: 1,
+      readyInstances: 1,
+    },
+  };
+  const resultPath = `/v1/regions/${fixture.regionId}/operations/${claim.operationId}/result`;
+  const result = await call(resultPath, {
+    method: "POST",
+    headers: fixture.regionHeaders,
+    body: JSON.stringify(resultInput),
+  });
+  expect(result.status).toBe(200);
+  const duplicateResult = await call(resultPath, {
+    method: "POST",
+    headers: fixture.regionHeaders,
+    body: JSON.stringify(resultInput),
+  });
+  expect(duplicateResult.status).toBe(200);
+  expect(await duplicateResult.json()).toEqual(await result.json());
+  const observed = await call(`${fixture.path}/${body.environment.id}`, {
+    headers: fixture.organizationHeaders,
+  });
+  expect(observed.status).toBe(200);
+  expect(
+    ((await observed.json()) as { environment: TestEnvironment }).environment
+      .status,
+  ).toBe("ready");
+  const operation = await call(
+    `/v1/organizations/${fixture.owner.organization.id}/operations/${claim.operationId}`,
+    {
+      headers: fixture.organizationHeaders,
+    },
+  );
+  expect(
+    (
+      (await operation.json()) as {
+        operation: { status: string; resultCode: string };
+      }
+    ).operation,
+  ).toMatchObject({ status: "succeeded", resultCode: "cnpg_ready" });
+});
+
+it("fences competing, expired, and cross-region environment execution leases", async () => {
+  const fixture = await environmentFixture("Execution fencing");
+  const other = await environmentFixture("Other executor");
+  await publishAndAdmit(fixture.regionId);
+  const created = await call(fixture.path, {
+    method: "POST",
+    headers: fixture.organizationHeaders,
+    body: JSON.stringify(fixture.input),
+  });
+  expect(created.status).toBe(202);
+  const { environment, operation } = (await created.json()) as {
+    environment: TestEnvironment;
+    operation: { id: string };
+  };
+  const claimPath = `/v1/regions/${fixture.regionId}/operations/claim`;
+  const crossedClaim = await call(claimPath, {
+    method: "POST",
+    headers: other.regionHeaders,
+    body: JSON.stringify({ leaseSeconds: 60 }),
+  });
+  expect(crossedClaim.status).toBe(404);
+  const claimed = await Promise.all([
+    call(claimPath, {
+      method: "POST",
+      headers: fixture.regionHeaders,
+      body: JSON.stringify({ leaseSeconds: 60 }),
+    }),
+    call(claimPath, {
+      method: "POST",
+      headers: fixture.regionHeaders,
+      body: JSON.stringify({ leaseSeconds: 60 }),
+    }),
+  ]);
+  expect(claimed.map((response) => response.status)).toEqual([200, 200]);
+  const claimBodies = await Promise.all(
+    claimed.map(
+      (response) => response.json() as Promise<{ claim: TestClaim | null }>,
+    ),
+  );
+  expect(claimBodies.filter((body) => body.claim)).toHaveLength(1);
+  const first = claimBodies.find((body) => body.claim)!.claim!;
+  expect(first.operationId).toBe(operation.id);
+  await env.DB.prepare(
+    "UPDATE operations SET lease_expires_at = ? WHERE id = ?",
+  )
+    .bind("2000-01-01T00:00:00.000Z", operation.id)
+    .run();
+  const reclaimed = await call(claimPath, {
+    method: "POST",
+    headers: fixture.regionHeaders,
+    body: JSON.stringify({ leaseSeconds: 60 }),
+  });
+  expect(reclaimed.status).toBe(200);
+  const second = ((await reclaimed.json()) as { claim: TestClaim }).claim;
+  expect(second.leaseEpoch).toBe(first.leaseEpoch + 1);
+  expect(second.leaseToken).not.toBe(first.leaseToken);
+  const staleRenew = await call(
+    `/v1/regions/${fixture.regionId}/operations/${operation.id}/renew`,
+    {
+      method: "POST",
+      headers: fixture.regionHeaders,
+      body: JSON.stringify({
+        leaseToken: first.leaseToken,
+        leaseEpoch: first.leaseEpoch,
+        leaseSeconds: 60,
+      }),
+    },
+  );
+  expect(staleRenew.status).toBe(409);
+  const readyResult = {
+    leaseToken: first.leaseToken,
+    leaseEpoch: first.leaseEpoch,
+    status: "ready",
+    resultCode: "cnpg_ready",
+    observation: {
+      clusterUid: "stale-cluster",
+      clusterGeneration: 1,
+      readyInstances: 1,
+    },
+  };
+  const staleResult = await call(
+    `/v1/regions/${fixture.regionId}/operations/${operation.id}/result`,
+    {
+      method: "POST",
+      headers: fixture.regionHeaders,
+      body: JSON.stringify(readyResult),
+    },
+  );
+  expect(staleResult.status).toBe(409);
+  const crossedResult = await call(
+    `/v1/regions/${other.regionId}/operations/${operation.id}/result`,
+    {
+      method: "POST",
+      headers: other.regionHeaders,
+      body: JSON.stringify({
+        ...readyResult,
+        leaseToken: second.leaseToken,
+        leaseEpoch: second.leaseEpoch,
+      }),
+    },
+  );
+  expect(crossedResult.status).toBe(409);
+  const failed = await call(
+    `/v1/regions/${fixture.regionId}/operations/${operation.id}/result`,
+    {
+      method: "POST",
+      headers: fixture.regionHeaders,
+      body: JSON.stringify({
+        leaseToken: second.leaseToken,
+        leaseEpoch: second.leaseEpoch,
+        status: "failed",
+        resultCode: "ownership_mismatch",
+        observation: null,
+      }),
+    },
+  );
+  expect(failed.status).toBe(200);
+  const final = await call(`${fixture.path}/${environment.id}`, {
+    headers: fixture.organizationHeaders,
+  });
+  expect(
+    ((await final.json()) as { environment: TestEnvironment }).environment
+      .status,
+  ).toBe("failed");
+});
