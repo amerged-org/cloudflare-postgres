@@ -8,6 +8,8 @@ Bounded read-only observations verify the current CNPG `1.30.1` and manual Barma
 
 The manual source database is Ready with one instance and a Bound 5-GiB volume. Both existing SQL marker counts remain one. No Cluster backup plugin/configuration, ObjectStore, Backup or database initialization/recovery Job is present. Plugin discovery metadata and Certificate readiness do not prove an actual CNPG-I mTLS handshake or working sidecar.
 
+A separate read of the existing `SIDECAR_IMAGE` configuration retained only its public image reference, `ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.15.0`; no credential value or operator configuration was changed. Registry metadata confirms OCI index `sha256:06c78deca670525daa35fb1e5323159092785d11cf87b86217bdd5c679a41a84` and a Linux amd64 manifest `sha256:7b3069c61e5678a2fd05dd937ef47e0337bfbac1c05f1e1051901b9a7d54b391`. No image was pulled or run by this observation. The future database sidecar's actual runtime digest still requires readback; a matching tag alone is insufficient.
+
 The LVM node inventory reports 83,452 MiB free from 98,300 MiB total, four logical volumes and no missing physical volume. Two additional 5-GiB restore targets fit this storage observation. Current scheduled requests are 1,555 millicores and 3,034 MiB against approximately 3,950 millicores and 7,312 MiB allocatable. Two 250-millicore/512-MiB restore requests plus three assumed 100-millicore/128-MiB sidecars fit those request totals.
 
 Existing declared CPU/RAM limits are already oversubscribed. This observation does not qualify simultaneous peak load, backup memory use, growth, replica failure or autoscaling. Perform bounded sequential restores and recheck actual pressure before each operation.
