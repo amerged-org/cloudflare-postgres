@@ -1,0 +1,14 @@
+# Activate once only after the eleven guarded ownership transfers and preflight.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../existing-manual-barman
+patches:
+  - target:
+      group: helm.toolkit.fluxcd.io
+      version: v2
+      kind: HelmRelease
+      name: plugin-barman-cloud
+    patch: |-
+      - op: remove
+        path: /spec/suspend

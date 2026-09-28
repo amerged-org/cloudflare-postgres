@@ -1,0 +1,42 @@
+# Stage compatibility configuration with Barman suspended; four releases must be Ready.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: pgcf-platform
+  namespace: flux-system
+spec:
+  interval: 30m
+  url: https://github.com/amerged-org/cloudflare-postgres
+  ref:
+    commit: REPLACE_WITH_REVIEWED_COMMIT_SHA
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: pgcf-platform
+  namespace: flux-system
+spec:
+  interval: 30m
+  timeout: 5m
+  path: ./infra/platform/overlays/existing-manual-barman
+  prune: true
+  sourceRef:
+    kind: GitRepository
+    name: pgcf-platform
+  healthChecks:
+    - apiVersion: helm.toolkit.fluxcd.io/v2
+      kind: HelmRelease
+      name: cilium
+      namespace: flux-system
+    - apiVersion: helm.toolkit.fluxcd.io/v2
+      kind: HelmRelease
+      name: openebs
+      namespace: flux-system
+    - apiVersion: helm.toolkit.fluxcd.io/v2
+      kind: HelmRelease
+      name: cert-manager
+      namespace: flux-system
+    - apiVersion: helm.toolkit.fluxcd.io/v2
+      kind: HelmRelease
+      name: cloudnative-pg
+      namespace: flux-system

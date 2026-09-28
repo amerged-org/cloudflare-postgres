@@ -24,10 +24,14 @@ spec:
     crds: CreateReplace
     remediation:
       retries: 0
+    serverSideApply: true
+    disableTakeOwnership: true
   upgrade:
     crds: CreateReplace
     remediation:
       retries: 0
+    serverSideApply: enabled
+    disableTakeOwnership: true
   driftDetection:
     mode: enabled
   valuesFrom:
