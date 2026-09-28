@@ -9,6 +9,11 @@ export default defineConfig({
       miniflare: {
         bindings: {
           INSTALLATION_BOOTSTRAP_TOKEN: "test-installation-token",
+          // Public fixture key; real installations supply a Worker Secret.
+          ALLOWANCE_FENCE_KEYS: JSON.stringify({
+            active: "test-v1",
+            keys: { "test-v1": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA" },
+          }),
           TEST_MIGRATIONS: await readD1Migrations(
             path.join(import.meta.dirname, "migrations"),
           ),

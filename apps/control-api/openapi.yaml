@@ -7,7 +7,10 @@ info:
     environments select an explicit admitted region and immutable profile
     version. Regional executors lease environment.create operations and report
     observed readiness. Ready does not imply an exposed connection endpoint,
-    customer credentials, or successful backup/recovery qualification.
+    customer credentials, or successful backup/recovery qualification. Usage and
+    budget APIs record exact control authority. Budget and allowance resources
+    report runtimeEnforced false and pending_runtime until M6 runtime collection,
+    durable journals, supervision and expiry guards are qualified.
 paths:
   /v1/regions:
     get:
@@ -718,8 +721,586 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/LeaseConflict"
+  /v1/regions/{regionId}/usage-tokens/reissue:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+    post:
+      operationId: reissueUsageMeterToken
+      summary: Issue separate regional meter authority
+      description: >-
+        Installation-only. Revokes old cpmtr credential and returns usage:write once; source ID/epoch
+        survive rotation.
+      security:
+        - installationToken: []
+      responses:
+        "201":
+          description: Meter credential issued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageMeterTokenResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+        "503":
+          $ref: "#/components/responses/AccountingUnavailable"
+  /v1/regions/{regionId}/usage-facts:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+    post:
+      operationId: appendUsageRevision
+      summary: Append or replay an immutable usage revision
+      description: >-
+        Only cpmtr usage:write. Identity stays immutable; revisions are conditional. Accepted
+        settled-fact corrections update bound accounts atomically. Body limit: 8192 UTF-8 bytes.
+      security:
+        - usageMeterToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UsageFactInput"
+      responses:
+        "200":
+          description: Identical revision replayed without duplicate accounting.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageFactResponse"
+        "201":
+          description: New revision accepted.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageFactResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+        "503":
+          $ref: "#/components/responses/AccountingUnavailable"
+  /v1/organizations/{organizationId}/usage:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    get:
+      operationId: queryUsageSnapshot
+      summary: Read one tenant-bound fixed-snapshot usage page
+      description: >-
+        Unknown/repeated parameters are rejected. Page-local totals and unknown coverage do not assert
+        a complete window. Cursors preserve the acceptance snapshot across later corrections;
+        installation-secret rotation invalidates cursors.
+      security:
+        - organizationToken: []
+        - budgetGrantorToken: []
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/UsageMinuteBoundary"
+          description: Inclusive minute boundary; positive window at most 31 days.
+        - name: to
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/UsageMinuteBoundary"
+          description: Exclusive minute boundary; facts wholly within window only.
+        - name: projectId
+          in: query
+          schema:
+            $ref: "#/components/schemas/AccountingUuid"
+        - name: environmentId
+          in: query
+          schema:
+            $ref: "#/components/schemas/AccountingUuid"
+          description: Tenant-owned, matching projectId when supplied.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            maxLength: 2048
+          description: Opaque cursor bound to tenant/window/filters and fixed watermark; page size may change.
+      responses:
+        "200":
+          description: Fixed-watermark page; not a complete-window total.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsagePage"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+  /v1/organizations/{organizationId}/usage/export:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    get:
+      operationId: exportUsageSnapshotPage
+      summary: Export one usage snapshot page as NDJSON
+      description: >-
+        Unknown/repeated parameters are rejected. Page-local totals and unknown coverage do not assert
+        a complete window. Cursors preserve the acceptance snapshot across later corrections;
+        installation-secret rotation invalidates cursors. One bare UsageFact per line, followed by
+        UsageExportMetadata. Follow nextCursor for more pages.
+      security:
+        - organizationToken: []
+        - budgetGrantorToken: []
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/UsageMinuteBoundary"
+          description: Inclusive minute boundary; positive window at most 31 days.
+        - name: to
+          in: query
+          required: true
+          schema:
+            $ref: "#/components/schemas/UsageMinuteBoundary"
+          description: Exclusive minute boundary; facts wholly within window only.
+        - name: projectId
+          in: query
+          schema:
+            $ref: "#/components/schemas/AccountingUuid"
+        - name: environmentId
+          in: query
+          schema:
+            $ref: "#/components/schemas/AccountingUuid"
+          description: Tenant-owned, matching projectId when supplied.
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: cursor
+          in: query
+          schema:
+            type: string
+            maxLength: 2048
+          description: Opaque cursor bound to tenant/window/filters and fixed watermark; page size may change.
+      responses:
+        "200":
+          description: Fact lines followed by one metadata line, each newline terminated.
+          content:
+            application/x-ndjson:
+              schema:
+                type: string
+                description: Zero or more UsageFact lines then one UsageExportMetadata line.
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+  /v1/organizations/{organizationId}/budget-tokens/reissue:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    post:
+      operationId: reissueBudgetGrantorToken
+      summary: Issue separate organization budget-grantor authority
+      description: >-
+        Installation-only. Revokes old cpbgt token; ordinary projects:write never grants or increases
+        budgets.
+      security:
+        - installationToken: []
+      responses:
+        "201":
+          description: Grantor credential issued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BudgetGrantorTokenResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+  /v1/organizations/{organizationId}/projects/{projectId}/budget:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      operationId: getProjectBudget
+      summary: Read scoped budget authority and counters
+      security:
+        - organizationToken: []
+        - budgetGrantorToken: []
+      responses:
+        "200":
+          $ref: "#/components/responses/BudgetAuthorityResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+    put:
+      operationId: setProjectBudget
+      summary: Conditionally assign scoped resource allowances
+      description: >-
+        Only cpbgt budgets:write. CAS expectedRevision; account period/dimensions stay immutable. New
+        periods cannot cover recorded usage/allowances retrospectively. Changes advance
+        revision/epoch, not a hard runtime cap.
+      security:
+        - budgetGrantorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BudgetPolicyInput"
+      responses:
+        "200":
+          $ref: "#/components/responses/BudgetAuthorityResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+  /v1/organizations/{organizationId}/projects/{projectId}/budget/pause:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      operationId: pauseProjectBudget
+      summary: Request paused scoped budget state
+      description: >-
+        Configured budget and current decimal expectedRevision required. Changes requestedState/epoch,
+        not Pod or PostgreSQL runtime state.
+      security:
+        - budgetGrantorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BudgetActionInput"
+      responses:
+        "200":
+          $ref: "#/components/responses/BudgetAuthorityResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+  /v1/organizations/{organizationId}/projects/{projectId}/budget/resume:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      operationId: resumeProjectBudget
+      summary: Request running scoped budget state
+      description: >-
+        Configured budget and current decimal expectedRevision required. Changes requestedState/epoch,
+        not Pod or PostgreSQL runtime state.
+      security:
+        - budgetGrantorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BudgetActionInput"
+      responses:
+        "200":
+          $ref: "#/components/responses/BudgetAuthorityResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/budget:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+    get:
+      operationId: getEnvironmentBudget
+      summary: Read scoped budget authority and counters
+      security:
+        - organizationToken: []
+        - budgetGrantorToken: []
+      responses:
+        "200":
+          $ref: "#/components/responses/BudgetAuthorityResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+    put:
+      operationId: setEnvironmentBudget
+      summary: Conditionally assign scoped resource allowances
+      description: >-
+        Only cpbgt budgets:write. CAS expectedRevision; account period/dimensions stay immutable. New
+        periods cannot cover recorded usage/allowances retrospectively. Changes advance
+        revision/epoch, not a hard runtime cap.
+      security:
+        - budgetGrantorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BudgetPolicyInput"
+      responses:
+        "200":
+          $ref: "#/components/responses/BudgetAuthorityResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/budget/pause:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+    post:
+      operationId: pauseEnvironmentBudget
+      summary: Request paused scoped budget state
+      description: >-
+        Configured budget and current decimal expectedRevision required. Changes requestedState/epoch,
+        not Pod or PostgreSQL runtime state.
+      security:
+        - budgetGrantorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BudgetActionInput"
+      responses:
+        "200":
+          $ref: "#/components/responses/BudgetAuthorityResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/budget/resume:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+    post:
+      operationId: resumeEnvironmentBudget
+      summary: Request running scoped budget state
+      description: >-
+        Configured budget and current decimal expectedRevision required. Changes requestedState/epoch,
+        not Pod or PostgreSQL runtime state.
+      security:
+        - budgetGrantorToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BudgetActionInput"
+      responses:
+        "200":
+          $ref: "#/components/responses/BudgetAuthorityResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+  /v1/regions/{regionId}/allowance-reservations:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+    post:
+      operationId: reserveResourceAllowance
+      summary: Reserve project/environment resource authority atomically
+      description: >-
+        cprgn operations:claim. Checks every applicable budget dimension, retains expired holds, and
+        blocks on active/historical gaps. Same region/requestId/body replays receipt without extending
+        expiry. Dedicated ALLOWANCE_FENCE_KEYS is required; no M3 runtime enforcer exists.
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AllowanceIssueInput"
+      responses:
+        "200":
+          description: Existing receipt replayed; expiry unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AllowanceReceiptResponse"
+        "201":
+          description: Authority reserved; not runtime-enforced.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AllowanceReceiptResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+        "503":
+          $ref: "#/components/responses/AllowanceFenceUnavailable"
+  /v1/regions/{regionId}/allowance-reservations/{reservationId}:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/AllowanceReservationId"
+    get:
+      operationId: getAllowanceReservation
+      summary: Read a regional receipt with its private replayable fence
+      description: >-
+        cprgn operations:claim. Historical readback permits disabled region with valid token. Retained
+        key version in ALLOWANCE_FENCE_KEYS is required.
+      security:
+        - regionToken: []
+      responses:
+        "200":
+          description: Receipt and private fence.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AllowanceReceiptResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
+        "503":
+          $ref: "#/components/responses/AllowanceFenceUnavailable"
+  /v1/regions/{regionId}/allowance-reservations/{reservationId}/settlement:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/AllowanceReservationId"
+    post:
+      operationId: settleResourceAllowance
+      summary: Settle a fenced receipt with current accepted final facts
+      description: >-
+        cprgn operations:report. Explicit final evidence, including zero, is required for every
+        positive reserved metric. Existing links cannot be removed or moved. Actual overruns are
+        charged; accepted evidence replay is deduplicated. Larger settlements require Workers Paid or
+        a separately qualified lower Free reference limit.
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AllowanceSettlementInput"
+      responses:
+        "200":
+          description: Evidence settled and hold released; runtime enforcement pending.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AllowanceSettlementResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/AccountingConflict"
+        "500":
+          $ref: "#/components/responses/AccountingUnavailable"
 components:
   securitySchemes:
+    usageMeterToken:
+      type: http
+      scheme: bearer
+      description: Installer-issued cpmtr regional meter credential with usage:write only.
+    budgetGrantorToken:
+      type: http
+      scheme: bearer
+      description: >-
+        Installer-issued cpbgt organization grantor with budgets:read, budgets:write and usage:read;
+        projects:write never grants budgets.
     installationToken:
       type: http
       scheme: bearer
@@ -735,6 +1316,18 @@ components:
       scheme: bearer
       description: Region-scoped executor token with operations:claim and operations:report.
   parameters:
+    AccountingEnvironmentId:
+      name: environmentId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/AccountingUuid"
+    AllowanceReservationId:
+      name: reservationId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/AccountingUuid"
     ProjectId:
       name: projectId
       in: path
@@ -764,6 +1357,37 @@ components:
         type: string
         format: uuid
   responses:
+    BudgetAuthorityResponse:
+      description: Current budget authority; runtimeEnforced is false.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/BudgetAuthorityEnvelope"
+    AccountingConflict:
+      description: >-
+        Conditional revision/accounting conflict, invalid period/dimensions, budget pause/exhaustion,
+        unreconciled gaps/holds, or invalid reservation/usage/settlement evidence. Read current state
+        before a bounded retry.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    AccountingUnavailable:
+      description: >-
+        Accounting state, provider, configuration, or crypto unavailable. No private evidence or
+        credentials are returned.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    AllowanceFenceUnavailable:
+      description: >-
+        Dedicated fence keyring missing/invalid or retained key version unavailable
+        (fence_key_unavailable). No provider/bootstrap key fallback.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     AdmissionResponse:
       description: Current admission, closed by default
       content:
@@ -1340,3 +1964,714 @@ components:
           properties:
             code:
               type: string
+    AccountingUuid:
+      type: string
+      format: uuid
+      pattern: ^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$
+    AccountingInstant:
+      type: string
+      format: date-time
+      pattern: ^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$
+      description: Exact UTC millisecond timestamp.
+    UsageMinuteBoundary:
+      allOf:
+        - $ref: "#/components/schemas/AccountingInstant"
+      pattern: T\d{2}:\d{2}:00\.000Z$
+    AccountingDecimal:
+      type: string
+      pattern: ^(?:0|[1-9][0-9]*)$
+      description: Exact unsigned integer as decimal TEXT, never a floating-point JSON number.
+    AccountingInputDecimal:
+      allOf:
+        - $ref: "#/components/schemas/AccountingDecimal"
+      maxLength: 78
+      description: At most78 decimal digits; no leading zeroes, sign, fraction, or exponent.
+    AccountingMetric:
+      type: string
+      enum:
+        - cpu_millicore_ms
+        - memory_byte_ms
+        - data_storage_byte_ms
+        - backup_storage_byte_ms
+        - wal_storage_byte_ms
+        - transfer_in_bytes
+        - transfer_out_bytes
+    AccountingAttribution:
+      type: string
+      enum:
+        - primary
+        - replica
+        - backup
+        - wal
+        - platform
+    AccountingUnits:
+      type: object
+      required: []
+      properties:
+        cpu_millicore_ms:
+          $ref: "#/components/schemas/AccountingDecimal"
+        memory_byte_ms:
+          $ref: "#/components/schemas/AccountingDecimal"
+        data_storage_byte_ms:
+          $ref: "#/components/schemas/AccountingDecimal"
+        backup_storage_byte_ms:
+          $ref: "#/components/schemas/AccountingDecimal"
+        wal_storage_byte_ms:
+          $ref: "#/components/schemas/AccountingDecimal"
+        transfer_in_bytes:
+          $ref: "#/components/schemas/AccountingDecimal"
+        transfer_out_bytes:
+          $ref: "#/components/schemas/AccountingDecimal"
+      additionalProperties: false
+      description: Exact quantities; omitted metrics are absent, not evidence of observed zero.
+    AccountingUnitsInput:
+      type: object
+      required: []
+      properties:
+        cpu_millicore_ms:
+          $ref: "#/components/schemas/AccountingInputDecimal"
+        memory_byte_ms:
+          $ref: "#/components/schemas/AccountingInputDecimal"
+        data_storage_byte_ms:
+          $ref: "#/components/schemas/AccountingInputDecimal"
+        backup_storage_byte_ms:
+          $ref: "#/components/schemas/AccountingInputDecimal"
+        wal_storage_byte_ms:
+          $ref: "#/components/schemas/AccountingInputDecimal"
+        transfer_in_bytes:
+          $ref: "#/components/schemas/AccountingInputDecimal"
+        transfer_out_bytes:
+          $ref: "#/components/schemas/AccountingInputDecimal"
+      minProperties: 1
+      additionalProperties: false
+    AccountingEvidenceHash:
+      type: string
+      pattern: ^[0-9a-f]{64}$
+    UsageRevision:
+      type: integer
+      minimum: 1
+      maximum: 9007199254740991
+    UsageSourceEpoch:
+      type: integer
+      minimum: 1
+      maximum: 9007199254740991
+    UsagePredecessor:
+      type: integer
+      minimum: 0
+      maximum: 9007199254740991
+    UsageAcceptanceSequence:
+      allOf:
+        - $ref: "#/components/schemas/AccountingDecimal"
+      maxLength: 19
+      description: D1 acceptance sequence cast to TEXT; not a coverage guarantee.
+    UsageMeterTokenResponse:
+      type: object
+      required:
+        - regionId
+        - sourceId
+        - sourceEpoch
+        - apiToken
+        - scopes
+      properties:
+        regionId:
+          $ref: "#/components/schemas/AccountingUuid"
+        sourceId:
+          $ref: "#/components/schemas/AccountingUuid"
+        sourceEpoch:
+          $ref: "#/components/schemas/UsageSourceEpoch"
+        apiToken:
+          type: string
+          pattern: ^cpmtr_[A-Za-z0-9_-]{43}$
+        scopes:
+          type: array
+          minItems: 1
+          maxItems: 1
+          items:
+            type: string
+            const: usage:write
+    BudgetGrantorTokenResponse:
+      type: object
+      required:
+        - organizationId
+        - apiToken
+        - scopes
+      properties:
+        organizationId:
+          $ref: "#/components/schemas/AccountingUuid"
+        apiToken:
+          type: string
+          pattern: ^cpbgt_[A-Za-z0-9_-]{43}$
+        scopes:
+          type: array
+          minItems: 3
+          maxItems: 3
+          items:
+            type: string
+            enum:
+              - budgets:read
+              - budgets:write
+              - usage:read
+    BudgetPeriod:
+      type: object
+      required:
+        - start
+        - end
+      properties:
+        start:
+          $ref: "#/components/schemas/AccountingInstant"
+        end:
+          $ref: "#/components/schemas/AccountingInstant"
+      additionalProperties: false
+      description: Positive period; end is in the future at configuration. Account period is immutable.
+    BudgetPolicyInput:
+      type: object
+      required:
+        - expectedRevision
+        - period
+        - granted
+      properties:
+        expectedRevision:
+          $ref: "#/components/schemas/AccountingInputDecimal"
+        period:
+          $ref: "#/components/schemas/BudgetPeriod"
+        granted:
+          $ref: "#/components/schemas/AccountingUnitsInput"
+      additionalProperties: false
+      description: >-
+        Only cpbgt budgets:write. Omitted metrics are unlimited; zero is explicit. Dimension keys are
+        immutable within an account.
+    BudgetActionInput:
+      type: object
+      required:
+        - expectedRevision
+      properties:
+        expectedRevision:
+          $ref: "#/components/schemas/AccountingInputDecimal"
+      additionalProperties: false
+    BudgetAccount:
+      type: object
+      required:
+        - id
+        - period
+        - granted
+        - consumed
+        - reserved
+        - remaining
+        - overrun
+        - gapCount
+      properties:
+        id:
+          $ref: "#/components/schemas/AccountingUuid"
+        period:
+          $ref: "#/components/schemas/BudgetPeriod"
+        granted:
+          $ref: "#/components/schemas/AccountingUnits"
+        consumed:
+          $ref: "#/components/schemas/AccountingUnits"
+        reserved:
+          $ref: "#/components/schemas/AccountingUnits"
+        remaining:
+          $ref: "#/components/schemas/AccountingUnits"
+        overrun:
+          $ref: "#/components/schemas/AccountingUnits"
+        gapCount:
+          $ref: "#/components/schemas/AccountingDecimal"
+    AllowanceIssueInput:
+      type: object
+      required:
+        - requestId
+        - environmentId
+        - leaseSeconds
+        - units
+      properties:
+        requestId:
+          $ref: "#/components/schemas/AccountingUuid"
+        environmentId:
+          $ref: "#/components/schemas/AccountingUuid"
+        leaseSeconds:
+          $ref: "#/components/schemas/LeaseSeconds"
+        units:
+          $ref: "#/components/schemas/AccountingUnitsInput"
+      additionalProperties: false
+      description: >-
+        At least one quantity must be positive. Same region/requestId/body preserves receipt and expiry.
+        Whole lease must fit every applicable period.
+    AllowanceFenceToken:
+      type: string
+      pattern: ^cprsv_[A-Za-z0-9_-]{43}$
+      description: Private regional reservation fence; encrypted with dedicated AES-GCM keys and separately hashed.
+    AllowanceUsageReference:
+      type: object
+      required:
+        - factId
+        - revision
+      properties:
+        factId:
+          $ref: "#/components/schemas/AccountingUuid"
+        revision:
+          $ref: "#/components/schemas/UsageRevision"
+      additionalProperties: false
+    UsageFactInput:
+      type: object
+      required:
+        - factId
+        - environmentId
+        - sourceId
+        - sourceEpoch
+        - revision
+        - expectedPreviousRevision
+        - metric
+        - attribution
+        - start
+        - end
+        - quantity
+        - status
+        - evidenceHash
+      properties:
+        factId:
+          $ref: "#/components/schemas/AccountingUuid"
+        environmentId:
+          $ref: "#/components/schemas/AccountingUuid"
+        sourceId:
+          $ref: "#/components/schemas/AccountingUuid"
+        sourceEpoch:
+          $ref: "#/components/schemas/UsageSourceEpoch"
+        revision:
+          $ref: "#/components/schemas/UsageRevision"
+        expectedPreviousRevision:
+          $ref: "#/components/schemas/UsagePredecessor"
+        metric:
+          $ref: "#/components/schemas/AccountingMetric"
+        attribution:
+          $ref: "#/components/schemas/AccountingAttribution"
+        start:
+          $ref: "#/components/schemas/AccountingInstant"
+        end:
+          $ref: "#/components/schemas/AccountingInstant"
+        quantity:
+          anyOf:
+            - $ref: "#/components/schemas/AccountingInputDecimal"
+            - type: "null"
+        status:
+          type: string
+          enum:
+            - provisional
+            - final
+            - gap
+        evidenceHash:
+          $ref: "#/components/schemas/AccountingEvidenceHash"
+      additionalProperties: false
+      oneOf:
+        - properties:
+            status:
+              const: gap
+            quantity:
+              type: "null"
+        - properties:
+            status:
+              enum:
+                - provisional
+                - final
+            quantity:
+              $ref: "#/components/schemas/AccountingInputDecimal"
+      description: >-
+        Positive interval of at most 60000 ms wholly within one UTC minute. revision equals expectedPreviousRevision + 1.
+        Identity and accepted versions are immutable; gaps require null.
+    UsageFact:
+      type: object
+      required:
+        - factId
+        - environmentId
+        - sourceId
+        - sourceEpoch
+        - revision
+        - expectedPreviousRevision
+        - metric
+        - attribution
+        - start
+        - end
+        - quantity
+        - status
+        - evidenceHash
+        - organizationId
+        - projectId
+        - regionId
+        - acceptanceSequence
+        - acceptedAt
+      properties:
+        factId:
+          $ref: "#/components/schemas/AccountingUuid"
+        environmentId:
+          $ref: "#/components/schemas/AccountingUuid"
+        sourceId:
+          $ref: "#/components/schemas/AccountingUuid"
+        sourceEpoch:
+          $ref: "#/components/schemas/UsageSourceEpoch"
+        revision:
+          $ref: "#/components/schemas/UsageRevision"
+        expectedPreviousRevision:
+          $ref: "#/components/schemas/UsagePredecessor"
+        metric:
+          $ref: "#/components/schemas/AccountingMetric"
+        attribution:
+          $ref: "#/components/schemas/AccountingAttribution"
+        start:
+          $ref: "#/components/schemas/AccountingInstant"
+        end:
+          $ref: "#/components/schemas/AccountingInstant"
+        quantity:
+          anyOf:
+            - $ref: "#/components/schemas/AccountingInputDecimal"
+            - type: "null"
+        status:
+          type: string
+          enum:
+            - provisional
+            - final
+            - gap
+        evidenceHash:
+          $ref: "#/components/schemas/AccountingEvidenceHash"
+        organizationId:
+          $ref: "#/components/schemas/AccountingUuid"
+        projectId:
+          $ref: "#/components/schemas/AccountingUuid"
+        regionId:
+          $ref: "#/components/schemas/AccountingUuid"
+        acceptanceSequence:
+          $ref: "#/components/schemas/UsageAcceptanceSequence"
+        acceptedAt:
+          $ref: "#/components/schemas/AccountingInstant"
+      oneOf:
+        - properties:
+            status:
+              const: gap
+            quantity:
+              type: "null"
+        - properties:
+            status:
+              enum:
+                - provisional
+                - final
+            quantity:
+              $ref: "#/components/schemas/AccountingInputDecimal"
+    UsageFactResponse:
+      type: object
+      required:
+        - fact
+      properties:
+        fact:
+          $ref: "#/components/schemas/UsageFact"
+    UsageWindow:
+      type: object
+      required:
+        - from
+        - to
+        - projectId
+        - environmentId
+      properties:
+        from:
+          $ref: "#/components/schemas/UsageMinuteBoundary"
+        to:
+          $ref: "#/components/schemas/UsageMinuteBoundary"
+        projectId:
+          anyOf:
+            - $ref: "#/components/schemas/AccountingUuid"
+            - type: "null"
+        environmentId:
+          anyOf:
+            - $ref: "#/components/schemas/AccountingUuid"
+            - type: "null"
+    UsagePageMetadata:
+      type: object
+      required:
+        - pageTotals
+        - pageTotalsByStatus
+        - nextCursor
+        - snapshot
+        - window
+        - coverage
+        - latestPageAcceptedAt
+        - retention
+      properties:
+        pageTotals:
+          $ref: "#/components/schemas/AccountingUnits"
+        pageTotalsByStatus:
+          type: object
+          required:
+            - provisional
+            - final
+          properties:
+            provisional:
+              $ref: "#/components/schemas/AccountingUnits"
+            final:
+              $ref: "#/components/schemas/AccountingUnits"
+        nextCursor:
+          type:
+            - string
+            - "null"
+        snapshot:
+          type: object
+          required:
+            - watermark
+          properties:
+            watermark:
+              $ref: "#/components/schemas/UsageAcceptanceSequence"
+        window:
+          $ref: "#/components/schemas/UsageWindow"
+        coverage:
+          type: object
+          required:
+            - status
+            - explicitGapRecords
+            - missingObservations
+          properties:
+            status:
+              type: string
+              const: unknown
+            explicitGapRecords:
+              type: integer
+              minimum: 0
+              description: Gap records on this page only.
+            missingObservations:
+              type: string
+              const: unknown
+        latestPageAcceptedAt:
+          anyOf:
+            - $ref: "#/components/schemas/AccountingInstant"
+            - type: "null"
+        retention:
+          type: string
+          const: indefinite-development-ledger
+      description: >-
+        Page-local totals exclude gaps. No complete-window total, finalized coverage, price, or invoice
+        is fabricated; empty pages retain unknown coverage.
+    UsagePage:
+      allOf:
+        - $ref: "#/components/schemas/UsagePageMetadata"
+        - type: object
+          required:
+            - records
+          properties:
+            records:
+              type: array
+              items:
+                $ref: "#/components/schemas/UsageFact"
+    UsageExportMetadata:
+      allOf:
+        - $ref: "#/components/schemas/UsagePageMetadata"
+        - type: object
+          required:
+            - type
+          properties:
+            type:
+              type: string
+              const: metadata
+    AllowanceSummary:
+      type: object
+      required:
+        - id
+        - environmentId
+        - regionId
+        - specRevision
+        - specHash
+        - epoch
+        - revision
+        - units
+        - issuedAt
+        - expiresAt
+        - status
+        - gapCount
+        - stoppedAt
+        - runtimeEnforced
+        - enforcementStatus
+      properties:
+        id:
+          $ref: "#/components/schemas/AccountingUuid"
+        environmentId:
+          $ref: "#/components/schemas/AccountingUuid"
+        regionId:
+          $ref: "#/components/schemas/AccountingUuid"
+        specRevision:
+          type: integer
+          minimum: 1
+        specHash:
+          $ref: "#/components/schemas/AccountingEvidenceHash"
+        epoch:
+          $ref: "#/components/schemas/AccountingDecimal"
+        revision:
+          $ref: "#/components/schemas/AccountingDecimal"
+        units:
+          $ref: "#/components/schemas/AccountingUnits"
+        issuedAt:
+          $ref: "#/components/schemas/AccountingInstant"
+        expiresAt:
+          $ref: "#/components/schemas/AccountingInstant"
+        status:
+          type: string
+          enum:
+            - issued
+            - settled
+        gapCount:
+          $ref: "#/components/schemas/AccountingDecimal"
+        stoppedAt:
+          anyOf:
+            - $ref: "#/components/schemas/AccountingInstant"
+            - type: "null"
+        runtimeEnforced:
+          type: boolean
+          const: false
+        enforcementStatus:
+          type: string
+          const: pending_runtime
+      description: >-
+        Expiry does not release the hold or prove runtime stop. Budget epoch is distinct from operation
+        leaseEpoch.
+    AllowanceBudgetView:
+      allOf:
+        - $ref: "#/components/schemas/AllowanceSummary"
+        - type: object
+          required:
+            - expired
+          properties:
+            expired:
+              type: boolean
+              description: Issued receipt past expiresAt; hold remains until evidence settlement.
+    AllowanceReceipt:
+      allOf:
+        - $ref: "#/components/schemas/AllowanceSummary"
+        - type: object
+          required:
+            - fenceToken
+          properties:
+            fenceToken:
+              $ref: "#/components/schemas/AllowanceFenceToken"
+    AllowanceReceiptResponse:
+      type: object
+      required:
+        - reservation
+      properties:
+        reservation:
+          $ref: "#/components/schemas/AllowanceReceipt"
+    AllowanceSettlementResponse:
+      type: object
+      required:
+        - reservation
+      properties:
+        reservation:
+          $ref: "#/components/schemas/AllowanceSummary"
+    AllowanceSettlementInput:
+      type: object
+      required:
+        - fenceToken
+        - epoch
+        - expectedRevision
+        - usageRefs
+        - stoppedAt
+        - stopEvidenceHash
+      properties:
+        fenceToken:
+          $ref: "#/components/schemas/AllowanceFenceToken"
+        epoch:
+          $ref: "#/components/schemas/AccountingInputDecimal"
+        expectedRevision:
+          $ref: "#/components/schemas/AccountingInputDecimal"
+        usageRefs:
+          type: array
+          minItems: 1
+          maxItems: 32
+          items:
+            $ref: "#/components/schemas/AllowanceUsageReference"
+          description: >-
+            Distinct fact IDs at current final heads. Explicit quantity, including zero, is needed for
+            every positive reserved metric.
+        stoppedAt:
+          $ref: "#/components/schemas/AccountingInstant"
+        stopEvidenceHash:
+          $ref: "#/components/schemas/AccountingEvidenceHash"
+      additionalProperties: false
+      description: >-
+        Stop is >=issuance, <=now and nondecreasing. Facts lie within issuedAt..stoppedAt; pre-authority
+        usage cannot release a hold. Accepted normalized evidence replays without double charge; actual
+        overruns are preserved.
+    BudgetAuthority:
+      type: object
+      required:
+        - scope
+        - revision
+        - executionEpoch
+        - requestedState
+        - configured
+        - unlimitedDimensions
+        - runtimeEnforced
+        - enforcementStatus
+        - account
+        - reservations
+      properties:
+        scope:
+          type: string
+          enum:
+            - project
+            - environment
+        revision:
+          $ref: "#/components/schemas/AccountingDecimal"
+        executionEpoch:
+          $ref: "#/components/schemas/AccountingDecimal"
+        requestedState:
+          type: string
+          enum:
+            - running
+            - paused
+        configured:
+          type: boolean
+        unlimitedDimensions:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountingMetric"
+        runtimeEnforced:
+          type: boolean
+          const: false
+        enforcementStatus:
+          type: string
+          const: pending_runtime
+        account:
+          anyOf:
+            - $ref: "#/components/schemas/BudgetAccount"
+            - type: "null"
+        reservations:
+          type: array
+          maxItems: 100
+          items:
+            $ref: "#/components/schemas/AllowanceBudgetView"
+        reservationsTruncated:
+          type: boolean
+      oneOf:
+        - properties:
+            configured:
+              const: false
+            revision:
+              const: "0"
+            executionEpoch:
+              const: "0"
+            requestedState:
+              const: running
+            account:
+              type: "null"
+            reservations:
+              maxItems: 0
+        - required:
+            - reservationsTruncated
+          properties:
+            configured:
+              const: true
+            account:
+              $ref: "#/components/schemas/BudgetAccount"
+      description: >-
+        M3 control authority only. requestedState does not stop/start PostgreSQL. Configured views show
+        oldest 100 receipts at most; unconfigured views omit reservationsTruncated.
+    BudgetAuthorityEnvelope:
+      type: object
+      required:
+        - budget
+      properties:
+        budget:
+          $ref: "#/components/schemas/BudgetAuthority"

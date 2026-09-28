@@ -1,4 +1,6 @@
 import { environmentRoutes } from "./environments";
+import { usageRoutes } from "./usage";
+import { budgetRoutes, planBudgetCorrection } from "./budgets";
 
 type Env = Cloudflare.Env;
 
@@ -765,6 +767,20 @@ async function getOperation(
 
 export default {
   async fetch(request, env): Promise<Response> {
+    try {
+      const budgetResponse = await budgetRoutes(request, env);
+      if (budgetResponse) return budgetResponse;
+      const usageResponse = await usageRoutes(
+        request,
+        env,
+        planBudgetCorrection,
+      );
+      if (usageResponse) return usageResponse;
+    } catch {
+      // Provider/crypto errors can carry private evidence. Keep them out of
+      // customer responses and logs; durable facts remain available for retry.
+      return error(500, "accounting_unavailable");
+    }
     const environmentResponse = await environmentRoutes(request, env);
     if (environmentResponse) return environmentResponse;
     const pathname = new URL(request.url).pathname;
