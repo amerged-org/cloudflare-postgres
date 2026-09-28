@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "preparedOn": "2026-09-28",
-  "status": "prepared_only_not_activated",
+  "status": "dev_admitted_all_30_under_kustomize_ownership",
   "chart": {
     "name": "kube-prometheus-stack",
     "version": "91.8.0",
@@ -70,7 +70,8 @@
       "sha256": "b8d11791866850f28bcf24f2a902b19758d7491d852e2a09287d5f04c855ac78"
     },
     "README.md": {
-      "sha256": "816881ae65d330fb2148257e5ff945e761768fefe9efe1dde593f5bec7c13e93"
+      "sha256": "3f7a81fdcd9aabf1e3b4cb34b2d61210848f76c24ce959564944c850a536bd59"
     }
-  }
+  },
+  "runtimeEvidence": "../../../docs/evidence/m4-telemetry-bootstrap-order-2026-09-28.md"
 }

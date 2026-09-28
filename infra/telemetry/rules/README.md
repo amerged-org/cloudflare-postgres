@@ -1,9 +1,12 @@
 # Ordered upstream telemetry Rules
 
-Status: **prepared only**. This directory contains the 30 default
+Status: **all 30 Rules admitted under Flux ownership in Dev** at source
+`59a6b3c0ef2481287963c54b81e0ef39751bbf0d`. This directory contains the 30 default
 PrometheusRules selected by kube-prometheus-stack 91.8.0 and the reviewed
 telemetry values. It is a separate Flux stage; it is not included in the
-core telemetry Kustomization and does not activate a release.
+core telemetry Kustomization and does not activate a release. See the
+[actual ordered-bootstrap checkpoint](../../../docs/evidence/m4-telemetry-bootstrap-order-2026-09-28.md)
+for runtime evidence and remaining TLS/cold-bootstrap gates.
 
 The core HelmRelease must use `defaultRules.create: false`. After its
 explicit admission-readiness health checks pass, a separate Flux

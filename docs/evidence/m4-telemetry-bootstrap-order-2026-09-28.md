@@ -1,6 +1,6 @@
 # M4 ordered telemetry bootstrap — 2026-09-28
 
-Status: **configuration prepared; new upgrade and Rule stage not executed**. The prior install observer is retired with its activation ledger consumed. Its null-list observation correction remains green at the conservative two-repair count. SDK/Barman/R2 held work is unchanged.
+Status: **core upgrade and all 30 ordered Rules Ready; Node-exporter scrape succeeds, kubelet TLS qualification fails**. The source is commit 59a6b3c0ef2481287963c54b81e0ef39751bbf0d. The prior install observer remains retired with its activation ledger consumed. Its null-list observation correction remains green at the conservative two-repair count. SDK/Barman/R2 held work is unchanged. This is a warm continuation, not a fresh cold-bootstrap or production acceptance result.
 
 ## Observed ordering exposure
 
@@ -27,3 +27,21 @@ A meaningful new configuration is expected to produce an ordinary upgrade to rev
 After core readiness, separately enable and qualify all 30 Rules under Kustomize ownership and verify Prometheus selects/evaluates them. Then qualify permitted scraping, kubelet TLS, target/volume metrics and null-only alert behavior. Existing warm Pods make the immediate continuation a warm upgrade; it cannot establish a fresh cold bootstrap or production recovery. Those gates remain open until their own actual evidence exists.
 
 The Rule extraction has strict YAML, unique identities and aggregate equality with its frozen upstream input. The source render used native Helm 3.22.0; production uses Helm SDK 4.2.4, so extraction equality does not substitute for upgrade rendering/runtime evidence. No new runtime tests, Promtool rerun or full workspace gate were introduced for unchanged expressions and configuration wiring.
+
+## Actual production-SDK check and warm continuation
+
+The single local SDK4/calibration invocation completed in 18.813 seconds under its 180-second total cap, using the pinned Go/module versions and public checksummed dependency downloads. It reproduced the failed `3b5...` configuration digest, then derived the new exact digest `sha256:a9973221f4447fd250b05089ec58fda8a49cfa81776ad13b8671a9f2dad28621`. Both SDK4 renders use the actual controller-decorated chart version `91.8.0+31d941e75adc`, Kubernetes 1.36.3 and the same capabilities. Strict parsing verifies 39 ordinary core payloads unchanged, ten CRDs preserved and only 30 absent Rules omitted. This avoids treating the earlier native version labels as literal production labels.
+
+Before execution, independent source review corrected the malformed bare `has(webhooks)` macro and verified the pinned Flux evaluator supports the corrected top-level expression. It also found missing generated-Pod observations and a legitimate attempted-generation/action transition that the private observer could have misclassified. The corrected observer uses immutable captured ordinary/init restart maps and checks the five actual Pod identities/readiness, handles historical install status as pending, and stops on actual action failure. Its guard/calibration binding and old ledger were unchanged; no hidden reset or extra rendering run was used.
+
+A fresh 1.334-second observation at 13:10:54 UTC verified the original source/path, four Ready platform releases, Barman hold, healthy Node/primary and both SQL markers. The new one-use core operation then completed in 20.708 seconds: same release UID, action upgrade, deployed revision two, exact configuration/chart digest and current-generation Ready under the ten-resource health graph. Revision-one storage, all core/CRD identities, two Bound PVCs and five Pod identities/restart maps were preserved. No Rules existed at core completion and no install/uninstall, adoption, force/reset or cleanup occurred.
+
+A separate one-use Rules operation created the same-source dependent Kustomization and completed in 6.412 seconds. All 30 Rules are present with complete unchanged specs and expected labels, kustomize-controller ownership and no Helm owner annotations. The core was already Ready at the same artifact revision and remained so. This establishes ordered application and current admission for the complete bundle. Actual Prometheus selection/evaluation and allowed target paths still need their own observation; adding Rule-file volumes may legitimately roll the generated Prometheus Pod after the core's preservation check.
+
+## Actual selected Rules and scrape paths
+
+One read-only observation at 13:20:34–35 UTC completed in 0.821 seconds using one localhost port-forward and exactly one Rules API request plus one targets request, with cleanup and no retries. Prometheus reported 30 loaded groups and 220 Rules. Both generated StatefulSets were at observed generation one with one Ready/updated replica; the observed Pods had zero container restarts. Raw responses and runtime identities stay private.
+
+The owned Node-exporter target is UP without a scrape error, establishing the selected permitted Prometheus-to-host exporter path alongside the earlier non-exempt deny proof. All three owned kubelet targets are DOWN with a TLS server-identity mismatch. Certificate verification remains enabled; no insecure override, policy change or second probe was made. Diagnose the served certificate identity and target addressing before another TLS check. These three endpoints expose one observed certificate-identity defect, not a generated test matrix or three implementation fixes.
+
+All-Rule content/evaluation comparison is still being finalized from that same saved response. Kubelet/volume metrics, platform-specific target/rule installation, useful alert behavior, namespace API isolation, sustained capacity, persistence/recovery and fresh cold bootstrap remain open. The successful Node-exporter scrape does not close those broader gates or establish production readiness.

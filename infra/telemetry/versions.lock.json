@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "verifiedOn": "2026-09-28",
-  "status": "flux_stage_live_release_suspended",
+  "status": "dev_core_revision_2_and_ordered_rules_ready_partial_runtime_qualification",
   "kubernetesRenderVersion": "1.36.3",
   "chart": {
     "name": "kube-prometheus-stack",
@@ -66,8 +66,11 @@
     "actualPodSecurityAdmissionPrerequisiteQualified": true,
     "runtimeDatapathQualified": false,
     "selectedDenyPathQualified": true,
-    "permittedScrapeQualified": false,
-    "fullTelemetryQualified": false
+    "permittedScrapeQualified": true,
+    "fullTelemetryQualified": false,
+    "permittedScrapeScope": "owned Prometheus to host Node-exporter TCP9100"
   },
-  "stageCommit": "222a8c833c2ee24a57af816a8b8a95e12c51e17d"
+  "stageCommit": "222a8c833c2ee24a57af816a8b8a95e12c51e17d",
+  "currentRuntimeSourceCommit": "59a6b3c0ef2481287963c54b81e0ef39751bbf0d",
+  "kubeletTlsQualified": false
 }
