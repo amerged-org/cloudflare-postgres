@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "verifiedOn": "2026-09-28",
-  "status": "prepared_suspended_unapplied",
+  "status": "flux_stage_live_release_suspended",
   "kubernetesRenderVersion": "1.36.3",
   "chart": {
     "name": "kube-prometheus-stack",
@@ -64,6 +64,10 @@
     "ciliumVersion": "1.20.2",
     "changesHostFirewallOrRouting": false,
     "actualPodSecurityAdmissionPrerequisiteQualified": true,
-    "runtimeDatapathQualified": false
-  }
+    "runtimeDatapathQualified": false,
+    "selectedDenyPathQualified": true,
+    "permittedScrapeQualified": false,
+    "fullTelemetryQualified": false
+  },
+  "stageCommit": "222a8c833c2ee24a57af816a8b8a95e12c51e17d"
 }
