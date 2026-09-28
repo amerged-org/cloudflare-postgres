@@ -1,16 +1,20 @@
 # Node-bound kubelet serving certificates
 
-Status: **source and adapted image qualified; runtime deployment pending**.
+Status: **single-node Dev deployment, automatic initial issuance and verified
+kubelet scraping qualified**. Runtime renewal and automated fleet enrollment
+remain open.
 The [attributed component](../../components/kubelet-serving-approver/README.md)
 passes its bounded three-case proof and the one final clean-worktree gate.
 [image.lock.json](image.lock.json) pins the verified AMD64 build; public image
 distribution remains unqualified. A private Dev overlay can select the exact
 authenticated Talos-imported tag with `imagePullPolicy: Never`. This directory
-is not included in active platform or telemetry sources. No approver or machine
-patch is live.
+is not included in the original platform or telemetry sources. A separate
+commit-pinned `pgcf-kubelet-certificates` source deploys the Dev overlay. The
+native patch is live on the enrolled Dev node; see the
+[runtime evidence](../../docs/evidence/m4-kubelet-serving-tls-2026-09-28.md).
 
-The current Dev kubelet targets fail verified TLS because the serving certificate
-lacks IP SANs. Talos 1.14 uses native `KubeletConfig` documents. The
+The previous Dev kubelet targets failed verified TLS because the serving
+certificate lacked IP SANs. Talos 1.14 uses native `KubeletConfig` documents. The
 [native patch](../talos/kubelet-serving-tls.patch.yaml) enables
 `config.serverTLSBootstrap` while preserving the selected image, seccomp and all
 other machine documents. Local merging against the authenticated 30-document
@@ -76,7 +80,10 @@ addresses by changing their own Node status.
 4. Confirm the approver can read its exact inventory, watch serving CSRs and
    perform the required authorization/approval API calls. A new authentic
    serving CSR appears after enabling bootstrap; do not wait for it beforehand.
-5. Guard and apply the single native machine-config change to the intended node.
+5. Fence the fresh authenticated configuration and apply the single native
+   change to the intended node with explicit `--mode no-reboot`. Require the
+   returned no-reboot mode, then compare the active and persistent configuration
+   and effective kubelet setting; no legacy flag may disable server rotation.
 6. Observe its supervised kubelet restart, automatic validated approval/signing,
    certificate identity/chain and all three verified Prometheus kubelet targets.
 7. Check Node/database readiness, existing SQL markers, PVCs and actual renewal.
@@ -89,9 +96,12 @@ Source inspection is not a zero-interruption or database-recovery guarantee.
 Stop on failed probes, unexpected identity or PLAN.md's repeated-failure/time
 limits; do not reset counters or use insecure TLS as a fallback.
 
-The current manifests have an immutable adapted image pin but need runtime
-deployment and CSR/renewal qualification.
-No existing controller/source, provider firewall, data volume or unrelated
-credential is changed by these prepared files. See
+The Dev deployment uses the verified local image. Initial automatic approval
+and signing, exact enrolled SANs, certificate chain and all three HTTPS targets
+pass. Node UID/boot ID, seven selected Pod identities/restart counts, four PVC
+identities/bindings and both SQL markers are preserved. A later renewal,
+public image distribution, cold bootstrap and automated enrollment maintenance
+are not established by this operation. Existing platform/telemetry sources,
+provider firewall, data volumes and unrelated credentials are preserved. See
 [Talos certificate guidance](https://docs.siderolabs.com/kubernetes-guides/monitoring-and-observability/deploy-metrics-server)
 and the pinned [kubelet configuration schema](https://github.com/siderolabs/talos/blob/v1.14.1/pkg/machinery/config/types/k8s/kubelet.go).

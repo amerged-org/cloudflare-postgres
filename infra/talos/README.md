@@ -36,12 +36,20 @@ The [native serving-TLS patch](kubelet-serving-tls.patch.yaml) enables
 `KubeletConfig.config.serverTLSBootstrap` for the selected Talos 1.14 schema.
 Merge it into the generated native document, preserving the pinned kubelet
 image and other configuration. A local merge against the actual lab's 30
-documents and strict validation pass; live application and automatic renewal
-remain pending. Do not add deprecated kubelet fields alongside the native
+documents and strict validation pass. One supervised no-reboot application,
+automatic initial issuance and verified scraping now pass in Dev; a later
+renewal remains pending. Do not add deprecated kubelet fields alongside the native
 document or substitute a nonexistent `serverCertExtraSANs` property.
 
 Install the qualified [node-bound approver](../kubelet-serving-certificates/README.md)
 and operator-owned enrollment before applying this change to a live node.
+Use explicit `--mode no-reboot` and verify the returned mode. Fence the fresh
+authenticated machine configuration, compare both active and persistent native
+documents after application, and check the effective kubelet configuration for
+the intended bit and any conflicting legacy rotation flag. Talos can return
+both `persistent` and `v1alpha1` MachineConfig objects after application; select
+the intended resource explicitly instead of treating the JSON stream as one
+object. Keep all machine configuration output private.
 Initial application restarts kubelet and removes its old self-signed serving
 files; the new serving endpoint waits for a signed CSR. Talos machine reboot is
 not required, but availability and PostgreSQL preservation must be observed.

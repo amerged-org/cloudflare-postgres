@@ -8,5 +8,9 @@
   "buildSucceeded": true,
   "runtimeHelpVerified": true,
   "publicDistributionQualified": false,
-  "deploymentQualified": false
+  "deploymentQualified": true,
+  "deploymentScope": "single-node Dev local-image overlay",
+  "nativeBootstrapQualified": true,
+  "automaticInitialIssuanceQualified": true,
+  "automaticRenewalQualified": false
 }

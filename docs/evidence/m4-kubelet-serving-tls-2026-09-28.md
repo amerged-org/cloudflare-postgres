@@ -1,7 +1,8 @@
 # M4 verified kubelet serving TLS — 2026-09-28
 
-Status: **native patch and node-bound automatic approver qualified in source;
-adapted image imported for Dev, runtime deployment still pending**. The working core/rules/exporter and all previous
+Status: **single-node Dev approver deployment, native no-reboot application,
+automatic initial issuance and verified kubelet scraping qualified**.
+Runtime renewal and automated fleet enrollment remain pending. The working core/rules/exporter and all previous
 operation ledgers are preserved. SDK/Barman stopped work is unchanged.
 
 ## Actual defect and native configuration
@@ -22,7 +23,8 @@ The [native patch](../../infra/talos/kubelet-serving-tls.patch.yaml) changes onl
 `KubeletConfig.config.serverTLSBootstrap` to true. A local merge against that
 actual configuration and strict Talos 1.14.1 validation pass; normalized
 comparison preserves all other 30-document content, image and seccomp settings.
-No live configuration change or approval occurred. The nonexistent legacy
+At the source qualification checkpoint, no live configuration change or approval
+had occurred. The nonexistent legacy
 `serverCertExtraSANs` alternative was rejected from pinned source.
 
 A direct external certificate observation did not supply stronger evidence:
@@ -47,8 +49,8 @@ SANs, uncached get-only reads, exact request identity/serving usage and valid CS
 signature checks. Missing or stale trust does not approve. The service handles
 future renewal as well as initial issuance; manual approval is not the intended
 completed software. The [prepared deployment](../../infra/kubelet-serving-certificates/README.md)
-has explicit minimal RBAC and an image placeholder, and is outside active Flux
-sources.
+has explicit minimal RBAC and an immutable adapted image pin. Its Dev overlay
+is deployed through a separate source, preserving the platform/telemetry sources.
 
 Exactly three focused new tests failed against actual upstream reconciliation:
 foreign SANs, an unenrolled requester and a replaced Node UID receive approval
@@ -87,7 +89,58 @@ matches the live Node name/UID. The private enrollment uses that independently
 verified provider address and hostname; mutable Node status and CSR SAN claims
 were not used as address authority. Private trust data is not committed.
 
-The approver is not deployed and the machine patch is not live. Runtime
-automatic approval/renewal, supervised kubelet restart, verified scraping,
-database preservation, public distribution and automated fleet enrollment
-maintenance remain required evidence.
+## Guarded Dev deployment and native application
+
+The separate GitRepository/Kustomization `pgcf-kubelet-certificates` pins
+public source commit `2fc69d7e7739ca74aeff95a46d98117de632cab1` and the explicit
+local-image overlay. One staged create followed by one guarded resume becomes
+Ready in 11.605 seconds. The actual single Ready Pod has zero restarts, runs on
+the enrolled node and reports the verified image identity. Private enrollment
+is operator-owned, outside the static Flux inventory. Original platform and
+telemetry source pins remain unchanged and Ready.
+
+Five ordinary service-account permission checks pass. The CLI check for the
+virtual signer resource initially reports false; an explicit Kubernetes
+SubjectAccessReview with the exact group/resource/name/verb reports allowed.
+No RBAC broadening is performed. This observation does not establish that a
+simple health probe checks permissions or that the CLI false result is a real
+authorization denial.
+
+Fresh authenticated configuration, hostname, Node UID, exact enrollment,
+approver readiness, database/SQL markers, four bound PVCs and zero pre-existing
+CSRs pass. Strict native validation and one CLI dry-run show only
+`KubeletConfig.config.serverTLSBootstrap: true`, with no reboot. Two private
+observer assumptions are corrected from actual outputs: the dry-run preview is
+on stderr, and the application database name comes from CNPG's bootstrap
+configuration. Neither failure was a behavioral RED or a live machine write.
+
+A one-use operation ledger precedes the single actual patch with explicit
+`--mode no-reboot`; Talos confirms no reboot in 1.093 seconds. Its immediate
+observer stops on two JSON MachineConfig objects. The patch is not repeated and
+the failed observer record is retained. Offline decoding and explicit read-only
+resource selection then verify both `persistent` and `v1alpha1`: all 30 documents
+match the prior configuration except the intended bit. The effective kubelet
+configuration enables bootstrap and has no conflicting false rotation flag.
+These readbacks and the already automatically approved/signed authentic node
+CSR complete in 1.223 seconds. There is no manual approval or security bypass.
+
+## Verified certificate, scraping and preserved state
+
+One bounded read-only qualification completes in 1.678 seconds. OpenSSL verifies
+the leaf's Kubernetes CA chain, server purpose, enrolled DNS name and IP. Its
+SANs exactly match enrollment, and its public key matches the authentic CSR.
+One Prometheus targets response supplies all three owned HTTPS paths
+(`/metrics`, `/metrics/cadvisor`, `/metrics/probes`) as UP without errors; all
+scrapes occur after the operation. TLS verification remains enabled.
+
+The Node UID and boot ID are unchanged and Ready without pressure. Seven
+selected database/monitoring/approver Pod identities and restart counts,
+four PVC identities and volume bindings, ready PostgreSQL and both SQL markers
+are preserved. This establishes the observed warm-node correction; it does not
+prove uninterrupted availability, a later certificate renewal, fresh cold
+bootstrap, public image pulling or automated fleet enrollment maintenance.
+
+No new runtime tests or broad gate reruns accompany infrastructure readbacks.
+The original three-case/two-correction limit, frozen source, prior consumed
+operation ledgers and all 22 stopped SDK candidate hashes remain unchanged.
+SDK/Barman/R2 stopped work is not resumed.
