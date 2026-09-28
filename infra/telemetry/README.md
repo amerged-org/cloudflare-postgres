@@ -1,18 +1,28 @@
 # Operational telemetry qualification
 
 Status: **core, default Rules and four platform monitoring objects Ready in
-Dev** at source commit `59a6b3c0ef2481287963c54b81e0ef39751bbf0d`. Deployed Helm
-revision two preserves core/CRDs and two bound PVCs. Core/default Rules retain
-their source; a separate pinned target source owns the four stateless platform
+Dev**. Core source `8b91c9cf5e4f5346b598f5e1a5ee1fa88fdbe5c0` supplies deployed
+Helm revision three; default Rules retain `59a6b3c0ef2481287963c54b81e0ef39751bbf0d`.
+Core/CRDs and two bound telemetry PVCs are preserved. A separate pinned target source owns the four stateless platform
 objects after the guarded correction. Five controller targets and seven
 selected Rule evaluations pass, and four false PVC-missing alerts are cleared.
-API-server sample capacity and other namespace-sensitive input coverage keep
-operational acceptance incomplete. This is a warm one-node feasibility continuation,
+API-server capacity passes a measured two-scrape window while keeping all
+thirteen other effective limits unchanged. Other namespace-sensitive input
+coverage and sustained/isolation/recovery evidence keep operational acceptance
+incomplete. This is a warm one-node feasibility continuation,
 not fresh-bootstrap or production acceptance. Actual Alertmanager configuration
 has only the null receiver and no integration. See
+[the API capacity evidence](../../docs/evidence/m4-api-sample-capacity-2026-09-28.md),
 [the platform telemetry evidence](../../docs/evidence/m4-platform-telemetry-2026-09-28.md),
 [the ordered bootstrap evidence](../../docs/evidence/m4-telemetry-bootstrap-order-2026-09-28.md)
 and [the historical install failure](../../docs/evidence/m4-telemetry-install-2026-09-28.md).
+
+The core-only [capacity bootstrap](bootstrap/flux-sync-core-capacity.example.yaml)
+uses the existing core writer with its unchanged ten-resource health graph and
+held default. Existing writers require a guarded source-reference handoff.
+The revision-three observer initially stopped on a bounded status-history
+projection; retained metadata-only storage proof and one same-revision unhold
+restore current readiness without another upgrade. Both records are preserved.
 
 Reuse kube-prometheus-stack 91.8.0 / Prometheus Operator v0.94.1, with Prometheus, Alertmanager, kube-state-metrics and node-exporter. The chart archive and OCI manifest are verified; six selected runtime images use verified manifest digests with Linux/amd64 support. `versions.lock.json` records identities. Publisher signatures and runtime image compatibility are not yet qualified.
 
@@ -76,9 +86,11 @@ enabled. The PVC warning now normalizes both operands to the resource namespace;
 the [two-case correction](../../docs/evidence/m4-pvc-alert-namespace-2026-09-28.md)
 clears all four false alerts in Dev while preserving global settings. Do not
 infer useful input from healthy expression evaluation for other namespace-filtered
-controller/upstream rules. The API-server target's 32,251 post-filter samples
-exceed its 20,000 cap; its TargetDown/sample-limit warnings remain a separate
-capacity correction.
+controller/upstream rules. The corrected API-server target retains 32,321
+samples within its finite 40,000 allowance. Its fourteen-job identity set and
+thirteen other 20,000 limits are unchanged; two distinct successful scrapes show
+no additional sample-limit failures. Aggregate warning history can persist
+until the existing five-minute window expires; do not erase counters to hide it.
 
 Before activation, verify current capacity/limits, API/CEL/PSA admission and generated Pods, cert-manager admission readiness, exact images and resource bounds, the tenant/host network boundary, verified kubelet TLS, named targets/PVC statistics, actual Flux series and useful alert states, null-receiver behavior, sustained cardinality/memory and storage growth. Filesystem/PVC metrics do not measure LVM VG free extents. The platform still needs authoritative capacity observation, recovery/PITR, updates, quorum and node-loss acceptance.
 

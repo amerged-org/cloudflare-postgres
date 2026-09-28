@@ -1,9 +1,9 @@
 # M4 API-server sample capacity — 2026-09-28
 
-Status: **bounded capacity correction qualified in source; core-only Dev
-promotion pending**. The completed PVC correction remains on its independent
-target source. Production capacity and complete operational acceptance remain
-unproven.
+Status: **core-only Dev revision-three upgrade and two-scrape capacity proof
+qualified**. A history-observer stop and a guarded same-revision unhold are
+retained below. The PVC correction remains on its independent target source.
+Production capacity and complete operational acceptance remain unproven.
 
 ## Measured defect and acceptance boundary
 
@@ -61,13 +61,48 @@ and that one case. All pass in 141.276 seconds without candidate changes. The
 ## Controlled core promotion
 
 The [held core-only bootstrap](../../infra/telemetry/bootstrap/flux-sync-core-capacity.example.yaml)
-uses a reviewed independent source and the existing core writer. Replace its
-commit placeholder before use. Preserve the original source for default Rules,
+pins the reviewed independent source at `8b91c9cf5e4f5346b598f5e1a5ee1fa88fdbe5c0`
+and the existing core writer. Preserve the original source for default Rules,
 the corrected target source, platform and kubelet source pins. Hold the same core
 writer before its Helm release, retain the ten-resource health graph and
 non-pruning/Orphan policy, then perform one guarded reference handoff and
 revision-three upgrade. A new operation ledger must not replay previous install
 or upgrade ledgers. Preserve old Helm storage identities while allowing revision
-two to become superseded. Actual rollout and the declared runtime evidence are
-pending. This operation changes no customer admission, host, database, Barman
-or R2 configuration.
+two to become superseded.
+
+One guarded operation installs revision three with the exact candidate digest,
+then stops after 27.347 seconds because its observer requires revision one to
+remain in the status history. The same core writer and release are safely held.
+Authoritative release readback proves `UpgradeSucceeded`, deployed revision
+three and superseded revision two. A separate metadata-only wire observation
+proves the original revision-one/two Secret UIDs are retained and exactly one
+new deployed revision-three record exists. No Secret payload is read.
+
+The pinned controller intentionally truncates its in-sync status projection to
+the latest and an eligible previous snapshot. The observer incorrectly equates
+that projection with storage retention; it is not an upgrade failure or an
+unverified cache promise. The original failed observation/ledger remains sealed.
+The [controller source](https://github.com/fluxcd/helm-controller/blob/v1.6.4/internal/reconcile/atomic_release.go)
+distinguishes in-sync no-action handling from another upgrade.
+
+A 92.928-second read-only observation proves all fourteen loaded job identities,
+API limit 40,000 and thirteen unchanged 20,000 limits. Two successful API scrapes
+over 90.199 seconds retain 32,321 samples; the sample-limit failure counter stays
+416. Resident bytes are 309,436,416 then 312,844,288; head series are 49,306 then
+49,772. Block bytes remain 6,856,586 and head-chunk storage 2,910,841. The bound
+Prometheus filesystem uses 41,639,936 then 42,131,456 bytes of 8,350,298,112,
+with positive free space. Memory stays below 1536Mi and 24h/4GB retention is
+unchanged. These are measured short-window effects, not long-term projections.
+
+Node UID/boot identity is Ready without pressure; seven selected Pod UIDs and
+regular-container restart maps, four PVC UIDs/bindings, Ready PostgreSQL and both
+SQL marker counts are preserved. A distinct reviewed one-use recovery changes
+only the same core's suspension flag. The overlay automatically resumes the
+same release; both reach current-generation Ready in 8.742 seconds, still at
+revision three without another upgrade. Exact source/values/digest fences,
+unhandled force/reset rejection and a reserved safety hold protect this unhold.
+No original activation is replayed and no frozen source or test is changed.
+
+This operation changes no customer admission, host, database, Barman or R2
+configuration. Broader rule-input, isolation, sustained-resource, recovery and
+maintenance qualification remain open.

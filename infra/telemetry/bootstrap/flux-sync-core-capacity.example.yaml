@@ -1,4 +1,4 @@
-# Replace the source commit with the reviewed capacity correction.
+# Reviewed core-only capacity source; replace URL/pin for an adopter fork.
 # Existing core writers require a UID/spec guarded reference handoff.
 # Keep held by default; preserve the original source used by default Rules.
 apiVersion: source.toolkit.fluxcd.io/v1
@@ -11,7 +11,7 @@ spec:
   timeout: 60s
   url: https://github.com/amerged-org/cloudflare-postgres
   ref:
-    commit: REPLACE_WITH_REVIEWED_CORE_CAPACITY_COMMIT
+    commit: 8b91c9cf5e4f5346b598f5e1a5ee1fa88fdbe5c0
 ---
 apiVersion: kustomize.toolkit.fluxcd.io/v1
 kind: Kustomization

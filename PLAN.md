@@ -307,8 +307,18 @@ recorded setup corrections, then passes after one implementation correction.
 Calibrated production SDK4 preserves 37 core payloads/ten CRDs and changes only
 the two intended resources. The frozen canonical/Go gate passes once in 141.276
 seconds using exact production inputs. Core-only revision-three promotion and
-two-scrape memory/head-series/storage/state-preservation evidence remain pending;
-default/target/platform/kubelet sources and all stopped work remain protected.
+two-scrape memory/head-series/storage/state-preservation evidence now pass. The
+single revision-three upgrade succeeds, but its history observer stops after
+27.347 seconds and safely holds the writers. Metadata-only readback preserves
+all three Helm storage records; the missing status entry is the controller's
+bounded projection. A 90.199-second window proves API Up, 32,321 retained
+samples within 40,000, thirteen unchanged limits, stable failure counter and
+measured memory/head/filesystem effects below the declared bounds. Node/boot,
+seven Pod identities/regular restart maps, four PVC bindings and SQL markers
+remain healthy. A separate same-revision unhold reaches Ready in 8.742 seconds
+without another upgrade, preserving the failed observer record and original
+ledgers. Default/target/platform/kubelet sources and all stopped work remain
+protected; sustained production capacity and other operational gates are open.
 
 ### Operational acceptance evidence
 

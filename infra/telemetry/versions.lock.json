@@ -1,7 +1,7 @@
 {
   "schemaVersion": 1,
   "verifiedOn": "2026-09-28",
-  "status": "dev_core_revision_2_and_ordered_rules_ready_partial_runtime_qualification",
+  "status": "dev_core_revision_3_api_capacity_and_target_namespace_corrections_qualified_partial_operational_evidence",
   "kubernetesRenderVersion": "1.36.3",
   "chart": {
     "name": "kube-prometheus-stack",
@@ -71,6 +71,18 @@
     "permittedScrapeScope": "owned Prometheus to host Node-exporter TCP9100"
   },
   "stageCommit": "222a8c833c2ee24a57af816a8b8a95e12c51e17d",
-  "currentRuntimeSourceCommit": "59a6b3c0ef2481287963c54b81e0ef39751bbf0d",
-  "kubeletTlsQualified": false
+  "currentRuntimeSourceCommit": "8b91c9cf5e4f5346b598f5e1a5ee1fa88fdbe5c0",
+  "kubeletTlsQualified": true,
+  "defaultRulesSourceCommit": "59a6b3c0ef2481287963c54b81e0ef39751bbf0d",
+  "platformTargetsSourceCommit": "c2d3ccb91d512f317ef7e74b3c0b12cedcb3c46c",
+  "kubeletCertificateSourceCommit": "2fc69d7e7739ca74aeff95a46d98117de632cab1",
+  "kubeletTlsQualificationScope": "single-node Dev initial issuance and three owned verified HTTPS targets; later renewal unproven",
+  "apiSampleCapacity": {
+    "defaultLimit": 20000,
+    "apiLimit": 40000,
+    "coreRevision": 3,
+    "observedSuccessfulScrapes": 2,
+    "observationWindowSeconds": 90.199,
+    "sustainedProductionCapacityQualified": false
+  }
 }
