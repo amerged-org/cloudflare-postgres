@@ -2,6 +2,9 @@
 .env*
 .dev.vars*
 
+# Local tools, caches and private evidence
+.local/
+
 # Local development and build output
 .wrangler/
 node_modules/
