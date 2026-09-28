@@ -22,6 +22,10 @@ The [platform inspection checkpoint](docs/evidence/m4-platform-inspection-2026-0
 
 The first implementation steps are infrastructure/recovery proofs and an early generic pilot using one always-on database over native PostgreSQL. Adopter-specific adapters and migration TODOs belong in their own repositories. Gateway selection follows technical and maintenance evaluation. Sleep/wake and bounded automatic compute scaling remain v1 requirements after that baseline.
 
+The [allocation continuity checkpoint](docs/evidence/m3-allocation-continuity-2026-09-28.md) preserves provisional resource-time through normal observation changes and retained storage. The updated Dev collector has verified public compiled code and journal preservation; positive managed usage, complete/final accounting and runtime budget enforcement remain open.
+
+The [maintenance preparation checkpoint](docs/evidence/m4-maintenance-preparation-2026-09-28.md) adds installation-owned immutable plans, separate preparer credentials, fenced leases and durable regional assessments. The Dev API/migration and compiled CLI persist the real lab's missing prerequisites as blockers. Preparation never grants execution authority; host updates, recovery and production qualification remain incomplete.
+
 ## Self-hosting model
 
 Adopters need their own Cloudflare account for the management deployment, authoritative control state, secrets, and R2 archives, plus Contabo infrastructure for PostgreSQL. This is not a Cloudflare-independent deployment. Initial [infrastructure](infra/README.md) and controller setup recipes are published; a complete, independently verified installation procedure remains a release gate.
