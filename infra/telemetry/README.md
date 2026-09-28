@@ -32,7 +32,7 @@ No SQL exporter, customer connection credentials, tenant workload or dynamic ten
 
 The pinned chart renders with Kubernetes 1.36.3, including ten CRDs and no hook Jobs. Promtool from the verified Prometheus v3.15.0 image passed all 32 rule files / 227 expressions, including reused upstream rules; these are configuration rules, not new tests. Their contents are unchanged after image pinning. No runtime tests or full workspace gate were added/run for this infrastructure delivery.
 
-The root and target Kustomizations build separately. Five staging resources passed a server-side dry-run; the quota in the uncreated namespace and monitoring CRD/CEL/generated-Pod admission remain pending. No staging object was persisted.
+The root and target Kustomizations build separately. Five staging resources passed a server-side dry-run; the quota in the uncreated namespace and monitoring CRD/CEL/generated-Pod admission remain pending. That historical dry-run persisted no objects; the subsequent eight-object live stage is recorded in the boundary checkpoint.
 
 Flux state uses maintained KSM customResourceState, four exact GVKs and scalar generation/readiness/suspension/deletion/reconciliation metrics. Current Ready requires both resource and Ready-condition observed generations to equal positive metadata generation. UID matching avoids mixing recreated objects. Suspended/deleting resources are excluded; missing expected-kind series alerts separately. Individual missing objects, malformed/duplicate conditions, stale exporter watches and source/image identities are not completely proven by these rules. Actual emitted series and alert evaluation remain unqualified.
 
@@ -43,3 +43,5 @@ See [the evidence checkpoint](../../docs/evidence/m4-telemetry-preparation-2026-
 The [boundary qualification checkpoint](../../docs/evidence/m4-telemetry-boundary-2026-09-28.md) records current admission and KSM evidence, policy scope, staged ownership and the remaining effective-data-path proof.
 
 The stage deliberately disables pruning and uses Orphan deletion policy; both namespace and protective network-policy objects additionally disable Flux pruning. Retiring or weakening protection requires an explicit reviewed operation after the listener/workloads are removed. Source removal cannot silently retire the protected resources while a retained HelmRelease remains.
+
+The explicit [qualification overlay](../telemetry-qualification/README.md) changes only the release suspension for a guarded controlled installation; the root stage remains held by default. Its sibling layout avoids Kustomize ancestor cycles. Generated Pod/SA and full telemetry checks still follow actual installation.

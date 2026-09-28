@@ -1,0 +1,16 @@
+# Controlled qualification deployment; operational readiness needs live evidence.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../telemetry
+patches:
+  - target:
+      group: helm.toolkit.fluxcd.io
+      version: v2
+      kind: HelmRelease
+      name: pgcf-telemetry
+      namespace: flux-system
+    patch: |-
+      - op: replace
+        path: /spec/suspend
+        value: false
