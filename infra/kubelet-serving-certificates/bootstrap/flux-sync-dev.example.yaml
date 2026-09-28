@@ -1,0 +1,35 @@
+# Separate opt-in source; static resources only, private enrollment excluded.
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: GitRepository
+metadata:
+  name: pgcf-kubelet-certificates
+  namespace: flux-system
+spec:
+  interval: 30m
+  url: https://github.com/amerged-org/cloudflare-postgres
+  ref:
+    commit: REPLACE_WITH_REVIEWED_COMMIT_SHA
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: pgcf-kubelet-certificates
+  namespace: flux-system
+spec:
+  suspend: true
+  interval: 30m
+  timeout: 3m
+  path: ./infra/kubelet-serving-certificates-dev
+  prune: false
+  deletionPolicy: Orphan
+  sourceRef:
+    kind: GitRepository
+    name: pgcf-kubelet-certificates
+  dependsOn:
+    - name: pgcf-platform
+      namespace: flux-system
+  healthChecks:
+    - apiVersion: apps/v1
+      kind: Deployment
+      name: kubelet-serving-cert-approver
+      namespace: kubelet-serving-cert-approver

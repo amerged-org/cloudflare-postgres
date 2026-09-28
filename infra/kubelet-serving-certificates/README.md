@@ -73,7 +73,9 @@ addresses by changing their own Node status.
 1. Complete the bounded red-first policy tests and frozen final verification.
 2. Pin the adapted runtime image and review namespace/RBAC/Pod admission.
 3. Install the approver and privately populated enrollment before TLS bootstrap.
-4. Confirm the approver can read its exact inventory and authentic pending CSR.
+4. Confirm the approver can read its exact inventory, watch serving CSRs and
+   perform the required authorization/approval API calls. A new authentic
+   serving CSR appears after enabling bootstrap; do not wait for it beforehand.
 5. Guard and apply the single native machine-config change to the intended node.
 6. Observe its supervised kubelet restart, automatic validated approval/signing,
    certificate identity/chain and all three verified Prometheus kubelet targets.
