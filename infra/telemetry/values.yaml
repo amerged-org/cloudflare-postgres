@@ -109,7 +109,8 @@ prometheus:
     arbitraryFSAccessThroughSMs:
       deny: true
     overrideHonorLabels: true
-    enforcedSampleLimit: 20000
+    sampleLimit: 20000
+    enforcedSampleLimit: 40000
     enforcedTargetLimit: 100
     enforcedLabelLimit: 64
     enforcedLabelNameLengthLimit: 128
@@ -195,6 +196,9 @@ alertmanager:
               - ALL
     image:
       sha: e9733bafb1bdef9b00e25a21f8f99dc26a22224bf16641ad754d1649f4c3357a
+kubeApiServer:
+  serviceMonitor:
+    sampleLimit: 40000
 kubelet:
   enabled: true
   serviceMonitor:

@@ -299,6 +299,17 @@ A separate fresh API-server observation
 measures 32,251 post-filter samples against the 20,000 cap; it requires its own
 capacity correction, not a speculative global change in this candidate.
 
+The [API scrape-capacity correction](docs/evidence/m4-api-sample-capacity-2026-09-28.md)
+measures 32,254 retained samples against 20,000 and introduces one bounded API
+allowance of 40,000 while preserving the other thirteen effective limits at
+20,000. One named maintained-Operator test reaches meaningful RED after two
+recorded setup corrections, then passes after one implementation correction.
+Calibrated production SDK4 preserves 37 core payloads/ten CRDs and changes only
+the two intended resources. The frozen canonical/Go gate passes once in 141.276
+seconds using exact production inputs. Core-only revision-three promotion and
+two-scrape memory/head-series/storage/state-preservation evidence remain pending;
+default/target/platform/kubelet sources and all stopped work remain protected.
+
 ### Operational acceptance evidence
 
 Publish the workload, versions, topology, sample counts, and pass/fail thresholds before each implementation acceptance run. These are operational measurements; a pricing or break-even study is not required. The table lists milestone evidence areas, not instructions to generate test matrices or permutations: select only the concrete cases needed for the current change, subject to section 10.
