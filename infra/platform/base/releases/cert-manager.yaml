@@ -20,10 +20,14 @@ spec:
     namespace: flux-system
   install:
     crds: CreateReplace
+    serverSideApply: true
+    disableTakeOwnership: true
     remediation:
       retries: 0
   upgrade:
     crds: CreateReplace
+    serverSideApply: enabled
+    disableTakeOwnership: true
     remediation:
       retries: 0
   driftDetection:

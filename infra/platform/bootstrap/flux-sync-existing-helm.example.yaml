@@ -1,5 +1,5 @@
-# Opt-in only after release identities and current Helm values have been checked.
-# The manually applied operators stay suspended; only two Helm releases are managed.
+# Opt-in only after release/value checks and the enumerated cert-manager handoff.
+# CloudNativePG and Barman stay suspended; these three releases must be Ready.
 apiVersion: source.toolkit.fluxcd.io/v1
 kind: GitRepository
 metadata:
@@ -32,4 +32,8 @@ spec:
     - apiVersion: helm.toolkit.fluxcd.io/v2
       kind: HelmRelease
       name: openebs
+      namespace: flux-system
+    - apiVersion: helm.toolkit.fluxcd.io/v2
+      kind: HelmRelease
+      name: cert-manager
       namespace: flux-system
