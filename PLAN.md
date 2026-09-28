@@ -283,6 +283,16 @@ alert have separate unresolved causes, and other namespace-filtered rules still
 need useful-input evidence. No new tests, gate reruns, source promotion or
 SDK/Barman/R2 resumption accompanies this checkpoint.
 
+The [PVC namespace correction](docs/evidence/m4-pvc-alert-namespace-2026-09-28.md)
+changes only the missing-metrics alert's operands, preserving global settings
+and its existing delay/join/metadata. Two meaningful cases fail first and pass
+after one correction; the frozen isolated canonical/Promtool gate passes exactly
+once in 16.390 seconds. Source review and stopped-candidate hash preservation
+pass. Target-only source promotion, loaded-rule/cleared-alert evidence and
+preserved runtime state remain pending. A separate fresh API-server observation
+measures 32,251 post-filter samples against the 20,000 cap; it requires its own
+capacity correction, not a speculative global change in this candidate.
+
 ### Operational acceptance evidence
 
 Publish the workload, versions, topology, sample counts, and pass/fail thresholds before each implementation acceptance run. These are operational measurements; a pricing or break-even study is not required. The table lists milestone evidence areas, not instructions to generate test matrices or permutations: select only the concrete cases needed for the current change, subject to section 10.

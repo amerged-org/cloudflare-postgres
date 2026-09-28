@@ -27,9 +27,12 @@ spec:
           annotations:
             summary: A selected platform metrics target cannot be scraped.
         - alert: PGCFPVCMetricsMissing
-          expr: (kube_persistentvolumeclaim_status_phase{phase="Bound"} == 1) unless
-            on(namespace,persistentvolumeclaim)
-            kubelet_volume_stats_capacity_bytes
+          expr: |-
+            label_replace(kube_persistentvolumeclaim_status_phase{phase="Bound"} == 1,
+              "namespace", "$1", "exported_namespace", "(.+)")
+            unless on(namespace,persistentvolumeclaim)
+            label_replace(kubelet_volume_stats_capacity_bytes,
+              "namespace", "$1", "exported_namespace", "(.+)")
           for: 15m
           labels:
             severity: warning

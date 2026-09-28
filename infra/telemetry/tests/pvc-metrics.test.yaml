@@ -1,0 +1,56 @@
+rule_files:
+  - platform.rules.yaml
+evaluation_interval: 1m
+tests:
+  - name: four_present_pvcs_do_not_alert_when_discovery_namespace_differs
+    interval: 1m
+    input_series:
+      - series: kube_persistentvolumeclaim_status_phase{namespace="pgcf-monitoring",exported_namespace="tenant-a",persistentvolumeclaim="db-a",phase="Bound"}
+        values: 1+0x20
+      - series: kube_persistentvolumeclaim_status_phase{namespace="pgcf-monitoring",exported_namespace="tenant-b",persistentvolumeclaim="db-b",phase="Bound"}
+        values: 1+0x20
+      - series: kube_persistentvolumeclaim_status_phase{namespace="pgcf-monitoring",exported_namespace="pgcf-monitoring",persistentvolumeclaim="prometheus",phase="Bound"}
+        values: 1+0x20
+      - series: kube_persistentvolumeclaim_status_phase{namespace="pgcf-monitoring",exported_namespace="pgcf-system",persistentvolumeclaim="usage-journal",phase="Bound"}
+        values: 1+0x20
+      - series: kubelet_volume_stats_capacity_bytes{namespace="kube-system",exported_namespace="tenant-a",persistentvolumeclaim="db-a"}
+        values: 4096+0x20
+      - series: kubelet_volume_stats_capacity_bytes{namespace="kube-system",exported_namespace="tenant-b",persistentvolumeclaim="db-b"}
+        values: 4096+0x20
+      - series: kubelet_volume_stats_capacity_bytes{namespace="kube-system",exported_namespace="pgcf-monitoring",persistentvolumeclaim="prometheus"}
+        values: 4096+0x20
+      - series: kubelet_volume_stats_capacity_bytes{namespace="kube-system",exported_namespace="pgcf-system",persistentvolumeclaim="usage-journal"}
+        values: 4096+0x20
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: PGCFPVCMetricsMissing
+        exp_alerts: []
+  - name: one_missing_pvc_metric_alerts_in_its_intrinsic_namespace
+    interval: 1m
+    input_series:
+      - series: kube_persistentvolumeclaim_status_phase{namespace="pgcf-monitoring",exported_namespace="tenant-a",persistentvolumeclaim="db-a",phase="Bound"}
+        values: 1+0x20
+      - series: kube_persistentvolumeclaim_status_phase{namespace="pgcf-monitoring",exported_namespace="tenant-b",persistentvolumeclaim="db-b",phase="Bound"}
+        values: 1+0x20
+      - series: kube_persistentvolumeclaim_status_phase{namespace="pgcf-monitoring",exported_namespace="pgcf-monitoring",persistentvolumeclaim="prometheus",phase="Bound"}
+        values: 1+0x20
+      - series: kube_persistentvolumeclaim_status_phase{namespace="pgcf-monitoring",exported_namespace="pgcf-system",persistentvolumeclaim="usage-journal",phase="Bound"}
+        values: 1+0x20
+      - series: kubelet_volume_stats_capacity_bytes{namespace="kube-system",exported_namespace="tenant-b",persistentvolumeclaim="db-b"}
+        values: 4096+0x20
+      - series: kubelet_volume_stats_capacity_bytes{namespace="kube-system",exported_namespace="pgcf-monitoring",persistentvolumeclaim="prometheus"}
+        values: 4096+0x20
+      - series: kubelet_volume_stats_capacity_bytes{namespace="kube-system",exported_namespace="pgcf-system",persistentvolumeclaim="usage-journal"}
+        values: 4096+0x20
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: PGCFPVCMetricsMissing
+        exp_alerts:
+          - exp_labels:
+              namespace: tenant-a
+              exported_namespace: tenant-a
+              persistentvolumeclaim: db-a
+              phase: Bound
+              severity: warning
+            exp_annotations:
+              summary: A bound PVC has no kubelet volume statistics; storage visibility is incomplete.
