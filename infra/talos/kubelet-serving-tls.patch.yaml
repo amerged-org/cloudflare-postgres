@@ -1,0 +1,6 @@
+# Native Talos 1.14 document; preserve the selected kubelet image/configuration.
+# Install a reviewed node-bound serving-CSR approver before live application.
+apiVersion: v1alpha1
+kind: KubeletConfig
+config:
+  serverTLSBootstrap: true

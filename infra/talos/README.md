@@ -30,6 +30,27 @@ chmod 600 .env.local.talos/config/*
 
 The two `single-*-lab` patches are deliberately scoped to the measured one-node lab. Replace the disk allocation and scheduling policy for another node pool; do not silently apply these sizes to a smaller disk or schedule customer databases on a production control plane. EPHEMERAL must be capped before first provisioning. Changing `maxSize` does not shrink an already grown filesystem.
 
+## Verified kubelet serving identity
+
+The [native serving-TLS patch](kubelet-serving-tls.patch.yaml) enables
+`KubeletConfig.config.serverTLSBootstrap` for the selected Talos 1.14 schema.
+Merge it into the generated native document, preserving the pinned kubelet
+image and other configuration. A local merge against the actual lab's 30
+documents and strict validation pass; live application and automatic renewal
+remain pending. Do not add deprecated kubelet fields alongside the native
+document or substitute a nonexistent `serverCertExtraSANs` property.
+
+Install the qualified [node-bound approver](../kubelet-serving-certificates/README.md)
+and operator-owned enrollment before applying this change to a live node.
+Initial application restarts kubelet and removes its old self-signed serving
+files; the new serving endpoint waits for a signed CSR. Talos machine reboot is
+not required, but availability and PostgreSQL preservation must be observed.
+Kubelet subsequently loads renewed certificates dynamically. Preserve verified
+TLS and scope enrollment to authenticated machine identities and addresses.
+
+The [current TLS checkpoint](../../docs/evidence/m4-kubelet-serving-tls-2026-09-28.md)
+distinguishes this prepared correction from an actual runtime success.
+
 ## Contabo rescue path
 
 Contabo's custom-image storage was unavailable in the observed account. The verified alternative uses its RAM-based rescue system, a registered SSH public-key secret, and a checksum-verified NoCloud raw image from the [Image Factory](https://docs.siderolabs.com/talos/v1.14/learn-more/image-factory). The private static-network schematic can be used with different Talos versions, but the version and artifact checksum must be pinned for each run.

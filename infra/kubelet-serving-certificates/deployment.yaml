@@ -1,0 +1,78 @@
+# Verified adapted image; a private Dev overlay may select its imported tag with Never.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubelet-serving-cert-approver
+  namespace: kubelet-serving-cert-approver
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubelet-serving-cert-approver
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: kubelet-serving-cert-approver
+    spec:
+      serviceAccountName: kubelet-serving-cert-approver
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65534
+        runAsGroup: 65534
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: cert-approver
+          image: docker.io/library/pgcf-kubelet-approver@sha256:8a7bc809f48a03395dec73f8fb1d8e1f6ccef7bc8483e9c55ec1dc8b235ae736
+          imagePullPolicy: IfNotPresent
+          args: [serve]
+          env:
+            - name: NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ENROLLMENT_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: ENROLLMENT_CONFIGMAP
+              value: pgcf-node-enrollment
+          ports:
+            - name: health
+              containerPort: 8080
+            - name: metrics
+              containerPort: 9090
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 5
+            failureThreshold: 12
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: health
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: health
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 250m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+      tolerations:
+        - key: node-role.kubernetes.io/control-plane
+          operator: Exists
+          effect: NoSchedule

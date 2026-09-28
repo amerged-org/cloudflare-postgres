@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Kubelet serving certificate node enrollment v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["apiVersion", "nodes"],
+  "properties": {
+    "apiVersion": {
+      "const": "pgcf.io/kubelet-serving-enrollment/v1"
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "uid", "ipAddresses"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 253
+          },
+          "uid": {
+            "type": "string",
+            "minLength": 1
+          },
+          "dnsNames": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 253
+            }
+          },
+          "ipAddresses": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "anyOf": [{ "format": "ipv4" }, { "format": "ipv6" }]
+            }
+          }
+        }
+      }
+    }
+  }
+}

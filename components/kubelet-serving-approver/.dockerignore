@@ -1,0 +1,3 @@
+.cache
+bin
+**/*_test.go

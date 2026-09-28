@@ -1,0 +1,12 @@
+{
+  "schemaVersion": 1,
+  "sourceModuleSha256": "6069c8a10058a41b421ddfd146886dfff63714a5e22cc05c6df23eed2e1cd699",
+  "indexDigest": "sha256:8a7bc809f48a03395dec73f8fb1d8e1f6ccef7bc8483e9c55ec1dc8b235ae736",
+  "linuxAmd64ManifestDigest": "sha256:c808f97241ad931515e39d12278ef9dbcc8d558eadd932f2bad9cdaf79d633d6",
+  "configDigest": "sha256:b5bd47baf5d1e804afe7136a3e01bf28f51407ddf1162ce830f40327b481d754",
+  "sourceLicense": "Apache-2.0",
+  "buildSucceeded": true,
+  "runtimeHelpVerified": true,
+  "publicDistributionQualified": false,
+  "deploymentQualified": false
+}
