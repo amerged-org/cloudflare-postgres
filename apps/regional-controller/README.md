@@ -1,6 +1,25 @@
 # Regional environment controller
 
-Apache-2.0 first-party code. This package implements the regional half of the versioned `environment.create` protocol and an optional file-backed usage collector. It initiates HTTPS requests to the adopter's control API; it opens no inbound listener. It creates internal CloudNativePG resources, reports observed readiness, and can deliver provisional observations of owned CPU/RAM requests and data-volume capacity. External PostgreSQL endpoint discovery, credential issuance, gateway routing, sleep, resizing, deletion, restore, allowance supervision, and hard runtime budget enforcement remain pending.
+Apache-2.0 first-party code. This package implements the regional half of the versioned `environment.create` protocol and an optional file-backed usage collector. It initiates HTTPS requests to the adopter's control API; it opens no inbound listener. It creates internal CloudNativePG resources, reports observed readiness, and can deliver provisional observations of owned CPU/RAM requests and data-volume capacity. External PostgreSQL endpoint discovery, credential issuance, gateway routing, sleep, resizing, deletion, restore, and hard runtime budget enforcement remain pending. A separate operator mode adds current allowance supervision and normal CNPG stop reconciliation; it is not enabled by the default controller.
+
+## Current allowance supervision and normal stop
+
+The separate [runtime allowance protocol](../../docs/contracts/runtime-allowance-authority-v1.md) acquires a durable reservation, refreshes its current control-plane authority and reconciles an owned normal stop. It is an explicit operator mode, not automatic `environment.create` admission or an independent workload-local budget guard. `runtimeEnforced` stays false.
+
+Fill [allowance-config.example.json](deploy/allowance-config.example.json) with the API environment's project/region/spec identity and independently observed Namespace, Cluster and ResourceQuota UIDs. Select an explicit kubeconfig context. Replace the zero unit placeholders with reviewed resource-time allocations; at least one dimension must be positive. Keep the journal in an owner-private persistent directory. Set `PGCF_CONTROL_ORIGIN` and `PGCF_REGION_TOKEN_FILE` to the existing executor credential, then run the built package under an operator-owned process supervisor:
+
+```sh
+node apps/regional-controller/dist/main.js supervise-allowance \
+  --config /private/installation/allowance.json
+```
+
+The default loop polls every five seconds, with bounded inventory and transport deadlines. `--once` performs one reconciliation and exits; it is an operator observation mode and does not supervise future expiry. SIGINT/SIGTERM ends the loop. Neither process exit nor a Kubernetes outage independently stops PostgreSQL.
+
+Before contacting the reservation API, the private SQLite journal persists one request ID and exact units. Lost responses and restarts reuse that identity; historical receipt replay never extends its original deadline. Current authority is cached for at most 15 seconds and must match the sealed project/environment/spec and policy epochs. All limited CPU/RAM/storage dimensions participate in the funded horizon; omitted units are zero. A fully reserved account may have zero remaining balance while its existing reservation remains valid.
+
+Loss of authority first sets the owned namespace's Pod quota to zero, then requests CNPG hibernation with UID/resource-version conditional patches. Matching readback resolves a lost patch response. A stopped result requires absent owned database Pods and unchanged bound Retain volumes. Unknown inventory or failed patches produce no success claim. This mode does not automatically resume, release reservations, invent final usage or settle the receipt; storage allocation can continue after compute stops.
+
+The selected Kubernetes identity needs inventory reads for the sealed namespace/Cluster/quota/Pods/PVCs/PVs and patch rights for the owned `database-resources` quota and `database` Cluster. Do not give this mode customer or unrestricted operator credentials. Namespace/UID/spec checks remain necessary alongside RBAC. Runtime counters, ingress closure, transaction draining, workload-local expiry, overshoot bounds and real installation qualification remain pending.
 
 ## Installation maintenance preparation
 
@@ -127,7 +146,7 @@ A restart, long sample gap, changed/missing allocation, incomplete inventory, cl
 
 The sender keeps each durable fact ID/revision/evidence identity across uncertain HTTP outcomes. It removes a pending record only after the control API returns `200`/`201` with matching sent fields, matching region, and a positive decimal acceptance sequence, followed by a matching local acknowledgement transaction. Token files are reloaded per request. Delivery failures retain the outbox and emit generic event codes without credentials, raw resource details, or tenant data. The sealed region/source/epoch must match on reopening; changing source identity requires an explicit journal recovery/migration procedure.
 
-This collector emits only revision-one `provisional` and `gap` facts for the three metrics above. Finalization, revision/correction production, initialization/job allocation, PostgreSQL WAL/backup storage, transfer, and complete coverage certification remain pending. It does not acquire or settle allowance reservations, supervise PostgreSQL, or enforce lease expiry/budget periods. Budget resources retain `runtimeEnforced: false` and `enforcementStatus: pending_runtime`; a provisional observation does not enable a hard runtime cap. M6 still requires the supervisor, restart-safe expiry guard, and qualified stop/overshoot behavior.
+This collector emits only revision-one `provisional` and `gap` facts for the three metrics above. Finalization, revision/correction production, initialization/job allocation, PostgreSQL WAL/backup storage, transfer, and complete coverage certification remain pending. It does not acquire or settle allowance reservations, supervise PostgreSQL, or enforce lease expiry/budget periods. Budget resources retain `runtimeEnforced: false` and `enforcementStatus: pending_runtime`; a provisional observation does not enable a hard runtime cap. The explicit supervision mode above supplies current-authority and normal-stop logic separately; M6 still requires the independent restart-safe expiry guard and qualified stop/overshoot behavior.
 
 ## Verification and upstream provenance
 

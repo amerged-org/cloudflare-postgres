@@ -26,6 +26,7 @@ import type {
   UnitVector,
 } from "./accounting";
 import type { UsageVersion } from "./usage";
+import { runtimeAuthority } from "./runtime-authority";
 
 interface Target {
   id: string;
@@ -1298,6 +1299,17 @@ export async function budgetRoutes(
 ): Promise<Response | null> {
   const db = env.DB.withSession("first-primary");
   const path = new URL(request.url).pathname;
+  const authorityPath =
+    /^\/v1\/regions\/([^/]+)\/allowance-reservations\/([^/]+)\/authority$/.exec(
+      path,
+    );
+  if (request.method === "GET" && authorityPath)
+    return await runtimeAuthority(
+      request,
+      db,
+      authorityPath[1]!,
+      authorityPath[2]!,
+    );
   const reissuePath =
     /^\/v1\/organizations\/([^/]+)\/budget-tokens\/reissue$/.exec(path);
   if (request.method === "POST" && reissuePath)

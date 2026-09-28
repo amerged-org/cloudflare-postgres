@@ -46,6 +46,12 @@ Use the organization token to read `GET /v1/organizations/{organizationId}/proje
 
 The current slice has no public native endpoint, customer database credentials, environment listing/deletion/resize, runtime usage collector, runtime allowance enforcer, idempotency archival, or rate limiting. A reported ready environment means the regional executor observed PostgreSQL resource readiness; it does not prove backups, restore qualification, credential access, or a production service objective.
 
+## Current allowance execution authority
+
+The [current authority and normal-stop contract](../../docs/contracts/runtime-allowance-authority-v1.md) adds `GET /v1/regions/{regionId}/allowance-reservations/{reservationId}/authority` for the ordinary regional executor. It returns a consistent, fresh decision bound to the receipt, environment specification, current policy/account/epoch state and funding. An already funded reservation remains valid at zero free balance; pause, changed epoch/account, expiry or inconsistent evidence cannot be converted into continued authority by replaying its historical receipt.
+
+Allow decisions are cached for at most 15 seconds and never beyond receipt/policy expiry. Changes after the sampled transaction have that bounded revocation delay. Historical receipt/settlement APIs retain their original behavior and credentials; the authority endpoint exposes no fence token and creates no new reservation. Regional normal stop uses owned quota/hibernation reconciliation. Independent expiry enforcement, ingress/session controls, final accounting and overshoot qualification remain open; `runtimeEnforced` stays false.
+
 ## Installation maintenance preparation
 
 Migration `0008_maintenance_preparation.sql` adds a separate installation-owned maintenance history, regional preparer credentials and fenced preparation leases. The installation token may submit/read an immutable Kubernetes upgrade plan and issue a dedicated `cpmtp_` preparer token. Existing customer, environment, usage and budget credentials receive no host privileges. Exact idempotency/result replay survives uncertain responses, while stale leases and inactive preparer credentials cannot report a result.
