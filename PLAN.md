@@ -470,6 +470,18 @@ No runtime source/tests/full gate change occurs. Reverse/all-protocol, SQL/TLS,
 verifier/gateway, multi-node and kernel/host isolation remain separate gates;
 this limited proof does not establish complete production tenancy.
 
+The [durable delivery diagnostic checkpoint](docs/evidence/m3-usage-delivery-diagnostics-2026-09-29.md)
+adds one bounded source/fact-bound last-failure record, safe paired HTTP codes and
+atomic matching clear only on strict accepted receipts. Two meaningful red-first
+cases pass on attempt one; one final gate passes 74 automated cases including six
+unchanged Go cases. The public-source Dev image is imported once and receives one
+guarded image-only rollout; all 63 compiled modules and actual 383-byte background
+`404/not_found` diagnostic pass readback. Original Node/28 other Running Pods/
+volumes/SQL and all 4,096 outbox hashes remain preserved. No acceptance, source
+rewrite, D1 migration, Secret/Worker change or fake customer authority occurs.
+This supplies failure visibility only; explicit fixture evidence disposition,
+complete accounting, safe replay and runtime enforcement remain open.
+
 The [remote control archive checkpoint](docs/evidence/m3-control-archive-2026-09-29.md)
 qualifies one upload of the existing encrypted bundle into the private EU R2
 bucket, exact remote download and offline reconstruction from those downloaded
