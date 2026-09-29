@@ -1,5 +1,10 @@
 # Regional environment controller
 
+The [remote archive workflow](../../docs/guides/control-archive-v1.md) stores and
+retrieves an already sealed recovery bundle using existing operator access.
+Verify exact downloaded bytes and matching historical migrations before offline
+restore. This does not activate recovered state or replace independent key custody.
+
 ## Fleet inspection
 
 The explicit `inspect-fleet` mode observes Contabo through the installation's

@@ -425,6 +425,19 @@ Worker-generated fixtures. No control activation, provider write, key rotation,
 server rollout or D1 migration occurs. Independent off-node custody, global
 fencing, fresh Cloudflare bootstrap and safe service reactivation remain open.
 
+The [remote control archive checkpoint](docs/evidence/m3-control-archive-2026-09-29.md)
+qualifies one upload of the existing encrypted bundle into the private EU R2
+bucket, exact remote download and offline reconstruction from those downloaded
+bytes. Existing operator access is reused; no new credential or runtime change
+is made. The retained aggregate bucket metrics remain zero and do not supply
+object-existence proof; the successful authenticated byte download does. The
+ciphertext now has off-node custody, while independently recoverable key/receipt/
+source custody, retention safety, fresh bootstrap and activation remain open.
+The generic [operator workflow](docs/guides/control-archive-v1.md) preserves
+historical migration sets and keeps key material outside the archive store.
+PostgreSQL backups/PITR and the pending dedicated S3-access confirmation remain
+separate required gates; the held Budget and other stopped candidates are unchanged.
+
 The [portable PostgreSQL candidate checkpoint](docs/evidence/m2-postgres-portability-held-2026-09-29.md)
 records a separate generic export/import draft using maintained PostgreSQL 18
 tools and exactly three real local TLS cases. Privacy/protection checks pass, but
