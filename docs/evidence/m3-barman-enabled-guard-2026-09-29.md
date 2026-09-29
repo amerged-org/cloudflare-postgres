@@ -39,8 +39,36 @@ and Linux manifest
 are recorded. The private 88,552,960-byte archive is mode 0600. This establishes
 artifact compilation and static identity, not live reconciliation or backup.
 
-The regional image is not replaced by this checkpoint, and its manual backup
-executor remains disabled. Image/runtime delivery is required before the first
-API-managed pilot. The separately held manual source activation still needs its
-one additional-attempt exception; this source fix does not resume that workflow
-or prove R2 WAL, physical backup, restore or PITR.
+## Live Dev delivery
+
+Before replacing the controller, the maintained SQLite backup command captured
+the complete journal and its manifest. Its first invocation failed before artifact
+creation because the selected target parent was not owner-private. One reviewed
+harness correction selects the existing private journal parent and preserves the
+original failed attempt. The corrected capture passes in 2.714 seconds; the
+maintained offline verifier independently checks the 3,076,096-byte copy without
+changing it. Checkpoints, retained-volume identity, coverage gaps and all 4,096
+unaccepted facts are preserved. This supplies recovery custody, not permission to
+acknowledge or invoice those facts.
+
+One authenticated Talos import passes in 9.712 seconds with the exact Linux
+manifest above. One UID/resource-version/full-spec-guarded Deployment patch
+replaces only the controller image in 0.201 seconds. The existing Recreate
+strategy and local `imagePullPolicy: Never` remain. One bounded rollout observation
+passes, followed by a single 5.064-second runtime verification.
+
+The new Ready Pod has zero restarts. All 72 compiled modules, Node 24.21.0,
+UID 1000 and both enablement guards match the sealed artifact. Node identity,
+boot/runtime, 28 other Running Pods and restart counters, four PVCs, five PVs,
+the source CNPG Cluster, Pooler and both named SQL markers are preserved.
+Configuration, service account and RBAC are unchanged. The original journal
+identity and exact 4,096 queued facts remain, with zero acknowledgements. Four
+compiled authenticated claim probes return null; no work is leased or dispatched.
+Credential values are not printed and no Kubernetes Secret data is queried.
+
+The controller image is now delivered in Dev. Its manual backup executor remains
+disabled, the source Cluster has no plugin, and Backup, ScheduledBackup and
+ObjectStore inventories remain empty. No runtime source changes, new tests or
+full gate reruns accompany this delivery. The separately held source activation still needs its
+one additional-attempt exception. This delivery does not resume that workflow
+or establish R2 WAL, physical backup, restore, PITR or an API-managed pilot.

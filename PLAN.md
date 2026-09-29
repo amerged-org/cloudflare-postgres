@@ -48,8 +48,11 @@ PostgreSQL pilot and its recovery/cleanup proof remain open.
 The [Barman enablement guard](docs/evidence/m3-barman-enabled-guard-2026-09-29.md)
 requires `enabled:true` in owned provisioning and manual-backup source checks.
 Two existing regression cases failed first and the source gate passed once.
-Regional image delivery remains required; this does not activate the held
-manual backup workflow or establish physical recovery.
+The sealed regional image is now delivered in Dev through one verified import
+and one guarded image-only replacement. All 72 compiled modules, complete private
+journal custody and original infrastructure/SQL state are verified. The backup
+executor remains disabled; this does not activate the held manual backup workflow
+or establish physical recovery or an API-managed pilot.
 
 ## 1. Product scope and decisions
 
