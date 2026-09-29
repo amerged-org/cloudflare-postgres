@@ -27,6 +27,7 @@ import {
 } from "./databases";
 
 import { publicBackup, publicBackupOperation, type Backup } from "./backups";
+import { publicResizeOperation } from "./resize";
 
 export interface ProjectRow {
   id: string;
@@ -89,12 +90,16 @@ type PageRow = (ProjectRow | EnvironmentRow | Role | Database | Backup) & {
   current_operation_id: string | null;
 };
 interface OperationRow extends LegacyOperationRow {
-  source: "legacy" | "role" | "database" | "backup";
+  source: "legacy" | "role" | "database" | "backup" | "resize";
   backup_id: string | null;
   environment_id: string | null;
   role_id: string | null;
   database_id: string | null;
   credential_revision: number | null;
+  cause: string | null;
+  compute_revision: number | null;
+  from_size_id: string | null;
+  target_size_id: string | null;
 }
 function base64(value: Uint8Array): string {
   return btoa(String.fromCharCode(...value))
@@ -385,34 +390,45 @@ function operationRead(
       `SELECT * FROM (
     SELECT 'legacy' AS source, o.id, o.organization_id, o.project_id, o.environment_id,
       NULL AS role_id, NULL AS database_id, NULL AS backup_id, NULL AS credential_revision,
-      o.kind, o.status, o.created_at, o.observed_at, o.result_code
+      o.kind, o.status, o.created_at, o.observed_at, o.result_code,
+      NULL AS cause, NULL AS compute_revision, NULL AS from_size_id, NULL AS target_size_id
     FROM operations o JOIN projects p ON p.id = o.project_id AND p.organization_id = o.organization_id
       LEFT JOIN environments e ON e.id = o.environment_id AND e.organization_id = o.organization_id AND e.project_id = o.project_id
     WHERE o.id = ? AND o.organization_id = ? AND (o.environment_id IS NULL OR e.id IS NOT NULL) AND ${guard}
     UNION ALL
     SELECT 'role', o.id, r.organization_id, r.project_id, r.environment_id,
-      r.id, NULL, NULL, o.credential_revision, o.kind, o.status, o.created_at, o.observed_at, o.result_code
+      r.id, NULL, NULL, o.credential_revision, o.kind, o.status, o.created_at, o.observed_at, o.result_code,
+      NULL, NULL, NULL, NULL
     FROM role_operations o JOIN database_roles r ON r.id = o.role_id
       JOIN projects p ON p.id = r.project_id AND p.organization_id = r.organization_id
       JOIN environments e ON e.id = r.environment_id AND e.organization_id = r.organization_id AND e.project_id = r.project_id
     WHERE o.id = ? AND r.organization_id = ? AND ${guard}
     UNION ALL
     SELECT 'database', o.id, d.organization_id, d.project_id, d.environment_id,
-      d.owner_role_id, d.id, NULL, NULL, o.kind, o.status, o.created_at, o.observed_at, o.result_code
+      d.owner_role_id, d.id, NULL, NULL, o.kind, o.status, o.created_at, o.observed_at, o.result_code,
+      NULL, NULL, NULL, NULL
     FROM database_operations o JOIN logical_databases d ON d.id = o.database_id AND d.owner_role_id = o.owner_role_id
       JOIN projects p ON p.id = d.project_id AND p.organization_id = d.organization_id
       JOIN environments e ON e.id = d.environment_id AND e.organization_id = d.organization_id AND e.project_id = d.project_id
     WHERE o.id = ? AND d.organization_id = ? AND ${guard}
     UNION ALL
     SELECT 'backup', o.id, b.organization_id, b.project_id, b.environment_id,
-      NULL, NULL, b.id, NULL, o.kind, o.status, o.created_at, o.observed_at, o.result_code
+      NULL, NULL, b.id, NULL, o.kind, o.status, o.created_at, o.observed_at, o.result_code,
+      NULL, NULL, NULL, NULL
     FROM backup_operations o JOIN environment_backups b ON b.id=o.backup_id
       JOIN projects p ON p.id=b.project_id AND p.organization_id=b.organization_id
       JOIN environments e ON e.id=b.environment_id AND e.organization_id=b.organization_id AND e.project_id=b.project_id
     WHERE o.id=? AND b.organization_id=? AND ${guard}
+    UNION ALL
+    SELECT 'resize', o.id, o.organization_id, o.project_id, o.environment_id,
+      NULL, NULL, NULL, NULL, o.kind, o.status, o.created_at, o.observed_at, o.result_code,
+      o.cause, o.compute_revision, o.from_size_id, o.target_size_id
+    FROM resize_operations o JOIN projects p ON p.id=o.project_id AND p.organization_id=o.organization_id
+      JOIN environments e ON e.id=o.environment_id AND e.organization_id=o.organization_id AND e.project_id=o.project_id
+    WHERE o.id=? AND o.organization_id=? AND ${guard}
   ) LIMIT 2`,
     )
-    .bind(...values, ...values, ...values, ...values);
+    .bind(...values, ...values, ...values, ...values, ...values);
 }
 function publicTask(row: OperationRow) {
   if (row.source === "legacy") return operationFromRow(row);
@@ -428,6 +444,22 @@ function publicTask(row: OperationRow) {
         backup_id: row.backup_id!,
         kind: "environment.backup",
         status: row.status as "queued" | "running" | "completed" | "failed",
+        created_at: row.created_at,
+        observed_at: row.observed_at,
+        result_code: row.result_code,
+      }),
+      ...ownership,
+    };
+  if (row.source === "resize")
+    return {
+      ...publicResizeOperation({
+        id: row.id,
+        kind: "environment.resize",
+        cause: "manual",
+        status: row.status as "queued" | "running" | "completed" | "failed",
+        compute_revision: row.compute_revision!,
+        from_size_id: row.from_size_id!,
+        target_size_id: row.target_size_id!,
         created_at: row.created_at,
         observed_at: row.observed_at,
         result_code: row.result_code,

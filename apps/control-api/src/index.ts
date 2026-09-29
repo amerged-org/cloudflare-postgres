@@ -5,6 +5,7 @@ import { maintenanceRoutes } from "./maintenance";
 import { roleRoutes } from "./roles";
 import { databaseRoutes } from "./databases";
 import { backupRoutes } from "./backups";
+import { resizeRoutes } from "./resize";
 import { suspendRoutes } from "./suspend";
 import { providerInventoryRoute } from "./provider-inventory";
 import {
@@ -722,6 +723,8 @@ export default {
     if (recoveryResponse) return recoveryResponse;
     const backupResponse = await backupRoutes(request, env);
     if (backupResponse) return backupResponse;
+    const resizeResponse = await resizeRoutes(request, env);
+    if (resizeResponse) return resizeResponse;
     const databaseResponse = await databaseRoutes(request, env);
     if (databaseResponse) return databaseResponse;
     const roleResponse = await roleRoutes(request, env);

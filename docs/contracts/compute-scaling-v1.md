@@ -20,9 +20,11 @@ not submit Kubernetes quantities, arbitrary CPU/RAM pairs, image names, storage
 classes, archive settings or credentials.
 
 The policy is optional. Existing profiles and environments remain valid and
-cannot be silently given a new size policy. This first source slice only makes
-the operator-approved sizes available and immutable; it does not add a resize
-request, auto-scaling decision, budget grant or Kubernetes mutation.
+cannot be silently given a new size policy. The catalog slice makes the
+operator-approved sizes immutable. The control slice retains a scoped manual
+resize request with separate requested and effective sizes; it does not
+activate physical resize, an auto-scaling decision, a budget grant or a
+Kubernetes mutation.
 
 ## Separate compute identity and operation
 
@@ -42,13 +44,28 @@ Both paths use the same durable regional operation and public
 `requested`/`applying`/`effective` status. A completed resize does not rewrite
 the initial profile or an earlier operation's result.
 
-At acceptance, D1 atomically checks active ownership and region, a ready
-environment, running runtime, unchanged run and Cluster identity, current
-revision, policy bounds, cooldown, no pending conflicting operation and budget
-state. Resize conflicts with suspend, backup and another resize. Existing
-in-flight database/role operations must finish or defer before the Pod rollout;
-the reverse admission check must also block them while resize is uncertain.
-Expiry of a lease does not clear these locks. Hard budget stopping remains
+The implemented control route is
+`POST /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/resize`
+with `projects:write`, `Idempotency-Key`, and exactly
+`{sizeId,expectedRevision}`. It pins the base environment, selected approved
+policy, Cluster UID, run epoch and runtime revision in retained D1 history.
+`GET .../environments/{environmentId}/compute` reports revision zero and the
+initial size until a request exists. A new request advances the desired compute
+revision and reports `phase: requested` while the effective size stays old;
+the ordinary operation read reports `awaiting_authority`. Exact idempotent
+replay returns the retained response. The queue grants no lease or patch. The
+planned regional activation and terminal result protocol are still required
+before `applying` or `effective` can be published.
+
+At current queue acceptance, D1 atomically checks active ownership and region,
+a ready environment, running runtime, unchanged run and Cluster identity,
+current revision, approved size, no pending conflicting operation and requested
+budget state. Resize conflicts with queued/running suspend, backup and another
+resize; in-flight database/role operations also prevent queuing. A future
+physical activation transaction must recheck all these facts and add funded
+capacity, execution authority and any automatic-policy cooldown. Its reverse
+admission check must block competing work while an effect is uncertain. An
+expired lease cannot clear that physical lock. Hard budget stopping remains
 independent and takes precedence.
 
 ## Funding and capacity before growth
@@ -73,6 +90,15 @@ size until the replacement Pods are actually effective.
 The current Dev runtime reports `runtimeEnforced: false`. Source code may be
 prepared with the above guards, but no live hard-budget or automatic-scaling
 guarantee follows from the existing allowance API or requested budget state.
+The current allowance receipt contains only the base spec, caller-proposed
+units, epoch and expiry. Before the first increase in quota, a new immutable
+compute funding segment must reserve the server-derived upper bound for the
+full old/new Pod overlap horizon and stop margin against every applicable
+project/environment account. It must bind compute revision, operation,
+Cluster/Quota identities and run epoch, then reconcile without double-charging
+or prematurely releasing old usage. A regional capacity reservation and
+independent local deadline stop must cover the same period. None is implemented
+by the queued control slice.
 
 ## Regional effect, uncertainty and completion
 
@@ -103,6 +129,21 @@ owned primary and instance Pod identities, each PostgreSQL container's actual
 CPU/RAM requests and limits, and absence of old effective Pods; then reread
 lease/run authority before reporting the effective revision. Usage facts remain
 attributable to the actual old and new Pod allocations across that transition.
+The read-only regional proof implements this Pod/Cluster readback predicate.
+The installed CNPG 1.30.1 does not populate a top-level Cluster
+`status.observedGeneration` or the Ready condition's observed generation. An
+absent optional generation is accepted only when the current Cluster UID,
+spec/resources and generation are stable and the complete replacement Pod set
+is Ready with target requests and limits in both Pod spec and
+`status.containerStatuses.resources`. A present mismatched generation defers.
+Completed CNPG initialization Job Pods may remain in the label-selector result;
+they are excluded only after their terminal phase and identity are verified.
+The full current Pod set is read once more after the final Namespace/Cluster
+read, with the same instance UIDs, names, resource versions, readiness and
+target Pod spec/status resources. A disappeared or changed Pod defers the result.
+This bounded observation is not an atomic freeze; the later result writer must
+recheck its lease and funding authority. The proof alone grants no effect,
+funding or capacity.
 
 Automatic scaling adds sustained CPU/memory/queue measurements, explicit
 minimum and maximum size IDs, cooldown and hysteresis. It must share all manual

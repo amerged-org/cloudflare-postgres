@@ -2102,6 +2102,95 @@ paths:
           $ref: "#/components/responses/DatabaseLifecycleUnavailable"
         "503":
           $ref: "#/components/responses/RoleCredentialKeyUnavailable"
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/compute:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+    get:
+      operationId: getEnvironmentCompute
+      summary: Read requested and effective approved compute size
+      description: >-
+        Requires projects:read. Revision zero and the initial profile size are
+        implicit until the first accepted resize. Requested is not effective;
+        this read supplies no live Pod or capacity evidence.
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Scoped nonsecret compute state
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [compute]
+                properties:
+                  compute:
+                    $ref: "#/components/schemas/EnvironmentCompute"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The immutable environment profile has no approved compute-size policy.
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/resize:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+    post:
+      operationId: requestManualEnvironmentResize
+      summary: Retain one approved manual resize intention
+      description: >-
+        Requires projects:write and Idempotency-Key. Accepts only an approved
+        immutable-profile size ID and the expected compute revision. An atomic
+        D1 check binds active ownership, ready running runtime, base spec,
+        Cluster/run identity, requested budget state and absence of conflicting
+        work. The response is queued with resultCode awaiting_authority. No
+        target funding, fleet reservation, regional lease, Kubernetes patch,
+        or claim that the requested size is effective is provided yet.
+      security:
+        - organizationToken: []
+      parameters:
+        - $ref: "#/components/parameters/LifecycleIdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [sizeId, expectedRevision]
+              properties:
+                sizeId:
+                  type: string
+                  pattern: ^[a-z][a-z0-9_-]{0,63}$
+                expectedRevision:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740990
+      responses:
+        "202":
+          description: Durable queued intent and recoverable operation; no physical resize.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ResizeIntentResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Stale revision, unapproved size, conflicting work or changed authority.
   /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/runtime:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -2797,6 +2886,53 @@ components:
             epochs. Present only for opted-in fencing.
         nodeCohort:
           $ref: "#/components/schemas/NodeCohortReference"
+    EnvironmentCompute:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          environmentId,
+          revision,
+          requestedSizeId,
+          effectiveSizeId,
+          phase,
+          operationId,
+          updatedAt,
+          observedAt,
+        ]
+      properties:
+        environmentId:
+          type: string
+          format: uuid
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+        requestedSizeId:
+          type: string
+        effectiveSizeId:
+          type: string
+        phase:
+          type: string
+          enum: [requested, applying, effective, failed]
+        operationId:
+          type: [string, "null"]
+          format: uuid
+        updatedAt:
+          type: [string, "null"]
+          format: date-time
+        observedAt:
+          type: [string, "null"]
+          format: date-time
+    ResizeIntentResponse:
+      type: object
+      additionalProperties: false
+      required: [compute, operation]
+      properties:
+        compute:
+          $ref: "#/components/schemas/EnvironmentCompute"
+        operation:
+          $ref: "#/components/schemas/RecoveryOperation"
     EnvironmentRuntime:
       type: object
       required:
@@ -4142,6 +4278,16 @@ components:
         backupId:
           type: string
           format: uuid
+        computeRevision:
+          type: integer
+          minimum: 1
+        fromSizeId:
+          type: string
+        targetSizeId:
+          type: string
+        cause:
+          type: string
+          enum: [manual]
         ownerRoleId:
           type: string
           format: uuid
@@ -4154,6 +4300,7 @@ components:
             - database.create
             - environment.suspend
             - environment.backup
+            - environment.resize
         status:
           type: string
           enum:

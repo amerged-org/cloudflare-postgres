@@ -12,6 +12,15 @@ remain unverified. No API-managed customer environment or Backup resource was
 created. CLI D1 query authorization still fails with `7403`; Dev migration used
 the authorized dashboard and exact schema readback.
 
+The [10,000-project feasibility checkpoint](docs/evidence/m3-scale-10000-projects-2026-09-29.md)
+sets a distinct logical-project scale target. A single offline metadata-only
+snapshot with 10,001 projects returned a 2,576,706-byte JSON string, exceeding
+D1's documented 2,000,000-byte string/row limit. The current one-row control
+recovery is therefore unqualified for that target, regardless of the shorter
+SQL statement. Consistent multi-part recovery, measured D1 throughput and,
+where needed, sharded control state are explicit gates. Ten thousand active
+PostgreSQL environments require a separate fleet and storage-capacity proof.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.
@@ -228,6 +237,14 @@ sustained signals, hysteresis and cooldown to those same effect guards. Existing
 allowance receipts and the current `runtimeEnforced: false` state do not prove
 that a larger size is funded or physically enforceable. This work does not
 activate either scaling mode in Dev.
+The current source slice retains a queued manual resize intention, separate
+requested/effective compute status and a read-only proof for later CNPG Pod
+rollouts. It issues no regional lease, funding grant or Kubernetes patch.
+Automatic scaling and physical resize remain blocked until target/overlap
+funding, fleet capacity, local expiry and bounded effect dispatch are proven.
+The [manual resize source checkpoint](docs/evidence/m6-manual-resize-intent-2026-09-29.md)
+separates those implemented control/readback pieces from physical qualification
+and preserves the three-case bounded test history.
 The [size-catalog source checkpoint](docs/evidence/m6-compute-size-catalog-2026-09-29.md)
 retains the red-first case, original typecheck stop, narrow correction and the
 fresh-worktree build setup repair without repeating the full gate. No physical

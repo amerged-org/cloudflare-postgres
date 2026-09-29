@@ -19,7 +19,14 @@ export const installerHeaders = {
   "content-type": "application/json",
 };
 
-export async function accountingFixture(label: string) {
+export async function accountingFixture(
+  label: string,
+  computeScaling?: {
+    version: 1;
+    initialSizeId: string;
+    sizes: Array<{ id: string; cpuMilli: number; memoryMiB: number }>;
+  },
+) {
   const organizationResponse = await accountingCall("/v1/organizations", {
     method: "POST",
     headers: installerHeaders,
@@ -58,6 +65,7 @@ export async function accountingFixture(label: string) {
     id: "accounting-fixture",
     postgresImage: `ghcr.io/cloudnative-pg/postgresql@sha256:${"a".repeat(64)}`,
     compute: { cpuMilli: 500, memoryMiB: 512 },
+    ...(computeScaling ? { computeScaling } : {}),
     storage: {
       classId: "local-volume",
       storageClassName: "test-local",

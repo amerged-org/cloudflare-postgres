@@ -159,6 +159,96 @@ test("rebuilds all current control migrations and historical encrypted credentia
       name,
       rows: f.db.prepare(`SELECT * FROM ${name}`).all(),
     }));
+    const resizeOperationId = "abababab-abab-4aba-8aba-abababababab";
+    const resizeResponse = JSON.stringify({
+      compute: {
+        environmentId: f.ids.environment,
+        revision: 1,
+        requestedSizeId: "large",
+        effectiveSizeId: "standard",
+        phase: "requested",
+        operationId: resizeOperationId,
+        updatedAt: now,
+        observedAt: null,
+      },
+      operation: {
+        id: resizeOperationId,
+        kind: "environment.resize",
+        cause: "manual",
+        status: "queued",
+        computeRevision: 1,
+        fromSizeId: "standard",
+        targetSizeId: "large",
+        createdAt: now,
+        observedAt: null,
+        resultCode: "awaiting_authority",
+      },
+    });
+    f.db
+      .prepare(
+        "INSERT INTO resize_operations(id,organization_id,project_id,environment_id,region_id,kind,cause,status,spec_revision,spec_hash,spec_json,cluster_uid,run_epoch,runtime_revision,policy_hash,compute_revision,from_size_id,target_size_id,created_at,result_code) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        resizeOperationId,
+        f.ids.organization,
+        f.ids.project,
+        f.ids.environment,
+        f.ids.region,
+        "environment.resize",
+        "manual",
+        "queued",
+        1,
+        "a".repeat(64),
+        '{"profile":{}}',
+        f.ids.cluster,
+        "1",
+        0,
+        "f".repeat(64),
+        1,
+        "standard",
+        "large",
+        now,
+        "awaiting_authority",
+      );
+    f.db
+      .prepare(
+        "INSERT INTO environment_compute(environment_id,organization_id,project_id,revision,requested_size_id,effective_size_id,phase,operation_id,version_token,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        f.ids.environment,
+        f.ids.organization,
+        f.ids.project,
+        1,
+        "large",
+        "standard",
+        "requested",
+        resizeOperationId,
+        "compute-version",
+        now,
+      );
+    f.db
+      .prepare(
+        "INSERT INTO resize_requests(organization_id,project_id,environment_id,scope_key,idempotency_key,request_hash,operation_id,response_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        f.ids.organization,
+        f.ids.project,
+        f.ids.environment,
+        `environment:${f.ids.environment}:resize`,
+        "retained-resize-intent",
+        "d".repeat(64),
+        resizeOperationId,
+        resizeResponse,
+        now,
+      );
+    const retainedResizeRows = [
+      "resize_operations",
+      "environment_compute",
+      "resize_requests",
+    ].map((name) => ({
+      name,
+      rows: f.db.prepare(`SELECT * FROM ${name}`).all(),
+    }));
     let reads = 0;
     const snapshot = await captureControlSnapshot(
       async (sql) => {
@@ -172,11 +262,16 @@ test("rebuilds all current control migrations and historical encrypted credentia
     );
     assert.equal(reads, 1);
     assert.equal(
+      snapshot.tables.some((table) => table.name === "environment_compute"),
+      true,
+      "control recovery must retain durable compute revisions",
+    );
+    assert.equal(
       snapshot.tables.some((table) => table.name === "environment_backups"),
       true,
       "current control recovery must include durable backup identities",
     );
-    assert.equal(snapshot.migrations.files.length, 15);
+    assert.equal(snapshot.migrations.files.length, 16);
     assert.equal(
       snapshot.sequences.find((s) => s.name === "d1_migrations").seq,
       "9007199254740993",
@@ -240,6 +335,14 @@ test("rebuilds all current control migrations and historical encrypted credentia
           db.prepare(`SELECT * FROM ${retained.name}`).all(),
           retained.rows,
           `${retained.name} must retain the exact accepted artifact, dispatch and replay identity`,
+        );
+      }
+      for (const retained of retainedResizeRows) {
+        assert.equal(retained.rows.length, 1);
+        assert.deepEqual(
+          db.prepare(`SELECT * FROM ${retained.name}`).all(),
+          retained.rows,
+          `${retained.name} must retain the exact queued intention and compute revision`,
         );
       }
       assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);

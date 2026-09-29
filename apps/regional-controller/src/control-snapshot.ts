@@ -242,11 +242,19 @@ export async function migrationSet(directory: string): Promise<MigrationSet> {
 export function buildSnapshotQuery(set: MigrationSet): string {
   if (!trustedSql.has(set)) throw fail("control_snapshot_migrations_invalid");
   const fragments = set.tables.map((table) => {
-    const cells = table.columns.map((name) => {
-      const column = quote(name);
+    // Short, private projection aliases keep a one-read snapshot below D1's
+    // statement bound as trusted migrations add application columns.
+    const aliases = table.columns.map((_, index) => quote(`c${index}`));
+    const cells = aliases.map((column) => {
       return `json_object('type',typeof(${column}),'value',CASE typeof(${column}) WHEN 'blob' THEN hex(${column}) WHEN 'real' THEN printf('%!.17g',${column}) ELSE CAST(${column} AS TEXT) END)`;
     });
-    return `(SELECT json_object('name',${literal(table.name)},'columns',json(${literal(JSON.stringify(table.columns))}),'rows',json((SELECT json_group_array(json_array(${cells.join(",")})) FROM (SELECT ${table.columns.map(quote).join(",")} FROM ${quote(table.name)} ORDER BY ${table.order.map(quote).join(",")})))))`;
+    const selected = table.columns
+      .map((name, index) => `${quote(name)} AS ${aliases[index]}`)
+      .join(",");
+    const ordered = table.order
+      .map((name) => `${quote(table.name)}.${quote(name)}`)
+      .join(",");
+    return `(SELECT json_object('name',${literal(table.name)},'columns',json(${literal(JSON.stringify(table.columns))}),'rows',json((SELECT json_group_array(json_array(${cells.join(",")})) FROM (SELECT ${selected} FROM ${quote(table.name)} ORDER BY ${ordered})))))`;
   });
   const concatenate = (parts: string[]): string => {
     if (parts.length === 1) return parts[0]!;

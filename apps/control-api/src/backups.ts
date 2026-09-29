@@ -427,8 +427,8 @@ async function create(
       ),
       assertion(
         db,
-        "NOT EXISTS (SELECT 1 FROM operations WHERE environment_id=? AND status IN ('queued','running') AND kind='environment.suspend') AND NOT EXISTS (SELECT 1 FROM backup_operations o JOIN environment_backups b ON b.id=o.backup_id WHERE b.environment_id=? AND o.status IN ('queued','running'))",
-        [environmentId, environmentId],
+        "NOT EXISTS (SELECT 1 FROM operations WHERE environment_id=? AND status IN ('queued','running') AND kind='environment.suspend') AND NOT EXISTS (SELECT 1 FROM backup_operations o JOIN environment_backups b ON b.id=o.backup_id WHERE b.environment_id=? AND o.status IN ('queued','running')) AND NOT EXISTS (SELECT 1 FROM resize_operations o WHERE o.environment_id=? AND o.status IN ('queued','running'))",
+        [environmentId, environmentId, environmentId],
       ),
       db
         .prepare(

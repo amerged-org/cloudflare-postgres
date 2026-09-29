@@ -396,8 +396,15 @@ async function createSuspend(
         "NOT EXISTS (SELECT 1 FROM operations WHERE environment_id = ? AND kind = 'environment.create' AND status IN ('queued','running')) " +
           "AND NOT EXISTS (SELECT 1 FROM role_operations o JOIN database_roles r ON r.id = o.role_id WHERE r.environment_id = ? AND o.status IN ('queued','running')) " +
           "AND NOT EXISTS (SELECT 1 FROM database_operations o JOIN logical_databases d ON d.id = o.database_id WHERE d.environment_id = ? AND o.status IN ('queued','running')) " +
-          "AND NOT EXISTS (SELECT 1 FROM backup_operations o JOIN environment_backups b ON b.id = o.backup_id WHERE b.environment_id = ? AND o.status IN ('queued','running'))",
-        [environmentId, environmentId, environmentId, environmentId],
+          "AND NOT EXISTS (SELECT 1 FROM backup_operations o JOIN environment_backups b ON b.id = o.backup_id WHERE b.environment_id = ? AND o.status IN ('queued','running')) " +
+          "AND NOT EXISTS (SELECT 1 FROM resize_operations o WHERE o.environment_id = ? AND o.status IN ('queued','running'))",
+        [
+          environmentId,
+          environmentId,
+          environmentId,
+          environmentId,
+          environmentId,
+        ],
       ),
       db
         .prepare(
