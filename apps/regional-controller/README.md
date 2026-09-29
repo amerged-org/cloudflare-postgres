@@ -183,11 +183,13 @@ key and snapshot mode 0600. The recovery key file contains a separately generate
 32-byte random key in unpadded base64url, with an optional newline. Keep it in
 independent custody. Nothing is read automatically from the repository's `.env`.
 
-`capture` uses an existing authenticated Wrangler installation and an explicit
-strict JSON configuration for the selected D1 binding. The Wrangler configuration
-and zero-byte environment file must also live in private directories. The snapshot
-contains operational identities and encrypted credentials; store it privately
-and seal it before transferring it to archive custody.
+`capture` supports an existing authenticated Wrangler installation or an explicit
+Cloudflare D1 REST read token. The Wrangler configuration and zero-byte environment
+file must also live in private directories. The snapshot contains operational
+identities and encrypted credentials; store it privately and seal it before
+transferring it to archive custody.
+
+The legacy Wrangler configuration remains valid:
 
 ```json
 {
@@ -211,6 +213,34 @@ The source database UUID must match the selected Wrangler binding; assign and
 retain an installation recovery UUID. A successful capture reports its digest
 and table/row counts. The remote subprocess has a 60-second bound and bounded
 output; its raw stdout/stderr never enters public command output.
+
+For the D1 REST backend, create a dedicated API token with only the necessary
+`D1 Read` permission and store the bare token, optionally followed by one newline,
+in a mode-0600 file inside a mode-0700 operator directory. The token never goes
+in the JSON configuration, command line, or repository. The endpoint is fixed to
+Cloudflare's API; the account and database UUID come only from this configuration.
+Keep `installationId` in the trusted operator inventory. REST capture performs one
+read-only, generated SELECT with a 60-second timeout, a 16-MiB streamed response
+limit, and no redirects. The D1 response must explicitly report
+`meta.served_by_primary: true`; a missing flag or replica response fails capture.
+This confirms the provider's routing assertion, not concurrent-write consistency
+or a production recovery-point objective.
+
+```json
+{
+  "schemaVersion": 1,
+  "action": "capture",
+  "backend": "cloudflare-rest",
+  "tokenFile": "/absolute/private/d1-read.token",
+  "accountId": "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID",
+  "migrationDirectory": "/absolute/checkout/apps/control-api/migrations",
+  "source": {
+    "installationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "databaseId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+  },
+  "snapshotPath": "/absolute/private/control.snapshot.json"
+}
+```
 
 `seal` verifies the snapshot against the current trusted migrations and verifies
 every encrypted credential before publishing its bundle. `keyringsFile` contains

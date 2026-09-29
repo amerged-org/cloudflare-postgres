@@ -105,3 +105,10 @@ contain only `control_recovery_failed`. Data, keys, source IDs and local paths d
 not enter command output.
 
 See the [operator examples](../../apps/regional-controller/README.md#control-recovery-artifacts).
+Capture accepts the original exact Wrangler configuration or an explicit
+`cloudflare-rest` backend with a separate owner-only token file. REST requests are
+bound to the configured Cloudflare account and source D1 UUID at a fixed HTTPS
+endpoint. Only one successful D1 query group explicitly reporting
+`meta.served_by_primary: true` is accepted; transport, provider, timeout, and
+shape errors collapse to the same public failure code. No token, provider body,
+row payload, or local path enters command output.

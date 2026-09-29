@@ -27,18 +27,34 @@ export async function runControlRecovery(args: string[]): Promise<number> {
       throw new Error();
     let result: unknown;
     if (value.action === "capture") {
-      const keys = [
-        "schemaVersion",
-        "action",
-        "wranglerExecutable",
-        "wranglerConfigFile",
-        "emptyEnvFile",
-        "accountId",
-        "databaseName",
-        "migrationDirectory",
-        "source",
-        "snapshotPath",
-      ];
+      const backend = value.backend ?? "wrangler";
+      if (backend !== "wrangler" && backend !== "cloudflare-rest")
+        throw new Error();
+      const keys =
+        backend === "cloudflare-rest"
+          ? [
+              "schemaVersion",
+              "action",
+              "backend",
+              "tokenFile",
+              "accountId",
+              "migrationDirectory",
+              "source",
+              "snapshotPath",
+            ]
+          : [
+              "schemaVersion",
+              "action",
+              ...(value.backend === "wrangler" ? ["backend"] : []),
+              "wranglerExecutable",
+              "wranglerConfigFile",
+              "emptyEnvFile",
+              "accountId",
+              "databaseName",
+              "migrationDirectory",
+              "source",
+              "snapshotPath",
+            ];
       if (
         Object.keys(value).length !== keys.length ||
         !keys.every((key) => Object.hasOwn(value, key)) ||

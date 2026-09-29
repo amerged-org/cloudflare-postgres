@@ -6,15 +6,27 @@ import { dirname, isAbsolute, join } from "node:path";
 import { captureControlSnapshotRows } from "./control-snapshot.ts";
 import type { ControlSnapshot } from "./control-snapshot.ts";
 
-export interface ControlRecoveryD1Config {
-  wranglerExecutable: string;
-  wranglerConfigFile: string;
-  emptyEnvFile: string;
+interface ControlRecoveryD1Common {
   accountId: string;
-  databaseName: string;
   migrationDirectory: string;
   source: ControlSnapshot["source"];
 }
+
+interface WranglerControlRecoveryD1Config extends ControlRecoveryD1Common {
+  backend?: "wrangler";
+  wranglerExecutable: string;
+  wranglerConfigFile: string;
+  emptyEnvFile: string;
+  databaseName: string;
+}
+
+interface RestControlRecoveryD1Config extends ControlRecoveryD1Common {
+  backend: "cloudflare-rest";
+  tokenFile: string;
+}
+
+export type ControlRecoveryD1Config =
+  WranglerControlRecoveryD1Config | RestControlRecoveryD1Config;
 
 const uuid = /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/;
 const failed = () => new Error("control_recovery_d1_failed");
@@ -31,26 +43,37 @@ const absolute = (value: unknown): value is string =>
   isAbsolute(value);
 
 function configuration(value: ControlRecoveryD1Config): void {
-  const keys = [
-    "wranglerExecutable",
-    "wranglerConfigFile",
-    "emptyEnvFile",
-    "accountId",
-    "databaseName",
-    "migrationDirectory",
-    "source",
-  ];
   if (!object(value)) throw failed();
+  const backend = value.backend ?? "wrangler";
+  const keys =
+    backend === "cloudflare-rest"
+      ? ["backend", "tokenFile", "accountId", "migrationDirectory", "source"]
+      : [
+          ...(value.backend === "wrangler" ? ["backend"] : []),
+          "wranglerExecutable",
+          "wranglerConfigFile",
+          "emptyEnvFile",
+          "accountId",
+          "databaseName",
+          "migrationDirectory",
+          "source",
+        ];
   const source: unknown = value.source;
   if (
+    (backend !== "wrangler" && backend !== "cloudflare-rest") ||
     Object.keys(value).length !== keys.length ||
     !keys.every((key) => Object.hasOwn(value, key)) ||
-    !keys.slice(0, 3).every((key) => absolute(value[key])) ||
+    (backend === "cloudflare-rest"
+      ? !absolute(value.tokenFile)
+      : !["wranglerExecutable", "wranglerConfigFile", "emptyEnvFile"].every(
+          (key) => absolute(value[key]),
+        )) ||
     !absolute(value.migrationDirectory) ||
     typeof value.accountId !== "string" ||
     !/^[a-f0-9]{32}$/.test(value.accountId) ||
-    typeof value.databaseName !== "string" ||
-    !/^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}$/.test(value.databaseName) ||
+    (backend === "wrangler" &&
+      (typeof value.databaseName !== "string" ||
+        !/^[a-zA-Z0-9_][a-zA-Z0-9_-]{0,62}$/.test(value.databaseName))) ||
     !object(source) ||
     Object.keys(source).length !== 2 ||
     !["installationId", "databaseId"].every(
@@ -108,7 +131,7 @@ async function privateFile(path: string, maximum: number): Promise<Buffer> {
 
 function validateWrangler(
   contents: Buffer,
-  config: ControlRecoveryD1Config,
+  config: WranglerControlRecoveryD1Config,
 ): void {
   const value: unknown = JSON.parse(
     new TextDecoder("utf-8", { fatal: true }).decode(contents),
@@ -158,7 +181,7 @@ async function writePrivate(path: string, contents: Buffer): Promise<void> {
 }
 
 function environment(
-  config: ControlRecoveryD1Config,
+  config: WranglerControlRecoveryD1Config,
   working: string,
 ): NodeJS.ProcessEnv {
   const result: NodeJS.ProcessEnv = {};
@@ -177,7 +200,7 @@ function environment(
 }
 
 async function query(
-  config: ControlRecoveryD1Config,
+  config: WranglerControlRecoveryD1Config,
   working: string,
   sql: string,
   cancellation?: AbortSignal,
@@ -272,6 +295,114 @@ async function query(
   return response[0].results;
 }
 
+function readBearerToken(contents: Buffer): string {
+  const token = new TextDecoder("utf-8", { fatal: true })
+    .decode(contents)
+    .replace(/\r?\n$/, "");
+  if (!/^[A-Za-z0-9._~-]{16,4096}$/.test(token)) throw failed();
+  return token;
+}
+
+async function queryRest(
+  config: RestControlRecoveryD1Config,
+  token: string,
+  sql: string,
+  cancellation?: AbortSignal,
+): Promise<unknown[]> {
+  const statement = typeof sql === "string" ? sql.trim() : "";
+  if (
+    Buffer.byteLength(statement, "utf8") > 100_000 ||
+    !/^SELECT\b/i.test(statement) ||
+    !statement.endsWith(";") ||
+    statement.slice(0, -1).includes(";")
+  )
+    throw failed();
+  const controller = new AbortController();
+  const stop = () => controller.abort();
+  const timer = setTimeout(stop, 60_000);
+  cancellation?.addEventListener("abort", stop, { once: true });
+  if (cancellation?.aborted) stop();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+  let body: ReadableStream<Uint8Array> | null = null;
+  let finished = false;
+  try {
+    if (controller.signal.aborted) throw failed();
+    const response = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${config.accountId}/d1/database/${config.source.databaseId}/query`,
+      {
+        method: "POST",
+        redirect: "error",
+        headers: {
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ sql }),
+        signal: controller.signal,
+      },
+    );
+    body = response.body;
+    if (
+      response.status !== 200 ||
+      !body ||
+      response.headers.get("content-type")?.split(";", 1)[0]?.trim() !==
+        "application/json"
+    )
+      throw failed();
+    const limit = 16 * 1024 * 1024;
+    const declared = response.headers.get("content-length");
+    if (declared !== null && Number(declared) > limit) throw failed();
+    reader = body.getReader();
+    const chunks: Buffer[] = [];
+    let length = 0;
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      length += part.value.byteLength;
+      if (length > limit) throw failed();
+      chunks.push(Buffer.from(part.value));
+    }
+    if (controller.signal.aborted) throw failed();
+    const value: unknown = JSON.parse(
+      new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)),
+    );
+    if (
+      !object(value) ||
+      value.success !== true ||
+      (value.errors !== undefined &&
+        (!Array.isArray(value.errors) || value.errors.length !== 0)) ||
+      !Array.isArray(value.result) ||
+      value.result.length !== 1 ||
+      !object(value.result[0]) ||
+      value.result[0].success !== true ||
+      !object(value.result[0].meta) ||
+      value.result[0].meta.served_by_primary !== true ||
+      value.result[0].meta.changed_db === true ||
+      (typeof value.result[0].meta.rows_written === "number" &&
+        value.result[0].meta.rows_written !== 0) ||
+      !Array.isArray(value.result[0].results) ||
+      value.result[0].results.length < 1 ||
+      value.result[0].results.length > 100131
+    )
+      throw failed();
+    finished = true;
+    return value.result[0].results;
+  } catch {
+    throw failed();
+  } finally {
+    if (!finished) {
+      controller.abort();
+      try {
+        if (reader) void reader.cancel().catch(() => {});
+        else if (body) void body.cancel().catch(() => {});
+      } catch {
+        /* Stream cleanup must never extend the capture deadline. */
+      }
+    }
+    cancellation?.removeEventListener("abort", stop);
+    clearTimeout(timer);
+  }
+}
+
 export async function captureD1(
   config: ControlRecoveryD1Config,
   cancellation?: AbortSignal,
@@ -283,29 +414,43 @@ export async function captureD1(
     configuration(config);
     if (process.platform !== "linux" && process.platform !== "darwin")
       throw failed();
-    const [wrangler, empty] = await Promise.all([
-      privateFile(config.wranglerConfigFile, 256 * 1024),
-      privateFile(config.emptyEnvFile, 0),
-    ]);
-    validateWrangler(wrangler, config);
-    if (empty.length !== 0) throw failed();
-    const parent = await privateDirectory(dirname(config.wranglerConfigFile));
-    working = await mkdtemp(join(parent, ".pgcf-d1-capture-"));
-    await chmod(working, 0o700);
-    await writePrivate(join(working, "wrangler.jsonc"), wrangler);
-    await writePrivate(join(working, "empty.env"), empty);
-    const capturedWorking = working;
     let invoked = false;
-    snapshot = await captureControlSnapshotRows(
-      async (sql) => {
-        if (invoked) throw failed();
-        invoked = true;
-        return query(config, capturedWorking, sql, cancellation);
-      },
-      config.migrationDirectory,
-      config.source,
-      new Date().toISOString(),
-    );
+    if (config.backend === "cloudflare-rest") {
+      const token = readBearerToken(await privateFile(config.tokenFile, 4096));
+      snapshot = await captureControlSnapshotRows(
+        async (sql) => {
+          if (invoked) throw failed();
+          invoked = true;
+          return queryRest(config, token, sql, cancellation);
+        },
+        config.migrationDirectory,
+        config.source,
+        new Date().toISOString(),
+      );
+    } else {
+      const [wrangler, empty] = await Promise.all([
+        privateFile(config.wranglerConfigFile, 256 * 1024),
+        privateFile(config.emptyEnvFile, 0),
+      ]);
+      validateWrangler(wrangler, config);
+      if (empty.length !== 0) throw failed();
+      const parent = await privateDirectory(dirname(config.wranglerConfigFile));
+      working = await mkdtemp(join(parent, ".pgcf-d1-capture-"));
+      await chmod(working, 0o700);
+      await writePrivate(join(working, "wrangler.jsonc"), wrangler);
+      await writePrivate(join(working, "empty.env"), empty);
+      const capturedWorking = working;
+      snapshot = await captureControlSnapshotRows(
+        async (sql) => {
+          if (invoked) throw failed();
+          invoked = true;
+          return query(config, capturedWorking, sql, cancellation);
+        },
+        config.migrationDirectory,
+        config.source,
+        new Date().toISOString(),
+      );
+    }
   } catch {
     unsuccessful = true;
   }
