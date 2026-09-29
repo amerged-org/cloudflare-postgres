@@ -19,3 +19,9 @@ The two Go cases pass their first implementation candidates. The real Linux fixt
 The frozen candidate's canonical gate runs exactly once in 24.404 seconds: format, lint, typecheck, 26 Worker cases, 31 Node cases and the two guard Go cases pass. Four unchanged CRI-reader cases retain their prior evidence instead of being rerun. Total automated coverage is 63 cases plus the single Linux qualification. Linux behavioral evidence precedes final formatting; no behavior changes follow it. Source review found no material defect in the scoped supervisor.
 
 The local environment is unchanged, mode 0600 and ignored/untracked. Public-file scanning finds zero actual environment-secret matches; all 22 held SDK files remain unchanged. Builds use explicit public inputs and retain the Go/x-sys BSD notices. No Contabo order, server reimage, Cloudflare schema/secret change, customer compute creation or default guard activation accompanies this source delivery.
+
+## Published artifact and Linux CI
+
+Runtime source `3c9981f2c6db10e20e1a4c125da875cc6b3b953c` is pushed and matching source/plan bytes were read back from GitHub. The [Linux guard workflow](https://github.com/amerged-org/cloudflare-postgres/actions/runs/36527654520) succeeds at that exact source, running only this changed Go package's formatting, vet and two cases on Ubuntu. It exercises the kernel-clock branch rather than repeating the full workspace gate.
+
+The standalone linux/amd64 image builds once in 38.285 seconds from exactly 12 public inputs. Its fixed entrypoint, non-root user, kernel clock read and both upstream BSD notices are verified. The local image index is `sha256:11a2f9363a993db9fbd20f218aa4db6f4b226c0a3825904a185c59ad541628d3`. No registry push or Contabo activation is claimed; public artifact distribution and the actual CNPG/allowance integration remain open.
