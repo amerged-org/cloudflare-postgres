@@ -50,6 +50,7 @@ interface SuspendSpec {
   cluster_uid: string;
   pooler_json: string | null;
   created_at: string;
+  run_epoch: string | null;
 }
 interface SuspendOperation {
   id: string;
@@ -83,6 +84,7 @@ interface SuspendObservation {
   quotaPodsZero: true;
   clusterHibernated: true;
   poolerStopped: true;
+  runEpoch?: string;
 }
 const hash = /^[a-f0-9]{64}$/;
 const environmentColumns =
@@ -111,6 +113,7 @@ function currentScope(operation: string): string {
     ".region_id AND e.status = 'ready' " +
     "AND p.status = 'active' AND g.status <> 'disabled' AND e.spec_revision = s.spec_revision " +
     "AND e.spec_hash = s.spec_hash AND e.resolved_spec = s.spec_json " +
+    "AND e.run_epoch IS s.run_epoch AND json_extract(e.observation_json, '$.runEpoch') IS e.run_epoch " +
     "AND json_extract(e.observation_json, '$.clusterUid') = s.cluster_uid " +
     "AND ((s.pooler_json IS NULL AND json_type(e.observation_json, '$.pooler') IS NULL) " +
     "OR (s.pooler_json IS NOT NULL AND json_extract(e.observation_json, '$.pooler.uid') = json_extract(s.pooler_json, '$.uid') " +
@@ -166,6 +169,9 @@ function publicRuntime(
     observation: runtime?.observation_json
       ? (JSON.parse(runtime.observation_json) as SuspendObservation)
       : null,
+    ...(environment.run_epoch === null
+      ? {}
+      : { runEpoch: environment.run_epoch }),
   };
 }
 async function previousIntent(
@@ -299,7 +305,11 @@ async function createSuspend(
   const pooled = Object.hasOwn(spec.profile, "pooling");
   const observed: unknown = JSON.parse(environment.observation_json ?? "null");
   if (
-    !validEnvironmentObservation(observed, pooled) ||
+    !validEnvironmentObservation(
+      observed,
+      pooled,
+      environment.run_epoch ?? undefined,
+    ) ||
     !uid(observed.clusterUid) ||
     !hash.test(environment.spec_hash) ||
     !integer(environment.spec_revision)
@@ -360,7 +370,7 @@ async function createSuspend(
           environmentJoins +
           " WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND e.region_id = ? " +
           "AND e.status = 'ready' AND p.status = 'active' AND g.status <> 'disabled' " +
-          "AND e.spec_revision = ? AND e.spec_hash = ? AND e.resolved_spec = ? AND e.observation_json = ?)",
+          "AND e.spec_revision = ? AND e.spec_hash = ? AND e.resolved_spec = ? AND e.observation_json = ? AND e.run_epoch IS ?)",
         [
           environmentId,
           organizationId,
@@ -370,6 +380,7 @@ async function createSuspend(
           environment.spec_hash,
           environment.resolved_spec,
           environment.observation_json,
+          environment.run_epoch,
         ],
       ),
       assertion(
@@ -393,7 +404,7 @@ async function createSuspend(
         ),
       db
         .prepare(
-          "INSERT INTO environment_suspend_specs (operation_id, environment_id, runtime_revision, spec_revision, spec_hash, spec_json, cluster_uid, pooler_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO environment_suspend_specs (operation_id, environment_id, runtime_revision, spec_revision, spec_hash, spec_json, cluster_uid, pooler_json, created_at, run_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(
           operationId,
@@ -405,6 +416,7 @@ async function createSuspend(
           observed.clusterUid,
           pooler ? JSON.stringify(pooler) : null,
           at,
+          environment.run_epoch,
         ),
       db
         .prepare(
@@ -557,6 +569,7 @@ async function claimSuspend(
       leaseToken: token,
       leaseEpoch: updated.lease_epoch,
       leaseExpiresAt: expiresAt,
+      ...(snapshot.run_epoch === null ? {} : { runEpoch: snapshot.run_epoch }),
     },
   });
 }
@@ -612,17 +625,23 @@ function suspendedObservation(
   snapshot: SuspendSpec,
 ): SuspendObservation | null {
   if (
-    !fields(value, [
-      "namespaceUid",
-      "clusterUid",
-      "quotaUid",
-      "volumesHash",
-      "pooler",
-      "computeAbsent",
-      "quotaPodsZero",
-      "clusterHibernated",
-      "poolerStopped",
-    ]) ||
+    !fields(
+      value,
+      [
+        "namespaceUid",
+        "clusterUid",
+        "quotaUid",
+        "volumesHash",
+        "pooler",
+        "computeAbsent",
+        "quotaPodsZero",
+        "clusterHibernated",
+        "poolerStopped",
+      ],
+      ["runEpoch"],
+    ) ||
+    Object.hasOwn(value, "runEpoch") !== (snapshot.run_epoch !== null) ||
+    (snapshot.run_epoch !== null && value.runEpoch !== snapshot.run_epoch) ||
     !uid(value.namespaceUid) ||
     value.clusterUid !== snapshot.cluster_uid ||
     !uid(value.quotaUid) ||
@@ -662,6 +681,7 @@ function suspendedObservation(
     quotaPodsZero: true,
     clusterHibernated: true,
     poolerStopped: true,
+    ...(snapshot.run_epoch === null ? {} : { runEpoch: snapshot.run_epoch }),
   };
 }
 async function resultSuspend(

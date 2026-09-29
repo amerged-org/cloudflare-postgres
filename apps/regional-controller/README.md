@@ -35,6 +35,12 @@ Success requires CNPG applied/current generation/exact password-Secret version, 
 
 [The maintained driver dependencies](THIRD_PARTY.md) are pinned and retain their licenses. This lifecycle does not automatically grant table permissions/ownership, terminate existing sessions, expose a public endpoint, enable closed regional admission or qualify backups/recovery. Real CNPG application, key recovery, image/runtime, networking and end-to-end pilot verification remain separate evidence.
 
+## Execution identity and stale writers
+
+The [execution-fencing contract](../../docs/contracts/execution-fencing-v1.md) binds updated writers to the explicit epoch produced by an opted-in new profile. Required Namespace/Cluster/quota/Pooler annotations must all match; an old binding rejects any annotated resource, and a mixed transition remains closed. Stop patches test epoch alongside UID/resourceVersion, with fresh adapter checks before dispatch. Allowance and suspend journals never adopt another run from live metadata.
+
+For a fenced allowance supervisor, add its independently verified `runEpoch` to the private runtime binding before first journal creation. A different epoch requires separately qualified authority and journal handoff; do not reset an old journal. The existing examples remain legacy/unfenced. No resume or epoch-advance writer is enabled, and older binaries with privileged Kubernetes access must be excluded operationally.
+
 ## Explicit suspend executor
 
 The [environment suspend contract](../../docs/contracts/environment-suspend-v1.md) connects a persisted customer compute-stop intention to a separately supervised executor. It claims only `environment.suspend` work, keeps ordinary operation leases fresh, seals workload/retained-volume identities in a private operation journal before effects and reuses the same owned normal-stop primitive as allowance supervision.

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createHash } from "node:crypto";
+import { RUN_EPOCH_PATCH_PATH, runtimeEpochMatches } from "./run-epoch.ts";
 import type {
   AllowanceRuntime,
   RuntimeBinding,
@@ -78,7 +79,16 @@ export function ownedInventory(
     inventory.quota.metadata.namespace === binding.namespace &&
     inventory.quota.metadata.uid === binding.quotaUid &&
     owned(inventory.quota, binding) &&
-    ownedPoolerInventory(inventory, binding)
+    ownedPoolerInventory(inventory, binding) &&
+    runtimeEpochMatches(
+      [
+        inventory.namespace,
+        inventory.cluster,
+        inventory.quota,
+        ...(binding.pooler ? (inventory.poolers ?? []) : []),
+      ],
+      binding,
+    )
   );
 }
 function controllerOwner(
@@ -229,8 +239,15 @@ export function volumeHash(
     .digest("hex");
 }
 
-function patchGuards(resource: Resource): RuntimePatch[] {
-  if (!resource.metadata.uid || !resource.metadata.resourceVersion)
+function patchGuards(
+  resource: Resource,
+  binding: RuntimeBinding,
+): RuntimePatch[] {
+  if (
+    !resource.metadata.uid ||
+    !resource.metadata.resourceVersion ||
+    !runtimeEpochMatches([resource], binding)
+  )
     throw new Error("allowance_patch_identity_unproven");
   return [
     { op: "test", path: "/metadata/uid", value: resource.metadata.uid },
@@ -239,6 +256,15 @@ function patchGuards(resource: Resource): RuntimePatch[] {
       path: "/metadata/resourceVersion",
       value: resource.metadata.resourceVersion,
     },
+    ...(binding.runEpoch === undefined
+      ? []
+      : [
+          {
+            op: "test" as const,
+            path: RUN_EPOCH_PATCH_PATH,
+            value: binding.runEpoch,
+          },
+        ]),
   ];
 }
 
@@ -278,7 +304,7 @@ export async function stopOwnedRuntime(
   try {
     if (object(object(inventory.quota.spec).hard).pods !== "0") {
       const operations = [
-        ...patchGuards(inventory.quota),
+        ...patchGuards(inventory.quota, binding),
         {
           op: Object.hasOwn(object(object(inventory.quota.spec).hard), "pods")
             ? ("replace" as const)
@@ -304,7 +330,7 @@ export async function stopOwnedRuntime(
       const pooler = inventory.poolers![0]!;
       if (pooler.spec?.instances !== 0) {
         const operations: RuntimePatch[] = [
-          ...patchGuards(pooler),
+          ...patchGuards(pooler, binding),
           { op: "replace", path: "/spec/instances", value: 0 },
         ];
         try {
@@ -321,7 +347,7 @@ export async function stopOwnedRuntime(
       inventory.cluster.metadata.annotations?.["cnpg.io/hibernation"] !== "on"
     ) {
       const operations = [
-        ...patchGuards(inventory.cluster),
+        ...patchGuards(inventory.cluster, binding),
         {
           op: "add" as const,
           path: "/metadata/annotations/cnpg.io~1hibernation",

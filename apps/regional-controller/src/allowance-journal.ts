@@ -12,6 +12,7 @@ import {
 } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { validRunEpoch } from "./run-epoch.ts";
 import type {
   AllowanceReceipt,
   AllowanceRequest,
@@ -80,6 +81,7 @@ export function validRuntimeBinding(value: RuntimeBinding): boolean {
     uuid.test(value.namespaceUid) &&
     uuid.test(value.clusterUid) &&
     uuid.test(value.quotaUid) &&
+    (value.runEpoch === undefined || validRunEpoch(value.runEpoch)) &&
     (value.pooler === undefined ||
       (value.pooler !== null &&
         typeof value.pooler === "object" &&

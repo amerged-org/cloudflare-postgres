@@ -46,6 +46,10 @@ Use the organization token to read `GET /v1/organizations/{organizationId}/proje
 
 The current slice has no public native endpoint, customer database credentials, environment listing/deletion/resize, runtime usage collector, runtime allowance enforcer, idempotency archival, or rate limiting. A reported ready environment means the regional executor observed PostgreSQL resource readiness; it does not prove backups, restore qualification, credential access, or a production service objective.
 
+## Opt-in execution fencing
+
+A new immutable operator profile may include exactly `executionFencing: {version: 1}`. The [execution-identity contract](../../docs/contracts/execution-fencing-v1.md) defines the server-assigned initial `runEpoch: "1"`, its required readiness/suspend propagation and protected regional mutations. Existing unfenced profiles/rows are not backfilled. Deploy every writer with these checks and exclude older privileged writers before enabling the profile; this is not Kubernetes admission enforcement or funded resume.
+
 ## Explicit compute suspension
 
 Use the [suspend contract](../../docs/contracts/environment-suspend-v1.md) to request an immediate owned compute stop with `POST .../environments/{environmentId}/suspend`, `Idempotency-Key` and `{expectedRevision}`. Read desired/observed runtime state separately at `GET .../runtime`; provisioning status and immutable specification remain unchanged. The ordinary operation endpoint recovers the task. Active database work conflicts, while suspended desired state blocks new work/credential disclosure and current execution funding.

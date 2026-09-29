@@ -12,6 +12,7 @@ export interface RuntimeBinding {
   namespaceUid: string;
   clusterUid: string;
   quotaUid: string;
+  runEpoch?: string;
   pooler?: { uid: string; deploymentUid: string };
 }
 export interface AllowanceRequest {

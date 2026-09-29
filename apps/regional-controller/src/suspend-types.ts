@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { RuntimeBinding } from "./allowance-types.ts";
+import { validRunEpoch } from "./run-epoch.ts";
 
 export interface SuspendClaim {
   schemaVersion: 1;
@@ -14,6 +15,7 @@ export interface SuspendClaim {
   runtimeRevision: number;
   clusterUid: string;
   pooler: { uid: string; deploymentUid: string } | null;
+  runEpoch?: string;
   leaseToken: string;
   leaseEpoch: number;
   leaseExpiresAt: string;
@@ -28,6 +30,7 @@ export interface SuspendObservation {
   quotaPodsZero: true;
   clusterHibernated: true;
   poolerStopped: true;
+  runEpoch?: string;
 }
 export interface SuspendSeal {
   binding: RuntimeBinding;
@@ -55,6 +58,7 @@ export function validSuspendClaim(value: unknown): value is SuspendClaim {
     /^[a-f0-9]{64}$/.test(claim.specHash) &&
     Number.isSafeInteger(claim.runtimeRevision) &&
     Number(claim.runtimeRevision) > 0 &&
+    (!Object.hasOwn(claim, "runEpoch") || validRunEpoch(claim.runEpoch)) &&
     (claim.pooler === null ||
       (claim.pooler !== null &&
         typeof claim.pooler === "object" &&

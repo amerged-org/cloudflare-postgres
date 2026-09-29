@@ -35,6 +35,7 @@ interface EnvironmentObservation {
   clusterGeneration: number;
   readyInstances: number;
   pooler?: PoolerObservation;
+  runEpoch?: string;
 }
 
 interface Profile {
@@ -62,6 +63,7 @@ interface Profile {
     };
   };
   pooling?: PoolingPolicy;
+  executionFencing?: { version: 1 };
 }
 
 interface EnvironmentInput {
@@ -89,6 +91,7 @@ export interface EnvironmentRow {
   created_at: string;
   observed_at: string | null;
   observation_json: string | null;
+  run_epoch: string | null;
 }
 
 interface ExecutionRow {
@@ -133,6 +136,7 @@ const identifier = /^[a-z][a-z0-9_-]{0,63}$/;
 const version = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const secretKey = /^[A-Za-z0-9._-]{1,253}$/;
+const runEpoch = /^[1-9][0-9]{0,18}$/;
 
 function json(body: unknown, status = 200): Response {
   return Response.json(body, {
@@ -378,16 +382,21 @@ function poolingFromJson(value: unknown): PoolingPolicy | null {
 export function validEnvironmentObservation(
   value: unknown,
   pooled: boolean,
+  expectedRunEpoch?: string,
 ): value is EnvironmentObservation {
   return (
     object(
       value,
       ["clusterUid", "clusterGeneration", "readyInstances"],
-      ["pooler"],
+      ["pooler", "runEpoch"],
     ) &&
     name(value.clusterUid) &&
     integer(value.clusterGeneration, 1, Number.MAX_SAFE_INTEGER) &&
     integer(value.readyInstances, 1, 9) &&
+    Object.hasOwn(value, "runEpoch") === (expectedRunEpoch !== undefined) &&
+    (expectedRunEpoch === undefined ||
+      (runEpoch.test(expectedRunEpoch) &&
+        value.runEpoch === expectedRunEpoch)) &&
     Object.hasOwn(value, "pooler") === pooled &&
     (!pooled ||
       (object(value.pooler, [
@@ -408,7 +417,7 @@ function profileFromJson(value: unknown): Profile | null {
     !object(
       value,
       ["id", "postgresImage", "compute", "storage", "instances", "backup"],
-      ["pooling"],
+      ["pooling", "executionFencing"],
     ) ||
     !text(value.id, identifier) ||
     !text(
@@ -461,6 +470,12 @@ function profileFromJson(value: unknown): Profile | null {
     ? poolingFromJson(value.pooling)
     : undefined;
   if (pooling === null) return null;
+  if (
+    Object.hasOwn(value, "executionFencing") &&
+    (!object(value.executionFencing, ["version"]) ||
+      value.executionFencing.version !== 1)
+  )
+    return null;
   try {
     const endpoint = new URL(value.backup.endpointURL);
     if (
@@ -504,6 +519,9 @@ function profileFromJson(value: unknown): Profile | null {
       },
     },
     ...(pooling === undefined ? {} : { pooling }),
+    ...(Object.hasOwn(value, "executionFencing")
+      ? { executionFencing: { version: 1 as const } }
+      : {}),
   };
 }
 
@@ -521,6 +539,9 @@ function publicProfile(profile: Profile) {
     instances: profile.instances,
     backup: { retentionPolicy: profile.backup.retentionPolicy },
     ...(profile.pooling === undefined ? {} : { pooling: profile.pooling }),
+    ...(profile.executionFencing === undefined
+      ? {}
+      : { executionFencing: profile.executionFencing }),
   };
 }
 
@@ -542,6 +563,7 @@ export function publicEnvironment(row: EnvironmentRow) {
       row.observation_json === null
         ? null
         : (JSON.parse(row.observation_json) as unknown),
+    ...(row.run_epoch === null ? {} : { runEpoch: row.run_epoch }),
   };
 }
 
@@ -792,6 +814,7 @@ async function createEnvironment(
   const spec: ResolvedSpec = { ...input, profile };
   const serialized = JSON.stringify(spec);
   const specHash = await sha256(serialized);
+  const initialRunEpoch = profile.executionFencing === undefined ? null : "1";
   const environmentId = crypto.randomUUID();
   const operationId = crypto.randomUUID();
   const now = new Date().toISOString();
@@ -799,7 +822,7 @@ async function createEnvironment(
     const written = await db.batch([
       db
         .prepare(
-          "INSERT INTO environments (id, organization_id, project_id, region_id, catalog_version, profile_id, name, status, spec_revision, spec_hash, resolved_spec, created_at) SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?, ? FROM projects AS p JOIN region_admission AS a ON a.region_id = ? JOIN regions AS r ON r.id = a.region_id WHERE p.id = ? AND p.organization_id = ? AND p.status = 'active' AND a.catalog_version = ? AND a.accepting_new_environments = 1 AND r.status != 'disabled'",
+          "INSERT INTO environments (id, organization_id, project_id, region_id, catalog_version, profile_id, name, status, spec_revision, spec_hash, resolved_spec, created_at, run_epoch) SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?, ?, ? FROM projects AS p JOIN region_admission AS a ON a.region_id = ? JOIN regions AS r ON r.id = a.region_id WHERE p.id = ? AND p.organization_id = ? AND p.status = 'active' AND a.catalog_version = ? AND a.accepting_new_environments = 1 AND r.status != 'disabled'",
         )
         .bind(
           environmentId,
@@ -812,6 +835,7 @@ async function createEnvironment(
           specHash,
           serialized,
           now,
+          initialRunEpoch,
           input.regionId,
           projectId,
           organizationId,
@@ -933,6 +957,9 @@ async function claimOperation(
       specRevision: environment.spec_revision,
       specHash: environment.spec_hash,
       spec: JSON.parse(environment.resolved_spec) as ResolvedSpec,
+      ...(environment.run_epoch === null
+        ? {}
+        : { runEpoch: environment.run_epoch }),
     },
   });
 }
@@ -1017,10 +1044,20 @@ async function reportResult(
     typeof input.observation === "object" &&
     input.observation !== null &&
     Object.hasOwn(input.observation, "pooler");
+  const reportedRunEpoch =
+    typeof input.observation === "object" &&
+    input.observation !== null &&
+    typeof (input.observation as JsonObject).runEpoch === "string"
+      ? ((input.observation as JsonObject).runEpoch as string)
+      : undefined;
   const ready =
     input.status === "ready" &&
     input.resultCode === "cnpg_ready" &&
-    validEnvironmentObservation(input.observation, reportedPooling);
+    validEnvironmentObservation(
+      input.observation,
+      reportedPooling,
+      reportedRunEpoch,
+    );
   const failed =
     input.status === "failed" &&
     ["ownership_mismatch", "spec_conflict", "reconcile_failed"].includes(
@@ -1042,6 +1079,7 @@ async function reportResult(
     (!validEnvironmentObservation(
       input.observation,
       profile.pooling !== undefined,
+      environment.run_epoch ?? undefined,
     ) ||
       (input.observation as EnvironmentObservation).readyInstances <
         profile.instances)
@@ -1064,6 +1102,9 @@ async function reportResult(
               },
             }
           : {}),
+        ...(environment.run_epoch === null
+          ? {}
+          : { runEpoch: environment.run_epoch }),
       }
     : null;
   const resultHash = await sha256(

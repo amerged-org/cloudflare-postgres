@@ -58,6 +58,7 @@ function identity(claim: SuspendClaim) {
       claim.pooler === null
         ? null
         : { uid: claim.pooler.uid, deploymentUid: claim.pooler.deploymentUid },
+    ...(claim.runEpoch === undefined ? {} : { runEpoch: claim.runEpoch }),
   };
 }
 function privateEntry(path: string, directory = false): void {
@@ -187,6 +188,7 @@ export class SuspendJournal {
       binding.specRevision === this.claim.specRevision &&
       binding.specHash === this.claim.specHash &&
       binding.clusterUid === this.claim.clusterUid &&
+      binding.runEpoch === this.claim.runEpoch &&
       equal(binding.pooler ?? null, this.claim.pooler) &&
       typeof value.volumesHash === "string" &&
       hash.test(value.volumesHash)
@@ -240,6 +242,7 @@ function discoverBinding(
     clusterUid: claim.clusterUid,
     quotaUid: inventory.quota.metadata.uid ?? "",
     ...(claim.pooler === null ? {} : { pooler: { ...claim.pooler } }),
+    ...(claim.runEpoch === undefined ? {} : { runEpoch: claim.runEpoch }),
   };
   if (!validRuntimeBinding(binding))
     throw new Error("suspend_binding_unproven");
@@ -285,6 +288,7 @@ export async function reconcileSuspend(
       quotaPodsZero: true,
       clusterHibernated: true,
       poolerStopped: true,
+      ...(binding.runEpoch === undefined ? {} : { runEpoch: binding.runEpoch }),
     };
     const persisted = journal.complete(observation);
     authorized();

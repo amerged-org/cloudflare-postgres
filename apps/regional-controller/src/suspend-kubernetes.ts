@@ -8,6 +8,7 @@ import type { AllowanceRuntime, RuntimeBinding } from "./allowance-types.ts";
 import { validSuspendClaim } from "./suspend-types.ts";
 import type { SuspendClaim } from "./suspend-types.ts";
 import type { Resource } from "./types.ts";
+import { RUN_EPOCH_ANNOTATION } from "./run-epoch.ts";
 
 function owned(resource: Resource, claim: SuspendClaim): boolean {
   return (
@@ -17,7 +18,18 @@ function owned(resource: Resource, claim: SuspendClaim): boolean {
     resource.metadata.labels?.["pgcf.io/environment-id"] ===
       claim.environmentId &&
     resource.metadata.labels?.["pgcf.io/region-id"] === claim.regionId &&
-    resource.metadata.annotations?.["pgcf.io/spec-hash"] === claim.specHash
+    resource.metadata.annotations?.["pgcf.io/spec-hash"] === claim.specHash &&
+    (claim.runEpoch === undefined
+      ? !Object.hasOwn(
+          resource.metadata.annotations ?? {},
+          RUN_EPOCH_ANNOTATION,
+        )
+      : Object.hasOwn(
+          resource.metadata.annotations ?? {},
+          RUN_EPOCH_ANNOTATION,
+        ) &&
+        resource.metadata.annotations?.[RUN_EPOCH_ANNOTATION] ===
+          claim.runEpoch)
   );
 }
 
@@ -90,6 +102,7 @@ export async function suspendKubernetesFromConfig(
     clusterUid: claim.clusterUid,
     quotaUid: quotaResource.metadata.uid,
     ...(claim.pooler ? { pooler: { ...claim.pooler } } : {}),
+    ...(claim.runEpoch === undefined ? {} : { runEpoch: claim.runEpoch }),
   };
   if (!validRuntimeBinding(discovered))
     throw new Error("suspend_kubernetes_identity_unproven");
@@ -105,6 +118,7 @@ export async function suspendKubernetesFromConfig(
       sealedBinding.namespaceUid !== discovered.namespaceUid ||
       sealedBinding.clusterUid !== discovered.clusterUid ||
       sealedBinding.quotaUid !== discovered.quotaUid ||
+      sealedBinding.runEpoch !== discovered.runEpoch ||
       sealedBinding.pooler?.uid !== discovered.pooler?.uid ||
       sealedBinding.pooler?.deploymentUid !== discovered.pooler?.deploymentUid)
   )

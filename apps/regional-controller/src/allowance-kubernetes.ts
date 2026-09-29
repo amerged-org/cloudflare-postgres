@@ -11,15 +11,29 @@ import {
 import type { ConfigurationOptions } from "@kubernetes/client-node";
 import { inventoryPages } from "./kubernetes.ts";
 import type { InventoryBudget } from "./kubernetes.ts";
-import type { AllowanceRuntime, RuntimeBinding } from "./allowance-types.ts";
+import type {
+  AllowanceRuntime,
+  RuntimeBinding,
+  RuntimeInventory,
+} from "./allowance-types.ts";
+import { ownedInventory } from "./owned-stop.ts";
+import { RUN_EPOCH_PATCH_PATH, validRunEpoch } from "./run-epoch.ts";
 import type { Resource } from "./types.ts";
 
 export function allowanceKubernetesFromConfig(
   file: string,
   context: string,
-  binding: RuntimeBinding,
+  suppliedBinding: RuntimeBinding,
   authorized: () => void = () => {},
 ): AllowanceRuntime {
+  const binding = Object.freeze({
+    ...suppliedBinding,
+    ...(suppliedBinding.pooler
+      ? { pooler: Object.freeze({ ...suppliedBinding.pooler }) }
+      : {}),
+  });
+  if (binding.runEpoch !== undefined && !validRunEpoch(binding.runEpoch))
+    throw new Error("allowance_run_epoch_invalid");
   const config = new KubeConfig();
   config.loadFromFile(file);
   if (!context || !config.getContexts().some((value) => value.name === context))
@@ -65,35 +79,68 @@ export function allowanceKubernetesFromConfig(
     plural: "poolers",
     name: "database-pool-rw",
   };
-  const poolerOwned = (resource: Resource): boolean => {
-    const owners = resource.metadata.ownerReferences?.filter(
-      (owner) => owner.controller === true,
-    );
-    return (
-      binding.pooler !== undefined &&
-      resource.kind === "Pooler" &&
-      resource.apiVersion === "postgresql.cnpg.io/v1" &&
-      resource.metadata.name === "database-pool-rw" &&
-      resource.metadata.namespace === binding.namespace &&
-      resource.metadata.uid === binding.pooler.uid &&
-      resource.metadata.labels?.["app.kubernetes.io/managed-by"] ===
-        "cloudflare-postgres" &&
-      resource.metadata.labels?.["pgcf.io/environment-id"] ===
-        binding.environmentId &&
-      resource.metadata.labels?.["pgcf.io/region-id"] === binding.regionId &&
-      resource.metadata.annotations?.["pgcf.io/spec-hash"] ===
-        binding.specHash &&
-      !resource.metadata.deletionTimestamp &&
-      owners?.length === 1 &&
-      owners[0]?.kind === "Cluster" &&
-      owners[0]?.apiVersion === "postgresql.cnpg.io/v1" &&
-      owners[0]?.name === "database" &&
-      owners[0]?.uid === binding.clusterUid &&
-      resource.spec?.cluster !== null &&
-      typeof resource.spec?.cluster === "object" &&
-      !Array.isArray(resource.spec.cluster) &&
-      (resource.spec.cluster as Record<string, unknown>).name === "database"
-    );
+  const freshOwners = async (): Promise<RuntimeInventory> => {
+    authorized();
+    const [namespace, cluster, quota, pooler, deployment] = await Promise.all([
+      core.readNamespace({ name: binding.namespace }, options),
+      custom.getNamespacedCustomObject(identity, options),
+      core.readNamespacedResourceQuota(
+        { namespace: binding.namespace, name: "database-resources" },
+        options,
+      ),
+      binding.pooler
+        ? custom.getNamespacedCustomObject(poolerIdentity, options)
+        : Promise.resolve(null),
+      binding.pooler
+        ? apps.readNamespacedDeployment(
+            { namespace: binding.namespace, name: "database-pool-rw" },
+            options,
+          )
+        : Promise.resolve(null),
+    ]);
+    authorized();
+    const current: RuntimeInventory = {
+      namespace: {
+        ...namespace,
+        kind: namespace.kind ?? "Namespace",
+        apiVersion: namespace.apiVersion ?? "v1",
+      } as unknown as Resource,
+      cluster: cluster as Resource,
+      quota: {
+        ...quota,
+        kind: quota.kind ?? "ResourceQuota",
+        apiVersion: quota.apiVersion ?? "v1",
+      } as unknown as Resource,
+      poolers: pooler ? [pooler as Resource] : [],
+      deployments: deployment
+        ? [
+            {
+              ...deployment,
+              kind: deployment.kind ?? "Deployment",
+              apiVersion: deployment.apiVersion ?? "apps/v1",
+            } as unknown as Resource,
+          ]
+        : [],
+      pods: [],
+      pvcs: [],
+      pvs: [],
+    };
+    const required = [
+      current.namespace,
+      current.cluster,
+      current.quota,
+      ...(current.poolers ?? []),
+    ];
+    if (
+      current.namespace.apiVersion !== "v1" ||
+      current.namespace.metadata.namespace !== undefined ||
+      current.cluster.apiVersion !== "postgresql.cnpg.io/v1" ||
+      current.quota.apiVersion !== "v1" ||
+      !ownedInventory(current, binding) ||
+      required.some((resource) => !resource.metadata.resourceVersion)
+    )
+      throw new Error("allowance_patch_owner_set_unproven");
+    return current;
   };
   return {
     async inventory() {
@@ -213,6 +260,60 @@ export function allowanceKubernetesFromConfig(
       )
         throw new Error("allowance_patch_unfenced");
       const edit = operations.find((op) => op.op !== "test")!;
+      const epochTests = operations.filter(
+        (op) => op.path === RUN_EPOCH_PATCH_PATH,
+      );
+      if (
+        binding.runEpoch === undefined
+          ? epochTests.length !== 0
+          : epochTests.length !== 1 ||
+            epochTests[0]?.op !== "test" ||
+            epochTests[0]?.value !== binding.runEpoch
+      )
+        throw new Error("allowance_patch_epoch_unfenced");
+      if (!(
+        (kind === "ResourceQuota" &&
+          name === "database-resources" &&
+          edit.path === "/spec/hard/pods" &&
+          edit.value === "0") ||
+        (kind === "Pooler" &&
+          name === "database-pool-rw" &&
+          binding.pooler !== undefined &&
+          edit.op === "replace" &&
+          edit.path === "/spec/instances" &&
+          edit.value === 0) ||
+        (kind === "Cluster" &&
+          name === "database" &&
+          edit.path === "/metadata/annotations/cnpg.io~1hibernation" &&
+          edit.value === "on")
+      ))
+        throw new Error("allowance_patch_scope_invalid");
+      // Recheck the entire required owner/epoch set, not merely the mutation
+      // target. A partially transitioned run must never authorize an old stop.
+      const current = await freshOwners();
+      const target =
+        kind === "ResourceQuota"
+          ? current.quota
+          : kind === "Cluster"
+            ? current.cluster
+            : current.poolers?.[0];
+      if (
+        !target ||
+        !operations.some(
+          (op) =>
+            op.op === "test" &&
+            op.path === "/metadata/uid" &&
+            op.value === target.metadata.uid,
+        ) ||
+        !operations.some(
+          (op) =>
+            op.op === "test" &&
+            op.path === "/metadata/resourceVersion" &&
+            op.value === target.metadata.resourceVersion,
+        )
+      )
+        throw new Error("allowance_patch_identity_changed");
+      authorized();
       if (
         kind === "ResourceQuota" &&
         name === "database-resources" &&
@@ -236,29 +337,6 @@ export function allowanceKubernetesFromConfig(
         edit.path === "/spec/instances" &&
         edit.value === 0
       ) {
-        // Re-read the scoped owner immediately before mutation. The JSON tests
-        // fence the exact resource version, so an ownership change cannot race
-        // this authenticated observation into an adopted Pooler.
-        const pooler = (await custom.getNamespacedCustomObject(
-          poolerIdentity,
-          options,
-        )) as Resource;
-        if (
-          !poolerOwned(pooler) ||
-          !operations.some(
-            (op) =>
-              op.op === "test" &&
-              op.path === "/metadata/uid" &&
-              op.value === pooler.metadata.uid,
-          ) ||
-          !operations.some(
-            (op) =>
-              op.op === "test" &&
-              op.path === "/metadata/resourceVersion" &&
-              op.value === pooler.metadata.resourceVersion,
-          )
-        )
-          throw new Error("allowance_pooler_identity_unproven");
         await custom.patchNamespacedCustomObject(
           { ...poolerIdentity, body: operations, fieldValidation: "Strict" },
           patchOptions,

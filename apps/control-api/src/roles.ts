@@ -38,6 +38,7 @@ interface Target {
   spec_hash: string;
   resolved_spec: string;
   observation_json: string;
+  run_epoch: string | null;
 }
 export interface Role {
   id: string;
@@ -152,7 +153,7 @@ async function target(
 ): Promise<Target | null> {
   return db
     .prepare(
-      `SELECT e.id, e.organization_id, e.project_id, e.region_id, e.spec_revision, e.spec_hash, e.resolved_spec, e.observation_json FROM environments e JOIN projects p ON p.id = e.project_id AND p.organization_id = e.organization_id JOIN regions g ON g.id = e.region_id WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND e.status = 'ready' AND p.status = 'active' AND g.status <> 'disabled' AND ${runtimeAllowsExecution("e")}`,
+      `SELECT e.id, e.organization_id, e.project_id, e.region_id, e.spec_revision, e.spec_hash, e.resolved_spec, e.observation_json, e.run_epoch FROM environments e JOIN projects p ON p.id = e.project_id AND p.organization_id = e.organization_id JOIN regions g ON g.id = e.region_id WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND e.status = 'ready' AND p.status = 'active' AND g.status <> 'disabled' AND ${runtimeAllowsExecution("e")}`,
     )
     .bind(environmentId, organizationId, projectId)
     .first<Target>();
@@ -318,6 +319,7 @@ async function createRole(
     !validEnvironmentObservation(
       observation,
       spec.profile.pooling !== undefined,
+      current.run_epoch ?? undefined,
     ) ||
     !uid(observation.clusterUid)
   )

@@ -32,8 +32,17 @@ function validObservation(
   value: unknown,
   claim: SuspendClaim,
 ): value is SuspendObservation {
-  if (!fields(value, observationKeys)) return false;
+  if (
+    !fields(
+      value,
+      claim.runEpoch === undefined
+        ? observationKeys
+        : [...observationKeys, "runEpoch"],
+    )
+  )
+    return false;
   return (
+    value.runEpoch === claim.runEpoch &&
     ["namespaceUid", "clusterUid", "quotaUid"].every(
       (key) => typeof value[key] === "string" && uuid.test(value[key]),
     ) &&

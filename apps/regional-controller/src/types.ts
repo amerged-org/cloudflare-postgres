@@ -47,6 +47,7 @@ export interface ExecutionSpec {
     };
     instances: number;
     pooling?: PoolingPolicy;
+    executionFencing?: { version: 1 };
     backup: {
       endpointURL: string;
       region: string;
@@ -68,6 +69,7 @@ export interface Claim {
   specRevision: 1;
   specHash: string;
   spec: ExecutionSpec;
+  runEpoch?: string;
 }
 
 export interface RegionalConfig {
@@ -133,6 +135,7 @@ export interface Observation {
   clusterUid: string;
   clusterGeneration: number;
   readyInstances: number;
+  runEpoch?: string;
   pooler?: {
     uid: string;
     generation: number;

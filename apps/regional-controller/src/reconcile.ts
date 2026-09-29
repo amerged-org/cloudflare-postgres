@@ -2,6 +2,7 @@
 import { createHash } from "node:crypto";
 import { ReconcileError } from "./types.ts";
 import { observePooler, validPoolingPolicy } from "./pooling.ts";
+import { RUN_EPOCH_ANNOTATION, validRunEpoch } from "./run-epoch.ts";
 import type {
   Claim,
   Kubernetes,
@@ -51,6 +52,8 @@ function validate(claim: Claim, config: RegionalConfig): void {
   const profile = spec?.profile;
   const storage = profile?.storage;
   const ref = profile?.backup?.credentialSecret;
+  const fenced = Object.hasOwn(profile ?? {}, "executionFencing");
+  const fencing = profile?.executionFencing;
   if (
     claim.kind !== "environment.create" ||
     claim.specRevision !== 1 ||
@@ -68,6 +71,15 @@ function validate(claim: Claim, config: RegionalConfig): void {
     !positive(profile?.compute?.cpuMilli, 1_000_000) ||
     !positive(profile?.compute?.memoryMiB, 1_048_576) ||
     (profile?.pooling !== undefined && !validPoolingPolicy(profile.pooling)) ||
+    fenced !== Object.hasOwn(claim, "runEpoch") ||
+    (fenced &&
+      (fencing === null ||
+        typeof fencing !== "object" ||
+        Array.isArray(fencing) ||
+        Object.keys(fencing).length !== 1 ||
+        fencing.version !== 1 ||
+        !validRunEpoch(claim.runEpoch) ||
+        claim.runEpoch !== "1")) ||
     !positive(spec?.volumeGiB, 1_048_576) ||
     !positive(storage?.minGiB, 1_048_576) ||
     !positive(storage?.maxGiB, 1_048_576) ||
@@ -147,6 +159,19 @@ function own(resource: Resource, expected: Resource): void {
   ) {
     throw new ReconcileError("spec_conflict");
   }
+  if (
+    ["Namespace", "ResourceQuota", "Cluster", "Pooler"].includes(expected.kind)
+  ) {
+    const expectedAnnotations = expected.metadata.annotations ?? {};
+    const annotations = resource.metadata.annotations ?? {};
+    if (
+      Object.hasOwn(expectedAnnotations, RUN_EPOCH_ANNOTATION) !==
+        Object.hasOwn(annotations, RUN_EPOCH_ANNOTATION) ||
+      annotations[RUN_EPOCH_ANNOTATION] !==
+        expectedAnnotations[RUN_EPOCH_ANNOTATION]
+    )
+      throw new ReconcileError("spec_conflict");
+  }
 }
 
 // Compare only the fields this controller owns: API defaulted fields belong to
@@ -215,11 +240,20 @@ export async function reconcileEnvironment(
     [ownerLabel]: claim.environmentId,
     [regionLabel]: claim.regionId,
   };
-  const metadata = (name: string, namespaced = true): Resource["metadata"] => ({
+  const metadata = (
+    name: string,
+    namespaced = true,
+    withRunEpoch = false,
+  ): Resource["metadata"] => ({
     name,
     ...(namespaced ? { namespace } : {}),
     labels,
-    annotations: { [specAnnotation]: claim.specHash },
+    annotations: {
+      [specAnnotation]: claim.specHash,
+      ...(withRunEpoch && claim.runEpoch !== undefined
+        ? { [RUN_EPOCH_ANNOTATION]: claim.runEpoch }
+        : {}),
+    },
   });
   await ensure(
     api,
@@ -227,7 +261,7 @@ export async function reconcileEnvironment(
       apiVersion: "v1",
       kind: "Namespace",
       metadata: {
-        ...metadata(namespace, false),
+        ...metadata(namespace, false, true),
         labels: {
           ...labels,
           "pod-security.kubernetes.io/enforce": "restricted",
@@ -245,7 +279,7 @@ export async function reconcileEnvironment(
     {
       apiVersion: "v1",
       kind: "ResourceQuota",
-      metadata: metadata("database-resources"),
+      metadata: metadata("database-resources", true, true),
       spec: {
         hard: {
           "requests.cpu": cpuQuantity(
@@ -446,7 +480,7 @@ export async function reconcileEnvironment(
     {
       apiVersion: "postgresql.cnpg.io/v1",
       kind: "Cluster",
-      metadata: metadata("database"),
+      metadata: metadata("database", true, true),
       spec: {
         instances: profile.instances,
         imageName: profile.postgresImage,
@@ -505,7 +539,7 @@ export async function reconcileEnvironment(
           apiVersion: "postgresql.cnpg.io/v1",
           kind: "Pooler",
           metadata: {
-            ...metadata("database-pool-rw"),
+            ...metadata("database-pool-rw", true, true),
             ownerReferences: [
               {
                 apiVersion: "postgresql.cnpg.io/v1",
@@ -642,6 +676,7 @@ export async function reconcileEnvironment(
       clusterUid: cluster.metadata.uid,
       clusterGeneration: cluster.metadata.generation,
       readyInstances: readyPods.length,
+      ...(claim.runEpoch === undefined ? {} : { runEpoch: claim.runEpoch }),
       ...(poolerObservation ? { pooler: poolerObservation } : {}),
     },
   };

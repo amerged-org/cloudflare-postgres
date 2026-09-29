@@ -1859,6 +1859,18 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    ExecutionFencingPolicy:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+      properties:
+        version:
+          type: integer
+          const: 1
+      description:
+        Opt-in new-environment execution fencing. The server assigns initial
+        epoch1; callers cannot choose it.
     SuspendObservation:
       type: object
       additionalProperties: false
@@ -1912,6 +1924,12 @@ components:
         poolerStopped:
           type: boolean
           const: true
+        runEpoch:
+          type: string
+          pattern: ^[1-9][0-9]{0,18}$
+          description:
+            Initial immutable execution identity, separate from lease/spec/budget
+            epochs. Present only for opted-in fencing.
     EnvironmentRuntime:
       type: object
       required:
@@ -2637,6 +2655,8 @@ components:
           $ref: "#/components/schemas/BackupPolicy"
         pooling:
           $ref: "#/components/schemas/PoolingPolicy"
+        executionFencing:
+          $ref: "#/components/schemas/ExecutionFencingPolicy"
     OperatorProfile:
       type: object
       additionalProperties: false
@@ -2662,6 +2682,8 @@ components:
           $ref: "#/components/schemas/OperatorBackupPolicy"
         pooling:
           $ref: "#/components/schemas/PoolingPolicy"
+        executionFencing:
+          $ref: "#/components/schemas/ExecutionFencingPolicy"
     PublicCatalog:
       type: object
       required: [regionId, version, profiles, catalogHash, createdAt]
@@ -2770,26 +2792,30 @@ components:
           maximum: 9
         pooler:
           $ref: "#/components/schemas/PoolerReadyObservation"
+        runEpoch:
+          type: string
+          pattern: ^[1-9][0-9]{0,18}$
+          description:
+            Initial immutable execution identity, separate from lease/spec/budget
+            epochs. Present only for opted-in fencing.
       description:
-        Pooler observation is required exactly when the frozen profile enables
-        pooling; forbidden for an unpooled environment.
+        Pooler proof is required iff pooled; runEpoch is required iff the stored
+        environment is fenced and must match. Omitted legacy observations remain unchanged.
     Environment:
       type: object
       required:
-        [
-          id,
-          organizationId,
-          projectId,
-          regionId,
-          name,
-          status,
-          specRevision,
-          specHash,
-          resolvedSpec,
-          createdAt,
-          observedAt,
-          observation,
-        ]
+        - id
+        - organizationId
+        - projectId
+        - regionId
+        - name
+        - status
+        - specRevision
+        - specHash
+        - resolvedSpec
+        - createdAt
+        - observedAt
+        - observation
       properties:
         id:
           type: string
@@ -2807,26 +2833,40 @@ components:
           type: string
         status:
           type: string
-          enum: [pending, provisioning, ready, failed]
+          enum:
+            - pending
+            - provisioning
+            - ready
+            - failed
         specRevision:
           type: integer
           const: 1
         specHash:
           type: string
-          pattern: "^[0-9a-f]{64}$"
-          description: SHA-256 of JSON.stringify of the complete immutable execution spec, not this redacted view.
+          pattern: ^[0-9a-f]{64}$
+          description:
+            SHA-256 of JSON.stringify of the complete immutable execution spec,
+            not this redacted view.
         resolvedSpec:
           $ref: "#/components/schemas/PublicResolvedSpec"
         createdAt:
           type: string
           format: date-time
         observedAt:
-          type: [string, "null"]
+          type:
+            - string
+            - "null"
           format: date-time
         observation:
           anyOf:
             - $ref: "#/components/schemas/ReadyObservation"
             - type: "null"
+        runEpoch:
+          type: string
+          pattern: ^[1-9][0-9]{0,18}$
+          description:
+            Initial immutable execution identity, separate from lease/spec/budget
+            epochs. Present only for opted-in fencing.
     EnvironmentOperationResponse:
       type: object
       required: [environment, operation]
