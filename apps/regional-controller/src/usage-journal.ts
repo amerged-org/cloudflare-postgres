@@ -12,7 +12,18 @@ import {
 } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { normalizeAcceptedUsageReceipt } from "./accepted-usage.ts";
+import {
+  normalizeAcceptedUsageReceipt,
+  validUsageFact,
+} from "./accepted-usage.ts";
+import {
+  deliveryFailureRecord,
+  validUsageDeliveryFailure,
+} from "./usage-delivery-status.ts";
+import type {
+  UsageDeliveryFailure,
+  UsageFailureDescriptor,
+} from "./usage-delivery-status.ts";
 import { AcceptedUsageLedger } from "./usage-accepted-ledger.ts";
 import type { AcceptedArchive } from "./usage-accepted-ledger.ts";
 import type {
@@ -251,6 +262,7 @@ export class UsageJournal {
         const expected = JSON.stringify(this.identity);
         if (sealed && sealed.value !== expected)
           throw new Error("identity_mismatch");
+        this.lastDeliveryFailure();
         this.accepted.initialize(version?.value);
         this.db
           .prepare(
@@ -573,9 +585,86 @@ export class UsageJournal {
     });
   }
 
-  acknowledgeAccepted(value: unknown): boolean {
+  private lastDeliveryFailure(): UsageDeliveryFailure | null {
+    const row = this.db
+      .prepare(
+        "SELECT value FROM journal_meta WHERE name='last_delivery_failure'",
+      )
+      .get() as { value: string } | undefined;
+    if (!row) return null;
     try {
-      return this.accepted.acknowledge(value);
+      if (
+        typeof row.value !== "string" ||
+        row.value.length > 2048 ||
+        Buffer.byteLength(row.value, "utf8") > 2048
+      )
+        throw new Error();
+      const value: unknown = JSON.parse(row.value);
+      if (!validUsageDeliveryFailure(value, this.identity)) throw new Error();
+      return value;
+    } catch {
+      throw new Error("journal_delivery_status_corrupt");
+    }
+  }
+  recordDeliveryFailure(
+    fact: UsageFact,
+    descriptor: UsageFailureDescriptor,
+  ): void {
+    this.transaction(() => {
+      this.lastDeliveryFailure();
+      if (!validUsageFact(fact, this.identity))
+        throw new Error("invalid_delivery_failure");
+      const row = this.db
+        .prepare("SELECT * FROM usage_outbox WHERE fact_id=?")
+        .get(fact.factId) as unknown as StoredFact | undefined;
+      if (
+        !row ||
+        digest(row.payload_json) !== row.payload_hash ||
+        row.byte_count !== Buffer.byteLength(row.payload_json, "utf8") ||
+        row.revision !== fact.revision ||
+        row.evidence_hash !== fact.evidenceHash
+      )
+        throw new Error("journal_delivery_evidence_conflict");
+      const pending: unknown = JSON.parse(row.payload_json);
+      if (
+        !validUsageFact(pending, this.identity) ||
+        JSON.stringify(pending) !== JSON.stringify(fact)
+      )
+        throw new Error("journal_delivery_evidence_conflict");
+      const value = JSON.stringify(
+        deliveryFailureRecord(
+          fact,
+          descriptor,
+          this.identity,
+          new Date(Date.now()).toISOString(),
+        ),
+      );
+      if (Buffer.byteLength(value, "utf8") > 2048)
+        throw new Error("invalid_delivery_failure");
+      this.db
+        .prepare(
+          "INSERT INTO journal_meta(name,value) VALUES ('last_delivery_failure',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+        )
+        .run(value);
+    });
+  }
+  private clearDeliveryFailure(fact: UsageFact): void {
+    const current = this.lastDeliveryFailure();
+    if (
+      current?.factId === fact.factId &&
+      current.revision === fact.revision &&
+      current.evidenceHash === fact.evidenceHash
+    )
+      this.db
+        .prepare("DELETE FROM journal_meta WHERE name='last_delivery_failure'")
+        .run();
+  }
+  acknowledgeAccepted(value: unknown): boolean {
+    this.lastDeliveryFailure();
+    try {
+      return this.accepted.acknowledge(value, (receipt) =>
+        this.clearDeliveryFailure(receipt.fact),
+      );
     } catch (failure) {
       if (
         failure instanceof Error &&
@@ -661,6 +750,7 @@ export class UsageJournal {
       .all() as unknown as GapRow[];
     return {
       identity: { ...this.identity },
+      lastDeliveryFailure: this.lastDeliveryFailure(),
       provisionalOnly: true,
       hasCoverageGaps: gaps.length > 0,
       gapCount: gaps

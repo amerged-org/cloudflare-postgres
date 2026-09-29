@@ -13,13 +13,13 @@ import {
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 
-export class UsageDeliveryError extends Error {
-  readonly status: number;
-  constructor(status: number) {
-    super("usage_http_failure");
-    this.status = status;
-  }
-}
+import {
+  parseUsageErrorBody,
+  UsageDeliveryError,
+  UsageAcknowledgementError,
+  UsageTransportError,
+} from "./usage-delivery-status.ts";
+export { UsageDeliveryError } from "./usage-delivery-status.ts";
 
 export class UsageClient {
   private readonly origin: string;
@@ -56,6 +56,7 @@ export class UsageClient {
   private async request(fact: UsageFact): Promise<{
     fact: UsageFact;
     accepted: Record<string, unknown>;
+    status: number;
   }> {
     if (!validUsageFact(fact, this.identity))
       throw new Error("invalid_usage_fact");
@@ -91,8 +92,50 @@ export class UsageClient {
         ),
       );
       if (response.status !== 200 && response.status !== 201) {
-        await bounded(response.body?.cancel() ?? Promise.resolve());
-        throw new UsageDeliveryError(response.status);
+        let code: ReturnType<typeof parseUsageErrorBody> = null;
+        try {
+          if (
+            !/^application\/json(?:\s*;|$)/i.test(
+              response.headers.get("content-type") ?? "",
+            )
+          )
+            throw new Error();
+          const announced = response.headers.get("content-length");
+          if (
+            announced !== null &&
+            (!/^(?:0|[1-9][0-9]*)$/.test(announced) || Number(announced) > 8192)
+          )
+            throw new Error();
+          reader = response.body?.getReader();
+          if (!reader) throw new Error();
+          const chunks: Uint8Array[] = [];
+          let length = 0;
+          while (true) {
+            const chunk = await bounded(reader.read());
+            if (chunk.done) break;
+            length += chunk.value.byteLength;
+            if (length > 8192) throw new Error();
+            chunks.push(chunk.value);
+          }
+          code = parseUsageErrorBody(
+            response.status,
+            new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
+              Buffer.concat(chunks),
+            ),
+          );
+        } catch {
+          code = null;
+        }
+        try {
+          await bounded(
+            reader
+              ? reader.cancel()
+              : (response.body?.cancel() ?? Promise.resolve()),
+          );
+        } catch {
+          code = null;
+        }
+        throw new UsageDeliveryError(response.status, code);
       }
       if (
         !/^application\/json(?:\s*;|$)/i.test(
@@ -100,10 +143,17 @@ export class UsageClient {
         )
       ) {
         await bounded(response.body?.cancel() ?? Promise.resolve());
-        throw new Error("invalid_usage_response");
+        throw new UsageAcknowledgementError(
+          "invalid_usage_response",
+          response.status,
+        );
       }
       reader = response.body?.getReader();
-      if (!reader) throw new Error("invalid_usage_response");
+      if (!reader)
+        throw new UsageAcknowledgementError(
+          "invalid_usage_response",
+          response.status,
+        );
       const chunks: Uint8Array[] = [];
       let length = 0;
       while (true) {
@@ -112,13 +162,26 @@ export class UsageClient {
         length += chunk.value.byteLength;
         if (length > 65_536) {
           await bounded(reader.cancel());
-          throw new Error("usage_response_too_large");
+          throw new UsageAcknowledgementError(
+            "usage_response_too_large",
+            response.status,
+          );
         }
         chunks.push(chunk.value);
       }
-      const payload: unknown = JSON.parse(
-        new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)),
-      );
+      let payload: unknown;
+      try {
+        payload = JSON.parse(
+          new TextDecoder("utf-8", { fatal: true }).decode(
+            Buffer.concat(chunks),
+          ),
+        );
+      } catch {
+        throw new UsageAcknowledgementError(
+          "invalid_usage_response",
+          response.status,
+        );
+      }
       const accepted =
         payload && typeof payload === "object" && "fact" in payload
           ? payload.fact
@@ -140,15 +203,31 @@ export class UsageClient {
           (accepted as Record<string, unknown>).acceptanceSequence as string,
         )
       )
-        throw new Error("usage_acknowledgement_conflict");
-      return { fact: submitted, accepted: accepted as Record<string, unknown> };
+        throw new UsageAcknowledgementError(
+          "usage_acknowledgement_conflict",
+          response.status,
+        );
+      return {
+        fact: submitted,
+        accepted: accepted as Record<string, unknown>,
+        status: response.status,
+      };
     } catch (failure) {
       controller.abort();
       if (reader) void reader.cancel().catch(() => {});
-      throw failure;
+      if (
+        failure instanceof UsageDeliveryError ||
+        failure instanceof UsageAcknowledgementError
+      )
+        throw failure;
+      throw new UsageTransportError();
     } finally {
       clearTimeout(timer!);
-      reader?.releaseLock();
+      try {
+        reader?.releaseLock();
+      } catch {
+        /* Preserve the safe original failure. */
+      }
     }
   }
 
@@ -168,7 +247,10 @@ export class UsageClient {
       acceptedAt: result.accepted.acceptedAt,
     };
     if (!validAcceptedUsageReceipt(receipt, this.identity))
-      throw new Error("usage_acknowledgement_conflict");
+      throw new UsageAcknowledgementError(
+        "usage_acknowledgement_conflict",
+        result.status,
+      );
     return normalizeAcceptedUsageReceipt(receipt, this.identity);
   }
 }
