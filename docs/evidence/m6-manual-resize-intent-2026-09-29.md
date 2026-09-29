@@ -65,3 +65,35 @@ regional package was built before the Node stage so its existing command tests
 used the actual compiled entry. The no-secret/private-file preflight matched
 all 427 frozen public files and found zero matches against 105 known-value
 variants. No source or test was changed after the gate.
+
+## Public source and Dev control delivery
+
+Commit [`bb8ead5`](https://github.com/amerged-org/cloudflare-postgres/commit/bb8ead5)
+publishes the source and contract. The remote main commit and public migration,
+API, regional proof and 10,000-project evidence blobs were read back.
+
+The existing Dev D1 database initially had 15 migrations, one organization,
+one project, zero managed environments and closed admission. The authorized
+dashboard applied the published additive SQL **once**. Before execution, its
+single-line adaptation (three leading comments removed and line feeds replaced
+with spaces) matched the published SQL-body SHA-256 exactly. Afterward, the
+three tables, two indexes and eight triggers were independently read back and
+matched every published definition. The three tables were empty and the
+foreign-key check returned no violations. The normal migration-history insert
+was made only after schema verification. All 16 migration names were then read
+back in order. Dashboard multi-statement atomicity is not claimed; the source
+CLI D1 query authorization error `7403` is still unresolved.
+
+One Wrangler dry run and one `--keep-vars` Worker deployment used the existing
+Dev account and D1 binding. The deployed version received 100% of traffic;
+all eight pre-existing Secret names/types remained present. Values were not
+read or changed. Four scoped, read-only HTTP probes passed. A fresh post-deploy
+D1 read still showed one organization, one project, no managed environment,
+closed admission, no usage or backup rows, no resize operation or compute-state
+row, and zero foreign-key violations.
+
+The installed regional image and its configuration remain unchanged and
+available. `PGCF_MANUAL_RESIZE_ENABLED` and `PGCF_MANUAL_BACKUPS_ENABLED` are
+absent. The new regional readback helper is published as source but is not a
+running resize executor. This delivery created no CNPG resize, R2 credential,
+Kubernetes patch, new customer database or funded execution authority.

@@ -245,6 +245,11 @@ funding, fleet capacity, local expiry and bounded effect dispatch are proven.
 The [manual resize source checkpoint](docs/evidence/m6-manual-resize-intent-2026-09-29.md)
 separates those implemented control/readback pieces from physical qualification
 and preserves the three-case bounded test history.
+Dev now has additive migration `0016` and the queued resize management route in
+the Worker. The regional image and execution flags are unchanged; no real
+resize, new environment or operator funding grant is claimed. The source
+checkpoint records exact schema readback, a single passing full gate and the
+post-deployment state-preservation checks.
 The [size-catalog source checkpoint](docs/evidence/m6-compute-size-catalog-2026-09-29.md)
 retains the red-first case, original typecheck stop, narrow correction and the
 fresh-worktree build setup repair without repeating the full gate. No physical
