@@ -457,6 +457,19 @@ inactive. The original queue/volume remain retained; explicit evidence dispositi
 qualification ownership, delivery visibility, scheduled custody, node-loss recovery
 and fenced replay remain open before customer admission.
 
+The [same-node network policy checkpoint](docs/evidence/m4-network-isolation-2026-09-29.md)
+qualifies one client-to-foreign-namespace TCP 5432 denial using four matching
+Cilium policy-drop events and successful nonce controls before/after. Exact
+production-generated policies, Pod/Namespace/policy UIDs and realized rule
+provenance are verified. The original failed revision-equality observer remains
+archived; one upstream-verified private correction passes the same case in
+33.707 seconds. Fresh Restricted/no-token/no-volume fixtures omit billing labels
+and are removed with UID guards. Original Node/29 Running Pods/four PVCs/five PVs/
+SQL markers/global policy and all 4,096 pending usage hashes remain preserved.
+No runtime source/tests/full gate change occurs. Reverse/all-protocol, SQL/TLS,
+verifier/gateway, multi-node and kernel/host isolation remain separate gates;
+this limited proof does not establish complete production tenancy.
+
 The [remote control archive checkpoint](docs/evidence/m3-control-archive-2026-09-29.md)
 qualifies one upload of the existing encrypted bundle into the private EU R2
 bucket, exact remote download and offline reconstruction from those downloaded
