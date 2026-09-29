@@ -1403,6 +1403,52 @@ paths:
       - $ref: "#/components/parameters/OrganizationId"
       - $ref: "#/components/parameters/ProjectId"
       - $ref: "#/components/parameters/AccountingEnvironmentId"
+    post:
+      operationId: createDatabaseRole
+      summary: Request a restricted PostgreSQL login role
+      description: >-
+        Requires projects:write and an existing ready, running environment in an
+        active project and enabled region. Accepts only name and connectionLimit;
+        the server generates the password. The 202 response contains metadata and
+        an immutable operation, never a credential or connection endpoint. Repeating
+        the same path, body and Idempotency-Key returns the original accepted response;
+        use resource and operation reads for current progress. No query parameters are accepted.
+      x-required-scopes: ["projects:write"]
+      security:
+        - organizationToken: []
+      parameters:
+        - $ref: "#/components/parameters/LifecycleIdempotencyKey"
+      requestBody:
+        required: true
+        description: Exact JSON object, limited to 8192 UTF-8 bytes.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoleCreateInput"
+      responses:
+        "202":
+          description: Role intent accepted or the identical original intent replayed.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LifecycleNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleOperationResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/RoleLifecycleConflict"
+        "500":
+          $ref: "#/components/responses/RoleLifecycleUnavailable"
+        "503":
+          $ref: "#/components/responses/RoleCredentialKeyUnavailable"
     get:
       operationId: listRoles
       summary: Recover roles in the authorized parent
@@ -1437,11 +1483,194 @@ paths:
             read
         "503":
           description: Cursor signing key unavailable
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/roles/{roleId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+      - $ref: "#/components/parameters/DatabaseRoleId"
+    get:
+      operationId: getDatabaseRole
+      summary: Read owned role metadata and credential revisions
+      description: >-
+        Requires projects:read. Returns observed role state without a password,
+        private execution evidence or endpoint. Metadata remains readable for the
+        authorized owner when execution is unavailable. No query parameters are accepted.
+      x-required-scopes: ["projects:read"]
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Observed role metadata.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LifecycleNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleMetadataResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/RoleLifecycleUnavailable"
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/roles/{roleId}/credentials:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+      - $ref: "#/components/parameters/DatabaseRoleId"
+    get:
+      operationId: getDatabaseRoleCredential
+      summary: Reveal only the latest applied role credential
+      description: >-
+        Requires projects:write. Disclosure requires the latest desired revision
+        to be applied and verified in the same current, running environment,
+        active project and enabled region. Pending, failed, superseded or changed
+        authority returns a conflict. The database field is the bootstrap database
+        app; this login alone grants no application-table privileges or database
+        ownership. No query parameters or credential revision selector are accepted.
+        No host, port, connection URL or externally reachable endpoint is returned.
+      x-required-scopes: ["projects:write"]
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Sensitive current role credential; do not log or cache the response.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LifecycleNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleCredentialResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/RoleLifecycleConflict"
+        "500":
+          $ref: "#/components/responses/RoleLifecycleUnavailable"
+        "503":
+          $ref: "#/components/responses/RoleCredentialKeyUnavailable"
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/roles/{roleId}/rotate:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+      - $ref: "#/components/parameters/DatabaseRoleId"
+    post:
+      operationId: rotateDatabaseRoleCredential
+      summary: Request conditional rotation of a managed role password
+      description: >-
+        Requires projects:write and Idempotency-Key. expectedCredentialRevision
+        must equal both current desired and applied revisions. The server creates
+        the next encrypted credential and a database.role.apply operation, without
+        revealing the password. An unavailable environment, competing rotation or
+        queued/running database creation owned by this role prevents a new rotation;
+        an expired database-operation lease does not remove that owner lock. Exact
+        request replay returns the immutable accepted response, not a newer credential.
+        Existing PostgreSQL sessions may survive rotation. No query parameters are accepted.
+      x-required-scopes: ["projects:write"]
+      security:
+        - organizationToken: []
+      parameters:
+        - $ref: "#/components/parameters/LifecycleIdempotencyKey"
+      requestBody:
+        required: true
+        description: Exact JSON object, limited to 8192 UTF-8 bytes.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RoleRotationInput"
+      responses:
+        "202":
+          description: Credential rotation intent accepted or its original response replayed.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LifecycleNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RoleOperationResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/RoleLifecycleConflict"
+        "500":
+          $ref: "#/components/responses/RoleLifecycleUnavailable"
+        "503":
+          $ref: "#/components/responses/RoleCredentialKeyUnavailable"
   /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/databases:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
       - $ref: "#/components/parameters/ProjectId"
       - $ref: "#/components/parameters/AccountingEnvironmentId"
+    post:
+      operationId: createOwnedDatabase
+      summary: Request a logical database owned by an applied managed role
+      description: >-
+        Requires projects:write, Idempotency-Key and an applied role in this same
+        ready, running environment. Accepts only name and ownerRoleId; callers
+        cannot choose a backend, namespace, SQL privilege or password. The response
+        contains immutable database intent and operation metadata, never credentials.
+        Owner rotation and new database creation serialize against one another.
+        Exact path/body/key replay returns the original accepted response; poll for
+        current progress. No query parameters are accepted. SQL creation depends on
+        the regional executor and coordinated privileged administrators; a pending
+        resource supplies no database endpoint or backup/restore guarantee.
+      x-required-scopes: ["projects:write"]
+      security:
+        - organizationToken: []
+      parameters:
+        - $ref: "#/components/parameters/LifecycleIdempotencyKey"
+      requestBody:
+        required: true
+        description: Exact JSON object, limited to 8192 UTF-8 bytes.
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DatabaseCreateInput"
+      responses:
+        "202":
+          description: Database intent accepted or the identical original intent replayed.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LifecycleNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseOperationResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/DatabaseLifecycleConflict"
+        "500":
+          $ref: "#/components/responses/DatabaseLifecycleUnavailable"
+        "503":
+          $ref: "#/components/responses/RoleCredentialKeyUnavailable"
     get:
       operationId: listDatabases
       summary: Recover databases in the authorized parent
@@ -1476,6 +1705,89 @@ paths:
             read
         "503":
           description: Cursor signing key unavailable
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/databases/{databaseId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+      - $ref: "#/components/parameters/OwnedDatabaseId"
+    get:
+      operationId: getOwnedDatabase
+      summary: Read an owned logical database and its accepted observation
+      description: >-
+        Requires projects:read. Returns owned metadata and the last accepted
+        non-secret observation. It does not reveal a password or claim current
+        SQL reachability. Metadata remains readable for the authorized owner when
+        execution is unavailable. No query parameters are accepted.
+      x-required-scopes: ["projects:read"]
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Observed logical database metadata.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LifecycleNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseMetadataResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/DatabaseLifecycleUnavailable"
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/databases/{databaseId}/credentials:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+      - $ref: "#/components/parameters/OwnedDatabaseId"
+    get:
+      operationId: getOwnedDatabaseCredential
+      summary: Reveal the database owner's latest applied credential
+      description: >-
+        Requires projects:write and an applied database with the same currently
+        applied owner role in its current, running environment. Disclosure waits
+        during owner rotation; after rotation it returns the owner's latest applied
+        password rather than the revision captured by the original database-create
+        operation. observedAt describes the database observation;
+        credentialVerifiedAt describes the owner's credential observation.
+        No query parameters or historical credential selector are accepted. No host,
+        port or connection URL is returned, and observation timestamps are not a
+        continuous connectivity, backup or budget-enforcement guarantee.
+      x-required-scopes: ["projects:write"]
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Sensitive current owner credential; do not log or cache the response.
+          headers:
+            Cache-Control:
+              $ref: "#/components/headers/LifecycleNoStore"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCredentialResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/DatabaseLifecycleConflict"
+        "500":
+          $ref: "#/components/responses/DatabaseLifecycleUnavailable"
+        "503":
+          $ref: "#/components/responses/RoleCredentialKeyUnavailable"
   /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/runtime:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -1759,6 +2071,30 @@ components:
       scheme: bearer
       description: Region-scoped executor token with operations:claim and operations:report.
   parameters:
+    LifecycleIdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: >-
+        Stable key for one logical request at this exact path. Keep the same body
+        and key after an uncertain HTTP outcome; another body with the same key conflicts.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: "^[A-Za-z0-9._~-]+$"
+    DatabaseRoleId:
+      name: roleId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/AccountingUuid"
+    OwnedDatabaseId:
+      name: databaseId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/AccountingUuid"
     RecoveryLimit:
       name: limit
       in: query
@@ -1815,7 +2151,68 @@ components:
       schema:
         type: string
         format: uuid
+  headers:
+    LifecycleNoStore:
+      description: Returned by lifecycle JSON responses, including credential disclosure.
+      required: true
+      schema:
+        type: string
+        const: no-store
   responses:
+    RoleLifecycleConflict:
+      description: >-
+        role_name_conflict, role_conflict, environment_not_ready,
+        credential_revision_conflict, credential_not_applied or idempotency_conflict.
+        Rotation also conflicts while database creation holds its owner lock.
+        Read current metadata/operation before deciding on a bounded retry.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/LifecycleNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    DatabaseLifecycleConflict:
+      description: >-
+        environment_suspended, owner_not_applied, database_name_conflict,
+        database_conflict, database_not_applied, credential_not_applied or
+        idempotency_conflict. Disclosure cannot bypass pending owner rotation.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/LifecycleNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RoleLifecycleUnavailable:
+      description: Role state or processing unavailable (role_unavailable); no private error body.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/LifecycleNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    DatabaseLifecycleUnavailable:
+      description: Database state or processing unavailable (database_unavailable); no private error body.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/LifecycleNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RoleCredentialKeyUnavailable:
+      description: >-
+        The dedicated role keyring or required historical key is unavailable
+        (role_credential_key_unavailable). No provider or allowance key fallback is used.
+      headers:
+        Cache-Control:
+          $ref: "#/components/headers/LifecycleNoStore"
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     BudgetAuthorityResponse:
       description: Current budget authority; runtimeEnforced is false.
       content:
@@ -2378,6 +2775,236 @@ components:
         observedAt:
           type: string
           format: date-time
+    RoleCreateInput:
+      type: object
+      additionalProperties: false
+      required: [name, connectionLimit]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 63
+          pattern: "^[a-z][a-z0-9_]{0,62}$"
+          not:
+            anyOf:
+              - enum: [app, postgres, streaming_replica]
+              - pattern: "^(pg_|cnpg_)"
+          description: Restricted login identifier; no password, privilege or membership input.
+        connectionLimit:
+          type: integer
+          minimum: 1
+          maximum: 1000
+    RoleRotationInput:
+      type: object
+      additionalProperties: false
+      required: [expectedCredentialRevision]
+      properties:
+        expectedCredentialRevision:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740990
+          description: Must equal the latest desired and applied revisions before a new rotation.
+    RoleLifecycleOperation:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          id,
+          roleId,
+          credentialRevision,
+          kind,
+          status,
+          createdAt,
+          observedAt,
+          resultCode,
+        ]
+      properties:
+        id:
+          $ref: "#/components/schemas/AccountingUuid"
+        roleId:
+          $ref: "#/components/schemas/AccountingUuid"
+        credentialRevision:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+        kind:
+          type: string
+          const: database.role.apply
+          description: Shared operation kind for role creation and password rotation.
+        status:
+          type: string
+          enum: [queued, running, applied, failed]
+        createdAt:
+          type: string
+          format: date-time
+        observedAt:
+          type: [string, "null"]
+          format: date-time
+        resultCode:
+          type: [string, "null"]
+    RoleMetadataResponse:
+      type: object
+      additionalProperties: false
+      required: [role]
+      properties:
+        role:
+          $ref: "#/components/schemas/RecoveryRole"
+    RoleOperationResponse:
+      type: object
+      additionalProperties: false
+      required: [role, operation]
+      properties:
+        role:
+          $ref: "#/components/schemas/RecoveryRole"
+        operation:
+          $ref: "#/components/schemas/RoleLifecycleOperation"
+      description: Immutable accepted response; no password and no regional lease authority.
+    RoleCredential:
+      type: object
+      additionalProperties: false
+      required:
+        [roleId, credentialRevision, username, password, database, observedAt]
+      properties:
+        roleId:
+          $ref: "#/components/schemas/AccountingUuid"
+        credentialRevision:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+        username:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,62}$"
+        password:
+          type: string
+          format: password
+          readOnly: true
+          minLength: 43
+          maxLength: 43
+          pattern: "^[A-Za-z0-9_-]{43}$"
+        database:
+          type: string
+          const: app
+        observedAt:
+          type: [string, "null"]
+          format: date-time
+      description: Sensitive latest-applied credential; no endpoint or automatic table grants.
+    RoleCredentialResponse:
+      type: object
+      additionalProperties: false
+      required: [credential]
+      properties:
+        credential:
+          $ref: "#/components/schemas/RoleCredential"
+    DatabaseCreateInput:
+      type: object
+      additionalProperties: false
+      required: [name, ownerRoleId]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 63
+          pattern: "^[a-z][a-z0-9_]{0,62}$"
+          not:
+            anyOf:
+              - enum: [app, postgres, template0, template1]
+              - pattern: "^(pg_|cnpg_)"
+          description: Application database identifier; the protected bootstrap name is excluded.
+        ownerRoleId:
+          $ref: "#/components/schemas/AccountingUuid"
+          description: Currently applied role owned by this same environment.
+    DatabaseLifecycleOperation:
+      type: object
+      additionalProperties: false
+      required:
+        [id, databaseId, kind, status, createdAt, observedAt, resultCode]
+      properties:
+        id:
+          $ref: "#/components/schemas/AccountingUuid"
+        databaseId:
+          $ref: "#/components/schemas/AccountingUuid"
+        kind:
+          type: string
+          const: database.create
+        status:
+          type: string
+          enum: [queued, running, applied, failed]
+        createdAt:
+          type: string
+          format: date-time
+        observedAt:
+          type: [string, "null"]
+          format: date-time
+        resultCode:
+          type: [string, "null"]
+    DatabaseMetadataResponse:
+      type: object
+      additionalProperties: false
+      required: [database]
+      properties:
+        database:
+          $ref: "#/components/schemas/RecoveryDatabase"
+    DatabaseOperationResponse:
+      type: object
+      additionalProperties: false
+      required: [database, operation]
+      properties:
+        database:
+          $ref: "#/components/schemas/RecoveryDatabase"
+        operation:
+          $ref: "#/components/schemas/DatabaseLifecycleOperation"
+      description: Immutable accepted response; no credential, owner secret or lease authority.
+    DatabaseCredential:
+      type: object
+      additionalProperties: false
+      required:
+        - databaseId
+        - ownerRoleId
+        - credentialRevision
+        - username
+        - password
+        - database
+        - observedAt
+        - credentialVerifiedAt
+      properties:
+        databaseId:
+          $ref: "#/components/schemas/AccountingUuid"
+        ownerRoleId:
+          $ref: "#/components/schemas/AccountingUuid"
+        credentialRevision:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+          description: Latest applied owner revision, possibly newer than the original database intent.
+        username:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,62}$"
+        password:
+          type: string
+          format: password
+          readOnly: true
+          minLength: 43
+          maxLength: 43
+          pattern: "^[A-Za-z0-9_-]{43}$"
+        database:
+          type: string
+          pattern: "^[a-z][a-z0-9_]{0,62}$"
+        observedAt:
+          type: [string, "null"]
+          format: date-time
+          description: The logical database's last accepted observation.
+        credentialVerifiedAt:
+          type: [string, "null"]
+          format: date-time
+          description: The owner's current applied credential observation.
+      description: Sensitive observed credential; no host, port, CA certificate or connection URL.
+    DatabaseCredentialResponse:
+      type: object
+      additionalProperties: false
+      required: [credential]
+      properties:
+        credential:
+          $ref: "#/components/schemas/DatabaseCredential"
     RecoveryRole:
       type: object
       additionalProperties: false
