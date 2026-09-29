@@ -35,6 +35,14 @@ integrity and no provider mutation. This is not live service activation or
 production disaster recovery; off-node key/archive custody, concurrent-writer
 behavior, fresh bootstrap and fencing remain open.
 
+The [one-use commissioning checkpoint](docs/evidence/m3-scoped-admission-2026-09-29.md)
+adds installation-issued permits bound to one exact project, immutable catalog
+and resolved environment specification. Atomic consumption keeps ordinary
+regional admission closed and still requires current organization authority.
+Requested budget pause and expiry are admission gates; the permit supplies no
+physical capacity or funded runtime enforcement. The source is locally
+qualified; a real PostgreSQL pilot and its recovery/cleanup proof remain open.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.
@@ -311,7 +319,7 @@ Test concurrent reservations, duplicated grants/events, period rollover, revisio
 
 M1 has a [live single-node infrastructure checkpoint](docs/evidence/m1-2026-09-28.md). Talos boot, node restart, Kubernetes networking, bounded local volumes, and a CloudNativePG SQL transaction with verified TLS and post-reboot readback were observed. R2 backup, independent restore, and production topology gates remain open.
 
-The [backup/recovery preflight](docs/evidence/m1-backup-preflight-2026-09-29.md) verifies the existing unchanged manual Barman plugin, available local storage/request capacity and installed-API acceptance of the generic [recovery examples](infra/backups/README.md). No backup, WAL upload, restore or new credential is claimed. A specific single-bucket, 30-day R2 credential is prepared in the browser and awaits the security-policy confirmation required at its final creation action. The stopped Flux handoff remains stopped; ordinary database qualification must not disguise a new repair of that installation. Actual backup/PITR, retention/deletion and independent recovery remain M1 gates.
+The [backup/recovery preflight](docs/evidence/m1-backup-preflight-2026-09-29.md) verifies the existing unchanged manual Barman plugin and generic [recovery examples](infra/backups/README.md). The dedicated EU-bucket R2 credential was explicitly issued and set to permanent validity at the user's request; object write/read verification passes. Source activation is held after two exact-spec preview stops; the sole diagnosed difference is CNPG's default `plugins[0].enabled=true`, with one additional guarded attempt awaiting its bounded-test exception. No PostgreSQL backup/WAL/restore is claimed. The stopped Flux handoff remains stopped. Actual backup/PITR, retention/deletion and independent recovery remain M1 gates.
 
 M3 has a [deployed Dev control API foundation checkpoint](docs/evidence/m3-logical-projects-2026-09-28.md): organization bootstrap, paginated recovery listing, region registration with a scoped token, and global logical project creation with a completed D1 audit operation. The [environment execution checkpoint](docs/evidence/m3-environment-execution-2026-09-28.md) records implemented immutable catalogs, explicit region admission, idempotent environment intents, fenced regional leases/results, and a CNPG controller that reconciles deterministic internal resources. Migration `0005` and the updated Worker are deployed; live readback verified closed admission, regional claim authorization, and preserved logical-project state. Local Worker/Node tests, package build, and container checks passed; the reviewed controller image was published to GHCR. The initial execution-only Dev deployment used source revision [8dc14f8](https://github.com/amerged-org/cloudflare-postgres/commit/8dc14f8e9e9b65e9a7853ce9cd33ebede6a10bb2), imported through Talos `ImageService.Import` and selected with `imagePullPolicy: Never`. A direct compiled `ControlClient` invocation from its running Pod authenticated to the control API and returned `{ claim: null }`. Anonymous registry pulling and API-to-CNPG qualification remain pending. No catalog or API-managed environment has been created. A ready observation does not yet supply a usable customer endpoint or credentials. The subsequent collector deployment and its limited runtime evidence are recorded below; neither deployment establishes complete coverage or enforcement.
 
