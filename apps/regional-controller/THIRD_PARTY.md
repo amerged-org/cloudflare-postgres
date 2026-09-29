@@ -1,5 +1,12 @@
 # Regional execution dependencies
 
+Fleet inspection directly pins `js-yaml` `5.4.2` (MIT) and development-only
+`@types/js-yaml` `4.0.9` (MIT), already present in the Kubernetes client's locked
+dependency graph. The maintained [parser](https://github.com/nodeca/js-yaml)
+validates kubeconfig input before SDK authentication can resolve external helpers
+or token files. Installed package/license metadata was inspected on 2026-09-29;
+the root lock retains exact integrity. No parser source is copied or modified.
+
 First-party code remains Apache-2.0. Upstream packages retain their licenses; no upstream source is vendored or modified. The workspace lock pins distribution integrity and the transitive graph. These dependencies support PostgreSQL authentication verification and regional Kubernetes execution.
 
 | Package     | Pinned version | Origin and license                                                                                                      | Integration                                                                                                                                 |

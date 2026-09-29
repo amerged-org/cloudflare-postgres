@@ -37,6 +37,11 @@ function milliseconds(
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "inspect-fleet") {
+    const { runFleetInspection } = await import("./fleet-inspection-cli.ts");
+    process.exitCode = await runFleetInspection(process.argv.slice(3));
+    return;
+  }
   if (process.argv[2] === "inspect-node-runtime") {
     const { inspectNodeRuntime } =
       await import("./inspect-node-runtime-cli.ts");

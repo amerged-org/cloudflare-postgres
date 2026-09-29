@@ -19,6 +19,7 @@ import type {
   MaintenanceSnapshot,
 } from "./maintenance-types.ts";
 import type { Resource } from "./types.ts";
+import type { FleetOperatorConfiguration } from "./fleet-inspection-cli.ts";
 
 export interface MaintenanceOperatorConfiguration {
   schemaVersion: 1;
@@ -28,6 +29,7 @@ export interface MaintenanceOperatorConfiguration {
   talosconfigSecret: string;
   endpoints: string[];
   targetNodeUid: string;
+  fleetInventory?: FleetOperatorConfiguration;
   evidence: {
     machineIdentity: MaintenanceEvidence | null;
     etcd:

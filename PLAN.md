@@ -399,14 +399,15 @@ physical LVM capacity. No runtime source or held qualifier changes. This advance
 filesystem containment only; PostgreSQL own-volume recovery, complete tenant
 isolation, backups/PITR and production readiness remain open.
 
-The [fleet inventory candidate checkpoint](docs/evidence/m4-fleet-inventory-held-2026-09-29.md)
-records an independent installation-only provider read and explicit enrolled-Node
-inspection draft. Two red-first targeted cases pass, including maintenance
-exclusion and verified static-auth boundaries. Its single frozen final gate
-stops at the Worker's control-byte regex lint rule. The equivalent character-code
-repair remains unapplied; no source merge, deployment or positive Dev provider
-qualification is claimed. Original infrastructure, private files and every
-earlier held draft are preserved. Actual fleet operations remain open.
+The [fleet inventory checkpoint](docs/evidence/m4-fleet-inventory-2026-09-29.md)
+adds an installation-only Contabo read path and explicit provider/Node correlation
+for maintenance exclusion. Two red-first local cases pass. After the original
+lint stop and the user's explicit resumption, only equivalent validators receive
+targeted corrections; previously unrun typecheck/Vitest/Node stages pass once with
+27 Worker and 34 Node cases, retaining six unchanged Go cases. No full gate is
+repeated. Actual Dev readback remains pending. Association cannot grant machine
+identity, reserved capacity or update authority. Other held workflows remain
+untouched.
 
 The [control recovery candidate checkpoint](docs/evidence/m3-control-recovery-held-2026-09-29.md)
 records two passing local reconstruction/key-custody cases and one failed actual

@@ -5,6 +5,7 @@ import { maintenanceRoutes } from "./maintenance";
 import { roleRoutes } from "./roles";
 import { databaseRoutes } from "./databases";
 import { suspendRoutes } from "./suspend";
+import { providerInventoryRoute } from "./provider-inventory";
 import {
   executionReads,
   projectFromRow,
@@ -712,6 +713,8 @@ async function getProject(
 
 export default {
   async fetch(request, env): Promise<Response> {
+    const providerResponse = await providerInventoryRoute(request, env);
+    if (providerResponse) return providerResponse;
     const suspendResponse = await suspendRoutes(request, env);
     if (suspendResponse) return suspendResponse;
     const recoveryResponse = await executionReads(request, env);

@@ -20,11 +20,13 @@
   },
   "dependencies": {
     "@kubernetes/client-node": "2.0.0",
+    "js-yaml": "5.4.2",
     "pg": "8.23.0",
     "ws": "8.21.0"
   },
   "devDependencies": {
     "@eslint/js": "9.39.5",
+    "@types/js-yaml": "4.0.9",
     "@types/node": "24.19.0",
     "@types/pg": "8.23.1",
     "eslint": "9.39.5",
