@@ -5,6 +5,25 @@ retrieves an already sealed recovery bundle using existing operator access.
 Verify exact downloaded bytes and matching historical migrations before offline
 restore. This does not activate recovered state or replace independent key custody.
 
+## Complete usage-journal snapshot
+
+The explicit `snapshot-usage` operator mode captures a full, source-bound SQLite
+usage journal without acknowledging or rewriting pending facts. It preserves
+outbox/checkpoints/gaps/retained-volume and accepted-receipt history, including
+committed WAL state. The [custody contract](../../docs/contracts/usage-journal-snapshot-v1.md)
+defines private paths, expected identity, size/deadline limits and inactive output.
+
+```sh
+node apps/regional-controller/dist/main.js snapshot-usage --config /absolute/private/snapshot.json
+```
+
+The version-one private config has `schemaVersion`, `sourcePath`, a fresh
+`targetDirectory` and exact `expectedIdentity`. Verified output is `usage.sqlite`
+plus a last-published `manifest.json`; the result reports digest/bytes/pending
+count and `activationSupported: false`. It starts no controller lane or network
+client. Off-node transfer, authority recovery and any replay remain separate
+operator responsibilities; a snapshot alone never makes a rejected fact accepted.
+
 ## Fleet inspection
 
 The explicit `inspect-fleet` mode observes Contabo through the installation's
