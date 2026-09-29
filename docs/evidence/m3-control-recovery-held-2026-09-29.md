@@ -62,9 +62,11 @@ environment and all prior held candidates remain protected.
 
 ## Recovery work still open
 
-The existing private role-key custody record is present. No local custody copy of
-the current allowance keyring was found in the inspected configuration/backup
-paths, and Worker Secret name listing cannot recover its value. No replacement
+The existing private role-key custody record is present. The initial limited
+search found no allowance-key custody copy in its inspected paths. A later
+[fleet preparation inventory](m4-fleet-inventory-held-2026-09-29.md) locates the
+nonfixture allowance `v1` keyring in the existing private `.dev.vars`; a local copy
+therefore exists. Worker Secret name listing cannot recover its value. No replacement
 key is generated and no rotation is attempted. Actual Dev encrypted-bundle/key
 recovery, off-node custody, global fencing, external-resource reconciliation,
 fresh Cloudflare rebuild and safe service reactivation remain required work.

@@ -391,6 +391,15 @@ The [Pod birth admission candidate](docs/evidence/m6-pod-birth-held-2026-09-29.m
 
 ## 10. Bounded TDD and verification discipline
 
+The [fleet inventory candidate checkpoint](docs/evidence/m4-fleet-inventory-held-2026-09-29.md)
+records an independent installation-only provider read and explicit enrolled-Node
+inspection draft. Two red-first targeted cases pass, including maintenance
+exclusion and verified static-auth boundaries. Its single frozen final gate
+stops at the Worker's control-byte regex lint rule. The equivalent character-code
+repair remains unapplied; no source merge, deployment or positive Dev provider
+qualification is claimed. Original infrastructure, private files and every
+earlier held draft are preserved. Actual fleet operations remain open.
+
 The [control recovery candidate checkpoint](docs/evidence/m3-control-recovery-held-2026-09-29.md)
 records two passing local reconstruction/key-custody cases and one failed actual
 Dev D1 capture. The latter remains held after two attempts: metadata/schema checks
