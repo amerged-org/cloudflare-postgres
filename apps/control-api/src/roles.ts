@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { runtimeAllowsExecution } from "./environment-runtime";
 import {
   assertion,
   body,
@@ -94,8 +95,7 @@ interface Observation {
 }
 const joins =
   "JOIN environments e ON e.id = r.environment_id JOIN projects p ON p.id = r.project_id AND p.organization_id = r.organization_id JOIN regions g ON g.id = r.region_id";
-const currentScope =
-  "e.organization_id = r.organization_id AND e.project_id = r.project_id AND e.region_id = r.region_id AND e.spec_revision = r.spec_revision AND e.spec_hash = r.spec_hash AND e.status = 'ready' AND json_extract(e.observation_json, '$.clusterUid') = r.cluster_uid AND p.status = 'active' AND g.status <> 'disabled'";
+const currentScope = `e.organization_id = r.organization_id AND e.project_id = r.project_id AND e.region_id = r.region_id AND e.spec_revision = r.spec_revision AND e.spec_hash = r.spec_hash AND e.status = 'ready' AND ${runtimeAllowsExecution("e")} AND json_extract(e.observation_json, '$.clusterUid') = r.cluster_uid AND p.status = 'active' AND g.status <> 'disabled'`;
 function identifier(value: unknown): value is string {
   return (
     typeof value === "string" &&
@@ -152,7 +152,7 @@ async function target(
 ): Promise<Target | null> {
   return db
     .prepare(
-      "SELECT e.id, e.organization_id, e.project_id, e.region_id, e.spec_revision, e.spec_hash, e.resolved_spec, e.observation_json FROM environments e JOIN projects p ON p.id = e.project_id AND p.organization_id = e.organization_id JOIN regions g ON g.id = e.region_id WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND e.status = 'ready' AND p.status = 'active' AND g.status <> 'disabled'",
+      `SELECT e.id, e.organization_id, e.project_id, e.region_id, e.spec_revision, e.spec_hash, e.resolved_spec, e.observation_json FROM environments e JOIN projects p ON p.id = e.project_id AND p.organization_id = e.organization_id JOIN regions g ON g.id = e.region_id WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND e.status = 'ready' AND p.status = 'active' AND g.status <> 'disabled' AND ${runtimeAllowsExecution("e")}`,
     )
     .bind(environmentId, organizationId, projectId)
     .first<Target>();
@@ -160,7 +160,7 @@ async function target(
 function targetAssertion(db: AccountingDb, role: Role): D1PreparedStatement {
   return assertion(
     db,
-    "EXISTS (SELECT 1 FROM environments e JOIN projects p ON p.id = e.project_id AND p.organization_id = e.organization_id JOIN regions g ON g.id = e.region_id WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND e.region_id = ? AND e.spec_revision = ? AND e.spec_hash = ? AND json_extract(e.observation_json, '$.clusterUid') = ? AND e.status = 'ready' AND p.status = 'active' AND g.status <> 'disabled')",
+    `EXISTS (SELECT 1 FROM environments e JOIN projects p ON p.id = e.project_id AND p.organization_id = e.organization_id JOIN regions g ON g.id = e.region_id WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND e.region_id = ? AND e.spec_revision = ? AND e.spec_hash = ? AND json_extract(e.observation_json, '$.clusterUid') = ? AND e.status = 'ready' AND p.status = 'active' AND g.status <> 'disabled' AND ${runtimeAllowsExecution("e")})`,
     [
       role.environment_id,
       role.organization_id,

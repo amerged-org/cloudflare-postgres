@@ -18,6 +18,7 @@ export function allowanceKubernetesFromConfig(
   file: string,
   context: string,
   binding: RuntimeBinding,
+  authorized: () => void = () => {},
 ): AllowanceRuntime {
   const config = new KubeConfig();
   config.loadFromFile(file);
@@ -33,6 +34,7 @@ export function allowanceKubernetesFromConfig(
     middleware: [
       {
         pre(request) {
+          authorized();
           const remaining = budget ? budget.deadline - Date.now() : 20_000;
           if (remaining <= 0) throw new Error("allowance_inventory_deadline");
           request.setSignal(

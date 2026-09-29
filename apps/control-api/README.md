@@ -46,6 +46,12 @@ Use the organization token to read `GET /v1/organizations/{organizationId}/proje
 
 The current slice has no public native endpoint, customer database credentials, environment listing/deletion/resize, runtime usage collector, runtime allowance enforcer, idempotency archival, or rate limiting. A reported ready environment means the regional executor observed PostgreSQL resource readiness; it does not prove backups, restore qualification, credential access, or a production service objective.
 
+## Explicit compute suspension
+
+Use the [suspend contract](../../docs/contracts/environment-suspend-v1.md) to request an immediate owned compute stop with `POST .../environments/{environmentId}/suspend`, `Idempotency-Key` and `{expectedRevision}`. Read desired/observed runtime state separately at `GET .../runtime`; provisioning status and immutable specification remain unchanged. The ordinary operation endpoint recovers the task. Active database work conflicts, while suspended desired state blocks new work/credential disclosure and current execution funding.
+
+The regional executor seals workload/volume identities before quota/Pooler/Cluster changes and reports completion through a fenced lease. It does not settle allowances, finalize usage, delete data or resume compute. Automatic idle detection, funded wake, ingress/draining and independent expiry remain separate v1 gates.
+
 ## Optional managed pooling
 
 An installation operator may append the exact version-one session `pooling` policy to a new immutable catalog profile. It is exposed publicly as nonsecret configuration and frozen in the environment specification; historical unpooled profiles and hashes remain unchanged. The [managed-pooling contract](../../docs/contracts/managed-pooling-v1.md) defines image/resource/connection/timeout bounds, derived CNPG certificate names and a single RW/Recreate Pooler.

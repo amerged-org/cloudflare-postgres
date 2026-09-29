@@ -4,6 +4,7 @@ import { budgetRoutes, planBudgetCorrection } from "./budgets";
 import { maintenanceRoutes } from "./maintenance";
 import { roleRoutes } from "./roles";
 import { databaseRoutes } from "./databases";
+import { suspendRoutes } from "./suspend";
 import {
   executionReads,
   projectFromRow,
@@ -711,6 +712,8 @@ async function getProject(
 
 export default {
   async fetch(request, env): Promise<Response> {
+    const suspendResponse = await suspendRoutes(request, env);
+    if (suspendResponse) return suspendResponse;
     const recoveryResponse = await executionReads(request, env);
     if (recoveryResponse) return recoveryResponse;
     const databaseResponse = await databaseRoutes(request, env);

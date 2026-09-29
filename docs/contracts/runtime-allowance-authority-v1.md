@@ -26,10 +26,12 @@ All receipt and limited-policy dimensions participate in the verified resource-r
 
 Loss of current authority closes owned namespace Pod growth before setting `cnpg.io/hibernation=on` on the owned CNPG Cluster. Conditional patches bind UID/resourceVersion and verified ownership/spec. They create no replacement namespace, Cluster, quota, Pod or volume. A lost patch response is resolved by matching readback before another mutation.
 
-Record stopped only after the owned database Pods are absent and the original PVC/PV UID bindings are preserved. Retained data storage remains allocated and may continue consuming storage-time. This path does not prove gateway admission closure, transaction/session draining, a Kubernetes-independent expiry fence, stop during API/operator failure or zero infrastructure cost.
+For pooled environments, conditionally scale the bound Pooler to zero and verify current-generation Deployment convergence. Record stopped only after all namespace compute is terminal/absent and the original PVC/PV UID bindings are preserved. The [managed pooling contract](managed-pooling-v1.md) specifies the additional immutable workload bindings. Retained data storage remains allocated and may continue consuming storage-time. This path does not prove gateway admission closure, transaction/session draining, a Kubernetes-independent expiry fence, stop during API/operator failure or zero infrastructure cost.
 
 Automatic restart/resume is outside this normal-stop slice. It requires fresh validated authority and separately qualified resource/startup policy; a readable old receipt is insufficient. Self-hosted operators use the same generic API and ownership rules as every integrator.
 
 ## Bounded evidence
 
 The three cases cover current funded authority through pause/epoch/expiry, durable uncertain reservation replay, and an unfunded limited RAM dimension causing owned normal stop that remains stopped through cache expiry and a control outage with retained volumes. Verification reports distinguish local cases from real deployment and operational evidence. The independent workload-local guard, full accounting/finalization, settlement, ingress and overshoot qualification remain required v1 work.
+
+The [explicit suspend contract](environment-suspend-v1.md) adds a separate customer intention and regional acknowledgement. Suspended desired runtime state denies new allowance issuance and yields a current `environment_suspended` stop decision; historical receipt replay and settlement remain recoverable. This does not finalize usage, release holds or implement funded resume.

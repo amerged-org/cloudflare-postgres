@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "kubeconfigFile": "/private/installation/kubeconfig",
+  "kubeconfigContext": "REPLACE_WITH_SELECTED_CONTEXT",
+  "journalDirectory": "/private/installation/suspend-operations"
+}

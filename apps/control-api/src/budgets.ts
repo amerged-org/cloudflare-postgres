@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { runtimeAllowsExecution } from "./environment-runtime";
 import {
   assertion,
   bearer,
@@ -727,6 +728,13 @@ async function issueAllowance(
       return error(503, "fence_key_unavailable");
     }
   }
+  const executable = await db
+    .prepare(
+      `SELECT 1 FROM environments e WHERE e.id = ? AND e.region_id = ? AND ${runtimeAllowsExecution("e")}`,
+    )
+    .bind(environment.id, regionId)
+    .first();
+  if (!executable) return error(409, "environment_suspended");
   const targets = (
     await db
       .prepare(
@@ -817,6 +825,16 @@ async function issueAllowance(
   const statements = [
     ...fence.statements,
     actorGuard(db, actor, true, true),
+    assertion(
+      db,
+      `EXISTS (SELECT 1 FROM environments e WHERE e.id = ? AND e.region_id = ? AND e.spec_revision = ? AND e.spec_hash = ? AND ${runtimeAllowsExecution("e")})`,
+      [
+        environment.id,
+        regionId,
+        environment.spec_revision,
+        environment.spec_hash,
+      ],
+    ),
     db
       .prepare(
         "INSERT INTO allowance_reservations (id, request_id, region_id, environment_id, organization_id, project_id, spec_revision, spec_hash, request_hash, issued_at, expires_at, execution_epoch, fence_token_hash, fence_ciphertext, fence_iv, fence_key_version, units_json, status, revision, gap_count, version_token) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

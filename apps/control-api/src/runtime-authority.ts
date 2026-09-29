@@ -21,6 +21,7 @@ type Reason =
   | "region_disabled"
   | "budget_paused"
   | "environment_changed"
+  | "environment_suspended"
   | "policy_changed"
   | "budget_period_inactive"
   | "unreconciled_usage"
@@ -54,6 +55,9 @@ interface ReceiptRow {
   current_project_id: string | null;
   current_spec_revision: number | null;
   current_spec_hash: string | null;
+  runtime_version: string | null;
+  runtime_desired_state: string | null;
+  runtime_phase: string | null;
   project_fence_version: string | null;
 }
 interface AccountFields {
@@ -222,8 +226,11 @@ export async function runtimeAuthority(
         e.id AS current_environment_id, e.region_id AS current_region_id,
         e.organization_id AS current_organization_id, e.project_id AS current_project_id,
         e.spec_revision AS current_spec_revision, e.spec_hash AS current_spec_hash,
+        rt.version_token AS runtime_version, rt.desired_state AS runtime_desired_state,
+        rt.phase AS runtime_phase,
         f.version_token AS project_fence_version FROM allowance_reservations q
         LEFT JOIN environments e ON e.id = q.environment_id
+        LEFT JOIN environment_runtime rt ON rt.environment_id = e.id
         LEFT JOIN accounting_fences f ON f.project_id = q.project_id
         WHERE q.id = ? AND q.region_id = ?`,
         )
@@ -343,6 +350,12 @@ export async function runtimeAuthority(
       receipt.current_spec_hash !== receipt.spec_hash
     )
       reason = "environment_changed";
+    else if (
+      receipt.runtime_desired_state !== null &&
+      (receipt.runtime_desired_state !== "running" ||
+        receipt.runtime_phase !== "running")
+    )
+      reason = "environment_suspended";
     else if (policies.some((policy) => policy.requested_state === "paused"))
       reason = "budget_paused";
     else if (
@@ -438,11 +451,13 @@ export async function runtimeAuthority(
       .prepare(
         `SELECT 1 AS stable FROM allowance_reservations q
       JOIN environments e ON e.id = q.environment_id JOIN regions r ON r.id = q.region_id
+      LEFT JOIN environment_runtime rt ON rt.environment_id = e.id
       LEFT JOIN accounting_fences f ON f.project_id = q.project_id
       WHERE q.id = ? AND q.region_id = ? AND q.version_token = ? AND q.status = ?
       AND q.expires_at = ? AND r.status = ? AND f.version_token IS ?
       AND e.id IS ? AND e.region_id IS ? AND e.organization_id IS ? AND e.project_id IS ?
-      AND e.spec_revision IS ? AND e.spec_hash IS ? AND ${tokenPredicate}`,
+      AND e.spec_revision IS ? AND e.spec_hash IS ?
+      AND rt.version_token IS ? AND rt.desired_state IS ? AND rt.phase IS ? AND ${tokenPredicate}`,
       )
       .bind(
         reservationId,
@@ -458,6 +473,9 @@ export async function runtimeAuthority(
         receipt.current_project_id,
         receipt.current_spec_revision,
         receipt.current_spec_hash,
+        receipt.runtime_version,
+        receipt.runtime_desired_state,
+        receipt.runtime_phase,
         actor.id,
         tokenHash,
         regionId,

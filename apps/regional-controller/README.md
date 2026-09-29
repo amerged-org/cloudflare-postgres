@@ -35,6 +35,21 @@ Success requires CNPG applied/current generation/exact password-Secret version, 
 
 [The maintained driver dependencies](THIRD_PARTY.md) are pinned and retain their licenses. This lifecycle does not automatically grant table permissions/ownership, terminate existing sessions, expose a public endpoint, enable closed regional admission or qualify backups/recovery. Real CNPG application, key recovery, image/runtime, networking and end-to-end pilot verification remain separate evidence.
 
+## Explicit suspend executor
+
+The [environment suspend contract](../../docs/contracts/environment-suspend-v1.md) connects a persisted customer compute-stop intention to a separately supervised executor. It claims only `environment.suspend` work, keeps ordinary operation leases fresh, seals workload/retained-volume identities in a private operation journal before effects and reuses the same owned normal-stop primitive as allowance supervision.
+
+This executor requires explicit installation configuration and patch authority; the default controller does not activate it.
+
+Fill [suspend-config.example.json](deploy/suspend-config.example.json), make the real configuration owner-readable only, and supply `PGCF_CONTROL_ORIGIN`, `PGCF_REGION_ID` and `PGCF_REGION_TOKEN_FILE`. Run the built entry point:
+
+```sh
+node apps/regional-controller/dist/main.js run-suspend --config /private/installation/suspend.json
+```
+
+Each invocation claims at most one task and is bounded to five minutes. No work exits cleanly; uncertain/incomplete work keeps its journal for a later supervised invocation after lease reclaim. The selected Kubernetes identity needs complete named-namespace resource reads and narrowly authorized quota/Cluster/Pooler patches. It needs no Secret listing or new provider access. The default deployment example deliberately adds no patch grant for this mode.
+It never creates a replacement database, adopts a changed UID, deletes retained storage, settles a receipt or wakes compute. Unknown state remains reclaimable. Provisioning status remains distinct from runtime state; observe the API's runtime resource to recover its desired revision and accepted regional completion. Funded resume, automatic idleness/wake, independent expiry and final accounting remain open.
+
 ## Optional managed session pooling
 
 The [managed-pooling contract](../../docs/contracts/managed-pooling-v1.md) enables a fixed `database-pool-rw` Pooler only for a newly accepted immutable profile. Composite namespace quotas reserve database maintenance separately, then add the Pooler main/init resource envelope without adding persistent storage. CNPG owns the actual pooler workload and certificate lifecycle; creation derives extra Cluster SANs and requires TLS on both sections. A complete owned Deployment/ReplicaSet/Pod chain is required for provisioning readiness. No native listener or customer endpoint is exposed by this controller.

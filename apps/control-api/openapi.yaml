@@ -1450,6 +1450,259 @@ paths:
             read
         "503":
           description: Cursor signing key unavailable
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/runtime:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+    get:
+      operationId: getEnvironmentRuntime
+      summary: Read stored desired and observed compute runtime state
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Current runtime; legacy running is not fresh SQL evidence
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - runtime
+                properties:
+                  runtime:
+                    $ref: "#/components/schemas/EnvironmentRuntime"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/suspend:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+    post:
+      operationId: suspendEnvironment
+      summary: Accept an owned manual compute-stop intention
+      description:
+        Requires projects:write, Idempotency-Key and expected runtime revision.
+        Active database work conflicts; no resume or settlement is promised.
+      security:
+        - organizationToken: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: ^[A-Za-z0-9._~-]{1,128}$
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - expectedRevision
+              properties:
+                expectedRevision:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740990
+      responses:
+        "202":
+          description: Persisted runtime intention and recoverable task
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - runtime
+                  - operation
+                properties:
+                  runtime:
+                    $ref: "#/components/schemas/EnvironmentRuntime"
+                  operation:
+                    $ref: "#/components/schemas/RecoveryOperation"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description:
+            Stale revision, active database work, nonready environment or
+            conflicting replay
+  /v1/regions/{regionId}/suspend-operations/claim:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+    post:
+      operationId: claimSuspendOperation
+      summary: Lease one owned suspend intention
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - leaseSeconds
+              properties:
+                leaseSeconds:
+                  type: integer
+                  minimum: 30
+                  maximum: 300
+      responses:
+        "200":
+          description: Scoped suspend execution result
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - claim
+                properties:
+                  claim:
+                    type:
+                      - object
+                      - "null"
+                    description:
+                      Bounded immutable suspend task identity and fenced
+                      lease; no password. See environment-suspend-v1 contract.
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Stale or foreign execution/runtime/spec authority
+  /v1/regions/{regionId}/suspend-operations/{operationId}/renew:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/OperationId"
+    post:
+      operationId: renewSuspendOperation
+      summary: Renew only current suspend execution authority
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - leaseToken
+                - leaseEpoch
+                - leaseSeconds
+              properties:
+                leaseToken:
+                  type: string
+                  pattern: ^cplease_[A-Za-z0-9_-]{43}$
+                leaseEpoch:
+                  type: integer
+                  minimum: 1
+                leaseSeconds:
+                  type: integer
+                  minimum: 30
+                  maximum: 300
+      responses:
+        "200":
+          description: Scoped suspend execution result
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - leaseExpiresAt
+                properties:
+                  leaseExpiresAt:
+                    type: string
+                    format: date-time
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Stale or foreign execution/runtime/spec authority
+  /v1/regions/{regionId}/suspend-operations/{operationId}/result:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/OperationId"
+    post:
+      operationId: reportSuspendOperation
+      summary: Publish observed retained-data compute suspension
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required:
+                - leaseToken
+                - leaseEpoch
+                - status
+                - resultCode
+                - observation
+              properties:
+                leaseToken:
+                  type: string
+                  pattern: ^cplease_[A-Za-z0-9_-]{43}$
+                leaseEpoch:
+                  type: integer
+                  minimum: 1
+                status:
+                  type: string
+                  const: suspended
+                resultCode:
+                  type: string
+                  const: compute_suspended
+                observation:
+                  $ref: "#/components/schemas/SuspendObservation"
+      responses:
+        "200":
+          description: Scoped suspend execution result
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - operation
+                properties:
+                  operation:
+                    $ref: "#/components/schemas/RecoveryOperation"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Stale or foreign execution/runtime/spec authority
 components:
   securitySchemes:
     usageMeterToken:
@@ -1606,6 +1859,99 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    SuspendObservation:
+      type: object
+      additionalProperties: false
+      required:
+        - namespaceUid
+        - clusterUid
+        - quotaUid
+        - volumesHash
+        - pooler
+        - computeAbsent
+        - quotaPodsZero
+        - clusterHibernated
+        - poolerStopped
+      properties:
+        namespaceUid:
+          type: string
+          format: uuid
+        clusterUid:
+          type: string
+          format: uuid
+        quotaUid:
+          type: string
+          format: uuid
+        volumesHash:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        pooler:
+          oneOf:
+            - type: "null"
+            - type: object
+              additionalProperties: false
+              required:
+                - uid
+                - deploymentUid
+              properties:
+                uid:
+                  type: string
+                  format: uuid
+                deploymentUid:
+                  type: string
+                  format: uuid
+        computeAbsent:
+          type: boolean
+          const: true
+        quotaPodsZero:
+          type: boolean
+          const: true
+        clusterHibernated:
+          type: boolean
+          const: true
+        poolerStopped:
+          type: boolean
+          const: true
+    EnvironmentRuntime:
+      type: object
+      required:
+        - revision
+        - desiredState
+        - phase
+      properties:
+        revision:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+        desiredState:
+          type: string
+          enum:
+            - running
+            - suspended
+        phase:
+          type: string
+          enum:
+            - running
+            - unknown
+            - suspending
+            - suspended
+        operationId:
+          type:
+            - string
+            - "null"
+          format: uuid
+        observedAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        observation:
+          type:
+            - object
+            - "null"
+          description:
+            Accepted nonsecret regional stop evidence; never settlement or
+            SQL reachability.
     PoolingPolicy:
       type: object
       additionalProperties: false
@@ -1992,6 +2338,7 @@ components:
             - environment.create
             - database.role.apply
             - database.create
+            - environment.suspend
         status:
           type: string
           enum:
@@ -2096,16 +2443,14 @@ components:
     Operation:
       type: object
       required:
-        [
-          id,
-          organizationId,
-          projectId,
-          kind,
-          status,
-          createdAt,
-          observedAt,
-          resultCode,
-        ]
+        - id
+        - organizationId
+        - projectId
+        - kind
+        - status
+        - createdAt
+        - observedAt
+        - resultCode
       properties:
         id:
           type: string
@@ -2118,10 +2463,17 @@ components:
           format: uuid
         kind:
           type: string
-          enum: [project.create, environment.create]
+          enum:
+            - project.create
+            - environment.create
+            - environment.suspend
         status:
           type: string
-          enum: [succeeded, queued, running, failed]
+          enum:
+            - succeeded
+            - queued
+            - running
+            - failed
           description: Projects succeed in D1; environments require regional execution.
         environmentId:
           type: string
@@ -2131,20 +2483,23 @@ components:
           type: string
           format: date-time
         observedAt:
-          type: [string, "null"]
+          type:
+            - string
+            - "null"
           format: date-time
           description: Time the final result was observed.
         resultCode:
-          type: [string, "null"]
+          type:
+            - string
+            - "null"
           enum:
-            [
-              logical_container_created,
-              cnpg_ready,
-              ownership_mismatch,
-              spec_conflict,
-              reconcile_failed,
-              null,
-            ]
+            - logical_container_created
+            - cnpg_ready
+            - ownership_mismatch
+            - spec_conflict
+            - reconcile_failed
+            - null
+            - compute_suspended
           description: Null while an operation has no final observed result.
     CatalogVersion:
       type: string

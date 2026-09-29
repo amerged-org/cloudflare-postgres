@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { runtimeAllowsExecution } from "./environment-runtime";
 import {
   assertion,
   body,
@@ -114,7 +115,7 @@ const joins =
   "JOIN database_roles r ON r.id = d.owner_role_id JOIN environments e ON e.id = d.environment_id JOIN projects p ON p.id = d.project_id AND p.organization_id = d.organization_id JOIN regions g ON g.id = d.region_id";
 const currentOwner = `e.organization_id = d.organization_id AND e.project_id = d.project_id
   AND e.region_id = d.region_id AND e.spec_revision = d.spec_revision AND e.spec_hash = d.spec_hash
-  AND e.status = 'ready' AND json_extract(e.observation_json, '$.clusterUid') = d.cluster_uid
+  AND e.status = 'ready' AND ${runtimeAllowsExecution("e")} AND json_extract(e.observation_json, '$.clusterUid') = d.cluster_uid
   AND p.status = 'active' AND g.status <> 'disabled'
   AND r.organization_id = d.organization_id AND r.project_id = d.project_id AND r.environment_id = d.environment_id
   AND r.region_id = d.region_id AND r.spec_revision = d.spec_revision AND r.spec_hash = d.spec_hash
@@ -305,6 +306,13 @@ async function create(
   );
   const prior = await intent(db, actor, scope, key);
   if (prior) return replay(prior, requestHash);
+  const running = await db
+    .prepare(
+      `SELECT 1 FROM environments e WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND ${runtimeAllowsExecution("e")}`,
+    )
+    .bind(environmentId, organizationId, projectId)
+    .first();
+  if (!running) return error(409, "environment_suspended");
   const owner = await db
     .prepare(
       `SELECT r.* FROM database_roles r WHERE r.id = ? AND r.organization_id = ? AND r.project_id = ? AND r.environment_id = ? AND ${actorPredicate(actor)}`,
@@ -371,7 +379,7 @@ async function create(
       assertion(db, actorPredicate(actor), actorBindings(actor)),
       assertion(
         db,
-        `EXISTS (SELECT 1 FROM database_roles r JOIN environments e ON e.id = r.environment_id JOIN projects p ON p.id = r.project_id AND p.organization_id = r.organization_id JOIN regions g ON g.id = r.region_id WHERE r.id = ? AND r.version_token = ? AND r.organization_id = ? AND r.project_id = ? AND r.environment_id = ? AND r.status = 'applied' AND r.desired_credential_revision = ? AND r.applied_credential_revision = ? AND r.spec_revision = e.spec_revision AND r.spec_hash = e.spec_hash AND r.region_id = e.region_id AND e.organization_id = r.organization_id AND e.project_id = r.project_id AND e.status = 'ready' AND json_extract(e.observation_json, '$.clusterUid') = ? AND p.status = 'active' AND g.status <> 'disabled' AND NOT EXISTS (SELECT 1 FROM role_operations WHERE role_id = r.id AND status IN ('queued', 'running')))`,
+        `EXISTS (SELECT 1 FROM database_roles r JOIN environments e ON e.id = r.environment_id JOIN projects p ON p.id = r.project_id AND p.organization_id = r.organization_id JOIN regions g ON g.id = r.region_id WHERE r.id = ? AND r.version_token = ? AND r.organization_id = ? AND r.project_id = ? AND r.environment_id = ? AND r.status = 'applied' AND r.desired_credential_revision = ? AND r.applied_credential_revision = ? AND r.spec_revision = e.spec_revision AND r.spec_hash = e.spec_hash AND r.region_id = e.region_id AND e.organization_id = r.organization_id AND e.project_id = r.project_id AND e.status = 'ready' AND ${runtimeAllowsExecution("e")} AND json_extract(e.observation_json, '$.clusterUid') = ? AND p.status = 'active' AND g.status <> 'disabled' AND NOT EXISTS (SELECT 1 FROM role_operations WHERE role_id = r.id AND status IN ('queued', 'running')))`,
         [
           owner.id,
           owner.version_token,
