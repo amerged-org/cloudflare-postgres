@@ -4,6 +4,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { AllowanceJournal } from "../src/allowance-journal.ts";
 import {
   acquireAllowance,
@@ -42,6 +44,29 @@ function receipt() {
     enforcementStatus: "pending_runtime",
   };
 }
+
+function stored(path, name) {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    return db
+      .prepare("SELECT payload_json FROM allowance_state WHERE name=?")
+      .get(name)?.payload_json;
+  } finally {
+    db.close();
+  }
+}
+function legacyEntry(path, name, value) {
+  const payload = JSON.stringify(value);
+  const db = new DatabaseSync(path);
+  try {
+    db.prepare(
+      "INSERT INTO allowance_state VALUES (?,?,?) ON CONFLICT(name) DO UPDATE SET payload_json=excluded.payload_json,payload_hash=excluded.payload_hash",
+    ).run(name, payload, createHash("sha256").update(payload).digest("hex"));
+  } finally {
+    db.close();
+  }
+  return payload;
+}
 function authority() {
   return {
     schemaVersion: 1,
@@ -73,6 +98,7 @@ function fixture(t) {
     rmSync(directory, { recursive: true, force: true });
   });
   return {
+    path,
     get journal() {
       return journal;
     },
@@ -143,7 +169,7 @@ test("lost reservation replies preserve the durable request, receipt and origina
   );
 });
 
-test("an unfunded policy dimension fences growth and remains stopped through cache expiry and control outage without changing volumes", async (t) => {
+test("an unfunded policy dimension fences growth and defers physical completion through restart and outage while preserving legacy evidence", async (t) => {
   const state = fixture(t);
   state.journal.recordReceipt({ ...receipt(), epoch: "1" });
   const limitedAuthority = {
@@ -304,7 +330,15 @@ test("an unfunded policy dimension fences growth and remains stopped through cac
     false,
     "a CPU receipt cannot authorize nonzero RAM under an unfunded RAM policy",
   );
-  assert.equal(stopped.state, "stopped");
+  assert.equal(
+    stopped.state,
+    "stopping",
+    "Kubernetes-only convergence cannot establish physical completion",
+  );
+  assert.equal(stopped.reason, "physical_verification_pending");
+  assert.equal(state.journal.stopState, "stopping");
+  assert.equal(stored(state.path, "stopped_at"), undefined);
+  const volumesHash = state.journal.volumesHash;
   assert.equal(inventory.quota.spec.hard.pods, "0");
   assert.equal(
     inventory.cluster.metadata.annotations["cnpg.io/hibernation"],
@@ -325,9 +359,34 @@ test("an unfunded policy dimension fences growth and remains stopped through cac
     start + 17_000,
   );
   assert.equal(restarted.growthAllowed, false);
+  assert.equal(restarted.state, "stopping");
+  assert.equal(restarted.reason, "physical_verification_pending");
+  assert.equal(state.journal.volumesHash, volumesHash);
+  assert.equal(stored(state.path, "stopped_at"), undefined);
   assert.equal(
     patches.length,
     2,
     "restarted stop reconciliation must not repeat committed patches",
   );
+  state.journal.close();
+  const legacyState = legacyEntry(state.path, "stop_state", "stopped");
+  const legacyTime = legacyEntry(
+    state.path,
+    "stopped_at",
+    new Date(start + 1_000).toISOString(),
+  );
+  state.reopen();
+  const historical = await reconcileAllowance(
+    state.journal,
+    client,
+    runtime,
+    start + 18_000,
+  );
+  assert.equal(historical.state, "stopping");
+  assert.equal(historical.reason, "physical_verification_pending");
+  assert.equal(historical.growthAllowed, false);
+  assert.equal(stored(state.path, "stop_state"), legacyState);
+  assert.equal(stored(state.path, "stopped_at"), legacyTime);
+  assert.equal(state.journal.volumesHash, volumesHash);
+  assert.equal(patches.length, 2);
 });

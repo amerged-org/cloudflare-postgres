@@ -204,6 +204,7 @@ export class AllowanceJournal {
     return this.load<RuntimeAuthority>("authority");
   }
   get stopState(): "stopping" | "stopped" | null {
+    // Predecessor "stopped" records remain historical, not current node proof.
     return this.load<"stopping" | "stopped">("stop_state");
   }
   get volumesHash(): string | null {
@@ -364,8 +365,10 @@ export class AllowanceJournal {
     return this.transaction(() => {
       const previous = this.load<number>("clock");
       if (previous !== null && now < previous) {
-        this.put("stop_state", "stopping");
-        this.put("stop_reason", "clock_rollback");
+        if (this.stopState !== "stopped") {
+          this.put("stop_state", "stopping");
+          this.put("stop_reason", "clock_rollback");
+        }
         return false;
       }
       this.put("clock", now);
@@ -395,17 +398,10 @@ export class AllowanceJournal {
       if (previous && previous !== volumesHash)
         throw new Error("allowance_volume_binding_changed");
       if (!previous) this.put("volumes_hash", volumesHash);
-      if (this.stopState !== "stopped") this.put("stop_state", "stopping");
-      this.put("stop_reason", reason);
-    });
-  }
-  recordStopped(now: number, volumesHash: string): void {
-    this.transaction(() => {
-      if (this.volumesHash !== volumesHash)
-        throw new Error("allowance_volume_binding_changed");
-      if (this.load<string>("stopped_at") === null)
-        this.put("stopped_at", new Date(now).toISOString());
-      this.put("stop_state", "stopped");
+      if (this.stopState !== "stopped") {
+        this.put("stop_state", "stopping");
+        this.put("stop_reason", reason);
+      }
     });
   }
   close(): void {

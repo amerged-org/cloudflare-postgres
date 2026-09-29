@@ -186,6 +186,12 @@ export async function runSuspend(arguments_: string[]): Promise<number> {
         authorized();
         const result = await reconcileSuspend(journal, runtime, authorized);
         authorized();
+        if (result.reason === "physical_verification_pending") {
+          process.stdout.write(
+            `${JSON.stringify({ mode: "environment-suspend", status: "deferred", error: { code: "physical_verification_pending" } })}\n`,
+          );
+          return 1;
+        }
         if (result.suspended && result.observation) {
           const observation = result.observation;
           await active(() => client.result(claim, observation));

@@ -2,6 +2,8 @@
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
+import { createHash } from "node:crypto";
+import { DatabaseSync } from "node:sqlite";
 import { once } from "node:events";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -207,7 +209,30 @@ function fixture(pooled = false) {
   return { claim, inventory, runtime, patches };
 }
 
-test("seals stop identities before uncertain effects and recovers suspension after restart without replaying patches or discarding volumes", async (t) => {
+function stored(path, name) {
+  const db = new DatabaseSync(path, { readOnly: true });
+  try {
+    return db
+      .prepare("SELECT payload_json FROM suspend_state WHERE name=?")
+      .get(name)?.payload_json;
+  } finally {
+    db.close();
+  }
+}
+function legacyEntry(path, name, value) {
+  const payload = JSON.stringify(value);
+  const db = new DatabaseSync(path);
+  try {
+    db.prepare(
+      "INSERT INTO suspend_state VALUES (?,?,?) ON CONFLICT(name) DO UPDATE SET payload_json=excluded.payload_json,payload_hash=excluded.payload_hash",
+    ).run(name, payload, createHash("sha256").update(payload).digest("hex"));
+  } finally {
+    db.close();
+  }
+  return payload;
+}
+
+test("seals stop identities before uncertain effects and defers physical completion after restart without trusting saved API-only success", async (t) => {
   const api = await import("../src/suspend-reconcile.ts").catch(() => null);
   assert.equal(
     typeof api?.SuspendJournal,
@@ -235,21 +260,40 @@ test("seals stop identities before uncertain effects and recovers suspension aft
     f.inventory.cluster.metadata.annotations["cnpg.io/hibernation"],
     "on",
   );
+  const seal = structuredClone(journal.seal);
   journal.close();
+  // These are exact predecessor records, not new proof of physical termination.
+  const legacyStage = legacyEntry(path, "stage", "suspended");
+  const legacyObservation = legacyEntry(path, "observation", {
+    namespaceUid: ids.namespace,
+    clusterUid: ids.cluster,
+    quotaUid: ids.quota,
+    volumesHash: seal.volumesHash,
+    pooler: null,
+    computeAbsent: true,
+    quotaPodsZero: true,
+    clusterHibernated: true,
+    poolerStopped: true,
+  });
   journal = new SuspendJournal(path, { ...f.claim, leaseEpoch: 2 });
+  // API disappearance can follow force deletion while node processes survive.
   f.inventory.pods = [];
   const recovered = await reconcileSuspend(journal, f.runtime, () => {});
-  assert.equal(recovered.suspended, true);
-  assert.equal(recovered.observation.namespaceUid, ids.namespace);
-  assert.equal(recovered.observation.quotaUid, ids.quota);
-  assert.equal(recovered.observation.clusterUid, ids.cluster);
-  assert.equal(recovered.observation.computeAbsent, true);
-  assert.match(recovered.observation.volumesHash, /^[a-f0-9]{64}$/);
+  assert.equal(
+    recovered.suspended,
+    false,
+    "API-only convergence and historical success cannot establish physical completion",
+  );
+  assert.equal(recovered.reason, "physical_verification_pending");
+  assert.equal(recovered.observation, undefined);
+  assert.deepEqual(journal.seal, seal);
+  assert.equal(stored(path, "stage"), legacyStage);
+  assert.equal(stored(path, "observation"), legacyObservation);
   assert.equal(f.patches.length, 2);
   assert.deepEqual({ pvcs: f.inventory.pvcs, pvs: f.inventory.pvs }, volumes);
 });
 
-test("refuses replacement identities or lost execution authority and waits for the bound Pooler and all unknown compute to stop", async (t) => {
+test("refuses replacement identities or lost authority and keeps converged Pooler compute pending without a physical verifier", async (t) => {
   const api = await import("../src/suspend-reconcile.ts").catch(() => null);
   assert.equal(
     typeof api?.SuspendJournal,
@@ -316,10 +360,16 @@ test("refuses replacement identities or lost execution authority and waits for t
   );
   assert.equal(f.patches.length, 3);
   f.inventory.quota.metadata.uid = ids.quota;
+  const converged = await reconcileSuspend(journal, f.runtime, authorized);
   assert.equal(
-    (await reconcileSuspend(journal, f.runtime, authorized)).suspended,
-    true,
+    converged.suspended,
+    false,
+    "zero API replicas do not prove physical termination",
   );
+  assert.equal(converged.reason, "physical_verification_pending");
+  assert.equal(converged.observation, undefined);
+  assert.equal(stored(path, "stage"), JSON.stringify("stopping"));
+  assert.equal(stored(path, "observation"), undefined);
   let adapterAuthority = true;
   let patchRequests = 0;
   const server = createServer((request, response) => {

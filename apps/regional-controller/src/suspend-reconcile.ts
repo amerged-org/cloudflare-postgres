@@ -209,16 +209,6 @@ export class SuspendJournal {
       }
     });
   }
-  complete(observation: SuspendObservation): SuspendObservation {
-    return this.transaction(() => {
-      const previous = this.load<SuspendObservation>("observation");
-      if (previous !== null && !equal(previous, observation))
-        throw new Error("suspend_observation_conflict");
-      if (previous === null) this.put("observation", observation);
-      this.put("stage", "suspended");
-      return previous ?? observation;
-    });
-  }
   close(): void {
     if (this.closed) return;
     this.db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
@@ -252,7 +242,11 @@ export async function reconcileSuspend(
   journal: SuspendJournal,
   runtime: AllowanceRuntime,
   authorized: () => void,
-): Promise<{ suspended: boolean; observation?: SuspendObservation }> {
+): Promise<{
+  suspended: boolean;
+  observation?: SuspendObservation;
+  reason?: "physical_verification_pending";
+}> {
   try {
     authorized();
     const inventory = await runtime.inventory();
@@ -278,21 +272,9 @@ export async function reconcileSuspend(
     )
       return { suspended: false };
     authorized();
-    const observation: SuspendObservation = {
-      namespaceUid: binding.namespaceUid,
-      clusterUid: binding.clusterUid,
-      quotaUid: binding.quotaUid,
-      volumesHash,
-      pooler: binding.pooler ? { ...binding.pooler } : null,
-      computeAbsent: true,
-      quotaPodsZero: true,
-      clusterHibernated: true,
-      poolerStopped: true,
-      ...(binding.runEpoch === undefined ? {} : { runEpoch: binding.runEpoch }),
-    };
-    const persisted = journal.complete(observation);
-    authorized();
-    return { suspended: true, observation: persisted };
+    // API absence can follow force deletion while node processes survive.
+    // Keep the seal and predecessor observations; neither is physical proof.
+    return { suspended: false, reason: "physical_verification_pending" };
   } catch {
     return { suspended: false };
   }

@@ -1,6 +1,6 @@
 # Explicit environment suspension v1
 
-This protocol accepts a customer-requested compute stop and records regional completion. It uses CNPG hibernation and the existing owned Pooler/namespace stop mechanism. Automatic idleness, connection-triggered wake, resizing and funded resume remain required later work; they are not supplied by this suspend-only contract.
+This protocol accepts a customer-requested compute stop and retains durable regional work. It uses CNPG hibernation and the existing owned Pooler/namespace convergence mechanism. The current executor defers physical completion; automatic idleness, connection-triggered wake, resizing and funded resume remain required later work.
 
 ## Customer intent and runtime state
 
@@ -32,7 +32,11 @@ The separate supervised executor mode requires explicit private configuration, a
 
 ## Completion and limits
 
-A result uses the winning lease, `status: suspended`, `resultCode: compute_suspended` and exactly:
+Kubernetes convergence does not prove that node processes terminated: force deletion can remove a Pod from the API without waiting for the kubelet. The current executor returns `suspended: false` with `reason: physical_verification_pending`, emits no completion observation and leaves its sealed work reclaimable. The supervised CLI exits promptly with deferred status and a nonzero code. No physical verifier is integrated yet.
+
+Historical journal `suspended`/`stopped` records and saved `computeAbsent` observations remain unchanged as predecessor evidence. They cannot produce a current success result or authorize resumption.
+
+The existing completion wire below is not emitted by the current executor. Qualified completion requires the winning lease, `status: suspended`, `resultCode: compute_suspended` and exactly:
 
 ```json
 {

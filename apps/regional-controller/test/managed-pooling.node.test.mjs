@@ -494,7 +494,7 @@ test("attributes Pooler compute through its complete owner chain and persists a 
   runtimeInventory.pods = [];
   assert.equal(
     (await reconcileAllowance(journal, client, runtime, now + 2000)).state,
-    "stopped",
+    "stopping",
   );
   assert.equal(patches.filter((x) => x.kind === "Pooler").length, 1);
   assert.deepEqual(runtimeInventory.pvcs, []);

@@ -113,9 +113,10 @@ export async function reconcileAllowance(
   now: number,
   completionClock: () => number = () => now,
 ): Promise<{
-  state: "authorized" | "stopping" | "stopped";
+  state: "authorized" | "stopping";
   growthAllowed: boolean;
   validUntil: string | null;
+  reason?: "physical_verification_pending";
 }> {
   const clockValid = journal.observeClock(now);
   let inventory: RuntimeInventory;
@@ -231,8 +232,9 @@ export async function reconcileAllowance(
       ))
     )
       return denied();
-    journal.recordStopped(completionClock(), volumes);
-    return { state: "stopped", growthAllowed: false, validUntil: null };
+    // Kubernetes convergence does not attest termination on the involved nodes.
+    // Preserve the stop seal and held receipt without inventing a stop timestamp.
+    return { ...denied(), reason: "physical_verification_pending" };
   } catch {
     return denied();
   }
