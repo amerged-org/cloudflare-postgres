@@ -685,7 +685,7 @@ paths:
         - organizationToken: []
       responses:
         "200":
-          description: Public environment state without internal routing or secrets
+          description: Public environment state without credential references or secret values
           content:
             application/json:
               schema:
@@ -700,6 +700,57 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/connections:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - name: environmentId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getEnvironmentConnection
+      summary: Discover an opted-in private direct PostgreSQL endpoint
+      description: >-
+        Requires projects:read in the owning organization. No query parameters
+        are accepted. A primary transaction rechecks the current token, project,
+        region, runtime and requested budget state. The stored proof describes
+        provisioning, not live reachability, policy realization, SQL availability
+        or permission to wake. The client must have the installation-approved
+        private network identity and verify the current server with this CA and
+        host. This response contains no passwords or Secret references and uses
+        Cache-Control no-store. Leaf identity and expiry are historical evidence;
+        normal CNPG leaf renewal does not change endpoint authority. The CA must
+        still be within its reported validity period.
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Owned private endpoint metadata and public CA
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [connection]
+                properties:
+                  connection:
+                    $ref: "#/components/schemas/NativeConnection"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: >-
+            Owned environment has no configured or valid bound native proof,
+            is not ready/running, has paused requested budget state, or its
+            project/region or reported CA is no longer available.
   /v1/regions/{regionId}/operations/claim:
     parameters:
       - $ref: "#/components/parameters/RegionId"
@@ -2523,6 +2574,212 @@ components:
           description:
             Accepted nonsecret regional stop evidence; never settlement or
             SQL reachability.
+    NativeAccessPolicy:
+      type: object
+      additionalProperties: false
+      required: [version, clientProfileId]
+      description: >-
+        Installation-owned immutable opt-in. The region independently maps the
+        opaque ID to an exact approved client Namespace and ServiceAccount;
+        customers cannot submit network identities or selectors.
+      properties:
+        version:
+          type: integer
+          const: 1
+        clientProfileId:
+          type: string
+          pattern: ^[a-z][a-z0-9_-]{0,63}$
+    NativeConnectionObservation:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+        - visibility
+        - mode
+        - clientProfileId
+        - namespaceUid
+        - clusterUid
+        - clusterGeneration
+        - specHash
+        - serviceUid
+        - serviceResourceVersion
+        - primaryPodUid
+        - endpointSliceUid
+        - policyUid
+        - host
+        - port
+        - caCertificate
+        - caCertificateSha256
+        - serverCertificateSha256
+        - caValidFrom
+        - caValidUntil
+        - serverValidUntil
+        - observedAt
+      description: >-
+        Authenticated regional provisioning evidence, fenced by the existing
+        environment-result lease. The Worker validates exact shape, resource
+        identities, derived host, frozen spec, public CA hash and reported time
+        intervals; the executor verifies X509 signatures, CA/server constraints,
+        server purpose and host. This is not a live SQL, TLS or Cilium-realization
+        observation. Server certificate identity/expiry are historical values.
+      properties:
+        version:
+          type: integer
+          const: 1
+        visibility:
+          type: string
+          const: private
+        mode:
+          type: string
+          const: direct
+        clientProfileId:
+          $ref: "#/components/schemas/NativeAccessPolicy/properties/clientProfileId"
+        namespaceUid:
+          type: string
+          format: uuid
+        clusterUid:
+          type: string
+          format: uuid
+        clusterGeneration:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+        specHash:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        serviceUid:
+          type: string
+          format: uuid
+        serviceResourceVersion:
+          type: string
+          pattern: ^[A-Za-z0-9._:-]{1,128}$
+        primaryPodUid:
+          type: string
+          format: uuid
+        endpointSliceUid:
+          type: string
+          format: uuid
+        policyUid:
+          type: string
+          format: uuid
+        host:
+          type: string
+          pattern: ^database-rw\.pgcf-[a-f0-9]{32}\.svc$
+        port:
+          type: integer
+          const: 5432
+        caCertificate:
+          type: string
+          maxLength: 8192
+          description: One bounded public PEM certificate, never a private key or bundle.
+        caCertificateSha256:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+          description: SHA-256 of the exact UTF-8 public PEM text.
+        serverCertificateSha256:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+          description: SHA-256 of the provisioning leaf DER, not a live leaf pin.
+        caValidFrom:
+          type: string
+          format: date-time
+        caValidUntil:
+          type: string
+          format: date-time
+        serverValidUntil:
+          type: string
+          format: date-time
+          description: Historical leaf validity at observedAt; normal renewal is allowed.
+        observedAt:
+          type: string
+          format: date-time
+    NativeConnection:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+        - visibility
+        - mode
+        - clientProfileId
+        - namespaceUid
+        - clusterUid
+        - clusterGeneration
+        - specHash
+        - serviceUid
+        - serviceResourceVersion
+        - primaryPodUid
+        - endpointSliceUid
+        - policyUid
+        - host
+        - port
+        - caCertificate
+        - caCertificateSha256
+        - serverCertificateSha256
+        - caValidFrom
+        - caValidUntil
+        - serverValidUntil
+        - observedAt
+        - environmentId
+        - specRevision
+        - sslmode
+        - observationScope
+      properties:
+        version:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/version"
+        visibility:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/visibility"
+        mode:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/mode"
+        clientProfileId:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/clientProfileId"
+        namespaceUid:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/namespaceUid"
+        clusterUid:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/clusterUid"
+        clusterGeneration:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/clusterGeneration"
+        specHash:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/specHash"
+        serviceUid:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/serviceUid"
+        serviceResourceVersion:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/serviceResourceVersion"
+        primaryPodUid:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/primaryPodUid"
+        endpointSliceUid:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/endpointSliceUid"
+        policyUid:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/policyUid"
+        host:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/host"
+        port:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/port"
+        caCertificate:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/caCertificate"
+        caCertificateSha256:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/caCertificateSha256"
+        serverCertificateSha256:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/serverCertificateSha256"
+        caValidFrom:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/caValidFrom"
+        caValidUntil:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/caValidUntil"
+        serverValidUntil:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/serverValidUntil"
+        observedAt:
+          $ref: "#/components/schemas/NativeConnectionObservation/properties/observedAt"
+        environmentId:
+          type: string
+          format: uuid
+        specRevision:
+          type: integer
+          const: 1
+        sslmode:
+          type: string
+          const: verify-full
+        observationScope:
+          type: string
+          const: provisioning
     PoolingPolicy:
       type: object
       additionalProperties: false
@@ -3440,6 +3697,8 @@ components:
           $ref: "#/components/schemas/BackupPolicy"
         pooling:
           $ref: "#/components/schemas/PoolingPolicy"
+        nativeAccess:
+          $ref: "#/components/schemas/NativeAccessPolicy"
         executionFencing:
           $ref: "#/components/schemas/ExecutionFencingPolicy"
         nodeTracking:
@@ -3471,6 +3730,8 @@ components:
           $ref: "#/components/schemas/OperatorBackupPolicy"
         pooling:
           $ref: "#/components/schemas/PoolingPolicy"
+        nativeAccess:
+          $ref: "#/components/schemas/NativeAccessPolicy"
         executionFencing:
           $ref: "#/components/schemas/ExecutionFencingPolicy"
         nodeTracking:
@@ -3591,7 +3852,11 @@ components:
             epochs. Present only for opted-in fencing.
         nodeCohort:
           $ref: "#/components/schemas/NodeCohortReference"
+        nativeConnection:
+          $ref: "#/components/schemas/NativeConnectionObservation"
       description:
+        Native proof is required iff nativeAccess is configured, with exact
+        environment host/spec and matching profile/cluster identities.
         Pooler proof is required iff pooled; runEpoch is required iff the stored
         environment is fenced and must match. nodeCohort is required iff nodeTracking is enabled.
         Omitted legacy observations remain unchanged.

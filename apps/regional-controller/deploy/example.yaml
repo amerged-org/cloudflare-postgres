@@ -25,6 +25,14 @@ rules:
     verbs: [get, create]
   - apiGroups: [""]
     resources: [pods]
+    verbs: [get, list]
+  # Optional private native access observes CNPG routing and protected clients.
+  # It never creates a Service or grants customers Kubernetes credentials.
+  - apiGroups: [""]
+    resources: [services, serviceaccounts]
+    verbs: [get]
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
     verbs: [list]
   # Optional nodeTracking profiles preserve immutable pre-execution provenance.
   # This is read-only Node identity access, not observer/exec or physical proof.

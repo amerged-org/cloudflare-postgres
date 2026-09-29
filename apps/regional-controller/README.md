@@ -1,5 +1,45 @@
 # Regional environment controller
 
+## Optional private native access
+
+A new immutable catalog profile can opt into `nativeAccess: {version: 1,
+clientProfileId: "private-application"}`. The trusted regional configuration
+resolves that identifier to an operator-protected namespace and ServiceAccount
+with observed UID bindings. The namespace must already carry its exact
+`pgcf.io/native-client-uid` marker. The controller never creates or relabels the
+client principal; customers cannot supply selectors or backend addresses.
+
+The controller creates one owned TCP5432 ingress policy, observes CNPG's actual
+direct RW Service/primary/EndpointSlice and validates its public server CA/leaf.
+The existing fenced ready report supplies the private connection observation to
+the management API. It transmits no password, private key or whole Secret.
+See the [contract](../../docs/contracts/private-native-access-v1.md) before
+configuring client profiles; logical ServiceAccount-name reuse remains a trusted
+operator revocation boundary.
+
+```json
+{
+  "nativeClientProfiles": [
+    {
+      "id": "private-application",
+      "namespace": "private-applications",
+      "namespaceUid": "11111111-1111-4111-8111-111111111111",
+      "serviceAccount": "private-client",
+      "serviceAccountUid": "22222222-2222-4222-8222-222222222222"
+    }
+  ]
+}
+```
+
+These are illustrative identifiers; configure real identity readbacks privately.
+Omitting both the catalog policy and this optional configuration preserves the
+previous environment path. The source path requires read-only Pod/Service/
+ServiceAccount/EndpointSlice access in addition to existing permissions. It
+opens no public listener and creates no Service. Its `.svc` DNS name is private;
+provisioning observations do not establish packet enforcement, SQL reachability,
+Cloudflare connectivity or ongoing health. Qualification and public routing
+remain required before customer admission.
+
 The [remote archive workflow](../../docs/guides/control-archive-v1.md) stores and
 retrieves an already sealed recovery bundle using existing operator access.
 Verify exact downloaded bytes and matching historical migrations before offline

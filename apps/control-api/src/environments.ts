@@ -1,3 +1,11 @@
+import {
+  boundNativeConnection,
+  readNativeConnection,
+  validNativeAccess,
+  validNativeConnection,
+  type NativeAccessPolicy,
+  type NativeConnectionObservation,
+} from "./native-access";
 type Env = Cloudflare.Env;
 type Database = D1DatabaseSession;
 type JsonObject = Record<string, unknown>;
@@ -31,6 +39,7 @@ interface PoolerObservation {
 }
 
 interface EnvironmentObservation {
+  nativeConnection?: NativeConnectionObservation;
   clusterUid: string;
   clusterGeneration: number;
   readyInstances: number;
@@ -64,6 +73,7 @@ interface Profile {
     };
   };
   pooling?: PoolingPolicy;
+  nativeAccess?: NativeAccessPolicy;
   executionFencing?: { version: 1 };
   nodeTracking?: { version: 1 };
 }
@@ -396,16 +406,23 @@ export function validEnvironmentObservation(
   pooled: boolean,
   expectedRunEpoch?: string,
   tracked = false,
+  native = false,
 ): value is EnvironmentObservation {
   return (
     object(
       value,
       ["clusterUid", "clusterGeneration", "readyInstances"],
-      ["pooler", "runEpoch", "nodeCohort"],
+      ["pooler", "runEpoch", "nodeCohort", "nativeConnection"],
     ) &&
     name(value.clusterUid) &&
     integer(value.clusterGeneration, 1, Number.MAX_SAFE_INTEGER) &&
     integer(value.readyInstances, 1, 9) &&
+    Object.hasOwn(value, "nativeConnection") === native &&
+    (!native ||
+      (validNativeConnection(value.nativeConnection) &&
+        value.nativeConnection.clusterUid === value.clusterUid &&
+        value.nativeConnection.clusterGeneration ===
+          value.clusterGeneration)) &&
     Object.hasOwn(value, "runEpoch") === (expectedRunEpoch !== undefined) &&
     (expectedRunEpoch === undefined ||
       (runEpoch.test(expectedRunEpoch) &&
@@ -434,7 +451,7 @@ function profileFromJson(value: unknown): Profile | null {
     !object(
       value,
       ["id", "postgresImage", "compute", "storage", "instances", "backup"],
-      ["pooling", "executionFencing", "nodeTracking"],
+      ["pooling", "executionFencing", "nodeTracking", "nativeAccess"],
     ) ||
     !text(value.id, identifier) ||
     !text(
@@ -487,6 +504,11 @@ function profileFromJson(value: unknown): Profile | null {
     ? poolingFromJson(value.pooling)
     : undefined;
   if (pooling === null) return null;
+  if (
+    Object.hasOwn(value, "nativeAccess") &&
+    !validNativeAccess(value.nativeAccess)
+  )
+    return null;
   if (
     Object.hasOwn(value, "executionFencing") &&
     (!object(value.executionFencing, ["version"]) ||
@@ -543,6 +565,15 @@ function profileFromJson(value: unknown): Profile | null {
       },
     },
     ...(pooling === undefined ? {} : { pooling }),
+    ...(Object.hasOwn(value, "nativeAccess")
+      ? {
+          nativeAccess: {
+            version: 1 as const,
+            clientProfileId: (value.nativeAccess as NativeAccessPolicy)
+              .clientProfileId,
+          },
+        }
+      : {}),
     ...(Object.hasOwn(value, "nodeTracking")
       ? { nodeTracking: { version: 1 as const } }
       : {}),
@@ -566,6 +597,9 @@ function publicProfile(profile: Profile) {
     instances: profile.instances,
     backup: { retentionPolicy: profile.backup.retentionPolicy },
     ...(profile.pooling === undefined ? {} : { pooling: profile.pooling }),
+    ...(profile.nativeAccess === undefined
+      ? {}
+      : { nativeAccess: profile.nativeAccess }),
     ...(profile.nodeTracking === undefined
       ? {}
       : { nodeTracking: profile.nodeTracking }),
@@ -1058,7 +1092,7 @@ async function reportResult(
     "operations:report",
   );
   if (denied) return denied;
-  const input = await body(request);
+  const input = await body(request, 16_384);
   if (
     !object(input, [
       "leaseToken",
@@ -1078,6 +1112,10 @@ async function reportResult(
     typeof input.observation === "object" &&
     input.observation !== null &&
     Object.hasOwn(input.observation, "nodeCohort");
+  const reportedNative =
+    typeof input.observation === "object" &&
+    input.observation !== null &&
+    Object.hasOwn(input.observation, "nativeConnection");
   const reportedRunEpoch =
     typeof input.observation === "object" &&
     input.observation !== null &&
@@ -1092,6 +1130,7 @@ async function reportResult(
       reportedPooling,
       reportedRunEpoch,
       reportedNodeTracking,
+      reportedNative,
     );
   const failed =
     input.status === "failed" &&
@@ -1116,16 +1155,38 @@ async function reportResult(
       profile.pooling !== undefined,
       environment.run_epoch ?? undefined,
       profile.nodeTracking !== undefined,
+      profile.nativeAccess !== undefined,
     ) ||
       (input.observation as EnvironmentObservation).readyInstances <
         profile.instances)
   )
     return error(400, "invalid_observation");
+  if (ready && profile.nativeAccess !== undefined) {
+    const native = (input.observation as EnvironmentObservation)
+      .nativeConnection;
+    if (
+      !boundNativeConnection(
+        native,
+        environment,
+        profile,
+        input.observation as EnvironmentObservation,
+      ) ||
+      Date.parse(native.observedAt) > Date.now() ||
+      (await sha256(native.caCertificate)) !== native.caCertificateSha256
+    )
+      return error(400, "invalid_observation");
+  }
   const observation = ready
     ? {
         clusterUid: (input.observation as JsonObject).clusterUid,
         clusterGeneration: (input.observation as JsonObject).clusterGeneration,
         readyInstances: (input.observation as JsonObject).readyInstances,
+        ...(reportedNative
+          ? {
+              nativeConnection: (input.observation as EnvironmentObservation)
+                .nativeConnection,
+            }
+          : {}),
         ...(reportedPooling
           ? {
               pooler: {
@@ -1282,6 +1343,18 @@ export async function environmentRoutes(
       environment[1]!,
       environment[2]!,
       environment[3]!,
+    );
+  const connections =
+    /^\/v1\/organizations\/([^/]+)\/projects\/([^/]+)\/environments\/([^/]+)\/connections$/.exec(
+      pathname,
+    );
+  if (request.method === "GET" && connections)
+    return readNativeConnection(
+      request,
+      db,
+      connections[1]!,
+      connections[2]!,
+      connections[3]!,
     );
   const claim = /^\/v1\/regions\/([^/]+)\/operations\/claim$/.exec(pathname);
   if (request.method === "POST" && claim)

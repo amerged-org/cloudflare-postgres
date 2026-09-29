@@ -316,6 +316,7 @@ async function createSuspend(
       pooled,
       environment.run_epoch ?? undefined,
       Object.hasOwn(spec.profile, "nodeTracking"),
+      Object.hasOwn(spec.profile, "nativeAccess"),
     ) ||
     !uid(observed.clusterUid) ||
     !hash.test(environment.spec_hash) ||

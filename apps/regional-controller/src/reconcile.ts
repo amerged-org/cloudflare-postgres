@@ -4,6 +4,11 @@ import { ReconcileError } from "./types.ts";
 import { observePooler, validPoolingPolicy } from "./pooling.ts";
 import { RUN_EPOCH_ANNOTATION, validRunEpoch } from "./run-epoch.ts";
 import {
+  prepareNativeClient,
+  reconcileNativeAccess,
+  validNativeAccess,
+} from "./native-access.ts";
+import {
   BIRTH_ANNOTATION,
   prepareNodeBirth,
   COHORT_HASH_ANNOTATION,
@@ -83,6 +88,8 @@ function validate(claim: Claim, config: RegionalConfig): void {
     !positive(profile?.compute?.cpuMilli, 1_000_000) ||
     !positive(profile?.compute?.memoryMiB, 1_048_576) ||
     (profile?.pooling !== undefined && !validPoolingPolicy(profile.pooling)) ||
+    (Object.hasOwn(profile ?? {}, "nativeAccess") &&
+      !validNativeAccess(profile.nativeAccess)) ||
     fenced !== Object.hasOwn(claim, "runEpoch") ||
     (fenced &&
       (fencing === null ||
@@ -257,6 +264,12 @@ export async function reconcileEnvironment(
 ): Promise<{ ready: boolean; observation?: Observation }> {
   validate(claim, config);
   authorized();
+  const nativeClient = await prepareNativeClient(
+    api,
+    claim,
+    config,
+    authorized,
+  );
   const namespace = `pgcf-${claim.environmentId.replaceAll("-", "")}`;
   const profile = claim.spec.profile;
   const pooling = profile.pooling;
@@ -806,12 +819,25 @@ export async function reconcileEnvironment(
   )
     return { ready: false };
   await verifyCohort();
+  const nativeConnection = nativeClient
+    ? await reconcileNativeAccess(
+        api,
+        claim,
+        latest,
+        ownedNamespace,
+        readyPods,
+        nativeClient,
+        authorized,
+      )
+    : null;
+  if (nativeClient && !nativeConnection) return { ready: false };
   return {
     ready: true,
     observation: {
       clusterUid: cluster.metadata.uid,
       clusterGeneration: cluster.metadata.generation,
       readyInstances: readyPods.length,
+      ...(nativeConnection ? { nativeConnection } : {}),
       ...(claim.runEpoch === undefined ? {} : { runEpoch: claim.runEpoch }),
       ...(cohort ? { nodeCohort: { ...cohort.pointer } } : {}),
       ...(poolerObservation ? { pooler: poolerObservation } : {}),
