@@ -313,13 +313,14 @@ async function createRole(
   if (!current) return error(409, "environment_not_ready");
   const observation: unknown = JSON.parse(current.observation_json);
   const spec = JSON.parse(current.resolved_spec) as {
-    profile: { pooling?: unknown };
+    profile: { pooling?: unknown; nodeTracking?: unknown };
   };
   if (
     !validEnvironmentObservation(
       observation,
       spec.profile.pooling !== undefined,
       current.run_epoch ?? undefined,
+      spec.profile.nodeTracking !== undefined,
     ) ||
     !uid(observation.clusterUid)
   )

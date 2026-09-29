@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { MeteringInventory } from "./metering-types.ts";
+import type { NodeCohortPointer } from "./node-cohort.ts";
 export interface BackupSecretRef {
   namespace: string;
   name: string;
@@ -48,6 +49,7 @@ export interface ExecutionSpec {
     instances: number;
     pooling?: PoolingPolicy;
     executionFencing?: { version: 1 };
+    nodeTracking?: { version: 1 };
     backup: {
       endpointURL: string;
       region: string;
@@ -73,6 +75,7 @@ export interface Claim {
 }
 
 export interface RegionalConfig {
+  nodeTrackingJournalPath?: string;
   operatorNamespace: string;
   operatorPodLabels: Record<string, string>;
   allowedBackupSecrets: BackupSecretRef[];
@@ -99,8 +102,10 @@ export interface Resource {
     }[];
   };
   spec?: Record<string, unknown>;
+  immutable?: boolean;
   data?: Record<string, string>;
   status?: {
+    nodeInfo?: { bootID?: string };
     phase?: string;
     image?: string;
     observedGeneration?: number;
@@ -129,6 +134,10 @@ export interface Kubernetes {
   readSecret(namespace: string, name: string): Promise<Record<string, string>>;
   listPods(namespace: string, clusterName: string): Promise<Resource[]>;
   meteringInventory?(regionId: string): Promise<MeteringInventory>;
+  listNodes?(): Promise<Resource[]>;
+  executionPreflight?(
+    namespace: string,
+  ): Promise<{ pods: Resource[]; clusters: Resource[]; poolers: Resource[] }>;
 }
 
 export interface Observation {
@@ -136,6 +145,7 @@ export interface Observation {
   clusterGeneration: number;
   readyInstances: number;
   runEpoch?: string;
+  nodeCohort?: NodeCohortPointer;
   pooler?: {
     uid: string;
     generation: number;

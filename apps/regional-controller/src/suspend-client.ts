@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { validSuspendClaim } from "./suspend-types.ts";
+import { validNodeCohortPointer } from "./node-cohort.ts";
 import type { SuspendClaim, SuspendObservation } from "./suspend-types.ts";
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -33,16 +34,20 @@ function validObservation(
   claim: SuspendClaim,
 ): value is SuspendObservation {
   if (
-    !fields(
-      value,
-      claim.runEpoch === undefined
-        ? observationKeys
-        : [...observationKeys, "runEpoch"],
-    )
+    !fields(value, [
+      ...observationKeys,
+      ...(claim.runEpoch === undefined ? [] : ["runEpoch"]),
+      ...(claim.nodeCohort === undefined ? [] : ["nodeCohort"]),
+    ])
   )
     return false;
   return (
     value.runEpoch === claim.runEpoch &&
+    (claim.nodeCohort === undefined
+      ? value.nodeCohort === undefined
+      : validNodeCohortPointer(value.nodeCohort) &&
+        value.nodeCohort.uid === claim.nodeCohort.uid &&
+        value.nodeCohort.hash === claim.nodeCohort.hash) &&
     ["namespaceUid", "clusterUid", "quotaUid"].every(
       (key) => typeof value[key] === "string" && uuid.test(value[key]),
     ) &&

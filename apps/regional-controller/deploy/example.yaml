@@ -26,6 +26,14 @@ rules:
   - apiGroups: [""]
     resources: [pods]
     verbs: [list]
+  # Optional nodeTracking profiles preserve immutable pre-execution provenance.
+  # This is read-only Node identity access, not observer/exec or physical proof.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, create]
   # Optional metering inventory: read resource identity/requests/capacity only.
   # Secret listing or additional Secret reads are not needed by the collector.
   - apiGroups: [""]
@@ -124,6 +132,7 @@ data:
   config.json: |
     {
       "operatorNamespace": "cnpg-system",
+      "nodeTrackingJournalPath": "/var/lib/pgcf/node-birth.sqlite",
       "operatorPodLabels": { "app.kubernetes.io/name": "cloudnative-pg" },
       "roleVerifier": {
         "verifierNamespace": "pgcf-system",

@@ -1547,6 +1547,9 @@ paths:
     post:
       operationId: claimSuspendOperation
       summary: Lease one owned suspend intention
+      description: >-
+        Tracked environments carry the exact immutable nodeCohort UID/hash from ready provisioning.
+        Lease authority is invalidated if that observed pointer changes. No server list is reconstructed.
       security:
         - regionToken: []
       requestBody:
@@ -1859,6 +1862,31 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    NodeTrackingPolicy:
+      type: object
+      additionalProperties: false
+      required: [version]
+      properties:
+        version:
+          type: integer
+          const: 1
+      description: >-
+        Opt-in pre-execution node membership recording for a new fenced environment.
+        Requires executionFencing. Records provenance, not physical termination or enforcement.
+    NodeCohortReference:
+      type: object
+      additionalProperties: false
+      required: [uid, hash]
+      properties:
+        uid:
+          type: string
+          format: uuid
+        hash:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+      description: >-
+        Immutable regional ConfigMap UID and canonical cohort SHA-256, sealed before compute.
+        Full server membership stays regional; this pointer alone proves no stopped processes.
     ExecutionFencingPolicy:
       type: object
       additionalProperties: false
@@ -1930,6 +1958,8 @@ components:
           description:
             Initial immutable execution identity, separate from lease/spec/budget
             epochs. Present only for opted-in fencing.
+        nodeCohort:
+          $ref: "#/components/schemas/NodeCohortReference"
     EnvironmentRuntime:
       type: object
       required:
@@ -2636,6 +2666,8 @@ components:
         - storage
         - instances
         - backup
+      dependentRequired:
+        nodeTracking: [executionFencing]
       properties:
         id:
           type: string
@@ -2657,6 +2689,8 @@ components:
           $ref: "#/components/schemas/PoolingPolicy"
         executionFencing:
           $ref: "#/components/schemas/ExecutionFencingPolicy"
+        nodeTracking:
+          $ref: "#/components/schemas/NodeTrackingPolicy"
     OperatorProfile:
       type: object
       additionalProperties: false
@@ -2667,6 +2701,8 @@ components:
         - storage
         - instances
         - backup
+      dependentRequired:
+        nodeTracking: [executionFencing]
       properties:
         id:
           $ref: "#/components/schemas/PublicProfile/properties/id"
@@ -2684,6 +2720,8 @@ components:
           $ref: "#/components/schemas/PoolingPolicy"
         executionFencing:
           $ref: "#/components/schemas/ExecutionFencingPolicy"
+        nodeTracking:
+          $ref: "#/components/schemas/NodeTrackingPolicy"
     PublicCatalog:
       type: object
       required: [regionId, version, profiles, catalogHash, createdAt]
@@ -2798,9 +2836,12 @@ components:
           description:
             Initial immutable execution identity, separate from lease/spec/budget
             epochs. Present only for opted-in fencing.
+        nodeCohort:
+          $ref: "#/components/schemas/NodeCohortReference"
       description:
         Pooler proof is required iff pooled; runEpoch is required iff the stored
-        environment is fenced and must match. Omitted legacy observations remain unchanged.
+        environment is fenced and must match. nodeCohort is required iff nodeTracking is enabled.
+        Omitted legacy observations remain unchanged.
     Environment:
       type: object
       required:

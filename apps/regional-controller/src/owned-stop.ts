@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createHash } from "node:crypto";
 import { RUN_EPOCH_PATCH_PATH, runtimeEpochMatches } from "./run-epoch.ts";
+import {
+  COHORT_HASH_PATCH_PATH,
+  COHORT_UID_PATCH_PATH,
+  runtimeNodeCohortMatches,
+} from "./node-cohort.ts";
 import type {
   AllowanceRuntime,
   RuntimeBinding,
@@ -80,6 +85,7 @@ export function ownedInventory(
     inventory.quota.metadata.uid === binding.quotaUid &&
     owned(inventory.quota, binding) &&
     ownedPoolerInventory(inventory, binding) &&
+    runtimeNodeCohortMatches(inventory, binding) &&
     runtimeEpochMatches(
       [
         inventory.namespace,
@@ -265,6 +271,21 @@ function patchGuards(
             value: binding.runEpoch,
           },
         ]),
+    ...(binding.nodeCohort &&
+    (resource.kind === "Cluster" || resource.kind === "Pooler")
+      ? [
+          {
+            op: "test" as const,
+            path: COHORT_UID_PATCH_PATH,
+            value: binding.nodeCohort.uid,
+          },
+          {
+            op: "test" as const,
+            path: COHORT_HASH_PATCH_PATH,
+            value: binding.nodeCohort.hash,
+          },
+        ]
+      : []),
   ];
 }
 

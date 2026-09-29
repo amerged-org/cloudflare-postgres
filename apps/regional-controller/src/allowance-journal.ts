@@ -13,6 +13,7 @@ import {
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { validRunEpoch } from "./run-epoch.ts";
+import { validNodeCohortPointer } from "./node-cohort.ts";
 import type {
   AllowanceReceipt,
   AllowanceRequest,
@@ -82,6 +83,9 @@ export function validRuntimeBinding(value: RuntimeBinding): boolean {
     uuid.test(value.clusterUid) &&
     uuid.test(value.quotaUid) &&
     (value.runEpoch === undefined || validRunEpoch(value.runEpoch)) &&
+    (!Object.hasOwn(value, "nodeCohort") ||
+      (validRunEpoch(value.runEpoch) &&
+        validNodeCohortPointer(value.nodeCohort))) &&
     (value.pooler === undefined ||
       (value.pooler !== null &&
         typeof value.pooler === "object" &&
@@ -101,6 +105,9 @@ export class AllowanceJournal {
       throw new Error("allowance_journal_configuration_invalid");
     this.binding = Object.freeze({
       ...binding,
+      ...(binding.nodeCohort
+        ? { nodeCohort: Object.freeze({ ...binding.nodeCohort }) }
+        : {}),
       ...(binding.pooler
         ? { pooler: Object.freeze({ ...binding.pooler }) }
         : {}),

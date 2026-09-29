@@ -10,6 +10,7 @@ import {
 } from "@kubernetes/client-node";
 import type {
   ConfigurationOptions,
+  V1ConfigMap,
   V1LimitRange,
   V1Namespace,
   V1NetworkPolicy,
@@ -136,6 +137,12 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
       try {
         let resource: unknown;
         switch (kind) {
+          case "ConfigMap":
+            resource = await core.readNamespacedConfigMap(
+              { namespace, name },
+              requestOptions,
+            );
+            break;
           case "Namespace":
             resource = await core.readNamespace({ name }, requestOptions);
             break;
@@ -195,6 +202,12 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
       const fieldValidation = "Strict";
       let created: unknown;
       switch (resource.kind) {
+        case "ConfigMap":
+          created = await core.createNamespacedConfigMap(
+            { namespace, body: resource as V1ConfigMap, fieldValidation },
+            requestOptions,
+          );
+          break;
         case "Namespace":
           created = await core.createNamespace(
             { body: resource as V1Namespace, fieldValidation },
@@ -242,6 +255,78 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
         requestOptions,
       );
       return secret.data ?? {};
+    },
+    async listNodes() {
+      const budget: InventoryBudget = {
+        remainingRequests: 10,
+        remainingResources: 1000,
+        deadline: Date.now() + 30_000,
+      };
+      const nodes = await inventoryPages(
+        (_continue) => core.listNode({ limit: 100, _continue }, requestOptions),
+        "Node",
+        "v1",
+        budget,
+      );
+      if (Date.now() >= budget.deadline)
+        throw new Error("node_cohort_inventory_deadline");
+      return nodes;
+    },
+    async executionPreflight(namespace) {
+      const budget: InventoryBudget = {
+        remainingRequests: 30,
+        remainingResources: 3000,
+        deadline: Date.now() + 30_000,
+      };
+      const [pods, clusters, poolers] = await Promise.all([
+        inventoryPages(
+          (_continue) =>
+            core.listNamespacedPod(
+              { namespace, limit: 100, _continue },
+              requestOptions,
+            ),
+          "Pod",
+          "v1",
+          budget,
+        ),
+        inventoryPages(
+          (_continue) =>
+            custom.listNamespacedCustomObject(
+              {
+                group: "postgresql.cnpg.io",
+                version: "v1",
+                plural: "clusters",
+                namespace,
+                limit: 100,
+                _continue,
+              },
+              requestOptions,
+            ),
+          "Cluster",
+          "postgresql.cnpg.io/v1",
+          budget,
+        ),
+        inventoryPages(
+          (_continue) =>
+            custom.listNamespacedCustomObject(
+              {
+                group: "postgresql.cnpg.io",
+                version: "v1",
+                plural: "poolers",
+                namespace,
+                limit: 100,
+                _continue,
+              },
+              requestOptions,
+            ),
+          "Pooler",
+          "postgresql.cnpg.io/v1",
+          budget,
+        ),
+      ]);
+      if (Date.now() >= budget.deadline)
+        throw new Error("node_cohort_inventory_deadline");
+      return { pods, clusters, poolers };
     },
     async listPods(namespace, clusterName) {
       const pods = await core.listNamespacedPod(

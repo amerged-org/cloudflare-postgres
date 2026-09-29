@@ -3,6 +3,18 @@ import { createHash } from "node:crypto";
 import { ReconcileError } from "./types.ts";
 import { observePooler, validPoolingPolicy } from "./pooling.ts";
 import { RUN_EPOCH_ANNOTATION, validRunEpoch } from "./run-epoch.ts";
+import {
+  BIRTH_ANNOTATION,
+  prepareNodeBirth,
+  COHORT_HASH_ANNOTATION,
+  COHORT_UID_ANNOTATION,
+  ensureNodeCohort,
+  inspectNodeCohort,
+  nodeCohortAffinity,
+  nodeCohortAnnotationsMatch,
+  nodesMatchCohort,
+  validNodeTrackingPolicy,
+} from "./node-cohort.ts";
 import type {
   Claim,
   Kubernetes,
@@ -80,6 +92,8 @@ function validate(claim: Claim, config: RegionalConfig): void {
         fencing.version !== 1 ||
         !validRunEpoch(claim.runEpoch) ||
         claim.runEpoch !== "1")) ||
+    (Object.hasOwn(profile ?? {}, "nodeTracking") &&
+      (!fenced || !validNodeTrackingPolicy(profile?.nodeTracking))) ||
     !positive(spec?.volumeGiB, 1_048_576) ||
     !positive(storage?.minGiB, 1_048_576) ||
     !positive(storage?.maxGiB, 1_048_576) ||
@@ -172,6 +186,17 @@ function own(resource: Resource, expected: Resource): void {
     )
       throw new ReconcileError("spec_conflict");
   }
+  const annotations = expected.metadata.annotations ?? {};
+  const cohortPointer = Object.keys(annotations).some((key) =>
+    key.startsWith("pgcf.io/node-cohort-"),
+  )
+    ? {
+        uid: annotations[COHORT_UID_ANNOTATION] ?? "",
+        hash: annotations[COHORT_HASH_ANNOTATION] ?? "",
+      }
+    : undefined;
+  if (!nodeCohortAnnotationsMatch(resource, cohortPointer))
+    throw new ReconcileError("spec_conflict");
 }
 
 // Compare only the fields this controller owns: API defaulted fields belong to
@@ -235,6 +260,19 @@ export async function reconcileEnvironment(
   const namespace = `pgcf-${claim.environmentId.replaceAll("-", "")}`;
   const profile = claim.spec.profile;
   const pooling = profile.pooling;
+  const tracked = profile.nodeTracking !== undefined;
+  let cohort: Awaited<ReturnType<typeof ensureNodeCohort>> | null = null;
+  if (tracked && !config.nodeTrackingJournalPath)
+    throw new Error("node_cohort_configuration_unavailable");
+  const birth = tracked
+    ? await prepareNodeBirth(
+        api,
+        claim,
+        config.nodeTrackingJournalPath!,
+        namespace,
+        authorized,
+      )
+    : null;
   const labels = {
     [managedLabel]: "cloudflare-postgres",
     [ownerLabel]: claim.environmentId,
@@ -244,6 +282,7 @@ export async function reconcileEnvironment(
     name: string,
     namespaced = true,
     withRunEpoch = false,
+    withCohort = false,
   ): Resource["metadata"] => ({
     name,
     ...(namespaced ? { namespace } : {}),
@@ -253,15 +292,29 @@ export async function reconcileEnvironment(
       ...(withRunEpoch && claim.runEpoch !== undefined
         ? { [RUN_EPOCH_ANNOTATION]: claim.runEpoch }
         : {}),
+      ...(withCohort && cohort
+        ? {
+            [COHORT_UID_ANNOTATION]: cohort.pointer.uid,
+            [COHORT_HASH_ANNOTATION]: cohort.pointer.hash,
+          }
+        : {}),
     },
   });
-  await ensure(
+  const ownedNamespace = await ensure(
     api,
     {
       apiVersion: "v1",
       kind: "Namespace",
       metadata: {
         ...metadata(namespace, false, true),
+        ...(birth
+          ? {
+              annotations: {
+                ...metadata(namespace, false, true).annotations,
+                [BIRTH_ANNOTATION]: birth.birthId,
+              },
+            }
+          : {}),
         labels: {
           ...labels,
           "pod-security.kubernetes.io/enforce": "restricted",
@@ -271,6 +324,65 @@ export async function reconcileEnvironment(
     },
     authorized,
   );
+  const cohortBinding = {
+    environmentId: claim.environmentId,
+    regionId: claim.regionId,
+    specHash: claim.specHash,
+    runEpoch: claim.runEpoch,
+    namespace,
+    namespaceUid: ownedNamespace.metadata.uid ?? "",
+  };
+  if (
+    birth &&
+    ownedNamespace.metadata.annotations?.[BIRTH_ANNOTATION] !== birth.birthId
+  )
+    throw new Error("node_birth_namespace_changed");
+  if (tracked)
+    cohort = await ensureNodeCohort(
+      api,
+      cohortBinding,
+      authorized,
+      birth!,
+      config.nodeTrackingJournalPath!,
+    );
+  const verifyCohort = async () => {
+    if (!cohort) return;
+    authorized();
+    const currentNamespace = await api.read("Namespace", "", namespace);
+    authorized();
+    if (
+      !currentNamespace ||
+      currentNamespace.metadata.uid !== ownedNamespace.metadata.uid ||
+      currentNamespace.metadata.name !== namespace ||
+      currentNamespace.metadata.labels?.[managedLabel] !==
+        "cloudflare-postgres" ||
+      currentNamespace.metadata.labels?.[ownerLabel] !== claim.environmentId ||
+      currentNamespace.metadata.labels?.[regionLabel] !== claim.regionId ||
+      currentNamespace.metadata.annotations?.[BIRTH_ANNOTATION] !==
+        birth?.birthId ||
+      currentNamespace.metadata.annotations?.[specAnnotation] !==
+        claim.specHash ||
+      currentNamespace.metadata.annotations?.[RUN_EPOCH_ANNOTATION] !==
+        claim.runEpoch ||
+      currentNamespace.metadata.deletionTimestamp
+    )
+      throw new Error("node_birth_namespace_changed");
+    const current = await api.read("ConfigMap", namespace, "execution-nodes");
+    authorized();
+    if (
+      !inspectNodeCohort(current, {
+        ...cohortBinding,
+        nodeCohort: cohort.pointer,
+      })
+    )
+      throw new Error("node_cohort_identity_unproven");
+    if (!api.listNodes)
+      throw new Error("node_cohort_configuration_unavailable");
+    const nodes = await api.listNodes();
+    authorized();
+    if (!nodesMatchCohort(cohort.data, nodes))
+      throw new Error("node_cohort_birth_changed");
+  };
   // Reserve one additional instance slot for CNPG initialization/maintenance;
   // this is a hard namespace ceiling, not a claim of spare fleet capacity.
   const slots = profile.instances + 1;
@@ -475,12 +587,13 @@ export async function reconcileEnvironment(
     cpu: cpuQuantity(profile.compute.cpuMilli),
     memory: binaryQuantity(profile.compute.memoryMiB),
   };
+  await verifyCohort();
   const cluster = await ensure(
     api,
     {
       apiVersion: "postgresql.cnpg.io/v1",
       kind: "Cluster",
-      metadata: metadata("database", true, true),
+      metadata: metadata("database", true, true, true),
       spec: {
         instances: profile.instances,
         imageName: profile.postgresImage,
@@ -494,6 +607,9 @@ export async function reconcileEnvironment(
         },
         resources: { requests: compute, limits: compute },
         seccompProfile: { type: "RuntimeDefault" },
+        ...(cohort
+          ? { affinity: { nodeAffinity: nodeCohortAffinity(cohort.data) } }
+          : {}),
         ...(pooling
           ? {
               certificates: {
@@ -532,6 +648,7 @@ export async function reconcileEnvironment(
     (cluster.status?.readyInstances ?? 0) < profile.instances
   )
     return { ready: false };
+  await verifyCohort();
   const pooler = pooling
     ? await ensure(
         api,
@@ -539,7 +656,7 @@ export async function reconcileEnvironment(
           apiVersion: "postgresql.cnpg.io/v1",
           kind: "Pooler",
           metadata: {
-            ...metadata("database-pool-rw", true, true),
+            ...metadata("database-pool-rw", true, true, true),
             ownerReferences: [
               {
                 apiVersion: "postgresql.cnpg.io/v1",
@@ -584,6 +701,13 @@ export async function reconcileEnvironment(
                 annotations: { [specAnnotation]: claim.specHash },
               },
               spec: {
+                ...(cohort
+                  ? {
+                      affinity: {
+                        nodeAffinity: nodeCohortAffinity(cohort.data),
+                      },
+                    }
+                  : {}),
                 containers: [
                   {
                     name: "pgbouncer",
@@ -631,6 +755,17 @@ export async function reconcileEnvironment(
       )
     : null;
   const pods = await api.listPods(namespace, "database");
+  if (
+    cohort &&
+    pods.some(
+      (pod) =>
+        (pod.status?.phase === "Running" &&
+          typeof pod.spec?.nodeName !== "string") ||
+        (pod.spec?.nodeName !== undefined &&
+          !cohort!.data.nodes.some((node) => node.name === pod.spec!.nodeName)),
+    )
+  )
+    throw new Error("node_cohort_placement_unproven");
   const readyPods = pods.filter(
     (pod) =>
       !pod.metadata.deletionTimestamp &&
@@ -670,6 +805,7 @@ export async function reconcileEnvironment(
     (latest.status?.readyInstances ?? 0) < profile.instances
   )
     return { ready: false };
+  await verifyCohort();
   return {
     ready: true,
     observation: {
@@ -677,6 +813,7 @@ export async function reconcileEnvironment(
       clusterGeneration: cluster.metadata.generation,
       readyInstances: readyPods.length,
       ...(claim.runEpoch === undefined ? {} : { runEpoch: claim.runEpoch }),
+      ...(cohort ? { nodeCohort: { ...cohort.pointer } } : {}),
       ...(poolerObservation ? { pooler: poolerObservation } : {}),
     },
   };

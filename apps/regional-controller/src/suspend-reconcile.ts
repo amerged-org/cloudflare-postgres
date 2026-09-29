@@ -20,6 +20,11 @@ import type {
 } from "./allowance-types.ts";
 import { ownedInventory, stopOwnedRuntime, volumeHash } from "./owned-stop.ts";
 import { validSuspendClaim } from "./suspend-types.ts";
+import {
+  canonicalCohort,
+  inspectNodeCohort,
+  validNodeCohortData,
+} from "./node-cohort.ts";
 import type {
   SuspendClaim,
   SuspendObservation,
@@ -59,6 +64,7 @@ function identity(claim: SuspendClaim) {
         ? null
         : { uid: claim.pooler.uid, deploymentUid: claim.pooler.deploymentUid },
     ...(claim.runEpoch === undefined ? {} : { runEpoch: claim.runEpoch }),
+    ...(claim.nodeCohort ? { nodeCohort: { ...claim.nodeCohort } } : {}),
   };
 }
 function privateEntry(path: string, directory = false): void {
@@ -82,6 +88,9 @@ export class SuspendJournal {
     // Leases stay in memory; only the immutable operation projection is persisted.
     this.claim = Object.freeze({
       ...claim,
+      ...(claim.nodeCohort
+        ? { nodeCohort: Object.freeze({ ...claim.nodeCohort }) }
+        : {}),
       ...(claim.pooler === null
         ? {}
         : { pooler: Object.freeze({ ...claim.pooler }) }),
@@ -189,6 +198,11 @@ export class SuspendJournal {
       binding.specHash === this.claim.specHash &&
       binding.clusterUid === this.claim.clusterUid &&
       binding.runEpoch === this.claim.runEpoch &&
+      equal(binding.nodeCohort ?? null, this.claim.nodeCohort ?? null) &&
+      (binding.nodeCohort
+        ? validNodeCohortData(value.nodeCohort, binding) &&
+          digest(canonicalCohort(value.nodeCohort)) === binding.nodeCohort.hash
+        : !Object.hasOwn(value, "nodeCohort")) &&
       equal(binding.pooler ?? null, this.claim.pooler) &&
       typeof value.volumesHash === "string" &&
       hash.test(value.volumesHash)
@@ -233,6 +247,7 @@ function discoverBinding(
     quotaUid: inventory.quota.metadata.uid ?? "",
     ...(claim.pooler === null ? {} : { pooler: { ...claim.pooler } }),
     ...(claim.runEpoch === undefined ? {} : { runEpoch: claim.runEpoch }),
+    ...(claim.nodeCohort ? { nodeCohort: { ...claim.nodeCohort } } : {}),
   };
   if (!validRuntimeBinding(binding))
     throw new Error("suspend_binding_unproven");
@@ -259,7 +274,15 @@ export async function reconcileSuspend(
     if (previous !== null && previous.volumesHash !== volumesHash)
       return { suspended: false };
     authorized();
-    journal.capture({ binding, volumesHash });
+    const cohort = binding.nodeCohort
+      ? inspectNodeCohort(inventory.nodeCohort, binding)
+      : null;
+    if (binding.nodeCohort && !cohort) return { suspended: false };
+    journal.capture({
+      binding,
+      volumesHash,
+      ...(cohort ? { nodeCohort: cohort.data } : {}),
+    });
     authorized();
     if (
       !(await stopOwnedRuntime(

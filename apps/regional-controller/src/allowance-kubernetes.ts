@@ -18,6 +18,11 @@ import type {
 } from "./allowance-types.ts";
 import { ownedInventory } from "./owned-stop.ts";
 import { RUN_EPOCH_PATCH_PATH, validRunEpoch } from "./run-epoch.ts";
+import {
+  COHORT_HASH_PATCH_PATH,
+  COHORT_UID_PATCH_PATH,
+  validNodeCohortPointer,
+} from "./node-cohort.ts";
 import type { Resource } from "./types.ts";
 
 export function allowanceKubernetesFromConfig(
@@ -28,12 +33,21 @@ export function allowanceKubernetesFromConfig(
 ): AllowanceRuntime {
   const binding = Object.freeze({
     ...suppliedBinding,
+    ...(suppliedBinding.nodeCohort
+      ? { nodeCohort: Object.freeze({ ...suppliedBinding.nodeCohort }) }
+      : {}),
     ...(suppliedBinding.pooler
       ? { pooler: Object.freeze({ ...suppliedBinding.pooler }) }
       : {}),
   });
   if (binding.runEpoch !== undefined && !validRunEpoch(binding.runEpoch))
     throw new Error("allowance_run_epoch_invalid");
+  if (
+    Object.hasOwn(binding, "nodeCohort") &&
+    (!validRunEpoch(binding.runEpoch) ||
+      !validNodeCohortPointer(binding.nodeCohort))
+  )
+    throw new Error("allowance_node_cohort_invalid");
   const config = new KubeConfig();
   config.loadFromFile(file);
   if (!context || !config.getContexts().some((value) => value.name === context))
@@ -79,68 +93,118 @@ export function allowanceKubernetesFromConfig(
     plural: "poolers",
     name: "database-pool-rw",
   };
-  const freshOwners = async (): Promise<RuntimeInventory> => {
-    authorized();
-    const [namespace, cluster, quota, pooler, deployment] = await Promise.all([
-      core.readNamespace({ name: binding.namespace }, options),
-      custom.getNamespacedCustomObject(identity, options),
-      core.readNamespacedResourceQuota(
-        { namespace: binding.namespace, name: "database-resources" },
+  const cohortEvidence = async (
+    current?: InventoryBudget,
+  ): Promise<{ nodeCohort?: Resource; nodes?: Resource[] }> => {
+    if (!binding.nodeCohort) return {};
+    const bounds = current ?? {
+      remainingRequests: 10,
+      remainingResources: 1000,
+      deadline: Date.now() + 30_000,
+    };
+    const [cohort, nodes] = await Promise.all([
+      core.readNamespacedConfigMap(
+        { namespace: binding.namespace, name: "execution-nodes" },
         options,
       ),
-      binding.pooler
-        ? custom.getNamespacedCustomObject(poolerIdentity, options)
-        : Promise.resolve(null),
-      binding.pooler
-        ? apps.readNamespacedDeployment(
-            { namespace: binding.namespace, name: "database-pool-rw" },
-            options,
-          )
-        : Promise.resolve(null),
+      inventoryPages(
+        (_continue) => core.listNode({ limit: 100, _continue }, options),
+        "Node",
+        "v1",
+        bounds,
+      ),
     ]);
     authorized();
-    const current: RuntimeInventory = {
-      namespace: {
-        ...namespace,
-        kind: namespace.kind ?? "Namespace",
-        apiVersion: namespace.apiVersion ?? "v1",
+    if (Date.now() >= bounds.deadline)
+      throw new Error("allowance_inventory_deadline");
+    return {
+      nodeCohort: {
+        ...cohort,
+        kind: cohort.kind ?? "ConfigMap",
+        apiVersion: cohort.apiVersion ?? "v1",
       } as unknown as Resource,
-      cluster: cluster as Resource,
-      quota: {
-        ...quota,
-        kind: quota.kind ?? "ResourceQuota",
-        apiVersion: quota.apiVersion ?? "v1",
-      } as unknown as Resource,
-      poolers: pooler ? [pooler as Resource] : [],
-      deployments: deployment
-        ? [
-            {
-              ...deployment,
-              kind: deployment.kind ?? "Deployment",
-              apiVersion: deployment.apiVersion ?? "apps/v1",
-            } as unknown as Resource,
-          ]
-        : [],
-      pods: [],
-      pvcs: [],
-      pvs: [],
+      nodes,
     };
-    const required = [
-      current.namespace,
-      current.cluster,
-      current.quota,
-      ...(current.poolers ?? []),
-    ];
-    if (
-      current.namespace.apiVersion !== "v1" ||
-      current.namespace.metadata.namespace !== undefined ||
-      current.cluster.apiVersion !== "postgresql.cnpg.io/v1" ||
-      current.quota.apiVersion !== "v1" ||
-      !ownedInventory(current, binding) ||
-      required.some((resource) => !resource.metadata.resourceVersion)
-    )
-      throw new Error("allowance_patch_owner_set_unproven");
-    return current;
+  };
+  const freshOwners = async (): Promise<RuntimeInventory> => {
+    authorized();
+    const previousBudget = budget;
+    const currentBudget: InventoryBudget = previousBudget ?? {
+      remainingRequests: 10,
+      remainingResources: 1000,
+      deadline: Date.now() + 30_000,
+    };
+    // Named owner reads and every cohort page share one dispatch deadline.
+    budget = currentBudget;
+    try {
+      const [namespace, cluster, quota, pooler, deployment, cohort] =
+        await Promise.all([
+          core.readNamespace({ name: binding.namespace }, options),
+          custom.getNamespacedCustomObject(identity, options),
+          core.readNamespacedResourceQuota(
+            { namespace: binding.namespace, name: "database-resources" },
+            options,
+          ),
+          binding.pooler
+            ? custom.getNamespacedCustomObject(poolerIdentity, options)
+            : Promise.resolve(null),
+          binding.pooler
+            ? apps.readNamespacedDeployment(
+                { namespace: binding.namespace, name: "database-pool-rw" },
+                options,
+              )
+            : Promise.resolve(null),
+          cohortEvidence(currentBudget),
+        ]);
+      authorized();
+      if (Date.now() >= currentBudget.deadline)
+        throw new Error("allowance_inventory_deadline");
+      const current: RuntimeInventory = {
+        namespace: {
+          ...namespace,
+          kind: namespace.kind ?? "Namespace",
+          apiVersion: namespace.apiVersion ?? "v1",
+        } as unknown as Resource,
+        cluster: cluster as Resource,
+        quota: {
+          ...quota,
+          kind: quota.kind ?? "ResourceQuota",
+          apiVersion: quota.apiVersion ?? "v1",
+        } as unknown as Resource,
+        poolers: pooler ? [pooler as Resource] : [],
+        deployments: deployment
+          ? [
+              {
+                ...deployment,
+                kind: deployment.kind ?? "Deployment",
+                apiVersion: deployment.apiVersion ?? "apps/v1",
+              } as unknown as Resource,
+            ]
+          : [],
+        pods: [],
+        pvcs: [],
+        pvs: [],
+        ...cohort,
+      };
+      const required = [
+        current.namespace,
+        current.cluster,
+        current.quota,
+        ...(current.poolers ?? []),
+      ];
+      if (
+        current.namespace.apiVersion !== "v1" ||
+        current.namespace.metadata.namespace !== undefined ||
+        current.cluster.apiVersion !== "postgresql.cnpg.io/v1" ||
+        current.quota.apiVersion !== "v1" ||
+        !ownedInventory(current, binding) ||
+        required.some((resource) => !resource.metadata.resourceVersion)
+      )
+        throw new Error("allowance_patch_owner_set_unproven");
+      return current;
+    } finally {
+      budget = previousBudget;
+    }
   };
   return {
     async inventory() {
@@ -160,6 +224,7 @@ export function allowanceKubernetesFromConfig(
           deployments,
           pvcs,
           allPvs,
+          cohort,
         ] = await Promise.all([
           core.readNamespace({ name: binding.namespace }, options),
           custom.getNamespacedCustomObject(identity, options),
@@ -221,6 +286,7 @@ export function allowanceKubernetesFromConfig(
             "v1",
             current,
           ),
+          cohortEvidence(current),
         ]);
         if (Date.now() >= current.deadline)
           throw new Error("allowance_inventory_deadline");
@@ -243,6 +309,7 @@ export function allowanceKubernetesFromConfig(
           pvs,
           poolers,
           deployments,
+          ...cohort,
         };
       } finally {
         budget = null;
@@ -271,6 +338,29 @@ export function allowanceKubernetesFromConfig(
             epochTests[0]?.value !== binding.runEpoch
       )
         throw new Error("allowance_patch_epoch_unfenced");
+      const cohortTests = operations.filter(
+        (op) =>
+          op.path === COHORT_UID_PATCH_PATH ||
+          op.path === COHORT_HASH_PATCH_PATH,
+      );
+      if (
+        binding.nodeCohort && (kind === "Cluster" || kind === "Pooler")
+          ? cohortTests.length !== 2 ||
+            !cohortTests.some(
+              (op) =>
+                op.op === "test" &&
+                op.path === COHORT_UID_PATCH_PATH &&
+                op.value === binding.nodeCohort!.uid,
+            ) ||
+            !cohortTests.some(
+              (op) =>
+                op.op === "test" &&
+                op.path === COHORT_HASH_PATCH_PATH &&
+                op.value === binding.nodeCohort!.hash,
+            )
+          : cohortTests.length !== 0
+      )
+        throw new Error("allowance_patch_cohort_unfenced");
       if (!(
         (kind === "ResourceQuota" &&
           name === "database-resources" &&

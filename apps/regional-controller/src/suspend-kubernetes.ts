@@ -9,10 +9,13 @@ import { validSuspendClaim } from "./suspend-types.ts";
 import type { SuspendClaim } from "./suspend-types.ts";
 import type { Resource } from "./types.ts";
 import { RUN_EPOCH_ANNOTATION } from "./run-epoch.ts";
+import { ownedInventory } from "./owned-stop.ts";
+import { nodeCohortAnnotationsMatch } from "./node-cohort.ts";
 
 function owned(resource: Resource, claim: SuspendClaim): boolean {
   return (
     !resource.metadata.deletionTimestamp &&
+    nodeCohortAnnotationsMatch(resource) &&
     resource.metadata.labels?.["app.kubernetes.io/managed-by"] ===
       "cloudflare-postgres" &&
     resource.metadata.labels?.["pgcf.io/environment-id"] ===
@@ -103,6 +106,7 @@ export async function suspendKubernetesFromConfig(
     quotaUid: quotaResource.metadata.uid,
     ...(claim.pooler ? { pooler: { ...claim.pooler } } : {}),
     ...(claim.runEpoch === undefined ? {} : { runEpoch: claim.runEpoch }),
+    ...(claim.nodeCohort ? { nodeCohort: { ...claim.nodeCohort } } : {}),
   };
   if (!validRuntimeBinding(discovered))
     throw new Error("suspend_kubernetes_identity_unproven");
@@ -119,16 +123,26 @@ export async function suspendKubernetesFromConfig(
       sealedBinding.clusterUid !== discovered.clusterUid ||
       sealedBinding.quotaUid !== discovered.quotaUid ||
       sealedBinding.runEpoch !== discovered.runEpoch ||
+      sealedBinding.nodeCohort?.uid !== discovered.nodeCohort?.uid ||
+      sealedBinding.nodeCohort?.hash !== discovered.nodeCohort?.hash ||
       sealedBinding.pooler?.uid !== discovered.pooler?.uid ||
       sealedBinding.pooler?.deploymentUid !== discovered.pooler?.deploymentUid)
   )
     throw new Error("suspend_kubernetes_sealed_identity_changed");
   // Discovery never changes a journal seal. Restart keeps the previously sealed
   // identities; the reconciler independently authorizes and seals inventory.
-  return allowanceKubernetesFromConfig(
+  const runtime = allowanceKubernetesFromConfig(
     file,
     context,
     sealedBinding ?? discovered,
     authorized,
   );
+  if (claim.nodeCohort) {
+    authorized();
+    const inventory = await runtime.inventory();
+    authorized();
+    if (!ownedInventory(inventory, sealedBinding ?? discovered))
+      throw new Error("suspend_kubernetes_cohort_unproven");
+  }
+  return runtime;
 }

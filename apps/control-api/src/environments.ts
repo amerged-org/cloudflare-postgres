@@ -36,6 +36,7 @@ interface EnvironmentObservation {
   readyInstances: number;
   pooler?: PoolerObservation;
   runEpoch?: string;
+  nodeCohort?: { uid: string; hash: string };
 }
 
 interface Profile {
@@ -64,6 +65,7 @@ interface Profile {
   };
   pooling?: PoolingPolicy;
   executionFencing?: { version: 1 };
+  nodeTracking?: { version: 1 };
 }
 
 interface EnvironmentInput {
@@ -379,16 +381,27 @@ function poolingFromJson(value: unknown): PoolingPolicy | null {
   };
 }
 
+export function validNodeCohortPointer(
+  value: unknown,
+): value is { uid: string; hash: string } {
+  return (
+    object(value, ["uid", "hash"]) &&
+    text(value.uid, uuid) &&
+    text(value.hash, /^[a-f0-9]{64}$/)
+  );
+}
+
 export function validEnvironmentObservation(
   value: unknown,
   pooled: boolean,
   expectedRunEpoch?: string,
+  tracked = false,
 ): value is EnvironmentObservation {
   return (
     object(
       value,
       ["clusterUid", "clusterGeneration", "readyInstances"],
-      ["pooler", "runEpoch"],
+      ["pooler", "runEpoch", "nodeCohort"],
     ) &&
     name(value.clusterUid) &&
     integer(value.clusterGeneration, 1, Number.MAX_SAFE_INTEGER) &&
@@ -397,6 +410,10 @@ export function validEnvironmentObservation(
     (expectedRunEpoch === undefined ||
       (runEpoch.test(expectedRunEpoch) &&
         value.runEpoch === expectedRunEpoch)) &&
+    Object.hasOwn(value, "nodeCohort") === tracked &&
+    (!tracked ||
+      (expectedRunEpoch !== undefined &&
+        validNodeCohortPointer(value.nodeCohort))) &&
     Object.hasOwn(value, "pooler") === pooled &&
     (!pooled ||
       (object(value.pooler, [
@@ -417,7 +434,7 @@ function profileFromJson(value: unknown): Profile | null {
     !object(
       value,
       ["id", "postgresImage", "compute", "storage", "instances", "backup"],
-      ["pooling", "executionFencing"],
+      ["pooling", "executionFencing", "nodeTracking"],
     ) ||
     !text(value.id, identifier) ||
     !text(
@@ -476,6 +493,13 @@ function profileFromJson(value: unknown): Profile | null {
       value.executionFencing.version !== 1)
   )
     return null;
+  if (
+    Object.hasOwn(value, "nodeTracking") &&
+    (!object(value.nodeTracking, ["version"]) ||
+      value.nodeTracking.version !== 1 ||
+      !Object.hasOwn(value, "executionFencing"))
+  )
+    return null;
   try {
     const endpoint = new URL(value.backup.endpointURL);
     if (
@@ -519,6 +543,9 @@ function profileFromJson(value: unknown): Profile | null {
       },
     },
     ...(pooling === undefined ? {} : { pooling }),
+    ...(Object.hasOwn(value, "nodeTracking")
+      ? { nodeTracking: { version: 1 as const } }
+      : {}),
     ...(Object.hasOwn(value, "executionFencing")
       ? { executionFencing: { version: 1 as const } }
       : {}),
@@ -539,6 +566,9 @@ function publicProfile(profile: Profile) {
     instances: profile.instances,
     backup: { retentionPolicy: profile.backup.retentionPolicy },
     ...(profile.pooling === undefined ? {} : { pooling: profile.pooling }),
+    ...(profile.nodeTracking === undefined
+      ? {}
+      : { nodeTracking: profile.nodeTracking }),
     ...(profile.executionFencing === undefined
       ? {}
       : { executionFencing: profile.executionFencing }),
@@ -1044,6 +1074,10 @@ async function reportResult(
     typeof input.observation === "object" &&
     input.observation !== null &&
     Object.hasOwn(input.observation, "pooler");
+  const reportedNodeTracking =
+    typeof input.observation === "object" &&
+    input.observation !== null &&
+    Object.hasOwn(input.observation, "nodeCohort");
   const reportedRunEpoch =
     typeof input.observation === "object" &&
     input.observation !== null &&
@@ -1057,6 +1091,7 @@ async function reportResult(
       input.observation,
       reportedPooling,
       reportedRunEpoch,
+      reportedNodeTracking,
     );
   const failed =
     input.status === "failed" &&
@@ -1080,6 +1115,7 @@ async function reportResult(
       input.observation,
       profile.pooling !== undefined,
       environment.run_epoch ?? undefined,
+      profile.nodeTracking !== undefined,
     ) ||
       (input.observation as EnvironmentObservation).readyInstances <
         profile.instances)
@@ -1102,6 +1138,16 @@ async function reportResult(
               },
             }
           : {}),
+        ...(profile.nodeTracking === undefined
+          ? {}
+          : {
+              nodeCohort: {
+                uid: (input.observation as EnvironmentObservation).nodeCohort!
+                  .uid,
+                hash: (input.observation as EnvironmentObservation).nodeCohort!
+                  .hash,
+              },
+            }),
         ...(environment.run_epoch === null
           ? {}
           : { runEpoch: environment.run_epoch }),

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { RuntimeBinding } from "./allowance-types.ts";
 import { validRunEpoch } from "./run-epoch.ts";
+import { validNodeCohortPointer } from "./node-cohort.ts";
+import type { NodeCohortData, NodeCohortPointer } from "./node-cohort.ts";
 
 export interface SuspendClaim {
   schemaVersion: 1;
@@ -16,6 +18,7 @@ export interface SuspendClaim {
   clusterUid: string;
   pooler: { uid: string; deploymentUid: string } | null;
   runEpoch?: string;
+  nodeCohort?: NodeCohortPointer;
   leaseToken: string;
   leaseEpoch: number;
   leaseExpiresAt: string;
@@ -31,10 +34,12 @@ export interface SuspendObservation {
   clusterHibernated: true;
   poolerStopped: true;
   runEpoch?: string;
+  nodeCohort?: NodeCohortPointer;
 }
 export interface SuspendSeal {
   binding: RuntimeBinding;
   volumesHash: string;
+  nodeCohort?: NodeCohortData;
 }
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 export function validSuspendClaim(value: unknown): value is SuspendClaim {
@@ -59,6 +64,9 @@ export function validSuspendClaim(value: unknown): value is SuspendClaim {
     Number.isSafeInteger(claim.runtimeRevision) &&
     Number(claim.runtimeRevision) > 0 &&
     (!Object.hasOwn(claim, "runEpoch") || validRunEpoch(claim.runEpoch)) &&
+    (!Object.hasOwn(claim, "nodeCohort") ||
+      (validRunEpoch(claim.runEpoch) &&
+        validNodeCohortPointer(claim.nodeCohort))) &&
     (claim.pooler === null ||
       (claim.pooler !== null &&
         typeof claim.pooler === "object" &&

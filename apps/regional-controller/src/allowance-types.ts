@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Resource } from "./types.ts";
+import type { NodeCohortPointer } from "./node-cohort.ts";
 
 export type AllowanceUnits = Record<string, string>;
 export interface RuntimeBinding {
@@ -13,6 +14,7 @@ export interface RuntimeBinding {
   clusterUid: string;
   quotaUid: string;
   runEpoch?: string;
+  nodeCohort?: NodeCohortPointer;
   pooler?: { uid: string; deploymentUid: string };
 }
 export interface AllowanceRequest {
@@ -80,6 +82,8 @@ export interface RuntimeInventory {
   pvs: Resource[];
   poolers?: Resource[];
   deployments?: Resource[];
+  nodeCohort?: Resource | null;
+  nodes?: Resource[];
 }
 export interface RuntimePatch {
   op: "test" | "add" | "replace";

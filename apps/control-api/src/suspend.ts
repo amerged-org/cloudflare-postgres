@@ -21,6 +21,7 @@ import {
 } from "./execution-auth";
 import {
   validEnvironmentObservation,
+  validNodeCohortPointer,
   type EnvironmentRow,
 } from "./environments";
 import { operationFromRow } from "./execution-reads";
@@ -51,6 +52,7 @@ interface SuspendSpec {
   pooler_json: string | null;
   created_at: string;
   run_epoch: string | null;
+  node_cohort_json: string | null;
 }
 interface SuspendOperation {
   id: string;
@@ -85,6 +87,7 @@ interface SuspendObservation {
   clusterHibernated: true;
   poolerStopped: true;
   runEpoch?: string;
+  nodeCohort?: { uid: string; hash: string };
 }
 const hash = /^[a-f0-9]{64}$/;
 const environmentColumns =
@@ -118,6 +121,9 @@ function currentScope(operation: string): string {
     "AND ((s.pooler_json IS NULL AND json_type(e.observation_json, '$.pooler') IS NULL) " +
     "OR (s.pooler_json IS NOT NULL AND json_extract(e.observation_json, '$.pooler.uid') = json_extract(s.pooler_json, '$.uid') " +
     "AND json_extract(e.observation_json, '$.pooler.deploymentUid') = json_extract(s.pooler_json, '$.deploymentUid'))) " +
+    "AND ((s.node_cohort_json IS NULL AND json_type(e.observation_json, '$.nodeCohort') IS NULL) " +
+    "OR (s.node_cohort_json IS NOT NULL AND json_extract(e.observation_json, '$.nodeCohort.uid') = json_extract(s.node_cohort_json, '$.uid') " +
+    "AND json_extract(e.observation_json, '$.nodeCohort.hash') = json_extract(s.node_cohort_json, '$.hash'))) " +
     "AND rt.operation_id = " +
     operation +
     ".id AND rt.revision = s.runtime_revision " +
@@ -309,6 +315,7 @@ async function createSuspend(
       observed,
       pooled,
       environment.run_epoch ?? undefined,
+      Object.hasOwn(spec.profile, "nodeTracking"),
     ) ||
     !uid(observed.clusterUid) ||
     !hash.test(environment.spec_hash) ||
@@ -404,7 +411,7 @@ async function createSuspend(
         ),
       db
         .prepare(
-          "INSERT INTO environment_suspend_specs (operation_id, environment_id, runtime_revision, spec_revision, spec_hash, spec_json, cluster_uid, pooler_json, created_at, run_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+          "INSERT INTO environment_suspend_specs (operation_id, environment_id, runtime_revision, spec_revision, spec_hash, spec_json, cluster_uid, pooler_json, created_at, run_epoch, node_cohort_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(
           operationId,
@@ -417,6 +424,7 @@ async function createSuspend(
           pooler ? JSON.stringify(pooler) : null,
           at,
           environment.run_epoch,
+          observed.nodeCohort ? JSON.stringify(observed.nodeCohort) : null,
         ),
       db
         .prepare(
@@ -570,6 +578,9 @@ async function claimSuspend(
       leaseEpoch: updated.lease_epoch,
       leaseExpiresAt: expiresAt,
       ...(snapshot.run_epoch === null ? {} : { runEpoch: snapshot.run_epoch }),
+      ...(snapshot.node_cohort_json === null
+        ? {}
+        : { nodeCohort: JSON.parse(snapshot.node_cohort_json) }),
     },
   });
 }
@@ -638,10 +649,17 @@ function suspendedObservation(
         "clusterHibernated",
         "poolerStopped",
       ],
-      ["runEpoch"],
+      ["runEpoch", "nodeCohort"],
     ) ||
     Object.hasOwn(value, "runEpoch") !== (snapshot.run_epoch !== null) ||
     (snapshot.run_epoch !== null && value.runEpoch !== snapshot.run_epoch) ||
+    Object.hasOwn(value, "nodeCohort") !==
+      (snapshot.node_cohort_json !== null) ||
+    (snapshot.node_cohort_json !== null &&
+      (!validNodeCohortPointer(value.nodeCohort) ||
+        value.nodeCohort.uid !== JSON.parse(snapshot.node_cohort_json).uid ||
+        value.nodeCohort.hash !==
+          JSON.parse(snapshot.node_cohort_json).hash)) ||
     !uid(value.namespaceUid) ||
     value.clusterUid !== snapshot.cluster_uid ||
     !uid(value.quotaUid) ||
@@ -682,6 +700,9 @@ function suspendedObservation(
     clusterHibernated: true,
     poolerStopped: true,
     ...(snapshot.run_epoch === null ? {} : { runEpoch: snapshot.run_epoch }),
+    ...(snapshot.node_cohort_json === null
+      ? {}
+      : { nodeCohort: JSON.parse(snapshot.node_cohort_json) }),
   };
 }
 async function resultSuspend(
