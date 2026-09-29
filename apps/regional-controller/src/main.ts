@@ -37,6 +37,14 @@ function milliseconds(
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "verify-usage-snapshot") {
+    const { runUsageSnapshotVerification } =
+      await import("./usage-snapshot-verification-cli.ts");
+    process.exitCode = await runUsageSnapshotVerification(
+      process.argv.slice(3),
+    );
+    return;
+  }
   if (process.argv[2] === "snapshot-usage") {
     const { runUsageJournalSnapshot } =
       await import("./usage-journal-snapshot-cli.ts");
