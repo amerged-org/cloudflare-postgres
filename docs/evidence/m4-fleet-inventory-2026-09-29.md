@@ -68,3 +68,31 @@ The latter is not a synthetic test key. This corrects the earlier limited custod
 search: the local copy exists. It does not qualify the stopped actual recovery
 chain, establish off-node custody or prove service reactivation. No secret is
 rotated, printed or copied to public source; the original files remain unchanged.
+
+## Actual Dev delivery
+
+Runtime source `a055f0feda6d6e362b9cfb75a28135cabe5e913a` is public. Eight selected
+source/schema/contract files are read back byte-for-byte; runtime bytes match the
+tested candidate. One Worker dry-run passes, and its bundle contains no actual
+operator/environment/key values. One Dev deployment completes in 13.368 seconds
+without a schema migration, new Secret, regional-image rollout or server action.
+
+The compiled operator CLI completes the single actual read-only case: both
+authorized purchased instances are observed, one explicitly enrolled Node is
+bound and the other instance remains unmanaged. There are no blockers, while
+machine identity, reserved capacity and actions remain false. The selected full
+report is mode 0600; public output contains counts/codes/hash only. Anonymous and
+organization-token calls return 401, and an unsupported backend query returns
+400 with no-store responses.
+
+Readback preserves all eight Secret names. D1 remains at 14 migrations, one
+organization/project and zero managed environments, roles, logical databases,
+facts or reservations; regional admission remains closed. The original Node,
+29 Running Pod identities/restart counts, five PV/PVC identities and both existing
+SQL marker counts are preserved. Neither `.env.local` nor `.dev.vars` changes.
+
+This qualifies provider observation and explicit enrolled-node association in
+Dev. It does not qualify automatic fleet enrollment, physical-host independence,
+capacity reservation, host upgrades, recovery or production readiness. The
+independent [disk-full containment proof](m4-disk-full-containment-2026-09-29.md)
+advances only its stated filesystem boundary.

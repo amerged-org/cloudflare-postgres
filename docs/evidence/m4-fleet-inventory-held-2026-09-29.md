@@ -1,5 +1,10 @@
 # Fleet inventory candidate held at final lint
 
+Historical stop record. The user's later explicit continuation authorizes the
+narrow equivalent validator repair. The interrupted stages and actual Dev
+delivery are qualified in the [subsequent checkpoint](m4-fleet-inventory-2026-09-29.md).
+The failure history below is preserved; no full gate is repeated.
+
 The isolated `codex/fleet-inventory` draft adds an installation-only Contabo read
 API and generic provider/Node enrollment inspection. Missing/replaced hosts can
 invalidate an optional maintenance preflight; association never grants machine

@@ -405,9 +405,11 @@ for maintenance exclusion. Two red-first local cases pass. After the original
 lint stop and the user's explicit resumption, only equivalent validators receive
 targeted corrections; previously unrun typecheck/Vitest/Node stages pass once with
 27 Worker and 34 Node cases, retaining six unchanged Go cases. No full gate is
-repeated. Actual Dev readback remains pending. Association cannot grant machine
-identity, reserved capacity or update authority. Other held workflows remain
-untouched.
+repeated. The Dev Worker and compiled inspector now qualify both authorized
+instances, one explicit Node binding and one unmanaged builder, with private
+output and unchanged schema/Secret/infrastructure/SQL state. Association cannot
+grant machine identity, reserved capacity or update authority. Other held
+workflows remain untouched; M4 is still incomplete.
 
 The [control recovery candidate checkpoint](docs/evidence/m3-control-recovery-held-2026-09-29.md)
 records two passing local reconstruction/key-custody cases and one failed actual
