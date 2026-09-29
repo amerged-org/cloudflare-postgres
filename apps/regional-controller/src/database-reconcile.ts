@@ -7,6 +7,7 @@ import type {
   DatabaseVerifier,
 } from "./database-types.ts";
 import { validRoleConfig } from "./role-reconcile.ts";
+import { restrictedRoleSpec } from "./role-spec.ts";
 import type { Resource } from "./types.ts";
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
@@ -222,7 +223,7 @@ export async function reconcileDatabase(
     claim.databaseName === bootstrap
   )
     throw new Error("database_spec_conflict");
-  const roleSpec = object(ownerRole.spec),
+  const roleSpec = restrictedRoleSpec(ownerRole.spec) ?? {},
     roleStatus = object(ownerRole.status);
   if (
     ownerRole.metadata.annotations?.["pgcf.io/credential-revision"] !==

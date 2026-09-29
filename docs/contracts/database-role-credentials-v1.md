@@ -28,6 +28,14 @@ never a customer-supplied namespace or access grant.
 
 Bind the owned namespace/Cluster to the accepted environment/spec/Cluster UID. Each credential revision has an immutable owned `kubernetes.io/basic-auth` Secret; the stable `DatabaseRole` references its exact Secret name. Its immutable cluster/name and explicit restricted attributes prevent privilege escalation. Apply UID/resource-version conditional changes with a monotonic credential-revision annotation; never downgrade a newer role. Lost create/patch responses require matching owned readback before further writes.
 
+CNPG 1.30.1 serializes its known default-false `superuser`, `createdb`,
+`createrole`, `replication` and `bypassrls` fields with omission, and omits an empty
+`inRoles` list. Readback treats only absence of those fields as their documented
+restricted defaults. Explicit null/wrong types, true privileges and memberships
+remain conflicts. `inherit` defaults to true, so our required explicit false is
+never supplied by this normalization. All role, password, ownership and operation
+bindings remain strict; the same rule protects owned-database owner verification.
+
 Wait for `DatabaseRole.status.applied`, current `observedGeneration`, and `secretResourceVersion` equal to the exact intended Secret resourceVersion. A noticed-Secret condition or successful CRD patch is insufficient. Read back Cluster/role/Secret identity around verification. Namespace policy admits only the installation-configured trusted verifier Pod identity to owned database Pods.
 
 The maintained PostgreSQL driver opens a fresh connection to the derived `database-rw.<owned-namespace>.svc:5432`, using only the public server CA certificate and strict hostname/TLS verification. No client certificate, environment-derived DSN, arbitrary host or superuser is used. Check expected user/database, writable primary and restricted role attributes. On rotation a second fresh connection using the old password must fail specifically with SQLSTATE `28P01`; a network/TLS timeout is not password invalidation evidence. Close every connection, bound transport/query deadlines and sanitize errors. Existing sessions can survive password rotation.

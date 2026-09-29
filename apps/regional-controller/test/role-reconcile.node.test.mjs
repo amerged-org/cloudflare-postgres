@@ -226,6 +226,16 @@ test("uncertain owned role application waits for the exact credential version be
     "bypassrls",
   ])
     assert.equal(role.spec[flag], false);
+  // CNPG's typed serialization omits these false booleans and empty membership.
+  for (const field of [
+    "superuser",
+    "createdb",
+    "createrole",
+    "replication",
+    "bypassrls",
+    "inRoles",
+  ])
+    delete role.spec[field];
   role.status = {
     applied: true,
     observedGeneration: role.metadata.generation,
@@ -248,6 +258,26 @@ test("uncertain owned role application waits for the exact credential version be
   );
   assert.equal(ready.observation.secretUid, secret.metadata.uid);
   assert.equal(ready.observation.clusterUid, claim.clusterUid);
+  const writesBeforePrivilegeChecks = f.writes.length;
+  role.spec.superuser = true;
+  await assert.rejects(
+    reconcileRole(f.runtime, claim, config, f.verifier, () => {}),
+    /role_spec_conflict/,
+  );
+  delete role.spec.superuser;
+  role.spec.inRoles = ["pg_read_server_files"];
+  await assert.rejects(
+    reconcileRole(f.runtime, claim, config, f.verifier, () => {}),
+    /role_spec_conflict/,
+  );
+  delete role.spec.inRoles;
+  delete role.spec.inherit;
+  await assert.rejects(
+    reconcileRole(f.runtime, claim, config, f.verifier, () => {}),
+    /role_spec_conflict/,
+  );
+  role.spec.inherit = false;
+  assert.equal(f.writes.length, writesBeforePrivilegeChecks);
   assert.equal(
     f.writes.filter((x) => x === "Secret" || x === "DatabaseRole").length,
     2,

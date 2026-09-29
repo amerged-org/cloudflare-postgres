@@ -231,6 +231,18 @@ function fixture(existingSql = false) {
 
 test("an uncertain owned database create waits for applied generation and fresh SQL ownership without duplicate resources", async () => {
   const f = fixture();
+  const ownerRole = [...f.resources.values()].find(
+    (resource) => resource.kind === "DatabaseRole",
+  );
+  for (const field of [
+    "superuser",
+    "createdb",
+    "createrole",
+    "replication",
+    "bypassrls",
+    "inRoles",
+  ])
+    delete ownerRole.spec[field];
   const pending = await reconcileDatabase(
     f.runtime,
     claim,
@@ -272,6 +284,26 @@ test("an uncertain owned database create waits for applied generation and fresh 
   assert.equal(f.probes.filter((p) => p.kind === "absence").length, 1);
   assert.equal(f.probes[1].host, `database-rw.${namespace}.svc`);
   assert.equal(f.probes[1].database, "customerdb");
+  const writesBeforePrivilegeChecks = f.writes.length;
+  ownerRole.spec.superuser = true;
+  await assert.rejects(
+    reconcileDatabase(f.runtime, claim, config, f.verifier, () => {}),
+    /database_spec_conflict/,
+  );
+  delete ownerRole.spec.superuser;
+  ownerRole.spec.inRoles = ["pg_read_server_files"];
+  await assert.rejects(
+    reconcileDatabase(f.runtime, claim, config, f.verifier, () => {}),
+    /database_spec_conflict/,
+  );
+  delete ownerRole.spec.inRoles;
+  delete ownerRole.spec.inherit;
+  await assert.rejects(
+    reconcileDatabase(f.runtime, claim, config, f.verifier, () => {}),
+    /database_spec_conflict/,
+  );
+  ownerRole.spec.inherit = false;
+  assert.equal(f.writes.length, writesBeforePrivilegeChecks);
 });
 
 test("a pre-existing unmanaged SQL database is rejected before CNPG can adopt or alter its owner", async () => {
