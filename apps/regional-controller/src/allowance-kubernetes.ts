@@ -24,13 +24,19 @@ import {
   validNodeCohortPointer,
 } from "./node-cohort.ts";
 import type { Resource } from "./types.ts";
+import { nodeObserverFromConfig } from "./node-observer.ts";
+import type { NodeObserverConfiguration } from "./node-observer.ts";
 
 export function allowanceKubernetesFromConfig(
   file: string,
   context: string,
   suppliedBinding: RuntimeBinding,
   authorized: () => void = () => {},
+  nodeObserver?: NodeObserverConfiguration,
+  signal?: AbortSignal,
 ): AllowanceRuntime {
+  if (nodeObserver && nodeObserver.regionId !== suppliedBinding.regionId)
+    throw new Error("allowance_node_observer_scope_invalid");
   const binding = Object.freeze({
     ...suppliedBinding,
     ...(suppliedBinding.nodeCohort
@@ -207,6 +213,17 @@ export function allowanceKubernetesFromConfig(
     }
   };
   return {
+    ...(nodeObserver
+      ? {
+          observeNode: nodeObserverFromConfig(
+            file,
+            context,
+            nodeObserver,
+            authorized,
+            signal,
+          ).observeNode,
+        }
+      : {}),
     async inventory() {
       const current: InventoryBudget = {
         remainingRequests: 40,

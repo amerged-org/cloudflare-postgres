@@ -1,0 +1,100 @@
+# SPDX-License-Identifier: Apache-2.0
+# Trusted node-administration boundary; exact socket access is privileged.
+# Replace image, installation and region, then bind observed UID/image identities
+# in private operator configuration. This grants no customer access or tokens.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: pgcf-runtime-observation
+  labels:
+    app.kubernetes.io/managed-by: cloudflare-postgres
+    pgcf.io/component: node-runtime-observer
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-network
+  namespace: pgcf-runtime-observation
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+  ingress: []
+  egress: []
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: node-runtime-observer
+  namespace: pgcf-runtime-observation
+  labels:
+    app.kubernetes.io/managed-by: cloudflare-postgres
+    pgcf.io/component: node-runtime-observer
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgcf-node-runtime-observer
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pgcf-node-runtime-observer
+        app.kubernetes.io/managed-by: cloudflare-postgres
+        pgcf.io/component: node-runtime-observer
+    spec:
+      automountServiceAccountToken: false
+      hostNetwork: false
+      hostPID: false
+      hostIPC: false
+      terminationGracePeriodSeconds: 5
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: observer
+          image: REPLACE_DIGEST_PINNED_OBSERVER_IMAGE
+          imagePullPolicy: Never
+          command: [/node-runtime-observer]
+          args: [agent]
+          env:
+            - name: PGCF_OBSERVER_POD_UID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.uid
+            - name: PGCF_OBSERVER_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: PGCF_OBSERVER_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: PGCF_OBSERVER_INSTALLATION_ID
+              value: REPLACE_INSTALLATION_ID
+            - name: PGCF_OBSERVER_REGION_ID
+              value: REPLACE_REGION_ID
+          securityContext:
+            runAsUser: 0
+            runAsGroup: 0
+            privileged: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          volumeMounts:
+            - name: cri-socket
+              mountPath: /run/cri.sock
+              readOnly: true
+      volumes:
+        - name: cri-socket
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket

@@ -37,6 +37,12 @@ function milliseconds(
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "inspect-node-runtime") {
+    const { inspectNodeRuntime } =
+      await import("./inspect-node-runtime-cli.ts");
+    process.exitCode = await inspectNodeRuntime(process.argv.slice(3));
+    return;
+  }
   if (process.argv[2] === "archive-accepted-usage") {
     const { archiveAcceptedUsage } = await import("./accepted-usage-cli.ts");
     process.exitCode = await archiveAcceptedUsage(process.argv.slice(3));

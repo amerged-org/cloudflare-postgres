@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Resource } from "./types.ts";
 import type { NodeCohortPointer } from "./node-cohort.ts";
+import type { NodeObserverResult } from "./node-observer.ts";
 
 export type AllowanceUnits = Record<string, string>;
 export interface RuntimeBinding {
@@ -91,6 +92,7 @@ export interface RuntimePatch {
   value: unknown;
 }
 export interface AllowanceRuntime {
+  observeNode?(nodeName: string): Promise<NodeObserverResult>;
   inventory(): Promise<RuntimeInventory>;
   patch(
     kind: "Cluster" | "ResourceQuota" | "Pooler",

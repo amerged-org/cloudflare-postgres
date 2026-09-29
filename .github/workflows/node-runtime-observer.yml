@@ -27,4 +27,4 @@ jobs:
         run: |
           test -z "$(gofmt -l observer cmd)"
           go vet ./observer ./cmd/node-runtime-observer
-          go test ./observer -count=1 -timeout=90s
+          go test ./observer ./cmd/node-runtime-observer -count=1 -timeout=90s

@@ -379,6 +379,8 @@ The [maintenance preparation checkpoint](docs/evidence/m4-maintenance-preparatio
 
 Implementation assumptions must be resolved with evidence, not advertised as existing guarantees. Hosted SaaS/reselling and branching require later plans; neither is a gate for this open-source delivery.
 
+The [node runtime transport checkpoint](docs/evidence/m6-node-runtime-transport-2026-09-29.md) adds a resident Go agent, challenged self identity and a bounded verified-TLS Kubernetes Exec adapter with explicit operator configuration. Exactly three new top-level cases fail first and the single frozen full gate passes all 61 cases. Contabo credentials are confirmed as Dev Worker Secret names; local credentials remain private. Live resident execution is not yet qualified; stop completion, original cohort coverage, independent expiry and finalized accounting remain open.
+
 ## 10. Bounded TDD and verification discipline
 
 Use test-driven development for concrete behavior changes: identify the intended behavior or observed defect, demonstrate a meaningful failing test, implement the smallest complete correction, and check the affected behavior again. Keep the task scope fixed; tests are evidence for that change, not a reason to build additional features or infrastructure.
@@ -398,7 +400,7 @@ After freezing the final candidate, run the full gate **exactly once**: format, 
 
 Documentation-only work checks the edited documents, links, and diff; do not invent runtime tests or package tooling just to test prose. The executable workspace gate is for frozen runtime candidates, not a reason to rerun all tests for document edits.
 
-For the Go node-runtime observer, the frozen candidate also runs `pnpm check:node-runtime` once: formatting, vet and the three bounded concrete cases. This does not add matrix cases or repeat the workspace gate. During iteration, explicitly select the named observer cases.
+For the Go node-runtime observer, the frozen candidate also runs `pnpm check:node-runtime` once: formatting, vet and its bounded concrete cases, including command behavior when changed. This does not add matrix cases or repeat the workspace gate. During iteration, explicitly select the named observer cases.
 
 ### Mandatory stop conditions
 

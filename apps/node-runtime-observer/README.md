@@ -25,3 +25,11 @@ A temporary qualification Pod requires a dedicated trusted namespace rather than
 Independently verify the observer Pod's actual Node placement, UID, image ID and immutable specification against fresh Kubernetes Node UID/boot ID before/after use. Caller-supplied scope alone proves none of these. A replaced/unreachable node or missing history remains unproven. Qualifying this reader does not enable it on customer nodes or prove all scheduling nodes were observed.
 
 Dependencies and distribution limits are recorded in [THIRD_PARTY.md](THIRD_PARTY.md). Physical stop requires sealed workload/node cohorts, durable evidence and ownership rechecks. Final accounting additionally requires retained allocation/rate/lifetime history and clock bounds; those remain implementation work.
+
+## Protected Kubernetes execution
+
+The `agent` command keeps a resident process available for bounded Kubernetes Exec calls. Its default lifetime is 24 hours, and SIGINT/SIGTERM terminate cleanly. It exposes no listener and performs no runtime reads while idle. The [agent recipe](deploy/agent.example.yaml) mounts only the exact CRI socket in a protected namespace, denies network traffic and supplies no ServiceAccount token. Socket access remains node-administration authority even though the program's observation behavior uses reads.
+
+`observe` requires a request UUID and server-owned Pod UID/namespace/node name from Downward API variables, plus configured installation/region values. The requested scope must match those actual values before CRI is contacted. Its envelope wraps the existing snapshot with the request ID and observed self identity. Ordinary one-shot output remains available for legacy tooling; it supplies no Kubernetes transport receipt.
+
+The operator transport must independently verify Namespace/DaemonSet/Pod/Node identity, current recipe and image before and after Exec, require successful bounded completion and reject drift. Exec names a Pod rather than atomically pinning its UID; the self envelope and fresh readbacks are conservative checks, not a cross-object transaction. This still establishes neither durable cohort coverage nor physical stop/final accounting.

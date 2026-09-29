@@ -1,6 +1,6 @@
-# Regional PostgreSQL verification dependencies
+# Regional execution dependencies
 
-First-party code remains Apache-2.0. Upstream packages retain their licenses; no upstream source is vendored or modified. The workspace lock pins distribution integrity and the transitive graph. These dependencies support ordinary PostgreSQL authentication verification, not a new database protocol or gateway.
+First-party code remains Apache-2.0. Upstream packages retain their licenses; no upstream source is vendored or modified. The workspace lock pins distribution integrity and the transitive graph. These dependencies support PostgreSQL authentication verification and regional Kubernetes execution.
 
 | Package     | Pinned version | Origin and license                                                                                                      | Integration                                                                                                                                 |
 | ----------- | -------------- | ----------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -10,3 +10,5 @@ First-party code remains Apache-2.0. Upstream packages retain their licenses; no
 The npm registry reports `pg` upstream revision `df274d1ba9ad9d11a8f1079314faeafde7208207`. Installed distribution metadata and license files were inspected on 2026-09-28. The exact package integrity values are recorded in `pnpm-lock.yaml`; runtime image and live CNPG qualification remain separate evidence.
 
 The existing [Kubernetes JavaScript client](https://github.com/kubernetes-client/javascript) remains Apache-2.0 licensed and pinned to `2.0.0`. It provides authenticated Kubernetes resource reads, creates and conditional JSON patches. CloudNativePG remains the PostgreSQL role engine. Its documentation carries a separate CC-BY-4.0 license; this implementation uses its APIs and links to documentation without copying those documents.
+
+The maintained client also supplies Exec/WebSocket channel handling. `ws` is pinned directly to `8.21.0` ([upstream](https://github.com/websockets/ws), MIT), with development-only `@types/ws` `8.18.1` ([DefinitelyTyped](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/ws), MIT). The adapter adds bounded transport and identity checks around the existing SDK; it does not implement Kubernetes authentication or an independent WebSocket protocol. Installed package manifests and MIT license files were checked on 2026-09-29; the lock retains distribution integrity.

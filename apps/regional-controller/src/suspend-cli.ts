@@ -6,12 +6,15 @@ import { SuspendClient } from "./suspend-client.ts";
 import { suspendKubernetesFromConfig } from "./suspend-kubernetes.ts";
 import { SuspendJournal, reconcileSuspend } from "./suspend-reconcile.ts";
 import type { AllowanceRuntime } from "./allowance-types.ts";
+import { validNodeObserverConfig } from "./node-observer.ts";
+import type { NodeObserverConfiguration } from "./node-observer.ts";
 
 interface Configuration {
   schemaVersion: 1;
   kubeconfigFile: string;
   kubeconfigContext: string;
   journalDirectory: string;
+  nodeObserver?: NodeObserverConfiguration;
 }
 function required(name: string): string {
   const value = process.env[name];
@@ -44,7 +47,8 @@ async function configuration(path: string): Promise<Configuration> {
     "journalDirectory",
   ];
   if (
-    Object.keys(input).length !== keys.length ||
+    Object.keys(input).length !==
+      keys.length + (Object.hasOwn(input, "nodeObserver") ? 1 : 0) ||
     !keys.every((key) => Object.hasOwn(input, key)) ||
     input.schemaVersion !== 1 ||
     typeof input.kubeconfigFile !== "string" ||
@@ -52,7 +56,9 @@ async function configuration(path: string): Promise<Configuration> {
     typeof input.kubeconfigContext !== "string" ||
     !input.kubeconfigContext.trim() ||
     typeof input.journalDirectory !== "string" ||
-    !isAbsolute(input.journalDirectory)
+    !isAbsolute(input.journalDirectory) ||
+    (Object.hasOwn(input, "nodeObserver") &&
+      !validNodeObserverConfig(input.nodeObserver))
   )
     throw new Error("suspend_configuration_invalid");
   return input as unknown as Configuration;
@@ -166,10 +172,18 @@ export async function runSuspend(arguments_: string[]): Promise<number> {
           claim,
           sealedBinding,
           authorized,
+          operator.nodeObserver,
+          shutdown.signal,
         ),
       );
       authorized();
       const runtime: AllowanceRuntime = {
+        ...(baseRuntime.observeNode
+          ? {
+              observeNode: (name: string) =>
+                active(() => baseRuntime.observeNode!(name)),
+            }
+          : {}),
         async inventory() {
           authorized();
           const inventory = await active(() => baseRuntime.inventory());

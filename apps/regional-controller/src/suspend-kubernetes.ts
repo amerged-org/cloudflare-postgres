@@ -11,6 +11,7 @@ import type { Resource } from "./types.ts";
 import { RUN_EPOCH_ANNOTATION } from "./run-epoch.ts";
 import { ownedInventory } from "./owned-stop.ts";
 import { nodeCohortAnnotationsMatch } from "./node-cohort.ts";
+import type { NodeObserverConfiguration } from "./node-observer.ts";
 
 function owned(resource: Resource, claim: SuspendClaim): boolean {
   return (
@@ -42,6 +43,8 @@ export async function suspendKubernetesFromConfig(
   claim: SuspendClaim,
   sealedBinding?: RuntimeBinding,
   authorized: () => void = () => {},
+  nodeObserver?: NodeObserverConfiguration,
+  signal?: AbortSignal,
 ): Promise<AllowanceRuntime> {
   if (!isAbsolute(file) || !context || !validSuspendClaim(claim))
     throw new Error("suspend_kubernetes_configuration_invalid");
@@ -136,6 +139,8 @@ export async function suspendKubernetesFromConfig(
     context,
     sealedBinding ?? discovered,
     authorized,
+    nodeObserver,
+    signal,
   );
   if (claim.nodeCohort) {
     authorized();
