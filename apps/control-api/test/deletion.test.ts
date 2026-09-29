@@ -331,6 +331,25 @@ it("atomically retains an owned deletion intention and its real suspend child, f
       .bind(f.environmentId)
       .first(),
   ).toEqual({ n: 1 });
+  // The live idle controller exposed a persisted guard on every empty claim.
+  // Polling after deletion has no work and must not grow control-state rows.
+  const assertionsBeforeEmptyClaim = await env.DB.prepare(
+    "SELECT count(*) AS n FROM accounting_assertions",
+  ).first();
+  expect(
+    await (
+      await call(`${creationLane}/claim`, {
+        method: "POST",
+        headers: f.regionHeaders,
+        body: JSON.stringify({ leaseSeconds: 90 }),
+      })
+    ).json(),
+  ).toEqual({ claim: null });
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) AS n FROM accounting_assertions",
+    ).first(),
+  ).toEqual(assertionsBeforeEmptyClaim);
   expect(JSON.stringify(intent)).not.toMatch(
     /credentialSecret|endpointURL|destinationPath|encrypted_json|password|leaseToken/,
   );

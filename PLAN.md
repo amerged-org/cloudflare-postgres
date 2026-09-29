@@ -61,8 +61,12 @@ their exact child. Two new Worker cases and one expanded recovery case pass,
 followed by one final gate with 35 Worker and 55 Node cases. Complete 50-table
 recovery remains within the unchanged query bound. The source never reports
 physical deletion, erases history, releases accounting holds or removes data.
-Dev delivery, pending/failed provisioning cleanup, actual retirement/disposal,
-retained-archive recovery and final accounting remain explicit v1 requirements.
+Dev migration `0018` and the API are delivered. Live preservation readback exposes
+an idle-claim guard-row regression; one same-case red-first correction passes
+targeted verification without repeating the full gate. Corrective delivery and
+stable idle polling remain required. Pending/failed provisioning cleanup, actual
+retirement/disposal, retained-archive recovery and final accounting remain
+explicit v1 requirements.
 
 ## 1. Product scope and decisions
 

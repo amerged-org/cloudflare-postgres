@@ -58,9 +58,38 @@ cases. Six unchanged Go cases retain their prior evidence. The source candidate
 does not change during the gate. OpenAPI resolves 807 references and 67 distinct
 operations with complete path parameters.
 
-## Delivery boundary
+## Dev delivery and observed idle-claim correction
 
-The source is qualified locally. Dev migration and Worker delivery are prepared
-as the next step; no API-managed deletion or physical disposal is claimed here.
-Ordinary admission remains closed. The separately held backup, native and birth
-qualification workflows are not resumed, and the full v1 objective remains open.
+Public source `29f7b4be2770ccff8df018f47661906701602ab7` is delivered in Dev.
+A fresh pre-migration capture, encrypted seal and independent offline restore
+verify 49 tables and 50 rows. Migration `0018` is applied once; its table/five
+triggers match, foreign keys pass and the new table is empty. One dry run checks
+the bundle, then one `--keep-vars` Worker deployment passes in 9.997 seconds.
+The deployed version is `2b18ef4a-7dd0-4624-bd5b-01c08f401c6c` at 100%.
+Eight Secret names/types remain. No Secret values are queried or printed.
+
+Six successful GET observations are retained. Two DELETE probe calls initially
+omit the required Idempotency-Key. One harness correction repeats only those
+calls: invalid input returns 400 and an unknown environment returns 404.
+No managed environment, deletion or stop operation is created.
+
+The post-migration capture, seal and offline restore each complete once, but the
+subsequent before/after count assertion stops: `accounting_assertions` grows from
+14 to 150 during idle controller polling. All other expected counts match.
+This exposes a genuine regression: the new creation-claim fence writes a durable
+guard even when its queue is empty. The failed preservation check and all complete
+artifacts remain private and unchanged; it is not reported as a clean delivery.
+
+One assertion added to the same existing causal deletion case fails first in
+2.669 seconds on an empty claim adding a row. A conditional guard INSERT now runs
+only for a genuinely selected create lease, keeping the same transaction and
+tombstone predicate. The case, including its actual nonempty creation claim,
+passes in 2.722 seconds after one correction. Selected-file formatting and lint
+pass. No new top-level case, data deletion or full gate rerun occurs. The single
+21.018-second workspace gate above predates this focused live correction;
+it is not claimed as a new clean full gate for the corrected source.
+
+Corrective Dev delivery and idle-poll stability are the next evidence step.
+Ordinary admission remains closed. No API-managed deletion or physical disposal
+is claimed. The separately held backup, native and birth qualification workflows
+are not resumed, and the full v1 objective remains open.

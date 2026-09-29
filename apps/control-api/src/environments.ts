@@ -1473,12 +1473,13 @@ async function claimOperation(
           AND EXISTS (SELECT 1 FROM environments e WHERE e.id=operations.environment_id AND ${environmentNotDeleting("e")}) RETURNING *`,
         )
         .bind(hash, expiresAt, regionId, now, regionId, now),
-      assertion(
-        db,
-        `NOT EXISTS (SELECT 1 FROM operations o WHERE o.lease_token_hash=? AND o.region_id=? AND o.status='running'
-          AND NOT EXISTS (SELECT 1 FROM environments e WHERE e.id=o.environment_id AND ${environmentNotDeleting("e")}))`,
-        [hash, regionId],
-      ),
+      db
+        .prepare(
+          `INSERT INTO accounting_assertions (id, ok)
+          SELECT ?, CASE WHEN EXISTS (SELECT 1 FROM environments e WHERE e.id=o.environment_id AND ${environmentNotDeleting("e")}) THEN 1 ELSE 0 END
+          FROM operations o WHERE o.lease_token_hash=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'`,
+        )
+        .bind(crypto.randomUUID(), hash, regionId),
       db
         .prepare(
           `UPDATE environments AS e SET status = 'provisioning'
