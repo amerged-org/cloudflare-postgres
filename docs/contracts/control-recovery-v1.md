@@ -12,17 +12,29 @@ One bounded read captures that schema, every canonical application table, the
 known D1 migration table and application AUTOINCREMENT high-water marks. It
 excludes Cloudflare/provider-internal tables. Schema drift, unknown application
 tables, missing migration history or incompatible source versions fail capture.
+The read is one ordered, read-only SQL statement returning multiple rows:
+schema and sequence count packets, a count marker for every table including
+empty ones, individually numbered data rows, and a terminal marker. Missing,
+duplicate, reordered or truncated results fail before any archive is sealed.
+Separate paged reads are not treated as one consistent snapshot.
 
 Cells retain their SQLite storage class: integer decimal strings, real strings,
 text, BLOB hex and null. No large integer passes through JavaScript number
-rounding. Deterministic row ordering supports exact reconstruction checks.
+rounding. Compact typed pairs are used only in the result transport; the
+authenticated v1 archive retains the original typed-cell objects and digest.
+Deterministic row ordering supports exact reconstruction checks.
 The statement is limited to 99,000 bytes, retaining 1,000 bytes below the
 [D1 SQL statement limit](https://developers.cloudflare.com/d1/platform/limits/).
-The D1 adapter also enforces the
-provider's 2,000,000-byte maximum returned string, with no more than 32 columns
-per application table. The offline snapshot envelope is limited to 8 MiB,
-128 tables and 100,000 rows. Exceeding any bound fails the operation; there is no truncated or
-multi-request fallback claiming a consistent snapshot.
+The current 16-migration statement is 89,572 bytes. The D1 adapter bounds its
+entire CLI output to 16 MiB; the decoder bounds every returned payload to
+2,000,000 bytes and accepts no more than 32 columns per application table.
+The offline snapshot envelope is limited to 8 MiB, 128 tables and 100,000
+application rows. Exceeding any bound fails the operation; there is no
+truncated or multi-request fallback claiming a consistent snapshot. An
+individual very large source value may expand beyond D1's row/string limit
+when encoded and must fail closed. The complete result, 30-second provider
+query deadline and concurrent-writer behavior require a live D1 qualification;
+the offline 10,000-project fixture does not establish them.
 
 The D1 adapter uses the adopter's authenticated Wrangler session, an explicit
 account, a private strict JSON configuration and an empty environment file. Its

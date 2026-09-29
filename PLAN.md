@@ -15,11 +15,14 @@ the authorized dashboard and exact schema readback.
 The [10,000-project feasibility checkpoint](docs/evidence/m3-scale-10000-projects-2026-09-29.md)
 sets a distinct logical-project scale target. A single offline metadata-only
 snapshot with 10,001 projects returned a 2,576,706-byte JSON string, exceeding
-D1's documented 2,000,000-byte string/row limit. The current one-row control
-recovery is therefore unqualified for that target, regardless of the shorter
-SQL statement. Consistent multi-part recovery, measured D1 throughput and,
-where needed, sharded control state are explicit gates. Ten thousand active
-PostgreSQL environments require a separate fleet and storage-capacity proof.
+D1's documented 2,000,000-byte string/row limit. The control-recovery reader
+now uses one ordered multirow statement with completeness markers; a local
+10,001-project fixture seals and restores the unchanged encrypted archive
+exactly. Live D1 result delivery, concurrent-write behavior, measured throughput
+and, where needed, sharded control state remain explicit gates. The 8 MiB
+archive bound still requires a future chunked design for denser workloads.
+Ten thousand active PostgreSQL environments require a separate fleet and
+storage-capacity proof.
 
 ## 1. Product scope and decisions
 
