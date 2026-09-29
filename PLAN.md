@@ -513,13 +513,18 @@ The [private native-access preflight](docs/evidence/m3-private-native-access-pre
 prepares an opt-in protected application ingress and scoped internal endpoint API.
 All three new cases fail first and pass on implementation attempt one; independent
 source/contract review passes. The one canonical gate stops in 9.896 seconds on
-two Worker fixture type errors after passing format and lint. Broad Vitest/Node
-stages remain unrun; the isolated candidate stays sealed, unmerged and undeployed.
-A one-file fixture-only repair is prepared but unapplied. There is no second gate,
-native profile activation, customer admission or resumption of held qualifications.
-Actual controller permission capture corrects an initial Pod GET assumption;
-four narrowly scoped read capabilities remain unapplied. Packet/TLS/SQL and
-end-to-end customer qualification remain gates.
+two Worker fixture type errors after passing format and lint. That failed gate is
+preserved. The [subsequent delivery](docs/evidence/m3-private-native-access-delivery-2026-09-29.md)
+applies only the prepared test correction, passes its named checks and previously
+unrun stages (28 Worker, 45 Node; six unchanged Go retained, 79 total evidence).
+Source `811153c`, one Dev Worker deployment, four guarded read capabilities and
+one verified regional image import/rollout are delivered. All 66 compiled modules,
+eight Secret names, dashboard D1 counts, Node/other Pods/volumes/SQL and every
+4,096 journal entry are verified. CLI D1 query 7403 remains unresolved; successful
+authenticated dashboard reads supply independent before/after evidence without
+new credentials or permissions. There is no second full gate, native profile
+activation, customer admission, fabricated authority or held-case resumption.
+Packet/TLS/SQL, public routing and end-to-end customer qualification remain gates.
 
 The [Cloudflare private-path assessment](docs/research/cloudflare-private-native-path-2026-09-29.md)
 records the documented Hyperdrive/Workers VPC/Tunnel integration and its current

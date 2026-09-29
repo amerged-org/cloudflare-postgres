@@ -1,7 +1,10 @@
 # Private native access: stopped source candidate
 
-Status: isolated implementation candidate, not merged, published as product
-source, deployed or activated. Existing Dev admission remains closed. The
+Status: historical stopped preflight. The [subsequent delivery](m3-private-native-access-delivery-2026-09-29.md)
+records its fixture-only repair, source publication and Dev installation while
+retaining the original failed gate below. At this checkpoint, the isolated
+candidate was not merged, published as product source, deployed or activated.
+Existing Dev admission remains closed. The
 candidate adds actual private application ingress and scoped endpoint discovery;
 it does not complete the public PostgreSQL pilot or gateway.
 
