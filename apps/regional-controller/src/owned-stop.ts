@@ -270,6 +270,8 @@ function patchGuards(
 
 // This helper changes only the sealed owned compute. It does not settle usage,
 // grant execution, restore replicas, or reset any caller's durable journal.
+// Success is Kubernetes convergence only: API Pod absence cannot prove that
+// node processes ended. Durable node-backed stop qualification remains required.
 export async function stopOwnedRuntime(
   runtime: AllowanceRuntime,
   binding: RuntimeBinding,

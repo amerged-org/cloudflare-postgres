@@ -84,3 +84,7 @@ These entries are **not selected for the default v1 stack and not integrated**.
 7. Replace moving-branch evidence with pinned-release references when adopting a component, and revisit licensing when upgrading.
 
 Cloudflare and Contabo are deployment/service providers, not bundled open-source components. Their service terms and operational capabilities are separate from the licenses above. V1 self-hosting requires the adopter's own Cloudflare account; Workers, D1, Durable Objects, R2, and secret bindings are managed-service dependencies, not Apache-licensed software shipped by this repository.
+
+## Direct node runtime observation
+
+The first-party [node-runtime observer](apps/node-runtime-observer/README.md) uses unmodified `k8s.io/cri-client` and `k8s.io/cri-api` `v0.36.3`, both [Apache-2.0](https://github.com/kubernetes/cri-client/blob/v0.36.3/LICENSE), through three narrow observation methods and the upstream read-only Version handshake. Its [module inventory](apps/node-runtime-observer/THIRD_PARTY.md) records dependency/checksum and pinned build-image boundaries. Socket access remains trusted node-administration authority; code restricts behavior, not host permission. Complete stop/lifetime accounting integration is not implemented.

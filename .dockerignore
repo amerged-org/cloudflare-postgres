@@ -13,3 +13,13 @@
 !apps/regional-controller/Dockerfile
 !apps/regional-controller/src/
 !apps/regional-controller/src/**
+!apps/node-runtime-observer/
+!apps/node-runtime-observer/go.mod
+!apps/node-runtime-observer/go.sum
+!apps/node-runtime-observer/Dockerfile
+!apps/node-runtime-observer/THIRD_PARTY.md
+!apps/node-runtime-observer/observer/
+!apps/node-runtime-observer/observer/**
+!apps/node-runtime-observer/cmd/
+!apps/node-runtime-observer/cmd/**
+!apps/node-runtime-observer/collect-notices.sh

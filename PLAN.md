@@ -390,6 +390,8 @@ After freezing the final candidate, run the full gate **exactly once**: format, 
 
 Documentation-only work checks the edited documents, links, and diff; do not invent runtime tests or package tooling just to test prose. The executable workspace gate is for frozen runtime candidates, not a reason to rerun all tests for document edits.
 
+For the Go node-runtime observer, the frozen candidate also runs `pnpm check:node-runtime` once: formatting, vet and the three bounded concrete cases. This does not add matrix cases or repeat the workspace gate. During iteration, explicitly select the named observer cases.
+
 ### Mandatory stop conditions
 
 Stop and report instead of widening the change when any of the following occurs:
