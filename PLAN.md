@@ -391,6 +391,15 @@ The [Pod birth admission candidate](docs/evidence/m6-pod-birth-held-2026-09-29.m
 
 ## 10. Bounded TDD and verification discipline
 
+The [budget history candidate checkpoint](docs/evidence/m3-budget-history-held-2026-09-29.md)
+records confirmed Dev Contabo Worker Secret names and a narrowly scoped M3 read API
+draft. Two new targeted Worker cases pass after meaningful failures; a read-only
+live case demonstrates the old route's absence. Its single frozen gate stops at
+strict typecheck after format/lint pass. The source, migration and contract remain
+sealed locally without merge or deployment; the next narrow type correction
+requires an explicit exception to that final-gate stop rule. No runtime budget
+enforcement, customer inventory change or milestone completion is claimed.
+
 Use test-driven development for concrete behavior changes: identify the intended behavior or observed defect, demonstrate a meaningful failing test, implement the smallest complete correction, and check the affected behavior again. Keep the task scope fixed; tests are evidence for that change, not a reason to build additional features or infrastructure.
 
 ### Test budget and red-first proof
