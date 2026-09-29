@@ -9,6 +9,7 @@
     "build:regional": "pnpm --filter @cloudflare-postgres/regional-controller build",
     "vitest": "pnpm --filter @cloudflare-postgres/control-api exec vitest",
     "test:node": "node --test 'apps/**/*.node.test.mjs'",
-    "check:node-runtime": "cd apps/node-runtime-observer && test -z \"$(gofmt -l observer cmd)\" && go vet ./observer ./cmd/node-runtime-observer && go test ./observer ./cmd/node-runtime-observer -count=1 -timeout=90s"
+    "check:node-runtime": "cd apps/node-runtime-observer && test -z \"$(gofmt -l observer cmd)\" && go vet ./observer ./cmd/node-runtime-observer && go test ./observer ./cmd/node-runtime-observer -count=1 -timeout=90s",
+    "check:execution-guard": "cd apps/execution-guard && test -z \"$(gofmt -l .)\" && go vet ./... && go test ./... -count=1 -timeout=90s"
   }
 }

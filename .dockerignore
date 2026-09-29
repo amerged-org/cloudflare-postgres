@@ -23,3 +23,11 @@
 !apps/node-runtime-observer/cmd/
 !apps/node-runtime-observer/cmd/**
 !apps/node-runtime-observer/collect-notices.sh
+!apps/execution-guard/
+!apps/execution-guard/go.mod
+!apps/execution-guard/go.sum
+!apps/execution-guard/Dockerfile
+!apps/execution-guard/THIRD_PARTY.md
+!apps/execution-guard/*.go
+!apps/execution-guard/cmd/
+!apps/execution-guard/cmd/**

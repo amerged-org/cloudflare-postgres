@@ -383,6 +383,8 @@ The [node runtime transport checkpoint](docs/evidence/m6-node-runtime-transport-
 
 The [runtime image identity repair](docs/evidence/m6-runtime-imageid-repair-2026-09-29.md) addresses a concrete post-rollout mismatch: repository-index-pinned Pods report the exact index reference rather than only the configuration digest. One existing case fails first and passes the narrow correction; no cases are added. Its separate frozen workspace gate passes once, with unchanged Go evidence retained. The corrected source is deployed; exactly one protected resident CLI invocation reports 59 containers and 37 sandboxes with validated identities, and all pre-existing resources remain unchanged. Original-cohort completeness, a durable node-local start/restart fence or quiescence acknowledgement, independent expiry and final accounting remain open.
 
+The [local execution deadline guard](docs/evidence/m6-execution-guard-2026-09-29.md) wraps the unchanged manager command with an immutable boot/run window, absolute CLOCK_BOOTTIME expiry and complete private-namespace cleanup. Two Go cases and one real Linux case fail first, then pass; the single frozen gate passes, with 63 automated cases plus the Linux qualification and no matrix growth. It is not yet activated for CNPG: secure funded renewal/admission, native retained-Pod acknowledgements, Pooler/sidecar coverage and final accounting remain required. The next physical-stop path retains each Pod UID before deletion, validates complete kubelet container termination plus original-node CRI evidence, and durably records each acknowledgement before releasing only its retention finalizer; phase alone is insufficient.
+
 ## 10. Bounded TDD and verification discipline
 
 Use test-driven development for concrete behavior changes: identify the intended behavior or observed defect, demonstrate a meaningful failing test, implement the smallest complete correction, and check the affected behavior again. Keep the task scope fixed; tests are evidence for that change, not a reason to build additional features or infrastructure.
@@ -402,7 +404,7 @@ After freezing the final candidate, run the full gate **exactly once**: format, 
 
 Documentation-only work checks the edited documents, links, and diff; do not invent runtime tests or package tooling just to test prose. The executable workspace gate is for frozen runtime candidates, not a reason to rerun all tests for document edits.
 
-For the Go node-runtime observer, the frozen candidate also runs `pnpm check:node-runtime` once: formatting, vet and its bounded concrete cases, including command behavior when changed. This does not add matrix cases or repeat the workspace gate. During iteration, explicitly select the named observer cases.
+For the Go node-runtime observer, the frozen candidate also runs `pnpm check:node-runtime` once: formatting, vet and its bounded concrete cases, including command behavior when changed. This does not add matrix cases or repeat the workspace gate. During iteration, explicitly select the named observer cases. The separate execution guard uses `pnpm check:execution-guard` once when that component changes; unchanged observer cases retain their earlier evidence.
 
 ### Mandatory stop conditions
 
