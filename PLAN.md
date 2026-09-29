@@ -4,6 +4,14 @@ Status: revised approved direction, updated 2026-09-29. M0 is complete. M1 has l
 
 This file is the canonical scope and roadmap. README.md summarizes it; AGENTS.md is the 25-line contributor brief; THIRD_PARTY.md records component provenance and adoption status. A documented target is not evidence of implemented behavior.
 
+The [manual backup Dev checkpoint](docs/evidence/m3-manual-backups-2026-09-29.md)
+now includes public source, verified additive migration `0015` and a Dev Worker/
+regional image delivery with the executor disabled. Operator-reported artifacts,
+real archive upload, WAL continuity, independent restore, PITR and retention
+remain unverified. No API-managed customer environment or Backup resource was
+created. CLI D1 query authorization still fails with `7403`; Dev migration used
+the authorized dashboard and exact schema readback.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.
