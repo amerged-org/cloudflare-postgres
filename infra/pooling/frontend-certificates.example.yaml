@@ -1,0 +1,62 @@
+# Example only: replace namespace and Pooler DNS names before applying.
+# Independent frontend trust keeps the PostgreSQL Cluster certificate unchanged.
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: pgcf-pooler-selfsigned
+  namespace: pgcf-example
+spec:
+  selfSigned: {}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pgcf-pooler-ca
+  namespace: pgcf-example
+spec:
+  isCA: true
+  commonName: pgcf-pooler-ca
+  secretName: pgcf-pooler-ca
+  duration: 8760h
+  renewBefore: 720h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  issuerRef:
+    name: pgcf-pooler-selfsigned
+    kind: Issuer
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: pgcf-pooler-ca
+  namespace: pgcf-example
+spec:
+  ca:
+    secretName: pgcf-pooler-ca
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: pgcf-session-rw
+  namespace: pgcf-example
+spec:
+  secretName: pgcf-session-rw-tls
+  duration: 2160h
+  renewBefore: 360h
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+  dnsNames:
+    - pgcf-session-rw
+    - pgcf-session-rw.pgcf-example
+    - pgcf-session-rw.pgcf-example.svc
+    - pgcf-session-rw.pgcf-example.svc.cluster.local
+  issuerRef:
+    name: pgcf-pooler-ca
+    kind: Issuer

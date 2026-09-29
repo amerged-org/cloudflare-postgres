@@ -9,3 +9,5 @@ The baseline is still a lab-qualified configuration, not a production installati
 The [backup/recovery recipe](backups/README.md) prepares ordinary CNPG/Barman resources with private credentials, separate archive identities and explicit evidence gates. The [latest backup preflight](../docs/evidence/m1-backup-preflight-2026-09-29.md) verifies the existing manual plugin, storage/request feasibility and accepted dry-run API shapes; no database backup or restore is enabled by those checks.
 
 An adopter must select its own region inventory, maintenance policy, storage allocation, management access rules, object-store credentials and recovery objectives. Values particular to an installation stay in its ignored local state or private deployment repository. Do not commit generated Talos files or Kubernetes Secrets to this public repository.
+
+The opt-in [CNPG session pooling recipe](pooling/README.md) and its [live lab evidence](../docs/evidence/m2-native-pooling-2026-09-29.md) cover internal TLS, transactions and cancellation. Automatic environment policy, endpoint publication, network/quota/metering/stop integration and production acceptance remain separate gates.
