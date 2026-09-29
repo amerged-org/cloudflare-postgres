@@ -3,6 +3,7 @@ import {
   ApiException,
   AppsV1Api,
   CoreV1Api,
+  DiscoveryV1Api,
   CustomObjectsApi,
   KubeConfig,
   NetworkingV1Api,
@@ -130,6 +131,7 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
   else throw new Error("explicit_kubeconfig_required");
   const core = config.makeApiClient(CoreV1Api);
   const apps = config.makeApiClient(AppsV1Api);
+  const discovery = config.makeApiClient(DiscoveryV1Api);
   const network = config.makeApiClient(NetworkingV1Api);
   const custom = config.makeApiClient(CustomObjectsApi);
   return {
@@ -137,6 +139,24 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
       try {
         let resource: unknown;
         switch (kind) {
+          case "Service":
+            resource = await core.readNamespacedService(
+              { namespace, name },
+              requestOptions,
+            );
+            break;
+          case "ServiceAccount":
+            resource = await core.readNamespacedServiceAccount(
+              { namespace, name },
+              requestOptions,
+            );
+            break;
+          case "Pod":
+            resource = await core.readNamespacedPod(
+              { namespace, name },
+              requestOptions,
+            );
+            break;
           case "ConfigMap":
             resource = await core.readNamespacedConfigMap(
               { namespace, name },
@@ -255,6 +275,66 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
         requestOptions,
       );
       return secret.data ?? {};
+    },
+    async readPublicCertificate(namespace, name, key) {
+      if (
+        !/^pgcf-[a-f0-9]{32}$/.test(namespace) ||
+        !/^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$/.test(name) ||
+        !["ca.crt", "tls.crt"].includes(key)
+      )
+        throw new Error("native_certificate_scope_invalid");
+      try {
+        const secret = await core.readNamespacedSecret(
+          { namespace, name },
+          requestOptions,
+        );
+        // Secrets can contain ca.key/tls.key and last-applied payloads. Expose
+        // only public certificate bytes and the ownership/version projection.
+        return {
+          apiVersion: "v1",
+          kind: "Secret",
+          metadata: {
+            name: secret.metadata!.name!,
+            namespace: secret.metadata!.namespace,
+            uid: secret.metadata!.uid,
+            resourceVersion: secret.metadata!.resourceVersion,
+            deletionTimestamp:
+              secret.metadata!.deletionTimestamp?.toISOString(),
+            ownerReferences: secret.metadata!.ownerReferences,
+          },
+          data: { [key]: secret.data?.[key] ?? "" },
+        };
+      } catch (error) {
+        if (error instanceof ApiException && error.code === 404) return null;
+        throw error;
+      }
+    },
+    async listEndpointSlices(namespace, serviceName) {
+      if (
+        !/^pgcf-[a-f0-9]{32}$/.test(namespace) ||
+        serviceName !== "database-rw"
+      )
+        throw new Error("native_endpoint_scope_invalid");
+      const budget: InventoryBudget = {
+        remainingRequests: 10,
+        remainingResources: 1000,
+        deadline: Date.now() + 30_000,
+      };
+      return inventoryPages(
+        (_continue) =>
+          discovery.listNamespacedEndpointSlice(
+            {
+              namespace,
+              labelSelector: "kubernetes.io/service-name=database-rw",
+              limit: 100,
+              _continue,
+            },
+            requestOptions,
+          ),
+        "EndpointSlice",
+        "discovery.k8s.io/v1",
+        budget,
+      );
     },
     async listNodes() {
       const budget: InventoryBudget = {

@@ -18,6 +18,7 @@ import { DatabaseClient } from "./database-client.ts";
 import { databaseKubernetesFromConfig } from "./database-kubernetes.ts";
 import { runDatabaseController } from "./database-controller.ts";
 import { postgresDatabaseVerifier } from "./database-postgres.ts";
+import { validNativeClientProfiles } from "./native-access.ts";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -102,7 +103,8 @@ async function main(): Promise<void> {
     !config.operatorPodLabels ||
     typeof config.operatorPodLabels !== "object" ||
     !Array.isArray(config.allowedBackupSecrets) ||
-    !validRoleConfig(config.roleVerifier)
+    !validRoleConfig(config.roleVerifier) ||
+    !validNativeClientProfiles(config.nativeClientProfiles)
   ) {
     throw new Error("invalid_regional_configuration");
   }

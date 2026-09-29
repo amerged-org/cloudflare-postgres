@@ -29,6 +29,42 @@ export interface PoolingPolicy {
   };
 }
 
+export interface NativeAccessPolicy {
+  version: 1;
+  clientProfileId: string;
+}
+export interface NativeClientProfile {
+  id: string;
+  namespace: string;
+  namespaceUid: string;
+  serviceAccount: string;
+  serviceAccountUid: string;
+}
+export interface NativeConnectionObservation {
+  version: 1;
+  visibility: "private";
+  mode: "direct";
+  clientProfileId: string;
+  namespaceUid: string;
+  clusterUid: string;
+  clusterGeneration: number;
+  specHash: string;
+  serviceUid: string;
+  serviceResourceVersion: string;
+  primaryPodUid: string;
+  endpointSliceUid: string;
+  policyUid: string;
+  host: string;
+  port: 5432;
+  caCertificate: string;
+  caCertificateSha256: string;
+  serverCertificateSha256: string;
+  caValidFrom: string;
+  caValidUntil: string;
+  serverValidUntil: string;
+  observedAt: string;
+}
+
 export interface ExecutionSpec {
   name: string;
   regionId: string;
@@ -48,6 +84,7 @@ export interface ExecutionSpec {
     };
     instances: number;
     pooling?: PoolingPolicy;
+    nativeAccess?: NativeAccessPolicy;
     executionFencing?: { version: 1 };
     nodeTracking?: { version: 1 };
     backup: {
@@ -75,6 +112,7 @@ export interface Claim {
 }
 
 export interface RegionalConfig {
+  nativeClientProfiles?: NativeClientProfile[];
   nodeTrackingJournalPath?: string;
   operatorNamespace: string;
   operatorPodLabels: Record<string, string>;
@@ -105,7 +143,23 @@ export interface Resource {
   spec?: Record<string, unknown>;
   immutable?: boolean;
   data?: Record<string, string>;
+  addressType?: string;
+  ports?: { name?: string; protocol?: string; port?: number }[];
+  endpoints?: {
+    addresses?: string[];
+    conditions?: { ready?: boolean; serving?: boolean; terminating?: boolean };
+    targetRef?: {
+      apiVersion?: string;
+      kind?: string;
+      name?: string;
+      namespace?: string;
+      uid?: string;
+    };
+  }[];
   status?: {
+    podIP?: string;
+    writeService?: string;
+    certificates?: { serverCASecret?: string; serverTLSSecret?: string };
     nodeInfo?: { bootID?: string };
     phase?: string;
     image?: string;
@@ -163,9 +217,19 @@ export interface Kubernetes {
   executionPreflight?(
     namespace: string,
   ): Promise<{ pods: Resource[]; clusters: Resource[]; poolers: Resource[] }>;
+  listEndpointSlices?(
+    namespace: string,
+    serviceName: string,
+  ): Promise<Resource[]>;
+  readPublicCertificate?(
+    namespace: string,
+    name: string,
+    key: "ca.crt" | "tls.crt",
+  ): Promise<Resource | null>;
 }
 
 export interface Observation {
+  nativeConnection?: NativeConnectionObservation;
   clusterUid: string;
   clusterGeneration: number;
   readyInstances: number;

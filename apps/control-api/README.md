@@ -29,7 +29,7 @@ Send `POST /v1/organizations` with `Authorization: Bearer <installation bootstra
 
 If the bootstrap response is lost after the database commits, use the installation token to call `GET /v1/organizations` and find the new organization. Results are newest first, with 1000 entries per page by default; `limit` accepts 1–1000. Follow each non-null `nextCursor` as the `cursor` query parameter until the target appears or `nextCursor` is null. The cursor advances by creation time and ID; concurrent creations or deletions can change later pages. Invalid pagination parameters return `400 invalid_request`. Then call `POST /v1/organizations/{organizationId}/tokens/reissue`. The response reveals a replacement token once and revokes every previously active token for that organization. A repeated reissue creates another replacement and invalidates the previous one; keep the final successful response. These installation routes never accept an ordinary organization token.
 
-Organization, project, and environment JSON bodies are limited to 4096 UTF-8 bytes, including when the caller omits `Content-Length`. The installation-only catalog publication route allows 16384 bytes and at most 16 profiles; accounting routes allow 8192 bytes. Oversized or invalid bodies return `400 invalid_request` without buffering the full request.
+Organization, project, and environment JSON bodies are limited to 4096 UTF-8 bytes, including when the caller omits `Content-Length`. The installation-only catalog publication route allows 16384 bytes and at most 16 profiles; environment execution results allow 16384 bytes for bounded public CA metadata; accounting routes allow 8192 bytes. Oversized or invalid bodies return `400 invalid_request` without buffering the full request.
 
 Send `POST /v1/organizations/{organizationId}/projects` with the organization token, JSON `{ "name": "..." }`, and an `Idempotency-Key` of 1–128 ASCII letters, digits, `.`, `_`, `~`, or `-`. A successful `201` response contains an `active` logical project and a `succeeded` `project.create` audit operation, with `observedAt` and `resultCode: logical_container_created`. The same key and same request return the same IDs and `201` response for a completed pair. An unmatched legacy `pending`/`queued` pair instead returns `202` with its original IDs and requires operator review. Reusing the key with a different name returns `409 idempotency_conflict`. Idempotency records currently have no expiry. D1 inserts the project, completed operation, and idempotency identity in one atomic batch, so a failed insert does not leave an orphan.
 
@@ -59,7 +59,7 @@ This zero-count check is separate from the preflight review of unmatched states;
 
 Use the organization token to read `GET /v1/organizations/{organizationId}/projects/{projectId}` and `GET /v1/organizations/{organizationId}/operations/{operationId}`. Token lookup and resource reads use the D1 primary. Missing or invalid tokens return `401`; a valid token for another organization receives `404`. All API responses set `Cache-Control: no-store`. The [OpenAPI contract](openapi.yaml) records request and response shapes.
 
-The current slice has no public native endpoint, customer database credentials, environment listing/deletion/resize, runtime usage collector, runtime allowance enforcer, idempotency archival, or rate limiting. A reported ready environment means the regional executor observed PostgreSQL resource readiness; it does not prove backups, restore qualification, credential access, or a production service objective.
+The current slice has no public native endpoint, environment deletion/resize, integrated runtime allowance enforcer, idempotency archival, or rate limiting. Opted-in private endpoint discovery and scoped credentials are separate metadata and credential paths. A reported ready environment means the regional executor observed PostgreSQL resource readiness; it does not prove backups, restore qualification, credential access, or a production service objective.
 
 ## Opt-in execution fencing
 
@@ -76,6 +76,45 @@ The regional executor seals workload/volume identities before quota/Pooler/Clust
 An installation operator may append the exact version-one session `pooling` policy to a new immutable catalog profile. It is exposed publicly as nonsecret configuration and frozen in the environment specification; historical unpooled profiles and hashes remain unchanged. The [managed-pooling contract](../../docs/contracts/managed-pooling-v1.md) defines image/resource/connection/timeout bounds, derived CNPG certificate names and a single RW/Recreate Pooler.
 
 A pooled environment result requires the additional owned Pooler/Deployment readiness observation. The existing role API accepts that observation without changing ordinary credential or privilege rules. This describes internal provisioning, not an external endpoint or successful SQL connection. Normal Pooler accounting/stopping needs the separately configured regional modes and independently bound resource identities. API-managed TLS/SQL, network isolation and integrated budget enforcement remain qualification gates.
+
+## Optional private native connection discovery
+
+An installation-owned catalog profile can opt into exactly
+`nativeAccess: {version: 1, clientProfileId: "private-application"}`. The regional
+configuration independently binds that opaque ID to an existing approved client
+Namespace and ServiceAccount, including their UIDs. Customers select only the
+catalog/profile; they cannot provide network selectors or backend URLs. Omitted
+legacy profiles, serialized specifications and hashes remain unchanged.
+
+`GET /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/connections`
+requires the owner's `projects:read` token and accepts no query parameters. It
+returns a direct private service host, port 5432, `sslmode: verify-full`, public CA
+and bound provisioning identities. Passwords and Secret references are omitted;
+roles/databases continue using their existing separate credential routes. The
+response uses `Cache-Control: no-store`. Legacy/unconfigured profiles, malformed
+proofs, unavailable reported CA validity, inactive projects/regions, nonrunning
+runtime, and requested budget pause return `409 native_connection_unavailable`.
+Foreign resources return 404. Current actor and scope/state are rechecked in a
+primary transaction before disclosure.
+
+The authenticated regional executor verifies the owned RW Service, ready primary,
+EndpointSlice, CA/server certificate chain, server purpose/host and exact client
+policy resources before reporting its existing fenced provisioning result. The
+Worker validates the bounded public proof, derived host, frozen spec/profile and
+cluster identity, CA hash and reported validity intervals. It does not independently
+query Kubernetes or parse/verify X509 signatures. `observedAt` and
+`observationScope: provisioning` explicitly describe historical provisioning
+material, not current SQL availability, policy realization or permission to wake.
+The CA must remain valid; `serverCertificateSha256` and `serverValidUntil` record
+the leaf observed at provisioning. CNPG leaf renewal does not change authority,
+and the client must verify the live server certificate with the returned CA and
+host on each connection. No freshness TTL turns this one-time observation into a
+permanently unavailable endpoint.
+
+This slice exposes no public TCP gateway and does not change admission, budget
+`runtimeEnforced`, or physical stop/expiry qualification. The approved client must
+already possess private network access; actual managed TLS/SQL and policy
+realization remain separate evidence gates.
 
 ## Customer role and database lifecycle
 
@@ -152,7 +191,7 @@ The [regional controller](../regional-controller/README.md) uses its region toke
 2. `POST /v1/regions/{regionId}/operations/{operationId}/renew` with `leaseToken`, `leaseEpoch`, and `leaseSeconds` extends an unexpired current lease. An expired or replaced epoch returns `409 lease_conflict`.
 3. `POST /v1/regions/{regionId}/operations/{operationId}/result` submits `leaseToken`, `leaseEpoch`, `status`, `resultCode`, and `observation`. A ready result uses `status: ready`, `resultCode: cnpg_ready`, and `{ clusterUid, clusterGeneration, readyInstances }`; the count must reach the frozen profile's instance count. A failed result uses `status: failed`, `observation: null`, and `ownership_mismatch`, `spec_conflict`, or `reconcile_failed`. The operation and environment transition together in a conditional D1 batch. Stale, expired, and cross-region results cannot complete it. The identical terminal result under the same winning lease can be retried after a lost response; changing that result is a conflict.
 
-The Worker trusts the authenticated executor's Kubernetes observations and does not independently probe Kubernetes. An executor must verify immutable ownership/spec identity, current CNPG generation, and actual owned PostgreSQL Pod readiness before reporting success. A controller restart or uncertain Kubernetes create must reconcile deterministic environment resources instead of creating another namespace. Private claims contain internal configuration and must not be returned to customer clients or written to public logs. A ready result issues no credentials or usable external endpoint in this slice.
+The Worker trusts the authenticated executor's Kubernetes observations and does not independently probe Kubernetes. An executor must verify immutable ownership/spec identity, current CNPG generation, and actual owned PostgreSQL Pod readiness before reporting success. A controller restart or uncertain Kubernetes create must reconcile deterministic environment resources instead of creating another namespace. Private claims contain internal configuration and must not be returned to customer clients or written to public logs. A ready result issues no credentials or public endpoint; an opted-in native profile can supply separately discoverable private endpoint metadata.
 
 ## Usage ledger and exports
 
