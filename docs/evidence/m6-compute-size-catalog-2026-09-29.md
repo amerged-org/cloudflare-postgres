@@ -47,3 +47,19 @@ again. `.env.local` and `apps/control-api/.dev.vars` remained byte-identical,
 ignored, untracked and mode 0600. `AGENTS.md` remained byte-identical at exactly
 25 lines. No customer environment, size change, archive credential or node
 operation was created during this source qualification.
+
+## Public source and Dev control API
+
+Commit [`6ec60d7`](https://github.com/amerged-org/cloudflare-postgres/commit/6ec60d776f903281ac1b7c1ef0b9923b6ee129c2)
+publishes the source, OpenAPI schema, contract and test. The remote main commit
+and three public blob hashes were read back. One Wrangler dry run and one
+`--keep-vars` deployment used the existing Dev account and D1 binding; the new
+Worker version received 100% of traffic. The same eight Secret names/types were
+present before and after deployment; their values were not read or changed.
+Four read-only scoped HTTP probes passed without creating resources.
+
+This slice adds no D1 migration, Dev catalog record, customer environment,
+regional image, R2 credential, Kubernetes right or physical scaling operation.
+Existing admission remains closed. The Worker can validate and retain the new
+optional policy when an installation operator publishes a future catalog
+version. It does not currently resize or automatically scale a database.

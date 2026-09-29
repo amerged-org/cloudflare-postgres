@@ -219,7 +219,8 @@ The original R2 reporter in [issue #411](https://github.com/cloudnative-pg/plugi
 The [compute scaling contract](docs/contracts/compute-scaling-v1.md) preserves
 the immutable environment identity while adding an operator-approved size ladder
 and, later, separate desired/effective compute revisions. The first source slice
-only publishes validated size choices in a new immutable catalog version. Manual
+allows an operator to publish validated size choices in a new immutable catalog
+version; no such Dev catalog has been published yet. Manual
 resize still requires a leased, idempotent operation with target funding and
 capacity reservations, bounded quota/Cluster patches, effective Pod-resource
 readback, and collision locks for suspend and backup. Automatic scaling adds
