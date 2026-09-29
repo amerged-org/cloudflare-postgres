@@ -444,6 +444,19 @@ zero accepted facts and closed admission. Unreconciled saturated usage remains
 an accounting/admission gate. This is not native traffic isolation, final usage
 or runtime budget enforcement, and no held workflow is resumed.
 
+The [complete usage-journal custody checkpoint](docs/evidence/m3-usage-journal-custody-2026-09-29.md)
+traces all 4,096 refused facts to a noncanonical prior Pod-retirement fixture and
+its preserved Released/Retain volume. Actual HTTP 404, matching active meter/
+source/epoch and zero D1 environments establish the authority gap; no customer
+mapping or weak acknowledgement is fabricated. A generic explicit full SQLite
+snapshot lane passes two meaningful red-first cases and one final gate with 72
+automated cases including six unchanged Go cases. One live 3,076,096-byte snapshot
+is verified off-node with exact nine-table schema, identity, integrity, queue
+hashes and preserved original infrastructure/SQL state. The snapshot stays
+inactive. The original queue/volume remain retained; explicit evidence disposition,
+qualification ownership, delivery visibility, scheduled custody, node-loss recovery
+and fenced replay remain open before customer admission.
+
 The [remote control archive checkpoint](docs/evidence/m3-control-archive-2026-09-29.md)
 qualifies one upload of the existing encrypted bundle into the private EU R2
 bucket, exact remote download and offline reconstruction from those downloaded
