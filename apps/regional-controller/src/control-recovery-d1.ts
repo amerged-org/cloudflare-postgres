@@ -3,7 +3,7 @@ import { spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { chmod, lstat, mkdtemp, open, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
-import { captureControlSnapshot } from "./control-snapshot.ts";
+import { captureControlSnapshotRows } from "./control-snapshot.ts";
 import type { ControlSnapshot } from "./control-snapshot.ts";
 
 export interface ControlRecoveryD1Config {
@@ -181,7 +181,7 @@ async function query(
   working: string,
   sql: string,
   cancellation?: AbortSignal,
-): Promise<string> {
+): Promise<unknown[]> {
   if (
     typeof sql !== "string" ||
     Buffer.byteLength(sql, "utf8") > 100_000 ||
@@ -265,14 +265,11 @@ async function query(
     !object(response[0]) ||
     response[0].success !== true ||
     !Array.isArray(response[0].results) ||
-    response[0].results.length !== 1 ||
-    !object(response[0].results[0]) ||
-    Object.keys(response[0].results[0]).length !== 1 ||
-    typeof response[0].results[0].snapshot_json !== "string" ||
-    Buffer.byteLength(response[0].results[0].snapshot_json, "utf8") > 2_000_000
+    response[0].results.length < 1 ||
+    response[0].results.length > 100131
   )
     throw failed();
-  return response[0].results[0].snapshot_json;
+  return response[0].results;
 }
 
 export async function captureD1(
@@ -299,7 +296,7 @@ export async function captureD1(
     await writePrivate(join(working, "empty.env"), empty);
     const capturedWorking = working;
     let invoked = false;
-    snapshot = await captureControlSnapshot(
+    snapshot = await captureControlSnapshotRows(
       async (sql) => {
         if (invoked) throw failed();
         invoked = true;

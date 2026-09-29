@@ -268,6 +268,43 @@ export function buildSnapshotQuery(set: MigrationSet): string {
     throw fail("control_snapshot_query_bound");
   return sql;
 }
+export function buildSnapshotRowsQuery(set: MigrationSet): string {
+  if (!trustedSql.has(set)) throw fail("control_snapshot_migrations_invalid");
+  const schemaRows = `(SELECT json_group_array(json_object('name',name,'type',type,'sql',sql)) FROM (SELECT name,type,sql FROM sqlite_master WHERE ${schemaWhere} ORDER BY type,name))`;
+  const sequenceWhere = "name NOT GLOB 'sqlite_*' AND name NOT GLOB '_cf_*'";
+  const sequenceRows = `(SELECT json_group_array(json_object('name',name,'seq',CAST(seq AS TEXT))) FROM (SELECT name,seq FROM sqlite_sequence WHERE ${sequenceWhere} ORDER BY name))`;
+  const parts = [
+    `SELECT -1 AS segment,0 AS ordinal,'schema' AS kind,json_object('count',(SELECT count(*) FROM sqlite_master WHERE ${schemaWhere}),'rows',json(${schemaRows})) AS payload`,
+  ];
+  for (const [index, table] of set.tables.entries()) {
+    const aliases = table.columns.map((_, column) => quote(`c${column}`));
+    const cells = aliases.map(
+      (column) =>
+        `json_array(typeof(${column}),CASE typeof(${column}) WHEN 'blob' THEN hex(${column}) WHEN 'real' THEN printf('%!.17g',${column}) ELSE CAST(${column} AS TEXT) END)`,
+    );
+    const selected = table.columns
+      .map((name, column) => `${quote(name)} AS ${aliases[column]}`)
+      .concat(
+        table.order.map(
+          (name, order) => `${quote(name)} AS ${quote(`o${order}`)}`,
+        ),
+      )
+      .join(",");
+    const order = table.order.map((_, column) => quote(`o${column}`)).join(",");
+    parts.push(
+      `SELECT ${index},0,'table',json_object('name',${literal(table.name)},'columns',json(${literal(JSON.stringify(table.columns))}),'count',(SELECT count(*) FROM ${quote(table.name)}))`,
+      `SELECT ${index},row_number() OVER (ORDER BY ${order}),'row',json_array(${cells.join(",")}) FROM (SELECT ${selected} FROM ${quote(table.name)})`,
+    );
+  }
+  parts.push(
+    `SELECT ${set.tables.length},0,'sequences',json_object('count',(SELECT count(*) FROM sqlite_sequence WHERE ${sequenceWhere}),'rows',json(${sequenceRows}))`,
+    `SELECT ${set.tables.length + 1},0,'end','1'`,
+  );
+  const sql = `SELECT segment,ordinal,kind,payload FROM (${parts.join(" UNION ALL ")}) ORDER BY segment,ordinal;`;
+  if (Buffer.byteLength(sql, "utf8") > 99000)
+    throw fail("control_snapshot_query_bound");
+  return sql;
+}
 function integerValue(value: string, nonnegative = false): bigint {
   if (!/^(?:0|-?[1-9][0-9]{0,18})$/.test(value)) throw fail();
   const parsed = BigInt(value);
@@ -431,6 +468,87 @@ function validateData(input: unknown, set: MigrationSet): SnapshotData {
       throw fail();
   return { schema: set.schema, tables, sequences };
 }
+function snapshotDataFromRows(input: unknown, set: MigrationSet): SnapshotData {
+  if (
+    !Array.isArray(input) ||
+    input.length < set.tables.length + 3 ||
+    input.length > 100000 + set.tables.length + 3
+  )
+    throw fail();
+  let cursor = 0;
+  let bytes = 0;
+  const next = (segment: number, ordinal: number, kind: string): unknown => {
+    const row: unknown = input[cursor++];
+    if (
+      !fields(row, ["segment", "ordinal", "kind", "payload"]) ||
+      row.segment !== segment ||
+      row.ordinal !== ordinal ||
+      row.kind !== kind ||
+      typeof row.payload !== "string"
+    )
+      throw fail();
+    const size = Buffer.byteLength(row.payload, "utf8");
+    bytes += size;
+    if (size > 2_000_000 || bytes > maximumBytes) throw fail();
+    try {
+      return JSON.parse(row.payload) as unknown;
+    } catch {
+      throw fail();
+    }
+  };
+  const schema = next(-1, 0, "schema");
+  if (
+    !fields(schema, ["count", "rows"]) ||
+    schema.count !== set.schema.length ||
+    !Array.isArray(schema.rows) ||
+    schema.rows.length !== schema.count
+  )
+    throw fail();
+  const tables: unknown[] = [];
+  let totalRows = 0;
+  for (const [index, table] of set.tables.entries()) {
+    const marker = next(index, 0, "table");
+    if (
+      !fields(marker, ["name", "columns", "count"]) ||
+      marker.name !== table.name ||
+      canonical(marker.columns) !== canonical(table.columns) ||
+      !Number.isSafeInteger(marker.count) ||
+      (marker.count as number) < 0
+    )
+      throw fail();
+    totalRows += marker.count as number;
+    if (totalRows > 100000) throw fail("control_snapshot_rows_bound");
+    const rows: unknown[] = [];
+    for (let ordinal = 1; ordinal <= (marker.count as number); ordinal++) {
+      const raw = next(index, ordinal, "row");
+      if (!Array.isArray(raw) || raw.length !== table.columns.length)
+        throw fail();
+      rows.push(
+        raw.map((entry) => {
+          if (!Array.isArray(entry) || entry.length !== 2) throw fail();
+          return { type: entry[0], value: entry[1] };
+        }),
+      );
+    }
+    tables.push({ name: table.name, columns: table.columns, rows });
+  }
+  const sequences = next(set.tables.length, 0, "sequences");
+  if (
+    !fields(sequences, ["count", "rows"]) ||
+    !Number.isSafeInteger(sequences.count) ||
+    (sequences.count as number) < 0 ||
+    (sequences.count as number) > set.tables.length ||
+    !Array.isArray(sequences.rows) ||
+    sequences.rows.length !== sequences.count
+  )
+    throw fail();
+  if (next(set.tables.length + 1, 0, "end") !== 1 || cursor !== input.length)
+    throw fail();
+  return validateData(
+    { schema: schema.rows, tables, sequences: sequences.rows },
+    set,
+  );
+}
 function validSource(source: unknown): source is ControlSnapshot["source"] {
   return (
     fields(source, ["installationId", "databaseId"]) &&
@@ -471,6 +589,30 @@ export async function captureControlSnapshot(
       ...data,
     };
   return { ...body, sha256: digest(canonical(body)) };
+}
+export async function captureControlSnapshotRows(
+  query: (sql: string) => Promise<unknown>,
+  directory: string,
+  source: ControlSnapshot["source"],
+  nowUTC: string,
+): Promise<ControlSnapshot> {
+  if (!validSource(source) || !validTime(nowUTC)) throw fail();
+  const set = await migrationSet(directory);
+  const data = snapshotDataFromRows(
+    await query(buildSnapshotRowsQuery(set)),
+    set,
+  );
+  const body = {
+    version: 1 as const,
+    source: { ...source },
+    capturedAtUTC: nowUTC,
+    migrations: { files: set.files, sha256: set.sha256 },
+    ...data,
+  };
+  const snapshot = { ...body, sha256: digest(canonical(body)) };
+  if (Buffer.byteLength(canonical(snapshot), "utf8") > maximumBytes)
+    throw fail("control_snapshot_result_bound");
+  return snapshot;
 }
 export async function restoreControlSnapshot(
   snapshot: ControlSnapshot,
@@ -577,13 +719,8 @@ export async function restoreControlSnapshot(
       db.prepare("PRAGMA integrity_check").get()?.integrity_check !== "ok"
     )
       throw fail("control_snapshot_restore_unproven");
-    const row = db.prepare(buildSnapshotQuery(set)).get() as
-      { snapshot_json: string } | undefined;
-    if (
-      !row ||
-      canonical(validateData(JSON.parse(row.snapshot_json) as unknown, set)) !==
-        canonical(data)
-    )
+    const rows = db.prepare(buildSnapshotRowsQuery(set)).all();
+    if (canonical(snapshotDataFromRows(rows, set)) !== canonical(data))
       throw fail("control_snapshot_restore_mismatch");
     db.exec("COMMIT");
     db.close();

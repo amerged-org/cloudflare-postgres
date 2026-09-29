@@ -15,7 +15,10 @@ import {
   fixture,
   migrationDirectory,
 } from "./control-recovery-fixture/fixture.mjs";
-import { captureControlSnapshot } from "../src/control-snapshot.ts";
+import {
+  captureControlSnapshot,
+  captureControlSnapshotRows,
+} from "../src/control-snapshot.ts";
 import {
   createRecoveryBundle,
   restoreRecoveryBundle,
@@ -492,6 +495,109 @@ test("authenticates recovery before publication and refuses wrong keys, missing 
     assert.equal(
       JSON.parse(refused.stdout).error.code,
       "control_recovery_failed",
+    );
+  } finally {
+    f.close();
+  }
+});
+
+test("captures and restores ten thousand logical projects in one bounded rowset read", async () => {
+  const f = await fixture();
+  try {
+    const insert = f.db.prepare("INSERT INTO projects VALUES(?,?,?,?,?)");
+    for (let index = 0; index < 10000; index++)
+      insert.run(
+        `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`,
+        f.ids.organization,
+        `Synthetic project ${index}`,
+        "active",
+        "2026-09-29T00:00:00.000Z",
+      );
+    let reads = 0;
+    const snapshot = await captureControlSnapshotRows(
+      async (sql) => {
+        reads++;
+        assert(Buffer.byteLength(sql, "utf8") < 99000);
+        const rows = f.db.prepare(sql).all();
+        assert(rows.length > 10000);
+        for (const row of rows)
+          assert(Buffer.byteLength(row.payload, "utf8") < 2000000);
+        return rows;
+      },
+      migrationDirectory,
+      f.source,
+      "2026-09-29T00:02:00.000Z",
+    );
+    assert.equal(reads, 1);
+    assert.equal(
+      snapshot.tables.find((table) => table.name === "projects").rows.length,
+      10001,
+    );
+    const historicalFormat = await captureControlSnapshot(
+      f.query,
+      migrationDirectory,
+      f.source,
+      "2026-09-29T00:02:00.000Z",
+    );
+    assert.equal(snapshot.sha256, historicalFormat.sha256);
+    const archivePath = join(f.directory, "large.bundle");
+    await createRecoveryBundle({
+      snapshot,
+      keyrings: f.keyrings,
+      recoveryKeyFile: f.recoveryKeyFile,
+      archivePath,
+      migrationDirectory,
+    });
+    const restored = await restoreRecoveryBundle({
+      archivePath,
+      recoveryKeyFile: f.recoveryKeyFile,
+      targetDirectory: join(f.directory, "large-offline"),
+      migrationDirectory,
+      expectedSource: f.source,
+    });
+    assert.equal(restored.status, "verified_offline");
+    const db = new DatabaseSync(
+      join(f.directory, "large-offline/control.sqlite"),
+      {
+        readOnly: true,
+      },
+    );
+    try {
+      assert.equal(
+        db.prepare("SELECT count(*) AS n FROM projects").get().n,
+        10001,
+      );
+      assert.equal(
+        db
+          .prepare("SELECT name FROM projects WHERE id=?")
+          .get("00000000-0000-4000-8000-00000000270f").name,
+        "Synthetic project 9999",
+      );
+    } finally {
+      db.close();
+    }
+  } finally {
+    f.close();
+  }
+});
+
+test("refuses a rowset with a missing terminal table row", async () => {
+  const f = await fixture();
+  try {
+    await assert.rejects(
+      captureControlSnapshotRows(
+        async (sql) => {
+          const rows = f.db.prepare(sql).all();
+          const last = rows.findLastIndex((row) => row.kind === "row");
+          assert(last > 0);
+          rows.splice(last, 1);
+          return rows;
+        },
+        migrationDirectory,
+        f.source,
+        "2026-09-29T00:02:00.000Z",
+      ),
+      /control_snapshot_invalid/,
     );
   } finally {
     f.close();
