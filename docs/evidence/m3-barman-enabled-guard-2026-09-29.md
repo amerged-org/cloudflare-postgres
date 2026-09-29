@@ -28,6 +28,17 @@ once in **19.731 seconds**, retaining **33 Worker and 55 Node cases**. Unchanged
 Go source retains its earlier evidence. There is no matrix growth, provider
 operation or runtime qualification in this source regression.
 
+A sealed Linux amd64 artifact was subsequently built from public source
+`64c6fa8b4135e3de85153c5e7d4cc2909783bb87` in 29.758 seconds using only 81
+committed Docker inputs. Its read-only, network-disabled static execution
+verifies Node 24.21.0, UID 1000, both compiled guards, 72 compiled modules and
+the first-party/dependency license files. OCI index
+`sha256:22d19f4125724d3d9da4d03c70ce21caf80f4eb621bfb28f1f9d66859d203a2b`
+and Linux manifest
+`sha256:683467ae946e557c62f395f2cf525301b3a3641cf94e3959d845006785c4e43a`
+are recorded. The private 88,552,960-byte archive is mode 0600. This establishes
+artifact compilation and static identity, not live reconciliation or backup.
+
 The regional image is not replaced by this checkpoint, and its manual backup
 executor remains disabled. Image/runtime delivery is required before the first
 API-managed pilot. The separately held manual source activation still needs its
