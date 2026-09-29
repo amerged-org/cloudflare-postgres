@@ -5,6 +5,11 @@ import { MaintenanceClient } from "./maintenance-client.ts";
 import { maintenanceKubernetesFromConfig } from "./maintenance-kubernetes.ts";
 import type { MaintenanceOperatorConfiguration } from "./maintenance-kubernetes.ts";
 import { prepareMaintenance } from "./maintenance.ts";
+import { applyFleetInspection } from "./fleet-inspection.ts";
+import {
+  collectFleet,
+  fleetOperatorConfiguration,
+} from "./fleet-inspection-cli.ts";
 import type {
   MaintenanceEvidence,
   MaintenanceSnapshot,
@@ -137,6 +142,9 @@ function operatorConfiguration(
     namespace: String(input.namespace),
     talosconfigSecret: String(input.talosconfigSecret),
     targetNodeUid: String(input.targetNodeUid),
+    ...(input.fleetInventory === undefined
+      ? {}
+      : { fleetInventory: fleetOperatorConfiguration(input.fleetInventory) }),
     endpoints: input.endpoints as string[],
     evidence: {
       machineIdentity: evidence(supplied.machineIdentity),
@@ -197,6 +205,11 @@ export async function runMaintenancePreparation(
     let snapshot: MaintenanceSnapshot;
     try {
       snapshot = await api.snapshot(claim, operator);
+      if (operator.fleetInventory)
+        snapshot = applyFleetInspection(
+          snapshot,
+          await collectFleet(operator.fleetInventory),
+        );
     } catch {
       snapshot = {
         complete: false,

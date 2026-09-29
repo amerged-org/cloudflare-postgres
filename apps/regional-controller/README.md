@@ -1,5 +1,58 @@
 # Regional environment controller
 
+## Fleet inspection
+
+The explicit `inspect-fleet` mode observes Contabo through the installation's
+control API and reads authenticated Kubernetes Nodes. It detects missing or
+replaced enrolled machines before maintenance. Provider matches do not prove
+machine identity, spare capacity, backup recovery or upgrade eligibility.
+See the [contract](../../docs/contracts/fleet-inventory-v1.md).
+
+Build this package, then run a mode-0600 configuration in a private directory:
+
+```sh
+pnpm --filter @cloudflare-postgres/regional-controller build
+node apps/regional-controller/dist/main.js inspect-fleet --config /absolute/private/fleet.json
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "regionId": "11111111-1111-4111-8111-111111111111",
+  "bindings": [
+    {
+      "instanceId": "12345",
+      "nodeName": "operator-enrolled-node",
+      "nodeUid": "22222222-2222-4222-8222-222222222222",
+      "regionId": "11111111-1111-4111-8111-111111111111"
+    }
+  ],
+  "controlOrigin": "https://your-control-api.example.com",
+  "installationTokenFile": "/absolute/private/installation.token",
+  "kubeconfigFile": "/absolute/private/kubeconfig",
+  "kubeconfigContext": "operator-context",
+  "reportPath": "/absolute/private/fleet-report.json"
+}
+```
+
+Keep token and kubeconfig files mode 0600. Use a verified HTTPS Kubernetes
+endpoint, embedded CA and static embedded certificate/key or token. Dynamic
+authentication helpers and credential-file references are outside this lane.
+Real provider IDs, addresses and enrollment records belong in private adopter
+configuration. The installation token stays with the operator; it is never
+installed into customer Pods or sent to Contabo.
+
+Exit 0 means observed association; exit 1 means blockers; exit 2 means observation
+could not complete. The private report retains selected provider/Node details;
+stdout contains only counts, codes, a digest and false authority flags. Choose a
+new report path each time: existing files are preserved.
+
+To add this guard to a maintenance preparation, include the same complete object
+as the optional `fleetInventory` property in its private operator configuration.
+It can invalidate stale identity evidence but cannot supply missing identity,
+quorum, backup, staging or capacity proof. Existing preparation behavior stays
+unchanged when the field is absent; execution remains unauthorized.
+
 Apache-2.0 first-party code. This package implements the regional half of the versioned `environment.create` protocol and an optional file-backed usage collector. It initiates HTTPS requests to the adopter's control API; it opens no inbound listener. It creates internal CloudNativePG resources, reports observed readiness, and can deliver provisional observations of owned CPU/RAM requests and data-volume capacity. External PostgreSQL endpoint discovery, gateway routing, sleep, resizing, deletion, restore, and hard runtime budget enforcement remain pending. The default controller also executes the separate restricted login-role and credential-rotation protocol. A separate operator mode adds current allowance supervision and normal CNPG stop reconciliation; it is not enabled by the default controller.
 
 ## Owned logical database execution

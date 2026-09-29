@@ -1,5 +1,20 @@
 # Control API
 
+## Installation provider inventory
+
+`GET /v1/installation/providers/contabo/instances` uses the installation bootstrap
+token and the four Contabo API Worker Secrets. It performs only authentication
+and bounded provider GETs; it accepts no backend URL, query, body or server action.
+Organization/regional credentials do not gain this access. Its selected instance
+metadata is for the installation operator and must remain private.
+
+The [fleet contract](../../docs/contracts/fleet-inventory-v1.md) defines observed
+scan consistency, limits and safe failure. The [regional inspector](../regional-controller/README.md#fleet-inspection)
+compares explicit enrollment with authenticated Node identity. No nominal provider
+resource total creates spare capacity, physical-host guarantees or upgrade
+authorization. Existing D1 schema, customer admission and default controller
+behavior are not changed by this read API.
+
 This Worker implements a generic `/v1` management API backed by one D1 database. It records organizations, registered regions, scoped API tokens, projects, immutable environment specifications, idempotency identities, audit operations, usage revisions, and budget/allowance authority. A project is a global logical container created immediately in D1. Its `active` status does not mean that a PostgreSQL cluster, database, credential, or connection endpoint exists. Database environments are separate resources executed through region-scoped leases. Registering a region alone neither admits environments nor provisions PostgreSQL.
 
 ## Operator setup

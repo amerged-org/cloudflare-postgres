@@ -12,6 +12,32 @@ info:
     report runtimeEnforced false and pending_runtime until M6 runtime collection,
     durable journals, supervision and expiry guards are qualified.
 paths:
+  /v1/installation/providers/contabo/instances:
+    get:
+      operationId: observeContaboInstances
+      summary: Observe installation-owned Contabo instances
+      description: >-
+        Installation token only. Bounded read-only provider scan; no query parameters,
+        body, backend URL or actions. Observed-scan consistency is not an atomic provider
+        snapshot, machine identity, reserved capacity or physical-host isolation proof.
+        Raw provider credentials/errors/opaque metadata are never returned.
+      security:
+        - installationToken: []
+      responses:
+        "200":
+          description: Complete bounded observed scan with selected private operator metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProviderInventory"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "405":
+          description: Only GET is supported; Allow header is GET
+        "503":
+          description: Provider credentials, authentication, response or observation unavailable
   /v1/regions:
     get:
       operationId: listRegions
@@ -1862,6 +1888,106 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    ProviderInstance:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          instanceId,
+          region,
+          dataCenter,
+          status,
+          cpuCores,
+          ramMb,
+          diskMb,
+          ipv4,
+          ipv6,
+        ]
+      properties:
+        instanceId:
+          type: string
+          pattern: "^[1-9][0-9]{0,18}$"
+        region:
+          type: string
+          minLength: 1
+          maxLength: 128
+        dataCenter:
+          type: string
+          minLength: 1
+          maxLength: 256
+        status:
+          type: string
+          minLength: 1
+          maxLength: 64
+        cpuCores:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+        ramMb:
+          type: string
+          pattern: "^(0|[1-9][0-9]{0,18})$"
+        diskMb:
+          type: string
+          pattern: "^(0|[1-9][0-9]{0,18})$"
+        ipv4:
+          type: [string, "null"]
+          format: ipv4
+        ipv6:
+          type: [string, "null"]
+          format: ipv6
+    ProviderInventory:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          provider,
+          instances,
+          observation,
+          actionsEnabled,
+          machineIdentityVerified,
+        ]
+      properties:
+        provider:
+          type: string
+          const: contabo
+        instances:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: "#/components/schemas/ProviderInstance"
+        observation:
+          type: object
+          additionalProperties: false
+          required:
+            [
+              startedAt,
+              observedAt,
+              consistency,
+              enumerationComplete,
+              evidenceHash,
+            ]
+          properties:
+            startedAt:
+              type: string
+              format: date-time
+            observedAt:
+              type: string
+              format: date-time
+            consistency:
+              type: string
+              const: observed-scan
+            enumerationComplete:
+              type: boolean
+              const: true
+            evidenceHash:
+              type: string
+              pattern: "^[a-f0-9]{64}$"
+        actionsEnabled:
+          type: boolean
+          const: false
+        machineIdentityVerified:
+          type: boolean
+          const: false
     NodeTrackingPolicy:
       type: object
       additionalProperties: false

@@ -74,6 +74,12 @@ Short reconnects during resizing are accepted. Branching is deferred. Supabase A
 
 ## Development discipline
 
+The [fleet inspector](apps/regional-controller/README.md#fleet-inspection) compares
+installation-owned Contabo observations with explicitly enrolled Kubernetes
+Nodes. Its optional maintenance guard detects missing/replaced hosts without
+turning provider totals into capacity or upgrade authority. See its
+[qualification checkpoint](docs/evidence/m4-fleet-inventory-2026-09-29.md).
+
 Use the [bounded TDD policy](PLAN.md#10-bounded-tdd-and-verification-discipline): at most three new or expanded top-level tests per fix, each red first; targeted test files during iteration; one final full gate; and mandatory stop/report limits. Do not generate test matrices or speculative suites. Consumer-specific defaults, adapters, and compatibility TODOs belong in consumer repositories.
 
 ## Project documents

@@ -43,6 +43,9 @@ importers:
       '@kubernetes/client-node':
         specifier: 2.0.0
         version: 2.0.0(supports-color@10.2.2)
+      js-yaml:
+        specifier: 5.4.2
+        version: 5.4.2
       pg:
         specifier: 8.23.0
         version: 8.23.0
@@ -53,6 +56,9 @@ importers:
       '@eslint/js':
         specifier: 9.39.5
         version: 9.39.5
+      '@types/js-yaml':
+        specifier: 4.0.9
+        version: 4.0.9
       '@types/node':
         specifier: 24.19.0
         version: 24.19.0
