@@ -52,3 +52,41 @@ The seven held Pod-birth files and 22 held SDK files remain byte-identical. The
 Dev Worker, D1 schema, PostgreSQL deployment, regional image and closed admission
 are preserved. Whole-environment admission, funded expiry, verified stop, complete
 final accounting, backup/restore and other open v1 gates remain unfinished.
+
+## User-resumed narrow type correction and subsequent stop
+
+The user explicitly requested continuation of the goal and plan. The known strict
+result/index types receive a narrow repair: the heterogeneous D1 batch declares
+its row shape and seven test dereferences use erased non-null markers after
+existing one-row assertions. Runtime predicates, test assertions and authority
+behavior remain unchanged. The draft integrates current main in its isolated
+worktree, retaining Fleet and Control Recovery. The two named Worker cases pass
+in 1.53 seconds; focused format/lint/typecheck also pass. A mistaken focused
+format command includes SQL, for which Prettier has no parser; the supported
+named files pass after the command-only correction.
+
+The original failed full gate remains recorded. Only its previously unrun Vitest
+and Node stages run once: 29 Worker cases pass in 5.951 seconds, then Node stops
+in 3.624 seconds with 35 of 36 passing. The existing Control Recovery case asserts
+a literal 14-migration count while the index draft now supplies 15. This is a
+stale fixture expectation, not a missing data reconstruction proof. No assertion
+is weakened or corrected after this stop; no broad gate is repeated.
+
+The smallest next step is to make that existing migration-count expectation
+track independently enumerated committed migration files and verify the same
+named recovery case. Its previous expected values, high-water mark and exact
+reconstruction checks remain required. This proposal is unapplied; the resumed
+six-file draft and original history remain sealed privately. No migration is
+applied, no runtime source is merged/published and no Worker is deployed.
+
+Read-only infrastructure preflight preserves one Node, 29 Running Pods, four
+PVCs, five PVs and both existing SQL markers. Initial inventory command plural
+errors are corrected without infrastructure effects. A separate SQL metadata
+preflight returns an error and supplies no state-count proof; the actual control
+recovery checkpoint already records the prior 14-migration Dev snapshot. The
+budget native route case remains its original red result, not a live green.
+
+After eventual migration `0015`, older recovery bundles must retain and use their
+matching 14-migration trusted source files. The recovery verifier intentionally
+rejects a changed migration set. Neither this draft nor its stop activates
+recovered state or alters runtime admission/enforcement.

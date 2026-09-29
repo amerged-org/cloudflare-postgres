@@ -435,13 +435,15 @@ portability completion is claimed; physical backup/WAL/PITR remain independent
 required work.
 
 The [budget history candidate checkpoint](docs/evidence/m3-budget-history-held-2026-09-29.md)
-records confirmed Dev Contabo Worker Secret names and a narrowly scoped M3 read API
-draft. Two new targeted Worker cases pass after meaningful failures; a read-only
-live case demonstrates the old route's absence. Its single frozen gate stops at
-strict typecheck after format/lint pass. The source, migration and contract remain
-sealed locally without merge or deployment; the next narrow type correction
-requires an explicit exception to that final-gate stop rule. No runtime budget
-enforcement, customer inventory change or milestone completion is claimed.
+retains the original strict-typecheck gate stop and the user's subsequent narrow
+resumption. The two unchanged named Worker cases and focused type checks pass.
+Only the previously unrun Vitest/Node stages run: 29 Worker cases pass, then Node
+stops with 35 of 36 passing because the existing recovery case fixes its migration
+count at 14 while the draft index makes 15. The proposed independent file-count
+expectation remains unapplied. No broad gate repeats, source merge, D1 migration
+or Worker deployment follows; six draft files remain sealed privately. The native
+route remains its original red proof. Runtime budget enforcement, customer
+inventory changes and milestone completion are not claimed.
 
 Use test-driven development for concrete behavior changes: identify the intended behavior or observed defect, demonstrate a meaningful failing test, implement the smallest complete correction, and check the affected behavior again. Keep the task scope fixed; tests are evidence for that change, not a reason to build additional features or infrastructure.
 
