@@ -259,6 +259,18 @@ function equal(a: unknown, b: unknown): boolean {
   return JSON.stringify(canonical(a)) === JSON.stringify(canonical(b));
 }
 
+// Fixed operator-only evidence for a rejected reference comparison. No resource
+// identity, version, path, certificate or error payload enters this channel.
+export type NativeAccessDeferral =
+  | "namespace_reference_changed"
+  | "cluster_reference_changed"
+  | "service_reference_changed"
+  | "primary_reference_changed"
+  | "client_reference_changed"
+  | "certificate_reference_changed"
+  | "routing_reference_changed"
+  | "policy_reference_changed";
+
 // This is a provision-time Kubernetes/TLS-material observation, not a wire SQL
 // verifier, a gateway, an ongoing health certificate or permission to wake.
 export async function reconcileNativeAccess(
@@ -269,7 +281,23 @@ export async function reconcileNativeAccess(
   pods: Resource[],
   binding: NativeClientBinding,
   authorized: () => void,
+  diagnostic: (category: NativeAccessDeferral) => void = () => {},
 ): Promise<NativeConnectionObservation | null> {
+  let diagnosticReported = false;
+  const referenceMatches = (
+    matches: boolean,
+    category: NativeAccessDeferral,
+  ) => {
+    if (!matches && !diagnosticReported) {
+      diagnosticReported = true;
+      try {
+        diagnostic(category);
+      } catch {
+        // An unavailable diagnostic sink cannot alter a readiness decision.
+      }
+    }
+    return matches;
+  };
   const namespace = namespaceResource.metadata.name;
   const deadline = Math.min(
     Date.now() + 30_000,
@@ -422,17 +450,36 @@ export async function reconcileNativeAccess(
     const slicesNow = await api.listEndpointSlices!(namespace, "database-rw");
     check();
     return (
-      same(namespaceResource, ns) &&
-      same(cluster, clusterNow) &&
-      same(service, serviceNow) &&
-      same(primary, primaryNow) &&
-      same(binding.namespace, clientNs) &&
-      same(binding.serviceAccount, clientSa) &&
-      clientNs?.metadata.labels?.[marker] === binding.profile.namespaceUid &&
-      same(ca, caNow) &&
-      same(server, serverNow) &&
-      slicesNow.length === 1 &&
-      same(slice, slicesNow[0] ?? null)
+      referenceMatches(
+        same(namespaceResource, ns),
+        "namespace_reference_changed",
+      ) &&
+      referenceMatches(
+        same(cluster, clusterNow),
+        "cluster_reference_changed",
+      ) &&
+      referenceMatches(
+        same(service, serviceNow),
+        "service_reference_changed",
+      ) &&
+      referenceMatches(
+        same(primary, primaryNow),
+        "primary_reference_changed",
+      ) &&
+      referenceMatches(
+        same(binding.namespace, clientNs) &&
+          same(binding.serviceAccount, clientSa) &&
+          clientNs?.metadata.labels?.[marker] === binding.profile.namespaceUid,
+        "client_reference_changed",
+      ) &&
+      referenceMatches(
+        same(ca, caNow) && same(server, serverNow),
+        "certificate_reference_changed",
+      ) &&
+      referenceMatches(
+        slicesNow.length === 1 && same(slice, slicesNow[0] ?? null),
+        "routing_reference_changed",
+      )
     );
   };
   if (!(await current())) return null;
@@ -532,7 +579,11 @@ export async function reconcileNativeAccess(
     namespace,
     desired.metadata.name,
   );
-  if (!same(policy, policyNow) || !(await current())) return null;
+  if (
+    !referenceMatches(same(policy, policyNow), "policy_reference_changed") ||
+    !(await current())
+  )
+    return null;
   check();
   return {
     version: 1,

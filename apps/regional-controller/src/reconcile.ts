@@ -7,6 +7,7 @@ import {
   prepareNativeClient,
   reconcileNativeAccess,
   validNativeAccess,
+  type NativeAccessDeferral,
 } from "./native-access.ts";
 import {
   BIRTH_ANNOTATION,
@@ -261,6 +262,7 @@ export async function reconcileEnvironment(
   claim: Claim,
   config: RegionalConfig,
   authorized: () => void = () => {},
+  nativeDiagnostic: (category: NativeAccessDeferral) => void = () => {},
 ): Promise<{ ready: boolean; observation?: Observation }> {
   validate(claim, config);
   authorized();
@@ -828,6 +830,7 @@ export async function reconcileEnvironment(
         readyPods,
         nativeClient,
         authorized,
+        nativeDiagnostic,
       )
     : null;
   if (nativeClient && !nativeConnection) return { ready: false };

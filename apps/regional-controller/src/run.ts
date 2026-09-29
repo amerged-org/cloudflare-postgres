@@ -51,7 +51,15 @@ async function execute(
     const deadline = Date.now() + options.readinessMilliseconds;
     while (Date.now() < deadline) {
       authorized();
-      const state = await reconcileEnvironment(api, claim, config, authorized);
+      const state = await reconcileEnvironment(
+        api,
+        claim,
+        config,
+        authorized,
+        (category) => {
+          options.log(`native_readback_deferred_${category}`);
+        },
+      );
       if (state.ready && state.observation) {
         authorized();
         await client.result(claim, state.observation);
