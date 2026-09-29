@@ -117,7 +117,7 @@ function fixture() {
         "cnpg.io/instanceRole": "primary",
       },
       ports: [
-        { name: "postgresql", protocol: "TCP", port: 5432, targetPort: 5432 },
+        { name: "postgres", protocol: "TCP", port: 5432, targetPort: 5432 },
       ],
     },
   };
@@ -142,7 +142,7 @@ function fixture() {
         },
       ],
     },
-    ports: [{ name: "postgresql", protocol: "TCP", port: 5432 }],
+    ports: [{ name: "postgres", protocol: "TCP", port: 5432 }],
     endpoints: [
       {
         addresses: ["10.0.0.5"],
@@ -291,6 +291,8 @@ function fixture() {
 
 test("converges an owned private native grant after an uncertain policy create and publishes the actual CNPG direct TLS identity", async () => {
   const f = fixture();
+  assert.equal(f.service.spec.ports[0].name, "postgres");
+  assert.equal(f.slice.ports[0].name, "postgres");
   const first = await reconcileEnvironment(f.api, f.claim, f.config);
   assert.equal(first.ready, true);
   assert.equal(

@@ -311,7 +311,7 @@ export async function reconcileNativeAccess(
     throw new Error("native_service_identity_unproven");
   const port = service.spec.ports[0] as Record<string, unknown>;
   if (
-    port.name !== "postgresql" ||
+    port.name !== "postgres" ||
     port.protocol !== "TCP" ||
     port.port !== 5432 ||
     port.targetPort !== 5432 ||
@@ -359,9 +359,7 @@ export async function reconcileNativeAccess(
       "endpointslice-controller.k8s.io" ||
     slice.addressType !==
       (isIP(primary.status.podIP) === 4 ? "IPv4" : "IPv6") ||
-    !equal(slice.ports, [
-      { name: "postgresql", protocol: "TCP", port: 5432 },
-    ]) ||
+    !equal(slice.ports, [{ name: "postgres", protocol: "TCP", port: 5432 }]) ||
     slice.endpoints?.length !== 1
   )
     throw new Error("native_service_identity_unproven");
