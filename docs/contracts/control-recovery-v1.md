@@ -17,6 +17,8 @@ schema and sequence count packets, a count marker for every table including
 empty ones, individually numbered data rows, and a terminal marker. Missing,
 duplicate, reordered or truncated results fail before any archive is sealed.
 Separate paged reads are not treated as one consistent snapshot.
+The statement groups its `UNION ALL` arms in nested pairs because the live D1
+engine rejects the equivalent flat compound SELECT.
 
 Cells retain their SQLite storage class: integer decimal strings, real strings,
 text, BLOB hex and null. No large integer passes through JavaScript number
@@ -25,7 +27,7 @@ authenticated v1 archive retains the original typed-cell objects and digest.
 Deterministic row ordering supports exact reconstruction checks.
 The statement is limited to 99,000 bytes, retaining 1,000 bytes below the
 [D1 SQL statement limit](https://developers.cloudflare.com/d1/platform/limits/).
-The current 16-migration statement is 89,572 bytes. The D1 adapter bounds its
+The current 16-migration statement is 92,644 bytes. The D1 adapter bounds its
 entire CLI output to 16 MiB; the decoder bounds every returned payload to
 2,000,000 bytes and accepts no more than 32 columns per application table.
 The offline snapshot envelope is limited to 8 MiB, 128 tables and 100,000
@@ -33,8 +35,11 @@ application rows. Exceeding any bound fails the operation; there is no
 truncated or multi-request fallback claiming a consistent snapshot. An
 individual very large source value may expand beyond D1's row/string limit
 when encoded and must fail closed. The complete result, 30-second provider
-query deadline and concurrent-writer behavior require a live D1 qualification;
-the offline 10,000-project fixture does not establish them.
+query deadline and concurrent-writer behavior need provider qualification.
+One isolated D1 test returned all rows for 10,000 synthetic projects within
+the result and time bounds, and its captured state passed independent offline
+restore. That does not establish behavior under concurrent writers, general
+request throughput, denser snapshots or a working Wrangler operator session.
 
 The D1 adapter uses the adopter's authenticated Wrangler session, an explicit
 account, a private strict JSON configuration and an empty environment file. Its

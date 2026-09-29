@@ -18,8 +18,11 @@ snapshot with 10,001 projects returned a 2,576,706-byte JSON string, exceeding
 D1's documented 2,000,000-byte string/row limit. The control-recovery reader
 now uses one ordered multirow statement with completeness markers; a local
 10,001-project fixture seals and restores the unchanged encrypted archive
-exactly. Live D1 result delivery, concurrent-write behavior, measured throughput
-and, where needed, sharded control state remain explicit gates. The 8 MiB
+exactly. An isolated live D1 returned the complete rowset for 10,000 synthetic
+projects, and an independent offline restore passed integrity and foreign-key
+checks. Concurrent-write behavior, representative API throughput, the operator
+CLI's D1 authorization and, where needed, sharded control state remain explicit
+gates. The 8 MiB
 archive bound still requires a future chunked design for denser workloads.
 Ten thousand active PostgreSQL environments require a separate fleet and
 storage-capacity proof.

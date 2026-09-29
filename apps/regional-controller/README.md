@@ -485,6 +485,10 @@ This collector emits only revision-one `provisional` and `gap` facts for the thr
 
 ## Verification and upstream provenance
 
+Running `pnpm test:node` requires Python 3.11 or newer for the control-recovery
+regression that lowers SQLite's compound-SELECT limit. The production
+controller does not use Python.
+
 The [Dev collector runtime checkpoint](../../docs/evidence/m3-regional-usage-collector-2026-09-28.md) verifies the pinned Node 24.21.0 image, both scoped client paths, exclusion of the manual lab database, and the private persistent journal across one Pod replacement on the selected CSI driver. It covers an empty managed inventory, not positive usage delivery or complete/final accounting.
 
 The bounded Node lifecycle regression is `test/reconcile.node.test.mjs`. It first failed on trusting a completed Pod with a stale Cluster Ready condition, then passed after the current-Pod check. It also exercises a lost committed-create response, restart reconciliation without duplicate resources, real API-added Namespace finalizers and canonical quantities, explicit S3 region and backup key selection, boundaries, and refusal to adopt another owner. The collector's bounded regressions are `test/usage-observer.node.test.mjs`, `test/usage-journal.node.test.mjs`, and `test/usage-delivery.node.test.mjs`, covering owned request/PV observation, crash-recoverable replay with bounded unknown coverage, and matching acknowledgements with credential reload. Local Node 24.6 execution is provisional evidence; qualify the pinned production Node 24.21.0 image and real journal mount independently. Actual Cilium admission/enforcement, CNPG defaults, resource capacity, managed-environment collection/delivery, and end-to-end API-to-CNPG provisioning still require target-installation evidence.
