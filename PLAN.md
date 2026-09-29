@@ -391,6 +391,15 @@ The [Pod birth admission candidate](docs/evidence/m6-pod-birth-held-2026-09-29.m
 
 ## 10. Bounded TDD and verification discipline
 
+The [portable PostgreSQL candidate checkpoint](docs/evidence/m2-postgres-portability-held-2026-09-29.md)
+records a separate generic export/import draft using maintained PostgreSQL 18
+tools and exactly three real local TLS cases. Privacy/protection checks pass, but
+the data roundtrip remains red after two attempts and the workflow is held. A
+single-request fixture rollback removes setup objects; the narrow fixture repair
+is identified but unapplied. No full gate, source merge, deployment or logical
+portability completion is claimed; physical backup/WAL/PITR remain independent
+required work.
+
 The [budget history candidate checkpoint](docs/evidence/m3-budget-history-held-2026-09-29.md)
 records confirmed Dev Contabo Worker Secret names and a narrowly scoped M3 read API
 draft. Two new targeted Worker cases pass after meaningful failures; a read-only
