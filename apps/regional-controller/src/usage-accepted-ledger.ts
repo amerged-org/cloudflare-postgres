@@ -277,7 +277,10 @@ export class AcceptedUsageLedger {
       ...(lastArchive ? { lastArchive } : {}),
     };
   }
-  acknowledge(value: unknown): boolean {
+  acknowledge(
+    value: unknown,
+    onAccepted?: (receipt: AcceptedUsageReceipt) => void,
+  ): boolean {
     const receipt = normalizeAcceptedUsageReceipt(value, this.identity);
     const receiptJson = json(receipt),
       receiptHash = digest(receiptJson);
@@ -296,6 +299,7 @@ export class AcceptedUsageLedger {
           json(record.receipt) !== receiptJson
         )
           throw new Error("accepted_receipt_conflict");
+        onAccepted?.(receipt);
         return true;
       }
       const pending = this.db
@@ -349,6 +353,7 @@ export class AcceptedUsageLedger {
           pending.payload_json,
         );
       if (deleted.changes !== 1) throw new Error("accepted_outbox_conflict");
+      onAccepted?.(receipt);
       return true;
     });
   }

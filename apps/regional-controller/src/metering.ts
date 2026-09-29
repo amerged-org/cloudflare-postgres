@@ -3,6 +3,7 @@ import { setTimeout as pause } from "node:timers/promises";
 import { observeUsage } from "./usage-observer.ts";
 import { UsageClient } from "./usage-client.ts";
 import { UsageJournal } from "./usage-journal.ts";
+import { usageFailureDescriptor } from "./usage-delivery-status.ts";
 import type { Kubernetes } from "./types.ts";
 import type {
   AcceptedUsageReceipt,
@@ -67,7 +68,10 @@ export async function deliverUsage(
     let accepted: AcceptedUsageReceipt;
     try {
       accepted = await client.sendReceipt(fact);
-    } catch {
+    } catch (failure) {
+      const descriptor = usageFailureDescriptor(failure);
+      if (!descriptor) throw failure;
+      journal.recordDeliveryFailure(fact, descriptor);
       // Preserve the same durable fact identity after uncertain HTTP outcomes.
       // Never log exception bodies, credentials, raw resource or tenant data.
       log("metering_delivery_deferred");
@@ -81,6 +85,11 @@ export async function deliverUsage(
         failure instanceof Error &&
         failure.message === "accepted_capacity_exceeded"
       ) {
+        journal.recordDeliveryFailure(fact, {
+          kind: "local_capacity",
+          httpStatus: null,
+          code: "accepted_capacity_exceeded",
+        });
         log("metering_delivery_deferred");
         return;
       }

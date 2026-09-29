@@ -5,6 +5,20 @@ retrieves an already sealed recovery bundle using existing operator access.
 Verify exact downloaded bytes and matching historical migrations before offline
 restore. This does not activate recovered state or replace independent key custody.
 
+## Durable delivery failure status
+
+`UsageJournal.status().lastDeliveryFailure` retains one bounded private diagnostic
+for the current source and original pending fact. It stores fixed failure kind,
+nullable HTTP status/known code and observation time; raw error bodies, headers
+and credentials are excluded. The [diagnostic contract](../../docs/contracts/usage-delivery-diagnostics-v1.md)
+defines the safe pairs, exact pending match, corruption refusal and atomic clear
+only after exact durable receipt acceptance.
+
+This status supplies no permission to skip, delete, reassign, invoice or activate
+pending facts. HTTP 404/409 remains an authority/state diagnosis to resolve with
+canonical control records and original provenance. Existing delivery cadence,
+strict acceptance, visible coverage gaps and capacity limits remain unchanged.
+
 ## Complete usage-journal snapshot
 
 The explicit `snapshot-usage` operator mode captures a full, source-bound SQLite
