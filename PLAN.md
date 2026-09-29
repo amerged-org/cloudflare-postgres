@@ -74,8 +74,12 @@ The [persistent stop worker candidate](docs/evidence/m6-suspend-worker-held-2026
 implements separate supervised queue consumption and fair lease-expiry rotation
 locally. Its three red-first cases pass targeted checks, but the one final gate
 stops on an existing invalid-settings startup fixture: 36 Worker and 56 of 57
-Node cases pass. The candidate stays uncommitted and undeployed until that
-failure is diagnosed; no full gate is repeated or held physical qualifier resumed.
+Node cases pass. One unchanged targeted diagnosis subsequently passes the
+existing case at 761 ms under its original 2,000-ms deadline, with expected exit
+and no journal. The original failed gate remains recorded; no clean uninterrupted
+gate is claimed, source/assertions are unchanged and no full gate is repeated.
+Source delivery and bounded empty-worker Dev qualification are the next steps;
+no held physical qualifier is resumed.
 
 ## 1. Product scope and decisions
 

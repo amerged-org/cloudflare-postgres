@@ -1,0 +1,144 @@
+# SPDX-License-Identifier: Apache-2.0
+# Replace both image placeholders with the same verified immutable release.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: suspend-worker
+  namespace: pgcf-system
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgcf-suspend-worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pgcf-suspend-worker
+    spec:
+      serviceAccountName: suspend-worker
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 15
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        # Repeat mounts skip group changes when the volume root already matches.
+        # Verify imported journal custody before mounting an existing volume.
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: prepare-private-configuration
+          image: registry.example.invalid/cloudflare-postgres/regional-controller@sha256:REPLACE_WITH_RELEASE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command: [node, /bootstrap/prepare.mjs]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 256Mi
+          volumeMounts:
+            - name: bootstrap
+              mountPath: /bootstrap
+              readOnly: true
+            - name: private-configuration
+              mountPath: /private
+            - name: journal
+              mountPath: /var/lib/pgcf
+            - name: kubernetes-identity
+              mountPath: /var/run/pgcf-kubernetes
+              readOnly: true
+      containers:
+        - name: worker
+          image: registry.example.invalid/cloudflare-postgres/regional-controller@sha256:REPLACE_WITH_RELEASE_DIGEST
+          imagePullPolicy: IfNotPresent
+          command:
+            - node
+            - /app/dist/main.js
+            - serve-suspend
+            - --config
+            - /private/pgcf/suspend.json
+            - --poll-milliseconds
+            - "5000"
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 25m
+              memory: 64Mi
+            limits:
+              cpu: 100m
+              memory: 256Mi
+          env:
+            - name: PGCF_CONTROL_ORIGIN
+              valueFrom:
+                configMapKeyRef:
+                  name: pgcf-suspend-worker-identity
+                  key: control-origin
+            - name: PGCF_REGION_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: pgcf-suspend-worker-identity
+                  key: region-id
+            - name: PGCF_REGION_TOKEN_FILE
+              value: /var/run/pgcf-region/token
+          volumeMounts:
+            - name: private-configuration
+              mountPath: /private
+              readOnly: true
+            - name: journal
+              mountPath: /var/lib/pgcf
+            - name: region-access
+              mountPath: /var/run/pgcf-region
+              readOnly: true
+            - name: kubernetes-identity
+              mountPath: /var/run/pgcf-kubernetes
+              readOnly: true
+      volumes:
+        - name: bootstrap
+          configMap:
+            name: pgcf-suspend-worker-bootstrap
+            items:
+              - key: prepare.mjs
+                path: prepare.mjs
+              - key: suspend-config.json
+                path: suspend-config.json
+        - name: private-configuration
+          emptyDir:
+            medium: Memory
+            sizeLimit: 1Mi
+        - name: journal
+          persistentVolumeClaim:
+            claimName: regional-suspend-journal
+        - name: region-access
+          secret:
+            secretName: pgcf-region-access
+            defaultMode: 288 # 0440; kubelet grants the trusted fsGroup read access.
+            items:
+              - key: token
+                path: token
+        - name: kubernetes-identity
+          projected:
+            defaultMode: 288 # 0440; no embedded Kubernetes credential value.
+            sources:
+              - serviceAccountToken:
+                  path: token
+                  expirationSeconds: 3600
+              - configMap:
+                  name: kube-root-ca.crt
+                  items:
+                    - key: ca.crt
+                      path: ca.crt

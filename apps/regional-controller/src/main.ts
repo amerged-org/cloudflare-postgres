@@ -81,6 +81,11 @@ async function main(): Promise<void> {
     process.exitCode = await runSuspend(process.argv.slice(3));
     return;
   }
+  if (process.argv[2] === "serve-suspend") {
+    const { runSuspendWorker } = await import("./suspend-worker.ts");
+    process.exitCode = await runSuspendWorker(process.argv.slice(3));
+    return;
+  }
   if (process.argv[2] === "supervise-allowance") {
     const { runAllowanceSupervision } = await import("./allowance-cli.ts");
     process.exitCode = await runAllowanceSupervision(process.argv.slice(3));

@@ -1,0 +1,15 @@
+# SPDX-License-Identifier: Apache-2.0
+# Select an enforced local-volume class with persistentVolumeReclaimPolicy Retain.
+# Retain is a StorageClass/PV property, not a configurable PVC field.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: regional-suspend-journal
+  namespace: pgcf-system
+spec:
+  accessModes: [ReadWriteOnce]
+  volumeMode: Filesystem
+  storageClassName: REPLACE_WITH_RETAIN_STORAGE_CLASS
+  resources:
+    requests:
+      storage: 1Gi

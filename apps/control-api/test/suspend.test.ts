@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { expect, it } from "vitest";
+import { expect, it, vi } from "vitest";
 import worker from "../src/index";
 import { accountingCall, accountingFixture } from "./accounting-fixture";
 
@@ -318,4 +318,154 @@ it("persists an owned suspend intent, locks database work and current funding, a
   expect(
     (await call(`${base}/runtime`, { headers: stranger.orgHeaders })).status,
   ).toBe(404);
+});
+
+it("rotates an expired deferred suspend behind newer queued work, including a deletion-bound stop, without completing either", async () => {
+  const f = await accountingFixture("fair suspend queue");
+  const environments = `/v1/organizations/${f.organizationId}/projects/${f.projectId}/environments`;
+  const lane = `/v1/regions/${f.regionId}/suspend-operations`;
+  interface Claim {
+    operationId: string;
+    leaseToken: string;
+    leaseEpoch: number;
+    leaseExpiresAt: string;
+  }
+  const post = (path: string, body: unknown) =>
+    call(path, {
+      method: "POST",
+      headers: f.regionHeaders,
+      body: JSON.stringify(body),
+    });
+  const claim = async () => {
+    const response = await post(`${lane}/claim`, { leaseSeconds: 90 });
+    expect(response.status).toBe(200);
+    return ((await response.json()) as { claim: Claim }).claim;
+  };
+  const ready = async (environmentId: string, clusterUid: string) => {
+    const creationLane = `/v1/regions/${f.regionId}/operations`;
+    const response = await post(`${creationLane}/claim`, {
+      leaseSeconds: 90,
+    });
+    expect(response.status).toBe(200);
+    const creation = (
+      (await response.json()) as { claim: Claim & { environmentId: string } }
+    ).claim;
+    expect(creation.environmentId).toBe(environmentId);
+    expect(
+      (
+        await post(`${creationLane}/${creation.operationId}/result`, {
+          leaseToken: creation.leaseToken,
+          leaseEpoch: creation.leaseEpoch,
+          status: "ready",
+          resultCode: "cnpg_ready",
+          observation: { clusterUid, clusterGeneration: 1, readyInstances: 1 },
+        })
+      ).status,
+    ).toBe(200);
+  };
+  vi.useFakeTimers({ toFake: ["Date"] });
+  const startedAt = Date.now();
+  try {
+    await ready(f.environmentId, "44444444-4444-4444-8444-444444444444");
+    const accepted = await call(`${environments}/${f.environmentId}/suspend`, {
+      method: "POST",
+      headers: { ...f.orgHeaders, "idempotency-key": "fair-old-stop" },
+      body: JSON.stringify({ expectedRevision: 0 }),
+    });
+    expect(accepted.status).toBe(202);
+    const older = (await accepted.json()) as { operation: { id: string } };
+    const original = await claim();
+    expect(original.operationId).toBe(older.operation.id);
+
+    // Advance the clock through genuine API lease renewal, not database edits.
+    vi.setSystemTime(startedAt + 20_000);
+    const renewal = await post(`${lane}/${original.operationId}/renew`, {
+      leaseToken: original.leaseToken,
+      leaseEpoch: original.leaseEpoch,
+      leaseSeconds: 90,
+    });
+    expect(renewal.status).toBe(200);
+    const renewed = (await renewal.json()) as { leaseExpiresAt: string };
+    expect(Date.parse(renewed.leaseExpiresAt)).toBeGreaterThan(
+      Date.parse(original.leaseExpiresAt),
+    );
+
+    vi.setSystemTime(startedAt + 21_000);
+    const created = await call(environments, {
+      method: "POST",
+      headers: { ...f.orgHeaders, "idempotency-key": "fair-new-environment" },
+      body: JSON.stringify({
+        name: "fair newer environment",
+        regionId: f.regionId,
+        catalogVersion: "accounting-v1",
+        profileId: "accounting-fixture",
+        volumeGiB: 8,
+      }),
+    });
+    expect(created.status).toBe(202);
+    const newer = (await created.json()) as { environment: { id: string } };
+    await ready(newer.environment.id, "55555555-5555-4555-8555-555555555555");
+    const deletion = await call(`${environments}/${newer.environment.id}`, {
+      method: "DELETE",
+      headers: { ...f.orgHeaders, "idempotency-key": "fair-new-deletion" },
+      body: JSON.stringify({
+        expectedRevision: 0,
+        volumePolicy: "delete",
+        backupPolicy: "retain",
+      }),
+    });
+    expect(deletion.status).toBe(202);
+    const deleting = (await deletion.json()) as {
+      operation: { id: string };
+      stopOperation: { id: string };
+    };
+
+    vi.setSystemTime(Date.parse(renewed.leaseExpiresAt) + 1_000);
+    const waiting = await claim();
+    expect(waiting.operationId).toBe(deleting.stopOperation.id);
+    expect(waiting.leaseEpoch).toBe(1);
+    vi.setSystemTime(Date.now() + 1_000);
+    const reclaimed = await claim();
+    expect(reclaimed.operationId).toBe(older.operation.id);
+    expect(reclaimed.leaseEpoch).toBe(original.leaseEpoch + 1);
+    expect(
+      (
+        await post(`${lane}/${original.operationId}/renew`, {
+          leaseToken: original.leaseToken,
+          leaseEpoch: original.leaseEpoch,
+          leaseSeconds: 90,
+        })
+      ).status,
+    ).toBe(409);
+
+    // With both deferred leases expired, the least recently attempted stop wins.
+    vi.setSystemTime(Date.parse(reclaimed.leaseExpiresAt) + 1_000);
+    const rotated = await claim();
+    expect(rotated.operationId).toBe(deleting.stopOperation.id);
+    expect(rotated.leaseEpoch).toBe(waiting.leaseEpoch + 1);
+    for (const environmentId of [f.environmentId, newer.environment.id]) {
+      expect(
+        await (
+          await call(`${environments}/${environmentId}/runtime`, {
+            headers: f.orgHeaders,
+          })
+        ).json(),
+      ).toMatchObject({
+        runtime: { desiredState: "suspended", phase: "suspending" },
+      });
+    }
+    expect(
+      await (
+        await call(`${environments}/${newer.environment.id}/lifecycle`, {
+          headers: f.orgHeaders,
+        })
+      ).json(),
+    ).toMatchObject({
+      lifecycle: { phase: "stopping", physicalDeletionVerified: false },
+      operation: { id: deleting.operation.id, status: "queued" },
+      stopOperation: { status: "running", resultCode: null },
+    });
+  } finally {
+    vi.useRealTimers();
+  }
 });

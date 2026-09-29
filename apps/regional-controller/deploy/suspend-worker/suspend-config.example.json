@@ -1,0 +1,6 @@
+{
+  "schemaVersion": 1,
+  "kubeconfigFile": "/private/pgcf/kubeconfig.json",
+  "kubeconfigContext": "pgcf-suspend-worker",
+  "journalDirectory": "/var/lib/pgcf/suspend"
+}

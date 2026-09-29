@@ -646,7 +646,7 @@ async function claimSuspend(
         currentScope("o") +
         " AND " +
         actorPredicate(actor) +
-        " ORDER BY o.created_at,o.id LIMIT 1",
+        " ORDER BY CASE WHEN o.status='queued' THEN o.created_at ELSE o.lease_expires_at END,o.created_at,o.id LIMIT 1",
     )
     .bind(regionId, now, ...actorBindings(actor))
     .first<SuspendOperation>();

@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: Apache-2.0
+# Trusted installation identity. RBAC does not restrict patches to individual
+# JSON fields or dynamic owned tenant namespaces; retain the admission boundary.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgcf-suspend-worker
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get]
+  - apiGroups: [""]
+    resources: [resourcequotas]
+    resourceNames: [database-resources]
+    verbs: [get, patch]
+  - apiGroups: [""]
+    resources: [pods, persistentvolumeclaims, persistentvolumes]
+    verbs: [list]
+  # Original-node cohort validation reads immutable identities, not runtime exec.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [configmaps]
+    resourceNames: [execution-nodes]
+    verbs: [get]
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters]
+    resourceNames: [database]
+    verbs: [get, patch]
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [poolers]
+    resourceNames: [database-pool-rw]
+    verbs: [get, patch]
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [poolers]
+    verbs: [list]
+  - apiGroups: [apps]
+    resources: [deployments]
+    resourceNames: [database-pool-rw]
+    verbs: [get]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgcf-suspend-worker
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgcf-suspend-worker
+subjects:
+  - kind: ServiceAccount
+    name: suspend-worker
+    namespace: pgcf-system

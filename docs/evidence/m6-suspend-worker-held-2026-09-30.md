@@ -57,3 +57,25 @@ provider writes. This is preparation evidence only; no stop worker is installed.
 The held backup, native, Pod-birth and physical-stop qualification paths remain
 held. Whole v1 completion, positive managed stop, independent expiry and final
 accounting remain unproved.
+
+## Subsequent unchanged targeted diagnosis
+
+On continued work, one invocation of the same existing named file uses private
+process-metadata instrumentation. The test source, assertions and 2,000-ms child
+deadline remain unchanged. It passes in 0.998 seconds; the startup child exits
+in 761 ms with status 1, no signal/error and the required fixed failure message.
+No journal is created. The recorder captures no environment or raw output.
+All original candidate source hashes remain unchanged.
+
+Independent read-only inspection finds no new import/timer on this default path:
+the added `serve-suspend` dispatch is dynamic and unvisited. Existing static
+Kubernetes SDK loading predates the candidate. Concurrency-sensitive startup is
+plausible, but the historical signal/error is unavailable and its cause is not
+claimed as proven. No timeout or assertion is weakened and no runtime repair or
+full gate repeat occurs.
+
+The original stop is retained. Subsequent targeted evidence supplies a passing
+result for the one previously failing case, alongside the other 56 Node cases and
+36 Worker cases from the frozen gate. This is complete per-case passing evidence,
+not a clean uninterrupted full gate. Source publication and separately bounded
+empty-worker Dev qualification may proceed with that limitation disclosed.

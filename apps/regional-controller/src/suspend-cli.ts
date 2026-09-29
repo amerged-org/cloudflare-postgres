@@ -11,7 +11,7 @@ import type { SuspendSeal } from "./suspend-types.ts";
 import { validNodeObserverConfig } from "./node-observer.ts";
 import type { NodeObserverConfiguration } from "./node-observer.ts";
 
-interface Configuration {
+export interface SuspendConfiguration {
   schemaVersion: 1;
   kubeconfigFile: string;
   kubeconfigContext: string;
@@ -24,7 +24,9 @@ function required(name: string): string {
   if (!value) throw new Error("suspend_configuration_missing");
   return value;
 }
-async function configuration(path: string): Promise<Configuration> {
+export async function readSuspendConfiguration(
+  path: string,
+): Promise<SuspendConfiguration> {
   const info = await lstat(path);
   if (
     !info.isFile() ||
@@ -73,7 +75,7 @@ async function configuration(path: string): Promise<Configuration> {
         (input.podRetirement as { version?: unknown }).version !== 1))
   )
     throw new Error("suspend_configuration_invalid");
-  return input as unknown as Configuration;
+  return input as unknown as SuspendConfiguration;
 }
 
 export async function runSuspend(arguments_: string[]): Promise<number> {
@@ -116,7 +118,9 @@ export async function runSuspend(arguments_: string[]): Promise<number> {
         !isAbsolute(arguments_[1])
       )
         throw new Error("suspend_arguments_invalid");
-      const operator = await active(() => configuration(arguments_[1]!));
+      const operator = await active(() =>
+        readSuspendConfiguration(arguments_[1]!),
+      );
       const regionId = required("PGCF_REGION_ID");
       const tokenFile = required("PGCF_REGION_TOKEN_FILE");
       const client = new SuspendClient(
