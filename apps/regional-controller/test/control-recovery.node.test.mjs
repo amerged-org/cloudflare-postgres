@@ -16,8 +16,10 @@ import {
   migrationDirectory,
 } from "./control-recovery-fixture/fixture.mjs";
 import {
+  buildSnapshotRowsQuery,
   captureControlSnapshot,
   captureControlSnapshotRows,
+  migrationSet,
 } from "../src/control-snapshot.ts";
 import {
   createRecoveryBundle,
@@ -579,6 +581,28 @@ test("captures and restores ten thousand logical projects in one bounded rowset 
   } finally {
     f.close();
   }
+});
+
+test("builds the complete rowset below a 3-term SQLite compound-select limit", async () => {
+  const set = await migrationSet(migrationDirectory);
+  const sql = buildSnapshotRowsQuery(set);
+  const result = spawnSync(
+    "python3",
+    [
+      "-c",
+      `import pathlib, sqlite3, sys
+db = sqlite3.connect(':memory:')
+db.execute('CREATE TABLE d1_migrations(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)')
+for migration in sorted(pathlib.Path(sys.argv[1]).glob('*.sql')):
+    db.executescript(migration.read_text())
+db.setlimit(sqlite3.SQLITE_LIMIT_COMPOUND_SELECT, 3)
+print(len(db.execute(sys.stdin.read()).fetchall()))`,
+      migrationDirectory,
+    ],
+    { input: sql, encoding: "utf8", timeout: 10000 },
+  );
+  assert.equal(result.status, 0, result.stderr);
+  assert.equal(Number(result.stdout.trim()), set.tables.length + 3);
 });
 
 test("refuses a rowset with a missing terminal table row", async () => {

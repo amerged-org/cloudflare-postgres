@@ -300,7 +300,14 @@ export function buildSnapshotRowsQuery(set: MigrationSet): string {
     `SELECT ${set.tables.length},0,'sequences',json_object('count',(SELECT count(*) FROM sqlite_sequence WHERE ${sequenceWhere}),'rows',json(${sequenceRows}))`,
     `SELECT ${set.tables.length + 1},0,'end','1'`,
   );
-  const sql = `SELECT segment,ordinal,kind,payload FROM (${parts.join(" UNION ALL ")}) ORDER BY segment,ordinal;`;
+  // D1 limits terms per compound SELECT. Nest each pair so the complete
+  // schema, markers, and rows still come from one ordered read view.
+  const compound = (items: string[]): string => {
+    if (items.length === 1) return items[0]!;
+    const middle = Math.floor(items.length / 2);
+    return `SELECT * FROM (${compound(items.slice(0, middle))}) UNION ALL SELECT * FROM (${compound(items.slice(middle))})`;
+  };
+  const sql = `SELECT segment,ordinal,kind,payload FROM (${compound(parts)}) ORDER BY segment,ordinal;`;
   if (Buffer.byteLength(sql, "utf8") > 99000)
     throw fail("control_snapshot_query_bound");
   return sql;
