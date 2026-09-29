@@ -1,7 +1,7 @@
 # One-use environment commissioning — v1
 
-Status: additive source implementation candidate. No permit is issued in Dev by
-this change, no region is opened, and no managed PostgreSQL environment is
+Status: additive source implementation with read-only Dev delivery evidence.
+No permit is issued in Dev by this change, no region is opened, and no managed PostgreSQL environment is
 claimed as qualified. Physical backup/PITR, native access, capacity, funded
 runtime authority and operational cleanup remain independent acceptance gates.
 

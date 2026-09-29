@@ -40,8 +40,16 @@ adds installation-issued permits bound to one exact project, immutable catalog
 and resolved environment specification. Atomic consumption keeps ordinary
 regional admission closed and still requires current organization authority.
 Requested budget pause and expiry are admission gates; the permit supplies no
-physical capacity or funded runtime enforcement. The source is locally
-qualified; a real PostgreSQL pilot and its recovery/cleanup proof remain open.
+physical capacity or funded runtime enforcement. The tested source, additive
+migration `0017` and Dev Worker are delivered, with empty permit tables, eight
+preserved Secret names and a verified 49-table control-state rebuild. A real
+PostgreSQL pilot and its recovery/cleanup proof remain open.
+
+The [Barman enablement guard](docs/evidence/m3-barman-enabled-guard-2026-09-29.md)
+requires `enabled:true` in owned provisioning and manual-backup source checks.
+Two existing regression cases failed first and the source gate passed once.
+Regional image delivery remains required; this does not activate the held
+manual backup workflow or establish physical recovery.
 
 ## 1. Product scope and decisions
 

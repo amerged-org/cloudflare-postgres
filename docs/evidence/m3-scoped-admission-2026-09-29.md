@@ -52,3 +52,37 @@ removed. The live baseline has one organization, one project, zero managed
 environments, zero resize/backup rows and no open admission record. No permit
 or catalog was issued by this qualification; actual capacity, PostgreSQL,
 funding and operational cleanup remain acceptance gates.
+
+## Public source and Dev delivery
+
+Source commit `54ddda5` and its migration were published and read back from
+GitHub with matching blob identities before delivery. The selected Dev D1
+received the additive migration once through the authenticated API. Its two
+tables and five triggers matched all seven pinned SQL definitions; new table
+counts were zero and the foreign-key check was empty. Migration history was
+recorded only after schema verification and then read back as all 17 names.
+
+One Wrangler 4.142.0 dry run passed, with no known credential values in its
+bundle. One `--keep-vars` deployment completed in 9.310 seconds. Provider
+readback confirms version `90bdb453-118d-40b6-8e4c-48630f1fcaf7` serves 100%
+and all eight existing Secret names/types are unchanged. No Secret value was
+queried from the provider. Four read-only HTTP probes verify an authorized
+unknown permit returns 404, unauthorized access 401, the existing project 200
+and closed admission 200. The original Python User-Agent rejection is retained;
+the maintained Node fetch transport passed without changing a security rule.
+
+Fresh post-delivery capture, sealing and independent offline restore each ran
+once against the actual 17-migration Dev D1. They preserve **49 tables and 50
+rows**, with integrity `ok`, zero foreign-key errors and activation disabled.
+The 96,524-byte statement returned an 83,016-byte snapshot, sealed into a
+111,422-byte bundle. All prior table counts are preserved except the one new
+migration-history row; both permit tables remain empty. The original oversized
+compound count-query diagnostic is retained; bounded scalar counts and the
+complete rowset capture passed. Pre-migration snapshot/bundle hashes remain
+unchanged, and temporary capture tokens were removed.
+
+The installation still has one organization and project, zero API-managed
+environments, zero permits and permit requests, and closed admission. No
+commissioning permit, catalog or new regional execution authority was issued.
+The regional workload image is unchanged. The new API path needs its positive
+PostgreSQL and recovery/cleanup qualification before commissioning a real pilot.
