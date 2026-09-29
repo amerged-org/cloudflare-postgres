@@ -487,14 +487,27 @@ fixes a real CNPG typed-readback mismatch with only documented omitted false/emp
 role defaults, keeping privilege/membership/inherit and identity fences strict.
 Two existing cases fail first and pass on attempt one; one final gate retains the
 74-case total. A distinct manual TLS role probe passes selected flags/membership,
-TEMP transaction rollback and four exact42501 refusals on same-case attempt two,
+TEMP transaction rollback and four exact `42501` refusals on same-case attempt two,
 with original failed preparation preserved. Exact ephemeral role/Secret/client
 cleanup restores all 21 original SQL roles and operator Role permissions.
 The verified public-source image reaches Dev after one terminally canceled transfer
 and one bounded same-archive retry, then one guarded image-only rollout. All 64
-compiled modules, original infrastructure/SQL and4096 usage hashes/diagnostic are
+compiled modules, original infrastructure/SQL and 4,096 usage hashes/diagnostic are
 preserved. No API-managed verifier/rotation/customer endpoint is qualified by this
 manual proof; physical recovery and other v1 gates remain open.
+
+The [offline custody verification checkpoint](docs/evidence/m3-usage-snapshot-verification-2026-09-29.md)
+adds the generic `verify-usage-snapshot` operator command. It binds a recovered
+complete journal to an independently retained identity and SHA-256, checks the
+existing manifest, private files, integrity and pending count, and uses the same
+bounded child with immutable read-only SQLite exclusively for a quiescent copy.
+Two meaningful red-first cases pass on attempt one; one canonical gate passes
+27 Worker and 43 Node cases, retaining six unchanged Go cases for 76 total evidence.
+One built-command invocation verifies the existing 3,076,096-byte off-node copy
+and 4,096 pending facts without changing either artifact or creating auxiliary files.
+No provider/runtime/control-state change or stopped case resumption occurs.
+Verification permits no replay, settlement or customer admission; complete
+node-loss recovery, final accounting and the other v1 gates remain open.
 
 The [remote control archive checkpoint](docs/evidence/m3-control-archive-2026-09-29.md)
 qualifies one upload of the existing encrypted bundle into the private EU R2
