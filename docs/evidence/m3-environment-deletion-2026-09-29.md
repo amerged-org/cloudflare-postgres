@@ -89,7 +89,21 @@ pass. No new top-level case, data deletion or full gate rerun occurs. The single
 21.018-second workspace gate above predates this focused live correction;
 it is not claimed as a new clean full gate for the corrected source.
 
-Corrective Dev delivery and idle-poll stability are the next evidence step.
+The corrective source is published as `1ab8822`. One credential-free dry run and
+one reviewed corrective Worker deployment pass, the latter in 9.558 seconds.
+Version `1361b660-cfdd-4cc3-87eb-c4aa287b0b8d` serves 100%; the same eight Secret
+names/types are preserved. An authenticated compiled ControlClient invocation in
+the running regional Pod returns null. Primary counts before/after that request
+and twelve seconds of ordinary background polling remain identical: 319
+historical guard rows, zero environments/deletions/stop operations and closed
+admission. No historical guard row is removed to conceal the regression.
+
+One fresh corrected capture, seal and independent offline restore each pass:
+**50 tables, 356 rows, 18 migrations**, exact retained counts, integrity and foreign
+keys. The snapshot is 116,980 bytes and the encrypted bundle 156,707 bytes. The
+temporary administrative token is removed; directories are mode 0700 and files 0600. This proves complete control-state recovery custody, not live activation,
+PostgreSQL backup/PITR or independently escrowed disaster recovery.
+
 Ordinary admission remains closed. No API-managed deletion or physical disposal
 is claimed. The separately held backup, native and birth qualification workflows
 are not resumed, and the full v1 objective remains open.

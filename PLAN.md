@@ -64,7 +64,9 @@ physical deletion, erases history, releases accounting holds or removes data.
 Dev migration `0018` and the API are delivered. Live preservation readback exposes
 an idle-claim guard-row regression; one same-case red-first correction passes
 targeted verification without repeating the full gate. Corrective delivery and
-stable idle polling remain required. Pending/failed provisioning cleanup, actual
+stable idle polling now pass in Dev, with all 319 historical guard rows retained.
+A fresh 50-table/356-row encrypted control-state rebuild passes integrity and
+foreign-key checks. Pending/failed provisioning cleanup, actual
 retirement/disposal, retained-archive recovery and final accounting remain
 explicit v1 requirements.
 
