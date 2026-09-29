@@ -526,6 +526,25 @@ new credentials or permissions. There is no second full gate, native profile
 activation, customer admission, fabricated authority or held-case resumption.
 Packet/TLS/SQL, public routing and end-to-end customer qualification remain gates.
 
+The [native readback-shape checkpoint](docs/evidence/m3-native-readback-shapes-2026-09-29.md)
+corrects two real integration mismatches observed through an operator lab and a
+read-only existing-database audit: stock CNPG port name `postgres`, and omitted
+Pod TypeMeta in SDK list results. One existing case is expanded and one new case
+fails first; bounded targeted checks and one complete canonical gate pass
+28 Worker/46 Node cases, retaining six unchanged Go cases for 80 total evidence.
+Source `6daa265` and one verified regional build/import/image-only rollout are
+delivered with all 66 modules, original infrastructure/SQL/config/RBAC and 4,096
+entries preserved. No Worker, D1, secret, admission or budget change occurs.
+The same actual private-native qualifier has two failed attempts, both before
+credential copy/client Pods/SQL; the second creates an exact native policy but
+withholds its final proof as `native_proof_unavailable`. It remains stopped with
+no third attempt or relaxed identity fence. Both disposable databases are cleaned
+up through recorded UIDs and owned volume reclamation; independent API/Talos
+readbacks verify original 29 Pods, four PVCs, five PV/LV identities/free space,
+SQL markers, Cilium and all 4,096 entries restored. Actual client access and
+API-managed pilot acceptance remain unproven; read-only diagnosis of the final
+identity/version comparison is the proposed next step.
+
 The [Cloudflare private-path assessment](docs/research/cloudflare-private-native-path-2026-09-29.md)
 records the documented Hyperdrive/Workers VPC/Tunnel integration and its current
 private-CA trust limitation. It selects no gateway, creates no provider resource
