@@ -7,6 +7,7 @@ import type {
   RoleVerifier,
 } from "./role-types.ts";
 import type { Resource } from "./types.ts";
+import { restrictedRoleSpec } from "./role-spec.ts";
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const hash = /^[a-f0-9]{64}$/;
@@ -114,6 +115,10 @@ function revision(role: Resource): bigint {
   return BigInt(value);
 }
 function matched(actual: Resource, expected: Resource): boolean {
+  const actualSpec =
+    expected.kind === "DatabaseRole"
+      ? restrictedRoleSpec(actual.spec)
+      : actual.spec;
   return (
     actual.apiVersion === expected.apiVersion &&
     actual.kind === expected.kind &&
@@ -128,7 +133,7 @@ function matched(actual: Resource, expected: Resource): boolean {
     equal(actual.metadata.ownerReferences, expected.metadata.ownerReferences) &&
     (expected.spec === undefined ||
       Object.entries(expected.spec).every(([key, value]) =>
-        equal(actual.spec?.[key], value),
+        equal(actualSpec?.[key], value),
       )) &&
     (expected.data === undefined || equal(actual.data, expected.data)) &&
     typeof actual.metadata.uid === "string" &&
@@ -283,8 +288,9 @@ export async function reconcileRole(
     },
   };
   if (role) {
+    const actualSpec = restrictedRoleSpec(role.spec);
     for (const [key, value] of Object.entries(desiredRole.spec!)) {
-      if (key !== "passwordSecret" && !equal(role.spec?.[key], value))
+      if (key !== "passwordSecret" && !equal(actualSpec?.[key], value))
         throw new Error("role_spec_conflict");
     }
     if (revision(role) < BigInt(claim.credentialRevision)) {
