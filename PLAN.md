@@ -482,6 +482,20 @@ rewrite, D1 migration, Secret/Worker change or fake customer authority occurs.
 This supplies failure visibility only; explicit fixture evidence disposition,
 complete accounting, safe replay and runtime enforcement remain open.
 
+The [restricted-role checkpoint](docs/evidence/m4-postgres-role-boundary-2026-09-29.md)
+fixes a real CNPG typed-readback mismatch with only documented omitted false/empty
+role defaults, keeping privilege/membership/inherit and identity fences strict.
+Two existing cases fail first and pass on attempt one; one final gate retains the
+74-case total. A distinct manual TLS role probe passes selected flags/membership,
+TEMP transaction rollback and four exact42501 refusals on same-case attempt two,
+with original failed preparation preserved. Exact ephemeral role/Secret/client
+cleanup restores all 21 original SQL roles and operator Role permissions.
+The verified public-source image reaches Dev after one terminally canceled transfer
+and one bounded same-archive retry, then one guarded image-only rollout. All 64
+compiled modules, original infrastructure/SQL and4096 usage hashes/diagnostic are
+preserved. No API-managed verifier/rotation/customer endpoint is qualified by this
+manual proof; physical recovery and other v1 gates remain open.
+
 The [remote control archive checkpoint](docs/evidence/m3-control-archive-2026-09-29.md)
 qualifies one upload of the existing encrypted bundle into the private EU R2
 bucket, exact remote download and offline reconstruction from those downloaded
