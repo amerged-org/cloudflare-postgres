@@ -241,15 +241,19 @@ export async function migrationSet(directory: string): Promise<MigrationSet> {
 }
 export function buildSnapshotQuery(set: MigrationSet): string {
   if (!trustedSql.has(set)) throw fail("control_snapshot_migrations_invalid");
-  const tables = set.tables
-    .map((table) => {
-      const cells = table.columns.map((name) => {
-        const column = quote(name);
-        return `json_object('type',typeof(${column}),'value',CASE typeof(${column}) WHEN 'blob' THEN hex(${column}) WHEN 'real' THEN printf('%!.17g',${column}) ELSE CAST(${column} AS TEXT) END)`;
-      });
-      return `(SELECT json_object('name',${literal(table.name)},'columns',json(${literal(JSON.stringify(table.columns))}),'rows',json((SELECT json_group_array(json_array(${cells.join(",")})) FROM (SELECT ${table.columns.map(quote).join(",")} FROM ${quote(table.name)} ORDER BY ${table.order.map(quote).join(",")})))))`;
-    })
-    .join(" || ',' || ");
+  const fragments = set.tables.map((table) => {
+    const cells = table.columns.map((name) => {
+      const column = quote(name);
+      return `json_object('type',typeof(${column}),'value',CASE typeof(${column}) WHEN 'blob' THEN hex(${column}) WHEN 'real' THEN printf('%!.17g',${column}) ELSE CAST(${column} AS TEXT) END)`;
+    });
+    return `(SELECT json_object('name',${literal(table.name)},'columns',json(${literal(JSON.stringify(table.columns))}),'rows',json((SELECT json_group_array(json_array(${cells.join(",")})) FROM (SELECT ${table.columns.map(quote).join(",")} FROM ${quote(table.name)} ORDER BY ${table.order.map(quote).join(",")})))))`;
+  });
+  const concatenate = (parts: string[]): string => {
+    if (parts.length === 1) return parts[0]!;
+    const middle = Math.floor(parts.length / 2);
+    return `(${concatenate(parts.slice(0, middle))} || ',' || ${concatenate(parts.slice(middle))})`;
+  };
+  const tables = concatenate(fragments);
   const sql = `SELECT json_object('schema',json((SELECT json_group_array(json_object('name',name,'type',type,'sql',sql)) FROM (SELECT name,type,sql FROM sqlite_master WHERE ${schemaWhere} ORDER BY type,name))),'tables',json('[' || ${tables} || ']'),'sequences',json((SELECT json_group_array(json_object('name',name,'seq',CAST(seq AS TEXT))) FROM (SELECT name,seq FROM sqlite_sequence WHERE name NOT GLOB 'sqlite_*' AND name NOT GLOB '_cf_*' ORDER BY name)))) AS snapshot_json;`;
   if (Buffer.byteLength(sql, "utf8") > 95000)
     throw fail("control_snapshot_query_bound");
