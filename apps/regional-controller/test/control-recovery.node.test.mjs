@@ -254,6 +254,47 @@ test("rebuilds all current control migrations and historical encrypted credentia
       name,
       rows: f.db.prepare(`SELECT * FROM ${name}`).all(),
     }));
+    const permitId = "acacacac-acac-4aca-8aca-acacacacacac";
+    const pinned = f.db
+      .prepare("SELECT * FROM environments WHERE id=?")
+      .get(f.ids.environment);
+    const permitBinding = JSON.stringify({
+      name: pinned.name,
+      profileId: pinned.profile_id,
+      volumeGiB: JSON.parse(pinned.resolved_spec).volumeGiB,
+      catalogHash: f.db
+        .prepare(
+          "SELECT catalog_hash FROM region_catalogs WHERE region_id=? AND version=?",
+        )
+        .get(pinned.region_id, pinned.catalog_version).catalog_hash,
+    });
+    f.db
+      .prepare(
+        "INSERT INTO environment_admission_permits(id,organization_id,project_id,region_id,catalog_version,binding_json,spec_hash,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        permitId,
+        f.ids.organization,
+        f.ids.project,
+        f.ids.region,
+        pinned.catalog_version,
+        permitBinding,
+        pinned.spec_hash,
+        now,
+        "2026-09-29T00:30:00.000Z",
+      );
+    f.db
+      .prepare(
+        "INSERT INTO admission_permit_requests(idempotency_key,request_hash,action,permit_id,created_at) VALUES(?,?,?,?,?)",
+      )
+      .run("retained-commissioning", "c".repeat(64), "issue", permitId, now);
+    const retainedAdmissionRows = [
+      "environment_admission_permits",
+      "admission_permit_requests",
+    ].map((name) => ({
+      name,
+      rows: f.db.prepare(`SELECT * FROM ${name}`).all(),
+    }));
     let reads = 0;
     const snapshot = await captureControlSnapshot(
       async (sql) => {
@@ -276,7 +317,7 @@ test("rebuilds all current control migrations and historical encrypted credentia
       true,
       "current control recovery must include durable backup identities",
     );
-    assert.equal(snapshot.migrations.files.length, 16);
+    assert.equal(snapshot.migrations.files.length, 17);
     assert.equal(
       snapshot.sequences.find((s) => s.name === "d1_migrations").seq,
       "9007199254740993",
@@ -348,6 +389,14 @@ test("rebuilds all current control migrations and historical encrypted credentia
           db.prepare(`SELECT * FROM ${retained.name}`).all(),
           retained.rows,
           `${retained.name} must retain the exact queued intention and compute revision`,
+        );
+      }
+      for (const retained of retainedAdmissionRows) {
+        assert.equal(retained.rows.length, 1);
+        assert.deepEqual(
+          db.prepare(`SELECT * FROM ${retained.name}`).all(),
+          retained.rows,
+          `${retained.name} must retain exact immutable commissioning and replay authority`,
         );
       }
       assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);

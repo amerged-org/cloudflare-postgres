@@ -227,9 +227,39 @@ Catalog versions and persisted environment specs are immutable in D1, including 
 
 An organization token with `projects:read` can fetch `GET /v1/organizations/{organizationId}/regions/{regionId}/catalogs/{catalogVersion}`. Public catalog and environment responses omit `storageClassName`, backup endpoint/destination, and credential references. They include compute, volume limits, topology, and backup retention. Catalog/spec hashes identify the complete private execution snapshot; they cannot be recomputed from the redacted public representation.
 
+## One-use environment commissioning
+
+The installation operator can issue `POST /v1/environment-admission-permits`
+with the exact organization, project, ordinary environment input, known
+`catalogHash`, known resolved `specHash`, and a canonical UTC `expiresAt` at
+most one hour ahead. The server independently resolves the immutable catalog
+and compares both hashes. Issuance requires the installation bearer token and
+an installation-wide `Idempotency-Key`. `GET /v1/environment-admission-permits/{permitId}`
+reads the binding and terminal state; `POST .../{permitId}/revoke` accepts `{}`
+and its own idempotency key to revoke unspent authority.
+
+An ordinary organization client with `projects:write` may add optional
+`admissionPermitId` to its existing environment-create input. The permit is
+exactly bound to organization, project, region, catalog version/hash, profile,
+name, volume and resolved specification. It is consumed atomically with the
+environment, queued operation and normal request identity. The resolved
+specification and existing clients' request hashes remain unchanged when no
+permit is supplied. Invalid explicit permits never fall back to open regional
+admission. Current actor, project, catalog, region and requested project budget
+pause are rechecked inside the same batch. Database-clock expiry prevents a
+request delayed before the batch from spending stale authority.
+
+Exact environment retries retain IDs after consumption or expiry. Operator
+issuance/revocation retries retain their permit identity; changed content under
+the same key conflicts. A permit supplies commissioning admission only. It
+does not prove capacity, fund runtime, bypass backup requirements, qualify
+native access or recovery, or open regional admission. This source addition
+has no live permit or managed-environment delivery evidence yet. See the
+[commissioning contract](../../docs/contracts/environment-admission-permits-v1.md).
+
 ## Environment creation and observation
 
-Send `POST /v1/organizations/{organizationId}/projects/{projectId}/environments` with the organization's `projects:write` token, an `Idempotency-Key`, and exactly `name`, `regionId`, `catalogVersion`, `profileId`, and `volumeGiB`. Callers cannot supply an image, Kubernetes mapping, resource override, or secret reference. The project must be active and the selected version must currently admit new environments. There is no inferred region or adopter-specific default.
+Send `POST /v1/organizations/{organizationId}/projects/{projectId}/environments` with the organization's `projects:write` token, an `Idempotency-Key`, required `name`, `regionId`, `catalogVersion`, `profileId`, and `volumeGiB`, and optional `admissionPermitId`. Callers cannot supply an image, Kubernetes mapping, resource override, or secret reference. The project must be active and unpaused; the selected version must currently admit new environments or the request must consume its exact installation-issued commissioning permit. There is no inferred region or adopter-specific default.
 
 The `202` response contains a `pending` environment and a `queued` `environment.create` operation. A conditional D1 batch checks admission again and creates the environment, operation, and request identity atomically. It stores the complete normalized profile snapshot with `specRevision: 1` and SHA-256 of `JSON.stringify(spec)` in its persisted key order. A retry of the same request/key returns the same IDs and current state, including after a newer catalog is published or admission closes. A changed body or project path under the same organization's environment key returns `409 idempotency_conflict`. Environment keys are retained indefinitely in this slice and are separate from the logical-project key namespace.
 

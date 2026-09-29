@@ -588,6 +588,108 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+  /v1/environment-admission-permits:
+    post:
+      operationId: issueEnvironmentAdmissionPermit
+      summary: Commission one exactly bound environment without opening regional admission
+      description: |
+        Installation-only authority, retained under an installation-wide Idempotency-Key.
+        The server resolves the immutable catalog profile and compares the supplied
+        catalogHash and specHash. Expiry is canonical UTC and at most one hour from
+        issuance. This supplies admission only: it does not qualify capacity, funding,
+        runtime enforcement, native access, backup or recovery. Ordinary projects:write
+        authorization and an unpaused project remain required when consuming the permit.
+      security:
+        - installationToken: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: ^[A-Za-z0-9._~-]{1,128}$
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/AdmissionPermitInput"
+      responses:
+        "201":
+          $ref: "#/components/responses/AdmissionPermitResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Hash/binding mismatch, unavailable scope, or changed idempotent request
+        "500":
+          description: Unavailable persistence or inconsistent retained identity
+  /v1/environment-admission-permits/{permitId}:
+    parameters:
+      - name: permitId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: readEnvironmentAdmissionPermit
+      summary: Read immutable commissioning binding and current terminal state
+      security:
+        - installationToken: []
+      responses:
+        "200":
+          $ref: "#/components/responses/AdmissionPermitResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+  /v1/environment-admission-permits/{permitId}/revoke:
+    parameters:
+      - name: permitId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      operationId: revokeEnvironmentAdmissionPermit
+      summary: Revoke unspent commissioning authority idempotently
+      description: |
+        Consumed permits cannot be revoked. Exact replay returns the retained permit
+        after terminal state changes; changed content conflicts. This never deletes
+        an environment or changes regional admission.
+      security:
+        - installationToken: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: ^[A-Za-z0-9._~-]{1,128}$
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              maxProperties: 0
+      responses:
+        "200":
+          $ref: "#/components/responses/AdmissionPermitResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Consumed/revoked authority or changed idempotent request
   /v1/organizations/{organizationId}/projects/{projectId}/environments:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -597,9 +699,13 @@ paths:
       summary: Accept a frozen environment specification for regional execution
       description:
         Requires projects:write, an active logical project, and admission
-        for the exact requested catalog version. There are no provider/customer defaults.
+        for the exact requested catalog version, or an explicitly supplied one-use
+        commissioning permit bound to this exact organization/project/specification.
+        Known project budget pause prevents fresh creation. There are no provider/customer defaults.
         Environment, queued operation, and idempotency identity are inserted atomically
-        with a fresh admission check. Identical retries preserve IDs and return current
+        with fresh current-actor, project, region, catalog, budget-pause and admission checks.
+        A supplied invalid permit never falls back to globally open admission.
+        Identical retries preserve IDs and return current
         observed state even after admission closes; changed content under the same organization-wide
         environment key returns 409. No endpoint or credential is issued.
       security:
@@ -633,7 +739,7 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
-          description: Admission closed, project not active, or idempotency conflict
+          description: Admission closed, permit unavailable, budget paused, project not active, or idempotency conflict
     get:
       operationId: listEnvironments
       summary: Recover environments in the authorized parent
@@ -2562,6 +2668,17 @@ components:
         type: string
         const: no-store
   responses:
+    AdmissionPermitResponse:
+      description: Immutable commissioning binding and observed permit state
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [permit]
+            properties:
+              permit:
+                $ref: "#/components/schemas/AdmissionPermit"
     RoleLifecycleConflict:
       description: >-
         role_name_conflict, role_conflict, environment_not_ready,
@@ -4711,6 +4828,114 @@ components:
         updatedAt:
           type: [string, "null"]
           format: date-time
+    AdmissionPermitInput:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          organizationId,
+          projectId,
+          name,
+          regionId,
+          catalogVersion,
+          profileId,
+          volumeGiB,
+          catalogHash,
+          specHash,
+          expiresAt,
+        ]
+      properties:
+        organizationId:
+          type: string
+          format: uuid
+        projectId:
+          type: string
+          format: uuid
+        name:
+          $ref: "#/components/schemas/EnvironmentInput/properties/name"
+        regionId:
+          $ref: "#/components/schemas/EnvironmentInput/properties/regionId"
+        catalogVersion:
+          $ref: "#/components/schemas/CatalogVersion"
+        profileId:
+          $ref: "#/components/schemas/EnvironmentInput/properties/profileId"
+        volumeGiB:
+          $ref: "#/components/schemas/EnvironmentInput/properties/volumeGiB"
+        catalogHash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        specHash:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+        expiresAt:
+          type: string
+          format: date-time
+          description: Canonical UTC with milliseconds, future and at most one hour from issuance.
+    AdmissionPermit:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          id,
+          organizationId,
+          projectId,
+          name,
+          regionId,
+          catalogVersion,
+          profileId,
+          volumeGiB,
+          catalogHash,
+          specHash,
+          issuedAt,
+          expiresAt,
+          status,
+          consumedEnvironmentId,
+          consumedOperationId,
+          consumedAt,
+          revokedAt,
+        ]
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          $ref: "#/components/schemas/AdmissionPermitInput/properties/organizationId"
+        projectId:
+          $ref: "#/components/schemas/AdmissionPermitInput/properties/projectId"
+        name:
+          $ref: "#/components/schemas/AdmissionPermitInput/properties/name"
+        regionId:
+          $ref: "#/components/schemas/AdmissionPermitInput/properties/regionId"
+        catalogVersion:
+          $ref: "#/components/schemas/CatalogVersion"
+        profileId:
+          $ref: "#/components/schemas/AdmissionPermitInput/properties/profileId"
+        volumeGiB:
+          $ref: "#/components/schemas/AdmissionPermitInput/properties/volumeGiB"
+        catalogHash:
+          $ref: "#/components/schemas/AdmissionPermitInput/properties/catalogHash"
+        specHash:
+          $ref: "#/components/schemas/AdmissionPermitInput/properties/specHash"
+        issuedAt:
+          type: string
+          format: date-time
+        expiresAt:
+          $ref: "#/components/schemas/AdmissionPermitInput/properties/expiresAt"
+        status:
+          type: string
+          enum: [issued, consumed, revoked, expired]
+        consumedEnvironmentId:
+          type: [string, "null"]
+          format: uuid
+        consumedOperationId:
+          type: [string, "null"]
+          format: uuid
+        consumedAt:
+          type: [string, "null"]
+          format: date-time
+        revokedAt:
+          type: [string, "null"]
+          format: date-time
     EnvironmentInput:
       type: object
       additionalProperties: false
@@ -4730,6 +4955,10 @@ components:
           minimum: 1
           maximum: 1048576
           description: Must match the selected profile range and step.
+        admissionPermitId:
+          type: string
+          format: uuid
+          description: Optional exactly bound installation-issued one-use admission. Invalid explicit permits never fall back to open regional admission.
     PublicResolvedSpec:
       type: object
       additionalProperties: false

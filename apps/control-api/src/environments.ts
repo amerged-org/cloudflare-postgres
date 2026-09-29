@@ -6,6 +6,14 @@ import {
   type NativeAccessPolicy,
   type NativeConnectionObservation,
 } from "./native-access";
+import { assertion } from "./accounting";
+import {
+  actorBindings,
+  actorPredicate,
+  authorize,
+  idempotencyKey,
+  type Actor,
+} from "./execution-auth";
 type Env = Cloudflare.Env;
 type Database = D1DatabaseSession;
 type JsonObject = Record<string, unknown>;
@@ -149,6 +157,25 @@ interface RequestRow {
   environment_id: string;
   operation_id: string;
 }
+interface AdmissionPermitRow {
+  id: string;
+  organization_id: string;
+  project_id: string;
+  region_id: string;
+  catalog_version: string;
+  binding_json: string;
+  spec_hash: string;
+  issued_at: string;
+  expires_at: string;
+  consumed_environment_id: string | null;
+  consumed_operation_id: string | null;
+  consumed_at: string | null;
+  revoked_at: string | null;
+}
+interface PermitRequestRow {
+  request_hash: string;
+  permit_id: string;
+}
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 const identifier = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -156,6 +183,7 @@ const version = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const dnsLabel = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
 const secretKey = /^[A-Za-z0-9._-]{1,253}$/;
 const runEpoch = /^[1-9][0-9]{0,18}$/;
+const digest = /^[0-9a-f]{64}$/;
 
 function json(body: unknown, status = 200): Response {
   return Response.json(body, {
@@ -830,15 +858,16 @@ async function setAdmission(
   return json({ admission: await admission(db, regionId) });
 }
 
-function environmentInput(input: unknown): EnvironmentInput | null {
+function environmentInput(
+  input: unknown,
+  optional: readonly string[] = [],
+): EnvironmentInput | null {
   if (
-    !object(input, [
-      "name",
-      "regionId",
-      "catalogVersion",
-      "profileId",
-      "volumeGiB",
-    ]) ||
+    !object(
+      input,
+      ["name", "regionId", "catalogVersion", "profileId", "volumeGiB"],
+      optional,
+    ) ||
     !name(input.name) ||
     !text(input.regionId, uuid) ||
     !text(input.catalogVersion, version) ||
@@ -855,21 +884,265 @@ function environmentInput(input: unknown): EnvironmentInput | null {
   };
 }
 
+function permitBinding(input: EnvironmentInput, catalogHash: string): string {
+  return JSON.stringify({
+    name: input.name,
+    profileId: input.profileId,
+    volumeGiB: input.volumeGiB,
+    catalogHash,
+  });
+}
+function publicPermit(row: AdmissionPermitRow) {
+  return {
+    id: row.id,
+    organizationId: row.organization_id,
+    projectId: row.project_id,
+    regionId: row.region_id,
+    catalogVersion: row.catalog_version,
+    ...(JSON.parse(row.binding_json) as {
+      name: string;
+      profileId: string;
+      volumeGiB: number;
+      catalogHash: string;
+    }),
+    specHash: row.spec_hash,
+    issuedAt: row.issued_at,
+    expiresAt: row.expires_at,
+    status: row.consumed_at
+      ? "consumed"
+      : row.revoked_at
+        ? "revoked"
+        : row.expires_at <= new Date().toISOString()
+          ? "expired"
+          : "issued",
+    consumedEnvironmentId: row.consumed_environment_id,
+    consumedOperationId: row.consumed_operation_id,
+    consumedAt: row.consumed_at,
+    revokedAt: row.revoked_at,
+  };
+}
+const readPermit = (db: Database, id: string) =>
+  db
+    .prepare("SELECT * FROM environment_admission_permits WHERE id=?")
+    .bind(id)
+    .first<AdmissionPermitRow>();
+const readPermitRequest = (db: Database, key: string) =>
+  db
+    .prepare(
+      "SELECT request_hash,permit_id FROM admission_permit_requests WHERE idempotency_key=?",
+    )
+    .bind(key)
+    .first<PermitRequestRow>();
+async function permitReplay(
+  db: Database,
+  row: PermitRequestRow,
+  requestHash: string,
+  status: number,
+) {
+  if (row.request_hash !== requestHash)
+    return error(409, "idempotency_conflict");
+  const permit = await readPermit(db, row.permit_id);
+  return permit
+    ? json({ permit: publicPermit(permit) }, status)
+    : error(500, "state_inconsistent");
+}
+function resolveSpec(
+  input: EnvironmentInput,
+  release: CatalogRow,
+): ResolvedSpec | null {
+  const profile = (JSON.parse(release.profiles_json) as Profile[]).find(
+    (item) => item.id === input.profileId,
+  );
+  if (
+    !profile ||
+    input.volumeGiB < profile.storage.minGiB ||
+    input.volumeGiB > profile.storage.maxGiB ||
+    (input.volumeGiB - profile.storage.minGiB) % profile.storage.stepGiB !== 0
+  )
+    return null;
+  return { ...input, profile };
+}
+async function issueAdmissionPermit(
+  request: Request,
+  env: Env,
+  db: Database,
+): Promise<Response> {
+  const denied = await installAuth(request, env);
+  if (denied) return denied;
+  const key = idempotencyKey(request);
+  if (!key) return error(400, "invalid_idempotency_key");
+  const value = await body(request);
+  const input = environmentInput(value, [
+    "organizationId",
+    "projectId",
+    "catalogHash",
+    "specHash",
+    "expiresAt",
+  ]);
+  if (
+    !input ||
+    !object(value, [
+      "organizationId",
+      "projectId",
+      "name",
+      "regionId",
+      "catalogVersion",
+      "profileId",
+      "volumeGiB",
+      "catalogHash",
+      "specHash",
+      "expiresAt",
+    ]) ||
+    !text(value.organizationId, uuid) ||
+    !text(value.projectId, uuid) ||
+    !text(value.catalogHash, digest) ||
+    !text(value.specHash, digest) ||
+    typeof value.expiresAt !== "string" ||
+    !Number.isFinite(Date.parse(value.expiresAt)) ||
+    new Date(value.expiresAt).toISOString() !== value.expiresAt
+  )
+    return error(400, "invalid_request");
+  const organizationId = value.organizationId,
+    projectId = value.projectId;
+  const requestHash = await sha256(
+    `POST /v1/environment-admission-permits\n${JSON.stringify({ organizationId, projectId, ...input, catalogHash: value.catalogHash, specHash: value.specHash, expiresAt: value.expiresAt })}`,
+  );
+  const prior = await readPermitRequest(db, key);
+  if (prior) return permitReplay(db, prior, requestHash, 201);
+  const now = new Date().toISOString();
+  if (
+    value.expiresAt <= now ||
+    Date.parse(value.expiresAt) - Date.parse(now) > 3_600_000
+  )
+    return error(400, "invalid_expiry");
+  const release = await catalog(db, input.regionId, input.catalogVersion);
+  if (!release) return error(404, "not_found");
+  const spec = resolveSpec(input, release);
+  if (!spec) return error(400, "unsupported_profile");
+  const specHash = await sha256(JSON.stringify(spec));
+  if (release.catalog_hash !== value.catalogHash || specHash !== value.specHash)
+    return error(409, "permit_binding_conflict");
+  const predicate =
+    "EXISTS (SELECT 1 FROM projects p JOIN regions g ON g.id=? JOIN region_catalogs c ON c.region_id=g.id AND c.version=? WHERE p.id=? AND p.organization_id=? AND p.status='active' AND g.status<>'disabled' AND c.catalog_hash=?)";
+  const bindings = [
+    input.regionId,
+    input.catalogVersion,
+    projectId,
+    organizationId,
+    release.catalog_hash,
+  ];
+  const id = crypto.randomUUID();
+  try {
+    await db.batch([
+      assertion(db, predicate, bindings),
+      db
+        .prepare(
+          "INSERT INTO environment_admission_permits(id,organization_id,project_id,region_id,catalog_version,binding_json,spec_hash,issued_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(
+          id,
+          organizationId,
+          projectId,
+          input.regionId,
+          input.catalogVersion,
+          permitBinding(input, release.catalog_hash),
+          specHash,
+          now,
+          value.expiresAt,
+        ),
+      assertion(db, "changes()=1"),
+      db
+        .prepare(
+          "INSERT INTO admission_permit_requests(idempotency_key,request_hash,action,permit_id,created_at) VALUES(?,?,?,?,?)",
+        )
+        .bind(key, requestHash, "issue", id, now),
+      assertion(db, "changes()=1"),
+    ]);
+  } catch {
+    const winner = await readPermitRequest(db, key);
+    if (winner) return permitReplay(db, winner, requestHash, 201);
+    if (
+      !(await db
+        .prepare(`SELECT 1 WHERE ${predicate}`)
+        .bind(...bindings)
+        .first())
+    )
+      return error(409, "permit_scope_unavailable");
+    return error(500, "write_failed");
+  }
+  return json({ permit: publicPermit((await readPermit(db, id))!) }, 201);
+}
+async function revokeAdmissionPermit(
+  request: Request,
+  env: Env,
+  db: Database,
+  id: string,
+): Promise<Response> {
+  const denied = await installAuth(request, env);
+  if (denied) return denied;
+  const key = idempotencyKey(request);
+  if (!key) return error(400, "invalid_idempotency_key");
+  if (!text(id, uuid) || !object(await body(request), []))
+    return error(400, "invalid_request");
+  const requestHash = await sha256(
+    `POST /v1/environment-admission-permits/${id}/revoke\n{}`,
+  );
+  const prior = await readPermitRequest(db, key);
+  if (prior) return permitReplay(db, prior, requestHash, 200);
+  const row = await readPermit(db, id);
+  if (!row) return error(404, "not_found");
+  if (row.consumed_at || row.revoked_at)
+    return error(409, "admission_permit_unavailable");
+  const now = new Date().toISOString();
+  try {
+    await db.batch([
+      db
+        .prepare(
+          "UPDATE environment_admission_permits SET revoked_at=? WHERE id=? AND consumed_at IS NULL AND revoked_at IS NULL",
+        )
+        .bind(now, id),
+      assertion(db, "changes()=1"),
+      db
+        .prepare(
+          "INSERT INTO admission_permit_requests(idempotency_key,request_hash,action,permit_id,created_at) VALUES(?,?,?,?,?)",
+        )
+        .bind(key, requestHash, "revoke", id, now),
+      assertion(db, "changes()=1"),
+    ]);
+  } catch {
+    const winner = await readPermitRequest(db, key);
+    return winner
+      ? permitReplay(db, winner, requestHash, 200)
+      : error(409, "admission_permit_unavailable");
+  }
+  return json({ permit: publicPermit((await readPermit(db, id))!) });
+}
+
 async function replay(
   db: Database,
   organizationId: string,
   row: RequestRow,
+  actor: Actor,
 ): Promise<Response> {
+  if (
+    !(await db
+      .prepare(`SELECT 1 WHERE ${actorPredicate(actor)}`)
+      .bind(...actorBindings(actor))
+      .first())
+  )
+    return error(401, "unauthorized");
   const [environment, operation] = await Promise.all([
     db
       .prepare(
-        "SELECT * FROM environments WHERE id = ? AND organization_id = ?",
+        `SELECT * FROM environments WHERE id = ? AND organization_id = ? AND ${actorPredicate(actor)}`,
       )
-      .bind(row.environment_id, organizationId)
+      .bind(row.environment_id, organizationId, ...actorBindings(actor))
       .first<EnvironmentRow>(),
     db
-      .prepare("SELECT * FROM operations WHERE id = ? AND organization_id = ?")
-      .bind(row.operation_id, organizationId)
+      .prepare(
+        `SELECT * FROM operations WHERE id = ? AND organization_id = ? AND ${actorPredicate(actor)}`,
+      )
+      .bind(row.operation_id, organizationId, ...actorBindings(actor))
       .first<ExecutionRow>(),
   ]);
   if (!environment || !operation) return error(500, "state_inconsistent");
@@ -888,34 +1161,62 @@ async function createEnvironment(
   organizationId: string,
   projectId: string,
 ): Promise<Response> {
-  const denied = await scopedAuth(
+  const actor = await authorize(
     request,
     db,
-    organizationId,
     "organization",
+    organizationId,
     "projects:write",
   );
-  if (denied) return denied;
+  if (actor instanceof Response) return actor;
   const key = request.headers.get("idempotency-key");
   if (!key || !/^[A-Za-z0-9._~-]{1,128}$/.test(key))
     return error(400, "invalid_idempotency_key");
-  const input = environmentInput(await body(request));
-  if (!input) return error(400, "invalid_request");
+  const value = await body(request);
+  const input = environmentInput(value, ["admissionPermitId"]);
+  if (
+    !input ||
+    !object(
+      value,
+      ["name", "regionId", "catalogVersion", "profileId", "volumeGiB"],
+      ["admissionPermitId"],
+    ) ||
+    (Object.hasOwn(value, "admissionPermitId") &&
+      !text(value.admissionPermitId, uuid))
+  )
+    return error(400, "invalid_request");
+  const permitId = value.admissionPermitId as string | undefined;
   const requestHash = await sha256(
-    `POST /v1/organizations/${organizationId}/projects/${projectId}/environments\n${JSON.stringify(input)}`,
+    `POST /v1/organizations/${organizationId}/projects/${projectId}/environments\n${JSON.stringify({ ...input, ...(permitId ? { admissionPermitId: permitId } : {}) })}`,
   );
   const existing = () =>
     db
       .prepare(
-        "SELECT request_hash, environment_id, operation_id FROM environment_requests WHERE organization_id = ? AND idempotency_key = ?",
+        `SELECT request_hash, environment_id, operation_id FROM environment_requests WHERE organization_id = ? AND idempotency_key = ? AND ${actorPredicate(actor)}`,
       )
-      .bind(organizationId, key)
+      .bind(organizationId, key, ...actorBindings(actor))
       .first<RequestRow>();
   const previous = await existing();
   if (previous)
     return previous.request_hash === requestHash
-      ? replay(db, organizationId, previous)
+      ? replay(db, organizationId, previous, actor)
       : error(409, "idempotency_conflict");
+  const unavailable = async (code: string): Promise<Response> => {
+    // An identical concurrent request may have committed since the first read.
+    const winner = await existing();
+    if (winner)
+      return winner.request_hash === requestHash
+        ? replay(db, organizationId, winner, actor)
+        : error(409, "idempotency_conflict");
+    if (
+      !(await db
+        .prepare(`SELECT 1 WHERE ${actorPredicate(actor)}`)
+        .bind(...actorBindings(actor))
+        .first())
+    )
+      return error(401, "unauthorized");
+    return error(409, code);
+  };
   const project = await db
     .prepare("SELECT status FROM projects WHERE id = ? AND organization_id = ?")
     .bind(projectId, organizationId)
@@ -924,34 +1225,76 @@ async function createEnvironment(
   if (project.status !== "active") return error(409, "project_not_active");
   const currentAdmission = await admission(db, input.regionId);
   if (
-    !currentAdmission.acceptingNewEnvironments ||
-    currentAdmission.catalogVersion !== input.catalogVersion
+    !permitId &&
+    (!currentAdmission.acceptingNewEnvironments ||
+      currentAdmission.catalogVersion !== input.catalogVersion)
   )
-    return error(409, "region_admission_closed");
+    return unavailable("region_admission_closed");
   const release = await catalog(db, input.regionId, input.catalogVersion);
   if (!release) return error(404, "not_found");
-  const profile = (JSON.parse(release.profiles_json) as Profile[]).find(
-    (item) => item.id === input.profileId,
-  );
-  if (
-    !profile ||
-    input.volumeGiB < profile.storage.minGiB ||
-    input.volumeGiB > profile.storage.maxGiB ||
-    (input.volumeGiB - profile.storage.minGiB) % profile.storage.stepGiB !== 0
-  )
-    return error(400, "unsupported_profile");
-  const spec: ResolvedSpec = { ...input, profile };
+  const spec = resolveSpec(input, release);
+  if (!spec) return error(400, "unsupported_profile");
   const serialized = JSON.stringify(spec);
   const specHash = await sha256(serialized);
-  const initialRunEpoch = profile.executionFencing === undefined ? null : "1";
+  const initialRunEpoch =
+    spec.profile.executionFencing === undefined ? null : "1";
   const environmentId = crypto.randomUUID();
   const operationId = crypto.randomUUID();
   const now = new Date().toISOString();
+  const binding = permitBinding(input, release.catalog_hash);
+  const permitPredicate =
+    "EXISTS (SELECT 1 FROM environment_admission_permits q WHERE q.id=? AND q.organization_id=? AND q.project_id=? AND q.region_id=? AND q.catalog_version=? AND q.binding_json=? AND q.spec_hash=? AND q.issued_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now') AND q.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') AND q.consumed_at IS NULL AND q.revoked_at IS NULL)";
+  const permitBindings = [
+    permitId ?? "",
+    organizationId,
+    projectId,
+    input.regionId,
+    input.catalogVersion,
+    binding,
+    specHash,
+  ];
+  const scopePredicate =
+    "EXISTS (SELECT 1 FROM projects p JOIN regions g ON g.id=? JOIN region_catalogs c ON c.region_id=g.id AND c.version=? WHERE p.id=? AND p.organization_id=? AND p.status='active' AND g.status<>'disabled' AND c.catalog_hash=?)";
+  const scopeBindings = [
+    input.regionId,
+    input.catalogVersion,
+    projectId,
+    organizationId,
+    release.catalog_hash,
+  ];
+  const budgetPredicate =
+    "NOT EXISTS (SELECT 1 FROM budget_targets b WHERE b.organization_id=? AND b.project_id=? AND b.environment_id IS NULL AND b.requested_state<>'running')";
+  const budgetBindings = [organizationId, projectId];
+  if (
+    permitId &&
+    !(await db
+      .prepare(`SELECT 1 WHERE ${permitPredicate}`)
+      .bind(...permitBindings)
+      .first())
+  )
+    return unavailable("admission_permit_unavailable");
+  if (
+    !(await db
+      .prepare(`SELECT 1 WHERE ${budgetPredicate}`)
+      .bind(...budgetBindings)
+      .first())
+  )
+    return unavailable("budget_paused");
   try {
-    const written = await db.batch([
+    await db.batch([
+      assertion(db, actorPredicate(actor), actorBindings(actor)),
+      assertion(db, scopePredicate, scopeBindings),
+      assertion(db, budgetPredicate, budgetBindings),
+      permitId
+        ? assertion(db, permitPredicate, permitBindings)
+        : assertion(
+            db,
+            "EXISTS (SELECT 1 FROM region_admission WHERE region_id=? AND catalog_version=? AND accepting_new_environments=1)",
+            [input.regionId, input.catalogVersion],
+          ),
       db
         .prepare(
-          "INSERT INTO environments (id, organization_id, project_id, region_id, catalog_version, profile_id, name, status, spec_revision, spec_hash, resolved_spec, created_at, run_epoch) SELECT ?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?, ?, ? FROM projects AS p JOIN region_admission AS a ON a.region_id = ? JOIN regions AS r ON r.id = a.region_id WHERE p.id = ? AND p.organization_id = ? AND p.status = 'active' AND a.catalog_version = ? AND a.accepting_new_environments = 1 AND r.status != 'disabled'",
+          "INSERT INTO environments (id, organization_id, project_id, region_id, catalog_version, profile_id, name, status, spec_revision, spec_hash, resolved_spec, created_at, run_epoch) VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', 1, ?, ?, ?, ?)",
         )
         .bind(
           environmentId,
@@ -965,36 +1308,89 @@ async function createEnvironment(
           serialized,
           now,
           initialRunEpoch,
-          input.regionId,
-          projectId,
-          organizationId,
-          input.catalogVersion,
         ),
+      assertion(db, "changes()=1"),
       db
         .prepare(
           "INSERT INTO operations (id, organization_id, project_id, environment_id, region_id, kind, status, created_at) SELECT ?, organization_id, project_id, id, region_id, 'environment.create', 'queued', ? FROM environments WHERE id = ?",
         )
         .bind(operationId, now, environmentId),
+      assertion(db, "changes()=1"),
       db
         .prepare(
           "INSERT INTO environment_requests (organization_id, idempotency_key, request_hash, project_id, environment_id, operation_id, created_at) SELECT organization_id, ?, ?, project_id, id, ?, ? FROM environments WHERE id = ?",
         )
         .bind(key, requestHash, operationId, now, environmentId),
+      assertion(db, "changes()=1"),
+      ...(permitId
+        ? [
+            db
+              .prepare(
+                "UPDATE environment_admission_permits SET consumed_environment_id=?,consumed_operation_id=?,consumed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=? AND consumed_at IS NULL AND revoked_at IS NULL AND issued_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now') AND expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+              )
+              .bind(environmentId, operationId, permitId),
+            assertion(db, "changes()=1"),
+          ]
+        : []),
     ]);
-    if (written[0]!.meta.changes !== 1)
-      return error(409, "region_admission_closed");
   } catch {
+    if (
+      !(await db
+        .prepare(`SELECT 1 WHERE ${actorPredicate(actor)}`)
+        .bind(...actorBindings(actor))
+        .first())
+    )
+      return error(401, "unauthorized");
     const winner = await existing();
-    if (!winner) return error(500, "write_failed");
+    if (!winner) {
+      if (
+        permitId &&
+        !(await db
+          .prepare(`SELECT 1 WHERE ${permitPredicate}`)
+          .bind(...permitBindings)
+          .first())
+      )
+        return error(409, "admission_permit_unavailable");
+      if (
+        !(await db
+          .prepare(`SELECT 1 WHERE ${budgetPredicate}`)
+          .bind(...budgetBindings)
+          .first())
+      )
+        return error(409, "budget_paused");
+      if (
+        !(await db
+          .prepare(`SELECT 1 WHERE ${scopePredicate}`)
+          .bind(...scopeBindings)
+          .first())
+      )
+        return error(409, "permit_scope_unavailable");
+      if (
+        !permitId &&
+        !(await db
+          .prepare(
+            "SELECT 1 FROM region_admission WHERE region_id=? AND catalog_version=? AND accepting_new_environments=1",
+          )
+          .bind(input.regionId, input.catalogVersion)
+          .first())
+      )
+        return error(409, "region_admission_closed");
+      return error(500, "write_failed");
+    }
     return winner.request_hash === requestHash
-      ? replay(db, organizationId, winner)
+      ? replay(db, organizationId, winner, actor)
       : error(409, "idempotency_conflict");
   }
-  return replay(db, organizationId, {
-    request_hash: requestHash,
-    environment_id: environmentId,
-    operation_id: operationId,
-  });
+  return replay(
+    db,
+    organizationId,
+    {
+      request_hash: requestHash,
+      environment_id: environmentId,
+      operation_id: operationId,
+    },
+    actor,
+  );
 }
 
 async function readEnvironment(
@@ -1345,6 +1741,21 @@ export async function environmentRoutes(
 ): Promise<Response | null> {
   const pathname = new URL(request.url).pathname;
   const db = env.DB.withSession("first-primary");
+  if (
+    pathname === "/v1/environment-admission-permits" &&
+    request.method === "POST"
+  )
+    return issueAdmissionPermit(request, env, db);
+  const permitPath =
+    /^\/v1\/environment-admission-permits\/([^/]+)(\/revoke)?$/.exec(pathname);
+  if (permitPath && request.method === "POST" && permitPath[2])
+    return revokeAdmissionPermit(request, env, db, permitPath[1]!);
+  if (permitPath && request.method === "GET" && !permitPath[2]) {
+    const denied = await installAuth(request, env);
+    if (denied) return denied;
+    const row = await readPermit(db, permitPath[1]!);
+    return row ? json({ permit: publicPermit(row) }) : error(404, "not_found");
+  }
   const catalogs = /^\/v1\/regions\/([^/]+)\/catalogs$/.exec(pathname);
   if (request.method === "POST" && catalogs)
     return publishCatalog(request, env, db, catalogs[1]!);
