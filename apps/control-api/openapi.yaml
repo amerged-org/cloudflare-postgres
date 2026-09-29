@@ -4333,6 +4333,40 @@ components:
           type: integer
           minimum: 1
           maximum: 1048576
+    ComputeSize:
+      type: object
+      additionalProperties: false
+      required: [id, cpuMilli, memoryMiB]
+      properties:
+        id:
+          type: string
+          pattern: ^[a-z][a-z0-9_-]{0,63}$
+        cpuMilli:
+          $ref: "#/components/schemas/Compute/properties/cpuMilli"
+        memoryMiB:
+          $ref: "#/components/schemas/Compute/properties/memoryMiB"
+    ComputeScalingPolicy:
+      type: object
+      additionalProperties: false
+      required: [version, initialSizeId, sizes]
+      description: >-
+        Immutable catalog metadata only. Sizes have distinct ASCII identifiers
+        and strictly increase in both CPU and memory. initialSizeId selects
+        exactly one size whose CPU and memory equal the profile's compute values.
+        Publishing this policy does not activate runtime resizing or autoscaling.
+      properties:
+        version:
+          type: integer
+          const: 1
+        initialSizeId:
+          type: string
+          pattern: ^[a-z][a-z0-9_-]{0,63}$
+        sizes:
+          type: array
+          minItems: 2
+          maxItems: 8
+          items:
+            $ref: "#/components/schemas/ComputeSize"
     PublicStorage:
       type: object
       additionalProperties: false
@@ -4445,6 +4479,8 @@ components:
           pattern: ^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$
         compute:
           $ref: "#/components/schemas/Compute"
+        computeScaling:
+          $ref: "#/components/schemas/ComputeScalingPolicy"
         storage:
           $ref: "#/components/schemas/PublicStorage"
         instances:
@@ -4480,6 +4516,8 @@ components:
           $ref: "#/components/schemas/PublicProfile/properties/postgresImage"
         compute:
           $ref: "#/components/schemas/Compute"
+        computeScaling:
+          $ref: "#/components/schemas/ComputeScalingPolicy"
         storage:
           $ref: "#/components/schemas/OperatorStorage"
         instances:

@@ -216,6 +216,22 @@ The original R2 reporter in [issue #411](https://github.com/cloudnative-pg/plugi
 
 ### Sleep/wake and scaling
 
+The [compute scaling contract](docs/contracts/compute-scaling-v1.md) preserves
+the immutable environment identity while adding an operator-approved size ladder
+and, later, separate desired/effective compute revisions. The first source slice
+only publishes validated size choices in a new immutable catalog version. Manual
+resize still requires a leased, idempotent operation with target funding and
+capacity reservations, bounded quota/Cluster patches, effective Pod-resource
+readback, and collision locks for suspend and backup. Automatic scaling adds
+sustained signals, hysteresis and cooldown to those same effect guards. Existing
+allowance receipts and the current `runtimeEnforced: false` state do not prove
+that a larger size is funded or physically enforceable. This work does not
+activate either scaling mode in Dev.
+The [size-catalog source checkpoint](docs/evidence/m6-compute-size-catalog-2026-09-29.md)
+retains the red-first case, original typecheck stop, narrow correction and the
+fresh-worktree build setup repair without repeating the full gate. No physical
+resize or autoscaling result is claimed.
+
 Reuse CNPG hibernation and resource reconciliation. The platform supplies idle detection, admission, wake coalescing, startup deadlines, and scaling policy. Monitoring and empty pool connections must not accidentally keep every database awake; active transactions and session-dependent work must be respected.
 
 Measure the whole cold connection path against the adopter's actual timeout. A generic 10-30 second Pod-start estimate is neither an accepted target nor evidence. The early always-on pilot is a baseline; v1 acceptance still requires successful cold requests under the declared deadline.

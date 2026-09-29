@@ -580,6 +580,71 @@ async function publishAndAdmit(regionId: string) {
   expect(admitted.status).toBe(200);
 }
 
+it("pins an optional compute-size catalog with a nonminimum initial size into the environment spec", async () => {
+  const fixture = await environmentFixture("Compute size catalog");
+  const computeScaling = {
+    version: 1,
+    initialSizeId: "standard",
+    sizes: [
+      { id: "small", cpuMilli: 250, memoryMiB: 256 },
+      { id: "standard", cpuMilli: 500, memoryMiB: 512 },
+      { id: "large", cpuMilli: 1000, memoryMiB: 1024 },
+    ],
+  };
+  const profile = { ...environmentProfile, computeScaling };
+  const published = await call(`/v1/regions/${fixture.regionId}/catalogs`, {
+    method: "POST",
+    headers: installationHeaders,
+    body: JSON.stringify({
+      version: "compute-sizes-v1",
+      profiles: [profile],
+    }),
+  });
+  expect(published.status).toBe(201);
+  const catalog = (await published.json()) as {
+    catalog: { profiles: Array<{ computeScaling?: unknown }> };
+  };
+  expect(catalog.catalog.profiles[0]?.computeScaling).toEqual(computeScaling);
+
+  const admitted = await call(`/v1/regions/${fixture.regionId}/admission`, {
+    method: "PUT",
+    headers: installationHeaders,
+    body: JSON.stringify({
+      catalogVersion: "compute-sizes-v1",
+      acceptingNewEnvironments: true,
+    }),
+  });
+  expect(admitted.status).toBe(200);
+  const created = await call(fixture.path, {
+    method: "POST",
+    headers: fixture.organizationHeaders,
+    body: JSON.stringify({
+      ...fixture.input,
+      catalogVersion: "compute-sizes-v1",
+    }),
+  });
+  expect(created.status).toBe(202);
+  const result = (await created.json()) as {
+    environment: {
+      id: string;
+      specHash: string;
+      resolvedSpec: { profile: { computeScaling?: unknown } };
+    };
+  };
+  expect(result.environment.resolvedSpec.profile.computeScaling).toEqual(
+    computeScaling,
+  );
+  const stored = await env.DB.prepare(
+    "SELECT spec_hash, resolved_spec FROM environments WHERE id = ?",
+  )
+    .bind(result.environment.id)
+    .first<{ spec_hash: string; resolved_spec: string }>();
+  expect(JSON.parse(stored!.resolved_spec).profile.computeScaling).toEqual(
+    computeScaling,
+  );
+  expect(stored!.spec_hash).toBe(result.environment.specHash);
+});
+
 it("creates a scoped immutable environment and observes its leased regional execution", async () => {
   const fixture = await environmentFixture("Environment lifecycle");
   const closed = await call(fixture.path, {

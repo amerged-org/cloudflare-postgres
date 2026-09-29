@@ -48,10 +48,17 @@ interface EnvironmentObservation {
   nodeCohort?: { uid: string; hash: string };
 }
 
+interface ComputeScalingPolicy {
+  version: 1;
+  initialSizeId: string;
+  sizes: { id: string; cpuMilli: number; memoryMiB: number }[];
+}
+
 interface Profile {
   id: string;
   postgresImage: string;
   compute: { cpuMilli: number; memoryMiB: number };
+  computeScaling?: ComputeScalingPolicy;
   storage: {
     classId: string;
     storageClassName: string;
@@ -446,12 +453,62 @@ export function validEnvironmentObservation(
   );
 }
 
+function computeScalingFromJson(
+  value: unknown,
+  initial: Record<string, unknown>,
+): ComputeScalingPolicy | null {
+  if (
+    !object(value, ["version", "initialSizeId", "sizes"]) ||
+    value.version !== 1 ||
+    !text(value.initialSizeId, identifier) ||
+    !Array.isArray(value.sizes) ||
+    value.sizes.length < 2 ||
+    value.sizes.length > 8
+  )
+    return null;
+  const sizes: ComputeScalingPolicy["sizes"] = [];
+  const ids = new Set<string>();
+  for (const entry of value.sizes) {
+    if (
+      !object(entry, ["id", "cpuMilli", "memoryMiB"]) ||
+      !text(entry.id, identifier) ||
+      !integer(entry.cpuMilli, 1, 1_000_000) ||
+      !integer(entry.memoryMiB, 1, 1_048_576) ||
+      ids.has(entry.id) ||
+      (sizes.length > 0 &&
+        (entry.cpuMilli <= sizes[sizes.length - 1]!.cpuMilli ||
+          entry.memoryMiB <= sizes[sizes.length - 1]!.memoryMiB))
+    )
+      return null;
+    ids.add(entry.id);
+    sizes.push({
+      id: entry.id,
+      cpuMilli: entry.cpuMilli,
+      memoryMiB: entry.memoryMiB,
+    });
+  }
+  const selected = sizes.find((size) => size.id === value.initialSizeId);
+  if (
+    !selected ||
+    selected.cpuMilli !== initial.cpuMilli ||
+    selected.memoryMiB !== initial.memoryMiB
+  )
+    return null;
+  return { version: 1, initialSizeId: value.initialSizeId, sizes };
+}
+
 function profileFromJson(value: unknown): Profile | null {
   if (
     !object(
       value,
       ["id", "postgresImage", "compute", "storage", "instances", "backup"],
-      ["pooling", "executionFencing", "nodeTracking", "nativeAccess"],
+      [
+        "pooling",
+        "executionFencing",
+        "nodeTracking",
+        "nativeAccess",
+        "computeScaling",
+      ],
     ) ||
     !text(value.id, identifier) ||
     !text(
@@ -504,6 +561,10 @@ function profileFromJson(value: unknown): Profile | null {
     ? poolingFromJson(value.pooling)
     : undefined;
   if (pooling === null) return null;
+  const computeScaling = Object.hasOwn(value, "computeScaling")
+    ? computeScalingFromJson(value.computeScaling, value.compute)
+    : undefined;
+  if (computeScaling === null) return null;
   if (
     Object.hasOwn(value, "nativeAccess") &&
     !validNativeAccess(value.nativeAccess)
@@ -544,6 +605,7 @@ function profileFromJson(value: unknown): Profile | null {
       cpuMilli: value.compute.cpuMilli,
       memoryMiB: value.compute.memoryMiB,
     },
+    ...(computeScaling === undefined ? {} : { computeScaling }),
     storage: {
       classId: value.storage.classId,
       storageClassName: value.storage.storageClassName,
@@ -588,6 +650,9 @@ function publicProfile(profile: Profile) {
     id: profile.id,
     postgresImage: profile.postgresImage,
     compute: profile.compute,
+    ...(profile.computeScaling === undefined
+      ? {}
+      : { computeScaling: profile.computeScaling }),
     storage: {
       classId: profile.storage.classId,
       minGiB: profile.storage.minGiB,
