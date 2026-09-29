@@ -91,6 +91,60 @@ Never create a fake customer environment, rewrite a fact's identity, weakly
 acknowledge, auto-delete or skip it merely because delivery failed. An intact
 snapshot supplies custody evidence, not permission to resume or invoice.
 
+## Offline custody verification
+
+`verify-usage-snapshot` verifies a recovered completed snapshot against an
+independently retained receipt. It does not create or activate a journal.
+Select a private, quiescent directory containing the unmodified `usage.sqlite`
+and `manifest.json`, the expected source identity and the database SHA-256
+from independent custody. A digest obtained solely from the recovered manifest
+does not establish provenance. The completed manifest keeps its existing exact
+six-field schema version two; operator configuration uses version one.
+
+```sh
+node apps/regional-controller/dist/main.js verify-usage-snapshot --config /absolute/private/verify.json
+```
+
+```json
+{
+  "schemaVersion": 1,
+  "snapshotDirectory": "/absolute/private/recovered-snapshot",
+  "expectedIdentity": {
+    "regionId": "11111111-1111-4111-8111-111111111111",
+    "sourceId": "22222222-2222-4222-8222-222222222222",
+    "sourceEpoch": 1
+  },
+  "expectedSha256": "<independently-retained-64-character-lowercase-sha256>"
+}
+```
+
+The reader requires owner-only regular files with no symlink/hardlink aliases,
+no `-wal`, `-shm` or `-journal` siblings and a finished SQLite DELETE-mode header.
+It verifies the exact manifest, source identity, byte length, independent digest,
+pending count, database integrity and foreign keys. The existing supervised
+child preserves the 64-MiB/60-second bounds and redacts native failures. Results
+contain only `status: "verified_snapshot_custody"`, digest, bytes, pending count
+and `activationSupported: false`. Failure returns
+`usage_snapshot_verification_failed`; paths and journal rows are not printed.
+
+Only the closed artifact is opened using an encoded string URI with
+`mode=ro&immutable=1`, a read-only connection, disabled extensions, untrusted
+schema, query-only SQL and memory-only temporary storage. No journal-mode
+change, checkpoint, auxiliary cleanup, permission change or `UsageJournal`
+initialization occurs. Held file handles, directory/path identity, metadata and
+before/after hashes detect observed replacement or modification.
+
+SQLite immutable access deliberately disables locking and change detection.
+The artifact must remain quiescent and owner-controlled throughout verification;
+these checks do not protect against hostile transient mutation by the same
+owner. This mode must never open a live journal. Passing verification does not
+authorize replay, settlement, evidence deletion, source reassignment or customer
+admission, and does not establish complete node-loss recovery.
+
+The pinned [Node SQLite implementation](https://github.com/nodejs/node/blob/v24.6.0/src/node_sqlite.cc#L658)
+enables SQLite URI filenames; pass the encoded URI as a string to retain its
+parameters. See [SQLite URI immutable semantics](https://www.sqlite.org/uri.html).
+
 Sources: [Node SQLite backup](https://nodejs.org/docs/latest-v24.x/api/sqlite.html#sqlitebackupsource-db-path-options),
 [SQLite online backup](https://www.sqlite.org/backup.html),
 [read-only WAL](https://www.sqlite.org/wal.html#read_only_databases).

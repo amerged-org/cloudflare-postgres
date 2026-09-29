@@ -28,6 +28,18 @@ export interface UsageSnapshotResult {
   pendingFacts: number;
   activationSupported: false;
 }
+export interface UsageSnapshotVerificationInput {
+  snapshotDirectory: string;
+  expectedIdentity: UsageIdentity;
+  expectedSha256: string;
+}
+export interface UsageSnapshotVerificationResult {
+  status: "verified_snapshot_custody";
+  sha256: string;
+  bytes: number;
+  pendingFacts: number;
+  activationSupported: false;
+}
 const maximum = 64 * 1024 * 1024;
 const failed = () => new Error("usage_snapshot_failed");
 const object = (value: unknown): value is Record<string, unknown> =>
@@ -218,6 +230,65 @@ async function worker(
       // timeout, publication waits for its actual close after TERM/KILL.
     },
   );
+}
+export async function verifyUsageSnapshot(
+  input: UsageSnapshotVerificationInput,
+  options: { signal?: AbortSignal } = {},
+): Promise<UsageSnapshotVerificationResult> {
+  const deadline = performance.now() + 59000;
+  try {
+    if (
+      !object(input) ||
+      Object.keys(input).length !== 3 ||
+      !absolute(input.snapshotDirectory) ||
+      !identity(input.expectedIdentity) ||
+      typeof input.expectedSha256 !== "string" ||
+      !/^[a-f0-9]{64}$/.test(input.expectedSha256) ||
+      (process.platform !== "linux" && process.platform !== "darwin")
+    )
+      throw failed();
+    await privateDirectory(input.snapshotDirectory);
+    const initialDirectory = await lstat(input.snapshotDirectory);
+    const directory = await realpath(input.snapshotDirectory),
+      sourcePath = join(directory, "usage.sqlite"),
+      manifestPath = join(directory, "manifest.json"),
+      sourceStat = await privateFile(sourcePath),
+      manifestStat = await privateFile(manifestPath),
+      result = await worker(
+        {
+          sourcePath,
+          sourceStat,
+          expectedIdentity: input.expectedIdentity,
+          verification: {
+            manifestPath,
+            manifestStat,
+            expectedSha256: input.expectedSha256,
+          },
+        },
+        deadline,
+        options.signal,
+      );
+    await privateDirectory(input.snapshotDirectory);
+    const finalDirectory = await lstat(input.snapshotDirectory);
+    if (
+      finalDirectory.dev !== initialDirectory.dev ||
+      finalDirectory.ino !== initialDirectory.ino ||
+      finalDirectory.mtimeMs !== initialDirectory.mtimeMs ||
+      finalDirectory.ctimeMs !== initialDirectory.ctimeMs ||
+      options.signal?.aborted ||
+      performance.now() >= deadline
+    )
+      throw failed();
+    return {
+      status: "verified_snapshot_custody",
+      sha256: input.expectedSha256,
+      bytes: result.bytes,
+      pendingFacts: result.pendingFacts,
+      activationSupported: false,
+    };
+  } catch {
+    throw new Error("usage_snapshot_verification_failed");
+  }
 }
 export async function snapshotUsageJournal(
   input: UsageSnapshotInput,
