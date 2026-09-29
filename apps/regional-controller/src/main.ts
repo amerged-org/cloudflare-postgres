@@ -37,6 +37,12 @@ function milliseconds(
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "snapshot-usage") {
+    const { runUsageJournalSnapshot } =
+      await import("./usage-journal-snapshot-cli.ts");
+    process.exitCode = await runUsageJournalSnapshot(process.argv.slice(3));
+    return;
+  }
   if (process.argv[2] === "inspect-fleet") {
     const { runFleetInspection } = await import("./fleet-inspection-cli.ts");
     process.exitCode = await runFleetInspection(process.argv.slice(3));
