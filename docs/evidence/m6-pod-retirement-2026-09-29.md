@@ -19,3 +19,9 @@ The quota closes new Pod admission; CNPG performs its normal ordered shutdown. T
 A separate explicit same-Cluster-UID restart of only this disposable fixture confirms the original SQL marker remains readable. This is data-persistence evidence, not qualified funded resume or run handoff. All 29 pre-existing active Pod UIDs and four original volume identities are preserved. One private count display initially reused the volume-loop variable; offline comparison corrects it to 29 without another resume or probe. Fixture cleanup removes only its exact owned Namespace; the new 5Gi Retain volume is kept, never treated as customer storage eligible for deletion.
 
 The ignored environment and all 22 held SDK files remain protected. Production birth/admission completeness, original-node loss handling, independent funded expiry, public artifact distribution, actual customer API/SQL and final accounting remain open. See [the contract](../contracts/pod-retirement-v1.md).
+
+## Dev delivery
+
+Runtime source `a608f794c816752cd59ad9f0c2a4a2273b054107` is pushed, and matching source/contract/plan bytes are read back from GitHub. One regional image builds from exactly 61 public inputs in 41.891 seconds. It is imported once; its cached approved repository-index reference is verified before one UID/resourceVersion/old-image-guarded image-only replacement. All 53 compiled JavaScript modules match, with current deployment availability and zero Pod restarts.
+
+The final rollout preserves 28 non-controller active Pods, all original four volumes plus the retained test PV, and both original lab SQL markers. No default controller RBAC, Cloudflare schema/Secret or operator configuration is changed. The new retirement lane stays explicitly disabled in the running default configuration. Production history/admission and funded enforcement gates remain open.
