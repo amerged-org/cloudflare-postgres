@@ -53,6 +53,13 @@ rules:
   - apiGroups: [postgresql.cnpg.io]
     resources: [clusters]
     verbs: [get, create, list]
+  # Optional pooling lifecycle and complete metering ownership inventory.
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [poolers]
+    verbs: [get, create, list]
+  - apiGroups: [apps]
+    resources: [deployments, replicasets]
+    verbs: [get, list]
   - apiGroups: [postgresql.cnpg.io]
     resources: [databaseroles]
     verbs: [get, create, patch]

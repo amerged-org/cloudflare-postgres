@@ -46,6 +46,12 @@ Use the organization token to read `GET /v1/organizations/{organizationId}/proje
 
 The current slice has no public native endpoint, customer database credentials, environment listing/deletion/resize, runtime usage collector, runtime allowance enforcer, idempotency archival, or rate limiting. A reported ready environment means the regional executor observed PostgreSQL resource readiness; it does not prove backups, restore qualification, credential access, or a production service objective.
 
+## Optional managed pooling
+
+An installation operator may append the exact version-one session `pooling` policy to a new immutable catalog profile. It is exposed publicly as nonsecret configuration and frozen in the environment specification; historical unpooled profiles and hashes remain unchanged. The [managed-pooling contract](../../docs/contracts/managed-pooling-v1.md) defines image/resource/connection/timeout bounds, derived CNPG certificate names and a single RW/Recreate Pooler.
+
+A pooled environment result requires the additional owned Pooler/Deployment readiness observation. The existing role API accepts that observation without changing ordinary credential or privilege rules. This describes internal provisioning, not an external endpoint or successful SQL connection. Normal Pooler accounting/stopping needs the separately configured regional modes and independently bound resource identities. API-managed TLS/SQL, network isolation and integrated budget enforcement remain qualification gates.
+
 ## Customer recovery reads
 
 The [recovery-read contract](../../docs/contracts/recovery-reads-v1.md) adds organization-scoped project, project-scoped environment, and environment-scoped role/database collection reads. Each entry contains the existing public resource plus `currentOperationId`; the page returns `nextCursor`, `consistency: observed-page` and `observedAt`. These reads require `projects:read` and do not disclose passwords or full operation status. Page limits default to 50 and are capped at 100; signed cursors bind the collection, parent and limit. Only one `limit` and `cursor` are accepted.

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   ApiException,
+  AppsV1Api,
   CoreV1Api,
   CustomObjectsApi,
   KubeConfig,
@@ -23,6 +24,7 @@ const customResources: Record<
   { group: string; version: string; plural: string }
 > = {
   Cluster: { group: "postgresql.cnpg.io", version: "v1", plural: "clusters" },
+  Pooler: { group: "postgresql.cnpg.io", version: "v1", plural: "poolers" },
   ObjectStore: {
     group: "barmancloud.cnpg.io",
     version: "v1",
@@ -126,6 +128,7 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
   else if (process.env.KUBERNETES_SERVICE_HOST) config.loadFromCluster();
   else throw new Error("explicit_kubeconfig_required");
   const core = config.makeApiClient(CoreV1Api);
+  const apps = config.makeApiClient(AppsV1Api);
   const network = config.makeApiClient(NetworkingV1Api);
   const custom = config.makeApiClient(CustomObjectsApi);
   return {
@@ -156,6 +159,18 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
             break;
           case "NetworkPolicy":
             resource = await network.readNamespacedNetworkPolicy(
+              { namespace, name },
+              requestOptions,
+            );
+            break;
+          case "Deployment":
+            resource = await apps.readNamespacedDeployment(
+              { namespace, name },
+              requestOptions,
+            );
+            break;
+          case "ReplicaSet":
+            resource = await apps.readNamespacedReplicaSet(
               { namespace, name },
               requestOptions,
             );
@@ -268,61 +283,103 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
         namespaces,
         clusters: [],
         pods: [],
+        poolers: [],
+        deployments: [],
+        replicaSets: [],
         pvcs: [],
         pvs: [],
       };
       for (const namespace of namespaces) {
         // No partial page/namespace is returned as a complete inventory. An SDK
         // timeout or 410 ends this poll; the durable collector records the gap.
-        const [clusters, pods, pvcs] = await Promise.all([
-          inventoryPages(
-            (_continue) =>
-              custom.listNamespacedCustomObject(
-                {
-                  group: "postgresql.cnpg.io",
-                  version: "v1",
-                  plural: "clusters",
-                  namespace: namespace.metadata.name,
-                  labelSelector,
-                  limit: 100,
-                  _continue,
-                },
-                requestOptions,
-              ),
-            "Cluster",
-            "postgresql.cnpg.io/v1",
-            budget,
-          ),
-          inventoryPages(
-            (_continue) =>
-              core.listNamespacedPod(
-                {
-                  namespace: namespace.metadata.name,
-                  labelSelector:
-                    "cnpg.io/cluster=database,cnpg.io/podRole=instance",
-                  limit: 100,
-                  _continue,
-                },
-                requestOptions,
-              ),
-            "Pod",
-            "v1",
-            budget,
-          ),
-          inventoryPages(
-            (_continue) =>
-              core.listNamespacedPersistentVolumeClaim(
-                { namespace: namespace.metadata.name, limit: 100, _continue },
-                requestOptions,
-              ),
-            "PersistentVolumeClaim",
-            "v1",
-            budget,
-          ),
-        ]);
+        const [clusters, pods, pvcs, poolers, deployments, replicaSets] =
+          await Promise.all([
+            inventoryPages(
+              (_continue) =>
+                custom.listNamespacedCustomObject(
+                  {
+                    group: "postgresql.cnpg.io",
+                    version: "v1",
+                    plural: "clusters",
+                    namespace: namespace.metadata.name,
+                    labelSelector,
+                    limit: 100,
+                    _continue,
+                  },
+                  requestOptions,
+                ),
+              "Cluster",
+              "postgresql.cnpg.io/v1",
+              budget,
+            ),
+            inventoryPages(
+              (_continue) =>
+                core.listNamespacedPod(
+                  {
+                    namespace: namespace.metadata.name,
+                    limit: 100,
+                    _continue,
+                  },
+                  requestOptions,
+                ),
+              "Pod",
+              "v1",
+              budget,
+            ),
+            inventoryPages(
+              (_continue) =>
+                core.listNamespacedPersistentVolumeClaim(
+                  { namespace: namespace.metadata.name, limit: 100, _continue },
+                  requestOptions,
+                ),
+              "PersistentVolumeClaim",
+              "v1",
+              budget,
+            ),
+            inventoryPages(
+              (_continue) =>
+                custom.listNamespacedCustomObject(
+                  {
+                    group: "postgresql.cnpg.io",
+                    version: "v1",
+                    plural: "poolers",
+                    namespace: namespace.metadata.name,
+                    limit: 100,
+                    _continue,
+                  },
+                  requestOptions,
+                ),
+              "Pooler",
+              "postgresql.cnpg.io/v1",
+              budget,
+            ),
+            inventoryPages(
+              (_continue) =>
+                apps.listNamespacedDeployment(
+                  { namespace: namespace.metadata.name, limit: 100, _continue },
+                  requestOptions,
+                ),
+              "Deployment",
+              "apps/v1",
+              budget,
+            ),
+            inventoryPages(
+              (_continue) =>
+                apps.listNamespacedReplicaSet(
+                  { namespace: namespace.metadata.name, limit: 100, _continue },
+                  requestOptions,
+                ),
+              "ReplicaSet",
+              "apps/v1",
+              budget,
+            ),
+          ]);
         inventory.clusters.push(...clusters);
         inventory.pods.push(...pods);
         inventory.pvcs.push(...pvcs);
+        inventory.poolers!.push(...poolers);
+        inventory.deployments!.push(...deployments);
+        inventory.replicaSets!.push(...replicaSets);
       }
       // Retained volumes can outlive both their PVC and their namespace. The
       // observer attributes these only through a previously proven UID chain.

@@ -81,21 +81,101 @@ function ownedInventory(
     inventory.quota.metadata.name === "database-resources" &&
     inventory.quota.metadata.namespace === binding.namespace &&
     inventory.quota.metadata.uid === binding.quotaUid &&
-    owned(inventory.quota, binding)
+    owned(inventory.quota, binding) &&
+    ownedPoolerInventory(inventory, binding)
   );
 }
-function ownedPod(pod: Resource, binding: RuntimeBinding): boolean {
-  return (
-    pod.metadata.namespace === binding.namespace &&
-    pod.metadata.ownerReferences?.some(
-      (owner) =>
-        owner.kind === "Cluster" &&
-        owner.apiVersion === "postgresql.cnpg.io/v1" &&
-        owner.name === "database" &&
-        owner.controller === true &&
-        owner.uid === binding.clusterUid,
-    ) === true
+function controllerOwner(
+  resource: Resource,
+  kind: string,
+  name: string,
+  uid: string,
+  apiVersion: string,
+): boolean {
+  const owners = resource.metadata.ownerReferences?.filter(
+    (owner) => owner.controller === true,
   );
+  return (
+    owners?.length === 1 &&
+    owners[0]?.kind === kind &&
+    owners[0]?.apiVersion === apiVersion &&
+    owners[0]?.name === name &&
+    owners[0]?.uid === uid
+  );
+}
+function ownedPoolerInventory(
+  inventory: RuntimeInventory,
+  binding: RuntimeBinding,
+): boolean {
+  const poolers = inventory.poolers ?? [];
+  const deployments = inventory.deployments ?? [];
+  if (!binding.pooler) return poolers.length === 0 && deployments.length === 0;
+  const pooler = poolers[0];
+  const deployment = deployments[0];
+  return (
+    poolers.length === 1 &&
+    deployments.length === 1 &&
+    pooler !== undefined &&
+    deployment !== undefined &&
+    pooler.kind === "Pooler" &&
+    pooler.apiVersion === "postgresql.cnpg.io/v1" &&
+    pooler.metadata.namespace === binding.namespace &&
+    pooler.metadata.name === "database-pool-rw" &&
+    pooler.metadata.uid === binding.pooler.uid &&
+    owned(pooler, binding) &&
+    object(pooler.spec?.cluster).name === "database" &&
+    controllerOwner(
+      pooler,
+      "Cluster",
+      "database",
+      binding.clusterUid,
+      "postgresql.cnpg.io/v1",
+    ) &&
+    deployment.kind === "Deployment" &&
+    deployment.apiVersion === "apps/v1" &&
+    deployment.metadata.namespace === binding.namespace &&
+    deployment.metadata.name === "database-pool-rw" &&
+    deployment.metadata.uid === binding.pooler.deploymentUid &&
+    !deployment.metadata.deletionTimestamp &&
+    controllerOwner(
+      deployment,
+      "Pooler",
+      "database-pool-rw",
+      binding.pooler.uid,
+      "postgresql.cnpg.io/v1",
+    )
+  );
+}
+function poolerStopped(
+  inventory: RuntimeInventory,
+  binding: RuntimeBinding,
+): boolean {
+  if (!binding.pooler) return true;
+  const pooler = inventory.poolers?.[0];
+  const deployment = inventory.deployments?.[0];
+  if (
+    !pooler ||
+    !deployment ||
+    !deployment.status ||
+    pooler.spec?.instances !== 0 ||
+    deployment.spec?.replicas !== 0 ||
+    !Number.isSafeInteger(deployment.metadata.generation) ||
+    deployment.metadata.generation! <= 0 ||
+    deployment.status?.observedGeneration !== deployment.metadata.generation
+  )
+    return false;
+  return [
+    "replicas",
+    "readyReplicas",
+    "availableReplicas",
+    "updatedReplicas",
+  ].every((field) => {
+    const value = (deployment.status as Record<string, unknown> | undefined)?.[
+      field
+    ];
+    // Kubernetes omits optional counters when their effective value is zero.
+    return value === undefined || value === 0;
+  });
 }
 function volumeHash(
   inventory: RuntimeInventory,
@@ -398,6 +478,22 @@ export async function reconcileAllowance(
       if (object(object(inventory.quota.spec).hard).pods !== "0")
         return denied();
     }
+    if (journal.binding.pooler) {
+      const pooler = inventory.poolers![0]!;
+      if (pooler.spec?.instances !== 0) {
+        const operations: RuntimePatch[] = [
+          ...patchGuards(pooler),
+          { op: "replace", path: "/spec/instances", value: 0 },
+        ];
+        try {
+          await runtime.patch("Pooler", "database-pool-rw", operations);
+        } catch {
+          /* Resolve a lost patch reply by owned readback, never blind retry. */
+        }
+        inventory = await verify();
+        if (inventory.poolers?.[0]?.spec?.instances !== 0) return denied();
+      }
+    }
     if (
       inventory.cluster.metadata.annotations?.["cnpg.io/hibernation"] !== "on"
     ) {
@@ -425,11 +521,20 @@ export async function reconcileAllowance(
         return denied();
     }
     inventory = await verify();
-    if (inventory.pods.some((pod) => ownedPod(pod, journal.binding)))
+    if (
+      inventory.pods.some(
+        (pod) =>
+          pod.metadata.namespace !== journal.binding.namespace ||
+          pod.metadata.deletionTimestamp !== undefined ||
+          !["Succeeded", "Failed"].includes(pod.status?.phase ?? ""),
+      )
+    )
       return denied();
     if (
       object(object(inventory.quota.spec).hard).pods !== "0" ||
-      inventory.cluster.metadata.annotations?.["cnpg.io/hibernation"] !== "on"
+      inventory.cluster.metadata.annotations?.["cnpg.io/hibernation"] !==
+        "on" ||
+      !poolerStopped(inventory, journal.binding)
     )
       return denied();
     journal.recordStopped(completionClock(), volumes);

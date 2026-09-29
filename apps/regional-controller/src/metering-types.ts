@@ -48,6 +48,11 @@ export interface MeteringInventory {
   namespaces: Resource[];
   clusters: Resource[];
   pods: Resource[];
+  // Legacy journals/fixtures may omit these; the SDK always collects complete
+  // namespace-bounded owner inventories before a Pooler allocation is proven.
+  poolers?: Resource[];
+  deployments?: Resource[];
+  replicaSets?: Resource[];
   pvcs: Resource[];
   pvs: Resource[];
 }

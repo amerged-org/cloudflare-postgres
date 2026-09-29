@@ -1606,6 +1606,114 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    PoolingPolicy:
+      type: object
+      additionalProperties: false
+      required:
+        - version
+        - image
+        - mode
+        - compute
+        - connections
+        - timeouts
+      properties:
+        version:
+          type: integer
+          const: 1
+        image:
+          type: string
+          pattern: ^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$
+        mode:
+          type: string
+          const: session
+        compute:
+          type: object
+          additionalProperties: false
+          required:
+            - requests
+            - limits
+          properties:
+            requests:
+              $ref: "#/components/schemas/Compute"
+            limits:
+              $ref: "#/components/schemas/Compute"
+          description:
+            Limits must be at least requests in every dimension; both bootstrap-init
+            and main Pooler container use these values.
+        connections:
+          type: object
+          additionalProperties: false
+          required:
+            - maxClients
+            - poolSize
+            - maxDatabaseConnections
+            - maxUserConnections
+          properties:
+            maxClients:
+              type: integer
+              minimum: 1
+              maximum: 10000
+            poolSize:
+              type: integer
+              minimum: 1
+              maximum: 1000
+            maxDatabaseConnections:
+              type: integer
+              minimum: 1
+              maximum: 1000
+            maxUserConnections:
+              type: integer
+              minimum: 1
+              maximum: 1000
+          description: Pool size cannot exceed any client or backend cap.
+        timeouts:
+          type: object
+          additionalProperties: false
+          required:
+            - queryWaitSeconds
+            - connectSeconds
+            - cancelWaitSeconds
+          properties:
+            queryWaitSeconds:
+              type: integer
+              minimum: 1
+              maximum: 300
+            connectSeconds:
+              type: integer
+              minimum: 1
+              maximum: 300
+            cancelWaitSeconds:
+              type: integer
+              minimum: 1
+              maximum: 300
+      description:
+        Optional immutable operator policy for one RW session Pooler with Recreate.
+        Absent preserves unpooled behavior. No arbitrary parameters, backend URLs or TLS
+        Secrets.
+    PoolerReadyObservation:
+      type: object
+      additionalProperties: false
+      required:
+        - uid
+        - generation
+        - deploymentUid
+        - readyInstances
+      properties:
+        uid:
+          type: string
+          format: uuid
+        generation:
+          type: integer
+          minimum: 1
+        deploymentUid:
+          type: string
+          format: uuid
+        readyInstances:
+          type: integer
+          const: 1
+      description:
+        Current owned internal Pooler/Deployment provisioning metadata. Not
+        SQL or public endpoint evidence.
     RecoveryProjectsPage:
       type: object
       additionalProperties: false
@@ -2148,14 +2256,20 @@ components:
     PublicProfile:
       type: object
       additionalProperties: false
-      required: [id, postgresImage, compute, storage, instances, backup]
+      required:
+        - id
+        - postgresImage
+        - compute
+        - storage
+        - instances
+        - backup
       properties:
         id:
           type: string
-          pattern: "^[a-z][a-z0-9_-]{0,63}$"
+          pattern: ^[a-z][a-z0-9_-]{0,63}$
         postgresImage:
           type: string
-          pattern: "^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$"
+          pattern: ^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$
         compute:
           $ref: "#/components/schemas/Compute"
         storage:
@@ -2166,10 +2280,18 @@ components:
           maximum: 9
         backup:
           $ref: "#/components/schemas/BackupPolicy"
+        pooling:
+          $ref: "#/components/schemas/PoolingPolicy"
     OperatorProfile:
       type: object
       additionalProperties: false
-      required: [id, postgresImage, compute, storage, instances, backup]
+      required:
+        - id
+        - postgresImage
+        - compute
+        - storage
+        - instances
+        - backup
       properties:
         id:
           $ref: "#/components/schemas/PublicProfile/properties/id"
@@ -2183,6 +2305,8 @@ components:
           $ref: "#/components/schemas/PublicProfile/properties/instances"
         backup:
           $ref: "#/components/schemas/OperatorBackupPolicy"
+        pooling:
+          $ref: "#/components/schemas/PoolingPolicy"
     PublicCatalog:
       type: object
       required: [regionId, version, profiles, catalogHash, createdAt]
@@ -2273,7 +2397,10 @@ components:
     ReadyObservation:
       type: object
       additionalProperties: false
-      required: [clusterUid, clusterGeneration, readyInstances]
+      required:
+        - clusterUid
+        - clusterGeneration
+        - readyInstances
       properties:
         clusterUid:
           type: string
@@ -2286,6 +2413,11 @@ components:
           type: integer
           minimum: 1
           maximum: 9
+        pooler:
+          $ref: "#/components/schemas/PoolerReadyObservation"
+      description:
+        Pooler observation is required exactly when the frozen profile enables
+        pooling; forbidden for an unpooled environment.
     Environment:
       type: object
       required:

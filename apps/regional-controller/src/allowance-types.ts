@@ -12,6 +12,7 @@ export interface RuntimeBinding {
   namespaceUid: string;
   clusterUid: string;
   quotaUid: string;
+  pooler?: { uid: string; deploymentUid: string };
 }
 export interface AllowanceRequest {
   requestId: string;
@@ -76,6 +77,8 @@ export interface RuntimeInventory {
   pods: Resource[];
   pvcs: Resource[];
   pvs: Resource[];
+  poolers?: Resource[];
+  deployments?: Resource[];
 }
 export interface RuntimePatch {
   op: "test" | "add" | "replace";
@@ -85,7 +88,7 @@ export interface RuntimePatch {
 export interface AllowanceRuntime {
   inventory(): Promise<RuntimeInventory>;
   patch(
-    kind: "Cluster" | "ResourceQuota",
+    kind: "Cluster" | "ResourceQuota" | "Pooler",
     name: string,
     operations: RuntimePatch[],
   ): Promise<void>;

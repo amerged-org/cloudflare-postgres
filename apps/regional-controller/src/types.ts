@@ -7,6 +7,27 @@ export interface BackupSecretRef {
   secretAccessKeyKey: string;
 }
 
+export interface PoolingPolicy {
+  version: 1;
+  image: string;
+  mode: "session";
+  compute: {
+    requests: { cpuMilli: number; memoryMiB: number };
+    limits: { cpuMilli: number; memoryMiB: number };
+  };
+  connections: {
+    maxClients: number;
+    poolSize: number;
+    maxDatabaseConnections: number;
+    maxUserConnections: number;
+  };
+  timeouts: {
+    queryWaitSeconds: number;
+    connectSeconds: number;
+    cancelWaitSeconds: number;
+  };
+}
+
 export interface ExecutionSpec {
   name: string;
   regionId: string;
@@ -25,6 +46,7 @@ export interface ExecutionSpec {
       stepGiB: number;
     };
     instances: number;
+    pooling?: PoolingPolicy;
     backup: {
       endpointURL: string;
       region: string;
@@ -78,6 +100,12 @@ export interface Resource {
   data?: Record<string, string>;
   status?: {
     phase?: string;
+    image?: string;
+    observedGeneration?: number;
+    replicas?: number;
+    readyReplicas?: number;
+    availableReplicas?: number;
+    updatedReplicas?: number;
     currentPrimary?: string;
     readyInstances?: number;
     initContainerStatuses?: {
@@ -105,6 +133,12 @@ export interface Observation {
   clusterUid: string;
   clusterGeneration: number;
   readyInstances: number;
+  pooler?: {
+    uid: string;
+    generation: number;
+    deploymentUid: string;
+    readyInstances: 1;
+  };
 }
 
 export type ResultCode =

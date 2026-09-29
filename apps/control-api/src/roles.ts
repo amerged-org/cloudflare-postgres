@@ -27,6 +27,7 @@ import {
   uid,
   type Actor,
 } from "./execution-auth";
+import { validEnvironmentObservation } from "./environments";
 interface Target {
   organization_id: string;
   project_id: string;
@@ -34,6 +35,7 @@ interface Target {
   region_id: string;
   spec_revision: number;
   spec_hash: string;
+  resolved_spec: string;
   observation_json: string;
 }
 export interface Role {
@@ -150,7 +152,7 @@ async function target(
 ): Promise<Target | null> {
   return db
     .prepare(
-      "SELECT e.id, e.organization_id, e.project_id, e.region_id, e.spec_revision, e.spec_hash, e.observation_json FROM environments e JOIN projects p ON p.id = e.project_id AND p.organization_id = e.organization_id JOIN regions g ON g.id = e.region_id WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND e.status = 'ready' AND p.status = 'active' AND g.status <> 'disabled'",
+      "SELECT e.id, e.organization_id, e.project_id, e.region_id, e.spec_revision, e.spec_hash, e.resolved_spec, e.observation_json FROM environments e JOIN projects p ON p.id = e.project_id AND p.organization_id = e.organization_id JOIN regions g ON g.id = e.region_id WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND e.status = 'ready' AND p.status = 'active' AND g.status <> 'disabled'",
     )
     .bind(environmentId, organizationId, projectId)
     .first<Target>();
@@ -309,12 +311,14 @@ async function createRole(
   const current = await target(db, organizationId, projectId, environmentId);
   if (!current) return error(409, "environment_not_ready");
   const observation: unknown = JSON.parse(current.observation_json);
+  const spec = JSON.parse(current.resolved_spec) as {
+    profile: { pooling?: unknown };
+  };
   if (
-    !fields(observation, [
-      "clusterUid",
-      "clusterGeneration",
-      "readyInstances",
-    ]) ||
+    !validEnvironmentObservation(
+      observation,
+      spec.profile.pooling !== undefined,
+    ) ||
     !uid(observation.clusterUid)
   )
     return error(409, "environment_not_ready");

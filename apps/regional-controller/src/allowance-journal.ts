@@ -79,7 +79,14 @@ export function validRuntimeBinding(value: RuntimeBinding): boolean {
     value.namespace === `pgcf-${value.environmentId.replaceAll("-", "")}` &&
     uuid.test(value.namespaceUid) &&
     uuid.test(value.clusterUid) &&
-    uuid.test(value.quotaUid)
+    uuid.test(value.quotaUid) &&
+    (value.pooler === undefined ||
+      (value.pooler !== null &&
+        typeof value.pooler === "object" &&
+        !Array.isArray(value.pooler) &&
+        Object.keys(value.pooler).length === 2 &&
+        uuid.test(value.pooler.uid) &&
+        uuid.test(value.pooler.deploymentUid)))
   );
 }
 export class AllowanceJournal {
@@ -90,7 +97,12 @@ export class AllowanceJournal {
   constructor(path: string, binding: RuntimeBinding) {
     if (!path || path === ":memory:" || !validRuntimeBinding(binding))
       throw new Error("allowance_journal_configuration_invalid");
-    this.binding = Object.freeze({ ...binding });
+    this.binding = Object.freeze({
+      ...binding,
+      ...(binding.pooler
+        ? { pooler: Object.freeze({ ...binding.pooler }) }
+        : {}),
+    });
     this.path = resolve(path);
     const directory = dirname(this.path);
     mkdirSync(directory, { recursive: true, mode: 0o700 });

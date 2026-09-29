@@ -2,6 +2,41 @@ type Env = Cloudflare.Env;
 type Database = D1DatabaseSession;
 type JsonObject = Record<string, unknown>;
 
+interface PoolingPolicy {
+  version: 1;
+  image: string;
+  mode: "session";
+  compute: {
+    requests: { cpuMilli: number; memoryMiB: number };
+    limits: { cpuMilli: number; memoryMiB: number };
+  };
+  connections: {
+    maxClients: number;
+    poolSize: number;
+    maxDatabaseConnections: number;
+    maxUserConnections: number;
+  };
+  timeouts: {
+    queryWaitSeconds: number;
+    connectSeconds: number;
+    cancelWaitSeconds: number;
+  };
+}
+
+interface PoolerObservation {
+  uid: string;
+  generation: number;
+  deploymentUid: string;
+  readyInstances: 1;
+}
+
+interface EnvironmentObservation {
+  clusterUid: string;
+  clusterGeneration: number;
+  readyInstances: number;
+  pooler?: PoolerObservation;
+}
+
 interface Profile {
   id: string;
   postgresImage: string;
@@ -26,6 +61,7 @@ interface Profile {
       secretAccessKeyKey: string;
     };
   };
+  pooling?: PoolingPolicy;
 }
 
 interface EnvironmentInput {
@@ -112,13 +148,19 @@ function error(status: number, code: string): Response {
   return json({ error: { code } }, status);
 }
 
-function object(value: unknown, keys: readonly string[]): value is JsonObject {
+function object(
+  value: unknown,
+  keys: readonly string[],
+  optional: readonly string[] = [],
+): value is JsonObject {
   return (
     typeof value === "object" &&
     value !== null &&
     !Array.isArray(value) &&
-    Object.keys(value).length === keys.length &&
-    keys.every((key) => Object.hasOwn(value, key))
+    keys.every((key) => Object.hasOwn(value, key)) &&
+    Object.keys(value).every(
+      (key) => keys.includes(key) || optional.includes(key),
+    )
   );
 }
 
@@ -248,16 +290,126 @@ async function scopedAuth(
   return null;
 }
 
-function profileFromJson(value: unknown): Profile | null {
+function poolingFromJson(value: unknown): PoolingPolicy | null {
   if (
     !object(value, [
-      "id",
-      "postgresImage",
+      "version",
+      "image",
+      "mode",
       "compute",
-      "storage",
-      "instances",
-      "backup",
+      "connections",
+      "timeouts",
     ]) ||
+    value.version !== 1 ||
+    value.mode !== "session" ||
+    !text(value.image, /^[a-z0-9][a-z0-9._:/-]*@sha256:[0-9a-f]{64}$/) ||
+    !object(value.compute, ["requests", "limits"]) ||
+    !object(value.compute.requests, ["cpuMilli", "memoryMiB"]) ||
+    !integer(value.compute.requests.cpuMilli, 1, 1_000_000) ||
+    !integer(value.compute.requests.memoryMiB, 1, 1_048_576) ||
+    !object(value.compute.limits, ["cpuMilli", "memoryMiB"]) ||
+    !integer(
+      value.compute.limits.cpuMilli,
+      value.compute.requests.cpuMilli,
+      1_000_000,
+    ) ||
+    !integer(
+      value.compute.limits.memoryMiB,
+      value.compute.requests.memoryMiB,
+      1_048_576,
+    ) ||
+    !object(value.connections, [
+      "maxClients",
+      "poolSize",
+      "maxDatabaseConnections",
+      "maxUserConnections",
+    ]) ||
+    !integer(value.connections.maxClients, 1, 10_000) ||
+    !integer(value.connections.poolSize, 1, 1_000) ||
+    value.connections.poolSize > value.connections.maxClients ||
+    !integer(
+      value.connections.maxDatabaseConnections,
+      value.connections.poolSize,
+      1_000,
+    ) ||
+    !integer(
+      value.connections.maxUserConnections,
+      value.connections.poolSize,
+      1_000,
+    ) ||
+    !object(value.timeouts, [
+      "queryWaitSeconds",
+      "connectSeconds",
+      "cancelWaitSeconds",
+    ]) ||
+    !integer(value.timeouts.queryWaitSeconds, 1, 300) ||
+    !integer(value.timeouts.connectSeconds, 1, 300) ||
+    !integer(value.timeouts.cancelWaitSeconds, 1, 300)
+  )
+    return null;
+  return {
+    version: 1,
+    image: value.image,
+    mode: "session",
+    compute: {
+      requests: {
+        cpuMilli: value.compute.requests.cpuMilli,
+        memoryMiB: value.compute.requests.memoryMiB,
+      },
+      limits: {
+        cpuMilli: value.compute.limits.cpuMilli,
+        memoryMiB: value.compute.limits.memoryMiB,
+      },
+    },
+    connections: {
+      maxClients: value.connections.maxClients,
+      poolSize: value.connections.poolSize,
+      maxDatabaseConnections: value.connections.maxDatabaseConnections,
+      maxUserConnections: value.connections.maxUserConnections,
+    },
+    timeouts: {
+      queryWaitSeconds: value.timeouts.queryWaitSeconds,
+      connectSeconds: value.timeouts.connectSeconds,
+      cancelWaitSeconds: value.timeouts.cancelWaitSeconds,
+    },
+  };
+}
+
+export function validEnvironmentObservation(
+  value: unknown,
+  pooled: boolean,
+): value is EnvironmentObservation {
+  return (
+    object(
+      value,
+      ["clusterUid", "clusterGeneration", "readyInstances"],
+      ["pooler"],
+    ) &&
+    name(value.clusterUid) &&
+    integer(value.clusterGeneration, 1, Number.MAX_SAFE_INTEGER) &&
+    integer(value.readyInstances, 1, 9) &&
+    Object.hasOwn(value, "pooler") === pooled &&
+    (!pooled ||
+      (object(value.pooler, [
+        "uid",
+        "generation",
+        "deploymentUid",
+        "readyInstances",
+      ]) &&
+        text(value.pooler.uid, uuid) &&
+        integer(value.pooler.generation, 1, Number.MAX_SAFE_INTEGER) &&
+        text(value.pooler.deploymentUid, uuid) &&
+        value.pooler.readyInstances === 1))
+  );
+}
+
+function profileFromJson(value: unknown): Profile | null {
+  if (
+    !object(
+      value,
+      ["id", "postgresImage", "compute", "storage", "instances", "backup"],
+      ["pooling"],
+    ) ||
     !text(value.id, identifier) ||
     !text(
       value.postgresImage,
@@ -305,6 +457,10 @@ function profileFromJson(value: unknown): Profile | null {
     !text(value.backup.credentialSecret.secretAccessKeyKey, secretKey)
   )
     return null;
+  const pooling = Object.hasOwn(value, "pooling")
+    ? poolingFromJson(value.pooling)
+    : undefined;
+  if (pooling === null) return null;
   try {
     const endpoint = new URL(value.backup.endpointURL);
     if (
@@ -347,6 +503,7 @@ function profileFromJson(value: unknown): Profile | null {
         secretAccessKeyKey: value.backup.credentialSecret.secretAccessKeyKey,
       },
     },
+    ...(pooling === undefined ? {} : { pooling }),
   };
 }
 
@@ -363,6 +520,7 @@ function publicProfile(profile: Profile) {
     },
     instances: profile.instances,
     backup: { retentionPolicy: profile.backup.retentionPolicy },
+    ...(profile.pooling === undefined ? {} : { pooling: profile.pooling }),
   };
 }
 
@@ -855,17 +1013,14 @@ async function reportResult(
     !validLease(input)
   )
     return error(400, "invalid_request");
+  const reportedPooling =
+    typeof input.observation === "object" &&
+    input.observation !== null &&
+    Object.hasOwn(input.observation, "pooler");
   const ready =
     input.status === "ready" &&
     input.resultCode === "cnpg_ready" &&
-    object(input.observation, [
-      "clusterUid",
-      "clusterGeneration",
-      "readyInstances",
-    ]) &&
-    name(input.observation.clusterUid) &&
-    integer(input.observation.clusterGeneration, 1, Number.MAX_SAFE_INTEGER) &&
-    integer(input.observation.readyInstances, 1, 9);
+    validEnvironmentObservation(input.observation, reportedPooling);
   const failed =
     input.status === "failed" &&
     ["ownership_mismatch", "spec_conflict", "reconcile_failed"].includes(
@@ -880,10 +1035,16 @@ async function reportResult(
     .bind(operationId, regionId)
     .first<EnvironmentRow>();
   if (!environment) return error(409, "lease_conflict");
+  const profile = (JSON.parse(environment.resolved_spec) as ResolvedSpec)
+    .profile;
   if (
     ready &&
-    ((input.observation as JsonObject).readyInstances as number) <
-      (JSON.parse(environment.resolved_spec) as ResolvedSpec).profile.instances
+    (!validEnvironmentObservation(
+      input.observation,
+      profile.pooling !== undefined,
+    ) ||
+      (input.observation as EnvironmentObservation).readyInstances <
+        profile.instances)
   )
     return error(400, "invalid_observation");
   const observation = ready
@@ -891,6 +1052,18 @@ async function reportResult(
         clusterUid: (input.observation as JsonObject).clusterUid,
         clusterGeneration: (input.observation as JsonObject).clusterGeneration,
         readyInstances: (input.observation as JsonObject).readyInstances,
+        ...(reportedPooling
+          ? {
+              pooler: {
+                uid: (input.observation as EnvironmentObservation).pooler!.uid,
+                generation: (input.observation as EnvironmentObservation)
+                  .pooler!.generation,
+                deploymentUid: (input.observation as EnvironmentObservation)
+                  .pooler!.deploymentUid,
+                readyInstances: 1,
+              },
+            }
+          : {}),
       }
     : null;
   const resultHash = await sha256(

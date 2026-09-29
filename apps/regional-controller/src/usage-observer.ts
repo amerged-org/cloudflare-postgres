@@ -109,6 +109,7 @@ type AllocationResource =
       podUid: string;
       container: string;
       nodeName: string;
+      pooler?: { uid: string; deploymentUid: string; replicaSetUid: string };
     }
   | {
       kind: "volume";
@@ -214,6 +215,115 @@ function sameOwner(
   );
 }
 
+function controllerOwner(
+  resource: Resource,
+  kind: string,
+  apiVersion: string,
+): NonNullable<Resource["metadata"]["ownerReferences"]>[number] | null {
+  const owners = resource.metadata.ownerReferences?.filter(
+    (reference) => reference.controller === true,
+  );
+  const owner = owners?.[0];
+  return owners?.length === 1 &&
+    owner?.kind === kind &&
+    owner.apiVersion === apiVersion &&
+    uid(owner.uid) &&
+    typeof owner.name === "string"
+    ? owner
+    : null;
+}
+
+function poolerOwnership(
+  pod: Resource,
+  proof: EnvironmentProof,
+  inventory: MeteringInventory,
+  regionId: string,
+): { uid: string; deploymentUid: string; replicaSetUid: string } | null {
+  const namespace = proof.namespace.metadata.name;
+  const candidates = (inventory.poolers ?? []).filter(
+    (candidate) =>
+      candidate.metadata.namespace === namespace &&
+      candidate.metadata.name === "database-pool-rw",
+  );
+  const pooler = candidates[0];
+  if (
+    candidates.length !== 1 ||
+    !pooler ||
+    pooler.kind !== "Pooler" ||
+    pooler.apiVersion !== "postgresql.cnpg.io/v1" ||
+    !uid(pooler.metadata.uid) ||
+    !sameOwner(pooler, proof.environmentId, regionId, proof.specHash) ||
+    !object(pooler.spec?.cluster) ||
+    pooler.spec.cluster.name !== "database"
+  )
+    return null;
+  const clusterOwner = controllerOwner(
+    pooler,
+    "Cluster",
+    "postgresql.cnpg.io/v1",
+  );
+  if (
+    clusterOwner?.uid !== proof.cluster.metadata.uid ||
+    clusterOwner?.name !== "database"
+  )
+    return null;
+  const deployments = (inventory.deployments ?? []).filter(
+    (candidate) =>
+      candidate.metadata.namespace === namespace &&
+      candidate.metadata.name === "database-pool-rw",
+  );
+  const deployment = deployments[0];
+  if (
+    deployments.length !== 1 ||
+    !deployment ||
+    deployment.kind !== "Deployment" ||
+    deployment.apiVersion !== "apps/v1" ||
+    !uid(deployment.metadata.uid)
+  )
+    return null;
+  const poolerOwner = controllerOwner(
+    deployment,
+    "Pooler",
+    "postgresql.cnpg.io/v1",
+  );
+  if (
+    poolerOwner?.uid !== pooler.metadata.uid ||
+    poolerOwner.name !== pooler.metadata.name
+  )
+    return null;
+  const podOwner = controllerOwner(pod, "ReplicaSet", "apps/v1");
+  if (!podOwner) return null;
+  const replicaSets = (inventory.replicaSets ?? []).filter(
+    (candidate) =>
+      candidate.metadata.namespace === namespace &&
+      candidate.metadata.name === podOwner.name &&
+      candidate.metadata.uid === podOwner.uid,
+  );
+  const replicaSet = replicaSets[0];
+  if (
+    replicaSets.length !== 1 ||
+    !replicaSet ||
+    replicaSet.kind !== "ReplicaSet" ||
+    replicaSet.apiVersion !== "apps/v1" ||
+    !uid(replicaSet.metadata.uid)
+  )
+    return null;
+  const deploymentOwner = controllerOwner(replicaSet, "Deployment", "apps/v1");
+  if (
+    deploymentOwner?.uid !== deployment.metadata.uid ||
+    deploymentOwner.name !== deployment.metadata.name ||
+    pod.metadata.labels?.["cnpg.io/cluster"] !== "database" ||
+    pod.metadata.labels?.["cnpg.io/podRole"] !== "pooler" ||
+    pod.metadata.labels?.["cnpg.io/poolerName"] !== "database-pool-rw"
+  )
+    return null;
+  return {
+    uid: pooler.metadata.uid,
+    deploymentUid: deployment.metadata.uid,
+    replicaSetUid: replicaSet.metadata.uid,
+  };
+}
+
 function completedInit(pod: Resource): boolean {
   const init = pod.spec?.initContainers;
   if (init === undefined || (Array.isArray(init) && init.length === 0))
@@ -307,18 +417,28 @@ export function observeUsage(
       (reference) =>
         reference.kind === "Cluster" && reference.controller === true,
     );
-    if (
-      !uid(pod.metadata.uid) ||
-      owner?.length !== 1 ||
-      owner[0]?.uid !== proof.cluster.metadata.uid ||
-      owner[0]?.name !== "database" ||
-      owner[0]?.apiVersion !== "postgresql.cnpg.io/v1" ||
-      pod.metadata.labels?.["cnpg.io/cluster"] !== "database" ||
-      pod.metadata.labels?.["cnpg.io/podRole"] !== "instance"
-    ) {
+    const instanceOwned =
+      uid(pod.metadata.uid) &&
+      owner?.length === 1 &&
+      owner[0]?.uid === proof.cluster.metadata.uid &&
+      owner[0]?.name === "database" &&
+      owner[0]?.apiVersion === "postgresql.cnpg.io/v1" &&
+      pod.metadata.labels?.["cnpg.io/cluster"] === "database" &&
+      pod.metadata.labels?.["cnpg.io/podRole"] === "instance";
+    const pooler = instanceOwned
+      ? null
+      : poolerOwnership(pod, proof, inventory, regionId);
+    if (!uid(pod.metadata.uid) || (!instanceOwned && !pooler)) {
       result.issues.push({
         environmentId: proof.environmentId,
-        code: "pod_owner_unproven",
+        code:
+          pod.metadata.labels?.["cnpg.io/podRole"] === "pooler" ||
+          pod.metadata.labels?.["cnpg.io/poolerName"] !== undefined ||
+          pod.metadata.ownerReferences?.some(
+            (reference) => reference.kind === "ReplicaSet",
+          )
+            ? "pooler_owner_unproven"
+            : "pod_owner_unproven",
       });
       continue;
     }
@@ -338,11 +458,13 @@ export function observeUsage(
               reference.uid === proof.cluster.metadata.uid,
           ),
       );
-    const role = primaryOwned
-      ? pod.metadata.name === primary
-        ? "primary"
-        : "replica"
-      : null;
+    const role = pooler
+      ? "platform"
+      : primaryOwned
+        ? pod.metadata.name === primary
+          ? "primary"
+          : "replica"
+        : null;
     const storage = proof.cluster.spec?.storage;
     const expectedClass =
       object(storage) && typeof storage.storageClass === "string"
@@ -352,7 +474,7 @@ export function observeUsage(
     // A bound disk remains allocated while the Pod is starting, completed, or
     // suspended. Its capacity comes from the PV, never a request/quota/profile.
     const volumes = pod.spec?.volumes;
-    if (Array.isArray(volumes))
+    if (instanceOwned && Array.isArray(volumes))
       for (const volume of volumes) {
         if (!object(volume) || !object(volume.persistentVolumeClaim)) continue;
         const postgres = Array.isArray(pod.spec?.containers)
@@ -533,6 +655,7 @@ export function observeUsage(
             podUid: pod.metadata.uid!,
             container: container.name,
             nodeName,
+            ...(pooler ? { pooler } : {}),
           },
           metric,
           attribution,

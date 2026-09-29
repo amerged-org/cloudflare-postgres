@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createHash } from "node:crypto";
 import { ReconcileError } from "./types.ts";
+import { observePooler, validPoolingPolicy } from "./pooling.ts";
 import type {
   Claim,
   Kubernetes,
@@ -66,6 +67,7 @@ function validate(claim: Claim, config: RegionalConfig): void {
     !positive(profile?.instances, 32) ||
     !positive(profile?.compute?.cpuMilli, 1_000_000) ||
     !positive(profile?.compute?.memoryMiB, 1_048_576) ||
+    (profile?.pooling !== undefined && !validPoolingPolicy(profile.pooling)) ||
     !positive(spec?.volumeGiB, 1_048_576) ||
     !positive(storage?.minGiB, 1_048_576) ||
     !positive(storage?.maxGiB, 1_048_576) ||
@@ -124,6 +126,21 @@ function own(resource: Resource, expected: Resource): void {
       expected.metadata.labels?.[regionLabel]
   )
     throw new ReconcileError("ownership_mismatch");
+  if (expected.metadata.ownerReferences) {
+    const expectedOwner = expected.metadata.ownerReferences[0];
+    const owners = resource.metadata.ownerReferences?.filter(
+      (owner) => owner.controller === true,
+    );
+    if (
+      !expectedOwner ||
+      owners?.length !== 1 ||
+      owners[0]?.uid !== expectedOwner.uid ||
+      owners[0]?.kind !== expectedOwner.kind ||
+      owners[0]?.name !== expectedOwner.name ||
+      owners[0]?.apiVersion !== expectedOwner.apiVersion
+    )
+      throw new ReconcileError("ownership_mismatch");
+  }
   if (
     resource.metadata.annotations?.[specAnnotation] !==
     expected.metadata.annotations?.[specAnnotation]
@@ -192,6 +209,7 @@ export async function reconcileEnvironment(
   authorized();
   const namespace = `pgcf-${claim.environmentId.replaceAll("-", "")}`;
   const profile = claim.spec.profile;
+  const pooling = profile.pooling;
   const labels = {
     [managedLabel]: "cloudflare-postgres",
     [ownerLabel]: claim.environmentId,
@@ -230,19 +248,27 @@ export async function reconcileEnvironment(
       metadata: metadata("database-resources"),
       spec: {
         hard: {
-          "requests.cpu": cpuQuantity(slots * (profile.compute.cpuMilli + 25)),
-          "limits.cpu": cpuQuantity(slots * (profile.compute.cpuMilli + 100)),
+          "requests.cpu": cpuQuantity(
+            slots * (profile.compute.cpuMilli + 25) +
+              (pooling?.compute.requests.cpuMilli ?? 0),
+          ),
+          "limits.cpu": cpuQuantity(
+            slots * (profile.compute.cpuMilli + 100) +
+              (pooling?.compute.limits.cpuMilli ?? 0),
+          ),
           "requests.memory": binaryQuantity(
-            slots * (profile.compute.memoryMiB + 64),
+            slots * (profile.compute.memoryMiB + 64) +
+              (pooling?.compute.requests.memoryMiB ?? 0),
           ),
           "limits.memory": binaryQuantity(
-            slots * (profile.compute.memoryMiB + 128),
+            slots * (profile.compute.memoryMiB + 128) +
+              (pooling?.compute.limits.memoryMiB ?? 0),
           ),
           "requests.storage": binaryQuantity(
             slots * claim.spec.volumeGiB * 1024,
           ),
           persistentvolumeclaims: String(slots),
-          pods: String(slots),
+          pods: String(slots + (pooling ? 1 : 0)),
         },
       },
     },
@@ -434,6 +460,17 @@ export async function reconcileEnvironment(
         },
         resources: { requests: compute, limits: compute },
         seccompProfile: { type: "RuntimeDefault" },
+        ...(pooling
+          ? {
+              certificates: {
+                serverAltDNSNames: [
+                  "database-pool-rw",
+                  `database-pool-rw.${namespace}`,
+                  `database-pool-rw.${namespace}.svc`,
+                ],
+              },
+            }
+          : {}),
         plugins: [
           {
             name: "barman-cloud.cloudnative-pg.io",
@@ -461,6 +498,104 @@ export async function reconcileEnvironment(
     (cluster.status?.readyInstances ?? 0) < profile.instances
   )
     return { ready: false };
+  const pooler = pooling
+    ? await ensure(
+        api,
+        {
+          apiVersion: "postgresql.cnpg.io/v1",
+          kind: "Pooler",
+          metadata: {
+            ...metadata("database-pool-rw"),
+            ownerReferences: [
+              {
+                apiVersion: "postgresql.cnpg.io/v1",
+                kind: "Cluster",
+                name: "database",
+                uid: cluster.metadata.uid,
+                controller: true,
+              },
+            ],
+          },
+          spec: {
+            cluster: { name: "database" },
+            instances: 1,
+            deploymentStrategy: { type: "Recreate" },
+            pgbouncer: {
+              image: pooling.image,
+              poolMode: "session",
+              paused: false,
+              parameters: {
+                client_tls_sslmode: "require",
+                server_tls_sslmode: "verify-full",
+                max_client_conn: String(pooling.connections.maxClients),
+                default_pool_size: String(pooling.connections.poolSize),
+                reserve_pool_size: "0",
+                max_db_connections: String(
+                  pooling.connections.maxDatabaseConnections,
+                ),
+                max_user_connections: String(
+                  pooling.connections.maxUserConnections,
+                ),
+                query_wait_timeout: String(pooling.timeouts.queryWaitSeconds),
+                server_connect_timeout: String(pooling.timeouts.connectSeconds),
+                cancel_wait_timeout: String(pooling.timeouts.cancelWaitSeconds),
+              },
+            },
+            template: {
+              metadata: {
+                labels: {
+                  [ownerLabel]: claim.environmentId,
+                  [regionLabel]: claim.regionId,
+                },
+                annotations: { [specAnnotation]: claim.specHash },
+              },
+              spec: {
+                containers: [
+                  {
+                    name: "pgbouncer",
+                    image: pooling.image,
+                    resources: {
+                      requests: {
+                        cpu: cpuQuantity(pooling.compute.requests.cpuMilli),
+                        memory: binaryQuantity(
+                          pooling.compute.requests.memoryMiB,
+                        ),
+                      },
+                      limits: {
+                        cpu: cpuQuantity(pooling.compute.limits.cpuMilli),
+                        memory: binaryQuantity(
+                          pooling.compute.limits.memoryMiB,
+                        ),
+                      },
+                    },
+                  },
+                ],
+                initContainers: [
+                  {
+                    name: "bootstrap-controller",
+                    resources: {
+                      requests: {
+                        cpu: cpuQuantity(pooling.compute.requests.cpuMilli),
+                        memory: binaryQuantity(
+                          pooling.compute.requests.memoryMiB,
+                        ),
+                      },
+                      limits: {
+                        cpu: cpuQuantity(pooling.compute.limits.cpuMilli),
+                        memory: binaryQuantity(
+                          pooling.compute.limits.memoryMiB,
+                        ),
+                      },
+                    },
+                  },
+                ],
+              },
+            },
+          },
+        },
+        authorized,
+      )
+    : null;
   const pods = await api.listPods(namespace, "database");
   const readyPods = pods.filter(
     (pod) =>
@@ -483,6 +618,11 @@ export async function reconcileEnvironment(
   ) {
     return { ready: false };
   }
+  const poolerObservation =
+    pooling && pooler
+      ? await observePooler(api, pooler, cluster, pooling, pods, authorized)
+      : null;
+  if (pooling && !poolerObservation) return { ready: false };
   // Do not report Pods observed for a Cluster that was replaced or revised
   // while listing them. Preserve the real Kubernetes UID and generation.
   const latest = await api.read("Cluster", namespace, "database");
@@ -502,6 +642,7 @@ export async function reconcileEnvironment(
       clusterUid: cluster.metadata.uid,
       clusterGeneration: cluster.metadata.generation,
       readyInstances: readyPods.length,
+      ...(poolerObservation ? { pooler: poolerObservation } : {}),
     },
   };
 }
