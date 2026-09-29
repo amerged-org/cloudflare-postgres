@@ -53,6 +53,99 @@ It can invalidate stale identity evidence but cannot supply missing identity,
 quorum, backup, staging or capacity proof. Existing preparation behavior stays
 unchanged when the field is absent; execution remains unauthorized.
 
+## Control recovery artifacts
+
+The explicit `recover-control` operator mode provides capture, encryption and
+verified offline reconstruction. It starts no controller lane and activates no
+recovered token, lease or allowance. Read the [contract](../../docs/contracts/control-recovery-v1.md)
+before treating a rebuilt artifact as control-service recovery.
+
+Build this package, then run one private configuration:
+
+```sh
+pnpm --filter @cloudflare-postgres/regional-controller build
+node apps/regional-controller/dist/main.js recover-control --config /absolute/private/config.json
+```
+
+Create a mode-0700 operator directory. Keep every configuration, keyring, recovery
+key and snapshot mode 0600. The recovery key file contains a separately generated
+32-byte random key in unpadded base64url, with an optional newline. Keep it in
+independent custody. Nothing is read automatically from the repository's `.env`.
+
+`capture` uses an existing authenticated Wrangler installation and an explicit
+strict JSON configuration for the selected D1 binding. The Wrangler configuration
+and zero-byte environment file must also live in private directories. The snapshot
+contains operational identities and encrypted credentials; store it privately
+and seal it before transferring it to archive custody.
+
+```json
+{
+  "schemaVersion": 1,
+  "action": "capture",
+  "wranglerExecutable": "/absolute/path/to/wrangler",
+  "wranglerConfigFile": "/absolute/private/wrangler.jsonc",
+  "emptyEnvFile": "/absolute/private/empty.env",
+  "accountId": "REPLACE_WITH_CLOUDFLARE_ACCOUNT_ID",
+  "databaseName": "DB",
+  "migrationDirectory": "/absolute/checkout/apps/control-api/migrations",
+  "source": {
+    "installationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "databaseId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+  },
+  "snapshotPath": "/absolute/private/control.snapshot.json"
+}
+```
+
+The source database UUID must match the selected Wrangler binding; assign and
+retain an installation recovery UUID. A successful capture reports its digest
+and table/row counts. The remote subprocess has a 60-second bound and bounded
+output; its raw stdout/stderr never enters public command output.
+
+`seal` verifies the snapshot against the current trusted migrations and verifies
+every encrypted credential before publishing its bundle. `keyringsFile` contains
+exactly two string values: `ROLE_CREDENTIAL_KEYS` and `ALLOWANCE_FENCE_KEYS`, each
+containing the original JSON keyring including retained historical versions.
+Worker Secret names do not supply the key values.
+
+```json
+{
+  "schemaVersion": 1,
+  "action": "seal",
+  "snapshotFile": "/absolute/private/control.snapshot.json",
+  "keyringsFile": "/absolute/private/credential-keyrings.json",
+  "recoveryKeyFile": "/absolute/private/recovery.key",
+  "archivePath": "/absolute/private/control.bundle",
+  "migrationDirectory": "/absolute/checkout/apps/control-api/migrations"
+}
+```
+
+`restore` authenticates the source and bundle, reconstructs the database, checks
+integrity/foreign keys/exact state and decrypts every retained credential before
+reserving a new output directory. The three verified files are `control.sqlite`,
+`keyrings.json` and the last-published `manifest.json`. An incomplete directory
+after a crash is unverified; subsequent commands refuse to overwrite it.
+
+```json
+{
+  "schemaVersion": 1,
+  "action": "restore",
+  "archivePath": "/absolute/private/control.bundle",
+  "recoveryKeyFile": "/absolute/private/recovery.key",
+  "targetDirectory": "/absolute/private/recovered",
+  "migrationDirectory": "/absolute/checkout/apps/control-api/migrations",
+  "expectedSource": {
+    "installationId": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    "databaseId": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+  }
+}
+```
+
+The result and manifest state `activationSupported: false`. No command imports
+state into live D1, reissues credentials, grants execution, contacts customer
+PostgreSQL or orders/changes Contabo servers. Production recovery still needs
+global fencing, external-state reconciliation, complete credential custody and
+independent off-node archive/key recovery. The existing runtime below is separate.
+
 Apache-2.0 first-party code. This package implements the regional half of the versioned `environment.create` protocol and an optional file-backed usage collector. It initiates HTTPS requests to the adopter's control API; it opens no inbound listener. It creates internal CloudNativePG resources, reports observed readiness, and can deliver provisional observations of owned CPU/RAM requests and data-volume capacity. External PostgreSQL endpoint discovery, gateway routing, sleep, resizing, deletion, restore, and hard runtime budget enforcement remain pending. The default controller also executes the separate restricted login-role and credential-rotation protocol. A separate operator mode adds current allowance supervision and normal CNPG stop reconciliation; it is not enabled by the default controller.
 
 ## Owned logical database execution

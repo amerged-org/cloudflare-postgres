@@ -42,6 +42,11 @@ async function main(): Promise<void> {
     process.exitCode = await runFleetInspection(process.argv.slice(3));
     return;
   }
+  if (process.argv[2] === "recover-control") {
+    const { runControlRecovery } = await import("./control-recovery-cli.ts");
+    process.exitCode = await runControlRecovery(process.argv.slice(3));
+    return;
+  }
   if (process.argv[2] === "inspect-node-runtime") {
     const { inspectNodeRuntime } =
       await import("./inspect-node-runtime-cli.ts");
