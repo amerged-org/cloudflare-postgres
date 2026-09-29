@@ -421,7 +421,15 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
       // Do not turn a truncated observation into a successful readiness report.
       if (pods.metadata?._continue)
         throw new Error("pod_observation_incomplete");
-      return pods.items as unknown as Resource[];
+      // The official Pod-list endpoint supplies trusted TypeMeta. SDK models
+      // omit item kind/apiVersion as undefined when absent on the wire;
+      // inventoryPages preserves identities and refuses explicit null/foreign
+      // TypeMeta before adding only this endpoint's fixed Pod/v1 projection.
+      return inventoryPages(async () => pods, "Pod", "v1", {
+        remainingRequests: 1,
+        remainingResources: 100,
+        deadline: Date.now() + 20_000,
+      });
     },
     async meteringInventory(regionId): Promise<MeteringInventory> {
       if (!/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(regionId))

@@ -61,8 +61,10 @@ and current CNPG Cluster before offering native access. It reads the stock
 - `Cluster.status.writeService` names that Service, and its controller owner
   reference identifies the exact accepted `database` Cluster UID.
 - The CNPG Cluster label and exact cluster/primary selector match the supported
-  stock RW Service, with one TCP `postgresql` port and numeric target port 5432.
-  A NodePort, external Service or unready-address route is not adopted.
+  stock CNPG 1.30.1 RW Service, with one TCP `postgres` port and numeric target
+  port 5432. The Service and its EndpointSlice use that observed stock port name;
+  the client connection port remains 5432. A NodePort, external Service or
+  unready-address route is not adopted.
 - A Ready, Running, nondeleting primary Pod matches `currentPrimary`, the Cluster
   UID and the CNPG instance/primary labels.
 - One operator-generated EndpointSlice belongs to the exact Service UID and
