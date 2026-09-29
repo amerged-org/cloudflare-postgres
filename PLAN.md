@@ -425,6 +425,25 @@ Worker-generated fixtures. No control activation, provider write, key rotation,
 server rollout or D1 migration occurs. Independent off-node custody, global
 fencing, fresh Cloudflare bootstrap and safe service reactivation remain open.
 
+The [customer lifecycle contract checkpoint](docs/evidence/m3-api-lifecycle-contracts-2026-09-29.md)
+adds seven already shipped role/database methods to OpenAPI and supplies generic
+[adopter examples](docs/guides/database-lifecycle-v1.md). Exact scopes, bodies,
+replays, current credentials and conflicts are source-checked; 45 prior methods,
+existing schemas and held SDK remain unchanged. This is contract completion,
+not new runtime behavior or a qualified end-to-end installation.
+
+The [verifier namespace guard checkpoint](docs/evidence/m4-verifier-namespace-guard-2026-09-29.md)
+closes an operator label override before credential/Kubernetes access, with one
+meaningful red-first regression and one final passing gate covering 70 automated
+cases including six unchanged Go cases. A public-source-only image is imported
+once and the Dev controller receives one guarded image-only update. All 59
+compiled modules, the actual guard, Node/28 other Running Pods/four PVCs/five PVs/
+SQL markers and eight Cloudflare Secret names pass readback. The existing private
+journal retains all 4,096 pending facts and five coverage-gap codes; D1 still has
+zero accepted facts and closed admission. Unreconciled saturated usage remains
+an accounting/admission gate. This is not native traffic isolation, final usage
+or runtime budget enforcement, and no held workflow is resumed.
+
 The [remote control archive checkpoint](docs/evidence/m3-control-archive-2026-09-29.md)
 qualifies one upload of the existing encrypted bundle into the private EU R2
 bucket, exact remote download and offline reconstruction from those downloaded

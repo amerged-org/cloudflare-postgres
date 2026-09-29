@@ -18,6 +18,12 @@ The base path is `/v1/organizations/{organizationId}/projects/{projectId}/enviro
 
 Separate role-operation tables and `/v1/regions/{regionId}/role-operations/{claim|operationId/renew|operationId/result}` reuse executor `operations:claim`/`operations:report` permissions while preserving the existing create-only protocol. Claims return the exact current task, credential and previous credential only to the bound trusted regional executor over HTTPS. Stable immutable operations, scoped idempotency, token identity, lease epoch/hash/expiry and current desired revision fence retries and uncertain results. Claims expire; no administrative password is supplied. Failed results accept only `ownership_mismatch`, `spec_conflict` or `credential_verification_failed` with a null observation. Unknown transport, TLS or operator outcomes remain deferred rather than becoming guessed failures.
 
+Operator verifier selection fixes `verifierNamespace` independently of Pod labels.
+`verifierPodLabels` must not contain the reserved `io.kubernetes.pod.namespace`
+key; invalid selection fails before Kubernetes or credential access. The same
+validator protects owned-database execution. This is operator configuration,
+never a customer-supplied namespace or access grant.
+
 ## Regional application and connection verification
 
 Bind the owned namespace/Cluster to the accepted environment/spec/Cluster UID. Each credential revision has an immutable owned `kubernetes.io/basic-auth` Secret; the stable `DatabaseRole` references its exact Secret name. Its immutable cluster/name and explicit restricted attributes prevent privilege escalation. Apply UID/resource-version conditional changes with a monotonic credential-revision annotation; never downgrade a newer role. Lost create/patch responses require matching owned readback before further writes.

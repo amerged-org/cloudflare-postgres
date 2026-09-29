@@ -77,6 +77,15 @@ An installation operator may append the exact version-one session `pooling` poli
 
 A pooled environment result requires the additional owned Pooler/Deployment readiness observation. The existing role API accepts that observation without changing ordinary credential or privilege rules. This describes internal provisioning, not an external endpoint or successful SQL connection. Normal Pooler accounting/stopping needs the separately configured regional modes and independently bound resource identities. API-managed TLS/SQL, network isolation and integrated budget enforcement remain qualification gates.
 
+## Customer role and database lifecycle
+
+The [generic adopter workflow](../../docs/guides/database-lifecycle-v1.md) explains
+role creation, current metadata/credentials, owned database creation and password
+rotation. The [OpenAPI contract](openapi.yaml) includes all seven existing methods,
+exact bodies/scopes and immutable operation responses. An accepted intent is not
+an external endpoint or a production qualification; closed admission and the
+independent native/backup/usage/isolation gates remain in force.
+
 ## Customer recovery reads
 
 The [recovery-read contract](../../docs/contracts/recovery-reads-v1.md) adds organization-scoped project, project-scoped environment, and environment-scoped role/database collection reads. Each entry contains the existing public resource plus `currentOperationId`; the page returns `nextCursor`, `consistency: observed-page` and `observedAt`. These reads require `projects:read` and do not disclose passwords or full operation status. Page limits default to 50 and are capped at 100; signed cursors bind the collection, parent and limit. Only one `limit` and `cursor` are accepted.

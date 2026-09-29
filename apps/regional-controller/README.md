@@ -178,6 +178,10 @@ The [role lifecycle contract](../../docs/contracts/database-role-credentials-v1.
 }
 ```
 
+The reserved `io.kubernetes.pod.namespace` key is refused in `verifierPodLabels`;
+`verifierNamespace` fixes the source namespace separately. Invalid selection stops
+before Kubernetes, credential or policy access, including database execution.
+
 Merge this field into the existing configuration rather than replacing its operator and backup settings. Select labels identifying the actual trusted verifier Pods in your installation. The [deployment example](deploy/example.yaml) includes this selection, DatabaseRole get/create/patch permissions and trusted operator Secret reads. The role client reloads the mounted executor token per request. Kubernetes RBAC cannot limit resource creation by name; admission and the trusted controller identity remain installation boundaries.
 
 Only current leased work for a ready API-managed environment is eligible. The controller derives the namespace, CNPG RW service and role resource names; it refuses foreign ownership and a newer observed credential revision before writes. It creates immutable basic-auth Secrets per credential revision and a stable restricted CNPG DatabaseRole. Lost responses reconcile through matching readback and UID/resource-version guarded rotation. It creates no arbitrary SQL, superuser or caller-selected role memberships.
