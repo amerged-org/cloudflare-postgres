@@ -332,6 +332,38 @@ test("converges an owned private native grant after an uncertain policy create a
     1,
   );
   assert.equal(JSON.stringify(second).includes("PRIVATE KEY"), false);
+  // Preserve the original successful create/retry checks. A later owned
+  // policy readback changes RV: publication must still defer without writes,
+  // but the operator now receives exactly one fixed diagnostic category.
+  const originalRead = f.api.read;
+  let ownedPolicyReads = 0;
+  f.api.read = async (kind, ns, name) => {
+    const value = await originalRead(kind, ns, name);
+    if (kind === "CiliumNetworkPolicy" && name === "native-client-access") {
+      ownedPolicyReads++;
+      if (ownedPolicyReads === 2) value.metadata.resourceVersion = "11";
+    }
+    return value;
+  };
+  const diagnostics = [];
+  const writesBefore = f.creations.length;
+  const deferred = await reconcileEnvironment(
+    f.api,
+    f.claim,
+    f.config,
+    () => {},
+    (category) => {
+      diagnostics.push(category);
+      throw new Error("unavailable diagnostic sink");
+    },
+  );
+  assert.deepEqual(deferred, { ready: false });
+  assert.equal(f.creations.length, writesBefore);
+  assert.deepEqual(
+    diagnostics,
+    ["policy_reference_changed"],
+    "owned policy drift must have fixed, payload-free deferral evidence even when logging fails",
+  );
   const legacy = fixture();
   delete legacy.claim.spec.profile.nativeAccess;
   legacy.claim.specHash = createHash("sha256")
@@ -422,5 +454,43 @@ test("refuses unapproved or replaced private-client identity, foreign routing, u
       (item) => item.metadata.name === "native-client-access",
     ),
     false,
+  );
+});
+
+test("keeps a post-policy Cluster revision change deferred and reports one fixed operator category without publishing or writing again", async () => {
+  const f = fixture();
+  const originalRead = f.api.read;
+  f.api.read = async (kind, ns, name) => {
+    const value = await originalRead(kind, ns, name);
+    if (
+      kind === "Cluster" &&
+      f.creations.some((item) => item.metadata.name === "native-client-access")
+    )
+      value.metadata.resourceVersion = "11";
+    return value;
+  };
+  const diagnostics = [];
+  let writesAtDeferral;
+  const result = await reconcileEnvironment(
+    f.api,
+    f.claim,
+    f.config,
+    () => {},
+    (category) => {
+      diagnostics.push(category);
+      writesAtDeferral = f.creations.length;
+    },
+  );
+  assert.deepEqual(result, { ready: false });
+  assert.deepEqual(
+    diagnostics,
+    ["cluster_reference_changed"],
+    "a rejected Cluster reference must produce its exact fixed category, no identity metadata",
+  );
+  assert.equal(f.creations.length, writesAtDeferral);
+  assert.equal(
+    f.creations.filter((item) => item.metadata.name === "native-client-access")
+      .length,
+    1,
   );
 });

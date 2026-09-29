@@ -40,6 +40,15 @@ provisioning observations do not establish packet enforcement, SQL reachability,
 Cloudflare connectivity or ongoing health. Qualification and public routing
 remain required before customer admission.
 
+When a final native reference comparison changes, the existing controller log
+emits at most one `native_readback_deferred_<category>` event for that reconciliation.
+The category is one fixed Namespace, Cluster, Service, primary, client, certificate,
+routing or policy reference comparison; no IDs, resource versions, paths,
+certificates or raw errors are logged. It identifies the first rejected comparison,
+not its underlying cause. Earlier ordinary readiness deferrals are not classified.
+The strict comparison, null/deferred result and owned retry behavior remain unchanged;
+a failing diagnostic sink cannot turn a deferred observation into readiness.
+
 The [remote archive workflow](../../docs/guides/control-archive-v1.md) stores and
 retrieves an already sealed recovery bundle using existing operator access.
 Verify exact downloaded bytes and matching historical migrations before offline
