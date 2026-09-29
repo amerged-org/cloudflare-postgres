@@ -509,6 +509,23 @@ No provider/runtime/control-state change or stopped case resumption occurs.
 Verification permits no replay, settlement or customer admission; complete
 node-loss recovery, final accounting and the other v1 gates remain open.
 
+The [private native-access preflight](docs/evidence/m3-private-native-access-preflight-2026-09-29.md)
+prepares an opt-in protected application ingress and scoped internal endpoint API.
+All three new cases fail first and pass on implementation attempt one; independent
+source/contract review passes. The one canonical gate stops in 9.896 seconds on
+two Worker fixture type errors after passing format and lint. Broad Vitest/Node
+stages remain unrun; the isolated candidate stays sealed, unmerged and undeployed.
+A one-file fixture-only repair is prepared but unapplied. There is no second gate,
+native profile activation, customer admission or resumption of held qualifications.
+Actual controller permission capture corrects an initial Pod GET assumption;
+four narrowly scoped read capabilities remain unapplied. Packet/TLS/SQL and
+end-to-end customer qualification remain gates.
+
+The [Cloudflare private-path assessment](docs/research/cloudflare-private-native-path-2026-09-29.md)
+records the documented Hyperdrive/Workers VPC/Tunnel integration and its current
+private-CA trust limitation. It selects no gateway, creates no provider resource
+and keeps full origin certificate/hostname verification as an integration gate.
+
 The [remote control archive checkpoint](docs/evidence/m3-control-archive-2026-09-29.md)
 qualifies one upload of the existing encrypted bundle into the private EU R2
 bucket, exact remote download and offline reconstruction from those downloaded
