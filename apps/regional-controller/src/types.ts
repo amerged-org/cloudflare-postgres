@@ -93,6 +93,7 @@ export interface Resource {
     deletionTimestamp?: string;
     labels?: Record<string, string>;
     annotations?: Record<string, string>;
+    finalizers?: string[];
     ownerReferences?: {
       uid: string;
       kind: string;
@@ -117,7 +118,31 @@ export interface Resource {
     readyInstances?: number;
     initContainerStatuses?: {
       name: string;
-      state?: { terminated?: { exitCode?: number } };
+      containerID?: string;
+      ready?: boolean;
+      restartCount?: number;
+      state?: {
+        terminated?: {
+          exitCode?: number;
+          startedAt?: string;
+          finishedAt?: string;
+          containerID?: string;
+        };
+      };
+    }[];
+    containerStatuses?: {
+      name: string;
+      containerID?: string;
+      ready?: boolean;
+      restartCount?: number;
+      state?: {
+        terminated?: {
+          exitCode?: number;
+          startedAt?: string;
+          finishedAt?: string;
+          containerID?: string;
+        };
+      };
     }[];
     capacity?: Record<string, string>;
     conditions?: {

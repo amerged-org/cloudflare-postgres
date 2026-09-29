@@ -19,6 +19,11 @@ import type {
   RuntimeInventory,
 } from "./allowance-types.ts";
 import { ownedInventory, stopOwnedRuntime, volumeHash } from "./owned-stop.ts";
+import { PodRetirementJournal } from "./pod-retirement.ts";
+import {
+  preparePodRetirement,
+  acknowledgePodRetirement,
+} from "./pod-retirement-reconcile.ts";
 import { validSuspendClaim } from "./suspend-types.ts";
 import {
   canonicalCohort,
@@ -257,6 +262,8 @@ export async function reconcileSuspend(
   journal: SuspendJournal,
   runtime: AllowanceRuntime,
   authorized: () => void,
+  retirement?:
+    PodRetirementJournal | ((seal: SuspendSeal) => PodRetirementJournal),
 ): Promise<{
   suspended: boolean;
   observation?: SuspendObservation;
@@ -284,16 +291,38 @@ export async function reconcileSuspend(
       ...(cohort ? { nodeCohort: cohort.data } : {}),
     });
     authorized();
-    if (
-      !(await stopOwnedRuntime(
+    const retiring =
+      typeof retirement === "function" ? retirement(journal.seal!) : retirement;
+    if (retiring) {
+      if (!cohort) return { suspended: false };
+      await preparePodRetirement(
+        retiring,
         runtime,
-        binding,
-        volumesHash,
-        authorized,
         inventory,
-      ))
-    )
-      return { suspended: false };
+        cohort.data,
+        authorized,
+      );
+      authorized();
+    }
+    const converged = await stopOwnedRuntime(
+      runtime,
+      binding,
+      volumesHash,
+      authorized,
+      inventory,
+    );
+    if (retiring) {
+      authorized();
+      const current = await runtime.inventory();
+      authorized();
+      if (
+        !ownedInventory(current, binding) ||
+        volumeHash(current, binding) !== volumesHash
+      )
+        return { suspended: false };
+      await acknowledgePodRetirement(retiring, runtime, current, authorized);
+    }
+    if (!converged) return { suspended: false };
     authorized();
     // API absence can follow force deletion while node processes survive.
     // Keep the seal and predecessor observations; neither is physical proof.

@@ -6,6 +6,8 @@ import { SuspendClient } from "./suspend-client.ts";
 import { suspendKubernetesFromConfig } from "./suspend-kubernetes.ts";
 import { SuspendJournal, reconcileSuspend } from "./suspend-reconcile.ts";
 import type { AllowanceRuntime } from "./allowance-types.ts";
+import { PodRetirementJournal } from "./pod-retirement.ts";
+import type { SuspendSeal } from "./suspend-types.ts";
 import { validNodeObserverConfig } from "./node-observer.ts";
 import type { NodeObserverConfiguration } from "./node-observer.ts";
 
@@ -15,6 +17,7 @@ interface Configuration {
   kubeconfigContext: string;
   journalDirectory: string;
   nodeObserver?: NodeObserverConfiguration;
+  podRetirement?: { version: 1 };
 }
 function required(name: string): string {
   const value = process.env[name];
@@ -48,7 +51,9 @@ async function configuration(path: string): Promise<Configuration> {
   ];
   if (
     Object.keys(input).length !==
-      keys.length + (Object.hasOwn(input, "nodeObserver") ? 1 : 0) ||
+      keys.length +
+        (Object.hasOwn(input, "nodeObserver") ? 1 : 0) +
+        (Object.hasOwn(input, "podRetirement") ? 1 : 0) ||
     !keys.every((key) => Object.hasOwn(input, key)) ||
     input.schemaVersion !== 1 ||
     typeof input.kubeconfigFile !== "string" ||
@@ -58,7 +63,14 @@ async function configuration(path: string): Promise<Configuration> {
     typeof input.journalDirectory !== "string" ||
     !isAbsolute(input.journalDirectory) ||
     (Object.hasOwn(input, "nodeObserver") &&
-      !validNodeObserverConfig(input.nodeObserver))
+      !validNodeObserverConfig(input.nodeObserver)) ||
+    (Object.hasOwn(input, "podRetirement") &&
+      (!validNodeObserverConfig(input.nodeObserver) ||
+        input.podRetirement === null ||
+        typeof input.podRetirement !== "object" ||
+        Array.isArray(input.podRetirement) ||
+        Object.keys(input.podRetirement).length !== 1 ||
+        (input.podRetirement as { version?: unknown }).version !== 1))
   )
     throw new Error("suspend_configuration_invalid");
   return input as unknown as Configuration;
@@ -66,6 +78,7 @@ async function configuration(path: string): Promise<Configuration> {
 
 export async function runSuspend(arguments_: string[]): Promise<number> {
   let journal: SuspendJournal | null = null;
+  let retirementJournal: PodRetirementJournal | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let claimed = false;
   const shutdown = new AbortController();
@@ -90,7 +103,10 @@ export async function runSuspend(arguments_: string[]): Promise<number> {
     }
   };
   let exitCode = 2;
-  const closeJournal = () => journal?.close();
+  const closeJournal = () => {
+    retirementJournal?.close();
+    journal?.close();
+  };
   try {
     const execute = async (): Promise<number> => {
       if (
@@ -174,10 +190,23 @@ export async function runSuspend(arguments_: string[]): Promise<number> {
           authorized,
           operator.nodeObserver,
           shutdown.signal,
+          operator.podRetirement !== undefined,
         ),
       );
       authorized();
       const runtime: AllowanceRuntime = {
+        ...(baseRuntime.retainPod
+          ? {
+              retainPod: (record, finalizer) =>
+                active(() => baseRuntime.retainPod!(record, finalizer)),
+            }
+          : {}),
+        ...(baseRuntime.releasePod
+          ? {
+              releasePod: (record, finalizer, proof) =>
+                active(() => baseRuntime.releasePod!(record, finalizer, proof)),
+            }
+          : {}),
         ...(baseRuntime.observeNode
           ? {
               observeNode: (name: string) =>
@@ -196,9 +225,33 @@ export async function runSuspend(arguments_: string[]): Promise<number> {
           authorized();
         },
       };
+      const retire =
+        operator.podRetirement && operator.nodeObserver
+          ? (seal: SuspendSeal) => {
+              authorized();
+              retirementJournal ??= new PodRetirementJournal(
+                join(
+                  operator.journalDirectory,
+                  `${claim.operationId}.retirement.sqlite`,
+                ),
+                {
+                  ...seal.binding,
+                  operationId: claim.operationId,
+                  installationId: operator.nodeObserver!.installationId,
+                },
+                claim.leaseEpoch,
+              );
+              return retirementJournal;
+            }
+          : undefined;
       while (true) {
         authorized();
-        const result = await reconcileSuspend(journal, runtime, authorized);
+        const result = await reconcileSuspend(
+          journal,
+          runtime,
+          authorized,
+          retire,
+        );
         authorized();
         if (result.reason === "physical_verification_pending") {
           process.stdout.write(

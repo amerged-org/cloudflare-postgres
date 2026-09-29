@@ -45,6 +45,7 @@ export async function suspendKubernetesFromConfig(
   authorized: () => void = () => {},
   nodeObserver?: NodeObserverConfiguration,
   signal?: AbortSignal,
+  podRetirement = false,
 ): Promise<AllowanceRuntime> {
   if (!isAbsolute(file) || !context || !validSuspendClaim(claim))
     throw new Error("suspend_kubernetes_configuration_invalid");
@@ -141,6 +142,7 @@ export async function suspendKubernetesFromConfig(
     authorized,
     nodeObserver,
     signal,
+    podRetirement ? { operationId: claim.operationId } : undefined,
   );
   if (claim.nodeCohort) {
     authorized();

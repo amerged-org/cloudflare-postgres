@@ -2,6 +2,10 @@
 import type { Resource } from "./types.ts";
 import type { NodeCohortPointer } from "./node-cohort.ts";
 import type { NodeObserverResult } from "./node-observer.ts";
+import type {
+  PodRetirementProof,
+  PodRetirementRecord,
+} from "./pod-retirement.ts";
 
 export type AllowanceUnits = Record<string, string>;
 export interface RuntimeBinding {
@@ -85,6 +89,8 @@ export interface RuntimeInventory {
   deployments?: Resource[];
   nodeCohort?: Resource | null;
   nodes?: Resource[];
+  jobs?: Resource[];
+  replicaSets?: Resource[];
 }
 export interface RuntimePatch {
   op: "test" | "add" | "replace";
@@ -93,6 +99,12 @@ export interface RuntimePatch {
 }
 export interface AllowanceRuntime {
   observeNode?(nodeName: string): Promise<NodeObserverResult>;
+  retainPod?(record: PodRetirementRecord, finalizer: string): Promise<void>;
+  releasePod?(
+    record: PodRetirementRecord,
+    finalizer: string,
+    proof: PodRetirementProof,
+  ): Promise<void>;
   inventory(): Promise<RuntimeInventory>;
   patch(
     kind: "Cluster" | "ResourceQuota" | "Pooler",

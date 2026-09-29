@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   AppsV1Api,
+  BatchV1Api,
   CoreV1Api,
   CustomObjectsApi,
   KubeConfig,
@@ -26,6 +27,7 @@ import {
 import type { Resource } from "./types.ts";
 import { nodeObserverFromConfig } from "./node-observer.ts";
 import type { NodeObserverConfiguration } from "./node-observer.ts";
+import { podRetirementAdapter } from "./pod-retirement-kubernetes.ts";
 
 export function allowanceKubernetesFromConfig(
   file: string,
@@ -34,6 +36,7 @@ export function allowanceKubernetesFromConfig(
   authorized: () => void = () => {},
   nodeObserver?: NodeObserverConfiguration,
   signal?: AbortSignal,
+  retirement?: { operationId: string },
 ): AllowanceRuntime {
   if (nodeObserver && nodeObserver.regionId !== suppliedBinding.regionId)
     throw new Error("allowance_node_observer_scope_invalid");
@@ -61,6 +64,7 @@ export function allowanceKubernetesFromConfig(
   config.setCurrentContext(context);
   const core = config.makeApiClient(CoreV1Api),
     apps = config.makeApiClient(AppsV1Api),
+    batch = config.makeApiClient(BatchV1Api),
     custom = config.makeApiClient(CustomObjectsApi);
   let budget: InventoryBudget | null = null;
   const options: ConfigurationOptions = {
@@ -212,7 +216,46 @@ export function allowanceKubernetesFromConfig(
       budget = previousBudget;
     }
   };
+  const retirementAdapter =
+    retirement && nodeObserver
+      ? podRetirementAdapter(
+          binding,
+          retirement.operationId,
+          {
+            owners: freshOwners,
+            async readPod(name) {
+              try {
+                const pod = await core.readNamespacedPod(
+                  { namespace: binding.namespace, name },
+                  options,
+                );
+                return JSON.parse(
+                  JSON.stringify({ ...pod, kind: "Pod", apiVersion: "v1" }),
+                ) as Resource;
+              } catch (error) {
+                if ((error as { code?: number }).code === 404) return null;
+                throw new Error("pod_retirement_read_unknown");
+              }
+            },
+            async patchPod(name, operations) {
+              await core.patchNamespacedPod(
+                {
+                  namespace: binding.namespace,
+                  name,
+                  body: operations,
+                  fieldValidation: "Strict",
+                },
+                patchOptions,
+              );
+            },
+          },
+          authorized,
+        )
+      : undefined;
+  if (retirement && !retirementAdapter)
+    throw new Error("pod_retirement_configuration_unavailable");
   return {
+    ...(retirementAdapter ?? {}),
     ...(nodeObserver
       ? {
           observeNode: nodeObserverFromConfig(
@@ -242,6 +285,8 @@ export function allowanceKubernetesFromConfig(
           pvcs,
           allPvs,
           cohort,
+          jobs,
+          replicaSets,
         ] = await Promise.all([
           core.readNamespace({ name: binding.namespace }, options),
           custom.getNamespacedCustomObject(identity, options),
@@ -304,6 +349,30 @@ export function allowanceKubernetesFromConfig(
             current,
           ),
           cohortEvidence(current),
+          retirement
+            ? inventoryPages(
+                (_continue) =>
+                  batch.listNamespacedJob(
+                    { namespace: binding.namespace, limit: 100, _continue },
+                    options,
+                  ),
+                "Job",
+                "batch/v1",
+                current,
+              )
+            : Promise.resolve([]),
+          retirement
+            ? inventoryPages(
+                (_continue) =>
+                  apps.listNamespacedReplicaSet(
+                    { namespace: binding.namespace, limit: 100, _continue },
+                    options,
+                  ),
+                "ReplicaSet",
+                "apps/v1",
+                current,
+              )
+            : Promise.resolve([]),
         ]);
         if (Date.now() >= current.deadline)
           throw new Error("allowance_inventory_deadline");
@@ -321,12 +390,13 @@ export function allowanceKubernetesFromConfig(
             kind: "ResourceQuota",
             apiVersion: "v1",
           } as unknown as Resource,
-          pods,
+          pods: JSON.parse(JSON.stringify(pods)) as Resource[],
           pvcs,
           pvs,
           poolers,
           deployments,
           ...cohort,
+          ...(retirement ? { jobs, replicaSets } : {}),
         };
       } finally {
         budget = null;
