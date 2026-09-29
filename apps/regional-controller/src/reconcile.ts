@@ -639,6 +639,7 @@ export async function reconcileEnvironment(
         plugins: [
           {
             name: "barman-cloud.cloudnative-pg.io",
+            enabled: true,
             isWALArchiver: true,
             parameters: { barmanObjectName: "archive", serverName: "database" },
           },

@@ -90,6 +90,8 @@ test("reclaims uncertain provisioning, verifies current Pods, and rejects anothe
             `${Number.parseInt(hard["requests.memory"]) / 1024}Gi`;
       }
       if (resource.kind === "Cluster") {
+        // CNPG defaults omitted plugin enabled fields to true on API readback.
+        for (const plugin of stored.spec.plugins) plugin.enabled ??= true;
         stored.status = {
           readyInstances: 1,
           currentPrimary: "database-1",
@@ -200,6 +202,14 @@ test("reclaims uncertain provisioning, verifies current Pods, and rejects anothe
     },
   });
   assert.equal(createCounts.get("Cluster"), 1);
+  cluster.spec.plugins[0].enabled = false;
+  await assert.rejects(
+    reconcileEnvironment(api, { ...claim, leaseEpoch: 3 }, config),
+    (error) => error.code === "spec_conflict",
+    "a disabled WAL plugin cannot satisfy the owned environment specification",
+  );
+  assert.equal(createCounts.get("Cluster"), 1);
+  cluster.spec.plugins[0].enabled = true;
   cluster.metadata.labels["pgcf.io/environment-id"] = "another-environment";
   await assert.rejects(
     reconcileEnvironment(api, { ...claim, leaseEpoch: 3 }, config),

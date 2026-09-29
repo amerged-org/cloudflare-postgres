@@ -103,6 +103,7 @@ test("retains one owned base-backup operation across uncertain creation and comp
       plugins: [
         {
           name: "barman-cloud.cloudnative-pg.io",
+          enabled: true,
           isWALArchiver: true,
           parameters: { barmanObjectName: "archive", serverName: "database" },
         },
@@ -202,6 +203,15 @@ test("retains one owned base-backup operation across uncertain creation and comp
     },
   };
   const attempt = { createAttempted: false, resourceUid: null };
+  cluster.spec.plugins[0].enabled = false;
+  await assert.rejects(
+    reconcileBackup(runtime, control, claim, attempt, () => {}),
+    /backup_identity_changed/,
+    "a disabled WAL plugin must refuse backup dispatch before physical effects",
+  );
+  assert.equal(dispatchCount, 0);
+  assert.equal(createCount, 0);
+  cluster.spec.plugins[0].enabled = true;
   const first = await reconcileBackup(
     runtime,
     control,
@@ -265,6 +275,15 @@ test("retains one owned base-backup operation across uncertain creation and comp
     s3Credentials: { secretName: "must-not-copy-secret-reference" },
   };
   store.metadata.resourceVersion = "12";
+  cluster.spec.plugins[0].enabled = false;
+  await assert.rejects(
+    reconcileBackup(runtime, control, resumed, attempt, () => {}),
+    /backup_identity_changed/,
+    "a disabled WAL plugin must not yield accepted completed-backup evidence",
+  );
+  assert.equal(dispatchCount, 1);
+  assert.equal(createCount, 1);
+  cluster.spec.plugins[0].enabled = true;
   const completed = await reconcileBackup(
     runtime,
     control,

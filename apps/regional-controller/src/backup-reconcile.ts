@@ -131,6 +131,7 @@ function clusterMatches(cluster: Resource, claim: BackupClaim): boolean {
       plugins: [
         {
           name: plugin,
+          enabled: true,
           isWALArchiver: true,
           parameters: { barmanObjectName: "archive", serverName: "database" },
         },
