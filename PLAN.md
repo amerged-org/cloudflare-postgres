@@ -391,6 +391,14 @@ The [Pod birth admission candidate](docs/evidence/m6-pod-birth-held-2026-09-29.m
 
 ## 10. Bounded TDD and verification discipline
 
+The [control recovery candidate checkpoint](docs/evidence/m3-control-recovery-held-2026-09-29.md)
+records two passing local reconstruction/key-custody cases and one failed actual
+Dev D1 capture. The latter remains held after two attempts: metadata/schema checks
+pass, while query planning identifies D1's compound-SELECT limit. The one-read
+query correction is proposed and awaits an explicit exception; no full gate,
+source merge, key rotation or activation follows. Current allowance-key custody
+and complete control-service disaster recovery remain open.
+
 The [portable PostgreSQL candidate checkpoint](docs/evidence/m2-postgres-portability-held-2026-09-29.md)
 records a separate generic export/import draft using maintained PostgreSQL 18
 tools and exactly three real local TLS cases. Privacy/protection checks pass, but
