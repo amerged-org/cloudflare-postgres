@@ -207,7 +207,10 @@ async function fixture(t) {
               {
                 name: "observer",
                 image: config.image.reference,
-                imageID: digest("c"),
+                imageID:
+                  state.mode === "index-image"
+                    ? config.image.reference
+                    : digest("c"),
                 containerID: `containerd://${"f".repeat(64)}`,
                 restartCount: 0,
                 ready: true,
@@ -365,6 +368,15 @@ test("observes through maintained SDK mutual-TLS Exec only after full challenged
   );
   assert.equal(f.state.execs, 1);
   assert.deepEqual(f.state.offeredProtocols, ["v4.channel.k8s.io"]);
+  f.state.mode = "index-image";
+  const pinned = await observer.observeNode("node-a");
+  assert.equal(pinned.envelope.observerPodUid, ids.pod);
+  assert.equal(
+    f.state.execs,
+    2,
+    "the observed exact repository index reference remains qualified",
+  );
+
   assert.deepEqual(f.state.commands[0].slice(0, 3), [
     "/node-runtime-observer",
     "observe",
@@ -378,7 +390,7 @@ test("observes through maintained SDK mutual-TLS Exec only after full challenged
     observer.observeNode("foreign-node"),
     /node_observation_unknown/,
   );
-  assert.equal(f.state.execs, 1, "unconfigured peer must never dispatch");
+  assert.equal(f.state.execs, 2, "unconfigured peer must never dispatch");
 });
 
 test("refuses nonzero or premature Exec, replaced observer identity and authority lost during async SDK authentication without exposing raw responses", async (t) => {

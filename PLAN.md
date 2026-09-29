@@ -381,6 +381,8 @@ Implementation assumptions must be resolved with evidence, not advertised as exi
 
 The [node runtime transport checkpoint](docs/evidence/m6-node-runtime-transport-2026-09-29.md) adds a resident Go agent, challenged self identity and a bounded verified-TLS Kubernetes Exec adapter with explicit operator configuration. Exactly three new top-level cases fail first and the single frozen full gate passes all 61 cases. Contabo credentials are confirmed as Dev Worker Secret names; local credentials remain private. Live resident execution is not yet qualified; stop completion, original cohort coverage, independent expiry and finalized accounting remain open.
 
+The [runtime image identity repair](docs/evidence/m6-runtime-imageid-repair-2026-09-29.md) addresses a concrete post-rollout mismatch: repository-index-pinned Pods report the exact index reference rather than only the configuration digest. One existing case fails first and passes the narrow correction; no cases are added. Its separate frozen workspace gate passes once, with unchanged Go evidence retained. Actual original-cohort stop, expiry enforcement and final accounting remain open.
+
 ## 10. Bounded TDD and verification discipline
 
 Use test-driven development for concrete behavior changes: identify the intended behavior or observed defect, demonstrate a meaningful failing test, implement the smallest complete correction, and check the affected behavior again. Keep the task scope fixed; tests are evidence for that change, not a reason to build additional features or infrastructure.

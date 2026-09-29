@@ -4,7 +4,7 @@ This transport binds the existing CRI observation to an explicit operator-owned 
 
 ## Identities and channel
 
-Private operator configuration pins installation/region, protected Namespace UID, DaemonSet name/UID, reviewed image index/amd64/configuration digests, and up to 32 unique Node/boot and observer Pod identities. Image references use the approved repository index; runtime container image ID is checked separately against its configuration digest. Namespace/node/pod naming alone is insufficient.
+Private operator configuration pins installation/region, protected Namespace UID, DaemonSet name/UID, reviewed image index/amd64/configuration digests, and up to 32 unique Node/boot and observer Pod identities. Image references use the approved repository index; runtime container image ID must equal the qualified configuration digest or the exact approved repository index reference. Operators verify the index-to-amd64-manifest-to-configuration chain before configuring those pins; the adapter does not infer that chain from a suffix. Namespace/node/pod naming alone is insufficient.
 
 Each call selects one exact peer. Fresh API reads verify protected Namespace, current DaemonSet identity/template, Pod UID/owner/scheduling/recipe/runtime image and selected Node UID/boot before and after execution. The approved spec includes exactly one CRI-socket mount, the fixed resident binary/arguments and server-owned Downward API fields. No provider credential, ServiceAccount token, host network/PID/IPC, injected sidecar or arbitrary environment is permitted. Socket access and `pods/exec` to this Pod remain trusted node-administration authority, even with a read-only mount.
 

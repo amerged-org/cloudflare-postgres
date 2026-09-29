@@ -491,13 +491,18 @@ function safePodSpec(
   }
   return true;
 }
-function imageId(value: unknown): string | null {
-  if (typeof value !== "string" || value.length > 1024) return null;
-  return /(sha256:[a-f0-9]{64})$/.exec(value)?.[1] ?? null;
+function qualifiedImageId(
+  value: unknown,
+  config: NodeObserverConfiguration,
+): value is string {
+  return (
+    value === config.image.configDigest || value === config.image.reference
+  );
 }
 interface ObservationIdentity {
   podUid: string;
   containerId: string;
+  imageId: string;
   restartCount: number;
   ownerGeneration: number;
   ownerTemplate: string;
@@ -574,7 +579,7 @@ async function verifyPeer(
     !statuses[0].state?.running ||
     !Number.isSafeInteger(statuses[0].restartCount) ||
     statuses[0].restartCount < 0 ||
-    imageId(statuses[0].imageID) !== config.image.configDigest ||
+    !qualifiedImageId(statuses[0].imageID, config) ||
     typeof statuses[0].containerID !== "string" ||
     !/^containerd:\/\/[a-f0-9]{64}$/.test(statuses[0].containerID)
   )
@@ -582,6 +587,7 @@ async function verifyPeer(
   return {
     podUid: pod.metadata.uid,
     containerId: statuses[0].containerID,
+    imageId: statuses[0].imageID,
     restartCount: statuses[0].restartCount,
     ownerGeneration: owner.metadata.generation!,
     ownerTemplate: encoded(owner.spec.template),
