@@ -1,4 +1,9 @@
-# Control recovery candidate held at D1 qualification
+# Control recovery candidate: original D1 qualification stop
+
+This historical checkpoint records the original stop. The later
+[user-resumed qualification](m3-control-recovery-2026-09-29.md) preserves these
+failures and supplies the subsequent bounded correction and actual evidence.
+Statements below describe the original held state.
 
 The isolated `codex/control-recovery` candidate implements a generic operator
 chain: one canonical-state read, encrypted recovery bundle and verified offline

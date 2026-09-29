@@ -411,13 +411,19 @@ output and unchanged schema/Secret/infrastructure/SQL state. Association cannot
 grant machine identity, reserved capacity or update authority. Other held
 workflows remain untouched; M4 is still incomplete.
 
-The [control recovery candidate checkpoint](docs/evidence/m3-control-recovery-held-2026-09-29.md)
-records two passing local reconstruction/key-custody cases and one failed actual
-Dev D1 capture. The latter remains held after two attempts: metadata/schema checks
-pass, while query planning identifies D1's compound-SELECT limit. The one-read
-query correction is proposed and awaits an explicit exception; no full gate,
-source merge, key rotation or activation follows. Current allowance-key custody
-and complete control-service disaster recovery remain open.
+The [control recovery checkpoint](docs/evidence/m3-control-recovery-2026-09-29.md)
+qualifies a bounded one-read Dev D1 capture, encrypted bundle and exact quarantined
+offline reconstruction. The user's explicit resumption preserves the original
+[stopped attempts](docs/evidence/m3-control-recovery-held-2026-09-29.md); a balanced
+SQL composition resolves the compound-SELECT and expression-depth limits within
+two resumed corrections. The same two meaningful red-first local cases pass and
+one final full gate passes 69 automated cases, including six unchanged Go cases.
+Actual capture/seal/restore verifies 40 tables, 47 rows, 121 schema objects and all
+14 migrations; both existing private keyrings are recovered exactly. Dev retains
+zero encrypted credential/fence rows; positive historical crypto uses actual
+Worker-generated fixtures. No control activation, provider write, key rotation,
+server rollout or D1 migration occurs. Independent off-node custody, global
+fencing, fresh Cloudflare bootstrap and safe service reactivation remain open.
 
 The [portable PostgreSQL candidate checkpoint](docs/evidence/m2-postgres-portability-held-2026-09-29.md)
 records a separate generic export/import draft using maintained PostgreSQL 18
