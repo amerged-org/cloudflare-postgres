@@ -391,6 +391,14 @@ The [Pod birth admission candidate](docs/evidence/m6-pod-birth-held-2026-09-29.m
 
 ## 10. Bounded TDD and verification discipline
 
+The [disk-full neighbor checkpoint](docs/evidence/m4-disk-full-containment-2026-09-29.md)
+passes one native same-Node/VG two-volume exercise in 33.184 seconds. Target
+`ENOSPC`, sibling durable writes, original PostgreSQL reads, 29 Running Pod
+identities and five original volumes are preserved; exact owned cleanup restores
+physical LVM capacity. No runtime source or held qualifier changes. This advances
+filesystem containment only; PostgreSQL own-volume recovery, complete tenant
+isolation, backups/PITR and production readiness remain open.
+
 The [fleet inventory candidate checkpoint](docs/evidence/m4-fleet-inventory-held-2026-09-29.md)
 records an independent installation-only provider read and explicit enrolled-Node
 inspection draft. Two red-first targeted cases pass, including maintenance
