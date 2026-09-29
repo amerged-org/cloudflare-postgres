@@ -27,6 +27,14 @@ archive bound still requires a future chunked design for denser workloads.
 Ten thousand active PostgreSQL environments require a separate fleet and
 storage-capacity proof.
 
+The [D1 REST operator-capture checkpoint](docs/evidence/m3-control-recovery-rest-2026-09-29.md)
+adds a fixed-origin, primary-verified read path when the current Wrangler
+session is denied D1 query access. The existing Dev control state was captured,
+sealed and independently reconstructed offline with 16 migrations, exact
+integrity and no provider mutation. This is not live service activation or
+production disaster recovery; off-node key/archive custody, concurrent-writer
+behavior, fresh bootstrap and fencing remain open.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.
