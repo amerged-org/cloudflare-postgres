@@ -70,6 +70,13 @@ foreign-key checks. Pending/failed provisioning cleanup, actual
 retirement/disposal, retained-archive recovery and final accounting remain
 explicit v1 requirements.
 
+The [persistent stop worker candidate](docs/evidence/m6-suspend-worker-held-2026-09-30.md)
+implements separate supervised queue consumption and fair lease-expiry rotation
+locally. Its three red-first cases pass targeted checks, but the one final gate
+stops on an existing invalid-settings startup fixture: 36 Worker and 56 of 57
+Node cases pass. The candidate stays uncommitted and undeployed until that
+failure is diagnosed; no full gate is repeated or held physical qualifier resumed.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.
