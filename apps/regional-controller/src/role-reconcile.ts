@@ -40,6 +40,7 @@ export function validRoleConfig(config: RoleConfig): boolean {
     Object.keys(config.verifierPodLabels).length <= 16 &&
     Object.entries(config.verifierPodLabels).every(
       ([key, value]) =>
+        key !== "io.kubernetes.pod.namespace" &&
         /^[A-Za-z0-9][A-Za-z0-9./_-]{0,252}$/.test(key) &&
         /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,61}[A-Za-z0-9])?$/.test(value),
     )
@@ -345,8 +346,8 @@ export async function reconcileRole(
           fromEndpoints: [
             {
               matchLabels: {
-                "k8s:io.kubernetes.pod.namespace": config.verifierNamespace,
                 ...selectors,
+                "k8s:io.kubernetes.pod.namespace": config.verifierNamespace,
               },
             },
           ],

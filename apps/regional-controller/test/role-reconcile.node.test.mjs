@@ -354,3 +354,37 @@ test("a reclaimed stale rotation cannot downgrade a newer role even after its op
     newer,
   );
 });
+
+test("rejects a verifier namespace selector override before reading or mutating credentials or policy", async () => {
+  const calls = [];
+  const runtime = new Proxy(
+    {},
+    {
+      get(_target, method) {
+        return async () => {
+          calls.push(String(method));
+          throw new Error("unexpected_kubernetes_or_secret_access");
+        };
+      },
+    },
+  );
+  await assert.rejects(
+    reconcileRole(
+      runtime,
+      claim,
+      {
+        ...config,
+        verifierPodLabels: {
+          ...config.verifierPodLabels,
+          "io.kubernetes.pod.namespace": "foreign-namespace",
+        },
+      },
+      async () => {
+        throw new Error("unexpected_database_access");
+      },
+      () => {},
+    ),
+    /role_spec_conflict/,
+  );
+  assert.deepEqual(calls, []);
+});
