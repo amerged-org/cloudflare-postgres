@@ -7,6 +7,13 @@ import {
   type NativeConnectionObservation,
 } from "./native-access";
 import { assertion } from "./accounting";
+import { environmentNotDeleting } from "./environment-runtime";
+import {
+  deletionReadColumns,
+  deletionReadJoins,
+  deletionView,
+  type DeletionPointer,
+} from "./environment-deletion";
 import {
   actorBindings,
   actorPredicate,
@@ -105,7 +112,7 @@ interface ResolvedSpec extends EnvironmentInput {
   profile: Profile;
 }
 
-export interface EnvironmentRow {
+export interface EnvironmentRow extends DeletionPointer {
   id: string;
   organization_id: string;
   project_id: string;
@@ -711,6 +718,7 @@ export function publicEnvironment(row: EnvironmentRow) {
     regionId: row.region_id,
     name: row.name,
     status: row.status,
+    lifecycle: deletionView(row),
     specRevision: row.spec_revision,
     specHash: row.spec_hash,
     resolvedSpec: { ...spec, profile: publicProfile(spec.profile) },
@@ -1134,7 +1142,7 @@ async function replay(
   const [environment, operation] = await Promise.all([
     db
       .prepare(
-        `SELECT * FROM environments WHERE id = ? AND organization_id = ? AND ${actorPredicate(actor)}`,
+        `SELECT e.*,${deletionReadColumns} FROM environments e ${deletionReadJoins("e")} WHERE e.id = ? AND e.organization_id = ? AND ${actorPredicate(actor)}`,
       )
       .bind(row.environment_id, organizationId, ...actorBindings(actor))
       .first<EnvironmentRow>(),
@@ -1410,7 +1418,7 @@ async function readEnvironment(
   if (denied) return denied;
   const row = await db
     .prepare(
-      "SELECT * FROM environments WHERE id = ? AND organization_id = ? AND project_id = ?",
+      `SELECT e.*,${deletionReadColumns} FROM environments e ${deletionReadJoins("e")} WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ?`,
     )
     .bind(environmentId, organizationId, projectId)
     .first<EnvironmentRow>();
@@ -1451,25 +1459,55 @@ async function claimOperation(
   const expiresAt = new Date(
     Date.now() + input.leaseSeconds * 1000,
   ).toISOString();
-  const written = await db.batch<ExecutionRow>([
-    db
-      .prepare(
-        "UPDATE operations SET status = 'running', lease_token_hash = ?, lease_epoch = lease_epoch + 1, lease_expires_at = ? WHERE id = (SELECT id FROM operations WHERE region_id = ? AND kind = 'environment.create' AND (status = 'queued' OR (status = 'running' AND lease_expires_at <= ?)) ORDER BY created_at, id LIMIT 1) AND region_id = ? AND kind = 'environment.create' AND (status = 'queued' OR (status = 'running' AND lease_expires_at <= ?)) RETURNING *",
-      )
-      .bind(hash, expiresAt, regionId, now, regionId, now),
-    db
-      .prepare(
-        "UPDATE environments SET status = 'provisioning' WHERE id IN (SELECT environment_id FROM operations WHERE lease_token_hash = ? AND region_id = ? AND status = 'running')",
-      )
-      .bind(hash, regionId),
-  ]);
+  let written: D1Result<ExecutionRow>[];
+  try {
+    written = await db.batch<ExecutionRow>([
+      db
+        .prepare(
+          `UPDATE operations SET status = 'running', lease_token_hash = ?, lease_epoch = lease_epoch + 1, lease_expires_at = ?
+          WHERE id = (SELECT candidate.id FROM operations candidate JOIN environments e ON e.id=candidate.environment_id
+            WHERE candidate.region_id = ? AND candidate.kind = 'environment.create'
+            AND (candidate.status = 'queued' OR (candidate.status = 'running' AND candidate.lease_expires_at <= ?))
+            AND ${environmentNotDeleting("e")} ORDER BY candidate.created_at, candidate.id LIMIT 1)
+          AND region_id = ? AND kind = 'environment.create' AND (status = 'queued' OR (status = 'running' AND lease_expires_at <= ?))
+          AND EXISTS (SELECT 1 FROM environments e WHERE e.id=operations.environment_id AND ${environmentNotDeleting("e")}) RETURNING *`,
+        )
+        .bind(hash, expiresAt, regionId, now, regionId, now),
+      assertion(
+        db,
+        `NOT EXISTS (SELECT 1 FROM operations o WHERE o.lease_token_hash=? AND o.region_id=? AND o.status='running'
+          AND NOT EXISTS (SELECT 1 FROM environments e WHERE e.id=o.environment_id AND ${environmentNotDeleting("e")}))`,
+        [hash, regionId],
+      ),
+      db
+        .prepare(
+          `UPDATE environments AS e SET status = 'provisioning'
+          WHERE e.id IN (SELECT environment_id FROM operations WHERE lease_token_hash = ? AND region_id = ? AND status = 'running')
+          AND ${environmentNotDeleting("e")}`,
+        )
+        .bind(hash, regionId),
+    ]);
+  } catch {
+    return error(409, "lease_conflict");
+  }
   const operation = written[0]!.results[0];
   if (!operation) return json({ claim: null });
   const environment = await db
-    .prepare("SELECT * FROM environments WHERE id = ?")
-    .bind(operation.environment_id)
+    .prepare(
+      `SELECT e.* FROM environments e JOIN operations o ON o.environment_id=e.id
+      WHERE e.id=? AND o.id=? AND o.region_id=? AND o.status='running' AND o.lease_token_hash=? AND o.lease_epoch=?
+      AND o.lease_expires_at=? AND ${environmentNotDeleting("e")}`,
+    )
+    .bind(
+      operation.environment_id,
+      operation.id,
+      regionId,
+      hash,
+      operation.lease_epoch,
+      expiresAt,
+    )
     .first<EnvironmentRow>();
-  if (!environment) return error(500, "state_inconsistent");
+  if (!environment) return error(409, "lease_conflict");
   return json({
     claim: {
       operationId: operation.id,
@@ -1521,19 +1559,46 @@ async function renewOperation(
   const expiresAt = new Date(
     Date.now() + input.leaseSeconds * 1000,
   ).toISOString();
-  const updated = await db
-    .prepare(
-      "UPDATE operations SET lease_expires_at = ? WHERE id = ? AND region_id = ? AND kind = 'environment.create' AND status = 'running' AND lease_token_hash = ? AND lease_epoch = ? AND lease_expires_at > ? RETURNING id",
-    )
-    .bind(
-      expiresAt,
-      operationId,
-      regionId,
-      await sha256(input.leaseToken as string),
-      input.leaseEpoch,
-      now,
-    )
-    .first();
+  const leaseHash = await sha256(input.leaseToken as string);
+  let updated: unknown;
+  try {
+    const written = await db.batch([
+      assertion(
+        db,
+        `EXISTS (SELECT 1 FROM operations o JOIN environments e ON e.id=o.environment_id
+        WHERE o.id=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'
+        AND o.lease_token_hash=? AND o.lease_epoch=? AND o.lease_expires_at>? AND ${environmentNotDeleting("e")})`,
+        [operationId, regionId, leaseHash, input.leaseEpoch as number, now],
+      ),
+      db
+        .prepare(
+          `UPDATE operations SET lease_expires_at = ? WHERE id = ? AND region_id = ? AND kind = 'environment.create'
+          AND status = 'running' AND lease_token_hash = ? AND lease_epoch = ? AND lease_expires_at > ?
+          AND EXISTS (SELECT 1 FROM environments e WHERE e.id=operations.environment_id AND ${environmentNotDeleting("e")}) RETURNING id`,
+        )
+        .bind(
+          expiresAt,
+          operationId,
+          regionId,
+          leaseHash,
+          input.leaseEpoch,
+          now,
+        ),
+      assertion(db, "changes()=1"),
+    ]);
+    updated = written[1]!.results[0];
+  } catch {
+    return error(409, "lease_conflict");
+  }
+  if (updated)
+    updated = await db
+      .prepare(
+        `SELECT o.id FROM operations o JOIN environments e ON e.id=o.environment_id
+        WHERE o.id=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'
+        AND o.lease_token_hash=? AND o.lease_epoch=? AND o.lease_expires_at=? AND ${environmentNotDeleting("e")}`,
+      )
+      .bind(operationId, regionId, leaseHash, input.leaseEpoch, expiresAt)
+      .first();
   return updated
     ? json({ leaseExpiresAt: expiresAt })
     : error(409, "lease_conflict");
@@ -1684,48 +1749,77 @@ async function reportResult(
   );
   const leaseHash = await sha256(input.leaseToken as string);
   const now = new Date().toISOString();
-  await db.batch([
+  const terminalResult = () =>
     db
       .prepare(
-        "UPDATE operations SET status = ?, observed_at = ?, result_code = ?, result_hash = ?, observation_json = ? WHERE id = ? AND region_id = ? AND kind = 'environment.create' AND status = 'running' AND lease_token_hash = ? AND lease_epoch = ? AND lease_expires_at > ?",
+        "SELECT * FROM operations WHERE id = ? AND region_id = ? AND kind='environment.create' AND lease_token_hash = ? AND lease_epoch = ? AND result_hash = ? AND status IN ('succeeded', 'failed')",
       )
-      .bind(
-        ready ? "succeeded" : "failed",
-        now,
-        input.resultCode,
-        resultHash,
-        JSON.stringify(observation),
-        operationId,
-        regionId,
-        leaseHash,
-        input.leaseEpoch,
-        now,
-      ),
-    db
-      .prepare(
-        "UPDATE environments SET status = ?, observed_at = (SELECT observed_at FROM operations WHERE id = ?), observation_json = (SELECT observation_json FROM operations WHERE id = ?) WHERE id = ? AND EXISTS (SELECT 1 FROM operations WHERE id = ? AND region_id = ? AND lease_token_hash = ? AND lease_epoch = ? AND result_hash = ? AND status IN ('succeeded', 'failed'))",
-      )
-      .bind(
-        input.status,
-        operationId,
-        operationId,
-        environment.id,
-        operationId,
-        regionId,
-        leaseHash,
-        input.leaseEpoch,
-        resultHash,
-      ),
-  ]);
-  const operation = await db
-    .prepare(
-      "SELECT * FROM operations WHERE id = ? AND region_id = ? AND lease_token_hash = ? AND lease_epoch = ? AND result_hash = ? AND status IN ('succeeded', 'failed')",
-    )
-    .bind(operationId, regionId, leaseHash, input.leaseEpoch, resultHash)
-    .first<ExecutionRow>();
+      .bind(operationId, regionId, leaseHash, input.leaseEpoch, resultHash)
+      .first<ExecutionRow>();
+  // Exact terminal replay is historical recovery, not a fresh publication or
+  // authority to rewrite the environment after its deletion was accepted.
+  let operation = await terminalResult();
+  if (!operation) {
+    try {
+      await db.batch([
+        assertion(
+          db,
+          `EXISTS (SELECT 1 FROM operations o JOIN environments e ON e.id=o.environment_id
+          WHERE o.id=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'
+          AND o.lease_token_hash=? AND o.lease_epoch=? AND o.lease_expires_at>? AND ${environmentNotDeleting("e")})`,
+          [operationId, regionId, leaseHash, input.leaseEpoch as number, now],
+        ),
+        db
+          .prepare(
+            `UPDATE operations SET status = ?, observed_at = ?, result_code = ?, result_hash = ?, observation_json = ?
+            WHERE id = ? AND region_id = ? AND kind = 'environment.create' AND status = 'running'
+            AND lease_token_hash = ? AND lease_epoch = ? AND lease_expires_at > ?
+            AND EXISTS (SELECT 1 FROM environments e WHERE e.id=operations.environment_id AND ${environmentNotDeleting("e")})`,
+          )
+          .bind(
+            ready ? "succeeded" : "failed",
+            now,
+            input.resultCode,
+            resultHash,
+            JSON.stringify(observation),
+            operationId,
+            regionId,
+            leaseHash,
+            input.leaseEpoch,
+            now,
+          ),
+        assertion(db, "changes()=1"),
+        db
+          .prepare(
+            `UPDATE environments AS e SET status = ?, observed_at = (SELECT observed_at FROM operations WHERE id = ?),
+            observation_json = (SELECT observation_json FROM operations WHERE id = ?) WHERE e.id = ?
+            AND ${environmentNotDeleting("e")} AND EXISTS (SELECT 1 FROM operations WHERE id = ? AND region_id = ?
+            AND lease_token_hash = ? AND lease_epoch = ? AND result_hash = ? AND status IN ('succeeded', 'failed'))`,
+          )
+          .bind(
+            input.status,
+            operationId,
+            operationId,
+            environment.id,
+            operationId,
+            regionId,
+            leaseHash,
+            input.leaseEpoch,
+            resultHash,
+          ),
+        assertion(db, "changes()=1"),
+      ]);
+    } catch {
+      // A concurrent identical terminal publication may already be durable.
+      // Read its exact historical identity; never retry the effect batch.
+    }
+    operation = await terminalResult();
+  }
   if (!operation) return error(409, "lease_conflict");
   const observedEnvironment = await db
-    .prepare("SELECT * FROM environments WHERE id = ?")
+    .prepare(
+      `SELECT e.*,${deletionReadColumns} FROM environments e ${deletionReadJoins("e")} WHERE e.id = ?`,
+    )
     .bind(environment.id)
     .first<EnvironmentRow>();
   if (!observedEnvironment) return error(500, "state_inconsistent");

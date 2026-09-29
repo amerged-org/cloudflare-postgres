@@ -242,9 +242,9 @@ export async function migrationSet(directory: string): Promise<MigrationSet> {
 export function buildSnapshotQuery(set: MigrationSet): string {
   if (!trustedSql.has(set)) throw fail("control_snapshot_migrations_invalid");
   const fragments = set.tables.map((table) => {
-    // Short, private projection aliases keep a one-read snapshot below D1's
-    // statement bound as trusted migrations add application columns.
-    const aliases = table.columns.map((_, index) => quote(`c${index}`));
+    // Generated aliases need no identifier quotes; actual schema names remain
+    // quoted while the complete one-read statement stays below D1's bound.
+    const aliases = table.columns.map((_, index) => `c${index}`);
     const cells = aliases.map((column) => {
       return `json_object('type',typeof(${column}),'value',CASE typeof(${column}) WHEN 'blob' THEN hex(${column}) WHEN 'real' THEN printf('%!.17g',${column}) ELSE CAST(${column} AS TEXT) END)`;
     });
@@ -277,20 +277,16 @@ export function buildSnapshotRowsQuery(set: MigrationSet): string {
     `SELECT -1 AS segment,0 AS ordinal,'schema' AS kind,json_object('count',(SELECT count(*) FROM sqlite_master WHERE ${schemaWhere}),'rows',json(${schemaRows})) AS payload`,
   ];
   for (const [index, table] of set.tables.entries()) {
-    const aliases = table.columns.map((_, column) => quote(`c${column}`));
+    const aliases = table.columns.map((_, column) => `c${column}`);
     const cells = aliases.map(
       (column) =>
         `json_array(typeof(${column}),CASE typeof(${column}) WHEN 'blob' THEN hex(${column}) WHEN 'real' THEN printf('%!.17g',${column}) ELSE CAST(${column} AS TEXT) END)`,
     );
     const selected = table.columns
       .map((name, column) => `${quote(name)} AS ${aliases[column]}`)
-      .concat(
-        table.order.map(
-          (name, order) => `${quote(name)} AS ${quote(`o${order}`)}`,
-        ),
-      )
+      .concat(table.order.map((name, order) => `${quote(name)} AS o${order}`))
       .join(",");
-    const order = table.order.map((_, column) => quote(`o${column}`)).join(",");
+    const order = table.order.map((_, column) => `o${column}`).join(",");
     parts.push(
       `SELECT ${index},0,'table',json_object('name',${literal(table.name)},'columns',json(${literal(JSON.stringify(table.columns))}),'count',(SELECT count(*) FROM ${quote(table.name)}))`,
       `SELECT ${index},row_number() OVER (ORDER BY ${order}),'row',json_array(${cells.join(",")}) FROM (SELECT ${selected} FROM ${quote(table.name)})`,

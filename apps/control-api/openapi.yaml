@@ -806,6 +806,73 @@ paths:
           $ref: "#/components/responses/Forbidden"
         "404":
           $ref: "#/components/responses/NotFound"
+    delete:
+      operationId: deleteEnvironment
+      summary: Accept an immutable environment deletion intention and close execution
+      description: >-
+        Requires projects:write, Idempotency-Key, current runtime revision and
+        explicit delete-volume/retain-backup policies. Atomically records a retained
+        parent operation and reuses or creates the ordinary suspend child.
+        The first stage accepts ready environments; pending/failed provisioning
+        cleanup remains unimplemented. No physical removal, storage deallocation,
+        final usage, settlement or archive purge is reported. Existing uncertain
+        database work conflicts. Exact replay retains parent and child identities.
+      security:
+        - organizationToken: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            pattern: ^[A-Za-z0-9._~-]{1,128}$
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expectedRevision, volumePolicy, backupPolicy]
+              properties:
+                expectedRevision:
+                  type: integer
+                  minimum: 0
+                  maximum: 9007199254740990
+                volumePolicy:
+                  type: string
+                  const: delete
+                backupPolicy:
+                  type: string
+                  const: retain
+      responses:
+        "202":
+          description: Persisted deletion barrier and linked compute-stop intention; not physical deletion
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [deletion, operation, stopOperation, runtime]
+                properties:
+                  deletion:
+                    $ref: "#/components/schemas/EnvironmentDeletion"
+                  operation:
+                    $ref: "#/components/schemas/RecoveryOperation"
+                  stopOperation:
+                    $ref: "#/components/schemas/RecoveryOperation"
+                  runtime:
+                    $ref: "#/components/schemas/EnvironmentRuntime"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Stale runtime/specification, nonready environment, uncertain active work, existing deletion or conflicting replay
   /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/connections:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -2297,6 +2364,52 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: Stale revision, unapproved size, conflicting work or changed authority.
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/lifecycle:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+    get:
+      operationId: getEnvironmentLifecycle
+      summary: Recover deletion intent and its linked compute-stop operation
+      description: >-
+        Requires projects:read. A null lifecycle means no deletion intention.
+        Historical provisioning readiness and reported suspension do not prove
+        disposal; physicalDeletionVerified remains false in this source stage.
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Current lifecycle and retained parent/child identities
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [lifecycle, operation, stopOperation, runtime]
+                properties:
+                  lifecycle:
+                    anyOf:
+                      - $ref: "#/components/schemas/EnvironmentDeletion"
+                      - type: "null"
+                  operation:
+                    anyOf:
+                      - $ref: "#/components/schemas/RecoveryOperation"
+                      - type: "null"
+                  stopOperation:
+                    anyOf:
+                      - $ref: "#/components/schemas/RecoveryOperation"
+                      - type: "null"
+                  runtime:
+                    $ref: "#/components/schemas/EnvironmentRuntime"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
   /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/runtime:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -3050,6 +3163,42 @@ components:
           $ref: "#/components/schemas/EnvironmentCompute"
         operation:
           $ref: "#/components/schemas/RecoveryOperation"
+    EnvironmentDeletion:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          desiredState,
+          phase,
+          operationId,
+          stopOperationId,
+          volumePolicy,
+          backupPolicy,
+          physicalDeletionVerified,
+        ]
+      properties:
+        desiredState:
+          type: string
+          const: deleted
+        phase:
+          type: string
+          enum: [stopping, pending_physical_deletion]
+        operationId:
+          type: string
+          format: uuid
+        stopOperationId:
+          type: string
+          format: uuid
+        volumePolicy:
+          type: string
+          const: delete
+        backupPolicy:
+          type: string
+          const: retain
+        physicalDeletionVerified:
+          type: boolean
+          const: false
+      description: Immutable deletion intention; retained-volume/physical disposal and archive custody still require qualification.
     EnvironmentRuntime:
       type: object
       required:
@@ -4416,6 +4565,7 @@ components:
             - database.role.apply
             - database.create
             - environment.suspend
+            - environment.delete
             - environment.backup
             - environment.resize
         status:
@@ -4547,6 +4697,7 @@ components:
             - project.create
             - environment.create
             - environment.suspend
+            - environment.delete
         status:
           type: string
           enum:
@@ -5069,6 +5220,11 @@ components:
             - provisioning
             - ready
             - failed
+        lifecycle:
+          anyOf:
+            - $ref: "#/components/schemas/EnvironmentDeletion"
+            - type: "null"
+          description: Deletion intention separate from historical provisioning status; never physical completion evidence.
         specRevision:
           type: integer
           const: 1

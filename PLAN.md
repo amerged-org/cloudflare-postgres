@@ -54,6 +54,16 @@ journal custody and original infrastructure/SQL state are verified. The backup
 executor remains disabled; this does not activate the held manual backup workflow
 or establish physical recovery or an API-managed pilot.
 
+The [deletion intention checkpoint](docs/evidence/m3-environment-deletion-2026-09-29.md)
+adds scoped DELETE, immutable lifecycle recovery, symmetric execution barriers
+and the existing ordinary suspend child. Already stopped environments reuse
+their exact child. Two new Worker cases and one expanded recovery case pass,
+followed by one final gate with 35 Worker and 55 Node cases. Complete 50-table
+recovery remains within the unchanged query bound. The source never reports
+physical deletion, erases history, releases accounting holds or removes data.
+Dev delivery, pending/failed provisioning cleanup, actual retirement/disposal,
+retained-archive recovery and final accounting remain explicit v1 requirements.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.

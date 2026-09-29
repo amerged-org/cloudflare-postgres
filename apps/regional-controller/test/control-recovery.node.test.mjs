@@ -295,12 +295,154 @@ test("rebuilds all current control migrations and historical encrypted credentia
       name,
       rows: f.db.prepare(`SELECT * FROM ${name}`).all(),
     }));
+    const deletionEnvironmentId = "adadadad-adad-4ada-8ada-adadadadadad",
+      deletionOperationId = "aeaeaeae-aeae-4aea-8aea-aeaeaeaeaeae",
+      stopOperationId = "afafafaf-afaf-4afa-8afa-afafafafafaf",
+      deletionSpec = JSON.stringify({
+        profile: { executionFencing: { version: 1 } },
+      }),
+      deletionObservation = JSON.stringify({
+        clusterUid: "babababa-baba-4bab-8bab-babababababa",
+        clusterGeneration: 1,
+        readyInstances: 1,
+        runEpoch: "1",
+      });
+    f.db
+      .prepare(
+        "INSERT INTO environments(id,organization_id,project_id,region_id,catalog_version,profile_id,name,status,spec_revision,spec_hash,resolved_spec,created_at,observed_at,observation_json,run_epoch) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        deletionEnvironmentId,
+        f.ids.organization,
+        f.ids.project,
+        f.ids.region,
+        pinned.catalog_version,
+        "fixture",
+        "Retained deletion environment",
+        "ready",
+        1,
+        "e".repeat(64),
+        deletionSpec,
+        now,
+        observedAt,
+        deletionObservation,
+        "1",
+      );
+    const insertDeletionOperation = f.db.prepare(
+      "INSERT INTO operations(id,organization_id,project_id,environment_id,region_id,kind,status,created_at) VALUES(?,?,?,?,?,?,?,?)",
+    );
+    insertDeletionOperation.run(
+      deletionOperationId,
+      f.ids.organization,
+      f.ids.project,
+      deletionEnvironmentId,
+      f.ids.region,
+      "environment.delete",
+      "queued",
+      observedAt,
+    );
+    insertDeletionOperation.run(
+      stopOperationId,
+      f.ids.organization,
+      f.ids.project,
+      deletionEnvironmentId,
+      f.ids.region,
+      "environment.suspend",
+      "queued",
+      observedAt,
+    );
+    f.db
+      .prepare(
+        "INSERT INTO environment_suspend_specs(operation_id,environment_id,runtime_revision,spec_revision,spec_hash,spec_json,cluster_uid,created_at,run_epoch) VALUES(?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        stopOperationId,
+        deletionEnvironmentId,
+        1,
+        1,
+        "e".repeat(64),
+        deletionSpec,
+        JSON.parse(deletionObservation).clusterUid,
+        observedAt,
+        "1",
+      );
+    f.db
+      .prepare(
+        "INSERT INTO environment_runtime(environment_id,revision,desired_state,phase,operation_id,version_token,updated_at) VALUES(?,1,'suspended','suspending',?,?,?)",
+      )
+      .run(
+        deletionEnvironmentId,
+        stopOperationId,
+        "retained-deletion-runtime",
+        observedAt,
+      );
+    const stopResponse = JSON.stringify({
+      runtime: { revision: 1, desiredState: "suspended", phase: "suspending" },
+      operation: { id: stopOperationId, kind: "environment.suspend" },
+    });
+    f.db
+      .prepare(
+        "INSERT INTO environment_suspend_requests(organization_id,project_id,environment_id,scope_key,idempotency_key,request_hash,operation_id,response_json,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        f.ids.organization,
+        f.ids.project,
+        deletionEnvironmentId,
+        `environment:${deletionEnvironmentId}:suspend`,
+        "retained-deletion-stop",
+        "d".repeat(64),
+        stopOperationId,
+        stopResponse,
+        observedAt,
+      );
+    const deletionResponse = JSON.stringify({
+      deletion: {
+        environmentId: deletionEnvironmentId,
+        operationId: deletionOperationId,
+        stopOperationId,
+        volumePolicy: "delete",
+        backupPolicy: "retain",
+      },
+      operation: { id: deletionOperationId, kind: "environment.delete" },
+    });
+    f.db
+      .prepare(
+        "INSERT INTO environment_deletions(environment_id,organization_id,project_id,region_id,operation_id,stop_operation_id,expected_runtime_revision,runtime_revision,spec_revision,spec_hash,spec_json,observation_json,run_epoch,volume_policy,backup_policy,scope_key,idempotency_key,request_hash,response_json,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        deletionEnvironmentId,
+        f.ids.organization,
+        f.ids.project,
+        f.ids.region,
+        deletionOperationId,
+        stopOperationId,
+        0,
+        1,
+        1,
+        "e".repeat(64),
+        deletionSpec,
+        deletionObservation,
+        "1",
+        "delete",
+        "retain",
+        `environment:${deletionEnvironmentId}:delete`,
+        "retained-deletion-intent",
+        "f".repeat(64),
+        deletionResponse,
+        observedAt,
+      );
+    const retainedControlRows = (
+      await migrationSet(migrationDirectory)
+    ).tables.map((table) => ({
+      name: table.name,
+      rows: f.db.prepare(`SELECT * FROM "${table.name}"`).all(),
+    }));
     let reads = 0;
-    const snapshot = await captureControlSnapshot(
+    const snapshot = await captureControlSnapshotRows(
       async (sql) => {
         reads++;
         assert(Buffer.byteLength(sql, "utf8") <= 99000);
-        return f.query(sql);
+        return f.db.prepare(sql).all();
       },
       migrationDirectory,
       f.source,
@@ -317,7 +459,12 @@ test("rebuilds all current control migrations and historical encrypted credentia
       true,
       "current control recovery must include durable backup identities",
     );
-    assert.equal(snapshot.migrations.files.length, 17);
+    assert.equal(
+      snapshot.tables.some((table) => table.name === "environment_deletions"),
+      true,
+      "control recovery must retain deletion and stop authority without disposing data",
+    );
+    assert.equal(snapshot.migrations.files.length, 18);
     assert.equal(
       snapshot.sequences.find((s) => s.name === "d1_migrations").seq,
       "9007199254740993",
@@ -399,6 +546,12 @@ test("rebuilds all current control migrations and historical encrypted credentia
           `${retained.name} must retain exact immutable commissioning and replay authority`,
         );
       }
+      for (const retained of retainedControlRows)
+        assert.deepEqual(
+          db.prepare(`SELECT * FROM "${retained.name}"`).all(),
+          retained.rows,
+          `${retained.name} must retain every exact control row, including deletion, child stop, runtime and replay history`,
+        );
       assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
       assert.equal(
         db.prepare("PRAGMA integrity_check").get().integrity_check,

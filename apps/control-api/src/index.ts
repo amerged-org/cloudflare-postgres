@@ -7,6 +7,7 @@ import { databaseRoutes } from "./databases";
 import { backupRoutes } from "./backups";
 import { resizeRoutes } from "./resize";
 import { suspendRoutes } from "./suspend";
+import { deletionRoutes } from "./environment-deletion";
 import { providerInventoryRoute } from "./provider-inventory";
 import {
   executionReads,
@@ -717,6 +718,8 @@ export default {
   async fetch(request, env): Promise<Response> {
     const providerResponse = await providerInventoryRoute(request, env);
     if (providerResponse) return providerResponse;
+    const deletionResponse = await deletionRoutes(request, env);
+    if (deletionResponse) return deletionResponse;
     const suspendResponse = await suspendRoutes(request, env);
     if (suspendResponse) return suspendResponse;
     const recoveryResponse = await executionReads(request, env);

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { expect, it, vi } from "vitest";
+import { env } from "cloudflare:workers";
 import {
   accountingCall,
   accountingFixture,
@@ -154,4 +155,222 @@ it("distinguishes current funded execution authority from paused, changed and ex
   } finally {
     vi.useRealTimers();
   }
+});
+
+it("keeps an irreversible deletion barrier after mutable runtime and budget changes while preserving historical allowance custody", async () => {
+  const fixture = await accountingFixture("Deletion authority");
+  const createLane = `/v1/regions/${fixture.regionId}/operations`;
+  const claimResponse = await accountingCall(`${createLane}/claim`, {
+    method: "POST",
+    headers: fixture.regionHeaders,
+    body: JSON.stringify({ leaseSeconds: 90 }),
+  });
+  expect(claimResponse.status).toBe(200);
+  const creation = (await claimResponse.json()) as {
+    claim: { operationId: string; leaseToken: string; leaseEpoch: number };
+  };
+  const readyBody = {
+    leaseToken: creation.claim.leaseToken,
+    leaseEpoch: creation.claim.leaseEpoch,
+    status: "ready",
+    resultCode: "cnpg_ready",
+    observation: {
+      clusterUid: "44444444-4444-4444-8444-444444444444",
+      clusterGeneration: 1,
+      readyInstances: 1,
+    },
+  };
+  expect(
+    (
+      await accountingCall(
+        `${createLane}/${creation.claim.operationId}/result`,
+        {
+          method: "POST",
+          headers: fixture.regionHeaders,
+          body: JSON.stringify(readyBody),
+        },
+      )
+    ).status,
+  ).toBe(200);
+  const reissued = await accountingCall(
+    `/v1/organizations/${fixture.organizationId}/budget-tokens/reissue`,
+    { method: "POST", headers: installerHeaders },
+  );
+  expect(reissued.status).toBe(201);
+  const grantor = (await reissued.json()) as { apiToken: string };
+  const budgetHeaders = {
+    authorization: `Bearer ${grantor.apiToken}`,
+    "content-type": "application/json",
+  };
+  const budget = `/v1/organizations/${fixture.organizationId}/projects/${fixture.projectId}/budget`;
+  expect(
+    (
+      await accountingCall(budget, {
+        method: "PUT",
+        headers: budgetHeaders,
+        body: JSON.stringify({
+          expectedRevision: "0",
+          period: {
+            start: new Date(Date.now() - 60_000).toISOString(),
+            end: new Date(Date.now() + 600_000).toISOString(),
+          },
+          granted: { cpu_millicore_ms: "200" },
+        }),
+      })
+    ).status,
+  ).toBe(200);
+  const reservations = `/v1/regions/${fixture.regionId}/allowance-reservations`;
+  const reservationBody = {
+    requestId: crypto.randomUUID(),
+    environmentId: fixture.environmentId,
+    leaseSeconds: 90,
+    units: { cpu_millicore_ms: "100" },
+  };
+  const issued = await accountingCall(reservations, {
+    method: "POST",
+    headers: fixture.regionHeaders,
+    body: JSON.stringify(reservationBody),
+  });
+  expect(issued.status).toBe(201);
+  const historical = (await issued.json()) as {
+    reservation: {
+      id: string;
+      fenceToken: string;
+      expiresAt: string;
+      status: string;
+    };
+  };
+  const authorityPath = `${reservations}/${historical.reservation.id}/authority`;
+  expect(
+    await (
+      await accountingCall(authorityPath, {
+        headers: fixture.regionHeaders,
+      })
+    ).json(),
+  ).toMatchObject({ authority: { decision: "allow", reason: "authorized" } });
+  const heldBefore = await env.DB.prepare(
+    "SELECT status,units_json,fence_ciphertext,fence_iv,fence_key_version,fence_token_hash,stopped_at,stop_evidence_hash FROM allowance_reservations WHERE id=?",
+  )
+    .bind(historical.reservation.id)
+    .first();
+  const environment = `/v1/organizations/${fixture.organizationId}/projects/${fixture.projectId}/environments/${fixture.environmentId}`;
+  const suspension = await accountingCall(`${environment}/suspend`, {
+    method: "POST",
+    headers: {
+      ...fixture.orgHeaders,
+      "idempotency-key": "delete-authority-stop",
+    },
+    body: JSON.stringify({ expectedRevision: 0 }),
+  });
+  expect(suspension.status).toBe(202);
+  const stopIntent = (await suspension.json()) as {
+    operation: { id: string };
+  };
+  const deletion = await accountingCall(environment, {
+    method: "DELETE",
+    headers: {
+      ...fixture.orgHeaders,
+      "idempotency-key": "delete-authority",
+    },
+    body: JSON.stringify({
+      expectedRevision: 1,
+      volumePolicy: "delete",
+      backupPolicy: "retain",
+    }),
+  });
+  expect(deletion.status).toBe(202);
+  expect(await deletion.json()).toMatchObject({
+    deletion: { stopOperationId: stopIntent.operation.id },
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM operations WHERE environment_id=? AND kind='environment.suspend'",
+    )
+      .bind(fixture.environmentId)
+      .first(),
+  ).toEqual({ count: 1 });
+  const stopped = await accountingCall(authorityPath, {
+    headers: fixture.regionHeaders,
+  });
+  expect(stopped.status).toBe(200);
+  expect(await stopped.json()).toMatchObject({
+    authority: {
+      decision: "stop",
+      reason: "environment_deleting",
+      runtimeEnforced: false,
+      enforcementStatus: "pending_runtime",
+    },
+  });
+
+  // Current runtime state is mutable; deleting authority is not reconstructed
+  // from it and cannot be removed by changing it back to running.
+  await env.DB.prepare(
+    "UPDATE environment_runtime SET desired_state='running',phase='running',version_token=? WHERE environment_id=?",
+  )
+    .bind(crypto.randomUUID(), fixture.environmentId)
+    .run();
+  expect(
+    (
+      await accountingCall(`${budget}/pause`, {
+        method: "POST",
+        headers: budgetHeaders,
+        body: JSON.stringify({ expectedRevision: "1" }),
+      })
+    ).status,
+  ).toBe(200);
+  expect(
+    (
+      await accountingCall(`${budget}/resume`, {
+        method: "POST",
+        headers: budgetHeaders,
+        body: JSON.stringify({ expectedRevision: "2" }),
+      })
+    ).status,
+  ).toBe(200);
+  const unchangedStop = await accountingCall(authorityPath, {
+    headers: fixture.regionHeaders,
+  });
+  expect(unchangedStop.status).toBe(200);
+  expect(await unchangedStop.json()).toMatchObject({
+    authority: { decision: "stop", reason: "environment_deleting" },
+  });
+  expect(
+    (
+      await accountingCall(reservations, {
+        method: "POST",
+        headers: fixture.regionHeaders,
+        body: JSON.stringify({
+          ...reservationBody,
+          requestId: crypto.randomUUID(),
+        }),
+      })
+    ).status,
+  ).toBe(409);
+  const replay = await accountingCall(reservations, {
+    method: "POST",
+    headers: fixture.regionHeaders,
+    body: JSON.stringify(reservationBody),
+  });
+  expect(replay.status).toBe(200);
+  expect(await replay.json()).toEqual(historical);
+  const read = await accountingCall(
+    `${reservations}/${historical.reservation.id}`,
+    { headers: fixture.regionHeaders },
+  );
+  expect(read.status).toBe(200);
+  expect(await read.json()).toEqual(historical);
+  expect(
+    await env.DB.prepare(
+      "SELECT status,units_json,fence_ciphertext,fence_iv,fence_key_version,fence_token_hash,stopped_at,stop_evidence_hash FROM allowance_reservations WHERE id=?",
+    )
+      .bind(historical.reservation.id)
+      .first(),
+  ).toEqual(heldBefore);
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) AS count FROM allowance_settlement_versions WHERE reservation_id=?",
+    )
+      .bind(historical.reservation.id)
+      .first(),
+  ).toEqual({ count: 0 });
 });

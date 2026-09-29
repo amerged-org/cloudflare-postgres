@@ -30,7 +30,7 @@ interface OwnedEnvironment extends EnvironmentRow {
   project_status: string;
   region_status: string;
 }
-interface RuntimeRow {
+export interface RuntimeRow {
   environment_id: string;
   revision: number;
   desired_state: "running" | "suspended";
@@ -158,7 +158,7 @@ async function runtimeRow(
     .bind(environmentId)
     .first<RuntimeRow>();
 }
-function publicRuntime(
+export function publicRuntime(
   environment: EnvironmentRow,
   runtime: RuntimeRow | null,
 ) {
@@ -276,6 +276,43 @@ async function createSuspend(
   );
   const previous = await previousIntent(db, actor, scope, key);
   if (previous) return replay(previous, requestHash);
+  const planned = await planSuspend(
+    db,
+    actor,
+    organizationId,
+    projectId,
+    environmentId,
+    input.expectedRevision,
+    scope,
+    key,
+    requestHash,
+  );
+  if (planned instanceof Response) return planned;
+  try {
+    await db.batch(planned.statements);
+  } catch {
+    const winner = await previousIntent(db, actor, scope, key);
+    return winner
+      ? replay(winner, requestHash)
+      : error(409, "suspend_conflict");
+  }
+  return json(planned.response, 202);
+}
+
+// One planner owns the actual stop transaction for manual suspension and
+// deletion. The caller commits all guards and resources in the same D1 batch.
+export async function planSuspend(
+  db: AccountingDb,
+  actor: Actor,
+  organizationId: string,
+  projectId: string,
+  environmentId: string,
+  expectedRevision: number,
+  scope: string,
+  key: string,
+  requestHash: string,
+  allowExistingStop = false,
+) {
   const environment = await ownedEnvironment(
     db,
     actor,
@@ -285,17 +322,27 @@ async function createSuspend(
   );
   if (!environment) return error(404, "not_found");
   if (
+    await db
+      .prepare("SELECT 1 FROM environment_deletions WHERE environment_id = ?")
+      .bind(environmentId)
+      .first()
+  )
+    return error(409, "environment_deleting");
+  if (
     environment.status !== "ready" ||
     environment.project_status !== "active" ||
     environment.region_status === "disabled"
   )
     return error(409, "environment_not_ready");
   const current = await runtimeRow(db, environmentId);
-  if ((current?.revision ?? 0) !== input.expectedRevision)
+  if ((current?.revision ?? 0) !== expectedRevision)
     return error(409, "revision_conflict");
   if (
     current &&
-    (current.desired_state !== "running" || current.phase !== "running")
+    (current.desired_state !== "running" || current.phase !== "running") &&
+    (!allowExistingStop ||
+      current.desired_state !== "suspended" ||
+      !["suspending", "suspended"].includes(current.phase))
   )
     return error(409, "environment_suspended");
   const spec: unknown = JSON.parse(environment.resolved_spec);
@@ -326,8 +373,137 @@ async function createSuspend(
   const pooler = observed.pooler
     ? { uid: observed.pooler.uid, deploymentUid: observed.pooler.deploymentUid }
     : null;
+  const statePredicate = current
+    ? "EXISTS (SELECT 1 FROM environment_runtime WHERE environment_id = ? AND revision = ? AND version_token = ? AND operation_id = ? AND desired_state = ? AND phase = ?)"
+    : "NOT EXISTS (SELECT 1 FROM environment_runtime WHERE environment_id = ?)";
+  const stateBindings: Array<string | number> = current
+    ? [
+        environmentId,
+        current.revision,
+        current.version_token,
+        current.operation_id,
+        current.desired_state,
+        current.phase,
+      ]
+    : [environmentId];
+  const guards = [
+    assertion(db, actorPredicate(actor), actorBindings(actor)),
+    assertion(
+      db,
+      "NOT EXISTS (SELECT 1 FROM environment_deletions WHERE environment_id = ?)",
+      [environmentId],
+    ),
+    assertion(db, statePredicate, stateBindings),
+    assertion(
+      db,
+      "EXISTS (SELECT 1 FROM environments e " +
+        environmentJoins +
+        " WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND e.region_id = ? " +
+        "AND e.status = 'ready' AND p.status = 'active' AND g.status <> 'disabled' " +
+        "AND e.spec_revision = ? AND e.spec_hash = ? AND e.resolved_spec = ? AND e.observation_json = ? AND e.run_epoch IS ?)",
+      [
+        environmentId,
+        organizationId,
+        projectId,
+        environment.region_id,
+        environment.spec_revision,
+        environment.spec_hash,
+        environment.resolved_spec,
+        environment.observation_json,
+        environment.run_epoch,
+      ],
+    ),
+    assertion(
+      db,
+      "NOT EXISTS (SELECT 1 FROM operations WHERE environment_id = ? AND kind = 'environment.create' AND status IN ('queued','running')) " +
+        "AND NOT EXISTS (SELECT 1 FROM role_operations o JOIN database_roles r ON r.id = o.role_id WHERE r.environment_id = ? AND o.status IN ('queued','running')) " +
+        "AND NOT EXISTS (SELECT 1 FROM database_operations o JOIN logical_databases d ON d.id = o.database_id WHERE d.environment_id = ? AND o.status IN ('queued','running')) " +
+        "AND NOT EXISTS (SELECT 1 FROM backup_operations o JOIN environment_backups b ON b.id = o.backup_id WHERE b.environment_id = ? AND o.status IN ('queued','running')) " +
+        "AND NOT EXISTS (SELECT 1 FROM resize_operations o WHERE o.environment_id = ? AND o.status IN ('queued','running'))",
+      [
+        environmentId,
+        environmentId,
+        environmentId,
+        environmentId,
+        environmentId,
+      ],
+    ),
+  ];
+  if (current && current.desired_state === "suspended") {
+    const [stop, snapshot] = await Promise.all([
+      db
+        .prepare("SELECT * FROM operations WHERE id = ?")
+        .bind(current.operation_id)
+        .first<SuspendOperation>(),
+      db
+        .prepare(
+          "SELECT * FROM environment_suspend_specs WHERE operation_id = ?",
+        )
+        .bind(current.operation_id)
+        .first<SuspendSpec>(),
+    ]);
+    const poolerJson = pooler ? JSON.stringify(pooler) : null;
+    const cohortJson = observed.nodeCohort
+      ? JSON.stringify(observed.nodeCohort)
+      : null;
+    if (
+      !stop ||
+      !snapshot ||
+      stop.kind !== "environment.suspend" ||
+      stop.environment_id !== environmentId ||
+      stop.organization_id !== organizationId ||
+      stop.project_id !== projectId ||
+      stop.region_id !== environment.region_id ||
+      (current.phase === "suspending"
+        ? !["queued", "running"].includes(stop.status)
+        : stop.status !== "succeeded") ||
+      snapshot.environment_id !== environmentId ||
+      snapshot.runtime_revision !== current.revision ||
+      snapshot.spec_revision !== environment.spec_revision ||
+      snapshot.spec_hash !== environment.spec_hash ||
+      snapshot.spec_json !== environment.resolved_spec ||
+      snapshot.cluster_uid !== observed.clusterUid ||
+      snapshot.run_epoch !== environment.run_epoch ||
+      snapshot.pooler_json !== poolerJson ||
+      snapshot.node_cohort_json !== cohortJson
+    )
+      return error(409, "stop_binding_conflict");
+    guards.push(
+      assertion(
+        db,
+        "EXISTS (SELECT 1 FROM environment_suspend_specs s JOIN operations o ON o.id=s.operation_id WHERE s.operation_id=? AND s.environment_id=? AND s.runtime_revision=? AND s.spec_revision=? AND s.spec_hash=? AND s.spec_json=? AND s.cluster_uid=? AND s.pooler_json IS ? AND s.run_epoch IS ? AND s.node_cohort_json IS ? AND o.kind='environment.suspend' AND o.environment_id=? AND o.organization_id=? AND o.project_id=? AND o.region_id=? AND o.status=?)",
+        [
+          stop.id,
+          environmentId,
+          current.revision,
+          environment.spec_revision,
+          environment.spec_hash,
+          environment.resolved_spec,
+          observed.clusterUid,
+          poolerJson,
+          environment.run_epoch,
+          cohortJson,
+          environmentId,
+          organizationId,
+          projectId,
+          environment.region_id,
+          stop.status,
+        ],
+      ),
+    );
+    return {
+      environment,
+      operation: stop,
+      runtime: current,
+      response: {
+        runtime: publicRuntime(environment, current),
+        operation: operationFromRow(stop),
+      },
+      statements: guards,
+    };
+  }
   const operationId = crypto.randomUUID(),
-    revision = input.expectedRevision + 1,
+    revision = expectedRevision + 1,
     at = new Date().toISOString();
   const operation: SuspendOperation = {
     id: operationId,
@@ -362,116 +538,69 @@ async function createSuspend(
     runtime: publicRuntime(environment, nextRuntime),
     operation: operationFromRow(operation),
   };
-  const statePredicate = current
-    ? "EXISTS (SELECT 1 FROM environment_runtime WHERE environment_id = ? AND revision = ? AND version_token = ? AND desired_state = 'running' AND phase = 'running')"
-    : "NOT EXISTS (SELECT 1 FROM environment_runtime WHERE environment_id = ?)";
-  const stateBindings: Array<string | number> = current
-    ? [environmentId, current.revision, current.version_token]
-    : [environmentId];
-  try {
-    await db.batch([
-      assertion(db, actorPredicate(actor), actorBindings(actor)),
-      assertion(db, statePredicate, stateBindings),
-      assertion(
-        db,
-        "EXISTS (SELECT 1 FROM environments e " +
-          environmentJoins +
-          " WHERE e.id = ? AND e.organization_id = ? AND e.project_id = ? AND e.region_id = ? " +
-          "AND e.status = 'ready' AND p.status = 'active' AND g.status <> 'disabled' " +
-          "AND e.spec_revision = ? AND e.spec_hash = ? AND e.resolved_spec = ? AND e.observation_json = ? AND e.run_epoch IS ?)",
-        [
-          environmentId,
-          organizationId,
-          projectId,
-          environment.region_id,
-          environment.spec_revision,
-          environment.spec_hash,
-          environment.resolved_spec,
-          environment.observation_json,
-          environment.run_epoch,
-        ],
+  const statements = [
+    ...guards,
+    db
+      .prepare(
+        "INSERT INTO operations (id, organization_id, project_id, environment_id, region_id, kind, status, created_at) VALUES (?, ?, ?, ?, ?, 'environment.suspend', 'queued', ?)",
+      )
+      .bind(
+        operationId,
+        organizationId,
+        projectId,
+        environmentId,
+        environment.region_id,
+        at,
       ),
-      assertion(
-        db,
-        "NOT EXISTS (SELECT 1 FROM operations WHERE environment_id = ? AND kind = 'environment.create' AND status IN ('queued','running')) " +
-          "AND NOT EXISTS (SELECT 1 FROM role_operations o JOIN database_roles r ON r.id = o.role_id WHERE r.environment_id = ? AND o.status IN ('queued','running')) " +
-          "AND NOT EXISTS (SELECT 1 FROM database_operations o JOIN logical_databases d ON d.id = o.database_id WHERE d.environment_id = ? AND o.status IN ('queued','running')) " +
-          "AND NOT EXISTS (SELECT 1 FROM backup_operations o JOIN environment_backups b ON b.id = o.backup_id WHERE b.environment_id = ? AND o.status IN ('queued','running')) " +
-          "AND NOT EXISTS (SELECT 1 FROM resize_operations o WHERE o.environment_id = ? AND o.status IN ('queued','running'))",
-        [
-          environmentId,
-          environmentId,
-          environmentId,
-          environmentId,
-          environmentId,
-        ],
+    db
+      .prepare(
+        "INSERT INTO environment_suspend_specs (operation_id, environment_id, runtime_revision, spec_revision, spec_hash, spec_json, cluster_uid, pooler_json, created_at, run_epoch, node_cohort_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind(
+        operationId,
+        environmentId,
+        revision,
+        environment.spec_revision,
+        environment.spec_hash,
+        environment.resolved_spec,
+        observed.clusterUid,
+        pooler ? JSON.stringify(pooler) : null,
+        at,
+        environment.run_epoch,
+        observed.nodeCohort ? JSON.stringify(observed.nodeCohort) : null,
       ),
-      db
-        .prepare(
-          "INSERT INTO operations (id, organization_id, project_id, environment_id, region_id, kind, status, created_at) VALUES (?, ?, ?, ?, ?, 'environment.suspend', 'queued', ?)",
-        )
-        .bind(
-          operationId,
-          organizationId,
-          projectId,
-          environmentId,
-          environment.region_id,
-          at,
-        ),
-      db
-        .prepare(
-          "INSERT INTO environment_suspend_specs (operation_id, environment_id, runtime_revision, spec_revision, spec_hash, spec_json, cluster_uid, pooler_json, created_at, run_epoch, node_cohort_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(
-          operationId,
-          environmentId,
-          revision,
-          environment.spec_revision,
-          environment.spec_hash,
-          environment.resolved_spec,
-          observed.clusterUid,
-          pooler ? JSON.stringify(pooler) : null,
-          at,
-          environment.run_epoch,
-          observed.nodeCohort ? JSON.stringify(observed.nodeCohort) : null,
-        ),
-      db
-        .prepare(
-          "INSERT INTO environment_runtime (environment_id, revision, desired_state, phase, operation_id, version_token, updated_at) VALUES (?, ?, 'suspended', 'suspending', ?, ?, ?) " +
-            "ON CONFLICT(environment_id) DO UPDATE SET revision=excluded.revision, desired_state=excluded.desired_state, phase=excluded.phase, operation_id=excluded.operation_id, " +
-            "version_token=excluded.version_token, updated_at=excluded.updated_at, observed_at=NULL, observation_json=NULL",
-        )
-        .bind(
-          environmentId,
-          revision,
-          operationId,
-          nextRuntime.version_token,
-          at,
-        ),
-      db
-        .prepare(
-          "INSERT INTO environment_suspend_requests (organization_id, project_id, environment_id, scope_key, idempotency_key, request_hash, operation_id, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(
-          organizationId,
-          projectId,
-          environmentId,
-          scope,
-          key,
-          requestHash,
-          operationId,
-          JSON.stringify(response),
-          at,
-        ),
-    ]);
-  } catch {
-    const winner = await previousIntent(db, actor, scope, key);
-    return winner
-      ? replay(winner, requestHash)
-      : error(409, "suspend_conflict");
-  }
-  return json(response, 202);
+    db
+      .prepare(
+        "INSERT INTO environment_runtime (environment_id, revision, desired_state, phase, operation_id, version_token, updated_at) VALUES (?, ?, 'suspended', 'suspending', ?, ?, ?) " +
+          "ON CONFLICT(environment_id) DO UPDATE SET revision=excluded.revision, desired_state=excluded.desired_state, phase=excluded.phase, operation_id=excluded.operation_id, " +
+          "version_token=excluded.version_token, updated_at=excluded.updated_at, observed_at=NULL, observation_json=NULL",
+      )
+      .bind(
+        environmentId,
+        revision,
+        operationId,
+        nextRuntime.version_token,
+        at,
+      ),
+    db
+      .prepare(
+        "INSERT INTO environment_suspend_requests (organization_id, project_id, environment_id, scope_key, idempotency_key, request_hash, operation_id, response_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .bind(
+        organizationId,
+        projectId,
+        environmentId,
+        scope,
+        key,
+        requestHash,
+        operationId,
+        JSON.stringify(response),
+        at,
+      ),
+  ];
+  return { environment, operation, runtime: nextRuntime, response, statements };
 }
+
 async function operationRow(
   db: AccountingDb,
   id: string,

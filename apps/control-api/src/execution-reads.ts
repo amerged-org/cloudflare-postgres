@@ -28,6 +28,7 @@ import {
 
 import { publicBackup, publicBackupOperation, type Backup } from "./backups";
 import { publicResizeOperation } from "./resize";
+import { deletionReadColumns, deletionReadJoins } from "./environment-deletion";
 
 export interface ProjectRow {
   id: string;
@@ -252,10 +253,12 @@ function pageRead(
     WHERE q.project_id = page.id AND q.organization_id = page.organization_id
     AND o.kind = 'project.create' AND o.environment_id IS NULL`;
   else if (scope.collection === "environments")
-    links = `FROM environment_requests q JOIN operations o
-    ON o.id = q.operation_id AND o.organization_id = q.organization_id AND o.project_id = q.project_id
-    WHERE q.environment_id = page.id AND q.organization_id = page.organization_id AND q.project_id = page.project_id
-    AND o.environment_id = page.id AND o.region_id = page.region_id AND o.kind = 'environment.create'`;
+    links = `FROM operations o WHERE o.organization_id=page.organization_id AND o.project_id=page.project_id
+    AND o.environment_id=page.id AND o.region_id=page.region_id AND (
+      (o.kind='environment.delete' AND EXISTS (SELECT 1 FROM environment_deletions d WHERE d.environment_id=page.id AND d.operation_id=o.id))
+      OR (o.kind='environment.create' AND NOT EXISTS (SELECT 1 FROM environment_deletions d WHERE d.environment_id=page.id)
+        AND EXISTS (SELECT 1 FROM environment_requests q
+          WHERE q.operation_id=o.id AND q.organization_id=page.organization_id AND q.project_id=page.project_id AND q.environment_id=page.id)))`;
   else if (scope.collection === "roles")
     links =
       "FROM role_operations o WHERE o.role_id = page.id AND o.credential_revision = page.desired_credential_revision";
@@ -268,8 +271,8 @@ function pageRead(
     .prepare(
       `WITH page AS (SELECT r.* FROM ${table} r WHERE ${predicates.join(" AND ")}
     ORDER BY r.created_at DESC, r.id DESC LIMIT ?)
-    SELECT page.*, (SELECT COUNT(DISTINCT o.id) ${links}) AS operation_count,
-    (SELECT MIN(o.id) ${links}) AS current_operation_id FROM page ORDER BY page.created_at DESC, page.id DESC`,
+    SELECT page.*, ${scope.collection === "environments" ? deletionReadColumns + "," : ""} (SELECT COUNT(DISTINCT o.id) ${links}) AS operation_count,
+    (SELECT MIN(o.id) ${links}) AS current_operation_id FROM page ${scope.collection === "environments" ? deletionReadJoins("page") : ""} ORDER BY page.created_at DESC, page.id DESC`,
     )
     .bind(...bindings);
 }
