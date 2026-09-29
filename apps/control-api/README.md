@@ -116,6 +116,48 @@ This slice exposes no public TCP gateway and does not change admission, budget
 already possess private network access; actual managed TLS/SQL and policy
 realization remain separate evidence gates.
 
+## Manual physical base backups
+
+`POST .../environments/{environmentId}/backups` accepts exactly `{}` and an
+`Idempotency-Key` with `projects:write`. It retains one immutable backup and
+`environment.backup` operation bound to the ready environment, frozen specification,
+Cluster, execution epoch, runtime revision and archive configuration. Customers
+cannot select paths, credentials, a target instance or arbitrary Kubernetes fields.
+An identical request replays its accepted response. Normal suspend and pending
+backup intents interlock atomically, including expired uncertain leases. Hard budget
+stop/expiry does not consult or extend this ordinary maintenance interlock.
+
+Read the item or signed-cursor collection with `projects:read`; recover its task
+through the ordinary organization operation endpoint with `operations:read`.
+Metadata remains readable after completion, pause and source state changes. Public
+responses omit archive URLs, Secret references, resource UIDs and raw operator
+errors. `completed` means a trusted operator base-backup artifact observation;
+`remoteObjectsVerified`, `restoreVerified`, and `PITRVerified` remain false.
+
+The private `/v1/regions/{regionId}/backup-operations` lane claims and renews work
+with existing executor scopes. Before any Backup CR create, `/{operationId}/dispatch`
+retains an immutable Namespace/Cluster/ObjectStore/spec binding plus a fresh process
+nonce under the winning lease. Only a positively acknowledged `created: true` for
+that same fresh process allows its one create attempt. Exact dispatch replay returns
+`created: false`; reclaimed claims carrying a checkpoint only observe the original
+owned resource. A missing CR after dispatch remains uncertain and never permits
+recreation, name adoption or a guessed terminal result.
+
+Enqueue, claim, renewal and dispatch require running runtime and requested budgets.
+Terminal custody is a separate narrow exception: an unexpired winning lease can
+record already observed whitelisted completion/failure after requested budget pause
+while the original environment/spec/Cluster/run epoch/runtime revision and actor
+remain current. It grants no renewal, create, wake or funding. Runtime/epoch changes
+or expiry still refuse the report. Successful completion normalizes the actual
+CNPG/Barman timestamp, WAL/LSN and six plugin metadata fields, including source
+Cluster UID and pinned plugin identity. Unknown/malformed results remain reclaimable.
+
+Migration `0015_environment_backups.sql` is additive and must be installed before
+this Worker writer is deployed. This API adds no schedule, restore, remote deletion
+or payment flow. The regional lane remains separately opt-in; source tests and a
+completed resource do not qualify R2 objects, restore or PITR. Customer admission
+and the pending backup-access confirmation remain separate gates.
+
 ## Customer role and database lifecycle
 
 The [generic adopter workflow](../../docs/guides/database-lifecycle-v1.md) explains

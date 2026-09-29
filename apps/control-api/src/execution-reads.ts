@@ -26,6 +26,8 @@ import {
   type Database,
 } from "./databases";
 
+import { publicBackup, publicBackupOperation, type Backup } from "./backups";
+
 export interface ProjectRow {
   id: string;
   organization_id: string;
@@ -66,7 +68,8 @@ export function operationFromRow(row: LegacyOperationRow) {
     ...(row.environment_id ? { environmentId: row.environment_id } : {}),
   };
 }
-type Collection = "projects" | "environments" | "roles" | "databases";
+type Collection =
+  "projects" | "environments" | "roles" | "databases" | "backups";
 interface Scope {
   collection: Collection;
   organizationId: string;
@@ -81,12 +84,13 @@ interface Cursor {
   createdAt: string;
   id: string;
 }
-type PageRow = (ProjectRow | EnvironmentRow | Role | Database) & {
+type PageRow = (ProjectRow | EnvironmentRow | Role | Database | Backup) & {
   operation_count: number;
   current_operation_id: string | null;
 };
 interface OperationRow extends LegacyOperationRow {
-  source: "legacy" | "role" | "database";
+  source: "legacy" | "role" | "database" | "backup";
+  backup_id: string | null;
   environment_id: string | null;
   role_id: string | null;
   database_id: string | null;
@@ -213,14 +217,20 @@ function pageRead(
       ? "database_roles"
       : scope.collection === "databases"
         ? "logical_databases"
-        : scope.collection;
+        : scope.collection === "backups"
+          ? "environment_backups"
+          : scope.collection;
   const predicates = ["r.organization_id = ?"];
   const bindings: Array<string | number> = [scope.organizationId];
   if (scope.collection !== "projects") {
     predicates.push("r.project_id = ?");
     bindings.push(scope.projectId!);
   }
-  if (scope.collection === "roles" || scope.collection === "databases") {
+  if (
+    scope.collection === "roles" ||
+    scope.collection === "databases" ||
+    scope.collection === "backups"
+  ) {
     predicates.push("r.environment_id = ?");
     bindings.push(scope.environmentId!);
   }
@@ -244,6 +254,8 @@ function pageRead(
   else if (scope.collection === "roles")
     links =
       "FROM role_operations o WHERE o.role_id = page.id AND o.credential_revision = page.desired_credential_revision";
+  else if (scope.collection === "backups")
+    links = "FROM backup_operations o WHERE o.backup_id = page.id";
   else
     links =
       "FROM database_operations o WHERE o.database_id = page.id AND o.owner_role_id = page.owner_role_id";
@@ -280,6 +292,8 @@ function entry(scope: Scope, row: PageRow) {
       return { role: publicRole(row as Role), currentOperationId };
     case "databases":
       return { database: publicDatabase(row as Database), currentOperationId };
+    case "backups":
+      return { backup: publicBackup(row as Backup), currentOperationId };
   }
 }
 async function collection(
@@ -370,28 +384,35 @@ function operationRead(
     .prepare(
       `SELECT * FROM (
     SELECT 'legacy' AS source, o.id, o.organization_id, o.project_id, o.environment_id,
-      NULL AS role_id, NULL AS database_id, NULL AS credential_revision,
+      NULL AS role_id, NULL AS database_id, NULL AS backup_id, NULL AS credential_revision,
       o.kind, o.status, o.created_at, o.observed_at, o.result_code
     FROM operations o JOIN projects p ON p.id = o.project_id AND p.organization_id = o.organization_id
       LEFT JOIN environments e ON e.id = o.environment_id AND e.organization_id = o.organization_id AND e.project_id = o.project_id
     WHERE o.id = ? AND o.organization_id = ? AND (o.environment_id IS NULL OR e.id IS NOT NULL) AND ${guard}
     UNION ALL
     SELECT 'role', o.id, r.organization_id, r.project_id, r.environment_id,
-      r.id, NULL, o.credential_revision, o.kind, o.status, o.created_at, o.observed_at, o.result_code
+      r.id, NULL, NULL, o.credential_revision, o.kind, o.status, o.created_at, o.observed_at, o.result_code
     FROM role_operations o JOIN database_roles r ON r.id = o.role_id
       JOIN projects p ON p.id = r.project_id AND p.organization_id = r.organization_id
       JOIN environments e ON e.id = r.environment_id AND e.organization_id = r.organization_id AND e.project_id = r.project_id
     WHERE o.id = ? AND r.organization_id = ? AND ${guard}
     UNION ALL
     SELECT 'database', o.id, d.organization_id, d.project_id, d.environment_id,
-      d.owner_role_id, d.id, NULL, o.kind, o.status, o.created_at, o.observed_at, o.result_code
+      d.owner_role_id, d.id, NULL, NULL, o.kind, o.status, o.created_at, o.observed_at, o.result_code
     FROM database_operations o JOIN logical_databases d ON d.id = o.database_id AND d.owner_role_id = o.owner_role_id
       JOIN projects p ON p.id = d.project_id AND p.organization_id = d.organization_id
       JOIN environments e ON e.id = d.environment_id AND e.organization_id = d.organization_id AND e.project_id = d.project_id
     WHERE o.id = ? AND d.organization_id = ? AND ${guard}
+    UNION ALL
+    SELECT 'backup', o.id, b.organization_id, b.project_id, b.environment_id,
+      NULL, NULL, b.id, NULL, o.kind, o.status, o.created_at, o.observed_at, o.result_code
+    FROM backup_operations o JOIN environment_backups b ON b.id=o.backup_id
+      JOIN projects p ON p.id=b.project_id AND p.organization_id=b.organization_id
+      JOIN environments e ON e.id=b.environment_id AND e.organization_id=b.organization_id AND e.project_id=b.project_id
+    WHERE o.id=? AND b.organization_id=? AND ${guard}
   ) LIMIT 2`,
     )
-    .bind(...values, ...values, ...values);
+    .bind(...values, ...values, ...values, ...values);
 }
 function publicTask(row: OperationRow) {
   if (row.source === "legacy") return operationFromRow(row);
@@ -400,6 +421,19 @@ function publicTask(row: OperationRow) {
     projectId: row.project_id,
     environmentId: row.environment_id,
   };
+  if (row.source === "backup")
+    return {
+      ...publicBackupOperation({
+        id: row.id,
+        backup_id: row.backup_id!,
+        kind: "environment.backup",
+        status: row.status as "queued" | "running" | "completed" | "failed",
+        created_at: row.created_at,
+        observed_at: row.observed_at,
+        result_code: row.result_code,
+      }),
+      ...ownership,
+    };
   if (row.source === "role")
     return {
       ...publicRoleOperation({
@@ -469,7 +503,7 @@ export async function executionReads(
         path,
       );
     const children =
-      /^\/v1\/organizations\/([^/]+)\/projects\/([^/]+)\/environments\/([^/]+)\/(roles|databases)$/.exec(
+      /^\/v1\/organizations\/([^/]+)\/projects\/([^/]+)\/environments\/([^/]+)\/(roles|databases|backups)$/.exec(
         path,
       );
     const task = /^\/v1\/organizations\/([^/]+)\/operations\/([^/]+)$/.exec(
@@ -501,7 +535,7 @@ export async function executionReads(
             environmentId: null,
           }
         : {
-            collection: children![4] as "roles" | "databases",
+            collection: children![4] as "roles" | "databases" | "backups",
             organizationId: children![1]!,
             projectId: children![2]!,
             environmentId: children![3]!,

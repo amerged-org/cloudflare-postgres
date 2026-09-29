@@ -19,6 +19,9 @@ import { databaseKubernetesFromConfig } from "./database-kubernetes.ts";
 import { runDatabaseController } from "./database-controller.ts";
 import { postgresDatabaseVerifier } from "./database-postgres.ts";
 import { validNativeClientProfiles } from "./native-access.ts";
+import { BackupClient } from "./backup-client.ts";
+import { backupKubernetesFromConfig } from "./backup-kubernetes.ts";
+import { runBackupController } from "./backup-controller.ts";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -109,6 +112,13 @@ async function main(): Promise<void> {
     throw new Error("invalid_regional_configuration");
   }
   const tokenFile = process.env.PGCF_REGION_TOKEN_FILE;
+  const manualBackups = process.env.PGCF_MANUAL_BACKUPS_ENABLED;
+  if (
+    manualBackups !== undefined &&
+    manualBackups !== "false" &&
+    manualBackups !== "true"
+  )
+    throw new Error("invalid_regional_configuration");
   const token = tokenFile
     ? (await readFile(tokenFile, "utf8")).trim()
     : required("PGCF_REGION_TOKEN").trim();
@@ -134,6 +144,18 @@ async function main(): Promise<void> {
     process.env.PGCF_KUBECONFIG_FILE,
   );
   const databaseVerifier = postgresDatabaseVerifier();
+  // Validate the optional lane before metering journals or controller work start.
+  const backupLane =
+    manualBackups === "true"
+      ? {
+          client: new BackupClient(
+            required("PGCF_CONTROL_ORIGIN"),
+            required("PGCF_REGION_ID"),
+            async () => (await readFile(roleTokenFile, "utf8")).trim(),
+          ),
+          runtime: backupKubernetesFromConfig(process.env.PGCF_KUBECONFIG_FILE),
+        }
+      : null;
   const shutdown = new AbortController();
   process.once("SIGINT", () => shutdown.abort());
   process.once("SIGTERM", () => shutdown.abort());
@@ -222,6 +244,15 @@ async function main(): Promise<void> {
       );
     }
     tasks.push(runController(api, client, config, controllerOptions));
+    if (backupLane) {
+      tasks.push(
+        runBackupController(
+          backupLane.runtime,
+          backupLane.client,
+          controllerOptions,
+        ),
+      );
+    }
     tasks.push(
       runRoleController(
         roleApi,

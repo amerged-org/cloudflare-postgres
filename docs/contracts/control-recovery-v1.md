@@ -16,7 +16,9 @@ tables, missing migration history or incompatible source versions fail capture.
 Cells retain their SQLite storage class: integer decimal strings, real strings,
 text, BLOB hex and null. No large integer passes through JavaScript number
 rounding. Deterministic row ordering supports exact reconstruction checks.
-The statement is limited to 95,000 bytes. The D1 adapter also enforces the
+The statement is limited to 99,000 bytes, retaining 1,000 bytes below the
+[D1 SQL statement limit](https://developers.cloudflare.com/d1/platform/limits/).
+The D1 adapter also enforces the
 provider's 2,000,000-byte maximum returned string, with no more than 32 columns
 per application table. The offline snapshot envelope is limited to 8 MiB,
 128 tables and 100,000 rows. Exceeding any bound fails the operation; there is no truncated or

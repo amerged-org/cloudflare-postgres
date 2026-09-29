@@ -182,6 +182,22 @@ OS rollback is not database rollback. PostgreSQL major upgrades and Kubernetes/e
 
 ### Backup, PITR, retention, and deletion
 
+The [manual base-backup source](docs/contracts/manual-backups-v1.md) adds
+generic scoped intent, collection/item reads, durable regional dispatch and
+operator-reported artifact custody. A successful response accepts an operation;
+it does not establish archive or recovery verification. Physical execution is
+an explicit installation opt-in, disabled until the selected archive path is
+qualified. Dispatch replay and lease reclaim are observation-only; an uncertain
+or missing recorded Backup cannot authorize a second physical backup. Manual
+suspend waits for pending backup operations, while hard budget stopping remains
+independent. Backup identities, dispatches and terminal metadata belong to the
+canonical Cloudflare control-state recovery artifact.
+The [source checkpoint](docs/evidence/m3-manual-backups-2026-09-29.md) retains
+the three bounded red-first cases and the original final-gate stop. A resumed
+constructor-only compatibility correction passes all four affected existing CLI
+cases without new cases or another full gate. Source delivery and Dev migration
+are recorded separately; physical provider/recovery qualification remains open.
+
 Use Barman/CNPG for base backups and WAL. R2 is archive storage, not PostgreSQL's live data volume. For pinned versions, separately test upload, WAL continuity, exact-time recovery, retention expiration, object deletion, interruption/resumption, and restore after the original database cluster has been removed while retained backups remain.
 
 Give restored clusters distinct target archive identities and preserve the source archive until validation. Do not bypass non-empty-WAL checks as a general workaround. Verify that retention never deletes a required base backup or breaks the retained recovery window, and never crosses project boundaries.

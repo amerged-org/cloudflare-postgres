@@ -1,5 +1,29 @@
 # Regional environment controller
 
+## Manual physical base backups
+
+The optional base-backup lane consumes durable customer requests for existing
+environments. It reuses the existing region executor token and configured CNPG/
+Barman archive, creates one fixed owned Backup resource, and retains a
+whitelisted operator-reported result in D1. It performs no SQL, archive deletion,
+restore, quota change or wake operation.
+
+Set `PGCF_MANUAL_BACKUPS_ENABLED=true` only after reviewing installation archive
+configuration and qualification. The default is off; `false` is also explicit.
+The existing token file/kubeconfig are reused and Backup `get/create` is the only
+new RBAC. A queued API request remains pending while its executor is disabled.
+
+The [contract](../../docs/contracts/manual-backups-v1.md) defines the durable
+pre-dispatch checkpoint. Only its initial positive acknowledgement permits one
+creation attempt; replay/reclaim observes the same resource and cannot recreate
+a missing Backup. ObjectStore UID/generation/full spec stay bound across
+status-only recovery-window updates. Unknown outcomes remain explicit.
+
+`completed` means CNPG/Barman reported a base artifact. Remote preservation,
+independent restore, PITR, retention and backup-byte accounting remain separate
+qualification gates with false verification flags. Source delivery does not
+activate the lane or resume previously held Barman/R2 work.
+
 ## Optional private native access
 
 A new immutable catalog profile can opt into `nativeAccess: {version: 1,

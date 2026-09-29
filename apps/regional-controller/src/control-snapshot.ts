@@ -255,7 +255,8 @@ export function buildSnapshotQuery(set: MigrationSet): string {
   };
   const tables = concatenate(fragments);
   const sql = `SELECT json_object('schema',json((SELECT json_group_array(json_object('name',name,'type',type,'sql',sql)) FROM (SELECT name,type,sql FROM sqlite_master WHERE ${schemaWhere} ORDER BY type,name))),'tables',json('[' || ${tables} || ']'),'sequences',json((SELECT json_group_array(json_object('name',name,'seq',CAST(seq AS TEXT))) FROM (SELECT name,seq FROM sqlite_sequence WHERE name NOT GLOB 'sqlite_*' AND name NOT GLOB '_cf_*' ORDER BY name)))) AS snapshot_json;`;
-  if (Buffer.byteLength(sql, "utf8") > 95000)
+  // Keep a margin below D1's 100,000-byte SQL statement limit.
+  if (Buffer.byteLength(sql, "utf8") > 99000)
     throw fail("control_snapshot_query_bound");
   return sql;
 }

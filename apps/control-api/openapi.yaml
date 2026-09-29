@@ -751,6 +751,269 @@ paths:
             Owned environment has no configured or valid bound native proof,
             is not ready/running, has paused requested budget state, or its
             project/region or reported CA is no longer available.
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/backups:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+    post:
+      operationId: createManualBaseBackup
+      summary: Retain an owned manual physical base-backup intent
+      description: >-
+        Requires projects:write and Idempotency-Key. Accepts exactly an empty
+        object. Running runtime and requested budgets, active parents and ready
+        owned specification are checked atomically with ordinary suspend and
+        pending backup interlocks. Expired uncertain backup work retains its hold.
+        Hard budget stop is never held or extended by this maintenance interlock.
+        No caller path, credential, target or Kubernetes field is accepted.
+      security:
+        - organizationToken: []
+      parameters:
+        - $ref: "#/components/parameters/LifecycleIdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              maxProperties: 0
+      responses:
+        "202":
+          description: Immutable accepted backup and operation metadata; no compute authority or credentials.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManualBackupResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Current authority, immutable checkpoint, idempotency or observation conflict.
+    get:
+      operationId: listEnvironmentBackups
+      summary: Read scoped retained backup metadata
+      description: Requires projects:read; observed primary page, signed cursor, no archive routing or secrets.
+      security:
+        - organizationToken: []
+      parameters:
+        - $ref: "#/components/parameters/RecoveryLimit"
+        - $ref: "#/components/parameters/RecoveryCursor"
+      responses:
+        "200":
+          description: Observed page of backup metadata and current operation identifiers.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [backups, nextCursor, consistency, observedAt]
+                properties:
+                  backups:
+                    type: array
+                    items:
+                      type: object
+                      required: [backup, currentOperationId]
+                      properties:
+                        backup:
+                          $ref: "#/components/schemas/ManualBackup"
+                        currentOperationId:
+                          type: [string, "null"]
+                          format: uuid
+                  nextCursor:
+                    type: [string, "null"]
+                  consistency:
+                    const: observed-page
+                  observedAt:
+                    type: string
+                    format: date-time
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Current authority, immutable checkpoint, idempotency or observation conflict.
+  /v1/organizations/{organizationId}/projects/{projectId}/environments/{environmentId}/backups/{backupId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - $ref: "#/components/parameters/ProjectId"
+      - $ref: "#/components/parameters/AccountingEnvironmentId"
+      - name: backupId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getManualBaseBackup
+      summary: Observe retained owned base-backup metadata
+      description: Requires projects:read. Completion is an operator artifact observation; remote objects and recovery are unverified.
+      security:
+        - organizationToken: []
+      responses:
+        "200":
+          description: Nonsecret historical backup metadata with no-store.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [backup]
+                properties:
+                  backup:
+                    $ref: "#/components/schemas/ManualBackup"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Current authority, immutable checkpoint, idempotency or observation conflict.
+  /v1/regions/{regionId}/backup-operations/claim:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+    post:
+      operationId: claimManualBaseBackup
+      summary: Lease current owned backup work
+      description: >-
+        Requires operations:claim, current running runtime/revision and requested budgets. Reclaimed checkpoint-bearing work is observation-only, even when its CR is absent.
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BackupLeaseRequest"
+      responses:
+        "200":
+          description: Bound private executor response; no-store.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupClaimResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Current authority, immutable checkpoint, idempotency or observation conflict.
+  /v1/regions/{regionId}/backup-operations/{operationId}/renew:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/OperationId"
+    post:
+      operationId: renewManualBaseBackup
+      summary: Renew only current backup authority
+      description: >-
+        Requires operations:claim and an unexpired winning actor/lease under current running runtime and requested budgets. A backup never extends hard stop authority.
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BackupRenewRequest"
+      responses:
+        "200":
+          description: Bound private executor response; no-store.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupRenewResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Current authority, immutable checkpoint, idempotency or observation conflict.
+  /v1/regions/{regionId}/backup-operations/{operationId}/dispatch:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/OperationId"
+    post:
+      operationId: checkpointManualBaseBackup
+      summary: Retain immutable binding before one initial Backup CR create
+      description: >-
+        Requires operations:report and current running runtime/budgets. Only created:true with the same fresh process nonce and winning lease permits that process its one create attempt. Exact replay is created:false; new claims never recreate a missing resource.
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BackupDispatchRequest"
+      responses:
+        "200":
+          description: Bound private executor response; no-store.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupDispatchResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Current authority, immutable checkpoint, idempotency or observation conflict.
+  /v1/regions/{regionId}/backup-operations/{operationId}/result:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/OperationId"
+    post:
+      operationId: reportManualBaseBackup
+      summary: Retain whitelisted existing terminal backup evidence
+      description: >-
+        Requires operations:report and an unexpired winning lease. Requested budget pause alone may allow terminal custody if original environment/spec/Cluster/run epoch/runtime revision and running runtime remain current. No renewal, create, wake or funding is granted. Unknown phases or missing-resource guesses are refused.
+      security:
+        - regionToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BackupResultRequest"
+      responses:
+        "200":
+          description: Bound private executor response; no-store.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ManualBackupResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Current authority, immutable checkpoint, idempotency or observation conflict.
   /v1/regions/{regionId}/operations/claim:
     parameters:
       - $ref: "#/components/parameters/RegionId"
@@ -2574,6 +2837,496 @@ components:
           description:
             Accepted nonsecret regional stop evidence; never settlement or
             SQL reachability.
+    BackupPublicArtifact:
+      type: object
+      additionalProperties: false
+      description: Operator base artifact only; times normalized to UTC milliseconds, begin/end times and LSN ordered.
+      required:
+        [
+          backupId,
+          backupName,
+          majorVersion,
+          startedAt,
+          stoppedAt,
+          beginWal,
+          endWal,
+          beginLSN,
+          endLSN,
+          online,
+        ]
+      properties:
+        backupId:
+          type: string
+          minLength: 1
+          maxLength: 255
+        backupName:
+          type: string
+          minLength: 1
+          maxLength: 255
+        majorVersion:
+          type: integer
+          minimum: 10
+          maximum: 99
+        startedAt:
+          type: string
+          format: date-time
+        stoppedAt:
+          type: string
+          format: date-time
+        beginWal:
+          type: string
+          pattern: ^[0-9A-F]{24}$
+        endWal:
+          type: string
+          pattern: ^[0-9A-F]{24}$
+        beginLSN:
+          type: string
+          pattern: ^[0-9A-F]{1,8}/[0-9A-F]{1,8}$
+        endLSN:
+          type: string
+          pattern: ^[0-9A-F]{1,8}/[0-9A-F]{1,8}$
+        online:
+          type: boolean
+          const: true
+    BackupPluginMetadata:
+      type: object
+      additionalProperties: false
+      description: Exact pinned Barman six-field metadata; clusterUID must match accepted source, no archive URLs or Secret references.
+      required: [timeline, version, name, displayName, clusterUID, pluginName]
+      properties:
+        timeline:
+          type: string
+          pattern: ^[1-9][0-9]{0,9}$
+        version:
+          type: string
+          const: 0.15.0
+        name:
+          type: string
+          const: barman-cloud.cloudnative-pg.io
+        displayName:
+          type: string
+          const: BarmanCloudInstance
+        clusterUID:
+          type: string
+          format: uuid
+        pluginName:
+          type: string
+          const: barman-cloud.cloudnative-pg.io
+    BackupExecutorArtifact:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          backupId,
+          backupName,
+          majorVersion,
+          startedAt,
+          stoppedAt,
+          beginWal,
+          endWal,
+          beginLSN,
+          endLSN,
+          online,
+          pluginMetadata,
+        ]
+      properties:
+        backupId:
+          type: string
+          minLength: 1
+          maxLength: 255
+        backupName:
+          type: string
+          minLength: 1
+          maxLength: 255
+        majorVersion:
+          type: integer
+          minimum: 10
+          maximum: 99
+        startedAt:
+          type: string
+          format: date-time
+        stoppedAt:
+          type: string
+          format: date-time
+        beginWal:
+          type: string
+          pattern: ^[0-9A-F]{24}$
+        endWal:
+          type: string
+          pattern: ^[0-9A-F]{24}$
+        beginLSN:
+          type: string
+          pattern: ^[0-9A-F]{1,8}/[0-9A-F]{1,8}$
+        endLSN:
+          type: string
+          pattern: ^[0-9A-F]{1,8}/[0-9A-F]{1,8}$
+        online:
+          type: boolean
+          const: true
+        pluginMetadata:
+          $ref: "#/components/schemas/BackupPluginMetadata"
+    ManualBackup:
+      type: object
+      additionalProperties: false
+      description: Historical operator artifact observation; not remote-object preservation, restore or PITR qualification.
+      required:
+        [
+          id,
+          organizationId,
+          projectId,
+          environmentId,
+          regionId,
+          status,
+          createdAt,
+          observedAt,
+          artifact,
+          remoteObjectsVerified,
+          restoreVerified,
+          PITRVerified,
+        ]
+      properties:
+        id:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        projectId:
+          type: string
+          format: uuid
+        environmentId:
+          type: string
+          format: uuid
+        regionId:
+          type: string
+          format: uuid
+        status:
+          type: string
+          enum: [pending, completed, failed]
+        createdAt:
+          type: string
+          format: date-time
+        observedAt:
+          type: [string, "null"]
+          format: date-time
+        artifact:
+          anyOf:
+            - $ref: "#/components/schemas/BackupPublicArtifact"
+            - type: "null"
+        remoteObjectsVerified:
+          type: boolean
+          const: false
+        restoreVerified:
+          type: boolean
+          const: false
+        PITRVerified:
+          type: boolean
+          const: false
+    ManualBackupOperation:
+      type: object
+      additionalProperties: false
+      description: Backup response operation metadata; ordinary organization recovery uses RecoveryOperation with ownership context.
+      required: [id, backupId, kind, status, createdAt, observedAt, resultCode]
+      properties:
+        id:
+          type: string
+          format: uuid
+        backupId:
+          type: string
+          format: uuid
+        kind:
+          type: string
+          const: environment.backup
+        status:
+          type: string
+          enum: [queued, running, completed, failed]
+        createdAt:
+          type: string
+          format: date-time
+        observedAt:
+          type: [string, "null"]
+          format: date-time
+        resultCode:
+          type: [string, "null"]
+          enum: [null, base_backup_completed, backup_failed]
+    ManualBackupResponse:
+      type: object
+      additionalProperties: false
+      required: [backup, operation]
+      properties:
+        backup:
+          $ref: "#/components/schemas/ManualBackup"
+        operation:
+          $ref: "#/components/schemas/ManualBackupOperation"
+    BackupDispatchBinding:
+      type: object
+      additionalProperties: false
+      description: Full actual ObjectStore spec and fixed Backup spec use recursive ASCII key-sorted JSON SHA-256; source specification is immutable.
+      required:
+        [
+          namespaceUid,
+          clusterUid,
+          specHash,
+          objectStoreUid,
+          objectStoreGeneration,
+          objectStoreSpecHash,
+          backupName,
+          backupSpecHash,
+        ]
+      properties:
+        namespaceUid:
+          type: string
+          format: uuid
+        clusterUid:
+          type: string
+          format: uuid
+        specHash:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        objectStoreUid:
+          type: string
+          format: uuid
+        objectStoreGeneration:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+        objectStoreSpecHash:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        backupName:
+          type: string
+          pattern: ^backup-[0-9a-f]{32}$
+        backupSpecHash:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+    BackupDispatch:
+      type: object
+      additionalProperties: false
+      required: [version, nonce, leaseEpoch, binding]
+      properties:
+        version:
+          type: integer
+          const: 1
+        nonce:
+          type: string
+          format: uuid
+        leaseEpoch:
+          $ref: "#/components/schemas/LeaseEpoch"
+        binding:
+          $ref: "#/components/schemas/BackupDispatchBinding"
+    BackupLeaseRequest:
+      type: object
+      additionalProperties: false
+      required: [leaseSeconds]
+      properties:
+        leaseSeconds:
+          $ref: "#/components/schemas/LeaseSeconds"
+    BackupRenewRequest:
+      type: object
+      additionalProperties: false
+      required: [leaseToken, leaseEpoch, leaseSeconds]
+      properties:
+        leaseToken:
+          $ref: "#/components/schemas/LeaseToken"
+        leaseEpoch:
+          $ref: "#/components/schemas/LeaseEpoch"
+        leaseSeconds:
+          $ref: "#/components/schemas/LeaseSeconds"
+    BackupRenewResponse:
+      type: object
+      additionalProperties: false
+      required: [leaseExpiresAt]
+      properties:
+        leaseExpiresAt:
+          type: string
+          format: date-time
+    BackupDispatchRequest:
+      type: object
+      additionalProperties: false
+      required: [leaseToken, leaseEpoch, nonce, binding]
+      properties:
+        leaseToken:
+          $ref: "#/components/schemas/LeaseToken"
+        leaseEpoch:
+          $ref: "#/components/schemas/LeaseEpoch"
+        nonce:
+          type: string
+          format: uuid
+        binding:
+          $ref: "#/components/schemas/BackupDispatchBinding"
+    BackupDispatchResponse:
+      type: object
+      additionalProperties: false
+      required: [dispatch, created]
+      properties:
+        dispatch:
+          $ref: "#/components/schemas/BackupDispatch"
+        created:
+          type: boolean
+          description: True only for the newly persisted same-process checkpoint; exact replay false forbids create.
+    BackupTerminalObservation:
+      type: object
+      additionalProperties: false
+      description: Bound immutable dispatch fields; completed requires artifact, failed requires null; no raw errors or credential data.
+      required:
+        [
+          namespaceUid,
+          clusterUid,
+          objectStoreUid,
+          objectStoreGeneration,
+          objectStoreSpecHash,
+          backupResourceUid,
+          backupResourceVersion,
+          backupSpecHash,
+          phase,
+          artifact,
+          remoteObjectsVerified,
+          restoreVerified,
+        ]
+      properties:
+        namespaceUid:
+          type: string
+          format: uuid
+        clusterUid:
+          type: string
+          format: uuid
+        objectStoreUid:
+          type: string
+          format: uuid
+        objectStoreGeneration:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+        objectStoreSpecHash:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        backupResourceUid:
+          type: string
+          format: uuid
+        backupResourceVersion:
+          type: string
+          pattern: ^[A-Za-z0-9._:-]{1,128}$
+        backupSpecHash:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        phase:
+          type: string
+          enum: [completed, failed]
+        artifact:
+          anyOf:
+            - $ref: "#/components/schemas/BackupExecutorArtifact"
+            - type: "null"
+        remoteObjectsVerified:
+          type: boolean
+          const: false
+        restoreVerified:
+          type: boolean
+          const: false
+    BackupResultRequest:
+      type: object
+      additionalProperties: false
+      required: [leaseToken, leaseEpoch, status, resultCode, observation]
+      properties:
+        leaseToken:
+          $ref: "#/components/schemas/LeaseToken"
+        leaseEpoch:
+          $ref: "#/components/schemas/LeaseEpoch"
+        status:
+          type: string
+          enum: [completed, failed]
+        resultCode:
+          type: string
+          enum: [base_backup_completed, backup_failed]
+        observation:
+          $ref: "#/components/schemas/BackupTerminalObservation"
+    BackupExecutionClaim:
+      type: object
+      additionalProperties: false
+      description: Private trusted executor input; specification includes credential references, never credential values. Existing dispatch prohibits create in a reclaimed process.
+      required:
+        [
+          schemaVersion,
+          kind,
+          operationId,
+          backupId,
+          organizationId,
+          projectId,
+          environmentId,
+          regionId,
+          specRevision,
+          specHash,
+          clusterUid,
+          runtimeRevision,
+          spec,
+          dispatch,
+          leaseToken,
+          leaseEpoch,
+          leaseExpiresAt,
+        ]
+      properties:
+        schemaVersion:
+          type: integer
+          const: 1
+        kind:
+          type: string
+          const: environment.backup
+        operationId:
+          type: string
+          format: uuid
+        backupId:
+          type: string
+          format: uuid
+        organizationId:
+          type: string
+          format: uuid
+        projectId:
+          type: string
+          format: uuid
+        environmentId:
+          type: string
+          format: uuid
+        regionId:
+          type: string
+          format: uuid
+        specRevision:
+          type: integer
+          minimum: 1
+          maximum: 9007199254740991
+        specHash:
+          type: string
+          pattern: ^[a-f0-9]{64}$
+        clusterUid:
+          type: string
+          format: uuid
+        runtimeRevision:
+          type: integer
+          minimum: 0
+          maximum: 9007199254740991
+        runEpoch:
+          type: string
+          pattern: ^[1-9][0-9]{0,18}$
+        spec:
+          $ref: "#/components/schemas/ExecutionSpec"
+        dispatch:
+          anyOf:
+            - $ref: "#/components/schemas/BackupDispatch"
+            - type: "null"
+        leaseToken:
+          $ref: "#/components/schemas/LeaseToken"
+        leaseEpoch:
+          $ref: "#/components/schemas/LeaseEpoch"
+        leaseExpiresAt:
+          type: string
+          format: date-time
+    BackupClaimResponse:
+      type: object
+      additionalProperties: false
+      required: [claim]
+      properties:
+        claim:
+          anyOf:
+            - $ref: "#/components/schemas/BackupExecutionClaim"
+            - type: "null"
     NativeAccessPolicy:
       type: object
       additionalProperties: false
@@ -3386,6 +4139,9 @@ components:
         databaseId:
           type: string
           format: uuid
+        backupId:
+          type: string
+          format: uuid
         ownerRoleId:
           type: string
           format: uuid
@@ -3397,6 +4153,7 @@ components:
             - database.role.apply
             - database.create
             - environment.suspend
+            - environment.backup
         status:
           type: string
           enum:
@@ -3404,6 +4161,7 @@ components:
             - queued
             - running
             - applied
+            - completed
             - failed
         credentialRevision:
           type: integer

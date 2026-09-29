@@ -24,10 +24,146 @@ import {
 test("rebuilds all current control migrations and historical encrypted credentials exactly from one read into a quarantined private recovery directory", async () => {
   const f = await fixture();
   try {
+    const backupId = "99999999-9999-4999-8999-999999999999",
+      operationId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+      tokenId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+      now = "2026-09-29T00:00:00.000Z",
+      observedAt = "2026-09-29T00:00:30.000Z",
+      resourceName = `backup-${backupId.replaceAll("-", "")}`;
+    const binding = JSON.stringify({
+      namespaceUid: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+      clusterUid: f.ids.cluster,
+      specHash: "a".repeat(64),
+      objectStoreUid: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      objectStoreGeneration: 1,
+      objectStoreSpecHash: "d".repeat(64),
+      backupName: resourceName,
+      backupSpecHash: "e".repeat(64),
+    });
+    const observation = JSON.stringify({
+      ...JSON.parse(binding),
+      backupResourceUid: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+      backupResourceVersion: "9007199254740994",
+      phase: "completed",
+      artifact: {
+        backupId: "20260929T000000",
+        backupName: "backup-20260929T000000",
+        majorVersion: 18,
+        startedAt: now,
+        stoppedAt: observedAt,
+        beginWal: "000000010000000000000001",
+        endWal: "000000010000000000000002",
+        beginLSN: "0/1000000",
+        endLSN: "0/2000000",
+        online: true,
+        pluginMetadata: {
+          timeline: "1",
+          version: "0.15.0",
+          name: "barman-cloud.cloudnative-pg.io",
+          displayName: "BarmanCloudInstance",
+          clusterUID: f.ids.cluster,
+          pluginName: "barman-cloud.cloudnative-pg.io",
+        },
+      },
+      remoteObjectsVerified: false,
+      restoreVerified: false,
+    });
+    f.db
+      .prepare("INSERT INTO region_tokens VALUES(?,?,?,?,?,?)")
+      .run(
+        tokenId,
+        f.ids.region,
+        "f".repeat(64),
+        '["region:execute"]',
+        now,
+        null,
+      );
+    f.db
+      .prepare(
+        "INSERT INTO environment_backups VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        backupId,
+        f.ids.organization,
+        f.ids.project,
+        f.ids.environment,
+        f.ids.region,
+        1,
+        "a".repeat(64),
+        '{"profile":{}}',
+        "b".repeat(64),
+        f.ids.cluster,
+        "1",
+        0,
+        resourceName,
+        "completed",
+        "backup-version",
+        now,
+        observedAt,
+        observation,
+      );
+    f.db
+      .prepare(
+        "INSERT INTO backup_operations VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+      )
+      .run(
+        operationId,
+        backupId,
+        "environment.backup",
+        "completed",
+        tokenId,
+        "c".repeat(64),
+        1,
+        "2026-09-29T00:01:00.000Z",
+        "operation-version",
+        now,
+        observedAt,
+        "base_backup_completed",
+        "a".repeat(64),
+        observation,
+      );
+    f.db.prepare("INSERT INTO backup_requests VALUES(?,?,?,?,?,?,?,?,?,?)").run(
+      f.ids.organization,
+      f.ids.project,
+      f.ids.environment,
+      `environment:${f.ids.environment}:backup:create`,
+      "retained-backup-intent",
+      "b".repeat(64),
+      backupId,
+      operationId,
+      JSON.stringify({
+        backup: { id: backupId, status: "pending" },
+        operation: { id: operationId, status: "queued" },
+      }),
+      now,
+    );
+    f.db
+      .prepare("INSERT INTO backup_dispatches VALUES(?,?,?,?,?,?,?,?,?)")
+      .run(
+        operationId,
+        backupId,
+        "ffffffff-ffff-4fff-8fff-ffffffffffff",
+        tokenId,
+        "c".repeat(64),
+        1,
+        binding,
+        "c".repeat(64),
+        now,
+      );
+    const retainedBackupRows = [
+      "environment_backups",
+      "backup_operations",
+      "backup_requests",
+      "backup_dispatches",
+    ].map((name) => ({
+      name,
+      rows: f.db.prepare(`SELECT * FROM ${name}`).all(),
+    }));
     let reads = 0;
     const snapshot = await captureControlSnapshot(
       async (sql) => {
         reads++;
+        assert(Buffer.byteLength(sql, "utf8") <= 99000);
         return f.query(sql);
       },
       migrationDirectory,
@@ -35,7 +171,12 @@ test("rebuilds all current control migrations and historical encrypted credentia
       "2026-09-29T00:02:00.000Z",
     );
     assert.equal(reads, 1);
-    assert.equal(snapshot.migrations.files.length, 14);
+    assert.equal(
+      snapshot.tables.some((table) => table.name === "environment_backups"),
+      true,
+      "current control recovery must include durable backup identities",
+    );
+    assert.equal(snapshot.migrations.files.length, 15);
     assert.equal(
       snapshot.sequences.find((s) => s.name === "d1_migrations").seq,
       "9007199254740993",
@@ -93,6 +234,14 @@ test("rebuilds all current control migrations and historical encrypted credentia
           .get(f.ids.reservation).status,
         "issued",
       );
+      for (const retained of retainedBackupRows) {
+        assert.equal(retained.rows.length, 1);
+        assert.deepEqual(
+          db.prepare(`SELECT * FROM ${retained.name}`).all(),
+          retained.rows,
+          `${retained.name} must retain the exact accepted artifact, dispatch and replay identity`,
+        );
+      }
       assert.deepEqual(db.prepare("PRAGMA foreign_key_check").all(), []);
       assert.equal(
         db.prepare("PRAGMA integrity_check").get().integrity_check,

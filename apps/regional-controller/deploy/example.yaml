@@ -83,6 +83,10 @@ rules:
   - apiGroups: [postgresql.cnpg.io]
     resources: [databases]
     verbs: [get, list, create]
+  # Optional manual physical backup lane; no archive or Backup deletion rights.
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [backups]
+    verbs: [get, create]
   - apiGroups: [barmancloud.cnpg.io]
     resources: [objectstores]
     verbs: [get, create]
@@ -224,6 +228,9 @@ spec:
                   key: region-id
             - name: PGCF_REGIONAL_CONFIG_FILE
               value: /etc/pgcf/config.json
+            # Opt in only after installation archive qualification:
+            # - name: PGCF_MANUAL_BACKUPS_ENABLED
+            #   value: "true"
             - name: PGCF_REGION_TOKEN_FILE
               value: /var/run/pgcf-region/token
             - name: PGCF_USAGE_JOURNAL_PATH
