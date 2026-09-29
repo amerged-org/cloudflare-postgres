@@ -545,6 +545,22 @@ SQL markers, Cilium and all 4,096 entries restored. Actual client access and
 API-managed pilot acceptance remain unproven; read-only diagnosis of the final
 identity/version comparison is the proposed next step.
 
+The [native reference-diagnostic checkpoint](docs/evidence/m3-native-readback-diagnostics-2026-09-29.md)
+records that the original final comparison cannot be identified from the archive;
+later version churn does not prove its cause. Existing-system read-only parity
+checks pass. Production `null` is a retryable deferral of the same owned operation,
+so the one-pass operator result does not establish permanent provisioning failure.
+Source `3b3bd73` adds one fixed operator-only category for the first failed existing
+reference fence, preserving all reads, comparison order, null/owned-retry behavior
+and acceptance checks. One existing case is expanded and one new case fails first;
+one canonical gate passes 28 Worker/47 Node cases, retaining six unchanged Go
+cases for 81 total evidence. One public-only image build/import/guarded rollout
+delivers all 66 matching modules with original Node/Pods/volumes/SQL, 4,096 entries,
+configuration and 16 RBAC rules preserved. No private metadata, credentials or
+raw errors enter the diagnostic. No third physical case, native profile/customer
+activation, CF/Worker/D1 change or original-cause claim occurs. The qualifier stays
+stopped and native/backup/production acceptance remains open.
+
 The [Cloudflare private-path assessment](docs/research/cloudflare-private-native-path-2026-09-29.md)
 records the documented Hyperdrive/Workers VPC/Tunnel integration and its current
 private-CA trust limitation. It selects no gateway, creates no provider resource
