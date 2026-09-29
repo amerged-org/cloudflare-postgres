@@ -12,6 +12,9 @@ import {
 } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { normalizeAcceptedUsageReceipt } from "./accepted-usage.ts";
+import { AcceptedUsageLedger } from "./usage-accepted-ledger.ts";
+import type { AcceptedArchive } from "./usage-accepted-ledger.ts";
 import type {
   Allocation,
   AllocationContinuity,
@@ -27,6 +30,9 @@ export interface UsageJournalOptions {
   maxIntervalMilliseconds?: number;
   maxAllocations?: number;
   maxAcknowledgedFacts?: number;
+  maxAcceptedFacts?: number;
+  maxAcceptedBytes?: number;
+  maxArchiveBytes?: number;
 }
 interface Checkpoint {
   allocation_key: string;
@@ -143,6 +149,7 @@ export class UsageJournal {
   private readonly db: DatabaseSync;
   private readonly identity: UsageIdentity;
   private readonly limits: Required<UsageJournalOptions>;
+  private readonly accepted: AcceptedUsageLedger;
   private sessionId: string | null = null;
   private closed = false;
 
@@ -177,6 +184,15 @@ export class UsageJournal {
         options.maxAcknowledgedFacts ?? 1024,
         16384,
       ),
+      maxAcceptedFacts: positive(options.maxAcceptedFacts ?? 4096, 65536),
+      maxAcceptedBytes: positive(
+        options.maxAcceptedBytes ?? 8 * 1024 * 1024,
+        256 * 1024 * 1024,
+      ),
+      maxArchiveBytes: positive(
+        options.maxArchiveBytes ?? 8 * 1024 * 1024,
+        8 * 1024 * 1024,
+      ),
     };
     const directory = dirname(this.path);
     mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -202,6 +218,13 @@ export class UsageJournal {
       enableDoubleQuotedStringLiterals: false,
       allowExtension: false,
     });
+    this.accepted = new AcceptedUsageLedger(
+      this.db,
+      this.identity,
+      this.path,
+      this.limits,
+      (action) => this.transaction(action),
+    );
     try {
       this.db.exec(
         "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA fullfsync=ON; PRAGMA checkpoint_fullfsync=ON; PRAGMA wal_autocheckpoint=64; PRAGMA auto_vacuum=INCREMENTAL;",
@@ -220,7 +243,7 @@ export class UsageJournal {
         const version = this.db
           .prepare("SELECT value FROM journal_meta WHERE name='schema_version'")
           .get() as { value: string } | undefined;
-        if (version && version.value !== "1")
+        if (version && !["1", "2"].includes(version.value))
           throw new Error("journal_schema_unsupported");
         const sealed = this.db
           .prepare("SELECT value FROM journal_meta WHERE name='identity'")
@@ -228,9 +251,10 @@ export class UsageJournal {
         const expected = JSON.stringify(this.identity);
         if (sealed && sealed.value !== expected)
           throw new Error("identity_mismatch");
+        this.accepted.initialize(version?.value);
         this.db
           .prepare(
-            "INSERT OR IGNORE INTO journal_meta VALUES ('schema_version','1')",
+            "INSERT INTO journal_meta (name,value) VALUES ('schema_version','2') ON CONFLICT(name) DO UPDATE SET value=excluded.value",
           )
           .run();
         this.db
@@ -548,6 +572,33 @@ export class UsageJournal {
       return JSON.parse(row.payload_json) as UsageFact;
     });
   }
+
+  acknowledgeAccepted(value: unknown): boolean {
+    try {
+      return this.accepted.acknowledge(value);
+    } catch (failure) {
+      if (
+        failure instanceof Error &&
+        failure.message === "accepted_capacity_exceeded"
+      ) {
+        const receipt = normalizeAcceptedUsageReceipt(value, this.identity);
+        this.transaction(() =>
+          this.gap(
+            "accepted_capacity_exceeded",
+            Date.parse(receipt.fact.start),
+            Date.parse(receipt.fact.end),
+          ),
+        );
+      }
+      throw failure;
+    }
+  }
+  acceptedPage(afterSequence = 0, limit = 50) {
+    return this.accepted.page(afterSequence, limit);
+  }
+  archiveAccepted(path: string, limit = 256): AcceptedArchive {
+    return this.accepted.archive(path, limit);
+  }
   acknowledge(
     fact: Pick<UsageFact, "factId" | "revision" | "evidenceHash">,
   ): boolean {
@@ -572,6 +623,9 @@ export class UsageJournal {
         pending.evidence_hash !== fact.evidenceHash
       )
         return false;
+      // Compatibility acknowledgements have no server receipt. They cannot
+      // manufacture accepted metadata or make historical coverage complete.
+      this.accepted.markLegacyAcknowledgement();
       this.db
         .prepare(
           "INSERT INTO usage_acknowledgements (fact_id,revision,evidence_hash) VALUES (?,?,?)",
@@ -601,6 +655,7 @@ export class UsageJournal {
   }
   status() {
     const pending = this.counts();
+    const accepted = this.accepted.summary();
     const gaps = this.db
       .prepare("SELECT * FROM coverage_gaps ORDER BY code")
       .all() as unknown as GapRow[];
@@ -621,6 +676,7 @@ export class UsageJournal {
       pendingBytes: pending.bytes,
       maxPendingFacts: this.limits.maxPendingFacts,
       maxPendingBytes: this.limits.maxPendingBytes,
+      ...accepted,
       checkpointObservedAt: this.state().observed_at,
     };
   }

@@ -4,7 +4,10 @@ import { observeUsage } from "./usage-observer.ts";
 import { UsageClient } from "./usage-client.ts";
 import { UsageJournal } from "./usage-journal.ts";
 import type { Kubernetes } from "./types.ts";
-import type { ObservationResult } from "./metering-types.ts";
+import type {
+  AcceptedUsageReceipt,
+  ObservationResult,
+} from "./metering-types.ts";
 
 export interface MeteringOptions {
   regionId: string;
@@ -61,17 +64,28 @@ export async function deliverUsage(
 ): Promise<void> {
   for (const fact of journal.pending(32)) {
     if (signal.aborted) return;
+    let accepted: AcceptedUsageReceipt;
     try {
-      const accepted = await client.send(fact);
-      if (!accepted) throw new Error("usage_acknowledgement_missing");
+      accepted = await client.sendReceipt(fact);
     } catch {
       // Preserve the same durable fact identity after uncertain HTTP outcomes.
       // Never log exception bodies, credentials, raw resource or tenant data.
       log("metering_delivery_deferred");
       return;
     }
-    if (!journal.acknowledge(fact))
-      throw new Error("usage_acknowledgement_lost");
+    try {
+      if (!journal.acknowledgeAccepted(accepted))
+        throw new Error("usage_acknowledgement_lost");
+    } catch (failure) {
+      if (
+        failure instanceof Error &&
+        failure.message === "accepted_capacity_exceeded"
+      ) {
+        log("metering_delivery_deferred");
+        return;
+      }
+      throw failure;
+    }
   }
 }
 

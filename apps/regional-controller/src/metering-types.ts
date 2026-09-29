@@ -85,3 +85,12 @@ export interface UsageFact {
   status: "provisional" | "gap";
   evidenceHash: string;
 }
+
+export interface AcceptedUsageReceipt {
+  fact: UsageFact;
+  regionId: string;
+  organizationId: string;
+  projectId: string;
+  acceptanceSequence: string;
+  acceptedAt: string;
+}

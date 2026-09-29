@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "journalPath": "/private/installation/usage.sqlite",
+  "identity": {
+    "regionId": "REPLACE_WITH_REGION_UUID",
+    "sourceId": "REPLACE_WITH_METER_SOURCE_UUID",
+    "sourceEpoch": 1
+  },
+  "archivePath": "/private/installation/usage-archives/REPLACE_WITH_UNIQUE_ARCHIVE.json",
+  "limit": 256
+}

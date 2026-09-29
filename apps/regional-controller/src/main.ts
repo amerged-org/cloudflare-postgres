@@ -37,6 +37,11 @@ function milliseconds(
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "archive-accepted-usage") {
+    const { archiveAcceptedUsage } = await import("./accepted-usage-cli.ts");
+    process.exitCode = await archiveAcceptedUsage(process.argv.slice(3));
+    return;
+  }
   if (process.argv[2] === "run-suspend") {
     const { runSuspend } = await import("./suspend-cli.ts");
     process.exitCode = await runSuspend(process.argv.slice(3));
