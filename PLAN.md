@@ -129,6 +129,16 @@ privileged writers/API Ready are not universal funding gates; signed workload
 injection, renewal, actual ceilings, expired-hold settlement, physical stopping,
 recovery and all held qualifications remain required before customer admission.
 
+The [logical-project authority checkpoint](docs/evidence/m3-logical-project-authority-2026-09-30.md)
+closes the observed stale-token write/replay race in logical project creation.
+The original actor guards an atomic batch and current primary reads; response
+and concurrent-winner recovery recheck authority without undoing valid commits.
+Two meaningful streamed-body stories fail first and pass; the one frozen gate
+passes 42 Worker/59 Node cases with unchanged Go evidence retained. Schema/wire and
+retained guard history are unchanged. Dev delivery is pending; all held signing,
+backup/native/admission qualifiers remain held. Other API readers and production
+acceptance remain outside this fix.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.

@@ -174,15 +174,16 @@ export async function organizationRead(
     : error(404, "not_found");
 }
 export function assertion(
-  db: AccountingDb,
+  db: Pick<AccountingDb, "prepare">,
   predicate: string,
   bindings: Array<string | number | null> = [],
+  id: string = crypto.randomUUID(),
 ): D1PreparedStatement {
   return db
     .prepare(
       `INSERT INTO accounting_assertions (id, ok) SELECT ?, CASE WHEN (${predicate}) THEN 1 ELSE 0 END`,
     )
-    .bind(crypto.randomUUID(), ...bindings);
+    .bind(id, ...bindings);
 }
 export async function projectFence(
   db: AccountingDb,

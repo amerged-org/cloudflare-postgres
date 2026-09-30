@@ -1,4 +1,6 @@
 import { environmentRoutes } from "./environments";
+import { assertion } from "./accounting";
+import { actorBindings, actorPredicate, type Actor } from "./execution-auth";
 import { usageRoutes } from "./usage";
 import { budgetRoutes, planBudgetCorrection } from "./budgets";
 import { maintenanceRoutes } from "./maintenance";
@@ -22,6 +24,7 @@ type Env = Cloudflare.Env;
 type Scope = "projects:read" | "projects:write" | "operations:read";
 
 interface TokenRow {
+  id: string;
   organization_id: string;
   scopes: string;
 }
@@ -531,18 +534,41 @@ async function authorizedOrganization(
   organizationId: string,
   requiredScope: Scope,
 ): Promise<Response | null> {
+  const actor = await organizationActor(
+    request,
+    env.DB,
+    organizationId,
+    requiredScope,
+  );
+  return actor instanceof Response ? actor : null;
+}
+
+async function organizationActor(
+  request: Request,
+  db: D1Database | D1DatabaseSession,
+  organizationId: string,
+  requiredScope: Scope,
+): Promise<Actor | Response> {
   const bearer = bearerToken(request);
   if (!bearer) return error(401, "unauthorized");
-  const token = await env.DB.prepare(
-    "SELECT organization_id, scopes FROM api_tokens WHERE token_hash = ? AND revoked_at IS NULL",
-  )
-    .bind(await sha256(bearer))
+  const hash = await sha256(bearer);
+  const token = await db
+    .prepare(
+      "SELECT id, organization_id, scopes FROM api_tokens WHERE token_hash = ? AND revoked_at IS NULL",
+    )
+    .bind(hash)
     .first<TokenRow>();
   if (!token) return error(401, "unauthorized");
   if (token.organization_id !== organizationId) return error(404, "not_found");
   if (!token.scopes.split(" ").includes(requiredScope))
     return error(403, "forbidden");
-  return null;
+  return {
+    kind: "organization",
+    id: token.id,
+    ownerId: organizationId,
+    hash,
+    scope: requiredScope,
+  };
 }
 
 async function projectAndOperation(
@@ -550,17 +576,25 @@ async function projectAndOperation(
   organizationId: string,
   projectId: string,
   operationId: string,
+  actor: Actor,
+  currentAuthority: () => Promise<Response | null>,
 ): Promise<Response> {
   const [project, operation] = await Promise.all([
     db
-      .prepare("SELECT * FROM projects WHERE id = ? AND organization_id = ?")
-      .bind(projectId, organizationId)
+      .prepare(
+        `SELECT * FROM projects WHERE id = ? AND organization_id = ? AND ${actorPredicate(actor)}`,
+      )
+      .bind(projectId, organizationId, ...actorBindings(actor))
       .first<ProjectRow>(),
     db
-      .prepare("SELECT * FROM operations WHERE id = ? AND organization_id = ?")
-      .bind(operationId, organizationId)
+      .prepare(
+        `SELECT * FROM operations WHERE id = ? AND organization_id = ? AND ${actorPredicate(actor)}`,
+      )
+      .bind(operationId, organizationId, ...actorBindings(actor))
       .first<OperationRow>(),
   ]);
+  const denied = await currentAuthority();
+  if (denied) return denied;
   if (!project || !operation) return error(500, "state_inconsistent");
   const status =
     project.status === "active" && operation.status === "succeeded"
@@ -582,12 +616,13 @@ async function existingRequest(
   db: D1Database,
   organizationId: string,
   key: string,
+  actor: Actor,
 ): Promise<IdempotencyRow | null> {
   return db
     .prepare(
-      "SELECT request_hash, project_id, operation_id FROM idempotency_requests WHERE organization_id = ? AND idempotency_key = ?",
+      `SELECT request_hash, project_id, operation_id FROM idempotency_requests WHERE organization_id = ? AND idempotency_key = ? AND ${actorPredicate(actor)}`,
     )
-    .bind(organizationId, key)
+    .bind(organizationId, key, ...actorBindings(actor))
     .first<IdempotencyRow>();
 }
 
@@ -596,13 +631,31 @@ async function createProject(
   env: Env,
   organizationId: string,
 ): Promise<Response> {
-  const auth = await authorizedOrganization(
+  // Non-session D1 reads hit primary, including after sibling revocation or a
+  // concurrent committed winner. Reusing a session bookmark can miss those.
+  const db = env.DB;
+  const actor = await organizationActor(
     request,
-    env,
+    db,
     organizationId,
     "projects:write",
   );
-  if (auth) return auth;
+  if (actor instanceof Response) return actor;
+  const currentAuthority = async (): Promise<Response | null> => {
+    const current = await organizationActor(
+      request,
+      db,
+      organizationId,
+      "projects:write",
+    );
+    if (current instanceof Response) return current;
+    // A replacement row cannot inherit this request's captured actor identity.
+    return current.id === actor.id &&
+      current.hash === actor.hash &&
+      current.ownerId === actor.ownerId
+      ? null
+      : error(401, "unauthorized");
+  };
   const key = request.headers.get("idempotency-key");
   if (!key || !/^[A-Za-z0-9._~-]{1,128}$/.test(key)) {
     return error(400, "invalid_idempotency_key");
@@ -612,61 +665,83 @@ async function createProject(
   const requestHash = await sha256(
     `POST /v1/organizations/${organizationId}/projects\n${JSON.stringify({ name })}`,
   );
-  const existing = await existingRequest(env.DB, organizationId, key);
+  const existing = await existingRequest(db, organizationId, key, actor);
+  const denied = await currentAuthority();
+  if (denied) return denied;
   if (existing) {
     if (existing.request_hash !== requestHash)
       return error(409, "idempotency_conflict");
     return projectAndOperation(
-      env.DB,
+      db,
       organizationId,
       existing.project_id,
       existing.operation_id,
+      actor,
+      currentAuthority,
     );
   }
 
   const projectId = crypto.randomUUID();
   const operationId = crypto.randomUUID();
   const createdAt = new Date().toISOString();
+  const guardId = crypto.randomUUID();
   try {
-    await env.DB.batch([
-      env.DB.prepare(
-        "INSERT INTO projects (id, organization_id, name, status, created_at) VALUES (?, ?, ?, ?, ?)",
-      ).bind(projectId, organizationId, name, "active", createdAt),
-      env.DB.prepare(
-        "INSERT INTO operations (id, organization_id, project_id, kind, status, created_at, observed_at, result_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-      ).bind(
-        operationId,
-        organizationId,
-        projectId,
-        "project.create",
-        "succeeded",
-        createdAt,
-        createdAt,
-        "logical_container_created",
-      ),
-      env.DB.prepare(
-        "INSERT INTO idempotency_requests (organization_id, idempotency_key, request_hash, project_id, operation_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-      ).bind(
-        organizationId,
-        key,
-        requestHash,
-        projectId,
-        operationId,
-        createdAt,
-      ),
+    await db.batch([
+      assertion(db, actorPredicate(actor), actorBindings(actor), guardId),
+      db
+        .prepare(
+          "INSERT INTO projects (id, organization_id, name, status, created_at) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(projectId, organizationId, name, "active", createdAt),
+      db
+        .prepare(
+          "INSERT INTO operations (id, organization_id, project_id, kind, status, created_at, observed_at, result_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(
+          operationId,
+          organizationId,
+          projectId,
+          "project.create",
+          "succeeded",
+          createdAt,
+          createdAt,
+          "logical_container_created",
+        ),
+      db
+        .prepare(
+          "INSERT INTO idempotency_requests (organization_id, idempotency_key, request_hash, project_id, operation_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(
+          organizationId,
+          key,
+          requestHash,
+          projectId,
+          operationId,
+          createdAt,
+        ),
+      db.prepare("DELETE FROM accounting_assertions WHERE id=?").bind(guardId),
     ]);
   } catch {
-    const winner = await existingRequest(env.DB, organizationId, key);
+    const revoked = await currentAuthority();
+    if (revoked) return revoked;
+    const winner = await existingRequest(db, organizationId, key, actor);
+    const expired = await currentAuthority();
+    if (expired) return expired;
     if (!winner) return error(500, "write_failed");
     if (winner.request_hash !== requestHash)
       return error(409, "idempotency_conflict");
     return projectAndOperation(
-      env.DB,
+      db,
       organizationId,
       winner.project_id,
       winner.operation_id,
+      actor,
+      currentAuthority,
     );
   }
+
+  const revokedAfterCommit = await currentAuthority();
+  if (revokedAfterCommit) return revokedAfterCommit;
 
   return json(
     {
