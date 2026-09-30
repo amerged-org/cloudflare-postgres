@@ -247,6 +247,180 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "503":
           description: Installation bootstrap secret is unconfigured
+  /v1/organizations/{organizationId}/tokens:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+    get:
+      operationId: listOrganizationTokens
+      summary: List organization integration-token metadata
+      description: >-
+        Installation authority only. Includes revoked and legacy history,
+        ordered newest first. Signed cursors bind organization and page size;
+        bootstrap rotation invalidates old cursors. No plaintext or digest
+        is returned. No role-master key is needed for metadata access.
+      security:
+        - installationToken: []
+      parameters:
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 50 }
+        - name: cursor
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Bounded metadata page
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [tokens, nextCursor]
+                properties:
+                  tokens:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/OrganizationTokenMetadata"
+                  nextCursor:
+                    type: [string, "null"]
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Authoritative control read/write unavailable; fixed error only
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Installation authority or bounded observation unavailable
+    post:
+      operationId: issueOrganizationToken
+      summary: Issue or replay an exact scoped integration credential
+      description: >-
+        Installation authority only. Retain the caller-selected UUID before
+        sending. Identical active replay returns the same credential; changed
+        scopes, revoked rows, legacy random credentials or missing historical
+        keys never rewrite an existing digest or restore authority. No implicit
+        privileges are added. Permissions cover the whole organization.
+      security:
+        - installationToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [id, scopes]
+              properties:
+                id:
+                  type: string
+                  format: uuid
+                  pattern: ^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$
+                scopes:
+                  $ref: "#/components/schemas/OrganizationTokenScopes"
+      responses:
+        "201":
+          description: Scoped token created; credential response is not cacheable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrganizationIssuedToken"
+        "200":
+          description: Exact active token replay with the original credential
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrganizationIssuedToken"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Conflicting, revoked or unrecoverable credential replay
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: Authoritative control read/write unavailable; fixed error only
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Installation/credential keys or authoritative state unavailable
+  /v1/organizations/{organizationId}/tokens/{tokenId}:
+    parameters:
+      - $ref: "#/components/parameters/OrganizationId"
+      - name: tokenId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      operationId: getOrganizationToken
+      summary: Read one organization token without its credential or digest
+      security:
+        - installationToken: []
+      responses:
+        "200":
+          description: Token metadata, including its original revocation timestamp
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrganizationTokenResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Authoritative control read/write unavailable; fixed error only
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Installation authority or authoritative state unavailable
+    delete:
+      operationId: revokeOrganizationToken
+      summary: Revoke this integration credential while preserving its siblings
+      description: >-
+        Installation authority only. Retains the row and original revocation
+        timestamp; exact repeated revocation returns the same metadata. This
+        operation requires no role-master key and never deletes token history.
+      security:
+        - installationToken: []
+      responses:
+        "200":
+          description: Revoked token metadata; repeated revocation is stable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/OrganizationTokenResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          description: Authoritative control read/write unavailable; fixed error only
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: Installation authority or authoritative state unavailable
   /v1/organizations/{organizationId}/tokens/reissue:
     parameters:
       - $ref: "#/components/parameters/OrganizationId"
@@ -3144,6 +3318,44 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    OrganizationTokenScopes:
+      type: array
+      minItems: 1
+      maxItems: 3
+      uniqueItems: true
+      description: Exact requested existing permissions, returned in lexical order.
+      items:
+        type: string
+        enum: [operations:read, projects:read, projects:write]
+    OrganizationTokenMetadata:
+      type: object
+      additionalProperties: false
+      required: [id, organizationId, scopes, createdAt, revokedAt]
+      properties:
+        id: { type: string, format: uuid }
+        organizationId: { type: string, format: uuid }
+        scopes:
+          $ref: "#/components/schemas/OrganizationTokenScopes"
+        createdAt: { type: string, format: date-time }
+        revokedAt: { type: [string, "null"], format: date-time }
+    OrganizationTokenResponse:
+      type: object
+      additionalProperties: false
+      required: [token]
+      properties:
+        token:
+          $ref: "#/components/schemas/OrganizationTokenMetadata"
+    OrganizationIssuedToken:
+      type: object
+      additionalProperties: false
+      required: [token, apiToken]
+      properties:
+        token:
+          $ref: "#/components/schemas/OrganizationTokenMetadata"
+        apiToken:
+          type: string
+          pattern: ^cporg_[A-Za-z0-9_-]{43}$
+          description: Secret credential; store privately and send only in Authorization headers.
     UsageArchivePreparation:
       type: object
       additionalProperties: false

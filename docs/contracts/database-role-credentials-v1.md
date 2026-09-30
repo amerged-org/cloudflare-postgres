@@ -16,6 +16,13 @@ The base path is `/v1/organizations/{organizationId}/projects/{projectId}/enviro
 
 `ROLE_CREDENTIAL_KEYS` is a dedicated Worker Secret with `{active,keys}`; each named key is a base64url-encoded 32-byte AES key. Retain previous keys for recovery and decrypting existing revisions. Do not reuse provider credentials or allowance keys. AES-256-GCM uses a fresh 96-bit nonce and authenticates organization, project, environment, region, spec/Cluster identity, role and credential revision. D1 stores ciphertext and key/context metadata, never plaintext passwords. Missing keys fail before issuing work; key loss remains a disaster-recovery responsibility.
 
+The same retained master ring also supplies organization integration credentials
+through a separate HKDF/HMAC purpose and key-version context. That derivation
+never changes role AES-GCM keys, nonce generation or authenticated context. See
+[organization API tokens](organization-api-tokens-v1.md) for replay and recovery
+limits; preserving role ciphertext keys alone does not prove all token replay
+keys remain available.
+
 Separate role-operation tables and `/v1/regions/{regionId}/role-operations/{claim|operationId/renew|operationId/result}` reuse executor `operations:claim`/`operations:report` permissions while preserving the existing create-only protocol. Claims return the exact current task, credential and previous credential only to the bound trusted regional executor over HTTPS. Stable immutable operations, scoped idempotency, token identity, lease epoch/hash/expiry and current desired revision fence retries and uncertain results. Claims expire; no administrative password is supplied. Failed results accept only `ownership_mismatch`, `spec_conflict` or `credential_verification_failed` with a null observation. Unknown transport, TLS or operator outcomes remain deferred rather than becoming guessed failures.
 
 Operator verifier selection fixes `verifierNamespace` independently of Pod labels.

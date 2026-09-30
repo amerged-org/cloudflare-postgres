@@ -179,6 +179,29 @@ collector activation after node loss, complete/final accounting, runtime
 enforcement, PostgreSQL backup/PITR and the remaining M1–M8 gates stay open.
 Closed customer admission and held qualifications remain unchanged.
 
+## Organization integration-token source checkpoint
+
+The [organization API-token contract](docs/contracts/organization-api-tokens-v1.md)
+adds installation-operated scoped issuance, metadata history and selective
+revocation. Stable caller UUIDs and purpose-separated credential derivation
+recover committed replies without duplicating authority or rewriting digests.
+The existing three scopes and token tables are reused; legacy emergency reissue
+retains its behavior. Metadata and normal authentication do not depend on the
+issuance master. Key recovery does not yet prove API replay-key completeness.
+
+Exactly three meaningful Worker stories fail first and pass the first
+implementation candidate, including actual scope use, uncertain writes,
+historical replay and selective revocation before a streamed project commit.
+Named checks and independent source review pass. The one frozen canonical gate
+passes format, lint, typecheck and all 49 Worker cases, then stops because three
+unchanged Node cases lack the compiled entry in the fresh worktree. One build
+and only that named test file pass with the frozen source unchanged: all 60 Node
+cases now have evidence, retaining six unchanged Go cases. The initial stop
+remains recorded; no second full gate runs. Public delivery and Dev qualification
+are pending. This independent
+management capability does not resume held SDK, capacity, signing, physical
+backup/native access or scheduled control-backup work. Admission remains closed.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.

@@ -12,6 +12,7 @@ import { resizeRoutes } from "./resize";
 import { suspendRoutes } from "./suspend";
 import { deletionRoutes } from "./environment-deletion";
 import { providerInventoryRoute } from "./provider-inventory";
+import { organizationTokenRoutes } from "./organization-tokens";
 import {
   executionReads,
   projectFromRow,
@@ -794,6 +795,8 @@ export default {
   async fetch(request, env): Promise<Response> {
     const archiveResponse = await usageArchiveRoutes(request, env);
     if (archiveResponse) return archiveResponse;
+    const tokenResponse = await organizationTokenRoutes(request, env);
+    if (tokenResponse) return tokenResponse;
     const providerResponse = await providerInventoryRoute(request, env);
     if (providerResponse) return providerResponse;
     const deletionResponse = await deletionRoutes(request, env);
