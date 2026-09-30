@@ -226,7 +226,21 @@ Named rendering and independent scope/network reviews pass. Fresh read-only
 inventory finds 30 Running Pods, five claims/six volumes, sufficient request and
 physical storage headroom, and the original SQL markers and unchanged 4,096-fact
 outbox. The first uint64-string capacity parser stop is retained and corrected
-without provider mutation. The actual PostgreSQL exercise is not yet dispatched.
+without provider mutation. The corrected native admission preview passes after replacing the rejected
+1-GB maximum with 96 MB and an explicitly run-owned, immediately reserved
+replication slot. The one actual attempt stops before SQL in 28.352 seconds:
+PostgreSQL becomes Ready while its CEP still reports `waiting-for-identity`.
+The immediate endpoint assertion does not wait for that independent readiness.
+Initial metadata-only cleanup also refuses `namespace_inventory_incomplete`.
+A separately reviewed safety cleanup removes only the two captured namespace
+UIDs and four fresh Delete-class volumes, restores exact physical VG capacity
+and removes the fixture class. Independent final readback preserves all original
+30 Pod identities/restarts, six volumes/five claims, SQL markers and the exact
+4,096-fact journal. No seed/producer SQL, replication-slot creation, volume
+expansion or WAL failure is observed. The next bounded preparation correction
+must wait for actual endpoint readiness and use the verified ordinary inventory
+shape for cleanup; no qualifier is automatically repeated. The [incident record](docs/evidence/m4-postgres-wal-preparation-stop-2026-09-30.md)
+retains both failures and restored state.
 A preventive CNPG shutdown is inconclusive without actual WAL ENOSPC; cleanup
 requires only-owned UID guards and original physical-group capacity restoration.
 These assets neither rerun the previous filesystem proof nor resume held native,
