@@ -94,6 +94,18 @@ Positive owned stopping, physical completion, nonempty-seal restart/node-loss
 custody, full CoreV1Api transport, production memory, funded expiry and final
 accounting remain open. No held physical qualifier is resumed.
 
+The [provisioning authority checkpoint](docs/evidence/m3-provisioning-authority-2026-09-30.md)
+closes a concrete claim/renew/result authorization race: regional token reissue
+during body delivery previously allowed an authenticated but revoked request
+to mutate provisioning. Current token/region authority now guards the atomic
+effects and readback/replay. New leases bind the existing actor-ID column;
+legacy NULL-actor renewal/recovery remains explicit without ownership inference.
+Three real streamed-body cases fail first and pass on correction attempt one.
+The one frozen full gate passes 39 Worker and 58 Node cases. Schema/wire and
+empty-poll behavior are unchanged; Dev delivery follows. Logical-project
+creation's similar unfenced write, pre-compute funding, independent signed
+expiry and physical pilot/production acceptance remain open.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.

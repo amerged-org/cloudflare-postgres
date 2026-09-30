@@ -136,6 +136,7 @@ interface ExecutionRow {
   region_id: string;
   kind: string;
   status: string;
+  lease_actor_token_id: string | null;
   lease_token_hash: string | null;
   lease_epoch: number;
   lease_expires_at: string | null;
@@ -1437,19 +1438,49 @@ function leaseToken(): string {
   );
 }
 
+async function provisioningActor(
+  request: Request,
+  db: Database,
+  regionId: string,
+  scope: "operations:claim" | "operations:report",
+): Promise<Actor | Response> {
+  const actor = await authorize(request, db, "region", regionId, scope);
+  // Preserve the original provisioning routes' disabled-region response.
+  return actor instanceof Response && actor.status === 409
+    ? error(403, "region_disabled")
+    : actor;
+}
+
+function provisioningAuthority(actor: Actor): string {
+  return `${actorPredicate(actor)} AND EXISTS (SELECT 1 FROM regions g WHERE g.id=? AND g.status<>'disabled')`;
+}
+
+function provisioningAuthorityBindings(actor: Actor): string[] {
+  return [...actorBindings(actor), actor.ownerId];
+}
+
+async function provisioningConflict(
+  request: Request,
+  db: Database,
+  regionId: string,
+  scope: "operations:claim" | "operations:report",
+): Promise<Response> {
+  const actor = await provisioningActor(request, db, regionId, scope);
+  return actor instanceof Response ? actor : error(409, "lease_conflict");
+}
+
 async function claimOperation(
   request: Request,
   db: Database,
   regionId: string,
 ): Promise<Response> {
-  const denied = await scopedAuth(
+  const actor = await provisioningActor(
     request,
     db,
     regionId,
-    "region",
     "operations:claim",
   );
-  if (denied) return denied;
+  if (actor instanceof Response) return actor;
   const input = await body(request);
   if (!object(input, ["leaseSeconds"]) || !integer(input.leaseSeconds, 30, 300))
     return error(400, "invalid_request");
@@ -1464,51 +1495,86 @@ async function claimOperation(
     written = await db.batch<ExecutionRow>([
       db
         .prepare(
-          `UPDATE operations SET status = 'running', lease_token_hash = ?, lease_epoch = lease_epoch + 1, lease_expires_at = ?
+          `UPDATE operations SET status = 'running', lease_actor_token_id=?, lease_token_hash = ?, lease_epoch = lease_epoch + 1, lease_expires_at = ?
           WHERE id = (SELECT candidate.id FROM operations candidate JOIN environments e ON e.id=candidate.environment_id
             WHERE candidate.region_id = ? AND candidate.kind = 'environment.create'
             AND (candidate.status = 'queued' OR (candidate.status = 'running' AND candidate.lease_expires_at <= ?))
             AND ${environmentNotDeleting("e")} ORDER BY candidate.created_at, candidate.id LIMIT 1)
           AND region_id = ? AND kind = 'environment.create' AND (status = 'queued' OR (status = 'running' AND lease_expires_at <= ?))
-          AND EXISTS (SELECT 1 FROM environments e WHERE e.id=operations.environment_id AND ${environmentNotDeleting("e")}) RETURNING *`,
+          AND EXISTS (SELECT 1 FROM environments e WHERE e.id=operations.environment_id AND ${environmentNotDeleting("e")})
+          AND ${provisioningAuthority(actor)} RETURNING *`,
         )
-        .bind(hash, expiresAt, regionId, now, regionId, now),
+        .bind(
+          actor.id,
+          hash,
+          expiresAt,
+          regionId,
+          now,
+          regionId,
+          now,
+          ...provisioningAuthorityBindings(actor),
+        ),
       db
         .prepare(
           `INSERT INTO accounting_assertions (id, ok)
           SELECT ?, CASE WHEN EXISTS (SELECT 1 FROM environments e WHERE e.id=o.environment_id AND ${environmentNotDeleting("e")}) THEN 1 ELSE 0 END
-          FROM operations o WHERE o.lease_token_hash=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'`,
+          FROM operations o WHERE o.lease_actor_token_id=? AND o.lease_token_hash=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'
+          AND ${provisioningAuthority(actor)}`,
         )
-        .bind(crypto.randomUUID(), hash, regionId),
+        .bind(
+          crypto.randomUUID(),
+          actor.id,
+          hash,
+          regionId,
+          ...provisioningAuthorityBindings(actor),
+        ),
       db
         .prepare(
           `UPDATE environments AS e SET status = 'provisioning'
-          WHERE e.id IN (SELECT environment_id FROM operations WHERE lease_token_hash = ? AND region_id = ? AND status = 'running')
-          AND ${environmentNotDeleting("e")}`,
+          WHERE e.id IN (SELECT environment_id FROM operations WHERE lease_actor_token_id=? AND lease_token_hash = ? AND region_id = ? AND kind='environment.create' AND status = 'running')
+          AND ${environmentNotDeleting("e")} AND ${provisioningAuthority(actor)}`,
         )
-        .bind(hash, regionId),
+        .bind(
+          actor.id,
+          hash,
+          regionId,
+          ...provisioningAuthorityBindings(actor),
+        ),
     ]);
   } catch {
-    return error(409, "lease_conflict");
+    return provisioningConflict(request, db, regionId, "operations:claim");
   }
   const operation = written[0]!.results[0];
-  if (!operation) return json({ claim: null });
+  if (!operation) {
+    const currentActor = await provisioningActor(
+      request,
+      db,
+      regionId,
+      "operations:claim",
+    );
+    return currentActor instanceof Response
+      ? currentActor
+      : json({ claim: null });
+  }
   const environment = await db
     .prepare(
       `SELECT e.* FROM environments e JOIN operations o ON o.environment_id=e.id
-      WHERE e.id=? AND o.id=? AND o.region_id=? AND o.status='running' AND o.lease_token_hash=? AND o.lease_epoch=?
-      AND o.lease_expires_at=? AND ${environmentNotDeleting("e")}`,
+      WHERE e.id=? AND o.id=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running' AND o.lease_actor_token_id=? AND o.lease_token_hash=? AND o.lease_epoch=?
+      AND o.lease_expires_at=? AND ${environmentNotDeleting("e")} AND ${provisioningAuthority(actor)}`,
     )
     .bind(
       operation.environment_id,
       operation.id,
       regionId,
+      actor.id,
       hash,
       operation.lease_epoch,
       expiresAt,
+      ...provisioningAuthorityBindings(actor),
     )
     .first<EnvironmentRow>();
-  if (!environment) return error(409, "lease_conflict");
+  if (!environment)
+    return provisioningConflict(request, db, regionId, "operations:claim");
   return json({
     claim: {
       operationId: operation.id,
@@ -1541,14 +1607,13 @@ async function renewOperation(
   regionId: string,
   operationId: string,
 ): Promise<Response> {
-  const denied = await scopedAuth(
+  const actor = await provisioningActor(
     request,
     db,
     regionId,
-    "region",
     "operations:claim",
   );
-  if (denied) return denied;
+  if (actor instanceof Response) return actor;
   const input = await body(request);
   if (
     !object(input, ["leaseToken", "leaseEpoch", "leaseSeconds"]) ||
@@ -1563,46 +1628,73 @@ async function renewOperation(
   const leaseHash = await sha256(input.leaseToken as string);
   let updated: unknown;
   try {
+    // Pre-existing provisioning leases have no recorded actor. Preserve their
+    // exact lease/epoch under current regional authority without inferring an
+    // owner; every newly claimed or reclaimed lease is bound to actor.id.
     const written = await db.batch([
       assertion(
         db,
         `EXISTS (SELECT 1 FROM operations o JOIN environments e ON e.id=o.environment_id
         WHERE o.id=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'
-        AND o.lease_token_hash=? AND o.lease_epoch=? AND o.lease_expires_at>? AND ${environmentNotDeleting("e")})`,
-        [operationId, regionId, leaseHash, input.leaseEpoch as number, now],
+        AND (o.lease_actor_token_id IS NULL OR o.lease_actor_token_id=?)
+        AND o.lease_token_hash=? AND o.lease_epoch=? AND o.lease_expires_at>? AND ${environmentNotDeleting("e")}
+        AND ${provisioningAuthority(actor)})`,
+        [
+          operationId,
+          regionId,
+          actor.id,
+          leaseHash,
+          input.leaseEpoch as number,
+          now,
+          ...provisioningAuthorityBindings(actor),
+        ],
       ),
       db
         .prepare(
           `UPDATE operations SET lease_expires_at = ? WHERE id = ? AND region_id = ? AND kind = 'environment.create'
+          AND (lease_actor_token_id IS NULL OR lease_actor_token_id=?)
           AND status = 'running' AND lease_token_hash = ? AND lease_epoch = ? AND lease_expires_at > ?
-          AND EXISTS (SELECT 1 FROM environments e WHERE e.id=operations.environment_id AND ${environmentNotDeleting("e")}) RETURNING id`,
+          AND EXISTS (SELECT 1 FROM environments e WHERE e.id=operations.environment_id AND ${environmentNotDeleting("e")})
+          AND ${provisioningAuthority(actor)} RETURNING id`,
         )
         .bind(
           expiresAt,
           operationId,
           regionId,
+          actor.id,
           leaseHash,
           input.leaseEpoch,
           now,
+          ...provisioningAuthorityBindings(actor),
         ),
       assertion(db, "changes()=1"),
     ]);
     updated = written[1]!.results[0];
   } catch {
-    return error(409, "lease_conflict");
+    return provisioningConflict(request, db, regionId, "operations:claim");
   }
   if (updated)
     updated = await db
       .prepare(
         `SELECT o.id FROM operations o JOIN environments e ON e.id=o.environment_id
         WHERE o.id=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'
-        AND o.lease_token_hash=? AND o.lease_epoch=? AND o.lease_expires_at=? AND ${environmentNotDeleting("e")}`,
+        AND (o.lease_actor_token_id IS NULL OR o.lease_actor_token_id=?)
+        AND o.lease_token_hash=? AND o.lease_epoch=? AND o.lease_expires_at=? AND ${environmentNotDeleting("e")}
+        AND ${provisioningAuthority(actor)}`,
       )
-      .bind(operationId, regionId, leaseHash, input.leaseEpoch, expiresAt)
+      .bind(
+        operationId,
+        regionId,
+        actor.id,
+        leaseHash,
+        input.leaseEpoch,
+        expiresAt,
+        ...provisioningAuthorityBindings(actor),
+      )
       .first();
   return updated
     ? json({ leaseExpiresAt: expiresAt })
-    : error(409, "lease_conflict");
+    : provisioningConflict(request, db, regionId, "operations:claim");
 }
 
 async function reportResult(
@@ -1611,14 +1703,13 @@ async function reportResult(
   regionId: string,
   operationId: string,
 ): Promise<Response> {
-  const denied = await scopedAuth(
+  const actor = await provisioningActor(
     request,
     db,
     regionId,
-    "region",
     "operations:report",
   );
-  if (denied) return denied;
+  if (actor instanceof Response) return actor;
   const input = await body(request, 16_384);
   if (
     !object(input, [
@@ -1668,11 +1759,19 @@ async function reportResult(
   if (!ready && !failed) return error(400, "invalid_request");
   const environment = await db
     .prepare(
-      "SELECT e.* FROM environments AS e JOIN operations AS o ON o.environment_id = e.id WHERE o.id = ? AND o.region_id = ?",
+      `SELECT e.* FROM environments AS e JOIN operations AS o ON o.environment_id=e.id
+      WHERE o.id=? AND o.region_id=? AND o.kind='environment.create'
+      AND (o.lease_actor_token_id IS NULL OR o.lease_actor_token_id=?) AND ${provisioningAuthority(actor)}`,
     )
-    .bind(operationId, regionId)
+    .bind(
+      operationId,
+      regionId,
+      actor.id,
+      ...provisioningAuthorityBindings(actor),
+    )
     .first<EnvironmentRow>();
-  if (!environment) return error(409, "lease_conflict");
+  if (!environment)
+    return provisioningConflict(request, db, regionId, "operations:report");
   const profile = (JSON.parse(environment.resolved_spec) as ResolvedSpec)
     .profile;
   if (
@@ -1753,9 +1852,20 @@ async function reportResult(
   const terminalResult = () =>
     db
       .prepare(
-        "SELECT * FROM operations WHERE id = ? AND region_id = ? AND kind='environment.create' AND lease_token_hash = ? AND lease_epoch = ? AND result_hash = ? AND status IN ('succeeded', 'failed')",
+        `SELECT * FROM operations WHERE id=? AND region_id=? AND kind='environment.create'
+        AND (lease_actor_token_id IS NULL OR lease_actor_token_id=?)
+        AND lease_token_hash=? AND lease_epoch=? AND result_hash=? AND status IN ('succeeded','failed')
+        AND ${provisioningAuthority(actor)}`,
       )
-      .bind(operationId, regionId, leaseHash, input.leaseEpoch, resultHash)
+      .bind(
+        operationId,
+        regionId,
+        actor.id,
+        leaseHash,
+        input.leaseEpoch,
+        resultHash,
+        ...provisioningAuthorityBindings(actor),
+      )
       .first<ExecutionRow>();
   // Exact terminal replay is historical recovery, not a fresh publication or
   // authority to rewrite the environment after its deletion was accepted.
@@ -1767,15 +1877,27 @@ async function reportResult(
           db,
           `EXISTS (SELECT 1 FROM operations o JOIN environments e ON e.id=o.environment_id
           WHERE o.id=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'
-          AND o.lease_token_hash=? AND o.lease_epoch=? AND o.lease_expires_at>? AND ${environmentNotDeleting("e")})`,
-          [operationId, regionId, leaseHash, input.leaseEpoch as number, now],
+          AND (o.lease_actor_token_id IS NULL OR o.lease_actor_token_id=?)
+          AND o.lease_token_hash=? AND o.lease_epoch=? AND o.lease_expires_at>? AND ${environmentNotDeleting("e")}
+          AND ${provisioningAuthority(actor)})`,
+          [
+            operationId,
+            regionId,
+            actor.id,
+            leaseHash,
+            input.leaseEpoch as number,
+            now,
+            ...provisioningAuthorityBindings(actor),
+          ],
         ),
         db
           .prepare(
             `UPDATE operations SET status = ?, observed_at = ?, result_code = ?, result_hash = ?, observation_json = ?
             WHERE id = ? AND region_id = ? AND kind = 'environment.create' AND status = 'running'
+            AND (lease_actor_token_id IS NULL OR lease_actor_token_id=?)
             AND lease_token_hash = ? AND lease_epoch = ? AND lease_expires_at > ?
-            AND EXISTS (SELECT 1 FROM environments e WHERE e.id=operations.environment_id AND ${environmentNotDeleting("e")})`,
+            AND EXISTS (SELECT 1 FROM environments e WHERE e.id=operations.environment_id AND ${environmentNotDeleting("e")})
+            AND ${provisioningAuthority(actor)}`,
           )
           .bind(
             ready ? "succeeded" : "failed",
@@ -1785,9 +1907,11 @@ async function reportResult(
             JSON.stringify(observation),
             operationId,
             regionId,
+            actor.id,
             leaseHash,
             input.leaseEpoch,
             now,
+            ...provisioningAuthorityBindings(actor),
           ),
         assertion(db, "changes()=1"),
         db
@@ -1795,7 +1919,9 @@ async function reportResult(
             `UPDATE environments AS e SET status = ?, observed_at = (SELECT observed_at FROM operations WHERE id = ?),
             observation_json = (SELECT observation_json FROM operations WHERE id = ?) WHERE e.id = ?
             AND ${environmentNotDeleting("e")} AND EXISTS (SELECT 1 FROM operations WHERE id = ? AND region_id = ?
-            AND lease_token_hash = ? AND lease_epoch = ? AND result_hash = ? AND status IN ('succeeded', 'failed'))`,
+            AND kind='environment.create' AND (lease_actor_token_id IS NULL OR lease_actor_token_id=?)
+            AND lease_token_hash = ? AND lease_epoch = ? AND result_hash = ? AND status IN ('succeeded', 'failed'))
+            AND ${provisioningAuthority(actor)}`,
           )
           .bind(
             input.status,
@@ -1804,9 +1930,11 @@ async function reportResult(
             environment.id,
             operationId,
             regionId,
+            actor.id,
             leaseHash,
             input.leaseEpoch,
             resultHash,
+            ...provisioningAuthorityBindings(actor),
           ),
         assertion(db, "changes()=1"),
       ]);
@@ -1816,14 +1944,29 @@ async function reportResult(
     }
     operation = await terminalResult();
   }
-  if (!operation) return error(409, "lease_conflict");
+  if (!operation)
+    return provisioningConflict(request, db, regionId, "operations:report");
   const observedEnvironment = await db
     .prepare(
-      `SELECT e.*,${deletionReadColumns} FROM environments e ${deletionReadJoins("e")} WHERE e.id = ?`,
+      `SELECT e.*,${deletionReadColumns} FROM environments e ${deletionReadJoins("e")}
+      JOIN operations o ON o.environment_id=e.id WHERE e.id=? AND o.id=? AND o.region_id=?
+      AND o.kind='environment.create' AND (o.lease_actor_token_id IS NULL OR o.lease_actor_token_id=?)
+      AND o.lease_token_hash=? AND o.lease_epoch=? AND o.result_hash=? AND o.status IN ('succeeded','failed')
+      AND ${provisioningAuthority(actor)}`,
     )
-    .bind(environment.id)
+    .bind(
+      environment.id,
+      operationId,
+      regionId,
+      actor.id,
+      leaseHash,
+      input.leaseEpoch,
+      resultHash,
+      ...provisioningAuthorityBindings(actor),
+    )
     .first<EnvironmentRow>();
-  if (!observedEnvironment) return error(500, "state_inconsistent");
+  if (!observedEnvironment)
+    return provisioningConflict(request, db, regionId, "operations:report");
   return json({
     operation: publicOperation(operation),
     environment: publicEnvironment(observedEnvironment),

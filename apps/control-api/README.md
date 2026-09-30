@@ -273,6 +273,20 @@ The [regional controller](../regional-controller/README.md) uses its region toke
 2. `POST /v1/regions/{regionId}/operations/{operationId}/renew` with `leaseToken`, `leaseEpoch`, and `leaseSeconds` extends an unexpired current lease. An expired or replaced epoch returns `409 lease_conflict`.
 3. `POST /v1/regions/{regionId}/operations/{operationId}/result` submits `leaseToken`, `leaseEpoch`, `status`, `resultCode`, and `observation`. A ready result uses `status: ready`, `resultCode: cnpg_ready`, and `{ clusterUid, clusterGeneration, readyInstances }`; the count must reach the frozen profile's instance count. A failed result uses `status: failed`, `observation: null`, and `ownership_mismatch`, `spec_conflict`, or `reconcile_failed`. The operation and environment transition together in a conditional D1 batch. Stale, expired, and cross-region results cannot complete it. The identical terminal result under the same winning lease can be retried after a lost response; changing that result is a conflict.
 
+Provisioning mutations and their readback/replay require current regional token
+identity, owner, scope and an enabled region. Token revocation during request-body
+delivery cannot issue or extend a lease, publish a result, or disclose its
+observation. Newly claimed or reclaimed leases bind the exact token ID; rotating
+that token does not transfer its lease to the replacement. Replacement credentials
+wait for unchanged lease expiry before reclaim. Historical provisioning leases
+whose actor ID is null retain exact lease/epoch/deadline handling under current
+regional authorization, including exact terminal recovery; no legacy owner is
+inferred or backfilled. An authorized same-region executor can still renew an
+unexpired legacy lease normally; reclaim records the new actor identity. These
+checks govern API authority, not immediate physical termination of work already
+authorized under an earlier valid lease. Empty claim polling persists no
+accounting guard row.
+
 The Worker trusts the authenticated executor's Kubernetes observations and does not independently probe Kubernetes. An executor must verify immutable ownership/spec identity, current CNPG generation, and actual owned PostgreSQL Pod readiness before reporting success. A controller restart or uncertain Kubernetes create must reconcile deterministic environment resources instead of creating another namespace. Private claims contain internal configuration and must not be returned to customer clients or written to public logs. A ready result issues no credentials or public endpoint; an opted-in native profile can supply separately discoverable private endpoint metadata.
 
 ## Usage ledger and exports
