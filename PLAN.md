@@ -117,7 +117,14 @@ units. The winning lease obtains one immutable operation-bound reservation;
 private bootstrap custody, replay and fresh effect/ready checks prevent unfunded
 dispatch by that maintained path. Two new causal stories fail first and pass;
 the one frozen gate passes 40 Worker and 59 Node cases. No schema, new secret,
-invoice or independent enforcement is introduced. Dev delivery follows. Other
+invoice or independent enforcement is introduced. The Dev Worker and sealed
+74-module regional image are delivered; the shared package and new empty private
+journal directory match readback. Complete off-node usage snapshot custody,
+4,096 pending facts, existing workloads/storage/SQL, eight Worker Secrets and
+budget/control counts remain preserved, with admission closed. One exact
+automatic ServiceAccount-projection checker correction retains its original
+stop and qualifies the same empty installation. No managed environment or
+positive funding request is created. Other
 privileged writers/API Ready are not universal funding gates; signed workload
 injection, renewal, actual ceilings, expired-hold settlement, physical stopping,
 recovery and all held qualifications remain required before customer admission.
