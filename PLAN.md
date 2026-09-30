@@ -184,6 +184,18 @@ Both unauthenticated credential routes refuse access without password reads.
 This is a point-in-time secrecy boundary, not runtime enforcement or production
 acceptance. All held backup/signing/native/admission qualifications remain held.
 
+The [signed native-window continuation](docs/evidence/m6-signed-window-native-2026-10-01.md)
+now closes the standalone Linux startup/lifecycle failure with the unchanged
+candidate binary. Exact private diagnostics locate a fixture owner-stat mismatch;
+Linux-native custody volumes preserve every production check. An external
+response transport then passes delayed signed startup, original-anchor process
+expiry and old-nonce restart refusal in 16.093 seconds with complete local cleanup.
+Prior failures remain retained; there are no new stories or broad gate reruns.
+The candidate remains outside mainline runtime pending current integration;
+installation keys, CNPG injection/coverage, capacity reservation, funded renewal,
+usage-queue resolution and ordinary API commissioning remain open. The historical
+two-attempt stop above no longer describes the current local lifecycle result.
+
 ## Automatic usage-journal R2 custody checkpoint
 
 The [custody checkpoint](docs/evidence/m3-usage-journal-r2-custody-2026-09-30.md)
