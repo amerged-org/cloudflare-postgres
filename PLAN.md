@@ -179,7 +179,7 @@ collector activation after node loss, complete/final accounting, runtime
 enforcement, PostgreSQL backup/PITR and the remaining M1–M8 gates stay open.
 Closed customer admission and held qualifications remain unchanged.
 
-## Organization integration-token source checkpoint
+## Organization integration-token source and Dev checkpoint
 
 The [organization API-token contract](docs/contracts/organization-api-tokens-v1.md)
 adds installation-operated scoped issuance, metadata history and selective
@@ -197,8 +197,18 @@ passes format, lint, typecheck and all 49 Worker cases, then stops because three
 unchanged Node cases lack the compiled entry in the fresh worktree. One build
 and only that named test file pass with the frozen source unchanged: all 60 Node
 cases now have evidence, retaining six unchanged Go cases. The initial stop
-remains recorded; no second full gate runs. Public delivery and Dev qualification
-are pending. This independent
+remains recorded; no second full gate runs. Runtime source `15355c5099edecce87718507c79a6ee118f74a54` is public and
+runs at 100% Dev traffic. The first live qualification discovers Cloudflare's
+empty DELETE stream representation. The same existing revoke story fails first
+with that wire shape, passes its one correction, and the new wire-fix candidate
+passes its one full gate (49 Worker/60 Node) in 56.638 seconds without adding cases.
+A same-resource live continuation passes in 8.350 seconds: exact replay, scoped
+use/refusal, redacted metadata and selective revocation are observed. Both probe
+tokens are revoked; the original token remains active. One logical test project
+is retained, with no managed environment. All other table counts, 18 migrations,
+nine Secret names and closed admission are preserved. The initial gate and live
+failure remain recorded; the [delivery evidence](docs/evidence/m3-organization-api-tokens-2026-09-30.md)
+distinguishes the separate correction from the original candidate. This independent
 management capability does not resume held SDK, capacity, signing, physical
 backup/native access or scheduled control-backup work. Admission remains closed.
 

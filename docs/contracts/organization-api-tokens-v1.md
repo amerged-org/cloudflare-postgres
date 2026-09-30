@@ -1,6 +1,6 @@
 # Organization API tokens v1
 
-Status: source qualified; Dev qualification pending. This extends organization management with
+Status: implemented and qualified in Dev. This extends organization management with
 installation-operated, scoped integration credentials. It adds no customer
 billing, identity-provider integration, project-specific privileges or schema.
 
@@ -30,6 +30,10 @@ returns the same metadata and original timestamp. Other organization credentials
 continue working. To rotate one integration, issue a new UUID with its exact
 scope set, verify its use, then revoke the previous UUID. No automatic replay
 resurrects a revoked credential or changes an existing scope set.
+
+Item operations permit an absent body or a present stream that immediately ends
+without data. This covers Cloudflare's actual empty `DELETE` representation;
+nonempty payloads and item query parameters are refused before token access.
 
 All responses use `Cache-Control: no-store`. Missing/wrong-parent resources are
 `404`; invalid bodies, duplicate/unknown scopes and malformed pagination are
