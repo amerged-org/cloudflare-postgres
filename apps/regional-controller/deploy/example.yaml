@@ -228,6 +228,10 @@ spec:
                   key: region-id
             - name: PGCF_REGIONAL_CONFIG_FILE
               value: /etc/pgcf/config.json
+            # The trusted installer must first prepare this owned 0700 sibling
+            # on the persistent journal volume; never chmod/reuse usage custody.
+            - name: PGCF_PROVISIONING_JOURNAL_DIRECTORY
+              value: /var/lib/pgcf/provisioning
             # Opt in only after installation archive qualification:
             # - name: PGCF_MANUAL_BACKUPS_ENABLED
             #   value: "true"

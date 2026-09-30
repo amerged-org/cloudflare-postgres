@@ -426,27 +426,72 @@ Lists reuse the collector's existing bounded pagination, stable resourceVersion 
 
 This is a point observation, not a maintenance authorization or a transaction across Kubernetes lists. SQL, backup/restore, replication, etcd, spare capacity, tenant isolation, image signatures/runtime images, effective values, Flux binary identity and fresh Node heartbeat/reachability remain explicitly unverified. Prometheus/Alertmanager/OpenTelemetry, lifecycle maintenance and operational recovery qualification remain required work in PLAN.md.
 
+## Funding before environment provisioning
+
+The default `environment.create` executor obtains a server-derived, durable
+allowance before any Kubernetes creation. Configure
+`PGCF_PROVISIONING_JOURNAL_DIRECTORY` with an existing absolute, owner-private
+mode-0700 directory on persistent storage, for example
+`/var/lib/pgcf/provisioning`. The operator prepares this directory without changing
+existing journal permissions. Symlink paths, changed directory/file identities,
+unsafe modes and missing custody fail closed. No temporary directory is used.
+The deployment example wires this sibling directory but does not create it;
+the trusted installer must prepare it before enabling that setting. Do not
+reuse or change the existing usage journal directory.
+An omitted setting preserves empty-queue startup compatibility; a claimed create
+cannot make Kubernetes effects or publish readiness without it.
+
+The separate bootstrap journal binds the create operation, environment, region,
+immutable specification and initial run epoch. It durably seals a fixed
+300-second funding request before HTTP, using the create operation UUID as the
+reservation request identity. An uncertain response is retried with that same
+identity and horizon under the new current operation lease. A reclaimed lease
+without prior local request custody is refused even though the server also
+deduplicates the operation. An expired receipt is retained; it is never replaced,
+renewed or automatically settled.
+
+The server supplies organization/project ownership and derives CPU, memory and
+data-storage units from the same shared resource envelope used for the namespace
+quota. This includes CNPG initialization/maintenance headroom, the archive
+sidecar and any configured Pooler. Receipt and authority are persisted before
+effects. Each creation and ready publication obtains current authority; local
+checks reject paused, unavailable, insufficient, expired or stale authorization
+and clock rollback. The Kubernetes client's final pre-send middleware repeats
+the check after asynchronous authentication and bounds the request deadline by
+remaining authorization. Long readbacks that outlive the 15-second authority
+snapshot defer conservatively.
+
+This is a pre-dispatch funding barrier, not an independent physical runtime
+expiry guard. A quota ceiling does not prove fleet capacity, actual PV sizes,
+complete usage or final settlement. The existing UID-bound `AllowanceJournal`
+and runtime supervisor retain their separate custody requirements. Held receipts
+remain held after uncertain/partial creation; normal accounting and recovery
+must preserve them. Budget resources continue to report `runtimeEnforced: false`.
+Runtime enforcement, positive installation qualification and physical stop/usage
+completion remain required before customer admission.
+
 ## Operator configuration
 
 Build with Node.js 24 or newer and `pnpm --filter @cloudflare-postgres/regional-controller build`. The production Dockerfile pins Node 24.21.0; local Node 24.6 executions are provisional tooling evidence and do not establish the pinned image's SQLite/runtime behavior. Supply:
 
-| Variable                           | Meaning                                                                                                                                           |
-| ---------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PGCF_CONTROL_ORIGIN`              | HTTPS origin of the adopter's control API, without path or credentials.                                                                           |
-| `PGCF_REGION_ID`                   | Region ID registered by the installation operator.                                                                                                |
-| `PGCF_REGION_TOKEN_FILE`           | Preferred: a mounted owner-readable file containing only the region-scoped API token.                                                             |
-| `PGCF_REGION_TOKEN`                | Alternative token source for a supervised process; file takes precedence.                                                                         |
-| `PGCF_REGIONAL_CONFIG_FILE`        | File containing the nonsecret JSON configuration below.                                                                                           |
-| `PGCF_KUBECONFIG_FILE`             | Explicit kubeconfig for local execution. Otherwise require in-cluster authentication; the user's default kubeconfig is never selected implicitly. |
-| `PGCF_LEASE_SECONDS`               | 30–300, default 90.                                                                                                                               |
-| `PGCF_POLL_MILLISECONDS`           | 1,000–60,000, default 5,000.                                                                                                                      |
-| `PGCF_READINESS_MILLISECONDS`      | 30,000–600,000, default 300,000; expiry defers the operation for reclaim.                                                                         |
-| `PGCF_USAGE_JOURNAL_PATH`          | Enables metering; an owner-private, persistent SQLite file such as `/var/lib/pgcf/usage/journal.sqlite`.                                          |
-| `PGCF_USAGE_SOURCE_ID`             | Nonsecret source UUID returned by the installation-only regional usage-token bootstrap.                                                           |
-| `PGCF_USAGE_SOURCE_EPOCH`          | Positive safe integer source epoch returned with that source ID.                                                                                  |
-| `PGCF_METER_TOKEN_FILE`            | Mounted file containing the separate `cpmtr_...` token with `usage:write`; no metering token environment fallback exists.                         |
-| `PGCF_USAGE_SAMPLE_MILLISECONDS`   | 1,000–30,000, default 5,000; delay between bounded inventory samples.                                                                             |
-| `PGCF_USAGE_DELIVERY_MILLISECONDS` | 1,000–60,000, default 5,000; delay between outbox delivery passes.                                                                                |
+| Variable                              | Meaning                                                                                                                                               |
+| ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PGCF_CONTROL_ORIGIN`                 | HTTPS origin of the adopter's control API, without path or credentials.                                                                               |
+| `PGCF_REGION_ID`                      | Region ID registered by the installation operator.                                                                                                    |
+| `PGCF_REGION_TOKEN_FILE`              | Preferred: a mounted owner-readable file containing only the region-scoped API token.                                                                 |
+| `PGCF_REGION_TOKEN`                   | Alternative token source for a supervised process; file takes precedence.                                                                             |
+| `PGCF_REGIONAL_CONFIG_FILE`           | File containing the nonsecret JSON configuration below.                                                                                               |
+| `PGCF_KUBECONFIG_FILE`                | Explicit kubeconfig for local execution. Otherwise require in-cluster authentication; the user's default kubeconfig is never selected implicitly.     |
+| `PGCF_LEASE_SECONDS`                  | 30–300, default 90.                                                                                                                                   |
+| `PGCF_POLL_MILLISECONDS`              | 1,000–60,000, default 5,000.                                                                                                                          |
+| `PGCF_READINESS_MILLISECONDS`         | 30,000–600,000, default 300,000; expiry defers the operation for reclaim.                                                                             |
+| `PGCF_PROVISIONING_JOURNAL_DIRECTORY` | Existing owner-private mode-0700 persistent directory for mandatory pre-provisioning funding custody. Missing configuration refuses claimed creation. |
+| `PGCF_USAGE_JOURNAL_PATH`             | Enables metering; an owner-private, persistent SQLite file such as `/var/lib/pgcf/usage/journal.sqlite`.                                              |
+| `PGCF_USAGE_SOURCE_ID`                | Nonsecret source UUID returned by the installation-only regional usage-token bootstrap.                                                               |
+| `PGCF_USAGE_SOURCE_EPOCH`             | Positive safe integer source epoch returned with that source ID.                                                                                      |
+| `PGCF_METER_TOKEN_FILE`               | Mounted file containing the separate `cpmtr_...` token with `usage:write`; no metering token environment fallback exists.                             |
+| `PGCF_USAGE_SAMPLE_MILLISECONDS`      | 1,000–30,000, default 5,000; delay between bounded inventory samples.                                                                                 |
+| `PGCF_USAGE_DELIVERY_MILLISECONDS`    | 1,000–60,000, default 5,000; delay between outbox delivery passes.                                                                                    |
 
 Example configuration, with deployment-specific operator Pod labels and an explicit allowed source Secret reference:
 

@@ -14,10 +14,12 @@ export class AllowanceProtocolError extends Error {
 }
 export class AllowanceClient implements AllowanceTransport {
   private readonly origin: string;
+  private readonly regionId: string;
+  private readonly readToken: () => Promise<string>;
   constructor(
     origin: string,
-    private readonly regionId: string,
-    private readonly readToken: () => Promise<string>,
+    regionId: string,
+    readToken: () => Promise<string>,
   ) {
     const url = new URL(origin);
     if (
@@ -31,6 +33,8 @@ export class AllowanceClient implements AllowanceTransport {
     )
       throw new Error("allowance_client_configuration_invalid");
     this.origin = url.origin;
+    this.regionId = regionId;
+    this.readToken = readToken;
   }
   private async request(
     path: string,

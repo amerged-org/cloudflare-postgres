@@ -217,45 +217,69 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
         throw error;
       }
     },
-    async create(resource) {
+    async create(resource, dispatchAuthority) {
       const namespace = resource.metadata.namespace ?? "";
       const fieldValidation = "Strict";
+      // The generated request factory awaits authentication before this last
+      // pre-send middleware. Revalidate here, not merely before the SDK call.
+      const createOptions: ConfigurationOptions = dispatchAuthority
+        ? {
+            middlewareMergeStrategy: "append",
+            middleware: [
+              {
+                pre(context) {
+                  dispatchAuthority.check();
+                  const remaining = dispatchAuthority.expiresAt() - Date.now();
+                  if (!Number.isSafeInteger(remaining) || remaining <= 0)
+                    throw new Error("provisioning_funding_dispatch_expired");
+                  context.setSignal(
+                    AbortSignal.timeout(Math.min(20_000, remaining)),
+                  );
+                  return new Observable(Promise.resolve(context));
+                },
+                post(context) {
+                  return new Observable(Promise.resolve(context));
+                },
+              },
+            ],
+          }
+        : requestOptions;
       let created: unknown;
       switch (resource.kind) {
         case "ConfigMap":
           created = await core.createNamespacedConfigMap(
             { namespace, body: resource as V1ConfigMap, fieldValidation },
-            requestOptions,
+            createOptions,
           );
           break;
         case "Namespace":
           created = await core.createNamespace(
             { body: resource as V1Namespace, fieldValidation },
-            requestOptions,
+            createOptions,
           );
           break;
         case "ResourceQuota":
           created = await core.createNamespacedResourceQuota(
             { namespace, body: resource as V1ResourceQuota, fieldValidation },
-            requestOptions,
+            createOptions,
           );
           break;
         case "LimitRange":
           created = await core.createNamespacedLimitRange(
             { namespace, body: resource as V1LimitRange, fieldValidation },
-            requestOptions,
+            createOptions,
           );
           break;
         case "Secret":
           created = await core.createNamespacedSecret(
             { namespace, body: resource as V1Secret, fieldValidation },
-            requestOptions,
+            createOptions,
           );
           break;
         case "NetworkPolicy":
           created = await network.createNamespacedNetworkPolicy(
             { namespace, body: resource as V1NetworkPolicy, fieldValidation },
-            requestOptions,
+            createOptions,
           );
           break;
         default: {
@@ -263,7 +287,7 @@ export function kubernetesFromConfig(kubeconfigFile?: string): Kubernetes {
           if (!type) throw new Error("unsupported_resource");
           created = await custom.createNamespacedCustomObject(
             { ...type, namespace, body: resource, fieldValidation },
-            requestOptions,
+            createOptions,
           );
         }
       }

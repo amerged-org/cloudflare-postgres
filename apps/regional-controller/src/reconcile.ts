@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createHash } from "node:crypto";
+import {
+  BARMAN_RESOURCES,
+  cpuQuantity,
+  binaryQuantity,
+  provisioningResourceEnvelope,
+} from "@cloudflare-postgres/resource-envelope";
 import { ReconcileError } from "./types.ts";
 import { observePooler, validPoolingPolicy } from "./pooling.ts";
 import { RUN_EPOCH_ANNOTATION, validRunEpoch } from "./run-epoch.ts";
@@ -40,29 +46,6 @@ const managedLabel = "app.kubernetes.io/managed-by";
 
 function positive(value: number, max: number): boolean {
   return Number.isSafeInteger(value) && value > 0 && value <= max;
-}
-
-function cpuQuantity(milli: number): string {
-  if (milli % 1000 !== 0) return `${milli}m`;
-  let value = milli / 1000;
-  let unit = 0;
-  const units = ["", "k", "M"];
-  while (value % 1000 === 0 && unit < units.length - 1) {
-    value /= 1000;
-    unit += 1;
-  }
-  return `${value}${units[unit]}`;
-}
-
-function binaryQuantity(mebibytes: number): string {
-  let value = mebibytes;
-  let unit = 0;
-  const units = ["Mi", "Gi", "Ti", "Pi"];
-  while (value % 1024 === 0 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value}${units[unit]}`;
 }
 
 function validate(claim: Claim, config: RegionalConfig): void {
@@ -400,7 +383,10 @@ export async function reconcileEnvironment(
   };
   // Reserve one additional instance slot for CNPG initialization/maintenance;
   // this is a hard namespace ceiling, not a claim of spare fleet capacity.
-  const slots = profile.instances + 1;
+  const envelope = provisioningResourceEnvelope({
+    ...profile,
+    volumeGiB: claim.spec.volumeGiB,
+  });
   await ensure(
     api,
     {
@@ -408,29 +394,7 @@ export async function reconcileEnvironment(
       kind: "ResourceQuota",
       metadata: metadata("database-resources", true, true),
       spec: {
-        hard: {
-          "requests.cpu": cpuQuantity(
-            slots * (profile.compute.cpuMilli + 25) +
-              (pooling?.compute.requests.cpuMilli ?? 0),
-          ),
-          "limits.cpu": cpuQuantity(
-            slots * (profile.compute.cpuMilli + 100) +
-              (pooling?.compute.limits.cpuMilli ?? 0),
-          ),
-          "requests.memory": binaryQuantity(
-            slots * (profile.compute.memoryMiB + 64) +
-              (pooling?.compute.requests.memoryMiB ?? 0),
-          ),
-          "limits.memory": binaryQuantity(
-            slots * (profile.compute.memoryMiB + 128) +
-              (pooling?.compute.limits.memoryMiB ?? 0),
-          ),
-          "requests.storage": binaryQuantity(
-            slots * claim.spec.volumeGiB * 1024,
-          ),
-          persistentvolumeclaims: String(slots),
-          pods: String(slots + (pooling ? 1 : 0)),
-        },
+        hard: envelope.quotaHard,
       },
     },
     authorized,
@@ -589,10 +553,7 @@ export async function reconcileEnvironment(
         },
         retentionPolicy: profile.backup.retentionPolicy,
         instanceSidecarConfiguration: {
-          resources: {
-            requests: { cpu: "25m", memory: "64Mi" },
-            limits: { cpu: "100m", memory: "128Mi" },
-          },
+          resources: BARMAN_RESOURCES,
         },
       },
     },

@@ -28,6 +28,19 @@ import type {
 } from "./accounting";
 import type { UsageVersion } from "./usage";
 import { runtimeAuthority } from "./runtime-authority";
+import {
+  actorBindings,
+  actorPredicate,
+  authorize,
+  integer,
+  lease,
+  type Actor as ExecutionActor,
+} from "./execution-auth";
+import {
+  provisioningAllowanceUnits,
+  provisioningResourceEnvelope,
+  type ResourceEnvelopeInput,
+} from "@cloudflare-postgres/resource-envelope";
 
 interface Target {
   id: string;
@@ -104,6 +117,24 @@ interface Link {
 interface Actor {
   id: string;
   token_hash: string;
+}
+interface AllowanceInput {
+  requestId: string;
+  environmentId: string;
+  leaseSeconds: number;
+  units: UnitVector;
+}
+interface FundingScope extends Environment {
+  resolved_spec: string;
+  run_epoch: string | null;
+  operationId: string;
+  actor: ExecutionActor;
+  leaseHash: string;
+  leaseEpoch: number;
+}
+interface FundingContext {
+  scope: FundingScope;
+  requestHash: string;
 }
 const scopes = ["budgets:read", "budgets:write", "usage:read"];
 const now = () => new Date(Date.now()).toISOString();
@@ -698,6 +729,23 @@ async function issueAllowance(
   const units = vector(input.units);
   if (!units || !Object.values(units).some((value) => BigInt(value!) > 0n))
     return error(400, "invalid_request");
+  return reserveAllowance(env, db, regionId, actor, {
+    requestId: input.requestId,
+    environmentId: input.environmentId,
+    leaseSeconds: input.leaseSeconds as number,
+    units,
+  });
+}
+
+async function reserveAllowance(
+  env: AccountingEnv,
+  db: AccountingDb,
+  regionId: string,
+  actor: Actor,
+  input: AllowanceInput,
+  funding?: FundingContext,
+): Promise<Response> {
+  const units = input.units;
   const environment = await db
     .prepare(
       "SELECT id, organization_id, project_id, region_id, spec_revision, spec_hash FROM environments WHERE id = ? AND region_id = ?",
@@ -705,13 +753,15 @@ async function issueAllowance(
     .bind(input.environmentId, regionId)
     .first<Environment>();
   if (!environment) return error(404, "not_found");
-  const requestHash = await sha256(
-    JSON.stringify({
-      environmentId: input.environmentId,
-      leaseSeconds: input.leaseSeconds,
-      units,
-    }),
-  );
+  const requestHash =
+    funding?.requestHash ??
+    (await sha256(
+      JSON.stringify({
+        environmentId: input.environmentId,
+        leaseSeconds: input.leaseSeconds,
+        units,
+      }),
+    ));
   const fence = await projectFence(db, environment.project_id);
   const replay = await db
     .prepare(
@@ -723,7 +773,12 @@ async function issueAllowance(
     if (replay.request_hash !== requestHash)
       return error(409, "request_conflict");
     try {
-      return json({ reservation: await protectedReceipt(env, replay) });
+      const reservation = await protectedReceipt(env, replay);
+      if (funding) {
+        const denied = await fundingReplay(db, funding, replay, fence.previous);
+        if (denied) return denied;
+      }
+      return json({ reservation });
     } catch {
       return error(503, "fence_key_unavailable");
     }
@@ -753,7 +808,7 @@ async function issueAllowance(
   const id = crypto.randomUUID();
   const issuedAt = now();
   const expiresAt = new Date(
-    Date.now() + (input.leaseSeconds as number) * 1000,
+    (funding ? Date.parse(issuedAt) : Date.now()) + input.leaseSeconds * 1000,
   ).toISOString();
   const snapshots: { target: Target; account: Account; units: UnitVector }[] =
     [];
@@ -771,6 +826,11 @@ async function issueAllowance(
     const grant = parsed(current.granted_json),
       consumed = parsed(current.consumed_json),
       reserved = parsed(current.reserved_json);
+    if (
+      funding &&
+      Object.keys(grant).some((metric) => !Object.hasOwn(units, metric))
+    )
+      return error(409, "provisioning_funding_dimension_unsupported");
     for (const metric of meters) {
       if (
         Object.hasOwn(grant, metric) &&
@@ -825,6 +885,7 @@ async function issueAllowance(
   const statements = [
     ...fence.statements,
     actorGuard(db, actor, true, true),
+    ...(funding ? [fundingAssertion(db, funding.scope)] : []),
     assertion(
       db,
       `EXISTS (SELECT 1 FROM environments e WHERE e.id = ? AND e.region_id = ? AND e.spec_revision = ? AND e.spec_hash = ? AND ${runtimeAllowsExecution("e")})`,
@@ -887,8 +948,14 @@ async function issueAllowance(
         ),
     );
   }
-  if (await batch(db, statements))
+  if (await batch(db, statements)) {
+    if (
+      funding &&
+      !(await fundingStable(db, funding.scope, fence.next, receipt))
+    )
+      return error(409, "provisioning_funding_unavailable");
     return json({ reservation: { ...summary(receipt), fenceToken } }, 201);
+  }
   const raced = await db
     .prepare(
       "SELECT * FROM allowance_reservations WHERE region_id = ? AND request_id = ?",
@@ -897,12 +964,330 @@ async function issueAllowance(
     .first<Receipt>();
   if (raced?.request_hash === requestHash) {
     try {
-      return json({ reservation: await protectedReceipt(env, raced) });
+      const reservation = await protectedReceipt(env, raced);
+      if (funding) {
+        const currentFence = await db
+          .prepare(
+            "SELECT version_token FROM accounting_fences WHERE project_id=?",
+          )
+          .bind(environment.project_id)
+          .first<{ version_token: string }>();
+        if (!currentFence)
+          return error(409, "provisioning_funding_unavailable");
+        const denied = await fundingReplay(
+          db,
+          funding,
+          raced,
+          currentFence.version_token,
+        );
+        if (denied) return denied;
+      }
+      return json({ reservation });
     } catch {
       return error(503, "fence_key_unavailable");
     }
   }
   return error(409, "accounting_conflict");
+}
+
+function fundingGuard(scope: FundingScope): {
+  predicate: string;
+  bindings: (string | number | null)[];
+} {
+  return {
+    predicate: `EXISTS (SELECT 1 FROM operations o JOIN environments e ON e.id=o.environment_id
+      JOIN projects p ON p.id=e.project_id AND p.organization_id=e.organization_id
+      JOIN regions g ON g.id=e.region_id
+      WHERE o.id=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'
+      AND o.lease_actor_token_id=? AND o.lease_token_hash=? AND o.lease_epoch=?
+      AND o.lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      AND e.id=? AND e.organization_id=? AND e.project_id=? AND e.region_id=?
+      AND e.spec_revision=? AND e.spec_hash=? AND e.resolved_spec=? AND e.run_epoch IS ?
+      AND e.status IN ('pending','provisioning') AND p.status='active' AND g.status<>'disabled'
+      AND ${runtimeAllowsExecution("e")} AND ${actorPredicate(scope.actor)}
+      AND NOT EXISTS (SELECT 1 FROM budget_targets t WHERE t.project_id=e.project_id
+        AND (t.environment_id IS NULL OR t.environment_id=e.id) AND t.requested_state<>'running')
+      AND NOT EXISTS (SELECT 1 FROM budget_targets t JOIN budget_accounts a ON a.id=t.active_account_id,
+        json_each(a.granted_json) m WHERE t.project_id=e.project_id
+        AND (t.environment_id IS NULL OR t.environment_id=e.id)
+        AND m.key NOT IN ('cpu_millicore_ms','memory_byte_ms','data_storage_byte_ms')))`,
+    bindings: [
+      scope.operationId,
+      scope.region_id,
+      scope.actor.id,
+      scope.leaseHash,
+      scope.leaseEpoch,
+      scope.id,
+      scope.organization_id,
+      scope.project_id,
+      scope.region_id,
+      scope.spec_revision,
+      scope.spec_hash,
+      scope.resolved_spec,
+      scope.run_epoch,
+      ...actorBindings(scope.actor),
+    ],
+  };
+}
+
+function fundingAssertion(
+  db: AccountingDb,
+  scope: FundingScope,
+): D1PreparedStatement {
+  const guard = fundingGuard(scope);
+  return assertion(db, guard.predicate, guard.bindings);
+}
+
+async function fundingStable(
+  db: AccountingDb,
+  scope: FundingScope,
+  fenceVersion: string,
+  receipt: Receipt,
+): Promise<boolean> {
+  const guard = fundingGuard(scope);
+  return !!(await db
+    .prepare(
+      `SELECT 1 FROM allowance_reservations q JOIN accounting_fences f ON f.project_id=q.project_id
+    WHERE q.id=? AND q.version_token=? AND q.request_id=? AND q.region_id=? AND q.environment_id=?
+    AND q.organization_id=? AND q.project_id=? AND q.spec_revision=? AND q.spec_hash=?
+    AND q.status='issued' AND q.gap_count='0' AND q.stopped_at IS NULL
+    AND q.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') AND f.version_token=? AND ${guard.predicate}`,
+    )
+    .bind(
+      receipt.id,
+      receipt.version_token,
+      scope.operationId,
+      scope.region_id,
+      scope.id,
+      scope.organization_id,
+      scope.project_id,
+      scope.spec_revision,
+      scope.spec_hash,
+      fenceVersion,
+      ...guard.bindings,
+    )
+    .first());
+}
+
+async function fundingReplay(
+  db: AccountingDb,
+  funding: FundingContext,
+  receipt: Receipt,
+  fenceVersion: string,
+): Promise<Response | null> {
+  if (receipt.expires_at <= now())
+    return error(409, "provisioning_funding_expired");
+  if (
+    receipt.status !== "issued" ||
+    receipt.gap_count !== "0" ||
+    receipt.stopped_at !== null
+  )
+    return error(409, "provisioning_funding_unavailable");
+  const targets = (
+    await db
+      .prepare(
+        "SELECT * FROM budget_targets WHERE project_id=? AND (environment_id IS NULL OR environment_id=?) ORDER BY id",
+      )
+      .bind(funding.scope.project_id, funding.scope.id)
+      .all<Target>()
+  ).results;
+  const bindings = (
+    await db
+      .prepare(
+        "SELECT b.*,a.target_id FROM allowance_accounts b JOIN budget_accounts a ON a.id=b.account_id WHERE b.reservation_id=?",
+      )
+      .bind(receipt.id)
+      .all<Binding & { target_id: string }>()
+  ).results;
+  if (targets.length !== bindings.length)
+    return error(409, "provisioning_funding_unavailable");
+  let epoch = 0n;
+  const units = parsed(receipt.units_json);
+  for (const target of targets) {
+    const current = await account(db, target.active_account_id);
+    const grant = parsed(current.granted_json),
+      reserved = parsed(current.reserved_json),
+      consumed = parsed(current.consumed_json);
+    if (Object.keys(grant).some((metric) => !Object.hasOwn(units, metric)))
+      return error(409, "provisioning_funding_dimension_unsupported");
+    const original = bindings.filter(
+      (binding) => binding.target_id === target.id,
+    );
+    if (
+      target.requested_state !== "running" ||
+      current.gap_count !== "0" ||
+      original.length !== 1 ||
+      original[0]!.account_id !== current.id ||
+      original[0]!.target_execution_epoch !== target.execution_epoch ||
+      JSON.stringify(parsed(original[0]!.reserved_json)) !==
+        JSON.stringify(limited(units, grant)) ||
+      current.period_start > receipt.issued_at ||
+      current.period_end < receipt.expires_at ||
+      meters.some(
+        (metric) =>
+          Object.hasOwn(grant, metric) &&
+          (amount(consumed, metric) + amount(reserved, metric) >
+            amount(grant, metric) ||
+            amount(reserved, metric) <
+              amount(parsed(original[0]!.reserved_json), metric)),
+      )
+    )
+      return error(409, "provisioning_funding_unavailable");
+    epoch += BigInt(target.execution_epoch);
+  }
+  if (
+    epoch.toString() !== receipt.execution_epoch ||
+    !(await fundingStable(db, funding.scope, fenceVersion, receipt))
+  )
+    return error(409, "provisioning_funding_unavailable");
+  return null;
+}
+
+async function provisioningFunding(
+  request: Request,
+  env: AccountingEnv,
+  db: AccountingDb,
+  regionId: string,
+  operationId: string,
+): Promise<Response> {
+  if (
+    !uuid.test(regionId) ||
+    !uuid.test(operationId) ||
+    new URL(request.url).searchParams.size > 0
+  )
+    return error(400, "invalid_request");
+  const actor = await authorize(
+    request,
+    db,
+    "region",
+    regionId,
+    "operations:claim",
+  );
+  if (actor instanceof Response) return actor;
+  const input = await body(request, 4096);
+  if (
+    !fields(input, ["leaseToken", "leaseEpoch", "fundingSeconds"]) ||
+    !lease(input) ||
+    !integer(input.fundingSeconds, 30, 300)
+  )
+    return error(400, "invalid_request");
+  const leaseHash = await sha256(input.leaseToken);
+  const row = await db
+    .prepare(
+      `SELECT e.id,e.organization_id,e.project_id,e.region_id,e.spec_revision,e.spec_hash,e.resolved_spec,e.run_epoch
+    FROM environments e JOIN operations o ON o.environment_id=e.id
+    WHERE o.id=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'
+    AND o.lease_actor_token_id=? AND o.lease_token_hash=? AND o.lease_epoch=?
+    AND o.lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+    )
+    .bind(operationId, regionId, actor.id, leaseHash, input.leaseEpoch)
+    .first<
+      Omit<FundingScope, "operationId" | "actor" | "leaseHash" | "leaseEpoch">
+    >();
+  if (!row) return error(409, "lease_conflict");
+  const scope: FundingScope = {
+    ...row,
+    operationId,
+    actor,
+    leaseHash,
+    leaseEpoch: input.leaseEpoch,
+  };
+  const spec = JSON.parse(scope.resolved_spec) as {
+    volumeGiB: number;
+    profile: Omit<ResourceEnvelopeInput, "volumeGiB">;
+  };
+  if ((await sha256(JSON.stringify(spec))) !== scope.spec_hash)
+    return error(409, "provisioning_funding_unavailable");
+  const envelopeInput: ResourceEnvelopeInput = {
+    instances: spec.profile.instances,
+    compute: spec.profile.compute,
+    volumeGiB: spec.volumeGiB,
+    ...(spec.profile.pooling ? { pooling: spec.profile.pooling } : {}),
+  };
+  const envelope = provisioningResourceEnvelope(envelopeInput);
+  const units = provisioningAllowanceUnits(envelopeInput, input.fundingSeconds);
+  const requestHash = await sha256(
+    JSON.stringify({
+      protocol: "provisioning-funding/v1",
+      operationId,
+      environmentId: scope.id,
+      regionId: scope.region_id,
+      specRevision: scope.spec_revision,
+      specHash: scope.spec_hash,
+      runEpoch: scope.run_epoch,
+      envelopeVersion: envelope.version,
+      fundingSeconds: input.fundingSeconds,
+      units,
+    }),
+  );
+  const result = await reserveAllowance(
+    env,
+    db,
+    regionId,
+    { id: actor.id, token_hash: actor.hash },
+    {
+      requestId: operationId,
+      environmentId: scope.id,
+      leaseSeconds: input.fundingSeconds,
+      units,
+    },
+    { scope, requestHash },
+  );
+  if (!result.ok) return result;
+  const value = (await result.json()) as {
+    reservation: Record<string, unknown>;
+  };
+  // Parsing the service response yields: recheck the exact current ledger and
+  // winning lease afterward, rather than publishing an earlier authority read.
+  const finalFence = await db
+    .prepare("SELECT version_token FROM accounting_fences WHERE project_id=?")
+    .bind(scope.project_id)
+    .first<{ version_token: string }>();
+  const finalReceipt = await db
+    .prepare(
+      "SELECT * FROM allowance_reservations WHERE region_id=? AND request_id=?",
+    )
+    .bind(regionId, operationId)
+    .first<Receipt>();
+  if (
+    !finalFence ||
+    !finalReceipt ||
+    finalReceipt.request_hash !== requestHash ||
+    finalReceipt.id !== value.reservation.id
+  )
+    return error(409, "provisioning_funding_unavailable");
+  const returnedSummary = { ...value.reservation };
+  delete returnedSummary.fenceToken;
+  if (JSON.stringify(returnedSummary) !== JSON.stringify(summary(finalReceipt)))
+    return error(409, "provisioning_funding_unavailable");
+  const finalDenied = await fundingReplay(
+    db,
+    { scope, requestHash },
+    finalReceipt,
+    finalFence.version_token,
+  );
+  if (finalDenied) return finalDenied;
+  return json(
+    {
+      funding: {
+        version: 1,
+        envelopeVersion: envelope.version,
+        operationId,
+        organizationId: scope.organization_id,
+        projectId: scope.project_id,
+        environmentId: scope.id,
+        regionId: scope.region_id,
+        specRevision: scope.spec_revision,
+        specHash: scope.spec_hash,
+        runEpoch: scope.run_epoch,
+        fundingSeconds: input.fundingSeconds,
+        rates: envelope.rates,
+        units,
+        reservation: value.reservation,
+      },
+    },
+    result.status,
+  );
 }
 
 async function version(
@@ -1317,6 +1702,16 @@ export async function budgetRoutes(
 ): Promise<Response | null> {
   const db = env.DB.withSession("first-primary");
   const path = new URL(request.url).pathname;
+  const fundingPath =
+    /^\/v1\/regions\/([^/]+)\/operations\/([^/]+)\/funding$/.exec(path);
+  if (request.method === "POST" && fundingPath)
+    return provisioningFunding(
+      request,
+      env,
+      db,
+      fundingPath[1]!,
+      fundingPath[2]!,
+    );
   const authorityPath =
     /^\/v1\/regions\/([^/]+)\/allowance-reservations\/([^/]+)\/authority$/.exec(
       path,

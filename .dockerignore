@@ -13,6 +13,10 @@
 !apps/regional-controller/Dockerfile
 !apps/regional-controller/src/
 !apps/regional-controller/src/**
+!apps/resource-envelope/
+!apps/resource-envelope/package.json
+!apps/resource-envelope/index.js
+!apps/resource-envelope/index.d.ts
 !apps/node-runtime-observer/
 !apps/node-runtime-observer/go.mod
 !apps/node-runtime-observer/go.sum

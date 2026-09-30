@@ -291,6 +291,19 @@ The Worker trusts the authenticated executor's Kubernetes observations and does 
 
 ## Usage ledger and exports
 
+The maintained provisioning executor first calls
+`POST /v1/regions/{regionId}/operations/{operationId}/funding` with only the
+winning `leaseToken`, `leaseEpoch` and integer `fundingSeconds` (30–300).
+The server derives resource units from the immutable specification and shared
+namespace ceiling; clients cannot submit cheaper units. The existing ledger
+uses the operation UUID as its one immutable request identity. Replay under a
+legitimate reclaimed lease retains the original hold/expiry; changed work or
+horizon conflicts, and expiry is not automatic renewal. Current lease/actor,
+budget and fence checks also guard replay after response parsing. See the
+[provisioning funding contract](../../docs/contracts/provisioning-funding-v1.md).
+This is maintained-controller funding, with `runtimeEnforced: false`; it is not
+universal workload admission or a substitute for signed expiry/stop/accounting.
+
 The [usage and budget authority contract](../../docs/contracts/usage-budget-authority-v1.md) describes the accounting request/response fields and invariants. Installation-only `POST /v1/regions/{regionId}/usage-tokens/reissue` issues a separate `cpmtr_...` token with `usage:write`, preserving the source ID and integer epoch on rotation. Only that purpose-specific meter token may append `POST /v1/regions/{regionId}/usage-facts`; a regional executor token does not grant metering authority.
 
 Facts report one of seven resource metrics, attribution, an immutable environment/source identity, an interval wholly within one UTC minute, a safe integer revision/predecessor, and a retained evidence digest. Quantities are exact unsigned decimal strings rather than floating-point JSON numbers. `provisional` and `final` require a quantity, including explicit `"0"`; `gap` requires null. Revisions are append-only. Exact revision replays are deduplicated, and corrections append a conditional next revision.

@@ -22,6 +22,7 @@ import { validNativeClientProfiles } from "./native-access.ts";
 import { BackupClient } from "./backup-client.ts";
 import { backupKubernetesFromConfig } from "./backup-kubernetes.ts";
 import { runBackupController } from "./backup-controller.ts";
+import { validateProvisioningJournalDirectory } from "./provisioning-funding.ts";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -117,6 +118,10 @@ async function main(): Promise<void> {
     throw new Error("invalid_regional_configuration");
   }
   const tokenFile = process.env.PGCF_REGION_TOKEN_FILE;
+  const provisioningJournalDirectory =
+    process.env.PGCF_PROVISIONING_JOURNAL_DIRECTORY;
+  if (provisioningJournalDirectory !== undefined)
+    validateProvisioningJournalDirectory(provisioningJournalDirectory);
   const manualBackups = process.env.PGCF_MANUAL_BACKUPS_ENABLED;
   if (
     manualBackups !== undefined &&
@@ -171,6 +176,7 @@ async function main(): Promise<void> {
     );
   // Validate all service configuration before any lane creates durable state or starts work.
   const controllerOptions = {
+    ...(provisioningJournalDirectory ? { provisioningJournalDirectory } : {}),
     leaseSeconds: milliseconds("PGCF_LEASE_SECONDS", 90, 30, 300),
     pollMilliseconds: milliseconds(
       "PGCF_POLL_MILLISECONDS",

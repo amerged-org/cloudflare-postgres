@@ -7,9 +7,11 @@ COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 COPY LICENSE ./LICENSE
 COPY apps/control-api/package.json apps/control-api/package.json
 COPY apps/regional-controller/package.json apps/regional-controller/package.json
+COPY apps/resource-envelope/package.json apps/resource-envelope/package.json
 RUN pnpm install --frozen-lockfile --ignore-scripts
 COPY apps/regional-controller/tsconfig.json apps/regional-controller/tsconfig.json
 COPY apps/regional-controller/src apps/regional-controller/src
+COPY apps/resource-envelope/index.js apps/resource-envelope/index.d.ts apps/resource-envelope/
 RUN pnpm --filter @cloudflare-postgres/regional-controller build
 RUN pnpm --filter @cloudflare-postgres/regional-controller --prod deploy --legacy /out
 

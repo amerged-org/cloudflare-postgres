@@ -4,6 +4,10 @@ import { ControlClient } from "./control-client.ts";
 import { reconcileEnvironment } from "./reconcile.ts";
 import { ReconcileError } from "./types.ts";
 import type { Claim, Kubernetes, RegionalConfig } from "./types.ts";
+import {
+  ProvisioningFundingBarrier,
+  ProvisioningFundingJournal,
+} from "./provisioning-funding.ts";
 
 interface RunOptions {
   leaseSeconds: number;
@@ -11,6 +15,7 @@ interface RunOptions {
   readinessMilliseconds: number;
   signal: AbortSignal;
   log: (event: string) => void;
+  provisioningJournalDirectory?: string;
 }
 
 async function execute(
@@ -24,9 +29,15 @@ async function execute(
   const stopped = new AbortController();
   const heartbeatSignal = AbortSignal.any([options.signal, stopped.signal]);
   let leaseLost = false;
-  const authorized = () => {
+  const leaseAuthorized = () => {
     if (leaseLost || options.signal.aborted || Date.now() >= leaseUntil - 5_000)
       throw new Error("lease_not_authorized");
+  };
+  let journal: ProvisioningFundingJournal | null = null;
+  let funding: ProvisioningFundingBarrier | null = null;
+  const authorized = () => {
+    leaseAuthorized();
+    funding?.assert();
   };
   const heartbeat = (async () => {
     try {
@@ -48,11 +59,28 @@ async function execute(
     }
   })();
   try {
+    // Empty queues preserve startup compatibility. Claimed creation cannot
+    // proceed without installation-owned durable bootstrap custody.
+    if (!options.provisioningJournalDirectory)
+      throw new Error("provisioning_funding_configuration_unavailable");
+    journal = new ProvisioningFundingJournal(
+      options.provisioningJournalDirectory,
+      claim,
+    );
+    funding = new ProvisioningFundingBarrier(
+      journal,
+      client,
+      leaseAuthorized,
+      () => leaseUntil - 5_000,
+    );
+    await funding.acquire(claim);
+    const fundedApi = funding.wrap(api);
     const deadline = Date.now() + options.readinessMilliseconds;
     while (Date.now() < deadline) {
+      await funding.refresh();
       authorized();
       const state = await reconcileEnvironment(
-        api,
+        fundedApi,
         claim,
         config,
         authorized,
@@ -61,6 +89,7 @@ async function execute(
         },
       );
       if (state.ready && state.observation) {
+        await funding.refresh();
         authorized();
         await client.result(claim, state.observation);
         options.log("environment_ready");
@@ -75,6 +104,7 @@ async function execute(
     options.log("readiness_deferred");
   } catch (error) {
     if (error instanceof ReconcileError) {
+      if (funding) await funding.refresh();
       authorized();
       await client.result(claim, null, error.code);
       options.log(error.code);
@@ -86,6 +116,7 @@ async function execute(
   } finally {
     stopped.abort();
     await heartbeat;
+    journal?.close();
   }
 }
 

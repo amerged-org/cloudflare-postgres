@@ -110,6 +110,18 @@ remain unchanged. No regional rollout or physical qualifier occurs. Logical-proj
 creation's similar unfenced write, pre-compute funding, independent signed
 expiry and physical pilot/production acceptance remain open.
 
+The [pre-compute funding checkpoint](docs/evidence/m6-provisioning-funding-2026-09-30.md)
+connects the maintained create controller to the existing ledger before effects.
+One shared pure package preserves quota/Barman policy and derives exact resource
+units. The winning lease obtains one immutable operation-bound reservation;
+private bootstrap custody, replay and fresh effect/ready checks prevent unfunded
+dispatch by that maintained path. Two new causal stories fail first and pass;
+the one frozen gate passes 40 Worker and 59 Node cases. No schema, new secret,
+invoice or independent enforcement is introduced. Dev delivery follows. Other
+privileged writers/API Ready are not universal funding gates; signed workload
+injection, renewal, actual ceilings, expired-hold settlement, physical stopping,
+recovery and all held qualifications remain required before customer admission.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.

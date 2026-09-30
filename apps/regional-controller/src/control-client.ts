@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Claim, Observation, ResultCode } from "./types.ts";
+import { AllowanceClient } from "./allowance-client.ts";
+import type { RuntimeAuthority } from "./allowance-types.ts";
+import type { ProvisioningFunding } from "./provisioning-funding.ts";
 
 export class ControlError extends Error {
   readonly status: number;
@@ -94,6 +97,35 @@ export class ControlClient {
       leaseEpoch: claim.leaseEpoch,
       leaseSeconds,
     });
+  }
+
+  async funding(
+    claim: Claim,
+    fundingSeconds: number,
+  ): Promise<ProvisioningFunding> {
+    const response = await this.post<{ funding: ProvisioningFunding }>(
+      `/${encodeURIComponent(claim.operationId)}/funding`,
+      {
+        leaseToken: claim.leaseToken,
+        leaseEpoch: claim.leaseEpoch,
+        fundingSeconds,
+      },
+    );
+    if (
+      !response.funding ||
+      typeof response.funding !== "object" ||
+      Array.isArray(response.funding)
+    )
+      throw new Error("invalid_provisioning_funding_response");
+    return response.funding;
+  }
+
+  authority(reservationId: string): Promise<RuntimeAuthority> {
+    return new AllowanceClient(
+      this.origin,
+      this.regionId,
+      async () => this.token,
+    ).authority(reservationId);
   }
 
   result(

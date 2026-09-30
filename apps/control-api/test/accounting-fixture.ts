@@ -26,6 +26,7 @@ export async function accountingFixture(
     initialSizeId: string;
     sizes: Array<{ id: string; cpuMilli: number; memoryMiB: number }>;
   },
+  profileOverrides: Record<string, unknown> = {},
 ) {
   const organizationResponse = await accountingCall("/v1/organizations", {
     method: "POST",
@@ -86,6 +87,7 @@ export async function accountingFixture(
         secretAccessKeyKey: "SECRET_ACCESS_KEY",
       },
     },
+    ...profileOverrides,
   };
   const catalog = await accountingCall(
     `/v1/regions/${region.region.id}/catalogs`,

@@ -213,7 +213,10 @@ export interface Resource {
 
 export interface Kubernetes {
   read(kind: string, namespace: string, name: string): Promise<Resource | null>;
-  create(resource: Resource): Promise<Resource>;
+  create(
+    resource: Resource,
+    dispatchAuthority?: { check: () => void; expiresAt: () => number },
+  ): Promise<Resource>;
   readSecret(namespace: string, name: string): Promise<Record<string, string>>;
   listPods(namespace: string, clusterName: string): Promise<Resource[]>;
   meteringInventory?(regionId: string): Promise<MeteringInventory>;
