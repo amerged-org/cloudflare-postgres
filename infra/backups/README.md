@@ -15,6 +15,7 @@ Add the following to the **existing source Cluster**, preserving every other spe
 ```yaml
 plugins:
   - name: barman-cloud.cloudnative-pg.io
+    enabled: true
     isWALArchiver: true
     parameters:
       barmanObjectName: source-archive
@@ -41,6 +42,13 @@ recoveryTarget:
   targetTime: REPLACE_WITH_RECORDED_UTC_RFC3339_TIME
 ```
 
+CNPG 1.30.1 defaults recovery's database/owner to `app` and creates a new target
+application Secret when no recovery Secret is specified. Authenticate using
+that target's own `<cluster-name>-app` Secret, bound to its exact Cluster UID;
+never assume the source password remains valid. Keep each target's certificate
+hostname and CA verification enabled. The plugin promotes PITR automatically;
+there is no `recoveryTarget.targetAction` field to add.
+
 The restore request uses **`backupID`**, unlike the Backup status field. Choose a time after the selected base backup and between two separately committed markers; archive the WAL covering both. Verify over TLS that full recovery contains the expected marker set and that PITR contains the earlier marker and excludes the later one. Confirm the target is writable and subsequent WAL uses only its own archive identity. Pod/Cluster Ready conditions do not replace SQL evidence.
 
 Run restoration sequentially when capacity for simultaneous loads is unqualified. Keep source archives/credentials and the original source until each recovery is validated. Restoring after the disposable source is removed requires a separately scoped operation; do not treat deletion as implicit cleanup. StorageClass Retain behavior and orphan-volume reclamation are distinct responsibilities.
@@ -51,6 +59,9 @@ Record observed RPO/RTO and archive growth from the actual run. Add interruption
 
 Retention windows accept days/weeks/months, not a fabricated minutes/hours window. A same-day run cannot prove real one-day expiration. Later evidence must show obsolete remote objects disappear, the required boundary base backup/WAL remain, a recovery within the retained window works, and a sibling archive stays unchanged. Deleting a Backup CR is not remote-object deletion evidence. Never disable safety checks, alter archived timestamps or broaden credentials to make a gate pass.
 
-These examples are preparation, not verified backup availability. Follow [PLAN.md](../../PLAN.md) and keep installation observations in ignored `.local/` or a private deployment repository.
+The [single-node R2 qualification](../../docs/evidence/m1-r2-backup-pitr-2026-09-30.md)
+now proves one physical backup, WAL coverage, full recovery, PITR and independent
+target archiving with the pinned tuple. Retention, interruption, fresh-infrastructure
+recovery and production availability remain unqualified. Follow [PLAN.md](../../PLAN.md) and keep installation observations in ignored `.local/` or a private deployment repository.
 
-Sources: [Barman plugin 0.15.0 usage](https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.0/web/versioned_docs/version-0.15.0/usage.md), [retention](https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.0/web/versioned_docs/version-0.15.0/retention.md), [CNPG 1.30.1 recovery](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/docs/src/recovery.md), [R2 S3 authentication and jurisdiction](https://developers.cloudflare.com/r2/api/tokens/).
+Sources: [Barman plugin 0.15.0 usage](https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.0/web/versioned_docs/version-0.15.0/usage.md), [retention](https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.0/web/versioned_docs/version-0.15.0/retention.md), [CNPG 1.30.1 recovery](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/docs/src/recovery.md), [recovery defaults](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/api/v1/cluster_defaults.go), [R2 S3 authentication and jurisdiction](https://developers.cloudflare.com/r2/api/tokens/).

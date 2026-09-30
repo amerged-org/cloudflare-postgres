@@ -2,6 +2,11 @@
 
 Status: **prepared, no database backup enabled**. This checkpoint advances the existing M1 backup gate and preserves the stopped Barman Flux handoff. It is not physical-backup, WAL, restore, retention or M1 completion evidence.
 
+Subsequent user-directed activation and the [actual R2 backup/full-restore/PITR
+qualification](m1-r2-backup-pitr-2026-09-30.md) now pass with the same upstream
+tuple. This earlier preparation and its failed previews remain historical;
+retention, fresh-infrastructure recovery and production are still separate.
+
 ## Existing installation and capacity
 
 Bounded read-only observations verify the current CNPG `1.30.1` and manual Barman `0.15.0` Deployments are Ready. The plugin Service has one Ready endpoint and discovery annotations; its server/client Certificates are current-generation Ready. The held Barman HelmRelease remains suspended, and no ownership/Deployment/image-reference repair was attempted.

@@ -25,6 +25,7 @@ spec:
       source: origin
   plugins:
     - name: barman-cloud.cloudnative-pg.io
+      enabled: true
       isWALArchiver: true
       parameters:
         barmanObjectName: target-archive
