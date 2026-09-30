@@ -2,7 +2,7 @@
 export type AccountingEnv = Cloudflare.Env & {
   ALLOWANCE_FENCE_KEYS?: string;
 };
-export type AccountingDb = D1DatabaseSession;
+export type AccountingDb = Pick<D1DatabaseSession, "prepare" | "batch">;
 export type JsonObject = Record<string, unknown>;
 export const meters = [
   "cpu_millicore_ms",

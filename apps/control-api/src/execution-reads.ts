@@ -553,7 +553,9 @@ export async function executionReads(
           ? [children[1], children[2], children[3]]
           : [task![1], task![2]];
     if (!identifiers.every(uid)) return error(400, "invalid_request");
-    const db = env.DB.withSession("first-primary");
+    // Authorization and ownership must use the primary on every read. A
+    // first-primary session can serve later reads from a pre-revocation replica.
+    const db = env.DB;
     if (task) return await operation(request, db, task[1]!, task[2]!);
     const scope: Scope = projects
       ? {

@@ -4,6 +4,15 @@ Status: revised approved direction, updated 2026-09-30. M0 is complete. M1 has l
 
 This file is the canonical scope and roadmap. README.md summarizes it; AGENTS.md is the 25-line contributor brief; THIRD_PARTY.md records component provenance and adoption status. A documented target is not evidence of implemented behavior.
 
+The [recovery-read authority correction](docs/evidence/m3-recovery-read-authority-2026-10-01.md)
+uses direct primary D1 reads for recovery authentication, owned page/operation
+batches and the final actor check after cursor signing. Two meaningful new cases
+first expose 200 responses after committed revocation, then pass with exact 401,
+unchanged business rows and active-sibling recovery. Eight named cases pass;
+the frozen single canonical gate passes 51 Worker cases and the existing Node
+suite in 56.559 seconds. Dev delivery/readback follows separately. Schema,
+wire format, cursor binding and regional execution are unchanged.
+
 The [R2 physical backup/full-restore/PITR checkpoint](docs/evidence/m1-r2-backup-pitr-2026-09-30.md)
 qualifies the selected PostgreSQL 18.4/CNPG 1.30.1/Barman 0.15.0 path. One guarded
 source activation preserves storage and replaces only its expected Pod. A
