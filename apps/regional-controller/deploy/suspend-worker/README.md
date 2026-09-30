@@ -53,6 +53,15 @@ token-file and CA-file references are written. The initializer does not read,
 copy or print token contents, embed keys, select an executable authentication
 plugin or contact an API.
 
+Creating `/private/pgcf` accepts the dedicated memory emptyDir's nonsymlink
+`/private` root only with UID `0`, GID `1000` and exact sticky/setgid mode `03777`
+when that root is world-writable. This exception relies on the operator-only Pod:
+the trusted sequential init has the only writable mount, and the worker mounts
+it read-only. Do not share this volume with untrusted containers or other
+UID-1000 writers. Sticky mode alone does not establish that trust boundary; all
+other parents, including the persistent journal volume, retain the strict
+world-write rejection.
+
 The init container creates only the exact private `0700` journal child on the
 retained PVC. Existing configuration must match its reviewed bytes; existing
 journal children must have valid operation filenames, regular-file identity,

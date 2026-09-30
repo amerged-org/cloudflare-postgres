@@ -58,10 +58,19 @@ function ensurePrivateDirectory(path) {
     if (!missing(error)) throw error;
   }
   const parent = lstatSync(dirname(path));
+  // Only this Pod's isolated memory emptyDir has a kubelet-owned sticky root.
+  // Trusted sequential init creates the child; the worker mounts it read-only.
+  // This exception never applies to persistent journal storage.
+  const isolatedBootstrapParent =
+    path === privateDirectory &&
+    dirname(path) === "/private" &&
+    parent.uid === 0 &&
+    parent.gid === 1000 &&
+    (parent.mode & 0o7777) === 0o3777;
   if (
     parent.isSymbolicLink() ||
     !parent.isDirectory() ||
-    (parent.mode & 0o002) !== 0 ||
+    ((parent.mode & 0o002) !== 0 && !isolatedBootstrapParent) ||
     ![0, process.getuid()].includes(parent.uid) ||
     ((parent.mode & 0o020) !== 0 && parent.gid !== process.getgid())
   )

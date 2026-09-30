@@ -161,7 +161,8 @@ starts. It uses the existing region token file and kubeconfig, introduces no
 Secret file, and adds only Backup `get/create` RBAC. A queued customer intention
 does not complete while the installation leaves its executor disabled.
 
-The source uses pinned CNPG 1.30.1 and Barman 0.15.0 contracts. Actual S3/R2 access,
+The source uses pinned CNPG 1.30.1 and Barman 0.15.0 contracts. Actual Cloudflare
+R2 access through its S3-compatible API,
 runtime backup/WAL/restore/PITR and archive accounting require their own qualified
 installation. The installation operator must qualify its existing plugin and provider
 credentials before enabling backup execution. No production availability or customer admission is

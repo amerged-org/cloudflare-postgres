@@ -78,8 +78,14 @@ Node cases pass. One unchanged targeted diagnosis subsequently passes the
 existing case at 761 ms under its original 2,000-ms deadline, with expected exit
 and no journal. The original failed gate remains recorded; no clean uninterrupted
 gate is claimed, source/assertions are unchanged and no full gate is repeated.
-Source delivery and bounded empty-worker Dev qualification are the next steps;
-no held physical qualifier is resumed.
+The source and fair-selection Dev API are now delivered. The separate worker
+installation is held at zero replicas after an observed initializer failure;
+its new Retain journal and original infrastructure are preserved. A credential-free
+diagnostic pins the isolated emptyDir permissions as the cause. One narrow
+bootstrap correction passes one new red-first regression and selected checks;
+it preserves every journal guard and does not repeat the full gate. A new immutable
+bootstrap and bounded empty-worker qualification are the next steps. No held
+physical qualifier is resumed.
 
 ## 1. Product scope and decisions
 
@@ -699,8 +705,11 @@ ciphertext now has off-node custody, while independently recoverable key/receipt
 source custody, retention safety, fresh bootstrap and activation remain open.
 The generic [operator workflow](docs/guides/control-archive-v1.md) preserves
 historical migration sets and keeps key material outside the archive store.
-PostgreSQL backups/PITR and the pending dedicated S3-access confirmation remain
-separate required gates; the held Budget and other stopped candidates are unchanged.
+This earlier checkpoint preceded the dedicated R2 credential qualification.
+The [later R2 access check](docs/evidence/m1-backup-preflight-2026-09-29.md)
+verifies object access through R2's S3-compatible API; PostgreSQL backups/PITR
+remain separate required gates. The held Budget and other stopped candidates
+are unchanged.
 
 The [portable PostgreSQL candidate checkpoint](docs/evidence/m2-postgres-portability-held-2026-09-29.md)
 records a separate generic export/import draft using maintained PostgreSQL 18

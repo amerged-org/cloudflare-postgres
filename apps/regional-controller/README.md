@@ -485,7 +485,7 @@ Metering adds only inventory reads for namespaces, CNPG Clusters/Poolers, Deploy
 
 ## Reconciliation and authority
 
-The controller claims one operation at a time, renews its versioned lease, and uses the persisted immutable profile snapshot. It verifies `sha256(JSON.stringify(spec))`, region identity, the digest-pinned PostgreSQL image, supported integer resource quantities, volume bounds, backup HTTPS origin and explicit S3 region, and the local source Secret allowlist before creating resources.
+The controller claims one operation at a time, renews its versioned lease, and uses the persisted immutable profile snapshot. It verifies `sha256(JSON.stringify(spec))`, region identity, the digest-pinned PostgreSQL image, supported integer resource quantities, volume bounds, backup HTTPS origin and explicit S3 API signing region, and the local source Secret allowlist before creating resources. The selected installation uses Cloudflare R2 through its S3-compatible API; `s3://` destinations and S3 client terminology do not select Amazon storage.
 
 Every environment uses `pgcf-<environment UUID without hyphens>` and a `database` Cluster. Owned resource labels identify both the environment and the region; an annotation records the execution-spec hash. A name collision or changed owned configuration fails without adopting or overwriting it. Stable names and readback resolve a create whose response was lost. Unknown infrastructure/control outcomes and readiness timeouts remain retryable through lease expiry and a fresh claim; they do not assert that no database exists. SIGINT/SIGTERM stops new work.
 

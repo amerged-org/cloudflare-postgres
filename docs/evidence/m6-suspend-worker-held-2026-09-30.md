@@ -39,7 +39,7 @@ The captured assertion does not retain the child signal/error, so a startup
 timeout is a hypothesis, not an established root cause. The main entry point adds
 only an explicit dynamic `serve-suspend` dispatch; default work is unchanged.
 
-The mandatory final-gate stop is honored. There is no further test run, functional
+At the original checkpoint, the mandatory final-gate stop is honored. There is no further test run, functional
 correction, broad gate repeat, image build/import or provider activation after this
 stop. Runtime source and the installation draft remain local and uncommitted;
 the currently deployed Dev service remains on its earlier qualified release.
@@ -79,3 +79,51 @@ result for the one previously failing case, alongside the other 56 Node cases an
 36 Worker cases from the frozen gate. This is complete per-case passing evidence,
 not a clean uninterrupted full gate. Source publication and separately bounded
 empty-worker Dev qualification may proceed with that limitation disclosed.
+
+## Dev delivery and observed initializer correction
+
+Source `bc5cf56` is published. One Cloudflare preview and one Dev deployment
+deliver the fair queue selection, preserving all eight Secret names/types,
+18 migrations, 319 historical guard rows and closed admission. Managed
+environments, permits, deletion intentions and stop operations remain empty.
+No Secret value is queried through the provider API or published.
+
+One public-only build seals 73 compiled regional modules. One authenticated
+Talos import verifies the exact manifest
+`sha256:c77f407adac98bda9ea79094c9e929f64f04900f0ec457b7d262943e064f0f30`.
+Seven exclusive resource creates install a separate worker, minimal read/patch
+identity, immutable bootstrap inputs and a new 1-GiB Retain journal. The ordinary
+controller, its permissions/configuration/journal and source database remain
+unchanged. This first installation does not qualify a running worker.
+
+The initializer exits before starting the worker. A guarded change holds only
+the new Deployment at zero replicas; its new journal remains bound. One
+credential-free diagnostic Pod mounts only this new journal read-only, the
+bootstrap input and its isolated memory emptyDir. It confirms UID/GID 1000,
+exact bootstrap bytes, Kubernetes service variables, root-owned GID-1000
+`/private` mode `03777` and journal-parent mode `02775`. One diagnostic harness
+correction removes a dangling volume reference after the original named target
+is confirmed absent; there is no automatic create replay or credential volume.
+
+The initializer's generic parent-world-write rejection refuses that legitimate
+sticky memory emptyDir. A distinct, narrow correction accepts only the fixed
+`/private/pgcf` child beneath nonsymlink `/private`, with root ownership,
+GID 1000 and exact sticky/setgid `03777` mode. Every journal-parent, existing
+owner/mode, exclusive-file, no-follow, exact-byte and fsync check is preserved.
+This exception depends on the operator-only isolated Pod and trusted sequential
+init; it is not permission to share the volume with untrusted containers.
+
+Exactly one new causal Node regression executes the real initializer against
+private temporary files with the observed mount metadata. It fails first on
+the unchanged initializer, then passes on correction attempt one in 0.280 seconds,
+including refusal to repair an unsafe retained journal. Selected formatting,
+lint and syntax checks pass. The original full gate is not repeated or relabeled
+as clean. The corrected initializer is external ConfigMap code, distinct from
+the unchanged 73-module image; its hash is
+`96a9ff68432ed55c6f3cf8309527aef0911f785e964fb666a670eb33517a8765`.
+
+One new immutable bootstrap ConfigMap and an exact guarded reference/start
+correction are the next Dev step. Empty recurring claims, live verified TLS/file
+authentication, private journal custody and original infrastructure/SQL
+preservation still require observed running-worker evidence. No held physical
+stop, deletion, backup/PITR, native or Pod-birth qualifier is resumed.
