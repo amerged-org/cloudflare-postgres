@@ -416,8 +416,18 @@ async function item(
   organizationId: string,
   id: string,
 ): Promise<Response> {
-  if (new URL(request.url).search || request.body)
-    return error(400, "invalid_request");
+  if (new URL(request.url).search) return error(400, "invalid_request");
+  if (request.body) {
+    // Real HTTP DELETE may expose an empty stream even without a payload.
+    // Inspect one read for EOF; refuse supplied data without buffering it.
+    const reader = request.body.getReader();
+    try {
+      if (!(await reader.read()).done) return error(400, "invalid_request");
+    } finally {
+      await reader.cancel().catch(() => {});
+      reader.releaseLock();
+    }
+  }
   const original = await readToken(env, id);
   if (!original || original.organization_id !== organizationId)
     return error(404, "not_found");

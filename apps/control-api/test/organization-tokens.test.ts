@@ -293,6 +293,11 @@ it("retains redacted organization-bound history and revokes one in-flight writer
           {
             method: "DELETE",
             headers: installerHeaders,
+            body: new ReadableStream<Uint8Array>({
+              start(empty) {
+                empty.close();
+              },
+            }),
           },
         );
         expect(response.status).toBe(200);
