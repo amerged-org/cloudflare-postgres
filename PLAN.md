@@ -212,56 +212,39 @@ distinguishes the separate correction from the original candidate. This independ
 management capability does not resume held SDK, capacity, signing, physical
 backup/native access or scheduled control-backup work. Admission remains closed.
 
-## PostgreSQL WAL-capacity recovery preparation
+## PostgreSQL WAL-capacity recovery qualification
 
-The [isolated WAL-storage qualification assets](infra/qualification/postgres-storage-recovery/README.md)
-define the remaining database-storage failure/recovery exercise. Two new,
-restricted operator fixtures use the pinned PostgreSQL image, separate thick
-data/WAL volumes and bounded resource quotas. The target's logged producer is
-bounded by bytes, rows and time; the neighbor must continue durable transactions.
-Only the fresh target WAL claim/Cluster size may expand. Confirmed and ambiguous
-transactions must be reconciled on the same PostgreSQL system before new writes.
+The [selected operator-owned WAL incident/recovery](docs/evidence/m4-postgres-wal-recovery-2026-09-30.md)
+is qualified on the current single-node installation. Two new restricted CNPG
+fixtures use separate thick data/WAL volumes and bounded quotas. A logged
+producer creates actual WAL PANIC/53100; the neighbor continues durable writes.
+Fresh filesystem observations use the unchanged trusted CSI node plugin's
+existing mounts, independently of the failed PostgreSQL container. The
+[public fixture](infra/qualification/postgres-storage-recovery/README.md)
+documents exact identity, device, freshness and operator trust checks.
 
-Named rendering and independent scope/network reviews pass. Fresh read-only
-inventory finds 30 Running Pods, five claims/six volumes, sufficient request and
-physical storage headroom, and the original SQL markers and unchanged 4,096-fact
-outbox. The first uint64-string capacity parser stop is retained and corrected
-without provider mutation. The corrected native admission preview passes after replacing the rejected
-1-GB maximum with 96 MB and an explicitly run-owned, immediately reserved
-replication slot. The one actual attempt stops before SQL in 28.352 seconds:
-PostgreSQL becomes Ready while its CEP still reports `waiting-for-identity`.
-The immediate endpoint assertion does not wait for that independent readiness.
-Initial metadata-only cleanup also refuses `namespace_inventory_incomplete`.
-A separately reviewed safety cleanup removes only the two captured namespace
-UIDs and four fresh Delete-class volumes, restores exact physical VG capacity
-and removes the fixture class. Independent final readback preserves all original
-30 Pod identities/restarts, six volumes/five claims, SQL markers and the exact
-4,096-fact journal. No seed/producer SQL, replication-slot creation, volume
-expansion or WAL failure is observed. The next bounded preparation correction
-must wait for actual endpoint readiness and use the verified ordinary inventory
-shape for cleanup; no qualifier is automatically repeated. The [incident record](docs/evidence/m4-postgres-wal-preparation-stop-2026-09-30.md)
-retains both failures and restored state.
-A preventive CNPG shutdown is inconclusive without actual WAL ENOSPC; cleanup
-requires only-owned UID guards and original physical-group capacity restoration.
-Two bounded corrections preserve that first stop. The first reaches actual
-PostgreSQL WAL PANIC/53100 after 74 acknowledged one-MiB transactions, then cannot
-Exec into the failed container. The second reaches the same WAL failure but finds
-only pre-failure Kubelet filesystem samples; freshness is not weakened. Both
-unknown final transaction IDs are retained without replay, both cleanup/final
-preservation checks pass, and neither recovery nor expansion is qualified. The
-same complete case remains held. The user authorized one additional read-only
-observer attempt, implemented by root after a narrow Astra Ultra review. The
-[fourth-attempt record](docs/evidence/m4-postgres-wal-observer-stop-2026-09-30.md)
-ends after 146.566 seconds: the installed CSI driver rejects both second mounts
-because the PostgreSQL mounts are already active. No WAL producer or expansion
-runs; ordinary cleanup and full original/journal/environment preservation pass.
-Zero new automated stories and zero workspace gates accompany this operational
-attempt. The smallest next proposal reviews live filesystem statistics through
-an existing trusted node mount without a second publication. That path remains
-unverified; no fifth incident or other held case is automatically dispatched.
+Only the fresh target WAL claim and matching Cluster size expand from 128 to
+384 MiB. Mounted filesystem growth is verified from CSI and PostgreSQL, with
+unchanged PVC/PV/CSI/LV and database-system identities. All 60 acknowledged
+one-MiB commits and hashes survive. Uncertain transaction 61 is wholly absent
+and is never replayed; a fresh transaction then commits and reads back.
+Recovery observation after the guarded resize patches takes 16.220 seconds.
+The full invocation passes in 125.006 seconds, including only-owned cleanup,
+physical capacity restoration and independent preservation of all original
+workloads/storage/SQL markers, the exact 4,096-fact journal and environment files.
 
-These assets neither rerun the previous filesystem proof nor resume held native,
-backup, SDK, capacity, signed execution or control-backup cases. M4 remains open.
+The [original preparation/correction record](docs/evidence/m4-postgres-wal-preparation-stop-2026-09-30.md)
+and [rejected second-mount observer](docs/evidence/m4-postgres-wal-observer-stop-2026-09-30.md)
+remain failed historical evidence. The user removed the fixed retry cap and
+required the fix. A later output-separator parser stop is retained; one captured
+native-output regression fails first and passes after the minimal correction.
+No public runtime test suite or workspace gate is added or repeated for this
+unchanged-upstream operational qualification.
+
+This closes the selected WAL-capacity exercise, not every disk-full mode,
+customer storage automation, backup/PITR, node-loss recovery or production
+acceptance. The other unqualified native, backup, SDK, capacity, signed-execution
+and control-backup work remains separate. M4 remains open.
 
 ## 1. Product scope and decisions
 
@@ -909,6 +892,13 @@ inventory changes and milestone completion are not claimed.
 
 Use test-driven development for concrete behavior changes: identify the intended behavior or observed defect, demonstrate a meaningful failing test, implement the smallest complete correction, and check the affected behavior again. Keep the task scope fixed; tests are evidence for that change, not a reason to build additional features or infrastructure.
 
+The user removed the fixed two-correction retry limit on 2026-09-30. Continue
+fixing an observed defect while each correction follows a concrete diagnosis;
+preserve every failed result and avoid repeating unchanged experiments. The
+three-test budget, targeted iteration, one final full gate, per-run time limits
+and original-state cleanup remain in force. Historical held evidence remains
+unqualified until its actual missing behavior is corrected and verified.
+
 ### Test budget and red-first proof
 
 - Add or materially expand **at most three top-level tests per fix**, each failing first for the intended missing behavior or defect before the implementation change. Preserve the red/green result in the work report; a harness/setup failure is not the required red proof.
@@ -930,7 +920,6 @@ For the Go node-runtime observer, the frozen candidate also runs `pnpm check:nod
 
 Stop and report instead of widening the change when any of the following occurs:
 
-- The same test remains red after **two fix attempts**. An attempt is an implementation correction followed by checking the same failure; renaming the test/task or creating a commit does not reset the count.
 - Any test/check run takes **more than 10 minutes**. Monitor elapsed wall time and stop the running invocation at that bound; do not keep it running in the background to evade the limit.
 - The test count grows by **more than a few dozen** relative to the current task's baseline. This is a guard against accumulated/generated cases, not a cap on the pre-existing tests executed by the expressly allowed final full gate; the per-fix three-test cap still applies.
 

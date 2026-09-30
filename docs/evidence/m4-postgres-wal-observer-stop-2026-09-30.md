@@ -4,6 +4,12 @@ Status: **held; the single additional authorized attempt has finished**.
 The independent filesystem observation and complete WAL incident/recovery remain
 unqualified. Cleanup and full original-state preservation pass.
 
+Subsequent user-directed work removes the fixed correction cap and qualifies
+the same selected case using the existing CSI mount. The
+[complete recovery result](m4-postgres-wal-recovery-2026-09-30.md) records the
+retained parser stop and successful fresh sixth invocation. This historical
+record's failed result is unchanged.
+
 ## Scope and review
 
 The human explicitly continued the proposed single observer attempt after the

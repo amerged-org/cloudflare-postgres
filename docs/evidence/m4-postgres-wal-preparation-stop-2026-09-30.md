@@ -10,6 +10,12 @@ This record ends before the user's later explicit exception. The subsequent
 also stops, on CSI second-mount refusal, with cleanup and preservation passing.
 Its separate result does not rewrite the failures or reset the counters below.
 
+Subsequent user-directed work removes the fixed correction cap and qualifies
+the same selected case using the existing CSI mount. The
+[complete recovery result](m4-postgres-wal-recovery-2026-09-30.md) records the
+retained parser stop and successful fresh sixth invocation. This historical
+record's failed result is unchanged.
+
 ## Admitted preparation
 
 The [public fixture](../../infra/qualification/postgres-storage-recovery/README.md)

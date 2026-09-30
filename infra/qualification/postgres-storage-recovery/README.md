@@ -1,17 +1,14 @@
 # Isolated PostgreSQL WAL-storage failure and recovery
 
-Status: **qualification assets; complete incident/recovery held after the single authorized extra attempt**.
-The [preparation-stop evidence](../../../docs/evidence/m4-postgres-wal-preparation-stop-2026-09-30.md)
-records the initial preparation/cleanup stops, two later actual PostgreSQL WAL
-panics, failed fresh filesystem observations and independently verified cleanup.
-The [subsequent authorized observer attempt](../../../docs/evidence/m4-postgres-wal-observer-stop-2026-09-30.md)
-stops because the installed CSI driver rejects a second mount while PostgreSQL
-uses the volumes. Do not assume a separate read-only Pod can share these claims.
-There is no complete WAL-failure/neighbor/recovery qualification claim. This is one
-operator-owned exercise of PostgreSQL 18.4, CloudNativePG 1.30.1 and an existing
-qualified OpenEBS LocalPV LVM stack. It measures a full WAL filesystem, a fresh
-neighbor's durable transactions and bounded storage-expansion recovery. It does
-not establish every disk-full mode, node loss, backup/PITR or production tenancy.
+Status: **the selected single-node WAL incident/recovery is qualified**.
+The [complete result](../../../docs/evidence/m4-postgres-wal-recovery-2026-09-30.md)
+records an actual WAL PANIC, fresh filesystem measurements, neighbor durability,
+guarded mounted WAL expansion, all acknowledged commits and ordinary cleanup.
+The [earlier preparation stops](../../../docs/evidence/m4-postgres-wal-preparation-stop-2026-09-30.md)
+and [rejected second-mount observer](../../../docs/evidence/m4-postgres-wal-observer-stop-2026-09-30.md)
+remain recorded. This is one operator-owned exercise of PostgreSQL 18.4,
+CloudNativePG 1.30.1 and an existing OpenEBS LocalPV LVM stack. It does not
+establish every disk-full mode, node loss, backup/PITR or production tenancy.
 
 The resources are examples, excluded from platform Flux reconciliation. Their
 placeholder values must be replaced in a private copy before rendering or any
@@ -97,6 +94,50 @@ data/WAL PVC/PV/CSI handles, the selected physical group and separate mounted
 filesystems. Confirm `/var/lib/postgresql/data/pgdata/pg_wal` resolves onto the WAL
 mount in the actual image. Record usable capacity and PostgreSQL system identity.
 Keep PostgreSQL durability enabled and make no archive/plugin configuration.
+
+### Fresh measurement independent of PostgreSQL
+
+Use the existing authenticated CSI node plugin's already-published mount,
+not a second observer Pod sharing the claims. The installed LVM driver rejects
+that second publication while PostgreSQL's mount is active. No new privileged
+Pod, host-path grant, volume remount or storage-driver change is necessary.
+This procedure is trusted operator authority; customer requests must never
+choose host paths or execute commands in the CSI service.
+
+Derive each path exclusively from the current owned database Pod UID and
+its sealed bound PV name:
+
+```text
+/var/lib/kubelet/pods/<owned-pod-uid>/volumes/kubernetes.io~csi/<bound-pv-name>/mount
+```
+
+Before each decisive read, verify Node UID/boot, CSI plugin Pod UID/full spec,
+container identity/image/restarts, database Pod ownership/placement, and both
+PVC UID → PV UID → CSI handle bindings. In the unchanged CSI container, read
+only filesystem metadata and its mount table:
+
+```sh
+stat -f -c '%S %b %f %a %c %d' "$DATA_MOUNT"
+stat -f -c '%S %b %f %a %c %d' "$WAL_MOUNT"
+cat /proc/self/mountinfo
+```
+
+The six stat values are fundamental block size, total blocks, free blocks,
+available blocks, total inodes and available inodes. Multiply total/available
+blocks by fundamental block size for capacity/available bytes. Require the
+exact two mount points, ext4, separate devices, expected LV source bindings and
+agreement with PostgreSQL's actual pre-incident mounted devices/capacities.
+Ignore blank output separators while rejecting malformed nonempty mount records.
+Freeze the device identities for post-failure and post-expansion comparison.
+
+Dispatch the failed-volume read after the recorded PostgreSQL failure and retain
+its dispatch/completion times. Do not accept earlier Kubelet samples as current.
+After expansion, require actual filesystem growth, unchanged devices and
+agreement with the recovered PostgreSQL container. An unavailable mount or
+changed ownership is a failed observation, not permission to remount or weaken
+checks. Preserve the declared producer/recovery/cleanup deadlines.
+
+### Logged producer and receipts
 
 Use authenticated operator Exec into each fresh PostgreSQL container and its
 local Unix socket. Run `psql -X -v ON_ERROR_STOP=1 -d app` as the trusted operator,
