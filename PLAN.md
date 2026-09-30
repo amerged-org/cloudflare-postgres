@@ -148,7 +148,10 @@ Captured actor and resource identities, current revisions/runtime and exact
 regional leases remain required; D1 time and conservative query-delay accounting
 bound lease disclosure. Encryption/history and wire are unchanged. Three real
 stale-session stories fail first and pass; the one frozen gate passes 45 Worker
-and 59 Node cases with unchanged Go evidence retained. Dev delivery is pending.
+and 59 Node cases with unchanged Go evidence retained. Public source `8aa8b78`
+and the new Dev version are delivered at 100 percent; eight Secret bindings,
+18 migrations/50 tables, 319 guards and original control/budget counts match readback.
+Both unauthenticated credential routes refuse access without password reads.
 This is a point-in-time secrecy boundary, not runtime enforcement or production
 acceptance. All held backup/signing/native/admission qualifications remain held.
 

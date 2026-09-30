@@ -1,6 +1,6 @@
 # Plaintext credential disclosure authority — 2026-09-30
 
-Status: source qualified; Dev delivery pending. Four secret-bearing responses
+Status: source qualified and delivered to Dev; bounded readback verified. Four secret-bearing responses
 now validate the original principal and current resources with a fresh primary
 D1 query after every decryption await: customer role credentials, customer
 owned-database credentials, regional role application claims (current and
@@ -73,10 +73,36 @@ format, lint, typecheck, **45 Worker** and **59 Node** cases. Six unchanged Go c
 retain prior evidence. Frozen source is unchanged; no second broad gate, regional
 build/image, schema migration, key creation or held qualifier occurs.
 
-Dev delivery and live readback remain pending. Planned credential route probes
-send no authorization, body or query; an unexpected response is cancelled before
-body consumption. They prove routing/auth refusal only. Actual password delivery,
-replica races and regional lease secrecy are not claimed from those live probes.
+## Public source and Dev delivery
+
+Source [8aa8b78](https://github.com/amerged-org/cloudflare-postgres/commit/8aa8b78091f72bb91b5bc32cbb74a77de4151b61)
+is published to the public default branch. Six edited file bytes match independent
+GitHub readback. One same-source Worker preview passes in 5.577 seconds; its three
+output files contain no known local credential variants. One reviewed Dev
+Worker deployment passes in 13.451 seconds without schema migrations, key changes,
+regional image changes or Contabo actions.
+
+The new Dev version is `4dee98aa-521b-455a-a990-e7a509f7f3b1`. Nine bounded
+post-deployment requests complete in 1.567 seconds and verify 100 percent traffic,
+exact account/database identity, eight unchanged Secret names/types,
+18 migrations/50 tables, 319 retained guard rows, the original one organization
+and project, closed admission and zero managed/create-stop-delete/permit/allowance
+work. Budget targets/accounts/revisions remain 1/1/3 with zero reserved units.
+The existing owned project remains readable. Secret values are never queried.
+
+Both unauthenticated customer credential GETs return exact `401` refusal. They send
+no token/body/query and request canonical absent environment/resource UUIDs.
+An unexpected response would be cancelled before body consumption; no password
+response is read, retained or printed. These probes establish routing/auth refusal
+only. Real password delivery, replica races and regional disclosure correctness
+come from source and isolated test evidence, not those live requests. The single
+counts snapshot precedes the two probes and is not a second post-probe capture.
+
+Known local configuration remains ignored, untracked and mode0600 with unchanged
+bytes. A public candidate scan checks 22 sensitive assignments and 65 variants
+against 470 files with zero matches; no private configuration is copied into the
+isolated worktree. Held signing/native/backup code is not part of this public
+source or deployment.
 
 Private source/RED/GREEN/gate/delivery evidence is retained under
 `.local/evidence/credential-disclosure-authority/`. Backup activation remains
