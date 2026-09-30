@@ -1,6 +1,6 @@
 # Logical-project write authority — 2026-09-30
 
-Status: source qualified; Dev delivery pending. This change closes the observed
+Status: source qualified and delivered to Dev, with bounded readback verified. This change closes the observed
 stale-authorization race in `POST /v1/organizations/{organizationId}/projects`,
 including its retained idempotent response and concurrent-winner recovery.
 It changes no API schema, database schema, region admission, compute operation
@@ -52,10 +52,41 @@ cases retain previous evidence. Application source stays frozen; no second broad
 gate is run. Unchanged regional artifacts are rebuilt for the isolated Node gate;
 no regional image or runtime is changed.
 
-Dev delivery and final readback remain pending. No live credential revocation,
-project write or customer provisioning is needed for delivery observations;
-streamed-body race evidence comes from the isolated Worker tests. Planned live
-checks must remain read-only apart from the reviewed Worker deployment.
+## Public source and Dev delivery
+
+Source [3c15c1c](https://github.com/amerged-org/cloudflare-postgres/commit/3c15c1cfd3b0e7e01dc83aeb47c2fdb68dee6ae7)
+is published to the public default branch. Five edited file contents match an
+independent GitHub readback. A same-source Worker preview passes in 4.900 seconds;
+all three output files contain no known local credential variants. One reviewed
+Dev deployment passes in 13.185 seconds, without schema migrations, new keys,
+regional images or Contabo effects.
+
+The new Worker version is `4580876f-add3-48e0-a24a-a9eecb46daed`. Eight bounded
+post-deployment requests complete in 1.140 seconds and verify 100 percent traffic,
+the exact account/database identity, eight unchanged Secret names/types,
+18 migrations/50 tables, 319 retained assertion rows, one organization/project,
+zero managed environments/create-stop-delete work/permits/allowance holds,
+budget counts 1/1/3, zero reserved units and closed admission. Secret values are
+never queried. The existing owned project GET returns `200` with matching identity;
+an unauthenticated empty POST on this logical-project collection returns exact
+401 `unauthorized`, without credentials, body or idempotency key.
+
+The single SELECT counts capture precedes that unauthenticated dispatch; it is
+post-deployment evidence, not a separate post-probe snapshot. These live probes
+establish routing/read compatibility, not reproduction of a credential-revocation
+race. That race evidence comes from the two isolated Worker stories.
+
+The first baseline capture correctly stops on a checker defect: a historical
+binding alias `DB` was compared with the live database display name. The original
+checker and failure remain retained. One approved manual correction takes the
+established Wrangler `database_name` while preserving account ID/database UUID
+checks; one fresh same-scope read captures metadata before validation and passes.
+No third baseline attempt or automatic retry occurs.
+
+The stopped signed candidate remains unpublished and unactivated. No held
+Linux, Barman/backup, native-access, birth or maintenance qualification resumes.
+Customer production acceptance, actual backup/PITR and runtime enforcement
+remain open.
 
 Private logs, source hashes, gate results and original held-source custody are
 retained under `.local/evidence/logical-project-authority/`. Credentials are not
