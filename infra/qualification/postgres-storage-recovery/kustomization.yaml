@@ -1,0 +1,77 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - settings.example.yaml
+  - storage-class.yaml
+  - namespaces.yaml
+  - quotas.yaml
+  - clusters.yaml
+  - network.yaml
+replacements:
+  - source:
+      kind: ConfigMap
+      name: pgcf-wal-qualification-settings
+      fieldPath: data.operationId
+    targets:
+      - select: {}
+        fieldPaths:
+          - metadata.labels.[pgcf.io/qualification-run]
+      - select:
+          kind: Cluster
+          group: postgresql.cnpg.io
+        fieldPaths:
+          - spec.inheritedMetadata.labels.[pgcf.io/qualification-run]
+  - source:
+      kind: ConfigMap
+      name: pgcf-wal-qualification-settings
+      fieldPath: data.storageClassName
+    targets:
+      - select:
+          kind: StorageClass
+          name: pgcf-wal-storage-example
+        fieldPaths:
+          - metadata.name
+      - select:
+          kind: Cluster
+          group: postgresql.cnpg.io
+        fieldPaths:
+          - spec.storage.storageClass
+          - spec.walStorage.storageClass
+  - source:
+      kind: ConfigMap
+      name: pgcf-wal-qualification-settings
+      fieldPath: data.nodeName
+    targets:
+      - select:
+          kind: Cluster
+          group: postgresql.cnpg.io
+        fieldPaths:
+          - spec.affinity.nodeSelector.[kubernetes.io/hostname]
+  - source:
+      kind: ConfigMap
+      name: pgcf-wal-qualification-settings
+      fieldPath: data.targetNamespace
+    targets:
+      - select:
+          kind: Namespace
+          name: pgcf-wal-target-example
+        fieldPaths:
+          - metadata.name
+      - select:
+          namespace: pgcf-wal-target-example
+        fieldPaths:
+          - metadata.namespace
+  - source:
+      kind: ConfigMap
+      name: pgcf-wal-qualification-settings
+      fieldPath: data.neighborNamespace
+    targets:
+      - select:
+          kind: Namespace
+          name: pgcf-wal-neighbor-example
+        fieldPaths:
+          - metadata.name
+      - select:
+          namespace: pgcf-wal-neighbor-example
+        fieldPaths:
+          - metadata.namespace

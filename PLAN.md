@@ -212,6 +212,26 @@ distinguishes the separate correction from the original candidate. This independ
 management capability does not resume held SDK, capacity, signing, physical
 backup/native access or scheduled control-backup work. Admission remains closed.
 
+## PostgreSQL WAL-capacity recovery preparation
+
+The [isolated WAL-storage qualification assets](infra/qualification/postgres-storage-recovery/README.md)
+define the remaining database-storage failure/recovery exercise. Two new,
+restricted operator fixtures use the pinned PostgreSQL image, separate thick
+data/WAL volumes and bounded resource quotas. The target's logged producer is
+bounded by bytes, rows and time; the neighbor must continue durable transactions.
+Only the fresh target WAL claim/Cluster size may expand. Confirmed and ambiguous
+transactions must be reconciled on the same PostgreSQL system before new writes.
+
+Named rendering and independent scope/network reviews pass. Fresh read-only
+inventory finds 30 Running Pods, five claims/six volumes, sufficient request and
+physical storage headroom, and the original SQL markers and unchanged 4,096-fact
+outbox. The first uint64-string capacity parser stop is retained and corrected
+without provider mutation. The actual PostgreSQL exercise is not yet dispatched.
+A preventive CNPG shutdown is inconclusive without actual WAL ENOSPC; cleanup
+requires only-owned UID guards and original physical-group capacity restoration.
+These assets neither rerun the previous filesystem proof nor resume held native,
+backup, SDK, capacity, signed execution or control-backup cases. M4 remains open.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.
