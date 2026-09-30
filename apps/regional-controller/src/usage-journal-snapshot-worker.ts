@@ -7,6 +7,8 @@ import type { FileHandle } from "node:fs/promises";
 import { dirname, isAbsolute, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { pathToFileURL } from "node:url";
+import { validAcceptedArchive } from "./usage-accepted-ledger.ts";
+import type { AcceptedArchive } from "./usage-accepted-ledger.ts";
 const maximum = 64 * 1024 * 1024,
   deadline = performance.now() + 57000;
 const object = (value: unknown): value is Record<string, unknown> =>
@@ -105,16 +107,20 @@ async function hashFile(file: FileHandle, bytes: number): Promise<string> {
   if ((await file.read(buffer, 0, 1, at)).bytesRead) throw failed();
   return hash.digest("hex");
 }
-async function verifyCompleted(
-  config: Record<string, unknown>,
-): Promise<{ pendingFacts: number; bytes: number }> {
+async function verifyCompleted(config: Record<string, unknown>): Promise<{
+  pendingFacts: number;
+  bytes: number;
+  sessionId?: string;
+  acceptedLastArchive?: AcceptedArchive | null;
+}> {
   const sourcePath = config.sourcePath as string,
     expected = config.expectedIdentity as Parameters<typeof verify>[1],
     sourceStat = config.sourceStat as { dev: string; ino: string },
     v = config.verification;
   if (
     !object(v) ||
-    Object.keys(v).length !== 3 ||
+    Object.keys(v).length !== (v.inspectMetadata === true ? 4 : 3) ||
+    (Object.hasOwn(v, "inspectMetadata") && v.inspectMetadata !== true) ||
     v.manifestPath !== join(dirname(sourcePath), "manifest.json") ||
     typeof v.expectedSha256 !== "string" ||
     !/^[a-f0-9]{64}$/.test(v.expectedSha256) ||
@@ -226,6 +232,38 @@ async function verifyCompleted(
       !db.prepare("PRAGMA foreign_key_check").iterate().next().done
     )
       throw failed();
+    let metadata:
+      | { sessionId: string; acceptedLastArchive: AcceptedArchive | null }
+      | undefined;
+    if (v.inspectMetadata === true) {
+      const state = db
+          .prepare("SELECT id,session_id FROM journal_state LIMIT 2")
+          .all(),
+        archiveRow = db
+          .prepare(
+            "SELECT value FROM journal_meta WHERE name='accepted_last_archive'",
+          )
+          .get();
+      if (
+        state.length !== 1 ||
+        state[0]?.id !== 1 ||
+        typeof state[0]?.session_id !== "string" ||
+        !uuid.test(state[0].session_id) ||
+        (archiveRow &&
+          (typeof archiveRow.value !== "string" ||
+            Buffer.byteLength(archiveRow.value) > 8192))
+      )
+        throw failed();
+      const acceptedLastArchive: unknown = archiveRow
+        ? JSON.parse(archiveRow.value as string)
+        : null;
+      if (
+        acceptedLastArchive !== null &&
+        !validAcceptedArchive(acceptedLastArchive)
+      )
+        throw failed();
+      metadata = { sessionId: state[0].session_id, acceptedLastArchive };
+    }
     db.close();
     db = null;
     const directoryAfter = await lstat(directory),
@@ -260,7 +298,7 @@ async function verifyCompleted(
     )
       throw failed();
     check();
-    return { pendingFacts, bytes: before.size };
+    return { pendingFacts, bytes: before.size, ...metadata };
   } finally {
     try {
       db?.close();

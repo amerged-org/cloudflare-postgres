@@ -22,6 +22,11 @@ import { validNativeClientProfiles } from "./native-access.ts";
 import { BackupClient } from "./backup-client.ts";
 import { backupKubernetesFromConfig } from "./backup-kubernetes.ts";
 import { runBackupController } from "./backup-controller.ts";
+import {
+  loadUsageArchiveConfiguration,
+  runUsageArchiveScheduler,
+} from "./usage-archive.ts";
+import { UsageArchiveClient } from "./usage-archive-client.ts";
 import { validateProvisioningJournalDirectory } from "./provisioning-funding.ts";
 
 function required(name: string): string {
@@ -42,6 +47,12 @@ function milliseconds(
 }
 
 async function main(): Promise<void> {
+  if (process.argv[2] === "recover-usage-archive") {
+    const { runUsageArchiveRecovery } =
+      await import("./usage-archive-recovery-cli.ts");
+    process.exitCode = await runUsageArchiveRecovery(process.argv.slice(3));
+    return;
+  }
   if (process.argv[2] === "verify-usage-snapshot") {
     const { runUsageSnapshotVerification } =
       await import("./usage-snapshot-verification-cli.ts");
@@ -241,6 +252,12 @@ async function main(): Promise<void> {
   ) {
     throw new Error("incomplete_metering_configuration");
   }
+  const archiveConfigPath = process.env.PGCF_USAGE_ARCHIVE_CONFIG_FILE;
+  if (archiveConfigPath && !metering)
+    throw new Error("invalid_usage_archive_configuration");
+  const archiveConfig = archiveConfigPath
+    ? await loadUsageArchiveConfiguration(archiveConfigPath)
+    : null;
   try {
     if (journalPath && metering) {
       journal = new UsageJournal(journalPath, metering.identity);
@@ -253,6 +270,26 @@ async function main(): Promise<void> {
           log,
         }),
       );
+      if (archiveConfig) {
+        const meterTokenFile = required("PGCF_METER_TOKEN_FILE");
+        const archiveClient = new UsageArchiveClient(
+          required("PGCF_CONTROL_ORIGIN"),
+          metering.identity,
+          async () => (await readFile(meterTokenFile, "utf8")).trim(),
+        );
+        tasks.push(
+          runUsageArchiveScheduler({
+            sourcePath: journalPath,
+            directory: archiveConfig.directory,
+            acceptedArchiveRoots: archiveConfig.acceptedArchiveRoots,
+            identity: metering.identity,
+            transport: archiveClient,
+            intervalMilliseconds: archiveConfig.intervalMilliseconds,
+            signal: shutdown.signal,
+            log,
+          }),
+        );
+      }
     }
     tasks.push(runController(api, client, config, controllerOptions));
     if (backupLane) {

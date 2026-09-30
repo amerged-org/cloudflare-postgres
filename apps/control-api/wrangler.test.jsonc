@@ -2,6 +2,9 @@
   "name": "cloudflare-postgres-control-api-test",
   "main": "src/index.ts",
   "compatibility_date": "2026-09-27",
+  "r2_buckets": [
+    { "binding": "USAGE_ARCHIVES", "bucket_name": "usage-archives-test" },
+  ],
   "d1_databases": [
     {
       "binding": "DB",

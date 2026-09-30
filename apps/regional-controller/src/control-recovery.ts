@@ -15,6 +15,7 @@ import { restoreControlSnapshot } from "./control-snapshot.ts";
 export interface RecoveryKeyrings {
   ROLE_CREDENTIAL_KEYS: string;
   ALLOWANCE_FENCE_KEYS: string;
+  USAGE_ARCHIVE_KEYS?: string;
 }
 interface Ring {
   active: string;
@@ -219,11 +220,22 @@ function clear(
 function verifyCustody(snapshot: ControlSnapshot, keyrings: RecoveryKeyrings) {
   if (
     !object(keyrings) ||
-    Object.keys(keyrings).length !== 2 ||
+    ![2, 3].includes(Object.keys(keyrings).length) ||
+    !Object.keys(keyrings).every((name) =>
+      [
+        "ROLE_CREDENTIAL_KEYS",
+        "ALLOWANCE_FENCE_KEYS",
+        "USAGE_ARCHIVE_KEYS",
+      ].includes(name),
+    ) ||
     typeof keyrings.ROLE_CREDENTIAL_KEYS !== "string" ||
     typeof keyrings.ALLOWANCE_FENCE_KEYS !== "string"
   )
     throw fail();
+  if (Object.hasOwn(keyrings, "USAGE_ARCHIVE_KEYS")) {
+    if (typeof keyrings.USAGE_ARCHIVE_KEYS !== "string") throw fail();
+    keyring(keyrings.USAGE_ARCHIVE_KEYS);
+  }
   const roles = keyring(keyrings.ROLE_CREDENTIAL_KEYS),
     fences = keyring(keyrings.ALLOWANCE_FENCE_KEYS),
     roleRows = rows(snapshot, "database_roles"),

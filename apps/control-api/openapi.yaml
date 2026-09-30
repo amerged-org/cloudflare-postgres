@@ -1345,6 +1345,213 @@ paths:
           $ref: "#/components/responses/AccountingUnavailable"
         "503":
           $ref: "#/components/responses/AccountingUnavailable"
+  /v1/regions/{regionId}/usage-archives/prepare:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+    post:
+      operationId: prepareUsageArchive
+      summary: Prepare immutable private R2 journal custody
+      description: >-
+        Source-bound usage meter authority only. The canonical descriptor fixes
+        the artifact identity before chunk transport. No paths, backend URLs or
+        provider credentials are accepted. A prepared header is not completion.
+      security:
+        - usageMeterToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UsageArchiveDescriptor"
+      responses:
+        "200":
+          description: The same durable descriptor was already prepared.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageArchivePreparation"
+        "201":
+          description: An encrypted immutable descriptor and wrapped data key were retained.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageArchivePreparation"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "409":
+          description: Source authority changed or immutable custody conflicts.
+        "503":
+          description: Archive configuration or storage is unavailable; retain the same local artifact.
+  /v1/regions/{regionId}/usage-archives/{sourceId}/{sourceEpoch}:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/UsageArchiveSourceId"
+      - $ref: "#/components/parameters/UsageArchiveSourceEpoch"
+    get:
+      operationId: listUsageArchiveReceipts
+      summary: Discover a bounded page of completed source custody
+      security:
+        - installationToken: []
+      parameters:
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 25
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Completed immutable receipts and an opaque nextCursor; prepared artifacts are excluded.
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: Archive configuration or observation unavailable.
+  /v1/regions/{regionId}/usage-archives/{sourceId}/{sourceEpoch}/{descriptorId}/chunks/{ordinal}:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/UsageArchiveSourceId"
+      - $ref: "#/components/parameters/UsageArchiveSourceEpoch"
+      - $ref: "#/components/parameters/UsageArchiveDescriptorId"
+      - name: ordinal
+        in: path
+        required: true
+        schema:
+          type: integer
+          minimum: 0
+          maximum: 255
+    put:
+      operationId: uploadUsageArchiveChunk
+      summary: Preserve one digest-bound encrypted chunk without overwriting custody
+      security:
+        - usageMeterToken: []
+      requestBody:
+        required: true
+        content:
+          application/octet-stream:
+            schema:
+              type: string
+              format: binary
+              maxLength: 1048576
+      responses:
+        "200":
+          description: Stored bytes match the promised ordinal, length and digest.
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Authority changed or stored bytes conflict; never replace them.
+        "503":
+          description: Transport outcome unavailable; retry only the original artifact/chunk.
+    get:
+      operationId: recoverUsageArchiveChunk
+      summary: Read a verified plaintext chunk into private inactive recovery custody
+      security:
+        - installationToken: []
+      parameters:
+        - name: receiptSha256
+          in: query
+          required: true
+          description: Digest from independently retained receipt custody.
+          schema:
+            $ref: "#/components/schemas/AccountingEvidenceHash"
+      responses:
+        "200":
+          description: Length- and digest-verified recovered chunk; Cache-Control no-store.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Retained receipt or byte custody does not match.
+        "503":
+          description: Recovery key or stored byte observation unavailable.
+  /v1/regions/{regionId}/usage-archives/{sourceId}/{sourceEpoch}/{descriptorId}/finalize:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/UsageArchiveSourceId"
+      - $ref: "#/components/parameters/UsageArchiveSourceEpoch"
+      - $ref: "#/components/parameters/UsageArchiveDescriptorId"
+    post:
+      operationId: finalizeUsageArchive
+      summary: Verify all stored file bytes and preserve an immutable completion receipt
+      security:
+        - usageMeterToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+      responses:
+        "200":
+          description: Verified original completion receipt and its canonical SHA-256.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageArchiveCompletion"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Missing chunks, byte conflicts or changed source authority; no completed archive claim.
+        "503":
+          description: Uncertain storage observation; recover the same receipt without replacing it.
+  /v1/regions/{regionId}/usage-archives/{sourceId}/{sourceEpoch}/{descriptorId}/recovery:
+    parameters:
+      - $ref: "#/components/parameters/RegionId"
+      - $ref: "#/components/parameters/UsageArchiveSourceId"
+      - $ref: "#/components/parameters/UsageArchiveSourceEpoch"
+      - $ref: "#/components/parameters/UsageArchiveDescriptorId"
+    post:
+      operationId: readUsageArchiveRecoveryDescriptor
+      summary: Authenticate original or historical-epoch custody against an independent receipt
+      security:
+        - installationToken: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [expectedReceiptSha256]
+              properties:
+                expectedReceiptSha256:
+                  $ref: "#/components/schemas/AccountingEvidenceHash"
+      responses:
+        "200":
+          description: Verified descriptor, immutable receipt and matching receiptSha256; no activation authority.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageArchiveRecovery"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: The independent receipt digest does not match stored custody.
+        "503":
+          description: Recovery configuration or stored custody is unavailable.
   /v1/regions/{regionId}/usage-facts:
     parameters:
       - $ref: "#/components/parameters/RegionId"
@@ -2693,6 +2900,25 @@ components:
       scheme: bearer
       description: Region-scoped executor token with operations:claim and operations:report.
   parameters:
+    UsageArchiveSourceId:
+      name: sourceId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UsageArchiveSourceEpoch:
+      name: sourceEpoch
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/UsageSourceEpoch"
+    UsageArchiveDescriptorId:
+      name: descriptorId
+      in: path
+      required: true
+      schema:
+        $ref: "#/components/schemas/AccountingEvidenceHash"
     LifecycleIdempotencyKey:
       name: Idempotency-Key
       in: header
@@ -2918,6 +3144,169 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
   schemas:
+    UsageArchivePreparation:
+      type: object
+      additionalProperties: false
+      required: [descriptorId, descriptorSha256, descriptor]
+      properties:
+        descriptorId:
+          $ref: "#/components/schemas/AccountingEvidenceHash"
+        descriptorSha256:
+          $ref: "#/components/schemas/AccountingEvidenceHash"
+        descriptor:
+          $ref: "#/components/schemas/UsageArchiveDescriptor"
+    UsageArchiveReceipt:
+      type: object
+      additionalProperties: false
+      required:
+        [
+          version,
+          descriptorId,
+          descriptorSha256,
+          identity,
+          sessionId,
+          capturedAt,
+          files,
+          chunkCount,
+          keyId,
+          completedAt,
+        ]
+      properties:
+        version:
+          type: integer
+          const: 1
+        descriptorId:
+          $ref: "#/components/schemas/AccountingEvidenceHash"
+        descriptorSha256:
+          $ref: "#/components/schemas/AccountingEvidenceHash"
+        identity:
+          $ref: "#/components/schemas/UsageArchiveDescriptor/properties/identity"
+        sessionId:
+          type: string
+          format: uuid
+        capturedAt:
+          type: string
+          format: date-time
+        files:
+          type: array
+          minItems: 2
+          maxItems: 66
+          items:
+            type: object
+            additionalProperties: false
+            required: [kind, id, bytes, sha256]
+            properties:
+              kind:
+                type: string
+                enum: [journal, manifest, accepted]
+              id:
+                type: string
+              bytes:
+                type: integer
+                minimum: 1
+              sha256:
+                $ref: "#/components/schemas/AccountingEvidenceHash"
+        chunkCount:
+          type: integer
+          minimum: 2
+          maximum: 256
+        keyId:
+          type: string
+          pattern: ^[A-Za-z0-9_.-]{1,32}$
+        completedAt:
+          type: string
+          format: date-time
+    UsageArchiveCompletion:
+      type: object
+      additionalProperties: false
+      required: [receipt, receiptSha256]
+      properties:
+        receipt:
+          $ref: "#/components/schemas/UsageArchiveReceipt"
+        receiptSha256:
+          $ref: "#/components/schemas/AccountingEvidenceHash"
+    UsageArchiveRecovery:
+      type: object
+      additionalProperties: false
+      required: [descriptor, receipt, receiptSha256]
+      properties:
+        descriptor:
+          $ref: "#/components/schemas/UsageArchiveDescriptor"
+        receipt:
+          $ref: "#/components/schemas/UsageArchiveReceipt"
+        receiptSha256:
+          $ref: "#/components/schemas/AccountingEvidenceHash"
+    UsageArchiveDescriptor:
+      type: object
+      additionalProperties: false
+      required: [version, identity, sessionId, capturedAt, files]
+      description: >-
+        Canonical ordered file/chunk custody, at most 66 files, 256 total chunks
+        and 256 MiB. Exactly one original manifest and one journal; accepted
+        files include the complete bounded predecessor closure, never a subset.
+      properties:
+        version:
+          type: integer
+          const: 1
+        identity:
+          type: object
+          additionalProperties: false
+          required: [regionId, sourceId, sourceEpoch]
+          properties:
+            regionId:
+              type: string
+              format: uuid
+            sourceId:
+              type: string
+              format: uuid
+            sourceEpoch:
+              $ref: "#/components/schemas/UsageSourceEpoch"
+        sessionId:
+          type: string
+          format: uuid
+        capturedAt:
+          type: string
+          format: date-time
+        files:
+          type: array
+          minItems: 2
+          maxItems: 66
+          items:
+            $ref: "#/components/schemas/UsageArchiveFile"
+    UsageArchiveFile:
+      type: object
+      additionalProperties: false
+      required: [kind, id, bytes, sha256, chunks]
+      properties:
+        kind:
+          type: string
+          enum: [journal, manifest, accepted]
+        id:
+          type: string
+          pattern: ^(?:journal|manifest|[a-f0-9]{64})$
+          description: Fixed journal/manifest identifier or accepted file SHA-256; never a path.
+        bytes:
+          type: integer
+          minimum: 1
+          maximum: 67108864
+          description: Manifest at most 16 KiB; an accepted bundle at most 8 MiB.
+        sha256:
+          $ref: "#/components/schemas/AccountingEvidenceHash"
+        chunks:
+          type: array
+          minItems: 1
+          maxItems: 256
+          items:
+            type: object
+            additionalProperties: false
+            required: [bytes, sha256]
+            properties:
+              bytes:
+                type: integer
+                minimum: 1
+                maximum: 1048576
+              sha256:
+                $ref: "#/components/schemas/AccountingEvidenceHash"
     ProviderInstance:
       type: object
       additionalProperties: false

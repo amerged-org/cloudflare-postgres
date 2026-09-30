@@ -16,6 +16,8 @@ import { basename, dirname, isAbsolute, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { fileURLToPath } from "node:url";
 import type { UsageIdentity } from "./metering-types.ts";
+import { validAcceptedArchive } from "./usage-accepted-ledger.ts";
+import type { AcceptedArchive } from "./usage-accepted-ledger.ts";
 export interface UsageSnapshotInput {
   sourcePath: string;
   targetDirectory: string;
@@ -39,6 +41,16 @@ export interface UsageSnapshotVerificationResult {
   bytes: number;
   pendingFacts: number;
   activationSupported: false;
+}
+export interface UsageSnapshotInspectionResult extends UsageSnapshotVerificationResult {
+  sessionId: string;
+  acceptedLastArchive: AcceptedArchive | null;
+}
+interface WorkerResult {
+  pendingFacts: number;
+  bytes: number;
+  sessionId?: string;
+  acceptedLastArchive?: AcceptedArchive | null;
 }
 const maximum = 64 * 1024 * 1024;
 const failed = () => new Error("usage_snapshot_failed");
@@ -129,7 +141,8 @@ async function worker(
   message: unknown,
   deadline: number,
   signal?: AbortSignal,
-): Promise<{ pendingFacts: number; bytes: number }> {
+  inspectMetadata = false,
+): Promise<WorkerResult> {
   if (signal?.aborted || performance.now() >= deadline) throw failed();
   const suffix = new URL(import.meta.url).pathname.endsWith(".ts")
       ? ".ts"
@@ -139,102 +152,113 @@ async function worker(
     );
   const encoded = JSON.stringify(message);
   if (Buffer.byteLength(encoded) > 16384) throw failed();
-  return await new Promise<{ pendingFacts: number; bytes: number }>(
-    (resolve, reject) => {
-      const child = spawn(process.execPath, [path], {
-        env: {
-          PATH: dirname(process.execPath),
-          LANG: "C",
-          LC_ALL: "C",
-          TZ: "UTC",
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-        detached: true,
-      });
-      let output = "",
-        outputBytes = 0,
-        errorBytes = 0,
-        unavailable = false,
-        escalation: ReturnType<typeof setTimeout> | null = null;
-      const kill = (signal: NodeJS.Signals) => {
-        if (child.pid)
-          try {
-            process.kill(-child.pid, signal);
-          } catch {
-            /* Closed group is already quiescent. */
-          }
-      };
-      const stop = () => {
-        if (unavailable) return;
-        unavailable = true;
-        kill("SIGTERM");
-        escalation = setTimeout(() => kill("SIGKILL"), 250);
-      };
-      const aborted = () => stop();
-      signal?.addEventListener("abort", aborted, { once: true });
-      const timer = setTimeout(
-        stop,
-        Math.max(1, deadline - performance.now() - 1500),
-      );
-      child.stdout.on("data", (chunk: Buffer) => {
-        outputBytes += chunk.length;
-        if (outputBytes > 4096) {
-          stop();
-          return;
-        }
-        output += chunk.toString("utf8");
-      });
-      child.stderr.on("data", (chunk: Buffer) => {
-        errorBytes += chunk.length;
-        if (errorBytes > 4096) stop();
-      });
-      child.on("error", stop);
-      child.stdin.on("error", stop);
-      child.on("close", (code) => {
-        clearTimeout(timer);
-        if (escalation) clearTimeout(escalation);
-        signal?.removeEventListener("abort", aborted);
-        if (
-          unavailable ||
-          code !== 0 ||
-          signal?.aborted ||
-          performance.now() >= deadline
-        ) {
-          reject(failed());
-          return;
-        }
+  return await new Promise<WorkerResult>((resolve, reject) => {
+    const child = spawn(process.execPath, [path], {
+      env: {
+        PATH: dirname(process.execPath),
+        LANG: "C",
+        LC_ALL: "C",
+        TZ: "UTC",
+      },
+      stdio: ["pipe", "pipe", "pipe"],
+      detached: true,
+    });
+    let output = "",
+      outputBytes = 0,
+      errorBytes = 0,
+      unavailable = false,
+      escalation: ReturnType<typeof setTimeout> | null = null;
+    const kill = (signal: NodeJS.Signals) => {
+      if (child.pid)
         try {
-          const result: unknown = JSON.parse(output);
-          if (
-            !object(result) ||
-            Object.keys(result).length !== 3 ||
-            result.status !== "verified" ||
-            !Number.isSafeInteger(result.pendingFacts) ||
-            Number(result.pendingFacts) < 0 ||
-            !Number.isSafeInteger(result.bytes) ||
-            Number(result.bytes) < 1 ||
-            Number(result.bytes) > maximum
-          )
-            throw failed();
-          resolve({
-            pendingFacts: Number(result.pendingFacts),
-            bytes: Number(result.bytes),
-          });
+          process.kill(-child.pid, signal);
         } catch {
-          reject(failed());
+          /* Closed group is already quiescent. */
         }
-      });
-      child.stdin.end(encoded);
-      if (signal?.aborted) stop();
-      // The backup process is never abandoned by Promise.race. On cancellation or
-      // timeout, publication waits for its actual close after TERM/KILL.
-    },
-  );
+    };
+    const stop = () => {
+      if (unavailable) return;
+      unavailable = true;
+      kill("SIGTERM");
+      escalation = setTimeout(() => kill("SIGKILL"), 250);
+    };
+    const aborted = () => stop();
+    signal?.addEventListener("abort", aborted, { once: true });
+    const timer = setTimeout(
+      stop,
+      Math.max(1, deadline - performance.now() - 1500),
+    );
+    child.stdout.on("data", (chunk: Buffer) => {
+      outputBytes += chunk.length;
+      if (outputBytes > (inspectMetadata ? 8192 : 4096)) {
+        stop();
+        return;
+      }
+      output += chunk.toString("utf8");
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      errorBytes += chunk.length;
+      if (errorBytes > 4096) stop();
+    });
+    child.on("error", stop);
+    child.stdin.on("error", stop);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (escalation) clearTimeout(escalation);
+      signal?.removeEventListener("abort", aborted);
+      if (
+        unavailable ||
+        code !== 0 ||
+        signal?.aborted ||
+        performance.now() >= deadline
+      ) {
+        reject(failed());
+        return;
+      }
+      try {
+        const result: unknown = JSON.parse(output);
+        if (
+          !object(result) ||
+          Object.keys(result).length !== (inspectMetadata ? 5 : 3) ||
+          result.status !== "verified" ||
+          !Number.isSafeInteger(result.pendingFacts) ||
+          Number(result.pendingFacts) < 0 ||
+          !Number.isSafeInteger(result.bytes) ||
+          Number(result.bytes) < 1 ||
+          Number(result.bytes) > maximum ||
+          (inspectMetadata &&
+            (typeof result.sessionId !== "string" ||
+              !uuid.test(result.sessionId) ||
+              (result.acceptedLastArchive !== null &&
+                !validAcceptedArchive(result.acceptedLastArchive))))
+        )
+          throw failed();
+        resolve({
+          pendingFacts: Number(result.pendingFacts),
+          bytes: Number(result.bytes),
+          ...(inspectMetadata
+            ? {
+                sessionId: result.sessionId as string,
+                acceptedLastArchive:
+                  result.acceptedLastArchive as AcceptedArchive | null,
+              }
+            : {}),
+        });
+      } catch {
+        reject(failed());
+      }
+    });
+    child.stdin.end(encoded);
+    if (signal?.aborted) stop();
+    // The backup process is never abandoned by Promise.race. On cancellation or
+    // timeout, publication waits for its actual close after TERM/KILL.
+  });
 }
-export async function verifyUsageSnapshot(
+async function verifyUsageSnapshotInternal(
   input: UsageSnapshotVerificationInput,
   options: { signal?: AbortSignal } = {},
-): Promise<UsageSnapshotVerificationResult> {
+  inspectMetadata = false,
+): Promise<UsageSnapshotVerificationResult | UsageSnapshotInspectionResult> {
   const deadline = performance.now() + 59000;
   try {
     if (
@@ -263,10 +287,12 @@ export async function verifyUsageSnapshot(
             manifestPath,
             manifestStat,
             expectedSha256: input.expectedSha256,
+            ...(inspectMetadata ? { inspectMetadata: true } : {}),
           },
         },
         deadline,
         options.signal,
+        inspectMetadata,
       );
     await privateDirectory(input.snapshotDirectory);
     const finalDirectory = await lstat(input.snapshotDirectory);
@@ -285,10 +311,34 @@ export async function verifyUsageSnapshot(
       bytes: result.bytes,
       pendingFacts: result.pendingFacts,
       activationSupported: false,
+      ...(inspectMetadata
+        ? {
+            sessionId: result.sessionId!,
+            acceptedLastArchive: result.acceptedLastArchive!,
+          }
+        : {}),
     };
   } catch {
     throw new Error("usage_snapshot_verification_failed");
   }
+}
+export async function verifyUsageSnapshot(
+  input: UsageSnapshotVerificationInput,
+  options: { signal?: AbortSignal } = {},
+): Promise<UsageSnapshotVerificationResult> {
+  return verifyUsageSnapshotInternal(input, options);
+}
+// The same bounded verification lane may expose only copied custody metadata.
+// It never opens a live UsageJournal or modifies the copied SQL/manifest bytes.
+export async function inspectUsageSnapshot(
+  input: UsageSnapshotVerificationInput,
+  options: { signal?: AbortSignal } = {},
+): Promise<UsageSnapshotInspectionResult> {
+  return (await verifyUsageSnapshotInternal(
+    input,
+    options,
+    true,
+  )) as UsageSnapshotInspectionResult;
 }
 export async function snapshotUsageJournal(
   input: UsageSnapshotInput,

@@ -66,7 +66,7 @@ interface PendingFact {
   payload_hash: string;
   byte_count: number;
 }
-interface ArchiveBundle {
+export interface AcceptedArchiveBundle {
   schemaVersion: 1;
   kind: "pgcf-accepted-usage";
   identity: UsageIdentity;
@@ -116,6 +116,137 @@ function directorySync(path: string): void {
   } finally {
     closeSync(descriptor);
   }
+}
+
+export function validAcceptedArchive(value: unknown): value is AcceptedArchive {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  return (
+    Object.keys(record).length === 5 &&
+    typeof record.path === "string" &&
+    isAbsolute(record.path) &&
+    record.path === resolve(record.path) &&
+    record.path.length <= 4096 &&
+    typeof record.sha256 === "string" &&
+    hash.test(record.sha256) &&
+    typeof record.archiveId === "string" &&
+    hash.test(record.archiveId) &&
+    localSequence(record.throughSequence) &&
+    typeof record.records === "number" &&
+    Number.isSafeInteger(record.records) &&
+    record.records > 0 &&
+    record.records <= 256
+  );
+}
+
+function acceptedFingerprint(records: AcceptedRecord[]): string {
+  return digest(
+    json(
+      records.map((record) => ({
+        sequence: record.sequence,
+        payloadHash: record.payloadHash,
+        receiptHash: record.receiptHash,
+      })),
+    ),
+  );
+}
+function acceptedBundle(
+  records: AcceptedRecord[],
+  identity: UsageIdentity,
+  previousArchive: AcceptedArchive | null,
+): AcceptedArchiveBundle {
+  if (records.length === 0 || records.length > 256)
+    throw new Error("accepted_archive_empty");
+  const receiptSetHash = acceptedFingerprint(records);
+  const archiveId = digest(
+    json({
+      kind: "pgcf-accepted-usage",
+      schemaVersion: 1,
+      identity,
+      previousArchive,
+      receiptSetHash,
+    }),
+  );
+  return {
+    schemaVersion: 1,
+    kind: "pgcf-accepted-usage",
+    identity: { ...identity },
+    previousArchive,
+    records,
+    manifest: {
+      archiveId,
+      fromSequence: records[0]!.sequence,
+      throughSequence: records.at(-1)!.sequence,
+      records: records.length,
+      receiptSetHash,
+    },
+  };
+}
+export function parseAcceptedArchiveBundle(
+  bytes: Buffer,
+  identity: UsageIdentity,
+): AcceptedArchiveBundle {
+  let value: unknown;
+  try {
+    value = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  } catch {
+    throw new Error("accepted_archive_invalid");
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("accepted_archive_invalid");
+  const bundle = value as AcceptedArchiveBundle;
+  if (
+    Object.keys(bundle).length !== 6 ||
+    bundle.schemaVersion !== 1 ||
+    bundle.kind !== "pgcf-accepted-usage" ||
+    json(bundle.identity) !== json(identity) ||
+    !Array.isArray(bundle.records) ||
+    bundle.records.length === 0 ||
+    bundle.records.length > 256 ||
+    (bundle.previousArchive !== null &&
+      !validAcceptedArchive(bundle.previousArchive))
+  )
+    throw new Error("accepted_archive_identity_conflict");
+  let previous = bundle.previousArchive?.throughSequence ?? 0;
+  const records = bundle.records.map((record) => {
+    if (
+      !record ||
+      typeof record !== "object" ||
+      Object.keys(record).length !== 5 ||
+      !localSequence(record.sequence) ||
+      record.sequence <= previous ||
+      typeof record.payloadJson !== "string" ||
+      typeof record.payloadHash !== "string" ||
+      !hash.test(record.payloadHash) ||
+      digest(record.payloadJson) !== record.payloadHash ||
+      typeof record.receiptHash !== "string" ||
+      !hash.test(record.receiptHash)
+    )
+      throw new Error("accepted_archive_evidence_corrupt");
+    previous = record.sequence;
+    const receipt = normalizeAcceptedUsageReceipt(record.receipt, identity);
+    const fact: unknown = JSON.parse(record.payloadJson);
+    if (
+      digest(json(receipt)) !== record.receiptHash ||
+      !validUsageFact(fact, identity) ||
+      !sameFact(fact, receipt.fact)
+    )
+      throw new Error("accepted_archive_evidence_corrupt");
+    return {
+      sequence: record.sequence,
+      receipt,
+      payloadJson: record.payloadJson,
+      payloadHash: record.payloadHash,
+      receiptHash: record.receiptHash,
+    };
+  });
+  const expected = acceptedBundle(records, identity, bundle.previousArchive);
+  if (
+    json(expected) !== json(bundle) ||
+    json(expected) !== bytes.toString("utf8")
+  )
+    throw new Error("accepted_archive_manifest_conflict");
+  return expected;
 }
 
 // Accepted evidence is immutable until an operator publishes a verified archive.
@@ -207,25 +338,7 @@ export class AcceptedUsageLedger {
     return value;
   }
   private validArchive(value: unknown): value is AcceptedArchive {
-    if (!value || typeof value !== "object" || Array.isArray(value))
-      return false;
-    const record = value as Record<string, unknown>;
-    return (
-      Object.keys(record).length === 5 &&
-      typeof record.path === "string" &&
-      isAbsolute(record.path) &&
-      record.path === resolve(record.path) &&
-      record.path.length <= 4096 &&
-      typeof record.sha256 === "string" &&
-      hash.test(record.sha256) &&
-      typeof record.archiveId === "string" &&
-      hash.test(record.archiveId) &&
-      localSequence(record.throughSequence) &&
-      typeof record.records === "number" &&
-      Number.isSafeInteger(record.records) &&
-      record.records > 0 &&
-      record.records <= 256
-    );
+    return validAcceptedArchive(value);
   }
   private decode(row: StoredReceipt): AcceptedRecord {
     if (
@@ -435,120 +548,19 @@ export class AcceptedUsageLedger {
       closeSync(descriptor);
     }
   }
-  private fingerprint(records: AcceptedRecord[]): string {
-    return digest(
-      json(
-        records.map((record) => ({
-          sequence: record.sequence,
-          payloadHash: record.payloadHash,
-          receiptHash: record.receiptHash,
-        })),
-      ),
-    );
-  }
   private bundle(
     records: AcceptedRecord[],
     previousArchive: AcceptedArchive | null,
-  ): ArchiveBundle {
-    if (records.length === 0 || records.length > 256)
-      throw new Error("accepted_archive_empty");
-    const receiptSetHash = this.fingerprint(records);
-    const archiveId = digest(
-      json({
-        kind: "pgcf-accepted-usage",
-        schemaVersion: 1,
-        identity: this.identity,
-        previousArchive,
-        receiptSetHash,
-      }),
-    );
-    return {
-      schemaVersion: 1,
-      kind: "pgcf-accepted-usage",
-      identity: { ...this.identity },
-      previousArchive,
-      records,
-      manifest: {
-        archiveId,
-        fromSequence: records[0]!.sequence,
-        throughSequence: records.at(-1)!.sequence,
-        records: records.length,
-        receiptSetHash,
-      },
-    };
+  ): AcceptedArchiveBundle {
+    return acceptedBundle(records, this.identity, previousArchive);
   }
-  private parseBundle(bytes: Buffer): ArchiveBundle {
-    let value: unknown;
-    try {
-      value = JSON.parse(
-        new TextDecoder("utf-8", { fatal: true }).decode(bytes),
-      );
-    } catch {
-      throw new Error("accepted_archive_invalid");
-    }
-    if (!value || typeof value !== "object" || Array.isArray(value))
-      throw new Error("accepted_archive_invalid");
-    const bundle = value as ArchiveBundle;
-    if (
-      Object.keys(bundle).length !== 6 ||
-      bundle.schemaVersion !== 1 ||
-      bundle.kind !== "pgcf-accepted-usage" ||
-      json(bundle.identity) !== json(this.identity) ||
-      !Array.isArray(bundle.records) ||
-      bundle.records.length === 0 ||
-      bundle.records.length > 256 ||
-      (bundle.previousArchive !== null &&
-        !this.validArchive(bundle.previousArchive))
-    )
-      throw new Error("accepted_archive_identity_conflict");
-    let previous = bundle.previousArchive?.throughSequence ?? 0;
-    const records = bundle.records.map((record) => {
-      if (
-        !record ||
-        typeof record !== "object" ||
-        Object.keys(record).length !== 5 ||
-        !localSequence(record.sequence) ||
-        record.sequence <= previous ||
-        typeof record.payloadJson !== "string" ||
-        typeof record.payloadHash !== "string" ||
-        !hash.test(record.payloadHash) ||
-        digest(record.payloadJson) !== record.payloadHash ||
-        typeof record.receiptHash !== "string" ||
-        !hash.test(record.receiptHash)
-      )
-        throw new Error("accepted_archive_evidence_corrupt");
-      previous = record.sequence;
-      const receipt = normalizeAcceptedUsageReceipt(
-        record.receipt,
-        this.identity,
-      );
-      const fact: unknown = JSON.parse(record.payloadJson);
-      if (
-        digest(json(receipt)) !== record.receiptHash ||
-        !validUsageFact(fact, this.identity) ||
-        !sameFact(fact, receipt.fact)
-      )
-        throw new Error("accepted_archive_evidence_corrupt");
-      return {
-        sequence: record.sequence,
-        receipt,
-        payloadJson: record.payloadJson,
-        payloadHash: record.payloadHash,
-        receiptHash: record.receiptHash,
-      };
-    });
-    const expected = this.bundle(records, bundle.previousArchive);
-    if (
-      json(expected) !== json(bundle) ||
-      json(expected) !== bytes.toString("utf8")
-    )
-      throw new Error("accepted_archive_manifest_conflict");
-    return expected;
+  private parseBundle(bytes: Buffer): AcceptedArchiveBundle {
+    return parseAcceptedArchiveBundle(bytes, this.identity);
   }
   private verify(
     path: string,
     expected?: AcceptedArchive,
-  ): { bundle: ArchiveBundle; result: AcceptedArchive } {
+  ): { bundle: AcceptedArchiveBundle; result: AcceptedArchive } {
     const bytes = this.readFile(path),
       bundle = this.parseBundle(bytes);
     const result: AcceptedArchive = {
@@ -562,7 +574,7 @@ export class AcceptedUsageLedger {
       throw new Error("accepted_archive_checkpoint_conflict");
     return { bundle, result };
   }
-  private publish(path: string, bundle: ArchiveBundle): void {
+  private publish(path: string, bundle: AcceptedArchiveBundle): void {
     const bytes = Buffer.from(json(bundle), "utf8");
     if (bytes.length > this.limits.maxArchiveBytes)
       throw new Error("accepted_archive_bound");
@@ -612,7 +624,7 @@ export class AcceptedUsageLedger {
       this.verify(absolute, checkpoint);
       return checkpoint;
     }
-    let prepared: { bundle: ArchiveBundle; result: AcceptedArchive };
+    let prepared: { bundle: AcceptedArchiveBundle; result: AcceptedArchive };
     if (existsSync(absolute)) {
       prepared = this.verify(absolute);
       if (

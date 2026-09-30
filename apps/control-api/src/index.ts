@@ -1,4 +1,5 @@
 import { environmentRoutes } from "./environments";
+import { usageArchiveRoutes } from "./usage-archives";
 import { assertion } from "./accounting";
 import { actorBindings, actorPredicate, type Actor } from "./execution-auth";
 import { usageRoutes } from "./usage";
@@ -791,6 +792,8 @@ async function getProject(
 
 export default {
   async fetch(request, env): Promise<Response> {
+    const archiveResponse = await usageArchiveRoutes(request, env);
+    if (archiveResponse) return archiveResponse;
     const providerResponse = await providerInventoryRoute(request, env);
     if (providerResponse) return providerResponse;
     const deletionResponse = await deletionRoutes(request, env);

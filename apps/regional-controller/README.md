@@ -1,5 +1,24 @@
 # Regional environment controller
 
+## Automatic off-node usage custody
+
+Set the optional `PGCF_USAGE_ARCHIVE_CONFIG_FILE` after the private Cloudflare
+archive binding and independently retained keys are ready. The [contract](../../docs/contracts/usage-journal-r2-custody-v1.md)
+defines private scratch space, explicit accepted-archive roots, bounded serial
+scheduling and installation cost attribution. Ordinary metering stays unchanged
+when this lane is absent.
+
+The publisher reuses the consistent snapshot and original session/epoch, includes
+the complete accepted-receipt predecessor chain, and persists pending custody
+before using its existing meter credential. An uncertain response retains the
+same artifact for the next cycle. It never acknowledges or reassigns source facts.
+
+The separate `recover-usage-archive --config /absolute/private/recovery.json`
+command uses installation recovery authority and an independently retained
+receipt digest. It downloads into exclusive private inactive custody, verifies
+all bytes/session/dependencies and invokes the existing SQLite verifier. This
+does not activate a collector, release budget holds or establish PostgreSQL PITR.
+
 ## Manual physical base backups
 
 The optional base-backup lane consumes durable customer requests for existing

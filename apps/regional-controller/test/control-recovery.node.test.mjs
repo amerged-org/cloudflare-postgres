@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
+import { randomBytes } from "node:crypto";
 import {
   fixture,
   migrationDirectory,
@@ -29,6 +30,14 @@ import {
 test("rebuilds all current control migrations and historical encrypted credentials exactly from one read into a quarantined private recovery directory", async () => {
   const f = await fixture();
   try {
+    // Retain both active and historical archive keys inside encrypted custody.
+    f.keyrings.USAGE_ARCHIVE_KEYS = JSON.stringify({
+      active: "archive-current",
+      keys: {
+        "archive-old": randomBytes(32).toString("base64url"),
+        "archive-current": randomBytes(32).toString("base64url"),
+      },
+    });
     const backupId = "99999999-9999-4999-8999-999999999999",
       operationId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       tokenId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
@@ -486,6 +495,7 @@ test("rebuilds all current control migrations and historical encrypted credentia
       f.currentPassword,
       f.fence,
       ...Object.values(JSON.parse(f.keyrings.ROLE_CREDENTIAL_KEYS).keys),
+      ...Object.values(JSON.parse(f.keyrings.USAGE_ARCHIVE_KEYS).keys),
     ])
       assert(!ciphertext.includes(secret));
     const restored = await restoreRecoveryBundle({

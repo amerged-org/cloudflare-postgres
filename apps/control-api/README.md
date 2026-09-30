@@ -61,6 +61,25 @@ Use the organization token to read `GET /v1/organizations/{organizationId}/proje
 
 The current slice has no public native endpoint, environment deletion, physical resize, integrated runtime allowance enforcer, idempotency archival, or rate limiting. Opted-in private endpoint discovery and scoped credentials are separate metadata and credential paths. A reported ready environment means the regional executor observed PostgreSQL resource readiness; it does not prove backups, restore qualification, credential access, or a production service objective.
 
+## Private usage-journal R2 custody
+
+The optional [custody lane](../../docs/contracts/usage-journal-r2-custody-v1.md)
+stores complete regional journal snapshots and accepted-receipt dependencies in
+private Cloudflare R2. Configure the adopter-owned `USAGE_ARCHIVES` binding and
+the dedicated `USAGE_ARCHIVE_KEYS` Worker Secret after independently retaining
+its active and historical keys in encrypted recovery custody.
+
+An existing source-bound meter prepares an immutable descriptor, uploads bounded
+chunks and finalizes verified byte custody through `/v1/regions/{regionId}/usage-archives`.
+Installation authority separately lists receipts and recovers historical source
+epochs against an independently retained receipt digest. Meter credentials
+cannot download raw journals. R2/provider/master credentials never go to the
+regional agent; the Worker encrypts objects and retains original conditional
+writes after uncertain responses. No additional D1 migration is required.
+
+This preserves recovery bytes. It does not acknowledge usage, produce final
+accounting, activate a restored collector or qualify PostgreSQL backup/PITR.
+
 ## Approved manual resize intention
 
 An immutable regional profile may include the [approved size policy](../../docs/contracts/compute-scaling-v1.md). `GET .../environments/{environmentId}/compute` requires `projects:read` and exposes requested/effective size IDs, phase and compute revision. Before any resize, revision `0` and the original nonminimum `initialSizeId` are implicit; a profile without `computeScaling` returns `409 compute_scaling_unavailable`.

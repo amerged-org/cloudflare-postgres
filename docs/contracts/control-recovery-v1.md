@@ -49,12 +49,19 @@ operator-assigned recovery identity, not a newly granted execution capability.
 
 ## Key custody and encryption
 
-Supply only `ROLE_CREDENTIAL_KEYS` and `ALLOWANCE_FENCE_KEYS` from private operator
+Supply `ROLE_CREDENTIAL_KEYS` and `ALLOWANCE_FENCE_KEYS` from private operator
 custody. Worker Secret name listing cannot recover their values. All referenced
 historical key versions must remain present. The recovery verifier decrypts every
 retained role credential and allowance fence using their exact source contexts;
 fence plaintext must match its stored digest. Compatibility tests generate
 ciphertext with the actual existing Worker code, not a separate fixture codec.
+
+When automated [usage-journal R2 custody](usage-journal-r2-custody-v1.md) is
+configured, also supply `USAGE_ARCHIVE_KEYS`. The optional ring is validated and
+sealed with all active and historical versions, then restored privately with
+the other rings. Retain it off-node before enabling uploads. It does not appear
+in D1, so a D1 snapshot or listing Worker Secret names cannot reconstruct it.
+Older bundles containing only the original two rings remain supported.
 
 The complete snapshot and keyrings are sealed using a separate random 32-byte
 AES-256-GCM recovery key, a random IV and authenticated domain/version/bundle/source

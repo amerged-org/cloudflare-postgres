@@ -5,6 +5,16 @@
   "secrets": {
     "required": ["INSTALLATION_BOOTSTRAP_TOKEN"],
   },
+  // Optional custody lane. Use an adopter-owned private bucket and supply
+  // USAGE_ARCHIVE_KEYS as a dedicated Worker Secret; never put keys here.
+  // Remove this binding when not enabling usage-journal custody.
+  "r2_buckets": [
+    {
+      "binding": "USAGE_ARCHIVES",
+      "bucket_name": "cloudflare-postgres-usage-archives",
+      "jurisdiction": "eu",
+    },
+  ],
   "d1_databases": [
     {
       "binding": "DB",

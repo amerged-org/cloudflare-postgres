@@ -155,6 +155,27 @@ Both unauthenticated credential routes refuse access without password reads.
 This is a point-in-time secrecy boundary, not runtime enforcement or production
 acceptance. All held backup/signing/native/admission qualifications remain held.
 
+## Automatic usage-journal R2 custody checkpoint
+
+The [custody checkpoint](docs/evidence/m3-usage-journal-r2-custody-2026-09-30.md)
+and [contract](docs/contracts/usage-journal-r2-custody-v1.md) describe the implemented
+path: scheduled consistent snapshots, complete accepted-receipt
+archive dependencies, durable pending upload, private encrypted Cloudflare R2
+objects, immutable completion receipts and independently verified inactive
+recovery. Provider credentials and archive master keys stay in Cloudflare;
+regional publication uses the existing source-bound meter credential. Completed
+local working copies have bounded retention; pending/uncertain custody and live
+source facts are not deleted or acknowledged.
+
+Exactly three counted red-first stories cover Worker storage/authority, regional
+HTTP recovery and archive-key retention in encrypted control recovery. Targeted
+checks and one frozen full gate pass: 46 Worker and 60 Node cases, with six
+unchanged Go cases retaining prior evidence (64.091 seconds for the new gate).
+No new live bucket, Secret, binding, regional configuration or deployment is claimed.
+Existing 4,096 refused facts, closed admission and held qualifications remain
+untouched. Final accounting, fenced collector activation after node loss,
+PostgreSQL backup/PITR and remaining M1–M8 acceptance gates stay open.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.
