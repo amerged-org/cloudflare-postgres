@@ -158,23 +158,26 @@ acceptance. All held backup/signing/native/admission qualifications remain held.
 ## Automatic usage-journal R2 custody checkpoint
 
 The [custody checkpoint](docs/evidence/m3-usage-journal-r2-custody-2026-09-30.md)
-and [contract](docs/contracts/usage-journal-r2-custody-v1.md) describe the implemented
-path: scheduled consistent snapshots, complete accepted-receipt
-archive dependencies, durable pending upload, private encrypted Cloudflare R2
-objects, immutable completion receipts and independently verified inactive
-recovery. Provider credentials and archive master keys stay in Cloudflare;
-regional publication uses the existing source-bound meter credential. Completed
-local working copies have bounded retention; pending/uncertain custody and live
-source facts are not deleted or acknowledged.
+and [contract](docs/contracts/usage-journal-r2-custody-v1.md) connect generic
+scheduled snapshots, complete accepted-receipt dependencies, durable uncertain
+upload recovery, private encrypted R2 storage and independently verified inactive
+recovery. Archive keys stay in Cloudflare and independently encrypted operator
+custody; regional publication uses the existing source-bound meter credential.
 
-Exactly three counted red-first stories cover Worker storage/authority, regional
-HTTP recovery and archive-key retention in encrypted control recovery. Targeted
-checks and one frozen full gate pass: 46 Worker and 60 Node cases, with six
-unchanged Go cases retaining prior evidence (64.091 seconds for the new gate).
-No new live bucket, Secret, binding, regional configuration or deployment is claimed.
-Existing 4,096 refused facts, closed admission and held qualifications remain
-untouched. Final accounting, fenced collector activation after node loss,
-PostgreSQL backup/PITR and remaining M1–M8 acceptance gates stay open.
+Exactly three counted red-first stories and one frozen full gate pass 46 Worker
+and 60 Node cases, retaining earlier evidence for six unchanged Go cases. Dev
+now has a private EU bucket, the same archived master ring as a Worker Secret,
+a verified one-binding Worker deployment, one public-source regional image and
+one guarded activation. Two real resident scheduler archives and one actual
+HTTP/off-node recovery preserve 4,096 original pending facts with zero accepted
+receipts or acknowledgements. The restored nine-table journal remains inactive.
+Other Pods, Node identity, storage, database/Pooler, SQL markers and controller
+configuration are preserved; no source/test/full-gate change follows delivery.
+
+Sustained cadence/outages and capacity, retained operator receipts, fenced
+collector activation after node loss, complete/final accounting, runtime
+enforcement, PostgreSQL backup/PITR and the remaining M1–M8 gates stay open.
+Closed customer admission and held qualifications remain unchanged.
 
 ## 1. Product scope and decisions
 

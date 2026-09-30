@@ -1,6 +1,6 @@
 # M3 — Automated encrypted usage-journal R2 custody
 
-Status: source qualified; installation activation remains pending.
+Status: source qualified and delivered in Dev; production qualification remains open.
 
 ## Implemented path
 
@@ -48,22 +48,59 @@ evidence; they were not rerun. No stopped qualifier, extra matrix or speculative
 introduced by these cases. The two earlier failed implementation observations
 remain recorded rather than relabelled as passing runs.
 
-## Installation boundary
+## Verified Dev delivery
 
-Source/configuration checks scan 481 public candidate files against 59
-sensitive variants with no matches. Both private environment files remain
-mode 0600, unchanged, ignored and untracked; AGENTS.md remains 25 lines.
-Frozen source/test hashes are unchanged through the final gate.
+Public source `91295569b825862d2cb6b8be2810a57caaaf6cae` is deployed in Dev.
+The Worker serves version `d5459289-fbe4-4a39-a3ec-536bf276d2ca` at 100% traffic
+with one private EU R2 binding and one dedicated archive Secret. The previous
+eight Secret names/types remain intact. Before activation, a fresh 50-table,
+356-row control capture was encrypted and independently restored with all three
+keyrings byte-for-byte, including the new archive ring. Secret values were never
+queried from Cloudflare or sent to the regional node.
 
-This checkpoint creates no live R2 bucket, Worker Secret, binding, controller
-configuration, deployment or customer environment. Existing private environment
-configuration and held source candidates are preserved. Admission stays closed
-and the 4,096 refused live journal facts are neither accepted nor rewritten.
+One dedicated EU bucket was created with r2.dev access disabled and no custom
+domains. One Worker deployment preserves existing variables. An initially
+unexpected Secret-write response was resolved by metadata readback, without
+replaying the write; later decryption of an actual stored encrypted header with
+the independently retained ring proves the installed key matches. An inherited
+summary constant reported eight Secrets despite its verified nine-name list;
+the retained metadata corrected that reporting field without rerunning delivery.
 
-Live scheduling, independently retained keys/receipts, actual R2 round-trip and
-fresh offline restore need installation evidence. Fenced node-loss collector
-activation, finalized usage/settlement, runtime enforcement, PostgreSQL backup/
-WAL/PITR, the native pilot and remaining M1–M8 gates remain incomplete.
+The sealed public Linux image contains 79 verified compiled modules and the
+unchanged resource-envelope package. Its 88,569,344-byte image archive was
+imported once. One guarded main Deployment patch changes only the image and adds
+the optional private archive configuration reference. The nonroot configuration
+and working directory are private on the existing persistent volume. The actual
+resident scheduler, configured at 60 seconds, completes two distinct verified
+archives; no separate manual publisher is launched.
+
+A single operator-authorized HTTP recovery downloads an actual completed R2
+archive into an exclusive off-node private directory in 2.763 seconds. The
+3,076,096-byte SQLite file and original six-field manifest match the independently
+source-held receipt digests. All nine tables, integrity, foreign keys, original
+identity, exact payload/byte-count hashes, 4,096 pending facts, zero acknowledgements
+and zero accepted receipts are verified. The captured post-restart session is
+checked separately; normal gap/checkpoint clocks are not falsely required to
+match the earlier session. Restored custody stays inactive.
+
+Post-delivery readback matches all 79 compiled modules and preserves the other
+29 Running Pod identities/restarts, Node/boot/runtime identity, five PVCs and six
+PVs, CNPG/Pooler specs and both SQL markers. Main configuration/RBAC/ServiceAccount,
+the suspend worker/initializer and the private empty provisioning sibling remain
+unchanged. Source epoch and all 4,096 refused facts remain unchanged.
+
+## Remaining qualification
+
+This proves automatic off-node custody and inactive recovery in the observed Dev
+window. Sustained cadence/outages, larger capacity and retention policies,
+independent disaster bootstrap and fenced activation of a restored collector
+still require evidence. No usage fact is acknowledged or billed by archiving.
+Final usage/settlement, runtime budget enforcement, PostgreSQL backup/WAL/PITR,
+the ordinary native pilot and the remaining M1–M8 gates stay incomplete. Held
+backup, signing, native, SDK and admission qualifiers are not resumed.
+
+Private environment files remain owner-only, unchanged, ignored and untracked.
+No runtime/source/test edit or repeated full gate accompanies this delivery.
 
 The [contract](../contracts/usage-journal-r2-custody-v1.md) defines wire bounds,
 operator configuration, authority, encryption and inactive recovery semantics.
