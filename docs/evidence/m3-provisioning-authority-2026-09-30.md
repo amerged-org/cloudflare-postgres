@@ -1,6 +1,6 @@
 # Provisioning lease authority — 2026-09-30
 
-Status: **source qualified; Dev delivery pending**. This fixes the original
+Status: **source and Dev delivery qualified**. This fixes the original
 provisioning lane's request-body authorization race. It does not activate a
 managed environment, fund execution or resume a held physical qualifier.
 
@@ -61,6 +61,37 @@ permits, pending provisioning, stop operations and deletion intentions remain
 empty; admission is closed. No credential value, provider token reissue or
 customer resource is used by these checks. Source delivery and the bounded Dev
 Worker preview/deploy/readback follow this checkpoint.
+
+## Observed Dev delivery
+
+Source `248c3e4` is public. One 1.192-second preview checks the existing
+configuration/binding and public bundle with no known credential value. One
+9.483-second deployment delivers Dev version
+`82d6de1b-6135-4783-bdd5-f450eb895823` while retaining dashboard variables and
+Secrets through an explicitly empty environment file. There is no schema
+migration, regional image replacement or Contabo mutation.
+
+The final five-request read-only check verifies the new version at 100%, eight
+unchanged Secret names/types, 18 migrations and 319 historical guard rows.
+Environments, permits, pending creates, stop operations and deletion intentions
+remain empty; admission stays closed and the existing authorized project reads
+successfully. No live regional token is reissued to demonstrate the source
+race; its causal tests use the real API locally.
+
+One bounded 4.389-second regional preservation observation verifies the same
+ordinary-controller and suspend-worker Pod UIDs/specs/images, private
+configuration and dedicated permissions. The worker remains Ready with zero
+restarts and four recent fixed no-work events. All 29 original Running Pod
+identities/restart counts, four PVC specs and five PV specs remain preserved,
+along with the separately bound 1-GiB Retain journal, source Cluster/Pooler and
+both SQL marker counts of one.
+
+The ordinary journal retains the same source identity and exact logical outbox
+payload/byte-count hashes for 4,096 pending facts and zero acknowledgements.
+The saved baseline does not establish physical SQLite/WAL byte, size or inode
+identity; that broader claim is not made. Preserving these facts does not prove
+complete/final accounting. No Secret value, customer resource, physical
+qualifier or regional rollout is involved in delivery verification.
 
 The similar original logical-project creation authorization race is outside
 this three-case fix and remains separate work. Pre-compute funding and signed

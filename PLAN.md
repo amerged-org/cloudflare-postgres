@@ -102,7 +102,11 @@ effects and readback/replay. New leases bind the existing actor-ID column;
 legacy NULL-actor renewal/recovery remains explicit without ownership inference.
 Three real streamed-body cases fail first and pass on correction attempt one.
 The one frozen full gate passes 39 Worker and 58 Node cases. Schema/wire and
-empty-poll behavior are unchanged; Dev delivery follows. Logical-project
+empty-poll behavior are unchanged. The new Dev Worker is delivered at 100%, with
+eight preserved Secret names/types, 18 migrations, 319 historical guard rows,
+empty managed work and closed admission. Regional controller/worker identities,
+original workloads/storage, SQL markers and exact logical usage-fact custody
+remain unchanged. No regional rollout or physical qualifier occurs. Logical-project
 creation's similar unfenced write, pre-compute funding, independent signed
 expiry and physical pilot/production acceptance remain open.
 
