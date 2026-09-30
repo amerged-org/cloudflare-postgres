@@ -9,9 +9,14 @@ uses direct primary D1 reads for recovery authentication, owned page/operation
 batches and the final actor check after cursor signing. Two meaningful new cases
 first expose 200 responses after committed revocation, then pass with exact 401,
 unchanged business rows and active-sibling recovery. Eight named cases pass;
-the frozen single canonical gate passes 51 Worker cases and the existing Node
-suite in 56.559 seconds. Dev delivery/readback follows separately. Schema,
-wire format, cursor binding and regional execution are unchanged.
+the frozen single canonical gate passes 51 Worker and 60 Node cases in
+56.559 seconds. The verified public source is delivered in Dev at 100%; a
+22-request live run passes selective revocation, pages, continuation and sibling
+access in 7.297 seconds. Both read probes are revoked; only two token-history
+rows are added. Other control counts, nine Secret names, 18 migrations, closed
+admission and original infrastructure/storage/SQL state remain exact. Concurrent
+stale-session schedules are qualified locally, not claimed as forced live replica
+events. Schema, wire format, cursor binding and regional execution are unchanged.
 
 The [R2 physical backup/full-restore/PITR checkpoint](docs/evidence/m1-r2-backup-pitr-2026-09-30.md)
 qualifies the selected PostgreSQL 18.4/CNPG 1.30.1/Barman 0.15.0 path. One guarded

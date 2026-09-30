@@ -1,6 +1,6 @@
 # Recovery reads — current token authority
 
-Status: source and local verification complete; Dev delivery is the next step.
+Status: source, local verification, public delivery and Dev readback complete.
 This closes one management-API revocation defect. It does not establish regional
 execution, customer SQL access or complete M3/M8 readiness.
 
@@ -48,13 +48,43 @@ The fresh isolated worktree installs the unchanged lockfile from its local
 store. It builds the regional artifact required by existing Node tests before
 starting the final gate. The frozen runtime source remains unchanged throughout.
 Exactly one canonical format/lint/typecheck/Vitest/Node gate passes in
-56.559 seconds, with 51 Worker cases and the existing Node suite.
+56.559 seconds, with 51 Worker cases and 60 existing Node cases.
 No matrices, renamed cases or extra test stories are added.
 
 Private environment files and unrelated held drafts remain outside the clean
 candidate. An incidental Kubernetes discovery cache is moved byte-for-byte into
 ignored `.local/cache/`; no environment data is deleted or published. Public
-source/Dev readback and live revocation/pagination checks follow separately.
+source/Dev readback and live revocation/pagination checks are recorded below.
+
+## Dev delivery and its evidence boundary
+
+Public source commit `58d853efe8ba2863490624aaec8a4cc1c0b4f674` is independently
+read back from GitHub. The frozen artifact dry-run passes and all three bundle
+files contain zero matches across 82 actual private-value representations.
+One deployment delivers Dev Worker version
+`ae59f9ec-907c-43f2-859f-3bf1de7bc556` at 100% traffic, retaining the existing
+bindings and nine Secret names/types. There is no migration or new regional image.
+
+One 22-request live qualification passes in 7.297 seconds. It creates two scoped
+read tokens, uses both existing logical projects and their stored operation,
+verifies bounded pages and continuation, then selectively revokes one token.
+That token receives exact 401/no-store responses for operation, initial page
+and cursor continuation, while the active sibling and original token retain
+access. Both probe tokens are finally revoked. No credential value is printed
+or published. Only two retained token-history rows are added; every other
+control-table count, 18 migrations, zero managed environments and closed
+admission remain exact.
+
+The asynchronous in-request cuts with legally stale replica results are proved
+by the two local Worker cases. The live qualification proves deployed ordinary
+revocation/pagination behavior; it does not claim that a physical D1 replica was
+forced to replay that exact concurrent schedule.
+
+Independent regional readback preserves Node/boot, all 30 post-backup Running
+Pod identities/restarts, all original PVC/PV full specs, the healthy source
+Cluster, enabled R2 archiving and both original SQL markers. Environment bytes,
+ignored/untracked mode 0600 and unrelated held source hashes remain unchanged.
+The broader original platform objective remains incomplete.
 
 References: [recovery contract](../contracts/recovery-reads-v1.md),
 [Cloudflare D1 session semantics](https://developers.cloudflare.com/d1/worker-api/d1-database/#withsession).
