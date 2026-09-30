@@ -78,14 +78,21 @@ Node cases pass. One unchanged targeted diagnosis subsequently passes the
 existing case at 761 ms under its original 2,000-ms deadline, with expected exit
 and no journal. The original failed gate remains recorded; no clean uninterrupted
 gate is claimed, source/assertions are unchanged and no full gate is repeated.
-The source and fair-selection Dev API are now delivered. The separate worker
-installation is held at zero replicas after an observed initializer failure;
-its new Retain journal and original infrastructure are preserved. A credential-free
+The source and fair-selection Dev API are now delivered. The first separate-worker
+installation is held after an observed initializer failure; a credential-free
 diagnostic pins the isolated emptyDir permissions as the cause. One narrow
-bootstrap correction passes one new red-first regression and selected checks;
-it preserves every journal guard and does not repeat the full gate. A new immutable
-bootstrap and bounded empty-worker qualification are the next steps. No held
-physical qualifier is resumed.
+bootstrap correction passes one new red-first regression and selected checks,
+preserving every journal guard without repeating the full gate. The corrected
+immutable bootstrap now runs in Dev with zero restarts, 20 authenticated no-work
+events and all 73 image modules verified. Actual Pod ownership/isolation, private
+configuration/journal modes, native file authentication over verified HTTPS and
+the original 29 Pods, four PVCs, five PVs, SQL markers and usage journal are
+preserved. One trailing-slash-only qualifier harness correction retains its
+original failed marker and passes the same bounded read-only qualification.
+Final Cloudflare metadata/counts remain unchanged and admission stays closed.
+Positive owned stopping, physical completion, nonempty-seal restart/node-loss
+custody, full CoreV1Api transport, production memory, funded expiry and final
+accounting remain open. No held physical qualifier is resumed.
 
 ## 1. Product scope and decisions
 

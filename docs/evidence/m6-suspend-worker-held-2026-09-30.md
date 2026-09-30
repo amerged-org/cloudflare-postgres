@@ -1,4 +1,8 @@
-# Persistent suspend worker candidate held — 2026-09-30
+# Persistent suspend worker — source and Dev checkpoint — 2026-09-30
+
+Status: **source and empty-worker Dev delivery qualified**. The original failed
+full gate and subsequent targeted diagnosis remain recorded. This checkpoint
+does not qualify positive physical stopping, final accounting or production.
 
 The local candidate adds an explicitly selected, separate persistent stop worker
 and fair ordinary/deletion-child queue selection. It supervises the unchanged
@@ -127,3 +131,58 @@ correction are the next Dev step. Empty recurring claims, live verified TLS/file
 authentication, private journal custody and original infrastructure/SQL
 preservation still require observed running-worker evidence. No held physical
 stop, deletion, backup/PITR, native or Pod-birth qualifier is resumed.
+
+## Observed empty-worker Dev qualification
+
+One new immutable bootstrap ConfigMap and one UID/resource-version/full-spec
+guarded reference/resume change deliver initializer `113b758` without changing
+the image, journal volume or ordinary controller. The init completes with exit
+zero and no restart; the worker is Running/Ready with no restart and 20 fixed
+`suspend_worker_no_work` events. All 73 compiled modules match the sealed image.
+The separately committed initializer matches its exact ConfigMap bytes.
+
+Readback verifies the admitted Pod's ReplicaSet/Deployment ownership, selected
+ServiceAccount, security contexts, containers, mounts, projections and absence
+of ephemeral containers. The isolated memory parent remains UID 0/GID 1000,
+sticky/setgid `03777`; child directories and configuration files retain private
+`0700`/`0600` permission bits and UID 1000. The separate empty journal has an exact
+1-GiB Bound Retain PVC/PV on the original node. Its empty state does not qualify
+custody of positive stop seals across restart or node loss.
+
+The first read-only qualifier stops because its expected discovery URL set
+omits two trailing-slash variants in Kubernetes' default issuer-discovery role.
+One exact four-role read establishes GET-only discovery and CREATE-only
+self-review authority. One manual harness correction adds only
+`/.well-known/openid-configuration/` and `/openid/v1/jwks/`; no role, resource,
+wildcard or source behavior changes. The original failed script, consumed
+marker and stop evidence remain unchanged. Attempt two passes in 7.622 seconds,
+revalidating 29 prefix reads and completing eight previously unfinished reads.
+The saved owner proof compares exactly without overwrite; no automatic retry
+or qualifier redefinition occurs.
+
+Applicable bindings comprise the single dedicated identity plus four validated
+default discovery/self-review group bindings, with no unexpected authority.
+This is scoped authority evidence, not an absolute least-privilege or adversarial
+tenant-isolation claim. The actual pinned SDK FileAuth class reads the mounted
+token reference and authenticates a bounded node-list request over verified
+HTTPS using the projected CA. The lightweight probe avoids generated API clients;
+the complete CoreV1Api transport and production peak memory remain unqualified.
+Credential values are not exported to operator logs or queried through the
+Secret API.
+
+All 29 original Running Pod UIDs/restart counts, four PVC specs, five PV specs,
+node identity/boot/runtime, source Cluster/Pooler and both SQL marker counts are
+preserved. Ordinary controller configuration, identity, permissions and all
+4,096 pending usage facts remain unchanged. Those facts still have no accepted
+receipts; their preservation does not establish complete or final accounting.
+
+A final five-request read-only Cloudflare check verifies the same Dev Worker at
+100%, eight preserved Secret names/types, 18 migrations and 319 historical guard
+rows. Environments, permits, pending creates, stop operations and deletion
+intentions remain empty; admission stays closed. No customer resource, physical
+backup, restore, deletion or held qualifier is activated by this delivery.
+
+The initializer regression and selected checks remain the only new test work
+after source publication; the original full workspace gate is not repeated or
+reported as clean. Public documentation now names Cloudflare R2 explicitly:
+S3 refers to its compatible API, not an Amazon storage deployment.
