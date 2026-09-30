@@ -37,7 +37,8 @@ spec:
     size: 128Mi
   postgresql:
     parameters:
-      max_wal_size: 1GB
+      max_wal_size: 96MB
+      max_slot_wal_keep_size: 1GB
       min_wal_size: 80MB
       checkpoint_timeout: 30min
       wal_compression: "off"

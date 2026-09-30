@@ -108,9 +108,20 @@ fixture. Keep row counts and expected payload hashes in the private ledger.
 Do not use unlogged/temporary tables, arbitrary filesystem filler, WAL deletion,
 `pg_resetwal` or a customer superuser as an alternative failure mechanism.
 
+Before the producer, the operator creates one physical replication slot with
+immediate WAL reservation in only the fresh target, using a unique run-bound
+name. Record its starting LSN and require that no receiver advances it. This
+models an unavailable replication receiver retaining WAL; the producer still
+uses the ordinary `app` role. The native CNPG admission requires `max_wal_size`
+to be smaller than its WAL volume, so the valid 96-MB threshold is explicit.
+The retained slot, not an invalid maximum or disabled durability, creates the
+selected pressure. `max_slot_wal_keep_size=1GB` stays above the producer's
+256-MiB bound. Do not create a slot in an existing database or change it after
+an observed incident to manufacture the required result.
+
 Freeze one producer of at most 256 transactions, at most 1 MiB of payload per
 transaction (256 MiB total plus measured row/WAL overhead), and a 120-second
-wall-clock deadline. The target's `max_wal_size=1GB`,
+wall-clock deadline. The target's `max_wal_size=96MB`, `max_slot_wal_keep_size=1GB`,
 `checkpoint_timeout=30min` and `wal_compression=off` are deliberate incident
 settings; `min_wal_size=80MB` is retained. Measure effective values and elapsed
 time. Stop when the selected
