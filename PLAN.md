@@ -243,6 +243,16 @@ shape for cleanup; no qualifier is automatically repeated. The [incident record]
 retains both failures and restored state.
 A preventive CNPG shutdown is inconclusive without actual WAL ENOSPC; cleanup
 requires only-owned UID guards and original physical-group capacity restoration.
+Two bounded corrections preserve that first stop. The first reaches actual
+PostgreSQL WAL PANIC/53100 after 74 acknowledged one-MiB transactions, then cannot
+Exec into the failed container. The second reaches the same WAL failure but finds
+only pre-failure Kubelet filesystem samples; freshness is not weakened. Both
+unknown final transaction IDs are retained without replay, both cleanup/final
+preservation checks pass, and neither recovery nor expansion is qualified. The
+same complete case is now held after two corrections; a read-only observer
+proposal and exactly one extra attempt await the user's explicit exception.
+No further incident is automatically dispatched.
+
 These assets neither rerun the previous filesystem proof nor resume held native,
 backup, SDK, capacity, signed execution or control-backup cases. M4 remains open.
 

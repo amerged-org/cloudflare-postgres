@@ -1,9 +1,10 @@
 # Isolated PostgreSQL WAL-storage failure and recovery
 
-Status: **qualification assets; first native attempt stopped before SQL**.
+Status: **qualification assets; complete incident/recovery held after two corrections**.
 The [preparation-stop evidence](../../../docs/evidence/m4-postgres-wal-preparation-stop-2026-09-30.md)
-records the endpoint-readiness and initial cleanup stops and independently verified
-safety cleanup. There is no successful WAL-exhaustion/recovery claim. This is one
+records the initial preparation/cleanup stops, two later actual PostgreSQL WAL
+panics, failed fresh filesystem observations and independently verified cleanup.
+There is no complete WAL-failure/neighbor/recovery qualification claim. This is one
 operator-owned exercise of PostgreSQL 18.4, CloudNativePG 1.30.1 and an existing
 qualified OpenEBS LocalPV LVM stack. It measures a full WAL filesystem, a fresh
 neighbor's durable transactions and bounded storage-expansion recovery. It does

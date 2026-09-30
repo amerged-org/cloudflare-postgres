@@ -1,7 +1,9 @@
 # PostgreSQL WAL qualification — preparation stop and safety cleanup
 
-Status: stopped before incident SQL; original state restored. This is not a WAL
-failure, recovery, storage expansion or M4 completion result.
+Status: held after two corrections. Actual target WAL failure is observed twice;
+independent post-failure filesystem evidence and recovery remain unqualified.
+Every attempt's fresh resources are removed and original state is restored.
+The first attempt below remains a preparation stop, not a successful incident.
 
 ## Admitted preparation
 
@@ -76,3 +78,66 @@ API-list shape while preserving exact owned UID and original-storage guards.
 Freeze and review that correction before a separately declared continuation.
 This record does not authorize a retry, weaken WAL ENOSPC acceptance, resume held
 work, or establish any result of incident SQL or recovery.
+
+## First correction: actual WAL panic, failed in-container observation
+
+The first bounded continuation changes only endpoint readiness waiting and the
+cleanup's ordinary API-list shape. All identities, enforced policy assertions,
+producer bounds, volume sizes and recovery conditions remain unchanged. Prior
+failure records are retained; this is corrective attempt one on the same case.
+
+The target commits and acknowledges 74 identified one-MiB logged payloads, each
+with an independently expected digest. Batch 75 returns `PANIC 53100` while
+writing `pg_wal/xlogtemp`: `No space left on device`. The disconnect is recorded
+as an uncertain transaction and it is not replayed. This is direct PostgreSQL
+WAL-storage failure evidence, not a generic readiness error.
+
+The subsequent filesystem observation uses Exec inside the target container.
+PostgreSQL's failure removes that available container, so the command returns
+`container not found`. The continuation ends after 83.675 seconds before neighbor
+incident proof or any expansion/recovery. Its corrected ordinary cleanup passes
+and the independent final full original/journal preservation passes.
+
+## Second correction: fresh off-process observation is unavailable
+
+Corrective attempt two observes the failed target through the existing native
+Kubelet stats-summary API, with no additional Pod, role or privilege. Read-only
+schema discovery confirms PVC capacity/free-byte/time fields. The observer binds
+the current owned Pod UID, namespace, both exact sealed PVC/PV/CSI identities and
+the actual pre-incident mounted capacities. It requires both measurement times
+to be at or after the independently recorded failure time. This freshness rule
+is not weakened to accept cached data.
+
+The same unchanged producer again acknowledges 74 transactions and receives the
+same PostgreSQL WAL `PANIC 53100` for batch 75. The failure is observed at
+19:03:11.794 UTC. The available target Kubelet samples are from 19:03:03 UTC,
+with 33,395,712 available WAL bytes before the failure; they cannot establish the
+post-failure filesystem condition. No fresh matching sample arrives within the
+75-second bound. The case ends after 171.017 seconds with
+`fresh_failed_volume_stats_deadline`, before neighbor incident proof or recovery.
+
+Cleanup removes only the two fresh namespace UIDs, their four claims/PVs and
+physical LVs and the fresh class. Physical VG identity/size/free bytes/LV count
+match the snapshot. Original Node/boot, all original workloads/restarts, full
+PV/PVC specs, retained class, manual Cluster/Pooler, both SQL markers and exact
+journal custody pass final verification. No extra source workload, API-managed
+environment, provider order, Worker deployment, schema or Secret change occurs.
+The two native corrections add no automated cases and run no workspace gate.
+
+## Mandatory stop and reviewable next proposal
+
+The same complete qualification remains red after two implementation corrections.
+It is held under PLAN.md's bounded-stop rule; there is no fourth invocation.
+WAL failure is proved, but the full incident/recovery claim remains false.
+The two unknown batch-75 outcomes are never replayed or assigned a guessed result;
+cleanup deletes only their independently declared disposable fixtures.
+
+A private, unapplied proposal adds one nonprivileged observer only in the new
+fresh target namespace after native bootstrap, with read-only mounts of only
+that target's two sealed new claims. It uses no service-account token or
+credentials, requests 50m CPU/64 MiB memory, and would measure the live filesystem
+without depending on PostgreSQL or cached Kubelet samples. The original workload,
+capacity/expansion limits, nine-minute total bound, failure/recovery assertions and
+cleanup remain fixed. Exactly one extra attempt has been requested from the
+human user. No observer resource or extra attempt exists without that explicit
+exception; elapsed time and automatic goal continuation are not approval.
