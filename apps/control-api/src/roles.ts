@@ -29,6 +29,7 @@ import {
   type Actor,
 } from "./execution-auth";
 import { validEnvironmentObservation } from "./environments";
+import { plaintextFence } from "./credential-disclosure";
 interface Target {
   organization_id: string;
   project_id: string;
@@ -458,18 +459,17 @@ async function customerRead(
     role.desired_credential_revision,
     env,
   );
-  const stable = await db
-    .prepare(
-      `SELECT 1 FROM database_roles r ${joins} WHERE r.id = ? AND r.version_token = ? AND r.status = 'applied' AND r.desired_credential_revision = ? AND r.applied_credential_revision = ? AND ${currentScope} AND ${actorPredicate(actor)}`,
-    )
-    .bind(
+  const stable = await plaintextFence(
+    env.DB,
+    `SELECT 1 FROM database_roles r ${joins} WHERE r.id = ? AND r.version_token = ? AND r.status = 'applied' AND r.desired_credential_revision = ? AND r.applied_credential_revision = ? AND ${currentScope} AND ${actorPredicate(actor)}`,
+    [
       role.id,
       role.version_token,
       role.desired_credential_revision,
       role.desired_credential_revision,
       ...actorBindings(actor),
-    )
-    .first();
+    ],
+  );
   if (!stable) return error(409, "credential_not_applied");
   return json({
     credential: {
@@ -647,20 +647,21 @@ async function claim(
     )
     .first<Operation>();
   if (!updated) return error(409, "lease_conflict");
-  const stable = await db
-    .prepare(
-      `SELECT 1 FROM role_operations o JOIN database_roles r ON r.id = o.role_id ${joins} WHERE o.id = ? AND o.status = 'running' AND o.lease_actor_token_id = ? AND o.lease_token_hash = ? AND o.lease_epoch = ? AND o.lease_expires_at > ? AND r.version_token = ? AND r.desired_credential_revision = o.credential_revision AND ${currentScope} AND ${actorPredicate(actor)}`,
-    )
-    .bind(
+  const stable = await plaintextFence(
+    env.DB,
+    `SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS serverNow,o.lease_expires_at AS leaseExpiresAt
+       FROM role_operations o JOIN database_roles r ON r.id = o.role_id ${joins} WHERE o.id = ? AND o.status = 'running' AND o.lease_actor_token_id = ? AND o.lease_token_hash = ? AND o.lease_epoch = ? AND o.lease_expires_at = ? AND o.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND r.version_token = ? AND r.status = 'pending' AND r.desired_credential_revision = o.credential_revision AND r.applied_credential_revision + 1 = o.credential_revision AND ${currentScope} AND ${actorPredicate(actor)}`,
+    [
       updated.id,
       actor.id,
       tokenHash,
       updated.lease_epoch,
-      new Date().toISOString(),
+      updated.lease_expires_at,
       role.version_token,
       ...actorBindings(actor),
-    )
-    .first();
+    ],
+    true,
+  );
   if (!stable) return error(409, "lease_conflict");
   return json({
     claim: {

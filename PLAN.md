@@ -142,6 +142,16 @@ read/unauthenticated write routing pass; no live revocation or project write is
 performed. All held signing/backup/native/admission qualifiers remain held; other
 API readers and production acceptance remain outside this fix.
 
+The [credential disclosure checkpoint](docs/evidence/m3-credential-disclosure-authority-2026-09-30.md)
+adds a fresh primary final check to all four plaintext role/database responses.
+Captured actor and resource identities, current revisions/runtime and exact
+regional leases remain required; D1 time and conservative query-delay accounting
+bound lease disclosure. Encryption/history and wire are unchanged. Three real
+stale-session stories fail first and pass; the one frozen gate passes 45 Worker
+and 59 Node cases with unchanged Go evidence retained. Dev delivery is pending.
+This is a point-in-time secrecy boundary, not runtime enforcement or production
+acceptance. All held backup/signing/native/admission qualifications remain held.
+
 ## 1. Product scope and decisions
 
 Build an independent, Apache-2.0-licensed open-source PostgreSQL management platform. Adopters deploy the management layer and authoritative control state into their own Cloudflare account and operate real PostgreSQL on Contabo infrastructure. All adopters use the same public contracts and execution paths. ohmyho.st is an early adopter; its adapter and migration work belong in its own repository.

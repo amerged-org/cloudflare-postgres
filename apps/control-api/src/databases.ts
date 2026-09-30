@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { runtimeAllowsExecution } from "./environment-runtime";
+import { plaintextFence } from "./credential-disclosure";
 import {
   assertion,
   body,
@@ -503,18 +504,17 @@ async function read(
     owner.applied_credential_revision,
     env,
   );
-  const stable = await db
-    .prepare(
-      `SELECT 1 FROM logical_databases d ${joins} WHERE d.id = ? AND d.version_token = ? AND d.status = 'applied' AND r.version_token = ? AND r.applied_credential_revision = ? AND ${currentOwner} AND ${actorPredicate(actor)}`,
-    )
-    .bind(
+  const stable = await plaintextFence(
+    env.DB,
+    `SELECT 1 FROM logical_databases d ${joins} WHERE d.id = ? AND d.version_token = ? AND d.status = 'applied' AND r.version_token = ? AND r.applied_credential_revision = ? AND ${currentOwner} AND ${actorPredicate(actor)}`,
+    [
       database.id,
       database.version_token,
       owner.version_token,
       owner.applied_credential_revision,
       ...actorBindings(actor),
-    )
-    .first();
+    ],
+  );
   if (!stable) return error(409, "credential_not_applied");
   return json({
     credential: {
@@ -588,21 +588,22 @@ async function claim(
     )
     .first<Operation>();
   if (!updated) return error(409, "lease_conflict");
-  const stable = await db
-    .prepare(
-      `SELECT 1 FROM database_operations o JOIN logical_databases d ON d.id = o.database_id ${joins} WHERE o.id = ? AND o.status = 'running' AND o.lease_actor_token_id = ? AND o.lease_token_hash = ? AND o.lease_epoch = ? AND o.lease_expires_at > ? AND d.status = 'pending' AND d.version_token = ? AND r.version_token = ? AND ${initialOwner} AND ${actorPredicate(actor)}`,
-    )
-    .bind(
+  const stable = await plaintextFence(
+    env.DB,
+    `SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS serverNow,o.lease_expires_at AS leaseExpiresAt
+       FROM database_operations o JOIN logical_databases d ON d.id = o.database_id ${joins} WHERE o.id = ? AND o.status = 'running' AND o.lease_actor_token_id = ? AND o.lease_token_hash = ? AND o.lease_epoch = ? AND o.lease_expires_at = ? AND o.lease_expires_at > strftime('%Y-%m-%dT%H:%M:%fZ','now') AND d.status = 'pending' AND d.version_token = ? AND r.version_token = ? AND ${initialOwner} AND ${actorPredicate(actor)}`,
+    [
       updated.id,
       actor.id,
       tokenHash,
       updated.lease_epoch,
-      new Date().toISOString(),
+      updated.lease_expires_at,
       database.version_token,
       owner.version_token,
       ...actorBindings(actor),
-    )
-    .first();
+    ],
+    true,
+  );
   if (!stable) return error(409, "lease_conflict");
   return json({
     claim: {
