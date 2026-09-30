@@ -1,9 +1,12 @@
 # Isolated PostgreSQL WAL-storage failure and recovery
 
-Status: **qualification assets; complete incident/recovery held after two corrections**.
+Status: **qualification assets; complete incident/recovery held after the single authorized extra attempt**.
 The [preparation-stop evidence](../../../docs/evidence/m4-postgres-wal-preparation-stop-2026-09-30.md)
 records the initial preparation/cleanup stops, two later actual PostgreSQL WAL
 panics, failed fresh filesystem observations and independently verified cleanup.
+The [subsequent authorized observer attempt](../../../docs/evidence/m4-postgres-wal-observer-stop-2026-09-30.md)
+stops because the installed CSI driver rejects a second mount while PostgreSQL
+uses the volumes. Do not assume a separate read-only Pod can share these claims.
 There is no complete WAL-failure/neighbor/recovery qualification claim. This is one
 operator-owned exercise of PostgreSQL 18.4, CloudNativePG 1.30.1 and an existing
 qualified OpenEBS LocalPV LVM stack. It measures a full WAL filesystem, a fresh

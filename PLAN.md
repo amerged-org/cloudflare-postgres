@@ -249,9 +249,16 @@ Exec into the failed container. The second reaches the same WAL failure but find
 only pre-failure Kubelet filesystem samples; freshness is not weakened. Both
 unknown final transaction IDs are retained without replay, both cleanup/final
 preservation checks pass, and neither recovery nor expansion is qualified. The
-same complete case is now held after two corrections; a read-only observer
-proposal and exactly one extra attempt await the user's explicit exception.
-No further incident is automatically dispatched.
+same complete case remains held. The user authorized one additional read-only
+observer attempt, implemented by root after a narrow Astra Ultra review. The
+[fourth-attempt record](docs/evidence/m4-postgres-wal-observer-stop-2026-09-30.md)
+ends after 146.566 seconds: the installed CSI driver rejects both second mounts
+because the PostgreSQL mounts are already active. No WAL producer or expansion
+runs; ordinary cleanup and full original/journal/environment preservation pass.
+Zero new automated stories and zero workspace gates accompany this operational
+attempt. The smallest next proposal reviews live filesystem statistics through
+an existing trusted node mount without a second publication. That path remains
+unverified; no fifth incident or other held case is automatically dispatched.
 
 These assets neither rerun the previous filesystem proof nor resume held native,
 backup, SDK, capacity, signed execution or control-backup cases. M4 remains open.

@@ -5,6 +5,11 @@ independent post-failure filesystem evidence and recovery remain unqualified.
 Every attempt's fresh resources are removed and original state is restored.
 The first attempt below remains a preparation stop, not a successful incident.
 
+This record ends before the user's later explicit exception. The subsequent
+[single authorized observer attempt](m4-postgres-wal-observer-stop-2026-09-30.md)
+also stops, on CSI second-mount refusal, with cleanup and preservation passing.
+Its separate result does not rewrite the failures or reset the counters below.
+
 ## Admitted preparation
 
 The [public fixture](../../infra/qualification/postgres-storage-recovery/README.md)
