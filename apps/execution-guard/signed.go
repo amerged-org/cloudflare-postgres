@@ -190,7 +190,7 @@ func strictValue(decoder *json.Decoder, depth int) (any, error) {
 		return array, nil
 	default:
 		switch token.(type) {
-		case string, json.Number:
+		case string, json.Number, bool:
 			return token, nil
 		}
 		return nil, invalidPermit

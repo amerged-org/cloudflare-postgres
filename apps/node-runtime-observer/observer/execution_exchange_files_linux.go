@@ -7,9 +7,9 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"os"
 
+	guard "github.com/amerged-org/cloudflare-postgres/apps/execution-guard"
 	"golang.org/x/sys/unix"
 )
 
@@ -44,9 +44,9 @@ func expectedExchangeRequest(config ExecutionExchangeConfiguration) ([]byte, err
 	}
 	// Exact canonical bytes reject duplicate/unknown fields and untrusted binding
 	// changes without introducing another permissive JSON parser.
-	return json.Marshal(map[string]any{"version": 2, "nonce": config.Nonce, "binding": map[string]string{
-		"installationId": p.InstallationID, "namespaceUid": p.NamespaceUID, "podUid": p.PodUID, "containerName": p.ContainerName,
-		"nodeName": p.NodeName, "nodeUid": p.NodeUID, "bootId": p.BootID, "imageHash": p.ImageHash, "commandHash": p.CommandHash}})
+	return guard.ProtocolJSON(guard.SignedChallenge{Version: 2, Nonce: config.Nonce, Binding: guard.ChallengeBinding{
+		InstallationID: p.InstallationID, NamespaceUID: p.NamespaceUID, PodUID: p.PodUID, ContainerName: p.ContainerName,
+		NodeName: p.NodeName, NodeUID: p.NodeUID, BootID: p.BootID, ImageHash: p.ImageHash, CommandHash: p.CommandHash}})
 }
 func exchangeDirectoryStat(fd int) (unix.Stat_t, uint64, error) {
 	var stat unix.Stat_t

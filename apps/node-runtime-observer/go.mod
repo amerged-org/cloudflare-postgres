@@ -1,8 +1,9 @@
 module github.com/amerged-org/cloudflare-postgres/apps/node-runtime-observer
 
-go 1.26.0
+go 1.27.1
 
 require (
+	github.com/amerged-org/cloudflare-postgres/apps/execution-guard v0.0.0
 	github.com/go-logr/logr v1.4.3
 	golang.org/x/sys v0.40.0
 	google.golang.org/grpc v1.79.3
@@ -10,6 +11,8 @@ require (
 	k8s.io/cri-client v0.36.3
 	k8s.io/klog/v2 v2.140.0
 )
+
+replace github.com/amerged-org/cloudflare-postgres/apps/execution-guard => ../execution-guard
 
 require (
 	github.com/Microsoft/go-winio v0.6.2 // indirect

@@ -7,7 +7,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
@@ -15,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	guard "github.com/amerged-org/cloudflare-postgres/apps/execution-guard"
 	"golang.org/x/sys/unix"
 	runtime "k8s.io/cri-api/pkg/apis/runtime/v1"
 )
@@ -51,8 +51,8 @@ func exchangeFixture(t *testing.T) (ExecutionExchangeConfiguration, *fakeReader,
 			t.Fatal(err)
 		}
 	}
-	request, err := json.Marshal(map[string]any{"version": 2, "nonce": nonce, "binding": map[string]string{
-		"installationId": config.Challenge.InstallationID, "namespaceUid": config.Challenge.NamespaceUID, "podUid": podUID, "containerName": "postgres", "nodeName": "node-a", "nodeUid": bootID, "bootId": bootID, "imageHash": config.Challenge.ImageHash, "commandHash": config.Challenge.CommandHash}})
+	request, err := guard.ProtocolJSON(guard.SignedChallenge{Version: 2, Nonce: nonce, Binding: guard.ChallengeBinding{
+		InstallationID: config.Challenge.InstallationID, NamespaceUID: config.Challenge.NamespaceUID, PodUID: podUID, ContainerName: "postgres", NodeName: "node-a", NodeUID: bootID, BootID: bootID, ImageHash: config.Challenge.ImageHash, CommandHash: config.Challenge.CommandHash}})
 	if err != nil {
 		t.Fatal(err)
 	}

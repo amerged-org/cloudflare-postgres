@@ -11,17 +11,17 @@ import (
 // These identities come from the authenticated Kubernetes/installation lookup,
 // not from a container's delivery request. Host paths remain node-local.
 type ExecutionMountProjection struct {
-	PodUID        string
-	Namespace     string
-	PodName       string
-	ContainerName string
-	ContainerID   string
-	Attempt       uint32
-	VolumeName    string
-	ContainerPath string
-	EmptyDir      bool
-	SubPath       string
-	SubPathExpr   string
+	PodUID        string `json:"podUid"`
+	Namespace     string `json:"namespace"`
+	PodName       string `json:"podName"`
+	ContainerName string `json:"containerName"`
+	ContainerID   string `json:"containerId"`
+	Attempt       uint32 `json:"attempt"`
+	VolumeName    string `json:"volumeName"`
+	ContainerPath string `json:"containerPath"`
+	EmptyDir      bool   `json:"emptyDir"`
+	SubPath       string `json:"subPath"`
+	SubPathExpr   string `json:"subPathExpr"`
 }
 type ExecutionMountLocation struct {
 	hostPath    string

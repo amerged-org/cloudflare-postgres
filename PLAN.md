@@ -266,6 +266,19 @@ backup/native access or scheduled control-backup work. Admission remains closed.
 
 ## Capacity admission integration candidate — 2026-10-01
 
+The [retained delivery process checkpoint](docs/evidence/m6-node-duplex-process-2026-10-01.md)
+adds a separate bounded node executable/image that retains original file custody
+through its framed challenge/signed-permit/receipt exchange. Two new Go stories
+and one expanded native producer story pass after meaningful red proof. The real
+guard serialization mismatch and inherited Exec-pipe deadline defect are fixed;
+the guarded signed schemas remain closed. Both separate images build locally.
+The regional authenticated WebSocket factory, current peer/Pod/lease checks and
+complete broker remain implementation work; no real node rollout is claimed.
+The frozen source passes its one complete eight-stage gate: 52 Worker, 62 Node
+and eleven Go cases plus Linux vet. Actual image readback confirms separate
+executables and preserved licenses. Local credentials remain private and
+unchanged; no provider mutation or managed-admission opening occurs.
+
 The [protected IPC publication source](docs/evidence/m6-execution-ipc-publication-2026-10-01.md)
 adds retained no-follow filesystem custody and root-private staging with a
 final current-authority check before no-overwrite publication. Exact replay
