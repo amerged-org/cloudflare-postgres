@@ -9,7 +9,13 @@ Run in a private container PID namespace with no host PID sharing, no privilege 
 The explicit `operator-window` mode retains the unsigned, unfunded operator configuration:
 
 ```json
-{"version":1,"bootId":"<kernel boot UUID>","runEpoch":"1","notBeforeBootNs":"<decimal CLOCK_BOOTTIME nanoseconds>","expiresAtBootNs":"<decimal CLOCK_BOOTTIME nanoseconds>"}
+{
+  "version": 1,
+  "bootId": "<kernel boot UUID>",
+  "runEpoch": "1",
+  "notBeforeBootNs": "<decimal CLOCK_BOOTTIME nanoseconds>",
+  "expiresAtBootNs": "<decimal CLOCK_BOOTTIME nanoseconds>"
+}
 ```
 
 ```text
@@ -39,3 +45,7 @@ PostgreSQL uses a separate process group, so signalling only the manager's group
 A valid window may still permit a container restart before expiry. A manual stop, future run handoff and physical completion therefore need retained kubelet termination evidence and controlled admission, not just this local receipt. Stopping PostgreSQL does not release scheduler allocations, stop a separately namespaced Pooler/backup sidecar, finalize usage or remove stored customer data. SIGKILL can require ordinary PostgreSQL WAL recovery and leaves uncertain writes uncertain; never replay them blindly.
 
 Build/check with `pnpm check:execution-guard`. The Docker build uses an explicit public context. First-party tests have three bounded Go cases, including signed verification before the maintained supervisor and original-anchor refusal. A separate real Linux namespace qualification exercises actual PID1 behavior; the [standalone signed lifecycle case](../../docs/evidence/m6-signed-window-native-2026-10-01.md) passes with the unchanged binary. The [current source integration](../../docs/evidence/m6-signed-window-integration-2026-10-01.md) retains closed managed admission; this does not qualify CNPG activation. The default regional controller does not activate the guard or gain new privileges.
+
+The Linux-only `prepare-inputs --input-directory <private-child> --ipc-directory <private-child>` command reads exactly `{expected,publicKeyPin}` from stdin with a 16 KiB byte limit and a 15-second read deadline. It validates the existing signed protocol, actual boot and Downward API identities before publishing any input file. It seals content hashes and both directory identities in an exclusive private capsule, then creates regular `0600` expected/key files. Matching replay preserves original files; conflicts, symlinks, orphaned files, wrong ownership/modes and input/IPC directory aliases fail closed. Existing directories are never repaired by changing ownership or permissions.
+
+Compute must receive the prepared input tree read-only and its distinct IPC tree writable. Preparation trusts the installation's input/key provenance and is not a signed grant. The initializer does not deliver permits, start the manager or establish whole-Pod mount isolation. Native preparation evidence remains separate from node-agent, broker and CNPG lifecycle qualification.

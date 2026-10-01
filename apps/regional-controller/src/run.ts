@@ -3,6 +3,9 @@ import { setTimeout as pause } from "node:timers/promises";
 import { ControlClient } from "./control-client.ts";
 import { reconcileEnvironment } from "./reconcile.ts";
 import { ReconcileError } from "./types.ts";
+import { prepareProvisioningCapacity } from "./capacity-provisioning.ts";
+import { initializeCapacityCustody } from "./capacity-reconcile.ts";
+import type { CapacityProvisioningConfiguration } from "./capacity-provisioning.ts";
 import type { Claim, Kubernetes, RegionalConfig } from "./types.ts";
 import {
   ProvisioningFundingBarrier,
@@ -16,6 +19,7 @@ interface RunOptions {
   signal: AbortSignal;
   log: (event: string) => void;
   provisioningJournalDirectory?: string;
+  capacity?: CapacityProvisioningConfiguration;
 }
 
 async function execute(
@@ -63,6 +67,17 @@ async function execute(
     // proceed without installation-owned durable bootstrap custody.
     if (!options.provisioningJournalDirectory)
       throw new Error("provisioning_funding_configuration_unavailable");
+    if (
+      !options.capacity ||
+      options.capacity.configuration.journalDirectory ===
+        options.provisioningJournalDirectory
+    )
+      throw new Error("provisioning_capacity_configuration_unavailable");
+    initializeCapacityCustody(
+      claim,
+      options.capacity.configuration,
+      leaseAuthorized,
+    );
     journal = new ProvisioningFundingJournal(
       options.provisioningJournalDirectory,
       claim,
@@ -74,20 +89,37 @@ async function execute(
       () => leaseUntil - 5_000,
     );
     await funding.acquire(claim);
-    const fundedApi = funding.wrap(api);
     const deadline = Date.now() + options.readinessMilliseconds;
     while (Date.now() < deadline) {
       await funding.refresh();
       authorized();
-      const state = await reconcileEnvironment(
-        fundedApi,
-        claim,
-        config,
-        authorized,
-        (category) => {
-          options.log(`native_readback_deferred_${category}`);
-        },
-      );
+      const capacity = await prepareProvisioningCapacity({
+        api,
+        claim: { ...claim, leaseExpiresAt: new Date(leaseUntil).toISOString() },
+        lane: options.capacity,
+        funding,
+        fundingIdentity: journal.funding!,
+      });
+      if (!capacity) {
+        options.log("capacity_pending");
+        await pause(options.pollMilliseconds, undefined, {
+          signal: options.signal,
+        });
+        continue;
+      }
+      let state: Awaited<ReturnType<typeof reconcileEnvironment>>;
+      try {
+        state = await reconcileEnvironment(
+          capacity.api,
+          claim,
+          config,
+          authorized,
+          (category) => options.log(`native_readback_deferred_${category}`),
+          capacity.stages,
+        );
+      } finally {
+        capacity.close();
+      }
       if (state.ready && state.observation) {
         await funding.refresh();
         authorized();

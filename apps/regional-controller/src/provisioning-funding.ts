@@ -529,6 +529,12 @@ export class ProvisioningFundingBarrier {
     this.refreshed = true;
     this.assert();
   }
+  dispatchAuthority(): { check: () => void; expiresAt: () => number } {
+    return {
+      check: () => this.assert(),
+      expiresAt: () => this.authorizationDeadline(),
+    };
+  }
   wrap(api: Kubernetes): Kubernetes {
     const read = async <T>(action: () => Promise<T>): Promise<T> => {
       this.assert();
@@ -541,10 +547,7 @@ export class ProvisioningFundingBarrier {
       create: async (resource) => {
         await this.refresh();
         this.assert();
-        const value = await api.create(resource, {
-          check: () => this.assert(),
-          expiresAt: () => this.authorizationDeadline(),
-        });
+        const value = await api.create(resource, this.dispatchAuthority());
         this.assert();
         return value;
       },

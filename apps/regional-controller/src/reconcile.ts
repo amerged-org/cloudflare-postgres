@@ -240,12 +240,20 @@ async function ensure(
   return current;
 }
 
+export interface ProvisioningCapacityStages {
+  podQuota: () => string;
+  beforeCluster: () => Promise<void>;
+  cluster: (resource: Resource) => Promise<boolean>;
+  pooler: (resource: Resource) => Promise<void>;
+  ready: (observation: Observation) => Promise<void>;
+}
 export async function reconcileEnvironment(
   api: Kubernetes,
   claim: Claim,
   config: RegionalConfig,
   authorized: () => void = () => {},
   nativeDiagnostic: (category: NativeAccessDeferral) => void = () => {},
+  capacity?: ProvisioningCapacityStages,
 ): Promise<{ ready: boolean; observation?: Observation }> {
   validate(claim, config);
   authorized();
@@ -394,7 +402,10 @@ export async function reconcileEnvironment(
       kind: "ResourceQuota",
       metadata: metadata("database-resources", true, true),
       spec: {
-        hard: envelope.quotaHard,
+        hard: {
+          ...envelope.quotaHard,
+          ...(capacity ? { pods: capacity.podQuota() } : {}),
+        },
       },
     },
     authorized,
@@ -564,6 +575,7 @@ export async function reconcileEnvironment(
     memory: binaryQuantity(profile.compute.memoryMiB),
   };
   await verifyCohort();
+  if (capacity) await capacity.beforeCluster();
   const cluster = await ensure(
     api,
     {
@@ -618,6 +630,7 @@ export async function reconcileEnvironment(
         (condition.observedGeneration === undefined ||
           condition.observedGeneration === resource.metadata.generation),
     ) === true;
+  if (capacity && !(await capacity.cluster(cluster))) return { ready: false };
   if (
     !readyCondition(cluster) ||
     !cluster.metadata.uid ||
@@ -764,6 +777,7 @@ export async function reconcileEnvironment(
   ) {
     return { ready: false };
   }
+  if (capacity && pooler) await capacity.pooler(pooler);
   const poolerObservation =
     pooling && pooler
       ? await observePooler(api, pooler, cluster, pooling, pods, authorized)
@@ -796,16 +810,16 @@ export async function reconcileEnvironment(
       )
     : null;
   if (nativeClient && !nativeConnection) return { ready: false };
-  return {
-    ready: true,
-    observation: {
-      clusterUid: cluster.metadata.uid,
-      clusterGeneration: cluster.metadata.generation,
-      readyInstances: readyPods.length,
-      ...(nativeConnection ? { nativeConnection } : {}),
-      ...(claim.runEpoch === undefined ? {} : { runEpoch: claim.runEpoch }),
-      ...(cohort ? { nodeCohort: { ...cohort.pointer } } : {}),
-      ...(poolerObservation ? { pooler: poolerObservation } : {}),
-    },
+  const observation: Observation = {
+    clusterUid: cluster.metadata.uid,
+    clusterGeneration: cluster.metadata.generation,
+    readyInstances: readyPods.length,
+    ...(nativeConnection ? { nativeConnection } : {}),
+    ...(claim.runEpoch === undefined ? {} : { runEpoch: claim.runEpoch }),
+    ...(cohort ? { nodeCohort: { ...cohort.pointer } } : {}),
+    ...(poolerObservation ? { pooler: poolerObservation } : {}),
   };
+  if (capacity) await capacity.ready(observation);
+  authorized();
+  return { ready: true, observation };
 }

@@ -264,6 +264,134 @@ distinguishes the separate correction from the original candidate. This independ
 management capability does not resume held SDK, capacity, signing, physical
 backup/native access or scheduled control-backup work. Admission remains closed.
 
+## Capacity admission integration candidate — 2026-10-01
+
+The regional source now keeps acquisition and Pod admission as
+separate authorities. Its actual Kubernetes SDK fixture proves owned Namespace
+and Cluster UID recovery after lost committed create responses, while the
+namespace remains behind a zero-Pod quota. Missing or replaced original identities
+are refused before a replacement effect.
+
+The same bounded acquisition story fails first when an externally opened quota
+without durable opening custody admits compute. The correction records immutable
+closed/open quota specifications and original operation/run/Namespace/Cluster/quota
+identities before changing only `spec.hard.pods`, with UID, fresh resource-version
+and complete-specification checks. A lost committed patch is read back without
+repeating the mutation. Applied and effective observations are separate durable
+phases: an applied gate later closed by another operation is never reopened by
+the original provisioner, even before controller convergence. The final SDK
+pre-send callback checks the current journal phase after asynchronous
+authentication, so a concurrently latched release refuses the physical write.
+Admission waits for the actual quota-controller hard limits to converge;
+reopening the private journal retains the original intent. CPU,
+memory, storage, PVC and Pod limits are derived from the sealed acquisition plan.
+Four explicitly named regional stories, named lint and the changed package's type
+check pass. No new top-level story or final full-gate invocation is added here.
+
+This candidate uses custody snapshot version two. Earlier unpublished version-one
+snapshots are rejected rather than silently treated as closed or initialized;
+their files and historical evidence remain preserved. No live capacity journal,
+Cloudflare resource or Contabo/Kubernetes workload is changed by these local checks.
+
+The same SDK workflow now distinguishes durable Binding approval from actual
+binding: an existing unbound Pod remains pending, and delayed reservation status
+cannot erase its recorded consumer. Confirmed occupied recovery checks the actual
+complete Pod specification hash, original Pod/owner/Node identities and boot,
+protected reservation annotations, and effective resource requests against the
+[upstream masked allocation contract](https://github.com/koordinator-sh/koordinator/blob/v1.8.0/pkg/scheduler/plugins/reservation/controller/controller.go#L302-L347).
+It preserves compute/storage identities without new effects and refuses a foreign
+owner UID. Admission and recovery share the same sidecar/init/overhead accounting.
+The emitted native owner combines the customer namespace with the protected
+labels; admission sets and validates the matching environment label. Cluster
+readback now distinguishes initial zero-Pod preparation from an applied or
+confirmed-open gate, while checking the complete current managed Pod inventory.
+
+The local regional startup candidate now requires an explicit capacity lane,
+persists its validated immutable plan before funding transport without provider
+effects, and uses the staged reconciliation driver after funding. It closes its bounded custody handle
+on every iteration, and defers without any customer effect when capacity
+configuration is absent. A red-first check proves the previous funding-only
+Namespace bypass and now passes. The original funding story now supplies shared
+installation inventory, real acquisition/handoff/quota code and actual protected
+Pod admission, allocation and binding. Its 23 original assertions are
+programmatically identical, including durable failed-funding recovery and the
+fresh authorization check after complete ready readback. Four named stories pass
+locally; no new top-level case is added by the fixture adaptation. These are
+dependency simulations, not live protection or compatibility evidence.
+
+The complete fixture exposes and corrects the missing standard NetworkPolicy
+creation path and a counter that incorrectly charged internal authorization
+checks against the API-request budget. The bounded counter now charges actual
+runtime/raw-API invocations; authorization, the original deadline and final
+release fences remain enforced. Exact owned Pooler creation also fails first and
+passes after adding its confirmed-open, pinned-image/Cluster/namespace checks and
+UID custody. The acquisition story retains its pending original plan through a
+failed funding transport and a real next-epoch lease. No final gate or
+publication is attempted before the complete candidate is qualified.
+
+The staged driver recovers uncertain quota intent before normal resource
+comparison, follows CNPG-owned claims, seals funded organization/project and node
+cohort identities, and checks actual admitted consumer history before readiness.
+The local issuer client now transports exactly one initial PostgreSQL challenge
+under the current create lease, with cancellation, a ten-second request limit,
+strict current-envelope bounds and unchanged false enforcement flags. Read-only
+expected-manifest preparation checks the sealed consumer, fresh actual
+Namespace/Cluster/Pod/Node identities, original Node boot, funding receipt identity
+and its remaining lifetime, the exact approved image-root guard recipe and the
+unchanged original manager argv. Its framed command hash matches the existing
+Go guard's independent published vector. This creates an input object only: no
+protected file delivery, process start or image/filesystem attestation is claimed.
+The server still authorizes PostgreSQL only; bootstrap, Barman and PgBouncer need
+separate server-derived image/command authorization, never PostgreSQL aliases.
+
+The candidate guard CLI now includes bounded `prepare-inputs` over stdin. It
+reuses strict manifest/public-pin parsing and private custody checks, validates
+actual boot and Downward API identities, creates only explicit private children,
+and seals original content plus both directory identities before exclusively
+publishing regular input files. Matching lost-acknowledgement replay preserves
+file identities; conflicts and orphaned/partial inputs are refused. Input/IPC
+paths with the same device/inode are rejected, preventing a writable IPC alias
+of protected inputs. Completion follows synchronized file/directory readback.
+
+One additional native lifecycle story runs the actual Linux binary in an isolated
+local container: private publication, unchanged replay, conflict/alias refusal,
+existing signed PID1 manager start/shutdown and preserved original inputs pass.
+The latest instrumented sample completes in 18.313 seconds and verifies exact resource labels
+and cleanup absence. Setup/observer corrections and an intermediate guard exit
+one in 9.241 seconds remain retained; the latter is unexplained, so sustained or
+repeatable qualification is not claimed. Only ephemeral test signing keys are
+used. No installation key, real node agent, broker or CNPG guard rollout is
+created. This consumes the remaining native story in the current three-story
+capacity budget; later evidence must extend this lifecycle rather than adding
+speculative suites. The frozen source candidate's one final workspace/Go gate
+passes all seven stages: 52 Worker, 62 Node and nine Go cases. Runtime source is
+unchanged afterward; only evidence documentation records the result.
+
+The separate node-observation work package adds two focused red-first source
+stories for exact IPC mount correlation and bracketed current-attempt lookup.
+Runtime-derived paths remain private, and two inventories/statuses plus the
+original boot fence reject changed attempts. The upstream review identified
+Pod-name validation parity; legal dotted names now follow the observer's existing
+validator. Targeted cases and the same single final gate pass. This does not add delivery or signing authority,
+filesystem custody, a listener, a write-capable deployment, or real CNPG coverage.
+The capacity package retains its three-story budget; the node lookup package
+has two new stories and no generated cases.
+
+The [source checkpoint](docs/evidence/m6-capacity-execution-source-2026-10-01.md)
+records the modular implementation, independent test budgets and remaining
+activation requirements. The CLI can load explicit capacity configuration, but signed CNPG delivery has no
+qualified regional broker yet: its execution preparation is explicitly absent
+and compute opening is refused, rather than replaced by a positive callback.
+Positive native Pooler execution, listener/context registry,
+native occupied-reservation recovery, sequential CNPG claim handoff,
+protected execution/admission installation and the real native lifecycle remain
+implementation gates. The [Koordinator reservation contract](https://github.com/koordinator-sh/koordinator/blob/v1.8.0/apis/scheduling/v1alpha1/reservation_types.go)
+is an adaptation candidate, not evidence of native compatibility on the installed
+Kubernetes version. The complete modular source candidate passes its one final
+full gate; activation still requires the remaining evidence.
+No production capacity or funded-runtime enforcement is
+claimed by this checkpoint.
+
 ## PostgreSQL WAL-capacity recovery qualification
 
 The [selected operator-owned WAL incident/recovery](docs/evidence/m4-postgres-wal-recovery-2026-09-30.md)

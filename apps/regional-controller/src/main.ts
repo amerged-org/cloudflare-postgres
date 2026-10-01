@@ -28,6 +28,8 @@ import {
 } from "./usage-archive.ts";
 import { UsageArchiveClient } from "./usage-archive-client.ts";
 import { validateProvisioningJournalDirectory } from "./provisioning-funding.ts";
+import { capacityKubernetesFromConfig } from "./capacity-kubernetes.ts";
+import type { CapacityConfiguration } from "./capacity-types.ts";
 
 function required(name: string): string {
   const value = process.env[name];
@@ -115,7 +117,10 @@ async function main(): Promise<void> {
   }
   const config = JSON.parse(
     await readFile(required("PGCF_REGIONAL_CONFIG_FILE"), "utf8"),
-  ) as RegionalConfig & { roleVerifier: RoleConfig };
+  ) as RegionalConfig & {
+    roleVerifier: RoleConfig;
+    capacity?: CapacityConfiguration;
+  };
   if (
     !config ||
     typeof config !== "object" ||
@@ -187,6 +192,23 @@ async function main(): Promise<void> {
     );
   // Validate all service configuration before any lane creates durable state or starts work.
   const controllerOptions = {
+    ...(config.capacity
+      ? {
+          capacity: {
+            configuration: config.capacity,
+            runtime: capacityKubernetesFromConfig(
+              process.env.PGCF_KUBECONFIG_FILE,
+              () => {
+                if (shutdown.signal.aborted)
+                  throw new Error("controller_stopped");
+              },
+              shutdown.signal,
+            ),
+            // Signed CNPG delivery/broker installation is not qualified yet.
+            execution: null,
+          },
+        }
+      : {}),
     ...(provisioningJournalDirectory ? { provisioningJournalDirectory } : {}),
     leaseSeconds: milliseconds("PGCF_LEASE_SECONDS", 90, 30, 300),
     pollMilliseconds: milliseconds(

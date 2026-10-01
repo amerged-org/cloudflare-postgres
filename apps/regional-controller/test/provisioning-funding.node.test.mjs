@@ -11,6 +11,7 @@ import {
 } from "@cloudflare-postgres/resource-envelope";
 import { runController } from "../src/run.ts";
 import { ProvisioningFundingJournal } from "../src/provisioning-funding.ts";
+import { provisioningCapacityFixture } from "./fixtures/provisioning-capacity.mjs";
 
 test("provisioning retains one funding hold across ambiguity and refuses expired effects and readiness", async () => {
   const directory = realpathSync(
@@ -37,6 +38,7 @@ test("provisioning retains one funding hold across ambiguity and refuses expired
         stepGiB: 5,
       },
       instances: 1,
+      executionFencing: { version: 1 },
       backup: {
         endpointURL: "https://archive.example.invalid",
         region: "auto",
@@ -60,6 +62,7 @@ test("provisioning retains one funding hold across ambiguity and refuses expired
     leaseEpoch: 1,
     leaseExpiresAt: "2099-01-01T00:00:00.000Z",
     specRevision: 1,
+    runEpoch: "1",
     specHash: createHash("sha256").update(JSON.stringify(spec)).digest("hex"),
     spec,
   };
@@ -76,6 +79,8 @@ test("provisioning retains one funding hold across ambiguity and refuses expired
   Date.now = () => now;
   let committedFunding;
   const requests = [];
+  const resources = new Map();
+  const capacity = provisioningCapacityFixture(directory, claim, resources);
   async function once(currentClaim, funding, authority, api) {
     const shutdown = new AbortController();
     let claimed = false;
@@ -101,17 +106,21 @@ test("provisioning retains one funding hold across ambiguity and refuses expired
         shutdown.abort();
       },
     };
+    capacity.setTransport(currentClaim, client);
+    const stopTimer = setTimeout(() => shutdown.abort(), 5000);
     await runController(api, client, config, {
       leaseSeconds: 90,
       pollMilliseconds: 1,
       readinessMilliseconds: 30_000,
       provisioningJournalDirectory: directory,
+      capacity: capacity.lane,
       signal: shutdown.signal,
       log(event) {
         if (["operation_deferred", "readiness_deferred"].includes(event))
           shutdown.abort();
       },
     });
+    clearTimeout(stopTimer);
   }
   const noEffectsApi = {
     async read() {
@@ -180,7 +189,7 @@ test("provisioning retains one funding hold across ambiguity and refuses expired
           regionId,
           specRevision: 1,
           specHash: claim.specHash,
-          runEpoch: null,
+          runEpoch: claim.runEpoch,
           fundingSeconds: 300,
           rates,
           units,
@@ -216,14 +225,18 @@ test("provisioning retains one funding hold across ambiguity and refuses expired
       "a lost committed funding response permits no Kubernetes effect",
     );
     const thirdClaim = { ...claim, leaseEpoch: 3, leaseToken: "third-lease" };
-    const resources = new Map();
     let readyReadback = false;
     let readyAuthorityChecks = 0;
     let authorityCalls = 0;
     const fundedApi = {
       async read(kind, ns, name) {
         const value = resources.get(`${kind}:${ns}:${name}`) ?? null;
-        if (kind === "Cluster" && value) readyReadback = true;
+        if (
+          kind === "Cluster" &&
+          value?.status?.readyInstances === 1 &&
+          capacity.completeReadback()
+        )
+          readyReadback = true;
         return structuredClone(value);
       },
       async create(resource, dispatchAuthority) {
@@ -243,40 +256,13 @@ test("provisioning retains one funding hold across ambiguity and refuses expired
         const value = structuredClone(resource);
         value.metadata.uid = operationId;
         value.metadata.generation = 1;
-        if (resource.kind === "Cluster")
-          value.status = {
-            readyInstances: 1,
-            currentPrimary: "database-1",
-            conditions: [
-              { type: "Ready", status: "True", observedGeneration: 1 },
-            ],
-          };
-        resources.set(
-          `${resource.kind}:${resource.metadata.namespace ?? ""}:${resource.metadata.name}`,
-          value,
-        );
-        return structuredClone(value);
+        return capacity.onCreate(value);
       },
       async readSecret() {
         return { access: "ZmFrZQ==", secret: "ZmFrZQ==" };
       },
       async listPods() {
-        return [
-          {
-            metadata: {
-              name: "database-1",
-              uid: "77777777-7777-4777-8777-777777777777",
-              labels: { "cnpg.io/podRole": "instance" },
-              ownerReferences: [
-                { kind: "Cluster", uid: operationId, controller: true },
-              ],
-            },
-            status: {
-              phase: "Running",
-              conditions: [{ type: "Ready", status: "True" }],
-            },
-          },
-        ];
+        return capacity.listPods();
       },
     };
     await once(

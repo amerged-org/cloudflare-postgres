@@ -24,6 +24,38 @@ func main() {
 }
 func run() error {
 	arguments := os.Args[1:]
+	if len(arguments) > 0 && arguments[0] == "prepare-inputs" {
+		flags := flag.NewFlagSet("prepare-inputs", flag.ContinueOnError)
+		flags.SetOutput(io.Discard)
+		inputs := flags.String("input-directory", "", "explicit private input child")
+		ipc := flags.String("ipc-directory", "", "explicit private IPC child")
+		if flags.Parse(arguments[1:]) != nil || flags.NArg() != 0 || *inputs == "" || *ipc == "" {
+			return errors.New("invalid")
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		type body struct {
+			data []byte
+			err  error
+		}
+		ready := make(chan body, 1)
+		go func() { data, err := io.ReadAll(io.LimitReader(os.Stdin, 16*1024+1)); ready <- body{data, err} }()
+		var input body
+		select {
+		case input = <-ready:
+		case <-ctx.Done():
+			_ = os.Stdin.Close()
+			return errors.New("invalid")
+		}
+		if input.err != nil || len(input.data) > 16*1024 {
+			return errors.New("invalid")
+		}
+		result, err := guard.PrepareSignedInputs(ctx, guard.SignedInputConfiguration{InputDirectory: *inputs, IPCDirectory: *ipc, Capsule: input.data})
+		if err != nil {
+			return err
+		}
+		return json.NewEncoder(os.Stdout).Encode(map[string]any{"mode": "prepare-inputs", "status": "prepared", "inputs": result})
+	}
 	if len(arguments) == 1 && arguments[0] == "clock" {
 		boot, ns, err := guard.ReadBootClock()
 		if err != nil {
