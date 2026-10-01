@@ -201,7 +201,11 @@ evidence. The interrupted gate remains failed; no whole gate repeats.
 Historical failed fixtures and the old-base gate remain retained.
 Installation keys, CNPG protected delivery/coverage, physical capacity, funded
 renewal, usage-queue resolution and ordinary API commissioning remain open;
-`runtimeEnforced` stays false and admission stays closed.
+`runtimeEnforced` stays false and admission stays closed. Source `b6e3f9d` is
+public; Dev version `507ca07e-657e-467a-84b8-2ab05ca6f4e2` serves 100 percent
+traffic. Readback preserves 50-table counts, 18 migrations and nine Secrets;
+anonymous and unfunded issuance refuse access. No installation key or regional
+runtime activation occurs.
 
 ## Automatic usage-journal R2 custody checkpoint
 

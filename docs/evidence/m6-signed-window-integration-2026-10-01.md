@@ -83,3 +83,25 @@ actual Pod/Node/image bindings, external transport, CNPG/Pooler/Barman coverage,
 physical compute/storage reservation, durable funded renewal/run handoff, final
 usage and disposition of the saturated noncanonical usage queue. The local
 signed primitive supplies none of those missing installation guarantees.
+
+## Public and Dev delivery
+
+Runtime source `b6e3f9d957b29995a547bfbd3b7eb6e281b135b7` is public on `main`.
+All 16 changed GitHub blobs match the qualified local bytes. The candidate scan
+finds zero matches for 82 actual private-value/encoded variants across 510 public
+files; the dry-run bundle also has zero matches across its three files.
+
+The single Dev deploy completes in **9.758 seconds**. Worker version
+`507ca07e-657e-467a-84b8-2ab05ca6f4e2` serves 100 percent traffic. Seven readback
+requests complete in **3.496 seconds**: anonymous permit issuance refuses `401`,
+a valid regional actor with no real operation/funding receives `409`, and an
+owned project read succeeds. All 50-table counts, 18 migrations and nine existing
+Secret names/types match the before snapshot. No signing Secret, key, schema,
+customer environment, funding reservation or regional rollout is created.
+
+This delivery does not issue a real funded permit or force a live replica race.
+The current installation remains unconfigured for signed issuance and managed
+admission. Local environment bytes remain unchanged, ignored, untracked and
+mode0600. The original source hold is promoted intentionally; its obsolete PLAN
+insert remains in private custody while the canonical roadmap records current
+passing evidence and the remaining activation requirements.
