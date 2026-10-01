@@ -5,7 +5,8 @@ The separate delivery image/profile has node-administration filesystem authority
 The existing observation command/profile remains read-only. The regional broker
 must authenticate and pin the delivery Namespace, Node, DaemonSet, Pod,
 container/image and restart identity around the complete exchange. That regional
-transport is implemented by `node-delivery.ts`; complete broker wiring and live
+transport is implemented by `node-delivery.ts`; post-birth broker custody is
+implemented by `execution-broker.ts`. Resident/bootstrap wiring and live
 qualification remain implementation work.
 
 ## Channel and framing
@@ -73,3 +74,10 @@ revalidation callbacks. Its issuer response is copied and the exact frame is
 constructed before final revalidation; those bytes cannot change while awaiting
 fresh metadata. Current authority is checked immediately before sending. The
 transport's callbacks are not a production-broker activation claim.
+
+The post-birth broker derives those callbacks from original capacity/manifest,
+current funding and exact target/recipe checks. It durably claims the attempt
+before dispatch, seals issuing before the one ControlClient request, and records
+publishing before returning exact permit bytes. In-progress or uncertain reopen
+does not issue again. An already-recorded receipt is historical evidence only.
+Pre-birth admission and protected-input/nonce bootstrap remain separate.

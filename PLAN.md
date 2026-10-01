@@ -266,6 +266,18 @@ backup/native access or scheduled control-backup work. Admission remains closed.
 
 ## Capacity admission integration candidate — 2026-10-01
 
+The [durable execution broker checkpoint](docs/evidence/m6-durable-execution-broker-2026-10-01.md)
+connects actual manifest/capacity/funding custody, the ControlClient issuer and
+node transport for one post-birth PostgreSQL attempt. Private CAS phases precede
+dispatch/issuance and preserve exact permit bytes plus uncertain outcomes across
+reopening. Three red-first stories pass with an unchanged capacity-journal case.
+Historical publication does not prove current execution. Pre-birth admission,
+protected-input publication and guard nonce discovery remain separate bootstrap
+requirements; the default execution prerequisite remains absent.
+The one frozen five-stage gate passes 52 Worker and 68 Node cases, with eleven
+unchanged Go cases retaining prior evidence. Runtime bytes remain unchanged
+afterward; original local credentials remain private, ignored and byte-identical.
+
 The [regional duplex transport checkpoint](docs/evidence/m6-regional-duplex-transport-2026-10-01.md)
 adds actual maintained-SDK authenticated HTTPS/WSS transport for the separate
 delivery process. Three red-first stories cover one complete signed exchange,

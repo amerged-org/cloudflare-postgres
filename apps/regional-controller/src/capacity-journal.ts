@@ -270,7 +270,7 @@ function validPlan(plan: CapacityPlan): boolean {
     plan.slots.filter((slot) => slot.kind === "pooler").length <= 1
   );
 }
-function privateEntry(path: string, directory = false): Stats {
+export function privateEntry(path: string, directory = false): Stats {
   const stat = lstatSync(path);
   if (
     stat.isSymbolicLink() ||
@@ -282,7 +282,7 @@ function privateEntry(path: string, directory = false): Stats {
     throw fail();
   return stat;
 }
-function privatePath(path: string): void {
+export function privatePath(path: string): void {
   if (!isAbsolute(path) || path !== resolve(path) || path.length > 4096)
     throw fail();
   const root = parse(path).root;
@@ -295,7 +295,7 @@ function privatePath(path: string): void {
   }
   privateEntry(dirname(path), true);
 }
-function sameIdentity(before: Stats, after: Stats): void {
+export function sameIdentity(before: Stats, after: Stats): void {
   for (const field of ["dev", "ino", "uid", "mode"] as const)
     if (before[field] !== after[field]) throw fail();
   // Creating journal entries can change directory nlink. Regular files retain
