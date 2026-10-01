@@ -1,4 +1,5 @@
 import { environmentRoutes } from "./environments";
+import { issueRuntimePermit } from "./runtime-permit";
 import { usageArchiveRoutes } from "./usage-archives";
 import { assertion } from "./accounting";
 import { actorBindings, actorPredicate, type Actor } from "./execution-auth";
@@ -816,6 +817,18 @@ export default {
     const maintenanceResponse = await maintenanceRoutes(request, env);
     if (maintenanceResponse) return maintenanceResponse;
     try {
+      const runtimePermitPath =
+        /^\/v1\/regions\/([^/]+)\/operations\/([^/]+)\/execution-permits$/.exec(
+          new URL(request.url).pathname,
+        );
+      if (request.method === "POST" && runtimePermitPath)
+        return await issueRuntimePermit(
+          request,
+          env,
+          env.DB,
+          runtimePermitPath[1]!,
+          runtimePermitPath[2]!,
+        );
       const budgetResponse = await budgetRoutes(request, env);
       if (budgetResponse) return budgetResponse;
       const usageResponse = await usageRoutes(

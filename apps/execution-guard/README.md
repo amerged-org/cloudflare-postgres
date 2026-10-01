@@ -1,20 +1,36 @@
 # Execution deadline guard
 
-Linux PID1 wrapper for an operator-protected, finite execution window. This is the local expiry component; signed allowance issuance, renewal delivery, CNPG integration, retained-Pod termination receipts and final accounting remain required before runtime enforcement can be enabled.
+Linux PID1 wrapper for a finite execution window. The signed startup mode verifies an operation-bound allowance envelope before launching the original command. Continuous renewal, trusted CNPG injection, complete workload coverage, retained-Pod termination receipts and final accounting remain required before runtime enforcement can be enabled.
 
 The guard uses the original manager command, not a PostgreSQL implementation. A CNPG-I OperatorLifecycle adapter can inject a wrapper before Pod creation. CloudNativePG's PostgreSQL interface offers configuration enrichment rather than a per-start authorization hook. [Lifecycle interface](https://github.com/cloudnative-pg/cnpg-i/blob/v0.6.0/proto/operator_lifecycle.proto).
 
 Run in a private container PID namespace with no host PID sharing, no privilege escalation and one fixed UID for all supervised processes. The guard must be PID1 before starting or signalling anything. The protected permit is read once; customer SQL access must not grant modification of the permit, epoch, command, executable or admission recipe.
+
+The explicit `operator-window` mode retains the unsigned, unfunded operator configuration:
 
 ```json
 {"version":1,"bootId":"<kernel boot UUID>","runEpoch":"1","notBeforeBootNs":"<decimal CLOCK_BOOTTIME nanoseconds>","expiresAtBootNs":"<decimal CLOCK_BOOTTIME nanoseconds>"}
 ```
 
 ```text
-/execution-guard --permit-file /etc/pgcf/permit.json --run-epoch 1 --grace 3s -- /controller/manager instance run <original arguments>
+/execution-guard --mode operator-window --permit-file /etc/pgcf/permit.json --run-epoch 1 --grace 3s -- /controller/manager instance run <original arguments>
 ```
 
 The window is at most 300 seconds. An absolute Linux timerfd uses CLOCK_BOOTTIME, including host suspend time. Wall-clock changes cannot renew a window; an expired permit or different boot/run cannot start a process. The `clock` subcommand reports the local boot identity and boot nanoseconds to trusted installation tooling. This unsigned operator configuration does not itself establish funded execution authority or authorize another environment.
+
+The explicit `signed-window` mode requires a protected expected manifest and a single pinned Ed25519 public key. It also checks `PGCF_EXECUTION_POD_UID`, `PGCF_EXECUTION_NAMESPACE` and `PGCF_EXECUTION_NODE_NAME` from trusted Downward API configuration against the expected binding. The native kernel boot UUID must match. The full actual argument vector is hashed using the agreed domain and UTF-8 length framing; it must match the protected command and signed binding.
+
+```text
+/execution-guard --mode signed-window --expected-file /private/expected.json --public-key-file /private/key.json --ipc-directory /private/ipc --startup-timeout 15s --grace 3s -- /controller/manager instance run <original arguments>
+```
+
+Before requesting authorization, PID1 reads native CLOCK_BOOTTIME and creates a fresh random nonce held in memory. It creates an exclusive `attempt-<nonce>` directory and `request.json`, then emits one bounded challenge-ready event. A trusted external broker supplies `permit.json` in that same attempt; the guard contains no regional or provider credential. Existing attempts and malformed, foreign, unsigned or stale responses are refused. There is no fallback to the operator lane; that lane also refuses configured signed-context variables.
+
+Protected input and response files must be regular, single-link, owned by the guard UID, and mode `0400` or `0600`. Their parent directories and the explicit IPC directory must be existing real directories owned by that UID with mode `0700`. Symlink parents/files are refused. Directory identity and file identity/content are checked through the exchange and immediately before launch; the native clock is checked again after those reads. Ancestor path checks are observations, not an atomic defense against concurrent administrator replacement. Installation tooling must preserve this custody boundary.
+
+The guard strictly verifies the routing-bound signature over the original canonical payload bytes and every expected receipt/environment/spec/run/Pod/Node/command/resource identity. Signed duration is at most 15 seconds. Its deadline is the original local pre-transport boot time plus that duration, so waiting consumes the window. Receipt wall timestamps never supply a local clock mapping. A response received after expiry or without enough shutdown grace cannot start the manager. Restart generates a new nonce; an old envelope cannot move that anchor. See the [signed window contract](../../docs/contracts/signed-execution-window-v2.md) and the [synthetic cross-language byte fixture](testdata/signed-window-v2.json).
+
+The protected Pod/Node/image/resource bindings are trusted installation assertions, not fresh hardware attestation or executable-byte measurement. This initial finite window is not activated for CNPG and does not renew itself. `runtimeEnforced` remains false; scheduler allocation release, retained-storage cost, Pooler/Barman coverage, final usage, settlement and measured overshoot remain separate gates.
 
 Shutdown starts before expiry, using the configured grace (at most ten seconds). SIGTERM asks the original manager to shut down, followed by namespace-wide SIGINT for fast PostgreSQL shutdown and SIGKILL if necessary at the hard deadline. Every waitable child is reaped and `/proc` must contain no other processes before local quiescence is reported. Error exit also ends container PID1; unknown cleanup never becomes a success. Kernel scheduling and uninterruptible I/O prevent an exact-time guarantee; measured overshoot and recovery remain installation gates.
 
@@ -22,4 +38,4 @@ PostgreSQL uses a separate process group, so signalling only the manager's group
 
 A valid window may still permit a container restart before expiry. A manual stop, future run handoff and physical completion therefore need retained kubelet termination evidence and controlled admission, not just this local receipt. Stopping PostgreSQL does not release scheduler allocations, stop a separately namespaced Pooler/backup sidecar, finalize usage or remove stored customer data. SIGKILL can require ordinary PostgreSQL WAL recovery and leaves uncertain writes uncertain; never replay them blindly.
 
-Build/check with `pnpm check:execution-guard`. The Docker build uses an explicit public context. First-party tests have two bounded cases; a separate real Linux namespace qualification exercises a detached/adopted group and expired restart refusal. The default regional controller does not activate the guard or gain new privileges.
+Build/check with `pnpm check:execution-guard`. The Docker build uses an explicit public context. First-party tests have three bounded Go cases, including signed verification before the maintained supervisor and original-anchor refusal. A separate real Linux namespace qualification exercises actual PID1 behavior; the [standalone signed lifecycle case](../../docs/evidence/m6-signed-window-native-2026-10-01.md) passes with the unchanged binary. The [current source integration](../../docs/evidence/m6-signed-window-integration-2026-10-01.md) retains closed managed admission; this does not qualify CNPG activation. The default regional controller does not activate the guard or gain new privileges.

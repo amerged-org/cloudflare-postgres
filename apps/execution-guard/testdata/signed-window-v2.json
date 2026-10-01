@@ -1,0 +1,13 @@
+{
+  "description": "Synthetic, nonproduction cross-language bytes; public key from the published RFC 8032 section 7.1 test vector. No private key is stored here.",
+  "keyId": "fixture-v2",
+  "publicKey": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+  "payload": "{\"binding\":{\"bootId\":\"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa\",\"commandHash\":\"1f259a04d72c56de188723150f69d8f2375c6e8b0cb32d7931ae1a544a960add\",\"containerName\":\"postgres\",\"environmentId\":\"66666666-6666-4666-8666-666666666666\",\"imageHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"installationId\":\"fixture-installation\",\"namespace\":\"pgcf-env-66666666-6666-4666-8666-666666666666\",\"namespaceUid\":\"77777777-7777-4777-8777-777777777777\",\"nodeName\":\"fixture-node\",\"nodeUid\":\"99999999-9999-4999-8999-999999999999\",\"operationId\":\"55555555-5555-4555-8555-555555555555\",\"organizationId\":\"11111111-1111-4111-8111-111111111111\",\"podUid\":\"88888888-8888-4888-8888-888888888888\",\"projectId\":\"22222222-2222-4222-8222-222222222222\",\"regionId\":\"33333333-3333-4333-8333-333333333333\",\"reservationEpoch\":\"1\",\"reservationId\":\"44444444-4444-4444-8444-444444444444\",\"reservationRevision\":\"0\",\"resourceEnvelopeHash\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"runEpoch\":\"1\",\"specHash\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"specRevision\":1},\"durationNs\":\"12000000000\",\"issuedAt\":\"2026-09-30T00:00:00.000Z\",\"nonce\":\"BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc\",\"validUntil\":\"2026-09-30T00:00:12.000Z\",\"version\":2}",
+  "signature": "S-CpuT0BcWV8idvUJrCEVHTz3elN2cR9JY-yYbtDa_aZhp9laVFt4BS0jTRSvfjlib_U_1HPZwvEZjY7AIZtAQ",
+  "command": [
+    "/controller/manager",
+    "instance",
+    "run"
+  ],
+  "commandHash": "1f259a04d72c56de188723150f69d8f2375c6e8b0cb32d7931ae1a544a960add"
+}

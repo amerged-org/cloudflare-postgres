@@ -391,6 +391,7 @@ it("replays historical derived credentials after key rotation and refuses unavai
   )
     .bind(organizationId)
     .all();
+  expect(before.success).toBe(true);
   const unavailable = await issue(
     { ...context, ROLE_CREDENTIAL_KEYS: ring("fixture-v2", false) },
     organizationId,
@@ -416,11 +417,11 @@ it("replays historical derived credentials after key rotation and refuses unavai
     { headers: installerHeaders },
   );
   expect(missing.status).toBe(404);
-  expect(
-    await env.DB.prepare(
-      "SELECT * FROM api_tokens WHERE organization_id=? ORDER BY id",
-    )
-      .bind(organizationId)
-      .all(),
-  ).toEqual(before);
+  const after = await env.DB.prepare(
+    "SELECT * FROM api_tokens WHERE organization_id=? ORDER BY id",
+  )
+    .bind(organizationId)
+    .all();
+  expect(after.success).toBe(true);
+  expect(after.results).toEqual(before.results);
 });

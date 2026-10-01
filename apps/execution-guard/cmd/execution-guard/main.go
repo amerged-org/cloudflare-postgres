@@ -34,9 +34,32 @@ func run() error {
 	flags := flag.NewFlagSet("execution-guard", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	path := flags.String("permit-file", "", "protected operator permit")
+	mode := flags.String("mode", "", "explicit operator-window or signed-window")
+	expectedPath := flags.String("expected-file", "", "protected signed workload manifest")
+	keyPath := flags.String("public-key-file", "", "protected single public key pin")
+	ipcDirectory := flags.String("ipc-directory", "", "existing private handshake directory")
+	startup := flags.Duration("startup-timeout", 15*time.Second, "finite signed startup window")
 	runEpoch := flags.String("run-epoch", "", "expected immutable execution epoch")
 	grace := flags.Duration("grace", 3*time.Second, "bounded shutdown before hard expiry")
-	if flags.Parse(arguments) != nil || *path == "" || *runEpoch == "" || flags.NArg() == 0 {
+	if flags.Parse(arguments) != nil || flags.NArg() == 0 {
+		return errors.New("invalid")
+	}
+	if *mode == "signed-window" {
+		if *path != "" || *runEpoch != "" || *expectedPath == "" || *keyPath == "" || *ipcDirectory == "" {
+			return errors.New("invalid")
+		}
+		ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+		defer cancel()
+		result, err := guard.RunSigned(ctx, guard.SignedRunConfiguration{ExpectedFile: *expectedPath, PublicKeyFile: *keyPath, IPCDirectory: *ipcDirectory, Command: flags.Args(), Grace: *grace, StartupTimeout: *startup, ReadyWriter: os.Stdout})
+		if err != nil || !result.Quiescent {
+			return errors.New("invalid")
+		}
+		return nil
+	}
+	if *mode != "operator-window" || *path == "" || *runEpoch == "" || *expectedPath != "" || *keyPath != "" || *ipcDirectory != "" {
+		return errors.New("invalid")
+	}
+	if os.Getenv("PGCF_EXECUTION_POD_UID") != "" || os.Getenv("PGCF_EXECUTION_NAMESPACE") != "" || os.Getenv("PGCF_EXECUTION_NODE_NAME") != "" {
 		return errors.New("invalid")
 	}
 	file, err := os.Open(*path)

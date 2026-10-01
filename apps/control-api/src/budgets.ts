@@ -1038,22 +1038,29 @@ function fundingAssertion(
   return assertion(db, guard.predicate, guard.bindings);
 }
 
-async function fundingStable(
+async function fundingObservation(
   db: AccountingDb,
   scope: FundingScope,
   fenceVersion: string,
   receipt: Receipt,
-): Promise<boolean> {
+  requiredUntil?: string,
+  requireStarted = false,
+): Promise<{ serverNow: string; leaseExpiresAt: string } | null> {
   const guard = fundingGuard(scope);
-  return !!(await db
+  return await db
     .prepare(
-      `SELECT 1 FROM allowance_reservations q JOIN accounting_fences f ON f.project_id=q.project_id
+      `SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now') AS serverNow,
+        (SELECT o.lease_expires_at FROM operations o WHERE o.id=?) AS leaseExpiresAt
+        FROM allowance_reservations q JOIN accounting_fences f ON f.project_id=q.project_id
     WHERE q.id=? AND q.version_token=? AND q.request_id=? AND q.region_id=? AND q.environment_id=?
     AND q.organization_id=? AND q.project_id=? AND q.spec_revision=? AND q.spec_hash=?
     AND q.status='issued' AND q.gap_count='0' AND q.stopped_at IS NULL
-    AND q.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') AND f.version_token=? AND ${guard.predicate}`,
+    AND q.expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now') AND f.version_token=? AND ${guard.predicate}
+    ${requireStarted ? "AND q.issued_at<=strftime('%Y-%m-%dT%H:%M:%fZ','now') AND NOT EXISTS (SELECT 1 FROM budget_targets t JOIN budget_accounts a ON a.id=t.active_account_id WHERE t.project_id=q.project_id AND (t.environment_id IS NULL OR t.environment_id=q.environment_id) AND a.period_start>strftime('%Y-%m-%dT%H:%M:%fZ','now'))" : ""}
+    ${requiredUntil ? "AND q.expires_at>=? AND EXISTS (SELECT 1 FROM operations o WHERE o.id=? AND o.lease_expires_at>=?) AND NOT EXISTS (SELECT 1 FROM budget_targets t JOIN budget_accounts a ON a.id=t.active_account_id WHERE t.project_id=q.project_id AND (t.environment_id IS NULL OR t.environment_id=q.environment_id) AND a.period_end<?)" : ""}`,
     )
     .bind(
+      scope.operationId,
       receipt.id,
       receipt.version_token,
       scope.operationId,
@@ -1065,8 +1072,28 @@ async function fundingStable(
       scope.spec_hash,
       fenceVersion,
       ...guard.bindings,
+      ...(requiredUntil
+        ? [requiredUntil, scope.operationId, requiredUntil, requiredUntil]
+        : []),
     )
-    .first());
+    .first<{ serverNow: string; leaseExpiresAt: string }>();
+}
+
+async function fundingStable(
+  db: AccountingDb,
+  scope: FundingScope,
+  fenceVersion: string,
+  receipt: Receipt,
+  requiredUntil?: string,
+): Promise<boolean> {
+  return !!(await fundingObservation(
+    db,
+    scope,
+    fenceVersion,
+    receipt,
+    requiredUntil,
+    requiredUntil !== undefined,
+  ));
 }
 
 async function fundingReplay(
@@ -1074,6 +1101,7 @@ async function fundingReplay(
   funding: FundingContext,
   receipt: Receipt,
   fenceVersion: string,
+  requiredUntil?: string,
 ): Promise<Response | null> {
   if (receipt.expires_at <= now())
     return error(409, "provisioning_funding_expired");
@@ -1137,10 +1165,228 @@ async function fundingReplay(
   }
   if (
     epoch.toString() !== receipt.execution_epoch ||
-    !(await fundingStable(db, funding.scope, fenceVersion, receipt))
+    !(await fundingStable(
+      db,
+      funding.scope,
+      fenceVersion,
+      receipt,
+      requiredUntil,
+    ))
   )
     return error(409, "provisioning_funding_unavailable");
   return null;
+}
+
+export interface RuntimePermitFunding {
+  binding: {
+    organizationId: string;
+    projectId: string;
+    environmentId: string;
+    regionId: string;
+    operationId: string;
+    reservationId: string;
+    reservationRevision: string;
+    reservationEpoch: string;
+    specRevision: number;
+    specHash: string;
+    runEpoch: string | null;
+    namespace: string;
+    imageHash: string;
+  };
+  envelope: ReturnType<typeof provisioningResourceEnvelope>;
+  deadline: number;
+  serverNow: string;
+  recheck(
+    requiredUntil: string,
+  ): Promise<Response | { serverNow: string; deadline: number }>;
+}
+
+export async function readRuntimePermitFunding(
+  request: Request,
+  db: AccountingDb,
+  regionId: string,
+  operationId: string,
+  input: { leaseToken: string; leaseEpoch: number; reservationId: string },
+): Promise<RuntimePermitFunding | Response> {
+  const actor = await authorize(
+    request,
+    db,
+    "region",
+    regionId,
+    "operations:claim",
+  );
+  if (actor instanceof Response) return actor;
+  const leaseHash = await sha256(input.leaseToken);
+  const row = await db
+    .prepare(
+      `SELECT e.id,e.organization_id,e.project_id,e.region_id,e.spec_revision,e.spec_hash,e.resolved_spec,e.run_epoch,
+    o.lease_expires_at FROM environments e JOIN operations o ON o.environment_id=e.id
+    WHERE o.id=? AND o.region_id=? AND o.kind='environment.create' AND o.status='running'
+    AND o.lease_actor_token_id=? AND o.lease_token_hash=? AND o.lease_epoch=?
+    AND o.lease_expires_at>strftime('%Y-%m-%dT%H:%M:%fZ','now')`,
+    )
+    .bind(operationId, regionId, actor.id, leaseHash, input.leaseEpoch)
+    .first<
+      Omit<
+        FundingScope,
+        "operationId" | "actor" | "leaseHash" | "leaseEpoch"
+      > & { lease_expires_at: string }
+    >();
+  if (!row) return error(409, "runtime_permit_unavailable");
+  const scope: FundingScope = {
+    ...row,
+    operationId,
+    actor,
+    leaseHash,
+    leaseEpoch: input.leaseEpoch,
+  };
+  const fence = await db
+    .prepare("SELECT version_token FROM accounting_fences WHERE project_id=?")
+    .bind(scope.project_id)
+    .first<{ version_token: string }>();
+  const receipt = await db
+    .prepare(
+      "SELECT * FROM allowance_reservations WHERE id=? AND region_id=? AND request_id=? AND environment_id=?",
+    )
+    .bind(input.reservationId, regionId, operationId, scope.id)
+    .first<Receipt>();
+  if (!receipt || !fence) return error(409, "runtime_permit_unavailable");
+  const fundingSeconds =
+    (Date.parse(receipt.expires_at) - Date.parse(receipt.issued_at)) / 1000;
+  if (!integer(fundingSeconds, 30, 300))
+    return error(409, "runtime_permit_unavailable");
+  const spec = JSON.parse(scope.resolved_spec) as {
+    volumeGiB: number;
+    profile: Omit<ResourceEnvelopeInput, "volumeGiB"> & {
+      postgresImage: string;
+    };
+  };
+  if ((await sha256(JSON.stringify(spec))) !== scope.spec_hash)
+    return error(409, "runtime_permit_unavailable");
+  const envelopeInput: ResourceEnvelopeInput = {
+    instances: spec.profile.instances,
+    compute: spec.profile.compute,
+    volumeGiB: spec.volumeGiB,
+    ...(spec.profile.pooling ? { pooling: spec.profile.pooling } : {}),
+  };
+  const envelope = provisioningResourceEnvelope(envelopeInput);
+  const units = provisioningAllowanceUnits(envelopeInput, fundingSeconds);
+  const requestHash = await sha256(
+    JSON.stringify({
+      protocol: "provisioning-funding/v1",
+      operationId,
+      environmentId: scope.id,
+      regionId: scope.region_id,
+      specRevision: scope.spec_revision,
+      specHash: scope.spec_hash,
+      runEpoch: scope.run_epoch,
+      envelopeVersion: envelope.version,
+      fundingSeconds,
+      units,
+    }),
+  );
+  if (
+    receipt.request_hash !== requestHash ||
+    receipt.units_json !== JSON.stringify(units)
+  )
+    return error(409, "runtime_permit_unavailable");
+  const context = { scope, requestHash };
+  if (await fundingReplay(db, context, receipt, fence.version_token))
+    return error(409, "runtime_permit_unavailable");
+  const authorityResponse = await runtimeAuthority(
+    request,
+    db,
+    regionId,
+    receipt.id,
+  );
+  if (!authorityResponse.ok) return error(409, "runtime_permit_unavailable");
+  const { authority } = (await authorityResponse.json()) as {
+    authority: { decision: string; reason: string; validUntil: string };
+  };
+  if (authority.decision !== "allow" || authority.reason !== "authorized")
+    return error(409, "runtime_permit_unavailable");
+  const observed = await fundingObservation(
+    db,
+    scope,
+    fence.version_token,
+    receipt,
+    undefined,
+    true,
+  );
+  if (!observed) return error(409, "runtime_permit_unavailable");
+  const deadline = Math.min(
+    Date.parse(authority.validUntil),
+    Date.parse(receipt.expires_at),
+    Date.parse(observed.leaseExpiresAt),
+  );
+  if (
+    !Number.isSafeInteger(deadline) ||
+    Date.parse(observed.serverNow) >= deadline
+  )
+    return error(409, "runtime_permit_unavailable");
+  const imageHash = /@sha256:([a-f0-9]{64})$/.exec(
+    spec.profile.postgresImage,
+  )?.[1];
+  if (!imageHash) return error(409, "runtime_permit_unavailable");
+  return {
+    binding: {
+      organizationId: scope.organization_id,
+      projectId: scope.project_id,
+      environmentId: scope.id,
+      regionId: scope.region_id,
+      operationId,
+      reservationId: receipt.id,
+      reservationRevision: receipt.revision,
+      reservationEpoch: receipt.execution_epoch,
+      specRevision: scope.spec_revision,
+      specHash: scope.spec_hash,
+      runEpoch: scope.run_epoch,
+      namespace: `pgcf-${scope.id.replaceAll("-", "")}`,
+      imageHash,
+    },
+    envelope,
+    deadline,
+    serverNow: observed.serverNow,
+    recheck: async (requiredUntil) => {
+      if (
+        !Number.isFinite(Date.parse(requiredUntil)) ||
+        Date.parse(requiredUntil) > deadline ||
+        Date.parse(observed.serverNow) >= Date.parse(requiredUntil)
+      )
+        return error(409, "runtime_permit_unavailable");
+      if (
+        await fundingReplay(
+          db,
+          context,
+          receipt,
+          fence.version_token,
+          requiredUntil,
+        )
+      )
+        return error(409, "runtime_permit_unavailable");
+      const finalObservation = await fundingObservation(
+        db,
+        scope,
+        fence.version_token,
+        receipt,
+        requiredUntil,
+        true,
+      );
+      if (
+        !finalObservation ||
+        Date.parse(finalObservation.serverNow) >= Date.parse(requiredUntil)
+      )
+        return error(409, "runtime_permit_unavailable");
+      return {
+        serverNow: finalObservation.serverNow,
+        deadline: Math.min(
+          deadline,
+          Date.parse(finalObservation.leaseExpiresAt),
+          Date.parse(receipt.expires_at),
+        ),
+      };
+    },
+  };
 }
 
 async function provisioningFunding(

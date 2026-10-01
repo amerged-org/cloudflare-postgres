@@ -185,16 +185,23 @@ This is a point-in-time secrecy boundary, not runtime enforcement or production
 acceptance. All held backup/signing/native/admission qualifications remain held.
 
 The [signed native-window continuation](docs/evidence/m6-signed-window-native-2026-10-01.md)
-now closes the standalone Linux startup/lifecycle failure with the unchanged
-candidate binary. Exact private diagnostics locate a fixture owner-stat mismatch;
-Linux-native custody volumes preserve every production check. An external
-response transport then passes delayed signed startup, original-anchor process
-expiry and old-nonce restart refusal in 16.093 seconds with complete local cleanup.
-Prior failures remain retained; there are no new stories or broad gate reruns.
-The candidate remains outside mainline runtime pending current integration;
-installation keys, CNPG injection/coverage, capacity reservation, funded renewal,
-usage-queue resolution and ordinary API commissioning remain open. The historical
-two-attempt stop above no longer describes the current local lifecycle result.
+closes the standalone Linux startup/lifecycle failure with the unchanged binary.
+Linux-native custody volumes and an external response writer preserve every
+production check; delayed startup, original-anchor expiry and old-nonce refusal
+pass in 16.093 seconds with complete cleanup. The [current source integration](docs/evidence/m6-signed-window-integration-2026-10-01.md)
+prepares the issuer and signed guard on the current baseline. Its existing Worker story
+now demonstrates a real post-sign revocation hidden by captured stale-session
+reads; all issuance checks use direct D1 primary reads. No new fourth story is
+introduced. The single final integration gate stops after 46.887 seconds on an
+existing organization-token assertion comparing D1 timing metadata; 51/52 Worker
+cases pass. On resumption only that assertion compares complete business rows
+instead of timing metadata. Its named file passes in 2.405 seconds; previously
+unrun Node/guard stages pass once, giving combined 52 Worker/60 Node/three Go
+evidence. The interrupted gate remains failed; no whole gate repeats.
+Historical failed fixtures and the old-base gate remain retained.
+Installation keys, CNPG protected delivery/coverage, physical capacity, funded
+renewal, usage-queue resolution and ordinary API commissioning remain open;
+`runtimeEnforced` stays false and admission stays closed.
 
 ## Automatic usage-journal R2 custody checkpoint
 
