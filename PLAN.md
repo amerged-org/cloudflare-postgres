@@ -266,6 +266,17 @@ backup/native access or scheduled control-backup work. Admission remains closed.
 
 ## Capacity admission integration candidate — 2026-10-01
 
+The [bounded input-startup checkpoint](docs/evidence/m6-bounded-input-startup-2026-10-01.md)
+adds an optional protected-input wait with original readonly/writable root
+custody and an immutable pre-wait boot anchor. PostgreSQL remains unstarted
+without a valid signed grant. One Go and two isolated PID1 lifecycle stories
+provide red-first evidence. This addresses the guard's startup wait, not node
+publication or birth funding: restart fencing, allocated-resource accounting,
+pre-birth readiness and live CNPG still require separate proof.
+The one frozen eight-stage gate passes 52 Worker, 68 Node and twelve Go cases
+plus Linux vet. Runtime bytes remain frozen after evidence updates; local
+credentials remain private, ignored and byte-identical.
+
 The [durable execution broker checkpoint](docs/evidence/m6-durable-execution-broker-2026-10-01.md)
 connects actual manifest/capacity/funding custody, the ControlClient issuer and
 node transport for one post-birth PostgreSQL attempt. Private CAS phases precede

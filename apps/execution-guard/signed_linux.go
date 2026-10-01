@@ -28,8 +28,9 @@ type filePin struct {
 	hash [32]byte
 }
 type signedCustody struct {
-	directories []directoryPin
-	files       []filePin
+	directories     []directoryPin
+	files           []filePin
+	additionalCheck func() error
 }
 type signedProcesses struct {
 	linuxProcesses
@@ -123,6 +124,9 @@ func (pin filePin) check() error {
 	return nil
 }
 func (custody *signedCustody) check() error {
+	if custody.additionalCheck != nil && custody.additionalCheck() != nil {
+		return failed
+	}
 	for _, pin := range custody.directories {
 		if pin.check() != nil {
 			return failed
@@ -167,7 +171,19 @@ func RunSigned(ctx context.Context, config SignedRunConfiguration) (Result, erro
 	if os.Getpid() != 1 || ctx == nil || ctx.Err() != nil || config.ReadyWriter == nil {
 		return Result{}, failed
 	}
+	var original *signedStartupAnchor
+	if config.InputWait != 0 {
+		var err error
+		original, err = waitSignedInputs(ctx, config)
+		if err != nil {
+			return Result{}, err
+		}
+		defer original.close()
+	}
 	custody := &signedCustody{}
+	if original != nil {
+		custody.additionalCheck = original.check
+	}
 	for _, directory := range []string{filepath.Dir(config.ExpectedFile), filepath.Dir(config.PublicKeyFile), config.IPCDirectory} {
 		pin, err := pinDirectory(directory)
 		if err != nil {
@@ -254,7 +270,7 @@ func RunSigned(ctx context.Context, config SignedRunConfiguration) (Result, erro
 			}
 		}
 	}
-	permit, err := prepareSignedWindow(ctx, expected, pin.KeyID, key, config.Command, config.Grace, config.StartupTimeout, exchange, linuxProcesses{})
+	permit, err := prepareSignedWindowAt(ctx, expected, pin.KeyID, key, config.Command, config.Grace, config.StartupTimeout, exchange, linuxProcesses{}, original)
 	if err != nil {
 		return Result{}, err
 	}

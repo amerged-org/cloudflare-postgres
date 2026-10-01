@@ -256,6 +256,7 @@ export async function deriveBrokerInitialization(
         "public-key-file",
         "ipc-directory",
         "startup-timeout",
+        "input-wait",
         "grace",
         "permit-file",
         "run-epoch",

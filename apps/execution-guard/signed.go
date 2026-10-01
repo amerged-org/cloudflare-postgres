@@ -65,6 +65,7 @@ type SignedRunConfiguration struct {
 	Command        []string
 	Grace          time.Duration
 	StartupTimeout time.Duration
+	InputWait      time.Duration
 	ReadyWriter    io.Writer
 }
 
@@ -394,6 +395,9 @@ func signedDuration(response []byte, nonce string, binding SignedBinding, keyID 
 	return duration, nil
 }
 func prepareSignedWindow(ctx context.Context, expected SignedExpected, keyID string, key ed25519.PublicKey, command []string, grace, startup time.Duration, exchange signedExchange, system processSystem) (Permit, error) {
+	return prepareSignedWindowAt(ctx, expected, keyID, key, command, grace, startup, exchange, system, nil)
+}
+func prepareSignedWindowAt(ctx context.Context, expected SignedExpected, keyID string, key ed25519.PublicKey, command []string, grace, startup time.Duration, exchange signedExchange, system processSystem, original *signedStartupAnchor) (Permit, error) {
 	if ctx == nil || ctx.Err() != nil || system == nil || system.pid() != 1 || exchange == nil || expected.Version != 2 || !validBinding(expected.Binding) || !signedKeyID.MatchString(keyID) || len(key) != ed25519.PublicKeySize || grace <= 0 || grace > 10*time.Second || startup <= 0 || startup > 15*time.Second || !reflect.DeepEqual(expected.Command, command) {
 		return Permit{}, failed
 	}
@@ -401,8 +405,15 @@ func prepareSignedWindow(ctx context.Context, expected SignedExpected, keyID str
 	if err != nil || hash != expected.Binding.CommandHash {
 		return Permit{}, failed
 	}
-	boot, anchor, err := system.clock()
-	if err != nil || anchor < 0 || boot != expected.Binding.BootID || anchor > math.MaxInt64-int64(startup) {
+	boot, current, err := system.clock()
+	anchor := current
+	if original != nil {
+		if original.boot != boot || original.now < 0 || original.now > current || (original.check != nil && original.check() != nil) {
+			return Permit{}, failed
+		}
+		anchor = original.now
+	}
+	if err != nil || current < 0 || boot != expected.Binding.BootID || anchor > math.MaxInt64-int64(startup) || current >= anchor+int64(startup) {
 		return Permit{}, failed
 	}
 	var random [32]byte
@@ -423,7 +434,10 @@ func prepareSignedWindow(ctx context.Context, expected SignedExpected, keyID str
 	}
 	afterBoot, now, err := system.clock()
 	expiry := anchor + duration
-	if err != nil || afterBoot != boot || now < anchor || now >= anchor+int64(startup) || expiry-now <= int64(grace) {
+	if err != nil || afterBoot != boot || now < current || now >= anchor+int64(startup) || expiry-now <= int64(grace) {
+		return Permit{}, failed
+	}
+	if original != nil && original.check != nil && original.check() != nil {
 		return Permit{}, failed
 	}
 	// The v1-shaped value is private to this verified call into the maintained
