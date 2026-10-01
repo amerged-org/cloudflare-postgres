@@ -359,11 +359,14 @@ function envelope(
     throw unknown();
   return value as unknown as NodeObserverEnvelope;
 }
-function controlledLabels(value: unknown): boolean {
+function controlledLabels(
+  value: unknown,
+  component = "node-runtime-observer",
+): boolean {
   return (
     object(value) &&
     value["app.kubernetes.io/managed-by"] === "cloudflare-postgres" &&
-    value["pgcf.io/component"] === "node-runtime-observer"
+    value["pgcf.io/component"] === component
   );
 }
 function arrayEmpty(value: unknown): boolean {
@@ -371,7 +374,7 @@ function arrayEmpty(value: unknown): boolean {
 }
 const presentKeys = (value: Record<string, unknown>) =>
   Object.keys(value).filter((key) => value[key] !== undefined);
-function safePodSpec(
+export function safeObserverPodSpec(
   value: unknown,
   config: NodeObserverConfiguration,
   nodeName?: string,
@@ -499,7 +502,7 @@ function qualifiedImageId(
     value === config.image.configDigest || value === config.image.reference
   );
 }
-interface ObservationIdentity {
+export interface ObservationIdentity {
   podUid: string;
   containerId: string;
   imageId: string;
@@ -507,12 +510,21 @@ interface ObservationIdentity {
   ownerGeneration: number;
   ownerTemplate: string;
 }
-async function verifyPeer(
+export async function verifyDaemonPeer(
   core: CoreV1Api,
   apps: AppsV1Api,
   options: ConfigurationOptions,
   config: NodeObserverConfiguration,
   peer: NodeObserverPeer,
+  profile: {
+    component: string;
+    containerName: string;
+    safeSpec: typeof safeObserverPodSpec;
+  } = {
+    component: "node-runtime-observer",
+    containerName: "observer",
+    safeSpec: safeObserverPodSpec,
+  },
 ): Promise<ObservationIdentity> {
   const [namespace, node, pod, owner] = await Promise.all([
     core.readNamespace({ name: config.observerNamespace }, options),
@@ -530,7 +542,7 @@ async function verifyPeer(
     namespace.metadata?.uid !== config.observerNamespaceUid ||
     namespace.metadata.name !== config.observerNamespace ||
     namespace.metadata.deletionTimestamp ||
-    !controlledLabels(namespace.metadata.labels) ||
+    !controlledLabels(namespace.metadata.labels, profile.component) ||
     node.metadata?.uid !== peer.nodeUid ||
     node.metadata.name !== peer.nodeName ||
     node.metadata.deletionTimestamp ||
@@ -540,8 +552,8 @@ async function verifyPeer(
     pod.metadata.name !== peer.podName ||
     pod.metadata.deletionTimestamp ||
     pod.metadata.namespace !== config.observerNamespace ||
-    !controlledLabels(pod.metadata.labels) ||
-    !safePodSpec(pod.spec, config, peer.nodeName) ||
+    !controlledLabels(pod.metadata.labels, profile.component) ||
+    !profile.safeSpec(pod.spec, config, peer.nodeName) ||
     pod.status?.phase !== "Running" ||
     !pod.status.conditions?.some(
       (condition) => condition.type === "Ready" && condition.status === "True",
@@ -553,10 +565,10 @@ async function verifyPeer(
     !Number.isSafeInteger(owner.metadata.generation) ||
     Number(owner.metadata.generation) < 1 ||
     owner.status?.observedGeneration !== owner.metadata.generation ||
-    !controlledLabels(owner.metadata.labels) ||
+    !controlledLabels(owner.metadata.labels, profile.component) ||
     !owner.spec?.template ||
-    !safePodSpec(owner.spec.template.spec, config) ||
-    !controlledLabels(owner.spec.template.metadata?.labels)
+    !profile.safeSpec(owner.spec.template.spec, config) ||
+    !controlledLabels(owner.spec.template.metadata?.labels, profile.component)
   )
     throw unknown();
   const owners = pod.metadata.ownerReferences?.filter(
@@ -574,7 +586,7 @@ async function verifyPeer(
   const statuses = pod.status.containerStatuses;
   if (
     statuses?.length !== 1 ||
-    statuses[0]?.name !== "observer" ||
+    statuses[0]?.name !== profile.containerName ||
     statuses[0].ready !== true ||
     !statuses[0].state?.running ||
     !Number.isSafeInteger(statuses[0].restartCount) ||
@@ -667,7 +679,7 @@ export function nodeObserverFromConfig(
       try {
         guard();
         const before = await bounded(
-          verifyPeer(core, apps, options, config, peer),
+          verifyDaemonPeer(core, apps, options, config, peer),
         );
         guard();
         const requestId = randomUUID();
@@ -844,7 +856,7 @@ export function nodeObserverFromConfig(
           peer,
         );
         const after = await bounded(
-          verifyPeer(core, apps, options, config, peer),
+          verifyDaemonPeer(core, apps, options, config, peer),
         );
         guard();
         if (encoded(before) !== encoded(after)) throw unknown();

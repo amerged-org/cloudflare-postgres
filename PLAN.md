@@ -266,6 +266,18 @@ backup/native access or scheduled control-backup work. Admission remains closed.
 
 ## Capacity admission integration candidate — 2026-10-01
 
+The [regional duplex transport checkpoint](docs/evidence/m6-regional-duplex-transport-2026-10-01.md)
+adds actual maintained-SDK authenticated HTTPS/WSS transport for the separate
+delivery process. Three red-first stories cover one complete signed exchange,
+lost acknowledgement uncertainty and pre-issuer peer replacement. The unchanged
+observer stories also pass. Independent review and the same positive case expose
+and correct a mutable issuer-result race; the outbound frame is now fixed before
+the final awaited refresh. The broker's actual capacity/target/funding callbacks,
+installation key provenance and live CNPG qualification remain required.
+The one frozen five-stage gate passes 52 Worker and 65 Node cases; eleven
+unchanged Go cases retain earlier evidence. Runtime bytes remain unchanged
+afterward, local credential bytes remain private and no provider resource changes.
+
 The [retained delivery process checkpoint](docs/evidence/m6-node-duplex-process-2026-10-01.md)
 adds a separate bounded node executable/image that retains original file custody
 through its framed challenge/signed-permit/receipt exchange. Two new Go stories

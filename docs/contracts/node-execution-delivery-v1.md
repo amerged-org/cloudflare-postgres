@@ -5,7 +5,8 @@ The separate delivery image/profile has node-administration filesystem authority
 The existing observation command/profile remains read-only. The regional broker
 must authenticate and pin the delivery Namespace, Node, DaemonSet, Pod,
 container/image and restart identity around the complete exchange. That regional
-transport and its live qualification remain implementation work.
+transport is implemented by `node-delivery.ts`; complete broker wiring and live
+qualification remain implementation work.
 
 ## Channel and framing
 
@@ -46,9 +47,10 @@ ten-second deadline; cancellation interrupts pipe waits.
    exact permit SHA-256, decimal deadline and `published`, `replayed` or
    `uncertain`. A receipt is file-publication evidence, not process-start evidence.
 
-The complete broker accepts success only with matching receipt, Kubernetes
+The implemented regional transport accepts success only with matching receipt, Kubernetes
 Success, completed stdout/socket closure and unchanged final peer identities.
-It must not mint another permit on a lost response or treat disconnect after
+It requests one issuer response through its mandatory authority callback and
+does not mint another permit on a lost response or treat disconnect after
 sending the permit as proof that execution stopped.
 
 ## Authority and limitations
@@ -65,3 +67,9 @@ An uncertain post-visibility result preserves artifacts and accounting holds
 until the existing runtime/stop evidence resolves it. No uncertain customer SQL
 write is replayed by this protocol. No real node-agent/issuer/CNPG deployment is
 qualified by the source or dependency fixtures alone.
+
+The regional caller supplies mandatory current-authority and target/funding
+revalidation callbacks. Its issuer response is copied and the exact frame is
+constructed before final revalidation; those bytes cannot change while awaiting
+fresh metadata. Current authority is checked immediately before sending. The
+transport's callbacks are not a production-broker activation claim.
