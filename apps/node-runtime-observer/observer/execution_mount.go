@@ -28,6 +28,8 @@ type ExecutionMountLocation struct {
 	containerID string
 	podUID      string
 	attempt     uint32
+	userKnown   bool
+	uid, gid    int64
 }
 
 // SelectExecutionMount performs node-local recipe/CRI correlation only. The
@@ -83,5 +85,11 @@ func SelectExecutionMount(sandbox *runtime.PodSandbox, container *runtime.Contai
 	if selected == nil {
 		return ExecutionMountLocation{}, fail()
 	}
-	return ExecutionMountLocation{hostPath: selected.HostPath, containerID: pod.ContainerID, podUID: pod.PodUID, attempt: pod.Attempt}, nil
+	location := ExecutionMountLocation{hostPath: selected.HostPath, containerID: pod.ContainerID, podUID: pod.PodUID, attempt: pod.Attempt}
+	if status.User != nil && status.User.Linux != nil {
+		location.userKnown = true
+		location.uid = status.User.Linux.Uid
+		location.gid = status.User.Linux.Gid
+	}
+	return location, nil
 }

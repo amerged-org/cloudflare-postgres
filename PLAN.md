@@ -266,6 +266,20 @@ backup/native access or scheduled control-backup work. Admission remains closed.
 
 ## Capacity admission integration candidate — 2026-10-01
 
+The [protected IPC publication source](docs/evidence/m6-execution-ipc-publication-2026-10-01.md)
+adds retained no-follow filesystem custody and root-private staging with a
+final current-authority check before no-overwrite publication. Exact replay
+synchronizes original file/directory custody. Three meaningful red-first Linux
+stories pass, using a distinct nonroot guard identity and actual filesystem
+operations. CRI inventory is simulated, not live qualification. Post-visibility
+failures remain explicitly uncertain because the guard can consume immediately.
+The existing read-only deployment is unchanged; authenticated transport,
+capability/image proof, broker/issuer coverage and live CNPG remain required.
+The one final frozen gate passes format/lint/typecheck, 52 Worker, 62 Node and
+six node-runtime Go cases plus Linux vet; the three named native filesystem
+cases are independently qualified. Runtime source stays unchanged after the
+gate. Original local credentials remain private, ignored and byte-identical.
+
 The regional source now keeps acquisition and Pod admission as
 separate authorities. Its actual Kubernetes SDK fixture proves owned Namespace
 and Cluster UID recovery after lost committed create responses, while the
