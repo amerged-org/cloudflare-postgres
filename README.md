@@ -34,7 +34,7 @@ flowchart LR
     API["API Worker<br/>/v1"]
     DBA["DatabaseActor DO<br/>per database: wake, idle, traffic"]
     RL["RegionLink DO<br/>per region"]
-    WF["Workflows<br/>create, restore, add node"]
+    WF["Workflows<br/>restore, add node"]
     D1[("D1<br/>state and usage")]
     R2[("R2<br/>backups and WAL")]
     Boot["Container<br/>node bootstrap"]
@@ -93,14 +93,14 @@ sequenceDiagram
   C->>P: PostgreSQL protocol, SCRAM end to end
 ```
 
-| Part | Where | Job |
-| --- | --- | --- |
-| API Worker | Cloudflare | `/v1` API, D1 state, Durable Objects, Workflows, usage rollups |
-| Edge Worker | Cloudflare | Database endpoint: wake, route, count traffic |
-| Regional agent | Kubernetes | Reconciles databases into CNPG resources; hibernate/wake; reports status and samples |
-| Gateway + cloudflared | Kubernetes | Only entry from Cloudflare to PostgreSQL |
-| Node bootstrap | Cloudflare Container | Turns a Contabo VPS into a Talos node |
-| Platform | Kubernetes (Flux) | Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin |
+| Part                  | Where                | Job                                                                                  |
+| --------------------- | -------------------- | ------------------------------------------------------------------------------------ |
+| API Worker            | Cloudflare           | `/v1` API, D1 state, Durable Objects, Workflows, usage rollups                       |
+| Edge Worker           | Cloudflare           | Database endpoint: wake, route, count traffic                                        |
+| Regional agent        | Kubernetes           | Reconciles databases into CNPG resources; hibernate/wake; reports status and samples |
+| Gateway + cloudflared | Kubernetes           | Only entry from Cloudflare to PostgreSQL                                             |
+| Node bootstrap        | Cloudflare Container | Turns a Contabo VPS into a Talos node                                                |
+| Platform              | Kubernetes (Flux)    | Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin        |
 
 ## Self-hosting requirements
 

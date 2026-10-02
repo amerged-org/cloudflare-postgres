@@ -73,7 +73,7 @@ helm install cilium \
   oci://quay.io/cilium/charts/cilium@sha256:a7c12d330dd96bfcda3bf057b24be8f36566c34868265f930f776dff6f42d838 \
   --namespace kube-system \
   --values infra/platform/base/values/cilium.yaml \
-  --wait --timeout 5m
+  --wait --timeout 10m
 
 flux install --version=v2.9.5 \
   --namespace=flux-system \
@@ -97,8 +97,8 @@ Verify with:
 - `flux get kustomizations -n flux-system`
 
 A release is usable when its current generation is Ready and its chart identity matches the lock.
-Release actions time out after five minutes and do not retry automatically; diagnose a failure
-before trying again.
+Release actions time out after 15 minutes (Cilium: 10 minutes). Install and upgrade remediation
+retry three times except Cilium, whose retry count is zero. Diagnose a failure before trying again.
 
 ## Changing versions
 

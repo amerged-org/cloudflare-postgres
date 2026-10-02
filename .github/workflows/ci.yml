@@ -54,7 +54,7 @@ jobs:
 
   image:
     needs: check
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    if: github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -67,7 +67,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: Check regional entry points
+        id: entries
+        run: |
+          if [ -f apps/regional/src/agent/main.ts ] && [ -f apps/regional/src/gateway/main.ts ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          fi
       - name: Build the linux/amd64 image
+        if: steps.entries.outputs.present == 'true'
         run: |
           docker buildx build --platform linux/amd64 --load \
             --provenance=false --sbom=false \
@@ -79,20 +88,22 @@ jobs:
             --label "org.opencontainers.image.licenses=Apache-2.0" \
             .
       - name: Fail if the image contains .env or .pem files
+        if: steps.entries.outputs.present == 'true'
         run: |
-          # find exits 1 on unreadable directories such as /root; only its output matters.
-          found=$(docker run --rm --platform linux/amd64 --entrypoint find "$IMAGE:latest" \
-            / -xdev \( -name '.env*' -o -name '*.pem' \) -print 2>/dev/null || true)
+          found=$(docker run --rm --platform linux/amd64 --user 0 --entrypoint find "$IMAGE:latest" \
+            / -xdev -type f \( -name '.env*' -o -name '.dev.vars*' -o -name '*.pem' -o -name '*.key' -o -name kubeconfig -o -name talosconfig \) -print)
           if [ -n "$found" ]; then
             echo "Forbidden files in the image:"
             echo "$found"
             exit 1
           fi
       - name: Log in to GHCR
+        if: steps.entries.outputs.present == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       - name: Push the image and record its digest
+        if: steps.entries.outputs.present == 'true'
         run: |
           docker push "$IMAGE:sha-${GITHUB_SHA::12}"
           docker push "$IMAGE:latest"
