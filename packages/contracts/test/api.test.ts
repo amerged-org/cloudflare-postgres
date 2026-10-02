@@ -1,0 +1,111 @@
+// SPDX-License-Identifier: Apache-2.0
+import { describe, expect, it } from "vitest";
+import {
+  ApiKeyCreate,
+  DatabasePatch,
+  ERROR_CODES,
+  ErrorBody,
+  IDEMPOTENCY_KEY_PATTERN,
+  ListQuery,
+  bytesToBase64url,
+  decodeCursor,
+  encodeCursor,
+  errorBody,
+  errorStatus,
+  newDatabaseId,
+  newProjectId,
+} from "../src/index.ts";
+
+const encode = (text: string) =>
+  bytesToBase64url(new TextEncoder().encode(text));
+
+describe("cursor", () => {
+  it("round-trips created_at and id", () => {
+    const cursor = {
+      created_at: "2026-10-02T10:46:00.123Z",
+      id: newProjectId(),
+    };
+    const encoded = encodeCursor(cursor);
+    expect(encoded).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(decodeCursor(encoded)).toEqual(cursor);
+    const database = { created_at: cursor.created_at, id: newDatabaseId() };
+    expect(decodeCursor(encodeCursor(database))).toEqual(database);
+  });
+
+  it("rejects malformed cursors", () => {
+    const id = newProjectId();
+    for (const value of [
+      "",
+      "not base64!",
+      encode(`2026-10-02T10:46:00.123Z`),
+      encode(`2026-10-02T10:46:00.123Z|${id}|x`),
+      encode(`2026-10-02T10:46:00Z|${id}`),
+      encode(`2026-02-30T10:46:00.123Z|${id}`),
+      encode(`2026-10-02T10:46:00.123Z|' OR 1=1 --`),
+      encode(`2026-10-02T10:46:00.123Z|`),
+      encode(`2026-10-02T10:46:00.123Z|${id}`) + "=",
+      "A".repeat(300),
+    ]) {
+      expect(decodeCursor(value)).toBeNull();
+    }
+    expect(() => encodeCursor({ created_at: "yesterday", id })).toThrow();
+  });
+});
+
+describe("errors", () => {
+  it("builds a valid envelope for every code", () => {
+    for (const code of ERROR_CODES) {
+      const body = errorBody(code, "message", "req-1");
+      expect(ErrorBody.parse(body)).toEqual(body);
+      expect(errorStatus(code)).toBeGreaterThanOrEqual(400);
+    }
+    expect(errorStatus("capacity_exhausted")).toBe(503);
+    expect(errorStatus("idempotency_conflict")).toBe(409);
+    expect(
+      errorBody("conflict", "x", "r", { field: "name" }).error.details,
+    ).toEqual({ field: "name" });
+    expect(
+      ErrorBody.safeParse({
+        error: { code: "teapot", message: "", request_id: "r" },
+      }).success,
+    ).toBe(false);
+  });
+});
+
+describe("request bodies", () => {
+  it("binds integrator keys to a project and admin keys to none", () => {
+    const project_id = newProjectId();
+    expect(
+      ApiKeyCreate.safeParse({ scope: "integrator", project_id, name: "omh" })
+        .success,
+    ).toBe(true);
+    expect(
+      ApiKeyCreate.safeParse({ scope: "integrator", name: "omh" }).success,
+    ).toBe(false);
+    expect(
+      ApiKeyCreate.safeParse({ scope: "admin", project_id, name: "ops" })
+        .success,
+    ).toBe(false);
+    expect(
+      ApiKeyCreate.safeParse({ scope: "admin", name: "ops", extra: 1 }).success,
+    ).toBe(false);
+  });
+
+  it("requires a field in database patches", () => {
+    expect(DatabasePatch.safeParse({}).success).toBe(false);
+    expect(DatabasePatch.safeParse({ size_class_id: "small" }).success).toBe(
+      true,
+    );
+  });
+
+  it("validates list queries and idempotency keys", () => {
+    expect(ListQuery.parse({})).toEqual({ limit: 50 });
+    expect(ListQuery.parse({ limit: "10" }).limit).toBe(10);
+    expect(ListQuery.safeParse({ limit: "0" }).success).toBe(false);
+    expect(ListQuery.safeParse({ limit: "101" }).success).toBe(false);
+    expect(IDEMPOTENCY_KEY_PATTERN.test("a.b_c~d-1")).toBe(true);
+    expect(IDEMPOTENCY_KEY_PATTERN.test("")).toBe(false);
+    expect(IDEMPOTENCY_KEY_PATTERN.test("a".repeat(129))).toBe(false);
+    expect(IDEMPOTENCY_KEY_PATTERN.test("a b")).toBe(false);
+  });
+});
