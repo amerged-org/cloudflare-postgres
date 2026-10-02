@@ -264,7 +264,10 @@ export class ReplayCache {
 }
 
 const encoder = new TextEncoder();
-const strictDecoder = new TextDecoder("utf-8", { fatal: true });
+const strictDecoder = new TextDecoder("utf-8", {
+  fatal: true,
+  ignoreBOM: false,
+});
 
 function fail(reason: RouteTokenFailure): RouteTokenResult {
   return { ok: false, reason };
