@@ -20,10 +20,11 @@ loss is recovered from R2.
 
 **Local build; live acceptance pending (2026-10-02).** The reset keeps the working Talos, Flux
 platform and R2 backup/PITR recipes in [infra/](infra/README.md). Phase 1 services have passed local
-checks; the approved native WebSocket connection path is being implemented. Phase 0 and Phase 1
-have not passed live acceptance. CI for `dc6ada6` passed its check and image jobs after the Ubuntu
-OpenSSL fixture portability fix. See [PLAN.md](PLAN.md#11-status) for chronological results and
-remaining phases.
+checks; the approved native WebSocket connection path is being implemented. Dev decommission
+completed; independent re-inventory is running and the lab rebuild remains pending. Phase 0 and
+Phase 1 have not passed live acceptance. CI for `dc6ada6` passed its check and image jobs after the
+Ubuntu OpenSSL fixture portability fix. See [PLAN.md](PLAN.md#11-status) for chronological results
+and remaining phases.
 
 ## Architecture
 

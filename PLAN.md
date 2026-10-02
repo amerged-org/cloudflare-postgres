@@ -6,9 +6,10 @@ WebSocket connection path is being implemented.
 The first build produced mostly budget-enforcement, signed-execution and evidence machinery but no
 database a client could connect to through the API. Those parts are removed. The Talos recipe,
 the Flux platform baseline and the R2 backup/PITR recipe stay, because they work in the lab.
-The old implementation has been removed and the workspace scaffolded. Phase 0's Dev reset and
-Phase 1's complete database chain have not passed live acceptance. The owner has requested
-delivery through Phase 5 and full Neon replacement.
+The old implementation has been removed and the workspace scaffolded. Dev decommission completed;
+independent re-inventory is running and the lab rebuild remains pending. Phase 0 and Phase 1's
+complete database chain have not passed live acceptance. The owner has requested delivery through
+Phase 5 and full Neon replacement.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
 AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.
@@ -628,3 +629,4 @@ infra/backups         CNPG/Barman/R2 backup and restore reference
 | 2026-10-02 | 1 | Owner approved `GET /v2?database=<id>&user=<role>` with untrusted hints admitted by authoritative D1, a signed v2 token with mandatory user, unopened-WebSocket native forwarding, and gateway validation of the actual startup before PostgreSQL dial. Gateway owns SSL/GSS/cancel handling, startup parsing/deadline and stream measurements. Implementation is in progress; live transport and Phase 1 acceptance remain pending. |
 | 2026-10-02 | CI | CI for `dc6ada6` passed both the check and image jobs. The public GitHub tree matched the pushed source across 196 blobs. This confirms the portability fix in CI; it is not live Dev acceptance. |
 | 2026-10-02 | 0 partial | The first bounded decommission run timed out after 600 s. Worker, D1, custody bucket and control-recovery prefix deletion were confirmed; qualification prefix deletion still has a pending intent. The same owner-approved plan is resuming with fresh guards. Foreign-resource preservation readback remains pending, and no owned orphans remain. This partial result does not complete Phase 0 or the lab rebuild. |
+| 2026-10-02 | 0 | Decommission resumed with the identical owner-approved plan hash and exited 0. Worker, D1 and custody bucket absence were confirmed; 27 owned backup keys were removed. All 174 foreign-resource fingerprints matched the inventory, and only the retained EU backup bucket remains in the owned scope. Independent re-inventory is running. The lab has not been rebuilt, so Phase 0 remains unaccepted. |
