@@ -96,7 +96,9 @@ export function decodeCursor(value: string): Cursor | null {
   if (bytes === null) return null;
   let text: string;
   try {
-    text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    text = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
+      bytes,
+    );
   } catch {
     return null;
   }
