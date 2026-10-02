@@ -113,9 +113,40 @@ function connectionIdentity(uri: string): {
 export function probePool(uri: string, marker?: string): Pool {
   validTraceMarker(marker);
   const target = connectionIdentity(uri);
+  return routedPool(uri, target, marker);
+}
+
+export function startupMismatchPool(
+  uri: string,
+  mode: "database" | "user",
+  marker?: string,
+): Pool {
+  if (mode !== "database" && mode !== "user")
+    throw new Error("invalid_startup_mismatch_mode");
+  if (validTraceMarker(marker) === undefined)
+    throw new Error("invalid_trace_marker");
+  const admitted = connectionIdentity(uri);
+  const startup = new URL(uri);
+  let changed: string;
+  do {
+    const suffix = crypto.randomUUID().replaceAll("-", "").slice(0, 19);
+    changed = `${mode === "database" ? "d" : "r"}${suffix}`;
+  } while (changed === admitted[mode === "database" ? "database" : "user"]);
+  if (mode === "database") startup.pathname = `/${changed}`;
+  else startup.username = changed;
+  // Only these named negative probes separate admitted hints from actual startup.
+  return routedPool(startup.href, admitted, marker);
+}
+
+function routedPool(
+  uri: string,
+  admitted: ReturnType<typeof connectionIdentity>,
+  marker?: string,
+): Pool {
+  const target = connectionIdentity(uri);
   const query = new URLSearchParams({
-    database: target.database,
-    user: target.user,
+    database: admitted.database,
+    user: admitted.user,
   });
   if (marker !== undefined) query.set("pgcf_trace", marker);
   const address = `${target.host}/v2?${query}`;
@@ -147,6 +178,37 @@ export function probePool(uri: string, marker?: string): Pool {
     }
   };
   return db;
+}
+
+export function startupMismatchRejection(error: unknown): {
+  sqlstate: "28000";
+  gateway_outcome: "startup_route_mismatch";
+} {
+  const rejection = error as { code?: unknown; message?: unknown } | undefined;
+  if (
+    rejection?.code !== "28000" ||
+    rejection.message !== "startup does not match the authorized route"
+  )
+    throw new Error("startup_mismatch_not_rejected_by_gateway");
+  return { sqlstate: "28000", gateway_outcome: "startup_route_mismatch" };
+}
+
+async function rejectsStartupMismatch(
+  uri: string,
+  mode: "database" | "user",
+  marker: string,
+): Promise<ReturnType<typeof startupMismatchRejection>> {
+  const db = startupMismatchPool(uri, mode, marker);
+  try {
+    try {
+      await db.query("SELECT 1");
+    } catch (error: unknown) {
+      return startupMismatchRejection(error);
+    }
+    throw new Error("startup_mismatch_not_rejected_by_gateway");
+  } finally {
+    await db.end();
+  }
 }
 
 async function rejects(uri: string, marker?: string): Promise<void> {
@@ -287,7 +349,14 @@ export default {
     try {
       const path = new URL(request.url).pathname;
       const marker = requestTraceMarker(request);
-      if (path === "/integrator-trace" && marker === undefined)
+      if (
+        [
+          "/integrator-trace",
+          "/startup-database-mismatch",
+          "/startup-user-mismatch",
+        ].includes(path) &&
+        marker === undefined
+      )
         return response({ code: "invalid_trace_marker" }, 400);
       if (path === "/scan") {
         const input = (await request.json()) as {
@@ -309,6 +378,8 @@ export default {
           "/metadata",
           "/integrator-trace",
           "/exercise",
+          "/startup-database-mismatch",
+          "/startup-user-mismatch",
         ].includes(path)
       )
         return response({ code: "not_found" }, 404);
@@ -353,6 +424,20 @@ export default {
           host_matches: true,
           database_matches: true,
         });
+      if (
+        path === "/startup-database-mismatch" ||
+        path === "/startup-user-mismatch"
+      ) {
+        const mode =
+          path === "/startup-database-mismatch" ? "database" : "user";
+        const started = performance.now();
+        const rejection = await rejectsStartupMismatch(uri, mode, marker!);
+        return response({
+          pass: true,
+          ...rejection,
+          duration_ms: performance.now() - started,
+        });
+      }
       if (path === "/exercise")
         return response({ pass: true, timings: await exercise(uri, marker) });
       return response({ code: "not_found" }, 404);

@@ -379,3 +379,155 @@ test("integrator trace uses the credential URI request and returns only safe met
     globalThis.fetch = original;
   }
 });
+
+test("named startup mismatch pools keep admitted hints while changing only actual startup identity", async () => {
+  const env = environment();
+  const password = `${randomBytes(16).toString("base64url")}:&?=${randomBytes(16).toString("base64url")}`;
+  const uri = `postgres://app:${encodeURIComponent(password)}@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`;
+  const marker = randomBytes(24).toString("hex");
+  const globalProxy = neonConfig.wsProxy;
+  const database = probe.startupMismatchPool(uri, "database", marker);
+  const user = probe.startupMismatchPool(uri, "user", marker);
+  const ordinary = probe.probePool(uri, marker);
+  try {
+    for (const [mode, pool] of [
+      ["database", database],
+      ["user", user],
+    ] as const) {
+      const client = new pool.Client(pool.options);
+      const url = new URL(
+        `wss://${client.neonConfig.wsProxyAddrForHost(env.ENDPOINT_HOST, 5432)}`,
+      );
+      assert.equal(client.host, env.ENDPOINT_HOST);
+      assert.equal(client.password, password);
+      assert.equal(url.searchParams.get("database"), env.DATABASE_ID);
+      assert.equal(url.searchParams.get("user"), "app");
+      assert.equal(url.searchParams.get("pgcf_trace"), marker);
+      assert.equal(url.pathname, "/v2");
+      assert(typeof client.database === "string");
+      assert(typeof client.user === "string");
+      if (mode === "database") {
+        assert.notEqual(client.database, env.DATABASE_ID);
+        assert.match(client.database, /^d[a-f0-9]{19}$/);
+        assert.equal(client.user, "app");
+      } else {
+        assert.equal(client.database, env.DATABASE_ID);
+        assert.notEqual(client.user, "app");
+        assert.match(client.user, /^r[a-f0-9]{19}$/);
+      }
+      assert.deepEqual([...url.searchParams.keys()].sort(), [
+        "database",
+        "pgcf_trace",
+        "user",
+      ]);
+      assert.equal(url.username, "");
+      assert.equal(url.password, "");
+      assert(!url.href.includes(password));
+      assert(!url.href.includes(encodeURIComponent(password)));
+      assert.equal(client.neonConfig.useSecureWebSocket, true);
+      assert.equal(client.neonConfig.pipelineConnect, false);
+      assert.equal(client.neonConfig.forceDisablePgSSL, true);
+      assert.throws(() => new pool.Client({ connectionString: uri }), {
+        message: "connection_metadata_invalid",
+      });
+      assert.throws(
+        () =>
+          client.neonConfig.wsProxyAddrForHost(
+            ["other", "test"].join("."),
+            5432,
+          ),
+        { message: "connection_metadata_invalid" },
+      );
+    }
+    const normalClient = new ordinary.Client({ connectionString: uri });
+    assert.equal(normalClient.database, env.DATABASE_ID);
+    assert.equal(normalClient.user, "app");
+    assert.throws(() => new ordinary.Client(database.options), {
+      message: "connection_metadata_invalid",
+    });
+    assert.equal(neonConfig.wsProxy, globalProxy);
+  } finally {
+    await Promise.all([database.end(), user.end(), ordinary.end()]);
+  }
+});
+
+test("startup mismatch mode must be named and retain strict URI and marker validation", () => {
+  const env = environment();
+  const uri = `postgres://app@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`;
+  const marker = randomBytes(24).toString("hex");
+  assert.throws(
+    () => probe.startupMismatchPool(uri, "password" as "database", marker),
+    { message: "invalid_startup_mismatch_mode" },
+  );
+  assert.throws(() => probe.startupMismatchPool(uri, "database", "invalid"), {
+    message: "invalid_trace_marker",
+  });
+  assert.throws(() => probe.startupMismatchPool(uri, "database"), {
+    message: "invalid_trace_marker",
+  });
+  const override = new URL(uri);
+  override.searchParams.set("host", ["other", "test"].join("."));
+  assert.throws(
+    () => probe.startupMismatchPool(override.href, "database", marker),
+    { message: "connection_metadata_invalid" },
+  );
+});
+
+test("startup mismatch proof requires the exact Gateway SQLSTATE and error message", () => {
+  const gatewayError = Object.assign(
+    new Error("startup does not match the authorized route"),
+    { code: "28000" },
+  );
+  assert.deepEqual(probe.startupMismatchRejection(gatewayError), {
+    sqlstate: "28000",
+    gateway_outcome: "startup_route_mismatch",
+  });
+  for (const error of [
+    Object.assign(new Error(gatewayError.message), { code: "28P01" }),
+    Object.assign(new Error(gatewayError.message), { code: "3D000" }),
+    Object.assign(new Error("another rejection"), { code: "28000" }),
+    new Error("network timeout"),
+    undefined,
+  ]) {
+    assert.throws(() => probe.startupMismatchRejection(error), {
+      message: "startup_mismatch_not_rejected_by_gateway",
+    });
+  }
+});
+
+test("named startup mismatch handlers require authentication and a trace marker before metadata", async () => {
+  const env = environment(new Date(Date.now() + 60_000).toISOString());
+  const original = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => {
+    calls++;
+    throw new Error("unexpected_metadata_call");
+  };
+  try {
+    for (const path of [
+      "/startup-database-mismatch",
+      "/startup-user-mismatch",
+    ]) {
+      const url = `https://${["probe", "test"].join(".")}${path}`;
+      const anonymous = await probe.default.fetch(
+        new Request(url, { method: "POST" }),
+        env,
+      );
+      assert.equal(anonymous.status, 401);
+      const missingMarker = await probe.default.fetch(
+        new Request(url, {
+          method: "POST",
+          headers: { Authorization: `Bearer ${env.PROBE_BEARER}` },
+        }),
+        env,
+      );
+      assert.equal(missingMarker.status, 400);
+      assert.deepEqual(await missingMarker.json(), {
+        code: "invalid_trace_marker",
+      });
+    }
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = original;
+  }
+});
