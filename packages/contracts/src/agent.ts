@@ -96,11 +96,13 @@ export const DesiredDatabase = z
   })
   .superRefine((db, ctx) => {
     const match = ARCHIVE_DESTINATION_PATTERN.exec(db.archive.destination_path);
-    if (match && (match[3] !== db.id || Number(match[4]) !== db.generation)) {
+    // Desired revisions advance for role changes and deletion without replacing the archive.
+    if (match && (match[3] !== db.id || Number(match[4]) > db.generation)) {
       ctx.addIssue({
         code: "custom",
         path: ["archive", "destination_path"],
-        message: "archive path must name this database and generation",
+        message:
+          "archive path must name this database and not a future generation",
       });
     }
     const names = new Set<string>();

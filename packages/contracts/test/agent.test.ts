@@ -201,7 +201,24 @@ describe("DesiredDatabase", () => {
     expect(DesiredDatabase.safeParse(tombstone).success).toBe(true);
   });
 
-  it("rejects an archive path for another database or generation", () => {
+  it("accepts an unchanged archive after a role update", () => {
+    expect(
+      DesiredDatabase.safeParse({ ...desired(), generation: 2 }).success,
+    ).toBe(true);
+  });
+
+  it("accepts an unchanged archive for a deletion tombstone", () => {
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        generation: 2,
+        desired_state: "deleted",
+        roles: [],
+      }).success,
+    ).toBe(true);
+  });
+
+  it("rejects an archive path for another database or future generation", () => {
     const other = archiveDestinationPath(
       "pgcf-backups",
       "eu-1",
@@ -216,7 +233,20 @@ describe("DesiredDatabase", () => {
       }).success,
     ).toBe(false);
     expect(
-      DesiredDatabase.safeParse({ ...desired(), generation: 2 }).success,
+      DesiredDatabase.safeParse({
+        ...desired(),
+        generation: 2,
+        archive: {
+          destination_path: archiveDestinationPath(
+            "pgcf-backups",
+            "eu-1",
+            id,
+            3,
+            opId,
+          ),
+          server_name: "database",
+        },
+      }).success,
     ).toBe(false);
   });
 
