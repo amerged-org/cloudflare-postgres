@@ -312,6 +312,28 @@ test("propagates a WebSocket close to the PostgreSQL TLS socket", async (t) => {
   await secureClosed;
 });
 
+test("rejects a message over 32 MiB with the payload close code before forwarding", async (t) => {
+  let received = 0;
+  const postgres = await postgresServer(validCertificate, (socket) =>
+    socket.on("data", (chunk: Buffer) => {
+      received += chunk.length;
+    }),
+  );
+  const { gateway, port, events } = await gatewayFor(postgres.port);
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const socket = await open(port);
+  const closed = once(socket, "close");
+  const released = once(events, "conn_close");
+  socket.send(Buffer.alloc(MAX_PAYLOAD_BYTES + 1));
+  assert.equal((await closed)[0], 1009);
+  await released;
+  assert.equal(received, 0);
+  assert.equal(gateway.metrics.activeConnections, 0);
+});
+
 test("marks readiness false, rejects new connections and drains existing connections with 1012", async (t) => {
   const postgres = await postgresServer();
   const { gateway, port } = await gatewayFor(postgres.port, { drainMs: 100 });

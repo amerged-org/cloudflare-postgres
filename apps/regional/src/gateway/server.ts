@@ -232,7 +232,8 @@ export function createGateway(options: GatewayOptions): Gateway {
     client.on("error", () => {
       outcome = "websocket_error";
       postgres.destroy();
-      client.terminate();
+      if (client.readyState === WebSocket.OPEN)
+        client.close(1011, "relay connection failed");
     });
     client.once("close", finish);
     client.on("message", (data: RawData, binary: boolean) => {
