@@ -25,10 +25,9 @@ and **Contabo VPS** can run and scale horizontally:
   (for example ohmyho.st) turns them into prices and credits. PGCF contains no pricing or wallets.
 - Cloudflare places databases, watches capacity and adds Contabo VPS through the Contabo API.
 
-First adopter: **ohmyho.st** replaces Neon with PGCF. Its plans, prices, credits, wallet and
-adapter live in the ohmyho.st repository. The near-term target is OMH Dev, then OMH production
-on PGCF. Customer databases and the internal platform databases are both in scope. US remains
-the default and EU remains selectable.
+First adopter: **ohmyho.st** replaces Neon with PGCF. Its provider adapter and commercial logic
+live in the adopter repository. Customer databases and internal platform databases are both in
+scope, first in Dev and then in production. US remains the default and EU remains selectable.
 
 ## 2. Principles
 
@@ -45,8 +44,9 @@ the default and EU remains selectable.
 5. **Generic.** No adopter names, plans or defaults in code. Size classes and policies are
    installation configuration.
 6. **Initial topology and recovery.** Two existing EU VPS and one new US VPS. EU has one
-   control-plane/worker node and a second worker; US has one control-plane/worker node. Recover a
-   lost node and its databases from R2. Three control-plane nodes per region are not required.
+   control-plane/worker node and a second worker; US has one control-plane/worker node. Both
+   control-plane/worker nodes host customer databases after reserving system and platform
+   resources. Recover a lost node and its databases from R2.
 7. **Smallest thing that works end to end.** Add machinery only for an observed problem.
 8. **Delete, don't park.** Unused code, files and branches are deleted. Git history is the archive.
 9. **Real systems.** No mocks or hardcoded data in product code. A phase passes only through its
@@ -63,7 +63,7 @@ The diagrams are in [README.md](README.md#architecture).
 | `apps/regional` `agent`   | Kubernetes Deployment (1 per region) | Holds an outbound WebSocket to `RegionLink` that only carries hints, and pulls full desired state (every 5 s while an operation is open, otherwise every 60 s, or immediately on a hint). Reconciles each database into Kubernetes resources (below) and reports observed state, node capacity and archive health. Hibernate/wake with safety checks and storage samples arrive in Phase 2.                                                                                                                                                    |
 | `apps/regional` `gateway` | Kubernetes Deployment (2 replicas)   | WebSocket-to-PostgreSQL bridge reached through the edge-to-region transport (section 6). Verifies the edge's signed routing token, negotiates TLS with the database's `-rw` Service itself (SSLRequest, then TLS with the CNPG CA), and relays the client stream.                                                                                                                                                                                                                                                                              |
 | `cloudflared`             | Kubernetes Deployment (2 replicas)   | The region's outbound Cloudflare Tunnel; the only path from Cloudflare into the cluster.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `apps/node-bootstrap`     | Cloudflare Container image           | Turns a Contabo VPS into a Talos node: rescue mode, verified Talos image, machine config, join. Started by the add-node Workflow.                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `apps/node-bootstrap`     | Cloudflare Container image           | Turns a Contabo VPS into a Talos node: rescue mode, verified Talos image, protected network, machine config, and worker join for an existing region or control-plane/worker bootstrap for a new region. Started by the add-node Workflow. |
 | `packages/contracts`      | shared                               | zod schemas for the API, the agent protocol and the edge routing token.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | Platform (Flux)           | Kubernetes                           | Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin, cloudflared and the regional image, pinned in `infra/platform`.                                                                                                                                                                                                                                                                                                                                                                                                 |
 
@@ -83,8 +83,9 @@ The diagrams are in [README.md](README.md#architecture).
   - PostgreSQL parameters derived from the size class.
   - Barman Cloud plugin as WAL archiver.
   - Sleep uses the CNPG hibernation annotation.
-- Barman `ObjectStore` writing to `s3://<bucket>/<region>/<db-id>/g<generation>-<opid>` on the region's R2
-  endpoint (`<opid>` is the operation that created the generation), plus a daily
+- Barman `ObjectStore` writing to `s3://<bucket>/<region>/<db-id>/g<storage-generation>-<opid>` on the region's R2
+  endpoint (storage generation is 1 until a Phase 4 restore; `<opid>` is the operation that created
+  that storage generation), plus a daily
   `ScheduledBackup`.
   EU backups use an EU-jurisdiction bucket and EU endpoint. US backups use a separate bucket on
   the general endpoint with a North America location hint; a hint is not a jurisdiction guarantee.
@@ -95,7 +96,7 @@ The diagrams are in [README.md](README.md#architecture).
 ### Flows
 
 - **Create:** `POST /v1/databases`
-  1. The API writes the database row (desired `running`, generation 1) and an operation.
+  1. The API writes the database row (desired `running`, configuration revision 1) and an operation.
   2. Placement picks a node.
   3. `RegionLink` sends a hint, the agent pulls the desired state and creates the resources.
   4. The agent reports `ready` (cluster ready and continuous archiving working), and the operation
@@ -131,16 +132,18 @@ The diagrams are in [README.md](README.md#architecture).
      `Retain`.
   3. It deletes the namespace, then waits until the PV and the `LVMVolume` are gone, so the logical
      volume is not leaked, and reports `deleted`. R2 objects follow the retention policy.
-- **Restore (PITR, Phase 4):** `POST /v1/databases/{id}/restore {target_time}` creates generation g+1 from
-  the g archive with a new archive path. The routing swaps to it, and the old generation is
-  deleted after verification.
+- **Restore (PITR, Phase 4):** `POST /v1/databases/{id}/restore {target_time}` creates storage generation
+  g+1 from the g archive with a new archive path. Verify the restored database before changing
+  its active route; retire the old storage generation afterward. Configuration revision is separate.
 - **Add node (Phase 3):**
   1. The cron sees region headroom below the threshold. Autoscaling must be enabled and within the
      caps for maximum nodes and maximum monthly spend.
   2. The `AddNode` Workflow orders a Contabo instance, or adopts an existing instance ID.
-  3. The `node-bootstrap` Container installs Talos and applies the worker config.
+  3. The `node-bootstrap` Container installs Talos, applies peer-only network protection and
+     ensures the encrypted Cilium overlay is configured before joining. It applies the worker
+     configuration for an existing region or bootstraps a control-plane/worker for a new region.
   4. The agent sees the Node `Ready` and reports allocatable resources. The node becomes
-     schedulable.
+     schedulable after network verification and system/platform reservations.
 
 ### Capacity and placement
 
@@ -173,11 +176,14 @@ D1 tables:
   resources, Kubernetes node name.
 - `databases`:
   - Ownership and placement: project, region, node, name, size class, PostgreSQL major version.
-  - State: desired and observed state, generation and observed generation, status message,
-    timestamps.
+  - State: desired and observed state, configuration revision (`generation`) and observed
+    configuration revision (`observed_generation`), status message, timestamps. Storage generation
+    is separate and remains 1 until Phase 4 restores.
 - `roles`: encrypted password with key version; unique on `(database_id, name)`, which is the
   edge's routing index.
-- `operations`: kind, subject, status, error, idempotency key, timestamps.
+- `operations`: kind, subject, configuration revision, status, error, timestamps.
+- `idempotency_keys`: API-key-scoped request hash, state, resulting resource ID and response status;
+  never credential-bearing response bodies.
 - `lifecycle_events`: created, ready, hibernated, woke, resized, suspended, deleted; each with
   node, size class and generation.
 - `usage_hourly`: one row per database and hour.
@@ -191,12 +197,14 @@ Endpoints:
   - `GET /v1/databases/{id}/archive` lists base backups and WAL in R2 through the Worker's R2
     binding.
   - `POST /v1/databases/{id}/suspend|resume|restore`.
-- Roles: `GET|POST /v1/databases/{id}/roles` and `POST .../roles/{name}/reset-password`. The
-  connection URI includes the password only for the `integrator` scope.
+- Roles: `GET|POST /v1/databases/{id}/roles`, `POST .../roles/{name}/reset-password` and
+  `GET /v1/databases/{id}/roles/{name}/connection-uri`. The connection URI includes the password
+  only for the `integrator` scope.
 - Operations: `GET /v1/operations/{id}`.
 - Metrics: `GET /v1/usage` and `GET /v1/costs` (section 5).
-- API keys: `POST /v1/api-keys`. The bootstrap token creates the first `admin` key and works only
-  while no admin key exists.
+- API keys: `POST|GET /v1/api-keys` and `DELETE /v1/api-keys/{id}`. The bootstrap token creates the
+  first `admin` key and works only while no admin key exists. API and agent credentials are returned
+  once; idempotency replays neither reissue nor replace them.
 - Admin: `GET /v1/size-classes`, `PUT /v1/size-classes/{id}`, `GET /v1/regions`,
   `POST /v1/regions`, `GET /v1/nodes` and `POST /v1/regions/{id}/nodes`.
 - Agent: `/agent/v1/link` (WebSocket), `/agent/v1/desired` and `/agent/v1/observations`.
@@ -227,17 +235,30 @@ are reported as gaps, never as zero.
 - Unreserved capacity appears as `idle_capacity_cost`.
 
 The cost view answers "what does each database cost us" and shows utilization. Integrators keep
-their own price lists. For example, ohmyho.st may charge a fixed credit amount per month per size
-class (512 MiB, 2 GiB).
+their own price lists and billing logic.
 
 ## 6. Security and isolation
 
-- The VPS firewall allows no inbound traffic except the Talos API (50000) and Kubernetes API
-  (6443), only from the operator and bootstrap addresses. Moving these behind the Tunnel or Access
-  is a Phase 4 item.
+- The VPS firewall denies inbound traffic by default. Operator and bootstrap addresses may reach
+  the Talos API (TCP 50000) and Kubernetes API (TCP 6443) only. From Phase 3, exact peer-node
+  addresses may additionally reach the required Kubernetes API, Talos (TCP 50000/50001), kubelet
+  (TCP 10250), control-plane etcd ports and CNI ports. No cluster port becomes world reachable.
+  Apply the peer allowlist before joining a node. Cilium 1.20.2 uses WireGuard transparent
+  encryption for inter-node Pod traffic (`encryption.enabled: true`, `encryption.type: wireguard`),
+  with UDP 51871 reachable only between peers; the VXLAN overlay and health paths are peer-only
+  too. Configure encryption before join, then verify it before placing databases on the new node.
+  Host control-plane traffic still uses its native TLS; Pod encryption is not a claim that all
+  host traffic uses WireGuard. These are Phase 3 requirements, not deployed evidence.
+  See [Cilium WireGuard](https://docs.cilium.io/en/stable/security/network/encryption-wireguard/),
+  [Cilium firewall requirements](https://docs.cilium.io/en/stable/operations/system_requirements/#firewall-rules)
+  and the [pinned Talos port constants](https://github.com/siderolabs/talos/blob/v1.14.1/pkg/machinery/constants/constants.go).
+  Moving operator access behind the Tunnel or Access is a Phase 4 item.
 - Database IDs are random 20-character strings (`^[a-z][a-z0-9]{19}$`, a letter first) and are
   also the PostgreSQL database name. There is no per-database hostname. The edge refuses unknown,
   deleted, suspended and not-ready databases and rate-limits connections per database.
+- StartupMessage protocol majors other than 3 and replication requests receive SQLSTATE `0A000`;
+  a missing user receives `28000`. Phase 1 rejects unknown databases with `3D000`, unknown roles
+  with `28P01` and unavailable databases with `57P03`; Phase 2 adds the decoy SCRAM exchange.
 - **Edge to gateway:**
   - An HMAC-SHA256 routing token with a per-region key: database ID, connection ID, region, key
     ID, issued-at and expiry, with expiry minus issued-at ≤ 30 s. It is single use per gateway
@@ -281,14 +302,12 @@ section 11.
 1. **Completed:** the old implementation was removed in commit `77ac865` and the new TypeScript
    workspace was scaffolded. Do not repeat the removal command: it would delete the new workspace.
 
-2. Remove all local worktrees and `codex/*` branches; only `main` remains. A local safety bundle
-   is in the ignored `.local/backups/20261002-reset/`.
-3. Decommission the old Dev deployment. The Cloudflare account is shared: touch only `pgcf-*`
-   resources.
-   - Inventory first.
-   - Delete the Worker `pgcf-control-dev` and its D1 database, the usage-custody R2 bucket and
-     obsolete Worker Secrets (for example the runtime permit signing keys).
-   - Keep the EU backup bucket, but empty its old lab prefixes.
+2. Remove completed implementation worktrees and branches; only `main` remains after integration.
+   Keep any local recovery bundle outside tracked files.
+3. Decommission the old Dev deployment after a complete inventory and the required approval.
+   Operate only on inventory-bound PGCF Dev resources; remove obsolete Workers, D1 databases,
+   backup prefixes and Worker Secrets according to that reviewed inventory.
+   Preserve the regional backup bucket selected for the new installation.
 4. Rebuild the lab Talos node from the repository recipes: Talos, Cilium, then the Flux platform.
    This removes the old controller, collectors, telemetry and adoption overlays, and proves the
    recipe on fresh infrastructure. The second VPS stays untouched for Phase 3.
@@ -369,6 +388,10 @@ Build:
 - The `node-bootstrap` Container. It runs the verified rescue path: per-node Image Factory
   schematic with static network arguments, checksum-verified NoCloud raw image, GPT relocation,
   `apply-config` worker for an existing region, or bootstrap a control-plane/worker for a new region.
+  Control-plane/worker nodes host customer databases with measured system/platform reservations.
+- Before join, apply the peer-address firewall allowlist for API, Talos, kubelet, control-plane
+  etcd and CNI traffic, and configure Cilium WireGuard Pod encryption. Keep the new node out of
+  database placement until the encrypted inter-node path and network isolation are verified.
 - Capacity cron with an autoscale policy and hard caps. Initial node caps are EU = 2 and US = 1.
 - Reconcile uncertain provider responses before retrying; a replay must never buy another node.
 - Node caps count live nodes. Marking a node lost frees its slot for a replacement; the replacement
@@ -380,6 +403,9 @@ Live acceptance:
   capacity path and API, with no manual console step.
 - New databases are placed on it.
 - Databases on both nodes are reachable.
+- Inter-node Pod traffic between the two EU nodes is proven encrypted on the public network;
+  WireGuard peers and handshake health match the inventory. An outside-allowlist IPv4/IPv6 scan
+  proves that joining added no world-reachable cluster port.
 - An autoscale dry run logs the decision.
 - A pending US database with no allocatable capacity triggers a real US VPS order and the full
   install/bootstrap path, after the owner's costed go. Interrupt and resume without a duplicate order.
@@ -404,8 +430,10 @@ Live acceptance:
   verify the target, switch connections, then reopen writes. Preserve US/EU and shared/isolated data
   scopes. Retire Neon only after successful verification; never switch back to an older source after
   the target has accepted writes.
-- The OMH adapter replaces Neon-specific receipts, host/database validation, native connections,
-  Control Hyperdrive and consumption. The MIT WebSocket driver may remain as a client library.
+- The provider adapter lives only in the adopter repository and replaces database and role
+  provisioning, resize, suspend/resume, deletion, usage import and customer/platform connections
+  with PGCF contracts. The MIT WebSocket driver may remain as a client library without a Neon
+  service dependency.
 
 Acceptance:
 
@@ -561,6 +589,7 @@ infra/backups         CNPG/Barman/R2 backup and restore reference
 
 | Date       | Phase | Result                                                                                                                                                                                                                                                                                                                   |
 | ---------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 2026-10-02 | 0     | Plan rewritten. Repository deletion, branch cleanup, Dev decommission and lab rebuild pending.                                                                                                                                                                                                                           |
+| 2026-10-02 | 0     | Plan rewritten. Old repository implementation was removed; completed-track worktrees are removed after integration. Dev decommission and lab rebuild remain pending. |
 | 2026-10-02 | 0     | Old implementation removed from the repository and the TypeScript workspace scaffolded. Documents aligned with the single-endpoint design and the Phase 1 scope; Flux release timeouts and retries raised for a fresh install. Nothing of this is verified live: Dev decommission, lab rebuild and Phase 1 have not run. |
-| 2026-10-02 | 0–5   | Owner scope: full Neon replacement for customer and platform databases; US default and EU selectable; initial two-EU/one-US topology with R2 recovery. Implementation adopted; live prep kits remain NOT_READY. No new live acceptance claimed.                                                                          |
+| 2026-10-02 | 0–5   | Owner scope: full Neon replacement for customer and platform databases; US default and EU selectable; initial two-EU/one-US topology with R2 recovery. Vetted live preparation kits are available, but the read-only inventory stopped on incomplete VPC-services pagination. No decommission or rebuild has passed. |
+| 2026-10-02 | 1 local | Management API, shared contracts, regional agent, gateway and edge are implemented at local revision `167a6ff`. Local AMD64 image build took 35.7 s; the forbidden-file scan found zero files, and both entry points loaded their modules and rejected missing configuration. These local checks are not Phase 1 live acceptance. M-A corrections, T10 harness review and the real E0–E6 run remain pending. |

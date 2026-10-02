@@ -1,4 +1,5 @@
-# Makes a single control-plane node schedulable for the single-node lab.
+# Allows customer databases on the initial EU/US control-plane/worker nodes.
+# Reserve system and platform resources before admitting database placements.
 apiVersion: v1alpha1
 kind: KubeNodeConfig
 taints:

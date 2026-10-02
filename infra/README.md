@@ -18,5 +18,8 @@ Ownership:
 - **CNPG** owns PostgreSQL instances.
 - **Talos** owns host and Kubernetes upgrades.
 
-These recipes ran on a single-node lab. Unattended node bootstrap from Cloudflare (Phase 3), a
-three-node production region, upgrades and tenant-isolation tests are still to be built (Phase 4).
+These recipes ran on a single-node lab. The agreed initial deployment is two EU VPS (one
+control-plane/worker and one worker) and one US control-plane/worker VPS, with customer databases
+on every node after reserving system and platform resources. Node loss is recovered from R2.
+Unattended worker join and new-region control-plane/worker bootstrap arrive in Phase 3;
+production recovery, upgrades and tenant-isolation acceptance arrive in Phase 4.

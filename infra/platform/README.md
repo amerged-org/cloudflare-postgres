@@ -17,7 +17,9 @@ follows the current HTTP index. Images keep the exact references shipped by the 
 `regional` section lists the cloudflared digest and the regional image reference.
 
 These versions ran together in the single-node Contabo lab. A fresh installation from this
-directory is part of Phase 0.
+directory is part of Phase 0. The initial EU and US control-plane/worker nodes also host customer
+databases with system and platform resources reserved; the second EU node joins as a worker in
+Phase 3. Node loss is recovered from R2.
 
 ## Ownership and prerequisites
 
@@ -38,6 +40,11 @@ Prepare the cluster before installation:
   records the lab allocation; review its sizes for the target disk. The platform manifests never
   partition disks. The StorageClass matches only `vgpattern: "^pgcf$"`.
 - Keep authenticated Talos and Kubernetes configurations outside Git.
+- The Cilium values request WireGuard transparent encryption for inter-node Pod traffic, using
+  the [documented Cilium 1.20.2 options](https://docs.cilium.io/en/stable/security/network/encryption-wireguard/).
+  Before a Phase 3 join, allow the required management and CNI ports only from exact peer-node
+  addresses, including UDP 51871 for WireGuard. Verify encryption and outside-allowlist denial
+  before database placement on that node. This setting is not evidence of a live encrypted path.
 - Install the pinned Flux CLI from its
   [official release](https://github.com/fluxcd/flux2/releases/tag/v2.9.5), verify its checksum and
   run `flux check --pre`.
@@ -120,7 +127,7 @@ and is excluded from the build.
 
 | Workload           | Replicas | Role                                                                                                                              |
 | ------------------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| `pgcf-cloudflared` | 2        | Remotely managed Cloudflare Tunnel. No inbound ports; metrics on localhost. Its public-hostname rule targets the gateway Service. |
+| `pgcf-cloudflared` | 2        | Remotely managed Cloudflare Tunnel. No inbound ports; metrics on localhost. If the Phase 1 transport spike selects a Tunnel hostname, its hostname rule targets the gateway Service. |
 | `pgcf-gateway`     | 2        | WebSocket-to-PostgreSQL bridge on port 8080 (`/healthz`, `/readyz`, 45 s termination grace). Service `pgcf-gateway`.              |
 | `pgcf-agent`       | 1        | Reconciles desired state into Kubernetes. Strategy `Recreate`, so two agents never overlap.                                       |
 
@@ -172,8 +179,10 @@ the keys of `pgcf-gateway` and `pgcf-agent` become environment variables of the 
 ### Network and access rules
 
 - `default-deny` blocks all ingress and egress in `pgcf-system`; one CiliumNetworkPolicy per
-  workload adds the allowed paths. cloudflared may reach the gateway on 8080 and the Cloudflare
-  edge on 7844, the gateway accepts traffic from cloudflared only, and may reach the Kubernetes API
+  workload adds the allowed paths. The current baseline covers the Tunnel fallback: cloudflared
+  may reach the gateway on 8080 and the Cloudflare edge on 7844; the gateway accepts traffic from
+  cloudflared only. If the Phase 1 spike selects Workers VPC TCP or HTTP, add only that verified
+  connector ingress before deployment. The gateway may reach the Kubernetes API
   and port 5432 of database Pods in namespaces labelled `pgcf.io/database-id`. The agent reaches the
   Kubernetes API, the API Worker host on 443 and CNPG Pods in labelled database namespaces on
   5432 for authenticated role readiness and 9187 for real WAL archive metrics; nothing accepts inbound traffic besides the

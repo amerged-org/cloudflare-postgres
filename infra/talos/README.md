@@ -2,7 +2,7 @@
 
 These first-party patches reproduce the configuration of the single-node Contabo lab. They target **Talos v1.14.1 with Kubernetes v1.36.3**; the Kubernetes version is explicit because the selected CNPG release supports 1.36, while this Talos release defaults to a newer one. Boot, storage, SQL and node-restart behavior worked in the lab.
 
-This is the manual recipe. In Phase 3 of [PLAN.md](../../PLAN.md), the `node-bootstrap` Container automates the same rescue path for new worker nodes. Two VPS in one data center are not independent failure domains.
+This is the manual recipe. In Phase 3 of [PLAN.md](../../PLAN.md), the `node-bootstrap` Container automates the same rescue path: a worker joins an existing region, while a new region bootstraps its first control-plane/worker. The initial topology has one EU control-plane/worker plus one EU worker and one US control-plane/worker. Customer databases run on these control-plane/worker nodes with system and platform resources reserved. Node loss is recovered from R2.
 
 ## Private configuration
 
@@ -28,7 +28,7 @@ talosctl validate --mode cloud --strict \
 chmod 600 .env.local.talos/config/*
 ```
 
-The two `single-*-lab` patches are deliberately scoped to the measured one-node lab. Replace the disk allocation and scheduling policy for another node pool; do not silently apply these sizes to a smaller disk or schedule customer databases on a production control plane. EPHEMERAL must be capped before first provisioning. Changing `maxSize` does not shrink an already grown filesystem.
+The `single-disk-lab-storage` patch uses the measured lab disk allocation; review its sizes for every target disk. The `single-node-lab-scheduling` patch also applies to the initial EU and US control-plane/worker nodes so they can host customer databases. Reserve system and platform resources before reporting database placement capacity; do not treat control-plane resources as available to tenants. An additional regional worker does not need this control-plane taint patch. EPHEMERAL must be capped before first provisioning. Changing `maxSize` does not shrink an already grown filesystem.
 
 ## Contabo rescue path
 
@@ -54,4 +54,6 @@ Invoke `talosctl bootstrap` exactly once against one control-plane node after re
 
 The CNI is intentionally absent at bootstrap. Install the pinned Cilium release promptly using the [platform baseline](../platform/README.md), then confirm Cilium, CoreDNS, Node Ready, one disposable Pod DNS check and Talos health. Flux subsequently owns platform releases; the regional agent owns per-database namespaces and CNPG resources. Talos lifecycle jobs own host and Kubernetes upgrades. Flux does not patch the guest OS.
 
-Sources: [Talos NoCloud](https://docs.siderolabs.com/talos/v1.14/platform-specific-installations/cloud-platforms/nocloud), [network kernel arguments](https://docs.siderolabs.com/talos/v1.14/reference/kernel), [raw volumes](https://docs.siderolabs.com/talos/v1.14/reference/configuration/block/rawvolumeconfig), [LVM groups](https://docs.siderolabs.com/talos/v1.14/reference/configuration/storage/lvmvolumegroupconfig), [lab control-plane scheduling](https://docs.siderolabs.com/talos/v1.14/deploy-and-manage-workloads/workloads-on-controlplane), [Contabo rescue](https://help.contabo.com/en/support/solutions/articles/103000295053-how-do-i-boot-a-rescue-system-for-my-server-).
+Before joining another node in Phase 3, apply the exact peer-address allowlist for Talos, Kubernetes, kubelet, control-plane etcd and CNI traffic described in [PLAN.md section 6](../../PLAN.md#6-security-and-isolation). The platform baseline requests Cilium WireGuard encryption for inter-node Pod traffic. Verify the encryption peers and traffic before admitting the new node for customer database placement; no cluster port may become world reachable. The checked-in configuration does not prove that encryption is deployed or that this two-node acceptance has passed.
+
+Sources: [Talos NoCloud](https://docs.siderolabs.com/talos/v1.14/platform-specific-installations/cloud-platforms/nocloud), [network kernel arguments](https://docs.siderolabs.com/talos/v1.14/reference/kernel), [raw volumes](https://docs.siderolabs.com/talos/v1.14/reference/configuration/block/rawvolumeconfig), [LVM groups](https://docs.siderolabs.com/talos/v1.14/reference/configuration/storage/lvmvolumegroupconfig), [control-plane scheduling](https://docs.siderolabs.com/talos/v1.14/deploy-and-manage-workloads/workloads-on-controlplane), [Contabo rescue](https://help.contabo.com/en/support/solutions/articles/103000295053-how-do-i-boot-a-rescue-system-for-my-server-).
