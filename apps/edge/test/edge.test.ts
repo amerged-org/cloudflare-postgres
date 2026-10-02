@@ -12,11 +12,12 @@ import {
   verifyRouteToken,
 } from "@pgcf/contracts/route-token";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import worker, {
+import worker from "../src/index.ts";
+import {
   connectionRateKey,
   normalizeCloseCode,
   STARTUP_DEADLINE_MS,
-} from "../src/index.ts";
+} from "../src/session-policy.ts";
 import type { Env } from "../src/env.ts";
 
 const testEnv = env as Env & { GATEWAY: Fetcher };
