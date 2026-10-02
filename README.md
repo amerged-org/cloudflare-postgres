@@ -119,6 +119,8 @@ An install path is part of the open-source release phase in [PLAN.md](PLAN.md#ph
 - [AGENTS.md](AGENTS.md): contributor and coding-agent brief.
 - [THIRD_PARTY.md](THIRD_PARTY.md): upstream components and licenses.
 - [infra/](infra/README.md): Talos, platform and backup recipes.
+- [Native external probe](docs/operations/native-external-probe.md): the supplemental Dev TCP/25
+  check for Phase 1 network isolation, including provenance verification and cleanup.
 
 ## License
 

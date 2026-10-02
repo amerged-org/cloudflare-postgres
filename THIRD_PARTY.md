@@ -79,6 +79,17 @@ are recorded in `pnpm-lock.yaml`; build and test tooling is not relicensed as fi
 | --------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------- |
 | [neondatabase/wsproxy](https://github.com/neondatabase/wsproxy) | Apache-2.0 | Read-only reference for the WebSocket-to-PostgreSQL bridge. Not vendored, not pinned, not a dependency. |
 
+## Acceptance workflow actions
+
+The supplemental native TCP probe uses these official actions in the existing CI workflow.
+They are pinned to immutable commits; their own bundled dependencies retain their upstream notices.
+The actions run on GitHub-hosted runners and are not included in the regional image.
+
+| Action                                                                | Release and commit                                | License                                                                                                 | Role                                                        |
+| --------------------------------------------------------------------- | ------------------------------------------------- | ------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------- |
+| [actions/attest](https://github.com/actions/attest)                   | 4.1.0, `59d89421af93a897026c735860bf21b6eb4f7b26` | [MIT](https://github.com/actions/attest/blob/59d89421af93a897026c735860bf21b6eb4f7b26/LICENSE)          | Signs provenance for the sanitized native-probe report.     |
+| [actions/upload-artifact](https://github.com/actions/upload-artifact) | 7.0.0, `bbbca2ddaa5d8feaa63e36b76fdaad77386f024f` | [MIT](https://github.com/actions/upload-artifact/blob/bbbca2ddaa5d8feaa63e36b76fdaad77386f024f/LICENSE) | Publishes only the sanitized report with one-day retention. |
+
 ## Not used
 
 | Component                                                                                                                              | Reason                                                                                                                                                   |
