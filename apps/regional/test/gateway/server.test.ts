@@ -6,6 +6,7 @@ import { createConnection } from "node:net";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { newDatabaseId } from "@pgcf/contracts";
+import { encodeStartup } from "@pgcf/contracts/pg-wire";
 import { ReplayCache } from "@pgcf/contracts/route-token";
 import { DatabaseCaCache } from "../../src/gateway/ca.ts";
 import {
@@ -25,6 +26,7 @@ import {
   postgresServer,
   rejection,
   signedClaims,
+  start,
   token,
   validCertificate,
 } from "./helpers.ts";
@@ -93,6 +95,7 @@ test("relays ten megabytes both directions through SSLRequest and verified TLS i
     await postgres.close();
   });
   const socket = await open(port);
+  const startup = await start(socket);
   const payload = randomBytes(10 * 1024 * 1024);
   const chunks: Buffer[] = [];
   let received = 0;
@@ -120,8 +123,8 @@ test("relays ten megabytes both directions through SSLRequest and verified TLS i
   assert.ok(
     gateway.metrics.peakBufferedBytes <= MAX_PAYLOAD_BYTES + MAX_FRAME_BYTES,
   );
-  assert.equal(logs[0]?.bytes_in, payload.length);
-  assert.equal(logs[0]?.bytes_out, payload.length);
+  assert.equal(logs[0]?.bytes_in, payload.length + startup.length);
+  assert.equal(logs[0]?.bytes_out, payload.length + startup.length);
 });
 
 test("checks replay before dialing and fails closed when replay storage is full", async (t) => {
@@ -135,6 +138,7 @@ test("checks replay before dialing and fails closed when replay storage is full"
   });
   const route = await token();
   const socket = await open(port, route);
+  await start(socket);
   assert.equal(await rejection(port, route), 403);
   assert.equal(await rejection(port, await token()), 429);
   assert.equal(postgres.handshakes(), 1);
@@ -164,10 +168,12 @@ test("a full database replay partition still admits another verified database", 
     await postgres.close();
   });
   const first = await open(port);
+  await start(first);
   assert.equal(await rejection(port, await token()), 429);
   assert.equal(gateway.metrics.activeConnections, 1);
   const secondDatabase = newDatabaseId();
   const second = await open(port, await token({ db: secondDatabase }));
+  await start(second, { user: "app", database: secondDatabase });
   assert.deepEqual(targets, [
     databaseTarget(database).host,
     databaseTarget(secondDatabase).host,
@@ -189,6 +195,7 @@ test("capacity denials do not consume fresh routing tokens", async (t) => {
     await postgres.close();
   });
   const first = await open(port);
+  await start(first);
   const retry = await token();
   assert.equal(await rejection(port, retry), 429);
   const released = once(events, "conn_close");
@@ -197,6 +204,7 @@ test("capacity denials do not consume fresh routing tokens", async (t) => {
   await closed;
   await released;
   const second = await open(port, retry);
+  await start(second);
   assert.equal(postgres.handshakes(), 2);
   const secondClosed = once(second, "close");
   second.close();
@@ -214,6 +222,7 @@ test("total capacity denials also leave routing tokens available for a later adm
     await postgres.close();
   });
   const first = await open(port);
+  await start(first);
   const retry = await token();
   assert.equal(await rejection(port, retry), 503);
   const released = once(events, "conn_close");
@@ -222,6 +231,7 @@ test("total capacity denials also leave routing tokens available for a later adm
   await closed;
   await released;
   const second = await open(port, retry);
+  await start(second);
   assert.equal(postgres.handshakes(), 2);
   const secondClosed = once(second, "close");
   second.close();
@@ -344,6 +354,7 @@ test("rejects all subprotocol headers before consuming tokens, reserving capacit
   );
   assert.equal(postgres.handshakes(), 0);
   const socket = await open(port, route);
+  await start(socket);
   assert.equal(postgres.handshakes(), 1);
   const released = once(events, "conn_close");
   const closed = once(socket, "close");
@@ -363,6 +374,7 @@ test("reserves per-database and total caps before dialing and releases them afte
     await postgres.close();
   });
   const socket = await open(port);
+  await start(socket);
   assert.equal(await rejection(port, await token()), 429);
   const { newDatabaseId } = await import("@pgcf/contracts");
   assert.equal(
@@ -374,6 +386,7 @@ test("reserves per-database and total caps before dialing and releases them afte
   socket.close();
   await closed;
   const next = await open(port);
+  await start(next);
   const nextClosed = once(next, "close");
   next.close();
   await nextClosed;
@@ -401,6 +414,7 @@ test("derives target only from verified database and ignores query and host head
     `/pg?host=${encodeURIComponent(randomUUID())}&port=1&database=${randomUUID()}`,
     { Host: randomUUID() },
   );
+  await start(socket);
   assert.deepEqual(targets, [`${databaseTarget(database).host}:5432`]);
   const closed = once(socket, "close");
   socket.close();
@@ -425,7 +439,12 @@ test("fails closed on wrong CA and mismatched certificate name with one refresh"
     await gateway.drain();
     await postgres.close();
   });
-  assert.equal(await rejection(port, await token()), 502);
+  const failed = await open(port);
+  const failedMessage = once(failed, "message");
+  const failedClosed = once(failed, "close");
+  failed.send(encodeStartup({ user: "app", database }));
+  assert.match(Buffer.from((await failedMessage)[0]).toString(), /08006/);
+  await failedClosed;
   assert.equal(reads, 2);
   assert.equal(postgres.handshakes(), 2);
   const trustedWrongName = new DatabaseCaCache(
@@ -438,7 +457,12 @@ test("fails closed on wrong CA and mismatched certificate name with one refresh"
     }),
   });
   t.after(() => otherGateway.gateway.drain());
-  assert.equal(await rejection(otherGateway.port, await token()), 502);
+  const wrongName = await open(otherGateway.port);
+  const wrongNameMessage = once(wrongName, "message");
+  const wrongNameClosed = once(wrongName, "close");
+  wrongName.send(encodeStartup({ user: "app", database }));
+  assert.match(Buffer.from((await wrongNameMessage)[0]).toString(), /08006/);
+  await wrongNameClosed;
   assert.equal(otherGateway.gateway.metrics.activeConnections, 0);
 });
 
@@ -459,6 +483,7 @@ test("refreshes a rotated CA once and establishes the connection", async (t) => 
     await postgres.close();
   });
   const socket = await open(port);
+  await start(socket);
   assert.equal(reads, 2);
   assert.equal(postgres.handshakes(), 2);
   const closed = once(socket, "close");
@@ -466,13 +491,18 @@ test("refreshes a rotated CA once and establishes the connection", async (t) => 
   await closed;
 });
 
-test("rejects unreachable PostgreSQL before upgrade", async (t) => {
+test("reports unreachable PostgreSQL after an authorized startup", async (t) => {
   const postgres = await postgresServer();
   const portUnused = postgres.port;
   await postgres.close();
   const { gateway, port } = await gatewayFor(portUnused);
   t.after(() => gateway.drain());
-  assert.equal(await rejection(port, await token()), 502);
+  const failed = await open(port);
+  const failedMessage = once(failed, "message");
+  const failedClosed = once(failed, "close");
+  failed.send(encodeStartup({ user: "app", database }));
+  assert.match(Buffer.from((await failedMessage)[0]).toString(), /08006/);
+  await failedClosed;
   assert.equal(gateway.metrics.activeConnections, 0);
 });
 
@@ -487,7 +517,7 @@ test("propagates PostgreSQL close and rejects text frames", async (t) => {
   });
   const socket = await open(port);
   const closed = once(socket, "close", { signal: AbortSignal.timeout(2_000) });
-  socket.send(Buffer.from([1]));
+  socket.send(encodeStartup({ user: "app", database }));
   assert.equal((await closed)[0], 1000);
   const text = await open(port);
   const textClosed = once(text, "close", {
@@ -511,6 +541,7 @@ test("propagates a WebSocket close to the PostgreSQL TLS socket", async (t) => {
     await postgres.close();
   });
   const socket = await open(port);
+  await start(socket);
   const echoed = once(socket, "message");
   socket.send(Buffer.from([1]));
   await echoed;
@@ -543,11 +574,37 @@ test("rejects a message over 32 MiB with the payload close code before forwardin
   assert.equal(gateway.metrics.activeConnections, 0);
 });
 
+test("an established relay rejects an oversized WebSocket message without forwarding its payload", async (t) => {
+  let received = 0;
+  const postgres = await postgresServer(validCertificate, (socket) =>
+    socket.on("data", (chunk: Buffer) => {
+      received += chunk.length;
+      socket.write(chunk);
+    }),
+  );
+  const { gateway, port, events } = await gatewayFor(postgres.port);
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const socket = await open(port);
+  const startup = await start(socket);
+  const closed = once(socket, "close");
+  const released = once(events, "conn_close");
+  socket.send(Buffer.alloc(MAX_PAYLOAD_BYTES + 1));
+  assert.equal((await closed)[0], 1009);
+  await released;
+  assert.equal(received, startup.length);
+  assert.equal(postgres.handshakes(), 1);
+  assert.equal(gateway.metrics.activeConnections, 0);
+});
+
 test("marks readiness false, rejects new connections and drains existing connections with 1012", async (t) => {
   const postgres = await postgresServer();
   const { gateway, port } = await gatewayFor(postgres.port, { drainMs: 100 });
   t.after(() => postgres.close());
   const socket = await open(port);
+  await start(socket);
   const closed = once(socket, "close");
   const drain = gateway.drain();
   assert.equal((await fetch(`http://${loopback}:${port}/readyz`)).status, 503);
@@ -591,7 +648,7 @@ test("bounds relay buffering for a paused slow WebSocket reader", async (t) => {
   });
   const socket = await open(port);
   socket.pause();
-  socket.send(Buffer.from([1]));
+  socket.send(encodeStartup({ user: "app", database }));
   await writing;
   await new Promise<void>((resolve) => setTimeout(resolve, 200));
   assert.ok(bytesWritten < payload.length);

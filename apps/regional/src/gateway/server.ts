@@ -9,11 +9,18 @@ import {
   ROUTE_TOKEN_HEADER,
   verifyRouteToken,
   type RouteKeyring,
+  type RouteTokenClaims,
 } from "@pgcf/contracts/route-token";
+import {
+  StartupReader,
+  encodeEncryptionDeclined,
+  encodeErrorResponse,
+} from "@pgcf/contracts/pg-wire";
 import { databaseTarget, type PostgresDial } from "./postgres.ts";
 
 export const MAX_PAYLOAD_BYTES = 32 * 1024 * 1024;
 export const MAX_FRAME_BYTES = 64 * 1024;
+export const MAX_STARTUP_BUFFER_BYTES = 64 * 1024;
 
 export interface GatewayOptions {
   readonly region: string;
@@ -24,6 +31,7 @@ export interface GatewayOptions {
   readonly replayCache?: ReplayCache;
   readonly heartbeatMs?: number;
   readonly drainMs?: number;
+  readonly startupTimeoutMs?: number;
   readonly log?: (event: Readonly<Record<string, string | number>>) => void;
 }
 
@@ -41,7 +49,14 @@ export function createGateway(options: GatewayOptions): Gateway {
   const totalLimit = options.totalLimit ?? 2_000;
   const heartbeatMs = options.heartbeatMs ?? 30_000;
   const drainMs = options.drainMs ?? 30_000;
-  for (const limit of [databaseLimit, totalLimit, heartbeatMs, drainMs])
+  const startupTimeoutMs = options.startupTimeoutMs ?? 10_000;
+  for (const limit of [
+    databaseLimit,
+    totalLimit,
+    heartbeatMs,
+    drainMs,
+    startupTimeoutMs,
+  ])
     if (!Number.isInteger(limit) || limit < 1)
       throw new RangeError("invalid gateway limits");
   const replay = options.replayCache ?? new ReplayCache();
@@ -162,50 +177,250 @@ export function createGateway(options: GatewayOptions): Gateway {
       rejectUpgrade(socket, used === "replayed" ? 403 : 429);
       return;
     }
+    let accepted = false;
+    try {
+      websockets.handleUpgrade(request, socket, head, (client) => {
+        accepted = true;
+        clients.add(client);
+        startup(client, socket, request, claims, release);
+      });
+    } finally {
+      if (!accepted) release();
+    }
+  }
+
+  function startup(
+    client: WebSocket,
+    socket: Duplex,
+    request: IncomingMessage,
+    claims: RouteTokenClaims,
+    release: () => void,
+  ): void {
     const abort = new AbortController();
-    let postgres: TLSSocket | undefined;
+    const reader = new StartupReader(MAX_STARTUP_BUFFER_BYTES);
+    const started = Date.now();
+    const queue: Buffer[] = [];
+    let queuedBytes = 0;
+    let bytesOut = 0;
+    let connecting = false;
+    let finished = false;
     let handedOff = false;
-    const disconnected = () => {
-      if (handedOff) return;
+    let alive = true;
+    let postgres: TLSSocket | undefined;
+    let closingDeadline: NodeJS.Timeout | undefined;
+    pending.add(abort);
+
+    const finish = (outcome: string) => {
+      if (finished || handedOff) return;
+      finished = true;
+      clearTimeout(deadline);
+      clearInterval(heartbeat);
+      pending.delete(abort);
       abort.abort();
       postgres?.destroy();
-      socket.destroy();
+      queue.length = 0;
+      clients.delete(client);
       release();
+      log({
+        event: "conn_close",
+        database: claims.db,
+        connection: claims.cid,
+        bytes_in: 0,
+        bytes_out: bytesOut,
+        duration_ms: Date.now() - started,
+        outcome,
+      });
+    };
+    const close = (
+      code: number,
+      outcome: string,
+      error?: { sqlstate: string; message: string },
+    ) => {
+      if (finished || handedOff) return;
+      const packet = error
+        ? encodeErrorResponse(error.sqlstate, error.message)
+        : undefined;
+      if (packet) bytesOut += packet.byteLength;
+      finish(outcome);
+      closingDeadline = setTimeout(() => client.terminate(), 500);
+      closingDeadline.unref();
+      if (client.readyState !== WebSocket.OPEN) {
+        client.terminate();
+        return;
+      }
+      if (packet)
+        client.send(packet, { binary: true }, (error) => {
+          if (error) client.terminate();
+          else client.close(code, "connection closed");
+        });
+      else client.close(code, "connection closed");
+    };
+    const disconnected = () => {
+      finish("client_closed");
+      client.terminate();
+    };
+    const clientClosed = () => {
+      clearTimeout(closingDeadline);
+      finish("client_closed");
+    };
+    const clientError = () => {
+      if (finished || handedOff) return;
+      finish("websocket_error");
+      closingDeadline = setTimeout(() => client.terminate(), 500);
+      closingDeadline.unref();
+      if (client.readyState === WebSocket.OPEN)
+        client.close(1011, "connection closed");
+    };
+    const pong = () => {
+      alive = true;
+    };
+    const interrupted = () => close(1012, "gateway_draining");
+    const deadline = setTimeout(
+      () =>
+        close(1000, "startup_timeout", {
+          sqlstate: "08006",
+          message: "database connection startup timed out",
+        }),
+      startupTimeoutMs,
+    );
+    deadline.unref();
+    const heartbeat = setInterval(() => {
+      if (!alive) {
+        finish("heartbeat_timeout");
+        client.terminate();
+        return;
+      }
+      alive = false;
+      if (client.readyState === WebSocket.OPEN) client.ping();
+    }, heartbeatMs);
+    heartbeat.unref();
+
+    const enqueue = (chunk: Buffer): boolean => {
+      if (chunk.length === 0) return true;
+      if (chunk.length > MAX_STARTUP_BUFFER_BYTES - queuedBytes) {
+        close(1013, "startup_buffer_full", {
+          sqlstate: "08P01",
+          message: "too much data before database connection",
+        });
+        return false;
+      }
+      queuedBytes += chunk.length;
+      queue.push(chunk);
+      metrics.peakBufferedBytes = Math.max(
+        metrics.peakBufferedBytes,
+        queuedBytes,
+      );
+      return true;
+    };
+    const connect = async () => {
+      try {
+        postgres = await options.dial(databaseTarget(claims.db), abort.signal);
+        if (
+          finished ||
+          draining ||
+          abort.signal.aborted ||
+          client.readyState !== WebSocket.OPEN ||
+          socket.destroyed ||
+          socket.readableEnded ||
+          postgres.destroyed ||
+          postgres.readableEnded
+        ) {
+          postgres.destroy();
+          close(1012, "gateway_draining");
+          return;
+        }
+        handedOff = true;
+        pending.delete(abort);
+        clearTimeout(deadline);
+        clearInterval(heartbeat);
+        abort.signal.removeEventListener("abort", interrupted);
+        socket.removeListener("close", disconnected);
+        socket.removeListener("end", disconnected);
+        socket.removeListener("error", disconnected);
+        request.removeListener("aborted", disconnected);
+        client.removeListener("close", clientClosed);
+        client.removeListener("error", clientError);
+        client.removeListener("pong", pong);
+        client.removeListener("message", message);
+        const initial = Buffer.concat(queue, queuedBytes);
+        queue.length = 0;
+        relay(
+          client,
+          postgres,
+          claims.db,
+          claims.cid,
+          release,
+          initial,
+          started,
+          bytesOut,
+        );
+      } catch {
+        close(1000, "postgres_connect_error", {
+          sqlstate: "08006",
+          message: "database connection failed",
+        });
+      }
+    };
+    const message = (data: RawData, binary: boolean) => {
+      if (finished || handedOff) return;
+      if (!binary) {
+        close(1003, "text_frame");
+        return;
+      }
+      const chunk = toBuffer(data);
+      if (connecting) {
+        enqueue(chunk);
+        return;
+      }
+      let event = reader.push(chunk);
+      for (;;) {
+        if (event.kind === "need-more") return;
+        if (event.kind === "ssl" || event.kind === "gss") {
+          const packet = encodeEncryptionDeclined();
+          bytesOut += packet.byteLength;
+          client.send(packet, { binary: true }, (error) => {
+            if (error) clientError();
+          });
+          event = reader.push(new Uint8Array(0));
+          continue;
+        }
+        if (event.kind === "cancel") {
+          close(1000, "cancel");
+          return;
+        }
+        if (event.kind === "error") {
+          close(1000, "startup_error", event);
+          return;
+        }
+        if (event.database !== claims.db || event.user !== claims.user) {
+          close(1000, "startup_route_mismatch", {
+            sqlstate: "28000",
+            message: "startup does not match the authorized route",
+          });
+          return;
+        }
+        if (
+          !enqueue(Buffer.from(event.raw)) ||
+          !enqueue(Buffer.from(event.rest))
+        )
+          return;
+        connecting = true;
+        void connect();
+        return;
+      }
     };
     socket.once("close", disconnected);
     socket.once("end", disconnected);
     socket.once("error", disconnected);
     request.once("aborted", disconnected);
-    pending.add(abort);
-    try {
-      if (socket.readableEnded || request.aborted) disconnected();
-      abort.signal.throwIfAborted();
-      postgres = await options.dial(databaseTarget(claims.db), abort.signal);
-      if (socket.destroyed || draining || abort.signal.aborted) {
-        postgres.destroy();
-        if (!socket.destroyed) rejectUpgrade(socket, 503);
-        return;
-      }
-      const upstream = postgres;
-      websockets.handleUpgrade(request, socket, head, (client) => {
-        handedOff = true;
-        clients.add(client);
-        relay(client, upstream, claims.db, claims.cid, release);
-      });
-    } catch {
-      postgres?.destroy();
-      if (!socket.destroyed) rejectUpgrade(socket, 502);
-    } finally {
-      pending.delete(abort);
-      socket.removeListener("close", disconnected);
-      socket.removeListener("end", disconnected);
-      socket.removeListener("error", disconnected);
-      request.removeListener("aborted", disconnected);
-      if (!handedOff) {
-        postgres?.destroy();
-        release();
-      }
-    }
+    client.once("close", clientClosed);
+    client.on("error", clientError);
+    client.on("pong", pong);
+    client.on("message", message);
+    abort.signal.addEventListener("abort", interrupted, { once: true });
+    if (draining) interrupted();
+    else if (socket.destroyed || socket.readableEnded || request.aborted)
+      disconnected();
   }
 
   function relay(
@@ -214,13 +429,15 @@ export function createGateway(options: GatewayOptions): Gateway {
     database: string,
     connection: string,
     release: () => void,
+    initial: Buffer,
+    started: number,
+    initialBytesOut: number,
   ): void {
     let bytesIn = 0;
-    let bytesOut = 0;
+    let bytesOut = initialBytesOut;
     let alive = true;
     let finished = false;
     let outcome = "closed";
-    const started = Date.now();
     const heartbeat = setInterval(() => {
       if (!alive) {
         outcome = "heartbeat_timeout";
@@ -264,15 +481,8 @@ export function createGateway(options: GatewayOptions): Gateway {
         client.close(1011, "relay connection failed");
     });
     client.once("close", finish);
-    client.on("message", (data: RawData, binary: boolean) => {
-      if (!binary) {
-        outcome = "text_frame";
-        postgres.destroy();
-        client.close(1003, "binary frames required");
-        return;
-      }
+    const forward = (chunk: Buffer) => {
       if (postgres.destroyed || client.readyState !== WebSocket.OPEN) return;
-      const chunk = toBuffer(data);
       if (postgres.writableLength + chunk.length > MAX_PAYLOAD_BYTES) {
         outcome = "backpressure_limit";
         postgres.destroy();
@@ -283,6 +493,15 @@ export function createGateway(options: GatewayOptions): Gateway {
       client.pause();
       if (postgres.write(chunk)) client.resume();
       buffered();
+    };
+    client.on("message", (data: RawData, binary: boolean) => {
+      if (!binary) {
+        outcome = "text_frame";
+        postgres.destroy();
+        client.close(1003, "binary frames required");
+        return;
+      }
+      forward(toBuffer(data));
     });
     postgres.on("drain", () => {
       if (client.readyState === WebSocket.OPEN) client.resume();
@@ -320,6 +539,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       };
       send();
     });
+    forward(initial);
     postgres.resume();
   }
 

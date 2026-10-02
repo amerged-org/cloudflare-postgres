@@ -3,10 +3,12 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { createConnection, createServer, type Socket } from "node:net";
 import { test } from "node:test";
+import { encodeStartup } from "@pgcf/contracts/pg-wire";
 import { DatabaseCaCache } from "../../src/gateway/ca.ts";
 import { createPostgresDial } from "../../src/gateway/postgres.ts";
 import {
   client,
+  database,
   gatewayFor,
   listen,
   loopback,
@@ -14,6 +16,7 @@ import {
   postgresServer,
   rejection,
   token,
+  start,
   validCertificate,
 } from "./helpers.ts";
 
@@ -28,6 +31,7 @@ test("a concurrent replay storm cannot dial again or reclaim a live database slo
   });
   const route = await token();
   const socket = await open(port, route);
+  await start(socket);
   const statuses = await Promise.all(
     Array.from({ length: 24 }, () => rejection(port, route)),
   );
@@ -44,6 +48,7 @@ test("a concurrent replay storm cannot dial again or reclaim a live database slo
   assert.equal(await rejection(port, route), 403);
   assert.equal(postgres.handshakes(), 1);
   const next = await open(port);
+  await start(next);
   assert.equal(postgres.handshakes(), 2);
   const nextReleased = once(events, "conn_close");
   const nextClosed = once(next, "close");
@@ -88,6 +93,8 @@ test("a client disconnect cancels a pending PostgreSQL SSLRequest and releases i
     for (const peer of peers) peer.destroy();
     await new Promise<void>((resolve) => postgres.close(() => resolve()));
   });
+  await once(socket, "open");
+  socket.send(encodeStartup({ user: "app", database }));
   const peer = await requestReached;
   assert.equal(gateway.metrics.activeConnections, 1);
   assert.equal(await rejection(port, route), 429);

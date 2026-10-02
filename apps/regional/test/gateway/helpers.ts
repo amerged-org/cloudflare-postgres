@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+import assert from "node:assert/strict";
+import { encodeStartup } from "@pgcf/contracts/pg-wire";
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
@@ -184,6 +186,7 @@ export function token(
     keyring: master,
     region,
     db: database,
+    user: "app",
     cid: randomUUID(),
     ...overrides,
   });
@@ -208,9 +211,9 @@ export async function signedClaims(
   const signature = await crypto.subtle.sign(
     "HMAC",
     key,
-    Buffer.from(`pgcf-route/v1\n${payload}`),
+    Buffer.from(`pgcf-route/v2\n${payload}`),
   );
-  return `v1.${payload}.${Buffer.from(signature).toString("base64url")}`;
+  return `v2.${payload}.${Buffer.from(signature).toString("base64url")}`;
 }
 
 export function client(
@@ -258,4 +261,19 @@ export async function rejection(
       resolve(response.statusCode ?? 0);
     });
   });
+}
+
+export async function start(
+  socket: WebSocket,
+  params: Readonly<Record<string, string>> = { user: "app", database },
+): Promise<Buffer> {
+  const raw = Buffer.from(encodeStartup(params));
+  const received = once(socket, "message", {
+    signal: AbortSignal.timeout(5_000),
+  });
+  socket.send(raw);
+  const [data, binary] = await received;
+  assert.equal(binary, true);
+  assert.deepEqual(Buffer.from(data), raw);
+  return raw;
 }
