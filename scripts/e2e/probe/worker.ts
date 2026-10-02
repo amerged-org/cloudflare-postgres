@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Pool, neonConfig } from "@neondatabase/serverless";
 import { connect } from "cloudflare:sockets";
+import { credentialOccurrences } from "../src/audit.ts";
+import { workerScanUnsupported } from "../src/transport.ts";
 
 interface Env {
   PROBE_BEARER: string;
@@ -153,6 +155,8 @@ async function scan(
     Array.from({ length: Math.min(6, ports.length) }, async () => {
       while (next < ports.length) {
         const port = ports[next++]!;
+        if (workerScanUnsupported(port))
+          throw new Error("worker_scan_unavailable");
         const socket = connect({ hostname: host, port });
         let timer: ReturnType<typeof setTimeout> | undefined;
         // Attach the closed rejection handler before connect can fail.
@@ -168,11 +172,7 @@ async function scan(
           else timedOut++;
         } catch (error: unknown) {
           const message = String((error as { message?: string }).message ?? "");
-          if (
-            /TCP Loop|not allowed|disallowed|unsupported|too many|limit exceeded/i.test(
-              message,
-            )
-          )
+          if (workerScanUnsupported(port, message))
             throw new Error("worker_scan_unavailable");
         } finally {
           if (timer) clearTimeout(timer);
@@ -207,6 +207,40 @@ export default {
         return response({ pass: true });
       }
       const uri = await connection(env);
+      if (path === "/canary-audit") {
+        const input = (await request.json()) as {
+          d1: string;
+          passwords: string[];
+          tails: string[];
+        };
+        if (
+          typeof input.d1 !== "string" ||
+          input.d1.length > 2_000_000 ||
+          !Array.isArray(input.passwords) ||
+          input.passwords.length > 100 ||
+          !Array.isArray(input.tails) ||
+          input.tails.some((t) => typeof t !== "string" || t.length > 2_000_000)
+        )
+          throw new Error("audit_input_invalid");
+        const password = decodeURIComponent(new URL(uri).password);
+        const passwords = input.passwords.map((encoded) => atob(encoded));
+        const counts = {
+          d1_plaintext_occurrences: credentialOccurrences(password, [input.d1]),
+          tail_plaintext_occurrences: credentialOccurrences(
+            password,
+            input.tails,
+          ),
+          matching_basic_auth_secrets: passwords.filter((p) => p === password)
+            .length,
+        };
+        return response({
+          pass:
+            counts.d1_plaintext_occurrences === 0 &&
+            counts.tail_plaintext_occurrences === 0 &&
+            counts.matching_basic_auth_secrets === 1,
+          counts,
+        });
+      }
       if (path === "/metadata")
         return response({
           includes_password: true,
@@ -216,7 +250,9 @@ export default {
       if (path === "/exercise")
         return response({ pass: true, timings: await exercise(uri) });
       return response({ code: "not_found" }, 404);
-    } catch {
+    } catch (error: unknown) {
+      if (error instanceof Error && error.message === "worker_scan_unavailable")
+        return response({ code: "worker_scan_unavailable" }, 503);
       return response({ code: "probe_failed" }, 500);
     }
   },

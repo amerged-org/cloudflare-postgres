@@ -21,6 +21,12 @@ import {
 } from "../src/phase0-accept.ts";
 import { quantityBytes, vgSamples } from "../src/clients.ts";
 import { networkingAudit } from "../src/security.ts";
+import { credentialOccurrences, redactKnownCredentials } from "../src/audit.ts";
+import { currentSnapshot } from "./chaos-relay.ts";
+import { chaosEgressPolicy } from "../src/security.ts";
+import { restartSummary } from "../src/restarts.ts";
+import { workerScanUnsupported } from "../src/transport.ts";
+import { liveArchiveCounts } from "../src/core.ts";
 
 test("TCP scanner finds a real open listener and excludes a closed port", async () => {
   const host = [127, 0, 0, 1].join(".");
@@ -95,6 +101,88 @@ test("ownership is both prefixed and exact", () => {
     assert.throws(() => assertOwned(name, "pgcf-e2e-test"));
 });
 
+test("canary audit counts plaintext occurrences without returning the credential", () => {
+  const canary = randomBytes(32).toString("base64url");
+  assert.equal(
+    credentialOccurrences(canary, [
+      canary,
+      `prefix${canary}suffix`,
+      "encrypted",
+    ]),
+    2,
+  );
+  assert.equal(
+    credentialOccurrences(canary, [randomBytes(48).toString("base64url")]),
+    0,
+  );
+  assert.throws(() => credentialOccurrences("", ["text"]));
+});
+
+test("trace redaction removes operator credentials while preserving the unknown canary", () => {
+  const operator = randomBytes(32).toString("base64url"),
+    canary = randomBytes(32).toString("base64url");
+  const redacted = redactKnownCredentials(`${operator} ${canary} ${operator}`, [
+    operator,
+  ]);
+  assert(!redacted.includes(operator));
+  assert(redacted.includes(canary));
+});
+
+test("test-only relay expires real snapshots rather than manufacturing a replacement", () => {
+  const snapshot = {
+    body: randomBytes(32).toString("base64url"),
+    captured_at: 1000,
+  };
+  assert.equal(currentSnapshot(snapshot, 1001), snapshot.body);
+  assert.throws(() => currentSnapshot(snapshot, 901001));
+  assert.throws(() => currentSnapshot(undefined, 1001));
+});
+
+test("chaos policy allows only the exact relay FQDN and labelled agent", () => {
+  const policy = chaosEgressPolicy(
+    "pgcf-e2e-policy",
+    "pgcf-system",
+    "pgcf-agent",
+    "pgcf-e2e-relay.test.workers.dev",
+    "pgcf-e2e-run",
+  );
+  const spec = policy.spec as { endpointSelector: unknown; egress: unknown };
+  assert.deepEqual(spec.endpointSelector, {
+    matchLabels: { "app.kubernetes.io/name": "pgcf-agent" },
+  });
+  assert.deepEqual(spec.egress, [
+    {
+      toFQDNs: [{ matchName: "pgcf-e2e-relay.test.workers.dev" }],
+      toPorts: [{ ports: [{ port: "443", protocol: "TCP" }] }],
+    },
+  ]);
+  assert.throws(() =>
+    chaosEgressPolicy(
+      "pgcf-e2e-policy",
+      "pgcf-system",
+      "pgcf-agent",
+      "*.workers.dev",
+      "pgcf-e2e-run",
+    ),
+  );
+});
+
+test("restart summary requires five distinct real-run ledgers with both interruption checks", () => {
+  const identity = randomBytes(32).toString("hex");
+  const ledgers = Array.from({ length: 5 }, (_, i) => ({
+    version: 1,
+    run_id: `${"1".repeat(14)}-${String(i).padStart(6, "0")}`,
+    identity,
+    completed: ["E1", "E5", "agent-restarted-create", "agent-restarted-delete"],
+  }));
+  assert.deepEqual(restartSummary(ledgers, identity), {
+    completed_create_delete_runs: 5,
+    agent_restarts: 10,
+  });
+  ledgers[0]!.completed.pop();
+  assert.throws(() => restartSummary(ledgers, identity));
+});
+
 test("percentiles use nearest rank, validate inputs and preserve the measurements", () => {
   const values = [9, 1, 5, 3];
   assert.equal(percentile(values, 50), 3);
@@ -132,6 +220,28 @@ test("R2 parser confines objects to the owned prefix and counts actual Barman ca
   );
   assert.throws(() =>
     parseArchiveObjects([{ key: `${prefix}backup.info`, size: -1 }], prefix),
+  );
+});
+
+test("live archive counters permit WAL to arrive between the two real listings", () => {
+  const id = `d${"a".repeat(19)}`;
+  const result = liveArchiveCounts(
+    { database_id: id, base_backup_count: 1, wal_count: 1, bytes: 30 },
+    id,
+    [
+      { key: "prefix/database/base/backup/backup.info", size: 10 },
+      { key: `prefix/database/wals/segment/${"0".repeat(24)}.gz`, size: 20 },
+      { key: `prefix/database/wals/segment/${"1".repeat(24)}.gz`, size: 20 },
+    ],
+  );
+  assert.equal(result.wal_count, 2);
+  assert.equal(result.api_wal_count, 1);
+  assert.throws(() =>
+    liveArchiveCounts(
+      { database_id: id, base_backup_count: -1, wal_count: 1 },
+      id,
+      [],
+    ),
   );
 });
 
@@ -238,4 +348,20 @@ test("network audit allows known platform host networking and rejects data/regio
       "pgcf-system",
     ),
   );
+});
+
+test("Worker platform restrictions cannot be counted as firewall rejection", () => {
+  assert.equal(workerScanUnsupported(25), true);
+  assert.equal(
+    workerScanUnsupported(443, "Connections to port 25 are prohibited"),
+    true,
+  );
+  assert.equal(
+    workerScanUnsupported(
+      443,
+      "proxy request failed, cannot connect to the specified address",
+    ),
+    true,
+  );
+  assert.equal(workerScanUnsupported(5432, "connection refused"), false);
 });

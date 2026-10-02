@@ -125,6 +125,28 @@ export function archiveCounts(
   };
 }
 
+export function liveArchiveCounts(
+  value: unknown,
+  databaseId: string,
+  objects: readonly ArchiveObject[],
+): Record<string, number> {
+  const summary = record(value),
+    counts = archiveCounts(objects);
+  if (
+    summary.database_id !== databaseId ||
+    !Number.isSafeInteger(summary.base_backup_count) ||
+    Number(summary.base_backup_count) < 0 ||
+    !Number.isSafeInteger(summary.wal_count) ||
+    Number(summary.wal_count) < 0
+  )
+    throw new HarnessError("archive_summary_mismatch");
+  return {
+    ...counts,
+    api_base_backup_count: Number(summary.base_backup_count),
+    api_wal_count: Number(summary.wal_count),
+  };
+}
+
 export function record(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value))
     throw new HarnessError("invalid_response");
@@ -163,6 +185,10 @@ const EVENTS = new Set([
   "archive_failure_start",
   "archive_failure_check",
   "error",
+  "canary_audit",
+  "restart_summary",
+  "chaos_start",
+  "chaos_check",
 ]);
 
 /** Evidence uses a positive schema; unknown fields and free text never cross this boundary. */

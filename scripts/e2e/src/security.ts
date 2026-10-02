@@ -7,6 +7,40 @@ import {
   record,
 } from "./core.ts";
 
+export function chaosEgressPolicy(
+  name: string,
+  namespace: string,
+  agentName: string,
+  host: string,
+  runName: string,
+): Record<string, unknown> {
+  if (!/^[a-z0-9-]+\.[a-z0-9-]+\.workers\.dev$/.test(host))
+    throw new HarnessError("relay_hostname_invalid");
+  return {
+    apiVersion: "cilium.io/v2",
+    kind: "CiliumNetworkPolicy",
+    metadata: {
+      name,
+      namespace,
+      labels: {
+        "app.kubernetes.io/part-of": "pgcf",
+        "pgcf.io/e2e-run": runName,
+      },
+    },
+    spec: {
+      endpointSelector: {
+        matchLabels: { "app.kubernetes.io/name": agentName },
+      },
+      egress: [
+        {
+          toFQDNs: [{ matchName: host }],
+          toPorts: [{ ports: [{ port: "443", protocol: "TCP" }] }],
+        },
+      ],
+    },
+  };
+}
+
 /** Cilium and Kubernetes control-plane host networking is platform infrastructure. */
 export function networkingAudit(
   workloads: readonly unknown[],

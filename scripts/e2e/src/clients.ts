@@ -28,19 +28,28 @@ function requestTimeout(deadline?: () => number): number {
 export async function command(
   program: string,
   args: readonly string[],
-  options: { cwd?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
+  options: {
+    cwd?: string;
+    env?: NodeJS.ProcessEnv;
+    timeoutMs?: number;
+    input?: string;
+  } = {},
 ): Promise<string> {
   return new Promise((resolve, reject) => {
     const child = spawn(program, [...args], {
       cwd: options.cwd,
       env: options.env ?? process.env,
-      stdio: ["ignore", "pipe", "pipe"],
+      stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       detached: true,
     });
     let stdout = "";
     let tooLarge = false;
     // Discard stderr: tools may include credentials or server-provided text in errors.
-    child.stderr.resume();
+    child.stderr!.resume();
+    if (options.input !== undefined) {
+      child.stdin?.on("error", () => undefined);
+      child.stdin?.end(options.input);
+    }
     const stop = () => {
       if (child.pid) {
         try {
@@ -54,7 +63,7 @@ export async function command(
       stop,
       Math.min(options.timeoutMs ?? 60_000, 540_000),
     );
-    child.stdout.on("data", (bytes: Buffer) => {
+    child.stdout!.on("data", (bytes: Buffer) => {
       stdout += bytes.toString();
       if (stdout.length > 16_000_000) {
         tooLarge = true;
@@ -285,6 +294,8 @@ export class Kubernetes {
         "services",
         "helmreleases.helm.toolkit.fluxcd.io",
         "storageclasses",
+        "replicasets",
+        "ciliumnetworkpolicies.cilium.io",
       ].includes(resource)
     )
       throw new HarnessError("read_scope_refused");
@@ -304,6 +315,295 @@ export class Kubernetes {
       await command("kubectl", args, {
         timeoutMs: requestTimeout(this.deadline),
       }),
+    );
+  }
+  async rolePasswords(namespace: string): Promise<string[]> {
+    assertOwned(namespace);
+    const args = [
+      "--kubeconfig",
+      this.configPath,
+      "--context",
+      this.context,
+      "--request-timeout=30s",
+      "get",
+      "secrets",
+      "--namespace",
+      namespace,
+      "--field-selector=type=kubernetes.io/basic-auth",
+      "-o",
+      "json",
+    ];
+    const secrets = items(
+      JSON.parse(
+        await command("kubectl", args, {
+          timeoutMs: requestTimeout(this.deadline),
+        }),
+      ),
+    );
+    return secrets.map((secret) => {
+      if (
+        record(secret.metadata).namespace !== namespace ||
+        secret.type !== "kubernetes.io/basic-auth"
+      )
+        throw new HarnessError("secret_scope_mismatch");
+      return string(record(secret.data).password);
+    });
+  }
+  async restartAgent(
+    namespace: string,
+    deploymentName: string,
+  ): Promise<string> {
+    assertOwned(namespace);
+    assertOwned(deploymentName);
+    const [deployments, replicaSets, pods] = await Promise.all([
+      this.read("deployments"),
+      this.read("replicasets"),
+      this.read("pods"),
+    ]);
+    const deploymentsInScope = items(deployments).filter(
+      (deployment) =>
+        record(deployment.metadata).namespace === namespace &&
+        objectName(deployment) === deploymentName,
+    );
+    if (deploymentsInScope.length !== 1)
+      throw new HarnessError("agent_deployment_missing");
+    const deployment = deploymentsInScope[0]!;
+    const uid = string(record(deployment.metadata).uid);
+    const sets = items(replicaSets).filter(
+      (set) =>
+        record(set.metadata).namespace === namespace &&
+        Array.isArray(record(set.metadata).ownerReferences) &&
+        (record(set.metadata).ownerReferences as unknown[])
+          .map(record)
+          .some(
+            (owner) =>
+              owner.kind === "Deployment" &&
+              owner.name === deploymentName &&
+              owner.uid === uid &&
+              owner.controller === true,
+          ),
+    );
+    const setIds = new Set(sets.map((set) => string(record(set.metadata).uid)));
+    const agents = items(pods).filter((pod) => {
+      const metadata = record(pod.metadata);
+      const labels = record(metadata.labels ?? {});
+      return (
+        metadata.namespace === namespace &&
+        labels["app.kubernetes.io/name"] === deploymentName &&
+        labels["app.kubernetes.io/part-of"] === "pgcf" &&
+        !metadata.deletionTimestamp &&
+        Array.isArray(metadata.ownerReferences) &&
+        metadata.ownerReferences
+          .map(record)
+          .some(
+            (owner) =>
+              owner.kind === "ReplicaSet" &&
+              setIds.has(string(owner.uid)) &&
+              owner.controller === true,
+          )
+      );
+    });
+    if (agents.length !== 1) throw new HarnessError("agent_pod_ambiguous");
+    const pod = agents[0]!,
+      name = objectName(pod),
+      podUid = string(record(pod.metadata).uid);
+    assertOwned(name);
+    const path = `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods/${encodeURIComponent(name)}`;
+    await command(
+      "kubectl",
+      [
+        "--kubeconfig",
+        this.configPath,
+        "--context",
+        this.context,
+        "--request-timeout=30s",
+        "delete",
+        "--raw",
+        path,
+        "-f",
+        "-",
+      ],
+      {
+        timeoutMs: requestTimeout(this.deadline),
+        input: JSON.stringify({
+          apiVersion: "v1",
+          kind: "DeleteOptions",
+          gracePeriodSeconds: 0,
+          preconditions: { uid: podUid },
+        }),
+      },
+    );
+    return podUid;
+  }
+  async agentSettings(
+    namespace: string,
+    deploymentName: string,
+  ): Promise<{
+    uid: string;
+    container: string;
+    override: Record<string, unknown> | null;
+  }> {
+    assertOwned(namespace);
+    assertOwned(deploymentName);
+    const deployment = items(await this.read("deployments")).find(
+      (object) =>
+        objectName(object) === deploymentName &&
+        record(object.metadata).namespace === namespace,
+    );
+    if (!deployment) throw new HarnessError("agent_deployment_missing");
+    const spec = record(record(record(deployment.spec).template).spec);
+    if (!Array.isArray(spec.containers))
+      throw new HarnessError("agent_container_missing");
+    const agent = spec.containers
+      .map(record)
+      .find((container) => container.name === "agent");
+    if (!agent) throw new HarnessError("agent_container_missing");
+    const variables = Array.isArray(agent.env) ? agent.env.map(record) : [];
+    const override =
+      variables.find((variable) => variable.name === "PGCF_API_URL") ?? null;
+    return {
+      uid: string(record(deployment.metadata).uid),
+      container: string(agent.name),
+      override,
+    };
+  }
+  async patchAgentUrl(
+    namespace: string,
+    deploymentName: string,
+    expectedUid: string,
+    container: string,
+    override: Record<string, unknown> | null,
+  ): Promise<void> {
+    assertOwned(namespace);
+    assertOwned(deploymentName);
+    const deployment = items(await this.read("deployments")).find(
+      (object) =>
+        objectName(object) === deploymentName &&
+        record(object.metadata).namespace === namespace,
+    );
+    if (!deployment || record(deployment.metadata).uid !== expectedUid)
+      throw new HarnessError("agent_identity_changed");
+    if (override && override.name !== "PGCF_API_URL")
+      throw new HarnessError("agent_patch_scope_refused");
+    const patch = {
+      metadata: {
+        resourceVersion: string(record(deployment.metadata).resourceVersion),
+      },
+      spec: {
+        template: {
+          spec: {
+            containers: [
+              {
+                name: container,
+                env: [override ?? { name: "PGCF_API_URL", $patch: "delete" }],
+              },
+            ],
+          },
+        },
+      },
+    };
+    await command(
+      "kubectl",
+      [
+        "--kubeconfig",
+        this.configPath,
+        "--context",
+        this.context,
+        "--request-timeout=30s",
+        "patch",
+        "deployment",
+        deploymentName,
+        "--namespace",
+        namespace,
+        "--type=strategic",
+        "--patch-file=/dev/stdin",
+      ],
+      {
+        timeoutMs: requestTimeout(this.deadline),
+        input: JSON.stringify(patch),
+      },
+    );
+  }
+  async applyPolicy(
+    policy: Record<string, unknown>,
+    name: string,
+    namespace: string,
+    runName: string,
+  ): Promise<void> {
+    assertOwned(name);
+    assertOwned(namespace);
+    assertOwned(runName);
+    const metadata = record(policy.metadata),
+      labels = record(metadata.labels);
+    if (
+      policy.apiVersion !== "cilium.io/v2" ||
+      policy.kind !== "CiliumNetworkPolicy" ||
+      metadata.name !== name ||
+      metadata.namespace !== namespace ||
+      labels["pgcf.io/e2e-run"] !== runName
+    )
+      throw new HarnessError("policy_scope_refused");
+    await command(
+      "kubectl",
+      [
+        "--kubeconfig",
+        this.configPath,
+        "--context",
+        this.context,
+        "--request-timeout=30s",
+        "apply",
+        "--server-side",
+        "--field-manager=pgcf-e2e",
+        "-f",
+        "-",
+      ],
+      {
+        timeoutMs: requestTimeout(this.deadline),
+        input: JSON.stringify(policy),
+      },
+    );
+  }
+  async deletePolicy(
+    name: string,
+    namespace: string,
+    runName: string,
+  ): Promise<void> {
+    assertOwned(name);
+    assertOwned(namespace);
+    assertOwned(runName);
+    const policy = items(
+      await this.read("ciliumnetworkpolicies.cilium.io"),
+    ).find(
+      (object) =>
+        objectName(object) === name &&
+        record(object.metadata).namespace === namespace,
+    );
+    if (!policy) return;
+    if (record(record(policy.metadata).labels)["pgcf.io/e2e-run"] !== runName)
+      throw new HarnessError("policy_scope_refused");
+    const path = `/apis/cilium.io/v2/namespaces/${encodeURIComponent(namespace)}/ciliumnetworkpolicies/${encodeURIComponent(name)}`;
+    await command(
+      "kubectl",
+      [
+        "--kubeconfig",
+        this.configPath,
+        "--context",
+        this.context,
+        "--request-timeout=30s",
+        "delete",
+        "--raw",
+        path,
+        "-f",
+        "-",
+      ],
+      {
+        timeoutMs: requestTimeout(this.deadline),
+        input: JSON.stringify({
+          apiVersion: "v1",
+          kind: "DeleteOptions",
+          preconditions: { uid: string(record(policy.metadata).uid) },
+        }),
+      },
     );
   }
 }

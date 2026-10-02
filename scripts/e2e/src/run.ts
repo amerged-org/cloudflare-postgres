@@ -24,7 +24,7 @@ import {
 import type { VgSample } from "./clients.ts";
 import {
   HarnessError,
-  archiveCounts,
+  liveArchiveCounts,
   assertOwned,
   assertRunId,
   evidence,
@@ -40,7 +40,10 @@ import {
 } from "./core.ts";
 import { cloudflareInventory } from "./phase0-accept.ts";
 import { assertOpenSubset, scanPorts } from "./scan.ts";
-import { networkingAudit } from "./security.ts";
+import { networkingAudit, chaosEgressPolicy } from "./security.ts";
+import { captureTrace } from "./trace.ts";
+import { restartSummary } from "./restarts.ts";
+import { redactKnownCredentials } from "./audit.ts";
 
 export const REQUIRED_ENV = [
   "CLOUDFLARE_ACCOUNT_ID",
@@ -89,6 +92,18 @@ interface Ledger {
   operator_scans: string[];
   scan_ranges: Record<string, [number, number][]>;
   archive_failure_started_at?: string;
+  tails: { worker: string; id: string }[];
+  chaos?: {
+    relay_name: string;
+    policy_name: string;
+    agent_name?: string;
+    settings?: {
+      uid: string;
+      container: string;
+      override: Record<string, unknown> | null;
+    };
+    inverse_needed: boolean;
+  };
 }
 
 function config(env: NodeJS.ProcessEnv): Config {
@@ -212,6 +227,7 @@ class Run {
   readonly api: ManagementApi;
   readonly kube: Kubernetes;
   readonly dir: string;
+  readonly stateDir: string;
   readonly runName: string;
   private deadline = Date.now() + 450_000;
   private probeHost?: string;
@@ -236,6 +252,7 @@ class Run {
       () => this.deadline,
     );
     this.dir = resolve(root, ".local", "evidence", "phase1", state.run_id);
+    this.stateDir = resolve(root, ".local", "state", "e2e", state.run_id);
     this.runName = `pgcf-e2e-${state.run_id}`;
     assertOwned(this.runName, state.worker_name);
     if (state.identity !== runIdentity(c))
@@ -243,8 +260,8 @@ class Run {
   }
   async save(): Promise<void> {
     if (this.dryRun) return;
-    await mkdir(this.dir, { recursive: true, mode: 0o700 });
-    const target = resolve(this.dir, "ledger.private.json");
+    await mkdir(this.stateDir, { recursive: true, mode: 0o700 });
+    const target = resolve(this.stateDir, "ledger.json");
     const temp = `${target}.tmp`;
     await writeFile(temp, JSON.stringify(this.state), { mode: 0o600 });
     await rename(temp, target);
@@ -290,7 +307,7 @@ class Run {
     if (!this.state.completed.includes(step))
       throw new HarnessError("previous_step_required");
   }
-  async verify(): Promise<void> {
+  async verifyIdentity(): Promise<void> {
     await this.cf.verifyAccount();
     const subdomain = string(
       record((await this.cf.request("/workers/subdomain")).result).subdomain,
@@ -307,6 +324,9 @@ class Run {
       )
         throw new HarnessError("api_worker_identity_mismatch");
     }
+  }
+  async verify(): Promise<void> {
+    await this.verifyIdentity();
     const regions = (await this.api.list("/v1/regions")).map((row) =>
       Region.parse(row),
     );
@@ -364,6 +384,7 @@ class Run {
     if (!this.state.baseline.length) this.state.baseline = baseline;
     if (!this.dryRun) {
       await this.complete("E0");
+      await mkdir(this.dir, { recursive: true, mode: 0o700 });
       // Only credential variable names and dates are stored, never credentials.
       await writeFile(
         resolve(this.dir, "credential-expiries.json"),
@@ -378,7 +399,7 @@ class Run {
   }
   async deployProbe(): Promise<void> {
     await this.intent("worker_create");
-    const configPath = resolve(this.dir, "wrangler.private.json");
+    const configPath = resolve(this.stateDir, "wrangler.json");
     await writeFile(
       configPath,
       JSON.stringify({
@@ -403,7 +424,8 @@ class Run {
       process.execPath,
       [wrangler, "deploy", "--config", configPath, "--keep-vars"],
       {
-        timeoutMs: 180_000,
+        timeoutMs: Math.min(180_000, this.deadline - Date.now()),
+        cwd: this.stateDir,
         env: {
           ...process.env,
           CI: "true",
@@ -422,6 +444,304 @@ class Run {
       text: value,
       type: "secret_text",
     });
+  }
+  async deployRelay(): Promise<void> {
+    const values = requireEnv(process.env, ["PGCF_E2E_AGENT_KEY"]);
+    if (
+      !this.c.credentialExpiries.some(
+        (entry) => entry.name === "PGCF_E2E_AGENT_KEY",
+      )
+    )
+      throw new HarnessError("credential_expiry_missing");
+    const relayName = `${this.runName}-relay`;
+    assertOwned(relayName);
+    this.state.chaos = {
+      relay_name: relayName,
+      policy_name: `${this.runName}-egress`,
+      inverse_needed: false,
+    };
+    await this.intent("relay_create");
+    const configPath = resolve(this.stateDir, "chaos-wrangler.json");
+    await writeFile(
+      configPath,
+      JSON.stringify({
+        name: relayName,
+        account_id: this.c.values.CLOUDFLARE_ACCOUNT_ID,
+        main: fileURLToPath(new URL("../test/chaos-relay.ts", import.meta.url)),
+        compatibility_date: "2026-10-01",
+        compatibility_flags: ["nodejs_compat"],
+        workers_dev: true,
+        observability: { enabled: false },
+        vars: { API_URL: this.c.apiUrl.href, RUN_NAME: this.runName },
+        durable_objects: {
+          bindings: [{ name: "RELAY", class_name: "ChaosRelay" }],
+        },
+        migrations: [{ tag: "initial", new_sqlite_classes: ["ChaosRelay"] }],
+      }),
+      { mode: 0o600 },
+    );
+    const wrangler = fileURLToPath(
+      new URL("../node_modules/wrangler/bin/wrangler.js", import.meta.url),
+    );
+    await command(
+      process.execPath,
+      [wrangler, "deploy", "--config", configPath],
+      {
+        cwd: this.stateDir,
+        timeoutMs: Math.min(180_000, this.deadline - Date.now()),
+        env: {
+          ...process.env,
+          CI: "true",
+          WRANGLER_SEND_METRICS: "false",
+          CLOUDFLARE_API_TOKEN: this.c.values.CLOUDFLARE_API_TOKEN!,
+          CLOUDFLARE_ACCOUNT_ID: this.c.values.CLOUDFLARE_ACCOUNT_ID!,
+        },
+      },
+    );
+    for (const [name, text] of [
+      ["PROBE_BEARER", this.c.values.PGCF_E2E_PROBE_BEARER!],
+      ["AGENT_KEY", values.PGCF_E2E_AGENT_KEY!],
+    ]) {
+      await this.intent("relay_secrets");
+      await this.cf.request(`/workers/scripts/${relayName}/secrets`, "PUT", {
+        name,
+        text,
+        type: "secret_text",
+      });
+    }
+    await this.relay("/control/capture-empty");
+    await this.complete("chaos-empty-captured");
+    await this.emit("chaos_start", { real_empty_snapshots: 1 });
+  }
+  async relayUrl(): Promise<URL> {
+    if (!this.state.chaos) throw new HarnessError("chaos_relay_required");
+    assertOwned(this.state.chaos.relay_name, `${this.runName}-relay`);
+    const subdomain = string(
+      record((await this.cf.request("/workers/subdomain")).result).subdomain,
+    );
+    return new URL(
+      `https://${this.state.chaos.relay_name}.${subdomain}.workers.dev`,
+    );
+  }
+  async relay(path: string, body?: unknown): Promise<Record<string, unknown>> {
+    const reply = await fetch(new URL(path, await this.relayUrl()), {
+      method: "POST",
+      redirect: "error",
+      signal: AbortSignal.timeout(Math.min(30_000, this.deadline - Date.now())),
+      headers: {
+        Authorization: `Bearer ${this.c.values.PGCF_E2E_PROBE_BEARER}`,
+        "Content-Type": "application/json",
+      },
+      ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+    });
+    if (!reply.ok)
+      throw new HarnessError("real_chaos_snapshot_or_relay_unavailable");
+    return record(await reply.json());
+  }
+  async startChaos(): Promise<void> {
+    this.requireStep("E1");
+    this.requireStep("chaos-empty-captured");
+    await this.verify();
+    const chaos = this.state.chaos!;
+    const name = requireEnv(process.env, [
+      "PGCF_E2E_AGENT_DEPLOYMENT_NAME",
+    ]).PGCF_E2E_AGENT_DEPLOYMENT_NAME!;
+    const namespace = this.c.values.PGCF_E2E_REGIONAL_NAMESPACE!;
+    const settings = await this.kube.agentSettings(namespace, name);
+    if (
+      settings.override &&
+      (typeof settings.override.value !== "string" ||
+        httpsUrl(settings.override.value).href !== this.c.apiUrl.href)
+    )
+      throw new HarnessError("agent_original_api_mismatch");
+    chaos.agent_name = name;
+    chaos.settings = settings;
+    const url = await this.relayUrl();
+    await this.intent("chaos_policy_create");
+    await this.kube.applyPolicy(
+      chaosEgressPolicy(
+        chaos.policy_name,
+        namespace,
+        name,
+        url.hostname,
+        this.runName,
+      ),
+      chaos.policy_name,
+      namespace,
+      this.runName,
+    );
+    // Record the inverse before replacing the real deployment's URL.
+    chaos.inverse_needed = true;
+    await this.intent("chaos_agent_patch");
+    await this.kube.patchAgentUrl(
+      namespace,
+      name,
+      settings.uid,
+      settings.container,
+      { name: "PGCF_API_URL", value: url.href.replace(/\/$/, "") },
+    );
+    await poll(
+      () => this.relay("/control/counts"),
+      (counts) => Number(counts.pulls) > 0 && Number(counts.observations) > 0,
+      90_000,
+    );
+    await this.complete("chaos-started");
+    await this.emit("chaos_start", {
+      agent_patches: 1,
+      exact_fqdn_policies: 1,
+    });
+  }
+  async restoreChaos(): Promise<void> {
+    const chaos = this.state.chaos;
+    if (!chaos) return;
+    const namespace = this.c.values.PGCF_E2E_REGIONAL_NAMESPACE!;
+    if (chaos.inverse_needed) {
+      if (!chaos.settings || !chaos.agent_name)
+        throw new HarnessError("chaos_inverse_missing");
+      const current = await this.kube.agentSettings(
+        namespace,
+        chaos.agent_name,
+      );
+      const expected = (await this.relayUrl()).href.replace(/\/$/, "");
+      const originalRestored =
+        current.override === null
+          ? chaos.settings.override === null
+          : current.override.name === chaos.settings.override?.name &&
+            current.override.value === chaos.settings.override?.value;
+      if (
+        current.uid !== chaos.settings.uid ||
+        (!originalRestored && current.override?.value !== expected)
+      )
+        throw new HarnessError("agent_inverse_conflict");
+      if (!originalRestored) {
+        await this.intent("chaos_agent_restore");
+        await this.kube.patchAgentUrl(
+          namespace,
+          chaos.agent_name,
+          chaos.settings.uid,
+          chaos.settings.container,
+          chaos.settings.override,
+        );
+      }
+      chaos.inverse_needed = false;
+      await this.save();
+      await poll(
+        () => this.kube.read("deployments"),
+        (value) =>
+          items(value).some(
+            (deployment) =>
+              objectName(deployment) === chaos.agent_name &&
+              record(deployment.metadata).namespace === namespace &&
+              record(deployment.status).observedGeneration ===
+                record(deployment.metadata).generation &&
+              Number(record(deployment.status).availableReplicas) ===
+                Number(record(deployment.spec).replicas),
+          ),
+        60_000,
+      );
+    }
+    await this.intent("chaos_policy_delete");
+    await this.kube.deletePolicy(chaos.policy_name, namespace, this.runName);
+  }
+  async checkChaos(): Promise<void> {
+    this.requireStep("chaos-started");
+    const chaos = this.state.chaos!;
+    const namespace = `pgcf-db-${this.state.database_id}`;
+    const before = items(await this.kube.read("namespaces")).find(
+      (ns) => objectName(ns) === namespace,
+    );
+    if (!before) throw new HarnessError("run_namespace_missing");
+    const uid = string(record(before.metadata).uid);
+    const assertPreserved = async () => {
+      const resource = items(await this.kube.read("namespaces")).find(
+        (ns) => objectName(ns) === namespace,
+      );
+      if (
+        !resource ||
+        record(resource.metadata).uid !== uid ||
+        record(resource.metadata).deletionTimestamp
+      )
+        throw new HarnessError("chaos_deleted_database");
+      const database = Database.parse(
+        await this.api.request(`/v1/databases/${this.state.database_id}`),
+      );
+      if (
+        database.desired_state !== "running" ||
+        database.observed_state === "deleted" ||
+        database.observed_generation < database.generation
+      )
+        throw new HarnessError("chaos_generation_regressed");
+    };
+    try {
+      const baseline = Database.parse(
+        await this.api.request(`/v1/databases/${this.state.database_id}`),
+      );
+      for (const mode of ["empty", "failure"] as const) {
+        const counts = await this.relay("/control/counts");
+        await this.relay("/control/mode", { mode });
+        await this.kube.restartAgent(
+          this.c.values.PGCF_E2E_REGIONAL_NAMESPACE!,
+          chaos.agent_name!,
+        );
+        await poll(
+          () => this.relay("/control/counts"),
+          (value) => Number(value.pulls) > Number(counts.pulls),
+          60_000,
+        );
+        await assertPreserved();
+        await this.relay("/control/mode", { mode: "pass" });
+      }
+      await this.relay("/control/capture-older", {
+        database_id: this.state.database_id,
+      });
+      await this.intent("chaos_real_password_rotation");
+      await this.api.request(
+        `/v1/databases/${this.state.database_id}/roles/app/reset-password`,
+        "POST",
+        undefined,
+        `${this.state.run_id}-chaos-rotate`,
+      );
+      await this.relay("/control/capture-fresh");
+      await poll(
+        async () =>
+          Database.parse(
+            await this.api.request(`/v1/databases/${this.state.database_id}`),
+          ),
+        (database) =>
+          database.generation > baseline.generation &&
+          database.observed_generation === database.generation &&
+          database.observed_state === "ready",
+        90_000,
+      );
+      for (const mode of ["older", "out_of_order"] as const) {
+        const counts = await this.relay("/control/counts");
+        await this.relay("/control/mode", { mode });
+        await this.kube.restartAgent(
+          this.c.values.PGCF_E2E_REGIONAL_NAMESPACE!,
+          chaos.agent_name!,
+        );
+        await poll(
+          () => this.relay("/control/counts"),
+          (value) =>
+            Number(value.pulls) >=
+            Number(counts.pulls) + (mode === "out_of_order" ? 2 : 1),
+          mode === "out_of_order" ? 135_000 : 60_000,
+        );
+        await assertPreserved();
+        await this.relay("/control/mode", { mode: "pass" });
+      }
+      const counts = await this.relay("/control/counts");
+      if (
+        Number(counts.regressed_generations) !== 0 ||
+        Number(counts.replayed) < 4 ||
+        Number(counts.transport_failures) < 1
+      )
+        throw new HarnessError("chaos_evidence_incomplete");
+      await this.complete("chaos-checked");
+      await this.emit("chaos_check", counts as Record<string, number>);
+    } finally {
+      await this.restoreChaos();
+    }
   }
   async probe(path: string, body?: unknown): Promise<Record<string, unknown>> {
     if (!this.probeHost) {
@@ -442,10 +762,15 @@ class Run {
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
-    if (!reply.ok) throw new HarnessError("probe_request_failed");
+    if (!reply.ok) {
+      const result = record(await reply.json());
+      if (result.code === "worker_scan_unavailable")
+        throw new HarnessError("supplemental_external_tcp_probe_required");
+      throw new HarnessError("probe_request_failed");
+    }
     return record(await reply.json());
   }
-  async create(): Promise<void> {
+  async create(restartAgent = false): Promise<void> {
     this.requireStep("E0");
     await this.verify();
     const started = Date.now();
@@ -488,6 +813,7 @@ class Run {
       region_id: this.c.values.PGCF_E2E_REGION_ID,
       size_class_id: "small",
     };
+    const databaseStarted = Date.now();
     const created = DatabaseWithOperation.parse(
       await this.api.request(
         "/v1/databases",
@@ -502,6 +828,7 @@ class Run {
     this.state.database_id = created.database.id;
     this.state.operation_id = created.operation.id;
     await this.save();
+    if (restartAgent) await this.restartAgent("create");
     const replay = DatabaseWithOperation.parse(
       await this.api.request(
         "/v1/databases",
@@ -528,6 +855,7 @@ class Run {
       (operation) => operation.status === "succeeded",
       240_000,
     );
+    const readyMs = Date.now() - databaseStarted;
     const database = Database.parse(
       await this.api.request(`/v1/databases/${created.database.id}`),
     );
@@ -552,7 +880,11 @@ class Run {
     );
     await this.captureStorage();
     await this.complete("E1");
-    await this.emit("E1", { databases: 1 }, { ready_ms: Date.now() - started });
+    await this.emit(
+      "E1",
+      { databases: 1 },
+      { ready_ms: readyMs, e1_ms: Date.now() - started },
+    );
   }
   async metadata(): Promise<void> {
     this.requireStep("E1");
@@ -564,6 +896,8 @@ class Run {
     if (
       admin.includes_password ||
       uri.password ||
+      admin.role !== "app" ||
+      decodeURIComponent(uri.username) !== "app" ||
       admin.host !== this.c.values.PGCF_E2E_ENDPOINT_HOST ||
       uri.hostname !== admin.host ||
       admin.database !== id ||
@@ -591,6 +925,123 @@ class Run {
       record(result.timings) as Record<string, number>,
     );
   }
+  async audit(): Promise<void> {
+    this.requireStep("E3");
+    await this.verify();
+    const edgeName = requireEnv(process.env, [
+      "PGCF_E2E_EDGE_WORKER_NAME",
+    ]).PGCF_E2E_EDGE_WORKER_NAME!;
+    assertOwned(edgeName);
+    if (!/(?:-dev|-test)$/.test(edgeName))
+      throw new HarnessError("dev_worker_required");
+    const domains = await this.cf.list("/workers/domains");
+    if (
+      !domains.some(
+        (domain) =>
+          domain.hostname === this.c.values.PGCF_E2E_ENDPOINT_HOST &&
+          domain.service === edgeName,
+      )
+    )
+      throw new HarnessError("edge_worker_identity_mismatch");
+    const settings = record(
+      (
+        await this.cf.request(
+          `/workers/scripts/${this.c.values.PGCF_E2E_API_WORKER_NAME}/settings`,
+        )
+      ).result,
+    );
+    if (!Array.isArray(settings.bindings))
+      throw new HarnessError("d1_binding_missing");
+    const binding = settings.bindings
+      .map(record)
+      .find((row) => row.type === "d1" && row.name === "DB");
+    if (!binding) throw new HarnessError("d1_binding_missing");
+    const d1Id = string(binding.id);
+    const d1Metadata = record(
+      (await this.cf.request(`/d1/database/${encodeURIComponent(d1Id)}`))
+        .result,
+    );
+    assertOwned(string(d1Metadata.name));
+    const d1 = (
+      await this.cf.request(
+        `/d1/database/${encodeURIComponent(d1Id)}/query`,
+        "POST",
+        {
+          sql: "SELECT database_id, name, password_ciphertext, password_iv, password_kid FROM roles WHERE database_id = ?",
+          params: [this.state.database_id],
+        },
+      )
+    ).result;
+    if (
+      !Array.isArray(d1) ||
+      !d1.length ||
+      !Array.isArray(record(d1[0]).results) ||
+      (record(d1[0]).results as unknown[]).length < 1
+    )
+      throw new HarnessError("d1_roles_missing");
+    const passwords = await this.kube.rolePasswords(
+      `pgcf-db-${this.state.database_id}`,
+    );
+    const tails: string[] = [];
+    for (const worker of [this.c.values.PGCF_E2E_API_WORKER_NAME!, edgeName]) {
+      await this.intent("tail_create");
+      const messages = await captureTrace(
+        this.cf,
+        worker,
+        () =>
+          worker === edgeName
+            ? this.probe("/exercise")
+            : this.api.request(
+                `/v1/databases/${this.state.database_id}/roles/app/connection-uri`,
+              ),
+        async (id) => {
+          this.state.tails.push({ worker, id });
+          await this.save();
+        },
+      );
+      tails.push(
+        ...messages.map((message) =>
+          redactKnownCredentials(message, [
+            this.c.values.CLOUDFLARE_API_TOKEN!,
+            this.c.values.PGCF_E2E_ADMIN_KEY!,
+            this.c.values.PGCF_E2E_PROBE_BEARER!,
+            process.env.PGCF_E2E_AGENT_KEY ?? "",
+          ]),
+        ),
+      );
+    }
+    const result = await this.probe("/canary-audit", {
+      d1: JSON.stringify(d1),
+      passwords,
+      tails,
+    });
+    if (result.pass !== true) throw new HarnessError("canary_plaintext_leak");
+    await this.complete("canary-audit");
+    await this.emit("canary_audit", {
+      ...(record(result.counts) as Record<string, number>),
+      trace_events: tails.length,
+    });
+  }
+  async restartAgent(stage: "create" | "delete"): Promise<void> {
+    const name = requireEnv(process.env, [
+      "PGCF_E2E_AGENT_DEPLOYMENT_NAME",
+    ]).PGCF_E2E_AGENT_DEPLOYMENT_NAME!;
+    assertOwned(name);
+    const database = Database.parse(
+      await this.api.request(`/v1/databases/${this.state.database_id}`),
+    );
+    if (
+      (stage === "create" && database.observed_state === "ready") ||
+      (stage === "delete" && database.observed_state === "deleted")
+    )
+      throw new HarnessError("restart_window_missed");
+    await this.intent(`agent_restart_${stage}`);
+    await this.kube.restartAgent(
+      this.c.values.PGCF_E2E_REGIONAL_NAMESPACE!,
+      name,
+    );
+    await this.complete(`agent-restarted-${stage}`);
+  }
   async backups(): Promise<void> {
     this.requireStep("E3");
     const classes = (await this.api.list("/v1/size-classes")).map((row) =>
@@ -613,16 +1064,13 @@ class Run {
           `${this.c.values.PGCF_E2E_REGION_ID}/${this.state.database_id}/`,
           this.c.jurisdiction,
         );
-        const counts = archiveCounts(objects);
-        if (
-          summary.database_id !== this.state.database_id ||
-          summary.base_backup_count !== counts.base_backup_count ||
-          summary.wal_count !== counts.wal_count
-        )
-          throw new HarnessError("archive_summary_mismatch");
-        return counts;
+        return liveArchiveCounts(summary, this.state.database_id!, objects);
       },
-      (counts) => counts.base_backup_count! >= 1 && counts.wal_count! >= 1,
+      (counts) =>
+        counts.base_backup_count! >= 1 &&
+        counts.wal_count! >= 1 &&
+        counts.api_base_backup_count! >= 1 &&
+        counts.api_wal_count! >= 1,
       timeout,
     );
     await this.complete("E4");
@@ -707,7 +1155,7 @@ class Run {
         );
     return !storageRemains && freeRestored;
   }
-  async deleteDatabase(): Promise<void> {
+  async deleteDatabase(restartAgent = false): Promise<void> {
     if (!this.state.database_id) return;
     const database = Database.parse(
       await this.api.request(`/v1/databases/${this.state.database_id}`),
@@ -724,6 +1172,7 @@ class Run {
         undefined,
         `${this.state.run_id}-delete`,
       );
+      if (restartAgent) await this.restartAgent("delete");
       await poll(
         async () =>
           Database.parse(
@@ -746,11 +1195,11 @@ class Run {
       this.c.jurisdiction,
     );
   }
-  async deletion(): Promise<void> {
+  async deletion(restartAgent = false): Promise<void> {
     this.requireStep("E4");
     await this.verify();
     const started = Date.now();
-    await this.deleteDatabase();
+    await this.deleteDatabase(restartAgent);
     const refusal = await this.probe("/refusal");
     if (refusal.pass !== true)
       throw new HarnessError("deleted_database_accepted");
@@ -907,9 +1356,33 @@ class Run {
   }
   async cleanup(): Promise<void> {
     this.deadline = Date.now() + 120_000;
-    await this.verify();
+    await this.verifyIdentity();
     await this.recoverOwnership();
     const failures: string[] = [];
+    // The real agent must use the real API before any database deletion is requested.
+    try {
+      await this.restoreChaos();
+    } catch {
+      await this.emit("cleanup", { failure_count: 1 }, {}, false);
+      throw new HarnessError("chaos_inverse_required");
+    }
+    for (const tail of this.state.tails) {
+      try {
+        assertOwned(tail.worker);
+        const existing = await this.cf.list(
+          `/workers/scripts/${tail.worker}/tails`,
+        );
+        if (existing.some((row) => row.id === tail.id)) {
+          await this.intent("tail_delete");
+          await this.cf.request(
+            `/workers/scripts/${tail.worker}/tails/${encodeURIComponent(tail.id)}`,
+            "DELETE",
+          );
+        }
+      } catch {
+        failures.push("tail");
+      }
+    }
     try {
       await this.deleteDatabase();
     } catch {
@@ -956,6 +1429,17 @@ class Run {
     }
     try {
       const workers = await this.cf.list("/workers/scripts");
+      if (
+        this.state.chaos &&
+        workers.some((worker) => worker.id === this.state.chaos!.relay_name)
+      ) {
+        assertOwned(this.state.chaos.relay_name, `${this.runName}-relay`);
+        await this.intent("relay_delete");
+        await this.cf.request(
+          `/workers/scripts/${this.state.chaos.relay_name}`,
+          "DELETE",
+        );
+      }
       if (workers.some((worker) => worker.id === this.runName)) {
         await this.intent("worker_delete");
         await this.cf.request(`/workers/scripts/${this.runName}`, "DELETE");
@@ -1001,11 +1485,17 @@ export async function main(
     "--run-id",
     "--step",
     "--scan-address-index",
+    "--restart-agent",
+    "--chaos",
+    "--restart-summary",
+    "--run-ids",
   ]);
   for (let i = 0; i < args.length; i++) {
     const flag = args[i]!;
     if (!known.has(flag)) throw new HarnessError("invalid_arguments");
-    if (["--run-id", "--step", "--scan-address-index"].includes(flag)) {
+    if (
+      ["--run-id", "--step", "--scan-address-index", "--run-ids"].includes(flag)
+    ) {
       if (!args[++i] || args[i]!.startsWith("--"))
         throw new HarnessError("invalid_arguments");
     }
@@ -1022,19 +1512,47 @@ export async function main(
       "E6",
       "archive-failure-start",
       "archive-failure-check",
+      "canary-audit",
+      "chaos-start",
+      "chaos-check",
     ].includes(step)
   )
     throw new HarnessError("invalid_step");
   const c = config(env);
   const root = (await command("git", ["rev-parse", "--show-toplevel"])).trim();
-  const path = resolve(
-    root,
-    ".local",
-    "evidence",
-    "phase1",
-    runId,
-    "ledger.private.json",
-  );
+  if (args.includes("--restart-summary")) {
+    if (
+      dryRun ||
+      cleanupOnly ||
+      args.includes("--chaos") ||
+      args.includes("--restart-agent")
+    )
+      throw new HarnessError("conflicting_arguments");
+    const ids = (value("--run-ids") ?? "").split(",");
+    ids.forEach(assertRunId);
+    const ledgers = await Promise.all(
+      ids.map(
+        async (id) =>
+          JSON.parse(
+            await readFile(
+              resolve(root, ".local", "state", "e2e", id, "ledger.json"),
+              "utf8",
+            ),
+          ) as unknown,
+      ),
+    );
+    console.log(
+      JSON.stringify(
+        evidence({
+          event: "restart_summary",
+          pass: true,
+          counts: restartSummary(ledgers, runIdentity(c)),
+        }),
+      ),
+    );
+    return;
+  }
+  const path = resolve(root, ".local", "state", "e2e", runId, "ledger.json");
   let state: Ledger;
   try {
     state = JSON.parse(await readFile(path, "utf8")) as Ledger;
@@ -1049,7 +1567,8 @@ export async function main(
       !Array.isArray(state.lvm_volumes) ||
       !Array.isArray(state.scans) ||
       !Array.isArray(state.operator_scans) ||
-      !state.scan_ranges
+      !state.scan_ranges ||
+      !Array.isArray(state.tails)
     )
       throw new HarnessError("invalid_run_ledger");
   } catch (error: unknown) {
@@ -1072,9 +1591,12 @@ export async function main(
       scans: [],
       operator_scans: [],
       scan_ranges: {},
+      tails: [],
     };
   }
   const run = new Run(c, state, root, dryRun);
+  if (!dryRun && !cleanupOnly && step === "E0" && state.intents.length)
+    throw new HarnessError("mutated_run_requires_resume_or_cleanup");
   if (dryRun) {
     await run.preflight();
     return;
@@ -1088,12 +1610,20 @@ export async function main(
   const addressIndex = value("--scan-address-index");
   let preserve = false;
   try {
-    if (!step || step === "E0") await run.preflight();
-    if (!step || step === "E1") await run.create();
+    if (!step || step === "E0") {
+      await run.preflight();
+      if (args.includes("--chaos")) await run.deployRelay();
+    }
+    if (!step || step === "E1")
+      await run.create(args.includes("--restart-agent"));
     if (!step || step === "E2") await run.metadata();
     if (!step || step === "E3") await run.exercise();
     if (!step || step === "E4") await run.backups();
-    if (!step || step === "E5") await run.deletion();
+    if (!step || step === "E5")
+      await run.deletion(args.includes("--restart-agent"));
+    if (step === "canary-audit") await run.audit();
+    if (step === "chaos-start") await run.startChaos();
+    if (step === "chaos-check") await run.checkChaos();
     if (!step || step === "E6") {
       if (
         !(await run.scan(

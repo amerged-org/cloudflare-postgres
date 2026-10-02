@@ -1,0 +1,17 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "pgcf-e2e-chaos",
+  "main": "chaos-relay.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": false },
+  "vars": {
+    "API_URL": "https://pgcf-api.example.invalid",
+    "RUN_NAME": "pgcf-e2e-run",
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "RELAY", "class_name": "ChaosRelay" }],
+  },
+  "migrations": [{ "tag": "initial", "new_sqlite_classes": ["ChaosRelay"] }],
+}
