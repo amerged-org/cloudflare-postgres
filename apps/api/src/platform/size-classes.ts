@@ -37,7 +37,7 @@ export async function upsertSizeClass(
     replay: read,
     execute: async (lease) => {
       const now = new Date().toISOString();
-      await c.env.DB.batch([
+      const results = await c.env.DB.batch([
         c.env.DB.prepare(
           `INSERT INTO size_classes
           (id, memory_mib, cpu_millicores, storage_gib, max_connections, sleep_after_seconds,
@@ -46,7 +46,15 @@ export async function upsertSizeClass(
           ON CONFLICT(id) DO UPDATE SET memory_mib = excluded.memory_mib, cpu_millicores = excluded.cpu_millicores,
             storage_gib = excluded.storage_gib, max_connections = excluded.max_connections,
             sleep_after_seconds = excluded.sleep_after_seconds, archive_timeout_seconds = excluded.archive_timeout_seconds,
-            backup_retention_days = excluded.backup_retention_days, enabled = excluded.enabled, updated_at = excluded.updated_at`,
+            backup_retention_days = excluded.backup_retention_days, enabled = excluded.enabled, updated_at = excluded.updated_at
+          WHERE NOT EXISTS (SELECT 1 FROM databases WHERE size_class_id = size_classes.id)
+            OR (size_classes.memory_mib IS excluded.memory_mib
+              AND size_classes.cpu_millicores IS excluded.cpu_millicores
+              AND size_classes.storage_gib IS excluded.storage_gib
+              AND size_classes.max_connections IS excluded.max_connections
+              AND size_classes.sleep_after_seconds IS excluded.sleep_after_seconds
+              AND size_classes.archive_timeout_seconds IS excluded.archive_timeout_seconds
+              AND size_classes.backup_retention_days IS excluded.backup_retention_days)`,
         ).bind(
           id,
           body.memory_mib,
@@ -60,8 +68,16 @@ export async function upsertSizeClass(
           now,
           now,
         ),
-        lease.completeStatement(id, 200),
+        lease.completeStatement(id, 200, {
+          sql: "changes() = 1",
+          bindings: [],
+        }),
       ]);
+      if (results[0]!.meta.changes === 0)
+        throw new ApiError(
+          "conflict",
+          "Referenced size class settings are immutable; create a new size class to change resources or policies",
+        );
       return read();
     },
   });

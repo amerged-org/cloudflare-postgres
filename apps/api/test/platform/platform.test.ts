@@ -700,6 +700,179 @@ describe("API platform on real Workers D1", () => {
     });
   });
 
+  it("keeps referenced size resources and policies immutable while allowing enable toggles and replay", async () => {
+    const admin = await bootstrap();
+    const owned = await project(admin.key);
+    const worker = app();
+    const region = regionBody();
+    expect(
+      (
+        await worker.fetch(
+          request("/v1/regions", admin.key, "POST", region),
+          env,
+        )
+      ).status,
+    ).toBe(201);
+    const originalKey = crypto.randomUUID();
+    expect(
+      (
+        await worker.fetch(
+          request(
+            "/v1/size-classes/small",
+            admin.key,
+            "PUT",
+            size,
+            originalKey,
+          ),
+          env,
+        )
+      ).status,
+    ).toBe(200);
+    const database = newDatabaseId();
+    const now = new Date().toISOString();
+    await env.DB.prepare(
+      `INSERT INTO databases
+      (id, project_id, region_id, name, size_class_id, desired_state, observed_state, archive_path, created_at, updated_at)
+      VALUES (?, ?, ?, ?, 'small', 'running', 'pending', ?, ?, ?)`,
+    )
+      .bind(
+        database,
+        owned.id,
+        region.id,
+        "referenced",
+        `s3://${region.backup_bucket}/${region.id}/${database}/archive`,
+        now,
+        now,
+      )
+      .run();
+    const resourceMutation = await worker.fetch(
+      request(
+        "/v1/size-classes/small",
+        admin.key,
+        "PUT",
+        { ...size, memory_mib: 1024 },
+        crypto.randomUUID(),
+      ),
+      env,
+    );
+    expect(resourceMutation.status).toBe(409);
+    expect(await errorCode(resourceMutation)).toBe("conflict");
+    const policyMutation = await worker.fetch(
+      request(
+        "/v1/size-classes/small",
+        admin.key,
+        "PUT",
+        { ...size, archive_timeout_seconds: 60 },
+        crypto.randomUUID(),
+      ),
+      env,
+    );
+    expect(policyMutation.status).toBe(409);
+    expect(await errorCode(policyMutation)).toBe("conflict");
+    expect(
+      (
+        await worker.fetch(
+          request(
+            "/v1/size-classes/small",
+            admin.key,
+            "PUT",
+            size,
+            originalKey,
+          ),
+          env,
+        )
+      ).status,
+    ).toBe(200);
+    const toggleKey = crypto.randomUUID();
+    const disabled = await worker.fetch(
+      request(
+        "/v1/size-classes/small",
+        admin.key,
+        "PUT",
+        { ...size, enabled: false },
+        toggleKey,
+      ),
+      env,
+    );
+    expect(disabled.status).toBe(200);
+    expect((await disabled.json<{ enabled: boolean }>()).enabled).toBe(false);
+    expect(
+      (
+        await worker.fetch(
+          request(
+            "/v1/size-classes/small",
+            admin.key,
+            "PUT",
+            { ...size, enabled: false },
+            toggleKey,
+          ),
+          env,
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await worker.fetch(
+          request("/v1/size-classes/small", admin.key, "PUT", size),
+          env,
+        )
+      ).status,
+    ).toBe(200);
+    await env.DB.prepare(
+      "UPDATE databases SET desired_state = 'deleted', observed_state = 'deleted', observed_generation = generation, deleted_at = ? WHERE id = ?",
+    )
+      .bind(now, database)
+      .run();
+    expect(
+      (
+        await worker.fetch(
+          request("/v1/size-classes/small", admin.key, "PUT", {
+            ...size,
+            backup_retention_days: 30,
+          }),
+          env,
+        )
+      ).status,
+    ).toBe(409);
+    expect(
+      await env.DB.prepare(
+        "SELECT memory_mib, archive_timeout_seconds, backup_retention_days, enabled FROM size_classes WHERE id = 'small'",
+      ).first(),
+    ).toEqual({
+      memory_mib: size.memory_mib,
+      archive_timeout_seconds: size.archive_timeout_seconds,
+      backup_retention_days: size.backup_retention_days,
+      enabled: 1,
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT COUNT(*) AS count FROM idempotency_keys WHERE state = 'in_progress'",
+      ).first("count"),
+    ).toBe(0);
+    expect(
+      (
+        await worker.fetch(
+          request("/v1/size-classes/larger", admin.key, "PUT", {
+            ...size,
+            memory_mib: 1024,
+          }),
+          env,
+        )
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await worker.fetch(
+          request("/v1/size-classes/larger", admin.key, "PUT", {
+            ...size,
+            memory_mib: 2048,
+          }),
+          env,
+        )
+      ).status,
+    ).toBe(200);
+  });
+
   it("refuses project deletion until owned databases are observed deleted", async () => {
     const admin = await bootstrap();
     const owned = await project(admin.key);
