@@ -1,4 +1,4 @@
-# Makes a single control-plane node schedulable for the disposable M1 lab.
+# Makes a single control-plane node schedulable for the single-node lab.
 apiVersion: v1alpha1
 kind: KubeNodeConfig
 taints:

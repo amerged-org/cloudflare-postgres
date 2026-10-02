@@ -1,8 +1,8 @@
 # Talos bootstrap assets
 
-These first-party patches reproduce the configuration used by the disposable M1 lab. They target **Talos v1.14.1 with Kubernetes v1.36.3**. The latter is explicit because the selected CNPG release supports Kubernetes 1.36, while this Talos release otherwise defaults to a newer Kubernetes version. This directory is a reviewed bootstrap recipe, not yet an unattended fleet installer or a production topology.
+These first-party patches reproduce the configuration of the single-node Contabo lab. They target **Talos v1.14.1 with Kubernetes v1.36.3**; the Kubernetes version is explicit because the selected CNPG release supports 1.36, while this Talos release defaults to a newer one. Boot, storage, SQL and node-restart behavior worked in the lab.
 
-The [live M1 record](../../docs/evidence/m1-2026-09-28.md) distinguishes the proven boot, storage, SQL, and restart behavior from the pending backup, replacement, and failover work. Two VPS in one data center do not prove independent failure domains.
+This is the manual recipe. In Phase 3 of [PLAN.md](../../PLAN.md), the `node-bootstrap` Container automates the same rescue path for new worker nodes. Two VPS in one data center are not independent failure domains.
 
 ## Private configuration
 
@@ -30,35 +30,6 @@ chmod 600 .env.local.talos/config/*
 
 The two `single-*-lab` patches are deliberately scoped to the measured one-node lab. Replace the disk allocation and scheduling policy for another node pool; do not silently apply these sizes to a smaller disk or schedule customer databases on a production control plane. EPHEMERAL must be capped before first provisioning. Changing `maxSize` does not shrink an already grown filesystem.
 
-## Verified kubelet serving identity
-
-The [native serving-TLS patch](kubelet-serving-tls.patch.yaml) enables
-`KubeletConfig.config.serverTLSBootstrap` for the selected Talos 1.14 schema.
-Merge it into the generated native document, preserving the pinned kubelet
-image and other configuration. A local merge against the actual lab's 30
-documents and strict validation pass. One supervised no-reboot application,
-automatic initial issuance and verified scraping now pass in Dev; a later
-renewal remains pending. Do not add deprecated kubelet fields alongside the native
-document or substitute a nonexistent `serverCertExtraSANs` property.
-
-Install the qualified [node-bound approver](../kubelet-serving-certificates/README.md)
-and operator-owned enrollment before applying this change to a live node.
-Use explicit `--mode no-reboot` and verify the returned mode. Fence the fresh
-authenticated machine configuration, compare both active and persistent native
-documents after application, and check the effective kubelet configuration for
-the intended bit and any conflicting legacy rotation flag. Talos can return
-both `persistent` and `v1alpha1` MachineConfig objects after application; select
-the intended resource explicitly instead of treating the JSON stream as one
-object. Keep all machine configuration output private.
-Initial application restarts kubelet and removes its old self-signed serving
-files; the new serving endpoint waits for a signed CSR. Talos machine reboot is
-not required, but availability and PostgreSQL preservation must be observed.
-Kubelet subsequently loads renewed certificates dynamically. Preserve verified
-TLS and scope enrollment to authenticated machine identities and addresses.
-
-The [current TLS checkpoint](../../docs/evidence/m4-kubelet-serving-tls-2026-09-28.md)
-distinguishes this prepared correction from an actual runtime success.
-
 ## Contabo rescue path
 
 Contabo's custom-image storage was unavailable in the observed account. The verified alternative uses its RAM-based rescue system, a registered SSH public-key secret, and a checksum-verified NoCloud raw image from the [Image Factory](https://docs.siderolabs.com/talos/v1.14/learn-more/image-factory). The private static-network schematic can be used with different Talos versions, but the version and artifact checksum must be pinned for each run.
@@ -81,6 +52,6 @@ Use the generated `talosconfig` for subsequent authenticated calls. Read back ST
 
 Invoke `talosctl bootstrap` exactly once against one control-plane node after recording the attempt. A timeout is an uncertain outcome, not permission to repeat it blindly. Save kubeconfig to an explicit ignored file with `--merge=false`; never overwrite or merge into an unrelated local Kubernetes context by default.
 
-The CNI is intentionally absent at bootstrap. Install the pinned Cilium release promptly using the [platform baseline](../platform/README.md), then confirm Cilium, CoreDNS, Node Ready, one disposable Pod DNS check and Talos health. Flux subsequently owns platform releases; our regional controller owns customer namespaces and CNPG resources. Talos lifecycle jobs own host and Kubernetes upgrades. Flux does not patch the guest OS.
+The CNI is intentionally absent at bootstrap. Install the pinned Cilium release promptly using the [platform baseline](../platform/README.md), then confirm Cilium, CoreDNS, Node Ready, one disposable Pod DNS check and Talos health. Flux subsequently owns platform releases; the regional agent owns per-database namespaces and CNPG resources. Talos lifecycle jobs own host and Kubernetes upgrades. Flux does not patch the guest OS.
 
 Sources: [Talos NoCloud](https://docs.siderolabs.com/talos/v1.14/platform-specific-installations/cloud-platforms/nocloud), [network kernel arguments](https://docs.siderolabs.com/talos/v1.14/reference/kernel), [raw volumes](https://docs.siderolabs.com/talos/v1.14/reference/configuration/block/rawvolumeconfig), [LVM groups](https://docs.siderolabs.com/talos/v1.14/reference/configuration/storage/lvmvolumegroupconfig), [lab control-plane scheduling](https://docs.siderolabs.com/talos/v1.14/deploy-and-manage-workloads/workloads-on-controlplane), [Contabo rescue](https://help.contabo.com/en/support/solutions/articles/103000295053-how-do-i-boot-a-rescue-system-for-my-server-).

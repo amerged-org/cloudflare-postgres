@@ -59,9 +59,10 @@ Record observed RPO/RTO and archive growth from the actual run. Add interruption
 
 Retention windows accept days/weeks/months, not a fabricated minutes/hours window. A same-day run cannot prove real one-day expiration. Later evidence must show obsolete remote objects disappear, the required boundary base backup/WAL remain, a recovery within the retained window works, and a sibling archive stays unchanged. Deleting a Backup CR is not remote-object deletion evidence. Never disable safety checks, alter archived timestamps or broaden credentials to make a gate pass.
 
-The [single-node R2 qualification](../../docs/evidence/m1-r2-backup-pitr-2026-09-30.md)
-now proves one physical backup, WAL coverage, full recovery, PITR and independent
-target archiving with the pinned tuple. Retention, interruption, fresh-infrastructure
-recovery and production availability remain unqualified. Follow [PLAN.md](../../PLAN.md) and keep installation observations in ignored `.local/` or a private deployment repository.
+With the pinned versions, the single-node lab passed one physical backup, WAL coverage, full
+recovery, PITR and separate target archiving against R2 (2026-09-30). Retention, interruption,
+recovery on fresh infrastructure and production availability are still open. The regional agent
+generates these resources per database (see [PLAN.md](../../PLAN.md)); this directory remains the
+manual reference.
 
 Sources: [Barman plugin 0.15.0 usage](https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.0/web/versioned_docs/version-0.15.0/usage.md), [retention](https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.0/web/versioned_docs/version-0.15.0/retention.md), [CNPG 1.30.1 recovery](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/docs/src/recovery.md), [recovery defaults](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/api/v1/cluster_defaults.go), [R2 S3 authentication and jurisdiction](https://developers.cloudflare.com/r2/api/tokens/).

@@ -1,25 +1,25 @@
 # cloudflare-postgres
-Build an independent PostgreSQL platform with Apache-2.0-licensed first-party code.
-Deliver the open-source solution first; hosted SaaS and reselling come later.
-Keep APIs, defaults, and execution paths generic; consumer adapters belong in consumer repositories.
-Run management APIs and authoritative control state in the adopter's Cloudflare account.
-Run real PostgreSQL on Contabo infrastructure with persistent local storage.
-Use CloudNativePG for database lifecycle, replication, failover, and resource changes.
-Use Talos Linux and Kubernetes as the target declarative server foundation.
-Use Flux for platform components and explicit lifecycle jobs for host upgrades.
-Reuse maintained upstream components before writing equivalent infrastructure.
-Evaluate gateway candidates for technical fit, security maintenance, and bounded adaptation.
-Reuse Supabase database tooling where it fits the selected trust boundaries.
-Preserve upstream licenses, attribution, notices, and separately licensed modifications.
-Expose a versioned management API with generated clients and auditable operations.
-Support organizations, projects, databases, roles, credentials, and regional placement.
-Deliver attributable usage reporting and API-controlled budgets with enforcement in v1.
-Deliver automatic sleep and wake without discarding committed customer data.
-Deliver manual resizing and bounded automatic compute scaling in v1.
-Allow documented reconnects during resizing; never replay uncertain writes blindly.
-Deliver physical backups, WAL archiving, tested point-in-time recovery, and safe retention.
-Defer database branching until after the initial open-source production release.
-Document tenant isolation guarantees and enforce identity, network, compute, and storage limits.
-Keep regional operation independent of continuous management access within authorized limits.
-Follow PLAN.md bounded red-first TDD, targeted test runs, one final full gate, and mandatory stop limits.
-Maintain PLAN.md as canonical scope and roadmap; distinguish proposals from verified behavior.
+Open-source, Neon-style serverless PostgreSQL: Cloudflare control plane, real PostgreSQL on Contabo VPS.
+Read PLAN.md first; it is the canonical scope, architecture, phases and status.
+Cloudflare is the control plane: Workers, D1, Durable Objects, Workflows, R2, Secrets, Containers.
+Only PostgreSQL data lives on VPS; regional components execute desired state and report observations.
+All database traffic enters through Cloudflare (edge Worker, Tunnel); VPS expose no PostgreSQL port.
+Run unmodified PostgreSQL with CloudNativePG on Talos Linux and Kubernetes with local LVM volumes.
+Back up every database to R2 with Barman Cloud: base backups, WAL archiving, point-in-time recovery.
+Databases sleep when idle and wake on connect; never lose committed data or replay uncertain writes.
+Cloudflare places databases, tracks capacity and adds Contabo VPS through their API within spend caps.
+Report usage and infrastructure cost as metrics; prices, credits and wallets belong to integrators.
+No budget enforcement, compute autoscaling or branching in v1; integrators call suspend and resume.
+Keep APIs and defaults generic; adopter adapters live in adopter repositories (e.g. ohmyho.st).
+Build the smallest thing that passes the current phase's live acceptance in Dev.
+Add machinery only for an observed problem, never for a hypothetical one.
+Delete unused code, files and branches; no parked, held or frozen work. Git history is the archive.
+No mocks, stubs or hardcoded data in product code; acceptance only from real Dev systems.
+Test the logic you write; write the failing test first for bug fixes; no test matrices; one CI workflow.
+Record phase results and measured numbers in PLAN.md Status; no per-change evidence documents.
+Docs live in PLAN.md, README.md, THIRD_PARTY.md, infra READMEs and docs/operations runbooks.
+TypeScript everywhere (Workers, regional agent and gateway) with shared zod contracts.
+First-party code is Apache-2.0; upstream components keep their own licenses.
+Pin upstream versions and digests; record licenses and notices in THIRD_PARTY.md.
+The repository is public: never print or commit secrets, .env* files, kubeconfigs or Talos configs.
+New paid resources and production writes need the owner's explicit, costed go.

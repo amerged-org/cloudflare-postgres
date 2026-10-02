@@ -1,97 +1,124 @@
 # cloudflare-postgres
 
-An independent, open-source PostgreSQL platform with a Cloudflare management layer and self-operated PostgreSQL infrastructure on Contabo.
+Open-source, Neon-style serverless PostgreSQL that runs on **your Cloudflare account** and **your
+Contabo VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
+The VPS run real, unmodified PostgreSQL under CloudNativePG.
 
-**Open source first.** The initial product gives adopters management APIs, database operations, usage reporting, and API-controlled budgets. Hosted SaaS and reselling come later. [ohmyho.st](https://ohmyho.st) is our first adopter and integration customer.
+- Create, resize, suspend, restore and delete databases through a versioned API.
+- Connect through Cloudflare: PostgreSQL over WebSocket. The VPS expose no database port.
+- Databases sleep when idle and wake on the next connection.
+- Continuous backups to R2 with point-in-time recovery.
+- Usage and infrastructure-cost metrics per database. You put your own pricing on top.
+- Horizontal scaling: Cloudflare adds Contabo VPS through the Contabo API within your caps.
 
-## Development status
+[ohmyho.st](https://ohmyho.st) is the first adopter. It replaces Neon with this service.
 
-**Early development.** The deployed [control API](apps/control-api/README.md) provides organization bootstrap, recovery listing, scoped regions, global logical projects, immutable catalogs, explicit admission, environment intents and leased execution. No catalog or API-managed environment has been created; lab admission is closed. An active logical project or controller-ready result supplies no customer database endpoint or credentials.
+## Status
 
-The [regional usage collector checkpoint](docs/evidence/m3-regional-usage-collector-2026-09-28.md) now verifies the running Dev controller, authenticated execution/meter clients, an empty owned inventory, and its persistent private journal across one Pod replacement under the pinned Node image. Local verification used exactly three new Node cases and one broad gate, followed by a targeted startup-test path correction recorded in the evidence. The manual M1 database is excluded from this collector. Positive managed usage, complete/final accounting and API-to-CNPG qualification remain open. Local Talos image import is a lab path; anonymous GHCR pulling and public release distribution are pending.
+**Reset on 2026-10-02.** A lean design (below) replaces the first implementation. The working
+Talos, Flux platform and R2 backup/PITR recipes in [infra/](infra/README.md) are kept. The
+services described here are being built; see [PLAN.md](PLAN.md) for phases and status.
 
-The [usage and budget authority checkpoint](docs/evidence/m3-usage-budget-authority-2026-09-28.md) supplies deployed exact revisions, fixed-snapshot exports, purpose-specific credentials, scoped policies and fenced allowance accounting. Live checks verified unknown empty coverage, credential boundaries, exact grants, conditional updates and requested pause/resume. Positive usage ingestion, receipt encryption/replay, settlement and PostgreSQL stop behavior remain unverified live. Budgets report `runtimeEnforced: false` and `enforcementStatus: pending_runtime`; the provisional collector does not enforce them. This does not complete M3 or M6.
-
-The [owned-database checkpoint](docs/evidence/m3-owned-databases-2026-09-29.md) adds database creation under verified roles and current owner-credential disclosure. One frozen full gate passed all 37 tests; the API/migration and regional lane are deployed in Dev with verified compiled code, authenticated empty queues and preserved journal/volumes/SQL markers. Positive customer SQL creation, native connectivity and recovery remain open.
-
-The [database-role checkpoint](docs/evidence/m3-database-roles-2026-09-29.md) adds scoped encrypted credential issuance and conditional rotation through a separate CNPG role lane. The API/key/migration and regional role executor are deployed in Dev; live checks cover authorization, an empty queue and preserved journal/volumes/SQL state. Local lifecycle cases and narrow verification continuations pass, with original gate stops disclosed. Real password application, data grants, external endpoints and recovery remain required.
-
-The [current allowance authority checkpoint](docs/evidence/m6-current-allowance-authority-2026-09-28.md) adds a deployed bounded authority read and an explicit regional normal-stop mode. One full gate passed all 31 tests with three new cases. The regional mode has local evidence only; independent expiry, ingress, final accounting, settlement and live stop qualification remain required. Budget enforcement flags stay false.
-
-The [M1 lab checkpoint](docs/evidence/m1-2026-09-28.md) verifies Talos, Kubernetes, Cilium, bounded local volumes, and one manually created PostgreSQL instance on a disposable Contabo node. SQL transactions and a node-restart readback passed. Public [Talos bootstrap assets](infra/talos/README.md) and a [pinned Flux platform baseline](infra/platform/README.md) package the installation configuration. The manual lab database was not provisioned by the management API.
-
-The [initial M4 adoption checkpoint](docs/evidence/m4-platform-adoption-2026-09-28.md) verifies Cilium/OpenEBS ownership and restoration of a nonsemantic ConfigMap drift. The [cert-manager checkpoint](docs/evidence/m4-cert-manager-adoption-2026-09-28.md) verifies its guarded same-version handoff. The [CNPG checkpoint](docs/evidence/m4-cnpg-adoption-2026-09-28.md) now verifies 19 guarded ownership patches and one activation of the unchanged `1.30.1` operator through its compatibility overlay. The release and operator Deployment are current-generation Ready; webhook admission, CA content/ownership, PostgreSQL Pod identities/restart counts, SQL markers and node health are preserved. Four platform releases are active; Barman remains suspended and manually installed. Automated provider bootstrap, host maintenance, staged upgrades, recovery, gateway, and production qualification remain open; M4 is incomplete.
-
-The [Barman preflight checkpoint](docs/evidence/m4-barman-preflight-2026-09-28.md) records the prepared compatibility assets and an actual SSA rejection when switching the sidecar-image reference. The bounded workflow stopped after two observation corrections. An explicit field migration is prepared privately and awaits a one-attempt exception; the active overlay is not qualified for promotion.
-
-The [platform inspection checkpoint](docs/evidence/m4-platform-inspection-2026-09-28.md) adds a reusable read-only CLI with redacted JSON, complete bounded lists, current-generation/version/source checks and explicit unverified operational gates. Three new integration cases failed first; one frozen full gate passed all 22 cases. Live inspection correctly reports four Ready releases and suspended Barman. It does not authorize maintenance or qualify database recovery.
-
-The first implementation steps are infrastructure/recovery proofs and an early generic pilot using one always-on database over native PostgreSQL. Adopter-specific adapters and migration TODOs belong in their own repositories. Gateway selection follows technical and maintenance evaluation. Sleep/wake and bounded automatic compute scaling remain v1 requirements after that baseline.
-
-The [allocation continuity checkpoint](docs/evidence/m3-allocation-continuity-2026-09-28.md) preserves provisional resource-time through normal observation changes and retained storage. The updated Dev collector has verified public compiled code and journal preservation; positive managed usage, complete/final accounting and runtime budget enforcement remain open.
-
-The [maintenance preparation checkpoint](docs/evidence/m4-maintenance-preparation-2026-09-28.md) adds installation-owned immutable plans, separate preparer credentials, fenced leases and durable regional assessments. The Dev API/migration and compiled CLI persist the real lab's missing prerequisites as blockers. Preparation never grants execution authority; host updates, recovery and production qualification remain incomplete.
-
-## Self-hosting model
-
-Adopters need their own Cloudflare account for the management deployment, authoritative control state, secrets, and R2 archives, plus Contabo infrastructure for PostgreSQL. This is not a Cloudflare-independent deployment. Initial [infrastructure](infra/README.md) and controller setup recipes are published; a complete, independently verified installation procedure remains a release gate.
-
-The selected control-state mapping uses Workers for APIs, D1 for canonical management/usage/budget data, Durable Objects for coordination, and R2 for large artifacts. The current development implementation supplies conditional execution leases and D1-backed usage/budget authority. Durable Object coordination, complete/final regional usage, journal node-loss recovery, runtime enforcement, and control-state recovery remain pending.
-
-## Planned architecture
+## Architecture
 
 ```mermaid
-flowchart TB
-    Adopters["Independent adopters"] --> API["Cloudflare Workers: management, usage and budget APIs"]
-    API --> State["D1: authoritative control state"]
-    API --> Coordination["Durable Objects: coordination"]
-    Coordination --> Controller["Contabo regional controller"]
-    Controller --> Fleet["Talos and Kubernetes"]
-    Controller --> CNPG["CloudNativePG"]
-    CNPG --> Databases["Isolated PostgreSQL environments and local volumes"]
-    Adopters --> Access["Native PostgreSQL access; gateway selection pending"]
-    Access --> Databases
-    Databases --> Backups["Barman backups and WAL to R2"]
-    Flux["Flux platform releases"] --> Fleet
+flowchart LR
+  subgraph Clients
+    App["Apps and Workers<br/>PostgreSQL over WebSocket"]
+    Tools["psql and migrations<br/>via pgcf connect"]
+    Integrator["Integrator backend<br/>e.g. ohmyho.st"]
+  end
+
+  subgraph CF["Your Cloudflare account: control plane"]
+    Edge["Edge Worker<br/>*.db.your-domain"]
+    API["API Worker<br/>/v1"]
+    DBA["DatabaseActor DO<br/>per database: wake, idle, traffic"]
+    RL["RegionLink DO<br/>per region"]
+    WF["Workflows<br/>create, restore, add node"]
+    D1[("D1<br/>state and usage")]
+    R2[("R2<br/>backups and WAL")]
+    Boot["Container<br/>node bootstrap"]
+  end
+
+  subgraph Region["Contabo region: Talos and Kubernetes"]
+    CFD["cloudflared<br/>outbound tunnel"]
+    GW["Gateway"]
+    Agent["Regional agent"]
+    CNPG["CloudNativePG"]
+    PG[("PostgreSQL per database<br/>local LVM volume")]
+  end
+
+  Contabo["Contabo API"]
+
+  App --> Edge
+  Tools --> Edge
+  Integrator -->|"manage, usage, costs"| API
+  Edge <--> DBA
+  Edge -->|"Tunnel and Access"| CFD
+  CFD --> GW
+  GW --> PG
+  API --> D1
+  API --> WF
+  DBA <--> RL
+  RL <-->|"outbound WebSocket"| Agent
+  Agent --> CNPG
+  CNPG --> PG
+  PG -->|"Barman Cloud"| R2
+  WF --> Contabo
+  WF --> Boot
+  Boot -->|"install Talos, join"| Region
 ```
 
-CloudNativePG manages PostgreSQL lifecycle and replication. Talos provides the declarative server foundation; Flux manages platform components. The product supplies project management, usage reporting, budget enforcement, policy, and orchestration between those components.
+Connecting to a sleeping database:
 
-Native PostgreSQL uses regional TCP endpoints. Ordinary Workers HTTP ingress is not a PostgreSQL listener. Gateway failover, pooling ownership, and regional operation during Cloudflare outages require explicit acceptance evidence.
+```mermaid
+sequenceDiagram
+  participant C as Client
+  participant E as Edge Worker
+  participant A as DatabaseActor
+  participant R as RegionLink
+  participant G as Regional agent
+  participant P as PostgreSQL
 
-## Initial scope
+  C->>E: wss://db-id.db.your-domain
+  E->>A: ensureAwake()
+  A->>R: wake (coalesced)
+  R->>G: wake db-id
+  G->>P: remove CNPG hibernation
+  P-->>G: ready
+  G-->>R: observed ready
+  R-->>A: ready
+  A-->>E: awake
+  E->>P: WebSocket via Tunnel and gateway (signed route)
+  C->>P: PostgreSQL protocol, SCRAM end to end
+```
 
-- Organizations, projects, databases, roles, credentials, and regional placement through versioned APIs.
-- Native PostgreSQL, connection pooling, and interactive transactions.
-- Attributable usage reporting, machine-readable exports, and API-controlled budgets with enforcement.
-- Automatic sleep/wake, manual resizing, and bounded automatic compute scaling.
-- Physical backups, WAL archiving, point-in-time recovery, retention, and safe deletion.
-- Repeatable maintenance, tenant isolation, monitoring, and recovery procedures.
+| Part | Where | Job |
+| --- | --- | --- |
+| API Worker | Cloudflare | `/v1` API, D1 state, Durable Objects, Workflows, usage rollups |
+| Edge Worker | Cloudflare | Database endpoint: wake, route, count traffic |
+| Regional agent | Kubernetes | Reconciles databases into CNPG resources; hibernate/wake; reports status and samples |
+| Gateway + cloudflared | Kubernetes | Only entry from Cloudflare to PostgreSQL |
+| Node bootstrap | Cloudflare Container | Turns a Contabo VPS into a Talos node |
+| Platform | Kubernetes (Flux) | Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin |
 
-Budget APIs remain in v1; payment processing, subscriptions, invoicing, and a retail pricing catalog are deferred with the hosted offering. Each integrator retains its own aggregate wallet and customer billing and assigns the database allowance through the same generic API.
+## Self-hosting requirements
 
-Short reconnects during resizing are accepted. Branching is deferred. Supabase Auth, Storage, Realtime, and Functions remain outside scope. HTTP/WebSocket access, PostgREST, postgres-meta, and a Studio-derived workbench are optional follow-on integrations after the native pilot.
+- A Cloudflare account on the Workers Paid plan, with a zone for database hostnames: Workers, D1,
+  Durable Objects, Workflows, R2, Tunnel, Access and Containers.
+- A Contabo account with API credentials. The lab uses Cloud VPS with 4 vCPU and 8 GiB.
 
-## Development discipline
+An install path is part of the open-source release phase in [PLAN.md](PLAN.md#phase-5--open-source-release).
 
-The [fleet inspector](apps/regional-controller/README.md#fleet-inspection) compares
-installation-owned Contabo observations with explicitly enrolled Kubernetes
-Nodes. Its optional maintenance guard detects missing/replaced hosts without
-turning provider totals into capacity or upgrade authority. See its
-[qualification checkpoint](docs/evidence/m4-fleet-inventory-2026-09-29.md).
+## Documents
 
-Use the [bounded TDD policy](PLAN.md#10-bounded-tdd-and-verification-discipline): at most three new or expanded top-level tests per fix, each red first; targeted test files during iteration; one final full gate; and mandatory stop/report limits. Do not generate test matrices or speculative suites. Consumer-specific defaults, adapters, and compatibility TODOs belong in consumer repositories.
+- [PLAN.md](PLAN.md): scope, architecture, phases, decisions and status.
+- [AGENTS.md](AGENTS.md): contributor and coding-agent brief.
+- [THIRD_PARTY.md](THIRD_PARTY.md): upstream components and licenses.
+- [infra/](infra/README.md): Talos, platform and backup recipes.
 
-## Project documents
+## License
 
-- [PLAN.md](PLAN.md): canonical scope, assumptions, architecture, delivery sequence, and acceptance gates.
-- [AGENTS.md](AGENTS.md): the 25-line contributor and coding-agent brief.
-- [THIRD_PARTY.md](THIRD_PARTY.md): upstream candidates, licenses, integration decisions, and provenance requirements.
-
-## License and independence
-
-Original project code and documentation are licensed under [Apache License 2.0](LICENSE). Third-party components retain their own licenses and notices; evaluated upstream projects have not been vendored into this repository.
-
-This is an independent project, not an official product of or affiliated with Cloudflare, Contabo, Neon, Supabase, or the CloudNativePG project. Product and project names identify the technologies being evaluated and remain the property of their respective owners.
-
-The [prepared telemetry configuration](infra/telemetry/README.md) reuses maintained Prometheus components with pinned chart/images and bounded lab resources. Its release remains suspended and unapplied pending network and runtime qualification; [evidence](docs/evidence/m4-telemetry-preparation-2026-09-28.md) distinguishes preparation from live behavior.
+Original code and documentation: [Apache License 2.0](LICENSE). Third-party components keep their
+own licenses. This is an independent project, not affiliated with Cloudflare, Contabo, Neon,
+Supabase or CloudNativePG.

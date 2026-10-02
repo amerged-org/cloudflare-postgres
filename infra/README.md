@@ -1,13 +1,22 @@
-# Regional infrastructure baseline
+# Regional infrastructure
 
-This directory packages the selected upstream platform components and the first-party configuration used to make the Contabo lab reproducible. It contains no provider credentials, node addresses, generated machine configurations, kubeconfigs, database passwords or backup keys.
+Recipes for the Contabo side of a region. They contain no provider credentials, node addresses,
+generated machine configurations, kubeconfigs, database passwords or backup keys. Keep those in
+ignored local state or a private deployment repository.
 
-Use the [Talos recipe](talos/README.md) to generate private machine configurations and reserve storage before first provisioning. Use the [Flux platform baseline](platform/README.md) after the one-time Cilium bootstrap. Flux owns platform releases; the regional controller owns customer environment resources; CNPG owns PostgreSQL instances; Talos lifecycle operations own host and Kubernetes upgrades.
+| Directory | Contents |
+| --- | --- |
+| [talos/](talos/README.md) | Talos patches and the Contabo rescue install path for a node |
+| [platform/](platform/README.md) | Pinned Flux baseline: Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin |
+| [backups/](backups/README.md) | Reference CNPG/Barman resources for R2 backups, full restore and PITR |
 
-The baseline is still a lab-qualified configuration, not a production installation guarantee. The [M1 evidence](../docs/evidence/m1-2026-09-28.md) records fixed volume limits, restart persistence and native TLS SQL on one manually provisioned database. Automated provider bootstrap, node replacement, multiple independent failure domains, staged upgrades, backup/PITR, capacity limits and tenant isolation acceptance remain required work.
+Ownership:
 
-The [backup/recovery recipe](backups/README.md) prepares ordinary CNPG/Barman resources with private credentials, separate archive identities and explicit evidence gates. The [latest backup preflight](../docs/evidence/m1-backup-preflight-2026-09-29.md) verifies the existing manual plugin, storage/request feasibility and accepted dry-run API shapes; no database backup or restore is enabled by those checks.
+- **Flux** owns platform releases.
+- **The regional agent** (see [PLAN.md](../PLAN.md)) owns per-database namespaces and CNPG
+  resources.
+- **CNPG** owns PostgreSQL instances.
+- **Talos** owns host and Kubernetes upgrades.
 
-An adopter must select its own region inventory, maintenance policy, storage allocation, management access rules, object-store credentials and recovery objectives. Values particular to an installation stay in its ignored local state or private deployment repository. Do not commit generated Talos files or Kubernetes Secrets to this public repository.
-
-The opt-in [CNPG session pooling recipe](pooling/README.md) and its [live lab evidence](../docs/evidence/m2-native-pooling-2026-09-29.md) cover internal TLS, transactions and cancellation. Automatic environment policy, endpoint publication, network/quota/metering/stop integration and production acceptance remain separate gates.
+These recipes ran on a single-node lab. Unattended node bootstrap from Cloudflare (Phase 3), a
+three-node production region, upgrades and tenant-isolation tests are still to be built (Phase 4).

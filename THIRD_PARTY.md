@@ -1,90 +1,51 @@
-# Third-party component inventory
+# Third-party components
 
-Reviewed: 2026-09-28. Scope follows the open-source-first revision in [PLAN.md](PLAN.md); hosted billing and reselling are deferred, while usage reporting and budget APIs remain in v1.
+Reviewed: 2026-10-02 (reset). The repository's [Apache License 2.0](LICENSE) covers original
+project work only. Upstream components keep their own licenses, notices and source obligations.
+No upstream source is vendored. Application dependencies are recorded in package manifests and the
+lockfile once the new apps exist. Recheck the exact release and its dependencies before upgrading
+or redistributing.
 
-**This inventory distinguishes packaging and lab evidence from production qualification.** No database/operator component source, binary, or container image is vendored in this repository. Application dependencies are recorded in package manifests and the root pnpm lockfile. Infrastructure release configuration is being packaged separately; a pinned release or successful lab install is not evidence of safe production tenancy.
+## Selected stack
 
-The repository's [Apache License 2.0](LICENSE) applies to original project work. Upstream components retain their own licenses, copyright statements, notices, and any source-availability obligations. Recheck the exact selected release and its dependencies before integration or redistribution.
+Pinned platform versions are in [infra/platform/versions.lock.json](infra/platform/versions.lock.json).
 
-## Planned database and access components
+| Component | License | Role |
+| --- | --- | --- |
+| [PostgreSQL](https://www.postgresql.org/) | [PostgreSQL License](https://www.postgresql.org/about/licence/) | The database engine, unmodified upstream images (18.x). |
+| [CloudNativePG](https://github.com/cloudnative-pg/cloudnative-pg) | [Apache-2.0](https://github.com/cloudnative-pg/cloudnative-pg/blob/main/LICENSE) | Operator: one Cluster per database, roles, hibernation, recovery. |
+| [Barman Cloud CNPG-I plugin](https://github.com/cloudnative-pg/plugin-barman-cloud) | [Apache-2.0](https://github.com/cloudnative-pg/plugin-barman-cloud/blob/main/LICENSE) | Base backups, WAL archiving and PITR to R2. |
+| [Barman / barman-cloud](https://github.com/EnterpriseDB/barman) | [GPL-3.0](https://github.com/EnterpriseDB/barman/blob/REL_3_X_master/LICENSE) (see note) | Backup tooling inside the plugin sidecar; used unmodified, not relicensed. |
+| [Talos Linux](https://github.com/siderolabs/talos) | [MPL-2.0](https://github.com/siderolabs/talos/blob/main/LICENSE) | Node operating system and Kubernetes lifecycle. |
+| [Kubernetes](https://github.com/kubernetes/kubernetes) | [Apache-2.0](https://github.com/kubernetes/kubernetes/blob/master/LICENSE) | Scheduling and resource limits in each region. |
+| [Flux](https://github.com/fluxcd/flux2) | [Apache-2.0](https://github.com/fluxcd/flux2/blob/main/LICENSE) | Reconciles pinned platform releases. |
+| [Cilium](https://github.com/cilium/cilium) | [Apache-2.0](https://github.com/cilium/cilium/blob/main/LICENSE); BPF parts [dual GPL-2.0/BSD-2-Clause](https://github.com/cilium/cilium#license) | Pod networking and NetworkPolicy. |
+| [OpenEBS LocalPV LVM](https://github.com/openebs/lvm-localpv) | [Apache-2.0](https://github.com/openebs/lvm-localpv/blob/develop/LICENSE) | Hard-limited local volumes on the `pgcf` LVM volume group. |
+| [cert-manager](https://github.com/cert-manager/cert-manager) | [Apache-2.0](https://github.com/cert-manager/cert-manager/blob/master/LICENSE) | Certificates required by the Barman plugin. |
+| [cloudflared](https://github.com/cloudflare/cloudflared) | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/master/LICENSE) | Outbound tunnel from each region to Cloudflare. |
+| [Kubernetes JavaScript client](https://github.com/kubernetes-client/javascript) | [Apache-2.0](https://github.com/kubernetes-client/javascript/blob/master/LICENSE) | Kubernetes API access from the regional agent. |
+| [Neon serverless driver](https://github.com/neondatabase/serverless) | [MIT](https://github.com/neondatabase/serverless/blob/main/LICENSE) | Client library compatible with the edge endpoint (WebSocket `Pool`/`Client`). Used by clients and tests, not bundled into the platform. |
 
-The [M1 evidence](docs/evidence/m1-2026-09-28.md) records installed Talos 1.14.1, Kubernetes 1.36.3, Cilium 1.20.2, OpenEBS 4.6.1 / LocalPV LVM 1.10.1, cert-manager 1.21.2, CNPG 1.30.1 and Barman plugin 0.15.0. PostgreSQL 18.4 SQL and restart behavior were tested; R2 backup/PITR, tenant isolation, failure domains and maintained fleet operation remain unqualified. Access components below remain candidates unless their own evidence is recorded.
+**Barman license note:** the upstream package metadata declares `GPL-3.0-only`, while the README
+and source headers say GPL version 3 or later. Record the declaration at the pinned release.
 
-| Component and source                                                                | License evidence                                                                                                          | Planned role and boundary                                                                                                                                                                                                                  |
-| ----------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| [PostgreSQL](https://www.postgresql.org/)                                           | [PostgreSQL License](https://www.postgresql.org/about/licence/)                                                           | Ordinary PostgreSQL engine; supported versions and extensions will be pinned and tested.                                                                                                                                                   |
-| [Kubernetes JavaScript client](https://github.com/kubernetes-client/javascript)     | [Apache-2.0](https://github.com/kubernetes-client/javascript/blob/master/LICENSE)                                         | Official SDK, pinned to `@kubernetes/client-node` 2.0.0 in the regional controller. Its distributed license remains with the package; no client source fork is maintained here.                                                            |
-| [CloudNativePG](https://github.com/cloudnative-pg/cloudnative-pg)                   | [Apache-2.0](https://github.com/cloudnative-pg/cloudnative-pg/blob/main/LICENSE)                                          | Core operator for database lifecycle, replication, failover, roles, resizing, hibernation, and recovery integration.                                                                                                                       |
-| [PgBouncer](https://github.com/pgbouncer/pgbouncer)                                 | [ISC](https://github.com/pgbouncer/pgbouncer/blob/master/COPYRIGHT)                                                       | Default pooling through CNPG Pooler resources. Upstream COPYRIGHT identifies ISC even when automated repository detection reports NOASSERTION.                                                                                             |
-| [Supabase postgres-meta](https://github.com/supabase/postgres-meta)                 | [Apache-2.0](https://github.com/supabase/postgres-meta/blob/master/LICENSE)                                               | Optional private metadata, schema administration, SQL tooling, and type generation after the native pilot. Keep it behind our authorization and routing; it is not a standalone security boundary.                                         |
-| [Supabase Studio](https://github.com/supabase/supabase/tree/master/apps/studio)     | [Apache-2.0 monorepo license](https://github.com/supabase/supabase/blob/master/LICENSE)                                   | Optional selected-database workbench after the native pilot. Prefer narrow integration before committing to a persistent fork. Hosted account/billing UI is later scope. Review package-level assets and dependencies when selecting code. |
-| [PostgREST](https://github.com/PostgREST/postgrest)                                 | [MIT](https://github.com/PostgREST/postgrest/blob/main/LICENSE)                                                           | Optional per-database REST/RPC API; preserve PostgreSQL grants, RLS, and JWT role boundaries. Not the platform management API.                                                                                                             |
-| [Neon proxy](https://github.com/neondatabase/neon/tree/main/proxy)                  | [Apache-2.0 core repository license](https://github.com/neondatabase/neon/blob/main/LICENSE)                              | Evaluation candidate, not preferred or selected. Require a production adapter plus explicit maintainer, security-update process, protocol acceptance, and bounded patch surface.                                                           |
-| [Xata OSS gateway](https://github.com/xataio/xata)                                  | [Apache-2.0 at inspected revision](https://github.com/xataio/xata/blob/98ced3cc9d5038c78c7f3a00ab7d22da847a4fdd/LICENSE)  | Evaluation only, not integrated or selected. The [pinned native gateway assessment](docs/research/xata-native-gateway-2026-09-28.md) records adapter seams, integration gaps and unverified runtime acceptance.                            |
-| [Neon serverless driver](https://github.com/neondatabase/serverless)                | [MIT](https://github.com/neondatabase/serverless/blob/main/LICENSE)                                                       | Optional supported client after proving the selected gateway's HTTP/WS contracts; not needed for the generic native PostgreSQL pilot.                                                                                                      |
-| [Barman Cloud CNPG-I plugin](https://github.com/cloudnative-pg/plugin-barman-cloud) | [Apache-2.0](https://github.com/cloudnative-pg/plugin-barman-cloud/blob/main/LICENSE)                                     | CNPG integration for physical backup, WAL archival, and recovery. Test R2 restore, retention, deletion, and distinct source/target archive identities.                                                                                     |
-| [Barman / barman-cloud](https://github.com/EnterpriseDB/barman)                     | [GPL-3.0 license text](https://github.com/EnterpriseDB/barman/blob/REL_3_X_master/LICENSE); declaration discrepancy below | Backup/recovery tooling used with the plugin; separately licensed and not relicensed by this repository.                                                                                                                                   |
+**Barman plugin issue:** the R2 restore failure reported in
+[plugin-barman-cloud issue #411](https://github.com/cloudnative-pg/plugin-barman-cloud/issues/411#issuecomment-3572945793)
+was a naming conflict between archives. Every restore target needs its own archive path and server
+name.
 
-### Maintenance and compatibility evidence
+## Not used
 
-Xata OSS remains an unintegrated evaluation candidate in PLAN.md. The [native gateway source assessment](docs/research/xata-native-gateway-2026-09-28.md) pins revision `98ced3cc9d5038c78c7f3a00ab7d22da847a4fdd` and its Apache-2.0 license, records reusable seams and concrete integration gaps, and leaves gateway selection and runtime acceptance open.
+| Component | Reason |
+| --- | --- |
+| [Neon storage engine, proxy](https://github.com/neondatabase/neon), [NeonVM](https://github.com/neondatabase/autoscaling) (Apache-2.0) | The public repository is effectively dormant. Its storage is a different architecture. NeonVM needs nested virtualization, which Contabo Cloud VPS lack. |
+| [Xata OSS](https://github.com/xataio/xata) (Apache-2.0) | Active and CNPG-based, but its SNI gateway is not needed: access runs through the Cloudflare edge and Tunnel. |
+| [PgBouncer](https://github.com/pgbouncer/pgbouncer) (ISC), [Supavisor](https://github.com/supabase/supavisor) (Apache-2.0) | No server-side pooler in v1; reconsider with measured connection pressure. |
+| [Omni](https://github.com/siderolabs/omni) (BUSL-1.1) | Not open source; not needed. |
 
-The Neon proxy has very limited recent public activity, including a functional [authentication fix on 2026-05-25](https://github.com/neondatabase/neon/commit/8f60b04da47ffefe0e52bda2440134b42874eb75). This justifies the maintenance gate; it is not evidence that the project is officially discontinued.
+## Rules
 
-The original R2 restore reporter in [Barman plugin issue #411](https://github.com/cloudnative-pg/plugin-barman-cloud/issues/411#issuecomment-3572945793) resolved the failure as a naming/archive conflict. Other comments describe retention/deletion issues with other S3 systems. Validate every offered backup operation on pinned versions rather than labeling all R2 restore paths broken.
-
-### Barman declaration discrepancy
-
-Current upstream [package metadata](https://github.com/EnterpriseDB/barman/blob/REL_3_X_master/pyproject.toml) declares `GPL-3.0-only`, while the [README](https://github.com/EnterpriseDB/barman/blob/REL_3_X_master/README.rst) and [source header](https://github.com/EnterpriseDB/barman/blob/REL_3_X_master/src/barman/__init__.py) describe GPL version 3 or later. Record the exact declarations at the selected release and resolve the discrepancy before redistribution. Do not present either SPDX variant as an unqualified repository-wide finding. The CNPG plugin's Apache-2.0 license does not change Barman's license.
-
-## Planned server and operations components
-
-All entries remain **not integrated**. Contabo/Talos bootstrap, local storage, and maintenance behavior require the acceptance gates in [PLAN.md](PLAN.md).
-
-| Component and source                                                                                 | License evidence                                                                                                                                | Planned role and boundary                                                                                                                                            |
-| ---------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [Talos Linux](https://github.com/siderolabs/talos)                                                   | [MPL-2.0](https://github.com/siderolabs/talos/blob/main/LICENSE)                                                                                | API-managed guest OS and Kubernetes foundation. Distributed OS packages retain their own licenses; Talos is not Apache-licensed.                                     |
-| [Kubernetes](https://github.com/kubernetes/kubernetes)                                               | [Apache-2.0](https://github.com/kubernetes/kubernetes/blob/master/LICENSE)                                                                      | Scheduling, resource policy, controller APIs, and cluster lifecycle through the selected Talos release.                                                              |
-| [Flux](https://github.com/fluxcd/flux2)                                                              | [Apache-2.0](https://github.com/fluxcd/flux2/blob/main/LICENSE)                                                                                 | Platform release reconciliation and configuration drift control. Does not patch the host OS.                                                                         |
-| [OpenEBS LocalPV LVM](https://github.com/openebs/lvm-localpv)                                        | [Apache-2.0](https://github.com/openebs/lvm-localpv/blob/develop/LICENSE)                                                                       | Fixed volume size and reboot persistence passed in the Talos lab. Expansion, node-loss recovery, capacity admission and production tenancy remain to be proven.      |
-| [Cilium](https://github.com/cilium/cilium)                                                           | [Apache-2.0 LICENSE](https://github.com/cilium/cilium/blob/main/LICENSE); [BPF licensing distinction](https://github.com/cilium/cilium#license) | Pod network isolation. User-space code is Apache-2.0; BPF templates use `(GPL-2.0-only OR BSD-2-Clause)`. Keep host-firewall ownership with the chosen Talos policy. |
-| [cert-manager](https://github.com/cert-manager/cert-manager)                                         | [Apache-2.0](https://github.com/cert-manager/cert-manager/blob/master/LICENSE)                                                                  | External certificate lifecycle; distinct from CNPG internal PKI.                                                                                                     |
-| [Prometheus](https://github.com/prometheus/prometheus)                                               | [Apache-2.0](https://github.com/prometheus/prometheus/blob/main/LICENSE)                                                                        | Operational metrics; authoritative usage observations and budget reservations follow the D1-backed product contract.                                                 |
-| [Alertmanager](https://github.com/prometheus/alertmanager)                                           | [Apache-2.0](https://github.com/prometheus/alertmanager/blob/main/LICENSE)                                                                      | Alert routing, grouping, and incident notifications.                                                                                                                 |
-| [OpenTelemetry Collector](https://github.com/open-telemetry/opentelemetry-collector)                 | [Apache-2.0](https://github.com/open-telemetry/opentelemetry-collector/blob/main/LICENSE)                                                       | Telemetry collection and export. Select only required receivers/processors/exporters.                                                                                |
-| [OpenTelemetry Collector Contrib](https://github.com/open-telemetry/opentelemetry-collector-contrib) | [Apache-2.0](https://github.com/open-telemetry/opentelemetry-collector-contrib/blob/main/LICENSE)                                               | Optional collector components if needed; inspect their transitive dependencies individually.                                                                         |
-
-## Qualified internal pooling artifact
-
-The [native pooling checkpoint](docs/evidence/m2-native-pooling-2026-09-29.md) uses the unmodified official CNPG PgBouncer 1.25.2 image through an opt-in Pooler recipe. Registry content digests and the live binary version are verified; the exact index/amd64 pins are recorded in [infra/pooling](infra/pooling/README.md). PgBouncer retains its [pinned ISC COPYRIGHT](https://github.com/pgbouncer/pgbouncer/blob/pgbouncer_1_25_2/COPYRIGHT); CNPG container build tooling is separately [Apache-2.0](https://github.com/cloudnative-pg/pgbouncer-containers/blob/main/LICENSE), and bundled distribution packages retain their licenses. No upstream source or binary is vendored/relicensed here. Full image dependency/signature qualification and integrated multi-tenant pooling remain release gates.
-
-## Alternatives, optional additions, and exclusions
-
-These entries are **not selected for the default v1 stack and not integrated**.
-
-| Component and source                                                     | License evidence                                                                               | Decision                                                                                                                                                                   |
-| ------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| [Supavisor](https://github.com/supabase/supavisor)                       | [Apache-2.0](https://github.com/supabase/supavisor/blob/main/LICENSE)                          | Alternative multi-tenant pooler only if measured requirements justify it. Do not assume a generic wake callback or deploy beside PgBouncer without a clear need.           |
-| [Neon wsproxy](https://github.com/neondatabase/wsproxy)                  | [Apache-2.0](https://github.com/neondatabase/wsproxy/blob/master/LICENSE)                      | Optional lightweight WebSocket-to-TCP bridge for compatibility work. It does not supply SQL-over-HTTP, pooling, or wake orchestration.                                     |
-| [Neon storage engine](https://github.com/neondatabase/neon)              | [Apache-2.0](https://github.com/neondatabase/neon/blob/main/LICENSE)                           | Excluded from CNPG v1. Its patched PostgreSQL, pageservers, and safekeepers form a different storage architecture. Reconsider separately for later branching requirements. |
-| [Neon autoscaling / NeonVM](https://github.com/neondatabase/autoscaling) | [Apache-2.0](https://github.com/neondatabase/autoscaling/blob/main/LICENSE)                    | Excluded from v1; its virtualization and scheduling stack is unnecessary for the accepted reconnect-based scaling contract.                                                |
-| [pg_graphql](https://github.com/supabase/pg_graphql)                     | [Apache-2.0](https://github.com/supabase/pg_graphql/blob/master/LICENSE)                       | Optional future extension if GraphQL enters scope; not an initial acceptance requirement.                                                                                  |
-| [OpenMeter](https://github.com/openmeterio/openmeter)                    | [Apache-2.0](https://github.com/openmeterio/openmeter/blob/main/LICENSE)                       | Unselected future hosted-service option. No v1 dependency or implementation work is required for usage reporting and budget enforcement.                                   |
-| [OpenCost](https://github.com/opencost/opencost)                         | [Apache-2.0](https://github.com/opencost/opencost/blob/develop/LICENSE)                        | Unselected future option. No cost/margin study or v1 adoption task is included in this revision.                                                                           |
-| [Omni](https://github.com/siderolabs/omni)                               | [Business Source License 1.1 / BUSL-1.1](https://github.com/siderolabs/omni/blob/main/LICENSE) | Excluded from the default open-source stack. Its production and business-dependent use conditions require a separate licensing decision.                                   |
-
-## Adoption and provenance rules
-
-1. Prefer supported upstream images, packages, and APIs; write narrow adapters before maintaining forks.
-2. Before integration, record the exact release/commit, source URL, artifact digest, license files, notices, dependency inventory, and any local changes.
-3. Preserve required copyright and license material. Distribute corresponding source or notices when an upstream license requires them.
-4. Treat product names, logos, and other branding separately from source-code licenses. Use this project's own identity.
-5. Never label a candidate as integrated or compatible without its real acceptance evidence. Passing a build is not proof of safe multi-tenant operation.
-6. Do not copy private consumer source or configuration into this public repository without an explicit provenance and publication review. Consumer adapters and compatibility TODOs belong in consumer repositories.
-7. Replace moving-branch evidence with pinned-release references when adopting a component, and revisit licensing when upgrading.
-
-Cloudflare and Contabo are deployment/service providers, not bundled open-source components. Their service terms and operational capabilities are separate from the licenses above. V1 self-hosting requires the adopter's own Cloudflare account; Workers, D1, Durable Objects, R2, and secret bindings are managed-service dependencies, not Apache-licensed software shipped by this repository.
-
-## Direct node runtime observation
-
-The first-party [node-runtime observer](apps/node-runtime-observer/README.md) uses unmodified `k8s.io/cri-client` and `k8s.io/cri-api` `v0.36.3`, both [Apache-2.0](https://github.com/kubernetes/cri-client/blob/v0.36.3/LICENSE), through three narrow observation methods and the upstream read-only Version handshake. Its [module inventory](apps/node-runtime-observer/THIRD_PARTY.md) records dependency/checksum and pinned build-image boundaries. Socket access remains trusted node-administration authority; code restricts behavior, not host permission. Complete stop/lifetime accounting integration is not implemented.
+1. Prefer maintained upstream images and APIs. Keep adapters narrow and do not fork.
+2. When adding a component, record its exact release or digest, source, license and notices here.
+3. Cloudflare and Contabo are service providers, not bundled software. Their terms apply
+   separately.

@@ -3,13 +3,8 @@
   "private": true,
   "packageManager": "pnpm@11.24.0",
   "scripts": {
-    "format:check": "pnpm --filter './apps/*' format:check",
-    "lint": "pnpm --filter './apps/*' lint",
-    "typecheck": "pnpm --filter './apps/*' typecheck",
-    "build:regional": "pnpm --filter @cloudflare-postgres/regional-controller build",
-    "vitest": "pnpm --filter @cloudflare-postgres/control-api exec vitest",
-    "test:node": "node --test 'apps/**/*.node.test.mjs'",
-    "check:node-runtime": "cd apps/node-runtime-observer && test -z \"$(gofmt -l observer delivery cmd)\" && go vet ./observer ./delivery ./cmd/node-runtime-observer ./cmd/node-execution-delivery && go test ./observer ./delivery ./cmd/node-runtime-observer ./cmd/node-execution-delivery -count=1 -timeout=90s",
-    "check:execution-guard": "cd apps/execution-guard && test -z \"$(gofmt -l .)\" && go vet ./... && go test ./... -count=1 -timeout=90s"
+    "lint": "pnpm -r --if-present lint",
+    "typecheck": "pnpm -r --if-present typecheck",
+    "test": "pnpm -r --if-present test"
   }
 }
