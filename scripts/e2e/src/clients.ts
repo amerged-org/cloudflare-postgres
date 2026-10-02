@@ -271,6 +271,104 @@ export class ManagementApi {
   }
 }
 
+export function gatewayLogPods(
+  deployments: unknown,
+  replicaSets: unknown,
+  pods: unknown,
+  namespace: string,
+  expectedImage: string,
+): string[] {
+  assertOwned(namespace);
+  const digest = /@sha256:([a-f0-9]{64})$/.exec(expectedImage)?.[1];
+  if (!digest) throw new HarnessError("gateway_log_source_image_unpinned");
+  const deployment = items(deployments).filter((row) => {
+    const metadata = record(row.metadata);
+    const labels = record(metadata.labels ?? {});
+    return (
+      metadata.namespace === namespace &&
+      metadata.name === "pgcf-gateway" &&
+      labels["app.kubernetes.io/name"] === "pgcf-gateway" &&
+      labels["app.kubernetes.io/part-of"] === "pgcf"
+    );
+  });
+  if (deployment.length !== 1)
+    throw new HarnessError("gateway_log_deployment_missing");
+  const uid = string(record(deployment[0]!.metadata).uid);
+  const template = record(record(record(deployment[0]!.spec).template).spec);
+  const gateway = Array.isArray(template.containers)
+    ? template.containers
+        .map(record)
+        .find((container) => container.name === "gateway")
+    : undefined;
+  if (gateway?.image !== expectedImage)
+    throw new HarnessError("gateway_log_source_image_mismatch");
+  const ownedBy = (
+    row: Record<string, unknown>,
+    kind: string,
+    ids: Set<string>,
+    name?: string,
+  ) => {
+    const metadata = record(row.metadata);
+    return (
+      metadata.namespace === namespace &&
+      Array.isArray(metadata.ownerReferences) &&
+      metadata.ownerReferences
+        .map(record)
+        .some(
+          (owner) =>
+            owner.kind === kind &&
+            typeof owner.uid === "string" &&
+            ids.has(owner.uid) &&
+            (name === undefined || owner.name === name) &&
+            owner.controller === true,
+        )
+    );
+  };
+  const sets = new Set(
+    items(replicaSets)
+      .filter((row) =>
+        ownedBy(row, "Deployment", new Set([uid]), "pgcf-gateway"),
+      )
+      .map((row) => string(record(row.metadata).uid)),
+  );
+  const selected = items(pods).filter((row) => {
+    const metadata = record(row.metadata);
+    const labels = record(metadata.labels ?? {});
+    return (
+      !metadata.deletionTimestamp &&
+      labels["app.kubernetes.io/name"] === "pgcf-gateway" &&
+      labels["app.kubernetes.io/part-of"] === "pgcf" &&
+      ownedBy(row, "ReplicaSet", sets)
+    );
+  });
+  if (!selected.length || selected.length > 3)
+    throw new HarnessError("gateway_log_pods_missing");
+  return selected.map((pod) => {
+    const spec = record(pod.spec);
+    const containers = Array.isArray(spec.containers)
+      ? spec.containers.map(record)
+      : [];
+    const status = record(pod.status);
+    const running = Array.isArray(status.containerStatuses)
+      ? status.containerStatuses.map(record)
+      : [];
+    const container = containers.find((row) => row.name === "gateway");
+    const imageId = running.find((row) => row.name === "gateway")?.imageID;
+    if (
+      container?.image !== expectedImage ||
+      typeof imageId !== "string" ||
+      !(
+        imageId.endsWith(`@sha256:${digest}`) ||
+        imageId === `containerd://sha256:${digest}`
+      )
+    )
+      throw new HarnessError("gateway_log_source_image_mismatch");
+    const name = objectName(pod);
+    assertOwned(name);
+    return name;
+  });
+}
+
 export class Kubernetes {
   private readonly configPath: string;
   private readonly context: string;
@@ -327,6 +425,59 @@ export class Kubernetes {
         timeoutMs: requestTimeout(this.deadline),
       }),
     );
+  }
+  async gatewayLogs(
+    namespace: string,
+    since: string,
+    expectedImage: string,
+  ): Promise<string> {
+    const started = Date.parse(since);
+    if (
+      !Number.isFinite(started) ||
+      new Date(started).toISOString() !== since ||
+      started > Date.now() ||
+      Date.now() - started > 600_000
+    )
+      throw new HarnessError("gateway_log_window_invalid");
+    await this.guard();
+    const deployments = await this.read("deployments");
+    await this.guard();
+    const replicaSets = await this.read("replicasets");
+    await this.guard();
+    const pods = await this.read("pods");
+    const names = gatewayLogPods(
+      deployments,
+      replicaSets,
+      pods,
+      namespace,
+      expectedImage,
+    );
+    const logs: string[] = [];
+    for (const name of names) {
+      await this.guard();
+      logs.push(
+        await command(
+          "kubectl",
+          [
+            "--kubeconfig",
+            this.configPath,
+            "--context",
+            this.context,
+            "--request-timeout=30s",
+            "logs",
+            name,
+            "--namespace",
+            namespace,
+            "--container=gateway",
+            `--since-time=${since}`,
+            "--tail=10000",
+            "--limit-bytes=2000000",
+          ],
+          { timeoutMs: requestTimeout(this.deadline) },
+        ),
+      );
+    }
+    return logs.join("\n");
   }
   async rolePasswords(namespace: string): Promise<string[]> {
     assertOwned(namespace);

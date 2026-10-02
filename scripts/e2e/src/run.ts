@@ -289,6 +289,94 @@ async function anonymousImage(image: string): Promise<void> {
   await reply.arrayBuffer();
 }
 
+export function startupMismatchAdmission(
+  traces: readonly string[],
+  marker: string,
+  database: string,
+  region: string,
+): string {
+  const connections = new Set<string>();
+  for (const trace of traces) {
+    let events: unknown;
+    try {
+      events = JSON.parse(trace);
+    } catch {
+      continue;
+    }
+    for (const value of Array.isArray(events) ? events : [events]) {
+      try {
+        const row = record(value);
+        const request = record(record(row.event).request);
+        const url = new URL(string(request.url));
+        if (
+          url.pathname !== "/v2" ||
+          ["pgcf_trace", "database", "user"].some(
+            (name) => url.searchParams.getAll(name).length !== 1,
+          ) ||
+          url.searchParams.get("pgcf_trace") !== marker ||
+          url.searchParams.get("database") !== database ||
+          url.searchParams.get("user") !== "app" ||
+          !Array.isArray(row.logs)
+        )
+          continue;
+        for (const log of row.logs) {
+          const messages = record(log).message;
+          if (!Array.isArray(messages)) continue;
+          for (const message of messages) {
+            if (typeof message !== "string") continue;
+            try {
+              const event = record(JSON.parse(message));
+              if (
+                event.event === "conn_admission" &&
+                event.database_id === database &&
+                event.user === "app" &&
+                event.region_id === region &&
+                event.outcome === "accepted" &&
+                typeof event.cid === "string" &&
+                /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(
+                  event.cid,
+                )
+              )
+                connections.add(event.cid);
+            } catch {
+              // Other Worker logs cannot establish admitted connection identity.
+            }
+          }
+        }
+      } catch {
+        // Only complete, correlated Edge request events can establish admission.
+      }
+    }
+  }
+  if (connections.size !== 1)
+    throw new HarnessError(
+      connections.size
+        ? "startup_mismatch_admission_ambiguous"
+        : "startup_mismatch_admission_missing",
+    );
+  return [...connections][0]!;
+}
+
+export function gatewayStartupMismatchClose(
+  logs: string,
+  connection: string,
+  database: string,
+): boolean {
+  return logs.split("\n").some((line) => {
+    try {
+      const event = record(JSON.parse(line));
+      return (
+        event.event === "conn_close" &&
+        event.connection === connection &&
+        event.database === database &&
+        event.outcome === "startup_route_mismatch"
+      );
+    } catch {
+      return false;
+    }
+  });
+}
+
 export class Run {
   readonly c: Config;
   readonly state: Ledger;
@@ -1203,12 +1291,91 @@ export class Run {
     this.requireStep("E2");
     const result = await this.probe("/exercise");
     if (result.pass !== true) throw new HarnessError("probe_failed");
+    const startupTimings = await this.startupMismatches();
     await this.complete("E3");
     await this.emit(
       "E3",
-      { transactions: 2, negative_cases: 3 },
-      record(result.timings) as Record<string, number>,
+      {
+        transactions: 2,
+        negative_cases: 5,
+        startup_mismatch_cases: 2,
+        gateway_startup_mismatch_events: 2,
+      },
+      {
+        ...(record(result.timings) as Record<string, number>),
+        ...startupTimings,
+      },
     );
+  }
+  async startupMismatches(): Promise<Record<string, number>> {
+    await this.assertCluster();
+    const database = string(this.state.database_id);
+    const operation = string(this.state.operation_id);
+    const timings: Record<string, number> = {};
+    for (const mode of ["database", "user"] as const) {
+      await this.assertCluster();
+      const marker = randomBytes(24).toString("hex");
+      const since = new Date().toISOString();
+      const action = await this.action("startup_mismatch_probe", {
+        mode,
+        marker,
+        operation_id: operation,
+        postgres_dial_evidence: "gateway_source_branch_inference",
+      });
+      const worker = this.c.values.PGCF_E2E_EDGE_WORKER_NAME!;
+      let result: Record<string, unknown> | undefined;
+      await this.intent("tail_create");
+      const traces = await captureTrace(
+        this.cf,
+        worker,
+        marker,
+        async () => {
+          result = await this.probe(
+            `/startup-${mode}-mismatch`,
+            undefined,
+            marker,
+          );
+        },
+        async (tail) => {
+          this.state.tails.push({ worker, ...tail });
+          await this.save();
+        },
+      );
+      if (
+        result?.pass !== true ||
+        result.sqlstate !== "28000" ||
+        result.gateway_outcome !== "startup_route_mismatch" ||
+        typeof result.duration_ms !== "number" ||
+        !Number.isFinite(result.duration_ms) ||
+        result.duration_ms < 0
+      )
+        throw new HarnessError("startup_mismatch_probe_failed");
+      const connection = startupMismatchAdmission(
+        traces,
+        marker,
+        database,
+        this.c.values.PGCF_E2E_REGION_ID!,
+      );
+      this.state.actions[action]!.target.connection = connection;
+      await this.save();
+      // The close event is measured; pre-dial rejection follows the pinned source branch.
+      await poll(
+        async () => {
+          await this.assertCluster();
+          const logs = await this.kube.gatewayLogs(
+            this.c.values.PGCF_E2E_REGIONAL_NAMESPACE!,
+            since,
+            this.c.values.PGCF_E2E_GHCR_IMAGE!,
+          );
+          return gatewayStartupMismatchClose(logs, connection, database);
+        },
+        (matched) => matched,
+        30_000,
+      );
+      timings[`negative_startup_${mode}_ms`] = result.duration_ms;
+      await this.actionDone(action);
+    }
+    return timings;
   }
   async audit(): Promise<void> {
     this.requireStep("E3");
