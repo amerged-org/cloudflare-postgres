@@ -86,7 +86,7 @@ test("rejects malformed upgrade, missing/bad token and wrong region before dial"
 
 test("relays ten megabytes both directions through SSLRequest and verified TLS in bounded frames", async (t) => {
   const postgres = await postgresServer();
-  const { gateway, port, logs } = await gatewayFor(postgres.port);
+  const { gateway, port, logs, events } = await gatewayFor(postgres.port);
   t.after(async () => {
     await gateway.drain();
     await postgres.close();
@@ -111,8 +111,10 @@ test("relays ten megabytes both directions through SSLRequest and verified TLS i
   assert.deepEqual(Buffer.concat(chunks), payload);
   assert.equal(postgres.handshakes(), 1);
   const closed = once(socket, "close");
+  const released = once(events, "conn_close");
   socket.close();
   await closed;
+  await released;
   assert.equal(gateway.metrics.activeConnections, 0);
   assert.ok(
     gateway.metrics.peakBufferedBytes <= MAX_PAYLOAD_BYTES + MAX_FRAME_BYTES,

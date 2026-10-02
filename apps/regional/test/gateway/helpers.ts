@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import {
   createServer,
   createConnection,
@@ -144,8 +144,10 @@ export async function gatewayFor(
   gateway: Gateway;
   port: number;
   logs: Readonly<Record<string, string | number>>[];
+  events: EventEmitter;
 }> {
   const logs: Readonly<Record<string, string | number>>[] = [];
+  const events = new EventEmitter();
   const ca = new DatabaseCaCache(async () => validCertificate.cert);
   const gateway = createGateway({
     region,
@@ -155,12 +157,15 @@ export async function gatewayFor(
         createConnection({ host: loopback, port: postgresPort }),
       timeoutMs: 2_000,
     }),
-    log: (event) => logs.push(event),
+    log: (event) => {
+      logs.push(event);
+      events.emit("conn_close", event);
+    },
     drainMs: 20,
     ...overrides,
   });
   const port = await listen(gateway.server);
-  return { gateway, port, logs };
+  return { gateway, port, logs, events };
 }
 
 export function token(
