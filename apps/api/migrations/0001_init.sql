@@ -1,6 +1,8 @@
 -- SPDX-License-Identifier: Apache-2.0
 -- Timestamps are ISO-8601 UTC TEXT exactly as Date#toISOString renders them,
 -- so string order equals time order for keyset pagination.
+-- Keep GLOB patterns short: Workers D1 rejects long LIKE/GLOB patterns.
+-- The separate digit check preserves the exact timestamp shape.
 
 CREATE TABLE projects (
   id TEXT PRIMARY KEY NOT NULL
@@ -8,9 +10,15 @@ CREATE TABLE projects (
   name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
   external_id TEXT CHECK (external_id IS NULL OR length(external_id) BETWEEN 1 AND 200),
   created_at TEXT NOT NULL
-    CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(created_at) = 24 AND created_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(created_at, 1, 4) || substr(created_at, 6, 2) || substr(created_at, 9, 2)
+        || substr(created_at, 12, 2) || substr(created_at, 15, 2) || substr(created_at, 18, 2)
+        || substr(created_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   updated_at TEXT NOT NULL
-    CHECK (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(updated_at) = 24 AND updated_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(updated_at, 1, 4) || substr(updated_at, 6, 2) || substr(updated_at, 9, 2)
+        || substr(updated_at, 12, 2) || substr(updated_at, 15, 2) || substr(updated_at, 18, 2)
+        || substr(updated_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   deleted_at TEXT
 );
 
@@ -29,7 +37,10 @@ CREATE TABLE api_keys (
   project_id TEXT REFERENCES projects(id),
   name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
   created_at TEXT NOT NULL
-    CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(created_at) = 24 AND created_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(created_at, 1, 4) || substr(created_at, 6, 2) || substr(created_at, 9, 2)
+        || substr(created_at, 12, 2) || substr(created_at, 15, 2) || substr(created_at, 18, 2)
+        || substr(created_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   last_used_at TEXT,
   revoked_at TEXT,
   CHECK ((scope = 'admin' AND project_id IS NULL) OR (scope = 'integrator' AND project_id IS NOT NULL))
@@ -52,9 +63,15 @@ CREATE TABLE size_classes (
   backup_retention_days INTEGER NOT NULL CHECK (backup_retention_days BETWEEN 1 AND 3650),
   enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
   created_at TEXT NOT NULL
-    CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(created_at) = 24 AND created_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(created_at, 1, 4) || substr(created_at, 6, 2) || substr(created_at, 9, 2)
+        || substr(created_at, 12, 2) || substr(created_at, 15, 2) || substr(created_at, 18, 2)
+        || substr(created_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   updated_at TEXT NOT NULL
-    CHECK (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z')
+    CHECK (length(updated_at) = 24 AND updated_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(updated_at, 1, 4) || substr(updated_at, 6, 2) || substr(updated_at, 9, 2)
+        || substr(updated_at, 12, 2) || substr(updated_at, 15, 2) || substr(updated_at, 18, 2)
+        || substr(updated_at, 21, 3)) NOT GLOB '*[^0-9]*')
 );
 
 CREATE TABLE regions (
@@ -73,9 +90,15 @@ CREATE TABLE regions (
     CHECK (length(agent_key_hash) = 64 AND NOT agent_key_hash GLOB '*[^0-9a-f]*'),
   agent_last_seen_at TEXT,
   created_at TEXT NOT NULL
-    CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(created_at) = 24 AND created_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(created_at, 1, 4) || substr(created_at, 6, 2) || substr(created_at, 9, 2)
+        || substr(created_at, 12, 2) || substr(created_at, 15, 2) || substr(created_at, 18, 2)
+        || substr(created_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   updated_at TEXT NOT NULL
-    CHECK (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z')
+    CHECK (length(updated_at) = 24 AND updated_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(updated_at, 1, 4) || substr(updated_at, 6, 2) || substr(updated_at, 9, 2)
+        || substr(updated_at, 12, 2) || substr(updated_at, 15, 2) || substr(updated_at, 18, 2)
+        || substr(updated_at, 21, 3)) NOT GLOB '*[^0-9]*')
 );
 
 CREATE TABLE nodes (
@@ -95,9 +118,15 @@ CREATE TABLE nodes (
   platform_reserved_memory_mib INTEGER NOT NULL DEFAULT 0 CHECK (platform_reserved_memory_mib >= 0),
   last_observed_at TEXT,
   created_at TEXT NOT NULL
-    CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(created_at) = 24 AND created_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(created_at, 1, 4) || substr(created_at, 6, 2) || substr(created_at, 9, 2)
+        || substr(created_at, 12, 2) || substr(created_at, 15, 2) || substr(created_at, 18, 2)
+        || substr(created_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   updated_at TEXT NOT NULL
-    CHECK (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(updated_at) = 24 AND updated_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(updated_at, 1, 4) || substr(updated_at, 6, 2) || substr(updated_at, 9, 2)
+        || substr(updated_at, 12, 2) || substr(updated_at, 15, 2) || substr(updated_at, 18, 2)
+        || substr(updated_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   CHECK ((monthly_price IS NULL) = (currency IS NULL))
 );
 
@@ -126,9 +155,15 @@ CREATE TABLE databases (
     CHECK (archiving_health IN ('ok', 'failing', 'unknown')),
   archiving_health_since TEXT,
   created_at TEXT NOT NULL
-    CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(created_at) = 24 AND created_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(created_at, 1, 4) || substr(created_at, 6, 2) || substr(created_at, 9, 2)
+        || substr(created_at, 12, 2) || substr(created_at, 15, 2) || substr(created_at, 18, 2)
+        || substr(created_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   updated_at TEXT NOT NULL
-    CHECK (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(updated_at) = 24 AND updated_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(updated_at, 1, 4) || substr(updated_at, 6, 2) || substr(updated_at, 9, 2)
+        || substr(updated_at, 12, 2) || substr(updated_at, 15, 2) || substr(updated_at, 18, 2)
+        || substr(updated_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   deleted_at TEXT,
   CHECK ((desired_state = 'deleted') = (deleted_at IS NOT NULL))
 );
@@ -154,9 +189,15 @@ CREATE TABLE roles (
   password_kid TEXT NOT NULL CHECK (length(password_kid) BETWEEN 1 AND 64),
   password_revision INTEGER NOT NULL DEFAULT 1 CHECK (password_revision >= 1),
   created_at TEXT NOT NULL
-    CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(created_at) = 24 AND created_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(created_at, 1, 4) || substr(created_at, 6, 2) || substr(created_at, 9, 2)
+        || substr(created_at, 12, 2) || substr(created_at, 15, 2) || substr(created_at, 18, 2)
+        || substr(created_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   updated_at TEXT NOT NULL
-    CHECK (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(updated_at) = 24 AND updated_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(updated_at, 1, 4) || substr(updated_at, 6, 2) || substr(updated_at, 9, 2)
+        || substr(updated_at, 12, 2) || substr(updated_at, 15, 2) || substr(updated_at, 18, 2)
+        || substr(updated_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   deleted_at TEXT,
   -- Routing index: the edge resolves (database, user) from the StartupMessage.
   PRIMARY KEY (database_id, name)
@@ -175,9 +216,15 @@ CREATE TABLE operations (
   error_code TEXT CHECK (error_code IS NULL OR length(error_code) BETWEEN 1 AND 64),
   error_message TEXT CHECK (error_message IS NULL OR length(error_message) <= 4096),
   created_at TEXT NOT NULL
-    CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(created_at) = 24 AND created_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(created_at, 1, 4) || substr(created_at, 6, 2) || substr(created_at, 9, 2)
+        || substr(created_at, 12, 2) || substr(created_at, 15, 2) || substr(created_at, 18, 2)
+        || substr(created_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   updated_at TEXT NOT NULL
-    CHECK (updated_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(updated_at) = 24 AND updated_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(updated_at, 1, 4) || substr(updated_at, 6, 2) || substr(updated_at, 9, 2)
+        || substr(updated_at, 12, 2) || substr(updated_at, 15, 2) || substr(updated_at, 18, 2)
+        || substr(updated_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   completed_at TEXT,
   CHECK ((status IN ('succeeded', 'failed')) = (completed_at IS NOT NULL)),
   CHECK (status = 'failed' OR (error_code IS NULL AND error_message IS NULL))
@@ -196,7 +243,10 @@ CREATE TABLE idempotency_keys (
   resource_id TEXT CHECK (resource_id IS NULL OR length(resource_id) BETWEEN 1 AND 64),
   response_status INTEGER CHECK (response_status IS NULL OR response_status BETWEEN 100 AND 599),
   created_at TEXT NOT NULL
-    CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+    CHECK (length(created_at) = 24 AND created_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(created_at, 1, 4) || substr(created_at, 6, 2) || substr(created_at, 9, 2)
+        || substr(created_at, 12, 2) || substr(created_at, 15, 2) || substr(created_at, 18, 2)
+        || substr(created_at, 21, 3)) NOT GLOB '*[^0-9]*'),
   PRIMARY KEY (api_key_id, key),
   CHECK ((state = 'completed') = (response_status IS NOT NULL))
 );
@@ -212,7 +262,10 @@ CREATE TABLE lifecycle_events (
   size_class_id TEXT NOT NULL REFERENCES size_classes(id),
   generation INTEGER NOT NULL CHECK (generation >= 1),
   occurred_at TEXT NOT NULL
-    CHECK (occurred_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z')
+    CHECK (length(occurred_at) = 24 AND occurred_at GLOB '????-??-??T??:??:??.???Z'
+      AND (substr(occurred_at, 1, 4) || substr(occurred_at, 6, 2) || substr(occurred_at, 9, 2)
+        || substr(occurred_at, 12, 2) || substr(occurred_at, 15, 2) || substr(occurred_at, 18, 2)
+        || substr(occurred_at, 21, 3)) NOT GLOB '*[^0-9]*')
 );
 
 CREATE INDEX lifecycle_events_database_idx ON lifecycle_events(database_id, occurred_at);
