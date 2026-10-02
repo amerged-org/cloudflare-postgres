@@ -15,6 +15,7 @@ export const keyRow = (row: Row): ApiKey =>
     scope: row.scope,
     project_id: row.project_id,
     name: row.name,
+    lookup_id: row.lookup_id,
     created_at: row.created_at,
     revoked_at: row.revoked_at,
   });

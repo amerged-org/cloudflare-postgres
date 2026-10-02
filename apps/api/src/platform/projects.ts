@@ -22,6 +22,7 @@ export async function createProject(
         .bind(id)
         .first<Row>();
       if (!row) throw new ApiError("not_found", "Project not found");
+      c.header("Location", `/v1/projects/${id}`);
       return c.json(projectRow(row), 201);
     },
     execute: async (lease) => {

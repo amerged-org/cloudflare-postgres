@@ -63,7 +63,10 @@ export function keyring(secret: string): CredentialKeyring {
   }
   if (!keys.has(config.data.active))
     throw new Error("Active credential key is missing");
-  const get = async (kid: string, usage: KeyUsage): Promise<CryptoKey> => {
+  const get = async (
+    kid: string,
+    usage: "encrypt" | "decrypt",
+  ): Promise<CryptoKey> => {
     const bytes = keys.get(kid);
     if (!bytes) throw new Error("Credential key version is unavailable");
     return crypto.subtle.importKey(
