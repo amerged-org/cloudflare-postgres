@@ -157,7 +157,9 @@ jobs:
             "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
             "$RUNNER_TEMP/pgcf-image-gate/qualification.json" "$RUNNER_TEMP/pgcf-image-gate/registry-sha.json"
           digest=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; console.log(JSON.parse(readFileSync(process.argv[1], "utf8")).digest)' "$RUNNER_TEMP/pgcf-image-gate/registry-sha.json")
-          docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" "$IMAGE@$digest"
+          node scripts/ci/image-qualification.ts promote "$IMAGE" \
+            "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/pgcf-image-gate/qualification.json" "$RUNNER_TEMP/pgcf-image-gate/registry-sha.json"
           node scripts/ci/image-qualification.ts registry "$IMAGE:latest" \
             "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
             "$RUNNER_TEMP/pgcf-image-gate/qualification.json" "$RUNNER_TEMP/pgcf-image-gate/registry-latest.json"

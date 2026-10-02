@@ -18,6 +18,32 @@ const digestPattern = /^sha256:[a-f0-9]{64}$/;
 const digest = (bytes: Buffer) =>
   "sha256:" + createHash("sha256").update(bytes).digest("hex");
 
+export function promotionArguments(
+  repository: string,
+  verified: { digest: string; manifestDigest: string; configDigest: string },
+  qualification: QualifiedImage,
+): string[] {
+  check(
+    /^ghcr\.io\/[a-z0-9._-]+\/[a-z0-9._-]+$/.test(repository) &&
+      digestPattern.test(verified.digest) &&
+      digestPattern.test(verified.manifestDigest),
+  );
+  check(
+    verified.configDigest === qualification.configDigest &&
+      (qualification.imageId === qualification.configDigest ||
+        verified.manifestDigest === qualification.imageId),
+  );
+  return [
+    "buildx",
+    "imagetools",
+    "create",
+    "--prefer-index=false",
+    "--tag",
+    `${repository}:latest`,
+    `${repository}@${verified.digest}`,
+  ];
+}
+
 export function validateRegistryBinding(
   manifestBytes: Buffer,
   manifestDigest: string,

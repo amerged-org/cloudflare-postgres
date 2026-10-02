@@ -28,7 +28,12 @@ import {
   safeFindingCounts,
   type ScanInput,
 } from "./scanner.ts";
-import { verifyRegistry } from "./registry.ts";
+import { verifyRegistry, promotionArguments } from "./registry.ts";
+import {
+  classifyReviewed,
+  readPackageProvenance,
+  reviewedFiles,
+} from "./reviewed-findings.ts";
 
 const scannerVersion = "8.30.1";
 // SHA256 values from the official v8.30.1 release checksums, not a moving tag.
@@ -786,28 +791,49 @@ export async function qualify(
       ...(await mapFindings(opaque.findings, prepared.opaque.aliases)),
       ...(await mapFindings(family.findings, prepared.family.aliases)),
     ]);
-    let resolved = 0;
-    for (const finding of canonical) {
-      if (finding.input.kind !== "layer-file" || finding.Tags.length) continue;
+    const manifests: { name: string; version: string }[] = [];
+    for (const reviewed of reviewedFiles) {
+      if (!reviewed.package) continue;
+      const path = reviewed.path.replace(/https\.d\.ts$/, "package.json");
+      const file = files.find(
+        (file) => file.path === path && file.layer === reviewed.layer,
+      );
+      requireCheck(file, "Reviewed runtime package manifest missing");
+      const manifest = JSON.parse(
+        await readFile(join(scanDirectory, file.scanPath), "utf8"),
+      ) as { name: string; version: string };
+      manifests.push({ name: manifest.name, version: manifest.version });
+    }
+    const packages = readPackageProvenance(
+      await readFile("pnpm-lock.yaml", "utf8"),
+      manifests,
+    );
+    const classification = classifyReviewed(canonical, {
+      baseImage,
+      baseDiffIDs: base.RootFS.Layers,
+      imageDiffIDs: config.rootfs.diff_ids,
+      packages,
+    });
+    // Retain the already-reviewed V8 redacted-report consistency check as an additional guard.
+    for (const finding of canonical.filter(
+      (finding) =>
+        finding.input.path === "usr/local/include/node/v8-internal.h",
+    )) {
       const file = files.find(
         (file) =>
           file.layer === finding.input.layer &&
-          file.tarEntry === finding.input.tarEntry &&
-          file.path === finding.input.path &&
-          file.sha256 === finding.input.sha256 &&
-          file.size === finding.input.size,
+          file.tarEntry === finding.input.tarEntry,
       );
-      if (file)
-        resolved += classifyFindings(
-          [{ ...finding, File: file.scanPath }],
-          [file],
-          base.RootFS.Layers.length,
-        ).resolved;
+      requireCheck(
+        file &&
+          classifyFindings(
+            [{ ...finding, File: file.scanPath }],
+            [file],
+            base.RootFS.Layers.length,
+          ).resolved === 1,
+        "Reviewed V8 report context changed",
+      );
     }
-    const classification = {
-      resolved,
-      unresolved: canonical.length - resolved,
-    };
     const report: QualificationReport = {
       version: 2,
       imageId,
@@ -932,7 +958,11 @@ async function main(): Promise<void> {
   if (action === "qualify") {
     const report = await qualify(image, imageId, revision, source, reportPath);
     console.log(JSON.stringify(report));
-  } else if (action === "verify" || action === "registry") {
+  } else if (
+    action === "verify" ||
+    action === "registry" ||
+    action === "promote"
+  ) {
     const report = JSON.parse(
       await readFile(reportPath, "utf8"),
     ) as QualificationReport;
@@ -952,6 +982,15 @@ async function main(): Promise<void> {
         "Missing registry verification report path",
       );
       await verifyRegistry(image, report, registryReportPath);
+    } else if (action === "promote") {
+      requireCheck(
+        registryReportPath,
+        "Missing verified SHA-tag registry report",
+      );
+      const verified = JSON.parse(
+        await readFile(registryReportPath, "utf8"),
+      ) as { digest: string; manifestDigest: string; configDigest: string };
+      await command("docker", promotionArguments(image, verified, report));
     } else
       requireCheck(
         (await inspectImage(image)).Id === imageId,

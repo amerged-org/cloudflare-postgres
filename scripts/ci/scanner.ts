@@ -361,6 +361,12 @@ export async function runPass(
 export interface CanonicalFinding extends Finding {
   input: Readonly<ScanInput>;
   Tags: string[];
+  span?: {
+    byteStart: number;
+    byteEndExclusive: number;
+    size: number;
+    sha256: string;
+  };
 }
 export function dedupeFindings(
   findings: CanonicalFinding[],
@@ -450,6 +456,24 @@ export async function mapFindings(
           (value.StartLine !== value.EndLine ||
             value.StartColumn <= value.EndColumn),
       );
+      const offsets: number[] = [0];
+      for (let index = 0; index < bytes.length; index++)
+        if (bytes[index] === 10) offsets.push(index);
+      const byteStart = offsets[value.StartLine - 1]! + value.StartColumn - 1;
+      const byteEndExclusive = offsets[value.EndLine - 1]! + value.EndColumn;
+      check(
+        byteStart >= 0 &&
+          byteEndExclusive > byteStart &&
+          byteEndExclusive <= bytes.length,
+      );
+      value.span = Object.freeze({
+        byteStart,
+        byteEndExclusive,
+        size: byteEndExclusive - byteStart,
+        sha256: createHash("sha256")
+          .update(bytes.subarray(byteStart, byteEndExclusive))
+          .digest("hex"),
+      });
     }
     const key = JSON.stringify([
       identity(alias.input),

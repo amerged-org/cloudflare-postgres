@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
-import { validateRegistryBinding } from "./registry.ts";
+import { validateRegistryBinding, promotionArguments } from "./registry.ts";
 
 test("published manifest/config must bind the qualified image, labels and ordered layers", () => {
   const config = Buffer.from(
@@ -74,5 +74,51 @@ test("published manifest/config must bind the qualified image, labels and ordere
       ...qualification,
       registryLayerDigests: ["sha256:" + "0".repeat(64)],
     }),
+  );
+});
+
+test("latest promotion only uses the verified immutable SHA-tag digest", () => {
+  const manifestDigest = "sha256:" + "a".repeat(64);
+  const configDigest = "sha256:" + "b".repeat(64);
+  const image = {
+    imageId: manifestDigest,
+    configDigest,
+    revision: "c".repeat(40),
+    source: "https://github.com/public/product",
+    diffIDs: [],
+  };
+  const verified = { digest: manifestDigest, manifestDigest, configDigest };
+  assert.deepEqual(
+    promotionArguments("ghcr.io/public/product", verified, image),
+    [
+      "buildx",
+      "imagetools",
+      "create",
+      "--prefer-index=false",
+      "--tag",
+      "ghcr.io/public/product:latest",
+      `ghcr.io/public/product@${manifestDigest}`,
+    ],
+  );
+  assert.throws(() =>
+    promotionArguments(
+      "ghcr.io/public/product",
+      { ...verified, digest: "latest" },
+      image,
+    ),
+  );
+  assert.throws(() =>
+    promotionArguments(
+      "ghcr.io/public/product",
+      { ...verified, configDigest: "sha256:" + "0".repeat(64) },
+      image,
+    ),
+  );
+  assert.throws(() =>
+    promotionArguments(
+      "ghcr.io/public/product",
+      { ...verified, manifestDigest: "sha256:" + "0".repeat(64) },
+      image,
+    ),
   );
 });
