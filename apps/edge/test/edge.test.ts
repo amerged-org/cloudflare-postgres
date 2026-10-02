@@ -28,6 +28,8 @@ let database: string;
 
 interface GatewayObservation {
   token: string;
+  path: string;
+  waiting: boolean;
   bytes: number[];
   closes: number[];
 }
@@ -158,14 +160,16 @@ beforeEach(async () => {
 
 afterEach(async () => {
   vi.useRealTimers();
-  for (const { socket, ctx } of live.splice(0)) {
+  const connections = live.splice(0);
+  for (const { socket } of connections) {
     try {
       socket.close(1000);
     } catch {
       /* Already closed. */
     }
-    await waitOnExecutionContext(ctx);
   }
+  await testEnv.GATEWAY.fetch(`${gatewayOrigin}/release`);
+  for (const { ctx } of connections) await waitOnExecutionContext(ctx);
   await testEnv.GATEWAY.fetch(`${gatewayOrigin}/reset`);
   logs.mockRestore();
 });
@@ -252,6 +256,26 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     await expect
       .poll(() => [...concat(...connection.messages)])
       .toEqual(expected);
+  });
+
+  it("declines GSS then SSL and forwards only the exact startup and trailing bytes", async () => {
+    const connection = await open();
+    const gss = encodeSslRequest();
+    new DataView(gss.buffer).setUint32(4, 80877104);
+    const startup = encodeStartup({ user: "app", database });
+    const trailing = Uint8Array.of(21, 22, 23);
+    connection.socket.send(concat(gss, encodeSslRequest(), startup, trailing));
+    await expect
+      .poll(() => connection.messages.length)
+      .toBeGreaterThanOrEqual(3);
+    expect([...connection.messages[0]!]).toEqual([0x4e]);
+    expect([...connection.messages[1]!]).toEqual([0x4e]);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...concat(startup, trailing)]);
+    expect([...concat(...connection.messages.slice(2))]).toEqual([
+      ...concat(startup, trailing),
+    ]);
   });
 
   it("declines SSL then forwards the exact startup without its encryption prelude", async () => {
@@ -359,12 +383,83 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
   });
 
   it("refuses public HTTP fallback before sending a routing token or database bytes", async () => {
-    await testEnv.DB.prepare("UPDATE regions SET gateway_binding = NULL, gateway_url = ? WHERE id = ?")
-      .bind(`${gatewayOrigin.replace("https:", "http:")}/pg`, region).run();
+    await testEnv.DB.prepare(
+      "UPDATE regions SET gateway_binding = NULL, gateway_url = ? WHERE id = ?",
+    )
+      .bind(`${gatewayOrigin.replace("https:", "http:")}/pg`, region)
+      .run();
     const connection = await open();
     connection.socket.send(encodeStartup({ user: "app", database }));
     expect(await errorCode(connection)).toBe("08006");
     expect(await stats()).toHaveLength(0);
+  });
+
+  it("allows HTTP only through an explicitly configured trusted service binding", async () => {
+    await testEnv.DB.prepare("UPDATE regions SET gateway_url = ? WHERE id = ?")
+      .bind(`${gatewayOrigin.replace("https:", "http:")}/pg`, region)
+      .run();
+    const connection = await open();
+    const startup = encodeStartup({ user: "app", database });
+    connection.socket.send(startup);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...startup]);
+    await expect
+      .poll(() => [...concat(...connection.messages)])
+      .toEqual([...startup]);
+  });
+
+  it("refuses gateway redirects without leaking a token to the redirect target", async () => {
+    await setGatewayMode("redirect");
+    await testEnv.DB.prepare(
+      "UPDATE regions SET gateway_binding = NULL WHERE id = ?",
+    )
+      .bind(region)
+      .run();
+    const connection = await open();
+    connection.socket.send(encodeStartup({ user: "app", database }));
+    expect(await errorCode(connection)).toBe("08006");
+    const observations = await stats();
+    expect(observations).toHaveLength(1);
+    expect(observations[0]!.path).toBe("/pg");
+    expect(observations[0]!.token).toBeTruthy();
+    expect(observations[0]!.bytes).toHaveLength(0);
+  });
+
+  it("does not flush startup or reconnect when the client closes during a gateway connection", async () => {
+    await setGatewayMode("held");
+    const connection = await open();
+    connection.socket.send(encodeStartup({ user: "app", database }));
+    await expect.poll(async () => (await stats())[0]?.waiting).toBe(true);
+    connection.socket.close(3001, "test cancellation");
+    await expect.poll(connection.closeCode).toBe(3001);
+    await testEnv.GATEWAY.fetch(`${gatewayOrigin}/release`);
+    await waitOnExecutionContext(connection.ctx);
+    const observations = await stats();
+    expect(observations).toHaveLength(1);
+    expect(observations[0]!.bytes).toHaveLength(0);
+    expect(connection.messages).toHaveLength(0);
+    expect(logs.mock.calls).toHaveLength(1);
+  });
+
+  it("enforces the startup deadline during a pending gateway upgrade without flushing bytes", async () => {
+    await setGatewayMode("held");
+    vi.useFakeTimers();
+    const connection = await open();
+    connection.socket.send(encodeStartup({ user: "app", database }));
+    await vi.waitFor(async () =>
+      expect((await stats())[0]?.waiting).toBe(true),
+    );
+    await vi.advanceTimersByTimeAsync(STARTUP_DEADLINE_MS);
+    vi.useRealTimers();
+    expect(await errorCode(connection)).toBe("08P01");
+    await expect.poll(connection.closeCode).toBe(1000);
+    await testEnv.GATEWAY.fetch(`${gatewayOrigin}/release`);
+    await waitOnExecutionContext(connection.ctx);
+    const observations = await stats();
+    expect(observations).toHaveLength(1);
+    expect(observations[0]!.bytes).toHaveLength(0);
+    expect(logs.mock.calls).toHaveLength(1);
   });
 
   it("routes the global fetch fallback to a real test gateway Worker", async () => {

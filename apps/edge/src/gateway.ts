@@ -18,6 +18,7 @@ export async function connectGateway(
   const url = new URL(region.gateway_url);
   if (
     !["http:", "https:"].includes(url.protocol) ||
+    (region.gateway_binding === null && url.protocol !== "https:") ||
     url.username ||
     url.password
   )
