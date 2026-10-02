@@ -191,6 +191,18 @@ function resources() {
       },
       { name: "PGCF_GATEWAY_PORT", value: "8080" },
     ],
+    ports: [{ name: "http", containerPort: 8080, protocol: "TCP" }],
+    livenessProbe: {
+      httpGet: { path: "/healthz", port: "http" },
+      initialDelaySeconds: 5,
+      periodSeconds: 10,
+      failureThreshold: 3,
+    },
+    readinessProbe: {
+      httpGet: { path: "/readyz", port: "http" },
+      periodSeconds: 5,
+      failureThreshold: 2,
+    },
     securityContext: {
       allowPrivilegeEscalation: false,
       readOnlyRootFilesystem: true,
@@ -983,5 +995,180 @@ test("Gateway source proof rejects Deployment args and nonroot overrides in eith
         fixture.image,
       ),
     { message: "gateway_log_execution_security_mismatch" },
+  );
+});
+
+test("Gateway source proof rejects postStart and preStop programs in both execution layers", () => {
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      container.lifecycle = {
+        postStart: { exec: { command: ["node", "-e", "process.exit(0)"] } },
+      };
+    }),
+    { message: "gateway_log_extra_program" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.lifecycle = {
+        postStart: { exec: { command: ["node", "-e", "process.exit(0)"] } },
+      };
+      container.ports = [
+        { name: "http", containerPort: 8090, protocol: "TCP" },
+      ];
+    }),
+    { message: "gateway_log_extra_program" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.lifecycle = {
+        preStop: { exec: { command: ["node", "-e", "process.exit(0)"] } },
+      };
+    }),
+    { message: "gateway_log_extra_program" },
+  );
+});
+
+test("Gateway source proof rejects executable probes in Deployment and Pod and unexpected startup probes", () => {
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      container.livenessProbe = {
+        exec: { command: ["node", "-e", "process.exit(0)"] },
+      };
+    }),
+    { message: "gateway_log_probe_mismatch" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.readinessProbe = {
+        exec: { command: ["node", "-e", "process.exit(0)"] },
+      };
+    }),
+    { message: "gateway_log_probe_mismatch" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.startupProbe = {
+        exec: { command: ["node", "-e", "process.exit(0)"] },
+      };
+    }),
+    { message: "gateway_log_probe_mismatch" },
+  );
+});
+
+test("Gateway source proof binds the advertised HTTP port to the actual approved 8080 listener", () => {
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      container.ports = [
+        { name: "http", containerPort: 8090, protocol: "TCP" },
+      ];
+    }),
+    { message: "gateway_log_port_mismatch" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.ports = [
+        { name: "http", containerPort: 8090, protocol: "TCP" },
+      ];
+    }),
+    { message: "gateway_log_port_mismatch" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.readinessProbe = { httpGet: { path: "/readyz", port: 8090 } };
+    }),
+    { message: "gateway_log_probe_mismatch" },
+  );
+});
+
+function changedGatewaySpec(
+  target: "deployment" | "pod",
+  change: (spec: Record<string, unknown>) => void,
+) {
+  const fixture = resources();
+  const spec =
+    target === "deployment"
+      ? fixture.deployment.spec.template.spec
+      : fixture.pod.spec;
+  change(spec);
+  return () =>
+    clients.gatewayLogPods(
+      { items: [fixture.deployment] },
+      { items: [fixture.set] },
+      { items: [fixture.pod] },
+      fixture.namespace,
+      fixture.image,
+    );
+}
+
+test("Gateway source proof permits only the approved single-container Deployment program", () => {
+  assert.throws(
+    changedGatewaySpec("deployment", (spec) => {
+      (spec.containers as Record<string, unknown>[]).push({
+        name: "helper",
+        image: (spec.containers as Record<string, unknown>[])[0]!.image,
+        command: ["node", "-e", "process.exit(0)"],
+      });
+    }),
+    { message: "gateway_log_extra_program" },
+  );
+  assert.throws(
+    changedGatewaySpec("deployment", (spec) => {
+      spec.initContainers = [
+        { name: "prepare", command: ["node", "-e", "process.exit(0)"] },
+      ];
+    }),
+    { message: "gateway_log_extra_program" },
+  );
+});
+
+test("Gateway source proof rejects Pod sidecar, init and ephemeral programs", () => {
+  assert.throws(
+    changedGatewaySpec("pod", (spec) => {
+      (spec.containers as Record<string, unknown>[]).push({
+        name: "helper",
+        image: (spec.containers as Record<string, unknown>[])[0]!.image,
+        command: ["node", "-e", "process.exit(0)"],
+      });
+    }),
+    { message: "gateway_log_extra_program" },
+  );
+  assert.throws(
+    changedGatewaySpec("pod", (spec) => {
+      spec.initContainers = [
+        { name: "prepare", command: ["node", "-e", "process.exit(0)"] },
+      ];
+    }),
+    { message: "gateway_log_extra_program" },
+  );
+  assert.throws(
+    changedGatewaySpec("pod", (spec) => {
+      spec.ephemeralContainers = [
+        { name: "inspect", command: ["node", "-e", "process.exit(0)"] },
+      ];
+    }),
+    { message: "gateway_log_extra_program" },
+  );
+});
+
+test("approved Gateway HTTP health and readiness probes remain valid with Kubernetes defaults", () => {
+  assert.doesNotThrow(
+    changedGateway("pod", (container) => {
+      container.livenessProbe = {
+        httpGet: { path: "/healthz", port: "http", scheme: "HTTP" },
+        initialDelaySeconds: 5,
+        periodSeconds: 10,
+        failureThreshold: 3,
+        timeoutSeconds: 1,
+        successThreshold: 1,
+      };
+      container.readinessProbe = {
+        httpGet: { path: "/readyz", port: "http", scheme: "HTTP" },
+        initialDelaySeconds: 0,
+        periodSeconds: 5,
+        failureThreshold: 2,
+        timeoutSeconds: 1,
+        successThreshold: 1,
+      };
+    }),
   );
 });

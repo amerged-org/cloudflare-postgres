@@ -285,11 +285,48 @@ export function assertGatewayEnvironmentKeys(names: readonly string[]): void {
     throw new HarnessError("gateway_log_execution_hook");
 }
 
+function assertGatewayHttpProbe(value: unknown, path: string): void {
+  const probe =
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  const http =
+    probe?.httpGet &&
+    typeof probe.httpGet === "object" &&
+    !Array.isArray(probe.httpGet)
+      ? (probe.httpGet as Record<string, unknown>)
+      : undefined;
+  if (
+    !http ||
+    probe!.exec !== undefined ||
+    probe!.tcpSocket !== undefined ||
+    probe!.grpc !== undefined ||
+    http.path !== path ||
+    http.port !== "http" ||
+    (http.scheme !== undefined && http.scheme !== "HTTP") ||
+    (http.host !== undefined && http.host !== "") ||
+    (http.httpHeaders !== undefined &&
+      (!Array.isArray(http.httpHeaders) || http.httpHeaders.length !== 0))
+  )
+    throw new HarnessError("gateway_log_probe_mismatch");
+}
+
 function assertGatewayEntrypoint(
   container: Record<string, unknown>,
   spec: Record<string, unknown>,
 ): void {
   // Match infra/platform/regional/gateway.yaml; the same image also contains the agent.
+  if (
+    !Array.isArray(spec.containers) ||
+    spec.containers.length !== 1 ||
+    [spec.initContainers, spec.ephemeralContainers].some(
+      (programs) =>
+        programs !== undefined &&
+        (!Array.isArray(programs) || programs.length !== 0),
+    ) ||
+    container.lifecycle !== undefined
+  )
+    throw new HarnessError("gateway_log_extra_program");
   if (
     !Array.isArray(container.command) ||
     container.command.length !== 2 ||
@@ -300,6 +337,20 @@ function assertGatewayEntrypoint(
     (container.workingDir !== undefined && container.workingDir !== "/app")
   )
     throw new HarnessError("gateway_log_entrypoint_mismatch");
+  if (
+    !Array.isArray(container.ports) ||
+    container.ports.length !== 1 ||
+    !sameStructuredValue(container.ports[0], {
+      name: "http",
+      containerPort: 8080,
+      protocol: "TCP",
+    })
+  )
+    throw new HarnessError("gateway_log_port_mismatch");
+  if (container.startupProbe !== undefined)
+    throw new HarnessError("gateway_log_probe_mismatch");
+  assertGatewayHttpProbe(container.livenessProbe, "/healthz");
+  assertGatewayHttpProbe(container.readinessProbe, "/readyz");
   const env = container.env === undefined ? [] : container.env;
   if (!Array.isArray(env)) throw new HarnessError("gateway_log_execution_hook");
   assertGatewayEnvironmentKeys(env.map((row) => string(record(row).name)));
