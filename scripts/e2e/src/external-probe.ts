@@ -87,6 +87,48 @@ function ipValue(host: string): { family: 4 | 6; value: bigint } {
     throw new HarnessError("external_probe_mapped_address_refused");
   return { family, value };
 }
+
+function publicIPv4(host: string): boolean {
+  const address = ipValue(host);
+  if (address.family !== 4) return false;
+  // IANA special-purpose registry, verified 2026-10-02; unknown reachability fails closed.
+  // https://www.iana.org/assignments/iana-ipv4-special-registry/
+  if (address.value === 3221225481n || address.value === 3221225482n)
+    return true;
+  const excluded: readonly [bigint, number][] = [
+    [0n, 8],
+    [167772160n, 8],
+    [1681915904n, 10],
+    [2130706432n, 8],
+    [2851995648n, 16],
+    [2886729728n, 12],
+    [3221225472n, 24],
+    [3221225984n, 24],
+    [3227017984n, 24],
+    [3232235520n, 16],
+    [3323068416n, 15],
+    [3325256704n, 24],
+    [3405803776n, 24],
+    [3758096384n, 4], // Multicast is outside the unicast special-purpose registry.
+    [4026531840n, 4],
+  ];
+  return excluded.every(
+    ([network, prefix]) =>
+      address.value >> BigInt(32 - prefix) !== network >> BigInt(32 - prefix),
+  );
+}
+
+function assertPublicProofAddresses(
+  config: Pick<ProbeConfig, "control" | "targets">,
+): void {
+  if (!publicIPv4(config.control))
+    throw new HarnessError("external_probe_public_control_required");
+  for (const target of config.targets) {
+    if (ipValue(target).family === 4 && !publicIPv4(target))
+      throw new HarnessError("external_probe_public_target_required");
+  }
+  // IPv6 is never dialled or marked proven by this IPv4-only candidate.
+}
 function cidr(value: string): { family: 4 | 6; first: bigint; last: bigint } {
   const parts = value.split("/");
   if (parts.length !== 2 || !/^(?:0|[1-9][0-9]{0,2})$/.test(parts[1]!))
@@ -167,6 +209,7 @@ export function parseProbeConfig(value: string, now = Date.now()): ProbeConfig {
   const control = string(entry.control);
   if (ipValue(control).family !== 4 || targets.includes(control))
     throw new HarnessError("external_probe_control_invalid");
+  assertPublicProofAddresses({ control, targets: targets as string[] });
   normalizedCidrs(allowlist as string[]);
   return {
     version: 1,
@@ -216,6 +259,7 @@ export function probeReport(
   now = Date.now(),
 ): ProbeReport {
   parseContext(context);
+  assertPublicProofAddresses(config);
   const at = new Date(now).toISOString();
   const disjoint = cidrPoolsDisjoint(pool, config.operator_allowlist);
   return {
@@ -465,10 +509,16 @@ export function assertProbeProvenance(
   if (!accepted) throw new HarnessError("external_probe_attestation_mismatch");
 }
 
+export interface ProbeIo {
+  command: typeof command;
+  sourcePool: () => Promise<string[]>;
+}
+
 export async function consumeExternalProbe(
   root: string,
   targets: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
+  io: ProbeIo = { command, sourcePool },
 ): Promise<Set<string>> {
   if (
     !env.PGCF_E2E_EXTERNAL_PROBE_CONFIG ||
@@ -486,7 +536,7 @@ export async function consumeExternalProbe(
     throw new HarnessError("external_probe_allowlist_required");
   const path = resolve(root, ".local/evidence/phase1/pgcf-e6-native.json");
   const body = await readFile(path, "utf8");
-  const verified = await command(
+  const verified = await io.command(
     "gh",
     [
       "attestation",
@@ -518,7 +568,7 @@ export async function consumeExternalProbe(
   );
   const run = record(
     JSON.parse(
-      await command(
+      await io.command(
         "gh",
         [
           "api",
@@ -542,7 +592,7 @@ export async function consumeExternalProbe(
     throw new HarnessError("external_probe_run_mismatch");
   const artifacts = record(
     JSON.parse(
-      await command(
+      await io.command(
         "gh",
         [
           "api",
@@ -563,10 +613,10 @@ export async function consumeExternalProbe(
   )
     throw new HarnessError("external_probe_artifact_missing");
   const currentCommit = (
-    await command("git", ["rev-parse", "HEAD"], { cwd: root })
+    await io.command("git", ["rev-parse", "HEAD"], { cwd: root })
   ).trim();
   const currentRef = (
-    await command("git", ["symbolic-ref", "HEAD"], { cwd: root })
+    await io.command("git", ["symbolic-ref", "HEAD"], { cwd: root })
   ).trim();
   if (currentCommit !== context.commit || currentRef !== "refs/heads/main")
     throw new HarnessError("external_probe_commit_mismatch");
@@ -574,7 +624,7 @@ export async function consumeExternalProbe(
     assertExternalReport(
       json(body),
       config,
-      await sourcePool(),
+      await io.sourcePool(),
       context,
       allowlist as string[],
       targets,

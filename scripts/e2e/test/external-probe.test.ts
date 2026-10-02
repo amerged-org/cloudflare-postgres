@@ -3,7 +3,11 @@ import assert from "node:assert/strict";
 import { createHash, randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { createServer } from "node:net";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { resolve } from "node:path";
 import test from "node:test";
+import type { TestContext } from "node:test";
 import {
   assertExternalReport,
   assertProbeProvenance,
@@ -14,6 +18,9 @@ import {
   parseProbeConfig,
   probeReport,
 } from "../src/external-probe.ts";
+import type { ProbeIo } from "../src/external-probe.ts";
+import { Run } from "../src/run.ts";
+import { fingerprint } from "../src/core.ts";
 
 const host4 = (...octets: number[]) => octets.join(".");
 const host6 = (value: number) => `${value.toString(16)}::1`;
@@ -25,8 +32,8 @@ function input() {
     salt: randomBytes(32).toString("base64url"),
     created_at: new Date(now - 1000).toISOString(),
     expires_at: new Date(now + 1_200_000).toISOString(),
-    targets: [host4(198, 18, 0, 10), host6(0x2001)],
-    control: host4(198, 19, 0, 10),
+    targets: [host4(11, 1, 2, 3), host6(0x2001)],
+    control: host4(12, 1, 2, 3),
     operator_allowlist: [`${host4(198, 18, 1, 0)}/24`, `${host6(0x2001)}/64`],
     operator_allowlist_complete: true,
   };
@@ -116,6 +123,97 @@ test("secret configuration expires and cannot omit the authoritative allowlist",
       JSON.stringify({
         ...value,
         targets: [`::ffff:${host4(198, 18, 0, 10)}`],
+      }),
+      now,
+    ),
+  );
+});
+
+test("a loopback TCP control cannot prove public SMTP egress", () => {
+  assert.throws(() =>
+    parseProbeConfig(
+      JSON.stringify({ ...input(), control: host4(127, 0, 0, 1) }),
+      now,
+    ),
+  );
+});
+
+test("a private TCP control cannot prove public SMTP egress", () => {
+  assert.throws(() =>
+    parseProbeConfig(
+      JSON.stringify({ ...input(), control: host4(10, 1, 2, 3) }),
+      now,
+    ),
+  );
+});
+
+test("a link-local TCP control cannot prove public SMTP egress", () => {
+  assert.throws(() =>
+    parseProbeConfig(
+      JSON.stringify({ ...input(), control: host4(169, 254, 1, 2) }),
+      now,
+    ),
+  );
+});
+
+test("a reserved TCP control cannot prove public SMTP egress", () => {
+  assert.throws(() =>
+    parseProbeConfig(
+      JSON.stringify({ ...input(), control: host4(198, 18, 1, 2) }),
+      now,
+    ),
+  );
+  assert.throws(() =>
+    parseProbeConfig(
+      JSON.stringify({ ...input(), control: host4(224, 0, 1, 2) }),
+      now,
+    ),
+  );
+  assert.throws(() =>
+    parseProbeConfig(
+      JSON.stringify({ ...input(), control: host4(100, 64, 1, 2) }),
+      now,
+    ),
+  );
+});
+
+test("a private target cannot produce a public firewall proof", () => {
+  assert.throws(() =>
+    parseProbeConfig(
+      JSON.stringify({ ...input(), targets: [host4(192, 168, 1, 2)] }),
+      now,
+    ),
+  );
+});
+
+test("a report cannot bypass public target validation with a documentation address", () => {
+  const { config, pool, report } = fixture();
+  config.targets[0] = host4(203, 0, 113, 2);
+  report.results[0]!.target_hash = keyedHash(
+    config,
+    "target",
+    config.targets[0],
+  );
+  assert.throws(() =>
+    assertExternalReport(
+      report,
+      config,
+      pool,
+      context,
+      config.operator_allowlist,
+      config.targets,
+      now + 5,
+    ),
+  );
+});
+
+test("IANA globally reachable anycast exceptions remain valid public addresses", () => {
+  assert.doesNotThrow(() =>
+    parseProbeConfig(
+      JSON.stringify({
+        ...input(),
+        control: host4(192, 0, 0, 9),
+        targets: [host4(192, 0, 0, 10)],
       }),
       now,
     ),
@@ -295,4 +393,205 @@ test("attestation policy binds the trusted certificate to the exact hosted main 
       digest,
     ),
   );
+});
+
+async function consumerFixture(t: TestContext, targets: string[]) {
+  const config = parseProbeConfig(JSON.stringify({ ...input(), targets }));
+  const pool = [`${host4(203, 0, 113, 0)}/24`];
+  const instant = Date.now();
+  const report = probeReport(config, pool, context, instant - 5);
+  for (const row of report.results) {
+    if (!row.native_source_proven) continue;
+    row.before = {
+      state: "connected",
+      at: new Date(instant - 4).toISOString(),
+    };
+    row.target = { state: "refused", at: new Date(instant - 3).toISOString() };
+    row.after = { state: "connected", at: new Date(instant - 2).toISOString() };
+  }
+  report.finished_at = new Date(instant - 1).toISOString();
+  const raw = `  ${JSON.stringify(report, null, 2)}\n`;
+  let signedDigest = createHash("sha256").update(raw).digest("hex");
+  const root = await mkdtemp(resolve(tmpdir(), "pgcf-e6-test-"));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const path = resolve(root, ".local/evidence/phase1/pgcf-e6-native.json");
+  await mkdir(resolve(root, ".local/evidence/phase1"), { recursive: true });
+  await writeFile(path, raw);
+  let verifications = 0;
+  const io: ProbeIo = {
+    sourcePool: async () => pool,
+    command: async (program, args) => {
+      if (program === "git") {
+        if (args[0] === "rev-parse") {
+          assert.deepEqual(args, ["rev-parse", "HEAD"]);
+          return `${context.commit}\n`;
+        }
+        assert.deepEqual(args, ["symbolic-ref", "HEAD"]);
+        return "refs/heads/main\n";
+      }
+      assert.equal(program, "gh");
+      if (args[0] === "attestation") {
+        verifications++;
+        assert.equal(args[2], path);
+        assert(args.includes("--deny-self-hosted-runners"));
+        assert(args.includes("--source-digest"));
+        assert(args.includes(context.commit));
+        assert(args.includes("refs/heads/main"));
+        assert(args.includes(`${context.repository}/.github/workflows/ci.yml`));
+        return JSON.stringify([
+          {
+            verificationResult: {
+              signature: {
+                certificate: {
+                  issuer: "https://token.actions.githubusercontent.com",
+                  subjectAlternativeName: `https://github.com/${context.repository}/.github/workflows/ci.yml@refs/heads/main`,
+                  sourceRepositoryURI: `https://github.com/${context.repository}`,
+                  sourceRepositoryDigest: context.commit,
+                  sourceRepositoryRef: "refs/heads/main",
+                  runnerEnvironment: "github-hosted",
+                  buildTrigger: "workflow_dispatch",
+                  runInvocationURI: `https://github.com/${context.repository}/actions/runs/${context.run_id}/attempts/${context.run_attempt}`,
+                  sourceRepositoryVisibilityAtSigning: "public",
+                },
+              },
+              statement: { subject: [{ digest: { sha256: signedDigest } }] },
+              verifiedTimestamps: [
+                { timestamp: new Date(instant).toISOString() },
+              ],
+            },
+          },
+        ]);
+      }
+      assert.equal(args[0], "api");
+      if (args.at(-1)?.endsWith("/artifacts")) {
+        assert.equal(
+          args.at(-1),
+          `repos/${context.repository}/actions/runs/${context.run_id}/artifacts`,
+        );
+        return JSON.stringify({
+          artifacts: [{ name: "pgcf-e6-native", expired: false }],
+        });
+      }
+      assert.equal(
+        args.at(-1),
+        `repos/${context.repository}/actions/runs/${context.run_id}`,
+      );
+      return JSON.stringify({
+        event: "workflow_dispatch",
+        head_branch: "main",
+        head_sha: context.commit,
+        path: ".github/workflows/ci.yml",
+        run_attempt: Number(context.run_attempt),
+        status: "completed",
+        conclusion: "success",
+      });
+    },
+  };
+  const env = {
+    PGCF_E2E_EXTERNAL_PROBE_CONFIG: JSON.stringify(config),
+    PGCF_E2E_EXTERNAL_PROBE_EXPECTATION: JSON.stringify({
+      ...context,
+      nonce: config.nonce,
+    }),
+    PGCF_E2E_OPERATOR_ALLOWLIST: JSON.stringify(config.operator_allowlist),
+  };
+  return {
+    root,
+    env,
+    io,
+    report,
+    path,
+    consume: () => consumeExternalProbe(root, targets, env, io),
+    verifications: () => verifications,
+    useReserializedDigest: () => {
+      signedDigest = createHash("sha256")
+        .update(JSON.stringify(JSON.parse(raw)))
+        .digest("hex");
+    },
+    replaceReport: async () => {
+      const bytes = `  ${JSON.stringify(report, null, 2)}\n`;
+      signedDigest = createHash("sha256").update(bytes).digest("hex");
+      await writeFile(path, bytes);
+    },
+  };
+}
+
+test("actual consumer verifies the raw signed JSON bytes including whitespace and its trailing newline", async (t) => {
+  const target = host4(11, 1, 2, 3);
+  const fixture = await consumerFixture(t, [target]);
+  assert.deepEqual(await fixture.consume(), new Set([target]));
+  assert.equal(fixture.verifications(), 1);
+});
+
+test("actual consumer rejects a signature digest for reserialized JSON instead of its raw file bytes", async (t) => {
+  const fixture = await consumerFixture(t, [host4(11, 1, 2, 3)]);
+  fixture.useReserializedDigest();
+  await assert.rejects(fixture.consume(), {
+    message: "external_probe_attestation_mismatch",
+  });
+  assert.equal(fixture.verifications(), 1);
+});
+
+function resumedScan(
+  targets: string[],
+  proof: () => Promise<Set<string>>,
+): Run {
+  const names = targets.map((_, index) => `pgcf-node-${index}`);
+  return Object.assign(Object.create(Run.prototype) as Run, {
+    c: { values: { PGCF_E2E_REGIONAL_NAMESPACE: "pgcf-system" } },
+    state: {
+      completed: ["E5"],
+      scans: targets.map((host, index) =>
+        fingerprint(`${names[index]}:${host}`),
+      ),
+      operator_scans: [],
+      scan_ranges: {},
+    },
+    assertCluster: async () => undefined,
+    kube: {
+      read: async (resource: string) =>
+        resource === "nodes"
+          ? {
+              items: targets.map((host, index) => ({
+                metadata: { name: names[index] },
+                status: { addresses: [{ type: "ExternalIP", address: host }] },
+              })),
+            }
+          : { items: [] },
+    },
+    nativeProof: proof,
+    save: async () => undefined,
+    emit: async () => undefined,
+  });
+}
+
+test("resumed Run.scan cannot complete E6 when a target lacks native coverage", async (t) => {
+  const targets = [host4(11, 1, 2, 3), host4(13, 1, 2, 3)];
+  const fixture = await consumerFixture(t, targets);
+  fixture.report.results[1]!.after.state = "inconclusive";
+  await fixture.replaceReport();
+  const run = resumedScan(targets, fixture.consume);
+  await assert.rejects(run.scan(), {
+    message: "supplemental_external_tcp_probe_required",
+  });
+  assert.deepEqual(run.state.completed, ["E5"]);
+});
+
+test("resumed Run.scan cannot complete E6 while IPv6 remains inconclusive", async (t) => {
+  const targets = [host4(11, 1, 2, 3), host6(0x2001)];
+  const fixture = await consumerFixture(t, targets);
+  const run = resumedScan(targets, fixture.consume);
+  await assert.rejects(run.scan(), {
+    message: "supplemental_external_tcp_probe_required",
+  });
+  assert.deepEqual(run.state.completed, ["E5"]);
+});
+
+test("resumed Run.scan completes E6 only after the actual consumer covers every current target", async (t) => {
+  const targets = [host4(11, 1, 2, 3), host4(13, 1, 2, 3)];
+  const fixture = await consumerFixture(t, targets);
+  const run = resumedScan(targets, fixture.consume);
+  assert.equal(await run.scan(), true);
+  assert.deepEqual(run.state.completed, ["E5", "E6"]);
+  assert.equal(fixture.verifications(), 1);
 });

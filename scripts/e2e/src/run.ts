@@ -1515,6 +1515,9 @@ export class Run {
       { delete_ms: Date.now() - started },
     );
   }
+  private nativeProof(targets: readonly string[]): Promise<Set<string>> {
+    return consumeExternalProbe(this.root, targets);
+  }
   async scan(addressIndex?: number): Promise<boolean> {
     this.requireStep("E5");
     await this.assertCluster();
@@ -1572,8 +1575,7 @@ export class Run {
         const batch = segment.slice(offset, offset + 256);
         // Workers cannot dial TCP/25. A signed, independent native probe must cover it.
         if (batch.includes(25)) {
-          const proven = await consumeExternalProbe(
-            this.root,
+          const proven = await this.nativeProof(
             addresses.map((entry) => entry.host),
           );
           if (!proven.has(address.host))
@@ -1602,8 +1604,7 @@ export class Run {
       this.state.scans.includes(fingerprint(`${a.node}:${a.host}`)),
     );
     if (complete) {
-      const proven = await consumeExternalProbe(
-        this.root,
+      const proven = await this.nativeProof(
         addresses.map((entry) => entry.host),
       );
       if (addresses.some((address) => !proven.has(address.host)))
