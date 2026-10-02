@@ -88,7 +88,7 @@ export const DesiredDatabase = z
     node: K8sNodeName,
     pg_major: z.literal(PG_MAJOR),
     size: DesiredSize,
-    roles: z.array(DesiredRole).max(100),
+    roles: z.array(DesiredRole).max(100).default([]),
     archive: z.strictObject({
       destination_path: z.string().regex(ARCHIVE_DESTINATION_PATTERN),
       server_name: z.literal(ARCHIVE_SERVER_NAME),

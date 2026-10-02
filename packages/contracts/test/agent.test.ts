@@ -193,6 +193,12 @@ describe("DesiredDatabase", () => {
         roles: [],
       }).success,
     ).toBe(true);
+    const tombstone: Record<string, unknown> = {
+      ...desired(),
+      desired_state: "deleted",
+    };
+    delete tombstone.roles;
+    expect(DesiredDatabase.safeParse(tombstone).success).toBe(true);
   });
 
   it("rejects an archive path for another database or generation", () => {
