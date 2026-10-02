@@ -23,19 +23,34 @@ function canonicalUrl(value: string): string {
   return url.href.replace(/\/$/, "");
 }
 
+export function assertClusterNodeIdentity(
+  actual: Pick<ClusterIdentity, "cluster_uid" | "nodes">,
+  expected: Pick<ClusterIdentity, "cluster_uid" | "nodes">,
+): void {
+  const names = Object.keys(actual.nodes).sort(),
+    wanted = Object.keys(expected.nodes).sort();
+  if (
+    !expected.cluster_uid ||
+    !wanted.length ||
+    actual.cluster_uid !== expected.cluster_uid ||
+    JSON.stringify(names) !== JSON.stringify(wanted) ||
+    names.some(
+      (name) =>
+        !expected.nodes[name] || actual.nodes[name] !== expected.nodes[name],
+    )
+  )
+    throw new HarnessError("dev_cluster_identity_mismatch");
+}
+
 export function assertClusterIdentity(
   actual: ClusterIdentity,
   expected: ClusterIdentity,
   allowedUrls: readonly string[],
 ): void {
-  const names = Object.keys(actual.nodes).sort(),
-    wanted = Object.keys(expected.nodes).sort();
+  assertClusterNodeIdentity(actual, expected);
   if (
-    actual.cluster_uid !== expected.cluster_uid ||
     actual.namespace_uid !== expected.namespace_uid ||
     actual.agent_uid !== expected.agent_uid ||
-    JSON.stringify(names) !== JSON.stringify(wanted) ||
-    names.some((name) => actual.nodes[name] !== expected.nodes[name]) ||
     actual.region_id !== expected.region_id ||
     !allowedUrls.map(canonicalUrl).includes(canonicalUrl(actual.agent_api_url))
   )

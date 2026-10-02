@@ -11,6 +11,7 @@ import {
   requireEnv,
   string,
 } from "./core.ts";
+import { assertClusterNodeIdentity, parseUidMap } from "./identity.ts";
 
 export interface Check {
   name: string;
@@ -193,8 +194,13 @@ export async function phase0(
     "PGCF_E2E_PHASE0_ALLOWED_RESOURCES",
     "PGCF_E2E_NODE_NAMES",
     "PGCF_E2E_HELM_RELEASE_NAMES",
+    "PGCF_E2E_EXPECTED_CLUSTER_UID",
+    "PGCF_E2E_EXPECTED_NODE_UIDS",
   ]);
-  let allowed: InventoryItem[], nodes: string[], releases: string[];
+  let allowed: InventoryItem[],
+    nodes: string[],
+    releases: string[],
+    nodeUids: Record<string, string>;
   try {
     const rawAllowed: unknown = JSON.parse(
       values.PGCF_E2E_PHASE0_ALLOWED_RESOURCES!,
@@ -208,15 +214,23 @@ export async function phase0(
     releases = JSON.parse(values.PGCF_E2E_HELM_RELEASE_NAMES!);
     if (
       !Array.isArray(nodes) ||
+      !nodes.length ||
+      new Set(nodes).size !== nodes.length ||
       nodes.some((n) => typeof n !== "string") ||
       !Array.isArray(releases) ||
       releases.length !== 5 ||
       releases.some((n) => typeof n !== "string")
     )
       throw new HarnessError("invalid_config");
+    nodeUids = parseUidMap(JSON.parse(values.PGCF_E2E_EXPECTED_NODE_UIDS!));
   } catch {
     throw new HarnessError("invalid_config");
   }
+  if (
+    JSON.stringify(Object.keys(nodeUids).sort()) !==
+    JSON.stringify([...nodes].sort())
+  )
+    throw new HarnessError("expected_node_identity_mismatch");
   const cf = new Cloudflare(
     values.CLOUDFLARE_ACCOUNT_ID!,
     values.CLOUDFLARE_API_TOKEN!,
@@ -227,7 +241,27 @@ export async function phase0(
     values.PGCF_E2E_KUBECONFIG!,
     values.PGCF_E2E_KUBE_CONTEXT!,
   );
-  const [files, worktrees, branches, inventory, nodeList, releaseList] =
+  const [namespaceList, nodeList] = await Promise.all([
+    kube.read("namespaces"),
+    kube.read("nodes"),
+  ]);
+  const system = items(namespaceList).filter(
+    (row) => objectName(row) === "kube-system",
+  );
+  if (system.length !== 1) throw new HarnessError("cluster_namespace_missing");
+  assertClusterNodeIdentity(
+    {
+      cluster_uid: string(record(system[0]!.metadata).uid),
+      nodes: Object.fromEntries(
+        items(nodeList).map((node) => [
+          objectName(node),
+          string(record(node.metadata).uid),
+        ]),
+      ),
+    },
+    { cluster_uid: values.PGCF_E2E_EXPECTED_CLUSTER_UID!, nodes: nodeUids },
+  );
+  const [files, worktrees, branches, inventory, releaseList] =
     await Promise.all([
       command("git", ["ls-files"]),
       command("git", ["worktree", "list", "--porcelain"]),
@@ -237,7 +271,6 @@ export async function phase0(
         "refs/heads",
       ]),
       cloudflareInventory(cf),
-      kube.read("nodes"),
       kube.read("helmreleases.helm.toolkit.fluxcd.io"),
     ]);
   return [
