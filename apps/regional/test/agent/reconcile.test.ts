@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import test from "node:test";
 import { Reconciler } from "../../src/agent/reconcile.ts";
 import { GENERATION_ANNOTATION } from "../../src/agent/observe.ts";
@@ -13,6 +14,193 @@ import {
 import { roleSecretName } from "../../src/agent/builders/index.ts";
 
 const signal = () => new AbortController().signal;
+
+test("a partial newer revision survives restart and rejects an intermediate stale snapshot", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  const intermediate = {
+    ...db,
+    generation: 2,
+    roles: [
+      {
+        ...db.roles[0]!,
+        password: fixture().db.roles[0]!.password,
+        revision: 2,
+      },
+    ],
+  };
+  const newest = {
+    ...db,
+    generation: 3,
+    roles: [
+      {
+        ...db.roles[0]!,
+        password: fixture().db.roles[0]!.password,
+        revision: 3,
+      },
+    ],
+  };
+  const apply = k8s.apply.bind(k8s);
+  let crash = true;
+  k8s.apply = async (resource) => {
+    await apply(resource);
+    if (
+      crash &&
+      resource.kind === "Secret" &&
+      resource.metadata.name === roleSecretName("app")
+    )
+      throw new Error("crash_after_newest_password_write");
+  };
+  await assert.rejects(
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile(
+      newest,
+      ctx,
+    ),
+  );
+  crash = false;
+  const before = k8s.actions.length;
+  const stale = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(intermediate, ctx);
+  assert.equal(stale, null);
+  assert.equal(k8s.actions.length, before);
+  assert.equal(
+    record(
+      (await k8s.read("Secret", `pgcf-db-${db.id}`, roleSecretName("app")))
+        ?.data,
+    ).password,
+    Buffer.from(newest.roles[0]!.password).toString("base64"),
+  );
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+      ).reconcile(newest, ctx)
+    )?.state,
+    "ready",
+  );
+});
+
+test("a PV UID race cannot reclaim a replacement volume or delete its namespace", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  k8s.addStorage(db);
+  const patch = k8s.patch.bind(k8s);
+  k8s.patch = async (kind, namespace, name, operations) => {
+    if (kind === "PersistentVolume")
+      k8s.resources.get(k8s.key(kind, namespace, name))!.metadata.uid =
+        randomUUID();
+    await patch(kind, namespace, name, operations);
+  };
+  await assert.rejects(
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile({
+      ...db,
+      generation: 2,
+      desired_state: "deleted",
+      roles: [],
+    }),
+  );
+  assert.equal(
+    record((await k8s.list("PersistentVolume"))[0]?.spec)
+      .persistentVolumeReclaimPolicy,
+    "Retain",
+  );
+  assert.ok(await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`));
+});
+
+test("a claim UID race cannot reclaim a volume rebound to another claim", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  k8s.addStorage(db);
+  const patch = k8s.patch.bind(k8s);
+  k8s.patch = async (kind, namespace, name, operations) => {
+    if (kind === "PersistentVolume")
+      record(
+        record(k8s.resources.get(k8s.key(kind, namespace, name))!.spec)
+          .claimRef,
+      ).uid = randomUUID();
+    await patch(kind, namespace, name, operations);
+  };
+  await assert.rejects(
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile({
+      ...db,
+      generation: 2,
+      desired_state: "deleted",
+      roles: [],
+    }),
+  );
+  assert.equal(
+    record((await k8s.list("PersistentVolume"))[0]?.spec)
+      .persistentVolumeReclaimPolicy,
+    "Retain",
+  );
+  assert.ok(await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`));
+});
+
+test("stale primary resources and unacknowledged managed-role passwords keep a revision provisioning", async () => {
+  const { db, ctx } = fixture();
+  db.roles.push({
+    name: "reader",
+    owner: false,
+    password: fixture().db.roles[0]!.password,
+    revision: 1,
+  });
+  const k8s = new MemoryKubernetes();
+  const reconcile = () =>
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile(
+      db,
+      ctx,
+    );
+  assert.equal((await reconcile())?.state, "ready");
+  const pod = k8s.resources.get(
+    k8s.key("Pod", `pgcf-db-${db.id}`, "database-1"),
+  )!;
+  const container = record((record(pod.spec).containers as unknown[])[0]);
+  const requests = record(record(container.resources).requests);
+  requests.memory = "256Mi";
+  assert.equal((await reconcile())?.state, "provisioning");
+  requests.memory = "512Mi";
+  const cluster = k8s.resources.get(
+    k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+  )!;
+  const passwordStatus = record(
+    record(record(cluster.status).managedRolesStatus).passwordStatus,
+  );
+  const acknowledged = record(passwordStatus.reader).resourceVersion;
+  record(passwordStatus.reader).resourceVersion = "older-secret";
+  assert.equal((await reconcile())?.state, "provisioning");
+  record(passwordStatus.reader).resourceVersion = acknowledged;
+  assert.equal((await reconcile())?.state, "ready");
+});
 
 test("Ready status cannot acknowledge credentials rejected by PostgreSQL", async () => {
   const { db, ctx } = fixture();

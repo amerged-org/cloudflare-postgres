@@ -8,6 +8,7 @@ import type { Kubernetes, Resource } from "./types.ts";
 
 export const DATABASE_LABEL = "pgcf.io/database-id";
 export const GENERATION_ANNOTATION = "pgcf.io/generation";
+export const ACCEPTED_GENERATION_ANNOTATION = "pgcf.io/accepted-generation";
 export const ARCHIVE_FAILURE_MS = 10 * 60_000;
 export const WAL_BACKLOG_LIMIT = 32;
 
@@ -22,8 +23,19 @@ export function condition(
 }
 
 export function appliedGeneration(resource: Resource | null): number {
+  return annotationGeneration(resource, GENERATION_ANNOTATION);
+}
+
+export function acceptedGeneration(resource: Resource | null): number {
+  return annotationGeneration(resource, ACCEPTED_GENERATION_ANNOTATION);
+}
+
+function annotationGeneration(
+  resource: Resource | null,
+  annotation: string,
+): number {
   if (!resource) return 0;
-  const value = resource.metadata.annotations?.[GENERATION_ANNOTATION];
+  const value = resource.metadata.annotations?.[annotation];
   if (value === undefined) return 0;
   if (!/^[1-9][0-9]*$/.test(value) || !Number.isSafeInteger(Number(value)))
     throw new Error("applied_generation_invalid");

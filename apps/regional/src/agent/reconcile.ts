@@ -14,6 +14,8 @@ import {
 import type { BuildContext } from "./builders/index.ts";
 import {
   appliedGeneration,
+  acceptedGeneration,
+  ACCEPTED_GENERATION_ANNOTATION,
   ARCHIVE_FAILURE_MS,
   condition,
   DATABASE_LABEL,
@@ -193,6 +195,7 @@ export class Reconciler {
     if (ledger) assertOwned(ledger, db.id, `${LEDGER_PREFIX}${db.id}`);
     const applied = Math.max(
       appliedGeneration(namespace),
+      acceptedGeneration(namespace),
       appliedGeneration(ledger),
       this.highWater.get(db.id) ?? 0,
     );
@@ -207,7 +210,7 @@ export class Reconciler {
 
     if (db.generation > appliedGeneration(namespace)) {
       const manifests = buildDatabaseManifests(db, ctx);
-      // Keep the last completed revision throughout a partial apply. The fence advances last.
+      // Accepted revisions fence out stale pulls before credentials can change. Completion advances last.
       const first = manifests[0];
       if (
         !first ||
@@ -215,11 +218,11 @@ export class Reconciler {
         first.metadata.name !== namespaceName
       )
         throw new Error("builder_namespace_invalid");
-      if (namespace?.metadata.annotations)
-        first.metadata.annotations = {
-          ...first.metadata.annotations,
-          ...namespace.metadata.annotations,
-        };
+      first.metadata.annotations = {
+        ...first.metadata.annotations,
+        ...namespace?.metadata.annotations,
+        [ACCEPTED_GENERATION_ANNOTATION]: String(db.generation),
+      };
       const hash = createHash("sha256")
         .update(JSON.stringify(manifests))
         .digest("hex");
@@ -232,6 +235,7 @@ export class Reconciler {
         );
         if (!active || record(active.status).phase !== "Active") return null;
         assertOwned(active, db.id, namespaceName);
+        if (acceptedGeneration(active) !== db.generation) return null;
         if (active.metadata.deletionTimestamp)
           throw new Error("database_namespace_deleting");
         for (const manifest of manifests.slice(1)) {
@@ -251,9 +255,18 @@ export class Reconciler {
       );
       if (!current) throw new Error("database_namespace_missing");
       assertOwned(current, db.id, namespaceName);
-      if (appliedGeneration(current) > db.generation) return null;
+      if (
+        appliedGeneration(current) > db.generation ||
+        acceptedGeneration(current) !== db.generation
+      )
+        return null;
       await this.k8s.patch("Namespace", undefined, namespaceName, [
         { op: "test", path: "/metadata/uid", value: uid(current) },
+        {
+          op: "test",
+          path: "/metadata/annotations/pgcf.io~1accepted-generation",
+          value: String(db.generation),
+        },
         {
           op: "add",
           path: "/metadata/annotations",
