@@ -111,9 +111,10 @@ The diagrams are in [README.md](README.md#architecture).
      `pipelineConnect=false`. `pgcf connect` for psql and migration tools is Phase 2.
   2. The edge treats the hints as untrusted, applies connection admission, and looks up the role
      and database in authoritative D1 state. Unknown roles and unknown, deleted or unavailable
-     databases are refused before upgrade. Both hints are required; missing or invalid hints are
-     refused, and the bare `/v2` endpoint is unsupported. Phase 2 inserts
-     `DatabaseActor.ensureAwake()` here.
+     databases are refused before any gateway upgrade or PostgreSQL dial. Admission failures
+     return a small failure-only `101` WebSocket carrying a PostgreSQL SQLSTATE error. Both hints
+     are required; missing or invalid hints are refused, and the bare `/v2` endpoint is
+     unsupported. Phase 2 inserts `DatabaseActor.ensureAwake()` here.
   3. It signs a v2 routing token binding the admitted database and user, opens the regional
      WebSocket through the transport seam (section 6), and returns that WebSocket unopened.
      Cloudflare forwards the stream natively; Edge does not accept it for a JavaScript relay.
@@ -267,7 +268,9 @@ their own price lists and billing logic.
 - Database IDs are random 20-character strings (`^[a-z][a-z0-9]{19}$`, a letter first) and are
   also the PostgreSQL database name. There is no per-database hostname. The edge refuses unknown,
   deleted, suspended and not-ready databases and rate-limits connections per database.
-- The edge admits URL hints against D1 before upgrade. The gateway parses the actual
+- The edge admits URL hints against D1 before any gateway upgrade or PostgreSQL dial. Admission
+  failures use a small failure-only `101` WebSocket carrying a PostgreSQL SQLSTATE error. The
+  gateway parses the actual
   StartupMessage and rejects a database or user mismatch before a PostgreSQL dial. Startup
   protocol majors other than 3 and replication requests receive SQLSTATE `0A000`; a missing
   startup user receives `28000`. The gateway declines client SSL/GSS requests and silently closes
@@ -624,3 +627,4 @@ infra/backups         CNPG/Barman/R2 backup and restore reference
 | 2026-10-02 | 1 local | Original manual-relay 100 MiB and 1 GiB stream trials failed under the unchanged local memory guard. A test-only native 1 GiB stream passed incremental hash verification. The guard and original failed assertions remain retained; local workerd RSS is not Cloudflare isolate-limit accounting. This control is not product or live acceptance. |
 | 2026-10-02 | 1 | Owner approved `GET /v2?database=<id>&user=<role>` with untrusted hints admitted by authoritative D1, a signed v2 token with mandatory user, unopened-WebSocket native forwarding, and gateway validation of the actual startup before PostgreSQL dial. Gateway owns SSL/GSS/cancel handling, startup parsing/deadline and stream measurements. Implementation is in progress; live transport and Phase 1 acceptance remain pending. |
 | 2026-10-02 | CI | CI for `dc6ada6` passed both the check and image jobs. The public GitHub tree matched the pushed source across 196 blobs. This confirms the portability fix in CI; it is not live Dev acceptance. |
+| 2026-10-02 | 0 partial | The first bounded decommission run timed out after 600 s. Worker, D1, custody bucket and control-recovery prefix deletion were confirmed; qualification prefix deletion still has a pending intent. The same owner-approved plan is resuming with fresh guards. Foreign-resource preservation readback remains pending, and no owned orphans remain. This partial result does not complete Phase 0 or the lab rebuild. |

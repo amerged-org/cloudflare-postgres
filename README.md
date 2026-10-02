@@ -113,7 +113,9 @@ Configure the Neon serverless driver's `Pool`/`Client` WebSocket mode with `pipe
 and a `wsProxy` URL containing both URL-encoded hints. Requests to the bare `/v2` endpoint or with
 missing or invalid hints are unsupported. Edge checks the database and role against D1, signs a
 v2 routing token with mandatory user, and returns the unopened upstream WebSocket for native
-forwarding. The live Cloudflare transport is still unselected.
+forwarding. Admission failures return a small failure-only `101` WebSocket carrying a PostgreSQL
+SQLSTATE error before any gateway upgrade or PostgreSQL dial. The live Cloudflare transport is
+still unselected.
 
 The gateway checks the actual PostgreSQL StartupMessage database and user against the signed
 route before opening PostgreSQL. It owns SSL/GSS preludes, CancelRequest, startup parsing and the
