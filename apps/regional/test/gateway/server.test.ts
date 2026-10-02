@@ -286,6 +286,30 @@ test("propagates PostgreSQL close and rejects text frames", async (t) => {
   assert.equal((await textClosed)[0], 1003);
 });
 
+test("propagates a WebSocket close to the PostgreSQL TLS socket", async (t) => {
+  let secureClosed: Promise<unknown[]> | undefined;
+  const postgres = await postgresServer(validCertificate, (socket) => {
+    secureClosed = once(socket, "close", {
+      signal: AbortSignal.timeout(2_000),
+    });
+    socket.on("data", (data: Buffer) => socket.write(data));
+  });
+  const { gateway, port } = await gatewayFor(postgres.port);
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const socket = await open(port);
+  const echoed = once(socket, "message");
+  socket.send(Buffer.from([1]));
+  await echoed;
+  assert.ok(secureClosed);
+  const closed = once(socket, "close");
+  socket.close();
+  await closed;
+  await secureClosed;
+});
+
 test("marks readiness false, rejects new connections and drains existing connections with 1012", async (t) => {
   const postgres = await postgresServer();
   const { gateway, port } = await gatewayFor(postgres.port, { drainMs: 100 });
