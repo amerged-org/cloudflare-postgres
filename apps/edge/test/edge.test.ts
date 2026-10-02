@@ -578,6 +578,38 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(logs.mock.calls).toHaveLength(1);
   });
 
+  it("closes a late gateway upgrade after admission cancellation", async () => {
+    let upgraded!: () => void;
+    const reachedUpgrade = new Promise<void>((resolve) => {
+      upgraded = resolve;
+    });
+    let release!: () => void;
+    const resume = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const gateway = {
+      async fetch(request: Request) {
+        const response = await testEnv.GATEWAY.fetch(
+          new Request(request, { signal: new AbortController().signal }),
+        );
+        upgraded();
+        await resume;
+        return response;
+      },
+    } as Fetcher;
+    const controller = new AbortController();
+    const pending = open({
+      bindings: { ...testEnv, GATEWAY: gateway },
+      signal: controller.signal,
+    });
+    await reachedUpgrade;
+    controller.abort();
+    const connection = await pending;
+    release();
+    expect(await errorCode(connection)).toBe("08006");
+    await expect.poll(async () => (await stats())[0]?.closes.length).toBe(1);
+  });
+
   it("replaces caller route headers and excludes authorization and cookies from a public gateway upgrade", async () => {
     await testEnv.DB.prepare(
       "UPDATE regions SET gateway_binding = NULL WHERE id = ?",
