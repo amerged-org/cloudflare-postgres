@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import {
   capacityPlan,
   parseQuantityBytes,
@@ -19,17 +20,33 @@ function fixture() {
     lvmnode_resource_version: "18",
     vg_uuid: randomUUID(),
   };
+  const readback = (secondsBefore: number, version: string, free: string) => ({
+    observed_at: new Date(now - secondsBefore * 1000).toISOString(),
+    node_uid: binding.node_uid,
+    lvmnode_uid: binding.lvmnode_uid,
+    resource_version: version,
+    vg_uuid: binding.vg_uuid,
+    size: "96Gi",
+    free,
+  });
+  const smoke = {
+    before: readback(50, "16", "64Gi"),
+    allocated: readback(40, "17", "63Gi"),
+    after: readback(20, "18", "64Gi"),
+  };
   const config: PublisherConfig = {
     clusterUid: randomUUID(),
     storageNamespaceUid: randomUUID(),
     context: `context-${randomUUID().slice(0, 8)}`,
     proofNotBefore: now - 60_000,
     proofCompletedAt: now - 10_000,
-    bindings: { [name]: binding },
+    bindings: { [name]: { ...binding, smoke } },
   };
   const node = {
     apiVersion: "v1",
     kind: "Node",
+    spec: { unschedulable: false },
+    status: { conditions: [{ type: "Ready", status: "True" }] },
     metadata: { name, uid: binding.node_uid, resourceVersion: "17" },
   };
   const lvm = {
@@ -127,7 +144,7 @@ test("foreign Node ownership and replaced LVMNode identities refuse publication"
   );
 });
 
-test("fresh annotation metadata does not refresh an old volumeGroups measurement", () => {
+test("fresh annotation metadata does not replace an observed smoke free-space change", () => {
   const f = fixture();
   const lvm = structuredClone(f.lvm) as Record<string, unknown>;
   lvm.metadata = {
@@ -140,13 +157,14 @@ test("fresh annotation metadata does not refresh an old volumeGroups measurement
       },
     ],
   };
+  f.config.bindings[f.name]!.smoke.allocated.free = "64Gi";
   assert.throws(
     () => capacityPlan(f.config, f.name, f.node, lvm, now),
-    /stale_vg_measurement/,
+    /invalid_smoke_transition/,
   );
 });
 
-test("an actual recent volumeGroups update can publish an older object", () => {
+test("authentic smoke readbacks can publish an older object without trusting managedFields", () => {
   const f = fixture();
   const lvm = structuredClone(f.lvm) as Record<string, unknown>;
   lvm.metadata = {
@@ -328,5 +346,105 @@ test("impossible free capacity and duplicated dedicated VGs refuse publication",
   assert.throws(
     () => capacityPlan(g.config, g.name, g.node, g.lvm, now),
     /missing_vg_measurement/,
+  );
+});
+
+test("metadata-only updates retaining VG ownership do not prove a fresh storage measurement", () => {
+  const f = fixture();
+  const lvm = structuredClone(f.lvm) as Record<string, unknown>;
+  lvm.metadata = {
+    ...f.lvm.metadata,
+    creationTimestamp: new Date(now - 3_600_000).toISOString(),
+    managedFields: [
+      {
+        time: new Date(now - 20_000).toISOString(),
+        fieldsV1: { "f:volumeGroups": {}, "f:metadata": {} },
+      },
+    ],
+  };
+  const config = {
+    ...f.config,
+    bindings: { [f.name]: { ...f.config.bindings[f.name], smoke: undefined } },
+  } as unknown as PublisherConfig;
+  assert.throws(
+    () => capacityPlan(config, f.name, f.node, lvm, now),
+    /missing_smoke_proof/,
+  );
+});
+
+test("a Node that is not Ready refuses storage publication", () => {
+  const f = fixture();
+  f.node.status.conditions[0]!.status = "False";
+  assert.throws(
+    () => capacityPlan(f.config, f.name, f.node, f.lvm, now),
+    /storage_node_not_ready/,
+  );
+});
+
+test("a cordoned Node refuses storage publication", () => {
+  const f = fixture();
+  f.node.spec.unschedulable = true;
+  assert.throws(
+    () => capacityPlan(f.config, f.name, f.node, f.lvm, now),
+    /storage_node_not_ready/,
+  );
+});
+
+test("explicit kubelet reservations preserve Talos PID and ephemeral storage defaults", () => {
+  const patch = readFileSync(
+    new URL("./single-node-lab-scheduling.patch.yaml", import.meta.url),
+    "utf8",
+  ).split("\n---\n")[0]!;
+  assert.match(patch, /systemReserved:[\s\S]*pid: "100"/);
+  assert.match(patch, /systemReserved:[\s\S]*ephemeral-storage: 256Mi/);
+});
+
+test("approved smoke readbacks require free space to decrease and return to the baseline", () => {
+  const f = fixture();
+  f.config.bindings[f.name]!.smoke.allocated.free = "64Gi";
+  assert.throws(
+    () => capacityPlan(f.config, f.name, f.node, f.lvm, now),
+    /invalid_smoke_transition/,
+  );
+  const g = fixture();
+  g.config.bindings[g.name]!.smoke.after.free = "63Gi";
+  assert.throws(
+    () => capacityPlan(g.config, g.name, g.node, g.lvm, now),
+    /invalid_smoke_transition/,
+  );
+});
+
+test("all smoke observations bind the same approved Node and LVMNode incarnation", () => {
+  const f = fixture();
+  f.config.bindings[f.name]!.smoke.allocated.lvmnode_uid = randomUUID();
+  assert.throws(
+    () => capacityPlan(f.config, f.name, f.node, f.lvm, now),
+    /foreign_smoke_readback/,
+  );
+});
+
+test("the current VG measurement must match the final approved readback", () => {
+  const f = fixture();
+  f.lvm.volumeGroups[0]!.free = "62Gi";
+  assert.throws(
+    () => capacityPlan(f.config, f.name, f.node, f.lvm, now),
+    /invalid_smoke_transition/,
+  );
+});
+
+test("out-of-window smoke capture times and reused revisions refuse publication", () => {
+  const f = fixture();
+  f.config.bindings[f.name]!.smoke.before.observed_at = new Date(
+    now - 90_000,
+  ).toISOString();
+  assert.throws(
+    () => capacityPlan(f.config, f.name, f.node, f.lvm, now),
+    /invalid_smoke_window/,
+  );
+  const g = fixture();
+  g.config.bindings[g.name]!.smoke.allocated.resource_version = "16";
+  assert.throws(
+    () => capacityPlan(g.config, g.name, g.node, g.lvm, now),
+    /invalid_smoke_revisions/,
   );
 });

@@ -178,7 +178,7 @@ configuration; the publisher never prints them.
 | `PGCF_STORAGE_KUBE_CONTEXT` | Explicit Kubernetes context for this cluster. `kubectl` consumes its private credentials; the publisher does not read or print their file. |
 | `PGCF_STORAGE_EXPECTED_CLUSTER_UID` | Expected UID of the cluster's `kube-system` namespace. |
 | `PGCF_STORAGE_EXPECTED_NAMESPACE_UID` | Expected UID of the pinned OpenEBS installation's `openebs` namespace. |
-| `PGCF_STORAGE_BINDINGS_JSON` | Object keyed by approved Node name. Each value contains `node_uid`, `lvmnode_uid`, `lvmnode_resource_version` and `vg_uuid`, captured and bound to the actual dedicated `pgcf` VG proof. |
+| `PGCF_STORAGE_BINDINGS_JSON` | Object keyed by approved Node name. Each value contains `node_uid`, `lvmnode_uid`, `lvmnode_resource_version`, `vg_uuid` and the approved `smoke` readbacks described below, captured from the actual dedicated `pgcf` VG smoke run. |
 | `PGCF_STORAGE_PROOF_NOT_BEFORE` | UTC ISO timestamp when the bounded VG-proof window began. |
 | `PGCF_STORAGE_PROOF_COMPLETED_AT` | UTC ISO timestamp when that proof completed. |
 
@@ -195,7 +195,7 @@ identity-bound reads and reports measured totals without writing. `--apply` perf
 again and publishes `pgcf.io/storage-gib-total` with JSON Patch tests for the Node's UID and current
 resource version; another Node incarnation or concurrent change refuses the patch. It checks both
 namespace identities immediately before each mutation and rechecks the bound LVMNode revision.
-Unrelated annotations remain intact. Repeat a refused plan after updating the approved measured
+The Node must be Ready and schedulable. Unrelated annotations remain intact. Repeat a refused plan after updating the approved measured
 proof; do not learn replacement identities automatically from an unexpected cluster.
 
 The pinned [OpenEBS LVMNode schema](https://github.com/openebs/lvm-localpv/blob/v1.10.1/pkg/apis/openebs.io/lvm/v1alpha1/lvmnode.go)
@@ -207,16 +207,44 @@ D1 already accounts for database allocations. Neither Kubernetes ephemeral stora
 configured partition size is a measurement of database capacity.
 
 The [pinned controller](https://github.com/openebs/lvm-localpv/blob/v1.10.1/pkg/mgmt/lvmnode/lvmnode.go)
-only updates the LVMNode when its VG fields or ownership change; it has no heartbeat. Publication
-therefore requires a creation timestamp or a `volumeGroups` managed-fields update inside the
-approved proof window and no older than five minutes. The proof window itself is at most five
-minutes and must have completed before publication. Run this step serially after the vetted L2 storage smoke test and its readback have passed. Bind
-the proof start/end to that actual smoke allocation/free window and record the corresponding
-LVMNode UID/resource version after the CSI measurement catches up; the publisher polls at most
-30 seconds for that exact approved revision. Do not run it concurrently with the vetted Flux or
-bootstrap commands. A long wait or an older unchanged CR intentionally fails closed. A new actual VG observation and approved proof are needed
-then; editing annotations cannot refresh storage evidence. Completing this local implementation
-does not prove that capacity has been published or that the live reserve/placement checks passed.
+updates the LVMNode when its VG fields **or ownership** change; it has no heartbeat. A manager's
+`managedFields.time` can change on an unrelated metadata update while it still owns `volumeGroups`.
+Neither that timestamp nor a changed resource version alone proves a fresh VG measurement. The
+publisher never uses them as measurement timestamps.
+
+Each binding's `smoke` object must contain three **actual, approved readbacks**: `before` the L2
+smoke PVC allocation, `allocated` while its logical volume exists, and `after` its verified deletion
+and storage reclamation. Each readback contains these fields:
+
+| Readback field | Authentic source |
+| --- | --- |
+| `observed_at` | UTC ISO timestamp captured by the operator/readback tool when it received the authenticated API response. |
+| `node_uid` | The bound Node UID, also matched to the LVMNode's Node owner reference. |
+| `lvmnode_uid` | `LVMNode.metadata.uid`. |
+| `resource_version` | `LVMNode.metadata.resourceVersion` from that response. |
+| `vg_uuid` | The dedicated `pgcf` entry's `uuid`. |
+| `size`, `free` | That same entry's measured `size` and `free` quantities, copied without substituting configured values. |
+
+All three observations must bind the same approved Node, LVMNode and VG UUID and unchanged total.
+Their capture times must be strictly ordered inside the approved proof window; their resource
+versions must be distinct. Free space must decrease during the allocation and return to its exact
+baseline after reclamation. The current authenticated LVMNode must match the final approved
+revision, total and free capacity. Timestamp-only or metadata-only changes cannot satisfy that
+transition. The entire proof window and its age are capped at five minutes.
+
+Run publication serially after the vetted L2 storage smoke test and its authenticated readback have
+passed. Ensure the CSI controller has actually reported both the allocated and reclaimed VG states
+before completing the proof; a fast allocation/free between controller polls can leave no observed
+change and will fail closed. The publisher polls at most 30 seconds for the exact approved final
+revision, and does not allocate storage, synthesize readbacks or change metadata to manufacture
+freshness. Do not run it concurrently with the vetted Flux or bootstrap commands.
+
+These three bound readbacks are **new required live inputs**. The existing L2 kit has not been
+verified to record them. The supervisor must review their collection/provenance and approve the
+public input changes before this step can run; missing observations block publication rather than
+being filled in manually or inferred from manager timestamps. An expired proof requires a new
+approved smoke observation. Completing this local implementation does not prove that capacity has
+been published or that the live reserve/placement checks passed.
 
 Flux substitutes two variables from a private ConfigMap (`PGCF_REGION_ID` and `PGCF_API_HOST`, the
 host name of the API Worker) into ConfigMap `pgcf-regional` and the agent's egress policy.

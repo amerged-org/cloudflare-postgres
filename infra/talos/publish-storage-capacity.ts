@@ -12,11 +12,26 @@ const nodePattern = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
 
 type JsonObject = Record<string, unknown>;
 type Patch = { op: "test" | "add"; path: string; value: unknown }[];
+export interface VgReadback {
+  observed_at: string;
+  node_uid: string;
+  lvmnode_uid: string;
+  resource_version: string;
+  vg_uuid: string;
+  size: string | number;
+  free: string | number;
+}
+export interface SmokeProof {
+  before: VgReadback;
+  allocated: VgReadback;
+  after: VgReadback;
+}
 export interface NodeBinding {
   node_uid: string;
   lvmnode_uid: string;
   lvmnode_resource_version: string;
   vg_uuid: string;
+  smoke: SmokeProof;
 }
 export interface PublisherConfig {
   clusterUid: string;
@@ -146,6 +161,7 @@ function configFromEnvironment(
       lvmnode_uid,
       lvmnode_resource_version,
       vg_uuid,
+      smoke: smokeFromInput(candidate.smoke),
     });
   }
   return Object.freeze({
@@ -169,6 +185,71 @@ function validateProofWindow(start: number, end: number, now: number): void {
     throw new Error("stale_storage_proof");
 }
 
+function smokeFromInput(value: unknown): SmokeProof {
+  if (!value) throw new Error("missing_smoke_proof");
+  const raw = object(value);
+  const readback = (value: unknown): VgReadback => {
+    const input = object(value);
+    if (
+      !["string", "number"].includes(typeof input.size) ||
+      !["string", "number"].includes(typeof input.free)
+    )
+      throw new Error("invalid_smoke_readback");
+    return Object.freeze({
+      observed_at: text(input.observed_at),
+      node_uid: text(input.node_uid),
+      lvmnode_uid: text(input.lvmnode_uid),
+      resource_version: text(input.resource_version),
+      vg_uuid: text(input.vg_uuid),
+      size: input.size as string | number,
+      free: input.free as string | number,
+    });
+  };
+  return Object.freeze({
+    before: readback(raw.before),
+    allocated: readback(raw.allocated),
+    after: readback(raw.after),
+  });
+}
+
+function verifySmokeProof(
+  config: PublisherConfig,
+  expected: NodeBinding,
+  totalBytes: number,
+  freeBytes: number,
+): void {
+  const proof = smokeFromInput(expected.smoke);
+  const readbacks = [proof.before, proof.allocated, proof.after];
+  const times = readbacks.map((sample) => timestamp(sample.observed_at));
+  for (const sample of readbacks) {
+    if (
+      sample.node_uid !== expected.node_uid ||
+      sample.lvmnode_uid !== expected.lvmnode_uid ||
+      sample.vg_uuid !== expected.vg_uuid ||
+      parseQuantityBytes(sample.size) !== totalBytes ||
+      parseQuantityBytes(sample.free) > totalBytes
+    )
+      throw new Error("foreign_smoke_readback");
+  }
+  if (
+    times[0]! < config.proofNotBefore ||
+    times[2]! > config.proofCompletedAt ||
+    times[0]! >= times[1]! ||
+    times[1]! >= times[2]!
+  )
+    throw new Error("invalid_smoke_window");
+  if (
+    new Set(readbacks.map((sample) => sample.resource_version)).size !== 3 ||
+    proof.after.resource_version !== expected.lvmnode_resource_version
+  )
+    throw new Error("invalid_smoke_revisions");
+  const before = parseQuantityBytes(proof.before.free);
+  const allocated = parseQuantityBytes(proof.allocated.free);
+  const after = parseQuantityBytes(proof.after.free);
+  if (allocated >= before || after !== before || after !== freeBytes)
+    throw new Error("invalid_smoke_transition");
+}
+
 export function capacityPlan(
   config: PublisherConfig,
   name: string,
@@ -190,6 +271,17 @@ export function capacityPlan(
     nodeMetadata.deletionTimestamp
   )
     throw new Error("foreign_node");
+  const conditions = object(node.status ?? {}).conditions;
+  const unschedulable = object(node.spec ?? {}).unschedulable;
+  const ready = Array.isArray(conditions)
+    ? conditions.map(object).filter((value) => value.type === "Ready")
+    : [];
+  if (
+    (unschedulable !== undefined && unschedulable !== false) ||
+    ready.length !== 1 ||
+    ready[0]!.status !== "True"
+  )
+    throw new Error("storage_node_not_ready");
   const nodeVersion = text(nodeMetadata.resourceVersion);
   const lvm = object(lvmValue);
   const metadata = object(lvm.metadata);
@@ -216,29 +308,6 @@ export function capacityPlan(
     owner.controller !== true
   )
     throw new Error("foreign_lvmnode_owner");
-  const sampleTimes: number[] = [];
-  if (metadata.creationTimestamp !== undefined)
-    sampleTimes.push(timestamp(metadata.creationTimestamp));
-  if (Array.isArray(metadata.managedFields)) {
-    for (const value of metadata.managedFields) {
-      const field = object(value);
-      if (
-        field.time !== undefined &&
-        field.fieldsV1 &&
-        Object.hasOwn(object(field.fieldsV1), "f:volumeGroups")
-      )
-        sampleTimes.push(timestamp(field.time));
-    }
-  }
-  if (
-    !sampleTimes.some(
-      (time) =>
-        time >= config.proofNotBefore &&
-        time <= config.proofCompletedAt &&
-        now - time <= maxAgeMs,
-    )
-  )
-    throw new Error("stale_vg_measurement");
   if (!Array.isArray(lvm.volumeGroups))
     throw new Error("missing_vg_measurement");
   const groups = lvm.volumeGroups
@@ -259,6 +328,7 @@ export function capacityPlan(
   const storageGiB = Math.floor(totalBytes / 2 ** 30);
   if (storageGiB < 1 || freeBytes > totalBytes)
     throw new Error("invalid_vg_capacity");
+  verifySmokeProof(config, expected, totalBytes, freeBytes);
   const patch: Patch = [
     { op: "test", path: "/metadata/uid", value: expected.node_uid },
     { op: "test", path: "/metadata/resourceVersion", value: nodeVersion },
@@ -401,9 +471,7 @@ export async function run(
       } catch (error) {
         if (
           !(error instanceof Error) ||
-          !["unexpected_lvmnode_revision", "stale_vg_measurement"].includes(
-            error.message,
-          ) ||
+          !["unexpected_lvmnode_revision"].includes(error.message) ||
           now() >= freshDeadline
         )
           throw error;

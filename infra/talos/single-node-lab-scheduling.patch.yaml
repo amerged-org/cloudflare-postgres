@@ -6,6 +6,8 @@ config:
   systemReserved:
     cpu: 500m
     memory: 512Mi
+    pid: "100"
+    ephemeral-storage: 256Mi
   kubeReserved:
     cpu: 500m
     memory: 512Mi
