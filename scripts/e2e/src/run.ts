@@ -53,6 +53,7 @@ import type { ClusterIdentity } from "./identity.ts";
 import { runActive } from "./run-expiry.ts";
 import { faultCycleReady, preservedDatabase } from "./cycles.ts";
 import type { DatabaseProof } from "./cycles.ts";
+import { consumeExternalProbe } from "./external-probe.ts";
 
 export const REQUIRED_ENV = [
   "CLOUDFLARE_ACCOUNT_ID",
@@ -298,10 +299,12 @@ export class Run {
   readonly dir: string;
   readonly stateDir: string;
   readonly runName: string;
+  private readonly root: string;
   private deadline = Date.now() + 450_000;
   private probeHost?: string;
   constructor(c: Config, state: Ledger, root: string, dryRun: boolean) {
     this.c = c;
+    this.root = root;
     this.state = state;
     this.dryRun = dryRun;
     this.cf = new Cloudflare(
@@ -1567,14 +1570,24 @@ export class Run {
       const segment = ports.slice(first - 1, last);
       for (let offset = 0; offset < segment.length; offset += 256) {
         const batch = segment.slice(offset, offset + 256);
+        // Workers cannot dial TCP/25. A signed, independent native probe must cover it.
+        if (batch.includes(25)) {
+          const proven = await consumeExternalProbe(
+            this.root,
+            addresses.map((entry) => entry.host),
+          );
+          if (!proven.has(address.host))
+            throw new HarnessError("supplemental_external_tcp_probe_required");
+        }
+        const workerPorts = batch.filter((port) => port !== 25);
         const result = await this.probe("/scan", {
           host: address.host,
-          ports: batch,
+          ports: workerPorts,
         });
         if (
           !Array.isArray(result.open) ||
           result.open.some((p) => typeof p !== "number") ||
-          result.checked !== batch.length
+          result.checked !== workerPorts.length
         )
           throw new HarnessError("invalid_scan_result");
         assertOpenSubset(result.open as number[], []);
@@ -1588,7 +1601,15 @@ export class Run {
     const complete = addresses.every((a) =>
       this.state.scans.includes(fingerprint(`${a.node}:${a.host}`)),
     );
-    if (complete) await this.complete("E6");
+    if (complete) {
+      const proven = await consumeExternalProbe(
+        this.root,
+        addresses.map((entry) => entry.host),
+      );
+      if (addresses.some((address) => !proven.has(address.host)))
+        throw new HarnessError("supplemental_external_tcp_probe_required");
+      await this.complete("E6");
+    }
     await this.emit(
       "E6",
       {
