@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { Client, Pool } from "@neondatabase/serverless";
+import { Client, Pool, parseIntoClientConfig } from "@neondatabase/serverless";
+import { isDatabaseId, isRoleName } from "@pgcf/contracts";
 import { connect } from "cloudflare:sockets";
 import { credentialOccurrences } from "../src/audit.ts";
 import { workerScanUnsupported } from "../src/transport.ts";
@@ -63,21 +64,61 @@ async function connection(env: Env, marker?: string): Promise<string> {
     uri: string;
     includes_password: boolean;
   };
-  const uri = new URL(result.uri);
+  const target = connectionIdentity(result.uri);
   if (
-    uri.protocol !== "postgres:" ||
-    uri.hostname !== env.ENDPOINT_HOST ||
-    decodeURIComponent(uri.pathname.slice(1)) !== env.DATABASE_ID ||
-    !result.includes_password ||
-    !uri.password ||
-    decodeURIComponent(uri.username) !== "app"
+    target.host !== env.ENDPOINT_HOST ||
+    target.database !== env.DATABASE_ID ||
+    result.includes_password !== true ||
+    !new URL(result.uri).password ||
+    target.user !== "app"
   )
     throw new Error("connection_metadata_invalid");
   return result.uri;
 }
 
+function connectionIdentity(uri: string): {
+  host: string;
+  database: string;
+  user: string;
+} {
+  try {
+    const target = new URL(uri);
+    const database = decodeURIComponent(target.pathname.slice(1));
+    const user = decodeURIComponent(target.username);
+    if (
+      uri.length > 2048 ||
+      target.protocol !== "postgres:" ||
+      !target.hostname ||
+      target.port ||
+      target.search ||
+      target.hash ||
+      !isDatabaseId(database) ||
+      !isRoleName(user)
+    )
+      throw new Error("connection_metadata_invalid");
+    // Validate before parsing: driver options can redirect hosts or load TLS files.
+    const parsed = parseIntoClientConfig(uri);
+    if (
+      parsed.host !== target.hostname ||
+      parsed.database !== database ||
+      parsed.user !== user
+    )
+      throw new Error("connection_metadata_invalid");
+    return { host: target.hostname, database, user };
+  } catch {
+    throw new Error("connection_metadata_invalid");
+  }
+}
+
 export function probePool(uri: string, marker?: string): Pool {
   validTraceMarker(marker);
+  const target = connectionIdentity(uri);
+  const query = new URLSearchParams({
+    database: target.database,
+    user: target.user,
+  });
+  if (marker !== undefined) query.set("pgcf_trace", marker);
+  const address = `${target.host}/v2?${query}`;
   const db = new Pool({
     connectionString: uri,
     max: 1,
@@ -89,11 +130,20 @@ export function probePool(uri: string, marker?: string): Pool {
   db.Client = class extends Client {
     constructor(config?: ConstructorParameters<typeof Client>[0]) {
       super(config);
+      if (
+        this.host !== target.host ||
+        this.database !== target.database ||
+        this.user !== target.user
+      )
+        throw new Error("connection_metadata_invalid");
       this.neonConfig.useSecureWebSocket = true;
       this.neonConfig.pipelineConnect = false;
       this.neonConfig.forceDisablePgSSL = true;
-      if (marker !== undefined)
-        this.neonConfig.wsProxy = (host) => `${host}/v2?pgcf_trace=${marker}`;
+      this.neonConfig.wsProxy = (host) => {
+        if (host !== target.host)
+          throw new Error("connection_metadata_invalid");
+        return address;
+      };
     }
   };
   return db;
