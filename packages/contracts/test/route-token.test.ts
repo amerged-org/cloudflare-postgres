@@ -376,6 +376,36 @@ describe("route token", () => {
       b64u(new Uint8Array(16)),
     );
   });
+
+  it("preserves longer master keys while deriving 32-byte region keys", async () => {
+    const masterBytes = Uint8Array.from(
+      { length: 64 },
+      (_, i) => (i * 7 + 31) & 0xff,
+    );
+    const keyring: RouteKeyring = {
+      active: "k1",
+      keys: new Map([["k1", masterBytes]]),
+    };
+    const parsed = parseRouteKeyring(serializeRouteKeyring(keyring));
+    expect(parsed.keys.get("k1")).toEqual(masterBytes);
+    const derived = await deriveRegionKeyring(parsed, region);
+    expect(derived.keys.get("k1")?.length).toBe(32);
+    expect(Buffer.from(derived.keys.get("k1")!)).toEqual(
+      createHmac("sha256", masterBytes)
+        .update("pgcf-route-key/v1\n" + region)
+        .digest(),
+    );
+    const token = await signRouteToken({
+      keyring: parsed,
+      region,
+      db,
+      cid,
+      now,
+    });
+    expect(
+      (await verifyRouteToken(token, { keys: derived.keys, region, now })).ok,
+    ).toBe(true);
+  });
 });
 
 describe("ReplayCache", () => {

@@ -9,6 +9,8 @@
 // derived for its own region, so a compromised gateway cannot mint tokens for
 // any other region.
 import { z } from "zod";
+import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
+import { DATABASE_ID_PATTERN, REGION_ID_PATTERN } from "./ids.ts";
 
 export const ROUTE_TOKEN_HEADER = "X-PGCF-Route";
 export const ROUTE_TOKEN_MAX_LENGTH = 512;
@@ -22,18 +24,15 @@ const SIGNATURE_DOMAIN = "pgcf-route/v1\n";
 const KEY_DOMAIN = "pgcf-route-key/v1\n";
 const SIGNATURE_BYTES = 32;
 
-const databaseIdPattern = /^[a-z][a-z0-9]{19}$/;
-const regionIdPattern = /^[a-z][a-z0-9-]{1,30}[a-z0-9]$/;
 const kidPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 const cidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
-const base64UrlPattern = /^[A-Za-z0-9_-]*$/;
 
 export const routeTokenClaimsSchema = z.strictObject({
   v: z.literal(1),
-  db: z.string().regex(databaseIdPattern),
+  db: z.string().regex(DATABASE_ID_PATTERN),
   cid: z.string().regex(cidPattern),
-  rg: z.string().regex(regionIdPattern),
+  rg: z.string().regex(REGION_ID_PATTERN),
   kid: z.string().regex(kidPattern),
   iat: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   exp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
@@ -67,7 +66,7 @@ export function parseRouteKeyring(json: string): RouteKeyring {
   if (!parsed.success) throw new Error("invalid route keyring: wrong shape");
   const keys = new Map<string, Uint8Array>();
   for (const [kid, encoded] of Object.entries(parsed.data.keys)) {
-    const bytes = base64UrlDecode(encoded);
+    const bytes = base64urlToBytes(encoded);
     if (bytes === null || bytes.length < ROUTE_KEY_MIN_BYTES)
       throw new Error(
         `invalid route keyring: key ${kid} must be base64url of at least ${ROUTE_KEY_MIN_BYTES} bytes`,
@@ -81,7 +80,7 @@ export function parseRouteKeyring(json: string): RouteKeyring {
 
 export function serializeRouteKeyring(keyring: RouteKeyring): string {
   const keys: Record<string, string> = {};
-  for (const [kid, bytes] of keyring.keys) keys[kid] = base64UrlEncode(bytes);
+  for (const [kid, bytes] of keyring.keys) keys[kid] = bytesToBase64url(bytes);
   return JSON.stringify({ active: keyring.active, keys });
 }
 
@@ -90,7 +89,7 @@ export async function deriveRegionKey(
   master: Uint8Array,
   regionId: string,
 ): Promise<Uint8Array> {
-  if (!regionIdPattern.test(regionId))
+  if (!REGION_ID_PATTERN.test(regionId))
     throw new RangeError("invalid region id");
   if (master.length < ROUTE_KEY_MIN_BYTES)
     throw new RangeError("master key too short");
@@ -138,10 +137,10 @@ export async function signRouteToken(
     exp: iat + ttl,
   });
   if (!claims.success) throw new RangeError("invalid route token claims");
-  const payload = base64UrlEncode(encoder.encode(JSON.stringify(claims.data)));
+  const payload = bytesToBase64url(encoder.encode(JSON.stringify(claims.data)));
   const key = await deriveRegionKey(master, input.region);
   const signature = await hmac(key, SIGNATURE_DOMAIN + payload);
-  return `${TOKEN_PREFIX}.${payload}.${base64UrlEncode(signature)}`;
+  return `${TOKEN_PREFIX}.${payload}.${bytesToBase64url(signature)}`;
 }
 
 export type RouteTokenFailure =
@@ -179,8 +178,8 @@ export async function verifyRouteToken(
   const parts = token.split(".");
   if (parts.length !== 3 || parts[0] !== TOKEN_PREFIX) return fail("malformed");
   const payload = parts[1] as string;
-  const payloadBytes = base64UrlDecode(payload);
-  const signature = base64UrlDecode(parts[2] as string);
+  const payloadBytes = base64urlToBytes(payload);
+  const signature = base64urlToBytes(parts[2] as string);
   if (
     payloadBytes === null ||
     payloadBytes.length === 0 ||
@@ -290,42 +289,4 @@ function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
   for (let i = 0; i < a.length; i++)
     diff |= (a[i] as number) ^ (b[i] as number);
   return diff === 0;
-}
-
-const alphabet =
-  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-const alphabetIndex = new Map([...alphabet].map((c, i) => [c, i]));
-
-function base64UrlEncode(bytes: Uint8Array): string {
-  let out = "";
-  for (let i = 0; i < bytes.length; i += 3) {
-    const b0 = bytes[i] as number;
-    const b1 = bytes[i + 1] ?? 0;
-    const b2 = bytes[i + 2] ?? 0;
-    const n = (b0 << 16) | (b1 << 8) | b2;
-    out += alphabet[(n >> 18) & 63]! + alphabet[(n >> 12) & 63]!;
-    if (i + 1 < bytes.length) out += alphabet[(n >> 6) & 63]!;
-    if (i + 2 < bytes.length) out += alphabet[n & 63]!;
-  }
-  return out;
-}
-
-/** Strict unpadded base64url; non-canonical encodings return null. */
-function base64UrlDecode(text: string): Uint8Array | null {
-  if (!base64UrlPattern.test(text) || text.length % 4 === 1) return null;
-  const out = new Uint8Array(Math.floor((text.length * 3) / 4));
-  let bits = 0;
-  let value = 0;
-  let o = 0;
-  for (const char of text) {
-    value = (value << 6) | (alphabetIndex.get(char) as number);
-    bits += 6;
-    if (bits >= 8) {
-      bits -= 8;
-      out[o++] = (value >> bits) & 0xff;
-    }
-    value &= (1 << bits) - 1;
-  }
-  if (value !== 0) return null;
-  return out;
 }
