@@ -241,6 +241,9 @@ async function inspectionProbe(
     apiVersion?: string;
     nativeInspection?: unknown;
     toolFailure?: boolean;
+    capabilityFailure?: boolean;
+    toolOverflow?: boolean;
+    invalidJson?: boolean;
   } = {},
 ): Promise<{
   status: number | null;
@@ -264,12 +267,17 @@ async function inspectionProbe(
         `#!${process.execPath}`,
         `const {appendFileSync} = require("node:fs"); const args = process.argv.slice(2);`,
         `appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");`,
+        `if (args.includes("--help") && ${options.capabilityFailure ?? false}) { process.stderr.write(${JSON.stringify(credentialShaped)}); process.exit(1); }`,
         `if (args[0] === "version") { process.stdout.write(${JSON.stringify(options.apiVersion ?? "1.48")}); process.exit(0); }`,
         `if (args.includes("--help")) { process.stdout.write(${JSON.stringify(options.platformFlag ? "Options:\n      --platform string Inspect a specific platform\n" : "Options:\n  -f, --format string Format output\n")}); process.exit(0); }`,
         `if (args.includes("--platform") && !${options.platformFlag ?? false}) { process.stderr.write("unknown flag: --platform"); process.exit(125); }`,
         options.toolFailure
           ? `process.stderr.write(${JSON.stringify(credentialShaped)}); process.exit(1);`
-          : `process.stdout.write(args.includes("--platform") ? ${JSON.stringify(JSON.stringify(inspection))} : ${JSON.stringify(JSON.stringify(options.nativeInspection ?? inspection))});`,
+          : options.toolOverflow
+            ? `process.stderr.write(${JSON.stringify(credentialShaped)} + "x".repeat(1_000_001));`
+            : options.invalidJson
+              ? `process.stdout.write("invalid JSON");`
+              : `process.stdout.write(args.includes("--platform") ? ${JSON.stringify(JSON.stringify(inspection))} : ${JSON.stringify(JSON.stringify(options.nativeInspection ?? inspection))});`,
       ].join("\n"),
       { mode: 0o700 },
     );
@@ -422,4 +430,38 @@ test("modern platform selection cannot authorize a different image or retry a fa
     1,
   );
   assert.ok(failedInspect.calls.at(-1)?.includes("--platform"));
+});
+
+test("invalid capability metadata fails closed before an image inspection", async () => {
+  const invalidApi = await inspectionProbe([inspectedImage], {
+    platformFlag: true,
+    apiVersion: "invalid",
+  });
+  assert.equal(invalidApi.status, 1);
+  assert.match(invalidApi.stderr, /Invalid negotiated Docker API version/);
+  assert.equal(
+    invalidApi.calls.filter(
+      (args) => args[0] === "image" && !args.includes("--help"),
+    ).length,
+    0,
+  );
+  const failedHelp = await inspectionProbe([inspectedImage], {
+    capabilityFailure: true,
+  });
+  assert.equal(failedHelp.status, 1);
+  assert.match(failedHelp.stderr, /tool_failed:inspect_help/);
+  assert.equal(failedHelp.calls.length, 1);
+});
+
+test("inspection parsing and output-limit errors return fixed safe reasons", async () => {
+  const invalidJson = await inspectionProbe([inspectedImage], {
+    invalidJson: true,
+  });
+  assert.equal(invalidJson.status, 1);
+  assert.match(invalidJson.stderr, /inspection_invalid_json/);
+  const overflow = await inspectionProbe([inspectedImage], {
+    toolOverflow: true,
+  });
+  assert.equal(overflow.status, 1);
+  assert.match(overflow.stderr, /tool_output_limit:image_inspect/);
 });

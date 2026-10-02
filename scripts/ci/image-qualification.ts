@@ -320,7 +320,20 @@ export function assertScanResult(
   );
 }
 
+type ToolStage =
+  | "runtime_help"
+  | "runtime_agent"
+  | "runtime_gateway"
+  | "scanner_version"
+  | "inspect_help"
+  | "docker_api"
+  | "image_inspect"
+  | "base_pull"
+  | "image_save"
+  | "image_promote";
+
 async function command(
+  stage: ToolStage,
   program: string,
   args: string[],
   cwd?: string,
@@ -351,11 +364,13 @@ async function command(
       } else stderr += chunk.toString();
     });
     child.on("error", () =>
-      reject(new Error("Qualification tool could not start")),
+      reject(new QualificationFailure(`tool_start_failed:${stage}`)),
     );
     child.on("close", (exit) => {
-      if (overflow || !accepted.includes(exit ?? -1))
-        reject(new Error("Qualification tool failed"));
+      if (overflow)
+        reject(new QualificationFailure(`tool_output_limit:${stage}`));
+      else if (!accepted.includes(exit ?? -1))
+        reject(new QualificationFailure(`tool_failed:${stage}`));
       else fulfill({ stdout, stderr, exit });
     });
   });
@@ -377,8 +392,13 @@ export async function qualifyRuntime(image: string): Promise<void> {
     "node",
     image,
   ];
-  await command("docker", [...args, "/app/agent.mjs", "--help"]);
+  await command("runtime_help", "docker", [
+    ...args,
+    "/app/agent.mjs",
+    "--help",
+  ]);
   const agent = await command(
+    "runtime_agent",
     "docker",
     [...args, "/app/agent.mjs"],
     undefined,
@@ -391,6 +411,7 @@ export async function qualifyRuntime(image: string): Promise<void> {
     "Agent runtime did not reject missing configuration cleanly",
   );
   const gateway = await command(
+    "runtime_gateway",
     "docker",
     [...args, "/app/gateway.mjs"],
     undefined,
@@ -452,8 +473,9 @@ export async function installScanner(directory: string): Promise<string> {
   requireCheck(found, "Scanner binary missing");
   await chmod(binary, 0o700);
   requireCheck(
-    (await command(binary, ["version"], directory)).stdout.trim() ===
-      scannerVersion,
+    (
+      await command("scanner_version", binary, ["version"], directory)
+    ).stdout.trim() === scannerVersion,
     "Scanner version mismatch",
   );
   return binary;
@@ -598,26 +620,64 @@ async function inspectImage(image: string): Promise<{
   Id: string;
   Architecture: string;
   Os: string;
-  RootFS: { Layers: string[] };
+  RootFS: { Type: string; Layers: string[] };
 }> {
-  const data = JSON.parse(
-    (
-      await command("docker", [
-        "image",
-        "inspect",
-        "--platform",
-        "linux/amd64",
-        image,
-      ])
-    ).stdout,
-  ) as {
+  // Check both parser and negotiated API before using the platform option introduced in 1.49.
+  const help = await command("inspect_help", "docker", [
+    "image",
+    "inspect",
+    "--help",
+  ]);
+  const version = await command("docker_api", "docker", [
+    "version",
+    "--format",
+    "{{.Client.APIVersion}}",
+  ]);
+  const api = /^1\.(\d+)$/.exec(version.stdout.trim());
+  requireCheck(api, "Invalid negotiated Docker API version");
+  const platformFlag =
+    /^\s+--platform\s/m.test(help.stdout) && Number(api[1]) >= 49;
+  const result = await command("image_inspect", "docker", [
+    "image",
+    "inspect",
+    ...(platformFlag ? ["--platform", "linux/amd64"] : []),
+    image,
+  ]);
+  let data: unknown;
+  try {
+    data = JSON.parse(result.stdout);
+  } catch {
+    throw new QualificationFailure("inspection_invalid_json");
+  }
+  requireCheck(
+    Array.isArray(data) &&
+      data.length === 1 &&
+      data[0] &&
+      typeof data[0] === "object",
+    "Unexpected Docker inspection result",
+  );
+  const inspected = data[0] as {
     Id: string;
     Architecture: string;
     Os: string;
-    RootFS: { Layers: string[] };
-  }[];
-  requireCheck(data.length === 1, "Unexpected Docker inspection result");
-  return data[0]!;
+    RootFS: { Type: string; Layers: string[] };
+  };
+  requireCheck(
+    inspected.Os === "linux" && inspected.Architecture === "amd64",
+    "Unexpected inspected image platform",
+  );
+  requireCheck(
+    typeof inspected.Id === "string" &&
+      digestPattern.test(inspected.Id) &&
+      inspected.RootFS?.Type === "layers" &&
+      Array.isArray(inspected.RootFS.Layers) &&
+      inspected.RootFS.Layers.length > 0 &&
+      inspected.RootFS.Layers.every(
+        (digest) => typeof digest === "string" && digestPattern.test(digest),
+      ),
+    "Invalid inspected image identity or diffIDs",
+  );
+  return inspected;
 }
 
 export async function qualify(
@@ -650,7 +710,12 @@ export async function qualify(
       "Dockerfile base is not an identical pinned official Node image",
     );
     const baseImage = bases[1]!;
-    await command("docker", ["pull", "--platform", "linux/amd64", baseImage]);
+    await command("base_pull", "docker", [
+      "pull",
+      "--platform",
+      "linux/amd64",
+      baseImage,
+    ]);
     const base = await inspectImage(baseImage);
     requireCheck(
       base.Architecture === "amd64" &&
@@ -660,7 +725,13 @@ export async function qualify(
     );
     const archive = join(directory, "image.tar");
     await writeFile(archive, "", { flag: "wx", mode: 0o600 });
-    await command("docker", ["image", "save", "--output", archive, imageId]);
+    await command("image_save", "docker", [
+      "image",
+      "save",
+      "--output",
+      archive,
+      imageId,
+    ]);
     const archiveSha256 = await hashFile(archive);
     const entries = await extractImageArchive(
       archive,
@@ -988,7 +1059,11 @@ async function main(): Promise<void> {
       const verified = JSON.parse(
         await readFile(registryReportPath, "utf8"),
       ) as { digest: string; manifestDigest: string; configDigest: string };
-      await command("docker", promotionArguments(image, verified, report));
+      await command(
+        "image_promote",
+        "docker",
+        promotionArguments(image, verified, report),
+      );
     } else
       requireCheck(
         (await inspectImage(image)).Id === imageId,
