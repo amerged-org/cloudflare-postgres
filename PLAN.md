@@ -1,18 +1,19 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-02): **local build; live acceptance pending.** The project has been redirected
-toward a lean, Neon-style service. Phase 1 services have passed local checks; the approved native
-WebSocket connection path is implemented locally at `344fd4d`, with successful CI check and image
-jobs. Local PostgreSQL stream wire checks passed; default decoded-binary client assertions still
-fail and live acceptance remains pending.
+Status (2026-10-02): **CI-qualified build; live acceptance pending.** Phase 1 services and the
+approved native WebSocket path are implemented. CI run `37064926148` for `a11e0c3` passed the code
+and image jobs, including complete image qualification and authenticated registry verification.
+The published regional image remains private under organization policy. Local PostgreSQL stream
+wire checks passed; the original default decoded-binary client assertions still fail.
 The first build produced mostly budget-enforcement, signed-execution and evidence machinery but no
 database a client could connect to through the API. Those parts are removed. The Talos recipe,
 the Flux platform baseline and the R2 backup/PITR recipe stay, because they work in the lab.
 The old implementation has been removed and the workspace scaffolded. Dev decommission and
-independent re-inventory completed. The first EU rebuild stopped at firewall rule validation
-before rescue or disk wipe; the lab rebuild remains pending. Phase 0 and Phase 1's complete
-database chain have not passed live acceptance, and Phase 2 has not begun. The owner has requested
-delivery through Phase 5 and full Neon replacement.
+independent re-inventory completed. The first EU firewall corrections are applied, and operator
+access plus mandatory foreign IPv4 and IPv6 refusal checks passed. No rescue or disk wipe has
+started; image preparation, the lab rebuild and custom-domain setup remain pending. Phase 0 and
+Phase 1's complete database chain have not passed live acceptance, and Phase 2 has not begun.
+The owner has requested delivery through Phase 5 and full Neon replacement.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
 AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.
@@ -616,6 +617,8 @@ infra/backups         CNPG/Barman/R2 backup and restore reference
 
 ## 11. Status
 
+Entries are chronological; later results supersede earlier pending work.
+
 | Date       | Phase | Result                                                                                                                                                                                                                                                                                                                   |
 | ---------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 2026-10-02 | 0     | Plan rewritten. Old repository implementation was removed; completed-track worktrees are removed after integration. Dev decommission and lab rebuild remain pending. |
@@ -641,3 +644,6 @@ infra/backups         CNPG/Barman/R2 backup and restore reference
 | 2026-10-02 | review | The author-reported E2E Startup-mismatch harness suite passed 111 local tests; fresh review and an additional defensive specification correction remain pending. S4, S56 and collector candidate fixes also await fresh reviews. None is live acceptance, and Phase 2 has not begun. |
 | 2026-10-02 | 0–1 local | Reviewed source and acceptance harness integrated at `9117de3`. All root gates passed, including 38 CI qualification tests and 121 live-harness unit tests. CI passed the code, test, manifest, image-build and runtime checks, then stopped before publication because Docker 28.0.4 does not support the image-inspection platform flag. The portability correction retains explicit image-platform and identity checks and remains pending CI verification. |
 | 2026-10-02 | 1 local | Private operational preparation passed two fresh reviews: 39 database/storage-helper tests and 37 measurement-helper tests. These are local checks only. The unapplied firewall-order correction passed 61 correctness and 20 security checks; modifying the vetted tool still needs explicit approval. Dev rebuild, transport selection and Phase 1 live acceptance remain pending. |
+| 2026-10-02 | CI / image | CI run `37064926148` for `a11e0c3` passed both code and image jobs. Actual Linux full-image qualification scanned exactly 657,428,957 bytes across 10,447 inputs, 10 layers and 10,207 regular files. All 26 findings matched exact reviewed upstream noncredentials; zero remained unresolved, without weakening the detector. Forbidden-path and runtime checks, authenticated registry SHA/config/RootFS binding and immutable latest promotion passed. Published regional image `sha-a11e0c3930b6` has registry manifest digest `sha256:b358c579bbd58cb7f74dd3aa047483ad9d9f71495f5f9902c72aa00450c7b9f5`. Organization policy currently disables public visibility; anonymous download, image signing and production acceptance remain pending. |
+| 2026-10-02 | 0 live | Both exact owner-approved first-EU firewall corrections are applied. The strict terminal-DROP correction passed 87 checks in each independent review. The actual firewall-prune step exited 0 with operator access and mandatory foreign IPv4 and IPv6 positive controls and refusal checks. No rescue, disk wipe or rebuild has started. Image preparation and custom-domain setup remain pending; Phase 0 is unaccepted. |
+| 2026-10-02 | 1 preparation | In-process default-text result compatibility preparation passed 14 checks; this is not a driver change or end-to-end acceptance. The original decoded-binary assertions still fail and remain retained. Live transport selection and the complete E0–E6 Dev run remain pending; Phase 2 has not begun. |

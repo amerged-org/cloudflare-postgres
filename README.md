@@ -18,17 +18,18 @@ loss is recovered from R2.
 
 ## Status
 
-**Local build; live acceptance pending (2026-10-02).** The reset keeps the working Talos, Flux
-platform and R2 backup/PITR recipes in [infra/](infra/README.md). Native WebSocket forwarding is
-implemented locally at `344fd4d`; CI passed its check and image jobs. Against real PostgreSQL,
-100 MiB and 1 GiB COPY and SELECT wire-hash checks passed with unchanged 192 MiB local memory
-guards. Default Neon decoded-binary result assertions still fail because of upstream parsing.
+**CI-qualified build; live acceptance pending (2026-10-02).** Phase 1 services and native
+WebSocket forwarding are implemented. CI run `37064926148` for `a11e0c3` passed code and full-image
+qualification, authenticated registry verification and immutable publication. The regional image
+remains private under organization policy. Against real PostgreSQL, 100 MiB and 1 GiB COPY and
+SELECT wire-hash checks passed with unchanged 192 MiB local memory guards. The original default
+Neon decoded-binary result assertions still fail because of upstream parsing.
 
 Dev decommission and independent re-inventory completed with all 174 foreign resources unchanged.
-The first EU rebuild stopped at a firewall rule-ordering error before rescue or disk wipe. The
-lab rebuild and published-image qualification remain pending. Phase 0 and Phase 1 have not passed
-live acceptance, and Phase 2 has not begun. See [PLAN.md](PLAN.md#11-status) for measured results,
-remaining reviews and blockers.
+First-EU firewall corrections and actual operator-access and foreign IPv4/IPv6 refusal checks
+passed. Rescue, disk wipe, the lab rebuild and custom-domain setup remain pending. Phase 0 and
+Phase 1 have not passed live acceptance, and Phase 2 has not begun. See
+[PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture
 
