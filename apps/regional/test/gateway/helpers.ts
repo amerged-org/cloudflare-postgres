@@ -2,13 +2,15 @@
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { EventEmitter, once } from "node:events";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import {
   createServer,
   createConnection,
   type Server,
   type Socket,
 } from "node:net";
-import { networkInterfaces } from "node:os";
+import { networkInterfaces, tmpdir } from "node:os";
+import { join } from "node:path";
 import { createSecureContext, TLSSocket } from "node:tls";
 import { WebSocket } from "ws";
 import { newDatabaseId, randomString } from "@pgcf/contracts";
@@ -45,31 +47,38 @@ export function certificate(host: string): { cert: string; key: string } {
   const key = pair.privateKey
     .export({ type: "pkcs8", format: "pem" })
     .toString();
-  const cert = execFileSync(
-    "openssl",
-    [
-      "req",
-      "-new",
-      "-x509",
-      "-key",
-      "/dev/stdin",
-      "-days",
-      "1",
-      "-subj",
-      "/CN=pgcf-test",
-      "-addext",
-      `subjectAltName=DNS:${host}`,
-      "-addext",
-      "basicConstraints=critical,CA:TRUE",
-    ],
-    {
-      input: key,
-      encoding: "utf8",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 10_000,
-    },
-  );
-  return { cert, key };
+  const directory = mkdtempSync(join(tmpdir(), "pgcf-test-cert-"));
+  try {
+    const keyPath = join(directory, "private-key");
+    // Linux cannot reopen Node's child-process socket through /dev/stdin.
+    writeFileSync(keyPath, key, { mode: 0o600 });
+    const cert = execFileSync(
+      "openssl",
+      [
+        "req",
+        "-new",
+        "-x509",
+        "-key",
+        keyPath,
+        "-days",
+        "1",
+        "-subj",
+        "/CN=pgcf-test",
+        "-addext",
+        `subjectAltName=DNS:${host}`,
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+      ],
+      {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 10_000,
+      },
+    );
+    return { cert, key };
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 export const validCertificate = certificate(databaseTarget(database).host);
