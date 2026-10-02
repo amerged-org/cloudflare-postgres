@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { CoreV1Api, KubeConfig } from "@kubernetes/client-node";
+import { CoreV1Api, KubeConfig, Observable } from "@kubernetes/client-node";
 import { DATABASE_ID_PATTERN } from "@pgcf/contracts";
 import { X509Certificate } from "node:crypto";
 
@@ -17,7 +17,29 @@ export function readClusterDatabaseCa(): ReadDatabaseCa {
   configuration.loadFromCluster();
   const api = configuration.makeApiClient(CoreV1Api);
   return async (name, namespace) => {
-    const map = await api.readNamespacedConfigMap({ name, namespace });
+    if (
+      namespace !== "pgcf-system" ||
+      !DATABASE_ID_PATTERN.test(name.slice(3)) ||
+      !name.startsWith("ca-")
+    )
+      throw new Error("invalid database CA source");
+    const map = await api.readNamespacedConfigMap(
+      { name, namespace },
+      {
+        middlewareMergeStrategy: "append",
+        middleware: [
+          {
+            pre(context) {
+              context.setSignal(AbortSignal.timeout(10_000));
+              return new Observable(Promise.resolve(context));
+            },
+            post(context) {
+              return new Observable(Promise.resolve(context));
+            },
+          },
+        ],
+      },
+    );
     const ca = map.data?.["ca.crt"];
     if (!ca) throw new Error("database CA unavailable");
     return ca;
@@ -55,6 +77,8 @@ export class DatabaseCaCache implements DatabaseCaProvider {
     if (!refresh && cached && cached.expires > this.#now()) return cached.ca;
     const current = this.#inflight.get(database);
     if (current) return current;
+    if (this.#inflight.size >= this.#maximum)
+      throw new Error("database CA request capacity exhausted");
     const read = this.#fetch(database);
     this.#inflight.set(database, read);
     try {

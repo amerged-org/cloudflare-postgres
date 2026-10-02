@@ -175,13 +175,41 @@ export function token(
   });
 }
 
+export async function signedClaims(
+  overrides: Readonly<Record<string, unknown>>,
+): Promise<string> {
+  const original = await token();
+  const encoded = original.split(".")[1] as string;
+  const claims = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  const payload = Buffer.from(
+    JSON.stringify({ ...claims, ...overrides }),
+  ).toString("base64url");
+  const key = await crypto.subtle.importKey(
+    "raw",
+    Uint8Array.from(derived.keys.get(derived.active) as Uint8Array),
+    { name: "HMAC", hash: "SHA-256" },
+    false,
+    ["sign"],
+  );
+  const signature = await crypto.subtle.sign(
+    "HMAC",
+    key,
+    Buffer.from(`pgcf-route/v1\n${payload}`),
+  );
+  return `v1.${payload}.${Buffer.from(signature).toString("base64url")}`;
+}
+
 export function client(
   port: number,
   route: string | undefined,
   path = "/pg",
+  headers: Record<string, string> = {},
 ): WebSocket {
   return new WebSocket(`ws://${loopback}:${port}${path}`, {
-    headers: route === undefined ? {} : { "X-PGCF-Route": route },
+    headers: {
+      ...headers,
+      ...(route === undefined ? {} : { "X-PGCF-Route": route }),
+    },
   });
 }
 
@@ -189,8 +217,9 @@ export async function open(
   port: number,
   route?: string,
   path = "/pg",
+  headers: Record<string, string> = {},
 ): Promise<WebSocket> {
-  const socket = client(port, route ?? (await token()), path);
+  const socket = client(port, route ?? (await token()), path, headers);
   await once(socket, "open", { signal: AbortSignal.timeout(5_000) });
   return socket;
 }

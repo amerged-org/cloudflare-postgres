@@ -16,7 +16,6 @@ import {
   MAX_PAYLOAD_BYTES,
 } from "../../src/gateway/server.ts";
 import {
-  client,
   database,
   gatewayFor,
   loopback,
@@ -24,6 +23,7 @@ import {
   otherCertificate,
   postgresServer,
   rejection,
+  signedClaims,
   token,
   validCertificate,
 } from "./helpers.ts";
@@ -40,6 +40,18 @@ test("rejects malformed upgrade, missing/bad token and wrong region before dial"
   assert.equal(await rejection(port, `v1.${randomUUID()}`), 401);
   assert.equal(
     await rejection(port, await token({ region: `other-region` })),
+    401,
+  );
+  assert.equal(
+    await rejection(port, await signedClaims({ rg: "other-region" })),
+    403,
+  );
+  assert.equal(
+    await rejection(port, await token({ now: Date.now() - 60_000 })),
+    401,
+  );
+  assert.equal(
+    await rejection(port, await signedClaims({ db: "../invalid" })),
     401,
   );
   assert.equal(postgres.handshakes(), 0);
@@ -176,6 +188,7 @@ test("derives target only from verified database and ignores query and host head
     port,
     await token(),
     `/pg?host=${encodeURIComponent(randomUUID())}&port=1&database=${randomUUID()}`,
+    { Host: randomUUID() },
   );
   assert.deepEqual(targets, [`${databaseTarget(database).host}:5432`]);
   const closed = once(socket, "close");

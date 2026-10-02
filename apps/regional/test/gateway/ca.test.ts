@@ -47,6 +47,23 @@ test("shares concurrent CA reads and never caches malformed certificates", async
   assert.equal(invalid.size, 0);
 });
 
+test("bounds concurrent CA reads and releases capacity on failure", async () => {
+  let rejectRead: ((error: Error) => void) | undefined;
+  const cache = new DatabaseCaCache(
+    () =>
+      new Promise<string>((_resolve, reject) => {
+        rejectRead = reject;
+      }),
+    { maximum: 1 },
+  );
+  const first = cache.get(database);
+  const failure = assert.rejects(first, /read failed/);
+  await assert.rejects(cache.get(newDatabaseId()), /capacity exhausted/);
+  rejectRead?.(new Error("read failed"));
+  await failure;
+  assert.equal(cache.size, 0);
+});
+
 test("loads the deployed derived region keyring variable and validates configuration", () => {
   const configured = readGatewayConfiguration({
     PGCF_REGION_ID: region,

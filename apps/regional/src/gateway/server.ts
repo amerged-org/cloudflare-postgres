@@ -79,8 +79,10 @@ export function createGateway(options: GatewayOptions): Gateway {
   });
   server.headersTimeout = 10_000;
   server.requestTimeout = 10_000;
+  server.maxConnections = totalLimit * 2;
   server.on("clientError", (_error, socket) => rejectUpgrade(socket, 400));
   server.on("upgrade", (request, socket, head) => {
+    socket.on("error", () => {});
     void upgrade(request, socket, head).catch(() => rejectUpgrade(socket, 502));
   });
 
