@@ -83,9 +83,11 @@ The diagrams are in [README.md](README.md#architecture).
   - PostgreSQL parameters derived from the size class.
   - Barman Cloud plugin as WAL archiver.
   - Sleep uses the CNPG hibernation annotation.
-- Barman `ObjectStore` writing to `s3://<bucket>/<region>/<db-id>/g<generation>-<opid>` on the R2
-  EU endpoint (`<opid>` is the operation that created the generation), plus a daily
+- Barman `ObjectStore` writing to `s3://<bucket>/<region>/<db-id>/g<generation>-<opid>` on the region's R2
+  endpoint (`<opid>` is the operation that created the generation), plus a daily
   `ScheduledBackup`.
+  EU backups use an EU-jurisdiction bucket and EU endpoint. US backups use a separate bucket on
+  the general endpoint with a North America location hint; a hint is not a jurisdiction guarantee.
 - Credentials: generated in the API Worker, stored AES-GCM-encrypted in D1 (key in a Worker
   Secret), delivered in the agent's authenticated desired-state pull and written as Kubernetes
   Secrets.
@@ -558,5 +560,4 @@ infra/backups         CNPG/Barman/R2 backup and restore reference
 | ---------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | 2026-10-02 | 0     | Plan rewritten. Repository deletion, branch cleanup, Dev decommission and lab rebuild pending.                                                                                                                                                                                                                           |
 | 2026-10-02 | 0     | Old implementation removed from the repository and the TypeScript workspace scaffolded. Documents aligned with the single-endpoint design and the Phase 1 scope; Flux release timeouts and retries raised for a fresh install. Nothing of this is verified live: Dev decommission, lab rebuild and Phase 1 have not run. |
-
-| 2026-10-02 | 0–5 | Owner scope: full Neon replacement for customer and platform databases; US default and EU selectable; initial two-EU/one-US topology with R2 recovery. Implementation adopted; live prep kits remain NOT_READY. No new live acceptance claimed. |
+| 2026-10-02 | 0–5   | Owner scope: full Neon replacement for customer and platform databases; US default and EU selectable; initial two-EU/one-US topology with R2 recovery. Implementation adopted; live prep kits remain NOT_READY. No new live acceptance claimed.                                                                          |
