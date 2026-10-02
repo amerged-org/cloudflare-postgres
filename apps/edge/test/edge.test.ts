@@ -216,13 +216,12 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     expect(await stats()).toHaveLength(0);
   });
 
-  it("rejects suspended, non-ready and stale readiness before a gateway call", async () => {
+  it("rejects suspended and non-ready databases before a gateway call", async () => {
     const states = [
       { desired: "suspended", observed: "ready", observedGeneration: 2 },
       { desired: "running", observed: "pending", observedGeneration: 0 },
       { desired: "running", observed: "provisioning", observedGeneration: 1 },
       { desired: "running", observed: "deleting", observedGeneration: 2 },
-      { desired: "running", observed: "ready", observedGeneration: 1 },
     ];
     for (const state of states) {
       await testEnv.DB.prepare(
@@ -243,6 +242,20 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     deleted.socket.send(encodeStartup({ user: "app", database }));
     expect(await errorCode(deleted)).toBe("3D000");
     expect(await stats()).toHaveLength(0);
+  });
+
+  it("keeps ready routing available across an unrelated role configuration revision", async () => {
+    await testEnv.DB.prepare(
+      "UPDATE databases SET generation = generation + 1 WHERE id = ?",
+    )
+      .bind(database)
+      .run();
+    const connection = await open();
+    const startup = encodeStartup({ user: "app", database });
+    connection.socket.send(startup);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...startup]);
   });
 
   it("forwards split startup, coalesced trailing bytes and later buffered frames once in order", async () => {
@@ -517,6 +530,74 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     const second = await open({ ip, bindings });
     expect(await errorCode(second)).toBe("53300");
     expect(await stats()).toHaveLength(1);
+  });
+
+  it("shares IPv6 admission across equivalent hosts in one /64 while preserving other /64s", async () => {
+    const limiter = (env as typeof env & { TEST_RATE_LIMITER: RateLimit })
+      .TEST_RATE_LIMITER;
+    const bindings = { ...testEnv, CONNECTION_RATE_LIMITER: limiter };
+    const prefix = [
+      0x2001,
+      0xdb8,
+      ...crypto.getRandomValues(new Uint16Array(2)),
+    ].map((part) => part.toString(16));
+    const first = await open({
+      ip: [...prefix, "0", "0", "0", "1"].join(":"),
+      bindings,
+    });
+    first.socket.send(encodeStartup({ user: "app", database }));
+    await expect.poll(async () => (await stats()).length).toBe(1);
+    const sameSubnet = await open({ ip: `${prefix.join(":")}::2`, bindings });
+    expect(await errorCode(sameSubnet)).toBe("53300");
+    prefix[3] = ((parseInt(prefix[3]!, 16) + 1) & 0xffff).toString(16);
+    const otherSubnet = await open({ ip: `${prefix.join(":")}::2`, bindings });
+    otherSubnet.socket.send(encodeStartup({ user: "app", database }));
+    await expect.poll(async () => (await stats()).length).toBe(2);
+  });
+
+  it("rejects malformed or oversized client IPs before a gateway connection", async () => {
+    for (const ip of [
+      "not-an-address",
+      "1".repeat(4096),
+      [256, 0, 2, 1].join("."),
+      "a::b::c",
+    ]) {
+      const connection = await open({ ip });
+      connection.socket.send(encodeStartup({ user: "app", database }));
+      expect(await errorCode(connection)).toBe("53300");
+    }
+    expect(await stats()).toHaveLength(0);
+  });
+
+  it("limits parsed database identities independently across client IPs", async () => {
+    const limiter = (env as typeof env & { TEST_RATE_LIMITER: RateLimit })
+      .TEST_RATE_LIMITER;
+    const bindings = { ...testEnv, DATABASE_CONNECTION_RATE_LIMITER: limiter };
+    const first = await open({ bindings });
+    first.socket.send(encodeStartup({ user: "app", database }));
+    await expect.poll(async () => (await stats()).length).toBe(1);
+    const denied = await open({ ip: [192, 0, 2, 9].join("."), bindings });
+    denied.socket.send(encodeStartup({ user: "app", database }));
+    expect(await errorCode(denied)).toBe("53300");
+    expect(await stats()).toHaveLength(1);
+    const other = newDatabaseId();
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        `INSERT INTO databases (id, project_id, region_id, name, size_class_id,
+        desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at)
+        SELECT ?, project_id, region_id, 'second', size_class_id, desired_state, observed_state,
+        generation, observed_generation, replace(archive_path, id, ?), created_at, updated_at
+        FROM databases WHERE id = ?`,
+      ).bind(other, other, database),
+      testEnv.DB.prepare(
+        `INSERT INTO roles (database_id, name, owner, password_ciphertext, password_iv,
+        password_kid, created_at, updated_at) SELECT ?, name, owner, password_ciphertext, password_iv,
+        password_kid, created_at, updated_at FROM roles WHERE database_id = ?`,
+      ).bind(other, database),
+    ]);
+    const independent = await open({ bindings });
+    independent.socket.send(encodeStartup({ user: "app", database: other }));
+    await expect.poll(async () => (await stats()).length).toBe(2);
   });
 
   it("mints correct short-lived tokens with unique connection IDs", async () => {
