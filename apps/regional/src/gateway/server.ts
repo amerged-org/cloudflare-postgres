@@ -133,7 +133,10 @@ export function createGateway(options: GatewayOptions): Gateway {
       region: options.region,
       keys: options.keyring.keys,
     });
-    if (socket.destroyed) return;
+    if (socket.destroyed || socket.readableEnded || request.aborted) {
+      socket.destroy();
+      return;
+    }
     if (!verified.ok) {
       rejectUpgrade(socket, verified.reason === "wrong_region" ? 403 : 401);
       return;
@@ -157,12 +160,23 @@ export function createGateway(options: GatewayOptions): Gateway {
       return;
     }
     const abort = new AbortController();
-    const disconnected = () => abort.abort();
-    socket.once("close", disconnected);
-    pending.add(abort);
     let postgres: TLSSocket | undefined;
     let handedOff = false;
+    const disconnected = () => {
+      if (handedOff) return;
+      abort.abort();
+      postgres?.destroy();
+      socket.destroy();
+      release();
+    };
+    socket.once("close", disconnected);
+    socket.once("end", disconnected);
+    socket.once("error", disconnected);
+    request.once("aborted", disconnected);
+    pending.add(abort);
     try {
+      if (socket.readableEnded || request.aborted) disconnected();
+      abort.signal.throwIfAborted();
       postgres = await options.dial(databaseTarget(claims.db), abort.signal);
       if (socket.destroyed || draining || abort.signal.aborted) {
         postgres.destroy();
@@ -181,6 +195,9 @@ export function createGateway(options: GatewayOptions): Gateway {
     } finally {
       pending.delete(abort);
       socket.removeListener("close", disconnected);
+      socket.removeListener("end", disconnected);
+      socket.removeListener("error", disconnected);
+      request.removeListener("aborted", disconnected);
       if (!handedOff) {
         postgres?.destroy();
         release();
