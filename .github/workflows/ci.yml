@@ -43,11 +43,14 @@ jobs:
       - name: Check formatting
         run: pnpm format:check
       - name: Typecheck
-        run: pnpm typecheck
+        run: |
+          pnpm typecheck
+          pnpm exec tsc -p scripts/ci/tsconfig.json
       - name: Test
         run: |
           pnpm test
           node --test infra/talos/publish-storage-capacity.test.ts
+          node --test scripts/ci/image-qualification.test.ts
       - name: Render the Kubernetes manifests
         run: |
           command -v kubectl >/dev/null || { echo "kubectl not available on this runner"; exit 1; }
@@ -83,11 +86,25 @@ jobs:
           else
             echo "present=false" >> "$GITHUB_OUTPUT"
           fi
+      - name: Set up pnpm at the version in package.json
+        if: steps.entries.outputs.present == 'true'
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Set up Node
+        if: steps.entries.outputs.present == 'true'
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install qualification dependencies
+        if: steps.entries.outputs.present == 'true'
+        run: CI=true pnpm install --frozen-lockfile --ignore-scripts
       - name: Build the linux/amd64 image
         if: steps.entries.outputs.present == 'true'
         run: |
+          mkdir -m 700 "$RUNNER_TEMP/pgcf-image-gate"
           docker buildx build --platform linux/amd64 --load \
             --provenance=false --sbom=false \
+            --iidfile "$RUNNER_TEMP/pgcf-image-gate/image.id" \
             --file apps/regional/Dockerfile \
             --tag "$IMAGE:sha-${GITHUB_SHA::12}" \
             --tag "$IMAGE:latest" \
@@ -98,13 +115,29 @@ jobs:
       - name: Fail if the image contains .env or .pem files
         if: steps.entries.outputs.present == 'true'
         run: |
-          found=$(docker run --rm --platform linux/amd64 --user 0 --entrypoint find "$IMAGE:latest" \
+          found=$(docker run --rm --platform linux/amd64 --cpus 2 --memory 2g --network none --user 0 --entrypoint find "$IMAGE:latest" \
             / -xdev -type f \( -name '.env*' -o -name '.dev.vars*' -o -name '*.pem' -o -name '*.key' -o -name kubeconfig -o -name talosconfig \) -print)
           if [ -n "$found" ]; then
             echo "Forbidden files in the image:"
             echo "$found"
             exit 1
           fi
+      - name: Load the runtime modules and check agent help
+        if: steps.entries.outputs.present == 'true'
+        run: |
+          node scripts/ci/image-qualification.ts runtime "$(cat "$RUNNER_TEMP/pgcf-image-gate/image.id")"
+      - name: Qualify every shipped image layer before publishing
+        if: steps.entries.outputs.present == 'true'
+        run: |
+          node scripts/ci/image-qualification.ts qualify "$IMAGE:latest" \
+            "$(cat "$RUNNER_TEMP/pgcf-image-gate/image.id")" "$GITHUB_SHA" \
+            "https://github.com/$GITHUB_REPOSITORY" "$RUNNER_TEMP/pgcf-image-gate/qualification.json"
+          {
+            echo 'Image qualification (all shipped layers, default gitleaks 8.30.1):'
+            echo '```json'
+            cat "$RUNNER_TEMP/pgcf-image-gate/qualification.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
       - name: Log in to GHCR
         if: steps.entries.outputs.present == 'true'
         env:
@@ -113,13 +146,21 @@ jobs:
       - name: Push the image and record its digest
         if: steps.entries.outputs.present == 'true'
         run: |
-          docker push "$IMAGE:sha-${GITHUB_SHA::12}"
-          docker push "$IMAGE:latest"
+          image_id=$(cat "$RUNNER_TEMP/pgcf-image-gate/image.id")
+          for tag in "sha-${GITHUB_SHA::12}" latest; do
+            node scripts/ci/image-qualification.ts verify "$IMAGE:$tag" \
+              "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+              "$RUNNER_TEMP/pgcf-image-gate/qualification.json"
+            docker push "$IMAGE:$tag"
+          done
           digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:latest")
           {
             echo "Image digest: \`$digest\`"
             echo "Tags: \`sha-${GITHUB_SHA::12}\`, \`latest\`"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove image qualification files
+        if: always() && steps.entries.outputs.present == 'true'
+        run: rm -rf "$RUNNER_TEMP/pgcf-image-gate"
 
   external_probe:
     if: github.event_name == 'workflow_dispatch' && inputs.external_probe && github.ref == 'refs/heads/main' && github.event.repository.private == false

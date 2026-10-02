@@ -19,6 +19,7 @@
     "eslint": "^9.39.0",
     "prettier": "^3.9.9",
     "typescript": "^5.9.3",
-    "typescript-eslint": "^8.45.0"
+    "typescript-eslint": "^8.45.0",
+    "tar-stream": "3.2.1"
   }
 }

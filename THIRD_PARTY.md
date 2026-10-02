@@ -64,6 +64,8 @@ read from the installed package manifests.
 | [@types/pg](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/pg)                    | 8.23.1  | MIT               | PostgreSQL client types (development only).                                               |
 | [vitest](https://github.com/vitest-dev/vitest)                                                          | 4.1.11  | MIT               | Test runner (development only).                                                           |
 | [@cloudflare/vitest-plugin](https://github.com/cloudflare/workers-sdk/tree/main/packages/vitest-plugin) | 1.3.5   | MIT               | Runs Worker tests in the Workers runtime (development only).                              |
+| [tar-stream](https://github.com/mafintosh/tar-stream) | 3.2.1 | MIT | Parses actual saved image archives and all shipped layer files during CI qualification (development only). |
+| [gitleaks](https://github.com/gitleaks/gitleaks/releases/tag/v8.30.1) | 8.30.1 | [MIT](https://github.com/gitleaks/gitleaks/blob/v8.30.1/LICENSE) | Default full-layer secret scanner; official release archives are SHA256-pinned and verified before execution in CI. |
 
 Direct root development tooling (`typescript`, `eslint`, `@eslint/js`, `typescript-eslint`,
 `prettier` and `@types/node`) and regional development type packages (`@types/ws`, `@types/pg`)
