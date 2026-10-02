@@ -44,6 +44,15 @@ import { networkingAudit, chaosEgressPolicy } from "./security.ts";
 import { captureTrace } from "./trace.ts";
 import { restartSummary } from "./restarts.ts";
 import { redactKnownCredentials } from "./audit.ts";
+import {
+  assertClusterIdentity,
+  inverseReady,
+  parseUidMap,
+} from "./identity.ts";
+import type { ClusterIdentity } from "./identity.ts";
+import { runActive } from "./run-expiry.ts";
+import { faultCycleReady, preservedDatabase } from "./cycles.ts";
+import type { DatabaseProof } from "./cycles.ts";
 
 export const REQUIRED_ENV = [
   "CLOUDFLARE_ACCOUNT_ID",
@@ -51,6 +60,9 @@ export const REQUIRED_ENV = [
   "PGCF_E2E_EXPECTED_ACCOUNT_NAME",
   "PGCF_E2E_API_URL",
   "PGCF_E2E_API_WORKER_NAME",
+  "PGCF_E2E_EDGE_WORKER_NAME",
+  "PGCF_E2E_CONNECTION_RATE_LIMIT_NAMESPACE_ID",
+  "PGCF_E2E_DATABASE_RATE_LIMIT_NAMESPACE_ID",
   "PGCF_E2E_ADMIN_KEY",
   "PGCF_E2E_ENDPOINT_HOST",
   "PGCF_E2E_REGION_ID",
@@ -60,6 +72,11 @@ export const REQUIRED_ENV = [
   "PGCF_E2E_KUBE_CONTEXT",
   "PGCF_E2E_NODE_NAMES",
   "PGCF_E2E_REGIONAL_NAMESPACE",
+  "PGCF_E2E_AGENT_DEPLOYMENT_NAME",
+  "PGCF_E2E_EXPECTED_CLUSTER_UID",
+  "PGCF_E2E_EXPECTED_REGIONAL_NAMESPACE_UID",
+  "PGCF_E2E_EXPECTED_AGENT_DEPLOYMENT_UID",
+  "PGCF_E2E_EXPECTED_NODE_UIDS",
   "PGCF_E2E_GHCR_IMAGE",
   "PGCF_E2E_PROBE_BEARER",
   "PGCF_E2E_CREDENTIAL_EXPIRIES",
@@ -71,6 +88,7 @@ interface Config {
   jurisdiction: "default" | "eu";
   apiUrl: URL;
   credentialExpiries: { name: string; expires_at: string }[];
+  expectedCluster: ClusterIdentity;
 }
 interface Ledger {
   version: 1;
@@ -78,6 +96,14 @@ interface Ledger {
   identity: string;
   worker_name: string;
   created_at: string;
+  expires_at: string;
+  cluster?: ClusterIdentity;
+  actions: {
+    kind: string;
+    target: Record<string, string>;
+    at: string;
+    completed_at?: string;
+  }[];
   intents: string[];
   completed: string[];
   baseline: VgSample[];
@@ -92,23 +118,41 @@ interface Ledger {
   operator_scans: string[];
   scan_ranges: Record<string, [number, number][]>;
   archive_failure_started_at?: string;
-  tails: { worker: string; id: string }[];
+  tails: { worker: string; id: string; expires_at: string }[];
   chaos?: {
     relay_name: string;
     policy_name: string;
+    policy_uid?: string;
     agent_name?: string;
     settings?: {
       uid: string;
       container: string;
       override: Record<string, unknown> | null;
+      effective: { api_url: string; region_id: string };
     };
     inverse_needed: boolean;
+    restore_started_at?: string;
+    restore_ready_at?: string;
+    restored_pod_uid?: string;
   };
 }
 
 function config(env: NodeJS.ProcessEnv): Config {
   const values = requireEnv(env, REQUIRED_ENV);
   assertOwned(values.PGCF_E2E_API_WORKER_NAME!);
+  assertOwned(values.PGCF_E2E_EDGE_WORKER_NAME!);
+  if (
+    !/^[0-9]{1,19}$/.test(
+      values.PGCF_E2E_CONNECTION_RATE_LIMIT_NAMESPACE_ID!,
+    ) ||
+    !/^[0-9]{1,19}$/.test(values.PGCF_E2E_DATABASE_RATE_LIMIT_NAMESPACE_ID!) ||
+    values.PGCF_E2E_CONNECTION_RATE_LIMIT_NAMESPACE_ID ===
+      values.PGCF_E2E_DATABASE_RATE_LIMIT_NAMESPACE_ID
+  )
+    throw new HarnessError("distinct_approved_rate_limit_namespaces_required");
+  assertOwned(values.PGCF_E2E_AGENT_DEPLOYMENT_NAME!);
+  if (!/(?:-dev|-test)$/.test(values.PGCF_E2E_EDGE_WORKER_NAME!))
+    throw new HarnessError("dev_worker_required");
   if (!/(?:-dev|-test)$/.test(values.PGCF_E2E_API_WORKER_NAME!))
     throw new HarnessError("dev_worker_required");
   assertOwned(values.PGCF_E2E_BACKUP_BUCKET!);
@@ -169,7 +213,28 @@ function config(env: NodeJS.ProcessEnv): Config {
     if (error instanceof HarnessError) throw error;
     throw new HarnessError("invalid_config");
   }
-  return { values, nodes, jurisdiction, apiUrl, credentialExpiries };
+  const nodeUids = parseUidMap(JSON.parse(values.PGCF_E2E_EXPECTED_NODE_UIDS!));
+  if (
+    JSON.stringify(Object.keys(nodeUids).sort()) !==
+    JSON.stringify([...nodes].sort())
+  )
+    throw new HarnessError("expected_node_identity_mismatch");
+  const expectedCluster = {
+    cluster_uid: values.PGCF_E2E_EXPECTED_CLUSTER_UID!,
+    namespace_uid: values.PGCF_E2E_EXPECTED_REGIONAL_NAMESPACE_UID!,
+    agent_uid: values.PGCF_E2E_EXPECTED_AGENT_DEPLOYMENT_UID!,
+    nodes: nodeUids,
+    agent_api_url: apiUrl.href,
+    region_id: values.PGCF_E2E_REGION_ID!,
+  };
+  return {
+    values,
+    nodes,
+    jurisdiction,
+    apiUrl,
+    credentialExpiries,
+    expectedCluster,
+  };
 }
 
 function runIdentity(c: Config): string {
@@ -183,6 +248,10 @@ function runIdentity(c: Config): string {
       c.values.PGCF_E2E_BACKUP_JURISDICTION,
       c.values.PGCF_E2E_KUBE_CONTEXT,
       ...c.nodes,
+      c.values.PGCF_E2E_REGIONAL_NAMESPACE,
+      c.values.PGCF_E2E_AGENT_DEPLOYMENT_NAME,
+      c.values.PGCF_E2E_EDGE_WORKER_NAME,
+      JSON.stringify(c.expectedCluster),
     ].join("\n"),
   );
 }
@@ -251,6 +320,7 @@ class Run {
       c.values.PGCF_E2E_KUBE_CONTEXT!,
       () => this.deadline,
     );
+    this.kube.setMutationGuard(() => this.assertCluster());
     this.dir = resolve(root, ".local", "evidence", "phase1", state.run_id);
     this.stateDir = resolve(root, ".local", "state", "e2e", state.run_id);
     this.runName = `pgcf-e2e-${state.run_id}`;
@@ -303,11 +373,37 @@ class Run {
     if (!this.state.completed.includes(step)) this.state.completed.push(step);
     await this.save();
   }
+  async action(kind: string, target: Record<string, string>): Promise<number> {
+    this.state.actions.push({ kind, target, at: new Date().toISOString() });
+    await this.save();
+    return this.state.actions.length - 1;
+  }
+  async actionDone(index: number): Promise<void> {
+    this.state.actions[index]!.completed_at = new Date().toISOString();
+    await this.save();
+  }
+  async assertCluster(): Promise<void> {
+    await this.verifyIdentity(false);
+    const actual = await this.kube.clusterIdentity(
+      this.c.values.PGCF_E2E_REGIONAL_NAMESPACE!,
+      this.c.values.PGCF_E2E_AGENT_DEPLOYMENT_NAME!,
+    );
+    const allowed = [this.c.apiUrl.href];
+    if (this.state.chaos?.inverse_needed)
+      allowed.push((await this.relayUrl()).href);
+    assertClusterIdentity(actual, this.c.expectedCluster, allowed);
+    if (this.state.cluster)
+      assertClusterIdentity(actual, this.state.cluster, allowed);
+    else {
+      this.state.cluster = actual;
+      await this.save();
+    }
+  }
   requireStep(step: string): void {
     if (!this.state.completed.includes(step))
       throw new HarnessError("previous_step_required");
   }
-  async verifyIdentity(): Promise<void> {
+  async verifyIdentity(checkEdge = true): Promise<void> {
     await this.cf.verifyAccount();
     const subdomain = string(
       record((await this.cf.request("/workers/subdomain")).result).subdomain,
@@ -323,6 +419,44 @@ class Run {
         )
       )
         throw new HarnessError("api_worker_identity_mismatch");
+    }
+    if (!checkEdge) return;
+    const edge = this.c.values.PGCF_E2E_EDGE_WORKER_NAME!,
+      endpoint = this.c.values.PGCF_E2E_ENDPOINT_HOST!;
+    if (endpoint !== `${edge}.${subdomain}.workers.dev`) {
+      const domains = await this.cf.list("/workers/domains");
+      if (
+        !domains.some(
+          (domain) => domain.hostname === endpoint && domain.service === edge,
+        )
+      )
+        throw new HarnessError("edge_worker_identity_mismatch");
+    }
+    const edgeSettings = record(
+      (await this.cf.request(`/workers/scripts/${edge}/settings`)).result,
+    );
+    if (!Array.isArray(edgeSettings.bindings))
+      throw new HarnessError("edge_rate_limit_bindings_missing");
+    const bindings = edgeSettings.bindings.map(record);
+    for (const [name, id] of [
+      [
+        "CONNECTION_RATE_LIMITER",
+        this.c.values.PGCF_E2E_CONNECTION_RATE_LIMIT_NAMESPACE_ID,
+      ],
+      [
+        "DATABASE_CONNECTION_RATE_LIMITER",
+        this.c.values.PGCF_E2E_DATABASE_RATE_LIMIT_NAMESPACE_ID,
+      ],
+    ]) {
+      if (
+        !bindings.some(
+          (binding) =>
+            binding.name === name &&
+            binding.type === "ratelimit" &&
+            String(binding.namespace_id) === id,
+        )
+      )
+        throw new HarnessError("edge_rate_limit_namespace_mismatch");
     }
   }
   async verify(): Promise<void> {
@@ -353,6 +487,7 @@ class Run {
   }
   async preflight(): Promise<void> {
     await this.verify();
+    await this.assertCluster();
     const [inventory, projects, keys, baseline] = await Promise.all([
       cloudflareInventory(this.cf),
       this.api.list("/v1/projects"),
@@ -413,6 +548,7 @@ class Run {
         vars: {
           API_URL: this.c.apiUrl.href,
           ENDPOINT_HOST: this.c.values.PGCF_E2E_ENDPOINT_HOST,
+          RUN_EXPIRES_AT: this.state.expires_at,
         },
       }),
       { mode: 0o600 },
@@ -472,7 +608,11 @@ class Run {
         compatibility_flags: ["nodejs_compat"],
         workers_dev: true,
         observability: { enabled: false },
-        vars: { API_URL: this.c.apiUrl.href, RUN_NAME: this.runName },
+        vars: {
+          API_URL: this.c.apiUrl.href,
+          RUN_NAME: this.runName,
+          RUN_EXPIRES_AT: this.state.expires_at,
+        },
         durable_objects: {
           bindings: [{ name: "RELAY", class_name: "ChaosRelay" }],
         },
@@ -558,7 +698,12 @@ class Run {
     chaos.settings = settings;
     const url = await this.relayUrl();
     await this.intent("chaos_policy_create");
-    await this.kube.applyPolicy(
+    const policyAction = await this.action("chaos_policy_create", {
+      policy_name: chaos.policy_name,
+      namespace_uid: this.state.cluster!.namespace_uid,
+      deployment_uid: settings.uid,
+    });
+    chaos.policy_uid = await this.kube.applyPolicy(
       chaosEgressPolicy(
         chaos.policy_name,
         namespace,
@@ -569,10 +714,18 @@ class Run {
       chaos.policy_name,
       namespace,
       this.runName,
+      chaos.policy_uid,
     );
+    await this.save();
+    await this.actionDone(policyAction);
     // Record the inverse before replacing the real deployment's URL.
     chaos.inverse_needed = true;
     await this.intent("chaos_agent_patch");
+    const patchAction = await this.action("chaos_agent_patch", {
+      namespace_uid: this.state.cluster!.namespace_uid,
+      deployment_uid: settings.uid,
+      deployment_name: name,
+    });
     await this.kube.patchAgentUrl(
       namespace,
       name,
@@ -580,6 +733,7 @@ class Run {
       settings.container,
       { name: "PGCF_API_URL", value: url.href.replace(/\/$/, "") },
     );
+    await this.actionDone(patchAction);
     await poll(
       () => this.relay("/control/counts"),
       (counts) => Number(counts.pulls) > 0 && Number(counts.observations) > 0,
@@ -598,6 +752,10 @@ class Run {
     if (chaos.inverse_needed) {
       if (!chaos.settings || !chaos.agent_name)
         throw new HarnessError("chaos_inverse_missing");
+      if (!chaos.restore_started_at) {
+        chaos.restore_started_at = new Date().toISOString();
+        await this.save();
+      }
       const current = await this.kube.agentSettings(
         namespace,
         chaos.agent_name,
@@ -614,7 +772,11 @@ class Run {
       )
         throw new HarnessError("agent_inverse_conflict");
       if (!originalRestored) {
-        await this.intent("chaos_agent_restore");
+        const action = await this.action("chaos_agent_restore", {
+          namespace_uid: this.state.cluster!.namespace_uid,
+          deployment_uid: chaos.settings.uid,
+          deployment_name: chaos.agent_name,
+        });
         await this.kube.patchAgentUrl(
           namespace,
           chaos.agent_name,
@@ -622,85 +784,198 @@ class Run {
           chaos.settings.container,
           chaos.settings.override,
         );
+        await this.actionDone(action);
       }
+      await poll(
+        async () => {
+          await this.assertCluster();
+          const deployment = items(await this.kube.read("deployments")).find(
+            (row) =>
+              objectName(row) === chaos.agent_name &&
+              record(row.metadata).namespace === namespace,
+          );
+          if (!deployment) throw new HarnessError("agent_deployment_missing");
+          const settings = await this.kube.agentSettings(
+            namespace,
+            chaos.agent_name!,
+          );
+          const pod = await this.kube.agentPod(namespace, chaos.agent_name!);
+          const containers = record(pod.spec).containers;
+          const agent = Array.isArray(containers)
+            ? containers.map(record).find((row) => row.name === "agent")
+            : undefined;
+          if (!agent) throw new HarnessError("agent_container_missing");
+          const podConfig = await this.kube.effectiveConfig(agent, namespace);
+          const regions = (await this.api.list("/v1/regions")).map((row) =>
+            Region.parse(row),
+          );
+          const region = regions.find(
+            (row) => row.id === this.c.values.PGCF_E2E_REGION_ID,
+          );
+          const status = record(deployment.status),
+            metadata = record(deployment.metadata);
+          const podOriginal =
+            podConfig.api_url.replace(/\/$/, "") ===
+              chaos.settings!.effective.api_url.replace(/\/$/, "") &&
+            podConfig.region_id === this.c.values.PGCF_E2E_REGION_ID &&
+            Array.isArray(record(pod.status).conditions) &&
+            (record(pod.status).conditions as unknown[])
+              .map(record)
+              .some(
+                (condition) =>
+                  condition.type === "Ready" && condition.status === "True",
+              );
+          const rolloutReady =
+            settings.uid === chaos.settings!.uid &&
+            Number(status.observedGeneration) === Number(metadata.generation) &&
+            Number(status.availableReplicas) ===
+              Number(record(deployment.spec).replicas) &&
+            podOriginal;
+          const podUid = string(record(pod.metadata).uid);
+          if (!rolloutReady) return false;
+          if (!chaos.restore_ready_at || chaos.restored_pod_uid !== podUid) {
+            chaos.restore_ready_at = new Date().toISOString();
+            chaos.restored_pod_uid = podUid;
+            await this.save();
+            return false;
+          }
+          return inverseReady({
+            uid: settings.uid,
+            expected_uid: chaos.settings!.uid,
+            actual_url: settings.effective.api_url,
+            original_url: chaos.settings!.effective.api_url,
+            generation: Number(metadata.generation),
+            observed_generation: Number(status.observedGeneration),
+            replicas: Number(record(deployment.spec).replicas),
+            available_replicas: Number(status.availableReplicas),
+            api_seen_at: region?.agent_last_seen_at ?? null,
+            started_at: chaos.restore_ready_at!,
+            pod_original_url: podOriginal,
+          });
+        },
+        (ready) => ready,
+        90_000,
+      );
       chaos.inverse_needed = false;
       await this.save();
-      await poll(
-        () => this.kube.read("deployments"),
-        (value) =>
-          items(value).some(
-            (deployment) =>
-              objectName(deployment) === chaos.agent_name &&
-              record(deployment.metadata).namespace === namespace &&
-              record(deployment.status).observedGeneration ===
-                record(deployment.metadata).generation &&
-              Number(record(deployment.status).availableReplicas) ===
-                Number(record(deployment.spec).replicas),
-          ),
-        60_000,
-      );
     }
-    await this.intent("chaos_policy_delete");
-    await this.kube.deletePolicy(chaos.policy_name, namespace, this.runName);
+    if (this.state.intents.includes("chaos_policy_create")) {
+      const action = await this.action("chaos_policy_delete", {
+        policy_name: chaos.policy_name,
+        policy_uid: chaos.policy_uid ?? "unknown",
+        namespace_uid: this.state.cluster!.namespace_uid,
+      });
+      await this.kube.deletePolicy(
+        chaos.policy_name,
+        namespace,
+        this.runName,
+        chaos.policy_uid,
+      );
+      await this.actionDone(action);
+    }
+  }
+  async mode(mode: string): Promise<void> {
+    const chaos = this.state.chaos!;
+    const cycle = randomBytes(24).toString("hex");
+    const action = await this.action("relay_mode", {
+      relay_name: chaos.relay_name,
+      mode,
+      cycle_id: cycle,
+      cluster_uid: this.state.cluster!.cluster_uid,
+    });
+    await this.relay("/control/mode", { mode, cycle_id: cycle });
+    await this.actionDone(action);
+  }
+  async databaseProof(): Promise<DatabaseProof> {
+    await this.assertCluster();
+    const namespace = `pgcf-db-${this.state.database_id}`;
+    const resource = items(await this.kube.read("namespaces")).find(
+      (row) => objectName(row) === namespace,
+    );
+    if (!resource || record(resource.metadata).deletionTimestamp)
+      throw new HarnessError("chaos_deleted_database");
+    const annotations = record(record(resource.metadata).annotations);
+    const accepted = Number(annotations["pgcf.io/accepted-generation"]),
+      completed = Number(annotations["pgcf.io/generation"]);
+    if (
+      !Number.isSafeInteger(accepted) ||
+      accepted < 1 ||
+      !Number.isSafeInteger(completed) ||
+      completed < 1
+    )
+      throw new HarnessError("database_fence_missing");
+    return {
+      uid: string(record(resource.metadata).uid),
+      accepted,
+      completed,
+      roles: (await this.kube.rolePasswords(namespace)).map(fingerprint).sort(),
+    };
+  }
+  async recoveredCycle(): Promise<void> {
+    await this.mode("pass");
+    await this.killAgent("chaos_recovery_restart");
+    await poll(
+      () => this.relay("/control/counts"),
+      (counts) => faultCycleReady(counts, 1),
+      90_000,
+    );
   }
   async checkChaos(): Promise<void> {
     this.requireStep("chaos-started");
-    const chaos = this.state.chaos!;
-    const namespace = `pgcf-db-${this.state.database_id}`;
-    const before = items(await this.kube.read("namespaces")).find(
-      (ns) => objectName(ns) === namespace,
-    );
-    if (!before) throw new HarnessError("run_namespace_missing");
-    const uid = string(record(before.metadata).uid);
-    const assertPreserved = async () => {
-      const resource = items(await this.kube.read("namespaces")).find(
-        (ns) => objectName(ns) === namespace,
-      );
-      if (
-        !resource ||
-        record(resource.metadata).uid !== uid ||
-        record(resource.metadata).deletionTimestamp
-      )
-        throw new HarnessError("chaos_deleted_database");
+    let replayed = 0,
+      failures = 0,
+      observed = 0;
+    const checkPreserved = async (before: DatabaseProof) => {
+      if (!preservedDatabase(before, await this.databaseProof()))
+        throw new HarnessError("chaos_persisted_state_regressed");
       const database = Database.parse(
         await this.api.request(`/v1/databases/${this.state.database_id}`),
       );
       if (
         database.desired_state !== "running" ||
-        database.observed_state === "deleted" ||
-        database.observed_generation < database.generation
+        database.observed_generation !== database.generation ||
+        database.observed_state !== "ready"
       )
         throw new HarnessError("chaos_generation_regressed");
     };
     try {
+      for (const mode of ["empty", "failure"] as const) {
+        const before = await this.databaseProof();
+        await this.mode(mode);
+        await this.killAgent(`chaos_${mode}_restart`);
+        const counts = await poll(
+          () => this.relay("/control/counts"),
+          (value) =>
+            mode === "failure"
+              ? Number(value.failure_responses) >= 1
+              : faultCycleReady(value, 1),
+          90_000,
+        );
+        failures += Number(counts.failure_responses);
+        replayed += mode === "empty" ? Number(counts.completed_responses) : 0;
+        observed += Number(counts.observations_after_response);
+        if (mode === "failure") await this.recoveredCycle();
+        await checkPreserved(before);
+        if (mode !== "failure") await this.recoveredCycle();
+        await checkPreserved(before);
+      }
       const baseline = Database.parse(
         await this.api.request(`/v1/databases/${this.state.database_id}`),
       );
-      for (const mode of ["empty", "failure"] as const) {
-        const counts = await this.relay("/control/counts");
-        await this.relay("/control/mode", { mode });
-        await this.kube.restartAgent(
-          this.c.values.PGCF_E2E_REGIONAL_NAMESPACE!,
-          chaos.agent_name!,
-        );
-        await poll(
-          () => this.relay("/control/counts"),
-          (value) => Number(value.pulls) > Number(counts.pulls),
-          60_000,
-        );
-        await assertPreserved();
-        await this.relay("/control/mode", { mode: "pass" });
-      }
       await this.relay("/control/capture-older", {
         database_id: this.state.database_id,
       });
-      await this.intent("chaos_real_password_rotation");
+      const rotate = await this.action("chaos_real_password_rotation", {
+        database_id: this.state.database_id!,
+        project_id: this.state.project_id!,
+      });
       await this.api.request(
         `/v1/databases/${this.state.database_id}/roles/app/reset-password`,
         "POST",
         undefined,
         `${this.state.run_id}-chaos-rotate`,
       );
+      await this.actionDone(rotate);
       await this.relay("/control/capture-fresh");
       await poll(
         async () =>
@@ -714,36 +989,40 @@ class Run {
         90_000,
       );
       for (const mode of ["older", "out_of_order"] as const) {
-        const counts = await this.relay("/control/counts");
-        await this.relay("/control/mode", { mode });
-        await this.kube.restartAgent(
-          this.c.values.PGCF_E2E_REGIONAL_NAMESPACE!,
-          chaos.agent_name!,
-        );
-        await poll(
+        const before = await this.databaseProof();
+        await this.mode(mode);
+        await this.killAgent(`chaos_${mode}_restart`);
+        const counts = await poll(
           () => this.relay("/control/counts"),
-          (value) =>
-            Number(value.pulls) >=
-            Number(counts.pulls) + (mode === "out_of_order" ? 2 : 1),
-          mode === "out_of_order" ? 135_000 : 60_000,
+          (value) => faultCycleReady(value, mode === "out_of_order" ? 2 : 1),
+          mode === "out_of_order" ? 135_000 : 90_000,
         );
-        await assertPreserved();
-        await this.relay("/control/mode", { mode: "pass" });
+        replayed += Number(counts.completed_responses);
+        observed += Number(counts.observations_after_response);
+        if (Number(counts.regressed_generations) !== 0)
+          throw new HarnessError("chaos_observation_generation_regressed");
+        await checkPreserved(before);
+        await this.recoveredCycle();
+        await checkPreserved(before);
       }
-      const counts = await this.relay("/control/counts");
-      if (
-        Number(counts.regressed_generations) !== 0 ||
-        Number(counts.replayed) < 4 ||
-        Number(counts.transport_failures) < 1
-      )
+      if (replayed < 4 || failures < 1 || observed < 4)
         throw new HarnessError("chaos_evidence_incomplete");
       await this.complete("chaos-checked");
-      await this.emit("chaos_check", counts as Record<string, number>);
+      await this.emit("chaos_check", {
+        completed_fault_responses: replayed,
+        failure_responses: failures,
+        observations_after_response: observed,
+      });
     } finally {
       await this.restoreChaos();
     }
   }
-  async probe(path: string, body?: unknown): Promise<Record<string, unknown>> {
+  async probe(
+    path: string,
+    body?: unknown,
+    marker?: string,
+  ): Promise<Record<string, unknown>> {
+    await this.verifyIdentity();
     if (!this.probeHost) {
       const subdomain = string(
         record((await this.cf.request("/workers/subdomain")).result).subdomain,
@@ -759,6 +1038,7 @@ class Run {
       headers: {
         Authorization: `Bearer ${this.c.values.PGCF_E2E_PROBE_BEARER}`,
         "Content-Type": "application/json",
+        ...(marker ? { "X-PGCF-E2E-Marker": marker } : {}),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
@@ -983,19 +1263,19 @@ class Run {
       `pgcf-db-${this.state.database_id}`,
     );
     const tails: string[] = [];
+    const marker = randomBytes(24).toString("hex");
     for (const worker of [this.c.values.PGCF_E2E_API_WORKER_NAME!, edgeName]) {
       await this.intent("tail_create");
       const messages = await captureTrace(
         this.cf,
         worker,
+        marker,
         () =>
           worker === edgeName
-            ? this.probe("/exercise")
-            : this.api.request(
-                `/v1/databases/${this.state.database_id}/roles/app/connection-uri`,
-              ),
-        async (id) => {
-          this.state.tails.push({ worker, id });
+            ? this.probe("/exercise", undefined, marker)
+            : this.probe("/integrator-trace", undefined, marker),
+        async (tail) => {
+          this.state.tails.push({ worker, ...tail });
           await this.save();
         },
       );
@@ -1036,11 +1316,27 @@ class Run {
     )
       throw new HarnessError("restart_window_missed");
     await this.intent(`agent_restart_${stage}`);
-    await this.kube.restartAgent(
-      this.c.values.PGCF_E2E_REGIONAL_NAMESPACE!,
-      name,
-    );
+    await this.killAgent(`agent_restart_${stage}`);
     await this.complete(`agent-restarted-${stage}`);
+  }
+  async killAgent(kind: string): Promise<void> {
+    await this.assertCluster();
+    const namespace = this.c.values.PGCF_E2E_REGIONAL_NAMESPACE!,
+      name = this.c.values.PGCF_E2E_AGENT_DEPLOYMENT_NAME!;
+    const pod = await this.kube.agentPod(namespace, name);
+    const victim = {
+      name: objectName(pod),
+      uid: string(record(pod.metadata).uid),
+    };
+    const action = await this.action(kind, {
+      cluster_uid: this.state.cluster!.cluster_uid,
+      namespace_uid: this.state.cluster!.namespace_uid,
+      deployment_uid: this.state.cluster!.agent_uid,
+      pod_name: victim.name,
+      pod_uid: victim.uid,
+    });
+    await this.kube.restartAgent(namespace, name, victim);
+    await this.actionDone(action);
   }
   async backups(): Promise<void> {
     this.requireStep("E3");
@@ -1356,7 +1652,7 @@ class Run {
   }
   async cleanup(): Promise<void> {
     this.deadline = Date.now() + 120_000;
-    await this.verifyIdentity();
+    await this.verifyIdentity(false);
     await this.recoverOwnership();
     const failures: string[] = [];
     // The real agent must use the real API before any database deletion is requested.
@@ -1568,7 +1864,9 @@ export async function main(
       !Array.isArray(state.scans) ||
       !Array.isArray(state.operator_scans) ||
       !state.scan_ranges ||
-      !Array.isArray(state.tails)
+      !Array.isArray(state.tails) ||
+      !Array.isArray(state.actions) ||
+      typeof state.expires_at !== "string"
     )
       throw new HarnessError("invalid_run_ledger");
   } catch (error: unknown) {
@@ -1582,6 +1880,8 @@ export async function main(
       identity: runIdentity(c),
       worker_name: `pgcf-e2e-${runId}`,
       created_at: new Date().toISOString(),
+      expires_at: new Date(Date.now() + 86_400_000).toISOString(),
+      actions: [],
       intents: [],
       completed: [],
       baseline: [],
@@ -1595,6 +1895,8 @@ export async function main(
     };
   }
   const run = new Run(c, state, root, dryRun);
+  if (!cleanupOnly && !runActive(state.expires_at))
+    throw new HarnessError("run_expired_cleanup_required");
   if (!dryRun && !cleanupOnly && step === "E0" && state.intents.length)
     throw new HarnessError("mutated_run_requires_resume_or_cleanup");
   if (dryRun) {

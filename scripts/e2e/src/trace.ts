@@ -1,27 +1,97 @@
 // SPDX-License-Identifier: Apache-2.0
-import { Cloudflare } from "./clients.ts";
+import type { Cloudflare } from "./clients.ts";
 import { HarnessError, assertOwned, record, string } from "./core.ts";
+
+function requestMatches(value: unknown, marker: string): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const event = (value as Record<string, unknown>).event;
+  if (!event || typeof event !== "object" || Array.isArray(event)) return false;
+  const request = (event as Record<string, unknown>).request;
+  if (!request || typeof request !== "object" || Array.isArray(request))
+    return false;
+  const row = request as Record<string, unknown>;
+  if (typeof row.url === "string") {
+    try {
+      const url = new URL(row.url);
+      if (
+        [...url.searchParams.values()].includes(marker) ||
+        url.pathname
+          .split("/")
+          .some((part) => decodeURIComponent(part) === marker)
+      )
+        return true;
+    } catch {
+      // Other events and malformed request URLs cannot establish correlation.
+    }
+  }
+  if (row.headers && typeof row.headers === "object") {
+    const values = Array.isArray(row.headers)
+      ? row.headers.map((pair: unknown) =>
+          Array.isArray(pair) && pair.length === 2 ? pair[1] : undefined,
+        )
+      : Object.values(row.headers);
+    return values.some(
+      (value) =>
+        value === marker || (Array.isArray(value) && value.includes(marker)),
+    );
+  }
+  return false;
+}
+
+function correlated(data: string, marker: string): boolean {
+  try {
+    const value: unknown = JSON.parse(data);
+    return Array.isArray(value)
+      ? value.some((event: unknown) => requestMatches(event, marker))
+      : requestMatches(value, marker);
+  } catch {
+    return false;
+  }
+}
 
 /** Trace bodies live only in memory until the deployed probe checks the canary. */
 export async function captureTrace(
   cf: Cloudflare,
   worker: string,
+  marker: string,
   trigger: () => Promise<unknown>,
-  owned: (id: string) => Promise<void>,
+  owned: (tail: { id: string; expires_at: string }) => Promise<void>,
 ): Promise<string[]> {
   assertOwned(worker);
   if (!/(?:-dev|-test)$/.test(worker))
     throw new HarnessError("dev_worker_required");
+  if (typeof marker !== "string" || marker.length < 16 || marker.length > 128)
+    throw new HarnessError("invalid_trace_marker");
+  let socket: WebSocket | undefined;
+  let accepting = true;
   const tail = record(
     (await cf.request(`/workers/scripts/${worker}/tails`, "POST", {})).result,
   );
   const id = string(tail.id);
-  await owned(id);
-  const url = new URL(string(tail.url));
-  if (url.protocol !== "wss:") throw new HarnessError("invalid_tail_url");
-  let socket: WebSocket | undefined;
   try {
-    socket = new WebSocket(url.href, "trace-v1");
+    const expiresAt = tail.expires_at;
+    const expiry = typeof expiresAt === "string" ? Date.parse(expiresAt) : NaN;
+    if (
+      typeof expiresAt !== "string" ||
+      !Number.isFinite(expiry) ||
+      expiry <= Date.now() ||
+      new Date(expiry).toISOString() !== expiresAt
+    )
+      throw new HarnessError("invalid_tail_expiry");
+    await owned({ id, expires_at: expiresAt });
+    let url: URL;
+    try {
+      url = new URL(string(tail.url));
+    } catch {
+      throw new HarnessError("invalid_tail_url");
+    }
+    if (url.protocol !== "wss:" || url.username || url.password || url.hash)
+      throw new HarnessError("invalid_tail_url");
+    try {
+      socket = new WebSocket(url.href, "trace-v1");
+    } catch {
+      throw new HarnessError("trace_failed");
+    }
     const messages: string[] = [];
     let size = 0;
     let received: (() => void) | undefined, failed: (() => void) | undefined;
@@ -32,6 +102,7 @@ export async function captureTrace(
     void event.catch(() => undefined);
     const pending: Promise<void>[] = [];
     socket.addEventListener("message", (message: MessageEvent) => {
+      if (!accepting) return;
       const operation = (async () => {
         const data =
           typeof message.data === "string"
@@ -39,16 +110,19 @@ export async function captureTrace(
             : message.data instanceof Blob
               ? await message.data.text()
               : new TextDecoder().decode(message.data as ArrayBuffer);
+        if (!accepting) return;
         size += data.length;
         if (size > 2_000_000) {
           failed?.();
           return;
         }
         messages.push(data);
-        received?.();
-      })();
+        if (correlated(data, marker)) received?.();
+      })().catch(() => failed?.());
       pending.push(operation);
     });
+    socket.addEventListener("error", () => failed?.(), { once: true });
+    socket.addEventListener("close", () => failed?.(), { once: true });
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new HarnessError("trace_open_timeout")),
@@ -91,10 +165,14 @@ export async function captureTrace(
     if (!messages.length) throw new HarnessError("trace_event_missing");
     return messages;
   } finally {
-    if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
-    await cf.request(
-      `/workers/scripts/${worker}/tails/${encodeURIComponent(id)}`,
-      "DELETE",
-    );
+    accepting = false;
+    try {
+      if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+    } finally {
+      await cf.request(
+        `/workers/scripts/${worker}/tails/${encodeURIComponent(id)}`,
+        "DELETE",
+      );
+    }
   }
 }

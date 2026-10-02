@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
-import { Pool, neonConfig } from "@neondatabase/serverless";
+import { Client, Pool } from "@neondatabase/serverless";
 import { connect } from "cloudflare:sockets";
 import { credentialOccurrences } from "../src/audit.ts";
 import { workerScanUnsupported } from "../src/transport.ts";
+import { runActive } from "../src/run-expiry.ts";
 
 interface Env {
   PROBE_BEARER: string;
@@ -10,11 +11,8 @@ interface Env {
   DATABASE_ID: string;
   API_URL: string;
   ENDPOINT_HOST: string;
+  RUN_EXPIRES_AT?: string;
 }
-
-neonConfig.useSecureWebSocket = true;
-neonConfig.pipelineConnect = false;
-neonConfig.forceDisablePgSSL = true;
 
 function response(body: unknown, status = 200): Response {
   return Response.json(body, {
@@ -23,18 +21,43 @@ function response(body: unknown, status = 200): Response {
   });
 }
 
-async function connection(env: Env): Promise<string> {
-  const reply = await fetch(
-    new URL(
-      `/v1/databases/${encodeURIComponent(env.DATABASE_ID)}/roles/app/connection-uri`,
-      env.API_URL,
-    ),
-    {
-      redirect: "error",
-      signal: AbortSignal.timeout(15_000),
-      headers: { Authorization: `Bearer ${env.INTEGRATOR_KEY}` },
-    },
+function validTraceMarker(marker: string | undefined): string | undefined {
+  if (marker !== undefined && !/^[a-f0-9]{48}$/.test(marker))
+    throw new Error("invalid_trace_marker");
+  return marker;
+}
+
+export function requestTraceMarker(request: Request): string | undefined {
+  return validTraceMarker(
+    request.headers.get("X-PGCF-E2E-Marker") ?? undefined,
   );
+}
+
+export function connectionRequest(
+  env: Pick<Env, "DATABASE_ID" | "API_URL" | "INTEGRATOR_KEY">,
+  marker?: string,
+): Request {
+  validTraceMarker(marker);
+  const url = new URL(
+    `/v1/databases/${encodeURIComponent(env.DATABASE_ID)}/roles/app/connection-uri`,
+    env.API_URL,
+  );
+  const headers = new Headers({
+    Authorization: `Bearer ${env.INTEGRATOR_KEY}`,
+  });
+  if (marker !== undefined) {
+    url.searchParams.set("pgcf_trace", marker);
+    headers.set("X-PGCF-E2E-Marker", marker);
+  }
+  return new Request(url, {
+    redirect: "error",
+    signal: AbortSignal.timeout(15_000),
+    headers,
+  });
+}
+
+async function connection(env: Env, marker?: string): Promise<string> {
+  const reply = await fetch(connectionRequest(env, marker));
   if (!reply.ok) throw new Error("connection_metadata_failed");
   const result = (await reply.json()) as {
     uri: string;
@@ -53,18 +76,31 @@ async function connection(env: Env): Promise<string> {
   return result.uri;
 }
 
-function pool(uri: string): Pool {
-  return new Pool({
+export function probePool(uri: string, marker?: string): Pool {
+  validTraceMarker(marker);
+  const db = new Pool({
     connectionString: uri,
     max: 1,
     connectionTimeoutMillis: 10_000,
     idleTimeoutMillis: 1000,
     query_timeout: 15_000,
   });
+  // Pool constructs clients before it emits connect, so configure their streams here.
+  db.Client = class extends Client {
+    constructor(config?: ConstructorParameters<typeof Client>[0]) {
+      super(config);
+      this.neonConfig.useSecureWebSocket = true;
+      this.neonConfig.pipelineConnect = false;
+      this.neonConfig.forceDisablePgSSL = true;
+      if (marker !== undefined)
+        this.neonConfig.wsProxy = (host) => `${host}/v2?pgcf_trace=${marker}`;
+    }
+  };
+  return db;
 }
 
-async function rejects(uri: string): Promise<void> {
-  const db = pool(uri);
+async function rejects(uri: string, marker?: string): Promise<void> {
+  const db = probePool(uri, marker);
   try {
     let rejected = false;
     try {
@@ -80,8 +116,11 @@ async function rejects(uri: string): Promise<void> {
   }
 }
 
-async function exercise(uri: string): Promise<Record<string, number>> {
-  const db = pool(uri);
+async function exercise(
+  uri: string,
+  marker?: string,
+): Promise<Record<string, number>> {
+  const db = probePool(uri, marker);
   const timings: Record<string, number> = {};
   const measured = async (name: string, operation: () => Promise<unknown>) => {
     const start = performance.now();
@@ -127,7 +166,7 @@ async function exercise(uri: string): Promise<Record<string, number>> {
       if (kind === "password") wrong.password = unknown;
       if (kind === "database") wrong.pathname = `/d${unknown.slice(0, 19)}`;
       if (kind === "user") wrong.username = `r${unknown.slice(0, 19)}`;
-      await measured(`negative_${kind}_ms`, () => rejects(wrong.href));
+      await measured(`negative_${kind}_ms`, () => rejects(wrong.href, marker));
     }
     return timings;
   } finally {
@@ -186,6 +225,8 @@ async function scan(
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    if (!runActive(env.RUN_EXPIRES_AT))
+      return response({ code: "run_expired" }, 410);
     if (
       !env.PROBE_BEARER ||
       request.headers.get("Authorization") !== `Bearer ${env.PROBE_BEARER}`
@@ -195,6 +236,9 @@ export default {
       return response({ code: "method_not_allowed" }, 405);
     try {
       const path = new URL(request.url).pathname;
+      const marker = requestTraceMarker(request);
+      if (path === "/integrator-trace" && marker === undefined)
+        return response({ code: "invalid_trace_marker" }, 400);
       if (path === "/scan") {
         const input = (await request.json()) as {
           host: string;
@@ -203,10 +247,22 @@ export default {
         return response(await scan(input.host, input.ports));
       }
       if (path === "/refusal") {
-        await rejects(`postgres://app@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`);
+        await rejects(
+          `postgres://app@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`,
+          marker,
+        );
         return response({ pass: true });
       }
-      const uri = await connection(env);
+      if (
+        ![
+          "/canary-audit",
+          "/metadata",
+          "/integrator-trace",
+          "/exercise",
+        ].includes(path)
+      )
+        return response({ code: "not_found" }, 404);
+      const uri = await connection(env, marker);
       if (path === "/canary-audit") {
         const input = (await request.json()) as {
           d1: string;
@@ -241,16 +297,18 @@ export default {
           counts,
         });
       }
-      if (path === "/metadata")
+      if (path === "/metadata" || path === "/integrator-trace")
         return response({
           includes_password: true,
           host_matches: true,
           database_matches: true,
         });
       if (path === "/exercise")
-        return response({ pass: true, timings: await exercise(uri) });
+        return response({ pass: true, timings: await exercise(uri, marker) });
       return response({ code: "not_found" }, 404);
     } catch (error: unknown) {
+      if (error instanceof Error && error.message === "invalid_trace_marker")
+        return response({ code: "invalid_trace_marker" }, 400);
       if (error instanceof Error && error.message === "worker_scan_unavailable")
         return response({ code: "worker_scan_unavailable" }, 503);
       return response({ code: "probe_failed" }, 500);

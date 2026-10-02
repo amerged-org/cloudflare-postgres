@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Live fault injection only. Every replay is an unmodified response captured from the real API.
 import { DesiredResponse, ObservationRequest } from "@pgcf/contracts";
+import { runActive } from "../src/run-expiry.ts";
 
 interface RelayEnv {
   API_URL: string;
   RUN_NAME: string;
+  RUN_EXPIRES_AT: string;
   PROBE_BEARER: string;
   AGENT_KEY: string;
   RELAY: {
@@ -45,6 +47,11 @@ export class ChaosRelay {
   private observations = 0;
   private regressed = 0;
   private highest = new Map<string, number>();
+  private cycleId = "";
+  private completedResponses = 0;
+  private observationsAfterResponse = 0;
+  private lastObservedResponse = 0;
+  private cycleFailures = 0;
   constructor(_state: unknown, env: RelayEnv) {
     this.env = env;
   }
@@ -66,6 +73,12 @@ export class ChaosRelay {
   }
 
   async fetch(request: Request): Promise<Response> {
+    if (!runActive(this.env.RUN_EXPIRES_AT)) {
+      this.empty = undefined;
+      this.older = undefined;
+      this.fresh = undefined;
+      return new Response(null, { status: 410 });
+    }
     const path = new URL(request.url).pathname;
     if (path.startsWith("/control/")) {
       if (
@@ -114,7 +127,7 @@ export class ChaosRelay {
         return Response.json({ count: source.databases.length });
       }
       if (path === "/control/mode") {
-        const body = (await request.json()) as { mode: Mode };
+        const body = (await request.json()) as { mode: Mode; cycle_id: string };
         if (
           !["pass", "empty", "older", "failure", "out_of_order"].includes(
             body.mode,
@@ -127,12 +140,22 @@ export class ChaosRelay {
           currentSnapshot(this.older, Date.now());
           currentSnapshot(this.fresh, Date.now());
         }
+        if (!/^[a-f0-9]{48}$/.test(body.cycle_id))
+          return new Response(null, { status: 400 });
+        this.cycleId = body.cycle_id;
+        this.completedResponses = 0;
+        this.observationsAfterResponse = 0;
+        this.lastObservedResponse = 0;
+        this.cycleFailures = 0;
         this.mode = body.mode;
         this.swapped = false;
         return Response.json({ pulls: this.pulls });
       }
       if (path === "/control/counts")
         return Response.json({
+          completed_responses: this.completedResponses,
+          observations_after_response: this.observationsAfterResponse,
+          failure_responses: this.cycleFailures,
           pulls: this.pulls,
           replayed: this.replayed,
           transport_failures: this.transportFailures,
@@ -165,6 +188,7 @@ export class ChaosRelay {
       this.pulls++;
       if (this.mode === "failure") {
         this.transportFailures++;
+        this.cycleFailures++;
         throw new Error("injected_desired_transport_failure");
       }
       if (this.mode !== "pass") {
@@ -178,9 +202,11 @@ export class ChaosRelay {
                 ? this.older
                 : this.fresh;
         if (this.mode === "out_of_order") this.swapped = true;
-        return new Response(currentSnapshot(source, Date.now()), {
-          headers: { "Content-Type": "application/json" },
-        });
+        return this.trackResponse(
+          new Response(currentSnapshot(source, Date.now()), {
+            headers: { "Content-Type": "application/json" },
+          }),
+        );
       }
     }
     if (path === "/agent/v1/observations") {
@@ -202,12 +228,43 @@ export class ChaosRelay {
       `${original.pathname}${original.search}`,
       this.env.API_URL,
     );
-    return fetch(new Request(target, request), { redirect: "error" });
+    const response = await fetch(new Request(target, request), {
+      redirect: "error",
+    });
+    if (
+      path === "/agent/v1/observations" &&
+      response.ok &&
+      this.completedResponses > this.lastObservedResponse
+    ) {
+      this.observationsAfterResponse++;
+      this.lastObservedResponse = this.completedResponses;
+    }
+    return path === "/agent/v1/desired"
+      ? this.trackResponse(response)
+      : response;
+  }
+  private trackResponse(response: Response): Response {
+    if (!response.body || !response.ok) return response;
+    const cycle = this.cycleId;
+    const tracked = response.body.pipeThrough(
+      new TransformStream<Uint8Array, Uint8Array>({
+        transform: (chunk, controller) => controller.enqueue(chunk),
+        flush: () => {
+          if (this.cycleId === cycle) this.completedResponses++;
+        },
+      }),
+    );
+    return new Response(tracked, {
+      status: response.status,
+      headers: response.headers,
+    });
   }
 }
 
 export default {
   async fetch(request: Request, env: RelayEnv): Promise<Response> {
+    if (!runActive(env.RUN_EXPIRES_AT))
+      return new Response(null, { status: 410 });
     const id = env.RELAY.idFromName(env.RUN_NAME);
     return env.RELAY.get(id).fetch(request);
   },

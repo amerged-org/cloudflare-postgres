@@ -12,6 +12,8 @@ import {
   string,
 } from "./core.ts";
 import type { ArchiveObject } from "./core.ts";
+import { assertPolicyIdentity, sameStructuredValue } from "./identity.ts";
+import type { ClusterIdentity } from "./identity.ts";
 
 export interface CloudflareEnvelope {
   result: unknown;
@@ -273,6 +275,15 @@ export class Kubernetes {
   private readonly configPath: string;
   private readonly context: string;
   private readonly deadline?: () => number;
+  private mutationGuard?: () => Promise<void>;
+  setMutationGuard(guard: () => Promise<void>): void {
+    this.mutationGuard = guard;
+  }
+  private async guard(): Promise<void> {
+    if (!this.mutationGuard)
+      throw new HarnessError("cluster_mutation_guard_missing");
+    await this.mutationGuard();
+  }
   constructor(configPath: string, context: string, deadline?: () => number) {
     this.configPath = configPath;
     this.context = context;
@@ -349,10 +360,143 @@ export class Kubernetes {
       return string(record(secret.data).password);
     });
   }
-  async restartAgent(
+  async named(
+    resource: "configmaps",
+    name: string,
+    namespace: string,
+  ): Promise<Record<string, unknown>> {
+    assertOwned(name);
+    assertOwned(namespace);
+    return record(
+      JSON.parse(
+        await command(
+          "kubectl",
+          [
+            "--kubeconfig",
+            this.configPath,
+            "--context",
+            this.context,
+            "--request-timeout=30s",
+            "get",
+            resource,
+            name,
+            "--namespace",
+            namespace,
+            "-o",
+            "json",
+          ],
+          { timeoutMs: requestTimeout(this.deadline) },
+        ),
+      ),
+    );
+  }
+  async effectiveConfig(
+    container: Record<string, unknown>,
+    namespace: string,
+  ): Promise<{ api_url: string; region_id: string }> {
+    const selected: Record<string, string> = {};
+    for (const from of Array.isArray(container.envFrom)
+      ? container.envFrom.map(record)
+      : []) {
+      const prefix = typeof from.prefix === "string" ? from.prefix : "";
+      if (from.configMapRef) {
+        const map = await this.named(
+          "configmaps",
+          string(record(from.configMapRef).name),
+          namespace,
+        );
+        for (const [key, value] of Object.entries(record(map.data)))
+          if (["PGCF_API_URL", "PGCF_REGION_ID"].includes(`${prefix}${key}`))
+            selected[`${prefix}${key}`] = string(value);
+      } else if (from.secretRef) {
+        const name = string(record(from.secretRef).name);
+        assertOwned(name);
+        const keys = await command(
+          "kubectl",
+          [
+            "--kubeconfig",
+            this.configPath,
+            "--context",
+            this.context,
+            "--request-timeout=30s",
+            "get",
+            "secret",
+            name,
+            "--namespace",
+            namespace,
+            "-o",
+            'go-template={{range $key, $value := .data}}{{printf "%s\\n" $key}}{{end}}',
+          ],
+          { timeoutMs: requestTimeout(this.deadline) },
+        );
+        if (
+          keys
+            .trim()
+            .split("\n")
+            .some((key) =>
+              ["PGCF_API_URL", "PGCF_REGION_ID"].includes(`${prefix}${key}`),
+            )
+        )
+          throw new HarnessError("secret_shadows_agent_configuration");
+      }
+    }
+    for (const variable of Array.isArray(container.env)
+      ? container.env.map(record)
+      : []) {
+      if (!["PGCF_API_URL", "PGCF_REGION_ID"].includes(String(variable.name)))
+        continue;
+      if (typeof variable.value === "string")
+        selected[string(variable.name)] = variable.value;
+      else if (
+        variable.valueFrom &&
+        record(variable.valueFrom).configMapKeyRef
+      ) {
+        const source = record(record(variable.valueFrom).configMapKeyRef),
+          map = await this.named("configmaps", string(source.name), namespace);
+        selected[string(variable.name)] = string(
+          record(map.data)[string(source.key)],
+        );
+      } else
+        throw new HarnessError("agent_effective_configuration_unverifiable");
+    }
+    return {
+      api_url: string(selected.PGCF_API_URL),
+      region_id: string(selected.PGCF_REGION_ID),
+    };
+  }
+  async clusterIdentity(
     namespace: string,
     deploymentName: string,
-  ): Promise<string> {
+  ): Promise<ClusterIdentity> {
+    const [namespaces, nodes, settings] = await Promise.all([
+      this.read("namespaces"),
+      this.read("nodes"),
+      this.agentSettings(namespace, deploymentName),
+    ]);
+    const system = items(namespaces).find(
+        (row) => objectName(row) === "kube-system",
+      ),
+      regional = items(namespaces).find((row) => objectName(row) === namespace);
+    if (!system || !regional)
+      throw new HarnessError("cluster_namespace_missing");
+    return {
+      cluster_uid: string(record(system.metadata).uid),
+      namespace_uid: string(record(regional.metadata).uid),
+      agent_uid: settings.uid,
+      nodes: Object.fromEntries(
+        items(nodes).map((node) => [
+          objectName(node),
+          string(record(node.metadata).uid),
+        ]),
+      ),
+      agent_api_url: settings.effective.api_url,
+      region_id: settings.effective.region_id,
+    };
+  }
+  async agentPod(
+    namespace: string,
+    deploymentName: string,
+  ): Promise<Record<string, unknown>> {
     assertOwned(namespace);
     assertOwned(deploymentName);
     const [deployments, replicaSets, pods] = await Promise.all([
@@ -404,11 +548,25 @@ export class Kubernetes {
       );
     });
     if (agents.length !== 1) throw new HarnessError("agent_pod_ambiguous");
-    const pod = agents[0]!,
-      name = objectName(pod),
+    return agents[0]!;
+  }
+  async restartAgent(
+    namespace: string,
+    deploymentName: string,
+    victim: { name: string; uid: string },
+  ): Promise<string> {
+    await this.guard();
+    const pod = await this.agentPod(namespace, deploymentName);
+    if (
+      objectName(pod) !== victim.name ||
+      record(pod.metadata).uid !== victim.uid
+    )
+      throw new HarnessError("agent_pod_identity_changed");
+    const name = objectName(pod),
       podUid = string(record(pod.metadata).uid);
     assertOwned(name);
     const path = `/api/v1/namespaces/${encodeURIComponent(namespace)}/pods/${encodeURIComponent(name)}`;
+    await this.guard();
     await command(
       "kubectl",
       [
@@ -442,6 +600,7 @@ export class Kubernetes {
     uid: string;
     container: string;
     override: Record<string, unknown> | null;
+    effective: { api_url: string; region_id: string };
   }> {
     assertOwned(namespace);
     assertOwned(deploymentName);
@@ -451,6 +610,12 @@ export class Kubernetes {
         record(object.metadata).namespace === namespace,
     );
     if (!deployment) throw new HarnessError("agent_deployment_missing");
+    if (
+      record(record(deployment.metadata).labels)[
+        "app.kubernetes.io/part-of"
+      ] !== "pgcf"
+    )
+      throw new HarnessError("agent_deployment_not_owned");
     const spec = record(record(record(deployment.spec).template).spec);
     if (!Array.isArray(spec.containers))
       throw new HarnessError("agent_container_missing");
@@ -465,6 +630,7 @@ export class Kubernetes {
       uid: string(record(deployment.metadata).uid),
       container: string(agent.name),
       override,
+      effective: await this.effectiveConfig(agent, namespace),
     };
   }
   async patchAgentUrl(
@@ -474,6 +640,7 @@ export class Kubernetes {
     container: string,
     override: Record<string, unknown> | null,
   ): Promise<void> {
+    await this.guard();
     assertOwned(namespace);
     assertOwned(deploymentName);
     const deployment = items(await this.read("deployments")).find(
@@ -487,6 +654,7 @@ export class Kubernetes {
       throw new HarnessError("agent_patch_scope_refused");
     const patch = {
       metadata: {
+        uid: expectedUid,
         resourceVersion: string(record(deployment.metadata).resourceVersion),
       },
       spec: {
@@ -502,6 +670,7 @@ export class Kubernetes {
         },
       },
     };
+    await this.guard();
     await command(
       "kubectl",
       [
@@ -529,7 +698,9 @@ export class Kubernetes {
     name: string,
     namespace: string,
     runName: string,
-  ): Promise<void> {
+    expectedUid?: string,
+  ): Promise<string> {
+    await this.guard();
     assertOwned(name);
     assertOwned(namespace);
     assertOwned(runName);
@@ -543,31 +714,55 @@ export class Kubernetes {
       labels["pgcf.io/e2e-run"] !== runName
     )
       throw new HarnessError("policy_scope_refused");
-    await command(
-      "kubectl",
-      [
-        "--kubeconfig",
-        this.configPath,
-        "--context",
-        this.context,
-        "--request-timeout=30s",
-        "apply",
-        "--server-side",
-        "--field-manager=pgcf-e2e",
-        "-f",
-        "-",
-      ],
-      {
-        timeoutMs: requestTimeout(this.deadline),
-        input: JSON.stringify(policy),
-      },
+    const existing = items(
+      await this.read("ciliumnetworkpolicies.cilium.io"),
+    ).find(
+      (row) =>
+        objectName(row) === name &&
+        record(row.metadata).namespace === namespace,
     );
+    if (existing) {
+      assertPolicyIdentity(existing, name, namespace, runName, expectedUid);
+      if (!sameStructuredValue(existing.spec, policy.spec))
+        throw new HarnessError("owned_policy_configuration_changed");
+      return string(record(existing.metadata).uid);
+    }
+    if (expectedUid) throw new HarnessError("owned_policy_missing");
+    await this.guard();
+    const created = record(
+      JSON.parse(
+        await command(
+          "kubectl",
+          [
+            "--kubeconfig",
+            this.configPath,
+            "--context",
+            this.context,
+            "--request-timeout=30s",
+            "create",
+            "-f",
+            "-",
+            "-o",
+            "json",
+          ],
+          {
+            timeoutMs: requestTimeout(this.deadline),
+            input: JSON.stringify(policy),
+          },
+        ),
+      ),
+    );
+    const uid = string(record(created.metadata).uid);
+    assertPolicyIdentity(created, name, namespace, runName, uid);
+    return uid;
   }
   async deletePolicy(
     name: string,
     namespace: string,
     runName: string,
+    expectedUid?: string,
   ): Promise<void> {
+    await this.guard();
     assertOwned(name);
     assertOwned(namespace);
     assertOwned(runName);
@@ -579,9 +774,9 @@ export class Kubernetes {
         record(object.metadata).namespace === namespace,
     );
     if (!policy) return;
-    if (record(record(policy.metadata).labels)["pgcf.io/e2e-run"] !== runName)
-      throw new HarnessError("policy_scope_refused");
+    assertPolicyIdentity(policy, name, namespace, runName, expectedUid);
     const path = `/apis/cilium.io/v2/namespaces/${encodeURIComponent(namespace)}/ciliumnetworkpolicies/${encodeURIComponent(name)}`;
+    await this.guard();
     await command(
       "kubectl",
       [
