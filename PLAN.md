@@ -1,12 +1,14 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-02): **reset.** The project has been redirected toward a lean, Neon-style service.
+Status (2026-10-02): **local build; live acceptance pending.** The project has been redirected
+toward a lean, Neon-style service. Phase 1 services have passed local checks; the approved native
+WebSocket connection path is being implemented.
 The first build produced mostly budget-enforcement, signed-execution and evidence machinery but no
 database a client could connect to through the API. Those parts are removed. The Talos recipe,
 the Flux platform baseline and the R2 backup/PITR recipe stay, because they work in the lab.
-The old implementation has been removed and the workspace scaffolded. The new service has not
-been verified live yet. Phase 0 completes the Dev reset; Phase 1 builds the first database through
-the whole chain. The owner has requested delivery through Phase 5 and full Neon replacement.
+The old implementation has been removed and the workspace scaffolded. Phase 0's Dev reset and
+Phase 1's complete database chain have not passed live acceptance. The owner has requested
+delivery through Phase 5 and full Neon replacement.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
 AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.
@@ -59,9 +61,9 @@ The diagrams are in [README.md](README.md#architecture).
 | Component                 | Runs on                              | Responsibility                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
 | ------------------------- | ------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `apps/api`                | Cloudflare Worker                    | `/v1` management API, API keys, D1 state. Durable Object `RegionLink` (one per region; holds the agent WebSocket); `DatabaseActor` (one per database; lifecycle, wake coalescing, idle timer, traffic counters) arrives in Phase 2. Workflows for restore and add-node arrive in Phase 3 and later. Phase 1 has neither `DatabaseActor` nor Workflows: an operation closes when the agent's observation arrives, and a cron marks stuck operations failed. Cron also covers usage rollups and capacity checks from their phases on.            |
-| `apps/edge`               | Cloudflare Worker                    | Data plane on **one endpoint hostname**, `db.<domain>`: PostgreSQL wire protocol over WebSocket. Reads the first PostgreSQL message (the StartupMessage with `user` and `database`, where `database` is the database ID), looks the role and database up in D1, then opens an upstream WebSocket to the region gateway and pipes bytes. Phase 1 databases always run, so the edge routes only databases that are observed `ready` and refuses the rest. `ensureAwake` through `DatabaseActor` is Phase 2. Reports bytes and connection events. |
+| `apps/edge`               | Cloudflare Worker                    | Data plane on **one endpoint hostname**, `db.<domain>`: PostgreSQL wire protocol over WebSocket. The approved path admits untrusted `database` and `user` URL hints against D1, signs a v2 routing token with mandatory `user`, and returns the unopened upstream WebSocket for native forwarding. Phase 1 routes only databases observed `ready`. `ensureAwake` through `DatabaseActor` is Phase 2. Records admission and upgrade events; the gateway measures stream bytes. |
 | `apps/regional` `agent`   | Kubernetes Deployment (1 per region) | Holds an outbound WebSocket to `RegionLink` that only carries hints, and pulls full desired state (every 5 s while an operation is open, otherwise every 60 s, or immediately on a hint). Reconciles each database into Kubernetes resources (below) and reports observed state, node capacity and archive health. Hibernate/wake with safety checks and storage samples arrive in Phase 2.                                                                                                                                                    |
-| `apps/regional` `gateway` | Kubernetes Deployment (2 replicas)   | WebSocket-to-PostgreSQL bridge reached through the edge-to-region transport (section 6). Verifies the edge's signed routing token, negotiates TLS with the database's `-rw` Service itself (SSLRequest, then TLS with the CNPG CA), and relays the client stream.                                                                                                                                                                                                                                                                              |
+| `apps/regional` `gateway` | Kubernetes Deployment (2 replicas)   | WebSocket-to-PostgreSQL bridge reached through the edge-to-region transport (section 6). Verifies the signed v2 token; handles SSL/GSS preludes, CancelRequest, startup parsing and the startup deadline; requires the actual StartupMessage database and user to match the token before dialing PostgreSQL. Negotiates TLS with the database's `-rw` Service (SSLRequest, then TLS with the CNPG CA), relays the raw stream, and measures bytes and connection events. |
 | `cloudflared`             | Kubernetes Deployment (2 replicas)   | The region's outbound Cloudflare Tunnel; the only path from Cloudflare into the cluster.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `apps/node-bootstrap`     | Cloudflare Container image           | Turns a Contabo VPS into a Talos node: rescue mode, verified Talos image, protected network, machine config, and worker join for an existing region or control-plane/worker bootstrap for a new region. Started by the add-node Workflow. |
 | `packages/contracts`      | shared                               | zod schemas for the API, the agent protocol and the edge routing token.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
@@ -102,19 +104,28 @@ The diagrams are in [README.md](README.md#architecture).
   4. The agent reports `ready` (cluster ready and continuous archiving working), and the operation
      completes.
 - **Connect:**
-  1. The client opens `wss://db.<domain>/v2` with the Neon serverless driver (`Pool`/`Client`
-     WebSocket mode). The connection URI is `postgres://<role>:<password>@db.<domain>/<db-id>`.
-     Customers must set `pipelineConnect=false`. `pgcf connect` for psql and migration tools is
-     Phase 2.
-  2. The edge Worker reads the StartupMessage and looks up the role (`user`) and database
-     (`database`) in D1. Unknown, deleted and not-ready databases are refused with a PostgreSQL
-     error. Phase 2 inserts `DatabaseActor.ensureAwake()` here.
-  3. It mints a routing token and connects to the region gateway over the edge-to-region
-     transport (section 6).
-  4. The gateway relays to PostgreSQL. SCRAM authentication runs end to end with PostgreSQL.
+  1. The client opens `GET /v2?database=<id>&user=<role>` on `wss://db.<domain>` with the Neon
+     serverless driver (`Pool`/`Client`, WebSocket mode). Its `wsProxy` configuration supplies
+     these URL-encoded hints from the connection settings. The connection URI remains
+     `postgres://<role>:<password>@db.<domain>/<db-id>`. Customers must set
+     `pipelineConnect=false`. `pgcf connect` for psql and migration tools is Phase 2.
+  2. The edge treats the hints as untrusted, applies connection admission, and looks up the role
+     and database in authoritative D1 state. Unknown roles and unknown, deleted or unavailable
+     databases are refused before upgrade. Both hints are required; missing or invalid hints are
+     refused, and the bare `/v2` endpoint is unsupported. Phase 2 inserts
+     `DatabaseActor.ensureAwake()` here.
+  3. It signs a v2 routing token binding the admitted database and user, opens the regional
+     WebSocket through the transport seam (section 6), and returns that WebSocket unopened.
+     Cloudflare forwards the stream natively; Edge does not accept it for a JavaScript relay.
+  4. The gateway verifies the token and reads the actual PostgreSQL StartupMessage. Its database
+     and user must exactly match the signed claims before any PostgreSQL dial. SSL/GSS preludes,
+     CancelRequest, startup parsing and the startup deadline belong to the gateway.
+  5. The gateway negotiates verified TLS to PostgreSQL and forwards the original startup and raw
+     stream. SCRAM authentication runs end to end with PostgreSQL; uncertain writes are never
+     replayed. Stream bytes and connection lifecycle measurements come from the gateway.
 - **Sleep (Phase 2):**
-  1. `DatabaseActor` sees no client bytes for the size class `sleep_after_seconds` and asks the
-     agent to hibernate.
+  1. `DatabaseActor` uses gateway client-activity measurements and the size class
+     `sleep_after_seconds` to ask the agent to hibernate after the idle window.
   2. The agent refuses if `pg_stat_activity` shows active backends or prepared transactions.
      Otherwise it runs `pg_switch_wal()`, waits for the archive, sets hibernation and reports.
   3. Open idle connections are closed. Clients reconnect, which wakes the database.
@@ -222,7 +233,7 @@ Usage is reported per database per UTC hour (`GET /v1/usage?project_id|database_
 | `memory_mib_seconds`, `cpu_millicore_seconds`                        | size class × awake time; a separate reserved figure covers sleep |
 | `storage_used_bytes_max`, `storage_allocated_bytes`                  | agent samples (hourly)                                           |
 | `backup_bytes_max`                                                   | R2 listing of the database prefix (hourly)                       |
-| `ingress_bytes`, `egress_bytes`, `connections`, `connection_seconds` | edge Worker via `DatabaseActor`                                  |
+| `ingress_bytes`, `egress_bytes`, `connections`, `connection_seconds` | gateway stream counters and connection events; Phase 2 rollups |
 
 Rows can change until `final: true`, which is set two hours after the hour ends. Missing samples
 are reported as gaps, never as zero.
@@ -256,18 +267,25 @@ their own price lists and billing logic.
 - Database IDs are random 20-character strings (`^[a-z][a-z0-9]{19}$`, a letter first) and are
   also the PostgreSQL database name. There is no per-database hostname. The edge refuses unknown,
   deleted, suspended and not-ready databases and rate-limits connections per database.
-- StartupMessage protocol majors other than 3 and replication requests receive SQLSTATE `0A000`;
-  a missing user receives `28000`. Phase 1 rejects unknown databases with `3D000`, unknown roles
-  with `28P01` and unavailable databases with `57P03`; Phase 2 adds the decoy SCRAM exchange.
+- The edge admits URL hints against D1 before upgrade. The gateway parses the actual
+  StartupMessage and rejects a database or user mismatch before a PostgreSQL dial. Startup
+  protocol majors other than 3 and replication requests receive SQLSTATE `0A000`; a missing
+  startup user receives `28000`. The gateway declines client SSL/GSS requests and silently closes
+  CancelRequest connections without dialing PostgreSQL. Phase 2 adds the decoy SCRAM exchange.
 - **Edge to gateway:**
-  - An HMAC-SHA256 routing token with a per-region key: database ID, connection ID, region, key
-    ID, issued-at and expiry, with expiry minus issued-at ≤ 30 s. It is single use per gateway
-    replica: each gateway keeps a connection-ID replay cache and rejects a reused token.
-  - The gateway derives the target only from the database ID.
+  - A v2 HMAC-SHA256 routing token with a per-region key: database ID, mandatory user, connection
+    ID, region, key ID, issued-at and expiry, with expiry minus issued-at ≤ 30 s. It is single use
+    per gateway replica: each gateway keeps a connection-ID replay cache and rejects a reused
+    token.
+  - The gateway derives the target only from the admitted database ID, after the actual startup
+    database and user exactly match the token. The token admits a route; PostgreSQL still
+    authenticates the user's password through SCRAM.
   - The transport is chosen by a Phase 1 spike behind one seam, preferring the existing path with
     the fewest parts that keeps TLS to PostgreSQL: Workers VPC TCP (`vpc_networks` binding), else
-    a Workers VPC HTTP service to the gateway, else a Tunnel hostname with the routing token. An
-    Access service token on a public Tunnel hostname needs the owner's consent to a Zero Trust
+    a Workers VPC HTTP service to the gateway, else a Tunnel hostname with the routing token.
+    Every candidate must preserve the approved unopened-WebSocket native forwarding path; raw
+    TCP support alone does not prove that path. No live transport has been selected. An Access
+    service token on a public Tunnel hostname needs the owner's consent to a Zero Trust
     organization first.
 - PostgreSQL:
   - Customer roles are non-superusers; superuser access is disabled.
@@ -331,8 +349,10 @@ Build:
   10 minutes, the agent reports `health.archiving=failing`, which `GET /v1/databases/{id}` shows.
   The agent has no `pods/exec`.
 - `cloudflared` and the regional image in the Flux platform; public GHCR images.
-- `apps/edge` on the single endpoint. `CancelRequest` is not routed in Phase 1; the connection
-  closes silently.
+- `apps/edge` on the single endpoint: D1 admission of URL hints, signed v2 database/user route,
+  and unopened-WebSocket native forwarding. The gateway owns startup validation, preludes and
+  the startup deadline. `CancelRequest` is not routed in Phase 1; the gateway closes it silently
+  without a PostgreSQL dial.
 - `scripts/e2e` (TypeScript).
 
 Live acceptance (`scripts/e2e` against Dev):
@@ -343,7 +363,9 @@ Live acceptance (`scripts/e2e` against Dev):
    for the `integrator` scope).
 3. From a deployed test Worker using `@neondatabase/serverless` (`Pool`, WebSocket mode,
    `pipelineConnect=false`), run DDL, a transaction, a rollback and reads through
-   `wss://db.<domain>/v2`. A wrong password, database ID and user are each refused.
+   `wss://db.<domain>/v2?database=<id>&user=<role>`. A wrong password, database ID and user are
+   each refused. A StartupMessage database or user that differs from the admitted hints is
+   rejected before a PostgreSQL dial.
 4. Find the base backup and WAL objects in R2.
 5. Delete the database. D1 shows `deleted`; the namespace, PVC, PV and `LVMVolume` are gone, the
    volume group's free space is back to its baseline and the edge refuses the ID.
@@ -534,14 +556,14 @@ Publish public images instead.
 | API                 | Hono + `@hono/zod-openapi`; OpenAPI and client generated from code                                                                                                                |
 | Region link         | Agent opens an outbound WebSocket to `RegionLink`, plus a 60 s full-state pull; desired state in D1 is the truth                                                                  |
 | Endpoint            | One hostname, `db.<domain>` (Worker custom domain). No per-database or per-region hostnames, no wildcard DNS; the region is routing data in D1                                    |
-| Routing             | The edge reads `user` and `database` from the StartupMessage; `database` is the database ID and the role is looked up in D1 by `(database_id, name)` before anything is forwarded |
-| Client protocol     | PostgreSQL over WebSocket (`wss://db.<domain>/v2`) via the edge Worker with `pipelineConnect=false`; native tools through `pgcf connect` (Phase 2)                                |
-| Edge to region      | Decided by the Phase 1 transport spike behind one seam: Workers VPC TCP, else Workers VPC HTTP, else Tunnel hostname; HMAC routing token in every case                            |
+| Routing             | Edge admits untrusted `database`/`user` URL hints against D1 and signs a v2 token with mandatory user; gateway requires the actual StartupMessage to match before PostgreSQL dial |
+| Client protocol     | PostgreSQL over WebSocket (`GET /v2?database=<id>&user=<role>`) via native Edge forwarding with `pipelineConnect=false`; native tools through `pgcf connect` (Phase 2) |
+| Edge to region      | Phase 1 spike behind one seam: Workers VPC TCP, else VPC HTTP, else Tunnel hostname; every candidate must preserve unopened-WebSocket native forwarding and signed v2 routing; live choice pending |
 | Desired state       | Deletion is an explicit tombstone; absence from a pull never deletes; generations only increase and the agent ignores older ones                                                  |
 | Database topology   | One CNPG Cluster with 1 instance per database, namespace per database, pinned to a node                                                                                           |
 | Sleep               | CNPG declarative hibernation                                                                                                                                                      |
 | Backups             | Barman Cloud plugin to R2; daily base backup, continuous WAL, retention per size class                                                                                            |
-| Metering            | Hourly; derived from lifecycle events, samples and edge counters; no per-minute billing                                                                                           |
+| Metering            | Hourly; derived from lifecycle events, samples and gateway stream counters; no per-minute billing |
 | Budgets             | None in PGCF; integrators suspend and resume                                                                                                                                      |
 | Compute autoscaling | None; manual resize by size class                                                                                                                                                 |
 | Cluster             | One Talos/Kubernetes cluster per region                                                                                                                                           |
@@ -597,3 +619,8 @@ infra/backups         CNPG/Barman/R2 backup and restore reference
 | 2026-10-02 | 1 local | Local AMD64 image built in 23.31 s: zero forbidden regular files, both entry-point modules loaded, agent help exited 0 and missing configuration produced the expected failure event in each entry point. The bundled zod MIT notice was verified at 1,072 bytes. The full-image scan covered 10 layers and 10,207 regular files; raw scan exit 1 came from one V8 compile-time integer in the official public Node base-image layer, independently verified by layer hash. Zero findings remain unresolved; the scanner was unchanged. This image has no published registry digest. |
 | 2026-10-02 | 0 | Read-only Dev inventory passed in 143.86 s after the pagination fix, with complete fingerprints for 174 foreign resources. Decommission planning passed in 215.01 s, including a 99,404-byte D1 export and guards. The exact destructive supervisor gate remains pending; no Dev resources were deleted and the lab was not rebuilt. |
 | 2026-10-02 | 0–5 | Harness review, real E0–E6 acceptance and the transport spike remain pending. Phase 0 and Phase 1 have not passed live acceptance; Phases 2–5 remain unaccepted and no Neon migration has taken place. |
+| 2026-10-02 | 1 local | Selected local suites passed: 66 E2E harness, 35 Edge, 67 regional and 21 infrastructure proof tests. These checks are local preparation, not live Dev acceptance. |
+| 2026-10-02 | CI | CI for `da6dd385` failed on an Ubuntu OpenSSL fixture. The portability fix passed locally; a new CI result remains pending. Earlier successful CI rows refer to their recorded revisions. |
+| 2026-10-02 | 1 local | Original manual-relay 100 MiB and 1 GiB stream trials failed under the unchanged local memory guard. A test-only native 1 GiB stream passed incremental hash verification. The guard and original failed assertions remain retained; local workerd RSS is not Cloudflare isolate-limit accounting. This control is not product or live acceptance. |
+| 2026-10-02 | 1 | Owner approved `GET /v2?database=<id>&user=<role>` with untrusted hints admitted by authoritative D1, a signed v2 token with mandatory user, unopened-WebSocket native forwarding, and gateway validation of the actual startup before PostgreSQL dial. Gateway owns SSL/GSS/cancel handling, startup parsing/deadline and stream measurements. Implementation is in progress; live transport and Phase 1 acceptance remain pending. |
+| 2026-10-02 | CI | CI for `dc6ada6` passed both the check and image jobs. The public GitHub tree matched the pushed source across 196 blobs. This confirms the portability fix in CI; it is not live Dev acceptance. |

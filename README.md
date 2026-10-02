@@ -14,28 +14,31 @@ loss is recovered from R2.
 - Usage and infrastructure-cost metrics per database. You put your own pricing on top.
 - Horizontal scaling: Cloudflare adds Contabo VPS through the Contabo API within your caps.
 
-[ohmyho.st](https://ohmyho.st) is the first adopter. It replaces Neon with this service.
+[ohmyho.st](https://ohmyho.st) is the first adopter. It will replace Neon with this service.
 
 ## Status
 
-**Reset on 2026-10-02.** A lean design (below) replaces the first implementation. The working
-Talos, Flux platform and R2 backup/PITR recipes in [infra/](infra/README.md) are kept. The
-services described here are being built; see [PLAN.md](PLAN.md) for phases and status.
+**Local build; live acceptance pending (2026-10-02).** The reset keeps the working Talos, Flux
+platform and R2 backup/PITR recipes in [infra/](infra/README.md). Phase 1 services have passed local
+checks; the approved native WebSocket connection path is being implemented. Phase 0 and Phase 1
+have not passed live acceptance. CI for `dc6ada6` passed its check and image jobs after the Ubuntu
+OpenSSL fixture portability fix. See [PLAN.md](PLAN.md#11-status) for chronological results and
+remaining phases.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
   subgraph Clients
-    App["Apps and Workers<br/>PostgreSQL over WebSocket"]
+    App["Apps and Workers<br/>PostgreSQL over WebSocket<br/>database and user hints"]
     Tools["psql and migrations<br/>via pgcf connect"]
     Integrator["Integrator backend<br/>e.g. ohmyho.st"]
   end
 
   subgraph CF["Your Cloudflare account: control plane"]
-    Edge["Edge Worker<br/>db.your-domain"]
+    Edge["Edge Worker<br/>D1 admission, signed route"]
     API["API Worker<br/>/v1"]
-    DBA["DatabaseActor DO<br/>per database: wake, idle, traffic"]
+    DBA["DatabaseActor DO<br/>per database: wake, idle, usage"]
     RL["RegionLink DO<br/>per region"]
     WF["Workflows<br/>restore, add node"]
     D1[("D1<br/>state and usage")]
@@ -45,7 +48,7 @@ flowchart LR
 
   subgraph Region["Contabo region: Talos and Kubernetes"]
     CFD["cloudflared<br/>outbound tunnel"]
-    GW["Gateway"]
+    GW["Gateway<br/>Startup validation, TLS, traffic"]
     Agent["Regional agent"]
     CNPG["CloudNativePG"]
     PG[("PostgreSQL per database<br/>local LVM volume")]
@@ -57,9 +60,9 @@ flowchart LR
   Tools --> Edge
   Integrator -->|"manage, usage, costs"| API
   Edge <--> DBA
-  Edge -->|"Cloudflare transport, signed route"| CFD
+  Edge -->|"native WebSocket, signed v2 route"| CFD
   CFD --> GW
-  GW --> PG
+  GW -->|"validated Startup, TLS"| PG
   API --> D1
   API --> WF
   DBA <--> RL
@@ -83,7 +86,7 @@ sequenceDiagram
   participant G as Regional agent
   participant P as PostgreSQL
 
-  C->>E: wss://db.your-domain/v2 (database=id, user)
+  C->>E: GET /v2?database=id&user=role (untrusted hints)
   E->>A: ensureAwake()
   A->>R: wake (coalesced)
   R->>G: wake db-id
@@ -92,18 +95,30 @@ sequenceDiagram
   G-->>R: observed ready
   R-->>A: ready
   A-->>E: awake
-  E->>P: WebSocket via Tunnel and gateway (signed route)
-  C->>P: PostgreSQL protocol, SCRAM end to end
+  E->>P: native WebSocket via Tunnel and gateway (signed v2 route)
+  C->>P: gateway validates Startup; PostgreSQL SCRAM end to end
 ```
 
 | Part                  | Where                | Job                                                                                  |
 | --------------------- | -------------------- | ------------------------------------------------------------------------------------ |
 | API Worker            | Cloudflare           | `/v1` API, D1 state, Durable Objects, Workflows, usage rollups                       |
-| Edge Worker           | Cloudflare           | Database endpoint: wake, route, count traffic                                        |
+| Edge Worker           | Cloudflare           | Database endpoint: D1 admission, wake, signed route, native forwarding |
 | Regional agent        | Kubernetes           | Reconciles databases into CNPG resources; hibernate/wake; reports status and samples |
-| Gateway + cloudflared | Kubernetes           | Only entry from Cloudflare to PostgreSQL                                             |
+| Gateway + cloudflared | Kubernetes           | Entry from Cloudflare; startup validation before PostgreSQL dial, TLS, stream counters |
 | Node bootstrap        | Cloudflare Container | Turns a Contabo VPS into a Talos node                                                |
 | Platform              | Kubernetes (Flux)    | Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin        |
+
+The approved client endpoint is `GET /v2?database=<id>&user=<role>` on the single database hostname.
+Configure the Neon serverless driver's `Pool`/`Client` WebSocket mode with `pipelineConnect=false`
+and a `wsProxy` URL containing both URL-encoded hints. Requests to the bare `/v2` endpoint or with
+missing or invalid hints are unsupported. Edge checks the database and role against D1, signs a
+v2 routing token with mandatory user, and returns the unopened upstream WebSocket for native
+forwarding. The live Cloudflare transport is still unselected.
+
+The gateway checks the actual PostgreSQL StartupMessage database and user against the signed
+route before opening PostgreSQL. It owns SSL/GSS preludes, CancelRequest, startup parsing and the
+startup deadline, negotiates verified TLS to PostgreSQL, and measures stream bytes and connection
+events. SCRAM authentication runs end to end with PostgreSQL; uncertain writes are never replayed.
 
 ## Self-hosting requirements
 
