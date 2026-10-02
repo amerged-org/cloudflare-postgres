@@ -65,11 +65,13 @@ read from the installed package manifests.
 | [vitest](https://github.com/vitest-dev/vitest)                                                          | 4.1.11  | MIT               | Test runner (development only).                                                           |
 | [@cloudflare/vitest-plugin](https://github.com/cloudflare/workers-sdk/tree/main/packages/vitest-plugin) | 1.3.5   | MIT               | Runs Worker tests in the Workers runtime (development only).                              |
 
-Root development tooling (`typescript`, `eslint`, `@eslint/js`, `typescript-eslint`, `prettier`
-and `@types/node`) and regional type packages (`@types/ws`, `@types/pg`) are excluded from the
-distributed runtime image. Their resolved versions remain in `pnpm-lock.yaml`; their licenses
-and notices remain in the installed development packages. Build and test tooling is not
-relicensed as first-party code.
+Direct root development tooling (`typescript`, `eslint`, `@eslint/js`, `typescript-eslint`,
+`prettier` and `@types/node`) and regional development type packages (`@types/ws`, `@types/pg`)
+are not intentionally installed as runtime dependencies. Production dependency trees can still
+retain type packages: `@kubernetes/client-node` includes `@types/node` 26.6.3, and
+`@types/stream-buffers` includes `@types/node` 24.19.0. These production transitive dependencies
+remain in the distributed image with their licenses and notices. Resolved dependency versions
+are recorded in `pnpm-lock.yaml`; build and test tooling is not relicensed as first-party code.
 
 ### Reference only
 
