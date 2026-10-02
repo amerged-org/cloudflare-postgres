@@ -2,9 +2,9 @@
 
 Reviewed: 2026-10-02 (reset). The repository's [Apache License 2.0](LICENSE) covers original
 project work only. Upstream components keep their own licenses, notices and source obligations.
-No upstream source is vendored. Application dependencies are recorded in package manifests and the
-lockfile once the new apps exist. Recheck the exact release and its dependencies before upgrading
-or redistributing.
+No upstream source is vendored. Direct application dependencies are listed below at the version
+resolved in `pnpm-lock.yaml`. Their transitive dependencies are recorded only in the lockfile.
+Recheck the exact release and its dependencies before upgrading or redistributing.
 
 ## Selected stack
 
@@ -33,6 +33,29 @@ and source headers say GPL version 3 or later. Record the declaration at the pin
 [plugin-barman-cloud issue #411](https://github.com/cloudnative-pg/plugin-barman-cloud/issues/411#issuecomment-3572945793)
 was a naming conflict between archives. Every restore target needs its own archive path and server
 name.
+
+## Application dependencies
+
+Direct npm dependencies at the versions resolved in [pnpm-lock.yaml](pnpm-lock.yaml). Licenses are
+read from the installed package manifests.
+
+| Package | Version | License | Role |
+| --- | --- | --- | --- |
+| [hono](https://github.com/honojs/hono) | 4.13.12 | MIT | HTTP framework of the API Worker. |
+| [zod](https://github.com/colinhacks/zod) | 4.6.5 | MIT | Shared schemas in `packages/contracts` and request validation. |
+| [@hono/zod-openapi](https://github.com/honojs/middleware/tree/main/packages/zod-openapi) | 1.6.3 | MIT | OpenAPI document generated from the route schemas. |
+| [ws](https://github.com/websockets/ws) | 8.22.0 | MIT | WebSocket server of the regional gateway and link client of the agent. |
+| [esbuild](https://github.com/evanw/esbuild) | 0.25.12 | MIT | Bundles the regional entry points into the container image (build only). |
+| [@neondatabase/serverless](https://github.com/neondatabase/serverless) | 1.2.0 | MIT | Client driver used by the live acceptance run (also listed above). |
+| [pg](https://github.com/brianc/node-postgres) | 8.23.1 | MIT | Direct PostgreSQL client for `scripts/e2e` only. |
+| [vitest](https://github.com/vitest-dev/vitest) | 4.1.11 | MIT | Test runner (development only). |
+| [@cloudflare/vitest-plugin](https://github.com/cloudflare/workers-sdk/tree/main/packages/vitest-plugin) | 1.3.5 | MIT | Runs Worker tests in the Workers runtime (development only). |
+
+### Reference only
+
+| Component | License | Use |
+| --- | --- | --- |
+| [neondatabase/wsproxy](https://github.com/neondatabase/wsproxy) | Apache-2.0 | Read-only reference for the WebSocket-to-PostgreSQL bridge. Not vendored, not pinned, not a dependency. |
 
 ## Not used
 
