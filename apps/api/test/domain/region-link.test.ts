@@ -85,3 +85,31 @@ it("authenticates the public agent link and rejects ordinary HTTP requests", asy
   expect((await request("/agent/v1/link", f.integrator)).status).toBe(401);
   expect((await request("/agent/v1/link", f.agent)).status).toBe(426);
 });
+
+it("upgrades the authenticated agent link through the real API middleware", async () => {
+  const f = await fixture();
+  const response = await request(
+    "/agent/v1/link",
+    f.agent,
+    "GET",
+    undefined,
+    undefined,
+    { Upgrade: "websocket" },
+  );
+  expect(response.status).toBe(101);
+  expect(response.headers.get("X-Request-Id")).toBeTruthy();
+  const socket = response.webSocket!;
+  expect(socket).toBeDefined();
+  socket.accept();
+  const welcome = nextMessage(socket);
+  socket.send(
+    JSON.stringify({
+      type: "hello",
+      protocol: 1,
+      agent_version: "test",
+      instance_id: crypto.randomUUID(),
+    }),
+  );
+  expect(JSON.parse(await welcome)).toEqual({ type: "welcome", protocol: 1 });
+  socket.close(1000);
+});

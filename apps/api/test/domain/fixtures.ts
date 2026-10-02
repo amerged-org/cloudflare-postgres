@@ -21,9 +21,11 @@ export async function request(
   method = "GET",
   body?: unknown,
   idempotency?: string,
+  extraHeaders?: HeadersInit,
 ): Promise<Response> {
   const context = createExecutionContext();
-  const headers = new Headers({ Authorization: `Bearer ${key}` });
+  const headers = new Headers(extraHeaders);
+  headers.set("Authorization", `Bearer ${key}`);
   if (body !== undefined) headers.set("Content-Type", "application/json");
   if (idempotency) headers.set("Idempotency-Key", idempotency);
   const response = await createApp().fetch(

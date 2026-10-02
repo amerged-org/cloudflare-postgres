@@ -159,6 +159,42 @@ describe("database domain on real Workers D1", () => {
         .first("archive_path"),
     ).toBe(before);
   });
+  it("pages desired state without omitting unapplied deletion tombstones", async () => {
+    const f = await fixture();
+    const first = await created(f, "one"),
+      second = await created(f, "two");
+    expect(
+      (
+        await request(
+          `/v1/databases/${first.database.id}`,
+          f.integrator,
+          "DELETE",
+        )
+      ).status,
+    ).toBe(202);
+    const pageOne = DesiredResponse.parse(
+      await (await request("/agent/v1/desired?limit=1", f.agent)).json(),
+    );
+    expect(pageOne.databases).toHaveLength(1);
+    expect(pageOne.next).not.toBeNull();
+    const pageTwo = DesiredResponse.parse(
+      await (
+        await request(
+          `/agent/v1/desired?limit=1&after=${pageOne.next}`,
+          f.agent,
+        )
+      ).json(),
+    );
+    expect(pageTwo.next).toBeNull();
+    expect(
+      [...pageOne.databases, ...pageTwo.databases].map((db) => db.id).sort(),
+    ).toEqual([first.database.id, second.database.id].sort());
+    expect(
+      [...pageOne.databases, ...pageTwo.databases].find(
+        (db) => db.id === first.database.id,
+      )?.desired_state,
+    ).toBe("deleted");
+  });
   it("keeps credentials encrypted and exposes passwords only in integrator URIs and desired", async () => {
     const f = await fixture(),
       body = await created(f),
