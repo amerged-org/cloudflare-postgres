@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { readFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   archiveDestinationPath,
   bytesToBase64url,
@@ -20,6 +20,8 @@ const MIGRATION = readFileSync(
   "utf8",
 );
 const NOW = "2026-10-02T10:46:00.000Z";
+const gatewayUrl = `https://${["gateway", "example", "com"].join(".")}`;
+const backupEndpoint = `https://${["r2", "example", "com"].join(".")}`;
 
 let db: DatabaseSync;
 let projectId: string;
@@ -73,6 +75,35 @@ function insertRole(databaseId: string, name: string, owner = 0) {
   );
 }
 
+async function insertApiKey(scope = "admin", project: string | null = null) {
+  const id = newApiKeyId();
+  run(
+    `INSERT INTO api_keys (id, lookup_id, key_hash, scope, project_id, name, created_at)
+     VALUES (?, ?, ?, ?, ?, 'k', ?)`,
+    id,
+    newApiKeyId().slice(4, 16),
+    await hashApiKey(newSecret(), newSecret()),
+    scope,
+    project,
+    NOW,
+  );
+  return id;
+}
+
+function insertOperation(databaseId: string) {
+  const id = newOperationId();
+  run(
+    `INSERT INTO operations (id, kind, status, project_id, database_id, generation, created_at, updated_at)
+     VALUES (?, 'database.create', 'pending', ?, ?, 1, ?, ?)`,
+    id,
+    projectId,
+    databaseId,
+    NOW,
+    NOW,
+  );
+  return id;
+}
+
 beforeEach(async () => {
   db = new DatabaseSync(":memory:");
   db.exec("PRAGMA foreign_keys = ON");
@@ -95,7 +126,9 @@ beforeEach(async () => {
   run(
     `INSERT INTO regions (id, provider, provider_region, gateway_url, backup_bucket, backup_endpoint_url,
        agent_key_hash, created_at, updated_at)
-     VALUES ('eu-1', 'contabo', 'EU', 'https://gateway.example.com', 'pgcf-backups', 'https://r2.example.com', ?, ?, ?)`,
+     VALUES ('eu-1', 'contabo', 'EU', ?, 'pgcf-backups', ?, ?, ?, ?)`,
+    gatewayUrl,
+    backupEndpoint,
     await hashApiKey(newSecret(), newSecret()),
     NOW,
     NOW,
@@ -108,6 +141,8 @@ beforeEach(async () => {
     NOW,
   );
 });
+
+afterEach(() => db.close());
 
 describe("0001_init.sql", () => {
   it("creates every table", () => {
@@ -131,6 +166,47 @@ describe("0001_init.sql", () => {
     ]);
   });
 
+  it("rejects NULL primary identities in every TEXT-id table", async () => {
+    const databaseId = newDatabaseId();
+    insertDatabase(databaseId);
+    insertOperation(databaseId);
+    await insertApiKey();
+    const rejectsNullIdentity = (table: string) => {
+      const row = db.prepare(`SELECT * FROM ${table} LIMIT 1`).get()!;
+      const columns = Object.keys(row);
+      const params = columns.map((column) =>
+        column === "id" ? null : row[column]!,
+      );
+      expect(() =>
+        db
+          .prepare(
+            `INSERT INTO ${table} (${columns.join(", ")}) VALUES (${columns.map(() => "?").join(", ")})`,
+          )
+          .run(...params),
+      ).toThrow(new RegExp(`NOT NULL constraint failed: ${table}\\.id`));
+    };
+    rejectsNullIdentity("projects");
+    rejectsNullIdentity("api_keys");
+    rejectsNullIdentity("size_classes");
+    rejectsNullIdentity("regions");
+    rejectsNullIdentity("nodes");
+    rejectsNullIdentity("databases");
+    rejectsNullIdentity("operations");
+  });
+
+  it("stores an API key's optional last-used UTC timestamp", async () => {
+    const id = await insertApiKey();
+    const column = db
+      .prepare("PRAGMA table_info(api_keys)")
+      .all()
+      .find((row) => row.name === "last_used_at");
+    expect(column).toMatchObject({ type: "TEXT", notnull: 0 });
+    const read = db.prepare("SELECT last_used_at FROM api_keys WHERE id = ?");
+    expect(read.get(id)).toEqual({ last_used_at: null });
+    run("UPDATE api_keys SET last_used_at = ? WHERE id = ?", NOW, id);
+    expect(read.get(id)).toEqual({ last_used_at: NOW });
+  });
+
   it("routes (database, user) through roles -> databases -> regions", () => {
     const id = newDatabaseId();
     insertDatabase(id, { observed_state: "ready", observed_generation: 1 });
@@ -146,7 +222,7 @@ describe("0001_init.sql", () => {
       id,
       desired_state: "running",
       observed_state: "ready",
-      gateway_url: "https://gateway.example.com",
+      gateway_url: gatewayUrl,
       region_id: "eu-1",
     });
     expect(route.get(id, "intruder")).toBeUndefined();
@@ -241,7 +317,7 @@ describe("0001_init.sql", () => {
     await expect(key("owner", null)).rejects.toThrow(/CHECK/);
   });
 
-  it("enforces operation state and idempotency key shape", () => {
+  it("enforces operation completion and failure state", () => {
     const id = newDatabaseId();
     insertDatabase(id);
     const op = (
@@ -267,6 +343,84 @@ describe("0001_init.sql", () => {
     expect(() => op("running", NOW)).toThrow(/CHECK/);
     expect(() => op("succeeded", NOW, "timeout")).toThrow(/CHECK/);
     expect(() => op("done", NOW)).toThrow(/CHECK/);
+  });
+
+  it("scopes idempotency keys to the API key and enforces valid state transitions", async () => {
+    const apiKeyId = await insertApiKey();
+    const otherApiKeyId = await insertApiKey();
+    const requestHash = await hashApiKey(newSecret(), newSecret());
+    const resourceId = newProjectId();
+    const insert = (
+      apiKey: string,
+      key: string,
+      state = "in_progress",
+      responseStatus: number | null = null,
+      hash = requestHash,
+    ) =>
+      run(
+        `INSERT INTO idempotency_keys (api_key_id, key, request_hash, state, resource_id, response_status, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        apiKey,
+        key,
+        hash,
+        state,
+        state === "completed" ? resourceId : null,
+        responseStatus,
+        NOW,
+      );
+    insert(apiKeyId, "create-1");
+    expect(() => insert(apiKeyId, "create-1")).toThrow(/UNIQUE/);
+    expect(() => insert(otherApiKeyId, "create-1")).not.toThrow();
+    expect(() => insert(newApiKeyId(), "unknown-key")).toThrow(/FOREIGN KEY/);
+    expect(() => insert(apiKeyId, "")).toThrow(/CHECK/);
+    expect(() => insert(apiKeyId, "contains space")).toThrow(/CHECK/);
+    expect(() => insert(apiKeyId, "x".repeat(129))).toThrow(/CHECK/);
+    expect(() =>
+      insert(apiKeyId, "bad-hash", "in_progress", null, "x"),
+    ).toThrow(/CHECK/);
+    expect(() => insert(apiKeyId, "bad-state", "pending")).toThrow(/CHECK/);
+    expect(() => insert(apiKeyId, "missing-status", "completed")).toThrow(
+      /CHECK/,
+    );
+    expect(() => insert(apiKeyId, "early-status", "in_progress", 201)).toThrow(
+      /CHECK/,
+    );
+    expect(() => insert(apiKeyId, "bad-status", "completed", 600)).toThrow(
+      /CHECK/,
+    );
+    expect(() =>
+      run(
+        "UPDATE idempotency_keys SET state = 'completed' WHERE api_key_id = ? AND key = ?",
+        apiKeyId,
+        "create-1",
+      ),
+    ).toThrow(/CHECK/);
+    run(
+      "UPDATE idempotency_keys SET state = 'completed', resource_id = ?, response_status = ? WHERE api_key_id = ? AND key = ?",
+      resourceId,
+      201,
+      apiKeyId,
+      "create-1",
+    );
+    expect(
+      db
+        .prepare(
+          "SELECT state, resource_id, response_status, request_hash FROM idempotency_keys WHERE api_key_id = ? AND key = ?",
+        )
+        .get(apiKeyId, "create-1"),
+    ).toEqual({
+      state: "completed",
+      resource_id: resourceId,
+      response_status: 201,
+      request_hash: requestHash,
+    });
+    expect(
+      db
+        .prepare(
+          "SELECT state, response_status FROM idempotency_keys WHERE api_key_id = ? AND key = ?",
+        )
+        .get(otherApiKeyId, "create-1"),
+    ).toEqual({ state: "in_progress", response_status: null });
   });
 
   it("enforces unique project external IDs only among live projects", () => {

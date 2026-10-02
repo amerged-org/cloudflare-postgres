@@ -3,7 +3,7 @@
 -- so string order equals time order for keyset pagination.
 
 CREATE TABLE projects (
-  id TEXT PRIMARY KEY
+  id TEXT PRIMARY KEY NOT NULL
     CHECK (length(id) = 24 AND substr(id, 1, 4) = 'prj_' AND NOT substr(id, 5) GLOB '*[^a-z0-9]*'),
   name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
   external_id TEXT CHECK (external_id IS NULL OR length(external_id) BETWEEN 1 AND 200),
@@ -19,7 +19,7 @@ CREATE UNIQUE INDEX projects_external_id_live_idx
 CREATE INDEX projects_created_idx ON projects(created_at DESC, id DESC);
 
 CREATE TABLE api_keys (
-  id TEXT PRIMARY KEY
+  id TEXT PRIMARY KEY NOT NULL
     CHECK (length(id) = 24 AND substr(id, 1, 4) = 'key_' AND NOT substr(id, 5) GLOB '*[^a-z0-9]*'),
   lookup_id TEXT NOT NULL UNIQUE
     CHECK (length(lookup_id) = 12 AND NOT lookup_id GLOB '*[^a-z0-9]*'),
@@ -30,6 +30,7 @@ CREATE TABLE api_keys (
   name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 200),
   created_at TEXT NOT NULL
     CHECK (created_at GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9].[0-9][0-9][0-9]Z'),
+  last_used_at TEXT,
   revoked_at TEXT,
   CHECK ((scope = 'admin' AND project_id IS NULL) OR (scope = 'integrator' AND project_id IS NOT NULL))
 );
@@ -38,7 +39,7 @@ CREATE INDEX api_keys_created_idx ON api_keys(created_at DESC, id DESC);
 CREATE INDEX api_keys_project_idx ON api_keys(project_id) WHERE project_id IS NOT NULL;
 
 CREATE TABLE size_classes (
-  id TEXT PRIMARY KEY
+  id TEXT PRIMARY KEY NOT NULL
     CHECK (length(id) BETWEEN 2 AND 32 AND substr(id, 1, 1) BETWEEN 'a' AND 'z'
       AND substr(id, -1) <> '-' AND NOT id GLOB '*[^a-z0-9-]*'),
   memory_mib INTEGER NOT NULL CHECK (memory_mib BETWEEN 256 AND 1048576),
@@ -57,7 +58,7 @@ CREATE TABLE size_classes (
 );
 
 CREATE TABLE regions (
-  id TEXT PRIMARY KEY
+  id TEXT PRIMARY KEY NOT NULL
     CHECK (length(id) BETWEEN 3 AND 32 AND substr(id, 1, 1) BETWEEN 'a' AND 'z'
       AND substr(id, -1) <> '-' AND NOT id GLOB '*[^a-z0-9-]*'),
   provider TEXT NOT NULL CHECK (length(provider) BETWEEN 2 AND 32),
@@ -78,7 +79,7 @@ CREATE TABLE regions (
 );
 
 CREATE TABLE nodes (
-  id TEXT PRIMARY KEY
+  id TEXT PRIMARY KEY NOT NULL
     CHECK (length(id) = 24 AND substr(id, 1, 4) = 'nod_' AND NOT substr(id, 5) GLOB '*[^a-z0-9]*'),
   region_id TEXT NOT NULL REFERENCES regions(id),
   k8s_node_name TEXT NOT NULL CHECK (length(k8s_node_name) BETWEEN 1 AND 253),
@@ -104,7 +105,7 @@ CREATE UNIQUE INDEX nodes_region_name_idx ON nodes(region_id, k8s_node_name);
 
 CREATE TABLE databases (
   -- The ID is also the PostgreSQL database name, so it starts with a letter.
-  id TEXT PRIMARY KEY
+  id TEXT PRIMARY KEY NOT NULL
     CHECK (length(id) = 20 AND substr(id, 1, 1) BETWEEN 'a' AND 'z' AND NOT id GLOB '*[^a-z0-9]*'),
   project_id TEXT NOT NULL REFERENCES projects(id),
   region_id TEXT NOT NULL REFERENCES regions(id),
@@ -164,7 +165,7 @@ CREATE TABLE roles (
 CREATE UNIQUE INDEX roles_one_owner_idx ON roles(database_id) WHERE owner = 1;
 
 CREATE TABLE operations (
-  id TEXT PRIMARY KEY
+  id TEXT PRIMARY KEY NOT NULL
     CHECK (length(id) = 23 AND substr(id, 1, 3) = 'op_' AND NOT substr(id, 4) GLOB '*[^a-z0-9]*'),
   kind TEXT NOT NULL CHECK (kind IN ('database.create', 'database.delete')),
   status TEXT NOT NULL CHECK (status IN ('pending', 'running', 'succeeded', 'failed')),
