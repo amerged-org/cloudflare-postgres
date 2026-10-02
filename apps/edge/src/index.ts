@@ -106,6 +106,15 @@ async function admit(
   });
   check();
   const socket = await connectGateway(route, token, env, signal);
+  if (signal.aborted) {
+    try {
+      socket.accept({ allowHalfOpen: true });
+      socket.close(1000, "connection admission interrupted");
+    } catch {
+      // An upgrade already torn down by the transport needs no further close.
+    }
+    check();
+  }
   return { socket, region: route.id };
 }
 
