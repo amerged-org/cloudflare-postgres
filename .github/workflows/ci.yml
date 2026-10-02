@@ -50,7 +50,7 @@ jobs:
         run: |
           pnpm test
           node --test infra/talos/publish-storage-capacity.test.ts
-          node --test scripts/ci/image-qualification.test.ts
+          node --test scripts/ci/*.test.ts
       - name: Render the Kubernetes manifests
         run: |
           command -v kubectl >/dev/null || { echo "kubectl not available on this runner"; exit 1; }
@@ -133,7 +133,7 @@ jobs:
             "$(cat "$RUNNER_TEMP/pgcf-image-gate/image.id")" "$GITHUB_SHA" \
             "https://github.com/$GITHUB_REPOSITORY" "$RUNNER_TEMP/pgcf-image-gate/qualification.json"
           {
-            echo 'Image qualification (all shipped layers, default gitleaks 8.30.1):'
+            echo 'Image qualification (all payload bytes and metadata, unchanged gitleaks 8.30.1 rules):'
             echo '```json'
             cat "$RUNNER_TEMP/pgcf-image-gate/qualification.json"
             echo '```'
@@ -145,17 +145,24 @@ jobs:
         run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
       - name: Push the image and record its digest
         if: steps.entries.outputs.present == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           image_id=$(cat "$RUNNER_TEMP/pgcf-image-gate/image.id")
-          for tag in "sha-${GITHUB_SHA::12}" latest; do
-            node scripts/ci/image-qualification.ts verify "$IMAGE:$tag" \
-              "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
-              "$RUNNER_TEMP/pgcf-image-gate/qualification.json"
-            docker push "$IMAGE:$tag"
-          done
-          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:latest")
+          node scripts/ci/image-qualification.ts verify "$IMAGE:sha-${GITHUB_SHA::12}" \
+            "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/pgcf-image-gate/qualification.json"
+          docker push "$IMAGE:sha-${GITHUB_SHA::12}"
+          node scripts/ci/image-qualification.ts registry "$IMAGE:sha-${GITHUB_SHA::12}" \
+            "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/pgcf-image-gate/qualification.json" "$RUNNER_TEMP/pgcf-image-gate/registry-sha.json"
+          digest=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; console.log(JSON.parse(readFileSync(process.argv[1], "utf8")).digest)' "$RUNNER_TEMP/pgcf-image-gate/registry-sha.json")
+          docker buildx imagetools create --prefer-index=false --tag "$IMAGE:latest" "$IMAGE@$digest"
+          node scripts/ci/image-qualification.ts registry "$IMAGE:latest" \
+            "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/pgcf-image-gate/qualification.json" "$RUNNER_TEMP/pgcf-image-gate/registry-latest.json"
           {
-            echo "Image digest: \`$digest\`"
+            echo "Image digest: \`$IMAGE@$digest\`"
             echo "Tags: \`sha-${GITHUB_SHA::12}\`, \`latest\`"
           } >> "$GITHUB_STEP_SUMMARY"
       - name: Remove image qualification files

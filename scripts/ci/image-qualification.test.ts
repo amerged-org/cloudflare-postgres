@@ -186,9 +186,10 @@ test("only resolves the exact verified official Node public integer finding", ()
 
 test("scanner errors and inconsistent exit codes fail closed", () => {
   assert.doesNotThrow(() => assertScanResult(0, 0));
-  assert.doesNotThrow(() => assertScanResult(1, 1));
+  assert.doesNotThrow(() => assertScanResult(2, 1));
   const cases: [number | null, number][] = [
     [2, 0],
+    [1, 1],
     [null, 0],
     [0, 1],
     [1, 0],

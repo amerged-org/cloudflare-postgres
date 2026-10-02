@@ -10,6 +10,7 @@ import {
   readFile,
   rm,
   writeFile,
+  stat,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -18,6 +19,16 @@ import { pipeline } from "node:stream/promises";
 import { pathToFileURL } from "node:url";
 import { createGunzip } from "node:zlib";
 import { extract, type Header } from "tar-stream";
+import {
+  metadataInputs,
+  prepareInputs,
+  runPass,
+  mapFindings,
+  dedupeFindings,
+  safeFindingCounts,
+  type ScanInput,
+} from "./scanner.ts";
+import { verifyRegistry } from "./registry.ts";
 
 const scannerVersion = "8.30.1";
 // SHA256 values from the official v8.30.1 release checksums, not a moving tag.
@@ -116,6 +127,8 @@ export interface LayerFile {
   sha256: string;
   size: number;
   publicLine?: string;
+  tarEntry?: number;
+  bodyOffset?: number;
 }
 
 export async function extractLayer(
@@ -125,8 +138,10 @@ export async function extractLayer(
 ): Promise<LayerFile[]> {
   const files: LayerFile[] = [];
   const links = new Set<string>();
+  let tarEntry = 0;
   await mkdir(join(directory, String(layer)), { mode: 0o700 });
   await readTar(input, async (header, stream) => {
+    const entry = tarEntry++;
     const path = safeArchivePath(header.name);
     const parts = path.split("/");
     requireCheck(
@@ -149,7 +164,14 @@ export async function extractLayer(
     });
     const metadata = await copyFileStream(stream, join(directory, scanPath));
     requireCheck(metadata.size === header.size, "Layer entry size mismatch");
-    const file: LayerFile = { path, scanPath, layer, ...metadata };
+    const file: LayerFile = {
+      path,
+      scanPath,
+      layer,
+      ...metadata,
+      tarEntry: entry,
+      bodyOffset: (header as Header & { byteOffset: number }).byteOffset,
+    };
     if (
       path === "usr/local/include/node/v8-internal.h" &&
       metadata.size === 70804
@@ -220,6 +242,7 @@ export interface Finding {
   EndColumn: number;
   Match: string;
   Secret: string;
+  Tags?: string[];
 }
 
 export function validateManifestBinding(
@@ -287,7 +310,7 @@ export function assertScanResult(
   findingCount: number,
 ): void {
   requireCheck(
-    (exit === 0 && findingCount === 0) || (exit === 1 && findingCount > 0),
+    (exit === 0 && findingCount === 0) || (exit === 2 && findingCount > 0),
     "Scanner failed or returned an inconsistent report",
   );
 }
@@ -383,7 +406,7 @@ async function hashFile(path: string): Promise<string> {
   return hash.digest("hex");
 }
 
-async function installScanner(directory: string): Promise<string> {
+export async function installScanner(directory: string): Promise<string> {
   const platform = `${process.platform}_${process.arch}`;
   const checksum = scannerArchives[platform];
   requireCheck(checksum, "Unsupported scanner host platform");
@@ -407,17 +430,20 @@ async function installScanner(directory: string): Promise<string> {
   );
   const binary = join(directory, "gitleaks");
   let found = false;
-  await readTar(
-    createReadStream(archive).pipe(createGunzip()),
-    async (header, stream) => {
-      const path = safeArchivePath(header.name);
-      requireCheck(header.type === "file", "Unexpected scanner archive entry");
-      if (path === "gitleaks") {
-        await copyFileStream(stream, binary);
-        found = true;
-      } else for await (const chunk of stream) void chunk;
-    },
+  const decompressed = join(directory, "scanner.tar");
+  await pipeline(
+    createReadStream(archive),
+    createGunzip(),
+    createWriteStream(decompressed, { flags: "wx", mode: 0o600 }),
   );
+  await readTar(createReadStream(decompressed), async (header, stream) => {
+    const path = safeArchivePath(header.name);
+    requireCheck(header.type === "file", "Unexpected scanner archive entry");
+    if (path === "gitleaks") {
+      await copyFileStream(stream, binary);
+      found = true;
+    } else for await (const chunk of stream) void chunk;
+  });
   requireCheck(found, "Scanner binary missing");
   await chmod(binary, 0o700);
   requireCheck(
@@ -452,22 +478,101 @@ async function extractImageArchive(
   return entries;
 }
 
-async function layerStream(path: string): Promise<Readable> {
-  const handle = await open(path, "r");
+export async function readLayerArchive(
+  path: string,
+  directory: string,
+  layer: number,
+  expectedDiffID: string,
+): Promise<{ files: LayerFile[]; metadata: ScanInput }> {
+  const scratch = await mkdtemp(join(directory, "decompression-"));
+  const raw = join(scratch, "layer.tar");
   const magic = Buffer.alloc(2);
   try {
-    await handle.read(magic, 0, 2, 0);
+    const handle = await open(path, "r");
+    try {
+      await handle.read(magic, 0, 2, 0);
+    } finally {
+      await handle.close();
+    }
+    const hash = createHash("sha256");
+    const hashing = new Transform({
+      transform(chunk: Buffer, _encoding, callback) {
+        hash.update(chunk);
+        callback(null, chunk);
+      },
+    });
+    const output = createWriteStream(raw, { flags: "wx", mode: 0o600 });
+    if (magic.equals(Buffer.from([0x1f, 0x8b])))
+      await pipeline(createReadStream(path), createGunzip(), hashing, output);
+    else await pipeline(createReadStream(path), hashing, output);
+    requireCheck(
+      "sha256:" + hash.digest("hex") === expectedDiffID,
+      "Saved layer digest differs from config diffID",
+    );
+    const files = await extractLayer(createReadStream(raw), directory, layer);
+    const rawSize = (await stat(raw)).size;
+    let offset = 0;
+    async function* metadataBytes() {
+      for (const file of files) {
+        const start = file.bodyOffset!;
+        requireCheck(
+          Number.isSafeInteger(start) &&
+            start >= offset &&
+            start + file.size <= rawSize,
+          "Invalid tar payload offsets",
+        );
+        if (start > offset)
+          for await (const chunk of createReadStream(raw, {
+            start: offset,
+            end: start - 1,
+          }))
+            yield chunk;
+        offset = start + file.size;
+      }
+      if (offset < rawSize)
+        for await (const chunk of createReadStream(raw, {
+          start: offset,
+          end: rawSize - 1,
+        }))
+          yield chunk;
+    }
+    const sourcePath = join(directory, `layer-${layer}-tar-metadata`);
+    const metadata = await copyFileStream(metadataBytes(), sourcePath);
+    requireCheck(
+      metadata.size + files.reduce((total, file) => total + file.size, 0) ===
+        rawSize,
+      "Tar metadata coverage mismatch",
+    );
+    return {
+      files,
+      metadata: {
+        kind: "tar-metadata",
+        layer,
+        tarEntry: null,
+        path: "tar-header-pax-link-padding",
+        sourcePath,
+        boundDigest: expectedDiffID,
+        ...metadata,
+      },
+    };
   } finally {
-    await handle.close();
+    await rm(scratch, { recursive: true, force: true });
   }
-  const stream = createReadStream(path);
-  return magic.equals(Buffer.from([0x1f, 0x8b]))
-    ? stream.pipe(createGunzip())
-    : stream;
 }
 
 interface QualificationReport {
-  version: 1;
+  version: 2;
+  canonicalFindings: number;
+  opaqueExpectedBytes: number;
+  opaqueDetectorBytes: number;
+  rawPayloadBytes: number;
+  scanInputs: number;
+  passes: Record<
+    string,
+    { aliases: number; detectorBytes: number; findings: number; exit: number }
+  >;
+  findingCounts: Record<string, number>;
+  registryLayerDigests?: string[];
   imageId: string;
   configDigest: string;
   archiveSha256: string;
@@ -567,6 +672,7 @@ export async function qualify(
       "Saved archive does not contain exactly one image",
     );
     const descriptor = manifest[0]!;
+    let registryLayerDigests: string[] | undefined;
     const configPath = entries.get(safeArchivePath(descriptor.Config));
     requireCheck(configPath, "Saved image config missing");
     const configBytes = await readFile(configPath);
@@ -589,6 +695,7 @@ export async function qualify(
         );
         return "sha256:" + layer.slice("blobs/sha256/".length);
       });
+      registryLayerDigests = layerDigests;
       validateManifestBinding(
         await readFile(manifestBlob),
         imageId,
@@ -611,68 +718,98 @@ export async function qualify(
     const scanDirectory = join(directory, "files");
     await mkdir(scanDirectory, { mode: 0o700 });
     const files: LayerFile[] = [];
+    const inputs: ScanInput[] = await metadataInputs(
+      configBytes,
+      "image-config",
+      directory,
+      configDigest,
+    );
+    const savedManifestBytes = await readFile(manifestPath);
+    inputs.push(
+      ...(await metadataInputs(
+        savedManifestBytes,
+        "image-manifest",
+        directory,
+        "sha256:" +
+          createHash("sha256").update(savedManifestBytes).digest("hex"),
+      )),
+    );
+    if (imageId !== configDigest) {
+      const manifestBytes = await readFile(
+        entries.get("blobs/sha256/" + imageId.slice(7))!,
+      );
+      inputs.push(
+        ...(await metadataInputs(
+          manifestBytes,
+          "image-manifest",
+          join(directory, "archive"),
+          imageId,
+        )),
+      );
+    }
     for (const [index, layer] of descriptor.Layers.entries()) {
       const path = entries.get(safeArchivePath(layer));
       requireCheck(path, "Saved image layer missing");
-      const hash = createHash("sha256");
-      const stream = (await layerStream(path)).pipe(
-        new Transform({
-          transform(chunk: Buffer, _encoding, callback) {
-            hash.update(chunk);
-            callback(null, chunk);
-          },
-        }),
+      const result = await readLayerArchive(
+        path,
+        scanDirectory,
+        index,
+        config.rootfs.diff_ids[index]!,
       );
-      files.push(...(await extractLayer(stream, scanDirectory, index)));
-      requireCheck(
-        "sha256:" + hash.digest("hex") === config.rootfs.diff_ids[index],
-        "Saved layer digest differs from config diffID",
+      files.push(...result.files);
+      inputs.push(result.metadata);
+      inputs.push(
+        ...result.files.map((file): ScanInput => ({
+          kind: "layer-file",
+          layer: index,
+          tarEntry: file.tarEntry!,
+          path: file.path,
+          sha256: file.sha256,
+          size: file.size,
+          sourcePath: join(scanDirectory, file.scanPath),
+          boundDigest: config.rootfs.diff_ids[index],
+        })),
       );
     }
     const scanner = await installScanner(directory);
-    const rawReport = join(directory, "findings.json");
-    await writeFile(rawReport, "", { flag: "wx", mode: 0o600 });
-    const scannerEnv = Object.fromEntries(
-      Object.entries(process.env).filter(
-        ([name]) => !name.startsWith("GITLEAKS_"),
-      ),
-    );
-    const result = await command(
+    const prepared = await prepareInputs(inputs, directory);
+    const original = await runPass(
       scanner,
-      [
-        "dir",
-        "--no-banner",
-        "--log-level",
-        "fatal",
-        "--redact",
-        "--report-format",
-        "json",
-        "--report-path",
-        rawReport,
-        ".",
-      ],
-      scanDirectory,
-      scannerEnv,
-      [0, 1],
+      prepared.original,
+      directory,
+      "original",
     );
-    const findings: unknown = JSON.parse(await readFile(rawReport, "utf8"));
-    requireCheck(
-      Array.isArray(findings) &&
-        findings.every(
-          (finding: Finding) =>
-            typeof finding.File === "string" &&
-            typeof finding.RuleID === "string",
-        ),
-      "Invalid scanner report",
-    );
-    assertScanResult(result.exit, findings.length);
-    const classification = classifyFindings(
-      findings as Finding[],
-      files,
-      base.RootFS.Layers.length,
-    );
+    const opaque = await runPass(scanner, prepared.opaque, directory, "opaque");
+    const family = await runPass(scanner, prepared.family, directory, "family");
+    const canonical = dedupeFindings([
+      ...(await mapFindings(original.findings, prepared.original.aliases)),
+      ...(await mapFindings(opaque.findings, prepared.opaque.aliases)),
+      ...(await mapFindings(family.findings, prepared.family.aliases)),
+    ]);
+    let resolved = 0;
+    for (const finding of canonical) {
+      if (finding.input.kind !== "layer-file" || finding.Tags.length) continue;
+      const file = files.find(
+        (file) =>
+          file.layer === finding.input.layer &&
+          file.tarEntry === finding.input.tarEntry &&
+          file.path === finding.input.path &&
+          file.sha256 === finding.input.sha256 &&
+          file.size === finding.input.size,
+      );
+      if (file)
+        resolved += classifyFindings(
+          [{ ...finding, File: file.scanPath }],
+          [file],
+          base.RootFS.Layers.length,
+        ).resolved;
+    }
+    const classification = {
+      resolved,
+      unresolved: canonical.length - resolved,
+    };
     const report: QualificationReport = {
-      version: 1,
+      version: 2,
       imageId,
       configDigest,
       archiveSha256,
@@ -684,13 +821,81 @@ export async function qualify(
       layers: descriptor.Layers.length,
       regularFiles: files.length,
       scanner: `gitleaks ${scannerVersion}`,
-      rawExit: result.exit!,
+      rawExit: canonical.length ? 2 : 0,
+      canonicalFindings: canonical.length,
+      opaqueExpectedBytes: prepared.opaque.expectedBytes,
+      opaqueDetectorBytes: opaque.detectorBytes,
+      rawPayloadBytes: inputs.reduce((total, input) => total + input.size, 0),
+      scanInputs: inputs.length,
+      passes: {
+        original: original.safe,
+        opaque: opaque.safe,
+        family: family.safe,
+      },
+      findingCounts: safeFindingCounts(canonical),
+      registryLayerDigests,
       ...classification,
     };
     await writeFile(reportPath, JSON.stringify(report, null, 2) + "\n", {
       flag: "wx",
       mode: 0o600,
     });
+    // Private provenance for independent review. No Match, Secret, diagnostics or raw payloads.
+    const reportDirectory = await stat(dirname(reportPath));
+    requireCheck(
+      (reportDirectory.mode & 0o777) === 0o700,
+      "Qualification report directory is not private",
+    );
+    await writeFile(
+      reportPath + ".provenance.json",
+      JSON.stringify({
+        candidate: {
+          imageId,
+          configDigest,
+          archiveSha256,
+          sourceUri: source,
+          sourceRevision: revision,
+          sourceUriSha256: createHash("sha256").update(source).digest("hex"),
+          baseImage,
+          baseImageId: base.Id,
+          baseDiffIDs: base.RootFS.Layers,
+          implementationSha256: createHash("sha256")
+            .update(await readFile("scripts/ci/image-qualification.ts"))
+            .update(await readFile("scripts/ci/scanner.ts"))
+            .digest("hex"),
+        },
+        findings: canonical.map((finding) => ({
+          kind: finding.input.kind,
+          layer: finding.input.layer,
+          tarEntry: finding.input.tarEntry,
+          path: finding.input.path,
+          pathSha256: createHash("sha256")
+            .update(finding.input.path)
+            .digest("hex"),
+          sha256: finding.input.sha256,
+          size: finding.input.size,
+          boundDigest: finding.input.boundDigest,
+          officialBaseMembership:
+            finding.input.layer !== null &&
+            finding.input.layer < base.RootFS.Layers.length,
+          tarBodyOffset:
+            finding.input.kind === "layer-file"
+              ? files.find(
+                  (file) =>
+                    file.layer === finding.input.layer &&
+                    file.tarEntry === finding.input.tarEntry,
+                )?.bodyOffset
+              : undefined,
+          rule: finding.RuleID,
+          startLine: finding.StartLine,
+          endLine: finding.EndLine,
+          startColumn: finding.StartColumn,
+          endColumn: finding.EndColumn,
+          tags: finding.Tags,
+        })),
+      }),
+      { flag: "wx", mode: 0o600 },
+    );
     requireCheck(
       classification.unresolved === 0,
       "Image has unresolved scanner findings",
@@ -706,8 +911,15 @@ export async function qualify(
 }
 
 async function main(): Promise<void> {
-  const [action, image, imageId, revision, source, reportPath] =
-    process.argv.slice(2);
+  const [
+    action,
+    image,
+    imageId,
+    revision,
+    source,
+    reportPath,
+    registryReportPath,
+  ] = process.argv.slice(2);
   if (action === "runtime") {
     requireCheck(image, "Missing runtime image");
     await qualifyRuntime(image);
@@ -720,23 +932,31 @@ async function main(): Promise<void> {
   if (action === "qualify") {
     const report = await qualify(image, imageId, revision, source, reportPath);
     console.log(JSON.stringify(report));
-  } else if (action === "verify") {
+  } else if (action === "verify" || action === "registry") {
     const report = JSON.parse(
       await readFile(reportPath, "utf8"),
     ) as QualificationReport;
     requireCheck(
-      report.version === 1 &&
+      report.version === 2 &&
         report.imageId === imageId &&
         report.revision === revision &&
         report.source === source &&
         report.unresolved === 0 &&
-        (report.rawExit === 0 || report.rawExit === 1),
+        (report.rawExit === 0 || report.rawExit === 2) &&
+        report.opaqueExpectedBytes === report.opaqueDetectorBytes,
       "Qualification report does not authorize this image",
     );
-    requireCheck(
-      (await inspectImage(image)).Id === imageId,
-      "Image tag differs from the qualified image",
-    );
+    if (action === "registry") {
+      requireCheck(
+        registryReportPath,
+        "Missing registry verification report path",
+      );
+      await verifyRegistry(image, report, registryReportPath);
+    } else
+      requireCheck(
+        (await inspectImage(image)).Id === imageId,
+        "Image tag differs from the qualified image",
+      );
   } else throw new Error("Unknown qualification action");
 }
 
