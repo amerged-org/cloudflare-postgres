@@ -10,6 +10,8 @@
 !apps/**
 !packages/
 !packages/**
+!scripts/
+!scripts/*/package.json
 **/node_modules
 **/dist
 **/.wrangler

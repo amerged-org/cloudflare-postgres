@@ -1,0 +1,103 @@
+# SPDX-License-Identifier: Apache-2.0
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pnpm at the version in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint
+        run: pnpm lint
+      - name: Check formatting
+        run: pnpm format:check
+      - name: Typecheck
+        run: pnpm typecheck
+      - name: Test
+        run: pnpm test
+      - name: Render the Kubernetes manifests
+        run: |
+          command -v kubectl >/dev/null || { echo "kubectl not available on this runner"; exit 1; }
+          for dir in infra/platform infra/platform/regional; do
+            if [ -f "$dir/kustomization.yaml" ]; then
+              echo "kubectl kustomize $dir"
+              kubectl kustomize "$dir" > /dev/null
+            else
+              echo "skipping $dir: no kustomization.yaml"
+            fi
+          done
+
+  image:
+    needs: check
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/amerged-org/pgcf-regional
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the linux/amd64 image
+        run: |
+          docker buildx build --platform linux/amd64 --load \
+            --provenance=false --sbom=false \
+            --file apps/regional/Dockerfile \
+            --tag "$IMAGE:sha-${GITHUB_SHA::12}" \
+            --tag "$IMAGE:latest" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.licenses=Apache-2.0" \
+            .
+      - name: Fail if the image contains .env or .pem files
+        run: |
+          # find exits 1 on unreadable directories such as /root; only its output matters.
+          found=$(docker run --rm --platform linux/amd64 --entrypoint find "$IMAGE:latest" \
+            / -xdev \( -name '.env*' -o -name '*.pem' \) -print 2>/dev/null || true)
+          if [ -n "$found" ]; then
+            echo "Forbidden files in the image:"
+            echo "$found"
+            exit 1
+          fi
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Push the image and record its digest
+        run: |
+          docker push "$IMAGE:sha-${GITHUB_SHA::12}"
+          docker push "$IMAGE:latest"
+          digest=$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:latest")
+          {
+            echo "Image digest: \`$digest\`"
+            echo "Tags: \`sha-${GITHUB_SHA::12}\`, \`latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
