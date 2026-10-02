@@ -1,0 +1,21 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pgcf-api-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-02",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "pgcf-api-test",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVE",
+      "bucket_name": "pgcf-api-test",
+      "jurisdiction": "eu",
+    },
+  ],
+  "vars": { "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>" },
+}

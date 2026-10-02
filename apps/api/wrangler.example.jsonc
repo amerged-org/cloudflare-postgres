@@ -1,0 +1,30 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pgcf-api-dev",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-02",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "<D1_DATABASE_NAME>",
+      "database_id": "<D1_DATABASE_ID>",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARCHIVE",
+      "bucket_name": "replace-r2-backup-bucket",
+      "jurisdiction": "eu",
+    },
+  ],
+  "vars": { "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>" },
+  "secrets": {
+    "required": [
+      "API_KEY_PEPPER",
+      "CREDENTIAL_KEYS",
+      "ROUTE_MASTER_KEYS",
+      "BOOTSTRAP_TOKEN",
+    ],
+  },
+}
