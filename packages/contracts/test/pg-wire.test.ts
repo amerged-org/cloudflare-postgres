@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CANCEL_REQUEST_CODE,
   DEFAULT_MAX_BUFFERED,
   GSSENC_REQUEST_CODE,
+  STARTUP_MAX_LENGTH,
   StartupReader,
   encodeEncryptionDeclined,
   encodeErrorResponse,
@@ -211,6 +212,42 @@ describe("encodings", () => {
     expect(() => encodeStartup({ user: "a\0b" })).toThrow(RangeError);
     expect(() => encodeStartup({ user: "x".repeat(10000) })).toThrow(
       RangeError,
+    );
+  });
+
+  it("rejects oversized source parameters before allocating encoded bytes", () => {
+    const encode = vi.spyOn(TextEncoder.prototype, "encode");
+    try {
+      expect(() =>
+        encodeStartup({ user: "x".repeat(STARTUP_MAX_LENGTH) }),
+      ).toThrow("startup too large");
+      expect(encode.mock.calls.length).toBe(0);
+      expect(() =>
+        encodeStartup({ ["x".repeat(STARTUP_MAX_LENGTH)]: "u" }),
+      ).toThrow("startup too large");
+      expect(encode.mock.calls.length).toBe(0);
+      expect(() =>
+        encodeStartup(
+          new Map([
+            ["user", "x".repeat(4990)],
+            ["options", "y".repeat(4990)],
+          ]),
+        ),
+      ).toThrow("startup too large");
+      expect(encode.mock.calls.length).toBe(0);
+    } finally {
+      encode.mockRestore();
+    }
+  });
+
+  it("enforces the exact UTF-8 byte limit for multibyte source parameters", () => {
+    const value = "€".repeat(3328) + "x";
+    const encoded = encodeStartup({ user: value });
+    expect(encoded.length).toBe(STARTUP_MAX_LENGTH);
+    const parsed = single(encoded);
+    expect(parsed.kind === "startup" && parsed.user).toBe(value);
+    expect(() => encodeStartup({ user: value + "x" })).toThrow(
+      "startup too large",
     );
   });
 });

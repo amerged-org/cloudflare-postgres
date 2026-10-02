@@ -227,18 +227,26 @@ export function encodeStartup(
     params instanceof Map
       ? [...(params as ReadonlyMap<string, string>)]
       : Object.entries(params);
+  // UTF-16 code-unit count is a lower bound on UTF-8 bytes.
+  let sourceLength = 9;
+  for (const [key, value] of entries) {
+    sourceLength += key.length + value.length + 2;
+    if (sourceLength > STARTUP_MAX_LENGTH)
+      throw new RangeError("startup too large");
+    if (key === "" || key.includes("\0") || value.includes("\0"))
+      throw new RangeError("invalid startup parameter");
+  }
   const parts: Uint8Array[] = [];
   let length = 9;
   for (const [key, value] of entries) {
-    if (key === "" || key.includes("\0") || value.includes("\0"))
-      throw new RangeError("invalid startup parameter");
     for (const text of [key, value]) {
       const bytes = encoder.encode(text);
-      parts.push(bytes);
       length += bytes.length + 1;
+      if (length > STARTUP_MAX_LENGTH)
+        throw new RangeError("startup too large");
+      parts.push(bytes);
     }
   }
-  if (length > STARTUP_MAX_LENGTH) throw new RangeError("startup too large");
   const out = new Uint8Array(length);
   writeUint32(out, 0, length);
   writeUint32(out, 4, (3 << 16) | minor);
