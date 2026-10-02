@@ -130,19 +130,22 @@ test("credential request carries one validated marker in its URL and header", ()
   });
 });
 
-test("native Pool clients keep concurrent trace markers on separate WebSocket URLs", async () => {
+test("native Pool clients keep interleaved database, role and trace hints separate", async () => {
   const env = environment();
+  const other = environment();
+  const role = `r${randomBytes(8).toString("hex")}`;
   const password = randomBytes(32).toString("base64url");
   const uri = `postgres://app:${password}@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`;
+  const otherUri = `postgres://${role}:${password}@${env.ENDPOINT_HOST}/${other.DATABASE_ID}`;
   const first = randomBytes(24).toString("hex");
   const second = randomBytes(24).toString("hex");
   const globalProxy = neonConfig.wsProxy;
   const a = probe.probePool(uri, first);
-  const b = probe.probePool(uri, second);
+  const b = probe.probePool(otherUri, second);
   const plain = probe.probePool(uri);
   try {
     const clientA = new a.Client({ connectionString: uri });
-    const clientB = new b.Client({ connectionString: uri });
+    const clientB = new b.Client({ connectionString: otherUri });
     const clientPlain = new plain.Client({ connectionString: uri });
     const urlA = new URL(
       `wss://${clientA.neonConfig.wsProxyAddrForHost(env.ENDPOINT_HOST, 5432)}`,
@@ -150,18 +153,185 @@ test("native Pool clients keep concurrent trace markers on separate WebSocket UR
     const urlB = new URL(
       `wss://${clientB.neonConfig.wsProxyAddrForHost(env.ENDPOINT_HOST, 5432)}`,
     );
+    const urlPlain = new URL(
+      `wss://${clientPlain.neonConfig.wsProxyAddrForHost(env.ENDPOINT_HOST, 5432)}`,
+    );
     assert.equal(urlA.searchParams.get("pgcf_trace"), first);
     assert.equal(urlB.searchParams.get("pgcf_trace"), second);
+    assert.equal(urlA.searchParams.get("database"), env.DATABASE_ID);
+    assert.equal(urlA.searchParams.get("user"), "app");
+    assert.equal(urlB.searchParams.get("database"), other.DATABASE_ID);
+    assert.equal(urlB.searchParams.get("user"), role);
+    assert.equal(urlPlain.searchParams.get("database"), env.DATABASE_ID);
+    assert.equal(urlPlain.searchParams.get("user"), "app");
+    assert.equal(urlPlain.searchParams.has("pgcf_trace"), false);
     assert.equal(urlA.pathname, "/v2");
     assert.equal(urlB.pathname, "/v2");
     assert.equal(neonConfig.wsProxy, globalProxy);
-    assert.equal(clientPlain.neonConfig.wsProxy, globalProxy);
+    assert.equal(neonConfig.wsProxy, globalProxy);
     assert.equal(clientA.neonConfig.useSecureWebSocket, true);
     assert.equal(clientA.neonConfig.pipelineConnect, false);
     assert.equal(clientA.neonConfig.forceDisablePgSSL, true);
   } finally {
     await Promise.all([a.end(), b.end(), plain.end()]);
   }
+});
+
+test("probe Pool refuses an implicit database instead of letting the driver default it", () => {
+  const env = environment();
+  assert.throws(() => probe.probePool(`postgres://app@${env.ENDPOINT_HOST}/`), {
+    message: "connection_metadata_invalid",
+  });
+});
+
+test("probe Pool refuses an implicit user instead of letting the driver default it", () => {
+  const env = environment();
+  assert.throws(
+    () => probe.probePool(`postgres://${env.ENDPOINT_HOST}/${env.DATABASE_ID}`),
+    { message: "connection_metadata_invalid" },
+  );
+});
+
+test("probe Pool refuses connection-option overrides and URI fragments", () => {
+  const env = environment();
+  const uri = `postgres://app@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`;
+  const changed = new URL(uri);
+  changed.searchParams.set("host", ["other", "test"].join("."));
+  assert.throws(() => probe.probePool(changed.href), {
+    message: "connection_metadata_invalid",
+  });
+  changed.search = "";
+  changed.hash = "route";
+  assert.throws(() => probe.probePool(changed.href), {
+    message: "connection_metadata_invalid",
+  });
+});
+
+test("encoded URI identities produce decoded hints without password or credential fields", async () => {
+  const env = environment();
+  const password = `${randomBytes(16).toString("base64url")}:&?=${randomBytes(16).toString("base64url")}`;
+  const uri = `postgres://%61%70%70:${encodeURIComponent(password)}@${env.ENDPOINT_HOST}/%64${env.DATABASE_ID.slice(1)}`;
+  const marker = randomBytes(24).toString("hex");
+  const pool = probe.probePool(uri, marker);
+  try {
+    const client = new pool.Client({ connectionString: uri });
+    const url = new URL(
+      `wss://${client.neonConfig.wsProxyAddrForHost(env.ENDPOINT_HOST, 5432)}`,
+    );
+    assert.equal(url.searchParams.get("database"), env.DATABASE_ID);
+    assert.equal(url.searchParams.get("user"), "app");
+    assert.deepEqual([...url.searchParams.keys()].sort(), [
+      "database",
+      "pgcf_trace",
+      "user",
+    ]);
+    assert.equal(client.database, url.searchParams.get("database"));
+    assert.equal(client.user, url.searchParams.get("user"));
+    assert.equal(url.username, "");
+    assert.equal(url.password, "");
+    assert(!url.href.includes(password));
+    assert(!url.href.includes(encodeURIComponent(password)));
+  } finally {
+    await pool.end();
+  }
+});
+
+test("a reset password keeps the same role hint and cannot leak into its WebSocket URL", async () => {
+  const env = environment();
+  const oldPassword = randomBytes(32).toString("base64url");
+  const newPassword = randomBytes(32).toString("base64url");
+  const oldUri = `postgres://app:${oldPassword}@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`;
+  const newUri = `postgres://app:${newPassword}@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`;
+  const oldPool = probe.probePool(oldUri);
+  const newPool = probe.probePool(newUri);
+  try {
+    const oldClient = new oldPool.Client({ connectionString: oldUri });
+    const newClient = new newPool.Client({ connectionString: newUri });
+    const oldAddress = oldClient.neonConfig.wsProxyAddrForHost(
+      env.ENDPOINT_HOST,
+      5432,
+    );
+    const newAddress = newClient.neonConfig.wsProxyAddrForHost(
+      env.ENDPOINT_HOST,
+      5432,
+    );
+    assert.equal(oldAddress, newAddress);
+    assert.equal(
+      new URL(`wss://${newAddress}`).searchParams.get("user"),
+      "app",
+    );
+    assert(!newAddress.includes(oldPassword));
+    assert(!newAddress.includes(newPassword));
+  } finally {
+    await Promise.all([oldPool.end(), newPool.end()]);
+  }
+});
+
+test("a Pool client and proxy cannot redirect the bound connection identity", async () => {
+  const env = environment();
+  const other = environment();
+  const uri = `postgres://app@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`;
+  const pool = probe.probePool(uri);
+  try {
+    assert.throws(
+      () =>
+        new pool.Client({
+          connectionString: `postgres://app@${env.ENDPOINT_HOST}/${other.DATABASE_ID}`,
+        }),
+      { message: "connection_metadata_invalid" },
+    );
+    const client = new pool.Client({ connectionString: uri });
+    assert.throws(
+      () =>
+        client.neonConfig.wsProxyAddrForHost(["other", "test"].join("."), 5432),
+      { message: "connection_metadata_invalid" },
+    );
+  } finally {
+    await pool.end();
+  }
+});
+
+async function refusedMetadata(transform: (uri: URL) => void): Promise<void> {
+  const env = environment(new Date(Date.now() + 60_000).toISOString());
+  const password = randomBytes(32).toString("base64url");
+  const uri = new URL(
+    `postgres://app:${password}@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`,
+  );
+  transform(uri);
+  const original = globalThis.fetch;
+  globalThis.fetch = async () =>
+    Response.json({ uri: uri.href, includes_password: true });
+  try {
+    const reply = await probe.default.fetch(
+      new Request(`https://${["probe", "test"].join(".")}/metadata`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.PROBE_BEARER}` },
+      }),
+      env,
+    );
+    assert.equal(reply.status, 500);
+    assert.deepEqual(await reply.json(), { code: "probe_failed" });
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+
+test("connection metadata refuses a different database in the returned URI", async () => {
+  await refusedMetadata((uri) => {
+    uri.pathname = `/${environment().DATABASE_ID}`;
+  });
+});
+
+test("connection metadata refuses a different role in the returned URI", async () => {
+  await refusedMetadata((uri) => {
+    uri.username = `r${randomBytes(8).toString("hex")}`;
+  });
+});
+
+test("connection metadata refuses a different endpoint in the returned URI", async () => {
+  await refusedMetadata((uri) => {
+    uri.hostname = ["other", "test"].join(".");
+  });
 });
 
 test("integrator trace uses the credential URI request and returns only safe metadata", async () => {
