@@ -16,3 +16,6 @@ wrangler.jsonc
 wrangler.json
 wrangler.toml
 worker-configuration.d.ts
+
+# Local agent harness state
+.claude/
