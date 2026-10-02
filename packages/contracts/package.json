@@ -1,0 +1,22 @@
+{
+  "name": "@pgcf/contracts",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./route-token": "./src/route-token.ts",
+    "./pg-wire": "./src/pg-wire.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "vitest": "^4.1.0"
+  }
+}

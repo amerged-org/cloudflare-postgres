@@ -1,0 +1,19 @@
+{
+  "name": "@pgcf/e2e",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "1.2.0",
+    "@pgcf/contracts": "workspace:*",
+    "pg": "^8.23.0"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.15.0",
+    "wrangler": "^4.142.0"
+  }
+}

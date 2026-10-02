@@ -1,0 +1,19 @@
+{
+  "name": "@pgcf/edge",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@pgcf/contracts": "workspace:*"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "^1.3.5",
+    "vitest": "^4.1.0",
+    "wrangler": "^4.142.0"
+  }
+}
