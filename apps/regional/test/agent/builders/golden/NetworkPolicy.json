@@ -1,0 +1,103 @@
+[
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "NetworkPolicy",
+    "metadata": {
+      "name": "default-deny",
+      "namespace": "$NAMESPACE",
+      "labels": {
+        "pgcf.io/database-id": "$DATABASE_ID"
+      }
+    },
+    "spec": {
+      "podSelector": {},
+      "policyTypes": ["Ingress", "Egress"]
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "NetworkPolicy",
+    "metadata": {
+      "name": "gateway-ingress",
+      "namespace": "$NAMESPACE",
+      "labels": {
+        "pgcf.io/database-id": "$DATABASE_ID"
+      }
+    },
+    "spec": {
+      "podSelector": {
+        "matchLabels": {
+          "cnpg.io/cluster": "database"
+        }
+      },
+      "policyTypes": ["Ingress"],
+      "ingress": [
+        {
+          "from": [
+            {
+              "namespaceSelector": {
+                "matchLabels": {
+                  "kubernetes.io/metadata.name": "pgcf-system"
+                }
+              },
+              "podSelector": {
+                "matchLabels": {
+                  "app.kubernetes.io/name": "pgcf-gateway"
+                }
+              }
+            }
+          ],
+          "ports": [
+            {
+              "port": 5432,
+              "protocol": "TCP"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "apiVersion": "networking.k8s.io/v1",
+    "kind": "NetworkPolicy",
+    "metadata": {
+      "name": "agent-metrics-ingress",
+      "namespace": "$NAMESPACE",
+      "labels": {
+        "pgcf.io/database-id": "$DATABASE_ID"
+      }
+    },
+    "spec": {
+      "podSelector": {
+        "matchLabels": {
+          "cnpg.io/cluster": "database"
+        }
+      },
+      "policyTypes": ["Ingress"],
+      "ingress": [
+        {
+          "from": [
+            {
+              "namespaceSelector": {
+                "matchLabels": {
+                  "kubernetes.io/metadata.name": "pgcf-system"
+                }
+              },
+              "podSelector": {
+                "matchLabels": {
+                  "app.kubernetes.io/name": "pgcf-agent"
+                }
+              }
+            }
+          ],
+          "ports": [
+            {
+              "port": 9187,
+              "protocol": "TCP"
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

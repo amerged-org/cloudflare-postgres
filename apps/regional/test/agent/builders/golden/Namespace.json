@@ -1,0 +1,14 @@
+[
+  {
+    "apiVersion": "v1",
+    "kind": "Namespace",
+    "metadata": {
+      "name": "$NAMESPACE",
+      "labels": {
+        "pgcf.io/database-id": "$DATABASE_ID",
+        "pod-security.kubernetes.io/enforce": "restricted",
+        "pod-security.kubernetes.io/enforce-version": "latest"
+      }
+    }
+  }
+]

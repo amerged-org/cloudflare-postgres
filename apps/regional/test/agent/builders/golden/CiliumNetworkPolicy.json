@@ -1,0 +1,155 @@
+[
+  {
+    "apiVersion": "cilium.io/v2",
+    "kind": "CiliumNetworkPolicy",
+    "metadata": {
+      "name": "database-boundaries",
+      "namespace": "$NAMESPACE",
+      "labels": {
+        "pgcf.io/database-id": "$DATABASE_ID"
+      }
+    },
+    "spec": {
+      "endpointSelector": {
+        "matchLabels": {
+          "cnpg.io/cluster": "database"
+        }
+      },
+      "ingress": [
+        {
+          "fromEndpoints": [
+            {
+              "matchLabels": {
+                "k8s:io.kubernetes.pod.namespace": "pgcf-system",
+                "k8s:app.kubernetes.io/name": "pgcf-gateway"
+              }
+            }
+          ],
+          "toPorts": [
+            {
+              "ports": [
+                {
+                  "port": "5432",
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "fromEndpoints": [
+            {
+              "matchLabels": {
+                "k8s:io.kubernetes.pod.namespace": "pgcf-system",
+                "k8s:app.kubernetes.io/name": "pgcf-agent"
+              }
+            }
+          ],
+          "toPorts": [
+            {
+              "ports": [
+                {
+                  "port": "9187",
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "fromEndpoints": [
+            {
+              "matchLabels": {
+                "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                "k8s:app.kubernetes.io/name": "cloudnative-pg"
+              }
+            },
+            {
+              "matchLabels": {
+                "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                "k8s:app.kubernetes.io/name": "plugin-barman-cloud"
+              }
+            }
+          ],
+          "toPorts": [
+            {
+              "ports": [
+                {
+                  "port": "8000",
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          ]
+        }
+      ],
+      "egress": [
+        {
+          "toEndpoints": [
+            {
+              "matchLabels": {
+                "k8s:io.kubernetes.pod.namespace": "kube-system",
+                "k8s:k8s-app": "kube-dns"
+              }
+            }
+          ],
+          "toPorts": [
+            {
+              "ports": [
+                {
+                  "port": "53",
+                  "protocol": "UDP"
+                },
+                {
+                  "port": "53",
+                  "protocol": "TCP"
+                }
+              ],
+              "rules": {
+                "dns": [
+                  {
+                    "matchPattern": "*"
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "toEntities": ["kube-apiserver"],
+          "toPorts": [
+            {
+              "ports": [
+                {
+                  "port": "443",
+                  "protocol": "TCP"
+                },
+                {
+                  "port": "6443",
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          ]
+        },
+        {
+          "toFQDNs": [
+            {
+              "matchName": "$ENDPOINT_HOST"
+            }
+          ],
+          "toPorts": [
+            {
+              "ports": [
+                {
+                  "port": "443",
+                  "protocol": "TCP"
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

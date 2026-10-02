@@ -1,0 +1,54 @@
+[
+  {
+    "apiVersion": "barmancloud.cnpg.io/v1",
+    "kind": "ObjectStore",
+    "metadata": {
+      "name": "archive",
+      "namespace": "$NAMESPACE",
+      "labels": {
+        "pgcf.io/database-id": "$DATABASE_ID"
+      }
+    },
+    "spec": {
+      "configuration": {
+        "destinationPath": "$ARCHIVE_DESTINATION",
+        "endpointURL": "$ENDPOINT",
+        "s3Credentials": {
+          "accessKeyId": {
+            "name": "archive-credentials",
+            "key": "AWS_ACCESS_KEY_ID"
+          },
+          "secretAccessKey": {
+            "name": "archive-credentials",
+            "key": "AWS_SECRET_ACCESS_KEY"
+          }
+        },
+        "wal": {
+          "compression": "gzip"
+        },
+        "data": {
+          "compression": "gzip"
+        }
+      },
+      "retentionPolicy": "7d",
+      "instanceSidecarConfiguration": {
+        "env": [
+          {
+            "name": "AWS_DEFAULT_REGION",
+            "value": "auto"
+          }
+        ],
+        "resources": {
+          "requests": {
+            "cpu": "100m",
+            "memory": "128Mi"
+          },
+          "limits": {
+            "cpu": "500m",
+            "memory": "512Mi"
+          }
+        }
+      }
+    }
+  }
+]

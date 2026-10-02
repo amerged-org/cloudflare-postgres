@@ -1,0 +1,25 @@
+[
+  {
+    "apiVersion": "postgresql.cnpg.io/v1",
+    "kind": "ScheduledBackup",
+    "metadata": {
+      "name": "daily-backup",
+      "namespace": "$NAMESPACE",
+      "labels": {
+        "pgcf.io/database-id": "$DATABASE_ID"
+      }
+    },
+    "spec": {
+      "schedule": "0 0 3 * * *",
+      "immediate": true,
+      "backupOwnerReference": "none",
+      "cluster": {
+        "name": "database"
+      },
+      "method": "plugin",
+      "pluginConfiguration": {
+        "name": "barman-cloud.cloudnative-pg.io"
+      }
+    }
+  }
+]

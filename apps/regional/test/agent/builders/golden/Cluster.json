@@ -1,0 +1,92 @@
+[
+  {
+    "apiVersion": "postgresql.cnpg.io/v1",
+    "kind": "Cluster",
+    "metadata": {
+      "name": "database",
+      "namespace": "$NAMESPACE",
+      "labels": {
+        "pgcf.io/database-id": "$DATABASE_ID"
+      }
+    },
+    "spec": {
+      "instances": 1,
+      "imageName": "$POSTGRES_IMAGE",
+      "inheritedMetadata": {
+        "labels": {
+          "pgcf.io/database-id": "$DATABASE_ID"
+        }
+      },
+      "enableSuperuserAccess": false,
+      "bootstrap": {
+        "initdb": {
+          "database": "$DATABASE_ID",
+          "owner": "app",
+          "secret": {
+            "name": "role-app"
+          }
+        }
+      },
+      "affinity": {
+        "nodeSelector": {
+          "kubernetes.io/hostname": "$NODE"
+        }
+      },
+      "resources": {
+        "requests": {
+          "cpu": "500m",
+          "memory": "512Mi"
+        },
+        "limits": {
+          "cpu": "500m",
+          "memory": "512Mi"
+        }
+      },
+      "seccompProfile": {
+        "type": "RuntimeDefault"
+      },
+      "storage": {
+        "storageClass": "pgcf-lvm",
+        "size": "5Gi"
+      },
+      "postgresql": {
+        "parameters": {
+          "shared_buffers": "128MB",
+          "effective_cache_size": "256MB",
+          "max_connections": "30",
+          "archive_timeout": "60s"
+        },
+        "pg_hba": ["hostnossl all all all reject"]
+      },
+      "managed": {
+        "roles": [
+          {
+            "name": "$MANAGED_ROLE",
+            "ensure": "present",
+            "login": true,
+            "superuser": false,
+            "createdb": false,
+            "createrole": false,
+            "replication": false,
+            "bypassrls": false,
+            "inherit": true,
+            "passwordSecret": {
+              "name": "$MANAGED_SECRET"
+            }
+          }
+        ]
+      },
+      "plugins": [
+        {
+          "name": "barman-cloud.cloudnative-pg.io",
+          "enabled": true,
+          "isWALArchiver": true,
+          "parameters": {
+            "barmanObjectName": "archive",
+            "serverName": "database"
+          }
+        }
+      ]
+    }
+  }
+]
