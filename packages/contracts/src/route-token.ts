@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Edge-to-gateway routing token. Pure WebCrypto so it runs in Workers and Node.
 //
-// Token:      v1.<payloadB64u>.<sigB64u>
-// Signature:  HMAC-SHA256(K, "pgcf-route/v1\n" + payloadB64u)
+// Token:      v2.<payloadB64u>.<sigB64u>
+// Signature:  HMAC-SHA256(K, "pgcf-route/v2\n" + payloadB64u)
 // Region key: K = HMAC-SHA256(master[kid], "pgcf-route-key/v1\n" + regionId)
 //
 // The edge holds the master keyring and signs; a gateway holds only the keyring
@@ -10,7 +10,7 @@
 // any other region.
 import { z } from "zod";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
-import { DATABASE_ID_PATTERN, REGION_ID_PATTERN } from "./ids.ts";
+import { DATABASE_ID_PATTERN, REGION_ID_PATTERN, RoleName } from "./ids.ts";
 
 export const ROUTE_TOKEN_HEADER = "X-PGCF-Route";
 export const ROUTE_TOKEN_MAX_LENGTH = 512;
@@ -19,8 +19,8 @@ export const ROUTE_TOKEN_MAX_LIFETIME_SECONDS = 30;
 export const ROUTE_TOKEN_SKEW_SECONDS = 5;
 export const ROUTE_KEY_MIN_BYTES = 32;
 
-const TOKEN_PREFIX = "v1";
-const SIGNATURE_DOMAIN = "pgcf-route/v1\n";
+const TOKEN_PREFIX = "v2";
+const SIGNATURE_DOMAIN = "pgcf-route/v2\n";
 const KEY_DOMAIN = "pgcf-route-key/v1\n";
 const SIGNATURE_BYTES = 32;
 
@@ -29,8 +29,9 @@ const cidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export const routeTokenClaimsSchema = z.strictObject({
-  v: z.literal(1),
+  v: z.literal(2),
   db: z.string().regex(DATABASE_ID_PATTERN),
+  user: RoleName,
   cid: z.string().regex(cidPattern),
   rg: z.string().regex(REGION_ID_PATTERN),
   kid: z.string().regex(kidPattern),
@@ -112,6 +113,7 @@ export interface SignRouteTokenInput {
   readonly keyring: RouteKeyring;
   readonly region: string;
   readonly db: string;
+  readonly user: RoleName;
   readonly cid: string;
   /** Milliseconds since the epoch. */
   readonly now?: number;
@@ -128,8 +130,9 @@ export async function signRouteToken(
   if (master === undefined) throw new RangeError("active key missing");
   const iat = Math.floor((input.now ?? Date.now()) / 1000);
   const claims = routeTokenClaimsSchema.safeParse({
-    v: 1,
+    v: 2,
     db: input.db,
+    user: input.user,
     cid: input.cid,
     rg: input.region,
     kid: input.keyring.active,
