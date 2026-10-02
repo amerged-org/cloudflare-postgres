@@ -197,7 +197,7 @@ export const DatabaseObservation = z.strictObject({
   message: z.string().max(TEXT_MAX_LENGTH).optional(),
   archive: z.strictObject({
     continuous: z.boolean(),
-    ready_wal_files: Count,
+    ready_wal_files: Count.nullable(),
   }),
 });
 export type DatabaseObservation = z.infer<typeof DatabaseObservation>;

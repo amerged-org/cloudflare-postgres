@@ -286,6 +286,37 @@ describe("DesiredDatabase", () => {
 });
 
 describe("ObservationRequest", () => {
+  it("records unavailable WAL samples as null and rejects invalid counts", () => {
+    const value = observation();
+    value.databases = [
+      {
+        id,
+        generation: 1,
+        state: "provisioning",
+        archive: { continuous: false, ready_wal_files: null },
+      },
+    ];
+    expect(ObservationRequest.safeParse(value).success).toBe(true);
+    value.databases = [
+      {
+        id,
+        generation: 1,
+        state: "ready",
+        archive: { continuous: true, ready_wal_files: -1 },
+      },
+    ];
+    expect(ObservationRequest.safeParse(value).success).toBe(false);
+    value.databases = [
+      {
+        id,
+        generation: 1,
+        state: "ready",
+        archive: { continuous: true, ready_wal_files: 1.5 },
+      },
+    ];
+    expect(ObservationRequest.safeParse(value).success).toBe(false);
+  });
+
   it("accepts a full observation", () => {
     expect(ObservationRequest.safeParse(observation()).success).toBe(true);
   });
