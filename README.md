@@ -30,7 +30,7 @@ flowchart LR
   end
 
   subgraph CF["Your Cloudflare account: control plane"]
-    Edge["Edge Worker<br/>*.db.your-domain"]
+    Edge["Edge Worker<br/>db.your-domain"]
     API["API Worker<br/>/v1"]
     DBA["DatabaseActor DO<br/>per database: wake, idle, traffic"]
     RL["RegionLink DO<br/>per region"]
@@ -54,7 +54,7 @@ flowchart LR
   Tools --> Edge
   Integrator -->|"manage, usage, costs"| API
   Edge <--> DBA
-  Edge -->|"Tunnel and Access"| CFD
+  Edge -->|"Cloudflare transport, signed route"| CFD
   CFD --> GW
   GW --> PG
   API --> D1
@@ -69,7 +69,7 @@ flowchart LR
   Boot -->|"install Talos, join"| Region
 ```
 
-Connecting to a sleeping database:
+Connecting to a sleeping database (sleep and wake arrive in Phase 2; in Phase 1 databases always run):
 
 ```mermaid
 sequenceDiagram
@@ -80,7 +80,7 @@ sequenceDiagram
   participant G as Regional agent
   participant P as PostgreSQL
 
-  C->>E: wss://db-id.db.your-domain
+  C->>E: wss://db.your-domain/v2 (database=id, user)
   E->>A: ensureAwake()
   A->>R: wake (coalesced)
   R->>G: wake db-id
@@ -104,8 +104,8 @@ sequenceDiagram
 
 ## Self-hosting requirements
 
-- A Cloudflare account on the Workers Paid plan, with a zone for database hostnames: Workers, D1,
-  Durable Objects, Workflows, R2, Tunnel, Access and Containers.
+- A Cloudflare account on the Workers Paid plan, with a zone that hosts one endpoint hostname
+  (`db.your-domain`): Workers, D1, Durable Objects, Workflows, R2, Tunnel and Containers.
 - A Contabo account with API credentials. The lab uses Cloud VPS with 4 vCPU and 8 GiB.
 
 An install path is part of the open-source release phase in [PLAN.md](PLAN.md#phase-5--open-source-release).
