@@ -412,10 +412,10 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
   });
 
   it("propagates a gateway close to the client without reconnecting", async () => {
+    await setGatewayMode("close");
     const connection = await open();
     connection.socket.send(encodeStartup({ user: "app", database }));
     await expect.poll(() => connection.messages.length).toBeGreaterThan(0);
-    await testEnv.GATEWAY.fetch(`${gatewayOrigin}/close`);
     await expect.poll(connection.closeCode).toBe(1012);
     expect(await stats()).toHaveLength(1);
   });

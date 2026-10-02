@@ -296,9 +296,12 @@ class EdgeSession {
 
   #close(code: number, outcome: string): void {
     if (this.#isClosed()) return;
+    const wasStreaming = this.#stage === "streaming";
     this.#stage = "closed";
     clearTimeout(this.#timer);
-    this.#abort.abort();
+    // Aborting a completed WebSocket upgrade tears down its stream without a
+    // close handshake. Abort only an outstanding connection attempt.
+    if (!wasStreaming) this.#abort.abort();
     this.#startupDone();
     this.#queue = [];
     this.#queuedBytes = 0;
