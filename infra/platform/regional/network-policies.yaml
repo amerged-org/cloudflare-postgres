@@ -88,7 +88,7 @@ spec:
         - matchLabels:
             cnpg.io/cluster: database
           matchExpressions:
-            # Without a namespace key Cilium scopes the selector to the policy's own namespace.
+            # Match CNPG Pods only in explicitly labelled database namespaces.
             - key: k8s:io.kubernetes.pod.namespace
               operator: Exists
             - key: k8s:io.cilium.k8s.namespace.labels.pgcf.io/database-id
@@ -98,7 +98,7 @@ spec:
             - port: "5432"
               protocol: TCP
 ---
-# No ingress. Egress to DNS, the Kubernetes API and the API Worker host over HTTPS.
+# No ingress. Egress to DNS, Kubernetes/API Worker, and scoped CNPG archive metrics.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -126,6 +126,18 @@ spec:
             - port: "443"
               protocol: TCP
             - port: "6443"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            cnpg.io/cluster: database
+          matchExpressions:
+            - key: k8s:io.kubernetes.pod.namespace
+              operator: Exists
+            - key: k8s:io.cilium.k8s.namespace.labels.pgcf.io/database-id
+              operator: Exists
+      toPorts:
+        - ports:
+            - port: "9187"
               protocol: TCP
     - toFQDNs:
         - matchName: "${PGCF_API_HOST}"

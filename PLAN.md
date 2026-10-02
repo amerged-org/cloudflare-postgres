@@ -71,7 +71,7 @@ The diagrams are in [README.md](README.md#architecture).
 
 - Namespace `pgcf-db-<id>` with PodSecurity `restricted`, a ResourceQuota, a default-deny
   NetworkPolicy and a `CiliumNetworkPolicy`. Ingress is allowed only from the gateway and the CNPG
-  operator and plugin; egress only to DNS, the Kubernetes API and the R2 host on 443 (the R2 rule
+  operator and plugin, plus the agent on metrics port 9187; egress only to DNS, the Kubernetes API and the R2 host on 443 (the R2 rule
   needs an FQDN match, which plain NetworkPolicy cannot express).
 - CNPG `Cluster`:
   - 1 instance, pinned PostgreSQL 18 image.

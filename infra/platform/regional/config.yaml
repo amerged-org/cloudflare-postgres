@@ -10,3 +10,4 @@ metadata:
 data:
   PGCF_REGION_ID: "${PGCF_REGION_ID}"
   PGCF_API_URL: "https://${PGCF_API_HOST}"
+  PGCF_POSTGRES_IMAGE: ghcr.io/cloudnative-pg/postgresql:18.4-standard-trixie@sha256:ebf3919504d7523a63e8e2fee9b051211de714644b36469275558c624afd50ec

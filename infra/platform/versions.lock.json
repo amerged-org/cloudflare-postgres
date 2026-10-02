@@ -110,7 +110,13 @@
         "reference": "ghcr.io/amerged-org/pgcf-regional",
         "note": "The release commit adds the digest to infra/platform/regional/kustomization.yaml once CI has published the image."
       }
-    ]
+    ],
+    "postgresImage": {
+      "reference": "ghcr.io/cloudnative-pg/postgresql:18.4-standard-trixie@sha256:ebf3919504d7523a63e8e2fee9b051211de714644b36469275558c624afd50ec",
+      "version": "18.4",
+      "source": "https://github.com/cloudnative-pg/postgres-containers",
+      "note": "Pinned image retained from the earlier lab; the new live chain has not been qualified."
+    }
   },
   "verificationScope": "Official chart versions, chart/app mappings, registry manifest digests, archive checksums, offline Helm lint/render and Kustomize build. Container image tag references remain as shipped by the pinned charts except digest defaults already shipped by Cilium; image signature and tag-to-digest verification are not claimed."
 }

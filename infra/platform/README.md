@@ -121,7 +121,7 @@ and is excluded from the build.
 | Workload           | Replicas | Role                                                                                                                              |
 | ------------------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
 | `pgcf-cloudflared` | 2        | Remotely managed Cloudflare Tunnel. No inbound ports; metrics on localhost. Its public-hostname rule targets the gateway Service. |
-| `pgcf-gateway`     | 2        | WebSocket-to-PostgreSQL bridge on port 8080 (`/healthz`, `/readyz`, 45 s termination grace). Service `pgcf-gateway`.             |
+| `pgcf-gateway`     | 2        | WebSocket-to-PostgreSQL bridge on port 8080 (`/healthz`, `/readyz`, 45 s termination grace). Service `pgcf-gateway`.              |
 | `pgcf-agent`       | 1        | Reconciles desired state into Kubernetes. Strategy `Recreate`, so two agents never overlap.                                       |
 
 Gateway and agent are two commands (`node /app/gateway.mjs`, `node /app/agent.mjs`) of one image
@@ -148,6 +148,12 @@ patches:
         value: Never
 ```
 
+The pinned `PGCF_POSTGRES_IMAGE` is supplied by ConfigMap `pgcf-regional` and recorded in the
+version lock. The agent validates the image digest before reconciling a database. Node capacity
+uses `pgcf.io/storage-gib-total`, published from the measured dedicated LVM volume group by the
+bootstrap/operator path; Kubernetes ephemeral storage is not database capacity. Missing capacity
+is reported as unavailable and cannot admit a placement.
+
 Flux substitutes two variables from a private ConfigMap (`PGCF_REGION_ID` and `PGCF_API_HOST`, the
 host name of the API Worker) into ConfigMap `pgcf-regional` and the agent's egress policy.
 
@@ -156,12 +162,12 @@ host name of the API Worker) into ConfigMap `pgcf-regional` and the agent's egre
 Create these in `pgcf-system` before the Deployments start; they are never committed and
 the keys of `pgcf-gateway` and `pgcf-agent` become environment variables of the same name.
 
-| Secret             | Keys                                       | Used by                                                                               |
-| ------------------ | ------------------------------------------ | ------------------------------------------------------------------------------------- |
-| `pgcf-cloudflared` | `token`                                    | cloudflared tunnel token (`TUNNEL_TOKEN`).                                            |
-| `pgcf-gateway`     | `PGCF_ROUTE_KEY`                           | Gateway: the region's derived route keyring, JSON `{"active":"<kid>","keys":{"<kid>":"<base64url>"}}`. |
-| `pgcf-agent`       | `PGCF_AGENT_KEY`                           | Agent: bearer key for the API Worker.                                                 |
-| `pgcf-backup-s3`   | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | R2 S3 credential; the agent copies it into each database namespace as `archive-credentials`. |
+| Secret             | Keys                                         | Used by                                                                                                |
+| ------------------ | -------------------------------------------- | ------------------------------------------------------------------------------------------------------ |
+| `pgcf-cloudflared` | `token`                                      | cloudflared tunnel token (`TUNNEL_TOKEN`).                                                             |
+| `pgcf-gateway`     | `PGCF_ROUTE_KEY`                             | Gateway: the region's derived route keyring, JSON `{"active":"<kid>","keys":{"<kid>":"<base64url>"}}`. |
+| `pgcf-agent`       | `PGCF_AGENT_KEY`                             | Agent: bearer key for the API Worker.                                                                  |
+| `pgcf-backup-s3`   | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | R2 S3 credential; the agent copies it into each database namespace as `archive-credentials`.           |
 
 ### Network and access rules
 
@@ -169,7 +175,8 @@ the keys of `pgcf-gateway` and `pgcf-agent` become environment variables of the 
   workload adds the allowed paths. cloudflared may reach the gateway on 8080 and the Cloudflare
   edge on 7844, the gateway accepts traffic from cloudflared only, and may reach the Kubernetes API
   and port 5432 of database Pods in namespaces labelled `pgcf.io/database-id`. The agent reaches the
-  Kubernetes API and the API Worker host on 443; nothing accepts inbound traffic besides the
+  Kubernetes API, the API Worker host on 443 and CNPG Pods in labelled database namespaces on
+  9187 for real WAL archive metrics; nothing accepts inbound traffic besides the
   gateway. Every policy also allows DNS.
 - The agent ClusterRole covers namespaces, Secrets (no list or watch), ResourceQuotas, LimitRanges,
   NetworkPolicies, CiliumNetworkPolicies, CNPG `Cluster`, `ScheduledBackup` and Barman
