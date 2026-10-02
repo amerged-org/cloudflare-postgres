@@ -288,7 +288,7 @@ async function anonymousImage(image: string): Promise<void> {
   await reply.arrayBuffer();
 }
 
-class Run {
+export class Run {
   readonly c: Config;
   readonly state: Ledger;
   readonly dryRun: boolean;
@@ -479,6 +479,7 @@ class Run {
       throw new HarnessError("small_size_class_required");
   }
   async sample(): Promise<VgSample[]> {
+    await this.assertCluster();
     return vgSamples(
       await this.kube.read("lvmnodes.local.openebs.io"),
       this.c.nodes,
@@ -1053,6 +1054,7 @@ class Run {
   async create(restartAgent = false): Promise<void> {
     this.requireStep("E0");
     await this.verify();
+    await this.assertCluster();
     const started = Date.now();
     if (this.state.intents.includes("integrator_key_create"))
       throw new HarnessError("one_time_key_resume_requires_cleanup");
@@ -1208,6 +1210,7 @@ class Run {
   async audit(): Promise<void> {
     this.requireStep("E3");
     await this.verify();
+    await this.assertCluster();
     const edgeName = requireEnv(process.env, [
       "PGCF_E2E_EDGE_WORKER_NAME",
     ]).PGCF_E2E_EDGE_WORKER_NAME!;
@@ -1373,6 +1376,7 @@ class Run {
     await this.emit("E4", counts, { archive_wait_ms: Date.now() - started });
   }
   async captureStorage(): Promise<void> {
+    await this.assertCluster();
     if (!this.state.database_id) return;
     const namespace = `pgcf-db-${this.state.database_id}`;
     assertOwned(namespace);
@@ -1403,6 +1407,7 @@ class Run {
     await this.save();
   }
   async assertStorageGone(): Promise<boolean> {
+    await this.assertCluster();
     const namespace = `pgcf-db-${this.state.database_id}`;
     const [namespaces, pvcs, pvs, lvms, samples] = await Promise.all([
       this.kube.read("namespaces"),
@@ -1484,6 +1489,7 @@ class Run {
       (gone) => gone,
       120_000,
     );
+    await this.assertCluster();
     await this.intent("archive_cleanup");
     await this.cf.deleteObjects(
       this.c.values.PGCF_E2E_BACKUP_BUCKET!,
@@ -1508,6 +1514,7 @@ class Run {
   }
   async scan(addressIndex?: number): Promise<boolean> {
     this.requireStep("E5");
+    await this.assertCluster();
     const [nodeList, pods, deployments, daemonsets, statefulsets, services] =
       await Promise.all([
         this.kube.read("nodes"),
@@ -1653,6 +1660,7 @@ class Run {
   async cleanup(): Promise<void> {
     this.deadline = Date.now() + 120_000;
     await this.verifyIdentity(false);
+    await this.assertCluster();
     await this.recoverOwnership();
     const failures: string[] = [];
     // The real agent must use the real API before any database deletion is requested.
