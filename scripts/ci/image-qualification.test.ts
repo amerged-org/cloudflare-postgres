@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
@@ -231,4 +232,114 @@ test("binds a containerd image manifest to the config and ordered saved blobs", 
       [...layers].reverse(),
     ),
   );
+});
+
+async function inspectionProbe(
+  inspection: unknown,
+  toolFailure = false,
+): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-inspect-test-"));
+  const imageId = "sha256:" + "a".repeat(64);
+  const revision = "a".repeat(40);
+  const source = "https://github.com/public/product";
+  const credentialShaped = ["gh", "p_", "s".repeat(36)].join("");
+  try {
+    const executable = join(directory, "docker");
+    // Emulates the exact v28.0.4 inspect parser: only --format/-f are supported.
+    await writeFile(
+      executable,
+      `#!${process.execPath}
+` +
+        `if (process.argv.slice(2).includes("--platform")) { process.stderr.write("unknown flag: --platform"); process.exit(125); }
+` +
+        (toolFailure
+          ? `process.stderr.write(${JSON.stringify(credentialShaped)}); process.exit(1);
+`
+          : `process.stdout.write(${JSON.stringify(JSON.stringify(inspection))});
+`),
+      { mode: 0o700 },
+    );
+    await chmod(executable, 0o700);
+    const report = join(directory, "report.json");
+    await writeFile(
+      report,
+      JSON.stringify({
+        version: 2,
+        imageId,
+        revision,
+        source,
+        unresolved: 0,
+        rawExit: 0,
+        opaqueExpectedBytes: 0,
+        opaqueDetectorBytes: 0,
+      }),
+    );
+    const result = spawnSync(
+      process.execPath,
+      [
+        "scripts/ci/image-qualification.ts",
+        "verify",
+        "fixture:qualified",
+        imageId,
+        revision,
+        source,
+        report,
+      ],
+      {
+        env: { ...process.env, PATH: directory },
+        encoding: "utf8",
+        timeout: 10_000,
+      },
+    );
+    assert.equal(result.error, undefined);
+    assert.ok(!result.stdout.includes(credentialShaped));
+    assert.ok(!result.stderr.includes(credentialShaped));
+    return result;
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+}
+
+const inspectedImage = {
+  Id: "sha256:" + "a".repeat(64),
+  Os: "linux",
+  Architecture: "amd64",
+  RootFS: { Type: "layers", Layers: ["sha256:" + "b".repeat(64)] },
+};
+
+test("verification supports the Ubuntu Docker 28.0.4 inspect flags", async () => {
+  const result = await inspectionProbe([inspectedImage]);
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("plain inspection rejects wrong platforms, ambiguous data and invalid diffIDs", async () => {
+  for (const inspection of [
+    [{ ...inspectedImage, Os: "windows" }],
+    [{ ...inspectedImage, Architecture: "arm64" }],
+    [{ ...inspectedImage, Id: "sha256:" + "c".repeat(64) }],
+    [inspectedImage, inspectedImage],
+    [],
+    { image: inspectedImage },
+    [null],
+    [{ ...inspectedImage, RootFS: { Type: "layers", Layers: ["invalid"] } }],
+    [{ ...inspectedImage, RootFS: { Type: "layers", Layers: [] } }],
+    [
+      {
+        ...inspectedImage,
+        RootFS: { Type: "other", Layers: inspectedImage.RootFS.Layers },
+      },
+    ],
+  ]) {
+    const result = await inspectionProbe(inspection);
+    assert.equal(result.status, 1);
+    assert.ok(!result.stderr.includes("Archive or tool error"));
+  }
+});
+
+test("inspection tool failures expose only a fixed safe stage code", async () => {
+  const result = await inspectionProbe([inspectedImage], true);
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /tool_failed:image_inspect/);
+  assert.ok(!result.stderr.includes("unknown flag"));
+  assert.ok(!result.stderr.includes("fixture:qualified"));
 });
