@@ -5,7 +5,10 @@
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "phase0": "node src/phase0-accept.ts",
+    "accept": "node src/run.ts"
   },
   "dependencies": {
     "@neondatabase/serverless": "1.2.0",

@@ -1,0 +1,13 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "pgcf-e2e-probe",
+  "main": "worker.ts",
+  "compatibility_date": "2026-10-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "workers_dev": true,
+  "observability": { "enabled": false },
+  "vars": {
+    "API_URL": "https://pgcf-api.example.invalid",
+    "ENDPOINT_HOST": "pgcf-edge.example.invalid",
+  },
+}
