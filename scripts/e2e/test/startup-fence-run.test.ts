@@ -166,20 +166,41 @@ function resources() {
     "app.kubernetes.io/name": "pgcf-gateway",
     "app.kubernetes.io/part-of": "pgcf",
   };
+  const securityContext = {
+    runAsNonRoot: true,
+    runAsUser: 1000,
+    runAsGroup: 1000,
+    seccompProfile: { type: "RuntimeDefault" },
+  };
   const gateway = (): Record<string, unknown> => ({
     name: "gateway",
     image,
     command: ["node", "/app/gateway.mjs"],
-    envFrom: [
-      { configMapRef: { name: "pgcf-regional" } },
-      { secretRef: { name: "pgcf-gateway" } },
+    env: [
+      {
+        name: "PGCF_REGION_ID",
+        valueFrom: {
+          configMapKeyRef: { name: "pgcf-regional", key: "PGCF_REGION_ID" },
+        },
+      },
+      {
+        name: "PGCF_ROUTE_KEY",
+        valueFrom: {
+          secretKeyRef: { name: "pgcf-gateway", key: "PGCF_ROUTE_KEY" },
+        },
+      },
+      { name: "PGCF_GATEWAY_PORT", value: "8080" },
     ],
-    env: [{ name: "PGCF_GATEWAY_PORT", value: "8080" }],
+    securityContext: {
+      allowPrivilegeEscalation: false,
+      readOnlyRootFilesystem: true,
+      capabilities: { drop: ["ALL"] },
+    },
     volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
   });
   const deployment = {
     metadata: { namespace, name: "pgcf-gateway", uid: deploymentUid, labels },
-    spec: { template: { spec: { containers: [gateway()] } } },
+    spec: { template: { spec: { containers: [gateway()], securityContext } } },
   };
   const set = {
     metadata: {
@@ -211,7 +232,7 @@ function resources() {
         },
       ],
     },
-    spec: { containers: [gateway()] },
+    spec: { containers: [gateway()], securityContext },
     status: {
       containerStatuses: [
         { name: "gateway", imageID: `docker-pullable://${image}` },
@@ -281,6 +302,7 @@ test("Gateway log pod selection requires namespace, Deployment ownership and the
       select({
         ...fixture.pod,
         spec: {
+          ...fixture.pod.spec,
           containers: [{ name: "gateway", image: `${fixture.image}-changed` }],
         },
       }),
@@ -312,6 +334,7 @@ test("Gateway log pod selection requires namespace, Deployment ownership and the
         spec: {
           template: {
             spec: {
+              ...fixture.deployment.spec.template.spec,
               containers: [
                 { name: "gateway", image: `${fixture.image}-changed` },
               ],
@@ -437,7 +460,10 @@ test("Gateway log read rechecks the bound cluster before reading pod ownership",
   assert.equal(reads, 0);
 });
 
-test("named mismatch run correlates each exact rejection with real-shaped Edge and Gateway events", async () => {
+function mismatchRun(
+  resultChanges: Record<string, unknown> = {},
+  gatewayEvidence?: (matching: ReturnType<typeof identity>) => string,
+) {
   const original = globalThis.WebSocket;
   const sockets: TraceSocket[] = [];
   class TraceSocket extends EventTarget {
@@ -475,6 +501,7 @@ test("named mismatch run correlates each exact rejection with real-shaped Edge a
     at: string;
     completed_at?: string;
   }[] = [];
+  const completed: string[] = [];
   const run = Object.assign(Object.create(Run.prototype) as Run, {
     c: {
       values: {
@@ -489,7 +516,13 @@ test("named mismatch run correlates each exact rejection with real-shaped Edge a
       operation_id: operation,
       actions,
       tails: [],
+      completed,
     },
+    requireStep: () => undefined,
+    complete: async (step: string) => {
+      completed.push(step);
+    },
+    emit: async () => undefined,
     assertCluster: async () => {
       guards++;
     },
@@ -512,6 +545,7 @@ test("named mismatch run correlates each exact rejection with real-shaped Edge a
       },
     },
     probe: async (path: string, body: unknown, marker: string) => {
+      if (path === "/exercise") return { pass: true, timings: {} };
       paths.push(path);
       assert.equal(body, undefined);
       assert.match(marker, /^[a-f0-9]{48}$/);
@@ -522,6 +556,7 @@ test("named mismatch run correlates each exact rejection with real-shaped Edge a
         sqlstate: "28000",
         gateway_outcome: "startup_route_mismatch",
         duration_ms: paths.length,
+        ...resultChanges,
       };
     },
     kube: {
@@ -530,32 +565,54 @@ test("named mismatch run correlates each exact rejection with real-shaped Edge a
         assert.equal(namespace, fixture.namespace);
         assert.equal(image, fixture.image);
         assert.equal(new Date(since).toISOString(), since);
-        return JSON.stringify({
-          event: "conn_close",
-          database: id.database,
-          connection: matching!.connection,
-          outcome: "startup_route_mismatch",
-        });
+        return (
+          gatewayEvidence?.(matching!) ??
+          JSON.stringify({
+            event: "conn_close",
+            database: id.database,
+            connection: matching!.connection,
+            outcome: "startup_route_mismatch",
+          })
+        );
       },
     },
   });
+  return {
+    run,
+    actions,
+    operation,
+    paths,
+    completed,
+    closed,
+    sockets,
+    guards: () => guards,
+    logReads: () => logReads,
+    restore() {
+      sockets.forEach((socket) => socket.close());
+      globalThis.WebSocket = original;
+    },
+  };
+}
+
+test("named mismatch run correlates each exact rejection with real-shaped Edge and Gateway events", async () => {
+  const fixture = mismatchRun();
   try {
-    assert.deepEqual(await run.startupMismatches(), {
+    assert.deepEqual(await fixture.run.startupMismatches(), {
       negative_startup_database_ms: 1,
       negative_startup_user_ms: 2,
     });
-    assert.deepEqual(paths, [
+    assert.deepEqual(fixture.paths, [
       "/startup-database-mismatch",
       "/startup-user-mismatch",
     ]);
-    assert.equal(logReads, 2);
-    assert.equal(guards, 5);
-    assert.equal(closed.length, 2);
-    assert.equal(actions.length, 2);
-    for (const [index, action] of actions.entries()) {
+    assert.equal(fixture.logReads(), 2);
+    assert.equal(fixture.guards(), 5);
+    assert.equal(fixture.closed.length, 2);
+    assert.equal(fixture.actions.length, 2);
+    for (const [index, action] of fixture.actions.entries()) {
       assert.equal(action.kind, "startup_mismatch_probe");
       assert.equal(action.target.mode, index === 0 ? "database" : "user");
-      assert.equal(action.target.operation_id, operation);
+      assert.equal(action.target.operation_id, fixture.operation);
       assert.equal(
         action.target.postgres_dial_evidence,
         "gateway_source_branch_inference",
@@ -565,12 +622,87 @@ test("named mismatch run correlates each exact rejection with real-shaped Edge a
       assert(action.completed_at);
       assert.equal(Object.hasOwn(action.target, "postgres_dials"), false);
     }
-    assert.notEqual(actions[0]!.target.marker, actions[1]!.target.marker);
-    assert(sockets.every((socket) => socket.readyState === 3));
+    assert.notEqual(
+      fixture.actions[0]!.target.marker,
+      fixture.actions[1]!.target.marker,
+    );
+    assert(fixture.sockets.every((socket) => socket.readyState === 3));
   } finally {
-    sockets.forEach((socket) => socket.close());
-    globalThis.WebSocket = original;
+    fixture.restore();
   }
+});
+
+async function incompleteMismatch(
+  resultChanges: Record<string, unknown>,
+  expectedError: string,
+  gatewayEvidence?: (matching: ReturnType<typeof identity>) => string,
+) {
+  const fixture = mismatchRun(resultChanges, gatewayEvidence);
+  try {
+    await assert.rejects(fixture.run.exercise(), { message: expectedError });
+    assert.deepEqual(fixture.completed, []);
+    assert.equal(fixture.actions.length, 1);
+    assert.equal(fixture.actions[0]!.completed_at, undefined);
+    assert.deepEqual(fixture.paths, ["/startup-database-mismatch"]);
+    assert.equal(fixture.logReads(), gatewayEvidence ? 1 : 0);
+    assert.equal(fixture.closed.length, 1);
+  } finally {
+    fixture.restore();
+  }
+}
+
+test("actual startup mismatch run keeps action and E3 incomplete for malformed SQLSTATE", async () => {
+  await incompleteMismatch(
+    { sqlstate: "28P01" },
+    "startup_mismatch_probe_failed",
+  );
+});
+
+test("actual startup mismatch run keeps action and E3 incomplete for an unrelated outcome", async () => {
+  await incompleteMismatch(
+    { gateway_outcome: "startup_error" },
+    "startup_mismatch_probe_failed",
+  );
+});
+
+test("actual startup mismatch run keeps action and E3 incomplete for a nonnumeric duration", async () => {
+  await incompleteMismatch(
+    { duration_ms: "1" },
+    "startup_mismatch_probe_failed",
+  );
+});
+
+test("actual startup mismatch run keeps action and E3 incomplete for a nonfinite duration", async () => {
+  await incompleteMismatch(
+    { duration_ms: Number.NaN },
+    "startup_mismatch_probe_failed",
+  );
+});
+
+test("actual startup mismatch run keeps action and E3 incomplete for a negative duration", async () => {
+  await incompleteMismatch(
+    { duration_ms: -1 },
+    "startup_mismatch_probe_failed",
+  );
+});
+
+test("actual startup mismatch run keeps action and E3 incomplete when Gateway evidence is unavailable", async () => {
+  await incompleteMismatch({}, "gateway_evidence_unavailable", () => {
+    throw new Error("gateway_evidence_unavailable");
+  });
+});
+
+test("actual startup mismatch run keeps action and E3 incomplete for wrong Gateway connection evidence", async (context) => {
+  context.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  await incompleteMismatch({}, "poll_timeout", (matching) => {
+    context.mock.timers.tick(30_000);
+    return JSON.stringify({
+      event: "conn_close",
+      database: matching.database,
+      connection: randomUUID(),
+      outcome: "startup_route_mismatch",
+    });
+  });
 });
 
 function changedGateway(
@@ -647,7 +779,7 @@ test("Gateway execution proof refuses inline runtime hooks in either Deployment 
   );
 });
 
-test("Gateway execution proof accepts approved envFrom references and rejects extra or prefixed sources", () => {
+test("Gateway execution proof accepts explicit references and rejects inherited environment sources", () => {
   assert.doesNotThrow(changedGateway("pod", () => undefined));
   assert.throws(
     changedGateway("deployment", (container) => {
@@ -670,7 +802,7 @@ test("Gateway execution proof accepts approved envFrom references and rejects ex
   );
 });
 
-test("Gateway envFrom key inspection rejects hooks without reading credential values", () => {
+test("Gateway inline environment key guard rejects execution hooks", () => {
   assert.doesNotThrow(() =>
     clients.assertGatewayEnvironmentKeys([
       "PGCF_ROUTE_KEY",
@@ -736,11 +868,14 @@ test("Gateway execution proof rejects mounts covering code, Node or runtime depe
   );
 });
 
-test("actual Gateway log reader refuses execution hooks inherited from approved envFrom sources", async () => {
+test("actual Gateway log reader refuses inherited environment before any log read", async () => {
   const fixture = resources();
+  fixture.pod.spec.containers[0]!.envFrom = [
+    { configMapRef: { name: "pgcf-regional" } },
+    { secretRef: { name: "pgcf-gateway" } },
+  ];
   const kube = new Kubernetes("test-kube-path", "test-context");
   let guards = 0;
-  let keyReads = 0;
   kube.setMutationGuard(async () => {
     guards++;
   });
@@ -751,11 +886,6 @@ test("actual Gateway log reader refuses execution hooks inherited from approved 
       assert.equal(resource, "pods");
       return { items: [fixture.pod] };
     },
-    gatewayEnvironmentKeys: async (namespace: string) => {
-      keyReads++;
-      assert.equal(namespace, fixture.namespace);
-      return ["PGCF_ROUTE_KEY", "NODE_OPTIONS"];
-    },
   });
   await assert.rejects(
     kube.gatewayLogs(
@@ -764,9 +894,94 @@ test("actual Gateway log reader refuses execution hooks inherited from approved 
       fixture.image,
     ),
     {
-      message: "gateway_log_execution_hook",
+      message: "gateway_log_environment_source_mismatch",
     },
   );
-  assert.equal(keyReads, 1);
   assert.equal(guards, 3);
+});
+
+test("Gateway source proof refuses inherited approved envFrom references because Pod environment is historical", () => {
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.envFrom = [
+        { configMapRef: { name: "pgcf-regional" } },
+        { secretRef: { name: "pgcf-gateway" } },
+      ];
+    }),
+    { message: "gateway_log_environment_source_mismatch" },
+  );
+});
+
+test("Gateway source proof requires readonly and nonroot execution settings", () => {
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.securityContext = {
+        allowPrivilegeEscalation: false,
+        readOnlyRootFilesystem: false,
+        capabilities: { drop: ["ALL"] },
+      };
+    }),
+    { message: "gateway_log_execution_security_mismatch" },
+  );
+});
+
+test("Gateway source proof binds explicit region and route-key names to their approved references", () => {
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      const env = container.env as Record<string, unknown>[];
+      env[0] = {
+        name: "PGCF_REGION_ID",
+        value: `r-${randomBytes(8).toString("hex")}`,
+      };
+    }),
+    { message: "gateway_log_environment_source_mismatch" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      const env = container.env as Record<string, unknown>[];
+      env[1] = {
+        name: "PGCF_ROUTE_KEY",
+        valueFrom: {
+          secretKeyRef: { name: "pgcf-other", key: "PGCF_ROUTE_KEY" },
+        },
+      };
+    }),
+    { message: "gateway_log_environment_source_mismatch" },
+  );
+});
+
+test("Gateway source proof rejects Deployment args and nonroot overrides in either execution layer", () => {
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      container.args = ["/app/agent.mjs"];
+    }),
+    { message: "gateway_log_entrypoint_mismatch" },
+  );
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      container.securityContext = {
+        allowPrivilegeEscalation: false,
+        readOnlyRootFilesystem: true,
+        runAsUser: 0,
+        capabilities: { drop: ["ALL"] },
+      };
+    }),
+    { message: "gateway_log_execution_security_mismatch" },
+  );
+  const fixture = resources();
+  fixture.pod.spec.securityContext = {
+    ...fixture.pod.spec.securityContext,
+    runAsNonRoot: false,
+  };
+  assert.throws(
+    () =>
+      clients.gatewayLogPods(
+        { items: [fixture.deployment] },
+        { items: [fixture.set] },
+        { items: [fixture.pod] },
+        fixture.namespace,
+        fixture.image,
+      ),
+    { message: "gateway_log_execution_security_mismatch" },
+  );
 });

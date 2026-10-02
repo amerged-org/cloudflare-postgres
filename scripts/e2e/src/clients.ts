@@ -285,7 +285,10 @@ export function assertGatewayEnvironmentKeys(names: readonly string[]): void {
     throw new HarnessError("gateway_log_execution_hook");
 }
 
-function assertGatewayEntrypoint(container: Record<string, unknown>): void {
+function assertGatewayEntrypoint(
+  container: Record<string, unknown>,
+  spec: Record<string, unknown>,
+): void {
   // Match infra/platform/regional/gateway.yaml; the same image also contains the agent.
   if (
     !Array.isArray(container.command) ||
@@ -300,23 +303,34 @@ function assertGatewayEntrypoint(container: Record<string, unknown>): void {
   const env = container.env === undefined ? [] : container.env;
   if (!Array.isArray(env)) throw new HarnessError("gateway_log_execution_hook");
   assertGatewayEnvironmentKeys(env.map((row) => string(record(row).name)));
-  const sources = container.envFrom;
   if (
-    !Array.isArray(sources) ||
-    sources.length !== 2 ||
-    sources.some((value) => {
-      const source = record(value);
-      return (
-        (source.prefix !== undefined && source.prefix !== "") ||
-        Boolean(source.configMapRef) === Boolean(source.secretRef) ||
-        (source.configMapRef !== undefined &&
-          record(source.configMapRef).name !== "pgcf-regional") ||
-        (source.secretRef !== undefined &&
-          record(source.secretRef).name !== "pgcf-gateway")
-      );
-    }) ||
-    !sources.some((value) => record(value).configMapRef !== undefined) ||
-    !sources.some((value) => record(value).secretRef !== undefined)
+    container.envFrom !== undefined &&
+    (!Array.isArray(container.envFrom) || container.envFrom.length !== 0)
+  )
+    throw new HarnessError("gateway_log_environment_source_mismatch");
+  const expectedEnvironment: Record<string, Record<string, unknown>> = {
+    PGCF_REGION_ID: {
+      name: "PGCF_REGION_ID",
+      valueFrom: {
+        configMapKeyRef: { name: "pgcf-regional", key: "PGCF_REGION_ID" },
+      },
+    },
+    PGCF_ROUTE_KEY: {
+      name: "PGCF_ROUTE_KEY",
+      valueFrom: {
+        secretKeyRef: { name: "pgcf-gateway", key: "PGCF_ROUTE_KEY" },
+      },
+    },
+    PGCF_GATEWAY_PORT: { name: "PGCF_GATEWAY_PORT", value: "8080" },
+  };
+  if (
+    env.length !== 3 ||
+    new Set(env.map((value) => record(value).name)).size !== 3 ||
+    env.some((value) => {
+      const row = record(value);
+      const expected = expectedEnvironment[string(row.name)];
+      return !expected || !sameStructuredValue(row, expected);
+    })
   )
     throw new HarnessError("gateway_log_environment_source_mismatch");
   const mounts =
@@ -349,6 +363,29 @@ function assertGatewayEntrypoint(container: Record<string, unknown>): void {
     )
       throw new HarnessError("gateway_log_executable_mount");
   }
+  const security = record(container.securityContext ?? {});
+  const podSecurity = record(spec.securityContext ?? {});
+  const capabilities = record(security.capabilities ?? {});
+  if (
+    security.readOnlyRootFilesystem !== true ||
+    security.allowPrivilegeEscalation !== false ||
+    (security.privileged !== undefined && security.privileged !== false) ||
+    !sameStructuredValue(capabilities.drop, ["ALL"]) ||
+    (capabilities.add !== undefined &&
+      !sameStructuredValue(capabilities.add, [])) ||
+    podSecurity.runAsNonRoot !== true ||
+    podSecurity.runAsUser !== 1000 ||
+    podSecurity.runAsGroup !== 1000 ||
+    !sameStructuredValue(podSecurity.seccompProfile, {
+      type: "RuntimeDefault",
+    }) ||
+    (security.runAsNonRoot !== undefined && security.runAsNonRoot !== true) ||
+    (security.runAsUser !== undefined && security.runAsUser !== 1000) ||
+    (security.runAsGroup !== undefined && security.runAsGroup !== 1000) ||
+    (security.seccompProfile !== undefined &&
+      !sameStructuredValue(security.seccompProfile, { type: "RuntimeDefault" }))
+  )
+    throw new HarnessError("gateway_log_execution_security_mismatch");
 }
 
 export function gatewayLogPods(
@@ -382,7 +419,7 @@ export function gatewayLogPods(
     : undefined;
   if (gateway?.image !== expectedImage)
     throw new HarnessError("gateway_log_source_image_mismatch");
-  assertGatewayEntrypoint(gateway);
+  assertGatewayEntrypoint(gateway, template);
   const ownedBy = (
     row: Record<string, unknown>,
     kind: string,
@@ -444,7 +481,7 @@ export function gatewayLogPods(
       )
     )
       throw new HarnessError("gateway_log_source_image_mismatch");
-    assertGatewayEntrypoint(container);
+    assertGatewayEntrypoint(container, spec);
     const name = objectName(pod);
     assertOwned(name);
     return name;
@@ -534,7 +571,6 @@ export class Kubernetes {
       namespace,
       expectedImage,
     );
-    assertGatewayEnvironmentKeys(await this.gatewayEnvironmentKeys(namespace));
     const logs: string[] = [];
     for (const name of names) {
       await this.guard();
@@ -561,36 +597,6 @@ export class Kubernetes {
       );
     }
     return logs.join("\n");
-  }
-  async gatewayEnvironmentKeys(namespace: string): Promise<string[]> {
-    assertOwned(namespace);
-    const names: string[] = [];
-    for (const [kind, name] of [
-      ["configmap", "pgcf-regional"],
-      ["secret", "pgcf-gateway"],
-    ]) {
-      await this.guard();
-      const keys = await command(
-        "kubectl",
-        [
-          "--kubeconfig",
-          this.configPath,
-          "--context",
-          this.context,
-          "--request-timeout=30s",
-          "get",
-          kind!,
-          name!,
-          "--namespace",
-          namespace,
-          "-o",
-          'go-template={{range $key, $value := .data}}{{printf "%s\\n" $key}}{{end}}',
-        ],
-        { timeoutMs: requestTimeout(this.deadline) },
-      );
-      names.push(...keys.trim().split("\n").filter(Boolean));
-    }
-    return names;
   }
   async rolePasswords(namespace: string): Promise<string[]> {
     assertOwned(namespace);

@@ -61,12 +61,17 @@ spec:
         - name: gateway
           image: pgcf-regional
           command: [node, /app/gateway.mjs]
-          envFrom:
-            - configMapRef:
-                name: pgcf-regional
-            - secretRef:
-                name: pgcf-gateway
           env:
+            - name: PGCF_REGION_ID
+              valueFrom:
+                configMapKeyRef:
+                  name: pgcf-regional
+                  key: PGCF_REGION_ID
+            - name: PGCF_ROUTE_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: pgcf-gateway
+                  key: PGCF_ROUTE_KEY
             - name: PGCF_GATEWAY_PORT
               value: "8080"
           ports:
