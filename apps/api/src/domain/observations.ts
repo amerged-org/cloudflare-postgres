@@ -13,7 +13,7 @@ export function truncateAgentText(value: string): string {
   const bytes = new TextEncoder().encode(value);
   return bytes.length <= 4096
     ? value
-    : new TextDecoder("utf-8", { ignoreBOM: false }).decode(
+    : new TextDecoder("utf-8", { fatal: false, ignoreBOM: false }).decode(
         bytes.subarray(0, 4096),
         { stream: true },
       );
@@ -183,25 +183,6 @@ export async function observations(
           observation.generation,
           observation.generation,
           observation.state,
-          body.observed_at,
-        ),
-      );
-    else if (observation.state === "error")
-      statements.push(
-        c.env.DB.prepare(
-          `UPDATE operations SET status='failed',error_code='reconcile_failed',error_message=?,updated_at=?,completed_at=? WHERE database_id=? AND project_id=? AND generation<=? AND status IN('pending','running')
-      AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.region_id=? AND d.generation=? AND d.observed_state='error' AND d.updated_at=?)`,
-        ).bind(
-          truncateAgentText(
-            observation.message ?? "Regional reconciliation failed",
-          ),
-          now,
-          now,
-          row.id,
-          row.project_id,
-          observation.generation,
-          region.id,
-          observation.generation,
           body.observed_at,
         ),
       );

@@ -4,14 +4,26 @@ import {
   DatabaseWithOperation,
   DesiredResponse,
   ConnectionUri,
+  archiveDestinationPath,
+  newDatabaseId,
+  newOperationId,
 } from "@pgcf/contracts";
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import { keyring } from "../../src/crypto/keyring.ts";
 import { runCron } from "../../src/cron.ts";
 import { choosePlacement } from "../../src/domain/placement.ts";
 import { truncateAgentText } from "../../src/domain/observations.ts";
-import type { RoleRow } from "../../src/domain/rows.ts";
-import { fixture, observation, observedBody, request } from "./fixtures.ts";
+import { databaseInsertStatement } from "../../src/domain/databases.ts";
+import type { RoleRow, SizeRow, RegionRow } from "../../src/domain/rows.ts";
+import {
+  cleanupFixtures,
+  fixture,
+  observation,
+  observedBody,
+  request,
+} from "./fixtures.ts";
+
+afterEach(cleanupFixtures);
 
 async function created(
   f: Awaited<ReturnType<typeof fixture>>,
@@ -89,6 +101,50 @@ describe("database domain on real Workers D1", () => {
       ).toBe(2);
     const noStorage = await fixture(4096, null);
     expect((await noStorage.create()).status).toBe(503);
+  });
+  it("rejects a changed class snapshot before the first guarded insert", async () => {
+    const f = await fixture();
+    const size = (await env.DB.prepare("SELECT * FROM size_classes WHERE id=?")
+      .bind(f.size)
+      .first<SizeRow>())!;
+    const region = (await env.DB.prepare("SELECT * FROM regions WHERE id=?")
+      .bind(f.region)
+      .first<RegionRow>())!;
+    const id = newDatabaseId(),
+      now = new Date().toISOString();
+    const snapshot = {
+      body: {
+        project_id: f.project,
+        region_id: f.region,
+        name: "guarded",
+        size_class_id: f.size,
+      },
+      size,
+      region,
+      nodeId: f.node,
+      id,
+      archivePath: archiveDestinationPath(
+        region.backup_bucket,
+        region.id,
+        id,
+        1,
+        newOperationId(),
+      ),
+      now,
+    };
+    await env.DB.prepare(
+      "UPDATE size_classes SET cpu_millicores=cpu_millicores+100 WHERE id=?",
+    )
+      .bind(f.size)
+      .run();
+    expect(
+      (await databaseInsertStatement(env.DB, snapshot).run()).meta.changes,
+    ).toBe(0);
+    expect(
+      await env.DB.prepare("SELECT COUNT(*) count FROM databases WHERE id=?")
+        .bind(id)
+        .first("count"),
+    ).toBe(0);
   });
   it("replays create once and preserves the fixed archive across role revisions", async () => {
     const f = await fixture(),

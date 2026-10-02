@@ -15,6 +15,57 @@ import {
 } from "@pgcf/contracts";
 import { createApp } from "../../src/app.ts";
 
+const fixtures: {
+  projects: string[];
+  regions: string[];
+  keyIds: string[];
+  size: string;
+}[] = [];
+export async function cleanupFixtures(): Promise<void> {
+  for (const fixture of fixtures.splice(0)) {
+    const [project, other] = fixture.projects;
+    const [region, foreign] = fixture.regions;
+    const databaseScope =
+      "database_id IN(SELECT id FROM databases WHERE project_id IN(?,?))";
+    await env.DB.batch([
+      env.DB.prepare(`DELETE FROM operations WHERE ${databaseScope}`).bind(
+        project,
+        other,
+      ),
+      env.DB.prepare(`DELETE FROM roles WHERE ${databaseScope}`).bind(
+        project,
+        other,
+      ),
+      env.DB.prepare(
+        `DELETE FROM lifecycle_events WHERE ${databaseScope}`,
+      ).bind(project, other),
+      env.DB.prepare("DELETE FROM databases WHERE project_id IN(?,?)").bind(
+        project,
+        other,
+      ),
+      env.DB.prepare(
+        "DELETE FROM idempotency_keys WHERE api_key_id IN(?,?,?)",
+      ).bind(...fixture.keyIds),
+      env.DB.prepare("DELETE FROM api_keys WHERE id IN(?,?,?)").bind(
+        ...fixture.keyIds,
+      ),
+      env.DB.prepare("DELETE FROM projects WHERE id IN(?,?)").bind(
+        project,
+        other,
+      ),
+      env.DB.prepare("DELETE FROM nodes WHERE region_id IN(?,?)").bind(
+        region,
+        foreign,
+      ),
+      env.DB.prepare("DELETE FROM regions WHERE id IN(?,?)").bind(
+        region,
+        foreign,
+      ),
+      env.DB.prepare("DELETE FROM size_classes WHERE id=?").bind(fixture.size),
+    ]);
+  }
+}
+
 export async function request(
   path: string,
   key: string,
@@ -85,16 +136,19 @@ export async function fixture(memory = 4096, storage: number | null = 30) {
         now,
       ),
     );
+  const keyIds: string[] = [];
   for (const [key, scope, projectId] of [
     [admin, "admin", null],
     [integrator, "integrator", project],
     [otherKey, "integrator", other],
-  ])
+  ]) {
+    const keyId = newApiKeyId();
+    keyIds.push(keyId);
     statements.push(
       env.DB.prepare(
         "INSERT INTO api_keys(id,lookup_id,key_hash,scope,project_id,name,created_at) VALUES (?,?,?,?,?,?,?)",
       ).bind(
-        newApiKeyId(),
+        keyId,
         key!.split("_")[2]!,
         await hashApiKey(env.API_KEY_PEPPER, key!),
         scope,
@@ -103,12 +157,19 @@ export async function fixture(memory = 4096, storage: number | null = 30) {
         now,
       ),
     );
+  }
   statements.push(
     env.DB.prepare(
       "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,created_at,updated_at) VALUES (?,?,?,1,?,2000,?,128,?,?)",
     ).bind(node, region, nodeName, memory, storage, now, now),
   );
   await env.DB.batch(statements);
+  fixtures.push({
+    projects: [project, other],
+    regions: [region, foreign],
+    keyIds,
+    size,
+  });
   const create = (name = "database", key = integrator, idempotency?: string) =>
     request(
       "/v1/databases",

@@ -2,8 +2,10 @@
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
 import { newDatabaseId } from "@pgcf/contracts";
-import { expect, it } from "vitest";
-import { fixture, request } from "./fixtures.ts";
+import { afterEach, expect, it } from "vitest";
+import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+
+afterEach(cleanupFixtures);
 
 function nextMessage(socket: WebSocket): Promise<string> {
   return new Promise((resolve) =>

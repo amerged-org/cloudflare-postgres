@@ -44,6 +44,52 @@ export async function databaseOperationResponse(
     { status, headers: c.res.headers },
   );
 }
+export interface DatabaseInsertSnapshot {
+  body: DatabaseCreate;
+  size: SizeRow;
+  region: RegionRow;
+  nodeId: string;
+  id: string;
+  archivePath: string;
+  now: string;
+}
+export function databaseInsertStatement(
+  db: D1Database,
+  snapshot: DatabaseInsertSnapshot,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,desired_state,generation,archive_path,created_at,updated_at)
+            SELECT ?,p.id,n.region_id,n.id,?,s.id,'running',1,?,?,? FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
+            JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id AND r.backup_bucket=?
+            WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND n.storage_gib_total IS NOT NULL
+            AND n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?
+            AND n.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.storage_gib
+            AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=? AND s.max_connections=?
+            AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?`,
+    )
+    .bind(
+      snapshot.id,
+      snapshot.body.name,
+      snapshot.archivePath,
+      snapshot.now,
+      snapshot.now,
+      snapshot.body.project_id,
+      snapshot.body.size_class_id,
+      snapshot.region.backup_bucket,
+      snapshot.nodeId,
+      snapshot.body.region_id,
+      SIDECAR.requestMemoryMib,
+      SIDECAR.requestMemoryMib,
+      snapshot.size.memory_mib,
+      snapshot.size.storage_gib,
+      snapshot.size.cpu_millicores,
+      snapshot.size.max_connections,
+      snapshot.size.sleep_after_seconds,
+      snapshot.size.archive_timeout_seconds,
+      snapshot.size.backup_retention_days,
+    );
+}
 export async function createDatabase(
   c: ApiContext,
   body: DatabaseCreate,
@@ -106,30 +152,15 @@ export async function createDatabase(
         let result: D1Result[];
         try {
           result = await c.env.DB.batch([
-            c.env.DB.prepare(
-              `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,desired_state,generation,archive_path,created_at,updated_at)
-            SELECT ?,p.id,n.region_id,n.id,?,s.id,'running',1,?,?,? FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
-            JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id AND r.backup_bucket=?
-            WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND n.storage_gib_total IS NOT NULL
-            AND n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?
-            AND n.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.storage_gib
-            AND s.memory_mib=? AND s.storage_gib=?`,
-            ).bind(
+            databaseInsertStatement(c.env.DB, {
+              body,
+              size,
+              region,
+              nodeId: node.id,
               id,
-              body.name,
-              archive,
+              archivePath: archive,
               now,
-              now,
-              body.project_id,
-              body.size_class_id,
-              region.backup_bucket,
-              node.id,
-              body.region_id,
-              SIDECAR.requestMemoryMib,
-              SIDECAR.requestMemoryMib,
-              size.memory_mib,
-              size.storage_gib,
-            ),
+            }),
             c.env.DB.prepare(
               `INSERT INTO roles (database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at)
             SELECT id,?,1,?,?,?,1,?,? FROM databases WHERE id=? AND project_id=?`,
