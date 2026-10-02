@@ -160,12 +160,9 @@ export function kubernetesFromConfig(
         }
         return {
           ...record(value),
-          apiVersion:
-            kind === "Cluster"
-              ? "postgresql.cnpg.io/v1"
-              : kind === "LVMVolume"
-                ? "local.openebs.io/v1alpha1"
-                : "v1",
+          apiVersion: CUSTOM[kind]
+            ? `${CUSTOM[kind]!.group}/${CUSTOM[kind]!.version}`
+            : "v1",
           kind,
         } as Resource;
       } catch (error) {

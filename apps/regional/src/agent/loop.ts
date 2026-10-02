@@ -14,6 +14,7 @@ import {
 } from "./observe.ts";
 import { backupCredentials, Reconciler } from "./reconcile.ts";
 import type { Kubernetes, Log } from "./types.ts";
+import type { AuthenticationProbe } from "./readiness.ts";
 
 export interface ControlApi {
   desired(signal: AbortSignal): Promise<DesiredResponse>;
@@ -31,16 +32,29 @@ export class AgentLoop {
   private waiting: (() => void) | undefined;
   private hinted = false;
   private reconcile: Reconciler;
+  private api: ControlApi;
+  private k8s: Kubernetes;
+  private postgresImage: string;
+  private signal: AbortSignal;
+  private log: Log;
+  private now: () => number;
   constructor(
-    private api: ControlApi,
-    private k8s: Kubernetes,
-    private postgresImage: string,
-    private signal: AbortSignal,
-    private log: Log,
-    private now = Date.now,
+    api: ControlApi,
+    k8s: Kubernetes,
+    postgresImage: string,
+    signal: AbortSignal,
+    log: Log,
+    now = Date.now,
     fetcher: typeof fetch = fetch,
+    authenticate?: AuthenticationProbe,
   ) {
-    this.reconcile = new Reconciler(k8s, signal, now, fetcher);
+    this.api = api;
+    this.k8s = k8s;
+    this.postgresImage = postgresImage;
+    this.signal = signal;
+    this.log = log;
+    this.now = now;
+    this.reconcile = new Reconciler(k8s, signal, now, fetcher, authenticate);
   }
 
   hint(): void {
@@ -50,15 +64,15 @@ export class AgentLoop {
 
   async cycle(): Promise<boolean> {
     const desired = await this.api.desired(this.signal);
-    const context: BuildContext | undefined = desired.databases.some(
-      (db) => db.desired_state === "running",
-    )
-      ? {
+    let context: Promise<BuildContext> | undefined;
+    const buildContext = () =>
+      (context ??= backupCredentials(this.k8s).then(
+        (credentials): BuildContext => ({
           backup: {
             bucket: desired.region.backup.bucket,
             endpointUrl: desired.region.backup.endpoint_url,
             region: desired.region.backup.region,
-            credentials: await backupCredentials(this.k8s),
+            credentials,
           },
           postgresImage: this.postgresImage,
           systemNamespace: "pgcf-system",
@@ -72,8 +86,8 @@ export class AgentLoop {
             namespace: "pgcf-system",
             podLabels: { "app.kubernetes.io/name": "pgcf-agent" },
           },
-        }
-      : undefined;
+        }),
+      ));
     const observations: DatabaseObservation[] = [];
     let nonterminal = false;
     let index = 0;
@@ -91,7 +105,10 @@ export class AgentLoop {
           continue;
         }
         try {
-          const observation = await this.reconcile.reconcile(db, context);
+          const observation = await this.reconcile.reconcile(
+            db,
+            db.desired_state === "running" ? await buildContext() : undefined,
+          );
           this.retries.delete(db.id);
           if (observation) observations.push(observation);
           if (!observation || !["ready", "deleted"].includes(observation.state))

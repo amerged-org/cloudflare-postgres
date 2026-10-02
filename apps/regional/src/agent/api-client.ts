@@ -41,10 +41,15 @@ export async function boundedText(
 }
 
 export class AgentApi {
+  private config: Pick<AgentConfig, "apiUrl" | "agentKey" | "regionId">;
+  private fetcher: typeof fetch;
   constructor(
-    private config: Pick<AgentConfig, "apiUrl" | "agentKey" | "regionId">,
-    private fetcher: typeof fetch = fetch,
-  ) {}
+    config: Pick<AgentConfig, "apiUrl" | "agentKey" | "regionId">,
+    fetcher: typeof fetch = fetch,
+  ) {
+    this.config = config;
+    this.fetcher = fetcher;
+  }
 
   private async request(
     path: string,
@@ -69,6 +74,7 @@ export class AgentApi {
   }
 
   async desired(signal: AbortSignal): Promise<DesiredResponse> {
+    const pullSignal = AbortSignal.any([signal, AbortSignal.timeout(60_000)]);
     let after: string | undefined;
     let region: DesiredResponse["region"] | undefined;
     const databases: DesiredResponse["databases"] = [];
@@ -80,7 +86,10 @@ export class AgentApi {
         limit: "200",
         ...(after ? { after } : {}),
       });
-      const response = await this.request(`/agent/v1/desired?${query}`, signal);
+      const response = await this.request(
+        `/agent/v1/desired?${query}`,
+        pullSignal,
+      );
       const parsed = DesiredResponse.safeParse(
         JSON.parse(await boundedText(response, MAX_BODY_BYTES)),
       );

@@ -12,7 +12,12 @@ import { AgentLink } from "../../src/agent/link.ts";
 import { AgentLoop } from "../../src/agent/loop.ts";
 import { DATABASE_LABEL } from "../../src/agent/observe.ts";
 import type { DesiredResponse, ObservationRequest } from "@pgcf/contracts";
-import { fixture, MemoryKubernetes, metrics } from "./fixtures.ts";
+import {
+  fixture,
+  MemoryKubernetes,
+  metrics,
+  authenticate,
+} from "./fixtures.ts";
 
 function desired(
   db: DesiredResponse["databases"][number] | undefined,
@@ -31,6 +36,43 @@ function desired(
     next: null,
   };
 }
+
+test("backup credential outage cannot block another database's deletion", async () => {
+  const { db, ctx } = fixture();
+  const removed = {
+    ...fixture().db,
+    desired_state: "deleted" as const,
+    roles: [],
+  };
+  const k8s = new MemoryKubernetes();
+  k8s.ownedNamespace(removed);
+  const reports: ObservationRequest[] = [];
+  const api = {
+    desired: async () => ({ ...desired(db), databases: [db, removed] }),
+    observations: async (value: ObservationRequest) => {
+      reports.push(value);
+    },
+  };
+  const loop = new AgentLoop(
+    api,
+    k8s,
+    ctx.postgresImage,
+    new AbortController().signal,
+    () => {},
+    Date.now,
+    metrics,
+    authenticate,
+  );
+  await loop.cycle();
+  assert.equal(
+    reports[0]?.databases.find((value) => value.id === removed.id)?.state,
+    "deleted",
+  );
+  assert.equal(
+    await k8s.read("Namespace", undefined, `pgcf-db-${removed.id}`),
+    null,
+  );
+});
 
 test("API client fetches full pages and authenticates observations; HTTP errors expose no body", async () => {
   const { db } = fixture();
@@ -163,6 +205,7 @@ test("empty and stale snapshots, reordered hints and failed pulls never delete o
     (event, fields) => logs.push(JSON.stringify({ event, ...fields })),
     Date.now,
     metrics,
+    authenticate,
   );
   await loop.cycle();
   const before = k8s.actions.length;
@@ -209,6 +252,7 @@ test("credential canaries never appear in agent failure logs and shutdown ends a
     (event, fields) => logs.push(JSON.stringify({ event, ...fields })),
     Date.now,
     metrics,
+    authenticate,
   );
   await loop.run();
   assert.ok(logs.some((line) => line.includes("database_reconcile_failed")));

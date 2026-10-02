@@ -76,10 +76,16 @@ importers:
       '@pgcf/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      pg:
+        specifier: 8.23.1
+        version: 8.23.1
       ws:
         specifier: ^8.21.0
         version: 8.22.0
     devDependencies:
+      '@types/pg':
+        specifier: 8.23.1
+        version: 8.23.1
       '@types/ws':
         specifier: ^8.18.0
         version: 8.18.2

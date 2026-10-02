@@ -9,6 +9,7 @@ import {
 } from "@pgcf/contracts";
 import type { DesiredDatabase, K8sObject } from "@pgcf/contracts";
 import type { BuildContext } from "../../src/agent/builders/index.ts";
+import { roleSecretName } from "../../src/agent/builders/index.ts";
 import { DATABASE_LABEL } from "../../src/agent/observe.ts";
 import { record } from "../../src/agent/types.ts";
 import type { Kubernetes, Resource } from "../../src/agent/types.ts";
@@ -72,8 +73,10 @@ export function fixture(): { db: DesiredDatabase; ctx: BuildContext } {
 
 export const metrics: typeof fetch = async () =>
   new Response('cnpg_collector_pg_wal_archive_status{value="ready"} 0\n');
+export const authenticate = async () => true;
 
 export class MemoryKubernetes implements Kubernetes {
+  revision = 0;
   resources = new Map<string, Resource>();
   actions: string[] = [];
   failAfter = -1;
@@ -90,7 +93,11 @@ export class MemoryKubernetes implements Kubernetes {
   put(resource: K8sObject): Resource {
     const value = {
       ...structuredClone(resource),
-      metadata: { ...structuredClone(resource.metadata), uid: randomUUID() },
+      metadata: {
+        ...structuredClone(resource.metadata),
+        uid: randomUUID(),
+        resourceVersion: String(++this.revision),
+      },
     } as Resource;
     this.resources.set(
       this.key(value.kind, value.metadata.namespace, value.metadata.name),
@@ -147,11 +154,38 @@ export class MemoryKubernetes implements Kubernetes {
       metadata: {
         ...structuredClone(resource.metadata),
         uid: old?.metadata.uid ?? randomUUID(),
+        resourceVersion: String(++this.revision),
       },
     } as Resource;
     if (resource.kind === "Namespace") current.status = { phase: "Active" };
     if (resource.kind === "Cluster") {
+      const clusterSpec = record(resource.spec);
+      const managedRoles = record(clusterSpec.managed).roles;
+      const roles = Array.isArray(managedRoles) ? managedRoles.map(record) : [];
+      const applicationSecret = this.resources.get(
+        this.key("Secret", resource.metadata.namespace, roleSecretName("app")),
+      );
       current.status = {
+        secretsResourceVersion: {
+          applicationSecretVersion: applicationSecret?.metadata.resourceVersion,
+        },
+        managedRolesStatus: {
+          byStatus: { reconciled: roles.map((role) => role.name) },
+          passwordStatus: Object.fromEntries(
+            roles.map((role) => [
+              String(role.name),
+              {
+                resourceVersion: this.resources.get(
+                  this.key(
+                    "Secret",
+                    resource.metadata.namespace,
+                    String(record(role.passwordSecret).name),
+                  ),
+                )?.metadata.resourceVersion,
+              },
+            ]),
+          ),
+        },
         currentPrimary: "database-1",
         conditions: [
           { type: "Ready", status: this.ready ? "True" : "False" },
@@ -173,7 +207,22 @@ export class MemoryKubernetes implements Kubernetes {
           namespace: resource.metadata.namespace,
           labels: { "cnpg.io/cluster": "database" },
         },
-        status: { podIP: [127, 0, 0, 1].join(".") },
+        spec: {
+          nodeName: record(record(clusterSpec.affinity).nodeSelector)[
+            "kubernetes.io/hostname"
+          ],
+          containers: [
+            {
+              name: "postgres",
+              image: clusterSpec.imageName,
+              resources: structuredClone(clusterSpec.resources),
+            },
+          ],
+        },
+        status: {
+          podIP: [127, 0, 0, 1].join("."),
+          conditions: [{ type: "Ready", status: "True" }],
+        },
       });
       if (this.caPresent)
         this.put({

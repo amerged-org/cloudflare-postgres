@@ -9,6 +9,7 @@ import {
   buildCaConfigMap,
   buildDatabaseManifests,
   databaseNamespace,
+  roleSecretName,
 } from "./builders/index.ts";
 import type { BuildContext } from "./builders/index.ts";
 import {
@@ -18,10 +19,13 @@ import {
   DATABASE_LABEL,
   GENERATION_ANNOTATION,
   readyWalFiles,
+  quantity,
   WAL_BACKLOG_LIMIT,
 } from "./observe.ts";
 import { record, string, uid } from "./types.ts";
 import type { Kubernetes, Resource } from "./types.ts";
+import { probeRoles } from "./readiness.ts";
+import type { AuthenticationProbe } from "./readiness.ts";
 
 interface VolumeIdentity {
   name: string;
@@ -40,6 +44,25 @@ interface DeleteState {
 const LEDGER_PREFIX = "delete-";
 const SYSTEM_NAMESPACE = "pgcf-system";
 const DELETE_TIMEOUT_MS = 10 * 60_000;
+
+function containsDesired(actual: unknown, desired: unknown): boolean {
+  if (Array.isArray(desired))
+    return (
+      Array.isArray(actual) &&
+      actual.length === desired.length &&
+      desired.every((value, index) => containsDesired(actual[index], value))
+    );
+  if (desired !== null && typeof desired === "object") {
+    return (
+      actual !== null &&
+      typeof actual === "object" &&
+      Object.entries(desired).every(([key, value]) =>
+        containsDesired(record(actual)[key], value),
+      )
+    );
+  }
+  return actual === desired;
+}
 
 export function assertOwned(
   resource: Resource,
@@ -114,7 +137,11 @@ export async function backupCredentials(
     )
       throw new Error("backup_credentials_invalid");
     const value = Buffer.from(encoded, "base64").toString("utf8");
-    if (!value || /[\r\n\u0000]/.test(value))
+    if (
+      !value ||
+      /[\r\n]/.test(value) ||
+      value.includes(String.fromCharCode(0))
+    )
       throw new Error("backup_credentials_invalid");
     return value;
   };
@@ -128,12 +155,24 @@ export class Reconciler {
   private hashes = new Map<string, string>();
   private highWater = new Map<string, number>();
   private archiveFailures = new Map<string, number>();
+  private k8s: Kubernetes;
+  private signal: AbortSignal;
+  private now: () => number;
+  private fetcher: typeof fetch;
+  private authenticate: AuthenticationProbe;
   constructor(
-    private k8s: Kubernetes,
-    private signal: AbortSignal,
-    private now = Date.now,
-    private fetcher: typeof fetch = fetch,
-  ) {}
+    k8s: Kubernetes,
+    signal: AbortSignal,
+    now = Date.now,
+    fetcher: typeof fetch = fetch,
+    authenticate: AuthenticationProbe = probeRoles,
+  ) {
+    this.k8s = k8s;
+    this.signal = signal;
+    this.now = now;
+    this.fetcher = fetcher;
+    this.authenticate = authenticate;
+  }
 
   async reconcile(
     db: DesiredDatabase,
@@ -263,6 +302,25 @@ export class Reconciler {
       );
     }
     const publicCa = await this.publishCa(db, cluster, namespaceName);
+    const desiredApplied = await this.desiredApplied(
+      db,
+      ctx,
+      cluster,
+      namespaceName,
+    );
+    const caMap = publicCa
+      ? await this.k8s.read("ConfigMap", SYSTEM_NAMESPACE, `ca-${db.id}`)
+      : null;
+    const ca = string(record(caMap?.data)["ca.crt"]);
+    const credentialsApplied =
+      condition(cluster, "Ready")?.status === "True" &&
+      continuous &&
+      publicCa &&
+      desiredApplied &&
+      count !== null &&
+      ca
+        ? await this.authenticate(db, ca, this.signal)
+        : false;
     const unhealthy =
       !continuous &&
       this.now() - (this.archiveFailures.get(db.id) ?? this.now()) >=
@@ -276,6 +334,8 @@ export class Reconciler {
           : condition(cluster, "Ready")?.status === "True" &&
               continuous &&
               publicCa &&
+              desiredApplied &&
+              credentialsApplied &&
               count !== null
             ? "ready"
             : "provisioning",
@@ -284,6 +344,104 @@ export class Reconciler {
         : {}),
       archive: { continuous, ready_wal_files: count },
     };
+  }
+
+  private async desiredApplied(
+    db: DesiredDatabase,
+    ctx: BuildContext,
+    cluster: Resource,
+    namespace: string,
+  ): Promise<boolean> {
+    assertOwned(cluster, db.id, "database");
+    const manifests = buildDatabaseManifests(db, ctx);
+    const expectedCluster = manifests.find(
+      (resource) => resource.kind === "Cluster",
+    );
+    if (
+      !expectedCluster ||
+      !containsDesired(cluster.spec, expectedCluster.spec)
+    )
+      return false;
+    for (const manifest of manifests.filter(
+      (resource) =>
+        resource.kind === "Secret" || resource.kind === "ObjectStore",
+    )) {
+      const actual = await this.k8s.read(
+        manifest.kind,
+        namespace,
+        manifest.metadata.name,
+      );
+      if (!actual) return false;
+      assertOwned(actual, db.id, manifest.metadata.name);
+      if (
+        !containsDesired(
+          actual.data ?? actual.spec,
+          manifest.data ?? manifest.spec,
+        )
+      )
+        return false;
+      if (manifest.kind === "Secret") {
+        const role = db.roles.find(
+          (value) => roleSecretName(value.name) === manifest.metadata.name,
+        );
+        if (role) {
+          if (!actual.metadata.resourceVersion) return false;
+          if (role.owner) {
+            if (
+              record(record(cluster.status).secretsResourceVersion)
+                .applicationSecretVersion !== actual.metadata.resourceVersion
+            )
+              return false;
+          } else {
+            const rolesStatus = record(
+              record(cluster.status).managedRolesStatus,
+            );
+            const reconciled = record(rolesStatus.byStatus).reconciled;
+            if (
+              !Array.isArray(reconciled) ||
+              !reconciled.includes(role.name) ||
+              record(record(rolesStatus.passwordStatus)[role.name])
+                .resourceVersion !== actual.metadata.resourceVersion
+            )
+              return false;
+          }
+        }
+      }
+    }
+    const primary = string(record(cluster.status).currentPrimary);
+    if (
+      !primary ||
+      !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(primary) ||
+      primary.length > 63
+    )
+      return false;
+    const pod = await this.k8s.read("Pod", namespace, primary);
+    if (
+      !pod ||
+      pod.metadata.deletionTimestamp ||
+      pod.metadata.namespace !== namespace ||
+      pod.metadata.labels?.["cnpg.io/cluster"] !== "database" ||
+      condition(pod, "Ready")?.status !== "True" ||
+      record(pod.spec).nodeName !== db.node
+    )
+      return false;
+    const containers = record(pod.spec).containers;
+    const postgres = Array.isArray(containers)
+      ? containers.map(record).find((value) => value.name === "postgres")
+      : undefined;
+    if (!postgres || postgres.image !== ctx.postgresImage) return false;
+    const compute = record(postgres.resources);
+    for (const resources of [
+      record(compute.requests),
+      record(compute.limits),
+    ]) {
+      if (
+        quantity(resources.memory) !== db.size.memory_mib * 2 ** 20 ||
+        quantity(resources.cpu) * 1000 !== db.size.cpu_millicores
+      )
+        return false;
+    }
+    return true;
   }
 
   private async publishCa(

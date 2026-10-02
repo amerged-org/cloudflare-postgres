@@ -10,16 +10,25 @@ import type { Log } from "./types.ts";
 
 export class AgentLink {
   private instanceId = randomUUID();
+  private config: Pick<AgentConfig, "apiUrl" | "agentKey">;
+  private hint: () => void;
+  private log: Log;
+  private version: string;
+  private connect: (url: URL, options: ClientOptions) => WebSocket;
   constructor(
-    private config: Pick<AgentConfig, "apiUrl" | "agentKey">,
-    private hint: () => void,
-    private log: Log,
-    private version = "0.0.0",
-    private connect: (url: URL, options: ClientOptions) => WebSocket = (
-      url,
-      options,
-    ) => new WebSocket(url, options),
-  ) {}
+    config: Pick<AgentConfig, "apiUrl" | "agentKey">,
+    hint: () => void,
+    log: Log,
+    version = "0.0.0",
+    connect: (url: URL, options: ClientOptions) => WebSocket = (url, options) =>
+      new WebSocket(url, options),
+  ) {
+    this.config = config;
+    this.hint = hint;
+    this.log = log;
+    this.version = version;
+    this.connect = connect;
+  }
 
   async run(signal: AbortSignal): Promise<void> {
     let attempts = 0;
