@@ -358,6 +358,15 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     expect((await stats())[0]!.bytes).toHaveLength(0);
   });
 
+  it("refuses public HTTP fallback before sending a routing token or database bytes", async () => {
+    await testEnv.DB.prepare("UPDATE regions SET gateway_binding = NULL, gateway_url = ? WHERE id = ?")
+      .bind(`${gatewayOrigin.replace("https:", "http:")}/pg`, region).run();
+    const connection = await open();
+    connection.socket.send(encodeStartup({ user: "app", database }));
+    expect(await errorCode(connection)).toBe("08006");
+    expect(await stats()).toHaveLength(0);
+  });
+
   it("routes the global fetch fallback to a real test gateway Worker", async () => {
     await testEnv.DB.prepare(
       "UPDATE regions SET gateway_binding = NULL WHERE id = ?",
