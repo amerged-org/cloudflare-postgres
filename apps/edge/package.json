@@ -5,8 +5,8 @@
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
-    "typecheck": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "typecheck": "wrangler types --config wrangler.example.jsonc && tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@pgcf/contracts": "workspace:*"

@@ -1,0 +1,22 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pgcf-edge-test",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-02",
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "pgcf-edge-test",
+    },
+  ],
+  "ratelimits": [
+    {
+      "name": "CONNECTION_RATE_LIMITER",
+      "namespace_id": "1",
+      "simple": {
+        "limit": 1000,
+        "period": 60,
+      },
+    },
+  ],
+}

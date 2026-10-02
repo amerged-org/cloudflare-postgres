@@ -1,0 +1,35 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pgcf-edge-dev",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-10-02",
+  "limits": {
+    "cpu_ms": 300000,
+  },
+  "routes": [
+    {
+      "pattern": "<DB_ENDPOINT_HOST>",
+      "custom_domain": true,
+    },
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "<CONTROL_DATABASE_NAME>",
+      "database_id": "<CONTROL_DATABASE_ID>",
+    },
+  ],
+  "ratelimits": [
+    {
+      "name": "CONNECTION_RATE_LIMITER",
+      "namespace_id": "<RATE_LIMIT_NAMESPACE_ID>",
+      "simple": {
+        "limit": 120,
+        "period": 60,
+      },
+    },
+  ],
+  "secrets": {
+    "required": ["ROUTE_MASTER_KEYS"],
+  },
+}
