@@ -1,0 +1,76 @@
+# Remotely managed named tunnel; its public-hostname routing (to the pgcf-gateway Service) lives in
+# Cloudflare. The pod accepts no inbound traffic and keeps metrics on localhost.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgcf-cloudflared
+  namespace: pgcf-system
+  labels:
+    app.kubernetes.io/name: pgcf-cloudflared
+    app.kubernetes.io/part-of: pgcf
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgcf-cloudflared
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pgcf-cloudflared
+        app.kubernetes.io/part-of: pgcf
+    spec:
+      serviceAccountName: pgcf-cloudflared
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: pgcf-cloudflared
+      containers:
+        - name: cloudflared
+          image: cloudflared
+          args: [tunnel, --metrics, "127.0.0.1:20241", run]
+          env:
+            - name: TUNNEL_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: pgcf-cloudflared
+                  key: token
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 500m
+              memory: 256Mi
+          # The metrics port is localhost-only, so probes run inside the container.
+          livenessProbe:
+            exec:
+              command: [cloudflared, tunnel, --metrics, "127.0.0.1:20241", ready]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            exec:
+              command: [cloudflared, tunnel, --metrics, "127.0.0.1:20241", ready]
+            periodSeconds: 5
+            failureThreshold: 2

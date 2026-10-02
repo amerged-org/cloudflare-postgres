@@ -1,0 +1,58 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgcf-agent
+  namespace: pgcf-system
+  labels:
+    app.kubernetes.io/name: pgcf-agent
+    app.kubernetes.io/part-of: pgcf
+spec:
+  replicas: 1
+  # One reconciler per region; a rolling overlap would run two.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: pgcf-agent
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: pgcf-agent
+        app.kubernetes.io/part-of: pgcf
+    spec:
+      serviceAccountName: pgcf-agent
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: agent
+          image: pgcf-regional
+          command: [node, /app/agent.mjs]
+          envFrom:
+            - configMapRef:
+                name: pgcf-regional
+            - secretRef:
+                name: pgcf-agent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 384Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi

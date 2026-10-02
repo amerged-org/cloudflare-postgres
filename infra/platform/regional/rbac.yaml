@@ -1,0 +1,150 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pgcf-agent
+  namespace: pgcf-system
+  labels:
+    app.kubernetes.io/name: pgcf-agent
+    app.kubernetes.io/part-of: pgcf
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pgcf-gateway
+  namespace: pgcf-system
+  labels:
+    app.kubernetes.io/name: pgcf-gateway
+    app.kubernetes.io/part-of: pgcf
+---
+# cloudflared never talks to the Kubernetes API.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: pgcf-cloudflared
+  namespace: pgcf-system
+  labels:
+    app.kubernetes.io/name: pgcf-cloudflared
+    app.kubernetes.io/part-of: pgcf
+automountServiceAccountToken: false
+---
+# The agent owns every per-database namespace and its resources. Namespace names are dynamic, so
+# these rules are cluster-wide. There is no pods/exec, pods/log, list or watch on Secrets, and no
+# RBAC or workload-controller access.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgcf-agent
+  labels:
+    app.kubernetes.io/part-of: pgcf
+rules:
+  - apiGroups: [""]
+    resources: [namespaces]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Role-password, archive-credential and CA Secrets live in the database namespaces. Secret names
+  # are dynamic, so get cannot be limited by resourceNames; list and watch are not granted.
+  - apiGroups: [""]
+    resources: [secrets]
+    verbs: [get, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [resourcequotas, limitranges]
+    verbs: [get, list, create, update, patch, delete]
+  - apiGroups: [networking.k8s.io]
+    resources: [networkpolicies]
+    verbs: [get, list, create, update, patch, delete]
+  - apiGroups: [cilium.io]
+    resources: [ciliumnetworkpolicies]
+    verbs: [get, list, create, update, patch, delete]
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters, scheduledbackups]
+    verbs: [get, list, create, update, patch, delete]
+  - apiGroups: [barmancloud.cnpg.io]
+    resources: [objectstores]
+    verbs: [get, list, create, update, patch, delete]
+  # Delete flow: find the PV bound to a database, set reclaim policy Delete, then wait for it.
+  - apiGroups: [""]
+    resources: [persistentvolumes]
+    verbs: [get, list, patch, delete]
+  # Waiting for the LV to disappear after the PV is gone.
+  - apiGroups: [local.openebs.io]
+    resources: [lvmvolumes]
+    verbs: [get, list]
+  - apiGroups: [""]
+    resources: [nodes, pods]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgcf-agent
+  labels:
+    app.kubernetes.io/part-of: pgcf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgcf-agent
+subjects:
+  - kind: ServiceAccount
+    name: pgcf-agent
+    namespace: pgcf-system
+---
+# The agent publishes the CNPG server CA of each database as ConfigMap ca-<id> for the gateway and
+# reads the shared R2 credential it copies into each database namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pgcf-agent
+  namespace: pgcf-system
+  labels:
+    app.kubernetes.io/part-of: pgcf
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, create, update, patch, delete]
+  - apiGroups: [""]
+    resources: [secrets]
+    resourceNames: [pgcf-backup-s3]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pgcf-agent
+  namespace: pgcf-system
+  labels:
+    app.kubernetes.io/part-of: pgcf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pgcf-agent
+subjects:
+  - kind: ServiceAccount
+    name: pgcf-agent
+    namespace: pgcf-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pgcf-gateway
+  namespace: pgcf-system
+  labels:
+    app.kubernetes.io/part-of: pgcf
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pgcf-gateway
+  namespace: pgcf-system
+  labels:
+    app.kubernetes.io/part-of: pgcf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pgcf-gateway
+subjects:
+  - kind: ServiceAccount
+    name: pgcf-gateway
+    namespace: pgcf-system

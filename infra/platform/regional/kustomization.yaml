@@ -1,0 +1,19 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - config.yaml
+  - rbac.yaml
+  - network-policies.yaml
+  - cloudflared.yaml
+  - gateway.yaml
+  - agent.yaml
+# The regional image (agent and gateway) is built by CI. Its digest does not exist until the first
+# image is published; the release commit then adds `digest: sha256:...` here. A private overlay may
+# replace newName/newTag for a locally imported Dev image (see ../README.md).
+images:
+  - name: pgcf-regional
+    newName: ghcr.io/amerged-org/pgcf-regional
+  - name: cloudflared
+    newName: docker.io/cloudflare/cloudflared
+    # cloudflared 2026.9.3 multi-arch index
+    digest: sha256:072c067d25ccbe61d46e18f0d0723255f2bb5304f7317caa95b27031520ff92c

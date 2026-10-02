@@ -1,0 +1,33 @@
+# Copy into private installation configuration. Excluded from ./kustomization.yaml on purpose.
+# Reuses the GitRepository pgcf-platform from ../bootstrap/flux-sync.example.yaml. This is a
+# separate Kustomization so a failure here cannot affect the five platform releases.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgcf-regional-vars
+  namespace: flux-system
+data:
+  PGCF_REGION_ID: REPLACE_WITH_REGION_ID
+  PGCF_API_HOST: REPLACE_WITH_API_WORKER_HOSTNAME
+---
+apiVersion: kustomize.toolkit.fluxcd.io/v1
+kind: Kustomization
+metadata:
+  name: pgcf-regional
+  namespace: flux-system
+spec:
+  interval: 30m
+  retryInterval: 2m
+  timeout: 10m
+  path: ./infra/platform/regional
+  prune: true
+  wait: true
+  sourceRef:
+    kind: GitRepository
+    name: pgcf-platform
+  dependsOn:
+    - name: pgcf-platform
+  postBuild:
+    substituteFrom:
+      - kind: ConfigMap
+        name: pgcf-regional-vars

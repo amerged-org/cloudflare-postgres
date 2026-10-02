@@ -1,0 +1,132 @@
+# Default deny for the whole namespace, then one CiliumNetworkPolicy per workload. Cilium treats a
+# selected endpoint as default-deny per direction and unions the allow rules.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+  namespace: pgcf-system
+spec:
+  podSelector: {}
+  policyTypes: [Ingress, Egress]
+---
+# Egress to the Cloudflare edge only on the tunnel port, and to the gateway Service Pods.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: pgcf-cloudflared
+  namespace: pgcf-system
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: pgcf-cloudflared
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: ANY
+          rules:
+            dns:
+              - matchPattern: "*"
+    - toEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: pgcf-gateway
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - toEntities: [world]
+      toPorts:
+        - ports:
+            - port: "7844"
+              protocol: TCP
+            - port: "7844"
+              protocol: UDP
+---
+# Ingress only from cloudflared. Egress to DNS, the Kubernetes API (ConfigMap reads) and the
+# PostgreSQL port of database Pods in per-database namespaces.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: pgcf-gateway
+  namespace: pgcf-system
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: pgcf-gateway
+  ingress:
+    - fromEndpoints:
+        - matchLabels:
+            app.kubernetes.io/name: pgcf-cloudflared
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: ANY
+          rules:
+            dns:
+              - matchPattern: "*"
+    - toEntities: [kube-apiserver]
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "6443"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            cnpg.io/cluster: database
+          matchExpressions:
+            - key: k8s:io.cilium.k8s.namespace.labels.pgcf.io/database-id
+              operator: Exists
+      toPorts:
+        - ports:
+            - port: "5432"
+              protocol: TCP
+---
+# No ingress. Egress to DNS, the Kubernetes API and the API Worker host over HTTPS.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: pgcf-agent
+  namespace: pgcf-system
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: pgcf-agent
+  egress:
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: kube-system
+            k8s-app: kube-dns
+      toPorts:
+        - ports:
+            - port: "53"
+              protocol: ANY
+          rules:
+            dns:
+              - matchPattern: "*"
+    - toEntities: [kube-apiserver]
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP
+            - port: "6443"
+              protocol: TCP
+    - toFQDNs:
+        - matchName: "${PGCF_API_HOST}"
+      toPorts:
+        - ports:
+            - port: "443"
+              protocol: TCP

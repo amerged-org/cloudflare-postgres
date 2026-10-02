@@ -1,0 +1,12 @@
+# Non-secret regional settings. The ${...} variables are filled by Flux post-build substitution
+# (see flux-sync.example.yaml); the same PGCF_API_HOST feeds the agent egress policy.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgcf-regional
+  namespace: pgcf-system
+  labels:
+    app.kubernetes.io/part-of: pgcf
+data:
+  PGCF_REGION_ID: "${PGCF_REGION_ID}"
+  PGCF_API_URL: "https://${PGCF_API_HOST}"
