@@ -21,6 +21,14 @@
   ],
   "ratelimits": [
     {
+      "name": "DATABASE_CONNECTION_RATE_LIMITER",
+      "namespace_id": "<DATABASE_RATE_LIMIT_NAMESPACE_ID>",
+      "simple": {
+        "limit": 120,
+        "period": 60,
+      },
+    },
+    {
       "name": "CONNECTION_RATE_LIMITER",
       "namespace_id": "<RATE_LIMIT_NAMESPACE_ID>",
       "simple": {

@@ -13,6 +13,7 @@ import {
 } from "@pgcf/contracts/route-token";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker, {
+  connectionRateKey,
   normalizeCloseCode,
   STARTUP_DEADLINE_MS,
 } from "../src/index.ts";
@@ -183,6 +184,38 @@ afterEach(async () => {
 });
 
 describe("edge routing with real Workers D1, parser and route-token modules", () => {
+  it("canonicalizes valid IPv4 and IPv6 admission keys with a bounded parser", () => {
+    const ipv4 = [192, 0, 2, 1].join(".");
+    expect(connectionRateKey(ipv4)).toBe(`ipv4:${ipv4}`);
+    expect(connectionRateKey([192, 0, 2, 2].join("."))).not.toBe(
+      connectionRateKey(ipv4),
+    );
+    const prefix = [0x2001, 0xdb8, 0xa, 0xb].map((part) => part.toString(16));
+    const short = `${prefix.join(":")}::1`;
+    const full = [
+      ...prefix.map((part) => part.toUpperCase().padStart(4, "0")),
+      "0000",
+      "0000",
+      "0000",
+      "0002",
+    ].join(":");
+    expect(connectionRateKey(short)).toBe(connectionRateKey(full));
+    expect(connectionRateKey(short)).toBe(
+      `ipv6:${prefix.map((part) => part.padStart(4, "0")).join(":")}/64`,
+    );
+    expect(connectionRateKey(`::ffff:${ipv4}`)).toBe(
+      connectionRateKey(`::ffff:${[192, 0, 2, 2].join(".")}`),
+    );
+    expect(connectionRateKey(":".repeat(2))).toBe(
+      `ipv6:${Array<string>(4).fill("0000").join(":")}/64`,
+    );
+    expect(connectionRateKey(`0${ipv4}`)).toBeNull();
+    expect(connectionRateKey("a::b::c")).toBeNull();
+    expect(connectionRateKey(Array<string>(9).fill("1").join(":"))).toBeNull();
+    expect(connectionRateKey("f".repeat(1_000_000))).toBeNull();
+    expect(connectionRateKey(`${short}%interface`)).toBeNull();
+  });
+
   it("serves health and requires a WebSocket upgrade for other requests", async () => {
     const ctx = createExecutionContext();
     const health = await worker.fetch(
