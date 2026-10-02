@@ -208,3 +208,51 @@ test("an additional finding in a reviewed file remains fatal", async () => {
   );
   assert.deepEqual(result, { resolved: 1, unresolved: 1 });
 });
+
+test("repacked application layers retain only the six exact package-proven spans", async () => {
+  const proof = await provenance();
+  const digest = "sha256:" + "e".repeat(64);
+  const values = reviewedFiles
+    .filter((file) => !file.officialBaseMembership)
+    .flatMap((file) =>
+      file.findings.map((_span, index) => {
+        const value = finding(file, index);
+        return {
+          ...value,
+          input: {
+            ...value.input,
+            layer: 7,
+            tarEntry: value.input.tarEntry! + 19,
+            boundDigest: digest,
+          },
+        };
+      }),
+    );
+  const repacked = { ...proof, imageDiffIDs: [...proof.imageDiffIDs, digest] };
+  assert.deepEqual(classifyReviewed(values, repacked), {
+    resolved: 6,
+    unresolved: 0,
+  });
+  assert.deepEqual(
+    classifyReviewed(
+      [...values, { ...values[0]!, StartLine: values[0]!.StartLine + 1 }],
+      repacked,
+    ),
+    { resolved: 6, unresolved: 1 },
+  );
+  assert.equal(
+    classifyReviewed(
+      [
+        {
+          ...values[0]!,
+          input: {
+            ...values[0]!.input,
+            boundDigest: "sha256:" + "f".repeat(64),
+          },
+        },
+      ],
+      repacked,
+    ).unresolved,
+    1,
+  );
+});

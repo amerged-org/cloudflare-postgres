@@ -65,13 +65,23 @@ export function classifyReviewed(
     );
   for (const finding of findings) {
     const input = finding.input;
+    if (
+      !Number.isSafeInteger(input.layer) ||
+      input.layer === null ||
+      input.layer < 0 ||
+      input.layer >= provenance.imageDiffIDs.length ||
+      !Number.isSafeInteger(input.tarEntry) ||
+      input.tarEntry === null ||
+      input.tarEntry < 0 ||
+      typeof input.boundDigest !== "string" ||
+      !/^sha256:[a-f0-9]{64}$/.test(input.boundDigest) ||
+      provenance.imageDiffIDs[input.layer] !== input.boundDigest
+    )
+      continue;
     const file = reviewedFiles.find(
       (file) =>
         input.kind === "layer-file" &&
         input.path === file.path &&
-        input.layer === file.layer &&
-        input.tarEntry === file.tarEntry &&
-        input.boundDigest === file.boundDigest &&
         input.sha256 === file.sha256 &&
         input.size === file.size,
     );
@@ -79,15 +89,21 @@ export function classifyReviewed(
       !file ||
       finding.File !== file.path ||
       finding.Tags.length ||
-      finding.Secret !== "REDACTED" ||
-      provenance.imageDiffIDs[file.layer] !== file.boundDigest
+      finding.Secret !== "REDACTED"
     )
       continue;
     if (file.officialBaseMembership) {
-      if (!exactBase || file.layer >= reviewedBase.diffIDs.length) continue;
+      if (
+        !exactBase ||
+        input.layer !== file.layer ||
+        input.tarEntry !== file.tarEntry ||
+        input.boundDigest !== file.boundDigest ||
+        file.layer >= reviewedBase.diffIDs.length
+      )
+        continue;
     } else if (
       !file.package ||
-      file.layer < provenance.baseDiffIDs.length ||
+      input.layer < provenance.baseDiffIDs.length ||
       !provenance.packages.some(
         (item) =>
           item.name === file.package!.name &&

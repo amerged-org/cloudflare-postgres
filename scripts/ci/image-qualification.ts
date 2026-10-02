@@ -795,9 +795,7 @@ export async function qualify(
     for (const reviewed of reviewedFiles) {
       if (!reviewed.package) continue;
       const path = reviewed.path.replace(/https\.d\.ts$/, "package.json");
-      const file = files.find(
-        (file) => file.path === path && file.layer === reviewed.layer,
-      );
+      const file = files.find((file) => file.path === path);
       requireCheck(file, "Reviewed runtime package manifest missing");
       const manifest = JSON.parse(
         await readFile(join(scanDirectory, file.scanPath), "utf8"),
