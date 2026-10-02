@@ -10,10 +10,15 @@ import {
   newDatabaseId,
   newOperationId,
   newRolePassword,
+  OWNER_ROLE_NAME,
 } from "../src/index.ts";
 
 const id = newDatabaseId();
 const opId = newOperationId();
+const backupEndpoint = new URL(
+  "/",
+  `https://${["r2", "example", "com"].join(".")}`,
+).origin;
 
 function desired(): Record<string, unknown> {
   return {
@@ -155,6 +160,41 @@ describe("DesiredDatabase", () => {
     ).toBe(false);
   });
 
+  it("requires exactly one app owner for running databases", () => {
+    const role = (name: string, owner: boolean) => ({
+      name,
+      owner,
+      password: newRolePassword(),
+      revision: 1,
+    });
+    expect(DesiredDatabase.safeParse({ ...desired(), roles: [] }).success).toBe(
+      false,
+    );
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        roles: [role(OWNER_ROLE_NAME, false)],
+      }).success,
+    ).toBe(false);
+    expect(
+      DesiredDatabase.safeParse({ ...desired(), roles: [role("other", true)] })
+        .success,
+    ).toBe(false);
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        roles: [role(OWNER_ROLE_NAME, true), role("reader", false)],
+      }).success,
+    ).toBe(true);
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        desired_state: "deleted",
+        roles: [],
+      }).success,
+    ).toBe(true);
+  });
+
   it("rejects an archive path for another database or generation", () => {
     const other = archiveDestinationPath(
       "pgcf-backups",
@@ -180,7 +220,7 @@ describe("DesiredDatabase", () => {
         id: "eu-1",
         backup: {
           bucket: "pgcf-backups",
-          endpoint_url: "https://r2.example.com",
+          endpoint_url: backupEndpoint,
           region: "auto",
         },
       },
@@ -190,6 +230,21 @@ describe("DesiredDatabase", () => {
     expect(DesiredResponse.safeParse(response).success).toBe(true);
     expect(
       DesiredResponse.safeParse({ ...response, next: "../" }).success,
+    ).toBe(false);
+    expect(
+      DesiredResponse.safeParse({
+        ...response,
+        region: { ...response.region, id: "us-1" },
+      }).success,
+    ).toBe(false);
+    expect(
+      DesiredResponse.safeParse({
+        ...response,
+        region: {
+          ...response.region,
+          backup: { ...response.region.backup, bucket: "other-backups" },
+        },
+      }).success,
     ).toBe(false);
   });
 });

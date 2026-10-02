@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { bytesToHex, newSecret } from "./encoding.ts";
+import { base64urlToBytes, bytesToHex, newSecret } from "./encoding.ts";
 import { ID_ALPHABET, REGION_ID_PATTERN, randomString } from "./ids.ts";
 import type { RegionId } from "./ids.ts";
 
@@ -20,6 +20,29 @@ export const HEX_SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 export const ApiKeyString = z.string().regex(API_KEY_PATTERN);
 export const AgentKeyString = z.string().regex(AGENT_KEY_PATTERN);
+
+export const ROUTE_KEY_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
+export const RouteKeyId = z.string().regex(ROUTE_KEY_ID_PATTERN);
+export type RouteKeyId = z.infer<typeof RouteKeyId>;
+
+const RegionRouteKey = z
+  .string()
+  .length(43)
+  .refine((value) => base64urlToBytes(value)?.length === 32, {
+    message: "region routing keys must be canonical base64url of 32 bytes",
+  });
+
+/** Derived region keys for gateway configuration; never the master keyring. */
+export const RegionRouteKeyring = z
+  .strictObject({
+    active: RouteKeyId,
+    keys: z.record(RouteKeyId, RegionRouteKey),
+  })
+  .refine((keyring) => Object.hasOwn(keyring.keys, keyring.active), {
+    path: ["active"],
+    message: "active routing key must be present",
+  });
+export type RegionRouteKeyring = z.infer<typeof RegionRouteKeyring>;
 
 export interface ParsedApiKey {
   lookupId: string;

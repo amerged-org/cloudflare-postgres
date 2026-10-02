@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { ApiKeyScope, ApiKeyString, AgentKeyString } from "./auth.ts";
+import {
+  ApiKeyScope,
+  ApiKeyString,
+  AgentKeyString,
+  RegionRouteKeyring,
+} from "./auth.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 import {
   ApiKeyId,
@@ -195,9 +200,13 @@ export const RegionCreate = z
   .meta({ id: "RegionCreate" });
 export type RegionCreate = z.infer<typeof RegionCreate>;
 
-/** The agent key is returned exactly once, at creation. */
+/** The agent key and derived routing keyring are returned exactly once, at creation. */
 export const RegionCreated = z
-  .strictObject({ region: Region, agent_key: AgentKeyString })
+  .strictObject({
+    region: Region,
+    agent_key: AgentKeyString,
+    route_keyring: RegionRouteKeyring,
+  })
   .meta({ id: "RegionCreated" });
 export type RegionCreated = z.infer<typeof RegionCreated>;
 

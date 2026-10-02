@@ -6,6 +6,7 @@ import {
   DATABASE_ID_PATTERN,
   DatabaseId,
   OPERATION_ID_PATTERN,
+  OWNER_ROLE_NAME,
   REGION_ID_PATTERN,
   RegionId,
   RoleName,
@@ -113,30 +114,58 @@ export const DesiredDatabase = z
         });
       }
       names.add(role.name);
-      if (role.owner) owners += 1;
+      if (role.owner) {
+        owners += 1;
+        if (role.name !== OWNER_ROLE_NAME) {
+          ctx.addIssue({
+            code: "custom",
+            path: ["roles"],
+            message: `owner role must be ${OWNER_ROLE_NAME}`,
+          });
+        }
+      }
     }
-    if (owners > 1) {
+    if (owners > 1 || (db.desired_state === "running" && owners !== 1)) {
       ctx.addIssue({
         code: "custom",
         path: ["roles"],
-        message: "at most one owner role",
+        message: "running databases require exactly one owner role",
       });
     }
   });
 export type DesiredDatabase = z.infer<typeof DesiredDatabase>;
 
-export const DesiredResponse = z.strictObject({
-  region: z.strictObject({
-    id: RegionId,
-    backup: z.strictObject({
-      bucket: BucketName,
-      endpoint_url: z.url({ protocol: /^https$/ }),
-      region: z.literal("auto"),
+export const DesiredResponse = z
+  .strictObject({
+    region: z.strictObject({
+      id: RegionId,
+      backup: z.strictObject({
+        bucket: BucketName,
+        endpoint_url: z.url({ protocol: /^https$/ }),
+        region: z.literal("auto"),
+      }),
     }),
-  }),
-  databases: z.array(DesiredDatabase).max(DESIRED_PAGE_LIMIT_MAX),
-  next: DatabaseId.nullable(),
-});
+    databases: z.array(DesiredDatabase).max(DESIRED_PAGE_LIMIT_MAX),
+    next: DatabaseId.nullable(),
+  })
+  .superRefine((response, ctx) => {
+    response.databases.forEach((database, index) => {
+      const match = ARCHIVE_DESTINATION_PATTERN.exec(
+        database.archive.destination_path,
+      );
+      if (
+        match &&
+        (match[1] !== response.region.backup.bucket ||
+          match[2] !== response.region.id)
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["databases", index, "archive", "destination_path"],
+          message: "archive path must name this response's region and bucket",
+        });
+      }
+    });
+  });
 export type DesiredResponse = z.infer<typeof DesiredResponse>;
 
 // ---------- Observations (POST /agent/v1/observations) ----------
