@@ -2,7 +2,9 @@
 
 Reviewed: 2026-10-02 (reset). The repository's [Apache License 2.0](LICENSE) covers original
 project work only. Upstream components keep their own licenses, notices and source obligations.
-No upstream source is vendored. Direct application dependencies are listed below at the version
+No upstream source is vendored in the repository. The regional image bundles zod and ships its MIT
+notice at `/app/licenses/zod/LICENSE`, copied from the lockfile-resolved installed package.
+Direct application dependencies are listed below at the version
 resolved in `pnpm-lock.yaml`. Their transitive dependencies are recorded only in the lockfile.
 Recheck the exact release and its dependencies before upgrading or redistributing.
 
@@ -23,11 +25,20 @@ Pinned platform versions are in [infra/platform/versions.lock.json](infra/platfo
 | [OpenEBS LocalPV LVM](https://github.com/openebs/lvm-localpv)                       | [Apache-2.0](https://github.com/openebs/lvm-localpv/blob/develop/LICENSE)                                                                         | Hard-limited local volumes on the `pgcf` LVM volume group.                                                                              |
 | [cert-manager](https://github.com/cert-manager/cert-manager)                        | [Apache-2.0](https://github.com/cert-manager/cert-manager/blob/master/LICENSE)                                                                    | Certificates required by the Barman plugin.                                                                                             |
 | [cloudflared 2026.9.3](https://github.com/cloudflare/cloudflared)                   | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/master/LICENSE)                                                                       | Outbound tunnel from each region to Cloudflare.                                                                                         |
+| [node:24.21.0-slim](https://github.com/nodejs/docker-node) | [Node.js MIT and bundled-component notices](https://github.com/nodejs/node/blob/v24.21.0/LICENSE); Debian packages retain their individual licenses | Redistributed runtime base image, pinned by its multi-platform digest in `apps/regional/Dockerfile`; see the base-image notice below. |
 | [Kubernetes JavaScript client](https://github.com/kubernetes-client/javascript)     | [Apache-2.0](https://github.com/kubernetes-client/javascript/blob/master/LICENSE)                                                                 | Kubernetes API access from the regional agent.                                                                                          |
 | [Neon serverless driver](https://github.com/neondatabase/serverless)                | [MIT](https://github.com/neondatabase/serverless/blob/main/LICENSE)                                                                               | Client library compatible with the edge endpoint (WebSocket `Pool`/`Client`). Used by clients and tests, not bundled into the platform. |
 
 **Barman license note:** the upstream package metadata declares `GPL-3.0-only`, while the README
 and source headers say GPL version 3 or later. Record the declaration at the pinned release.
+
+**Regional base-image notice:** the image uses
+`node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6`.
+Node.js includes components with their own notices; the Debian base is not covered by Node's MIT
+license alone. The [official image guidance](https://github.com/nodejs/docker-node#license) refers
+to these upstream licenses. Node's `/usr/local/LICENSE`, Debian package copyright files under
+`/usr/share/doc` and the other notices present in the pinned base remain in the regional image.
+Redistributors must retain those notices and satisfy each component's applicable obligations.
 
 **Barman plugin issue:** the R2 restore failure reported in
 [plugin-barman-cloud issue #411](https://github.com/cloudnative-pg/plugin-barman-cloud/issues/411#issuecomment-3572945793)
@@ -42,7 +53,7 @@ read from the installed package manifests.
 | Package                                                                                                 | Version | License           | Role                                                                                      |
 | ------------------------------------------------------------------------------------------------------- | ------- | ----------------- | ----------------------------------------------------------------------------------------- |
 | [hono](https://github.com/honojs/hono)                                                                  | 4.13.12 | MIT               | HTTP framework of the API Worker.                                                         |
-| [zod](https://github.com/colinhacks/zod)                                                                | 4.6.5   | MIT               | Shared schemas in `packages/contracts` and request validation.                            |
+| [zod](https://github.com/colinhacks/zod)                                                                | 4.6.5   | MIT               | Shared schemas and validation; bundled into the regional entry points, with LICENSE shipped in the image. |
 | [@hono/zod-openapi](https://github.com/honojs/middleware/tree/main/packages/zod-openapi)                | 1.6.3   | MIT               | OpenAPI document generated from the route schemas.                                        |
 | [@kubernetes/client-node](https://github.com/kubernetes-client/javascript)                              | 2.0.0   | Apache-2.0        | Regional Kubernetes API client.                                                           |
 | [wrangler](https://github.com/cloudflare/workers-sdk)                                                   | 4.145.0 | MIT OR Apache-2.0 | Worker build, type generation and deployment tooling.                                     |
@@ -53,6 +64,12 @@ read from the installed package manifests.
 | [@types/pg](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/pg)                    | 8.23.1  | MIT               | PostgreSQL client types (development only).                                               |
 | [vitest](https://github.com/vitest-dev/vitest)                                                          | 4.1.11  | MIT               | Test runner (development only).                                                           |
 | [@cloudflare/vitest-plugin](https://github.com/cloudflare/workers-sdk/tree/main/packages/vitest-plugin) | 1.3.5   | MIT               | Runs Worker tests in the Workers runtime (development only).                              |
+
+Root development tooling (`typescript`, `eslint`, `@eslint/js`, `typescript-eslint`, `prettier`
+and `@types/node`) and regional type packages (`@types/ws`, `@types/pg`) are excluded from the
+distributed runtime image. Their resolved versions remain in `pnpm-lock.yaml`; their licenses
+and notices remain in the installed development packages. Build and test tooling is not
+relicensed as first-party code.
 
 ### Reference only
 
