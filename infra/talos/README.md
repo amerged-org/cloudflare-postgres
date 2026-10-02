@@ -15,6 +15,8 @@ Generate the initial control-plane configuration with explicit operator-provided
 ```sh
 umask 077
 mkdir -p .env.local.talos/config
+awk '/^---$/ {exit} {print}' infra/talos/single-node-lab-scheduling.patch.yaml \
+  > .env.local.talos/worker-reservations.patch.yaml
 talosctl gen config "$PGCF_CLUSTER_NAME" "$PGCF_KUBERNETES_API_ENDPOINT" \
   --talos-version v1.14.1 --kubernetes-version 1.36.3 \
   --install-disk "$PGCF_INSTALL_DISK" \
@@ -22,13 +24,18 @@ talosctl gen config "$PGCF_CLUSTER_NAME" "$PGCF_KUBERNETES_API_ENDPOINT" \
   --config-patch @infra/talos/single-disk-lab-storage.patch.yaml \
   --config-patch @.env.local.talos/network.patch.yaml \
   --config-patch-control-plane @infra/talos/single-node-lab-scheduling.patch.yaml \
+  --config-patch-worker @.env.local.talos/worker-reservations.patch.yaml \
   --output .env.local.talos/config
 talosctl validate --mode cloud --strict \
   --config .env.local.talos/config/controlplane.yaml
 chmod 600 .env.local.talos/config/*
 ```
 
-The `single-disk-lab-storage` patch uses the measured lab disk allocation; review its sizes for every target disk. The `single-node-lab-scheduling` patch also applies to the initial EU and US control-plane/worker nodes so they can host customer databases. Reserve system and platform resources before reporting database placement capacity; do not treat control-plane resources as available to tenants. An additional regional worker does not need this control-plane taint patch. EPHEMERAL must be capped before first provisioning. Changing `maxSize` does not shrink an already grown filesystem.
+The `single-disk-lab-storage` patch uses the measured lab disk allocation; review its sizes for every target disk. EPHEMERAL must be capped before first provisioning. Changing `maxSize` does not shrink an already grown filesystem.
+
+The scheduling patch uses Talos 1.14's [KubeletConfig](https://docs.siderolabs.com/talos/v1.14/reference/configuration/kubernetes/kubeletconfig) `config` field. Its first document applies to both node roles: `systemReserved` reserves 500 millicores and 512 MiB for host daemons; `kubeReserved` reserves another 500 millicores and 512 MiB for kubelet and the container runtime. These are initial operator settings, not measured workload requirements. Kubernetes subtracts them, together with its eviction reservation, from Node allocatable. Read back the effective kubelet configuration and Node capacity/allocatable after boot; stop admission if the node cannot provide these reserves and the measured platform workload requests.
+
+The generated worker patch contains only that first document. The second document removes the control-plane taint on the initial EU and US control-plane/worker nodes; it must not be applied to a worker. API-server, scheduler, controller-manager and etcd static Pods are not covered by these non-Pod daemon reserves. The agent separately subtracts the requests of every non-database Pod on the node, including control-plane and platform Pods, from allocatable memory. Do not include those same Pod requests in `kubeReserved` or subtract the host/daemon reserves again in the agent. Confirm the actual platform requests and control-plane load in Dev before admitting databases. See [Kubernetes resource reservation](https://kubernetes.io/docs/tasks/administer-cluster/reserve-compute-resources/).
 
 ## Contabo rescue path
 

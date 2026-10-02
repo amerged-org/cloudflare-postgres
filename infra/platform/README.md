@@ -161,6 +161,63 @@ uses `pgcf.io/storage-gib-total`, published from the measured dedicated LVM volu
 bootstrap/operator path; Kubernetes ephemeral storage is not database capacity. Missing capacity
 is reported as unavailable and cannot admit a placement.
 
+### Publish measured LVM capacity
+
+After the L2 bootstrap's authenticated disk/VG and post-reboot smoke proof, publish storage with
+[the capacity publisher](../talos/publish-storage-capacity.ts). This is an operator action, not an
+agent permission: the regional agent can read Nodes but cannot annotate them. The supervisor must
+review the changed scheduling inputs and this step before using the vetted L2 live kit. The
+publisher does not replace or modify that kit.
+
+Prepare these runtime inputs from the approved cluster inventory and actual measured proof, not
+from whatever cluster happens to be selected in a terminal. Keep their values in private operator
+configuration; the publisher never prints them.
+
+| Environment variable | Meaning |
+| --- | --- |
+| `PGCF_STORAGE_KUBE_CONTEXT` | Explicit Kubernetes context for this cluster. `kubectl` consumes its private credentials; the publisher does not read or print their file. |
+| `PGCF_STORAGE_EXPECTED_CLUSTER_UID` | Expected UID of the cluster's `kube-system` namespace. |
+| `PGCF_STORAGE_EXPECTED_NAMESPACE_UID` | Expected UID of the pinned OpenEBS installation's `openebs` namespace. |
+| `PGCF_STORAGE_BINDINGS_JSON` | Object keyed by approved Node name. Each value contains `node_uid`, `lvmnode_uid`, `lvmnode_resource_version` and `vg_uuid`, captured and bound to the actual dedicated `pgcf` VG proof. |
+| `PGCF_STORAGE_PROOF_NOT_BEFORE` | UTC ISO timestamp when the bounded VG-proof window began. |
+| `PGCF_STORAGE_PROOF_COMPLETED_AT` | UTC ISO timestamp when that proof completed. |
+
+Use Node 24.6 or newer, from the repository root:
+
+```sh
+node infra/talos/publish-storage-capacity.ts
+node infra/talos/publish-storage-capacity.ts --plan
+node infra/talos/publish-storage-capacity.ts --apply
+```
+
+The invocation without an option only shows usage and makes no network call. `--plan` performs
+identity-bound reads and reports measured totals without writing. `--apply` performs those checks
+again and publishes `pgcf.io/storage-gib-total` with JSON Patch tests for the Node's UID and current
+resource version; another Node incarnation or concurrent change refuses the patch. It checks both
+namespace identities immediately before each mutation and rechecks the bound LVMNode revision.
+Unrelated annotations remain intact. Repeat a refused plan after updating the approved measured
+proof; do not learn replacement identities automatically from an unexpected cluster.
+
+The pinned [OpenEBS LVMNode schema](https://github.com/openebs/lvm-localpv/blob/v1.10.1/pkg/apis/openebs.io/lvm/v1alpha1/lvmnode.go)
+reports total size in `volumeGroups[].size` and available size in `free`. The publisher requires
+exactly the dedicated `pgcf` group with its expected UUID, a writable group, no missing physical
+volumes or thin pools, and the exact Node owner reference. It rounds the measured **total** down to
+whole GiB. Free space must be valid and no greater than total; it is not published as total because
+D1 already accounts for database allocations. Neither Kubernetes ephemeral storage nor the recipe's
+configured partition size is a measurement of database capacity.
+
+The [pinned controller](https://github.com/openebs/lvm-localpv/blob/v1.10.1/pkg/mgmt/lvmnode/lvmnode.go)
+only updates the LVMNode when its VG fields or ownership change; it has no heartbeat. Publication
+therefore requires a creation timestamp or a `volumeGroups` managed-fields update inside the
+approved proof window and no older than five minutes. The proof window itself is at most five
+minutes and must have completed before publication. Run this step serially after the vetted L2 storage smoke test and its readback have passed. Bind
+the proof start/end to that actual smoke allocation/free window and record the corresponding
+LVMNode UID/resource version after the CSI measurement catches up; the publisher polls at most
+30 seconds for that exact approved revision. Do not run it concurrently with the vetted Flux or
+bootstrap commands. A long wait or an older unchanged CR intentionally fails closed. A new actual VG observation and approved proof are needed
+then; editing annotations cannot refresh storage evidence. Completing this local implementation
+does not prove that capacity has been published or that the live reserve/placement checks passed.
+
 Flux substitutes two variables from a private ConfigMap (`PGCF_REGION_ID` and `PGCF_API_HOST`, the
 host name of the API Worker) into ConfigMap `pgcf-regional` and the agent's egress policy.
 

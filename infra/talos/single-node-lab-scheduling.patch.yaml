@@ -1,5 +1,16 @@
+# SPDX-License-Identifier: Apache-2.0
+# Apply this kubelet document to both control-plane/worker and worker nodes.
+apiVersion: v1alpha1
+kind: KubeletConfig
+config:
+  systemReserved:
+    cpu: 500m
+    memory: 512Mi
+  kubeReserved:
+    cpu: 500m
+    memory: 512Mi
+---
 # Allows customer databases on the initial EU/US control-plane/worker nodes.
-# Reserve system and platform resources before admitting database placements.
 apiVersion: v1alpha1
 kind: KubeNodeConfig
 taints:
