@@ -236,8 +236,18 @@ test("binds a containerd image manifest to the config and ordered saved blobs", 
 
 async function inspectionProbe(
   inspection: unknown,
-  toolFailure = false,
-): Promise<{ status: number | null; stdout: string; stderr: string }> {
+  options: {
+    platformFlag?: boolean;
+    apiVersion?: string;
+    nativeInspection?: unknown;
+    toolFailure?: boolean;
+  } = {},
+): Promise<{
+  status: number | null;
+  stdout: string;
+  stderr: string;
+  calls: string[][];
+}> {
   const directory = await mkdtemp(join(tmpdir(), "pgcf-inspect-test-"));
   const imageId = "sha256:" + "a".repeat(64);
   const revision = "a".repeat(40);
@@ -245,18 +255,22 @@ async function inspectionProbe(
   const credentialShaped = ["gh", "p_", "s".repeat(36)].join("");
   try {
     const executable = join(directory, "docker");
-    // Emulates the exact v28.0.4 inspect parser: only --format/-f are supported.
+    const calls = join(directory, "calls.jsonl");
+    // Runner image 20260927.320.1 pins Docker 28.0.4; its inspect parser has no platform flag.
+    // https://github.com/actions/runner-images/blob/1275e33f5019b02660b81ecc5622fe196211fa89/images/ubuntu/Ubuntu2404-Readme.md
     await writeFile(
       executable,
-      `#!${process.execPath}
-` +
-        `if (process.argv.slice(2).includes("--platform")) { process.stderr.write("unknown flag: --platform"); process.exit(125); }
-` +
-        (toolFailure
-          ? `process.stderr.write(${JSON.stringify(credentialShaped)}); process.exit(1);
-`
-          : `process.stdout.write(${JSON.stringify(JSON.stringify(inspection))});
-`),
+      [
+        `#!${process.execPath}`,
+        `const {appendFileSync} = require("node:fs"); const args = process.argv.slice(2);`,
+        `appendFileSync(${JSON.stringify(calls)}, JSON.stringify(args) + "\\n");`,
+        `if (args[0] === "version") { process.stdout.write(${JSON.stringify(options.apiVersion ?? "1.48")}); process.exit(0); }`,
+        `if (args.includes("--help")) { process.stdout.write(${JSON.stringify(options.platformFlag ? "Options:\n      --platform string Inspect a specific platform\n" : "Options:\n  -f, --format string Format output\n")}); process.exit(0); }`,
+        `if (args.includes("--platform") && !${options.platformFlag ?? false}) { process.stderr.write("unknown flag: --platform"); process.exit(125); }`,
+        options.toolFailure
+          ? `process.stderr.write(${JSON.stringify(credentialShaped)}); process.exit(1);`
+          : `process.stdout.write(args.includes("--platform") ? ${JSON.stringify(JSON.stringify(inspection))} : ${JSON.stringify(JSON.stringify(options.nativeInspection ?? inspection))});`,
+      ].join("\n"),
       { mode: 0o700 },
     );
     await chmod(executable, 0o700);
@@ -294,7 +308,13 @@ async function inspectionProbe(
     assert.equal(result.error, undefined);
     assert.ok(!result.stdout.includes(credentialShaped));
     assert.ok(!result.stderr.includes(credentialShaped));
-    return result;
+    return {
+      ...result,
+      calls: (await readFile(calls, "utf8"))
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line) as string[]),
+    };
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -310,6 +330,7 @@ const inspectedImage = {
 test("verification supports the Ubuntu Docker 28.0.4 inspect flags", async () => {
   const result = await inspectionProbe([inspectedImage]);
   assert.equal(result.status, 0, result.stderr);
+  assert.ok(result.calls.every((args) => !args.includes("--platform")));
 });
 
 test("plain inspection rejects wrong platforms, ambiguous data and invalid diffIDs", async () => {
@@ -337,9 +358,68 @@ test("plain inspection rejects wrong platforms, ambiguous data and invalid diffI
 });
 
 test("inspection tool failures expose only a fixed safe stage code", async () => {
-  const result = await inspectionProbe([inspectedImage], true);
+  const result = await inspectionProbe([inspectedImage], { toolFailure: true });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /tool_failed:image_inspect/);
   assert.ok(!result.stderr.includes("unknown flag"));
   assert.ok(!result.stderr.includes("fixture:qualified"));
+});
+
+test("modern inspection selects AMD64 from a mixed native-platform cache", async () => {
+  const result = await inspectionProbe([inspectedImage], {
+    platformFlag: true,
+    apiVersion: "1.56",
+    nativeInspection: [{ ...inspectedImage, Architecture: "arm64" }],
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls.at(-1), [
+    "image",
+    "inspect",
+    "--platform",
+    "linux/amd64",
+    "fixture:qualified",
+  ]);
+});
+
+test("an older negotiated API never receives the newer inspect platform flag", async () => {
+  const result = await inspectionProbe([inspectedImage], {
+    platformFlag: true,
+    apiVersion: "1.48",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.deepEqual(result.calls.at(-1), [
+    "image",
+    "inspect",
+    "fixture:qualified",
+  ]);
+  assert.ok(result.calls.every((args) => !args.includes("--platform")));
+});
+
+test("modern platform selection cannot authorize a different image or retry a failed inspect", async () => {
+  const wrongImage = await inspectionProbe(
+    [{ ...inspectedImage, Id: "sha256:" + "c".repeat(64) }],
+    {
+      platformFlag: true,
+      apiVersion: "1.56",
+    },
+  );
+  assert.equal(wrongImage.status, 1);
+  assert.match(wrongImage.stderr, /Image tag differs from the qualified image/);
+  const failedInspect = await inspectionProbe([inspectedImage], {
+    platformFlag: true,
+    apiVersion: "1.56",
+    toolFailure: true,
+  });
+  assert.equal(failedInspect.status, 1);
+  assert.match(failedInspect.stderr, /tool_failed:image_inspect/);
+  assert.equal(
+    failedInspect.calls.filter(
+      (args) =>
+        args[0] === "image" &&
+        args[1] === "inspect" &&
+        !args.includes("--help"),
+    ).length,
+    1,
+  );
+  assert.ok(failedInspect.calls.at(-1)?.includes("--platform"));
 });
