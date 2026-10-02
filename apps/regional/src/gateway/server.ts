@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createServer, type IncomingMessage, type Server } from "node:http";
+import type { Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import type { TLSSocket } from "node:tls";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
@@ -50,8 +51,10 @@ export function createGateway(options: GatewayOptions): Gateway {
   const counts = new Map<string, number>();
   const pending = new Set<AbortController>();
   const clients = new Set<WebSocket>();
+  const sockets = new Set<Socket>();
   const metrics = { activeConnections: 0, peakBufferedBytes: 0 };
   let draining = false;
+  let closing = false;
   let drainPromise: Promise<void> | undefined;
   let empty: (() => void) | undefined;
   const websockets = new WebSocketServer({
@@ -80,9 +83,14 @@ export function createGateway(options: GatewayOptions): Gateway {
   server.headersTimeout = 10_000;
   server.requestTimeout = 10_000;
   server.maxConnections = totalLimit * 2;
+  server.on("connection", (socket) => {
+    sockets.add(socket);
+    socket.on("error", () => {});
+    socket.once("close", () => sockets.delete(socket));
+    if (closing) socket.destroy();
+  });
   server.on("clientError", (_error, socket) => rejectUpgrade(socket, 400));
   server.on("upgrade", (request, socket, head) => {
-    socket.on("error", () => {});
     void upgrade(request, socket, head).catch(() => rejectUpgrade(socket, 502));
   });
 
@@ -303,34 +311,43 @@ export function createGateway(options: GatewayOptions): Gateway {
       draining = true;
       for (const attempt of pending) attempt.abort();
       drainPromise = (async () => {
-        if (metrics.activeConnections !== 0) {
+        let closed: Promise<void> | undefined;
+        const stop = () => {
+          closing = true;
+          closed ??= new Promise<void>((resolve, reject) =>
+            server.close((error) => (error ? reject(error) : resolve())),
+          );
+          for (const attempt of pending) attempt.abort();
+          for (const client of clients) client.terminate();
+          for (const socket of sockets) socket.destroy();
+          empty?.();
+        };
+        const deadline = setTimeout(stop, drainMs);
+        const graceMs = Math.min(500, Math.max(1, Math.floor(drainMs / 4)));
+        const wait = async (milliseconds: number) => {
           await new Promise<void>((resolve) => {
-            const timer = setTimeout(resolve, drainMs);
+            const timer = setTimeout(resolve, milliseconds);
             empty = () => {
               clearTimeout(timer);
               resolve();
             };
           });
           empty = undefined;
-        }
-        for (const client of clients) client.close(1012, "gateway restarting");
-        if (clients.size !== 0) {
-          await new Promise<void>((resolve) => {
-            const timer = setTimeout(() => {
-              for (const client of clients) client.terminate();
-              resolve();
-            }, 500);
-            empty = () => {
-              clearTimeout(timer);
-              resolve();
-            };
-          });
+        };
+        try {
+          if (metrics.activeConnections !== 0) await wait(drainMs - graceMs);
+          if (!closing) {
+            for (const client of clients)
+              client.close(1012, "gateway restarting");
+            if (clients.size !== 0) await wait(graceMs);
+          }
+          stop();
+          await closed;
+          websockets.close();
+        } finally {
+          clearTimeout(deadline);
           empty = undefined;
         }
-        await new Promise<void>((resolve, reject) =>
-          server.close((error) => (error ? reject(error) : resolve())),
-        );
-        websockets.close();
       })();
       return drainPromise;
     },
@@ -354,6 +371,7 @@ function validUpgrade(request: IncomingMessage): boolean {
       .split(/\s*,\s*/)
       .includes("upgrade") === true &&
     request.headers["sec-websocket-version"] === "13" &&
+    request.headers["sec-websocket-protocol"] === undefined &&
     typeof key === "string" &&
     /^[A-Za-z0-9+/]{22}==$/.test(key) &&
     Buffer.from(key, "base64").length === 16 &&
@@ -363,6 +381,9 @@ function validUpgrade(request: IncomingMessage): boolean {
 
 function rejectUpgrade(socket: Duplex, status: number): void {
   if (socket.destroyed) return;
+  const deadline = setTimeout(() => socket.destroy(), 500);
+  deadline.unref();
+  socket.once("close", () => clearTimeout(deadline));
   const reasons: Record<number, string> = {
     400: "Bad Request",
     401: "Unauthorized",
@@ -373,6 +394,7 @@ function rejectUpgrade(socket: Duplex, status: number): void {
   };
   socket.end(
     `HTTP/1.1 ${status} ${reasons[status]}\r\nConnection: close\r\nContent-Length: 0\r\n\r\n`,
+    () => socket.destroy(),
   );
 }
 

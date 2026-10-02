@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { once } from "node:events";
 import { request } from "node:http";
 import { createConnection } from "node:net";
-import { randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { ReplayCache } from "@pgcf/contracts/route-token";
 import { DatabaseCaCache } from "../../src/gateway/ca.ts";
@@ -92,7 +92,7 @@ test("relays ten megabytes both directions through SSLRequest and verified TLS i
     await postgres.close();
   });
   const socket = await open(port);
-  const payload = Buffer.alloc(10 * 1024 * 1024, 37);
+  const payload = randomBytes(10 * 1024 * 1024);
   const chunks: Buffer[] = [];
   let received = 0;
   const echoed = new Promise<void>((resolve, reject) => {
@@ -141,6 +141,97 @@ test("checks replay before dialing and fails closed when replay storage is full"
   socket.close();
   await closed;
   assert.equal(await rejection(port, route), 403);
+});
+
+test("rejected upgrades close half-open TCP peers and release raw connection capacity", async (t) => {
+  const postgres = await postgresServer();
+  const { gateway, port } = await gatewayFor(postgres.port, { totalLimit: 1 });
+  const accepted = once(gateway.server, "connection");
+  const peer = createConnection({ host: loopback, port, allowHalfOpen: true });
+  peer.on("error", () => {});
+  t.after(async () => {
+    peer.destroy();
+    await gateway.drain();
+    await postgres.close();
+  });
+  const [raw] = await accepted;
+  const rawClosed = once(raw, "close", { signal: AbortSignal.timeout(750) });
+  let response = "";
+  peer.on("data", (chunk: Buffer) => {
+    response += chunk.toString("ascii");
+  });
+  const ended = once(peer, "end", { signal: AbortSignal.timeout(750) });
+  peer.write(
+    `GET /pg HTTP/1.1\r\nHost: ${loopback}:${port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: ${randomBytes(16).toString("base64")}\r\n\r\n`,
+  );
+  await ended;
+  assert.match(response, /^HTTP\/1\.1 401 /);
+  await rawClosed;
+  const connections = await new Promise<number>((resolve, reject) =>
+    gateway.server.getConnections((error, count) =>
+      error ? reject(error) : resolve(count),
+    ),
+  );
+  assert.equal(connections, 0);
+  assert.equal((await fetch(`http://${loopback}:${port}/healthz`)).status, 200);
+  assert.equal(postgres.handshakes(), 0);
+});
+
+test("drain destroys incomplete HTTP headers within the shutdown deadline without peer FIN", async (t) => {
+  const postgres = await postgresServer();
+  const { gateway, port } = await gatewayFor(postgres.port, { drainMs: 100 });
+  const accepted = once(gateway.server, "connection");
+  const peer = createConnection({ host: loopback, port, allowHalfOpen: true });
+  peer.on("error", () => {});
+  t.after(async () => {
+    peer.destroy();
+    await gateway.drain();
+    await postgres.close();
+  });
+  const [raw] = await accepted;
+  const rawClosed = once(raw, "close", { signal: AbortSignal.timeout(750) });
+  peer.write(`GET /healthz HTTP/1.1\r\nHost: ${loopback}:${port}\r\n`);
+  const drain = gateway.drain();
+  await Promise.all([within(drain, 750), rawClosed]);
+  assert.equal(gateway.server.listening, false);
+});
+
+test("rejects all subprotocol headers before consuming tokens, reserving capacity or dialing", async (t) => {
+  const postgres = await postgresServer();
+  const { gateway, port, events } = await gatewayFor(postgres.port, {
+    totalLimit: 1,
+  });
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const route = await token();
+  assert.equal(
+    await rejection(port, route, "/pg", {
+      "Sec-WebSocket-Protocol": "relay, relay",
+    }),
+    400,
+  );
+  assert.equal(postgres.handshakes(), 0);
+  assert.equal(gateway.metrics.activeConnections, 0);
+  assert.equal(
+    await rejection(port, route, "/pg", {
+      "Sec-WebSocket-Protocol": "bad protocol",
+    }),
+    400,
+  );
+  assert.equal(
+    await rejection(port, route, "/pg", { "Sec-WebSocket-Protocol": "relay" }),
+    400,
+  );
+  assert.equal(postgres.handshakes(), 0);
+  const socket = await open(port, route);
+  assert.equal(postgres.handshakes(), 1);
+  const released = once(events, "conn_close");
+  const closed = once(socket, "close");
+  socket.close();
+  await closed;
+  await released;
 });
 
 test("reserves per-database and total caps before dialing and releases them after close", async (t) => {
@@ -350,11 +441,32 @@ test("marks readiness false, rejects new connections and drains existing connect
 });
 
 test("bounds relay buffering for a paused slow WebSocket reader", async (t) => {
-  const payload = Buffer.alloc(10 * 1024 * 1024, 53);
+  const payload = randomBytes(48 * 1024 * 1024);
+  const expected = createHash("sha256").update(payload).digest("hex");
+  let bytesWritten = 0;
+  let started: (() => void) | undefined;
+  const writing = new Promise<void>((resolve) => {
+    started = resolve;
+  });
+  let producer: Promise<void> | undefined;
   const postgres = await postgresServer(validCertificate, (socket) =>
-    socket.on("data", () => socket.write(payload)),
+    socket.once("data", () => {
+      producer = (async () => {
+        for (
+          let offset = 0;
+          offset < payload.length;
+          offset += MAX_FRAME_BYTES
+        ) {
+          const chunk = payload.subarray(offset, offset + MAX_FRAME_BYTES);
+          const ready = socket.write(chunk);
+          bytesWritten += chunk.length;
+          started?.();
+          if (!ready) await once(socket, "drain");
+        }
+      })();
+    }),
   );
-  const { gateway, port } = await gatewayFor(postgres.port);
+  const { gateway, port, events } = await gatewayFor(postgres.port);
   t.after(async () => {
     await gateway.drain();
     await postgres.close();
@@ -362,20 +474,56 @@ test("bounds relay buffering for a paused slow WebSocket reader", async (t) => {
   const socket = await open(port);
   socket.pause();
   socket.send(Buffer.from([1]));
-  await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  await writing;
+  await new Promise<void>((resolve) => setTimeout(resolve, 200));
+  assert.ok(bytesWritten < payload.length);
   assert.ok(
     gateway.metrics.peakBufferedBytes <= MAX_PAYLOAD_BYTES + MAX_FRAME_BYTES,
   );
   let bytes = 0;
+  const hash = createHash("sha256");
   const received = new Promise<void>((resolve) =>
-    socket.on("message", (data) => {
-      bytes += (data as Buffer).length;
+    socket.on("message", (data, binary) => {
+      assert.equal(binary, true);
+      const chunk = data as Buffer;
+      assert.ok(chunk.length <= MAX_FRAME_BYTES);
+      hash.update(chunk);
+      bytes += chunk.length;
       if (bytes === payload.length) resolve();
     }),
   );
   socket.resume();
   await received;
+  await producer;
+  assert.equal(bytesWritten, payload.length);
+  assert.equal(hash.digest("hex"), expected);
+  assert.ok(gateway.metrics.peakBufferedBytes > 0);
+  assert.ok(
+    gateway.metrics.peakBufferedBytes <= MAX_PAYLOAD_BYTES + MAX_FRAME_BYTES,
+  );
   const closed = once(socket, "close");
+  const released = once(events, "conn_close");
   socket.close();
   await closed;
+  await released;
 });
+
+async function within<T>(
+  promise: Promise<T>,
+  milliseconds: number,
+): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("shutdown deadline exceeded")),
+          milliseconds,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}

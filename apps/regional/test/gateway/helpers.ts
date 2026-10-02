@@ -233,8 +233,9 @@ export async function rejection(
   port: number,
   route: string | undefined,
   path = "/pg",
+  headers: Record<string, string> = {},
 ): Promise<number> {
-  const socket = client(port, route, path);
+  const socket = client(port, route, path, headers);
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       socket.terminate();
