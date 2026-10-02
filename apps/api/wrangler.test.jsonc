@@ -17,8 +17,13 @@
       "jurisdiction": "eu",
     },
   ],
-  "vars": { "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>", "ARCHIVE_BUCKET_NAME": "pgcf-api-test" },
-  "durable_objects": { "bindings": [{ "name": "REGION_LINK", "class_name": "RegionLink" }] },
+  "vars": {
+    "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>",
+    "ARCHIVE_BUCKET_NAME": "pgcf-api-test",
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "REGION_LINK", "class_name": "RegionLink" }],
+  },
   "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RegionLink"] }],
   "triggers": { "crons": ["*/5 * * * *"] },
 }
