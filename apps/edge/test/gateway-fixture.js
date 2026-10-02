@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+/* global URL, Response, WebSocketPair, setTimeout */
 // Only a test Worker: observations never stand in for live gateway acceptance.
 let connections = [];
 let sockets = [];
@@ -9,7 +10,9 @@ export default {
       for (const socket of sockets) {
         try {
           socket.close();
-        } catch {}
+        } catch {
+          /* Already closed. */
+        }
       }
       sockets = [];
       connections = [];
