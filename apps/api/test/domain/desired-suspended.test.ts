@@ -15,8 +15,11 @@ async function create(f: Awaited<ReturnType<typeof fixture>>, name: string) {
 describe("suspended rows in Phase 1 desired pages", () => {
   it("omits a suspended row without resuming, deleting or altering its stored state", async () => {
     const f = await fixture(),
-      suspended = await create(f, "suspended"),
-      running = await create(f, "running");
+      ordered = [await create(f, "first"), await create(f, "second")].sort(
+        (a, b) => a.database.id.localeCompare(b.database.id),
+      ),
+      suspended = ordered[0]!,
+      running = ordered[1]!;
     await env.DB.prepare(
       "UPDATE databases SET desired_state='suspended' WHERE id=?",
     )
@@ -36,7 +39,7 @@ describe("suspended rows in Phase 1 desired pages", () => {
     )
       .bind(suspended.database.id)
       .all();
-    const response = await request("/agent/v1/desired", f.agent);
+    const response = await request("/agent/v1/desired?limit=1", f.agent);
     expect(response.status).toBe(200);
     const desired = DesiredResponse.parse(await response.json());
     expect(desired.databases.map((db) => db.id)).toEqual([running.database.id]);
@@ -56,7 +59,7 @@ describe("suspended rows in Phase 1 desired pages", () => {
     ).toEqual(rolesBefore.results);
   });
 
-  it("advances empty suspended pages through their original row cursor", async () => {
+  it("returns a terminal empty page when every database is suspended", async () => {
     const f = await fixture(),
       first = await create(f, "first"),
       second = await create(f, "second");
@@ -70,15 +73,7 @@ describe("suspended rows in Phase 1 desired pages", () => {
     const page = DesiredResponse.parse(await response.json()),
       ordered = [first.database.id, second.database.id].sort();
     expect(page.databases).toEqual([]);
-    expect(page.next).toBe(ordered[0]);
-    const lastResponse = await request(
-      `/agent/v1/desired?limit=1&after=${page.next}`,
-      f.agent,
-    );
-    expect(lastResponse.status).toBe(200);
-    const last = DesiredResponse.parse(await lastResponse.json());
-    expect(last.databases).toEqual([]);
-    expect(last.next).toBeNull();
+    expect(page.next).toBeNull();
     expect(
       (
         await env.DB.prepare(
