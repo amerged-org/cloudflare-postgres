@@ -370,6 +370,8 @@ Build:
   `apply-config` worker for an existing region, or bootstrap a control-plane/worker for a new region.
 - Capacity cron with an autoscale policy and hard caps. Initial node caps are EU = 2 and US = 1.
 - Reconcile uncertain provider responses before retrying; a replay must never buy another node.
+- Node caps count live nodes. Marking a node lost frees its slot for a replacement; the replacement
+  order still needs the owner's costed approval. Reinstalling the same VPS in place needs no purchase.
 
 Live acceptance:
 
