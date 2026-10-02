@@ -18,7 +18,8 @@ metadata:
   namespace: flux-system
 spec:
   interval: 30m
-  timeout: 5m
+  retryInterval: 2m
+  timeout: 30m
   path: ./infra/platform
   prune: true
   sourceRef:

@@ -7,7 +7,7 @@ metadata:
     kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
   interval: 30m
-  timeout: 5m
+  timeout: 15m
   releaseName: cloudnative-pg
   targetNamespace: cnpg-system
   storageNamespace: cnpg-system
@@ -21,13 +21,13 @@ spec:
   install:
     crds: CreateReplace
     remediation:
-      retries: 0
+      retries: 3
     serverSideApply: true
     disableTakeOwnership: true
   upgrade:
     crds: CreateReplace
     remediation:
-      retries: 0
+      retries: 3
     serverSideApply: enabled
     disableTakeOwnership: true
   driftDetection:

@@ -7,7 +7,7 @@ metadata:
     kustomize.toolkit.fluxcd.io/prune: disabled
 spec:
   interval: 30m
-  timeout: 5m
+  timeout: 10m
   releaseName: cilium
   targetNamespace: kube-system
   storageNamespace: kube-system
@@ -17,6 +17,7 @@ spec:
     namespace: flux-system
   install:
     crds: CreateReplace
+    replace: true
     remediation:
       retries: 0
   upgrade:
