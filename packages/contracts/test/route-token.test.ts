@@ -205,14 +205,14 @@ describe("route token", () => {
     });
   });
 
-  it("rejects lifetimes over 60 s and non-positive lifetimes", async () => {
+  it("rejects lifetimes over 30 s and non-positive lifetimes", async () => {
     const regionKey = (await regionKeys()).get("k2")!;
     const base = { v: 1, db, cid, rg: region, kid: "k2", iat: nowSec };
     const keys = await regionKeys();
     expect(
       (
         await verifyRouteToken(
-          resign({ ...base, exp: nowSec + 60 }, regionKey),
+          resign({ ...base, exp: nowSec + 30 }, regionKey),
           {
             keys,
             region,
@@ -221,7 +221,7 @@ describe("route token", () => {
         )
       ).ok,
     ).toBe(true);
-    for (const exp of [nowSec + 61, nowSec]) {
+    for (const exp of [nowSec + 31, nowSec]) {
       expect(
         await verifyRouteToken(resign({ ...base, exp }, regionKey), {
           keys,
@@ -233,6 +233,21 @@ describe("route token", () => {
     await expect(
       signRouteToken({ keyring: master, region, db, cid, now, ttlSeconds: 31 }),
     ).rejects.toThrow(RangeError);
+  });
+
+  it("fails closed for nonfinite verification clocks", async () => {
+    const token = await signRouteToken({
+      keyring: master,
+      region,
+      db,
+      cid,
+      now,
+    });
+    const keys = await regionKeys();
+    for (const time of [NaN, Infinity, -Infinity])
+      expect(
+        (await verifyRouteToken(token, { keys, region, now: time })).ok,
+      ).toBe(false);
   });
 
   it("rejects oversize and structurally invalid tokens without throwing", async () => {
@@ -409,17 +424,32 @@ describe("route token", () => {
 });
 
 describe("ReplayCache", () => {
+  it("isolates replay capacity and identical connection IDs by verified database", () => {
+    const cache = new ReplayCache(1);
+    const other = "b".repeat(20);
+    expect(cache.use(db, cid, nowSec + 30, now)).toBe("fresh");
+    expect(cache.use(db, "next", nowSec + 30, now)).toBe("full");
+    expect(cache.use(other, cid, nowSec + 30, now)).toBe("fresh");
+    expect(cache.use(other, cid, nowSec + 30, now)).toBe("replayed");
+    expect(cache.size).toBe(2);
+    expect(cache.use("c".repeat(20), cid, nowSec + 30, now + 35_001)).toBe(
+      "full",
+    );
+    expect(cache.size).toBe(0);
+  });
+
   it("accepts a cid once and rejects the second use", () => {
     const cache = new ReplayCache();
-    expect(cache.use(cid, nowSec + 30, now)).toBe("fresh");
-    expect(cache.use(cid, nowSec + 30, now + 1000)).toBe("replayed");
+    expect(cache.use(db, cid, nowSec + 30, now)).toBe("fresh");
+    expect(cache.use(db, cid, nowSec + 30, now + 1000)).toBe("replayed");
   });
 
   it("keeps a cid until its token can no longer verify, then evicts it", () => {
     const cache = new ReplayCache();
-    cache.use(cid, nowSec + 30, now);
-    expect(cache.use(cid, nowSec + 30, now + 35_000)).toBe("replayed");
+    cache.use(db, cid, nowSec + 30, now);
+    expect(cache.use(db, cid, nowSec + 30, now + 35_000)).toBe("replayed");
     cache.use(
+      db,
       "11111111-1111-4111-8111-111111111111",
       nowSec + 60,
       now + 35_001,
@@ -429,15 +459,15 @@ describe("ReplayCache", () => {
 
   it("fails closed when full of live entries and recovers after expiry", () => {
     const cache = new ReplayCache(2);
-    expect(cache.use("a", nowSec + 30, now)).toBe("fresh");
-    expect(cache.use("b", nowSec + 60, now)).toBe("fresh");
-    expect(cache.use("c", nowSec + 30, now)).toBe("full");
+    expect(cache.use(db, "a", nowSec + 30, now)).toBe("fresh");
+    expect(cache.use(db, "b", nowSec + 30, now)).toBe("fresh");
+    expect(cache.use(db, "c", nowSec + 30, now)).toBe("full");
     expect(cache.size).toBe(2);
     // An expired entry behind a longer-lived one is found by the full sweep.
     const swept = new ReplayCache(2);
-    swept.use("long", nowSec + 60, now);
-    swept.use("short", nowSec + 10, now);
-    expect(swept.use("next", nowSec + 60, now + 20_000)).toBe("fresh");
-    expect(swept.use("short", nowSec + 10, now + 20_000)).toBe("full");
+    swept.use(db, "long", nowSec + 30, now);
+    swept.use(db, "short", nowSec + 10, now);
+    expect(swept.use(db, "next", nowSec + 30, now + 20_000)).toBe("fresh");
+    expect(swept.size).toBe(2);
   });
 });

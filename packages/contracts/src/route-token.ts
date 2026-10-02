@@ -15,7 +15,7 @@ import { DATABASE_ID_PATTERN, REGION_ID_PATTERN } from "./ids.ts";
 export const ROUTE_TOKEN_HEADER = "X-PGCF-Route";
 export const ROUTE_TOKEN_MAX_LENGTH = 512;
 export const ROUTE_TOKEN_SIGN_TTL_SECONDS = 30;
-export const ROUTE_TOKEN_MAX_LIFETIME_SECONDS = 60;
+export const ROUTE_TOKEN_MAX_LIFETIME_SECONDS = 30;
 export const ROUTE_TOKEN_SKEW_SECONDS = 5;
 export const ROUTE_KEY_MIN_BYTES = 32;
 
@@ -153,7 +153,8 @@ export type RouteTokenFailure =
   | "wrong_region"
   | "invalid_lifetime"
   | "not_yet_valid"
-  | "expired";
+  | "expired"
+  | "invalid_time";
 
 export type RouteTokenResult =
   | { readonly ok: true; readonly claims: RouteTokenClaims }
@@ -173,6 +174,8 @@ export async function verifyRouteToken(
   token: string | null | undefined,
   input: VerifyRouteTokenInput,
 ): Promise<RouteTokenResult> {
+  const time = input.now ?? Date.now();
+  if (!Number.isFinite(time)) return fail("invalid_time");
   if (typeof token !== "string" || token.length === 0) return fail("missing");
   if (token.length > ROUTE_TOKEN_MAX_LENGTH) return fail("too_long");
   const parts = token.split(".");
@@ -209,7 +212,7 @@ export async function verifyRouteToken(
   if (rg !== input.region) return fail("wrong_region");
   if (exp <= iat || exp - iat > ROUTE_TOKEN_MAX_LIFETIME_SECONDS)
     return fail("invalid_lifetime");
-  const now = (input.now ?? Date.now()) / 1000;
+  const now = time / 1000;
   if (iat > now + ROUTE_TOKEN_SKEW_SECONDS) return fail("not_yet_valid");
   if (now > exp + ROUTE_TOKEN_SKEW_SECONDS) return fail("expired");
   return { ok: true, claims: claims.data };
@@ -224,7 +227,7 @@ export type ReplayCheck = "fresh" | "replayed" | "full";
  */
 export class ReplayCache {
   readonly #maxEntries: number;
-  readonly #expiries = new Map<string, number>();
+  readonly #databases = new Map<string, Map<string, number>>();
 
   constructor(maxEntries = 50_000) {
     if (!Number.isInteger(maxEntries) || maxEntries < 1)
@@ -233,33 +236,40 @@ export class ReplayCache {
   }
 
   get size(): number {
-    return this.#expiries.size;
+    let size = 0;
+    for (const entries of this.#databases.values()) size += entries.size;
+    return size;
   }
 
-  /** Records `cid` for a verified token with expiry `exp` (seconds). */
-  use(cid: string, exp: number, now: number = Date.now()): ReplayCheck {
-    this.#evictFront(now);
-    if (this.#expiries.has(cid)) return "replayed";
-    if (this.#expiries.size >= this.#maxEntries) {
-      this.#evictAll(now);
-      if (this.#expiries.size >= this.#maxEntries) return "full";
+  /** Records one verified token in its database's independent capacity. */
+  use(
+    database: string,
+    cid: string,
+    exp: number,
+    now: number = Date.now(),
+  ): ReplayCheck {
+    if (!Number.isFinite(now) || !Number.isFinite(exp)) return "full";
+    this.#evict(now);
+    const expiry = (exp + ROUTE_TOKEN_SKEW_SECONDS) * 1000;
+    // Never retain already expired entries, including after a clock boundary.
+    if (expiry < now) return "full";
+    let entries = this.#databases.get(database);
+    if (entries?.has(cid)) return "replayed";
+    if ((entries?.size ?? 0) >= this.#maxEntries) return "full";
+    if (!entries) {
+      entries = new Map();
+      this.#databases.set(database, entries);
     }
-    this.#expiries.set(cid, (exp + ROUTE_TOKEN_SKEW_SECONDS) * 1000);
+    entries.set(cid, expiry);
     return "fresh";
   }
 
-  // Insertion order roughly follows expiry, so trimming the front is cheap and
-  // usually enough; a full sweep runs only when the cache is at capacity.
-  #evictFront(now: number): void {
-    for (const [cid, expiry] of this.#expiries) {
-      if (expiry >= now) return;
-      this.#expiries.delete(cid);
+  #evict(now: number): void {
+    for (const [database, entries] of this.#databases) {
+      for (const [cid, expiry] of entries)
+        if (expiry < now) entries.delete(cid);
+      if (entries.size === 0) this.#databases.delete(database);
     }
-  }
-
-  #evictAll(now: number): void {
-    for (const [cid, expiry] of this.#expiries)
-      if (expiry < now) this.#expiries.delete(cid);
   }
 }
 

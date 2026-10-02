@@ -129,9 +129,11 @@ export function createGateway(options: GatewayOptions): Gateway {
     }
     const value = request.headers[ROUTE_TOKEN_HEADER.toLowerCase()];
     const token = typeof value === "string" ? value : undefined;
+    const now = Date.now();
     const verified = await verifyRouteToken(token, {
       region: options.region,
       keys: options.keyring.keys,
+      now,
     });
     if (socket.destroyed || socket.readableEnded || request.aborted) {
       socket.destroy();
@@ -142,11 +144,6 @@ export function createGateway(options: GatewayOptions): Gateway {
       return;
     }
     const claims = verified.claims;
-    const used = replay.use(claims.cid, claims.exp);
-    if (used !== "fresh") {
-      rejectUpgrade(socket, used === "replayed" ? 403 : 503);
-      return;
-    }
     if (draining) {
       rejectUpgrade(socket, 503);
       return;
@@ -157,6 +154,12 @@ export function createGateway(options: GatewayOptions): Gateway {
         socket,
         (counts.get(claims.db) ?? 0) >= databaseLimit ? 429 : 503,
       );
+      return;
+    }
+    const used = replay.use(claims.db, claims.cid, claims.exp, now);
+    if (used !== "fresh") {
+      release();
+      rejectUpgrade(socket, used === "replayed" ? 403 : 429);
       return;
     }
     const abort = new AbortController();

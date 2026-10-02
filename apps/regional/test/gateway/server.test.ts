@@ -5,6 +5,7 @@ import { request } from "node:http";
 import { createConnection } from "node:net";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import { test } from "node:test";
+import { newDatabaseId } from "@pgcf/contracts";
 import { ReplayCache } from "@pgcf/contracts/route-token";
 import { DatabaseCaCache } from "../../src/gateway/ca.ts";
 import {
@@ -135,12 +136,104 @@ test("checks replay before dialing and fails closed when replay storage is full"
   const route = await token();
   const socket = await open(port, route);
   assert.equal(await rejection(port, route), 403);
-  assert.equal(await rejection(port, await token()), 503);
+  assert.equal(await rejection(port, await token()), 429);
   assert.equal(postgres.handshakes(), 1);
   const closed = once(socket, "close");
   socket.close();
   await closed;
   assert.equal(await rejection(port, route), 403);
+});
+
+test("a full database replay partition still admits another verified database", async (t) => {
+  const postgres = await postgresServer();
+  const targets: string[] = [];
+  const ca = new DatabaseCaCache(async () => validCertificate.cert);
+  const actualDial = createPostgresDial(ca, {
+    tcpConnect: () => createConnection({ host: loopback, port: postgres.port }),
+  });
+  const { gateway, port } = await gatewayFor(postgres.port, {
+    replayCache: new ReplayCache(1),
+    dial: (target, signal) => {
+      targets.push(target.host);
+      // Test backend is one real TLS server; target identity is separately asserted.
+      return actualDial(databaseTarget(database), signal);
+    },
+  });
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const first = await open(port);
+  assert.equal(await rejection(port, await token()), 429);
+  assert.equal(gateway.metrics.activeConnections, 1);
+  const secondDatabase = newDatabaseId();
+  const second = await open(port, await token({ db: secondDatabase }));
+  assert.deepEqual(targets, [
+    databaseTarget(database).host,
+    databaseTarget(secondDatabase).host,
+  ]);
+  assert.equal(postgres.handshakes(), 2);
+  const closed = [once(first, "close"), once(second, "close")];
+  first.close();
+  second.close();
+  await Promise.all(closed);
+});
+
+test("capacity denials do not consume fresh routing tokens", async (t) => {
+  const postgres = await postgresServer();
+  const { gateway, port, events } = await gatewayFor(postgres.port, {
+    databaseLimit: 1,
+  });
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const first = await open(port);
+  const retry = await token();
+  assert.equal(await rejection(port, retry), 429);
+  const released = once(events, "conn_close");
+  const closed = once(first, "close");
+  first.close();
+  await closed;
+  await released;
+  const second = await open(port, retry);
+  assert.equal(postgres.handshakes(), 2);
+  const secondClosed = once(second, "close");
+  second.close();
+  await secondClosed;
+});
+
+test("verification and replay admission share one clock at the expiry boundary", async (t) => {
+  const postgres = await postgresServer();
+  const now = Date.now();
+  const exp = Math.floor(now / 1000);
+  const boundary = (exp + 5) * 1000;
+  class ObservedReplay extends ReplayCache {
+    readonly times: (number | undefined)[] = [];
+    override use(...args: Parameters<ReplayCache["use"]>) {
+      this.times.push(args[3]);
+      return super.use(...args);
+    }
+  }
+  const replayCache = new ObservedReplay();
+  const { gateway, port } = await gatewayFor(postgres.port, { replayCache });
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const route = await signedClaims({ iat: exp - 30, exp });
+  replayCache.use(
+    database,
+    JSON.parse(Buffer.from(route.split(".")[1]!, "base64url").toString()).cid,
+    exp,
+    boundary,
+  );
+  replayCache.times.length = 0;
+  let reads = 0;
+  t.mock.method(Date, "now", () => (reads++ === 0 ? boundary : boundary + 1));
+  assert.equal(await rejection(port, route), 403);
+  assert.deepEqual(replayCache.times, [boundary]);
+  assert.equal(postgres.handshakes(), 0);
 });
 
 test("rejected upgrades close half-open TCP peers and release raw connection capacity", async (t) => {
