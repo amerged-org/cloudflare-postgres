@@ -45,7 +45,9 @@ jobs:
       - name: Typecheck
         run: pnpm typecheck
       - name: Test
-        run: pnpm test
+        run: |
+          pnpm test
+          node --test infra/talos/publish-storage-capacity.test.ts
       - name: Render the Kubernetes manifests
         run: |
           command -v kubectl >/dev/null || { echo "kubectl not available on this runner"; exit 1; }
