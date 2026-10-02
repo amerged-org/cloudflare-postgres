@@ -22,6 +22,7 @@ export default defineConfig({
           ),
         },
         serviceBindings: { GATEWAY: "test-gateway" },
+        outboundService: "test-gateway",
         ratelimits: {
           TEST_RATE_LIMITER: {
             namespace_id: "2",

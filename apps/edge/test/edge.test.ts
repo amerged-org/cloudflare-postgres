@@ -358,6 +358,23 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     expect((await stats())[0]!.bytes).toHaveLength(0);
   });
 
+  it("routes the global fetch fallback to a real test gateway Worker", async () => {
+    await testEnv.DB.prepare(
+      "UPDATE regions SET gateway_binding = NULL WHERE id = ?",
+    )
+      .bind(region)
+      .run();
+    const connection = await open();
+    const startup = encodeStartup({ user: "app", database });
+    connection.socket.send(startup);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...startup]);
+    await expect
+      .poll(() => [...concat(...connection.messages)])
+      .toEqual([...startup]);
+  });
+
   it("rejects a missing configured service binding instead of falling back to fetch", async () => {
     await testEnv.DB.prepare(
       "UPDATE regions SET gateway_binding = 'UNCONFIGURED' WHERE id = ?",
