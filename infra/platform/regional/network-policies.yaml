@@ -88,6 +88,9 @@ spec:
         - matchLabels:
             cnpg.io/cluster: database
           matchExpressions:
+            # Without a namespace key Cilium scopes the selector to the policy's own namespace.
+            - key: k8s:io.kubernetes.pod.namespace
+              operator: Exists
             - key: k8s:io.cilium.k8s.namespace.labels.pgcf.io/database-id
               operator: Exists
       toPorts:

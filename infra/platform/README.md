@@ -13,7 +13,8 @@ OCI manifest digests, archive checksums and rendered image references. The four 
 are pinned by digest. OpenEBS uses its
 [documented HTTP Helm repository](https://openebs.io/docs/main/quickstart-guide/installation): its
 version is fixed and its archive matched the recorded repository-index checksum, but Flux still
-follows the current HTTP index. Images keep the exact references shipped by the pinned charts.
+follows the current HTTP index. Images keep the exact references shipped by the pinned charts. The
+`regional` section lists the cloudflared digest and the regional image reference.
 
 These versions ran together in the single-node Contabo lab. A fresh installation from this
 directory is part of Phase 0.
@@ -130,13 +131,17 @@ is pinned by digest. No `imagePullPolicy` is set. For Dev, keep a private overla
 `regional` and sets a locally imported image and the pull policy, for example:
 
 ```yaml
-resources: [../../infra/platform/regional] # path inside the private checkout
+resources:
+  - ../../infra/platform/regional # path inside the private checkout
 images:
-  - name: pgcf-regional
+  # The base already rewrote the name, so match the GHCR name, not `pgcf-regional`.
+  - name: ghcr.io/amerged-org/pgcf-regional
     newName: pgcf-regional
     newTag: dev-local
 patches:
-  - target: { kind: Deployment, labelSelector: app.kubernetes.io/name in (pgcf-gateway,pgcf-agent) }
+  - target:
+      kind: Deployment
+      labelSelector: "app.kubernetes.io/name in (pgcf-gateway,pgcf-agent)"
     patch: |
       - op: add
         path: /spec/template/spec/containers/0/imagePullPolicy
@@ -154,7 +159,7 @@ the keys of `pgcf-gateway` and `pgcf-agent` become environment variables of the 
 | Secret             | Keys                                       | Used by                                                                               |
 | ------------------ | ------------------------------------------ | ------------------------------------------------------------------------------------- |
 | `pgcf-cloudflared` | `token`                                    | cloudflared tunnel token (`TUNNEL_TOKEN`).                                            |
-| `pgcf-gateway`     | `PGCF_ROUTE_KEY`                           | Gateway: the region's derived routing-token key.                                      |
+| `pgcf-gateway`     | `PGCF_ROUTE_KEY`                           | Gateway: the region's derived route keyring, JSON `{"active":"<kid>","keys":{"<kid>":"<base64url>"}}`. |
 | `pgcf-agent`       | `PGCF_AGENT_KEY`                           | Agent: bearer key for the API Worker.                                                 |
 | `pgcf-backup-s3`   | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | R2 S3 credential; the agent copies it into each database namespace as `archive-credentials`. |
 

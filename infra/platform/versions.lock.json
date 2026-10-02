@@ -1,6 +1,6 @@
 {
   "schemaVersion": 1,
-  "verifiedOn": "2026-09-28",
+  "verifiedOn": "2026-10-02",
   "target": {
     "talosVersion": "1.14.1",
     "kubernetesVersion": "1.36.3",
@@ -95,5 +95,22 @@
       "runtimeSidecarImage": "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.15.0"
     }
   ],
+  "regional": {
+    "namespace": "pgcf-system",
+    "images": [
+      {
+        "name": "cloudflared",
+        "reference": "docker.io/cloudflare/cloudflared",
+        "version": "2026.9.3",
+        "indexDigest": "sha256:072c067d25ccbe61d46e18f0d0723255f2bb5304f7317caa95b27031520ff92c",
+        "releaseURL": "https://github.com/cloudflare/cloudflared/releases/tag/2026.9.3"
+      },
+      {
+        "name": "pgcf-regional",
+        "reference": "ghcr.io/amerged-org/pgcf-regional",
+        "note": "The release commit adds the digest to infra/platform/regional/kustomization.yaml once CI has published the image."
+      }
+    ]
+  },
   "verificationScope": "Official chart versions, chart/app mappings, registry manifest digests, archive checksums, offline Helm lint/render and Kustomize build. Container image tag references remain as shipped by the pinned charts except digest defaults already shipped by Cilium; image signature and tag-to-digest verification are not claimed."
 }
