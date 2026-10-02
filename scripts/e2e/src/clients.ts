@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { spawn } from "node:child_process";
 import { isIP } from "node:net";
-import { posix } from "node:path";
 import {
   HarnessError,
   assertOwned,
@@ -285,158 +284,479 @@ export function assertGatewayEnvironmentKeys(names: readonly string[]): void {
     throw new HarnessError("gateway_log_execution_hook");
 }
 
-function assertGatewayHttpProbe(value: unknown, path: string): void {
-  const probe =
-    value && typeof value === "object" && !Array.isArray(value)
-      ? (value as Record<string, unknown>)
-      : undefined;
-  const http =
-    probe?.httpGet &&
-    typeof probe.httpGet === "object" &&
-    !Array.isArray(probe.httpGet)
-      ? (probe.httpGet as Record<string, unknown>)
-      : undefined;
+function defaulted(
+  value: unknown,
+  defaults: Record<string, unknown>,
+): Record<string, unknown> {
+  return {
+    ...defaults,
+    ...Object.fromEntries(
+      Object.entries(record(value === undefined ? {} : value)).filter(
+        ([, entry]) => entry !== undefined,
+      ),
+    ),
+  };
+}
+
+function gatewayProbe(
+  value: unknown,
+  path: string,
+  initial: number,
+  period: number,
+  failures: number,
+): Record<string, unknown> {
+  const probe = defaulted(value, {
+    initialDelaySeconds: 0,
+    timeoutSeconds: 1,
+    periodSeconds: 10,
+    successThreshold: 1,
+    failureThreshold: 3,
+    terminationGracePeriodSeconds: 45,
+  });
+  for (const [name, fallback] of [
+    ["timeoutSeconds", 1],
+    ["periodSeconds", 10],
+    ["successThreshold", 1],
+    ["failureThreshold", 3],
+  ] as const)
+    if (probe[name] === 0) probe[name] = fallback;
+  const http = defaulted(probe.httpGet, {
+    host: "",
+    scheme: "HTTP",
+    httpHeaders: [],
+  });
+  if (http.scheme === "") http.scheme = "HTTP";
+  probe.httpGet = http;
   if (
-    !http ||
-    probe!.exec !== undefined ||
-    probe!.tcpSocket !== undefined ||
-    probe!.grpc !== undefined ||
-    http.path !== path ||
-    http.port !== "http" ||
-    (http.scheme !== undefined && http.scheme !== "HTTP") ||
-    (http.host !== undefined && http.host !== "") ||
-    (http.httpHeaders !== undefined &&
-      (!Array.isArray(http.httpHeaders) || http.httpHeaders.length !== 0))
+    !sameStructuredValue(probe, {
+      httpGet: {
+        path,
+        port: "http",
+        host: "",
+        scheme: "HTTP",
+        httpHeaders: [],
+      },
+      initialDelaySeconds: initial,
+      timeoutSeconds: 1,
+      periodSeconds: period,
+      successThreshold: 1,
+      failureThreshold: failures,
+      terminationGracePeriodSeconds: 45,
+    })
   )
     throw new HarnessError("gateway_log_probe_mismatch");
+  return probe;
+}
+
+function gatewayVolumes(
+  container: Record<string, unknown>,
+  spec: Record<string, unknown>,
+  admitted: boolean,
+): Record<string, unknown> {
+  // Kubernetes v1.36.3 ServiceAccount admission adds this one readonly projection:
+  // https://github.com/kubernetes/kubernetes/blob/v1.36.3/plugin/pkg/admission/serviceaccount/admission.go
+  try {
+    if (
+      !Array.isArray(container.volumeMounts) ||
+      !Array.isArray(spec.volumes) ||
+      (container.volumeDevices !== undefined &&
+        (!Array.isArray(container.volumeDevices) ||
+          container.volumeDevices.length))
+    )
+      throw new Error();
+    const mounts = container.volumeMounts.map(record),
+      volumes = spec.volumes.map(record);
+    if (
+      mounts.length !== (admitted ? 2 : 1) ||
+      volumes.length !== mounts.length
+    )
+      throw new Error();
+    const tmpMount = mounts.find((mount) => mount.name === "tmp"),
+      tmpVolume = volumes.find((volume) => volume.name === "tmp");
+    if (!tmpMount || !tmpVolume) throw new Error();
+    const normalizedMount = defaulted(tmpMount, {
+      readOnly: false,
+      subPath: "",
+      subPathExpr: "",
+      mountPropagation: "None",
+    });
+    if (
+      !sameStructuredValue(normalizedMount, {
+        name: "tmp",
+        mountPath: "/tmp",
+        readOnly: false,
+        subPath: "",
+        subPathExpr: "",
+        mountPropagation: "None",
+      })
+    )
+      throw new Error();
+    const emptyDir = defaulted(tmpVolume.emptyDir, { medium: "" });
+    emptyDir.sizeLimit = quantityBytes(emptyDir.sizeLimit);
+    if (
+      !sameStructuredValue(
+        { ...tmpVolume, emptyDir },
+        { name: "tmp", emptyDir: { medium: "", sizeLimit: 67_108_864 } },
+      )
+    )
+      throw new Error();
+    const normalized = {
+      mounts: [normalizedMount],
+      volumes: [{ ...tmpVolume, emptyDir }],
+    };
+    if (!admitted) return normalized;
+    const mount = mounts.find((row) => row.name !== "tmp"),
+      volume = volumes.find((row) => row.name !== "tmp");
+    if (
+      !mount ||
+      !volume ||
+      typeof volume.name !== "string" ||
+      !/^kube-api-access-[bcdfghjklmnpqrstvwxz2456789]{5}$/.test(volume.name)
+    )
+      throw new Error();
+    if (
+      !sameStructuredValue(
+        defaulted(mount, {
+          subPath: "",
+          subPathExpr: "",
+          mountPropagation: "None",
+          recursiveReadOnly: "Disabled",
+        }),
+        {
+          name: volume.name,
+          mountPath: "/var/run/secrets/kubernetes.io/serviceaccount",
+          readOnly: true,
+          subPath: "",
+          subPathExpr: "",
+          mountPropagation: "None",
+          recursiveReadOnly: "Disabled",
+        },
+      )
+    )
+      throw new Error();
+    const projected = defaulted(volume.projected, { defaultMode: 420 });
+    if (!Array.isArray(projected.sources) || projected.sources.length !== 3)
+      throw new Error();
+    const sources = projected.sources.map(record);
+    const token = defaulted(sources[0]!.serviceAccountToken, {
+      audience: "",
+      expirationSeconds: 3600,
+    });
+    const ca = defaulted(sources[1]!.configMap, { optional: false });
+    if (!Array.isArray(ca.items)) throw new Error();
+    ca.items = ca.items.map((item) => defaulted(item, { mode: 420 }));
+    const downward = record(sources[2]!.downwardAPI);
+    if (!Array.isArray(downward.items)) throw new Error();
+    const items = downward.items.map((value) => {
+      const item = defaulted(value, { mode: 420 });
+      item.fieldRef = defaulted(item.fieldRef, { apiVersion: "v1" });
+      if ((item.fieldRef as Record<string, unknown>).apiVersion === "")
+        (item.fieldRef as Record<string, unknown>).apiVersion = "v1";
+      return item;
+    });
+    projected.sources = [
+      { ...sources[0], serviceAccountToken: token },
+      { ...sources[1], configMap: ca },
+      { ...sources[2], downwardAPI: { ...downward, items } },
+    ];
+    if (
+      !sameStructuredValue(
+        { ...volume, projected },
+        {
+          name: volume.name,
+          projected: {
+            defaultMode: 420,
+            sources: [
+              {
+                serviceAccountToken: {
+                  path: "token",
+                  expirationSeconds: 3607,
+                  audience: "",
+                },
+              },
+              {
+                configMap: {
+                  name: "kube-root-ca.crt",
+                  optional: false,
+                  items: [{ key: "ca.crt", path: "ca.crt", mode: 420 }],
+                },
+              },
+              {
+                downwardAPI: {
+                  items: [
+                    {
+                      path: "namespace",
+                      mode: 420,
+                      fieldRef: {
+                        apiVersion: "v1",
+                        fieldPath: "metadata.namespace",
+                      },
+                    },
+                  ],
+                },
+              },
+            ],
+          },
+        },
+      )
+    )
+      throw new Error();
+    // Exclude the verified admission-only token pair from template comparison.
+    return normalized;
+  } catch {
+    throw new HarnessError("gateway_log_executable_mount");
+  }
+}
+
+function gatewayPodConfiguration(
+  spec: Record<string, unknown>,
+): Record<string, unknown> {
+  const selected = Object.fromEntries(
+    [
+      "serviceAccountName",
+      "serviceAccount",
+      "enableServiceLinks",
+      "automountServiceAccountToken",
+      "hostNetwork",
+      "hostPID",
+      "hostIPC",
+      "hostUsers",
+      "shareProcessNamespace",
+      "dnsPolicy",
+      "dnsConfig",
+      "hostAliases",
+      "hostname",
+      "subdomain",
+      "hostnameOverride",
+      "setHostnameAsFQDN",
+      "runtimeClassName",
+      "restartPolicy",
+      "schedulerName",
+      "terminationGracePeriodSeconds",
+    ]
+      .filter((name) => spec[name] !== undefined)
+      .map((name) => [name, spec[name]]),
+  );
+  const defaults = {
+    serviceAccount: "pgcf-gateway",
+    automountServiceAccountToken: true,
+    hostNetwork: false,
+    hostPID: false,
+    hostIPC: false,
+    hostUsers: true,
+    shareProcessNamespace: false,
+    dnsPolicy: "ClusterFirst",
+    dnsConfig: { nameservers: [], searches: [], options: [] },
+    hostAliases: [],
+    hostname: "",
+    subdomain: "",
+    hostnameOverride: "",
+    setHostnameAsFQDN: false,
+    runtimeClassName: "",
+    restartPolicy: "Always",
+    schedulerName: "default-scheduler",
+  };
+  const config = defaulted(selected, defaults);
+  config.dnsConfig = defaulted(config.dnsConfig, {
+    nameservers: [],
+    searches: [],
+    options: [],
+  });
+  if (
+    !sameStructuredValue(config, {
+      ...defaults,
+      serviceAccountName: "pgcf-gateway",
+      enableServiceLinks: false,
+      terminationGracePeriodSeconds: 45,
+    })
+  )
+    throw new HarnessError("gateway_log_pod_configuration_mismatch");
+  return config;
 }
 
 function assertGatewayEntrypoint(
   container: Record<string, unknown>,
   spec: Record<string, unknown>,
-): void {
-  // Match infra/platform/regional/gateway.yaml; the same image also contains the agent.
+  admitted = false,
+): Record<string, unknown> {
+  // Normalize only approved execution fields, using pinned Kubernetes v1.36.3 defaults:
+  // https://github.com/kubernetes/kubernetes/blob/v1.36.3/pkg/apis/core/v1/defaults.go
   if (
     !Array.isArray(spec.containers) ||
     spec.containers.length !== 1 ||
+    container.name !== "gateway" ||
     [spec.initContainers, spec.ephemeralContainers].some(
       (programs) =>
-        programs !== undefined &&
-        (!Array.isArray(programs) || programs.length !== 0),
+        programs !== undefined && (!Array.isArray(programs) || programs.length),
     ) ||
     container.lifecycle !== undefined
   )
     throw new HarnessError("gateway_log_extra_program");
   if (
-    !Array.isArray(container.command) ||
-    container.command.length !== 2 ||
-    container.command[0] !== "node" ||
-    container.command[1] !== "/app/gateway.mjs" ||
+    !sameStructuredValue(container.command, ["node", "/app/gateway.mjs"]) ||
     (container.args !== undefined &&
-      (!Array.isArray(container.args) || container.args.length !== 0)) ||
+      !sameStructuredValue(container.args, [])) ||
     (container.workingDir !== undefined && container.workingDir !== "/app")
   )
     throw new HarnessError("gateway_log_entrypoint_mismatch");
+  const port =
+    Array.isArray(container.ports) && container.ports.length === 1
+      ? defaulted(container.ports[0], {
+          protocol: "TCP",
+          hostPort: 0,
+          hostIP: "",
+        })
+      : undefined;
+  if (port?.protocol === "") port.protocol = "TCP";
   if (
-    !Array.isArray(container.ports) ||
-    container.ports.length !== 1 ||
-    !sameStructuredValue(container.ports[0], {
+    !sameStructuredValue(port, {
       name: "http",
       containerPort: 8080,
       protocol: "TCP",
+      hostPort: 0,
+      hostIP: "",
     })
   )
     throw new HarnessError("gateway_log_port_mismatch");
   if (container.startupProbe !== undefined)
     throw new HarnessError("gateway_log_probe_mismatch");
-  assertGatewayHttpProbe(container.livenessProbe, "/healthz");
-  assertGatewayHttpProbe(container.readinessProbe, "/readyz");
-  const env = container.env === undefined ? [] : container.env;
+  const live = gatewayProbe(container.livenessProbe, "/healthz", 5, 10, 3),
+    ready = gatewayProbe(container.readinessProbe, "/readyz", 0, 5, 2);
+  const env = container.env;
   if (!Array.isArray(env)) throw new HarnessError("gateway_log_execution_hook");
   assertGatewayEnvironmentKeys(env.map((row) => string(record(row).name)));
   if (
     container.envFrom !== undefined &&
-    (!Array.isArray(container.envFrom) || container.envFrom.length !== 0)
+    !sameStructuredValue(container.envFrom, [])
   )
     throw new HarnessError("gateway_log_environment_source_mismatch");
   const expectedEnvironment: Record<string, Record<string, unknown>> = {
     PGCF_REGION_ID: {
       name: "PGCF_REGION_ID",
       valueFrom: {
-        configMapKeyRef: { name: "pgcf-regional", key: "PGCF_REGION_ID" },
+        configMapKeyRef: {
+          name: "pgcf-regional",
+          key: "PGCF_REGION_ID",
+          optional: false,
+        },
       },
     },
     PGCF_ROUTE_KEY: {
       name: "PGCF_ROUTE_KEY",
       valueFrom: {
-        secretKeyRef: { name: "pgcf-gateway", key: "PGCF_ROUTE_KEY" },
+        secretKeyRef: {
+          name: "pgcf-gateway",
+          key: "PGCF_ROUTE_KEY",
+          optional: false,
+        },
       },
     },
     PGCF_GATEWAY_PORT: { name: "PGCF_GATEWAY_PORT", value: "8080" },
   };
+  const environment = env.map((value) => {
+    const row = { ...record(value) };
+    if (row.valueFrom !== undefined) {
+      const source = { ...record(row.valueFrom) };
+      for (const name of ["configMapKeyRef", "secretKeyRef"])
+        if (source[name] !== undefined)
+          source[name] = defaulted(source[name], { optional: false });
+      row.valueFrom = source;
+    }
+    return row;
+  });
   if (
-    env.length !== 3 ||
-    new Set(env.map((value) => record(value).name)).size !== 3 ||
-    env.some((value) => {
-      const row = record(value);
-      const expected = expectedEnvironment[string(row.name)];
-      return !expected || !sameStructuredValue(row, expected);
-    })
+    environment.length !== 3 ||
+    new Set(environment.map((row) => row.name)).size !== 3 ||
+    environment.some(
+      (row) => !sameStructuredValue(row, expectedEnvironment[string(row.name)]),
+    )
   )
     throw new HarnessError("gateway_log_environment_source_mismatch");
-  const mounts =
-    container.volumeMounts === undefined ? [] : container.volumeMounts;
-  if (!Array.isArray(mounts))
-    throw new HarnessError("gateway_log_executable_mount");
-  const executablePaths = [
-    "/app",
-    "/usr",
-    "/bin",
-    "/sbin",
-    "/lib",
-    "/lib64",
-    "/etc/ld.so.preload",
-    "/etc/ld.so.conf",
-    "/etc/ld.so.conf.d",
-  ];
-  for (const value of mounts) {
-    const mount = string(record(value).mountPath);
-    const path = posix.normalize(mount);
-    if (
-      !mount.startsWith("/") ||
-      executablePaths.some(
-        (executable) =>
-          path === "/" ||
-          path === executable ||
-          path.startsWith(`${executable}/`) ||
-          executable.startsWith(`${path}/`),
-      )
-    )
-      throw new HarnessError("gateway_log_executable_mount");
-  }
-  const security = record(container.securityContext ?? {});
-  const podSecurity = record(spec.securityContext ?? {});
-  const capabilities = record(security.capabilities ?? {});
+  const volumes = gatewayVolumes(container, spec, admitted);
+  const podDefaults = {
+    supplementalGroups: [],
+    sysctls: [],
+    supplementalGroupsPolicy: "Merge",
+    fsGroupChangePolicy: "Always",
+  };
+  const podSecurity = defaulted(spec.securityContext, podDefaults);
   if (
-    security.readOnlyRootFilesystem !== true ||
-    security.allowPrivilegeEscalation !== false ||
-    (security.privileged !== undefined && security.privileged !== false) ||
-    !sameStructuredValue(capabilities.drop, ["ALL"]) ||
-    (capabilities.add !== undefined &&
-      !sameStructuredValue(capabilities.add, [])) ||
-    podSecurity.runAsNonRoot !== true ||
-    podSecurity.runAsUser !== 1000 ||
-    podSecurity.runAsGroup !== 1000 ||
-    !sameStructuredValue(podSecurity.seccompProfile, {
-      type: "RuntimeDefault",
-    }) ||
-    (security.runAsNonRoot !== undefined && security.runAsNonRoot !== true) ||
-    (security.runAsUser !== undefined && security.runAsUser !== 1000) ||
-    (security.runAsGroup !== undefined && security.runAsGroup !== 1000) ||
-    (security.seccompProfile !== undefined &&
-      !sameStructuredValue(security.seccompProfile, { type: "RuntimeDefault" }))
+    !sameStructuredValue(podSecurity, {
+      ...podDefaults,
+      runAsNonRoot: true,
+      runAsUser: 1000,
+      runAsGroup: 1000,
+      seccompProfile: { type: "RuntimeDefault" },
+    })
   )
     throw new HarnessError("gateway_log_execution_security_mismatch");
+  const inherited = {
+    privileged: false,
+    procMount: "Default",
+    runAsNonRoot: true,
+    runAsUser: 1000,
+    runAsGroup: 1000,
+    seccompProfile: { type: "RuntimeDefault" },
+  };
+  const security = defaulted(container.securityContext, inherited);
+  security.capabilities = defaulted(security.capabilities, { add: [] });
+  if (
+    !sameStructuredValue(security, {
+      ...inherited,
+      readOnlyRootFilesystem: true,
+      allowPrivilegeEscalation: false,
+      capabilities: { drop: ["ALL"], add: [] },
+    })
+  )
+    throw new HarnessError("gateway_log_execution_security_mismatch");
+  const process = defaulted(
+    Object.fromEntries(
+      [
+        "stdin",
+        "stdinOnce",
+        "tty",
+        "terminationMessagePath",
+        "terminationMessagePolicy",
+      ]
+        .filter((name) => container[name] !== undefined)
+        .map((name) => [name, container[name]]),
+    ),
+    {
+      stdin: false,
+      stdinOnce: false,
+      tty: false,
+      terminationMessagePath: "/dev/termination-log",
+      terminationMessagePolicy: "File",
+    },
+  );
+  if (
+    !sameStructuredValue(process, {
+      stdin: false,
+      stdinOnce: false,
+      tty: false,
+      terminationMessagePath: "/dev/termination-log",
+      terminationMessagePolicy: "File",
+    })
+  )
+    throw new HarnessError("gateway_log_pod_configuration_mismatch");
+  return {
+    name: container.name,
+    image: container.image,
+    command: container.command,
+    args: container.args ?? [],
+    workingDir: container.workingDir ?? "/app",
+    volumes,
+    environment: environment.sort((a, b) =>
+      string(a.name).localeCompare(string(b.name)),
+    ),
+    port,
+    live,
+    ready,
+    security,
+    podSecurity,
+    process,
+    pod: gatewayPodConfiguration(spec),
+  };
 }
 
 export function gatewayLogPods(
@@ -470,7 +790,7 @@ export function gatewayLogPods(
     : undefined;
   if (gateway?.image !== expectedImage)
     throw new HarnessError("gateway_log_source_image_mismatch");
-  assertGatewayEntrypoint(gateway, template);
+  const deploymentExecution = assertGatewayEntrypoint(gateway, template);
   const ownedBy = (
     row: Record<string, unknown>,
     kind: string,
@@ -493,13 +813,14 @@ export function gatewayLogPods(
         )
     );
   };
-  const sets = new Set(
+  const parents = new Map(
     items(replicaSets)
       .filter((row) =>
         ownedBy(row, "Deployment", new Set([uid]), "pgcf-gateway"),
       )
-      .map((row) => string(record(row.metadata).uid)),
+      .map((row) => [string(record(row.metadata).uid), row]),
   );
+  const sets = new Set(parents.keys());
   const selected = items(pods).filter((row) => {
     const metadata = record(row.metadata);
     const labels = record(metadata.labels ?? {});
@@ -532,7 +853,37 @@ export function gatewayLogPods(
       )
     )
       throw new HarnessError("gateway_log_source_image_mismatch");
-    assertGatewayEntrypoint(container, spec);
+    const podExecution = assertGatewayEntrypoint(container, spec, true);
+    const owners = (record(pod.metadata).ownerReferences as unknown[])
+      .map(record)
+      .filter(
+        (owner) => owner.kind === "ReplicaSet" && owner.controller === true,
+      );
+    const parent =
+      owners.length === 1 && typeof owners[0]!.uid === "string"
+        ? parents.get(owners[0]!.uid)
+        : undefined;
+    try {
+      if (!parent || record(parent.metadata).name !== owners[0]!.name)
+        throw new Error();
+      const parentSpec = record(record(record(parent.spec).template).spec);
+      if (
+        !Array.isArray(parentSpec.containers) ||
+        parentSpec.containers.length !== 1
+      )
+        throw new Error();
+      const parentExecution = assertGatewayEntrypoint(
+        record(parentSpec.containers[0]),
+        parentSpec,
+      );
+      if (
+        !sameStructuredValue(parentExecution, deploymentExecution) ||
+        !sameStructuredValue(parentExecution, podExecution)
+      )
+        throw new Error();
+    } catch {
+      throw new HarnessError("gateway_log_replica_set_template_mismatch");
+    }
     const name = objectName(pod);
     assertOwned(name);
     return name;

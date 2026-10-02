@@ -156,6 +156,46 @@ test("Gateway mismatch proof matches the admitted connection, database and actua
   }
 });
 
+function serviceAccountProjection() {
+  const alphabet = "bcdfghjklmnpqrstvwxz2456789";
+  const name = `kube-api-access-${[...randomBytes(5)].map((value) => alphabet[value % alphabet.length]).join("")}`;
+  return {
+    mount: {
+      name,
+      mountPath: "/var/run/secrets/kubernetes.io/serviceaccount",
+      readOnly: true,
+    },
+    volume: {
+      name,
+      projected: {
+        defaultMode: 420,
+        sources: [
+          { serviceAccountToken: { expirationSeconds: 3607, path: "token" } },
+          {
+            configMap: {
+              name: "kube-root-ca.crt",
+              items: [{ key: "ca.crt", path: "ca.crt" }],
+            },
+          },
+          {
+            downwardAPI: {
+              items: [
+                {
+                  path: "namespace",
+                  fieldRef: {
+                    apiVersion: "v1",
+                    fieldPath: "metadata.namespace",
+                  },
+                },
+              ],
+            },
+          },
+        ],
+      },
+    },
+  };
+}
+
 function resources() {
   const namespace = "pgcf-system";
   const digest = randomBytes(32).toString("hex");
@@ -212,7 +252,23 @@ function resources() {
   });
   const deployment = {
     metadata: { namespace, name: "pgcf-gateway", uid: deploymentUid, labels },
-    spec: { template: { spec: { containers: [gateway()], securityContext } } },
+    spec: {
+      template: {
+        spec: {
+          containers: [gateway()],
+          securityContext,
+          serviceAccountName: "pgcf-gateway",
+          enableServiceLinks: false,
+          terminationGracePeriodSeconds: 45,
+          volumes: [
+            { name: "tmp", emptyDir: { sizeLimit: "64Mi" } } as Record<
+              string,
+              unknown
+            >,
+          ],
+        },
+      },
+    },
   };
   const set = {
     metadata: {
@@ -229,6 +285,15 @@ function resources() {
       ],
     },
   };
+  const projection = serviceAccountProjection();
+  const podSpec = structuredClone(deployment.spec.template.spec);
+  podSpec.volumes.push(projection.volume);
+  (podSpec.containers[0]!.volumeMounts as Record<string, unknown>[]).push(
+    projection.mount,
+  );
+  const setSpec = {
+    template: { spec: structuredClone(deployment.spec.template.spec) },
+  };
   const pod = {
     metadata: {
       namespace,
@@ -244,14 +309,14 @@ function resources() {
         },
       ],
     },
-    spec: { containers: [gateway()], securityContext },
+    spec: podSpec,
     status: {
       containerStatuses: [
         { name: "gateway", imageID: `docker-pullable://${image}` },
       ],
     },
   };
-  return { namespace, image, deployment, set, pod };
+  return { namespace, image, deployment, set: { ...set, spec: setSpec }, pod };
 }
 
 test("Gateway log pod selection requires namespace, Deployment ownership and the approved source image", () => {
@@ -868,14 +933,13 @@ test("Gateway execution proof rejects mounts covering code, Node or runtime depe
   );
   assert.doesNotThrow(
     changedGateway("pod", (container) => {
-      container.volumeMounts = [
-        { name: "tmp", mountPath: "/tmp" },
-        {
-          name: `kube-api-access-${randomBytes(5).toString("hex")}`,
-          mountPath: "/var/run/secrets/kubernetes.io/serviceaccount",
-          readOnly: true,
-        },
-      ];
+      const mounts = container.volumeMounts as Record<string, unknown>[];
+      assert.equal(mounts[0]!.name, "tmp");
+      assert.equal(
+        mounts[1]!.mountPath,
+        "/var/run/secrets/kubernetes.io/serviceaccount",
+      );
+      assert.equal(mounts[1]!.readOnly, true);
     }),
   );
 });
@@ -1171,4 +1235,308 @@ test("approved Gateway HTTP health and readiness probes remain valid with Kubern
       };
     }),
   );
+});
+
+function selectResources(
+  fixture: ReturnType<typeof resources>,
+  sets = [fixture.set],
+) {
+  return clients.gatewayLogPods(
+    { items: [fixture.deployment] },
+    { items: sets },
+    { items: [fixture.pod] },
+    fixture.namespace,
+    fixture.image,
+  );
+}
+
+test("Gateway approved mounts reject extra and renamed mounts outside executable paths", () => {
+  assert.throws(
+    changedGateway("pod", (container) => {
+      (container.volumeMounts as Record<string, unknown>[]).push({
+        name: "extra",
+        mountPath: "/opt/data",
+      });
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      container.volumeMounts = [{ name: "renamed", mountPath: "/tmp" }];
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.volumeMounts = [];
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+});
+
+test("Gateway tmp volume must be the approved ordinary emptyDir with its complete mount", () => {
+  assert.throws(
+    changedGatewaySpec("deployment", (spec) => {
+      spec.volumes = [
+        { name: "tmp", emptyDir: { medium: "Memory", sizeLimit: "64Mi" } },
+      ];
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGatewaySpec("pod", (spec) => {
+      (spec.volumes as Record<string, unknown>[])[0] = {
+        name: "tmp",
+        configMap: { name: "pgcf-regional" },
+      };
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      (container.volumeMounts as Record<string, unknown>[])[0]!.subPath =
+        "data";
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      container.volumeDevices = [{ name: "tmp", devicePath: "/tmp/device" }];
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+});
+
+test("Gateway mount conformance rejects missing, extra and differently sized backing volumes", () => {
+  assert.throws(
+    changedGatewaySpec("pod", (spec) => {
+      (spec.volumes as Record<string, unknown>[]).shift();
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGatewaySpec("deployment", (spec) => {
+      spec.volumes = [{ name: "tmp", emptyDir: { sizeLimit: "65Mi" } }];
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGatewaySpec("deployment", (spec) => {
+      (spec.volumes as Record<string, unknown>[]).push({
+        name: "unused",
+        emptyDir: { sizeLimit: "64Mi" },
+      });
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+});
+
+test("Gateway admitted service-account projection must be paired, readonly and standard", () => {
+  assert.throws(
+    changedGateway("pod", (container) => {
+      (container.volumeMounts as Record<string, unknown>[])[1]!.readOnly =
+        false;
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGatewaySpec("pod", (spec) => {
+      (spec.volumes as Record<string, unknown>[])[1]!.name =
+        serviceAccountProjection().volume.name;
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGatewaySpec("pod", (spec) => {
+      const projected = (spec.volumes as Record<string, unknown>[])[1]!
+        .projected as { sources: Record<string, unknown>[] };
+      projected.sources[1] = {
+        configMap: {
+          name: "pgcf-other",
+          items: [{ key: "ca.crt", path: "ca.crt" }],
+        },
+      };
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGatewaySpec("pod", (spec) => {
+      const projected = (spec.volumes as Record<string, unknown>[])[1]!
+        .projected as { sources: Record<string, unknown>[] };
+      projected.sources[0] = {
+        serviceAccountToken: { expirationSeconds: 3600, path: "token" },
+      };
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+});
+
+test("Gateway service-account and ordinary networking/process configuration are bound", () => {
+  assert.throws(
+    changedGatewaySpec("pod", (spec) => {
+      spec.serviceAccountName = "pgcf-other";
+    }),
+    { message: "gateway_log_pod_configuration_mismatch" },
+  );
+  assert.throws(
+    changedGatewaySpec("deployment", (spec) => {
+      spec.enableServiceLinks = true;
+    }),
+    { message: "gateway_log_pod_configuration_mismatch" },
+  );
+  assert.throws(
+    changedGatewaySpec("pod", (spec) => {
+      spec.hostNetwork = true;
+    }),
+    { message: "gateway_log_pod_configuration_mismatch" },
+  );
+  assert.throws(
+    changedGatewaySpec("pod", (spec) => {
+      spec.shareProcessNamespace = true;
+    }),
+    { message: "gateway_log_pod_configuration_mismatch" },
+  );
+});
+
+test("selected Gateway ReplicaSet template must match approved execution; unrelated historical sets are ignored", () => {
+  const missing = resources();
+  delete (missing.set as { spec?: unknown }).spec;
+  assert.throws(() => selectResources(missing), {
+    message: "gateway_log_replica_set_template_mismatch",
+  });
+  const drift = resources();
+  const probe = drift.set.spec.template.spec.containers[0]!
+    .livenessProbe as Record<string, unknown>;
+  probe.periodSeconds = 11;
+  assert.throws(() => selectResources(drift), {
+    message: "gateway_log_replica_set_template_mismatch",
+  });
+  const valid = resources();
+  const historical = structuredClone(valid.set);
+  historical.metadata.uid = randomUUID();
+  historical.metadata.name = `pgcf-gateway-${randomBytes(5).toString("hex")}`;
+  delete (historical as { spec?: unknown }).spec;
+  assert.deepEqual(selectResources(valid, [valid.set, historical]), [
+    valid.pod.metadata.name,
+  ]);
+});
+
+test("Kubernetes 1.36.3 documented defaults remain equivalent in Gateway templates and admitted Pods", () => {
+  const fixture = resources();
+  for (const spec of [fixture.set.spec.template.spec, fixture.pod.spec]) {
+    const container = spec.containers[0]!;
+    const env = container.env as {
+      valueFrom?: {
+        configMapKeyRef?: Record<string, unknown>;
+        secretKeyRef?: Record<string, unknown>;
+      };
+    }[];
+    env[0]!.valueFrom!.configMapKeyRef!.optional = false;
+    env[1]!.valueFrom!.secretKeyRef!.optional = false;
+    const security = container.securityContext as Record<string, unknown>;
+    security.privileged = false;
+    security.procMount = "Default";
+    security.runAsNonRoot = true;
+    security.runAsUser = 1000;
+    security.runAsGroup = 1000;
+    security.seccompProfile = { type: "RuntimeDefault" };
+    (security.capabilities as Record<string, unknown>).add = [];
+    (container.volumeMounts as Record<string, unknown>[])[0]!.readOnly = false;
+    (container.volumeMounts as Record<string, unknown>[])[0]!.mountPropagation =
+      "None";
+    (spec.volumes[0]!.emptyDir as Record<string, unknown>).medium = "";
+    (spec.volumes[0]!.emptyDir as Record<string, unknown>).sizeLimit =
+      "67108864";
+    const live = container.livenessProbe as Record<string, unknown>;
+    const ready = container.readinessProbe as Record<string, unknown>;
+    for (const probe of [live, ready]) {
+      (probe.httpGet as Record<string, unknown>).scheme = "HTTP";
+      probe.timeoutSeconds = 1;
+      probe.successThreshold = 1;
+    }
+    ready.initialDelaySeconds = 0;
+    Object.assign(spec, {
+      hostNetwork: false,
+      hostPID: false,
+      hostIPC: false,
+      shareProcessNamespace: false,
+      hostUsers: true,
+      dnsPolicy: "ClusterFirst",
+      restartPolicy: "Always",
+      schedulerName: "default-scheduler",
+      automountServiceAccountToken: true,
+    });
+  }
+  const projection = fixture.pod.spec.volumes[1]!.projected as {
+    defaultMode?: number;
+    sources: Record<string, unknown>[];
+  };
+  delete projection.defaultMode;
+  const ca = projection.sources[1]!.configMap as Record<string, unknown>;
+  ca.optional = false;
+  (ca.items as Record<string, unknown>[])[0]!.mode = 420;
+  const namespace = (
+    projection.sources[2]!.downwardAPI as {
+      items: { fieldRef: Record<string, unknown>; mode?: number }[];
+    }
+  ).items[0]!;
+  delete namespace.fieldRef.apiVersion;
+  namespace.mode = 420;
+  assert.deepEqual(selectResources(fixture), [fixture.pod.metadata.name]);
+});
+
+test("Gateway nondefault probe timing and security changes cannot normalize to approved execution", () => {
+  assert.throws(
+    changedGateway("pod", (container) => {
+      (container.livenessProbe as Record<string, unknown>).periodSeconds = 11;
+    }),
+    { message: "gateway_log_probe_mismatch" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      (container.securityContext as Record<string, unknown>).procMount =
+        "Unmasked";
+    }),
+    { message: "gateway_log_execution_security_mismatch" },
+  );
+});
+
+test("actual Gateway log reader refuses mount/backing drift before any log command", async () => {
+  const fixture = resources();
+  fixture.pod.spec.volumes[0] = {
+    name: "tmp",
+    emptyDir: { medium: "Memory", sizeLimit: "64Mi" },
+  };
+  const kube = new Kubernetes("test-kube-path", "test-context", () => 0);
+  let guards = 0;
+  kube.setMutationGuard(async () => {
+    guards++;
+  });
+  Object.assign(kube, {
+    read: async (resource: string) => ({
+      items:
+        resource === "deployments"
+          ? [fixture.deployment]
+          : resource === "replicasets"
+            ? [fixture.set]
+            : [fixture.pod],
+    }),
+  });
+  await assert.rejects(
+    kube.gatewayLogs(
+      fixture.namespace,
+      new Date().toISOString(),
+      fixture.image,
+    ),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.equal(guards, 3);
+});
+
+test("selected Gateway ReplicaSet container identity is part of normalized execution", () => {
+  const fixture = resources();
+  fixture.set.spec.template.spec.containers[0]!.name = "other";
+  assert.throws(() => selectResources(fixture), {
+    message: "gateway_log_replica_set_template_mismatch",
+  });
 });
