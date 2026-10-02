@@ -24,7 +24,7 @@ export async function desired(
     `SELECT d.*,n.k8s_node_name,s.memory_mib,s.cpu_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
-    WHERE d.region_id=? AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
+    WHERE d.region_id=? AND d.desired_state IN('running','deleted') AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
     ${query.after ? "AND d.id>?" : ""} ORDER BY d.id LIMIT ?`,
   )
     .bind(region.id, ...(query.after ? [query.after] : []), query.limit + 1)
@@ -33,8 +33,6 @@ export async function desired(
     databases: DesiredDatabase[] = [];
   const credentials = keyring(c.env.CREDENTIAL_KEYS);
   for (const row of rows) {
-    // Phase 1 cannot execute suspended state. Omission never deletes regional resources.
-    if (row.desired_state === "suspended") continue;
     const roles: DesiredDatabase["roles"] = [];
     // Deletion can recover even if a credential key has been retired.
     if (row.desired_state !== "deleted") {
