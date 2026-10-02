@@ -15,8 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import worker from "../src/index.ts";
 import {
   connectionRateKey,
-  normalizeCloseCode,
-  STARTUP_DEADLINE_MS,
+  ADMISSION_DEADLINE_MS,
 } from "../src/session-policy.ts";
 import type { Env } from "../src/env.ts";
 
@@ -35,6 +34,8 @@ interface GatewayObservation {
   waiting: boolean;
   bytes: number[];
   closes: number[];
+  byte_count: number;
+  text_frames: number;
 }
 
 async function stats(): Promise<GatewayObservation[]> {
@@ -59,6 +60,10 @@ async function open(
     ip?: string | null;
     bindings?: Env;
     headers?: HeadersInit;
+    database?: string;
+    user?: string;
+    query?: string;
+    signal?: AbortSignal;
   } = {},
 ) {
   const ctx = createExecutionContext();
@@ -67,7 +72,10 @@ async function open(
   const ip = options.ip === undefined ? [192, 0, 2, 1].join(".") : options.ip;
   if (ip !== null) headers.set("CF-Connecting-IP", ip);
   const response = await worker.fetch(
-    new Request(`${origin}/v2`, { headers }),
+    new Request(
+      `${origin}/v2?${options.query ?? new URLSearchParams({ database: options.database ?? database, user: options.user ?? "app" })}`,
+      { headers, signal: options.signal },
+    ),
     options.bindings ?? testEnv,
     ctx,
   );
@@ -76,9 +84,11 @@ async function open(
   socket.binaryType = "arraybuffer";
   socket.accept({ allowHalfOpen: true });
   const messages: Uint8Array[] = [];
+  const textMessages: string[] = [];
   socket.addEventListener("message", (event) => {
     if (event.data instanceof ArrayBuffer)
       messages.push(new Uint8Array(event.data));
+    else if (typeof event.data === "string") textMessages.push(event.data);
   });
   let closeCode: number | null = null;
   socket.addEventListener("close", (event) => {
@@ -86,7 +96,7 @@ async function open(
     socket.close();
   });
   live.push({ socket, ctx });
-  return { socket, messages, closeCode: () => closeCode, ctx };
+  return { socket, messages, textMessages, closeCode: () => closeCode, ctx };
 }
 
 async function errorCode(
@@ -184,7 +194,64 @@ afterEach(async () => {
   logs.mockRestore();
 });
 
-describe("edge routing with real Workers D1, parser and route-token modules", () => {
+describe("native edge admission with real Workers D1 and route-token modules", () => {
+  it("returns the unopened gateway WebSocket directly without accepting or relaying it", async () => {
+    let upstream: WebSocket | null = null;
+    let accept: ReturnType<typeof vi.spyOn> | null = null;
+    const gateway = {
+      async fetch(request: Request) {
+        const response = await testEnv.GATEWAY.fetch(request);
+        upstream = response.webSocket;
+        accept = vi.spyOn(upstream!, "accept");
+        return response;
+      },
+    } as Fetcher;
+    const ctx = createExecutionContext();
+    const response = await worker.fetch(
+      new Request(
+        `${origin}/v2?${new URLSearchParams({ database, user: "app" })}`,
+        {
+          headers: {
+            Upgrade: "websocket",
+            "CF-Connecting-IP": [192, 0, 2, 1].join("."),
+          },
+        },
+      ),
+      { ...testEnv, GATEWAY: gateway },
+      ctx,
+    );
+    expect(await stats()).toHaveLength(1);
+    expect(response.status).toBe(101);
+    expect(response.webSocket).toBe(upstream);
+    expect(accept).not.toHaveBeenCalled();
+    response.webSocket!.accept({ allowHalfOpen: true });
+    live.push({ socket: response.webSocket!, ctx });
+    accept!.mockRestore();
+  });
+
+  it("rejects missing and duplicate admission hints before any gateway call", async () => {
+    for (const query of [
+      "",
+      new URLSearchParams({ database }).toString(),
+      new URLSearchParams({ user: "app" }).toString(),
+      new URLSearchParams([
+        ["database", database],
+        ["database", database],
+        ["user", "app"],
+      ]).toString(),
+      new URLSearchParams([
+        ["database", database],
+        ["user", "app"],
+        ["user", "app"],
+      ]).toString(),
+    ]) {
+      const connection = await open({ query });
+      expect(["3D000", "28P01", "08P01"]).toContain(
+        await errorCode(connection),
+      );
+    }
+    expect(await stats()).toHaveLength(0);
+  });
   it("canonicalizes valid IPv4 and IPv6 admission keys with a bounded parser", () => {
     const ipv4 = [192, 0, 2, 1].join(".");
     expect(connectionRateKey(ipv4)).toBe(`ipv4:${ipv4}`);
@@ -230,14 +297,10 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     ).toBe(426);
   });
 
-  it("distinguishes unknown database and role without contacting a gateway", async () => {
-    const absentDatabase = await open();
-    absentDatabase.socket.send(
-      encodeStartup({ user: "app", database: newDatabaseId() }),
-    );
+  it("distinguishes unknown database and role hints without contacting a gateway", async () => {
+    const absentDatabase = await open({ database: newDatabaseId() });
     expect(await errorCode(absentDatabase)).toBe("3D000");
-    const absentRole = await open();
-    absentRole.socket.send(encodeStartup({ user: "missing", database }));
+    const absentRole = await open({ user: "missing" });
     expect(await errorCode(absentRole)).toBe("28P01");
     await testEnv.DB.prepare(
       "UPDATE roles SET deleted_at = ? WHERE database_id = ?",
@@ -245,7 +308,6 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
       .bind(new Date().toISOString(), database)
       .run();
     const deletedRole = await open();
-    deletedRole.socket.send(encodeStartup({ user: "app", database }));
     expect(await errorCode(deletedRole)).toBe("28P01");
     expect(await stats()).toHaveLength(0);
   });
@@ -264,7 +326,6 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
         .bind(state.desired, state.observed, state.observedGeneration, database)
         .run();
       const connection = await open();
-      connection.socket.send(encodeStartup({ user: "app", database }));
       expect(await errorCode(connection)).toBe("57P03");
     }
     await testEnv.DB.prepare(
@@ -273,7 +334,6 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
       .bind(new Date().toISOString(), database)
       .run();
     const deleted = await open();
-    deleted.socket.send(encodeStartup({ user: "app", database }));
     expect(await errorCode(deleted)).toBe("3D000");
     expect(await stats()).toHaveLength(0);
   });
@@ -313,94 +373,110 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
       .toEqual(expected);
   });
 
-  it("declines GSS then SSL and forwards only the exact startup and trailing bytes", async () => {
+  it("passes GSS, SSL, startup and trailing bytes unchanged to the gateway", async () => {
     const connection = await open();
     const gss = encodeSslRequest();
     new DataView(gss.buffer).setUint32(4, 80877104);
     const startup = encodeStartup({ user: "app", database });
-    const trailing = Uint8Array.of(21, 22, 23);
-    connection.socket.send(concat(gss, encodeSslRequest(), startup, trailing));
-    await expect
-      .poll(() => connection.messages.length)
-      .toBeGreaterThanOrEqual(3);
-    expect([...connection.messages[0]!]).toEqual([0x4e]);
-    expect([...connection.messages[1]!]).toEqual([0x4e]);
-    await expect
-      .poll(async () => (await stats())[0]?.bytes)
-      .toEqual([...concat(startup, trailing)]);
-    expect([...concat(...connection.messages.slice(2))]).toEqual([
-      ...concat(startup, trailing),
-    ]);
-  });
-
-  it("declines SSL then forwards the exact startup without its encryption prelude", async () => {
-    const connection = await open();
-    const startup = encodeStartup({ user: "app", database });
-    connection.socket.send(concat(encodeSslRequest(), startup));
-    await expect.poll(() => connection.messages[0]?.[0]).toBe(0x4e);
-    await expect
-      .poll(async () => (await stats())[0]?.bytes)
-      .toEqual([...startup]);
-    await expect
-      .poll(() => [...concat(...connection.messages.slice(1))])
-      .toEqual([...startup]);
-  });
-
-  it("preserves parser SQLSTATE for replication, missing user and unsupported protocol", async () => {
-    const replication = await open();
-    replication.socket.send(
-      encodeStartup({ user: "app", database, replication: "database" }),
+    const payload = concat(
+      gss,
+      encodeSslRequest(),
+      startup,
+      Uint8Array.of(21, 22, 23),
     );
-    expect(await errorCode(replication)).toBe("0A000");
+    connection.socket.send(payload);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...payload]);
+    await expect
+      .poll(() => [...concat(...connection.messages)])
+      .toEqual([...payload]);
+  });
+
+  it("passes SSL plus exact startup to the gateway without answering the prelude", async () => {
+    const connection = await open();
+    const payload = concat(
+      encodeSslRequest(),
+      encodeStartup({ user: "app", database }),
+    );
+    connection.socket.send(payload);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...payload]);
+    await expect
+      .poll(() => [...concat(...connection.messages)])
+      .toEqual([...payload]);
+  });
+
+  it("passes replication, missing-user and unsupported-protocol packets to gateway parsing unchanged", async () => {
+    const replication = await open();
+    const replicationPacket = encodeStartup({
+      user: "app",
+      database,
+      replication: "database",
+    });
+    replication.socket.send(replicationPacket);
     const missingUser = await open();
-    missingUser.socket.send(encodeStartup({ database }));
-    expect(await errorCode(missingUser)).toBe("28000");
+    const missingUserPacket = encodeStartup({ database });
+    missingUser.socket.send(missingUserPacket);
     const protocol = await open();
     const packet = encodeStartup({ user: "app", database });
     new DataView(packet.buffer).setUint32(4, 4 << 16);
     protocol.socket.send(packet);
-    expect(await errorCode(protocol)).toBe("0A000");
-    expect(await stats()).toHaveLength(0);
+    await expect
+      .poll(async () => (await stats()).map((connection) => connection.bytes))
+      .toEqual([[...replicationPacket], [...missingUserPacket], [...packet]]);
   });
 
-  it("bounds a 10 MiB first frame and bytes arriving during gateway connection", async () => {
+  it("leaves large-frame bounds and startup buffering to the gateway", async () => {
+    await setGatewayMode("count");
     const oversized = await open();
     oversized.socket.send(new Uint8Array(10 * 1024 * 1024));
-    expect(await errorCode(oversized)).toBe("08P01");
-    const pending = await open();
-    pending.socket.send(encodeStartup({ user: "app", database }));
-    pending.socket.send(new Uint8Array(64 * 1024));
-    expect(await errorCode(pending)).toBe("08P01");
-    expect(await stats()).toHaveLength(0);
+    await expect
+      .poll(async () => (await stats())[0]?.byte_count)
+      .toBe(10 * 1024 * 1024);
+    await expect.poll(() => oversized.messages.length).toBe(1);
+    expect(new DataView(oversized.messages[0]!.buffer).getUint32(0)).toBe(
+      10 * 1024 * 1024,
+    );
+    await setGatewayMode("slow");
+    const connection = await open();
+    const startup = encodeStartup({ user: "app", database });
+    const trailing = new Uint8Array(64 * 1024);
+    connection.socket.send(startup);
+    connection.socket.send(trailing);
+    await expect
+      .poll(async () => (await stats())[1]?.bytes)
+      .toEqual([...concat(startup, trailing)]);
   });
 
-  it("enforces the ten-second startup deadline with fake timers", async () => {
+  it("does not own the gateway's startup deadline after native admission", async () => {
     vi.useFakeTimers();
     const connection = await open();
-    await vi.advanceTimersByTimeAsync(STARTUP_DEADLINE_MS);
+    await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
     vi.useRealTimers();
-    expect(await errorCode(connection)).toBe("08P01");
-    await expect.poll(connection.closeCode).toBe(1000);
-    expect(await stats()).toHaveLength(0);
+    expect(connection.messages).toHaveLength(0);
+    expect(connection.closeCode()).toBeNull();
+    expect(await stats()).toHaveLength(1);
+    expect((await stats())[0]!.bytes).toHaveLength(0);
   });
 
-  it("does not extend the first-frame deadline when startup bytes arrive slowly", async () => {
+  it("passes slow partial startup bytes without installing an edge startup timer", async () => {
     vi.useFakeTimers();
     const connection = await open();
     const startup = encodeStartup({ user: "app", database });
     connection.socket.send(startup.subarray(0, 1));
-    await vi.advanceTimersByTimeAsync(STARTUP_DEADLINE_MS - 1);
+    await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS - 1);
     connection.socket.send(startup.subarray(1, 3));
-    expect(connection.messages).toHaveLength(0);
-    expect(connection.closeCode()).toBeNull();
     await vi.advanceTimersByTimeAsync(1);
     vi.useRealTimers();
-    expect(await errorCode(connection)).toBe("08P01");
-    await expect.poll(connection.closeCode).toBe(1000);
-    expect(await stats()).toHaveLength(0);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...startup.subarray(0, 3)]);
+    expect(connection.closeCode()).toBeNull();
   });
 
-  it("rejects a duplicate key split across frames and an overflowing startup length without dialing", async () => {
+  it("passes fragmented duplicate keys and overflowing startup lengths to gateway validation", async () => {
     const startup = encodeStartup({ user: "app", database });
     const duplicated = concat(
       startup.subarray(0, startup.length - 1),
@@ -411,18 +487,17 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     duplicate.socket.send(duplicated.subarray(0, startup.length + 1));
     duplicate.socket.send(new Uint8Array(0));
     duplicate.socket.send(duplicated.subarray(startup.length + 1));
-    expect(await errorCode(duplicate)).toBe("08P01");
-
-    const length = await open();
+    const connection = await open();
     const invalid = startup.slice();
     new DataView(invalid.buffer).setUint32(0, 0xffffffff);
-    length.socket.send(invalid.subarray(0, 3));
-    length.socket.send(invalid.subarray(3));
-    expect(await errorCode(length)).toBe("08P01");
-    expect(await stats()).toHaveLength(0);
+    connection.socket.send(invalid.subarray(0, 3));
+    connection.socket.send(invalid.subarray(3));
+    await expect
+      .poll(async () => (await stats()).map((value) => value.bytes))
+      .toEqual([[...duplicated], [...invalid]]);
   });
 
-  it("silently closes a fragmented maximum-length CancelRequest before lookup", async () => {
+  it("passes fragmented maximum-length CancelRequest unchanged to the gateway", async () => {
     const connection = await open();
     const cancel = crypto.getRandomValues(new Uint8Array(268));
     const fields = new DataView(cancel.buffer);
@@ -432,46 +507,36 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     connection.socket.send(new Uint8Array(0));
     connection.socket.send(cancel.subarray(3, 11));
     connection.socket.send(cancel.subarray(11));
-    await expect.poll(connection.closeCode).toBe(1000);
-    expect(connection.messages).toHaveLength(0);
-    expect(await stats()).toHaveLength(0);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...cancel]);
+    await expect
+      .poll(() => [...concat(...connection.messages)])
+      .toEqual([...cancel]);
   });
 
-  it("expires one thousand idle upgrades without dialing and still routes a later startup", async () => {
+  it("admits one thousand idle native upgrades without installing per-stream edge timers", async () => {
     vi.useFakeTimers();
     const ip = [198, 51, 100, 7].join(".");
     const idle = await Promise.all(
       Array.from({ length: 1_000 }, () => open({ ip })),
     );
-    await vi.advanceTimersByTimeAsync(STARTUP_DEADLINE_MS);
+    await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
     vi.useRealTimers();
-    await expect
-      .poll(
-        () =>
-          idle.filter((connection) => connection.closeCode() === 1000).length,
-      )
-      .toBe(1_000);
     expect(
       idle.every(
         (connection) =>
-          connection.messages.length === 1 &&
-          new TextDecoder()
-            .decode(connection.messages[0]!)
-            .includes("\0C08P01\0"),
+          connection.closeCode() === null && connection.messages.length === 0,
       ),
     ).toBe(true);
-    expect(await stats()).toHaveLength(0);
+    expect(await stats()).toHaveLength(1_000);
     expect(logs.mock.calls).toHaveLength(1_000);
-
-    const subsequent = await open();
-    const startup = encodeStartup({ user: "app", database });
-    subsequent.socket.send(startup);
-    await expect
-      .poll(async () => (await stats())[0]?.bytes)
-      .toEqual([...startup]);
+    const denied = await open();
+    expect(await errorCode(denied)).toBe("53300");
+    expect(await stats()).toHaveLength(1_000);
   });
 
-  it("does not dial after a client closes while a real D1 lookup result is pending", async () => {
+  it("does not dial after an upgrade request aborts while a real D1 result is pending", async () => {
     let queried!: () => void;
     let release!: () => void;
     const lookupReached = new Promise<void>((resolve) => {
@@ -480,7 +545,6 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     const resume = new Promise<void>((resolve) => {
       release = resolve;
     });
-    // Execute the actual D1 query, holding only its delivery to the session.
     const db = {
       prepare(query: string) {
         return {
@@ -499,18 +563,18 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
         } as D1PreparedStatement;
       },
     } as D1Database;
-    const connection = await open({ bindings: { ...testEnv, DB: db } });
-    try {
-      connection.socket.send(encodeStartup({ user: "app", database }));
-      await lookupReached;
-      connection.socket.close(3001, "test lookup cancellation");
-      await expect.poll(connection.closeCode).toBe(3001);
-    } finally {
-      release();
-    }
+    const controller = new AbortController();
+    const pending = open({
+      bindings: { ...testEnv, DB: db },
+      signal: controller.signal,
+    });
+    await lookupReached;
+    controller.abort();
+    const connection = await pending;
+    release();
     await waitOnExecutionContext(connection.ctx);
+    expect(await errorCode(connection)).toBe("08006");
     expect(await stats()).toHaveLength(0);
-    expect(connection.messages).toHaveLength(0);
     expect(logs.mock.calls).toHaveLength(1);
   });
 
@@ -547,6 +611,8 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     });
     expect(verified.ok).toBe(true);
     if (!verified.ok) throw new Error("edge must mint the gateway token");
+    expect(verified.claims.v).toBe(2);
+    expect(verified.claims.user).toBe("app");
     expect(verified.claims.db).toBe(database);
   });
 
@@ -597,7 +663,6 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
       "a::b::c",
     ]) {
       const connection = await open({ ip });
-      connection.socket.send(encodeStartup({ user: "app", database }));
       expect(await errorCode(connection)).toBe("53300");
     }
     expect(await stats()).toHaveLength(0);
@@ -629,9 +694,54 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
         password_kid, created_at, updated_at FROM roles WHERE database_id = ?`,
       ).bind(other, database),
     ]);
-    const independent = await open({ bindings });
+    const independent = await open({ bindings, database: other });
     independent.socket.send(encodeStartup({ user: "app", database: other }));
     await expect.poll(async () => (await stats()).length).toBe(2);
+  });
+
+  it("rejects malformed and reserved hints without contacting a gateway", async () => {
+    const invalidDatabase = await open({ database: "invalid" });
+    expect(await errorCode(invalidDatabase)).toBe("3D000");
+    const reservedRole = await open({ user: "postgres" });
+    expect(await errorCode(reservedRole)).toBe("28P01");
+    const reservedPrefix = await open({ user: "pg_reserved" });
+    expect(await errorCode(reservedPrefix)).toBe("28P01");
+    const malformedRole = await open({ user: "app\0other" });
+    expect(await errorCode(malformedRole)).toBe("28P01");
+    expect(await stats()).toHaveLength(0);
+  });
+
+  it("signs only the admitted hints while unrelated query values and Startup bytes stay untrusted", async () => {
+    const trace = crypto.randomUUID();
+    const unadmitted = newDatabaseId();
+    const connection = await open({
+      query: new URLSearchParams({
+        database,
+        user: "app",
+        cf_trace: trace,
+      }).toString(),
+    });
+    const packet = encodeStartup({ database: unadmitted, user: "missing" });
+    connection.socket.send(packet);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...packet]);
+    const observation = (await stats())[0]!;
+    const keys = await deriveRegionKeyring(
+      parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
+      region,
+    );
+    const verified = await verifyRouteToken(observation.token, {
+      region,
+      keys: keys.keys,
+    });
+    expect(verified.ok).toBe(true);
+    if (!verified.ok) throw new Error("admitted route must verify");
+    expect(verified.claims.db).toBe(database);
+    expect(verified.claims.user).toBe("app");
+    expect(observation.path).toBe("/pg");
+    expect(JSON.stringify(logs.mock.calls)).not.toContain(trace);
+    expect(JSON.stringify(logs.mock.calls)).not.toContain(unadmitted);
   });
 
   it("mints correct short-lived tokens with unique connection IDs", async () => {
@@ -656,6 +766,8 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     expect(first.ok).toBe(true);
     expect(second.ok).toBe(true);
     if (!first.ok || !second.ok) throw new Error("route token must verify");
+    expect(first.claims.v).toBe(2);
+    expect(first.claims.user).toBe("app");
     expect(first.claims.db).toBe(database);
     expect(first.claims.rg).toBe(region);
     expect(first.claims.exp - first.claims.iat).toBe(30);
@@ -665,7 +777,6 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
   it("returns a generic PostgreSQL error for gateway failure without replaying", async () => {
     await setGatewayMode("reject");
     const connection = await open();
-    connection.socket.send(encodeStartup({ user: "app", database }));
     expect(await errorCode(connection)).toBe("08006");
     expect(await stats()).toHaveLength(1);
     expect((await stats())[0]!.bytes).toHaveLength(0);
@@ -678,7 +789,6 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
       .bind(`${gatewayOrigin.replace("https:", "http:")}/pg`, region)
       .run();
     const connection = await open();
-    connection.socket.send(encodeStartup({ user: "app", database }));
     expect(await errorCode(connection)).toBe("08006");
     expect(await stats()).toHaveLength(0);
   });
@@ -706,7 +816,6 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
       .bind(region)
       .run();
     const connection = await open();
-    connection.socket.send(encodeStartup({ user: "app", database }));
     expect(await errorCode(connection)).toBe("08006");
     const observations = await stats();
     expect(observations).toHaveLength(1);
@@ -715,39 +824,37 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     expect(observations[0]!.bytes).toHaveLength(0);
   });
 
-  it("does not flush startup or reconnect when the client closes during a gateway connection", async () => {
+  it("does not reconnect when an upgrade request aborts during gateway connection", async () => {
     await setGatewayMode("held");
-    const connection = await open();
-    connection.socket.send(encodeStartup({ user: "app", database }));
+    const controller = new AbortController();
+    const pending = open({ signal: controller.signal });
     await expect.poll(async () => (await stats())[0]?.waiting).toBe(true);
-    connection.socket.close(3001, "test cancellation");
-    await expect.poll(connection.closeCode).toBe(3001);
+    controller.abort();
+    const connection = await pending;
+    expect(await errorCode(connection)).toBe("08006");
     await testEnv.GATEWAY.fetch(`${gatewayOrigin}/release`);
     await waitOnExecutionContext(connection.ctx);
     const observations = await stats();
     expect(observations).toHaveLength(1);
     expect(observations[0]!.bytes).toHaveLength(0);
-    expect(connection.messages).toHaveLength(0);
     expect(logs.mock.calls).toHaveLength(1);
   });
 
-  it("enforces the startup deadline during a pending gateway upgrade without flushing bytes", async () => {
+  it("bounds a pending gateway upgrade without sending bytes or reconnecting", async () => {
     await setGatewayMode("held");
     vi.useFakeTimers();
-    const connection = await open();
-    connection.socket.send(encodeStartup({ user: "app", database }));
+    const pending = open();
     await vi.waitFor(async () =>
       expect((await stats())[0]?.waiting).toBe(true),
     );
-    await vi.advanceTimersByTimeAsync(STARTUP_DEADLINE_MS);
+    await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
+    const connection = await pending;
     vi.useRealTimers();
-    expect(await errorCode(connection)).toBe("08P01");
-    await expect.poll(connection.closeCode).toBe(1000);
+    expect(await errorCode(connection)).toBe("08006");
     await testEnv.GATEWAY.fetch(`${gatewayOrigin}/release`);
     await waitOnExecutionContext(connection.ctx);
-    const observations = await stats();
-    expect(observations).toHaveLength(1);
-    expect(observations[0]!.bytes).toHaveLength(0);
+    expect(await stats()).toHaveLength(1);
+    expect((await stats())[0]!.bytes).toHaveLength(0);
     expect(logs.mock.calls).toHaveLength(1);
   });
 
@@ -775,33 +882,35 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
       .bind(region)
       .run();
     const connection = await open();
-    connection.socket.send(encodeStartup({ user: "app", database }));
     expect(await errorCode(connection)).toBe("08006");
     expect(await stats()).toHaveLength(0);
   });
 
-  it("counts bytes manually and propagates a client close to the gateway", async () => {
+  it("logs only admission fields and propagates a native client close without invented byte counts", async () => {
     const connection = await open();
-    const startup = encodeStartup({ user: "app", database });
-    const payload = Uint8Array.of(11, 12, 13, 14, 15);
-    connection.socket.send(concat(encodeSslRequest(), startup));
-    await expect
-      .poll(async () => (await stats())[0]?.bytes.length)
-      .toBe(startup.length);
+    const payload = concat(
+      encodeSslRequest(),
+      encodeStartup({ user: "app", database }),
+      Uint8Array.of(11, 12, 13, 14, 15),
+    );
     connection.socket.send(payload);
     await expect
       .poll(() => concat(...connection.messages).length)
-      .toBe(startup.length + payload.length + 1);
+      .toBe(payload.length);
     connection.socket.close(3001, "test completion");
     await expect.poll(async () => (await stats())[0]?.closes).toEqual([3001]);
-    await expect.poll(() => logs.mock.calls.length).toBe(1);
+    expect(logs.mock.calls).toHaveLength(1);
     const log = JSON.parse(logs.mock.calls[0]![0] as string);
-    expect(log.event).toBe("conn_close");
-    expect(log.ingress_bytes).toBe(startup.length + payload.length + 8);
-    expect(log.egress_bytes).toBe(startup.length + payload.length + 1);
+    expect(log.event).toBe("conn_admission");
     expect(log.database_id).toBe(database);
+    expect(log.user).toBe("app");
+    expect(log.region_id).toBe(region);
+    expect(log.outcome).toBe("accepted");
     expect(log.duration_ms).toBeGreaterThanOrEqual(0);
     expect(Object.keys(log)).not.toContain("password");
+    expect(Object.keys(log)).not.toContain("ingress_bytes");
+    expect(Object.keys(log)).not.toContain("egress_bytes");
+    expect(Object.keys(log)).not.toContain("token");
   });
 
   it("propagates a gateway close to the client without reconnecting", async () => {
@@ -813,32 +922,30 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     expect(await stats()).toHaveLength(1);
   });
 
-  it("rejects text frames in both directions", async () => {
+  it("passes text frames unchanged while the real gateway owns binary-frame enforcement", async () => {
     const clientText = await open();
     clientText.socket.send("unsupported");
-    await expect.poll(clientText.closeCode).toBe(1003);
-    expect(await stats()).toHaveLength(0);
+    await expect.poll(async () => (await stats())[0]?.text_frames).toBe(1);
+    await expect.poll(() => clientText.textMessages).toEqual(["unsupported"]);
     await setGatewayMode("text");
     const gatewayText = await open();
     gatewayText.socket.send(encodeStartup({ user: "app", database }));
-    await expect.poll(gatewayText.closeCode).toBe(1003);
-    expect(await stats()).toHaveLength(1);
+    await expect.poll(() => gatewayText.textMessages).toEqual(["unsupported"]);
+    expect(await stats()).toHaveLength(2);
   });
 
-  it("silently closes CancelRequest and maps reserved close codes", async () => {
+  it("preserves CancelRequest bytes for gateway-owned cancellation", async () => {
     const connection = await open();
     const packet = new Uint8Array(16);
     const view = new DataView(packet.buffer);
     view.setUint32(0, 16);
     view.setUint32(4, 80877102);
     connection.socket.send(packet);
-    await expect.poll(connection.closeCode).toBe(1000);
-    expect(connection.messages).toHaveLength(0);
-    expect(await stats()).toHaveLength(0);
-    expect(normalizeCloseCode(1005)).toBe(1000);
-    expect(normalizeCloseCode(1006)).toBe(1011);
-    expect(normalizeCloseCode(1015)).toBe(1011);
-    expect(normalizeCloseCode(1012)).toBe(1012);
-    expect(normalizeCloseCode(3001)).toBe(3001);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...packet]);
+    await expect
+      .poll(() => [...concat(...connection.messages)])
+      .toEqual([...packet]);
   });
 });

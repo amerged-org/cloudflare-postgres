@@ -1,17 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-export const STARTUP_DEADLINE_MS = 10_000;
-
-export function normalizeCloseCode(code: number): number {
-  if (code === 1005) return 1000;
-  if (code === 1006 || code === 1015) return 1011;
-  if (
-    code === 1000 ||
-    (code >= 1001 && code <= 1014 && code !== 1004) ||
-    (code >= 3000 && code <= 4999)
-  )
-    return code;
-  return 1011;
-}
+export const ADMISSION_DEADLINE_MS = 10_000;
 
 /** IPv4 admission is per address; IPv6 admission is per canonical /64. */
 export function connectionRateKey(ip: string | null): string | null {

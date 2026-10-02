@@ -19,6 +19,8 @@ export default {
       released: false,
       bytes: [],
       closes: [],
+      byte_count: 0,
+      text_frames: 0,
     };
     connections.push(connection);
     if (url.searchParams.get("mode") === "redirect") {
@@ -45,7 +47,19 @@ export default {
     socket.binaryType = "arraybuffer";
     socket.accept({ allowHalfOpen: true });
     socket.addEventListener("message", (event) => {
-      connection.bytes.push(...new Uint8Array(event.data));
+      if (typeof event.data === "string") connection.text_frames++;
+      else {
+        connection.byte_count += event.data.byteLength;
+        if (url.searchParams.get("mode") !== "count")
+          for (const byte of new Uint8Array(event.data))
+            connection.bytes.push(byte);
+      }
+      if (url.searchParams.get("mode") === "count") {
+        const count = new Uint8Array(4);
+        new DataView(count.buffer).setUint32(0, connection.byte_count);
+        socket.send(count);
+        return;
+      }
       if (url.searchParams.get("mode") === "text") socket.send("unsupported");
       else {
         socket.send(event.data);

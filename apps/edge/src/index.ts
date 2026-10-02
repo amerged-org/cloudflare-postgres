@@ -1,32 +1,22 @@
 // SPDX-License-Identifier: Apache-2.0
 import { isDatabaseId, isRoleName } from "@pgcf/contracts";
-import {
-  DEFAULT_MAX_BUFFERED,
-  StartupReader,
-  encodeEncryptionDeclined,
-  encodeErrorResponse,
-  type StartupEvent,
-} from "@pgcf/contracts/pg-wire";
+import { encodeErrorResponse } from "@pgcf/contracts/pg-wire";
 import { parseRouteKeyring, signRouteToken } from "@pgcf/contracts/route-token";
 import type { Env } from "./env.ts";
 import { connectGateway, type GatewayRegion } from "./gateway.ts";
-import {
-  STARTUP_DEADLINE_MS,
-  normalizeCloseCode,
-  connectionRateKey,
-} from "./session-policy.ts";
-
-const MAX_FRAME_BYTES = 64 * 1024;
-const EMPTY = new Uint8Array(0);
+import { ADMISSION_DEADLINE_MS, connectionRateKey } from "./session-policy.ts";
 
 interface RouteRow extends GatewayRegion {
   readonly role_name: string | null;
   readonly desired_state: string;
   readonly observed_state: string;
 }
+interface Hints {
+  readonly database: string;
+  readonly user: string;
+}
 
-// One read-only query retains the distinction between an absent database and
-// an absent live role; role credentials are never selected by the data plane.
+// Credentials never enter the data plane's read-only admission query.
 const ROUTE_QUERY = `
   SELECT d.desired_state, d.observed_state,
          roles.name AS role_name, regions.id, regions.gateway_url,
@@ -38,6 +28,133 @@ const ROUTE_QUERY = `
    WHERE d.id = ? AND d.deleted_at IS NULL
    LIMIT 1`;
 
+class AdmissionFailure extends Error {
+  readonly sqlstate: string;
+  constructor(sqlstate: string, message: string) {
+    super(message);
+    this.sqlstate = sqlstate;
+  }
+}
+
+function routingHints(url: URL): Hints {
+  const databases = url.searchParams.getAll("database");
+  const users = url.searchParams.getAll("user");
+  if (databases.length > 1 || users.length > 1)
+    throw new AdmissionFailure("08P01", "duplicate connection admission hint");
+  if (databases.length !== 1 || !isDatabaseId(databases[0]))
+    throw new AdmissionFailure("3D000", "database does not exist");
+  if (users.length !== 1 || !isRoleName(users[0]))
+    throw new AdmissionFailure("28P01", "authentication failed");
+  return { database: databases[0], user: users[0] };
+}
+
+async function admit(
+  request: Request,
+  env: Env,
+  hints: Hints,
+  cid: string,
+  signal: AbortSignal,
+): Promise<{ socket: WebSocket; region: string }> {
+  const check = () => {
+    if (signal.aborted)
+      throw new AdmissionFailure("08006", "connection admission interrupted");
+  };
+  check();
+  const key = connectionRateKey(request.headers.get("CF-Connecting-IP"));
+  if (key === null)
+    throw new AdmissionFailure("53300", "connection rate limit exceeded");
+  let connectionAllowed: boolean;
+  let databaseAllowed: boolean;
+  try {
+    connectionAllowed = (await env.CONNECTION_RATE_LIMITER.limit({ key }))
+      .success;
+    check();
+    if (!connectionAllowed)
+      throw new AdmissionFailure("53300", "connection rate limit exceeded");
+    databaseAllowed = (
+      await env.DATABASE_CONNECTION_RATE_LIMITER.limit({ key: hints.database })
+    ).success;
+  } catch (error) {
+    if (error instanceof AdmissionFailure) throw error;
+    throw new AdmissionFailure("53300", "connection admission unavailable");
+  }
+  check();
+  if (!databaseAllowed)
+    throw new AdmissionFailure(
+      "53300",
+      "database connection rate limit exceeded",
+    );
+  const route = await env.DB.prepare(ROUTE_QUERY)
+    .bind(hints.user, hints.database)
+    .first<RouteRow>();
+  check();
+  if (route === null)
+    throw new AdmissionFailure("3D000", "database does not exist");
+  if (route.role_name === null)
+    throw new AdmissionFailure("28P01", "authentication failed");
+  if (route.desired_state !== "running" || route.observed_state !== "ready")
+    throw new AdmissionFailure(
+      "57P03",
+      "database is not accepting connections",
+    );
+  const token = await signRouteToken({
+    keyring: parseRouteKeyring(env.ROUTE_MASTER_KEYS),
+    region: route.id,
+    db: hints.database,
+    user: hints.user,
+    cid,
+  });
+  check();
+  const socket = await connectGateway(route, token, env, signal);
+  return { socket, region: route.id };
+}
+
+async function boundedAdmission(
+  request: Request,
+  env: Env,
+  hints: Hints,
+  cid: string,
+  ctx: ExecutionContext,
+): Promise<{ socket: WebSocket; region: string }> {
+  const controller = new AbortController();
+  const abort = () => controller.abort();
+  request.signal.addEventListener("abort", abort, { once: true });
+  if (request.signal.aborted) abort();
+  let refuse!: () => void;
+  const interrupted = new Promise<never>((_resolve, reject) => {
+    refuse = () =>
+      reject(new AdmissionFailure("08006", "connection admission interrupted"));
+    if (controller.signal.aborted) refuse();
+    else controller.signal.addEventListener("abort", refuse, { once: true });
+  });
+  const timer = setTimeout(abort, ADMISSION_DEADLINE_MS);
+  const admission = Promise.race([
+    interrupted,
+    admit(request, env, hints, cid, controller.signal),
+  ]);
+  ctx.waitUntil(
+    admission.then(
+      () => undefined,
+      () => undefined,
+    ),
+  );
+  try {
+    return await admission;
+  } finally {
+    clearTimeout(timer);
+    request.signal.removeEventListener("abort", abort);
+    controller.signal.removeEventListener("abort", refuse);
+  }
+}
+
+function refused(failure: AdmissionFailure): Response {
+  const pair = new WebSocketPair();
+  pair[1].accept();
+  pair[1].send(encodeErrorResponse(failure.sqlstate, failure.message));
+  pair[1].close(1000, "connection refused");
+  return new Response(null, { status: 101, webSocket: pair[0] });
+}
+
 export default {
   async fetch(
     request: Request,
@@ -47,298 +164,43 @@ export default {
     const url = new URL(request.url);
     if (request.method === "GET" && url.pathname === "/healthz")
       return Response.json({ status: "ok" });
+    if (url.pathname !== "/v2")
+      return new Response("Not found", { status: 404 });
     if (
       request.method !== "GET" ||
       request.headers.get("Upgrade")?.toLowerCase() !== "websocket"
     )
       return new Response("WebSocket upgrade required", { status: 426 });
-
-    const pair = new WebSocketPair();
-    const session = new EdgeSession(pair[1], env, ctx);
-    const ip = request.headers.get("CF-Connecting-IP");
-    session.checkRateLimit(ip);
-    return new Response(null, { status: 101, webSocket: pair[0] });
+    const started = Date.now();
+    const cid = crypto.randomUUID();
+    let hints: Hints | null = null;
+    let region: string | null = null;
+    let outcome = "accepted";
+    try {
+      hints = routingHints(url);
+      const upstream = await boundedAdmission(request, env, hints, cid, ctx);
+      region = upstream.region;
+      // Attaching an unopened socket delegates the stream to the runtime.
+      return new Response(null, { status: 101, webSocket: upstream.socket });
+    } catch (error) {
+      const failure =
+        error instanceof AdmissionFailure
+          ? error
+          : new AdmissionFailure("08006", "gateway connection failed");
+      outcome = failure.sqlstate;
+      return refused(failure);
+    } finally {
+      console.log(
+        JSON.stringify({
+          event: "conn_admission",
+          cid,
+          database_id: hints?.database ?? null,
+          user: hints?.user ?? null,
+          region_id: region,
+          duration_ms: Math.max(0, Date.now() - started),
+          outcome,
+        }),
+      );
+    }
   },
 } satisfies ExportedHandler<Env>;
-
-class EdgeSession {
-  readonly #client: WebSocket;
-  readonly #env: Env;
-  readonly #ctx: ExecutionContext;
-  readonly #reader = new StartupReader();
-  readonly #started = Date.now();
-  readonly #cid = crypto.randomUUID();
-  readonly #abort = new AbortController();
-  readonly #timer: ReturnType<typeof setTimeout>;
-  readonly #startupDone: () => void;
-  #upstream: WebSocket | null = null;
-  #stage: "startup" | "connecting" | "streaming" | "closed" = "startup";
-  #queue: Uint8Array[] = [];
-  #queuedBytes = 0;
-  #rateAllowed: Promise<boolean> = Promise.resolve(false);
-  #database: string | null = null;
-  #bytesIn = 0;
-  #bytesOut = 0;
-
-  constructor(client: WebSocket, env: Env, ctx: ExecutionContext) {
-    this.#client = client;
-    this.#env = env;
-    this.#ctx = ctx;
-    let done!: () => void;
-    ctx.waitUntil(
-      new Promise<void>((resolve) => {
-        done = resolve;
-      }),
-    );
-    this.#startupDone = done;
-    client.binaryType = "arraybuffer";
-    client.accept({ allowHalfOpen: true });
-    this.#timer = setTimeout(
-      () => this.#fatal("08P01", "startup deadline exceeded"),
-      STARTUP_DEADLINE_MS,
-    );
-    client.addEventListener("message", (event) => this.#fromClient(event));
-    client.addEventListener("close", (event) =>
-      this.#close(event.code, "client_closed"),
-    );
-    client.addEventListener("error", () => this.#close(1011, "client_error"));
-  }
-
-  checkRateLimit(ip: string | null): void {
-    const key = connectionRateKey(ip);
-    this.#rateAllowed = (async () => {
-      try {
-        const result =
-          key === null
-            ? { success: false }
-            : await this.#env.CONNECTION_RATE_LIMITER.limit({ key });
-        if (!result.success)
-          this.#fatal("53300", "connection rate limit exceeded");
-        return result.success;
-      } catch {
-        this.#fatal("53300", "connection admission unavailable");
-        return false;
-      }
-    })();
-    this.#ctx.waitUntil(this.#rateAllowed);
-  }
-
-  #fromClient(event: MessageEvent): void {
-    if (this.#stage === "closed") return;
-    if (typeof event.data === "string") {
-      this.#close(1003, "text_frame");
-      return;
-    }
-    if (!(event.data instanceof ArrayBuffer)) {
-      this.#close(1003, "non_binary_frame");
-      return;
-    }
-    const bytes = new Uint8Array(event.data);
-    this.#bytesIn += bytes.length;
-    if (this.#stage === "streaming") {
-      try {
-        this.#send(this.#upstream!, bytes);
-      } catch {
-        this.#close(1011, "gateway_send_error");
-      }
-      return;
-    }
-    if (this.#stage === "connecting") {
-      this.#buffer(bytes);
-      return;
-    }
-    let result = this.#reader.push(bytes);
-    while (result.kind === "ssl" || result.kind === "gss") {
-      try {
-        this.#toClient(encodeEncryptionDeclined());
-      } catch {
-        this.#close(1011, "client_send_error");
-        return;
-      }
-      result = this.#reader.push(EMPTY);
-    }
-    if (result.kind === "need-more") return;
-    if (result.kind === "cancel") {
-      this.#close(1000, "cancel");
-      return;
-    }
-    if (result.kind === "error") {
-      this.#fatal(result.sqlstate, result.message);
-      return;
-    }
-    this.#stage = "connecting";
-    if (!this.#buffer(result.raw) || !this.#buffer(result.rest)) return;
-    this.#ctx.waitUntil(this.#route(result));
-  }
-
-  #buffer(bytes: Uint8Array): boolean {
-    if (bytes.length > DEFAULT_MAX_BUFFERED - this.#queuedBytes) {
-      this.#fatal("08P01", "too much data before gateway connection");
-      return false;
-    }
-    if (bytes.length > 0) {
-      this.#queue.push(bytes);
-      this.#queuedBytes += bytes.length;
-    }
-    return true;
-  }
-
-  async #route(
-    startup: Extract<StartupEvent, { kind: "startup" }>,
-  ): Promise<void> {
-    try {
-      if (!(await this.#rateAllowed) || this.#isClosed()) return;
-      if (!isDatabaseId(startup.database)) {
-        this.#fatal("3D000", "database does not exist");
-        return;
-      }
-      if (!isRoleName(startup.user)) {
-        this.#fatal("28P01", "authentication failed");
-        return;
-      }
-      this.#database = startup.database;
-      try {
-        const admission =
-          await this.#env.DATABASE_CONNECTION_RATE_LIMITER.limit({
-            key: startup.database,
-          });
-        if (this.#isClosed()) return;
-        if (!admission.success) {
-          this.#fatal("53300", "database connection rate limit exceeded");
-          return;
-        }
-      } catch {
-        this.#fatal("53300", "database connection admission unavailable");
-        return;
-      }
-      const route = await this.#env.DB.prepare(ROUTE_QUERY)
-        .bind(startup.user, startup.database)
-        .first<RouteRow>();
-      if (this.#isClosed()) return;
-      if (route === null) {
-        this.#fatal("3D000", "database does not exist");
-        return;
-      }
-      if (route.role_name === null) {
-        this.#fatal("28P01", "authentication failed");
-        return;
-      }
-      if (
-        route.desired_state !== "running" ||
-        route.observed_state !== "ready"
-      ) {
-        this.#fatal("57P03", "database is not accepting connections");
-        return;
-      }
-      const token = await signRouteToken({
-        keyring: parseRouteKeyring(this.#env.ROUTE_MASTER_KEYS),
-        region: route.id,
-        db: startup.database,
-        cid: this.#cid,
-      });
-      if (this.#isClosed()) return;
-      const upstream = await connectGateway(
-        route,
-        token,
-        this.#env,
-        this.#abort.signal,
-      );
-      if (this.#isClosed()) {
-        upstream.accept({ allowHalfOpen: true });
-        upstream.close(1000, "connection closed");
-        return;
-      }
-      this.#upstream = upstream;
-      upstream.binaryType = "arraybuffer";
-      upstream.addEventListener("message", (event) => this.#fromGateway(event));
-      upstream.addEventListener("close", (event) =>
-        this.#close(event.code, "gateway_closed"),
-      );
-      upstream.addEventListener("error", () =>
-        this.#close(1011, "gateway_error"),
-      );
-      upstream.accept({ allowHalfOpen: true });
-      this.#stage = "streaming";
-      // The flush is synchronous, so subsequent client events cannot overtake it.
-      for (const bytes of this.#queue) this.#send(upstream, bytes);
-      this.#queue = [];
-      this.#queuedBytes = 0;
-      clearTimeout(this.#timer);
-      this.#startupDone();
-    } catch {
-      if (!this.#isClosed()) this.#fatal("08006", "gateway connection failed");
-    }
-  }
-
-  #isClosed(): boolean {
-    return this.#stage === "closed";
-  }
-
-  #fromGateway(event: MessageEvent): void {
-    if (this.#stage !== "streaming") return;
-    if (!(event.data instanceof ArrayBuffer)) {
-      this.#close(1003, "gateway_text_frame");
-      return;
-    }
-    try {
-      this.#toClient(new Uint8Array(event.data));
-    } catch {
-      this.#close(1011, "client_send_error");
-    }
-  }
-
-  #toClient(bytes: Uint8Array): void {
-    this.#send(this.#client, bytes);
-    this.#bytesOut += bytes.length;
-  }
-
-  #send(socket: WebSocket, bytes: Uint8Array): void {
-    // Workers exposes neither drain nor a writable bufferedAmount. There is no
-    // application queue after startup, but runtime transport buffering must be
-    // measured by S2; frame slicing is not a backpressure guarantee.
-    for (let offset = 0; offset < bytes.length; offset += MAX_FRAME_BYTES)
-      socket.send(bytes.subarray(offset, offset + MAX_FRAME_BYTES));
-  }
-
-  #fatal(sqlstate: string, message: string): void {
-    if (this.#isClosed()) return;
-    try {
-      this.#toClient(encodeErrorResponse(sqlstate, message));
-    } catch {
-      /* A disconnected client cannot receive the error. */
-    }
-    this.#close(1000, sqlstate);
-  }
-
-  #close(code: number, outcome: string): void {
-    if (this.#isClosed()) return;
-    const wasStreaming = this.#stage === "streaming";
-    this.#stage = "closed";
-    clearTimeout(this.#timer);
-    // Aborting a completed WebSocket upgrade tears down its stream without a
-    // close handshake. Abort only an outstanding connection attempt.
-    if (!wasStreaming) this.#abort.abort();
-    this.#startupDone();
-    this.#queue = [];
-    this.#queuedBytes = 0;
-    const safeCode = normalizeCloseCode(code);
-    for (const socket of [this.#client, this.#upstream]) {
-      try {
-        socket?.close(safeCode, "connection closed");
-      } catch {
-        /* The other peer still needs its close. */
-      }
-    }
-    console.log(
-      JSON.stringify({
-        event: "conn_close",
-        cid: this.#cid,
-        database_id: this.#database,
-        ingress_bytes: this.#bytesIn,
-        egress_bytes: this.#bytesOut,
-        duration_ms: Math.max(0, Date.now() - this.#started),
-        outcome,
-      }),
-    );
-  }
-}
