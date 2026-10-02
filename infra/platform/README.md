@@ -176,7 +176,7 @@ the keys of `pgcf-gateway` and `pgcf-agent` become environment variables of the 
   edge on 7844, the gateway accepts traffic from cloudflared only, and may reach the Kubernetes API
   and port 5432 of database Pods in namespaces labelled `pgcf.io/database-id`. The agent reaches the
   Kubernetes API, the API Worker host on 443 and CNPG Pods in labelled database namespaces on
-  9187 for real WAL archive metrics; nothing accepts inbound traffic besides the
+  5432 for authenticated role readiness and 9187 for real WAL archive metrics; nothing accepts inbound traffic besides the
   gateway. Every policy also allows DNS.
 - The agent ClusterRole covers namespaces, Secrets (no list or watch), ResourceQuotas, LimitRanges,
   NetworkPolicies, CiliumNetworkPolicies, CNPG `Cluster`, `ScheduledBackup` and Barman

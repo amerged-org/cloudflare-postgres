@@ -39,19 +39,20 @@ name.
 Direct npm dependencies at the versions resolved in [pnpm-lock.yaml](pnpm-lock.yaml). Licenses are
 read from the installed package manifests.
 
-| Package                                                                                                 | Version | License           | Role                                                                     |
-| ------------------------------------------------------------------------------------------------------- | ------- | ----------------- | ------------------------------------------------------------------------ |
-| [hono](https://github.com/honojs/hono)                                                                  | 4.13.12 | MIT               | HTTP framework of the API Worker.                                        |
-| [zod](https://github.com/colinhacks/zod)                                                                | 4.6.5   | MIT               | Shared schemas in `packages/contracts` and request validation.           |
-| [@hono/zod-openapi](https://github.com/honojs/middleware/tree/main/packages/zod-openapi)                | 1.6.3   | MIT               | OpenAPI document generated from the route schemas.                       |
-| [@kubernetes/client-node](https://github.com/kubernetes-client/javascript)                              | 2.0.0   | Apache-2.0        | Regional Kubernetes API client.                                          |
-| [wrangler](https://github.com/cloudflare/workers-sdk)                                                   | 4.145.0 | MIT OR Apache-2.0 | Worker build, type generation and deployment tooling.                    |
-| [ws](https://github.com/websockets/ws)                                                                  | 8.22.0  | MIT               | WebSocket server of the regional gateway and link client of the agent.   |
-| [esbuild](https://github.com/evanw/esbuild)                                                             | 0.25.12 | MIT               | Bundles the regional entry points into the container image (build only). |
-| [@neondatabase/serverless](https://github.com/neondatabase/serverless)                                  | 1.2.0   | MIT               | Client driver used by the live acceptance run (also listed above).       |
-| [pg](https://github.com/brianc/node-postgres)                                                           | 8.23.1  | MIT               | Direct PostgreSQL client for `scripts/e2e` only.                         |
-| [vitest](https://github.com/vitest-dev/vitest)                                                          | 4.1.11  | MIT               | Test runner (development only).                                          |
-| [@cloudflare/vitest-plugin](https://github.com/cloudflare/workers-sdk/tree/main/packages/vitest-plugin) | 1.3.5   | MIT               | Runs Worker tests in the Workers runtime (development only).             |
+| Package                                                                                                 | Version | License           | Role                                                                                      |
+| ------------------------------------------------------------------------------------------------------- | ------- | ----------------- | ----------------------------------------------------------------------------------------- |
+| [hono](https://github.com/honojs/hono)                                                                  | 4.13.12 | MIT               | HTTP framework of the API Worker.                                                         |
+| [zod](https://github.com/colinhacks/zod)                                                                | 4.6.5   | MIT               | Shared schemas in `packages/contracts` and request validation.                            |
+| [@hono/zod-openapi](https://github.com/honojs/middleware/tree/main/packages/zod-openapi)                | 1.6.3   | MIT               | OpenAPI document generated from the route schemas.                                        |
+| [@kubernetes/client-node](https://github.com/kubernetes-client/javascript)                              | 2.0.0   | Apache-2.0        | Regional Kubernetes API client.                                                           |
+| [wrangler](https://github.com/cloudflare/workers-sdk)                                                   | 4.145.0 | MIT OR Apache-2.0 | Worker build, type generation and deployment tooling.                                     |
+| [ws](https://github.com/websockets/ws)                                                                  | 8.22.0  | MIT               | WebSocket server of the regional gateway and link client of the agent.                    |
+| [esbuild](https://github.com/evanw/esbuild)                                                             | 0.25.12 | MIT               | Bundles the regional entry points into the container image (build only).                  |
+| [@neondatabase/serverless](https://github.com/neondatabase/serverless)                                  | 1.2.0   | MIT               | Client driver used by the live acceptance run (also listed above).                        |
+| [pg](https://github.com/brianc/node-postgres)                                                           | 8.23.1  | MIT               | Authenticated TLS readiness probes in the regional agent and PostgreSQL acceptance tools. |
+| [@types/pg](https://github.com/DefinitelyTyped/DefinitelyTyped/tree/master/types/pg)                    | 8.23.1  | MIT               | PostgreSQL client types (development only).                                               |
+| [vitest](https://github.com/vitest-dev/vitest)                                                          | 4.1.11  | MIT               | Test runner (development only).                                                           |
+| [@cloudflare/vitest-plugin](https://github.com/cloudflare/workers-sdk/tree/main/packages/vitest-plugin) | 1.3.5   | MIT               | Runs Worker tests in the Workers runtime (development only).                              |
 
 ### Reference only
 

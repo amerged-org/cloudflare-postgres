@@ -259,7 +259,7 @@ export function buildDatabaseManifests(
     {
       apiVersion: "networking.k8s.io/v1",
       kind: "NetworkPolicy",
-      metadata: metadata("agent-metrics-ingress"),
+      metadata: metadata("agent-management-ingress"),
       spec: {
         podSelector: { matchLabels: { "cnpg.io/cluster": CLUSTER_NAME } },
         policyTypes: ["Ingress"],
@@ -277,7 +277,10 @@ export function buildDatabaseManifests(
                 },
               },
             ],
-            ports: [{ port: 9187, protocol: "TCP" }],
+            ports: [
+              { port: 5432, protocol: "TCP" },
+              { port: 9187, protocol: "TCP" },
+            ],
           },
         ],
       },
@@ -299,7 +302,14 @@ export function buildDatabaseManifests(
           },
           {
             fromEndpoints: [{ matchLabels: endpointLabels(ctx.agentSelector) }],
-            toPorts: [{ ports: [{ port: "9187", protocol: "TCP" }] }],
+            toPorts: [
+              {
+                ports: [
+                  { port: "5432", protocol: "TCP" },
+                  { port: "9187", protocol: "TCP" },
+                ],
+              },
+            ],
           },
           {
             fromEndpoints: [

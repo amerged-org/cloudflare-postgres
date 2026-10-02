@@ -71,7 +71,7 @@ The diagrams are in [README.md](README.md#architecture).
 
 - Namespace `pgcf-db-<id>` with PodSecurity `restricted`, a ResourceQuota, a default-deny
   NetworkPolicy and a `CiliumNetworkPolicy`. Ingress is allowed only from the gateway and the CNPG
-  operator and plugin, plus the agent on metrics port 9187; egress only to DNS, the Kubernetes API and the R2 host on 443 (the R2 rule
+  operator and plugin, plus the agent on authenticated readiness port 5432 and metrics port 9187; egress only to DNS, the Kubernetes API and the R2 host on 443 (the R2 rule
   needs an FQDN match, which plain NetworkPolicy cannot express).
 - CNPG `Cluster`:
   - 1 instance, pinned PostgreSQL 18 image.
@@ -252,7 +252,8 @@ class (512 MiB, 2 GiB).
   - Customer roles are non-superusers; superuser access is disabled.
   - `scram-sha-256`; extensions limited to the image allowlist.
   - TLS only (`hostnossl` is rejected); the gateway negotiates it itself.
-  - Traffic only from gateway Pods.
+  - Gateway Pods carry customer connections. The agent verifies desired role credentials through
+    authenticated TLS readiness probes before reporting ready.
 - Kubernetes: one namespace per database, default-deny NetworkPolicy plus a
   `CiliumNetworkPolicy`, hard LVM volume limits, CPU and memory limits, PodSecurity `restricted`.
   The agent has no `pods/exec` permission.

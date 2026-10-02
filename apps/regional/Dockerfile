@@ -17,7 +17,7 @@ COPY apps/regional/tsconfig.json apps/regional/tsconfig.json
 COPY apps/regional/src apps/regional/src
 RUN pnpm --filter @pgcf/regional build \
  && test -f apps/regional/dist/agent/main.mjs && test -f apps/regional/dist/gateway/main.mjs
-# The runtime image carries only the external packages (@kubernetes/client-node, ws); the
+# The runtime image carries only the external packages (@kubernetes/client-node, ws, pg); the
 # workspace contracts are bundled into the entry points, so drop them from the deployed manifest.
 RUN node -e "const f='apps/regional/package.json',p=JSON.parse(require('fs').readFileSync(f));delete p.dependencies['@pgcf/contracts'];delete p.devDependencies;require('fs').writeFileSync(f,JSON.stringify(p))" \
  && pnpm --filter @pgcf/regional --prod deploy --legacy /out \

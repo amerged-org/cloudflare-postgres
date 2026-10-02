@@ -334,9 +334,9 @@ test("quota covers two PostgreSQL and Barman pod slots for the supported size ex
 test("gateway and agent ingress each require their namespace and pod labels in one peer", () => {
   const { db, ctx } = fixture();
   const manifests = buildDatabaseManifests(db, ctx);
-  for (const [policyName, selector, port] of [
-    ["gateway-ingress", ctx.gatewaySelector, 5432],
-    ["agent-metrics-ingress", ctx.agentSelector, 9187],
+  for (const [policyName, selector, ports] of [
+    ["gateway-ingress", ctx.gatewaySelector, [5432]],
+    ["agent-management-ingress", ctx.agentSelector, [5432, 9187]],
   ] as const) {
     const ingress = array(
       record(object(manifests, "NetworkPolicy", policyName).spec).ingress,
@@ -350,7 +350,10 @@ test("gateway and agent ingress each require their namespace and pod labels in o
     assert.deepEqual(record(peers[0]).podSelector, {
       matchLabels: selector.podLabels,
     });
-    assert.deepEqual(rule.ports, [{ port, protocol: "TCP" }]);
+    assert.deepEqual(
+      rule.ports,
+      ports.map((port) => ({ port, protocol: "TCP" })),
+    );
   }
   const policy = record(object(manifests, "CiliumNetworkPolicy").spec);
   const ingress = array(policy.ingress);
@@ -502,4 +505,28 @@ test("CA ConfigMap publishes only the CA certificate in the gateway namespace", 
   assert.deepEqual(ca.data, { "ca.crt": caCrt });
   assert.throws(() => buildCaConfigMap(id, ""), TypeError);
   assert.throws(() => buildCaConfigMap("invalid", caCrt), TypeError);
+});
+
+test("agent ingress permits authenticated readiness and archive metrics only", () => {
+  const { db, ctx } = fixture();
+  const manifests = buildDatabaseManifests(db, ctx);
+  const ingress = array(
+    record(object(manifests, "NetworkPolicy", "agent-management-ingress").spec)
+      .ingress,
+  );
+  assert.deepEqual(record(ingress[0]).ports, [
+    { port: 5432, protocol: "TCP" },
+    { port: 9187, protocol: "TCP" },
+  ]);
+  const cilium = array(
+    record(object(manifests, "CiliumNetworkPolicy").spec).ingress,
+  );
+  assert.deepEqual(record(cilium[1]).toPorts, [
+    {
+      ports: [
+        { port: "5432", protocol: "TCP" },
+        { port: "9187", protocol: "TCP" },
+      ],
+    },
+  ]);
 });

@@ -137,6 +137,8 @@ spec:
               operator: Exists
       toPorts:
         - ports:
+            - port: "5432"
+              protocol: TCP
             - port: "9187"
               protocol: TCP
     - toFQDNs:
