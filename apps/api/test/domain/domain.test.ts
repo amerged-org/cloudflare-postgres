@@ -320,6 +320,13 @@ describe("database domain on real Workers D1", () => {
       .first();
     expect(ready).toEqual({ observed_state: "ready", observed_generation: 2 });
     expect(
+      (
+        await (
+          await request(`/v1/operations/${body.operation.id}`, f.integrator)
+        ).json<{ status: string }>()
+      ).status,
+    ).toBe("succeeded");
+    expect(
       await (await post(f.agent, [observation(id, 2, "provisioning")])).json(),
     ).toEqual({ accepted: 0 });
     const deleted = await request(
