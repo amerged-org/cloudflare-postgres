@@ -1,2 +1,0 @@
-# Preserve the exact Wrangler output for generated runtime declarations.
-apps/control-api/src/worker-configuration.d.ts whitespace=-blank-at-eol

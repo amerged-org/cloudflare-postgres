@@ -1,8 +1,0 @@
-# Stage the reviewed compatibility configuration while Barman remains suspended.
-apiVersion: kustomize.config.k8s.io/v1beta1
-kind: Kustomization
-resources:
-  - ../existing-manual-cnpg
-patches:
-  - path: release-compatibility.yaml
-  - path: values-compatibility.yaml
