@@ -166,9 +166,20 @@ function resources() {
     "app.kubernetes.io/name": "pgcf-gateway",
     "app.kubernetes.io/part-of": "pgcf",
   };
+  const gateway = (): Record<string, unknown> => ({
+    name: "gateway",
+    image,
+    command: ["node", "/app/gateway.mjs"],
+    envFrom: [
+      { configMapRef: { name: "pgcf-regional" } },
+      { secretRef: { name: "pgcf-gateway" } },
+    ],
+    env: [{ name: "PGCF_GATEWAY_PORT", value: "8080" }],
+    volumeMounts: [{ name: "tmp", mountPath: "/tmp" }],
+  });
   const deployment = {
     metadata: { namespace, name: "pgcf-gateway", uid: deploymentUid, labels },
-    spec: { template: { spec: { containers: [{ name: "gateway", image }] } } },
+    spec: { template: { spec: { containers: [gateway()] } } },
   };
   const set = {
     metadata: {
@@ -200,7 +211,7 @@ function resources() {
         },
       ],
     },
-    spec: { containers: [{ name: "gateway", image }] },
+    spec: { containers: [gateway()] },
     status: {
       containerStatuses: [
         { name: "gateway", imageID: `docker-pullable://${image}` },
@@ -560,4 +571,202 @@ test("named mismatch run correlates each exact rejection with real-shaped Edge a
     sockets.forEach((socket) => socket.close());
     globalThis.WebSocket = original;
   }
+});
+
+function changedGateway(
+  target: "deployment" | "pod",
+  change: (container: Record<string, unknown>) => void,
+) {
+  const fixture = resources();
+  const container =
+    target === "deployment"
+      ? fixture.deployment.spec.template.spec.containers[0]!
+      : fixture.pod.spec.containers[0]!;
+  change(container);
+  return () =>
+    clients.gatewayLogPods(
+      { items: [fixture.deployment] },
+      { items: [fixture.set] },
+      { items: [fixture.pod] },
+      fixture.namespace,
+      fixture.image,
+    );
+}
+
+test("approved Gateway image cannot prove source execution with an alternate Deployment command", () => {
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      container.command = ["node", "-e", "process.exit(0)"];
+    }),
+    { message: "gateway_log_entrypoint_mismatch" },
+  );
+});
+
+test("approved Gateway image cannot prove source execution with an alternate Pod command or args", () => {
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.command = ["node", "-e", "process.exit(0)"];
+    }),
+    { message: "gateway_log_entrypoint_mismatch" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.args = ["--import", "/tmp/preload.mjs"];
+    }),
+    { message: "gateway_log_entrypoint_mismatch" },
+  );
+});
+
+test("Gateway execution proof refuses inline runtime hooks in either Deployment or Pod", () => {
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      container.env = [
+        { name: "NODE_OPTIONS", value: "--import=/tmp/preload.mjs" },
+      ];
+    }),
+    { message: "gateway_log_execution_hook" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.env = [{ name: "PATH", value: "/tmp" }];
+    }),
+    { message: "gateway_log_execution_hook" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.env = [
+        {
+          name: "LD_PRELOAD",
+          valueFrom: {
+            configMapKeyRef: { name: "pgcf-regional", key: "library" },
+          },
+        },
+      ];
+    }),
+    { message: "gateway_log_execution_hook" },
+  );
+});
+
+test("Gateway execution proof accepts approved envFrom references and rejects extra or prefixed sources", () => {
+  assert.doesNotThrow(changedGateway("pod", () => undefined));
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      container.envFrom = [
+        { configMapRef: { name: "pgcf-regional" }, prefix: "NODE_" },
+        { secretRef: { name: "pgcf-gateway" } },
+      ];
+    }),
+    { message: "gateway_log_environment_source_mismatch" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.envFrom = [
+        { configMapRef: { name: "pgcf-regional" } },
+        { secretRef: { name: "pgcf-gateway" } },
+        { configMapRef: { name: "pgcf-preload" } },
+      ];
+    }),
+    { message: "gateway_log_environment_source_mismatch" },
+  );
+});
+
+test("Gateway envFrom key inspection rejects hooks without reading credential values", () => {
+  assert.doesNotThrow(() =>
+    clients.assertGatewayEnvironmentKeys([
+      "PGCF_ROUTE_KEY",
+      "PGCF_REGION_ID",
+      "PGCF_API_URL",
+    ]),
+  );
+  for (const key of [
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "PATH",
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "OPENSSL_CONF",
+  ]) {
+    assert.throws(
+      () => clients.assertGatewayEnvironmentKeys(["PGCF_ROUTE_KEY", key]),
+      { message: "gateway_log_execution_hook" },
+    );
+  }
+});
+
+test("Gateway execution proof rejects mounts covering code, Node or runtime dependencies", () => {
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      container.volumeMounts = [{ name: "override", mountPath: "/app" }];
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.volumeMounts = [
+        { name: "override", mountPath: "/usr/local/bin/node", subPath: "node" },
+      ];
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.volumeMounts = [
+        { name: "override", mountPath: "/app/node_modules" },
+      ];
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.volumeMounts = [{ name: "override", mountPath: "/lib" }];
+    }),
+    { message: "gateway_log_executable_mount" },
+  );
+  assert.doesNotThrow(
+    changedGateway("pod", (container) => {
+      container.volumeMounts = [
+        { name: "tmp", mountPath: "/tmp" },
+        {
+          name: `kube-api-access-${randomBytes(5).toString("hex")}`,
+          mountPath: "/var/run/secrets/kubernetes.io/serviceaccount",
+          readOnly: true,
+        },
+      ];
+    }),
+  );
+});
+
+test("actual Gateway log reader refuses execution hooks inherited from approved envFrom sources", async () => {
+  const fixture = resources();
+  const kube = new Kubernetes("test-kube-path", "test-context");
+  let guards = 0;
+  let keyReads = 0;
+  kube.setMutationGuard(async () => {
+    guards++;
+  });
+  Object.assign(kube, {
+    read: async (resource: string) => {
+      if (resource === "deployments") return { items: [fixture.deployment] };
+      if (resource === "replicasets") return { items: [fixture.set] };
+      assert.equal(resource, "pods");
+      return { items: [fixture.pod] };
+    },
+    gatewayEnvironmentKeys: async (namespace: string) => {
+      keyReads++;
+      assert.equal(namespace, fixture.namespace);
+      return ["PGCF_ROUTE_KEY", "NODE_OPTIONS"];
+    },
+  });
+  await assert.rejects(
+    kube.gatewayLogs(
+      fixture.namespace,
+      new Date().toISOString(),
+      fixture.image,
+    ),
+    {
+      message: "gateway_log_execution_hook",
+    },
+  );
+  assert.equal(keyReads, 1);
+  assert.equal(guards, 3);
 });
