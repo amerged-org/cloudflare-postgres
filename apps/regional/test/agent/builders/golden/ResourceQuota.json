@@ -4,7 +4,7 @@
     "kind": "ResourceQuota",
     "metadata": {
       "name": "database-resources",
-      "namespace": "$NAMESPACE",
+      "namespace": "pgcf-db-$DATABASE_ID",
       "labels": {
         "pgcf.io/database-id": "$DATABASE_ID"
       }

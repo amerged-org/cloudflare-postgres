@@ -4,15 +4,15 @@
     "kind": "ObjectStore",
     "metadata": {
       "name": "archive",
-      "namespace": "$NAMESPACE",
+      "namespace": "pgcf-db-$DATABASE_ID",
       "labels": {
         "pgcf.io/database-id": "$DATABASE_ID"
       }
     },
     "spec": {
       "configuration": {
-        "destinationPath": "$ARCHIVE_DESTINATION",
-        "endpointURL": "$ENDPOINT",
+        "destinationPath": "s3://$BUCKET/test-region/$DATABASE_ID/g1-$OPERATION_ID",
+        "endpointURL": "https://$ENDPOINT_HOST",
         "s3Credentials": {
           "accessKeyId": {
             "name": "archive-credentials",

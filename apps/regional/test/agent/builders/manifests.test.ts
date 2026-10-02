@@ -20,7 +20,7 @@ import {
 import type { BuildContext } from "../../../src/agent/builders/index.ts";
 
 const id = "d" + "b".repeat(19);
-const managedRole = ["reader", "query"].join("_");
+const managedRole = "reader_query";
 const operation = "op_" + "z".repeat(20);
 const region = ["test", "region"].join("-");
 const bucket = ["pgcf", "archive", "test"].join("-");
@@ -78,7 +78,8 @@ function fixture(): { db: DesiredDatabase; ctx: BuildContext } {
           secretAccessKey: randomBytes(32).toString("hex"),
         },
       },
-      postgresImage: `postgres:18@sha256:${createHash("sha256").update("image-test").digest("hex")}`,
+      postgresImage:
+        "ghcr.io/cloudnative-pg/postgresql:18.4-standard-trixie@sha256:ebf3919504d7523a63e8e2fee9b051211de714644b36469275558c624afd50ec",
       systemNamespace: "pgcf-system",
       cnpgNamespace: "cnpg-system",
       gatewaySelector: {
@@ -123,19 +124,8 @@ function normalize(
   ctx: BuildContext,
 ): unknown[] {
   const substitutions = new Map<string, string>([
-    [databaseNamespace(id), "$NAMESPACE"],
-    [`ca-${id}`, "$CA_NAME"],
-    [id, "$DATABASE_ID"],
     [db.node, "$NODE"],
-    [db.archive.destination_path, "$ARCHIVE_DESTINATION"],
-    [ctx.postgresImage, "$POSTGRES_IMAGE"],
-    [ctx.backup.endpointUrl, "$ENDPOINT"],
-    [endpointHost, "$ENDPOINT_HOST"],
-    [managedRole, "$MANAGED_ROLE"],
-    [roleSecretName(managedRole), "$MANAGED_SECRET"],
     [caCrt, "$CA_CERT"],
-    [Buffer.from(OWNER_ROLE_NAME).toString("base64"), "$OWNER_USERNAME"],
-    [Buffer.from(managedRole).toString("base64"), "$MANAGED_USERNAME"],
     [Buffer.from(db.roles[0]!.password).toString("base64"), "$OWNER_PASSWORD"],
     [
       Buffer.from(db.roles[1]!.password).toString("base64"),
@@ -151,7 +141,16 @@ function normalize(
     ],
   ]);
   const walk = (value: unknown): unknown => {
-    if (typeof value === "string") return substitutions.get(value) ?? value;
+    if (typeof value === "string") {
+      return (
+        substitutions.get(value) ??
+        value
+          .replaceAll(db.id, "$DATABASE_ID")
+          .replaceAll(operation, "$OPERATION_ID")
+          .replaceAll(ctx.backup.bucket, "$BUCKET")
+          .replaceAll(endpointHost, "$ENDPOINT_HOST")
+      );
+    }
     if (Array.isArray(value)) return value.map(walk);
     if (value && typeof value === "object") {
       return Object.fromEntries(
@@ -163,6 +162,56 @@ function normalize(
   return resources.map(walk);
 }
 
+test("golden normalization preserves image, roles, Secret names and archive layout", () => {
+  const { db, ctx } = fixture();
+  const normalized = normalize(
+    buildDatabaseManifests(db, ctx),
+    db,
+    ctx,
+  ) as K8sObject[];
+  const cluster = record(object(normalized, "Cluster").spec);
+  assert.equal(cluster.imageName, ctx.postgresImage);
+  const managed = record(array(record(cluster.managed).roles)[0]);
+  assert.equal(managed.name, managedRole);
+  assert.deepEqual(managed.passwordSecret, {
+    name: roleSecretName(managedRole),
+  });
+  assert.equal(
+    object(normalized, "Secret", roleSecretName(managedRole)).metadata.name,
+    roleSecretName(managedRole),
+  );
+  const archive = record(
+    record(object(normalized, "ObjectStore").spec).configuration,
+  );
+  assert.equal(
+    archive.destinationPath,
+    `s3://$BUCKET/${region}/$DATABASE_ID/g1-$OPERATION_ID`,
+  );
+  assert.equal(archive.endpointURL, "https://$ENDPOINT_HOST");
+  const later = structuredClone(db);
+  later.generation = 2;
+  later.archive.destination_path = archiveDestinationPath(
+    bucket,
+    region,
+    id,
+    2,
+    operation,
+  );
+  const laterNormalized = normalize(
+    buildDatabaseManifests(later, ctx),
+    later,
+    ctx,
+  ) as K8sObject[];
+  const laterArchive = record(
+    record(object(laterNormalized, "ObjectStore").spec).configuration,
+  );
+  assert.equal(
+    laterArchive.destinationPath,
+    `s3://$BUCKET/${region}/$DATABASE_ID/g2-$OPERATION_ID`,
+  );
+  assert.notEqual(laterArchive.destinationPath, archive.destinationPath);
+});
+
 test("small database manifests match a golden file for every object kind", () => {
   const { db, ctx } = fixture();
   const actual = normalize(
@@ -170,7 +219,7 @@ test("small database manifests match a golden file for every object kind", () =>
     db,
     ctx,
   );
-  for (const kind of [
+  const kinds = [
     "Namespace",
     "ResourceQuota",
     "LimitRange",
@@ -181,7 +230,12 @@ test("small database manifests match a golden file for every object kind", () =>
     "Cluster",
     "ScheduledBackup",
     "ConfigMap",
-  ]) {
+  ];
+  assert.deepEqual(
+    [...new Set(actual.map((item) => record(item).kind))].sort(),
+    kinds.toSorted(),
+  );
+  for (const kind of kinds) {
     const expected = JSON.parse(
       readFileSync(new URL(`./golden/${kind}.json`, import.meta.url), "utf8"),
     ) as unknown;

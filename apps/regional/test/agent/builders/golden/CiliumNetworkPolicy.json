@@ -4,7 +4,7 @@
     "kind": "CiliumNetworkPolicy",
     "metadata": {
       "name": "database-boundaries",
-      "namespace": "$NAMESPACE",
+      "namespace": "pgcf-db-$DATABASE_ID",
       "labels": {
         "pgcf.io/database-id": "$DATABASE_ID"
       }

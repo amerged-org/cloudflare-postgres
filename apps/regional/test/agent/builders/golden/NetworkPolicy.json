@@ -4,7 +4,7 @@
     "kind": "NetworkPolicy",
     "metadata": {
       "name": "default-deny",
-      "namespace": "$NAMESPACE",
+      "namespace": "pgcf-db-$DATABASE_ID",
       "labels": {
         "pgcf.io/database-id": "$DATABASE_ID"
       }
@@ -19,7 +19,7 @@
     "kind": "NetworkPolicy",
     "metadata": {
       "name": "gateway-ingress",
-      "namespace": "$NAMESPACE",
+      "namespace": "pgcf-db-$DATABASE_ID",
       "labels": {
         "pgcf.io/database-id": "$DATABASE_ID"
       }
@@ -62,7 +62,7 @@
     "kind": "NetworkPolicy",
     "metadata": {
       "name": "agent-metrics-ingress",
-      "namespace": "$NAMESPACE",
+      "namespace": "pgcf-db-$DATABASE_ID",
       "labels": {
         "pgcf.io/database-id": "$DATABASE_ID"
       }

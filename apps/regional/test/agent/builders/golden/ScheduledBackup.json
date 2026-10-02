@@ -4,7 +4,7 @@
     "kind": "ScheduledBackup",
     "metadata": {
       "name": "daily-backup",
-      "namespace": "$NAMESPACE",
+      "namespace": "pgcf-db-$DATABASE_ID",
       "labels": {
         "pgcf.io/database-id": "$DATABASE_ID"
       }
