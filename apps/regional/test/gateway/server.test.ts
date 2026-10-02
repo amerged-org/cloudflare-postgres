@@ -203,6 +203,31 @@ test("capacity denials do not consume fresh routing tokens", async (t) => {
   await secondClosed;
 });
 
+test("total capacity denials also leave routing tokens available for a later admission", async (t) => {
+  const postgres = await postgresServer();
+  const { gateway, port, events } = await gatewayFor(postgres.port, {
+    totalLimit: 1,
+    databaseLimit: 2,
+  });
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const first = await open(port);
+  const retry = await token();
+  assert.equal(await rejection(port, retry), 503);
+  const released = once(events, "conn_close");
+  const closed = once(first, "close");
+  first.close();
+  await closed;
+  await released;
+  const second = await open(port, retry);
+  assert.equal(postgres.handshakes(), 2);
+  const secondClosed = once(second, "close");
+  second.close();
+  await secondClosed;
+});
+
 test("verification and replay admission share one clock at the expiry boundary", async (t) => {
   const postgres = await postgresServer();
   const now = Date.now();

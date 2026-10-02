@@ -225,9 +225,14 @@ export type ReplayCheck = "fresh" | "replayed" | "full";
  * until its token can no longer verify (exp + skew), so a replay is always
  * caught; when the cache is full of live entries it fails closed.
  */
+interface ReplayPartition {
+  readonly entries: Map<string, number>;
+  latestExpiry: number;
+}
+
 export class ReplayCache {
   readonly #maxEntries: number;
-  readonly #databases = new Map<string, Map<string, number>>();
+  readonly #databases = new Map<string, ReplayPartition>();
 
   constructor(maxEntries = 50_000) {
     if (!Number.isInteger(maxEntries) || maxEntries < 1)
@@ -237,7 +242,8 @@ export class ReplayCache {
 
   get size(): number {
     let size = 0;
-    for (const entries of this.#databases.values()) size += entries.size;
+    for (const partition of this.#databases.values())
+      size += partition.entries.size;
     return size;
   }
 
@@ -252,24 +258,39 @@ export class ReplayCache {
     this.#evict(now);
     const expiry = (exp + ROUTE_TOKEN_SKEW_SECONDS) * 1000;
     // Never retain already expired entries, including after a clock boundary.
-    if (expiry < now) return "full";
-    let entries = this.#databases.get(database);
-    if (entries?.has(cid)) return "replayed";
-    if ((entries?.size ?? 0) >= this.#maxEntries) return "full";
-    if (!entries) {
-      entries = new Map();
-      this.#databases.set(database, entries);
+    if (
+      expiry < now ||
+      expiry - now >
+        (ROUTE_TOKEN_MAX_LIFETIME_SECONDS + 2 * ROUTE_TOKEN_SKEW_SECONDS) * 1000
+    )
+      return "full";
+    let partition = this.#databases.get(database);
+    if (!partition) {
+      partition = { entries: new Map(), latestExpiry: expiry };
+      this.#databases.set(database, partition);
     }
+    const entries = partition.entries;
+    // Most tokens expire in insertion order. Sweep only this partition at its cap.
+    for (const [existing, until] of entries) {
+      if (until >= now) break;
+      entries.delete(existing);
+    }
+    if (entries.size >= this.#maxEntries)
+      for (const [existing, until] of entries)
+        if (until < now) entries.delete(existing);
+    const existingExpiry = entries.get(cid);
+    if (existingExpiry !== undefined && existingExpiry < now)
+      entries.delete(cid);
+    if (entries.has(cid)) return "replayed";
+    if (entries.size >= this.#maxEntries) return "full";
     entries.set(cid, expiry);
+    partition.latestExpiry = Math.max(partition.latestExpiry, expiry);
     return "fresh";
   }
 
   #evict(now: number): void {
-    for (const [database, entries] of this.#databases) {
-      for (const [cid, expiry] of entries)
-        if (expiry < now) entries.delete(cid);
-      if (entries.size === 0) this.#databases.delete(database);
-    }
+    for (const [database, partition] of this.#databases)
+      if (partition.latestExpiry < now) this.#databases.delete(database);
   }
 }
 

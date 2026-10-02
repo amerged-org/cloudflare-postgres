@@ -438,6 +438,14 @@ describe("ReplayCache", () => {
     expect(cache.size).toBe(0);
   });
 
+  it("rejects invalid clocks and expiration beyond a verified token's maximum remaining lifetime", () => {
+    const cache = new ReplayCache();
+    expect(cache.use(db, cid, nowSec + 1000, now)).toBe("full");
+    expect(cache.use(db, cid, nowSec + 30, NaN)).toBe("full");
+    expect(cache.use(db, cid, Infinity, now)).toBe("full");
+    expect(cache.size).toBe(0);
+  });
+
   it("accepts a cid once and rejects the second use", () => {
     const cache = new ReplayCache();
     expect(cache.use(db, cid, nowSec + 30, now)).toBe("fresh");

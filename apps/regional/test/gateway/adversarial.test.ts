@@ -31,7 +31,7 @@ test("a concurrent replay storm cannot dial again or reclaim a live database slo
   const statuses = await Promise.all(
     Array.from({ length: 24 }, () => rejection(port, route)),
   );
-  assert.deepEqual(new Set(statuses), new Set([403]));
+  assert.deepEqual(new Set(statuses), new Set([429]));
   assert.equal(await rejection(port, await token()), 429);
   assert.equal(postgres.handshakes(), 1);
   assert.equal(gateway.metrics.activeConnections, 1);
@@ -41,6 +41,8 @@ test("a concurrent replay storm cannot dial again or reclaim a live database slo
   await closed;
   await released;
   assert.equal(gateway.metrics.activeConnections, 0);
+  assert.equal(await rejection(port, route), 403);
+  assert.equal(postgres.handshakes(), 1);
   const next = await open(port);
   assert.equal(postgres.handshakes(), 2);
   const nextReleased = once(events, "conn_close");
@@ -88,12 +90,14 @@ test("a client disconnect cancels a pending PostgreSQL SSLRequest and releases i
   });
   const peer = await requestReached;
   assert.equal(gateway.metrics.activeConnections, 1);
-  assert.equal(await rejection(port, route), 403);
+  assert.equal(await rejection(port, route), 429);
   assert.equal(await rejection(port, await token()), 429);
   const upstreamClosed = once(peer, "close", {
     signal: AbortSignal.timeout(2_000),
   });
   socket.terminate();
   await upstreamClosed;
+  assert.equal(gateway.metrics.activeConnections, 0);
+  assert.equal(await rejection(port, route), 403);
   assert.equal(gateway.metrics.activeConnections, 0);
 });
