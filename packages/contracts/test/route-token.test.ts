@@ -40,7 +40,11 @@ async function regionKeys(regionId = region) {
 }
 
 function resign(payloadJson: object, regionKey: Uint8Array): string {
-  const payload = b64u(Buffer.from(JSON.stringify(payloadJson)));
+  return signPayload(JSON.stringify(payloadJson), regionKey);
+}
+
+function signPayload(payloadJson: string, regionKey: Uint8Array): string {
+  const payload = b64u(Buffer.from(payloadJson));
   const sig = createHmac("sha256", regionKey)
     .update("pgcf-route/v1\n" + payload)
     .digest();
@@ -317,6 +321,39 @@ describe("route token", () => {
         String(token),
       ).toEqual({ ok: false, reason });
     }
+  });
+
+  it("enforces the exact 512 and 513 character limit", async () => {
+    const keys = await regionKeys();
+    const regionKey = keys.get("k2")!;
+    const claims = JSON.stringify({
+      v: 1,
+      db,
+      cid,
+      rg: region,
+      kid: "k2",
+      iat: nowSec,
+      exp: nowSec + 30,
+    });
+    const allowed = signPayload(claims.padEnd(348, " "), regionKey);
+    expect(allowed.length).toBe(511);
+    expect((await verifyRouteToken(allowed, { keys, region, now })).ok).toBe(
+      true,
+    );
+    // Fixed 43-character signatures make a 512-character token's payload
+    // noncanonical base64url; it must reach structure validation, not the cap.
+    const atLimit = allowed.replace("v1.", "v1.A");
+    expect(atLimit.length).toBe(512);
+    expect(await verifyRouteToken(atLimit, { keys, region, now })).toEqual({
+      ok: false,
+      reason: "malformed",
+    });
+    const oversize = signPayload(claims.padEnd(349, " "), regionKey);
+    expect(oversize.length).toBe(513);
+    expect(await verifyRouteToken(oversize, { keys, region, now })).toEqual({
+      ok: false,
+      reason: "too_long",
+    });
   });
 
   it("parses and serializes keyrings and refuses weak or inconsistent ones", () => {

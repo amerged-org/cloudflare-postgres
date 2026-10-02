@@ -33,7 +33,15 @@ function u32(value: number): number[] {
 }
 
 function concat(...parts: (Uint8Array | number[])[]): Uint8Array {
-  return Uint8Array.from(parts.flatMap((p) => [...p]));
+  const out = new Uint8Array(
+    parts.reduce((length, part) => length + part.length, 0),
+  );
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
 }
 
 function packet(code: number, body: number[] = []): Uint8Array {
@@ -54,7 +62,10 @@ function rawStartup(fields: (number[] | string)[], minor = 0): Uint8Array {
 }
 
 /** Feeds chunks like the edge does: after ssl/gss, drain with an empty push. */
-function drive(reader: StartupReader, chunks: Uint8Array[]): StartupEvent[] {
+function drive(
+  reader: StartupReader,
+  chunks: Iterable<Uint8Array>,
+): StartupEvent[] {
   const events: StartupEvent[] = [];
   for (const chunk of chunks) {
     let event = reader.push(chunk);
@@ -70,6 +81,88 @@ function drive(reader: StartupReader, chunks: Uint8Array[]): StartupEvent[] {
 
 function bytewise(input: Uint8Array): Uint8Array[] {
   return [...input].map((b) => Uint8Array.of(b));
+}
+
+function* chunkInput(
+  input: Uint8Array,
+  nextSize: () => number,
+): Generator<Uint8Array> {
+  for (const [start, end] of chunkRanges(input.length, nextSize))
+    yield input.subarray(start, end);
+}
+
+function* chunkRanges(
+  length: number,
+  nextSize: () => number,
+): Generator<readonly [number, number]> {
+  let offset = 0;
+  do {
+    const end = Math.min(offset + nextSize(), length);
+    yield [offset, end];
+    offset = end;
+  } while (offset < length);
+}
+
+function seededRandom(seed: number): (n: number) => number {
+  let state = seed;
+  return (n) => {
+    state ^= state << 13;
+    state >>>= 0;
+    state ^= state >>> 17;
+    state ^= state << 5;
+    state >>>= 0;
+    return state % n;
+  };
+}
+
+function chunkSize(below: (n: number) => number): number {
+  return below(4) === 0 ? 0 : 1 + below(below(2) === 0 ? 16 : 4096);
+}
+
+/** Generate only bytes the reader requests; a terminal event stops iteration. */
+function* randomChunks(
+  prefix: Uint8Array,
+  bodyLength: number,
+  below: (n: number) => number,
+): Generator<Uint8Array> {
+  const length = prefix.length + bodyLength;
+  for (const [offset, end] of chunkRanges(length, () => chunkSize(below))) {
+    const size = end - offset;
+    const prefixEnd = Math.min(end, prefix.length);
+    if (end <= prefix.length) {
+      yield prefix.subarray(offset, end);
+    } else {
+      const chunk = new Uint8Array(size);
+      const prefixLength = Math.max(prefixEnd - offset, 0);
+      if (prefixLength > 0) chunk.set(prefix.subarray(offset, prefixEnd));
+      for (let i = prefixLength; i < size; i++)
+        chunk[i] = below(4) === 0 ? 0 : below(256);
+      yield chunk;
+    }
+  }
+}
+
+/** Include later frames in rest, as the edge forwards them after routing. */
+function driveComplete(
+  input: Uint8Array,
+  nextSize: () => number,
+): StartupEvent[] {
+  let received = 0;
+  function* chunks() {
+    for (const chunk of chunkInput(input, nextSize)) {
+      received += chunk.length;
+      yield chunk;
+    }
+  }
+  const events = drive(new StartupReader(), chunks());
+  const last = events.at(-1);
+  if (last?.kind === "startup") {
+    events[events.length - 1] = {
+      ...last,
+      rest: concat(last.rest, input.subarray(received)),
+    };
+  }
+  return events;
 }
 
 function single(input: Uint8Array): StartupEvent {
@@ -123,6 +216,16 @@ describe("encodings", () => {
 });
 
 describe("StartupReader", () => {
+  it("keeps every input byte when chunking includes empty pushes", () => {
+    const sizes = [0, 3, 0, 5, 0, startup.length];
+    let next = 0;
+    const chunks = [...chunkInput(startup, () => sizes[next++]!)];
+    expect(concat(...chunks)).toEqual(startup);
+    expect(drive(new StartupReader(), chunks)).toEqual(
+      drive(new StartupReader(), [startup]),
+    );
+  });
+
   it("parses a startup message whole and byte by byte identically", () => {
     const whole = drive(new StartupReader(), [startup]);
     const split = drive(new StartupReader(), bytewise(startup));
@@ -182,6 +285,21 @@ describe("StartupReader", () => {
     ]);
     expect(single(cancel32)).toEqual({ kind: "cancel" });
     expectError(single(packet(CANCEL_REQUEST_CODE, u32(1))), "08P01");
+    const max = packet(CANCEL_REQUEST_CODE, [
+      ...u32(1),
+      ...new Array(256).fill(7),
+    ]);
+    expect(max.length).toBe(268);
+    expect(single(max)).toEqual({ kind: "cancel" });
+    expect(drive(new StartupReader(), bytewise(max))).toEqual([
+      { kind: "cancel" },
+    ]);
+    const oversize = packet(CANCEL_REQUEST_CODE, [
+      ...u32(1),
+      ...new Array(257).fill(7),
+    ]);
+    expect(oversize.length).toBe(269);
+    expectError(single(oversize), "08P01");
   });
 
   it("rejects undersize and oversize lengths as soon as the length is known", () => {
@@ -275,20 +393,48 @@ describe("StartupReader", () => {
     big.set(startup);
     expectError(reader.push(big), "08P01");
     expect(reader.bufferedBytes).toBe(0);
+    const atLimit = big.subarray(0, DEFAULT_MAX_BUFFERED);
+    const accepted = single(atLimit);
+    expect(accepted.kind).toBe("startup");
+    if (accepted.kind !== "startup") return;
+    expect(accepted.raw).toEqual(startup);
+    expect(accepted.rest.length).toBe(DEFAULT_MAX_BUFFERED - startup.length);
+    expect(accepted.rest.every((byte) => byte === 0)).toBe(true);
+  });
+
+  it("parses representative seeded streams identically whole and in random chunks", () => {
+    const below = seededRandom(0x6a09e667);
+    const gss = packet(GSSENC_REQUEST_CODE);
+    const samples = [
+      startup,
+      concat(encodeSslRequest(), startup),
+      concat(gss, encodeSslRequest(), startup),
+      concat(gss, encodeSslRequest(), gss),
+      concat(startup, Uint8Array.of(0x70, 0, 0, 0, 5, 0x41)),
+      packet(CANCEL_REQUEST_CODE, [...u32(1), ...new Array(256).fill(7)]),
+      rawStartup(["user", "u", "user", "v"]),
+      rawStartup(["user", "u", "replication", "database"]),
+      rawStartup(["user", [0xc3, 0x28]]),
+      Uint8Array.from(u32(10001)),
+      startup.subarray(0, 7),
+    ];
+    for (const input of samples) {
+      expect(driveComplete(input, () => chunkSize(below))).toEqual(
+        drive(new StartupReader(), [input]),
+      );
+    }
+    for (let round = 0; round < 500; round++) {
+      const input = Uint8Array.from(startup);
+      for (let i = below(3); i >= 0; i--)
+        input[below(input.length)] = below(256);
+      expect(driveComplete(input, () => chunkSize(below))).toEqual(
+        drive(new StartupReader(), [input]),
+      );
+    }
   });
 
   it("never throws and never buffers beyond its limit on seeded random input", () => {
-    // xorshift32: deterministic, so a failure reproduces from the seed.
-    let state = 0x9e3779b9;
-    const next = () => {
-      state ^= state << 13;
-      state >>>= 0;
-      state ^= state >>> 17;
-      state ^= state << 5;
-      state >>>= 0;
-      return state;
-    };
-    const below = (n: number) => next() % n;
+    const below = seededRandom(0x9e3779b9);
     const prefixes = [
       encodeSslRequest(),
       packet(GSSENC_REQUEST_CODE),
@@ -307,29 +453,24 @@ describe("StartupReader", () => {
       const reader = new StartupReader(maxBuffered);
       const prefix =
         below(4) === 0 ? mutated() : prefixes[below(prefixes.length)]!;
-      const body = Uint8Array.from(
-        { length: below(below(4) === 0 ? 70_000 : 300) },
-        () => (below(4) === 0 ? 0 : below(256)),
-      );
-      const input = concat(prefix, body);
-      let offset = 0;
-      while (offset <= input.length) {
-        const size = below(4) === 0 ? 0 : 1 + below(below(2) === 0 ? 16 : 4096);
-        const event = reader.push(input.subarray(offset, offset + size));
-        expect(reader.bufferedBytes).toBeLessThanOrEqual(maxBuffered);
-        kinds.add(event.kind);
-        if (event.kind === "startup")
-          expect(event.raw.length + event.rest.length).toBeLessThanOrEqual(
-            maxBuffered,
-          );
-        if (
-          event.kind !== "need-more" &&
-          event.kind !== "ssl" &&
-          event.kind !== "gss"
-        )
-          break;
-        offset += Math.max(size, 1);
+      const bodyLength = below(below(4) === 0 ? 70_000 : 300);
+      let maxObserved = 0;
+      for (const chunk of randomChunks(prefix, bodyLength, below)) {
+        let event = reader.push(chunk);
+        for (;;) {
+          maxObserved = Math.max(maxObserved, reader.bufferedBytes);
+          kinds.add(event.kind);
+          if (event.kind === "startup")
+            maxObserved = Math.max(
+              maxObserved,
+              event.raw.length + event.rest.length,
+            );
+          if (event.kind !== "ssl" && event.kind !== "gss") break;
+          event = reader.push(new Uint8Array(0));
+        }
+        if (event.kind !== "need-more") break;
       }
+      expect(maxObserved).toBeLessThanOrEqual(maxBuffered);
     }
     expect(kinds).toContain("error");
     expect(kinds).toContain("ssl");
