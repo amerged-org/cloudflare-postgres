@@ -28,6 +28,7 @@ let database: string;
 
 interface GatewayObservation {
   token: string;
+  headers: Record<string, string>;
   path: string;
   waiting: boolean;
   bytes: number[];
@@ -51,9 +52,16 @@ function concat(...parts: Uint8Array[]): Uint8Array {
   return result;
 }
 
-async function open(options: { ip?: string | null; bindings?: Env } = {}) {
+async function open(
+  options: {
+    ip?: string | null;
+    bindings?: Env;
+    headers?: HeadersInit;
+  } = {},
+) {
   const ctx = createExecutionContext();
-  const headers = new Headers({ Upgrade: "websocket" });
+  const headers = new Headers(options.headers);
+  headers.set("Upgrade", "websocket");
   const ip = options.ip === undefined ? [192, 0, 2, 1].join(".") : options.ip;
   if (ip !== null) headers.set("CF-Connecting-IP", ip);
   const response = await worker.fetch(
@@ -327,6 +335,172 @@ describe("edge routing with real Workers D1, parser and route-token modules", ()
     expect(await errorCode(connection)).toBe("08P01");
     await expect.poll(connection.closeCode).toBe(1000);
     expect(await stats()).toHaveLength(0);
+  });
+
+  it("does not extend the first-frame deadline when startup bytes arrive slowly", async () => {
+    vi.useFakeTimers();
+    const connection = await open();
+    const startup = encodeStartup({ user: "app", database });
+    connection.socket.send(startup.subarray(0, 1));
+    await vi.advanceTimersByTimeAsync(STARTUP_DEADLINE_MS - 1);
+    connection.socket.send(startup.subarray(1, 3));
+    expect(connection.messages).toHaveLength(0);
+    expect(connection.closeCode()).toBeNull();
+    await vi.advanceTimersByTimeAsync(1);
+    vi.useRealTimers();
+    expect(await errorCode(connection)).toBe("08P01");
+    await expect.poll(connection.closeCode).toBe(1000);
+    expect(await stats()).toHaveLength(0);
+  });
+
+  it("rejects a duplicate key split across frames and an overflowing startup length without dialing", async () => {
+    const startup = encodeStartup({ user: "app", database });
+    const duplicated = concat(
+      startup.subarray(0, startup.length - 1),
+      new TextEncoder().encode("user\0app\0\0"),
+    );
+    new DataView(duplicated.buffer).setUint32(0, duplicated.length);
+    const duplicate = await open();
+    duplicate.socket.send(duplicated.subarray(0, startup.length + 1));
+    duplicate.socket.send(new Uint8Array(0));
+    duplicate.socket.send(duplicated.subarray(startup.length + 1));
+    expect(await errorCode(duplicate)).toBe("08P01");
+
+    const length = await open();
+    const invalid = startup.slice();
+    new DataView(invalid.buffer).setUint32(0, 0xffffffff);
+    length.socket.send(invalid.subarray(0, 3));
+    length.socket.send(invalid.subarray(3));
+    expect(await errorCode(length)).toBe("08P01");
+    expect(await stats()).toHaveLength(0);
+  });
+
+  it("silently closes a fragmented maximum-length CancelRequest before lookup", async () => {
+    const connection = await open();
+    const cancel = crypto.getRandomValues(new Uint8Array(268));
+    const fields = new DataView(cancel.buffer);
+    fields.setUint32(0, cancel.length);
+    fields.setUint32(4, 80877102);
+    connection.socket.send(cancel.subarray(0, 3));
+    connection.socket.send(new Uint8Array(0));
+    connection.socket.send(cancel.subarray(3, 11));
+    connection.socket.send(cancel.subarray(11));
+    await expect.poll(connection.closeCode).toBe(1000);
+    expect(connection.messages).toHaveLength(0);
+    expect(await stats()).toHaveLength(0);
+  });
+
+  it("expires one thousand idle upgrades without dialing and still routes a later startup", async () => {
+    vi.useFakeTimers();
+    const ip = [198, 51, 100, 7].join(".");
+    const idle = await Promise.all(
+      Array.from({ length: 1_000 }, () => open({ ip })),
+    );
+    await vi.advanceTimersByTimeAsync(STARTUP_DEADLINE_MS);
+    vi.useRealTimers();
+    await expect
+      .poll(
+        () =>
+          idle.filter((connection) => connection.closeCode() === 1000).length,
+      )
+      .toBe(1_000);
+    expect(
+      idle.every(
+        (connection) =>
+          connection.messages.length === 1 &&
+          new TextDecoder()
+            .decode(connection.messages[0]!)
+            .includes("\0C08P01\0"),
+      ),
+    ).toBe(true);
+    expect(await stats()).toHaveLength(0);
+    expect(logs.mock.calls).toHaveLength(1_000);
+
+    const subsequent = await open();
+    const startup = encodeStartup({ user: "app", database });
+    subsequent.socket.send(startup);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...startup]);
+  });
+
+  it("does not dial after a client closes while a real D1 lookup result is pending", async () => {
+    let queried!: () => void;
+    let release!: () => void;
+    const lookupReached = new Promise<void>((resolve) => {
+      queried = resolve;
+    });
+    const resume = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    // Execute the actual D1 query, holding only its delivery to the session.
+    const db = {
+      prepare(query: string) {
+        return {
+          bind(...values: unknown[]) {
+            const statement = testEnv.DB.prepare(query).bind(...values);
+            return {
+              async first<T>() {
+                const row = await statement.first<T>();
+                expect(row).not.toBeNull();
+                queried();
+                await resume;
+                return row;
+              },
+            } as D1PreparedStatement;
+          },
+        } as D1PreparedStatement;
+      },
+    } as D1Database;
+    const connection = await open({ bindings: { ...testEnv, DB: db } });
+    try {
+      connection.socket.send(encodeStartup({ user: "app", database }));
+      await lookupReached;
+      connection.socket.close(3001, "test lookup cancellation");
+      await expect.poll(connection.closeCode).toBe(3001);
+    } finally {
+      release();
+    }
+    await waitOnExecutionContext(connection.ctx);
+    expect(await stats()).toHaveLength(0);
+    expect(connection.messages).toHaveLength(0);
+    expect(logs.mock.calls).toHaveLength(1);
+  });
+
+  it("replaces caller route headers and excludes authorization and cookies from a public gateway upgrade", async () => {
+    await testEnv.DB.prepare(
+      "UPDATE regions SET gateway_binding = NULL WHERE id = ?",
+    )
+      .bind(region)
+      .run();
+    const callerRoute = crypto.randomUUID();
+    const connection = await open({
+      headers: {
+        Authorization: `Bearer ${crypto.randomUUID()}`,
+        Cookie: `session=${crypto.randomUUID()}`,
+        "X-PGCF-Route": callerRoute,
+      },
+    });
+    const startup = encodeStartup({ user: "app", database });
+    connection.socket.send(startup);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...startup]);
+    const observation = (await stats())[0]!;
+    expect(observation.headers.authorization).toBeUndefined();
+    expect(observation.headers.cookie).toBeUndefined();
+    expect(observation.token).not.toBe(callerRoute);
+    const keyring = await deriveRegionKeyring(
+      parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
+      region,
+    );
+    const verified = await verifyRouteToken(observation.token, {
+      region,
+      keys: keyring.keys,
+    });
+    expect(verified.ok).toBe(true);
+    if (!verified.ok) throw new Error("edge must mint the gateway token");
+    expect(verified.claims.db).toBe(database);
   });
 
   it("fails connection admission closed without an IP and applies a real rate limit", async () => {

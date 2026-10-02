@@ -13,6 +13,7 @@ export default {
     if (url.pathname === "/stats") return Response.json(connections);
     const connection = {
       token: request.headers.get("X-PGCF-Route"),
+      headers: Object.fromEntries(request.headers),
       path: url.pathname,
       waiting: false,
       released: false,
