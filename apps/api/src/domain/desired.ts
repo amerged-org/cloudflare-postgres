@@ -33,6 +33,8 @@ export async function desired(
     databases: DesiredDatabase[] = [];
   const credentials = keyring(c.env.CREDENTIAL_KEYS);
   for (const row of rows) {
+    // Phase 1 cannot execute suspended state. Omission never deletes regional resources.
+    if (row.desired_state === "suspended") continue;
     const roles: DesiredDatabase["roles"] = [];
     // Deletion can recover even if a credential key has been retired.
     if (row.desired_state !== "deleted") {

@@ -22,13 +22,13 @@ export function observationApplies(
   row: DatabaseRow,
   regionId: string,
   observation: DatabaseObservation,
-  observedAt: string,
+  receivedAt: string,
 ): boolean {
   if (
     row.region_id !== regionId ||
     observation.generation !== row.generation ||
     observation.generation < row.observed_generation ||
-    observedAt < row.updated_at
+    receivedAt < row.updated_at
   )
     return false;
   if (row.desired_state === "deleted")
@@ -69,8 +69,9 @@ export async function observations(
   if (!parsed.success)
     throw new ApiError("invalid_request", "Invalid observations");
   const body = parsed.data,
-    now = new Date().toISOString();
-  if (Date.parse(body.observed_at) > Date.now() + 300_000)
+    receivedAt = Date.now(),
+    now = new Date(receivedAt).toISOString();
+  if (Date.parse(body.observed_at) > receivedAt + 300_000)
     throw new ApiError("invalid_request", "Observation time is in the future");
   const names = new Set<string>(),
     ids = new Set<string>();
@@ -84,7 +85,7 @@ export async function observations(
       `INSERT INTO nodes (id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,last_observed_at,created_at,updated_at)
       VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(region_id,k8s_node_name) DO UPDATE SET ready=excluded.ready,allocatable_memory_mib=excluded.allocatable_memory_mib,
       allocatable_cpu_millicores=excluded.allocatable_cpu_millicores,storage_gib_total=excluded.storage_gib_total,platform_reserved_memory_mib=excluded.platform_reserved_memory_mib,
-      last_observed_at=excluded.last_observed_at,updated_at=excluded.updated_at WHERE nodes.last_observed_at IS NULL OR excluded.last_observed_at>=nodes.last_observed_at`,
+      last_observed_at=excluded.last_observed_at,updated_at=excluded.updated_at WHERE excluded.updated_at>=nodes.updated_at`,
     )
       .bind(
         newNodeId(),
@@ -97,7 +98,7 @@ export async function observations(
         node.platform_reserved_memory_mib,
         body.observed_at,
         now,
-        body.observed_at,
+        now,
       )
       .run();
   }
@@ -108,11 +109,7 @@ export async function observations(
     )
       .bind(observation.id, region.id)
       .first<DatabaseRow>();
-    if (
-      !row ||
-      !observationApplies(row, region.id, observation, body.observed_at)
-    )
-      continue;
+    if (!row || !observationApplies(row, region.id, observation, now)) continue;
     const health = observation.archive.continuous
       ? observation.archive.ready_wal_files === null
         ? "unknown"
@@ -130,7 +127,7 @@ export async function observations(
       c.env.DB.prepare(
         `UPDATE databases SET observed_state=?,observed_generation=CASE WHEN ? THEN ? ELSE observed_generation END,status_message=?,
       archiving_health_since=CASE WHEN archiving_health<>? THEN ? ELSE archiving_health_since END,archiving_health=?,updated_at=?
-      WHERE id=? AND region_id=? AND generation=? AND observed_generation<=? AND updated_at<=? AND desired_state=? AND observed_state=?`,
+      WHERE id=? AND region_id=? AND generation=? AND observed_generation<=? AND updated_at=? AND desired_state=? AND observed_state=?`,
       ).bind(
         observation.state,
         Number(applied),
@@ -141,12 +138,12 @@ export async function observations(
         health,
         body.observed_at,
         health,
-        body.observed_at,
+        now,
         row.id,
         region.id,
         observation.generation,
         observation.generation,
-        body.observed_at,
+        row.updated_at,
         row.desired_state,
         row.observed_state,
       ),
@@ -183,7 +180,7 @@ export async function observations(
           observation.generation,
           observation.generation,
           observation.state,
-          body.observed_at,
+          now,
         ),
       );
     else
@@ -199,7 +196,7 @@ export async function observations(
           region.id,
           observation.generation,
           observation.state,
-          body.observed_at,
+          now,
         ),
       );
     const result = await c.env.DB.batch(statements);
