@@ -20,8 +20,9 @@ loss is recovered from R2.
 
 **CI-qualified build; live acceptance pending (2026-10-03).** Phase 1 services and native
 WebSocket forwarding are implemented. CI run `37074208451` for `c3dcfd6` passed code and full-image
-qualification, authenticated registry verification and immutable publication. Anonymous public
-access was verified for the prior `a11e0c3` image. Image signing remains pending. Against real PostgreSQL, 100 MiB and 1 GiB COPY and SELECT wire-hash
+qualification, authenticated registry verification and immutable publication. Anonymous reads of
+the `c3dcfd6` image and `latest` matched the immutable digest, with source revision, config, RootFS
+and layer binding verified. Image signing remains pending. Against real PostgreSQL, 100 MiB and 1 GiB COPY and SELECT wire-hash
 checks passed with unchanged 192 MiB local memory guards. The original default Neon decoded-binary
 result assertions still fail because of upstream parsing.
 
