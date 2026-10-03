@@ -1,6 +1,6 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-03): **Dev foundation rebuilt; full database path pending.** The first EU node is
+Status (2026-10-03): **Phase 0 live accepted; full database path pending.** The first EU node is
 rebuilt and `Ready`, with all five Flux platform releases `Ready`. Authoritative storage
 measurement and publication cycles completed; a fresh identity-bound capture took 112.09 s.
 Capture and publication took 114.132 s in total, with 95 GiB published. CI run `37120159676` for
@@ -17,9 +17,11 @@ the complete run took 603.438 s. Reviewed clock and domain-ID guard corrections 
 Scoped rollback completed and confirmed the spike Worker, custom domain and DNS absent, with
 the existing universal certificate untouched.
 
-The layout fix is reviewed, pushed and CI-green; temporary worktree cleanup and the formal
-Phase 0 live harness rerun remain pending. Phase 0 and Phase 1's E0–E6 complete database chain have
-not passed live acceptance, and Phase 2 has not begun. The second EU node is untouched, the US
+Phase 0 passed the real Dev harness: layout, Git topology, Cloudflare inventory, node readiness
+and all five platform releases. The rebuild probe is removed, with all 174 foreign resources
+unchanged. The Dev management API is deployed against a fresh D1 schema; health, authentication,
+once-only admin creation and size-class readback passed. Phase 1's E0–E6 complete database chain
+has not passed live acceptance, and Phase 2 has not begun. The second EU node is untouched, the US
 node has not been bought, and no production writes have occurred.
 The owner has requested delivery through Phase 5 and full Neon replacement.
 
@@ -665,3 +667,5 @@ Entries are chronological; later results supersede earlier pending work.
 | 2026-10-03 | 0 storage | Actual LVM volume-group total and initial free capacity were 103,075,020,800 bytes. A 1 GiB allocation reduced free capacity to 102,001,278,976 bytes; reclamation restored 103,075,020,800 bytes. Authoritative measurement and publication cycles completed; a fresh identity-bound storage capture took 112.09 s. Capture and publication took 114.132 s in total, with 95 GiB published. Regional agent and gateway manifests pin published image digest `sha256:93ad150c4d807cac81f865c9e2f1f6a2cd83eeeaf2ffd4e977a26635549ee8a6`; image signing remains pending. These results do not complete formal Phase 0 or Phase 1 acceptance. |
 | 2026-10-03 | 1 S1 pending | Preliminary DNS, TLS, HTTP, WebSocket, 1 MiB binary and 30 s checks passed. The full 600 s test failed strict completion at 599,970 ms despite 24 ping/pong exchanges; mixed-clock correction and a full rerun remain pending. Rollback refused the actual 40-character hexadecimal domain ID before transport because its guard assumed 32 characters, leaving the spike Worker and custom domain present pending reviewed correction and cleanup. S1 and Phase 1 E0–E6 live acceptance remain pending; Phase 2 has not begun. |
 | 2026-10-03 | 1 S1 | The corrected full S1 transport run passed DNS, TLS, HTTP, WebSocket `101`, text and 1 MiB binary checks, plus 600,011 ms idle with 24 ping/pong exchanges; the complete foreground run took 603.438 s. The exact reviewed clock correction and domain-ID guard for 32 or 40 hexadecimal characters were applied. Post-success scoped rollback exited 0 and confirmed the spike Worker, custom domain and DNS absent; the existing universal certificate is untouched. Formal Phase 0 live harness rerun still awaits temporary worktree cleanup; Phase 1 E0–E6 has not run and Phase 2 has not begun. |
+| 2026-10-03 | 0 accepted | The formal Dev harness passed all five checks in 1.769 s: 208 tracked layout files, one main worktree/branch, one retained Cloudflare backup bucket, one Ready node and five Ready releases. The completed rebuild probe was removed with all 174 foreign resources unchanged. CI run `37125104436` for `d8d048c` passed. Phase 0 is accepted; new Phase 1 work starts from this verified foundation. |
+| 2026-10-03 | 1 management | Fresh control D1 creation, schema migration, dry deployment and actual API deployment exited 0. Independent health probes returned 200; anonymous management access returned 401. First admin creation returned 201, captured its credential privately once, and authenticated listing returned no credential fields. The small size class was created and read back; regions and observed nodes remain empty until the transport and agent are connected. All 174 foreign resources remain unchanged. Transport, S2 and E0–E6 are pending; Phase 2 has not begun. |

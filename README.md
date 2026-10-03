@@ -18,7 +18,7 @@ loss is recovered from R2.
 
 ## Status
 
-**Dev foundation rebuilt; full database path pending (2026-10-03).** The first EU node and all
+**Phase 0 live accepted; full database path pending (2026-10-03).** The first EU node and all
 five Flux platform releases are `Ready`. Authoritative storage cycles completed, and a fresh
 identity-bound capture took 112.09 s. Capture and publication took 114.132 s in total, with 95 GiB
 published. CI run `37120159676` for `0846597` passed; the
@@ -35,10 +35,10 @@ The full S1 transport spike passed DNS, TLS, HTTP, WebSocket `101`, text and 1 M
 plus 600,011 ms idle with 24 ping/pong exchanges; the complete run took 603.438 s. Reviewed clock
 and domain-ID guard corrections are applied. Scoped rollback completed and confirmed the spike
 Worker, custom domain and DNS absent, with the existing universal certificate untouched.
-Temporary worktree cleanup and the formal Phase 0 live harness rerun after the layout fix remain
-pending.
-Phase 0 and Phase 1's E0–E6 complete database chain have not passed live acceptance; Phase 2 has
-not begun. The second EU node is untouched, the US node has not been bought and no production
+Phase 0 passed all five real Dev checks after temporary worktree and rebuild-probe cleanup.
+The Dev management API is deployed with its fresh D1 schema; health, authentication, once-only
+admin creation and size-class readback passed. Transport and Phase 1's E0–E6 complete database chain
+remain pending; Phase 2 has not begun. The second EU node is untouched, the US node has not been bought and no production
 writes occurred. See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture
