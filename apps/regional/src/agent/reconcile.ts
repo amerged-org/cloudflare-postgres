@@ -54,20 +54,51 @@ const LEDGER_PREFIX = "delete-";
 const STORAGE_PREFIX = "storage-";
 const SYSTEM_NAMESPACE = "pgcf-system";
 const DELETE_TIMEOUT_MS = 10 * 60_000;
+const CLUSTER_QUANTITY_FIELDS = new Set([
+  "resources.requests.cpu",
+  "resources.requests.memory",
+  "resources.limits.cpu",
+  "resources.limits.memory",
+  "storage.size",
+]);
 
-function containsDesired(actual: unknown, desired: unknown): boolean {
+function containsDesired(
+  actual: unknown,
+  desired: unknown,
+  quantityFields?: ReadonlySet<string>,
+  path = "",
+): boolean {
+  if (quantityFields?.has(path)) {
+    try {
+      return quantity(actual) === quantity(desired);
+    } catch {
+      return false;
+    }
+  }
   if (Array.isArray(desired))
     return (
       Array.isArray(actual) &&
       actual.length === desired.length &&
-      desired.every((value, index) => containsDesired(actual[index], value))
+      desired.every((value, index) =>
+        containsDesired(
+          actual[index],
+          value,
+          quantityFields,
+          `${path}[${index}]`,
+        ),
+      )
     );
   if (desired !== null && typeof desired === "object") {
     return (
       actual !== null &&
       typeof actual === "object" &&
       Object.entries(desired).every(([key, value]) =>
-        containsDesired(record(actual)[key], value),
+        containsDesired(
+          record(actual)[key],
+          value,
+          quantityFields,
+          path ? `${path}.${key}` : key,
+        ),
       )
     );
   }
@@ -662,7 +693,11 @@ export class Reconciler {
     );
     if (
       !expectedCluster ||
-      !containsDesired(cluster.spec, expectedCluster.spec)
+      !containsDesired(
+        cluster.spec,
+        expectedCluster.spec,
+        CLUSTER_QUANTITY_FIELDS,
+      )
     )
       return false;
     for (const manifest of manifests.filter(

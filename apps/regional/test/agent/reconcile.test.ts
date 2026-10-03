@@ -772,6 +772,79 @@ test("a claim UID race cannot reclaim a volume rebound to another claim", async 
   assert.ok(await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`));
 });
 
+test("canonical Cluster quantities satisfy readiness before role authentication", async () => {
+  const { db, ctx } = fixture();
+  db.size.memory_mib = 1024;
+  const k8s = new MemoryKubernetes();
+  let authenticated = 0;
+  const probe = async () => {
+    authenticated++;
+    return true;
+  };
+  const reconcile = () =>
+    new Reconciler(k8s, signal(), Date.now, metrics, probe).reconcile(db, ctx);
+  assert.equal((await reconcile())?.state, "ready");
+  const cluster = k8s.resources.get(
+    k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+  )!;
+  const resources = record(record(cluster.spec).resources);
+  record(resources.requests).memory = "1Gi";
+  record(resources.limits).memory = "1Gi";
+  record(resources.requests).cpu = "0.5";
+  record(resources.limits).cpu = "0.5";
+  record(record(cluster.spec).storage).size = "10240Mi";
+  const pod = k8s.resources.get(
+    k8s.key("Pod", `pgcf-db-${db.id}`, "database-1"),
+  )!;
+  const podResources = record(
+    record((record(pod.spec).containers as unknown[])[0]).resources,
+  );
+  record(podResources.requests).memory = "1Gi";
+  record(podResources.limits).memory = "1Gi";
+  record(podResources.requests).cpu = "0.5";
+  record(podResources.limits).cpu = "0.5";
+  authenticated = 0;
+  const before = k8s.actions.length;
+  assert.equal((await reconcile())?.state, "ready");
+  assert.equal(authenticated, 1);
+  assert.equal(k8s.actions.length, before);
+});
+
+test("different Cluster quantities and numeric PostgreSQL strings keep readiness fenced", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  let authenticated = 0;
+  const probe = async () => {
+    authenticated++;
+    return true;
+  };
+  const reconcile = () =>
+    new Reconciler(k8s, signal(), Date.now, metrics, probe).reconcile(db, ctx);
+  assert.equal((await reconcile())?.state, "ready");
+  const cluster = k8s.resources.get(
+    k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+  )!;
+  const resources = record(record(cluster.spec).resources);
+  authenticated = 0;
+  record(resources.requests).cpu = "0.75";
+  assert.equal((await reconcile())?.state, "provisioning");
+  record(resources.requests).cpu = "0.5";
+  record(resources.limits).memory = "1Gi";
+  assert.equal((await reconcile())?.state, "provisioning");
+  record(resources.limits).memory = "512Mi";
+  record(record(cluster.spec).storage).size = "11Gi";
+  assert.equal((await reconcile())?.state, "provisioning");
+  record(record(cluster.spec).storage).size = "10Gi";
+  record(record(record(cluster.spec).postgresql).parameters).max_connections =
+    "1e2";
+  assert.equal((await reconcile())?.state, "provisioning");
+  assert.equal(authenticated, 0);
+  record(record(record(cluster.spec).postgresql).parameters).max_connections =
+    "100";
+  assert.equal((await reconcile())?.state, "ready");
+  assert.equal(authenticated, 1);
+});
+
 test("stale primary resources and unacknowledged managed-role passwords keep a revision provisioning", async () => {
   const { db, ctx } = fixture();
   db.roles.push({
