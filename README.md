@@ -18,22 +18,26 @@ loss is recovered from R2.
 
 ## Status
 
-**CI-qualified build; live acceptance pending (2026-10-03).** Phase 1 services and native
-WebSocket forwarding are implemented. CI run `37074208451` for `c3dcfd6` passed code and full-image
-qualification, authenticated registry verification and immutable publication. Anonymous reads of
-the `c3dcfd6` image and `latest` matched the immutable digest, with source revision, config, RootFS
-and layer binding verified. Image signing remains pending. Against real PostgreSQL, 100 MiB and 1 GiB COPY and SELECT wire-hash
-checks passed with unchanged 192 MiB local memory guards. The original default Neon decoded-binary
-result assertions still fail because of upstream parsing.
+**Dev foundation rebuilt; full database path pending (2026-10-03).** The first EU node and all
+five Flux platform releases are `Ready`. Authoritative storage cycles completed, and a fresh
+identity-bound proof published 95 GiB in 112.09 s. CI run `37120159676` for `0846597` passed; the
+regional agent and gateway pin the published image digest recorded in [PLAN.md](PLAN.md#11-status).
+Image signing remains pending.
 
-Dev decommission and independent re-inventory completed with all 174 foreign resources unchanged.
-First-EU firewall corrections and actual operator-access and foreign IPv4/IPv6 refusal checks
-passed. The Talos image is verified and the first EU node is in rescue. Installation stopped
-when initial signature cleanup found a busy disk; partition rewriting and image writing did not
-run. The observed LVM preparation correction is under review. Bootstrap, platform release,
-storage proof and custom-domain setup remain pending. Phase 0 and Phase 1 have not passed live
-acceptance, and Phase 2 has not begun. See [PLAN.md](PLAN.md#11-status) for measured results and
-remaining work.
+Phase 1 services and native WebSocket forwarding are implemented. Against real PostgreSQL,
+100 MiB and 1 GiB COPY and SELECT wire-hash checks passed with unchanged 192 MiB local memory
+guards. The original default Neon decoded-binary result assertions still fail because of upstream
+parsing. Dev decommission and independent re-inventory completed with all 174 foreign resources
+unchanged; first-EU operator access and foreign IPv4/IPv6 refusal checks passed.
+
+S1 preliminary DNS, TLS, HTTP, WebSocket, 1 MiB binary and 30 s checks passed. The full 600 s test
+failed strict completion at 599,970 ms despite 24 ping/pong exchanges; clock correction and a full
+rerun remain pending. Rollback rejected the returned domain ID before transport, so the spike
+Worker and custom domain remain present pending reviewed correction and cleanup. Temporary
+worktree cleanup and the formal Phase 0 live harness rerun after the layout fix remain pending.
+Phase 0 and Phase 1's E0–E6 complete database chain have not passed live acceptance; Phase 2 has
+not begun. The second EU node is untouched, the US node has not been bought and no production
+writes occurred. See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture
 

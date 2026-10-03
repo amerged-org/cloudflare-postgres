@@ -1,23 +1,26 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-03): **CI-qualified build; live acceptance pending.** Phase 1 services and the
-approved native WebSocket path are implemented. CI run `37074208451` for `c3dcfd6` passed the code
-and image jobs, including complete image qualification and authenticated registry verification.
-The `c3dcfd6` regional image passed anonymous registry verification by immutable digest, including
-source revision, config, RootFS and layer binding. Image signing remains pending. Local PostgreSQL
-stream wire checks passed; the original default decoded-binary client assertions still fail.
-The first build produced mostly budget-enforcement, signed-execution and evidence machinery but no
-database a client could connect to through the API. Those parts are removed. The Talos recipe,
-the Flux platform baseline and the R2 backup/PITR recipe stay, because they work in the lab.
-The old implementation has been removed and the workspace scaffolded. Dev decommission and
-independent re-inventory completed. The first EU firewall corrections are applied, and operator
-access plus mandatory foreign IPv4 and IPv6 refusal checks passed. The Talos image is verified,
-and the first EU node entered rescue with pinned host identity and validated memory-root, disk
-and network assertions. Installation stopped when signature cleanup reported a busy disk;
-partition rewriting and image writing did not run. The observed LVM preparation correction is
-under review. Bootstrap, platform release, storage proof and custom-domain setup remain pending.
-Phase 0 and Phase 1's complete database chain have not passed live acceptance, and Phase 2 has
-not begun.
+Status (2026-10-03): **Dev foundation rebuilt; full database path pending.** The first EU node is
+rebuilt and `Ready`, with all five Flux platform releases `Ready`. Authoritative storage
+measurement and publication cycles completed; a fresh identity-bound proof published 95 GiB in
+112.09 s. CI run `37120159676` for `0846597` passed. The regional agent and gateway pin the
+published image digest `sha256:93ad150c4d807cac81f865c9e2f1f6a2cd83eeeaf2ffd4e977a26635549ee8a6`;
+image signing remains pending.
+
+Phase 1 services and the approved native WebSocket path are implemented. Local PostgreSQL stream
+wire checks passed; the original default decoded-binary client assertions still fail. Dev
+decommission and independent re-inventory completed, and first-EU operator access plus mandatory
+foreign IPv4 and IPv6 refusal checks passed. The S1 preliminary DNS, TLS, HTTP, WebSocket, 1 MiB
+binary and 30 s checks passed, but the full 600 s run failed strict completion at 599,970 ms
+despite 24 ping/pong exchanges. Clock correction and the full rerun remain pending. Rollback
+rejected the returned 40-character hexadecimal domain ID before transport because its guard
+assumed 32 characters; the actual spike Worker and custom domain remain present pending a
+reviewed correction and cleanup.
+
+The layout fix is reviewed, pushed and CI-green; temporary worktree cleanup and the formal
+Phase 0 live harness rerun remain pending. Phase 0 and Phase 1's E0–E6 complete database chain have
+not passed live acceptance, and Phase 2 has not begun. The second EU node is untouched, the US
+node has not been bought, and no production writes have occurred.
 The owner has requested delivery through Phase 5 and full Neon replacement.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
@@ -658,3 +661,6 @@ Entries are chronological; later results supersede earlier pending work.
 | 2026-10-03 | CI / image | CI run `37074208451` for `c3dcfd6` passed both code and image jobs. Complete qualification expected and scanned exactly 657,429,509 bytes across 10 layers, 10,207 regular files and 10,447 inputs; all 26 exact reviewed upstream noncredentials were resolved, with zero unresolved findings. The published regional image `sha-c3dcfd62d9b0` has registry manifest digest `sha256:c8f87dc787ee7197c3fe370196dbd40536730eaf9bc6bf8ae24146a016a08bcc`. Anonymous authorization and both this SHA tag and `latest` manifest reads returned HTTP 200 with the same digest; actual validation confirmed source revision, config, RootFS and layer binding. Image signing and production acceptance remain pending. |
 | 2026-10-03 | 0 image | The resumed Talos image step exited 0 with all 231,195,631 bytes. SHA-256 matched the trusted pinned digest `515034e3b138902062687f9cf9d6a2da1504768febb2929f6fa70503dc8df4ac`; GPT inspection found exactly four partitions labeled EFI, BIOS, BOOT and META, and network settings matched the private inventory. This verifies the install artifact, not the rebuilt node. |
 | 2026-10-03 | 0 live | First-EU rescue and host-key pinning passed, followed by assertions for a memory-root environment, one unmounted writable 150 GiB physical disk and matching network inventory. The first `wipefs` command exited 1 with Device or resource busy; partition zap and image writing never ran. Read-only inspection found one owned, unmounted PGCF volume group with all physical volumes on the asserted disk and six active unmounted logical volumes. No force, volume deactivation or retry has occurred; the preparation correction is under review. Phase 0 remains unaccepted until bootstrap, platform release and storage proof; Phase 1 transport and E0–E6 acceptance remain pending, and Phase 2 has not begun. |
+| 2026-10-03 | 0 live | First-EU rebuild completed: the node and all five Flux platform releases are `Ready`. Image write took 68.327 s, disk verification 18.676 s, configuration apply 17.604 s, configured reboot 52.557 s and bootstrap 17.387 s. The reviewed layout fix at `0846597` passed CI run `37120159676`; temporary worktree cleanup and the formal Phase 0 live harness rerun remain pending. The second EU node is untouched, the US node has not been bought and no production writes occurred. |
+| 2026-10-03 | 0 storage | Actual LVM volume-group total and initial free capacity were 103,075,020,800 bytes. A 1 GiB allocation reduced free capacity to 102,001,278,976 bytes; reclamation restored 103,075,020,800 bytes. Authoritative measurement and publication cycles completed; a fresh identity-bound storage proof published 95 GiB in 112.09 s. Regional agent and gateway manifests pin published image digest `sha256:93ad150c4d807cac81f865c9e2f1f6a2cd83eeeaf2ffd4e977a26635549ee8a6`; image signing remains pending. These results do not complete formal Phase 0 or Phase 1 acceptance. |
+| 2026-10-03 | 1 S1 pending | Preliminary DNS, TLS, HTTP, WebSocket, 1 MiB binary and 30 s checks passed. The full 600 s test failed strict completion at 599,970 ms despite 24 ping/pong exchanges; mixed-clock correction and a full rerun remain pending. Rollback refused the actual 40-character hexadecimal domain ID before transport because its guard assumed 32 characters, leaving the spike Worker and custom domain present pending reviewed correction and cleanup. S1 and Phase 1 E0–E6 live acceptance remain pending; Phase 2 has not begun. |
