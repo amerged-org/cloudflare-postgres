@@ -664,6 +664,70 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(await stats()).toHaveLength(1);
   });
 
+  it("isolates database admission buckets when one tenant floods a shared source network", async () => {
+    const limiter = (env as typeof env & { TEST_RATE_LIMITER: RateLimit })
+      .TEST_RATE_LIMITER;
+    const bindings = { ...testEnv, CONNECTION_RATE_LIMITER: limiter };
+    const other = newDatabaseId();
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        `INSERT INTO databases (id, project_id, region_id, name, size_class_id,
+        desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at)
+        SELECT ?, project_id, region_id, 'second', size_class_id, desired_state, observed_state,
+        generation, observed_generation, replace(archive_path, id, ?), created_at, updated_at
+        FROM databases WHERE id = ?`,
+      ).bind(other, other, database),
+      testEnv.DB.prepare(
+        `INSERT INTO roles (database_id, name, owner, password_ciphertext, password_iv,
+        password_kid, created_at, updated_at) SELECT ?, name, owner, password_ciphertext, password_iv,
+        password_kid, created_at, updated_at FROM roles WHERE database_id = ?`,
+      ).bind(other, database),
+    ]);
+    const ip = [0x2001, 0xdb8, 0xa, 0xb, 0, 0, 0, 1]
+      .map((part) => part.toString(16))
+      .join(":");
+    const first = await open({ ip, bindings });
+    first.socket.send(encodeStartup({ user: "app", database }));
+    await expect.poll(async () => (await stats()).length).toBe(1);
+    const flood = await open({ ip, bindings });
+    expect(await errorCode(flood)).toBe("53300");
+    const independent = await open({ ip, bindings, database: other });
+    const startup = encodeStartup({ user: "app", database: other });
+    independent.socket.send(startup);
+    await expect
+      .poll(async () => (await stats())[1]?.bytes)
+      .toEqual([...startup]);
+    expect(independent.messages[0]?.[0]).not.toBe(0x45);
+    expect(await stats()).toHaveLength(2);
+  });
+
+  it("isolates admitted roles on one database and shared source network", async () => {
+    const limiter = (env as typeof env & { TEST_RATE_LIMITER: RateLimit })
+      .TEST_RATE_LIMITER;
+    const bindings = { ...testEnv, CONNECTION_RATE_LIMITER: limiter };
+    const otherRole = "reader";
+    await testEnv.DB.prepare(
+      `INSERT INTO roles (database_id, name, owner, password_ciphertext, password_iv,
+      password_kid, created_at, updated_at) SELECT database_id, ?, 0, password_ciphertext,
+      password_iv, password_kid, created_at, updated_at FROM roles WHERE database_id = ?`,
+    )
+      .bind(otherRole, database)
+      .run();
+    const first = await open({ bindings });
+    first.socket.send(encodeStartup({ user: "app", database }));
+    await expect.poll(async () => (await stats()).length).toBe(1);
+    const flood = await open({ bindings });
+    expect(await errorCode(flood)).toBe("53300");
+    const independent = await open({ bindings, user: otherRole });
+    const startup = encodeStartup({ user: otherRole, database });
+    independent.socket.send(startup);
+    await expect
+      .poll(async () => (await stats())[1]?.bytes)
+      .toEqual([...startup]);
+    expect(independent.messages[0]?.[0]).not.toBe(0x45);
+    expect(await stats()).toHaveLength(2);
+  });
+
   it("shares IPv6 admission across equivalent hosts in one /64 while preserving other /64s", async () => {
     const limiter = (env as typeof env & { TEST_RATE_LIMITER: RateLimit })
       .TEST_RATE_LIMITER;
@@ -685,6 +749,26 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const otherSubnet = await open({ ip: `${prefix.join(":")}::2`, bindings });
     otherSubnet.socket.send(encodeStartup({ user: "app", database }));
     await expect.poll(async () => (await stats()).length).toBe(2);
+  });
+
+  it("does not reset admission through caller Worker or forwarded-client headers", async () => {
+    const limiter = (env as typeof env & { TEST_RATE_LIMITER: RateLimit })
+      .TEST_RATE_LIMITER;
+    const bindings = { ...testEnv, CONNECTION_RATE_LIMITER: limiter };
+    const first = await open({ bindings });
+    first.socket.send(encodeStartup({ user: "app", database }));
+    await expect.poll(async () => (await stats()).length).toBe(1);
+    const denied = await open({
+      bindings,
+      headers: {
+        "CF-Worker": ["claimed-worker", "invalid"].join("."),
+        "X-Real-IP": [192, 0, 2, 7].join("."),
+        "X-Forwarded-For": [192, 0, 2, 8].join("."),
+        "X-Tenant-ID": crypto.randomUUID(),
+      },
+    });
+    expect(await errorCode(denied)).toBe("53300");
+    expect(await stats()).toHaveLength(1);
   });
 
   it("rejects malformed or oversized client IPs before a gateway connection", async () => {
@@ -710,6 +794,17 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const denied = await open({ ip: [192, 0, 2, 9].join("."), bindings });
     denied.socket.send(encodeStartup({ user: "app", database }));
     expect(await errorCode(denied)).toBe("53300");
+    expect(await stats()).toHaveLength(1);
+    const otherRole = "reader";
+    await testEnv.DB.prepare(
+      `INSERT INTO roles (database_id, name, owner, password_ciphertext, password_iv,
+      password_kid, created_at, updated_at) SELECT database_id, ?, 0, password_ciphertext,
+      password_iv, password_kid, created_at, updated_at FROM roles WHERE database_id = ?`,
+    )
+      .bind(otherRole, database)
+      .run();
+    const deniedRole = await open({ bindings, user: otherRole });
+    expect(await errorCode(deniedRole)).toBe("53300");
     expect(await stats()).toHaveLength(1);
     const other = newDatabaseId();
     await testEnv.DB.batch([

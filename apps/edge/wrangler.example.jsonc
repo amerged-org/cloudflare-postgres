@@ -20,9 +20,13 @@
     },
   ],
   "ratelimits": [
+    // Configure limits for the installation's new WebSocket handshakes.
+    // SQL statements on an existing connection do not consume these buckets.
+    // Counters are per Cloudflare location and eventually consistent.
     {
       "name": "DATABASE_CONNECTION_RATE_LIMITER",
       "namespace_id": "<DATABASE_RATE_LIMIT_NAMESPACE_ID>",
+      // Aggregate per database across all roles and source networks.
       "simple": {
         "limit": 120,
         "period": 60,
@@ -31,6 +35,7 @@
     {
       "name": "CONNECTION_RATE_LIMITER",
       "namespace_id": "<RATE_LIMIT_NAMESPACE_ID>",
+      // Per database + role + normalized network, never the whole endpoint.
       "simple": {
         "limit": 120,
         "period": 60,

@@ -60,9 +60,12 @@ async function admit(
       throw new AdmissionFailure("08006", "connection admission interrupted");
   };
   check();
-  const key = connectionRateKey(request.headers.get("CF-Connecting-IP"));
-  if (key === null)
+  const network = connectionRateKey(request.headers.get("CF-Connecting-IP"));
+  if (network === null)
     throw new AdmissionFailure("53300", "connection rate limit exceeded");
+  // Shared proxy networks must not couple unrelated database/role routes.
+  // These untrusted hints scope admission; PostgreSQL authenticates the user.
+  const key = JSON.stringify([hints.database, hints.user, network]);
   let connectionAllowed: boolean;
   let databaseAllowed: boolean;
   try {
