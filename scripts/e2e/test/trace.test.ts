@@ -568,3 +568,61 @@ test("trace open timeout prevents triggering and deletes after termination", asy
   assert.equal(terminated, 1);
   assert.equal(value.deletes.length, 1);
 });
+
+test("trace never dispatches a trigger when settling resumes after expiry", async (context) => {
+  context.mock.timers.enable({
+    apis: ["Date", "setTimeout"],
+    now: Date.UTC(2030, 0, 1),
+  });
+  const value = fixture();
+  value.tail.expires_at = new Date(Date.now() + 8_000).toISOString();
+  const socket = installSocket();
+  const factory = socketFactory!;
+  let initialized: (() => void) | undefined;
+  const initialization = new Promise<void>((resolve) => {
+    initialized = resolve;
+  });
+  let calls = 0;
+  let failure: unknown;
+  const captured = capture(
+    value.client,
+    worker,
+    value.marker,
+    async () => {
+      calls++;
+    },
+    async () => {},
+    {
+      settleMs: 7_000,
+      socketFactory: (url) => {
+        const created = factory(url);
+        const send = created.send.bind(created);
+        created.send = (data, options, callback) => {
+          send(data, options, callback);
+          initialized!();
+        };
+        return created;
+      },
+    },
+  ).catch((error: unknown) => {
+    failure = error;
+  });
+  try {
+    await initialization;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    context.mock.timers.tick(9_000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    context.mock.timers.tick(0);
+    await captured;
+    assert.equal(calls, 0);
+    assert(failure instanceof Error);
+    assert.equal(failure.message, "invalid_tail_expiry");
+    assert.equal(socket.sockets[0]!.terminated, 1);
+    assert.deepEqual(value.deletes, [
+      `/workers/scripts/${worker}/tails/${value.tail.id}`,
+    ]);
+  } finally {
+    socket.restore();
+    context.mock.timers.reset();
+  }
+});

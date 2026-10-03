@@ -236,6 +236,11 @@ export async function captureTrace(
     try {
       await Promise.race([
         (async () => {
+          const dispatchedAt = Date.now();
+          if (dispatchedAt >= expiry)
+            throw new HarnessError("invalid_tail_expiry");
+          if (dispatchedAt >= eventDeadline)
+            throw new HarnessError("trace_event_missing");
           await trigger();
           await event;
         })(),
