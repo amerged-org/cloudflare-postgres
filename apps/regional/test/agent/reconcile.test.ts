@@ -15,6 +15,475 @@ import { roleSecretName } from "../../src/agent/builders/index.ts";
 
 const signal = () => new AbortController().signal;
 
+test("initial pending CREATE initializes once and its bound identity survives restart", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  const reconcile = () =>
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile(
+      db,
+      ctx,
+    );
+  assert.equal((await reconcile())?.state, "ready");
+  const namespace = await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`);
+  const cluster = await k8s.read("Cluster", `pgcf-db-${db.id}`, "database");
+  const fence = await k8s.read("ConfigMap", "pgcf-system", `storage-${db.id}`);
+  assert.ok(fence);
+  const bound = record(JSON.parse(String(record(fence.data).state)));
+  assert.equal(bound.namespaceUid, namespace?.metadata.uid);
+  assert.equal(bound.clusterUid, cluster?.metadata.uid);
+  assert.equal(bound.node, db.node);
+  assert.equal(bound.archivePath, db.archive.destination_path);
+  assert.equal(fence.metadata.annotations?.[GENERATION_ANNOTATION], "1");
+  const before = k8s.actions.length;
+  assert.equal((await reconcile())?.state, "ready");
+  assert.equal(k8s.actions.length, before);
+  assert.equal(
+    k8s.actions.filter(
+      (action) => action === `create:Namespace:pgcf-db-${db.id}`,
+    ).length,
+    1,
+  );
+  assert.equal(
+    k8s.actions.filter((action) => action === "create:Cluster:database").length,
+    1,
+  );
+});
+
+test("Cloudflare ready history refuses initialization even if all regional history is absent", async () => {
+  const { db, ctx } = fixture();
+  db.creation = { ...db.creation!, status: "succeeded", ever_ready: true };
+  const k8s = new MemoryKubernetes();
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(observation?.state, "error");
+  assert.match(observation?.message ?? "", /recovery required/);
+  assert.equal(k8s.actions.length, 0);
+});
+
+test("missing creation authority fails closed before any namespace or storage mutation", async () => {
+  const { db, ctx } = fixture();
+  delete db.creation;
+  const k8s = new MemoryKubernetes();
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(observation?.state, "error");
+  assert.match(observation?.message ?? "", /recovery required/);
+  assert.equal(k8s.actions.length, 0);
+});
+
+test("a failed CREATE cannot initialize missing storage", async () => {
+  const { db, ctx } = fixture();
+  db.creation = { ...db.creation!, status: "failed" };
+  const k8s = new MemoryKubernetes();
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "error",
+  );
+  assert.equal(k8s.actions.length, 0);
+});
+
+test("a later configuration revision cannot authorize first namespace creation", async () => {
+  const { db, ctx } = fixture();
+  db.generation = 2;
+  db.roles[0]!.revision = 2;
+  const k8s = new MemoryKubernetes();
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "error",
+  );
+  assert.equal(k8s.actions.length, 0);
+});
+
+test("a missing namespace after ready requires recovery instead of recreating empty storage", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "ready",
+  );
+  k8s.addStorage(db);
+  const volumes = await k8s.list("PersistentVolume");
+  const namespace = await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`);
+  assert.ok(namespace?.metadata.uid);
+  await k8s.delete(
+    "Namespace",
+    undefined,
+    namespace.metadata.name,
+    namespace.metadata.uid,
+  );
+  const before = k8s.actions.length;
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(observation?.state, "error");
+  assert.match(observation?.message ?? "", /recovery required/);
+  assert.equal(
+    await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`),
+    null,
+  );
+  assert.equal(await k8s.read("Cluster", `pgcf-db-${db.id}`, "database"), null);
+  assert.equal(k8s.actions.length, before);
+  assert.deepEqual(await k8s.list("PersistentVolume"), volumes);
+});
+
+test("namespace loss retains the durable accepted revision against stale snapshots after restart", async () => {
+  const { db, ctx } = fixture();
+  const newest = { ...db, generation: 3 };
+  const k8s = new MemoryKubernetes();
+  const reconciler = new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  );
+  await reconciler.reconcile(db, ctx);
+  await reconciler.reconcile(newest, ctx);
+  const namespace = await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`);
+  assert.ok(namespace?.metadata.uid);
+  await k8s.delete(
+    "Namespace",
+    undefined,
+    namespace.metadata.name,
+    namespace.metadata.uid,
+  );
+  const before = k8s.actions.length;
+  assert.equal(
+    await new Reconciler(
+      k8s,
+      signal(),
+      Date.now,
+      metrics,
+      authenticate,
+    ).reconcile(db, ctx),
+    null,
+  );
+  assert.equal(k8s.actions.length, before);
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(newest, ctx);
+  assert.equal(observation?.state, "error");
+  assert.match(observation?.message ?? "", /recovery required/);
+  assert.equal(k8s.actions.length, before);
+});
+
+test("role changes cannot recreate a bound namespace and fence stale revisions on another restart", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  const fenceBefore = await k8s.read(
+    "ConfigMap",
+    "pgcf-system",
+    `storage-${db.id}`,
+  );
+  const namespace = await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`);
+  assert.ok(namespace?.metadata.uid);
+  await k8s.delete(
+    "Namespace",
+    undefined,
+    namespace.metadata.name,
+    namespace.metadata.uid,
+  );
+  const updated = {
+    ...db,
+    generation: 2,
+    roles: [
+      {
+        ...db.roles[0]!,
+        revision: 2,
+        password: fixture().db.roles[0]!.password,
+      },
+    ],
+  };
+  const before = k8s.actions.length;
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(updated, ctx);
+  assert.equal(observation?.state, "error");
+  assert.match(observation?.message ?? "", /recovery required/);
+  assert.equal(
+    await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`),
+    null,
+  );
+  assert.equal(await k8s.read("Cluster", `pgcf-db-${db.id}`, "database"), null);
+  assert.deepEqual(
+    (await k8s.read("ConfigMap", "pgcf-system", `storage-${db.id}`))?.data,
+    fenceBefore?.data,
+  );
+  assert.ok(
+    k8s.actions
+      .slice(before)
+      .every((action) => action.startsWith("patch:ConfigMap:storage-")),
+  );
+  const after = k8s.actions.length;
+  assert.equal(
+    await new Reconciler(
+      k8s,
+      signal(),
+      Date.now,
+      metrics,
+      authenticate,
+    ).reconcile(db, ctx),
+    null,
+  );
+  assert.equal(k8s.actions.length, after);
+});
+
+test("a namespace UID race during a configuration update cannot create a replacement", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  const patch = k8s.patch.bind(k8s);
+  k8s.patch = async (kind, namespace, name, operations) => {
+    if (kind === "Namespace") {
+      const current = await k8s.read(kind, namespace, name);
+      assert.ok(current?.metadata.uid);
+      await k8s.delete(kind, namespace, name, current.metadata.uid);
+    }
+    await patch(kind, namespace, name, operations);
+  };
+  await assert.rejects(
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile(
+      { ...db, generation: 2 },
+      ctx,
+    ),
+  );
+  assert.equal(
+    await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`),
+    null,
+  );
+  assert.equal(await k8s.read("Cluster", `pgcf-db-${db.id}`, "database"), null);
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+      ).reconcile({ ...db, generation: 2 }, ctx)
+    )?.state,
+    "error",
+  );
+});
+
+test("storage identity rejects placement changes and a replacement namespace before deletion", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  const before = k8s.actions.length;
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+      ).reconcile(
+        { ...db, generation: 2, node: `node-${randomUUID().slice(0, 8)}` },
+        ctx,
+      )
+    )?.state,
+    "error",
+  );
+  assert.equal(k8s.actions.length, before);
+  k8s.ownedNamespace(db);
+  await assert.rejects(
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile({
+      ...db,
+      generation: 2,
+      desired_state: "deleted",
+      roles: [],
+    }),
+    /namespace_identity_changed/,
+  );
+  assert.equal(k8s.actions.length, before);
+});
+
+test("a missing Cluster after ready cannot be initialized by a later role revision", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  k8s.resources.delete(k8s.key("Cluster", `pgcf-db-${db.id}`, "database"));
+  const before = k8s.actions.length;
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile({ ...db, generation: 2 }, ctx);
+  assert.equal(observation?.state, "error");
+  assert.match(observation?.message ?? "", /recovery required/);
+  assert.equal(await k8s.read("Cluster", `pgcf-db-${db.id}`, "database"), null);
+  assert.ok(
+    k8s.actions
+      .slice(before)
+      .every((action) => action.startsWith("patch:ConfigMap:storage-")),
+  );
+});
+
+test("a fence revision race cannot overwrite a newer durable generation", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  const patch = k8s.patch.bind(k8s);
+  k8s.patch = async (kind, namespace, name, operations) => {
+    if (kind === "ConfigMap" && name === `storage-${db.id}`) {
+      const current = k8s.resources.get(k8s.key(kind, namespace, name))!;
+      current.metadata.annotations![GENERATION_ANNOTATION] = "3";
+      current.metadata.resourceVersion = String(++k8s.revision);
+    }
+    await patch(kind, namespace, name, operations);
+  };
+  const before = k8s.actions.length;
+  await assert.rejects(
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile(
+      { ...db, generation: 2 },
+      ctx,
+    ),
+  );
+  assert.equal(k8s.actions.length, before);
+  assert.equal(
+    (await k8s.read("ConfigMap", "pgcf-system", `storage-${db.id}`))?.metadata
+      .annotations?.[GENERATION_ANNOTATION],
+    "3",
+  );
+  assert.equal(
+    (await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`))?.metadata
+      .annotations?.[GENERATION_ANNOTATION],
+    "1",
+  );
+  assert.equal(
+    await new Reconciler(
+      k8s,
+      signal(),
+      Date.now,
+      metrics,
+      authenticate,
+    ).reconcile({ ...db, generation: 2 }, ctx),
+    null,
+  );
+});
+
+test("a running CREATE resumes after the first namespace mutation without initializing twice", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  const create = k8s.create.bind(k8s);
+  k8s.create = async (resource) => {
+    await create(resource);
+    if (resource.kind === "Namespace")
+      throw new Error("crash_after_namespace_creation");
+  };
+  await assert.rejects(
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile(
+      db,
+      ctx,
+    ),
+  );
+  k8s.create = create;
+  db.creation = { ...db.creation!, status: "running" };
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "ready",
+  );
+  assert.equal(
+    k8s.actions.filter(
+      (action) => action === `create:Namespace:pgcf-db-${db.id}`,
+    ).length,
+    1,
+  );
+  assert.equal(
+    k8s.actions.filter((action) => action === "create:Cluster:database").length,
+    1,
+  );
+});
+
 test("a partial newer revision survives restart and rejects an intermediate stale snapshot", async () => {
   const { db, ctx } = fixture();
   const k8s = new MemoryKubernetes();

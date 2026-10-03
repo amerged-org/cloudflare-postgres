@@ -207,6 +207,86 @@ describe("DesiredDatabase", () => {
     ).toBe(true);
   });
 
+  it("accepts original creation history independently of the desired revision", () => {
+    const creation = {
+      operation_id: opId,
+      generation: 1,
+      status: "running",
+      ever_ready: false,
+    };
+    const parsed = DesiredDatabase.parse({
+      ...desired(),
+      generation: 3,
+      creation,
+    });
+    expect(parsed.creation).toEqual(creation);
+    expect(
+      DesiredDatabase.parse({ ...desired(), creation: null }).creation,
+    ).toBeNull();
+    expect(DesiredDatabase.parse(desired()).creation).toBeUndefined();
+  });
+
+  it("binds creation history to the archive operation and an existing revision", () => {
+    const creation = {
+      operation_id: opId,
+      generation: 1,
+      status: "pending",
+      ever_ready: false,
+    };
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        creation: { ...creation, operation_id: newOperationId() },
+      }).success,
+    ).toBe(false);
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        creation: { ...creation, generation: 2 },
+      }).success,
+    ).toBe(false);
+  });
+
+  it("requires complete creation history with a valid operation status", () => {
+    const creation = {
+      operation_id: opId,
+      generation: 1,
+      status: "failed",
+      ever_ready: false,
+    };
+    expect(DesiredDatabase.safeParse({ ...desired(), creation }).success).toBe(
+      true,
+    );
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        creation: { ...creation, status: "succeeded", ever_ready: true },
+      }).success,
+    ).toBe(true);
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        creation: { ...creation, status: "ready" },
+      }).success,
+    ).toBe(false);
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        creation: { ...creation, generation: 0 },
+      }).success,
+    ).toBe(false);
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        creation: {
+          operation_id: opId,
+          generation: 1,
+          status: "pending",
+        },
+      }).success,
+    ).toBe(false);
+  });
+
   it("accepts an unchanged archive for a deletion tombstone", () => {
     expect(
       DesiredDatabase.safeParse({

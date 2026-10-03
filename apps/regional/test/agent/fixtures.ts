@@ -16,6 +16,7 @@ import type { Kubernetes, Resource } from "../../src/agent/types.ts";
 
 export function fixture(): { db: DesiredDatabase; ctx: BuildContext } {
   const id = newDatabaseId();
+  const operationId = newOperationId();
   return {
     db: {
       id,
@@ -34,13 +35,19 @@ export function fixture(): { db: DesiredDatabase; ctx: BuildContext } {
       roles: [
         { name: "app", owner: true, password: newRolePassword(), revision: 1 },
       ],
+      creation: {
+        operation_id: operationId,
+        generation: 1,
+        status: "pending",
+        ever_ready: false,
+      },
       archive: {
         destination_path: archiveDestinationPath(
           "pgcf-backups",
           "eu-test",
           id,
           1,
-          newOperationId(),
+          operationId,
         ),
         server_name: "database",
       },
@@ -137,6 +144,22 @@ export class MemoryKubernetes implements Kubernetes {
       .map((resource) => structuredClone(resource));
   }
   async apply(resource: K8sObject): Promise<void> {
+    await this.write(resource, "apply");
+  }
+  async create(resource: K8sObject): Promise<void> {
+    assert.equal(
+      this.resources.has(
+        this.key(
+          resource.kind,
+          resource.metadata.namespace,
+          resource.metadata.name,
+        ),
+      ),
+      false,
+    );
+    await this.write(resource, "create");
+  }
+  private async write(resource: K8sObject, verb: string): Promise<void> {
     if (
       this.failCaPublication &&
       resource.kind === "ConfigMap" &&
@@ -241,7 +264,7 @@ export class MemoryKubernetes implements Kubernetes {
         });
     }
     this.resources.set(key, current);
-    this.mutation(`apply:${resource.kind}:${resource.metadata.name}`);
+    this.mutation(`${verb}:${resource.kind}:${resource.metadata.name}`);
   }
   async patch(
     kind: string,
@@ -263,7 +286,11 @@ export class MemoryKubernetes implements Kubernetes {
       if (op.op === "test") assert.deepEqual(parent[last], op.value);
       else parent[last] = structuredClone(op.value);
     }
-    this.mutation(`patch:${kind}:${name}`);
+    if (kind === "Cluster") await this.write(resource, "patch");
+    else {
+      resource.metadata.resourceVersion = String(++this.revision);
+      this.mutation(`patch:${kind}:${name}`);
+    }
   }
   async delete(
     kind: string,

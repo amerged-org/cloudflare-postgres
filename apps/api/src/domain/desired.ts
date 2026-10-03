@@ -3,6 +3,7 @@ import {
   ARCHIVE_SERVER_NAME,
   DesiredDatabase,
   DesiredResponse,
+  type DesiredCreation,
   type DesiredQuery,
   type DesiredSize,
 } from "@pgcf/contracts";
@@ -14,6 +15,10 @@ import type { DatabaseRow, RoleRow } from "./rows.ts";
 interface DesiredRow extends DatabaseRow, DesiredSize {
   k8s_node_name: string;
   roles_json: string;
+  creation_operation_id: string | null;
+  creation_generation: number | null;
+  creation_status: DesiredCreation["status"] | null;
+  ever_ready: number;
 }
 export async function desired(
   c: ApiContext,
@@ -22,8 +27,11 @@ export async function desired(
   const region = await agentRegion(c);
   const result = await c.env.DB.prepare(
     `SELECT d.*,n.k8s_node_name,s.memory_mib,s.cpu_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
-    (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json
+    (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json,
+    o.id creation_operation_id,o.generation creation_generation,o.status creation_status,
+    EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
+    LEFT JOIN operations o ON o.id=substr(d.archive_path,-23) AND o.kind='database.create' AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation
     WHERE d.region_id=? AND d.desired_state IN('running','deleted') AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
     ${query.after ? "AND d.id>?" : ""} ORDER BY d.id LIMIT ?`,
   )
@@ -65,6 +73,15 @@ export async function desired(
           backup_retention_days: row.backup_retention_days,
         },
         roles,
+        creation:
+          row.creation_operation_id === null
+            ? null
+            : {
+                operation_id: row.creation_operation_id,
+                generation: row.creation_generation,
+                status: row.creation_status,
+                ever_ready: Boolean(row.ever_ready),
+              },
         archive: {
           destination_path: row.archive_path,
           server_name: ARCHIVE_SERVER_NAME,
