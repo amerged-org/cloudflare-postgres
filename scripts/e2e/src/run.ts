@@ -815,7 +815,7 @@ export class Run {
         account_id: this.c.values.CLOUDFLARE_ACCOUNT_ID,
         main: fileURLToPath(new URL("../probe/worker.ts", import.meta.url)),
         compatibility_date: "2026-10-01",
-        compatibility_flags: ["nodejs_compat"],
+        compatibility_flags: ["nodejs_compat", "global_fetch_strictly_public"],
         workers_dev: true,
         observability: { enabled: false },
         vars: {
@@ -878,7 +878,7 @@ export class Run {
         account_id: this.c.values.CLOUDFLARE_ACCOUNT_ID,
         main: fileURLToPath(new URL("../test/chaos-relay.ts", import.meta.url)),
         compatibility_date: "2026-10-01",
-        compatibility_flags: ["nodejs_compat"],
+        compatibility_flags: ["nodejs_compat", "global_fetch_strictly_public"],
         workers_dev: true,
         observability: { enabled: false },
         vars: {

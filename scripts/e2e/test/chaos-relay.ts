@@ -60,7 +60,7 @@ export class ChaosRelay {
     const response = await fetch(
       new URL("/agent/v1/desired", this.env.API_URL),
       {
-        redirect: "error",
+        redirect: "manual",
         signal: AbortSignal.timeout(15_000),
         headers: { Authorization: `Bearer ${this.env.AGENT_KEY}` },
       },
@@ -229,7 +229,7 @@ export class ChaosRelay {
       this.env.API_URL,
     );
     const response = await fetch(new Request(target, request), {
-      redirect: "error",
+      redirect: "manual",
     });
     if (
       path === "/agent/v1/observations" &&

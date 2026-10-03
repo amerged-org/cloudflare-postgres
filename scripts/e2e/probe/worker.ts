@@ -51,7 +51,7 @@ export function connectionRequest(
     headers.set("X-PGCF-E2E-Marker", marker);
   }
   return new Request(url, {
-    redirect: "error",
+    redirect: "manual",
     signal: AbortSignal.timeout(15_000),
     headers,
   });

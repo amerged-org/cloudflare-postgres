@@ -114,7 +114,7 @@ test("credential request carries one validated marker in its URL and header", ()
   assert.equal(url.pathname.endsWith("/roles/app/connection-uri"), true);
   assert.equal(url.pathname.includes(env.DATABASE_ID), true);
   assert.equal(url.searchParams.has("password"), false);
-  assert.equal(request.redirect, "error");
+  assert.equal(request.redirect, "manual");
   assert.equal(probe.requestTraceMarker(new Request(incoming.url)), undefined);
   assert.throws(
     () =>
@@ -530,4 +530,32 @@ test("named startup mismatch handlers require authentication and a trace marker 
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test("credential request uses manual redirects and refuses an upstream redirect", async (context) => {
+  const env = environment(new Date(Date.now() + 60_000).toISOString());
+  const outgoing = probe.connectionRequest(env);
+  assert.equal(outgoing.redirect, "manual");
+  let calls = 0;
+  context.mock.method(globalThis, "fetch", async (input: RequestInfo | URL) => {
+    calls++;
+    assert.ok(input instanceof Request);
+    assert.equal(input.redirect, "manual");
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: `https://${["redirect", "test", "invalid"].join(".")}`,
+      },
+    });
+  });
+  const reply = await probe.default.fetch(
+    new Request(`https://${["probe", "test"].join(".")}/metadata`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${env.PROBE_BEARER}` },
+    }),
+    env,
+  );
+  assert.equal(reply.status, 500);
+  assert.deepEqual(await reply.json(), { code: "probe_failed" });
+  assert.equal(calls, 1);
 });
