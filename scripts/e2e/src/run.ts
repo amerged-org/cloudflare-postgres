@@ -83,12 +83,97 @@ export const REQUIRED_ENV = [
   "PGCF_E2E_CREDENTIAL_EXPIRIES",
 ] as const;
 
+export type CredentialExpiry =
+  | { name: string; expires_at: string; expiry_source?: never }
+  // Null explicitly confirms that the v1 API/agent key has no expiry; it is not unknown.
+  | {
+      name: "PGCF_E2E_ADMIN_KEY" | "PGCF_E2E_AGENT_KEY";
+      expires_at: null;
+      expiry_source?: never;
+    }
+  // The probe secret's effective expiry is the deployed Worker's RUN_EXPIRES_AT.
+  | {
+      name: "PGCF_E2E_PROBE_BEARER";
+      expiry_source: "run";
+      expires_at?: never;
+    };
+
+export function parseCredentialExpiries(
+  input: unknown,
+  now = Date.now(),
+): CredentialExpiry[] {
+  if (!Array.isArray(input) || !Number.isFinite(now))
+    throw new HarnessError("invalid_config");
+  const names = new Set<string>();
+  const entries = input.map((value: unknown): CredentialExpiry => {
+    const row = record(value);
+    const name = string(row.name);
+    if (
+      !/^[A-Z][A-Z0-9_]{0,63}$/.test(name) ||
+      Object.keys(row).some(
+        (key) => !["name", "expires_at", "expiry_source"].includes(key),
+      )
+    )
+      throw new HarnessError("credential_expiry_invalid");
+    if (names.has(name)) throw new HarnessError("credential_expiry_duplicate");
+    names.add(name);
+    if (row.expiry_source === "run") {
+      if (name !== "PGCF_E2E_PROBE_BEARER" || "expires_at" in row)
+        throw new HarnessError("credential_expiry_invalid");
+      return { name, expiry_source: "run" };
+    }
+    if ("expiry_source" in row)
+      throw new HarnessError("credential_expiry_invalid");
+    if (row.expires_at === null) {
+      if (name !== "PGCF_E2E_ADMIN_KEY" && name !== "PGCF_E2E_AGENT_KEY")
+        throw new HarnessError("credential_expiry_invalid");
+      return { name, expires_at: null };
+    }
+    const expires_at = string(row.expires_at);
+    const iso =
+      /^(\d{4}-\d{2}-\d{2})T(?:[01]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d{1,3})?(?:Z|[+-](?:[01]\d|2[0-3]):[0-5]\d)$/.exec(
+        expires_at,
+      );
+    const expiry = Date.parse(expires_at);
+    if (
+      !iso ||
+      !Number.isFinite(expiry) ||
+      expiry <= now ||
+      new Date(`${iso[1]}T00:00:00.000Z`).toISOString().slice(0, 10) !== iso[1]
+    )
+      throw new HarnessError("credential_expired");
+    return { name, expires_at: new Date(expiry).toISOString() };
+  });
+  for (const name of [
+    "CLOUDFLARE_API_TOKEN",
+    "PGCF_E2E_ADMIN_KEY",
+    "PGCF_E2E_PROBE_BEARER",
+    "PGCF_E2E_KUBECONFIG",
+  ])
+    if (!names.has(name)) throw new HarnessError("credential_expiry_missing");
+  return entries;
+}
+
+export function credentialInventory(
+  entries: readonly CredentialExpiry[],
+  runExpiresAt: string,
+  now = Date.now(),
+) {
+  if (!runActive(runExpiresAt, now))
+    throw new HarnessError("run_expired_cleanup_required");
+  return entries.map((entry) =>
+    entry.expiry_source === "run"
+      ? { ...entry, expires_at: runExpiresAt }
+      : entry,
+  );
+}
+
 interface Config {
   values: Record<string, string>;
   nodes: string[];
   jurisdiction: "default" | "eu";
   apiUrl: URL;
-  credentialExpiries: { name: string; expires_at: string }[];
+  credentialExpiries: CredentialExpiry[];
   expectedCluster: ClusterIdentity;
 }
 interface Ledger {
@@ -174,8 +259,7 @@ function config(env: NodeJS.ProcessEnv): Config {
     throw new HarnessError("invalid_jurisdiction");
   if (values.PGCF_E2E_PROBE_BEARER!.length < 32)
     throw new HarnessError("probe_bearer_too_short");
-  let nodes: string[],
-    credentialExpiries: { name: string; expires_at: string }[];
+  let nodes: string[], credentialExpiries: CredentialExpiry[];
   try {
     nodes = JSON.parse(values.PGCF_E2E_NODE_NAMES!);
     const input: unknown = JSON.parse(values.PGCF_E2E_CREDENTIAL_EXPIRIES!);
@@ -186,30 +270,10 @@ function config(env: NodeJS.ProcessEnv): Config {
       nodes.some(
         (name) =>
           typeof name !== "string" || !/^[a-z0-9][a-z0-9.-]{0,252}$/.test(name),
-      ) ||
-      !Array.isArray(input)
+      )
     )
       throw new HarnessError("invalid_config");
-    credentialExpiries = input.map((row: unknown) => {
-      const entry = record(row);
-      const name = string(entry.name),
-        expires_at = string(entry.expires_at);
-      if (
-        !/^[A-Z][A-Z0-9_]{0,63}$/.test(name) ||
-        Number.isNaN(Date.parse(expires_at)) ||
-        Date.parse(expires_at) <= Date.now()
-      )
-        throw new HarnessError("credential_expired");
-      return { name, expires_at: new Date(expires_at).toISOString() };
-    });
-    for (const name of [
-      "CLOUDFLARE_API_TOKEN",
-      "PGCF_E2E_ADMIN_KEY",
-      "PGCF_E2E_PROBE_BEARER",
-      "PGCF_E2E_KUBECONFIG",
-    ])
-      if (!credentialExpiries.some((e) => e.name === name))
-        throw new HarnessError("credential_expiry_missing");
+    credentialExpiries = parseCredentialExpiries(input);
   } catch (error) {
     if (error instanceof HarnessError) throw error;
     throw new HarnessError("invalid_config");
@@ -610,12 +674,16 @@ export class Run {
     await anonymousImage(this.c.values.PGCF_E2E_GHCR_IMAGE!);
     if (!this.state.baseline.length) this.state.baseline = baseline;
     if (!this.dryRun) {
+      const credentials = credentialInventory(
+        this.c.credentialExpiries,
+        this.state.expires_at,
+      );
       await this.complete("E0");
       await mkdir(this.dir, { recursive: true, mode: 0o700 });
-      // Only credential variable names and dates are stored, never credentials.
+      // Only names, explicit nonexpiry and actual expiry sources are stored.
       await writeFile(
         resolve(this.dir, "credential-expiries.json"),
-        JSON.stringify(this.c.credentialExpiries),
+        JSON.stringify(credentials),
         { mode: 0o600 },
       );
     }
