@@ -1,11 +1,17 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { BucketName, Timestamp, TEXT_MAX_LENGTH } from "./api.ts";
+import {
+  BucketName,
+  OperationStatus,
+  Timestamp,
+  TEXT_MAX_LENGTH,
+} from "./api.ts";
 import { RolePassword } from "./auth.ts";
 import {
   DATABASE_ID_PATTERN,
   DatabaseId,
   OPERATION_ID_PATTERN,
+  OperationId,
   OWNER_ROLE_NAME,
   REGION_ID_PATTERN,
   RegionId,
@@ -80,6 +86,14 @@ export const DesiredRole = z.strictObject({
 });
 export type DesiredRole = z.infer<typeof DesiredRole>;
 
+export const DesiredCreation = z.strictObject({
+  operation_id: OperationId,
+  generation: z.number().int().min(1),
+  status: OperationStatus,
+  ever_ready: z.boolean(),
+});
+export type DesiredCreation = z.infer<typeof DesiredCreation>;
+
 export const DesiredDatabase = z
   .strictObject({
     id: DatabaseId,
@@ -89,6 +103,8 @@ export const DesiredDatabase = z
     pg_major: z.literal(PG_MAJOR),
     size: DesiredSize,
     roles: z.array(DesiredRole).max(100).default([]),
+    // Older desired pages omit this field; omission cannot authorize initial storage.
+    creation: DesiredCreation.nullable().optional(),
     archive: z.strictObject({
       destination_path: z.string().regex(ARCHIVE_DESTINATION_PATTERN),
       server_name: z.literal(ARCHIVE_SERVER_NAME),
@@ -103,6 +119,20 @@ export const DesiredDatabase = z
         path: ["archive", "destination_path"],
         message:
           "archive path must name this database and not a future generation",
+      });
+    }
+    if (match && db.creation && match[5] !== db.creation.operation_id) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["creation", "operation_id"],
+        message: "creation operation must match the archive path",
+      });
+    }
+    if (db.creation && db.creation.generation > db.generation) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["creation", "generation"],
+        message: "creation must not name a future desired revision",
       });
     }
     const names = new Set<string>();
