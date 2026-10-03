@@ -36,7 +36,8 @@ function canonical(value: unknown): string {
     .join(",")}}`;
 }
 export async function requestHash(c: ApiContext): Promise<string> {
-  const body: unknown = c.req.raw.body === null ? null : await c.req.json();
+  const text = c.req.raw.body === null ? "" : await c.req.text();
+  const body: unknown = text === "" ? null : JSON.parse(text);
   const bytes = new TextEncoder().encode(
     `${c.req.method}\n${new URL(c.req.url).pathname}\n${canonical(body)}`,
   );

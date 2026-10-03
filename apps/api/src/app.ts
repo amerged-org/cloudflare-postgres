@@ -40,7 +40,9 @@ export function apiError(
   );
 }
 
-async function readJsonBody(request: Request): Promise<string> {
+async function readJsonBody(
+  request: Request,
+): Promise<{ text: string; byteLength: number }> {
   const reader = request.body!.getReader();
   const bytes = new Uint8Array(JSON_BODY_MAX_BYTES);
   let length = 0;
@@ -64,9 +66,12 @@ async function readJsonBody(request: Request): Promise<string> {
       bytes.set(chunk.value, length);
       length += chunk.value.byteLength;
     }
-    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
-      bytes.subarray(0, length),
-    );
+    return {
+      text: new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(
+        bytes.subarray(0, length),
+      ),
+      byteLength: length,
+    };
   } catch (error) {
     if (error instanceof ApiError) throw error;
     throw new ApiError("invalid_request", "Could not read JSON body");
@@ -139,21 +144,24 @@ export function createApp(): ApiApp {
 
   app.use("*", async (c, next) => {
     if (c.req.raw.body !== null) {
-      const text = await readJsonBody(c.req.raw);
-      const mediaType = c.req.header("Content-Type")?.split(";")[0]?.trim();
-      if (
-        mediaType === undefined ||
-        !/^application\/(?:[a-z0-9.+-]+\+)?json$/i.test(mediaType)
-      ) {
-        throw new ApiError(
-          "invalid_request",
-          "Content-Type must be application/json",
-        );
-      }
-      try {
-        JSON.parse(text);
-      } catch {
-        throw new ApiError("invalid_request", "Malformed JSON body");
+      const { text, byteLength } = await readJsonBody(c.req.raw);
+      // A bodyless HTTP request can arrive as a non-null zero-byte stream.
+      if (byteLength !== 0) {
+        const mediaType = c.req.header("Content-Type")?.split(";")[0]?.trim();
+        if (
+          mediaType === undefined ||
+          !/^application\/(?:[a-z0-9.+-]+\+)?json$/i.test(mediaType)
+        ) {
+          throw new ApiError(
+            "invalid_request",
+            "Content-Type must be application/json",
+          );
+        }
+        try {
+          JSON.parse(text);
+        } catch {
+          throw new ApiError("invalid_request", "Malformed JSON body");
+        }
       }
       // Preserve the bounded body for validators and idempotency request hashing.
       c.req.raw = new Request(c.req.raw, { body: text });
