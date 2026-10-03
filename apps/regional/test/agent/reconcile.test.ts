@@ -15,6 +15,50 @@ import { roleSecretName } from "../../src/agent/builders/index.ts";
 
 const signal = () => new AbortController().signal;
 
+test("a missing namespace after ready requires recovery instead of recreating empty storage", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "ready",
+  );
+  k8s.addStorage(db);
+  const volumes = await k8s.list("PersistentVolume");
+  const namespace = await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`);
+  assert.ok(namespace?.metadata.uid);
+  await k8s.delete(
+    "Namespace",
+    undefined,
+    namespace.metadata.name,
+    namespace.metadata.uid,
+  );
+  const before = k8s.actions.length;
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(observation?.state, "error");
+  assert.match(observation?.message ?? "", /recovery required/);
+  assert.equal(
+    await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`),
+    null,
+  );
+  assert.equal(await k8s.read("Cluster", `pgcf-db-${db.id}`, "database"), null);
+  assert.equal(k8s.actions.length, before);
+  assert.deepEqual(await k8s.list("PersistentVolume"), volumes);
+});
+
 test("a partial newer revision survives restart and rejects an intermediate stale snapshot", async () => {
   const { db, ctx } = fixture();
   const k8s = new MemoryKubernetes();
