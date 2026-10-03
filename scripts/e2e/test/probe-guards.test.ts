@@ -130,6 +130,34 @@ test("credential request carries one validated marker in its URL and header", ()
   });
 });
 
+test("segmented markers retain exactly one request hint and strict input validation", () => {
+  const env = environment();
+  const entropy = randomBytes(24).toString("hex");
+  const marker = `${entropy.slice(0, 16)}.${entropy.slice(16, 32)}.${entropy.slice(32)}`;
+  const incoming = new Request(`https://${["probe", "test"].join(".")}`, {
+    headers: { "X-PGCF-E2E-Marker": marker },
+  });
+  assert.equal(probe.requestTraceMarker(incoming), marker);
+  const request = probe.connectionRequest(env, marker);
+  assert.deepEqual(new URL(request.url).searchParams.getAll("pgcf_trace"), [
+    marker,
+  ]);
+  assert.equal(request.headers.get("X-PGCF-E2E-Marker"), marker);
+  assert.equal(
+    request.headers.get("Authorization"),
+    `Bearer ${env.INTEGRATOR_KEY}`,
+  );
+  assert.equal(request.redirect, "manual");
+  assert.equal(request.signal.aborted, false);
+  assert.throws(() => probe.connectionRequest(env, marker + "."), {
+    message: "invalid_trace_marker",
+  });
+  assert.throws(
+    () => probe.connectionRequest(env, marker.replaceAll(".", "_")),
+    { message: "invalid_trace_marker" },
+  );
+});
+
 test("native Pool clients keep interleaved database, role and trace hints separate", async () => {
   const env = environment();
   const other = environment();

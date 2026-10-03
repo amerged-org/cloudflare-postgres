@@ -42,6 +42,7 @@ import { cloudflareInventory } from "./phase0-accept.ts";
 import { assertOpenSubset, scanPorts } from "./scan.ts";
 import { networkingAudit, chaosEgressPolicy } from "./security.ts";
 import { captureTrace } from "./trace.ts";
+import { formatTraceMarker } from "./trace-marker.ts";
 import { restartSummary } from "./restarts.ts";
 import { redactKnownCredentials } from "./audit.ts";
 import {
@@ -1499,7 +1500,7 @@ export class Run {
     const timings: Record<string, number> = {};
     for (const mode of ["database", "user"] as const) {
       await this.assertCluster();
-      const marker = randomBytes(24).toString("hex");
+      const marker = formatTraceMarker(randomBytes(24).toString("hex"));
       const since = new Date().toISOString();
       const action = await this.action("startup_mismatch_probe", {
         mode,
@@ -1621,7 +1622,7 @@ export class Run {
       `pgcf-db-${this.state.database_id}`,
     );
     const tails: string[] = [];
-    const marker = randomBytes(24).toString("hex");
+    const marker = formatTraceMarker(randomBytes(24).toString("hex"));
     for (const worker of [this.c.values.PGCF_E2E_API_WORKER_NAME!, edgeName]) {
       await this.intent("tail_create");
       const messages = await captureTrace(

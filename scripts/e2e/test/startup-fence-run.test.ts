@@ -625,7 +625,7 @@ function mismatchRun(
       if (path === "/exercise") return { pass: true, timings: {} };
       paths.push(path);
       assert.equal(body, undefined);
-      assert.match(marker, /^[a-f0-9]{48}$/);
+      assert.match(marker, /^[a-f0-9]{16}\.[a-f0-9]{16}\.[a-f0-9]{16}$/);
       matching = { ...id, marker, connection: randomUUID() };
       sockets.at(-1)!.emit(edgeTrace(matching));
       return {
@@ -694,7 +694,10 @@ test("named mismatch run correlates each exact rejection with real-shaped Edge a
         action.target.postgres_dial_evidence,
         "gateway_source_branch_inference",
       );
-      assert.match(action.target.marker!, /^[a-f0-9]{48}$/);
+      assert.match(
+        action.target.marker!,
+        /^[a-f0-9]{16}\.[a-f0-9]{16}\.[a-f0-9]{16}$/,
+      );
       assert.match(action.target.connection!, /^[a-f0-9-]{36}$/);
       assert(action.completed_at);
       assert.equal(Object.hasOwn(action.target, "postgres_dials"), false);

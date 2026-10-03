@@ -5,6 +5,7 @@ import { connect } from "cloudflare:sockets";
 import { credentialOccurrences } from "../src/audit.ts";
 import { workerScanUnsupported } from "../src/transport.ts";
 import { runActive } from "../src/run-expiry.ts";
+import { isTraceMarker } from "../src/trace-marker.ts";
 
 interface Env {
   PROBE_BEARER: string;
@@ -23,7 +24,7 @@ function response(body: unknown, status = 200): Response {
 }
 
 function validTraceMarker(marker: string | undefined): string | undefined {
-  if (marker !== undefined && !/^[a-f0-9]{48}$/.test(marker))
+  if (marker !== undefined && !isTraceMarker(marker))
     throw new Error("invalid_trace_marker");
   return marker;
 }
