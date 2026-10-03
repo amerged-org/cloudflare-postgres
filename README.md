@@ -31,11 +31,12 @@ guards. The original default Neon decoded-binary result assertions still fail be
 parsing. Dev decommission and independent re-inventory completed with all 174 foreign resources
 unchanged; first-EU operator access and foreign IPv4/IPv6 refusal checks passed.
 
-S1 preliminary DNS, TLS, HTTP, WebSocket, 1 MiB binary and 30 s checks passed. The full 600 s test
-failed strict completion at 599,970 ms despite 24 ping/pong exchanges; clock correction and a full
-rerun remain pending. Rollback rejected the returned domain ID before transport, so the spike
-Worker and custom domain remain present pending reviewed correction and cleanup. Temporary
-worktree cleanup and the formal Phase 0 live harness rerun after the layout fix remain pending.
+The full S1 transport spike passed DNS, TLS, HTTP, WebSocket `101`, text and 1 MiB binary checks,
+plus 600,011 ms idle with 24 ping/pong exchanges; the complete run took 603.438 s. Reviewed clock
+and domain-ID guard corrections are applied. Scoped rollback completed and confirmed the spike
+Worker, custom domain and DNS absent, with the existing universal certificate untouched.
+Temporary worktree cleanup and the formal Phase 0 live harness rerun after the layout fix remain
+pending.
 Phase 0 and Phase 1's E0–E6 complete database chain have not passed live acceptance; Phase 2 has
 not begun. The second EU node is untouched, the US node has not been bought and no production
 writes occurred. See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
