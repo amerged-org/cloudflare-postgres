@@ -4,7 +4,50 @@ import { randomBytes, randomUUID } from "node:crypto";
 import test from "node:test";
 import type { TestContext } from "node:test";
 import { Cloudflare, Kubernetes } from "../src/clients.ts";
-import { checkReady, phase0 } from "../src/phase0-accept.ts";
+import { checkLayout, checkReady, phase0 } from "../src/phase0-accept.ts";
+
+test("Phase 0 accepts the Docker context and CI image qualification source layout", () => {
+  const files = [
+    ".dockerignore",
+    "scripts/ci/image-qualification.test.ts",
+    "scripts/ci/image-qualification.ts",
+    "scripts/ci/registry.test.ts",
+    "scripts/ci/registry.ts",
+    "scripts/ci/reviewed-findings.json",
+    "scripts/ci/reviewed-findings.test.ts",
+    "scripts/ci/reviewed-findings.ts",
+    "scripts/ci/scanner.test.ts",
+    "scripts/ci/scanner.ts",
+    "scripts/ci/tsconfig.json",
+  ];
+  const check = checkLayout(files);
+  assert.equal(check.pass, true);
+  assert.deepEqual(check.names, []);
+});
+
+test("Phase 0 rejects secrets under CI and paths outside the target layout", () => {
+  const files = [
+    "scripts/ci/.env",
+    "scripts/ci/.env.production",
+    "scripts/ci/.dev.vars",
+    "scripts/ci/.dev.vars.production",
+    "scripts/ci/review.private.json",
+    "scripts/ci/config/kubeconfig",
+    "scripts/ci/config/talosconfig",
+    "scripts/ci/certificate.pem",
+    "scripts/ci/signing.key",
+    ".local/scripts/ci/scanner.ts",
+    ".dockerignore.backup",
+    "scanner.ts",
+    "ci/scanner.ts",
+    "scripts/scanner.ts",
+    "scripts/other/scanner.ts",
+    "scripts/circle/scanner.ts",
+  ];
+  const check = checkLayout(files);
+  assert.equal(check.pass, false);
+  assert.deepEqual(check.names, files);
+});
 
 function configuredPhase0(t: TestContext) {
   const clusterUid = randomUUID(),

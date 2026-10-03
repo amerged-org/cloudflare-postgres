@@ -614,6 +614,7 @@ apps/edge             Cloudflare Worker: database WebSocket proxy
 apps/regional         Node image: `agent` and `gateway` commands
 apps/node-bootstrap   Cloudflare Container image: Contabo → Talos node bootstrap (Phase 3)
 packages/contracts    shared zod schemas
+scripts/ci            image qualification, scanner and registry CI helpers
 scripts/e2e           live end-to-end acceptance
 infra/talos           Talos patches and Contabo rescue install recipe
 infra/platform        Flux platform baseline (pinned)
