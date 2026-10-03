@@ -20,7 +20,8 @@ loss is recovered from R2.
 
 **Dev foundation rebuilt; full database path pending (2026-10-03).** The first EU node and all
 five Flux platform releases are `Ready`. Authoritative storage cycles completed, and a fresh
-identity-bound proof published 95 GiB in 112.09 s. CI run `37120159676` for `0846597` passed; the
+identity-bound capture took 112.09 s. Capture and publication took 114.132 s in total, with 95 GiB
+published. CI run `37120159676` for `0846597` passed; the
 regional agent and gateway pin the published image digest recorded in [PLAN.md](PLAN.md#11-status).
 Image signing remains pending.
 
