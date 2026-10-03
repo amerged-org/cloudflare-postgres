@@ -133,8 +133,8 @@ and is excluded from the build.
 
 Gateway and agent are two commands (`node /app/gateway.mjs`, `node /app/agent.mjs`) of one image
 referenced as `pgcf-regional`. `regional/kustomization.yaml` maps it to the GHCR repository with an
-`images:` entry; the release commit adds the `digest` once CI has published the image. `cloudflared`
-is pinned by digest. No `imagePullPolicy` is set. For Dev, keep a private overlay that references
+`images:` entry and the published release digest. `cloudflared` is also pinned by digest.
+No `imagePullPolicy` is set. For Dev, keep a private overlay that references
 `regional` and sets a locally imported image and the pull policy, for example:
 
 ```yaml

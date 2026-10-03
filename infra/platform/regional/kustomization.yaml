@@ -7,12 +7,12 @@ resources:
   - cloudflared.yaml
   - gateway.yaml
   - agent.yaml
-# The regional image (agent and gateway) is built by CI. Its digest does not exist until the first
-# image is published; the release commit then adds `digest: sha256:...` here. A private overlay may
-# replace newName/newTag for a locally imported Dev image (see ../README.md).
+# CI publishes one image for the agent and gateway. A private overlay may replace newName/newTag
+# for a locally imported Dev image (see ../README.md).
 images:
   - name: pgcf-regional
     newName: ghcr.io/amerged-org/pgcf-regional
+    digest: sha256:93ad150c4d807cac81f865c9e2f1f6a2cd83eeeaf2ffd4e977a26635549ee8a6
   - name: cloudflared
     newName: docker.io/cloudflare/cloudflared
     # cloudflared 2026.9.3 multi-arch index
