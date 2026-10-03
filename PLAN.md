@@ -1,19 +1,23 @@
 # cloudflare-postgres — Plan
 
 Status (2026-10-03): **CI-qualified build; live acceptance pending.** Phase 1 services and the
-approved native WebSocket path are implemented. CI run `37064926148` for `a11e0c3` passed the code
+approved native WebSocket path are implemented. CI run `37074208451` for `c3dcfd6` passed the code
 and image jobs, including complete image qualification and authenticated registry verification.
-The published regional image passed anonymous registry verification by immutable digest. Image
-signing remains pending. Local PostgreSQL stream wire checks passed; the original default
-decoded-binary client assertions still fail.
+The regional image is published; anonymous registry access was verified for the prior `a11e0c3`
+release. Image signing remains pending. Local PostgreSQL stream wire checks passed; the original
+default decoded-binary client assertions still fail.
 The first build produced mostly budget-enforcement, signed-execution and evidence machinery but no
 database a client could connect to through the API. Those parts are removed. The Talos recipe,
 the Flux platform baseline and the R2 backup/PITR recipe stay, because they work in the lab.
 The old implementation has been removed and the workspace scaffolded. Dev decommission and
 independent re-inventory completed. The first EU firewall corrections are applied, and operator
-access plus mandatory foreign IPv4 and IPv6 refusal checks passed. No rescue or disk wipe has
-started; image preparation, the lab rebuild and custom-domain setup remain pending. Phase 0 and
-Phase 1's complete database chain have not passed live acceptance, and Phase 2 has not begun.
+access plus mandatory foreign IPv4 and IPv6 refusal checks passed. The Talos image is verified,
+and the first EU node entered rescue with pinned host identity and validated memory-root, disk
+and network assertions. Installation stopped when signature cleanup reported a busy disk;
+partition rewriting and image writing did not run. The observed LVM preparation correction is
+under review. Bootstrap, platform release, storage proof and custom-domain setup remain pending.
+Phase 0 and Phase 1's complete database chain have not passed live acceptance, and Phase 2 has
+not begun.
 The owner has requested delivery through Phase 5 and full Neon replacement.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
@@ -650,3 +654,6 @@ Entries are chronological; later results supersede earlier pending work.
 | 2026-10-02 | 1 preparation | In-process default-text result compatibility preparation passed 14 checks; this is not a driver change or end-to-end acceptance. The original decoded-binary assertions still fail and remain retained. Live transport selection and the complete E0–E6 Dev run remain pending; Phase 2 has not begun. |
 | 2026-10-03 | image public | Regional image publication completed. Anonymous authorization and both `sha-a11e0c3930b6` and `latest` manifest reads returned HTTP 200 with the exact recorded immutable manifest digest. Real registry validation confirmed source revision, config, RootFS and layer binding. Organization creation defaults were restored after publication. Image signing and production acceptance remain pending. |
 | 2026-10-03 | 0 image | The first-EU Talos image download exited 124 after 585 s, retaining 120,717,312 bytes of the expected 231,195,631-byte artifact. An actual range request returned HTTP 206, confirming resume support; resume-tool preparation is offline only. Image checksum verification, rescue, disk wipe and rebuild have not completed. |
+| 2026-10-03 | CI / image | CI run `37074208451` for `c3dcfd6` passed both code and image jobs. Complete qualification expected and scanned exactly 657,429,509 bytes across 10 layers, 10,207 regular files and 10,447 inputs; all 26 exact reviewed upstream noncredentials were resolved, with zero unresolved findings. The published regional image `sha-c3dcfd62d9b0` has registry manifest digest `sha256:c8f87dc787ee7197c3fe370196dbd40536730eaf9bc6bf8ae24146a016a08bcc`. Image signing and production acceptance remain pending. |
+| 2026-10-03 | 0 image | The resumed Talos image step exited 0 with all 231,195,631 bytes. SHA-256 matched the trusted pinned digest `515034e3b138902062687f9cf9d6a2da1504768febb2929f6fa70503dc8df4ac`; GPT inspection found exactly four partitions labeled EFI, BIOS, BOOT and META, and network settings matched the private inventory. This verifies the install artifact, not the rebuilt node. |
+| 2026-10-03 | 0 live | First-EU rescue and host-key pinning passed, followed by assertions for a memory-root environment, one unmounted writable 150 GiB physical disk and matching network inventory. The first `wipefs` command exited 1 with Device or resource busy; partition zap and image writing never ran. Read-only inspection found one owned, unmounted PGCF volume group with all physical volumes on the asserted disk and six active unmounted logical volumes. No force, volume deactivation or retry has occurred; the preparation correction is under review. Phase 0 remains unaccepted until bootstrap, platform release and storage proof; Phase 1 transport and E0–E6 acceptance remain pending, and Phase 2 has not begun. |

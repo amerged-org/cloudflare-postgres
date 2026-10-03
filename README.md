@@ -19,18 +19,20 @@ loss is recovered from R2.
 ## Status
 
 **CI-qualified build; live acceptance pending (2026-10-03).** Phase 1 services and native
-WebSocket forwarding are implemented. CI run `37064926148` for `a11e0c3` passed code and full-image
-qualification, authenticated registry verification and immutable publication. The regional image
-is public, with anonymous reads and exact revision, config and layer binding verified. Image
-signing remains pending. Against real PostgreSQL, 100 MiB and 1 GiB COPY and SELECT wire-hash
+WebSocket forwarding are implemented. CI run `37074208451` for `c3dcfd6` passed code and full-image
+qualification, authenticated registry verification and immutable publication. Anonymous public
+access was verified for the prior `a11e0c3` image. Image signing remains pending. Against real PostgreSQL, 100 MiB and 1 GiB COPY and SELECT wire-hash
 checks passed with unchanged 192 MiB local memory guards. The original default Neon decoded-binary
 result assertions still fail because of upstream parsing.
 
 Dev decommission and independent re-inventory completed with all 174 foreign resources unchanged.
 First-EU firewall corrections and actual operator-access and foreign IPv4/IPv6 refusal checks
-passed. Rescue, disk wipe, the lab rebuild and custom-domain setup remain pending. Phase 0 and
-Phase 1 have not passed live acceptance, and Phase 2 has not begun. See
-[PLAN.md](PLAN.md#11-status) for measured results and remaining work.
+passed. The Talos image is verified and the first EU node is in rescue. Installation stopped
+when initial signature cleanup found a busy disk; partition rewriting and image writing did not
+run. The observed LVM preparation correction is under review. Bootstrap, platform release,
+storage proof and custom-domain setup remain pending. Phase 0 and Phase 1 have not passed live
+acceptance, and Phase 2 has not begun. See [PLAN.md](PLAN.md#11-status) for measured results and
+remaining work.
 
 ## Architecture
 
