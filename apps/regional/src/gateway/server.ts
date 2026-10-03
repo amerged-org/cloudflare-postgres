@@ -17,10 +17,21 @@ import {
   encodeErrorResponse,
 } from "@pgcf/contracts/pg-wire";
 import { databaseTarget, type PostgresDial } from "./postgres.ts";
+import {
+  BudgetedWebSocketSocket,
+  GatewayMemoryBudget,
+  DEFAULT_MEMORY_LIMIT_BYTES,
+  DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
+  type MemoryLease,
+} from "./frame-budget.ts";
 
 export const MAX_PAYLOAD_BYTES = 32 * 1024 * 1024;
 export const MAX_FRAME_BYTES = 64 * 1024;
 export const MAX_STARTUP_BUFFER_BYTES = 64 * 1024;
+export {
+  DEFAULT_MEMORY_LIMIT_BYTES,
+  DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
+} from "./frame-budget.ts";
 
 export interface GatewayOptions {
   readonly region: string;
@@ -28,6 +39,8 @@ export interface GatewayOptions {
   readonly dial: PostgresDial;
   readonly databaseLimit?: number;
   readonly totalLimit?: number;
+  readonly memoryLimitBytes?: number;
+  readonly databaseMemoryLimitBytes?: number;
   readonly replayCache?: ReplayCache;
   readonly heartbeatMs?: number;
   readonly drainMs?: number;
@@ -40,6 +53,8 @@ export interface Gateway {
   readonly metrics: {
     activeConnections: number;
     peakBufferedBytes: number;
+    readonly memoryBytes: number;
+    readonly peakMemoryBytes: number;
   };
   drain(): Promise<void>;
 }
@@ -59,6 +74,10 @@ export function createGateway(options: GatewayOptions): Gateway {
   ])
     if (!Number.isInteger(limit) || limit < 1)
       throw new RangeError("invalid gateway limits");
+  const memory = new GatewayMemoryBudget(
+    options.memoryLimitBytes ?? DEFAULT_MEMORY_LIMIT_BYTES,
+    options.databaseMemoryLimitBytes ?? DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
+  );
   const replay = options.replayCache ?? new ReplayCache();
   const log =
     options.log ??
@@ -67,7 +86,16 @@ export function createGateway(options: GatewayOptions): Gateway {
   const pending = new Set<AbortController>();
   const clients = new Set<WebSocket>();
   const sockets = new Set<Socket>();
-  const metrics = { activeConnections: 0, peakBufferedBytes: 0 };
+  const metrics = {
+    activeConnections: 0,
+    peakBufferedBytes: 0,
+    get memoryBytes() {
+      return memory.used;
+    },
+    get peakMemoryBytes() {
+      return memory.peak;
+    },
+  };
   let draining = false;
   let closing = false;
   let drainPromise: Promise<void> | undefined;
@@ -76,6 +104,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     noServer: true,
     maxPayload: MAX_PAYLOAD_BYTES,
     perMessageDeflate: false,
+    allowSynchronousEvents: true,
   });
   const server = createServer((request, response) => {
     const path = request.url?.split("?", 1)[0];
@@ -178,20 +207,30 @@ export function createGateway(options: GatewayOptions): Gateway {
       return;
     }
     let accepted = false;
+    const ingress = new BudgetedWebSocketSocket(
+      socket,
+      memory.owner(claims.db),
+      MAX_PAYLOAD_BYTES,
+      head,
+    );
     try {
-      websockets.handleUpgrade(request, socket, head, (client) => {
+      websockets.handleUpgrade(request, ingress, Buffer.alloc(0), (client) => {
         accepted = true;
         clients.add(client);
-        startup(client, socket, request, claims, release);
+        client.binaryType = "fragments";
+        startup(client, ingress, request, claims, release);
       });
     } finally {
-      if (!accepted) release();
+      if (!accepted) {
+        ingress.destroy();
+        release();
+      }
     }
   }
 
   function startup(
     client: WebSocket,
-    socket: Duplex,
+    socket: BudgetedWebSocketSocket,
     request: IncomingMessage,
     claims: RouteTokenClaims,
     release: () => void,
@@ -200,6 +239,8 @@ export function createGateway(options: GatewayOptions): Gateway {
     const reader = new StartupReader(MAX_STARTUP_BUFFER_BYTES);
     const started = Date.now();
     const queue: Buffer[] = [];
+    const startupMemory = socket.memory.lease();
+    const queueMemory = socket.memory.lease();
     let queuedBytes = 0;
     let bytesOut = 0;
     let connecting = false;
@@ -270,6 +311,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       closingDeadline.unref();
       if (client.readyState === WebSocket.OPEN)
         client.close(1011, "connection closed");
+      socket.closeAfterFlush();
     };
     const pong = () => {
       alive = true;
@@ -302,6 +344,10 @@ export function createGateway(options: GatewayOptions): Gateway {
           sqlstate: "08P01",
           message: "too much data before database connection",
         });
+        return false;
+      }
+      if (!queueMemory.grow(chunk.length * 2 + 256)) {
+        socket.rejectMemory();
         return false;
       }
       queuedBytes += chunk.length;
@@ -342,15 +388,18 @@ export function createGateway(options: GatewayOptions): Gateway {
         client.removeListener("error", clientError);
         client.removeListener("pong", pong);
         client.removeListener("message", message);
-        const initial = Buffer.concat(queue, queuedBytes);
-        queue.length = 0;
+        socket.removeListener("rejected", rejected);
+        startupMemory.release();
+        const initial = queue.splice(0);
         relay(
           client,
+          socket,
           postgres,
           claims.db,
           claims.cid,
           release,
           initial,
+          queueMemory,
           started,
           bytesOut,
         );
@@ -362,14 +411,26 @@ export function createGateway(options: GatewayOptions): Gateway {
       }
     };
     const message = (data: RawData, binary: boolean) => {
+      const lease = socket.takeMessage();
+      try {
+        if (finished || handedOff) return;
+        for (const chunk of toBuffers(data)) receive(chunk, binary);
+      } finally {
+        lease?.release();
+      }
+    };
+    const receive = (chunk: Buffer, binary: boolean) => {
       if (finished || handedOff) return;
       if (!binary) {
         close(1003, "text_frame");
         return;
       }
-      const chunk = toBuffer(data);
       if (connecting) {
         enqueue(chunk);
+        return;
+      }
+      if (!startupMemory.grow(chunk.length * 4 + 256)) {
+        socket.rejectMemory();
         return;
       }
       let event = reader.push(chunk);
@@ -409,6 +470,9 @@ export function createGateway(options: GatewayOptions): Gateway {
         return;
       }
     };
+    const rejected = (code: number) =>
+      close(code, code === 1013 ? "memory_limit" : "payload_limit");
+    socket.on("rejected", rejected);
     socket.once("close", disconnected);
     socket.once("end", disconnected);
     socket.once("error", disconnected);
@@ -425,11 +489,13 @@ export function createGateway(options: GatewayOptions): Gateway {
 
   function relay(
     client: WebSocket,
+    ingress: BudgetedWebSocketSocket,
     postgres: TLSSocket,
     database: string,
     connection: string,
     release: () => void,
-    initial: Buffer,
+    initial: readonly Buffer[],
+    initialMemory: MemoryLease,
     started: number,
     initialBytesOut: number,
   ): void {
@@ -479,29 +545,56 @@ export function createGateway(options: GatewayOptions): Gateway {
       postgres.destroy();
       if (client.readyState === WebSocket.OPEN)
         client.close(1011, "relay connection failed");
+      ingress.closeAfterFlush();
     });
     client.once("close", finish);
-    const forward = (chunk: Buffer) => {
-      if (postgres.destroyed || client.readyState !== WebSocket.OPEN) return;
-      if (postgres.writableLength + chunk.length > MAX_PAYLOAD_BYTES) {
+    ingress.on("rejected", (code: number) => {
+      outcome = code === 1013 ? "memory_limit" : "payload_limit";
+      postgres.destroy();
+      client.close(code, "relay buffer full");
+    });
+    const forward = (chunks: readonly Buffer[], lease?: MemoryLease) => {
+      if (postgres.destroyed || client.readyState !== WebSocket.OPEN) {
+        lease?.release();
+        return;
+      }
+      const length = chunks.reduce((total, chunk) => total + chunk.length, 0);
+      if (postgres.writableLength + length > MAX_PAYLOAD_BYTES) {
+        lease?.release();
         outcome = "backpressure_limit";
         postgres.destroy();
         client.close(1013, "relay buffer full");
         return;
       }
-      bytesIn += chunk.length;
+      if (chunks.length === 0) {
+        lease?.release();
+        return;
+      }
+      bytesIn += length;
       client.pause();
-      if (postgres.write(chunk)) client.resume();
+      let remaining = chunks.length;
+      for (const chunk of chunks) {
+        postgres.write(chunk, (error) => {
+          if (--remaining === 0) lease?.release();
+          if (error) {
+            outcome = "postgres_error";
+            client.terminate();
+          }
+        });
+      }
+      if (!postgres.writableNeedDrain) client.resume();
       buffered();
     };
     client.on("message", (data: RawData, binary: boolean) => {
+      const lease = ingress.takeMessage();
       if (!binary) {
+        lease?.release();
         outcome = "text_frame";
         postgres.destroy();
         client.close(1003, "binary frames required");
         return;
       }
-      forward(toBuffer(data));
+      forward(toBuffers(data), lease);
     });
     postgres.on("drain", () => {
       if (client.readyState === WebSocket.OPEN) client.resume();
@@ -518,10 +611,20 @@ export function createGateway(options: GatewayOptions): Gateway {
     });
     postgres.on("data", (chunk: Buffer) => {
       postgres.pause();
+      const lease = ingress.memory.lease();
+      if (!lease.grow(chunk.length * 2 + 256)) {
+        lease.release();
+        ingress.rejectMemory();
+        return;
+      }
       let offset = 0;
       const send = () => {
-        if (client.readyState !== WebSocket.OPEN || postgres.destroyed) return;
+        if (client.readyState !== WebSocket.OPEN || postgres.destroyed) {
+          lease.release();
+          return;
+        }
         if (offset === chunk.length) {
+          lease.release();
           postgres.resume();
           return;
         }
@@ -531,6 +634,7 @@ export function createGateway(options: GatewayOptions): Gateway {
         client.send(frame, { binary: true }, (error) => {
           if (error) {
             outcome = "websocket_error";
+            lease.release();
             postgres.destroy();
             client.terminate();
           } else send();
@@ -539,7 +643,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       };
       send();
     });
-    forward(initial);
+    forward(initial, initialMemory);
     postgres.resume();
   }
 
@@ -638,8 +742,8 @@ function rejectUpgrade(socket: Duplex, status: number): void {
   );
 }
 
-function toBuffer(data: RawData): Buffer {
-  if (Buffer.isBuffer(data)) return data;
-  if (Array.isArray(data)) return Buffer.concat(data);
-  return Buffer.from(data);
+function toBuffers(data: RawData): readonly Buffer[] {
+  if (Buffer.isBuffer(data)) return [data];
+  if (Array.isArray(data)) return data;
+  return [Buffer.from(data)];
 }
