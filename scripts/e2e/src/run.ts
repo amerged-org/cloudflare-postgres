@@ -55,6 +55,119 @@ import { faultCycleReady, preservedDatabase } from "./cycles.ts";
 import type { DatabaseProof } from "./cycles.ts";
 import { consumeExternalProbe } from "./external-probe.ts";
 
+const PROBE_ERROR_CODES = new Set([
+  "run_expired",
+  "unauthorized",
+  "method_not_allowed",
+  "invalid_trace_marker",
+  "not_found",
+  "worker_scan_unavailable",
+  "probe_failed",
+]);
+
+function failureCode(error: unknown): string {
+  return error instanceof HarnessError &&
+    /^[a-z][a-z0-9_]{0,79}$/.test(error.code)
+    ? error.code
+    : "acceptance_failed";
+}
+
+class ProbeFailure extends HarnessError {
+  readonly httpStatus: number;
+  readonly probeCode: string;
+  constructor(code: string, httpStatus: number, probeCode = "unknown") {
+    super(code);
+    this.httpStatus = httpStatus;
+    this.probeCode = probeCode;
+  }
+}
+
+interface CleanupReason {
+  stage: "tail" | "database" | "key" | "project" | "worker" | "chaos_inverse";
+  code: string;
+}
+
+class CleanupFailure extends HarnessError {
+  readonly failures: readonly CleanupReason[];
+  constructor(failures: readonly CleanupReason[], code = "cleanup_incomplete") {
+    super(code);
+    this.failures = failures;
+  }
+}
+
+class AcceptanceFailure extends HarnessError {
+  readonly stage: string;
+  readonly original: unknown;
+  readonly cleanup: unknown;
+  constructor(stage: string, original: unknown, cleanup?: unknown) {
+    super(failureCode(original));
+    this.stage = stage;
+    this.original = original;
+    this.cleanup = cleanup;
+  }
+}
+
+export function acceptanceDiagnostic(error: unknown): Record<string, unknown> {
+  const failure = error instanceof AcceptanceFailure ? error : undefined;
+  const original = failure ? failure.original : error;
+  return {
+    code: failureCode(error),
+    ...(failure ? { stage: failure.stage } : {}),
+    ...(original instanceof ProbeFailure
+      ? { http_status: original.httpStatus, probe_code: original.probeCode }
+      : {}),
+    ...(original instanceof HarnessError &&
+    original.code === "missing_environment"
+      ? { names: original.names }
+      : {}),
+    ...(failure?.cleanup !== undefined
+      ? {
+          cleanup: {
+            code: failureCode(failure.cleanup),
+            failure_count:
+              failure.cleanup instanceof CleanupFailure
+                ? failure.cleanup.failures.length
+                : 1,
+            ...(failure.cleanup instanceof CleanupFailure
+              ? { failures: failure.cleanup.failures.slice(0, 16) }
+              : {}),
+          },
+        }
+      : {}),
+    ...(error instanceof CleanupFailure
+      ? {
+          failure_count: error.failures.length,
+          failures: error.failures.slice(0, 16),
+        }
+      : {}),
+  };
+}
+
+async function probeErrorCode(reply: Response): Promise<string> {
+  const reader = reply.body?.getReader();
+  if (!reader) return "unknown";
+  const chunks: Uint8Array[] = [];
+  let length = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      length += value.byteLength;
+      if (length > 8192) return "unknown";
+      chunks.push(value);
+    }
+    const parsed = record(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    return typeof parsed.code === "string" && PROBE_ERROR_CODES.has(parsed.code)
+      ? parsed.code
+      : "unknown";
+  } catch {
+    return "unknown";
+  } finally {
+    await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+}
+
 export const REQUIRED_ENV = [
   "CLOUDFLARE_ACCOUNT_ID",
   "CLOUDFLARE_API_TOKEN",
@@ -1203,10 +1316,14 @@ export class Run {
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
     if (!reply.ok) {
-      const result = record(await reply.json());
-      if (result.code === "worker_scan_unavailable")
-        throw new HarnessError("supplemental_external_tcp_probe_required");
-      throw new HarnessError("probe_request_failed");
+      const code = await probeErrorCode(reply);
+      throw new ProbeFailure(
+        code === "worker_scan_unavailable"
+          ? "supplemental_external_tcp_probe_required"
+          : "probe_request_failed",
+        reply.status,
+        code,
+      );
     }
     return record(await reply.json());
   }
@@ -1919,13 +2036,16 @@ export class Run {
     await this.verifyIdentity(false);
     await this.assertCluster();
     await this.recoverOwnership();
-    const failures: string[] = [];
+    const failures: CleanupReason[] = [];
     // The real agent must use the real API before any database deletion is requested.
     try {
       await this.restoreChaos();
-    } catch {
+    } catch (error) {
       await this.emit("cleanup", { failure_count: 1 }, {}, false);
-      throw new HarnessError("chaos_inverse_required");
+      throw new CleanupFailure(
+        [{ stage: "chaos_inverse", code: failureCode(error) }],
+        "chaos_inverse_required",
+      );
     }
     for (const tail of this.state.tails) {
       try {
@@ -1940,14 +2060,14 @@ export class Run {
             "DELETE",
           );
         }
-      } catch {
-        failures.push("tail");
+      } catch (error) {
+        failures.push({ stage: "tail", code: failureCode(error) });
       }
     }
     try {
       await this.deleteDatabase();
-    } catch {
-      failures.push("database");
+    } catch (error) {
+      failures.push({ stage: "database", code: failureCode(error) });
     }
     try {
       const keys = (await this.api.list("/v1/api-keys")).filter(
@@ -1966,10 +2086,13 @@ export class Run {
           `${this.state.run_id}-revoke-${string(key.id)}`,
         );
       }
-    } catch {
-      failures.push("key");
+    } catch (error) {
+      failures.push({ stage: "key", code: failureCode(error) });
     }
-    if (!failures.includes("database") && this.state.project_id) {
+    if (
+      !failures.some((failure) => failure.stage === "database") &&
+      this.state.project_id
+    ) {
       try {
         const project = Project.parse(
           await this.api.request(`/v1/projects/${this.state.project_id}`),
@@ -1984,8 +2107,8 @@ export class Run {
           undefined,
           `${this.state.run_id}-project-delete`,
         );
-      } catch {
-        failures.push("project");
+      } catch (error) {
+        failures.push({ stage: "project", code: failureCode(error) });
       }
     }
     try {
@@ -2005,8 +2128,8 @@ export class Run {
         await this.intent("worker_delete");
         await this.cf.request(`/workers/scripts/${this.runName}`, "DELETE");
       }
-    } catch {
-      failures.push("worker");
+    } catch (error) {
+      failures.push({ stage: "worker", code: failureCode(error) });
     }
     await this.emit(
       "cleanup",
@@ -2014,7 +2137,7 @@ export class Run {
       {},
       failures.length === 0,
     );
-    if (failures.length) throw new HarnessError("cleanup_incomplete");
+    if (failures.length) throw new CleanupFailure(failures);
     await this.complete("cleanup");
   }
 }
@@ -2176,6 +2299,10 @@ export async function main(
     throw new HarnessError("run_already_cleaned");
   const addressIndex = value("--scan-address-index");
   let preserve = false;
+  let failed = false;
+  let originalFailure: unknown;
+  let cleanupFailed = false;
+  let cleanupFailure: unknown;
   try {
     if (!step || step === "E0") {
       await run.preflight();
@@ -2203,15 +2330,30 @@ export async function main(
       await run.archiveFailure(step.endsWith("start") ? "start" : "check");
     preserve ||= !!step && step !== "E6";
   } catch (error) {
+    failed = true;
+    originalFailure = error;
     if (
       error instanceof HarnessError &&
       error.code === "archive_failure_wait_pending"
     )
       preserve = true;
-    throw error;
   } finally {
-    if (!preserve && state.intents.length) await run.cleanup();
+    if (!preserve && state.intents.length) {
+      try {
+        await run.cleanup();
+      } catch (cleanupError) {
+        cleanupFailed = true;
+        cleanupFailure = cleanupError;
+      }
+    }
   }
+  if (cleanupFailed)
+    throw new AcceptanceFailure(
+      step,
+      failed ? originalFailure : cleanupFailure,
+      cleanupFailure,
+    );
+  if (failed) throw new AcceptanceFailure(step, originalFailure);
 }
 
 if (
@@ -2219,15 +2361,7 @@ if (
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
   main().catch((error: unknown) => {
-    console.error(
-      JSON.stringify({
-        code: error instanceof HarnessError ? error.code : "acceptance_failed",
-        ...(error instanceof HarnessError &&
-        error.code === "missing_environment"
-          ? { names: error.names }
-          : {}),
-      }),
-    );
+    console.error(JSON.stringify(acceptanceDiagnostic(error)));
     process.exitCode = 1;
   });
 }
