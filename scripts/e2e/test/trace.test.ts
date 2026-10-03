@@ -150,6 +150,38 @@ test("trace matches the request header marker in a binary provider frame", async
   }
 });
 
+test("trace accepts provider UTC seconds and records canonical milliseconds", async () => {
+  const fixtureValue = fixture();
+  fixtureValue.tail.expires_at =
+    fixtureValue.tail.expires_at.slice(0, 19) + "Z";
+  const canonical = fixtureValue.tail.expires_at.slice(0, 19) + ".000Z";
+  const socket = installSocket();
+  const matching = event({ headers: { "x-pgcf-trace": fixtureValue.marker } });
+  let ownedExpiry: string | undefined;
+  try {
+    const messages = await capture(
+      fixtureValue.client,
+      worker,
+      fixtureValue.marker,
+      async () => {
+        socket.sockets[0]!.emit(matching);
+      },
+      async (tail) => {
+        assert.equal(tail.id, fixtureValue.tail.id);
+        ownedExpiry = tail.expires_at;
+      },
+    );
+    assert.equal(ownedExpiry, canonical);
+    assert.deepEqual(messages, [matching]);
+    assert.equal(socket.sockets[0]!.readyState, 3);
+    assert.deepEqual(fixtureValue.deletes, [
+      `/workers/scripts/${worker}/tails/${fixtureValue.tail.id}`,
+    ]);
+  } finally {
+    socket.restore();
+  }
+});
+
 test("trace deletes the real tail when its ownership callback rejects", async () => {
   const fixtureValue = fixture();
   const socket = installSocket();
@@ -223,11 +255,11 @@ test("trace rejects expired provider expiry and still deletes the real tail", as
   }
 });
 
-test("trace rejects noncanonical provider expiry and still deletes the real tail", async () => {
+test("trace rejects impossible provider expiry and still deletes the real tail", async () => {
   const fixtureValue = fixture();
   const socket = installSocket();
-  fixtureValue.tail.expires_at =
-    fixtureValue.tail.expires_at.slice(0, 19) + "Z";
+  const year = new Date(fixtureValue.tail.expires_at).getUTCFullYear() + 1;
+  fixtureValue.tail.expires_at = `${year}-02-30T12:00:00Z`;
   try {
     await assert.rejects(
       capture(
@@ -241,6 +273,94 @@ test("trace rejects noncanonical provider expiry and still deletes the real tail
     );
     assert.equal(socket.sockets.length, 0);
     assert.equal(fixtureValue.deletes.length, 1);
+  } finally {
+    socket.restore();
+  }
+});
+
+test("trace rejects expired UTC seconds before ownership and still deletes the tail", async () => {
+  const fixtureValue = fixture();
+  fixtureValue.tail.expires_at =
+    new Date(Date.now() - 60_000).toISOString().slice(0, 19) + "Z";
+  const socket = installSocket();
+  let owned = false;
+  try {
+    await assert.rejects(
+      capture(
+        fixtureValue.client,
+        worker,
+        fixtureValue.marker,
+        async () => {},
+        async () => {
+          owned = true;
+        },
+      ),
+      { message: "invalid_tail_expiry" },
+    );
+    assert.equal(owned, false);
+    assert.equal(socket.sockets.length, 0);
+    assert.deepEqual(fixtureValue.deletes, [
+      `/workers/scripts/${worker}/tails/${fixtureValue.tail.id}`,
+    ]);
+  } finally {
+    socket.restore();
+  }
+});
+
+test("trace rejects UTC offsets before ownership and still deletes the tail", async () => {
+  const fixtureValue = fixture();
+  fixtureValue.tail.expires_at = fixtureValue.tail.expires_at.replace(
+    /Z$/,
+    "+00:00",
+  );
+  const socket = installSocket();
+  let owned = false;
+  try {
+    await assert.rejects(
+      capture(
+        fixtureValue.client,
+        worker,
+        fixtureValue.marker,
+        async () => {},
+        async () => {
+          owned = true;
+        },
+      ),
+      { message: "invalid_tail_expiry" },
+    );
+    assert.equal(owned, false);
+    assert.equal(socket.sockets.length, 0);
+    assert.deepEqual(fixtureValue.deletes, [
+      `/workers/scripts/${worker}/tails/${fixtureValue.tail.id}`,
+    ]);
+  } finally {
+    socket.restore();
+  }
+});
+
+test("trace rejects malformed expiry text before ownership and still deletes the tail", async () => {
+  const fixtureValue = fixture();
+  fixtureValue.tail.expires_at = " " + fixtureValue.tail.expires_at;
+  const socket = installSocket();
+  let owned = false;
+  try {
+    await assert.rejects(
+      capture(
+        fixtureValue.client,
+        worker,
+        fixtureValue.marker,
+        async () => {},
+        async () => {
+          owned = true;
+        },
+      ),
+      { message: "invalid_tail_expiry" },
+    );
+    assert.equal(owned, false);
+    assert.equal(socket.sockets.length, 0);
+    assert.deepEqual(fixtureValue.deletes, [
+      `/workers/scripts/${worker}/tails/${fixtureValue.tail.id}`,
+    ]);
   } finally {
     socket.restore();
   }

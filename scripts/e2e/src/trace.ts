@@ -70,15 +70,23 @@ export async function captureTrace(
   const id = string(tail.id);
   try {
     const expiresAt = tail.expires_at;
-    const expiry = typeof expiresAt === "string" ? Date.parse(expiresAt) : NaN;
+    const normalizedExpiresAt =
+      typeof expiresAt === "string" &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(expiresAt)
+        ? expiresAt.slice(0, -1) + ".000Z"
+        : expiresAt;
+    const expiry =
+      typeof normalizedExpiresAt === "string"
+        ? Date.parse(normalizedExpiresAt)
+        : NaN;
     if (
-      typeof expiresAt !== "string" ||
+      typeof normalizedExpiresAt !== "string" ||
       !Number.isFinite(expiry) ||
       expiry <= Date.now() ||
-      new Date(expiry).toISOString() !== expiresAt
+      new Date(expiry).toISOString() !== normalizedExpiresAt
     )
       throw new HarnessError("invalid_tail_expiry");
-    await owned({ id, expires_at: expiresAt });
+    await owned({ id, expires_at: normalizedExpiresAt });
     let url: URL;
     try {
       url = new URL(string(tail.url));
