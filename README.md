@@ -18,28 +18,22 @@ loss is recovered from R2.
 
 ## Status
 
-**Phase 0 live accepted; full database path pending (2026-10-03).** The first EU node and all
-five Flux platform releases are `Ready`. Authoritative storage cycles completed, and a fresh
-identity-bound capture took 112.09 s. Capture and publication took 114.132 s in total, with 95 GiB
-published. CI run `37120159676` for `0846597` passed; the
-regional agent and gateway pin the published image digest recorded in [PLAN.md](PLAN.md#11-status).
-Image signing remains pending.
+**Phase 0 accepted; Phase 1 live acceptance in progress (2026-10-03).** The first EU node and
+all five Flux releases are Ready, with 95 GiB storage. The complete Dev connection path through
+`db.ohmyho.st` reaches real PostgreSQL with verified TLS, WAL archiving and an R2 base backup.
 
-Phase 1 services and native WebSocket forwarding are implemented. Against real PostgreSQL,
-100 MiB and 1 GiB COPY and SELECT wire-hash checks passed with unchanged 192 MiB local memory
-guards. The original default Neon decoded-binary result assertions still fail because of upstream
-parsing. Dev decommission and independent re-inventory completed with all 174 foreign resources
-unchanged; first-EU operator access and foreign IPv4/IPv6 refusal checks passed.
+Real Dev checks passed transactions, rollback, 50 concurrent connections, 100 MiB and 1 GiB
+stream integrity, slow reception, disconnect cleanup and 600 seconds idle without reconnect.
+These results are not sustained throughput or 1,000-customer capacity claims. Strong
+binary-result client assertions remain failed, including on direct TCP with node-postgres 8.22.
+The raw transport checks pass.
 
-The full S1 transport spike passed DNS, TLS, HTTP, WebSocket `101`, text and 1 MiB binary checks,
-plus 600,011 ms idle with 24 ping/pong exchanges; the complete run took 603.438 s. Reviewed clock
-and domain-ID guard corrections are applied. Scoped rollback completed and confirmed the spike
-Worker, custom domain and DNS absent, with the existing universal certificate untouched.
-Phase 0 passed all five real Dev checks after temporary worktree and rebuild-probe cleanup.
-The Dev management API is deployed with its fresh D1 schema; health, authentication, once-only
-admin creation and size-class readback passed. Transport and Phase 1's E0–E6 complete database chain
-remain pending; Phase 2 has not begun. The second EU node is untouched, the US node has not been bought and no production
-writes occurred. See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
+Formal E0 and E1 passed. E2 failed and exposed an empty HTTP-body handling defect during
+cleanup; the correction and diagnostic improvements await deployment. E2–E6, restart cycles,
+RPO and restore proof, and the adopter Workers client remain required. Phase 2 has not begun;
+the second EU node is untouched, the US node has not been bought, and existing production
+routes and databases have not changed. Image signing remains pending.
+See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture
 

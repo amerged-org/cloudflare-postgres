@@ -1,33 +1,34 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-03): **Phase 0 live accepted; full database path pending.** The first EU node is
-rebuilt and `Ready`, with all five Flux platform releases `Ready`. Authoritative storage
-measurement and publication cycles completed; a fresh identity-bound capture took 112.09 s.
-Capture and publication took 114.132 s in total, with 95 GiB published. CI run `37120159676` for
-`0846597` passed. The regional agent and gateway pin the
-published image digest `sha256:93ad150c4d807cac81f865c9e2f1f6a2cd83eeeaf2ffd4e977a26635549ee8a6`;
-image signing remains pending.
+Status (2026-10-03): **Phase 0 accepted; Phase 1 live acceptance in progress.** The first EU node
+and all five Flux platform releases are Ready, with 95 GiB measured and published storage.
+The Dev management API, fresh D1, region, agent, tunnel, VPC HTTP service and single endpoint
+`db.ohmyho.st` are deployed. PostgreSQL is reachable through the complete connection chain with
+verified gateway-to-PostgreSQL TLS. The provider quantity-normalization defect is fixed and the
+first database reports Ready with continuous WAL archiving and a completed R2 base backup.
 
-Phase 1 services and the approved native WebSocket path are implemented. Local PostgreSQL stream
-wire checks passed; the original default decoded-binary client assertions still fail. Dev
-decommission and independent re-inventory completed, and first-EU operator access plus mandatory
-foreign IPv4 and IPv6 refusal checks passed. The full S1 transport spike passed DNS, TLS, HTTP,
-WebSocket `101`, text and 1 MiB binary checks, plus 600,011 ms idle with 24 ping/pong exchanges;
-the complete run took 603.438 s. Reviewed clock and domain-ID guard corrections are applied.
-Scoped rollback completed and confirmed the spike Worker, custom domain and DNS absent, with
-the existing universal certificate untouched.
+The regional agent and gateway run the qualified immutable image
+`sha256:eb90f09f9b9c6cb25be7e1956b955a9bff4c818ec08f82bea10f7b2cca9c9296`
+from source `490a822`. Full image qualification scanned all 657,457,671 expected bytes;
+all 26 reviewed upstream noncredentials resolved, with zero unresolved findings. CI runs
+`37139678694` and `37144897211` passed. Image signing remains pending.
 
-Phase 0 passed the real Dev harness: layout, Git topology, Cloudflare inventory, node readiness
-and all five platform releases. The rebuild probe is removed, with all 174 foreign resources
-unchanged. The Dev management API is deployed against a fresh D1 schema; health, authentication,
-once-only admin creation and size-class readback passed. Phase 1's E0–E6 complete database chain
-has not passed live acceptance, and Phase 2 has not begun. The Dev region is registered and its
-agent reports one ready, schedulable node. The first API-created PostgreSQL Cluster is Ready with
-continuous WAL archiving and a completed base backup in R2. Management readiness is still blocked
-by the observed `1Gi` versus `1024Mi` comparison; the fix and the scale/isolation changes below
-are implemented and awaiting the final review and Dev deployment. The second EU node is untouched, the US
-node has not been bought, and no production writes have occurred.
-The owner has requested delivery through Phase 5 and full Neon replacement.
+Real Dev transport checks passed 50 concurrent connections, transactions and rollback, negative
+SCRAM cases, 100 MiB and 1 GiB COPY/SELECT integrity, slow reception, disconnect cleanup and
+600,002 ms continuous idle without reconnect. Across 1,000 paired SELECT measurements, direct
+p95 was 29.093 ms and WebSocket p95 35.541 ms. These measurements establish neither sustained
+maximum SQL throughput nor capacity for 1,000 customers. Strong decoded-binary client assertions
+remain failed and unchanged; the same failure was reproduced over direct verified TCP with
+node-postgres 8.22. The raw stream integrity checks pass.
+
+Formal E0 and E1 passed; the E1 database was ready in 24,942 ms. E2 then failed, and its cleanup
+exposed a real API defect: an empty HTTP DELETE stream was parsed as malformed JSON. The
+reproducing tests and correction are implemented; corrected Dev deployment and complete cleanup
+remain pending. E2–E6, agent-restart cycles, RPO measurement, a separate R2 restore drill and the
+actual adopter Workers client proof are still required before Phase 1 acceptance. Phase 2 has
+not begun. The second EU node is untouched, the US node has not been bought, and existing
+production routes and databases have not changed. The owner has requested delivery through
+Phase 5 and full Neon replacement.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
 AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.
@@ -188,6 +189,38 @@ reservation. Each database reserves:
 
 Placement picks the node with the most free memory in the region that fits. Contabo contracts are
 monthly, so scale-in only cancels at the end of a term, and autoscaling uses hysteresis.
+
+### Scaling and adopter connection capacity
+
+The public data plane keeps one hostname. Regional routing and additional nodes provide
+horizontal capacity behind it; extra public hostnames are not required for Worker throughput.
+[Workers limits](https://developers.cloudflare.com/workers/platform/limits/) specify no general
+requests-per-second cap. A new connection needs D1 admission and routing; SQL on an admitted
+stream does not query D1. Measure connection creation separately from SQL requests and respect
+[D1 throughput limits](https://developers.cloudflare.com/d1/platform/limits/).
+
+Admission keys combine database, role and normalized source network; a separate database-wide
+counter bounds aggregate handshakes. A shared source address from cross-zone Workers never
+creates one installation-wide connection bucket. The current Dev starting limits are 6,000
+handshakes/minute for each combined key and 12,000/minute per database. They are configuration,
+not a measured service throughput. The gateway budgets 192 MiB aggregate and 96 MiB per database,
+including fragmented and control traffic, with 16 MiB reserved for healthy traffic. The settings
+are `PGCF_GATEWAY_MEMORY_BYTES` and `PGCF_GATEWAY_DATABASE_MEMORY_BYTES`.
+
+Source inspection found that the current adopter uses node-postgres 8.22 and persistent Durable
+Object pools: query maximum 1, transaction maximum 2 and authentication maximum 2 per physical
+environment, with a bounded waiting queue. Requests reuse these pools. PGCF currently provides
+session forwarding; it has no transaction pooler. The Workers-compatible replacement must prove
+pool reuse, backend counts, identity isolation and actual application compatibility before the
+adapter changes. A Node-only custom stream passed the actual Dev text, preparation, transaction
+and reuse checks, but it is not a Workers-compatible client.
+
+The initial density decision must follow measured active-memory and storage capacity. An adopter
+goal of 1,000 customers is not an assertion that the three initial VPS can host 1,000 simultaneously
+active databases. A read-only Neon metadata capture found 25 adopter projects, 26 branches,
+23 projects on PostgreSQL 17 and two on 18. The queried default-branch databases total
+489,480,192 bytes; extensions include `plpgsql`, `pgcrypto` and `btree_gist`. Full migration
+inventory, connection rates and downtime measurements remain pending.
 
 ## 4. Data model and API v1
 
@@ -502,7 +535,7 @@ the docs.
 
 ### Later
 
-Extend backup and replication later so a server loss cannot lose acknowledged writes.
+Später Backup und Replikation so erweitern, dass bei Serververlust keine bestätigten Daten verloren gehen.
 Relocation of sleeping databases, branching, other VPS providers, an HTTP SQL endpoint, PostgREST,
 a Studio workbench.
 
@@ -676,3 +709,6 @@ Entries are chronological; later results supersede earlier pending work.
 | 2026-10-03 | 1 transport / agent | The ordered capability probe reached the private gateway over VPC TCP with a validated raw HTTP 101 handshake, but its Socket exposed streams rather than the required native WebSocket. VPC HTTP service fetch passed actual 101, unopened forwarding, gateway SSLRequest response and safe cancellation/closure; the repeated native round trip took 235 ms. This configures the Dev HTTP-service candidate; full SQL S2 and E0–E6 remain pending. Region creation returned 201 once; its derived key matched the preliminary gateway. The agent connected and reported one ready, schedulable node with 6,799 MiB allocatable memory, 3,000 millicores, 1,878 MiB platform memory reservation and 95 GiB storage. |
 | 2026-10-03 | 1 database / archive | The first real Dev database request returned 202. CloudNativePG reports Initialized, Ready, ContinuousArchiving and LastBackupSucceeded True, one Ready PostgreSQL Pod, one completed base backup and a Bound PVC. Management remains provisioning because the agent compares provider-normalized `1Gi` with desired `1024Mi` as literal strings. The real response reproduced the bug; a narrowly scoped quantity comparison is implemented, tested and awaiting deployment. No successful SQL connection, RPO, restore drill or complete phase acceptance is claimed. |
 | 2026-10-03 | 1 scale / safety | Shared-network connection admission now keys by database, role and normalized network, with a separate configurable database-wide counter. It counts new handshakes, not SQL queries on existing sessions. The gateway adds 192 MiB aggregate and 96 MiB per-database memory budgets before frame assembly, including fragmented and control traffic, with healthy-traffic headroom. A local real-WebSocket/TLS-echo attack trial measured 193,675,264 bytes baseline RSS and 360,513,536 bytes peak against the existing 536,870,912-byte Pod limit; 50 healthy relays remained usable. These are local transport figures, not SQL throughput or Dev acceptance. Control-queue fairness, stale Cluster/Secret writes and missing-namespace recreation each have reproducible failed tests and tested fixes; the combined final candidate remains under review. |
+| 2026-10-03 | 1 live path | The Dev API, D1, region, agent, tunnel, VPC HTTP service and `db.ohmyho.st` endpoint are connected. Verified PostgreSQL TLS, real SELECT, transaction and rollback passed. The normalized resource-quantity fix and reviewed namespace/credential/memory protections are deployed in qualified regional image `sha256:eb90f09f9b9c6cb25be7e1956b955a9bff4c818ec08f82bea10f7b2cca9c9296`. Encrypted recovery copies of once-issued admin, agent and integrator credentials plus configuration are verified outside Git; this is local recovery storage, not an air-gapped copy. |
+| 2026-10-03 | 1 S2 measurements | 50 simultaneous connections and queries completed in 86.439 ms; this is a burst, not sustained RPS. Across 1,000 paired SELECT measurements, direct p95 was 29.093 ms and WebSocket p95 35.541 ms, a 6.448 ms difference. Real 100 MiB and 1 GiB COPY/SELECT checksums match direct PostgreSQL; backend removal after disconnect took 70.645 ms. A 1 GiB slow-reader run paused 1,024 times for 103.804 s; client memory growth was 999,424 bytes. Twenty-eight captures made while the child was active measured combined gateway-associated Talos CRI MEMORY(MB) between 158.05 and 165.46; this metric is not asserted to be RSS. Idle held 600,002 ms with no reconnect and a successful subsequent query. Workers client execution and remaining live safety checks remain pending. |
+| 2026-10-03 | 1 E0–E2 | E0 passed real account, cluster, credential and image checks in 7.185 s. E1 passed in 58.738 s, with PostgreSQL ready in 24,942 ms. E2 failed and cleanup remained incomplete: bodyless DELETE arrived as a non-null empty stream and returned 400 before mutation. The API defect and original-error masking both have reproducing failed tests and corrections under review. The failed run is not accepted; complete cleanup and a fresh formal run are required. Phase 2 has not begun. |
