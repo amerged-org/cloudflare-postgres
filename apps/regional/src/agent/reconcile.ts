@@ -5,6 +5,7 @@ import type {
   DesiredDatabase,
   K8sObject,
 } from "@pgcf/contracts";
+import { ARCHIVE_DESTINATION_PATTERN } from "@pgcf/contracts";
 import {
   buildCaConfigMap,
   buildDatabaseManifests,
@@ -42,8 +43,15 @@ interface DeleteState {
   volumes: VolumeIdentity[];
   completed: boolean;
 }
+interface StorageState {
+  namespaceUid: string | null;
+  clusterUid: string | null;
+  node: string;
+  archivePath: string;
+}
 
 const LEDGER_PREFIX = "delete-";
+const STORAGE_PREFIX = "storage-";
 const SYSTEM_NAMESPACE = "pgcf-system";
 const DELETE_TIMEOUT_MS = 10 * 60_000;
 
@@ -123,6 +131,56 @@ function stateFromLedger(ledger: Resource): DeleteState {
   }
 }
 
+function stateFromStorage(fence: Resource): StorageState {
+  try {
+    const state = record(JSON.parse(string(record(fence.data).state) ?? ""));
+    const identity = (value: unknown) =>
+      value === null ||
+      (typeof value === "string" && value.length > 0 && value.length <= 253);
+    if (
+      !identity(state.namespaceUid) ||
+      !identity(state.clusterUid) ||
+      (state.namespaceUid === null && state.clusterUid !== null) ||
+      typeof state.node !== "string" ||
+      state.node.length === 0 ||
+      state.node.length > 253 ||
+      typeof state.archivePath !== "string" ||
+      !ARCHIVE_DESTINATION_PATTERN.test(state.archivePath)
+    )
+      throw new Error();
+    return state as unknown as StorageState;
+  } catch {
+    throw new Error("storage_fence_invalid");
+  }
+}
+
+function pendingCreation(db: DesiredDatabase): boolean {
+  const creation = db.creation;
+  const archive = ARCHIVE_DESTINATION_PATTERN.exec(db.archive.destination_path);
+  return Boolean(
+    creation &&
+    !creation.ever_ready &&
+    ["pending", "running"].includes(creation.status) &&
+    creation.generation === 1 &&
+    archive?.[3] === db.id &&
+    archive[4] === "1" &&
+    archive[5] === creation.operation_id,
+  );
+}
+
+function recoveryRequired(
+  db: DesiredDatabase,
+  reason: string,
+): DatabaseObservation {
+  return {
+    id: db.id,
+    generation: db.generation,
+    state: "error",
+    message: `${reason}; recovery required`,
+    archive: { continuous: false, ready_wal_files: null },
+  };
+}
+
 export async function backupCredentials(
   k8s: Kubernetes,
 ): Promise<BuildContext["backup"]["credentials"]> {
@@ -193,20 +251,103 @@ export class Reconciler {
       `${LEDGER_PREFIX}${db.id}`,
     );
     if (ledger) assertOwned(ledger, db.id, `${LEDGER_PREFIX}${db.id}`);
+    let fence = await this.k8s.read(
+      "ConfigMap",
+      SYSTEM_NAMESPACE,
+      `${STORAGE_PREFIX}${db.id}`,
+    );
+    if (fence) assertOwned(fence, db.id, `${STORAGE_PREFIX}${db.id}`);
     const applied = Math.max(
       appliedGeneration(namespace),
       acceptedGeneration(namespace),
       appliedGeneration(ledger),
+      appliedGeneration(fence),
       this.highWater.get(db.id) ?? 0,
     );
     if (db.generation < applied) return null;
     this.highWater.set(db.id, db.generation);
-    if (db.desired_state === "deleted")
-      return this.delete(db, namespace, ledger);
+    let storage: StorageState | undefined;
+    try {
+      storage = fence ? stateFromStorage(fence) : undefined;
+    } catch {
+      return recoveryRequired(db, "storage history is invalid");
+    }
+    if (db.desired_state === "deleted") {
+      if (
+        namespace &&
+        storage?.namespaceUid &&
+        uid(namespace) !== storage.namespaceUid
+      )
+        throw new Error("delete_namespace_identity_changed");
+      return this.delete(db, namespace, ledger, fence);
+    }
     if (!ctx) throw new Error("build_context_required");
     if (ledger) throw new Error("database_deletion_irreversible");
     if (namespace?.metadata.deletionTimestamp)
       throw new Error("database_namespace_deleting");
+
+    if (
+      storage &&
+      (storage.node !== db.node ||
+        storage.archivePath !== db.archive.destination_path)
+    )
+      return recoveryRequired(
+        db,
+        "storage placement or archive identity changed",
+      );
+    if (
+      namespace &&
+      storage?.namespaceUid &&
+      uid(namespace) !== storage.namespaceUid
+    )
+      return recoveryRequired(db, "database namespace identity changed");
+    if (storage && fence && appliedGeneration(fence) < db.generation)
+      fence = await this.saveStorage(db, storage, fence);
+    if (!namespace) {
+      if (storage?.namespaceUid)
+        return recoveryRequired(db, "database namespace is missing");
+      if (!pendingCreation(db) || db.generation !== db.creation?.generation)
+        return recoveryRequired(
+          db,
+          "missing namespace has no initial CREATE authority",
+        );
+      const [ca, volumes] = await Promise.all([
+        this.k8s.read("ConfigMap", SYSTEM_NAMESPACE, `ca-${db.id}`),
+        this.k8s.list("PersistentVolume"),
+      ]);
+      if (
+        ca ||
+        volumes.some(
+          (volume) =>
+            record(record(volume.spec).claimRef).namespace === namespaceName,
+        )
+      )
+        return recoveryRequired(
+          db,
+          "missing namespace has prior storage evidence",
+        );
+    }
+    const priorCluster = namespace
+      ? await this.k8s.read("Cluster", namespaceName, "database")
+      : null;
+    if (priorCluster) assertOwned(priorCluster, db.id, "database");
+    if (
+      priorCluster &&
+      storage?.clusterUid &&
+      uid(priorCluster) !== storage.clusterUid
+    )
+      return recoveryRequired(db, "database cluster identity changed");
+    if (!priorCluster && (storage?.clusterUid || !pendingCreation(db)))
+      return recoveryRequired(db, "database cluster is missing");
+    storage = storage ?? {
+      namespaceUid: null,
+      clusterUid: null,
+      node: db.node,
+      archivePath: db.archive.destination_path,
+    };
+    if (namespace) storage.namespaceUid = uid(namespace);
+    if (priorCluster) storage.clusterUid = uid(priorCluster);
+    fence = await this.saveStorage(db, storage, fence);
 
     if (db.generation > appliedGeneration(namespace)) {
       const manifests = buildDatabaseManifests(db, ctx);
@@ -227,14 +368,44 @@ export class Reconciler {
         .update(JSON.stringify(manifests))
         .digest("hex");
       if (this.hashes.get(db.id) !== hash) {
-        await this.k8s.apply(first);
+        if (namespace) {
+          if (!namespace.metadata.resourceVersion)
+            throw new Error("database_namespace_version_missing");
+          await this.k8s.patch("Namespace", undefined, namespaceName, [
+            { op: "test", path: "/metadata/uid", value: uid(namespace) },
+            {
+              op: "test",
+              path: "/metadata/resourceVersion",
+              value: namespace.metadata.resourceVersion,
+            },
+            {
+              op: "add",
+              path: "/metadata/annotations",
+              value: first.metadata.annotations,
+            },
+            {
+              op: "add",
+              path: "/metadata/labels",
+              value: { ...namespace.metadata.labels, ...first.metadata.labels },
+            },
+          ]);
+        } else await this.k8s.create(first);
         const active = await this.k8s.read(
           "Namespace",
           undefined,
           namespaceName,
         );
-        if (!active || record(active.status).phase !== "Active") return null;
+        if (!active)
+          return recoveryRequired(
+            db,
+            "database namespace disappeared during creation",
+          );
         assertOwned(active, db.id, namespaceName);
+        if (storage.namespaceUid && uid(active) !== storage.namespaceUid)
+          return recoveryRequired(db, "database namespace identity changed");
+        storage.namespaceUid = uid(active);
+        fence = await this.saveStorage(db, storage, fence);
+        if (record(active.status).phase !== "Active") return null;
         if (acceptedGeneration(active) !== db.generation) return null;
         if (active.metadata.deletionTimestamp)
           throw new Error("database_namespace_deleting");
@@ -244,7 +415,58 @@ export class Reconciler {
             manifest.metadata.labels?.[DATABASE_LABEL] !== db.id
           )
             throw new Error("builder_resource_scope_invalid");
-          await this.k8s.apply(manifest);
+          if (manifest.kind === "Cluster") {
+            const currentCluster = await this.k8s.read(
+              "Cluster",
+              namespaceName,
+              "database",
+            );
+            if (currentCluster) {
+              assertOwned(currentCluster, db.id, "database");
+              if (
+                storage.clusterUid &&
+                uid(currentCluster) !== storage.clusterUid
+              )
+                return recoveryRequired(
+                  db,
+                  "database cluster identity changed",
+                );
+              storage.clusterUid = uid(currentCluster);
+              fence = await this.saveStorage(db, storage, fence);
+              await this.k8s.patch("Cluster", namespaceName, "database", [
+                {
+                  op: "test",
+                  path: "/metadata/uid",
+                  value: uid(currentCluster),
+                },
+                {
+                  op: "add",
+                  path: "/spec",
+                  value: {
+                    ...record(currentCluster.spec),
+                    ...record(manifest.spec),
+                  },
+                },
+              ]);
+            } else {
+              if (storage.clusterUid || !pendingCreation(db))
+                return recoveryRequired(db, "database cluster is missing");
+              await this.k8s.create(manifest);
+              const created = await this.k8s.read(
+                "Cluster",
+                namespaceName,
+                "database",
+              );
+              if (!created)
+                return recoveryRequired(
+                  db,
+                  "database cluster disappeared during creation",
+                );
+              assertOwned(created, db.id, "database");
+              storage.clusterUid = uid(created);
+              fence = await this.saveStorage(db, storage, fence);
+            }
+          } else await this.k8s.apply(manifest);
         }
         this.hashes.set(db.id, hash);
       }
@@ -253,8 +475,11 @@ export class Reconciler {
         undefined,
         namespaceName,
       );
-      if (!current) throw new Error("database_namespace_missing");
+      if (!current)
+        return recoveryRequired(db, "database namespace is missing");
       assertOwned(current, db.id, namespaceName);
+      if (uid(current) !== storage.namespaceUid)
+        return recoveryRequired(db, "database namespace identity changed");
       if (
         appliedGeneration(current) > db.generation ||
         acceptedGeneration(current) !== db.generation
@@ -279,13 +504,10 @@ export class Reconciler {
     }
     // Equal revisions still observe asynchronous CNPG readiness, archiving and CA publication.
     const cluster = await this.k8s.read("Cluster", namespaceName, "database");
-    if (!cluster)
-      return {
-        id: db.id,
-        generation: db.generation,
-        state: "provisioning",
-        archive: { continuous: false, ready_wal_files: null },
-      };
+    if (!cluster) return recoveryRequired(db, "database cluster is missing");
+    assertOwned(cluster, db.id, "database");
+    if (uid(cluster) !== storage.clusterUid)
+      return recoveryRequired(db, "database cluster identity changed");
     let count: number | null;
     try {
       count = await readyWalFiles(
@@ -502,6 +724,62 @@ export class Reconciler {
     );
   }
 
+  private async saveStorage(
+    db: DesiredDatabase,
+    state: StorageState,
+    previous: Resource | null,
+  ): Promise<Resource> {
+    const data = { state: JSON.stringify(state) };
+    if (
+      previous &&
+      appliedGeneration(previous) === db.generation &&
+      record(previous.data).state === data.state
+    )
+      return previous;
+    const name = `${STORAGE_PREFIX}${db.id}`;
+    if (previous) {
+      if (!previous.metadata.resourceVersion)
+        throw new Error("storage_fence_version_missing");
+      await this.k8s.patch("ConfigMap", SYSTEM_NAMESPACE, name, [
+        { op: "test", path: "/metadata/uid", value: uid(previous) },
+        {
+          op: "test",
+          path: "/metadata/resourceVersion",
+          value: previous.metadata.resourceVersion,
+        },
+        {
+          op: "add",
+          path: "/metadata/annotations",
+          value: {
+            ...previous.metadata.annotations,
+            [GENERATION_ANNOTATION]: String(db.generation),
+          },
+        },
+        { op: "add", path: "/data", value: data },
+      ]);
+    } else
+      await this.k8s.create({
+        apiVersion: "v1",
+        kind: "ConfigMap",
+        metadata: {
+          name,
+          namespace: SYSTEM_NAMESPACE,
+          labels: { [DATABASE_LABEL]: db.id },
+          annotations: { [GENERATION_ANNOTATION]: String(db.generation) },
+        },
+        data,
+      });
+    const current = await this.k8s.read("ConfigMap", SYSTEM_NAMESPACE, name);
+    if (!current) throw new Error("storage_fence_missing");
+    assertOwned(current, db.id, name);
+    if (
+      appliedGeneration(current) !== db.generation ||
+      record(current.data).state !== data.state
+    )
+      throw new Error("storage_fence_identity_changed");
+    return current;
+  }
+
   private async saveLedger(
     db: DesiredDatabase,
     state: DeleteState,
@@ -524,6 +802,7 @@ export class Reconciler {
     db: DesiredDatabase,
     namespace: Resource | null,
     ledger: Resource | null,
+    fence: Resource | null,
   ): Promise<DatabaseObservation> {
     const namespaceName = databaseNamespace(db.id);
     const state: DeleteState = ledger
@@ -674,6 +953,13 @@ export class Reconciler {
         uid(ca),
       );
     }
+    if (fence)
+      await this.k8s.delete(
+        "ConfigMap",
+        SYSTEM_NAMESPACE,
+        fence.metadata.name,
+        uid(fence),
+      );
     if (!state.completed) {
       state.completed = true;
       state.volumes = [];

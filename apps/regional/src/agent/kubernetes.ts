@@ -223,6 +223,19 @@ export function kubernetesFromConfig(
         }
       }
     },
+    async create(body: K8sObject) {
+      const args = { namespace: body.metadata.namespace ?? "", body };
+      if (body.kind === "Namespace")
+        await core.createNamespace({ body }, options);
+      else if (body.kind === "ConfigMap")
+        await core.createNamespacedConfigMap(args, options);
+      else if (body.kind === "Cluster")
+        await custom.createNamespacedCustomObject(
+          { ...customKind(body.kind), ...args },
+          options,
+        );
+      else throw new Error("unsupported_create_kind");
+    },
     async apply(body: K8sObject) {
       const args = {
         name: body.metadata.name,
@@ -272,6 +285,15 @@ export function kubernetesFromConfig(
           break;
         case "PersistentVolume":
           await core.patchPersistentVolume(args, patchOptions);
+          break;
+        case "ConfigMap":
+          await core.patchNamespacedConfigMap(args, patchOptions);
+          break;
+        case "Cluster":
+          await custom.patchNamespacedCustomObject(
+            { ...customKind(kind), ...args },
+            patchOptions,
+          );
           break;
         default:
           throw new Error("unsupported_patch_kind");

@@ -20,6 +20,7 @@ export interface Kubernetes {
     namespace?: string,
     labelSelector?: string,
   ): Promise<Resource[]>;
+  create(resource: K8sObject): Promise<void>;
   apply(resource: K8sObject): Promise<void>;
   patch(
     kind: string,

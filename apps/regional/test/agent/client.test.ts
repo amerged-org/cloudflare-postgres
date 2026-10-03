@@ -183,7 +183,7 @@ test("empty and stale snapshots, reordered hints and failed pulls never delete o
   const { db, ctx } = fixture();
   const k8s = new MemoryKubernetes();
   k8s.backupSecret(ctx);
-  let snapshot = desired({ ...db, generation: 2 });
+  let snapshot = desired(db);
   let fail = false;
   const reports: ObservationRequest[] = [];
   const controller = new AbortController();
@@ -208,6 +208,8 @@ test("empty and stale snapshots, reordered hints and failed pulls never delete o
     authenticate,
   );
   await loop.cycle();
+  snapshot = desired({ ...db, generation: 2 });
+  await loop.cycle();
   const before = k8s.actions.length;
   snapshot = desired(undefined);
   loop.hint();
@@ -228,6 +230,48 @@ test("empty and stale snapshots, reordered hints and failed pulls never delete o
   );
   const orphan = k8s.ownedNamespace({ ...db, id: fixture().db.id });
   assert.ok(orphan.metadata.labels?.[DATABASE_LABEL]);
+});
+
+test("namespace loss is published as a recovery-required database error", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  k8s.backupSecret(ctx);
+  const reports: ObservationRequest[] = [];
+  const api = {
+    desired: async () => desired(db),
+    observations: async (observation: ObservationRequest) => {
+      reports.push(observation);
+    },
+  };
+  const loop = () =>
+    new AgentLoop(
+      api,
+      k8s,
+      ctx.postgresImage,
+      new AbortController().signal,
+      () => {},
+      Date.now,
+      metrics,
+      authenticate,
+    );
+  assert.equal(await loop().cycle(), false);
+  assert.equal(reports.at(-1)?.databases[0]?.state, "ready");
+  const namespace = await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`);
+  assert.ok(namespace?.metadata.uid);
+  await k8s.delete(
+    "Namespace",
+    undefined,
+    namespace.metadata.name,
+    namespace.metadata.uid,
+  );
+  const before = k8s.actions.length;
+  assert.equal(await loop().cycle(), true);
+  assert.equal(reports.at(-1)?.databases[0]?.state, "error");
+  assert.match(
+    reports.at(-1)?.databases[0]?.message ?? "",
+    /recovery required/,
+  );
+  assert.equal(k8s.actions.length, before);
 });
 
 test("credential canaries never appear in agent failure logs and shutdown ends an idle loop", async () => {
