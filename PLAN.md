@@ -21,14 +21,33 @@ maximum SQL throughput nor capacity for 1,000 customers. Strong decoded-binary c
 remain failed and unchanged; the same failure was reproduced over direct verified TCP with
 node-postgres 8.22. The raw stream integrity checks pass.
 
-Formal E0 and E1 passed; the E1 database was ready in 24,942 ms. E2 then failed, and its cleanup
-exposed a real API defect: an empty HTTP DELETE stream was parsed as malformed JSON. The
-reproducing tests and correction are implemented; corrected Dev deployment and complete cleanup
-remain pending. E2–E6, agent-restart cycles, RPO measurement, a separate R2 restore drill and the
-actual adopter Workers client proof are still required before Phase 1 acceptance. Phase 2 has
-not begun. The second EU node is untouched, the US node has not been bought, and existing
-production routes and databases have not changed. The owner has requested delivery through
-Phase 5 and full Neon replacement.
+Formal E0, E1 and E2 passed in the latest completed run; E1 remained correct through an agent
+restart during creation. The Worker-to-management API path now uses supported manual redirects
+and public same-account routing. E3's SQL exercise reached its success guard, but live trace
+validation failed before the complete E3 result. Cloudflare returns valid UTC-second tail expiry
+and redacts long hexadecimal correlation IDs. The expiry parser is corrected; a segmented
+192-bit marker and real CLI-compatible trace transport are implemented, with a reproduced and
+fixed post-settle expiry boundary. Final integrated Dev verification remains pending.
+
+The actual deployed Workers client proved persistent backend reuse, three pools capped at 1/2/2
+clients, text byte fidelity, prepared statements, transactions, authentication, negative startup
+cases, cancellation and complete same-bank cleanup. All three native sockets closed, pools ended
+and outstanding leases reached zero. A second actual database/user identity is still required;
+the strong binary-result assertion remains failed on both WebSocket and direct TCP controls.
+
+The separate R2 restore drill passed two committed markers, rollback absence, verified TLS,
+promotion, target WAL archival, unchanged source and exact 5 GiB storage reclamation. Provider
+WAL-object timestamps measured a maximum 52,427 ms after the observed COMMIT acknowledgements.
+This is one measured archive delay, not a sustained zero-loss guarantee. The first list poll was
+late and gave only a 701,848 ms upper bound. Cleanup required recording exact identities of
+operator-generated monitoring and service Endpoints after matching their source/owner bindings;
+a delayed capacity observation subsequently converged to the 97,706,311,680-byte baseline.
+Full Phase 4 PITR and disaster recovery workflows remain pending.
+
+E3–E6, remaining restart cycles, fault tests and full adopter compatibility are still required
+before Phase 1 acceptance. Phase 2 has not begun. The second EU node is untouched, the US node
+has not been bought, and existing production routes and databases have not changed. The owner
+has requested delivery through Phase 5 and full Neon replacement.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
 AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.
@@ -713,3 +732,6 @@ Entries are chronological; later results supersede earlier pending work.
 | 2026-10-03 | 1 S2 measurements | 50 simultaneous connections and queries completed in 86.439 ms; this is a burst, not sustained RPS. Across 1,000 paired SELECT measurements, direct p95 was 29.093 ms and WebSocket p95 35.541 ms, a 6.448 ms difference. Real 100 MiB and 1 GiB COPY/SELECT checksums match direct PostgreSQL; backend removal after disconnect took 70.645 ms. A 1 GiB slow-reader run paused 1,024 times for 103.804 s; client memory growth was 999,424 bytes. Twenty-eight captures made while the child was active measured combined gateway-associated Talos CRI MEMORY(MB) between 158.05 and 165.46; this metric is not asserted to be RSS. Idle held 600,002 ms with no reconnect and a successful subsequent query. Workers client execution and remaining live safety checks remain pending. |
 | 2026-10-03 | 1 E0–E2 | E0 passed real account, cluster, credential and image checks in 7.185 s. E1 passed in 58.738 s, with PostgreSQL ready in 24,942 ms. E2 failed and cleanup remained incomplete: bodyless DELETE arrived as a non-null empty stream and returned 400 before mutation. The API defect and original-error masking both have reproducing failed tests and corrections under review. The failed run is not accepted; complete cleanup and a fresh formal run are required. Phase 2 has not begun. |
 | 2026-10-03 | 1 Worker request diagnosis | Corrected Dev API deployment and failed-run cleanup passed with full storage reclamation. A fresh E0/E1 passed with an agent restart during create; readiness took 30,059 ms. E2 then reported the original Worker HTTP 500, and cleanup passed. A minimal real Worker localized a TypeError to request construction with redirect mode error. Manual redirect mode reached the network; without global_fetch_strictly_public the same-account Worker lookup returned 404, while enabling it returned 200 with correct credential metadata and identity. Worker request/relay guards and deployment configuration are corrected; fresh E2–E6 acceptance remains pending. No Phase 2 acceptance is claimed. |
+| 2026-10-04 | 1 actual Workers client | Native Cloudflare execution passed repeated backend reuse, three pools with maxima 1/2/2, 4,096-byte default-text bytea and checksum, two prepared executions, transaction/authentication and bad password/startup rejection. A real cleanup ordering defect was reproduced before correction. The corrected deployed candidate passed cancellation and same-bank cleanup: 3/3 native sockets closed, 3/3 pools ended, zero leases, clients and pending end promises. Binary result decoding remains failed; a second actual identity remains untested. No sustained throughput or 1,000-customer capacity is claimed. |
+| 2026-10-04 | 1 R2 restore drill | Two small committed markers written through the public endpoint were restored from the source base backup and archived WAL into a separate namespace/storage generation; the rolled-back marker remained absent. Verified TLS, promotion and target archive succeeded. R2 object last-modified timestamps measured maximum 52,427 ms after COMMIT acknowledgement; the late first poll gave only an upper bound of 701,848 ms. Target creation to verified result took 304,128 ms including operator pacing. Cleanup recorded exact identities of the matching CNPG monitoring ConfigMap and three Endpoints tied to owned Services/Pods, then removed the target namespace/PV/LVM and reclaimed 5 GiB. Source preserved; final free bytes exactly 97,706,311,680. This is a drill, not the complete Phase 4 recovery API. |
+| 2026-10-04 | 1 trace / cleanup | The real CF tail response uses UTC-second expiry; its normalized parser passed all original guards. Long hexadecimal URL markers are redacted. A segmented 192-bit marker and CLI wire initialization produced one correlated event in 9.587 s in the private counterfactual; the integrated transport still needs its real run. A deterministic post-settle expiry test failed before the final dispatch guard; no trigger runs after expiry. Two obsolete owned capability/metadata Workers were deleted with absence verified and all 78 other Workers unchanged. Phase 1 E3–E6 and Phase 2 remain unaccepted. |

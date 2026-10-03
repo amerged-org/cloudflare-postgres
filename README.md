@@ -28,11 +28,13 @@ These results are not sustained throughput or 1,000-customer capacity claims. St
 binary-result client assertions remain failed, including on direct TCP with node-postgres 8.22.
 The raw transport checks pass.
 
-Formal E0 and E1 passed. E2 failed and exposed an empty HTTP-body handling defect during
-cleanup; the correction and diagnostic improvements await deployment. E2–E6, restart cycles,
-RPO and restore proof, and the adopter Workers client remain required. Phase 2 has not begun;
-the second EU node is untouched, the US node has not been bought, and existing production
-routes and databases have not changed. Image signing remains pending.
+Formal E0–E2 passed, including an agent restart during creation. The remaining trace transport
+corrections await final integrated verification before E3–E6 can pass. A real R2 restore drill
+passed committed markers, rollback absence, TLS, separate target WAL and exact storage cleanup;
+measured WAL upload delay was 52.4 seconds for these writes. The deployed Workers client proved
+backend reuse and complete cancellation/cleanup; a second actual identity remains untested.
+Phase 2 has not begun. The second EU node is untouched, the US node has not been bought, and
+existing production routes and databases have not changed. Image signing remains pending.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture
