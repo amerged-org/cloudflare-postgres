@@ -1,6 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { Cloudflare } from "./clients.ts";
 import { HarnessError, assertOwned, record, string } from "./core.ts";
+import {
+  tailSocket,
+  TRACE_BYTES_MAX,
+  TRACE_SEND_OPTIONS,
+} from "./trace-transport.ts";
+import type { TailSocket, TailSocketFactory } from "./trace-transport.ts";
+
+export interface TraceOptions {
+  socketFactory?: TailSocketFactory;
+  settleMs?: number;
+  openTimeoutMs?: number;
+  eventTimeoutMs?: number;
+}
 
 function requestMatches(value: unknown, marker: string): boolean {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
@@ -56,16 +69,36 @@ export async function captureTrace(
   marker: string,
   trigger: () => Promise<unknown>,
   owned: (tail: { id: string; expires_at: string }) => Promise<void>,
+  options: TraceOptions = {},
 ): Promise<string[]> {
   assertOwned(worker);
   if (!/(?:-dev|-test)$/.test(worker))
     throw new HarnessError("dev_worker_required");
   if (typeof marker !== "string" || marker.length < 16 || marker.length > 128)
     throw new HarnessError("invalid_trace_marker");
-  let socket: WebSocket | undefined;
+  const settleMs = options.settleMs ?? 7_000;
+  const openTimeoutMs = options.openTimeoutMs ?? 15_000;
+  const eventTimeoutMs = options.eventTimeoutMs ?? 30_000;
+  if (
+    !Number.isSafeInteger(settleMs) ||
+    settleMs < 0 ||
+    settleMs > 7_000 ||
+    !Number.isSafeInteger(openTimeoutMs) ||
+    openTimeoutMs < 1 ||
+    openTimeoutMs > 15_000 ||
+    !Number.isSafeInteger(eventTimeoutMs) ||
+    eventTimeoutMs < 1 ||
+    eventTimeoutMs > 30_000
+  )
+    throw new HarnessError("invalid_trace_timeout");
+  let socket: TailSocket | undefined;
   let accepting = true;
   const tail = record(
-    (await cf.request(`/workers/scripts/${worker}/tails`, "POST", {})).result,
+    (
+      await cf.request(`/workers/scripts/${worker}/tails`, "POST", {
+        filters: [],
+      })
+    ).result,
   );
   const id = string(tail.id);
   try {
@@ -96,7 +129,7 @@ export async function captureTrace(
     if (url.protocol !== "wss:" || url.username || url.password || url.hash)
       throw new HarnessError("invalid_tail_url");
     try {
-      socket = new WebSocket(url.href, "trace-v1");
+      socket = (options.socketFactory ?? tailSocket)(url.href);
     } catch {
       throw new HarnessError("trace_failed");
     }
@@ -109,7 +142,7 @@ export async function captureTrace(
     });
     void event.catch(() => undefined);
     const pending: Promise<void>[] = [];
-    socket.addEventListener("message", (message: MessageEvent) => {
+    socket.addEventListener("message", (message) => {
       if (!accepting) return;
       const operation = (async () => {
         const data =
@@ -119,8 +152,8 @@ export async function captureTrace(
               ? await message.data.text()
               : new TextDecoder().decode(message.data as ArrayBuffer);
         if (!accepting) return;
-        size += data.length;
-        if (size > 2_000_000) {
+        size += Buffer.byteLength(data, "utf8");
+        if (size > TRACE_BYTES_MAX) {
           failed?.();
           return;
         }
@@ -131,10 +164,11 @@ export async function captureTrace(
     });
     socket.addEventListener("error", () => failed?.(), { once: true });
     socket.addEventListener("close", () => failed?.(), { once: true });
+    const openDeadline = Math.min(Date.now() + openTimeoutMs, expiry);
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new HarnessError("trace_open_timeout")),
-        15_000,
+        Math.max(0, openDeadline - Date.now()),
       );
       socket!.addEventListener(
         "open",
@@ -152,17 +186,63 @@ export async function captureTrace(
         },
         { once: true },
       );
+      socket!.addEventListener(
+        "close",
+        () => {
+          clearTimeout(timer);
+          reject(new HarnessError("trace_failed"));
+        },
+        { once: true },
+      );
     });
-    socket.send(JSON.stringify({ debug: false }));
-    await trigger();
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new HarnessError("trace_failed")),
+        Math.max(0, openDeadline - Date.now()),
+      );
+      try {
+        socket!.send(
+          JSON.stringify({ debug: true }),
+          TRACE_SEND_OPTIONS,
+          (error) => {
+            clearTimeout(timer);
+            if (error) reject(new HarnessError("trace_failed"));
+            else resolve();
+          },
+        );
+      } catch {
+        clearTimeout(timer);
+        reject(new HarnessError("trace_failed"));
+      }
+    });
+    if (Date.now() + settleMs >= expiry)
+      throw new HarnessError("invalid_tail_expiry");
+    if (settleMs) {
+      let settleTimer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([
+          new Promise<void>((resolve) => {
+            settleTimer = setTimeout(resolve, settleMs);
+          }),
+          event,
+        ]);
+      } finally {
+        if (settleTimer) clearTimeout(settleTimer);
+      }
+    }
+    if (socket.readyState !== 1) throw new HarnessError("trace_failed");
     let timer: ReturnType<typeof setTimeout> | undefined;
+    const eventDeadline = Math.min(Date.now() + eventTimeoutMs, expiry);
     try {
       await Promise.race([
-        event,
+        (async () => {
+          await trigger();
+          await event;
+        })(),
         new Promise<void>((_, reject) => {
           timer = setTimeout(
             () => reject(new HarnessError("trace_event_missing")),
-            30_000,
+            Math.max(0, eventDeadline - Date.now()),
           );
         }),
       ]);
@@ -175,7 +255,7 @@ export async function captureTrace(
   } finally {
     accepting = false;
     try {
-      if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
+      socket?.terminate();
     } finally {
       await cf.request(
         `/workers/scripts/${worker}/tails/${encodeURIComponent(id)}`,

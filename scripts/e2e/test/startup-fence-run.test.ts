@@ -541,7 +541,6 @@ function mismatchRun(
   resultChanges: Record<string, unknown> = {},
   gatewayEvidence?: (matching: ReturnType<typeof identity>) => string,
 ) {
-  const original = globalThis.WebSocket;
   const sockets: TraceSocket[] = [];
   class TraceSocket extends EventTarget {
     static CLOSING = 2;
@@ -554,16 +553,27 @@ function mismatchRun(
         this.dispatchEvent(new Event("open"));
       });
     }
-    send() {}
+    send(value: string, options: unknown, callback: (error?: Error) => void) {
+      assert.deepEqual(JSON.parse(value), { debug: true });
+      assert.deepEqual(options, {
+        binary: false,
+        compress: false,
+        mask: false,
+        fin: true,
+      });
+      callback();
+    }
     close() {
       this.readyState = 3;
       this.dispatchEvent(new Event("close"));
+    }
+    terminate() {
+      this.close();
     }
     emit(data: string) {
       this.dispatchEvent(new MessageEvent("message", { data }));
     }
   }
-  globalThis.WebSocket = TraceSocket as unknown as typeof WebSocket;
   const id = identity();
   const fixture = resources();
   const operation = randomUUID();
@@ -580,6 +590,7 @@ function mismatchRun(
   }[] = [];
   const completed: string[] = [];
   const run = Object.assign(Object.create(Run.prototype) as Run, {
+    traceOptions: { socketFactory: () => new TraceSocket(), settleMs: 0 },
     c: {
       values: {
         PGCF_E2E_EDGE_WORKER_NAME: "pgcf-edge-dev",
@@ -666,7 +677,6 @@ function mismatchRun(
     logReads: () => logReads,
     restore() {
       sockets.forEach((socket) => socket.close());
-      globalThis.WebSocket = original;
     },
   };
 }

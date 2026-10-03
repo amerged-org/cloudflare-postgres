@@ -42,6 +42,7 @@ import { cloudflareInventory } from "./phase0-accept.ts";
 import { assertOpenSubset, scanPorts } from "./scan.ts";
 import { networkingAudit, chaosEgressPolicy } from "./security.ts";
 import { captureTrace } from "./trace.ts";
+import type { TraceOptions } from "./trace.ts";
 import { formatTraceMarker } from "./trace-marker.ts";
 import { restartSummary } from "./restarts.ts";
 import { redactKnownCredentials } from "./audit.ts";
@@ -568,7 +569,15 @@ export class Run {
   private readonly root: string;
   private deadline = Date.now() + 450_000;
   private probeHost?: string;
-  constructor(c: Config, state: Ledger, root: string, dryRun: boolean) {
+  readonly traceOptions?: TraceOptions;
+  constructor(
+    c: Config,
+    state: Ledger,
+    root: string,
+    dryRun: boolean,
+    traceOptions?: TraceOptions,
+  ) {
+    this.traceOptions = traceOptions;
     this.c = c;
     this.root = root;
     this.state = state;
@@ -1526,6 +1535,7 @@ export class Run {
           this.state.tails.push({ worker, ...tail });
           await this.save();
         },
+        this.traceOptions,
       );
       if (
         result?.pass !== true ||
@@ -1637,6 +1647,7 @@ export class Run {
           this.state.tails.push({ worker, ...tail });
           await this.save();
         },
+        this.traceOptions,
       );
       tails.push(
         ...messages.map((message) =>

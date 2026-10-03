@@ -4,9 +4,23 @@ import { randomBytes } from "node:crypto";
 import test from "node:test";
 import type { Cloudflare } from "../src/clients.ts";
 import { captureTrace } from "../src/trace.ts";
+import type { TailSocket, TailSocketFactory } from "../src/trace-transport.ts";
 
 type Tail = { id: string; url: string; expires_at: string };
-const capture = captureTrace;
+let socketFactory: TailSocketFactory | undefined;
+const capture: typeof captureTrace = (
+  cf,
+  worker,
+  marker,
+  trigger,
+  owned,
+  options,
+) =>
+  captureTrace(cf, worker, marker, trigger, owned, {
+    socketFactory,
+    settleMs: 0,
+    ...options,
+  });
 const worker = "pgcf-api-dev";
 const authority = ["trace", "test"].join(".");
 
@@ -21,8 +35,11 @@ function fixture() {
   };
   const deletes: string[] = [];
   const client = {
-    async request(path: string, method: string) {
-      if (method === "POST") return { result: tail, success: true };
+    async request(path: string, method: string, body: unknown) {
+      if (method === "POST") {
+        assert.deepEqual(body, { filters: [] });
+        return { result: tail, success: true };
+      }
       assert.equal(method, "DELETE");
       deletes.push(path);
       return { result: null, success: true };
@@ -32,11 +49,11 @@ function fixture() {
 }
 
 function installSocket() {
-  const original = globalThis.WebSocket;
   const sockets: TraceSocket[] = [];
   class TraceSocket extends EventTarget {
     static CLOSING = 2;
     readyState = 0;
+    terminated = 0;
     constructor(url: string, protocol: string) {
       super();
       assert.equal(new URL(url).protocol, "wss:");
@@ -47,25 +64,64 @@ function installSocket() {
         this.dispatchEvent(new Event("open"));
       });
     }
-    send(message: string) {
-      assert.deepEqual(JSON.parse(message), { debug: false });
+    send(message: string, options: unknown, callback: (error?: Error) => void) {
+      assert.deepEqual(JSON.parse(message), { debug: true });
+      assert.deepEqual(options, {
+        binary: false,
+        compress: false,
+        mask: false,
+        fin: true,
+      });
+      callback();
     }
     close() {
       this.readyState = 3;
       this.dispatchEvent(new Event("close"));
     }
+    terminate() {
+      this.terminated++;
+      this.close();
+    }
     emit(data: unknown) {
       this.dispatchEvent(new MessageEvent("message", { data }));
     }
   }
-  globalThis.WebSocket = TraceSocket as unknown as typeof WebSocket;
+  socketFactory = (url) =>
+    new TraceSocket(url, "trace-v1") as unknown as TailSocket;
   return {
     sockets,
     restore() {
-      globalThis.WebSocket = original;
+      socketFactory = undefined;
+      sockets
+        .filter((socket) => socket.readyState !== 3)
+        .forEach((socket) => socket.terminate());
     },
   };
 }
+
+test("trace initializes the CLI wire settings and terminates its owned socket", async () => {
+  const fixtureValue = fixture();
+  const socket = installSocket();
+  try {
+    const matching = event({
+      headers: { "x-pgcf-trace": fixtureValue.marker },
+    });
+    const messages = await capture(
+      fixtureValue.client,
+      worker,
+      fixtureValue.marker,
+      async () => {
+        socket.sockets[0]!.emit(matching);
+      },
+      async () => {},
+    );
+    assert.deepEqual(messages, [matching]);
+    assert.equal(socket.sockets[0]!.terminated, 1);
+    assert.equal(fixtureValue.deletes.length, 1);
+  } finally {
+    socket.restore();
+  }
+});
 
 function event(request: Record<string, unknown>, logs: unknown[] = []) {
   return JSON.stringify([{ event: { request }, logs }]);
@@ -364,4 +420,151 @@ test("trace rejects malformed expiry text before ownership and still deletes the
   } finally {
     socket.restore();
   }
+});
+
+test("trace event timeout never replays its trigger and always terminates and deletes", async () => {
+  const value = fixture();
+  const socket = installSocket();
+  let calls = 0;
+  try {
+    await assert.rejects(
+      capture(
+        value.client,
+        worker,
+        value.marker,
+        async () => {
+          calls++;
+        },
+        async () => {},
+        { eventTimeoutMs: 1 },
+      ),
+      { message: "trace_event_missing" },
+    );
+    assert.equal(calls, 1);
+    assert.equal(socket.sockets[0]!.terminated, 1);
+    assert.equal(value.deletes.length, 1);
+  } finally {
+    socket.restore();
+  }
+});
+
+test("trace bounds a stalled trigger without replay or leaked tail", async () => {
+  const value = fixture();
+  const socket = installSocket();
+  let calls = 0;
+  try {
+    await assert.rejects(
+      capture(
+        value.client,
+        worker,
+        value.marker,
+        () => {
+          calls++;
+          return new Promise(() => {});
+        },
+        async () => {},
+        { eventTimeoutMs: 1 },
+      ),
+      { message: "trace_event_missing" },
+    );
+    assert.equal(calls, 1);
+    assert.equal(socket.sockets[0]!.terminated, 1);
+    assert.equal(value.deletes.length, 1);
+  } finally {
+    socket.restore();
+  }
+});
+
+test("trace counts UTF-8 bytes before retaining oversized metadata", async () => {
+  const value = fixture();
+  const socket = installSocket();
+  try {
+    await assert.rejects(
+      capture(
+        value.client,
+        worker,
+        value.marker,
+        async () => {
+          socket.sockets[0]!.emit("é".repeat(1_000_001));
+        },
+        async () => {},
+      ),
+      { message: "trace_failed" },
+    );
+    assert.equal(socket.sockets[0]!.terminated, 1);
+    assert.equal(value.deletes.length, 1);
+  } finally {
+    socket.restore();
+  }
+});
+
+test("trace initialization failure excludes socket error content and never triggers", async () => {
+  const value = fixture();
+  const socket = installSocket();
+  const factory = socketFactory!;
+  let calls = 0;
+  const secret = randomBytes(32).toString("base64url");
+  try {
+    await assert.rejects(
+      capture(
+        value.client,
+        worker,
+        value.marker,
+        async () => {
+          calls++;
+        },
+        async () => {},
+        {
+          socketFactory: (url) => {
+            const created = factory(url);
+            created.send = (_data, _options, callback) =>
+              callback(new Error(secret));
+            return created;
+          },
+        },
+      ),
+      (error: unknown) =>
+        error instanceof Error &&
+        error.message === "trace_failed" &&
+        !String(error).includes(secret),
+    );
+    assert.equal(calls, 0);
+    assert.equal(socket.sockets[0]!.terminated, 1);
+    assert.equal(value.deletes.length, 1);
+  } finally {
+    socket.restore();
+  }
+});
+
+test("trace open timeout prevents triggering and deletes after termination", async () => {
+  const value = fixture();
+  let calls = 0;
+  let terminated = 0;
+  const target = new EventTarget();
+  const stalled = {
+    readyState: 0,
+    addEventListener: target.addEventListener.bind(target),
+    send: () => {
+      throw new Error("unexpected_send");
+    },
+    terminate: () => {
+      terminated++;
+    },
+  } as unknown as TailSocket;
+  await assert.rejects(
+    capture(
+      value.client,
+      worker,
+      value.marker,
+      async () => {
+        calls++;
+      },
+      async () => {},
+      { socketFactory: () => stalled, openTimeoutMs: 1 },
+    ),
+    { message: "trace_open_timeout" },
+  );
+  assert.equal(calls, 0);
+  assert.equal(terminated, 1);
+  assert.equal(value.deletes.length, 1);
 });

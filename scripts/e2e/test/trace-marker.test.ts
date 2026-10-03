@@ -12,7 +12,6 @@ function producer() {
   const edge = "pgcf-edge-dev";
   const api = "pgcf-api-dev";
   const host = ["edge", "test"].join(".");
-  const original = globalThis.WebSocket;
   const markers: string[] = [];
   const deletes: string[] = [];
   const sockets: Socket[] = [];
@@ -28,15 +27,24 @@ function producer() {
         this.dispatchEvent(new Event("open"));
       });
     }
-    send(value: string) {
-      assert.deepEqual(JSON.parse(value), { debug: false });
+    send(value: string, options: unknown, callback: (error?: Error) => void) {
+      assert.deepEqual(JSON.parse(value), { debug: true });
+      assert.deepEqual(options, {
+        binary: false,
+        compress: false,
+        mask: false,
+        fin: true,
+      });
+      callback();
     }
     close() {
       this.readyState = 3;
       this.dispatchEvent(new Event("close"));
     }
+    terminate() {
+      this.close();
+    }
   }
-  globalThis.WebSocket = Socket as unknown as typeof WebSocket;
   const secret = randomBytes(32).toString("base64url");
   const state = {
     database_id: database,
@@ -46,6 +54,10 @@ function producer() {
   };
   const run = Object.create(Run.prototype) as Run;
   Object.assign(run, {
+    traceOptions: {
+      socketFactory: (url: string) => new Socket(url, "trace-v1"),
+      settleMs: 0,
+    },
     state,
     c: {
       values: {
@@ -164,7 +176,9 @@ function producer() {
     deletes,
     edge,
     restore: () => {
-      globalThis.WebSocket = original;
+      sockets
+        .filter((socket) => socket.readyState !== 3)
+        .forEach((socket) => socket.terminate());
     },
   };
 }
