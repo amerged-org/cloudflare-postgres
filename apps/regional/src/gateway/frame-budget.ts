@@ -89,6 +89,10 @@ export class MemoryOwner {
 
   release(lease: MemoryLease, bytes: number): void {
     this.leases.delete(lease);
+    this.credit(bytes);
+  }
+
+  credit(bytes: number): void {
     this.budget.release(this.database, bytes);
   }
 
@@ -119,6 +123,14 @@ export class MemoryLease {
     return true;
   }
 
+  shrink(bytes: number): void {
+    if (this.released) return;
+    if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.bytes)
+      throw new RangeError("invalid memory credit");
+    this.bytes -= bytes;
+    this.owner.credit(bytes);
+  }
+
   release(): void {
     if (this.released) return;
     this.released = true;
@@ -145,6 +157,7 @@ export class BudgetedWebSocketSocket extends Duplex {
   private readonly socket: Duplex;
   readonly memory: MemoryOwner;
   private readonly maxPayload: number;
+  private readonly outgoing: MemoryLease;
 
   constructor(
     socket: Duplex,
@@ -159,6 +172,7 @@ export class BudgetedWebSocketSocket extends Duplex {
     this.socket = socket;
     this.memory = memory;
     this.maxPayload = maxPayload;
+    this.outgoing = memory.lease();
     socket.pause();
     socket.on("data", (chunk: Buffer) => this.accept(chunk));
     socket.once("end", () => this.push(null));
@@ -354,7 +368,6 @@ export class BudgetedWebSocketSocket extends Duplex {
     encodingOrCallback?: BufferEncoding | ((error?: Error | null) => void),
     callback?: (error?: Error | null) => void,
   ): boolean {
-    const lease = this.memory.lease();
     const encoding =
       typeof encodingOrCallback === "string" ? encodingOrCallback : undefined;
     const done =
@@ -363,15 +376,16 @@ export class BudgetedWebSocketSocket extends Duplex {
       typeof chunk === "string"
         ? Buffer.byteLength(chunk, encoding)
         : chunk.byteLength;
-    if (!lease.grow(length + BUFFER_OVERHEAD_BYTES)) {
-      lease.release();
+    const charge = length + BUFFER_OVERHEAD_BYTES;
+    // Tiny control replies form one queue and must not spend the small-stream reserve.
+    if (!this.outgoing.grow(charge)) {
       const error = new Error("gateway memory limit");
       queueMicrotask(() => done?.(error));
       this.destroy(error);
       return false;
     }
     const complete = (error?: Error | null) => {
-      lease.release();
+      this.outgoing.shrink(charge);
       done?.(error);
     };
     return encoding
