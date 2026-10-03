@@ -146,6 +146,18 @@ export function kubernetesFromConfig(
           case "ConfigMap":
             value = await core.readNamespacedConfigMap(namespaced, options);
             break;
+          case "ResourceQuota":
+            value = await core.readNamespacedResourceQuota(namespaced, options);
+            break;
+          case "LimitRange":
+            value = await core.readNamespacedLimitRange(namespaced, options);
+            break;
+          case "NetworkPolicy":
+            value = await network.readNamespacedNetworkPolicy(
+              namespaced,
+              options,
+            );
+            break;
           case "Pod":
             value = await core.readNamespacedPod(namespaced, options);
             break;
@@ -225,18 +237,34 @@ export function kubernetesFromConfig(
     },
     async create(body: K8sObject) {
       const args = { namespace: body.metadata.namespace ?? "", body };
-      if (body.kind === "Namespace")
-        await core.createNamespace({ body }, options);
-      else if (body.kind === "ConfigMap")
-        await core.createNamespacedConfigMap(args, options);
-      else if (body.kind === "Cluster")
-        await custom.createNamespacedCustomObject(
-          { ...customKind(body.kind), ...args },
-          options,
-        );
-      else throw new Error("unsupported_create_kind");
+      switch (body.kind) {
+        case "Namespace":
+          await core.createNamespace({ body }, options);
+          break;
+        case "ConfigMap":
+          await core.createNamespacedConfigMap(args, options);
+          break;
+        case "Secret":
+          await core.createNamespacedSecret(args, options);
+          break;
+        case "ResourceQuota":
+          await core.createNamespacedResourceQuota(args, options);
+          break;
+        case "LimitRange":
+          await core.createNamespacedLimitRange(args, options);
+          break;
+        case "NetworkPolicy":
+          await network.createNamespacedNetworkPolicy(args, options);
+          break;
+        default:
+          await custom.createNamespacedCustomObject(
+            { ...customKind(body.kind), ...args },
+            options,
+          );
+      }
     },
     async apply(body: K8sObject) {
+      if (body.kind !== "ConfigMap") throw new Error("unsupported_apply_kind");
       const args = {
         name: body.metadata.name,
         namespace: body.metadata.namespace ?? "",
@@ -245,31 +273,7 @@ export function kubernetesFromConfig(
         force: true,
         fieldValidation: "Strict",
       };
-      switch (body.kind) {
-        case "Namespace":
-          await core.patchNamespace(args, applyOptions);
-          break;
-        case "Secret":
-          await core.patchNamespacedSecret(args, applyOptions);
-          break;
-        case "ConfigMap":
-          await core.patchNamespacedConfigMap(args, applyOptions);
-          break;
-        case "ResourceQuota":
-          await core.patchNamespacedResourceQuota(args, applyOptions);
-          break;
-        case "LimitRange":
-          await core.patchNamespacedLimitRange(args, applyOptions);
-          break;
-        case "NetworkPolicy":
-          await network.patchNamespacedNetworkPolicy(args, applyOptions);
-          break;
-        default:
-          await custom.patchNamespacedCustomObject(
-            { ...customKind(body.kind), ...args },
-            applyOptions,
-          );
-      }
+      await core.patchNamespacedConfigMap(args, applyOptions);
     },
     async patch(kind, namespace, name, body) {
       const args = {
@@ -289,14 +293,24 @@ export function kubernetesFromConfig(
         case "ConfigMap":
           await core.patchNamespacedConfigMap(args, patchOptions);
           break;
-        case "Cluster":
+        case "Secret":
+          await core.patchNamespacedSecret(args, patchOptions);
+          break;
+        case "ResourceQuota":
+          await core.patchNamespacedResourceQuota(args, patchOptions);
+          break;
+        case "LimitRange":
+          await core.patchNamespacedLimitRange(args, patchOptions);
+          break;
+        case "NetworkPolicy":
+          await network.patchNamespacedNetworkPolicy(args, patchOptions);
+          break;
+        default:
           await custom.patchNamespacedCustomObject(
             { ...customKind(kind), ...args },
             patchOptions,
           );
           break;
-        default:
-          throw new Error("unsupported_patch_kind");
       }
     },
     async delete(kind, namespace, name, uid) {

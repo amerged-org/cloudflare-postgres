@@ -443,6 +443,147 @@ test("a fence revision race cannot overwrite a newer durable generation", async 
   );
 });
 
+test("a same-UID Cluster version race cannot overwrite a concurrently changed spec", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  const reconcile = () =>
+    new Reconciler(
+      k8s,
+      new AbortController().signal,
+      Date.now,
+      metrics,
+      authenticate,
+    ).reconcile(db, ctx);
+  assert.equal((await reconcile())?.state, "ready");
+  db.generation++;
+  db.size.memory_mib = 768;
+  const newer = {
+    ...db,
+    generation: 3,
+    size: { ...db.size, memory_mib: 1024 },
+  };
+  const patch = k8s.patch.bind(k8s);
+  let changed = false;
+  k8s.patch = async (kind, namespace, name, operations) => {
+    if (kind === "Cluster" && !changed) {
+      changed = true;
+      const concurrent = await new Reconciler(
+        k8s,
+        new AbortController().signal,
+        Date.now,
+        metrics,
+        authenticate,
+      ).reconcile(newer, ctx);
+      assert.equal(concurrent?.state, "ready");
+    }
+    await patch(kind, namespace, name, operations);
+  };
+  await reconcile().catch(() => null);
+  assert.equal(changed, true);
+  const cluster = await k8s.read("Cluster", `pgcf-db-${db.id}`, "database");
+  const restarted = await new Reconciler(
+    k8s,
+    new AbortController().signal,
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(newer, ctx);
+  assert.deepEqual(
+    {
+      memory: record(record(record(cluster?.spec).resources).requests).memory,
+      state: restarted?.state,
+    },
+    { memory: "1024Mi", state: "ready" },
+  );
+});
+
+test("an older role Secret write cannot replace credentials from a ready newer revision", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  const older = {
+    ...db,
+    generation: 2,
+    roles: [
+      {
+        ...db.roles[0]!,
+        revision: 2,
+        password: fixture().db.roles[0]!.password,
+      },
+    ],
+  };
+  const newer = {
+    ...db,
+    generation: 3,
+    roles: [
+      {
+        ...db.roles[0]!,
+        revision: 3,
+        password: fixture().db.roles[0]!.password,
+      },
+    ],
+  };
+  const apply = k8s.apply.bind(k8s);
+  const patch = k8s.patch.bind(k8s);
+  let advanced = false;
+  const advance = async (kind: string, name: string) => {
+    if (kind === "Secret" && name === roleSecretName("app") && !advanced) {
+      advanced = true;
+      assert.equal(
+        (
+          await new Reconciler(
+            k8s,
+            signal(),
+            Date.now,
+            metrics,
+            authenticate,
+          ).reconcile(newer, ctx)
+        )?.state,
+        "ready",
+      );
+    }
+  };
+  k8s.apply = async (resource) => {
+    await advance(resource.kind, resource.metadata.name);
+    await apply(resource);
+  };
+  k8s.patch = async (kind, namespace, name, operations) => {
+    await advance(kind, name);
+    await patch(kind, namespace, name, operations);
+  };
+  await new Reconciler(k8s, signal(), Date.now, metrics, authenticate)
+    .reconcile(older, ctx)
+    .catch(() => null);
+  assert.equal(advanced, true);
+  const secret = await k8s.read(
+    "Secret",
+    `pgcf-db-${db.id}`,
+    roleSecretName("app"),
+  );
+  assert.equal(
+    record(secret?.data).password,
+    Buffer.from(newer.roles[0]!.password).toString("base64"),
+  );
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+      ).reconcile(newer, ctx)
+    )?.state,
+    "ready",
+  );
+});
+
 test("a running CREATE resumes after the first namespace mutation without initializing twice", async () => {
   const { db, ctx } = fixture();
   const k8s = new MemoryKubernetes();
@@ -516,15 +657,11 @@ test("a partial newer revision survives restart and rejects an intermediate stal
       },
     ],
   };
-  const apply = k8s.apply.bind(k8s);
+  const patch = k8s.patch.bind(k8s);
   let crash = true;
-  k8s.apply = async (resource) => {
-    await apply(resource);
-    if (
-      crash &&
-      resource.kind === "Secret" &&
-      resource.metadata.name === roleSecretName("app")
-    )
+  k8s.patch = async (kind, namespace, name, operations) => {
+    await patch(kind, namespace, name, operations);
+    if (crash && kind === "Secret" && name === roleSecretName("app"))
       throw new Error("crash_after_newest_password_write");
   };
   await assert.rejects(

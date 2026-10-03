@@ -415,6 +415,10 @@ export class Reconciler {
             manifest.metadata.labels?.[DATABASE_LABEL] !== db.id
           )
             throw new Error("builder_resource_scope_invalid");
+          manifest.metadata.annotations = {
+            ...manifest.metadata.annotations,
+            [GENERATION_ANNOTATION]: String(db.generation),
+          };
           if (manifest.kind === "Cluster") {
             const currentCluster = await this.k8s.read(
               "Cluster",
@@ -423,6 +427,8 @@ export class Reconciler {
             );
             if (currentCluster) {
               assertOwned(currentCluster, db.id, "database");
+              if (appliedGeneration(currentCluster) > db.generation)
+                return null;
               if (
                 storage.clusterUid &&
                 uid(currentCluster) !== storage.clusterUid
@@ -433,11 +439,26 @@ export class Reconciler {
                 );
               storage.clusterUid = uid(currentCluster);
               fence = await this.saveStorage(db, storage, fence);
+              if (!currentCluster.metadata.resourceVersion)
+                throw new Error("database_cluster_version_missing");
               await this.k8s.patch("Cluster", namespaceName, "database", [
                 {
                   op: "test",
                   path: "/metadata/uid",
                   value: uid(currentCluster),
+                },
+                {
+                  op: "test",
+                  path: "/metadata/resourceVersion",
+                  value: currentCluster.metadata.resourceVersion,
+                },
+                {
+                  op: "add",
+                  path: "/metadata/annotations",
+                  value: {
+                    ...currentCluster.metadata.annotations,
+                    ...manifest.metadata.annotations,
+                  },
                 },
                 {
                   op: "add",
@@ -466,7 +487,7 @@ export class Reconciler {
               storage.clusterUid = uid(created);
               fence = await this.saveStorage(db, storage, fence);
             }
-          } else await this.k8s.apply(manifest);
+          } else if (!(await this.applyRevision(db, manifest))) return null;
         }
         this.hashes.set(db.id, hash);
       }
@@ -579,6 +600,53 @@ export class Reconciler {
         : {}),
       archive: { continuous, ready_wal_files: count },
     };
+  }
+
+  private async applyRevision(
+    db: DesiredDatabase,
+    manifest: K8sObject,
+  ): Promise<boolean> {
+    const { kind, metadata } = manifest;
+    const current = await this.k8s.read(
+      kind,
+      metadata.namespace,
+      metadata.name,
+    );
+    if (!current) {
+      await this.k8s.create(manifest);
+      return true;
+    }
+    assertOwned(current, db.id, metadata.name);
+    // Namespace completion cannot fence a resource write already in flight.
+    if (appliedGeneration(current) > db.generation) return false;
+    if (!current.metadata.resourceVersion)
+      throw new Error("database_resource_version_missing");
+    await this.k8s.patch(kind, metadata.namespace, metadata.name, [
+      { op: "test", path: "/metadata/uid", value: uid(current) },
+      {
+        op: "test",
+        path: "/metadata/resourceVersion",
+        value: current.metadata.resourceVersion,
+      },
+      {
+        op: "add",
+        path: "/metadata/annotations",
+        value: { ...current.metadata.annotations, ...metadata.annotations },
+      },
+      {
+        op: "add",
+        path: "/metadata/labels",
+        value: { ...current.metadata.labels, ...metadata.labels },
+      },
+      ...Object.entries(manifest)
+        .filter(([key]) => !["apiVersion", "kind", "metadata"].includes(key))
+        .map(([key, value]) => ({
+          op: "add",
+          path: `/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`,
+          value,
+        })),
+    ]);
+    return true;
   }
 
   private async desiredApplied(
