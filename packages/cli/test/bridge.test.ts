@@ -17,6 +17,8 @@ import { newDatabaseId } from "@pgcf/contracts";
 import {
   CLIENT_LIMIT,
   FRAGMENT_LIMIT,
+  HALF_CLOSE_MS,
+  HANDSHAKE_MS,
   MESSAGE_BYTES,
   STREAM_BYTES,
   startBridge,
@@ -40,6 +42,31 @@ function options(): ConnectOptions {
     user: "app",
     port: 0,
   };
+}
+function graceTimer(context: TestContext) {
+  const scheduled: { delay: number; expire: () => void }[] = [];
+  const original = globalThis.setTimeout;
+  const scheduler = ((
+    callback: (...args: unknown[]) => void,
+    delay?: number,
+    ...args: unknown[]
+  ) => {
+    const timer = original(callback, delay, ...args);
+    if (
+      callback.name === "finish" &&
+      (delay === HALF_CLOSE_MS || delay === HALF_CLOSE_MS + HANDSHAKE_MS)
+    )
+      scheduled.push({
+        delay,
+        expire: () => {
+          clearTimeout(timer);
+          callback(...args);
+        },
+      });
+    return timer;
+  }) as typeof setTimeout;
+  context.mock.method(globalThis, "setTimeout", scheduler);
+  return scheduled;
 }
 async function until(predicate: () => boolean): Promise<void> {
   for (let count = 0; count < 5000; count++) {
@@ -212,7 +239,7 @@ test("actual TCP and WebSocket peers preserve every byte and ignore empty binary
   socket.write(payload.subarray(17));
   assert.deepEqual(await read, payload);
   assert.equal(sample.connections(), 1);
-  socket.destroy();
+  socket.resetAndDestroy();
   await until(() => sample.bridge.clients === 0);
   assert.equal(sample.disconnections(), 1);
 });
@@ -233,9 +260,133 @@ test("concurrent clients use isolated one-to-one sessions", async (context) => {
   assert.deepEqual(await readB, right);
   assert.equal(sample.connections(), 2);
   assert.equal(sample.bridge.clients, 2);
-  a.destroy();
-  b.destroy();
+  a.resetAndDestroy();
+  b.resetAndDestroy();
   await until(() => sample.bridge.clients === 0);
+});
+
+test("TCP FIN before WebSocket startup preserves queued bytes and peer reply", async (context) => {
+  const grace = graceTimer(context);
+  let received = 0;
+  const sample = await fixture(context, (peer) =>
+    peer.on("message", (data) => {
+      received += (data as Buffer).length;
+      peer.send(data, { binary: true });
+    }),
+  );
+  const socket = await local(sample.bridge);
+  const chunks: Buffer[] = [];
+  let consumed: (() => void) | undefined;
+  const replied = new Promise<void>((resolve) => {
+    consumed = resolve;
+  });
+  socket.on("data", (value: Buffer) => chunks.push(value));
+  socket.on("data", () => {
+    if (Buffer.concat(chunks).length === 128) consumed!();
+  });
+  const closed = new Promise<void>((resolve) =>
+    socket.once("close", () => resolve()),
+  );
+  socket.end(Buffer.alloc(128, 7));
+  await Promise.race([replied, closed]);
+  await until(() => grace.length === 1);
+  assert(grace[0]!.delay <= HALF_CLOSE_MS + HANDSHAKE_MS);
+  grace[0]!.expire();
+  await closed;
+  assert.equal(received, 128);
+  assert.deepEqual(Buffer.concat(chunks), Buffer.alloc(128, 7));
+  assert.equal(sample.connections(), 1);
+});
+
+test("TCP FIN after WebSocket startup preserves the peer reply", async (context) => {
+  const grace = graceTimer(context);
+  let received = 0;
+  const sample = await fixture(context, (peer) =>
+    peer.on("message", (data) => {
+      received += (data as Buffer).length;
+      peer.send(data, { binary: true });
+    }),
+  );
+  const socket = await local(sample.bridge);
+  await until(() => sample.sessions[0]?.upstream.readyState === WebSocket.OPEN);
+  const chunks: Buffer[] = [];
+  let consumed: (() => void) | undefined;
+  const replied = new Promise<void>((resolve) => {
+    consumed = resolve;
+  });
+  socket.on("data", (value: Buffer) => chunks.push(value));
+  socket.on("data", () => {
+    if (Buffer.concat(chunks).length === 128) consumed!();
+  });
+  const closed = new Promise<void>((resolve) =>
+    socket.once("close", () => resolve()),
+  );
+  socket.end(Buffer.alloc(128, 7));
+  await Promise.race([replied, closed]);
+  await until(() => grace.length === 1);
+  assert.equal(grace[0]!.delay, HALF_CLOSE_MS);
+  grace[0]!.expire();
+  await turn();
+  assert.equal(sample.bridge.clients, 0);
+  await closed;
+  assert.equal(received, 128);
+  assert.deepEqual(Buffer.concat(chunks), Buffer.alloc(128, 7));
+  assert.equal(sample.connections(), 1);
+});
+
+test("TCP FIN permits a delayed peer response before bounded grace ends", async (context) => {
+  const grace = graceTimer(context);
+  let release: (() => void) | undefined;
+  const delayed = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let received = false;
+  const sample = await fixture(context, (peer) =>
+    peer.on("message", async (data) => {
+      received = true;
+      await delayed;
+      peer.send(data, { binary: true }, () => peer.close());
+    }),
+  );
+  const socket = await local(sample.bridge);
+  await until(() => sample.sessions[0]?.upstream.readyState === WebSocket.OPEN);
+  const closed = new Promise<void>((resolve) =>
+    socket.once("close", () => resolve()),
+  );
+  const payload = Buffer.alloc(128, 7);
+  const bytes = collect(socket, payload.length);
+  socket.end(payload);
+  await until(() => received && sample.sessions[0]!.local.readableEnded);
+  assert.equal(grace.length, 1);
+  assert.equal(grace[0]!.delay, HALF_CLOSE_MS);
+  assert.equal(sample.bridge.clients, 1);
+  release!();
+  assert.deepEqual(await bytes, payload);
+  await closed;
+  assert.equal(sample.connections(), 1);
+});
+
+test("TCP FIN cannot retain a silent peer beyond bounded grace", async (context) => {
+  const grace = graceTimer(context);
+  const sample = await fixture(context, () => {});
+  const socket = await local(sample.bridge);
+  await until(() => sample.sessions[0]?.upstream.readyState === WebSocket.OPEN);
+  const closed = new Promise<void>((resolve) =>
+    socket.once("close", () => resolve()),
+  );
+  const ended = once(sample.sessions[0]!.local, "end");
+  socket.end();
+  socket.resume();
+  await ended;
+  assert.equal(grace.length, 1);
+  assert.equal(grace[0]!.delay, HALF_CLOSE_MS);
+  grace[0]!.expire();
+  await turn();
+  assert.equal(sample.bridge.clients, 0);
+  await closed;
+  await until(() => sample.bridge.clients === 0);
+  assert.equal(sample.connections(), 1);
+  assert.equal(sample.disconnections(), 1);
 });
 
 test("oversized fragmented aggregate closes once without reconnecting", async (context) => {
@@ -370,7 +521,7 @@ test("local close and upstream failure release one session without replay", asyn
     }),
   );
   const first = await local(sample.bridge);
-  first.destroy();
+  first.resetAndDestroy();
   await until(() => sample.bridge.clients === 0);
   const second = await local(sample.bridge);
   const closed = once(second, "close");
@@ -452,7 +603,10 @@ test("shutdown closes the listener and every owned client idempotently", async (
   const sample = await fixture(context, () => {});
   const a = await local(sample.bridge);
   const b = await local(sample.bridge);
-  const closing = [once(a, "close"), once(b, "close")];
+  const closing = [
+    new Promise<void>((resolve) => a.once("close", () => resolve())),
+    new Promise<void>((resolve) => b.once("close", () => resolve())),
+  ];
   await sample.bridge.close();
   await Promise.all(closing);
   assert.equal(sample.bridge.clients, 0);
