@@ -14,6 +14,7 @@ import {
 } from "./observe.ts";
 import { backupCredentials, Reconciler } from "./reconcile.ts";
 import type { Kubernetes, Log } from "./types.ts";
+import type { RegionalMeasurements } from "./measurements.ts";
 import type { PowerCoordinator } from "./power.ts";
 import type { AuthenticationProbe } from "./readiness.ts";
 
@@ -40,6 +41,7 @@ export class AgentLoop {
   private signal: AbortSignal;
   private log: Log;
   private now: () => number;
+  private measurements?: Pick<RegionalMeasurements, "update">;
   constructor(
     api: ControlApi,
     k8s: Kubernetes,
@@ -50,6 +52,7 @@ export class AgentLoop {
     fetcher: typeof fetch = fetch,
     authenticate?: AuthenticationProbe,
     power?: PowerCoordinator,
+    measurements?: Pick<RegionalMeasurements, "update">,
   ) {
     this.api = api;
     this.k8s = k8s;
@@ -57,6 +60,7 @@ export class AgentLoop {
     this.signal = signal;
     this.log = log;
     this.now = now;
+    this.measurements = measurements;
     this.reconcile = new Reconciler(
       k8s,
       signal,
@@ -76,6 +80,7 @@ export class AgentLoop {
   async cycle(): Promise<boolean> {
     this.wakePending = false;
     const desired = await this.api.desired(this.signal);
+    this.measurements?.update(desired.databases);
     let context: Promise<BuildContext> | undefined;
     const buildContext = () =>
       (context ??= backupCredentials(this.k8s).then(

@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-import { DesiredResponse, ObservationRequest } from "@pgcf/contracts";
+import {
+  DesiredResponse,
+  ObservationRequest,
+  AgentActivityRequest,
+  AgentUsageRequest,
+} from "@pgcf/contracts";
 import type { AgentConfig } from "./config.ts";
 
 export const API_TIMEOUT_MS = 20_000;
@@ -73,6 +78,51 @@ export class AgentApi {
     return response;
   }
 
+  async activity(
+    value: AgentActivityRequest,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const parsed = AgentActivityRequest.safeParse(value);
+    if (!parsed.success) throw new Error("activity_measurements_invalid");
+    const body = JSON.stringify(parsed.data);
+    if (Buffer.byteLength(body) > 64 * 1024)
+      throw new Error("activity_measurements_too_large");
+    const response = await this.request("/agent/v1/activity", signal, body);
+    const reply = JSON.parse(await boundedText(response, 4096)) as {
+      accepted?: unknown;
+      idle_intents?: unknown;
+    };
+    if (
+      !Number.isSafeInteger(reply.accepted) ||
+      (reply.accepted as number) < 0 ||
+      (reply.accepted as number) > parsed.data.databases.length ||
+      !Number.isSafeInteger(reply.idle_intents) ||
+      (reply.idle_intents as number) < 0 ||
+      (reply.idle_intents as number) > (reply.accepted as number)
+    )
+      throw new Error("activity_ack_invalid");
+  }
+  async usage(value: AgentUsageRequest, signal: AbortSignal): Promise<void> {
+    const parsed = AgentUsageRequest.safeParse(value);
+    if (!parsed.success) throw new Error("usage_measurements_invalid");
+    const body = JSON.stringify(parsed.data);
+    if (Buffer.byteLength(body) > 64 * 1024)
+      throw new Error("usage_measurements_too_large");
+    const response = await this.request("/agent/v1/usage", signal, body);
+    const reply = JSON.parse(await boundedText(response, 4096)) as {
+      recorded?: unknown;
+      duplicates?: unknown;
+    };
+    if (
+      !Number.isSafeInteger(reply.recorded) ||
+      (reply.recorded as number) < 0 ||
+      !Number.isSafeInteger(reply.duplicates) ||
+      (reply.duplicates as number) < 0 ||
+      (reply.recorded as number) + (reply.duplicates as number) !==
+        parsed.data.samples.length
+    )
+      throw new Error("usage_ack_invalid");
+  }
   async desired(signal: AbortSignal): Promise<DesiredResponse> {
     const pullSignal = AbortSignal.any([signal, AbortSignal.timeout(60_000)]);
     let after: string | undefined;
