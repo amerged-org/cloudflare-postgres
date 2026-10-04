@@ -180,6 +180,7 @@ test("pending startup/dial remains fenced and resumes its original bytes without
   await until(
     () => gateway.beginQuiesce(database, operation).pendingDials === 0,
   );
+  await until(() => postgres.peers.length === 1);
   assert.equal(chunks.length, 0);
   assert.equal(postgres.peers[0]!.bytes.length, 0);
   assert.equal(gateway.beginQuiesce(database, operation).status, "busy");
