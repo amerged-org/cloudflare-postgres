@@ -145,6 +145,40 @@ beforeEach(async () => {
 afterEach(() => db.close());
 
 describe("0001_init.sql", () => {
+  it("adds nullable platform CPU measurement without rewriting existing node values", () => {
+    const before = db.prepare("SELECT * FROM nodes WHERE id=?").get(nodeId)!;
+    db.exec(
+      readFileSync(
+        new URL(
+          "../../../apps/api/migrations/0002_node_cpu_capacity.sql",
+          import.meta.url,
+        ),
+        "utf8",
+      ),
+    );
+    expect(db.prepare("SELECT * FROM nodes WHERE id=?").get(nodeId)).toEqual({
+      ...before,
+      platform_reserved_cpu_millicores: null,
+    });
+    run(
+      "UPDATE nodes SET platform_reserved_cpu_millicores=0 WHERE id=?",
+      nodeId,
+    );
+    expect(
+      db
+        .prepare(
+          "SELECT platform_reserved_cpu_millicores FROM nodes WHERE id=?",
+        )
+        .get(nodeId),
+    ).toEqual({ platform_reserved_cpu_millicores: 0 });
+    expect(() =>
+      run(
+        "UPDATE nodes SET platform_reserved_cpu_millicores=-1 WHERE id=?",
+        nodeId,
+      ),
+    ).toThrow(/CHECK/);
+  });
+
   it("creates every table", () => {
     const tables = db
       .prepare(

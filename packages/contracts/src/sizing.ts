@@ -27,6 +27,12 @@ export function databaseMemoryReservationMib(
   return size.memory_mib + SIDECAR.requestMemoryMib;
 }
 
+export function databaseCpuReservationMillicores(
+  size: Pick<SizeResources, "cpu_millicores">,
+): number {
+  return size.cpu_millicores + SIDECAR.requestCpuMillicores;
+}
+
 export interface ResourceQuotaMath {
   requestsCpuMillicores: number;
   limitsCpuMillicores: number;

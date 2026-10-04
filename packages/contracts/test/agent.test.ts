@@ -11,6 +11,7 @@ import {
   newOperationId,
   newRolePassword,
   OWNER_ROLE_NAME,
+  NodeObservation,
 } from "../src/index.ts";
 
 const id = newDatabaseId();
@@ -75,6 +76,35 @@ function observation(): Record<string, unknown> {
     orphans: [],
   };
 }
+
+describe("platform CPU observation compatibility", () => {
+  it("keeps absent measurements unknown while accepting measured zero and null", () => {
+    const node = (observation().nodes as Record<string, unknown>[])[0]!;
+    expect(
+      NodeObservation.parse(node).platform_reserved_cpu_millicores,
+    ).toBeUndefined();
+    expect(
+      NodeObservation.parse({ ...node, platform_reserved_cpu_millicores: null })
+        .platform_reserved_cpu_millicores,
+    ).toBeNull();
+    expect(
+      NodeObservation.parse({ ...node, platform_reserved_cpu_millicores: 0 })
+        .platform_reserved_cpu_millicores,
+    ).toBe(0);
+    expect(
+      NodeObservation.safeParse({
+        ...node,
+        platform_reserved_cpu_millicores: -1,
+      }).success,
+    ).toBe(false);
+    expect(
+      NodeObservation.safeParse({
+        ...node,
+        platform_reserved_cpu_millicores: 0.5,
+      }).success,
+    ).toBe(false);
+  });
+});
 
 describe("archive path", () => {
   it("builds s3://<bucket>/<region>/<id>/g<generation>-<operation>", () => {

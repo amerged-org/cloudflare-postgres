@@ -217,6 +217,7 @@ export const NodeObservation = z.strictObject({
   allocatable_cpu_millicores: Count,
   storage_gib_total: Count.nullable(),
   platform_reserved_memory_mib: Count,
+  platform_reserved_cpu_millicores: Count.nullable().optional(),
 });
 export type NodeObservation = z.infer<typeof NodeObservation>;
 

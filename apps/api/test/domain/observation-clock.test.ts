@@ -42,6 +42,7 @@ describe("observation ordering on real Workers D1", () => {
             allocatable_cpu_millicores: 2000,
             storage_gib_total: null,
             platform_reserved_memory_mib: 128,
+            platform_reserved_cpu_millicores: 100,
           },
         ],
       ),
@@ -67,16 +68,18 @@ describe("observation ordering on real Workers D1", () => {
     expect(database!.updated_at >= receivedAfter).toBe(true);
     expect(database!.updated_at <= new Date().toISOString()).toBe(true);
     const node = await env.DB.prepare(
-      "SELECT storage_gib_total,last_observed_at,updated_at FROM nodes WHERE id=?",
+      "SELECT storage_gib_total,platform_reserved_cpu_millicores,last_observed_at,updated_at FROM nodes WHERE id=?",
     )
       .bind(f.node)
       .first<{
         storage_gib_total: number | null;
+        platform_reserved_cpu_millicores: number | null;
         last_observed_at: string;
         updated_at: string;
       }>();
     expect(node).toMatchObject({
       storage_gib_total: null,
+      platform_reserved_cpu_millicores: 100,
       last_observed_at: sampledAt,
     });
     expect(node!.updated_at >= receivedAfter).toBe(true);

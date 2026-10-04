@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   databaseMemoryReservationMib,
+  databaseCpuReservationMillicores,
   SIDECAR,
   type SizeResources,
 } from "@pgcf/contracts";
@@ -12,6 +13,9 @@ export interface PlacementNode {
   schedulable: number | boolean;
   allocatable_memory_mib: number;
   platform_reserved_memory_mib: number;
+  allocatable_cpu_millicores: number;
+  platform_reserved_cpu_millicores?: number | null;
+  reserved_cpu_millicores: number;
   storage_gib_total: number | null;
   reserved_memory_mib: number;
   reserved_storage_gib: number;
@@ -29,6 +33,12 @@ export function choosePlacement(
           n.region_id === regionId &&
           n.ready &&
           n.schedulable &&
+          Number.isSafeInteger(n.platform_reserved_cpu_millicores) &&
+          n.platform_reserved_cpu_millicores! >= 0 &&
+          n.allocatable_cpu_millicores -
+            n.platform_reserved_cpu_millicores! -
+            n.reserved_cpu_millicores >=
+            databaseCpuReservationMillicores(size) &&
           n.storage_gib_total !== null &&
           n.allocatable_memory_mib -
             n.platform_reserved_memory_mib -
@@ -53,11 +63,11 @@ export async function placementNodes(
 ): Promise<PlacementNode[]> {
   const result = await db
     .prepare(
-      `SELECT n.*, COALESCE(SUM(s.memory_mib + ?),0) reserved_memory_mib, COALESCE(SUM(s.storage_gib),0) reserved_storage_gib
+      `SELECT n.*, COALESCE(SUM(s.memory_mib + ?),0) reserved_memory_mib, COALESCE(SUM(s.cpu_millicores + ?),0) reserved_cpu_millicores, COALESCE(SUM(s.storage_gib),0) reserved_storage_gib
     FROM nodes n LEFT JOIN databases d ON d.node_id=n.id AND d.observed_state <> 'deleted' LEFT JOIN size_classes s ON s.id=d.size_class_id
     WHERE n.region_id=? GROUP BY n.id`,
     )
-    .bind(SIDECAR.requestMemoryMib, regionId)
+    .bind(SIDECAR.requestMemoryMib, SIDECAR.requestCpuMillicores, regionId)
     .all<PlacementNode>();
   return result.results;
 }

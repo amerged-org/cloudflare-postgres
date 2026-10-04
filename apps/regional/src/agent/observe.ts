@@ -124,11 +124,17 @@ export function quantity(value: unknown): number {
   return result;
 }
 
-export function podMemoryRequest(pod: Resource): number {
+function podRequest(
+  pod: Resource,
+  resource: "memory" | "cpu",
+  convert: (value: unknown) => number,
+): number {
   const spec = record(pod.spec);
-  const memory = (container: unknown) => {
-    const value = record(record(record(container).resources).requests).memory;
-    return value === undefined ? 0 : quantity(value);
+  const request = (container: unknown) => {
+    const value = record(record(record(container).resources).requests)[
+      resource
+    ];
+    return value === undefined ? 0 : convert(value);
   };
   const containers = Array.isArray(spec.containers) ? spec.containers : [];
   const init = Array.isArray(spec.initContainers) ? spec.initContainers : [];
@@ -136,21 +142,34 @@ export function podMemoryRequest(pod: Resource): number {
   let initMaximum = 0;
   for (const container of init) {
     if (record(container).restartPolicy === "Always")
-      restartable += memory(container);
+      restartable += request(container);
     initMaximum = Math.max(
       initMaximum,
       restartable +
-        (record(container).restartPolicy === "Always" ? 0 : memory(container)),
+        (record(container).restartPolicy === "Always" ? 0 : request(container)),
     );
   }
   const apps =
-    containers.reduce<number>((sum, container) => sum + memory(container), 0) +
+    containers.reduce<number>((sum, container) => sum + request(container), 0) +
     restartable;
-  const overhead = record(spec.overhead).memory;
+  const overhead = record(spec.overhead)[resource];
   return (
     Math.max(apps, initMaximum) +
-    (overhead === undefined ? 0 : quantity(overhead))
+    (overhead === undefined ? 0 : convert(overhead))
   );
+}
+
+export function podMemoryRequest(pod: Resource): number {
+  return podRequest(pod, "memory", quantity);
+}
+
+export function podCpuRequestMillicores(pod: Resource): number {
+  const requested = podRequest(pod, "cpu", (value) =>
+    Math.ceil(quantity(value) * 1000),
+  );
+  if (!Number.isSafeInteger(requested))
+    throw new Error("resource_quantity_invalid");
+  return requested;
 }
 
 export function nodeObservations(
@@ -178,16 +197,24 @@ export function nodeObservations(
       Number.isSafeInteger(Number(storage))
         ? Number(storage)
         : null;
-    const reserved = pods
-      .filter(
-        (pod) =>
-          record(pod.spec).nodeName === node.metadata.name &&
-          !databaseNamespaces.has(pod.metadata.namespace ?? "") &&
-          !["Succeeded", "Failed"].includes(
-            string(record(pod.status).phase) ?? "",
-          ),
-      )
-      .reduce((sum, pod) => sum + podMemoryRequest(pod), 0);
+    const platform = pods.filter(
+      (pod) =>
+        record(pod.spec).nodeName === node.metadata.name &&
+        !databaseNamespaces.has(pod.metadata.namespace ?? "") &&
+        !["Succeeded", "Failed"].includes(
+          string(record(pod.status).phase) ?? "",
+        ),
+    );
+    const reserved = platform.reduce(
+      (sum, pod) => sum + podMemoryRequest(pod),
+      0,
+    );
+    const cpu = platform.reduce(
+      (sum, pod) => sum + podCpuRequestMillicores(pod),
+      0,
+    );
+    if (!Number.isSafeInteger(cpu))
+      throw new Error("resource_quantity_invalid");
     return {
       name: node.metadata.name,
       ready:
@@ -199,6 +226,7 @@ export function nodeObservations(
       allocatable_cpu_millicores: Math.floor(quantity(allocatable.cpu) * 1000),
       storage_gib_total: storageGiB,
       platform_reserved_memory_mib: Math.ceil(reserved / 2 ** 20),
+      platform_reserved_cpu_millicores: cpu,
     };
   });
 }

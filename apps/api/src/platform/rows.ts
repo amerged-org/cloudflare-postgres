@@ -37,6 +37,8 @@ export const regionRow = (row: Row): Region =>
 export const nodeRow = (row: Row): Node =>
   Node.parse({
     ...row,
+    platform_reserved_cpu_millicores:
+      row.platform_reserved_cpu_millicores ?? null,
     ready: row.ready === 1,
     schedulable: row.schedulable === 1,
   });

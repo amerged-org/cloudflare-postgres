@@ -7,6 +7,7 @@ import {
   ErrorBody,
   IDEMPOTENCY_KEY_PATTERN,
   ListQuery,
+  Node,
   Region,
   RegionCreated,
   newAgentKey,
@@ -18,10 +19,44 @@ import {
   errorStatus,
   newDatabaseId,
   newProjectId,
+  newNodeId,
 } from "../src/index.ts";
 
 const encode = (text: string) =>
   bytesToBase64url(new TextEncoder().encode(text));
+
+describe("node CPU measurement compatibility", () => {
+  it("keeps legacy views valid without inventing measured platform CPU", () => {
+    const now = new Date().toISOString();
+    const node = {
+      id: newNodeId(),
+      region_id: "eu-test",
+      k8s_node_name: "test-node",
+      provider_instance_id: null,
+      provider_product: null,
+      monthly_price: null,
+      currency: null,
+      ready: true,
+      schedulable: true,
+      allocatable_memory_mib: 4096,
+      allocatable_cpu_millicores: 2000,
+      storage_gib_total: 30,
+      platform_reserved_memory_mib: 128,
+      last_observed_at: null,
+      created_at: now,
+      updated_at: now,
+    };
+    expect(Node.parse(node).platform_reserved_cpu_millicores).toBeUndefined();
+    expect(
+      Node.parse({ ...node, platform_reserved_cpu_millicores: null })
+        .platform_reserved_cpu_millicores,
+    ).toBeNull();
+    expect(
+      Node.parse({ ...node, platform_reserved_cpu_millicores: 0 })
+        .platform_reserved_cpu_millicores,
+    ).toBe(0);
+  });
+});
 
 describe("cursor", () => {
   it("round-trips created_at and id", () => {
