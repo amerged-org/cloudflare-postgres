@@ -50,7 +50,7 @@ export type GatewayControlReport = z.infer<typeof gatewayControlReportSchema>;
 export const gatewayFenceName = (database: string): string =>
   `gateway-fence-${DatabaseId.parse(database)}`;
 const encoder = new TextEncoder(),
-  decoder = new TextDecoder("utf-8", { fatal: true });
+  decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 const signingPurpose = "pgcf-gateway-control/v1\n";
 const keyPurpose = "pgcf-gateway-control-key/v1\n";
 async function hmac(key: Uint8Array, value: string): Promise<Uint8Array> {
