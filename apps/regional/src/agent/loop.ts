@@ -15,7 +15,11 @@ import {
 import { backupCredentials, Reconciler } from "./reconcile.ts";
 import type { Kubernetes, Log } from "./types.ts";
 import type { RegionalMeasurements } from "./measurements.ts";
-import type { PowerCoordinator } from "./power.ts";
+import {
+  beginWakePhase,
+  type WakePhaseOutcome,
+  type PowerCoordinator,
+} from "./power.ts";
 import type { AuthenticationProbe } from "./readiness.ts";
 
 export interface ControlApi {
@@ -41,6 +45,7 @@ export class AgentLoop {
   private signal: AbortSignal;
   private log: Log;
   private now: () => number;
+  private phaseNow: () => number;
   private measurements?: Pick<RegionalMeasurements, "update">;
   constructor(
     api: ControlApi,
@@ -53,6 +58,7 @@ export class AgentLoop {
     authenticate?: AuthenticationProbe,
     power?: PowerCoordinator,
     measurements?: Pick<RegionalMeasurements, "update">,
+    phaseNow = () => performance.now(),
   ) {
     this.api = api;
     this.k8s = k8s;
@@ -61,6 +67,7 @@ export class AgentLoop {
     this.log = log;
     this.now = now;
     this.measurements = measurements;
+    this.phaseNow = phaseNow;
     this.reconcile = new Reconciler(
       k8s,
       signal,
@@ -68,6 +75,8 @@ export class AgentLoop {
       fetcher,
       authenticate,
       power,
+      log,
+      phaseNow,
     );
   }
 
@@ -160,23 +169,40 @@ export class AgentLoop {
       Array.from({ length: Math.min(4, desired.databases.length) }, worker),
     );
     if (this.signal.aborted) return nonterminal;
-    const [namespaces, nodes, pods] = await Promise.all([
-      this.k8s.list("Namespace", undefined, DATABASE_LABEL),
-      this.k8s.list("Node"),
-      this.k8s.list("Pod"),
-    ]);
-    await this.api.observations(
-      {
-        observed_at: new Date(this.now()).toISOString(),
-        nodes: nodeObservations(nodes, pods, namespaces),
-        databases: observations,
-        orphans: orphanObservations(
-          namespaces,
-          new Set(desired.databases.map((db: DesiredDatabase) => db.id)),
-        ),
-      },
-      this.signal,
+    const phaseLog = desired.databases.some(
+      (db) => db.desired_state === "running" && db.power?.mode === "running",
+    )
+      ? this.log
+      : undefined;
+    const finishPost = beginWakePhase(
+      phaseLog,
+      "observation_post",
+      undefined,
+      this.phaseNow,
     );
+    let postOutcome: WakePhaseOutcome = "failed";
+    try {
+      const [namespaces, nodes, pods] = await Promise.all([
+        this.k8s.list("Namespace", undefined, DATABASE_LABEL),
+        this.k8s.list("Node"),
+        this.k8s.list("Pod"),
+      ]);
+      await this.api.observations(
+        {
+          observed_at: new Date(this.now()).toISOString(),
+          nodes: nodeObservations(nodes, pods, namespaces),
+          databases: observations,
+          orphans: orphanObservations(
+            namespaces,
+            new Set(desired.databases.map((db: DesiredDatabase) => db.id)),
+          ),
+        },
+        this.signal,
+      );
+      postOutcome = "completed";
+    } finally {
+      finishPost(postOutcome);
+    }
     for (const id of this.retries.keys())
       if (!desired.databases.some((db) => db.id === id))
         this.retries.delete(id);

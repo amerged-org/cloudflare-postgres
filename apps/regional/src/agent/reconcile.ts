@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   desiredPower,
+  beginWakePhase,
+  measureWakePhase,
+  type WakePhaseOutcome,
   type PowerCoordinator,
   type PowerObservation,
 } from "./power.ts";
@@ -35,7 +38,7 @@ import {
 } from "./observe.ts";
 import type { ArchiveProgress } from "./observe.ts";
 import { record, string, uid } from "./types.ts";
-import type { Kubernetes, Resource } from "./types.ts";
+import type { Kubernetes, Resource, Log } from "./types.ts";
 import { probeRoles } from "./readiness.ts";
 import type { AuthenticationProbe } from "./readiness.ts";
 
@@ -281,6 +284,8 @@ export class Reconciler {
   private fetcher: typeof fetch;
   private authenticate: AuthenticationProbe;
   private power?: PowerCoordinator;
+  private log?: Log;
+  private phaseNow: () => number;
   constructor(
     k8s: Kubernetes,
     signal: AbortSignal,
@@ -288,6 +293,8 @@ export class Reconciler {
     fetcher: typeof fetch = fetch,
     authenticate: AuthenticationProbe = probeRoles,
     power?: PowerCoordinator,
+    log?: Log,
+    phaseNow = () => performance.now(),
   ) {
     this.k8s = k8s;
     this.signal = signal;
@@ -295,6 +302,8 @@ export class Reconciler {
     this.fetcher = fetcher;
     this.authenticate = authenticate;
     this.power = power;
+    this.log = log;
+    this.phaseNow = phaseNow;
   }
 
   hint(): void {
@@ -305,6 +314,16 @@ export class Reconciler {
     db: DesiredDatabase,
     ctx?: BuildContext,
   ): Promise<PowerObservation | null> {
+    const phaseLog =
+      db.desired_state === "running" && db.power?.mode === "running"
+        ? this.log
+        : undefined;
+    const finishPrepare = beginWakePhase(
+      phaseLog,
+      "wake_prepare",
+      db.id,
+      this.phaseNow,
+    );
     const namespaceName = databaseNamespace(db.id);
     const namespace = await this.k8s.read(
       "Namespace",
@@ -445,193 +464,218 @@ export class Reconciler {
         );
       if (storage && fence && appliedGeneration(fence) < db.generation)
         fence = await this.saveStorage(db, storage, fence);
-      const pending = await this.power.prepareRunning(db);
+      let pending: PowerObservation | null | undefined;
+      try {
+        pending = await this.power.prepareRunning(db);
+      } catch (error) {
+        finishPrepare("failed");
+        throw error;
+      }
+      finishPrepare(pending === undefined ? "completed" : "pending");
       if (pending !== undefined) return pending;
     }
     if (!ctx) throw new Error("build_context_required");
-    storage = storage ?? {
-      namespaceUid: null,
-      clusterUid: null,
-      node: db.node,
-      archivePath: db.archive.destination_path,
-    };
-    if (namespace) storage.namespaceUid = uid(namespace);
-    if (priorCluster) storage.clusterUid = uid(priorCluster);
-    fence = await this.saveStorage(db, storage, fence);
-
-    if (db.generation > appliedGeneration(namespace)) {
-      const manifests = buildDatabaseManifests(db, ctx);
-      // Accepted revisions fence out stale pulls before credentials can change. Completion advances last.
-      const first = manifests[0];
-      if (
-        !first ||
-        first.kind !== "Namespace" ||
-        first.metadata.name !== namespaceName
-      )
-        throw new Error("builder_namespace_invalid");
-      first.metadata.annotations = {
-        ...first.metadata.annotations,
-        ...namespace?.metadata.annotations,
-        [ACCEPTED_GENERATION_ANNOTATION]: String(db.generation),
+    const finishApply = beginWakePhase(
+      phaseLog,
+      "desired_apply",
+      db.id,
+      this.phaseNow,
+    );
+    let applyOutcome: WakePhaseOutcome = "pending";
+    try {
+      storage = storage ?? {
+        namespaceUid: null,
+        clusterUid: null,
+        node: db.node,
+        archivePath: db.archive.destination_path,
       };
-      const hash = createHash("sha256")
-        .update(JSON.stringify(manifests))
-        .digest("hex");
-      if (this.hashes.get(db.id) !== hash) {
-        if (namespace) {
-          if (!namespace.metadata.resourceVersion)
-            throw new Error("database_namespace_version_missing");
-          await this.k8s.patch("Namespace", undefined, namespaceName, [
-            { op: "test", path: "/metadata/uid", value: uid(namespace) },
-            {
-              op: "test",
-              path: "/metadata/resourceVersion",
-              value: namespace.metadata.resourceVersion,
-            },
-            {
-              op: "add",
-              path: "/metadata/annotations",
-              value: first.metadata.annotations,
-            },
-            {
-              op: "add",
-              path: "/metadata/labels",
-              value: { ...namespace.metadata.labels, ...first.metadata.labels },
-            },
-          ]);
-        } else await this.k8s.create(first);
-        const active = await this.k8s.read(
-          "Namespace",
-          undefined,
-          namespaceName,
-        );
-        if (!active)
-          return recoveryRequired(
-            db,
-            "database namespace disappeared during creation",
+      if (namespace) storage.namespaceUid = uid(namespace);
+      if (priorCluster) storage.clusterUid = uid(priorCluster);
+      fence = await this.saveStorage(db, storage, fence);
+
+      if (db.generation > appliedGeneration(namespace)) {
+        const manifests = buildDatabaseManifests(db, ctx);
+        // Accepted revisions fence out stale pulls before credentials can change. Completion advances last.
+        const first = manifests[0];
+        if (
+          !first ||
+          first.kind !== "Namespace" ||
+          first.metadata.name !== namespaceName
+        )
+          throw new Error("builder_namespace_invalid");
+        first.metadata.annotations = {
+          ...first.metadata.annotations,
+          ...namespace?.metadata.annotations,
+          [ACCEPTED_GENERATION_ANNOTATION]: String(db.generation),
+        };
+        const hash = createHash("sha256")
+          .update(JSON.stringify(manifests))
+          .digest("hex");
+        if (this.hashes.get(db.id) !== hash) {
+          if (namespace) {
+            if (!namespace.metadata.resourceVersion)
+              throw new Error("database_namespace_version_missing");
+            await this.k8s.patch("Namespace", undefined, namespaceName, [
+              { op: "test", path: "/metadata/uid", value: uid(namespace) },
+              {
+                op: "test",
+                path: "/metadata/resourceVersion",
+                value: namespace.metadata.resourceVersion,
+              },
+              {
+                op: "add",
+                path: "/metadata/annotations",
+                value: first.metadata.annotations,
+              },
+              {
+                op: "add",
+                path: "/metadata/labels",
+                value: {
+                  ...namespace.metadata.labels,
+                  ...first.metadata.labels,
+                },
+              },
+            ]);
+          } else await this.k8s.create(first);
+          const active = await this.k8s.read(
+            "Namespace",
+            undefined,
+            namespaceName,
           );
-        assertOwned(active, db.id, namespaceName);
-        if (storage.namespaceUid && uid(active) !== storage.namespaceUid)
-          return recoveryRequired(db, "database namespace identity changed");
-        storage.namespaceUid = uid(active);
-        fence = await this.saveStorage(db, storage, fence);
-        if (record(active.status).phase !== "Active") return null;
-        if (acceptedGeneration(active) !== db.generation) return null;
-        if (active.metadata.deletionTimestamp)
-          throw new Error("database_namespace_deleting");
-        for (const manifest of manifests.slice(1)) {
-          if (
-            manifest.metadata.namespace !== namespaceName ||
-            manifest.metadata.labels?.[DATABASE_LABEL] !== db.id
-          )
-            throw new Error("builder_resource_scope_invalid");
-          manifest.metadata.annotations = {
-            ...manifest.metadata.annotations,
-            [GENERATION_ANNOTATION]: String(db.generation),
-          };
-          if (manifest.kind === "Cluster") {
-            const currentCluster = await this.k8s.read(
-              "Cluster",
-              namespaceName,
-              "database",
+          if (!active)
+            return recoveryRequired(
+              db,
+              "database namespace disappeared during creation",
             );
-            if (currentCluster) {
-              assertOwned(currentCluster, db.id, "database");
-              if (appliedGeneration(currentCluster) > db.generation)
-                return null;
-              if (
-                storage.clusterUid &&
-                uid(currentCluster) !== storage.clusterUid
-              )
-                return recoveryRequired(
-                  db,
-                  "database cluster identity changed",
-                );
-              storage.clusterUid = uid(currentCluster);
-              fence = await this.saveStorage(db, storage, fence);
-              if (!currentCluster.metadata.resourceVersion)
-                throw new Error("database_cluster_version_missing");
-              await this.k8s.patch("Cluster", namespaceName, "database", [
-                {
-                  op: "test",
-                  path: "/metadata/uid",
-                  value: uid(currentCluster),
-                },
-                {
-                  op: "test",
-                  path: "/metadata/resourceVersion",
-                  value: currentCluster.metadata.resourceVersion,
-                },
-                {
-                  op: "add",
-                  path: "/metadata/annotations",
-                  value: {
-                    ...currentCluster.metadata.annotations,
-                    ...manifest.metadata.annotations,
-                  },
-                },
-                {
-                  op: "add",
-                  path: "/spec",
-                  value: {
-                    ...record(currentCluster.spec),
-                    ...record(manifest.spec),
-                  },
-                },
-              ]);
-            } else {
-              if (storage.clusterUid || !pendingCreation(db))
-                return recoveryRequired(db, "database cluster is missing");
-              await this.k8s.create(manifest);
-              const created = await this.k8s.read(
+          assertOwned(active, db.id, namespaceName);
+          if (storage.namespaceUid && uid(active) !== storage.namespaceUid)
+            return recoveryRequired(db, "database namespace identity changed");
+          storage.namespaceUid = uid(active);
+          fence = await this.saveStorage(db, storage, fence);
+          if (record(active.status).phase !== "Active") return null;
+          if (acceptedGeneration(active) !== db.generation) return null;
+          if (active.metadata.deletionTimestamp)
+            throw new Error("database_namespace_deleting");
+          for (const manifest of manifests.slice(1)) {
+            if (
+              manifest.metadata.namespace !== namespaceName ||
+              manifest.metadata.labels?.[DATABASE_LABEL] !== db.id
+            )
+              throw new Error("builder_resource_scope_invalid");
+            manifest.metadata.annotations = {
+              ...manifest.metadata.annotations,
+              [GENERATION_ANNOTATION]: String(db.generation),
+            };
+            if (manifest.kind === "Cluster") {
+              const currentCluster = await this.k8s.read(
                 "Cluster",
                 namespaceName,
                 "database",
               );
-              if (!created)
-                return recoveryRequired(
-                  db,
-                  "database cluster disappeared during creation",
+              if (currentCluster) {
+                assertOwned(currentCluster, db.id, "database");
+                if (appliedGeneration(currentCluster) > db.generation)
+                  return null;
+                if (
+                  storage.clusterUid &&
+                  uid(currentCluster) !== storage.clusterUid
+                )
+                  return recoveryRequired(
+                    db,
+                    "database cluster identity changed",
+                  );
+                storage.clusterUid = uid(currentCluster);
+                fence = await this.saveStorage(db, storage, fence);
+                if (!currentCluster.metadata.resourceVersion)
+                  throw new Error("database_cluster_version_missing");
+                await this.k8s.patch("Cluster", namespaceName, "database", [
+                  {
+                    op: "test",
+                    path: "/metadata/uid",
+                    value: uid(currentCluster),
+                  },
+                  {
+                    op: "test",
+                    path: "/metadata/resourceVersion",
+                    value: currentCluster.metadata.resourceVersion,
+                  },
+                  {
+                    op: "add",
+                    path: "/metadata/annotations",
+                    value: {
+                      ...currentCluster.metadata.annotations,
+                      ...manifest.metadata.annotations,
+                    },
+                  },
+                  {
+                    op: "add",
+                    path: "/spec",
+                    value: {
+                      ...record(currentCluster.spec),
+                      ...record(manifest.spec),
+                    },
+                  },
+                ]);
+              } else {
+                if (storage.clusterUid || !pendingCreation(db))
+                  return recoveryRequired(db, "database cluster is missing");
+                await this.k8s.create(manifest);
+                const created = await this.k8s.read(
+                  "Cluster",
+                  namespaceName,
+                  "database",
                 );
-              assertOwned(created, db.id, "database");
-              storage.clusterUid = uid(created);
-              fence = await this.saveStorage(db, storage, fence);
-            }
-          } else if (!(await this.applyRevision(db, manifest))) return null;
+                if (!created)
+                  return recoveryRequired(
+                    db,
+                    "database cluster disappeared during creation",
+                  );
+                assertOwned(created, db.id, "database");
+                storage.clusterUid = uid(created);
+                fence = await this.saveStorage(db, storage, fence);
+              }
+            } else if (!(await this.applyRevision(db, manifest))) return null;
+          }
+          this.hashes.set(db.id, hash);
         }
-        this.hashes.set(db.id, hash);
-      }
-      const current = await this.k8s.read(
-        "Namespace",
-        undefined,
-        namespaceName,
-      );
-      if (!current)
-        return recoveryRequired(db, "database namespace is missing");
-      assertOwned(current, db.id, namespaceName);
-      if (uid(current) !== storage.namespaceUid)
-        return recoveryRequired(db, "database namespace identity changed");
-      if (
-        appliedGeneration(current) > db.generation ||
-        acceptedGeneration(current) !== db.generation
-      )
-        return null;
-      await this.k8s.patch("Namespace", undefined, namespaceName, [
-        { op: "test", path: "/metadata/uid", value: uid(current) },
-        {
-          op: "test",
-          path: "/metadata/annotations/pgcf.io~1accepted-generation",
-          value: String(db.generation),
-        },
-        {
-          op: "add",
-          path: "/metadata/annotations",
-          value: {
-            ...current.metadata.annotations,
-            [GENERATION_ANNOTATION]: String(db.generation),
+        const current = await this.k8s.read(
+          "Namespace",
+          undefined,
+          namespaceName,
+        );
+        if (!current)
+          return recoveryRequired(db, "database namespace is missing");
+        assertOwned(current, db.id, namespaceName);
+        if (uid(current) !== storage.namespaceUid)
+          return recoveryRequired(db, "database namespace identity changed");
+        if (
+          appliedGeneration(current) > db.generation ||
+          acceptedGeneration(current) !== db.generation
+        )
+          return null;
+        await this.k8s.patch("Namespace", undefined, namespaceName, [
+          { op: "test", path: "/metadata/uid", value: uid(current) },
+          {
+            op: "test",
+            path: "/metadata/annotations/pgcf.io~1accepted-generation",
+            value: String(db.generation),
           },
-        },
-      ]);
+          {
+            op: "add",
+            path: "/metadata/annotations",
+            value: {
+              ...current.metadata.annotations,
+              [GENERATION_ANNOTATION]: String(db.generation),
+            },
+          },
+        ]);
+      }
+      applyOutcome = "completed";
+    } catch (error) {
+      applyOutcome = "failed";
+      throw error;
+    } finally {
+      finishApply(applyOutcome);
     }
     // Equal revisions still observe asynchronous CNPG readiness, archiving and CA publication.
     const cluster = await this.k8s.read("Cluster", namespaceName, "database");
@@ -643,13 +687,20 @@ export class Reconciler {
     let progress: ArchiveProgress | null = null;
     let measured = false;
     try {
-      const metrics = await archiveMetrics(
-        this.k8s,
-        namespaceName,
-        cluster,
-        this.signal,
-        this.now,
-        this.fetcher,
+      const metrics = await measureWakePhase(
+        phaseLog,
+        "archive_metrics",
+        db.id,
+        () =>
+          archiveMetrics(
+            this.k8s,
+            namespaceName,
+            cluster,
+            this.signal,
+            this.now,
+            this.fetcher,
+          ),
+        this.phaseNow,
       );
       count = metrics.readyWalFiles;
       progress = metrics.progress;
@@ -692,14 +743,21 @@ export class Reconciler {
         this.archiveFailures.get(db.id) ?? firstFailure,
       );
     }
-    const publicCa = await this.publishCa(db, cluster, namespaceName);
+    const publicCa = await measureWakePhase(
+      phaseLog,
+      "ca_publication",
+      db.id,
+      () => this.publishCa(db, cluster, namespaceName),
+      this.phaseNow,
+    );
     const runtimeResources: Resource[] = [];
-    const desiredApplied = await this.desiredApplied(
-      db,
-      ctx,
-      cluster,
-      namespaceName,
-      runtimeResources,
+    const desiredApplied = await measureWakePhase(
+      phaseLog,
+      "desired_applied",
+      db.id,
+      () =>
+        this.desiredApplied(db, ctx, cluster, namespaceName, runtimeResources),
+      this.phaseNow,
     );
     const caMap = publicCa
       ? await this.k8s.read("ConfigMap", SYSTEM_NAMESPACE, `ca-${db.id}`)
@@ -710,13 +768,32 @@ export class Reconciler {
       publicCa &&
       desiredApplied &&
       ca
-        ? await this.authenticate(db, ca, this.signal)
+        ? await measureWakePhase(
+            phaseLog,
+            "role_runtime_auth",
+            db.id,
+            () => this.authenticate(db, ca, this.signal),
+            this.phaseNow,
+          )
         : false;
     const storageVerified =
       credentialsApplied &&
-      (await this.verifyVolumeIdentity(db, fence, runtimeResources));
+      (await measureWakePhase(
+        phaseLog,
+        "volume_identity",
+        db.id,
+        () => this.verifyVolumeIdentity(db, fence, runtimeResources),
+        this.phaseNow,
+      ));
     const runtimeUnchanged =
-      storageVerified && (await this.runtimeUnchanged(runtimeResources));
+      storageVerified &&
+      (await measureWakePhase(
+        phaseLog,
+        "runtime_unchanged",
+        db.id,
+        () => this.runtimeUnchanged(runtimeResources),
+        this.phaseNow,
+      ));
     const unhealthy =
       stalled === true ||
       (archive?.status === "False" &&
@@ -746,7 +823,13 @@ export class Reconciler {
     };
     return this.power
       ? powerIntent
-        ? this.power.finishRunning(db, observation)
+        ? measureWakePhase(
+            phaseLog,
+            "fence_release",
+            db.id,
+            () => this.power!.finishRunning(db, observation),
+            this.phaseNow,
+          )
         : this.power.publishReadyFence(db, observation)
       : observation;
   }

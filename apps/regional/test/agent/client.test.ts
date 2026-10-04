@@ -385,3 +385,55 @@ test("configuration matches deployed environment names and requires a pinned ima
     /invalid_agent_key/,
   );
 });
+
+test("the production loop logger records bounded observation-post duration without reporting payloads", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  k8s.backupSecret(ctx);
+  db.power = {
+    operation: db.creation!.operation_id,
+    revision: db.generation,
+    mode: "running",
+    reason: null,
+  };
+  const power = {
+    prepareRunning: async () => undefined,
+    finishRunning: async (_db: unknown, value: unknown) => value,
+  } as unknown as import("../../src/agent/power.ts").PowerCoordinator;
+  const logs: {
+    event: string;
+    fields: Record<string, string | number | boolean>;
+  }[] = [];
+  let ticks = 0;
+  const reports: ObservationRequest[] = [];
+  const loop = new AgentLoop(
+    {
+      desired: async () => desired(db),
+      observations: async (value) => {
+        reports.push(value);
+      },
+    },
+    k8s,
+    ctx.postgresImage,
+    new AbortController().signal,
+    (event, fields = {}) => logs.push({ event, fields }),
+    Date.now,
+    metrics,
+    authenticate,
+    power,
+    undefined,
+    () => ticks++,
+  );
+  await loop.cycle();
+  assert.equal(reports[0]!.databases[0]!.state, "ready");
+  const post = logs.filter(
+    (entry) => entry.fields.phase === "observation_post",
+  );
+  assert.equal(post.length, 1);
+  assert.deepEqual(post[0], {
+    event: "wake_phase",
+    fields: { phase: "observation_post", elapsedMs: 1, outcome: "completed" },
+  });
+  for (const role of db.roles)
+    assert.equal(JSON.stringify(logs).includes(role.password), false);
+});
