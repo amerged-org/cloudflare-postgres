@@ -3,6 +3,7 @@ import { isDatabaseId, isRoleName } from "@pgcf/contracts";
 import { encodeErrorResponse } from "@pgcf/contracts/pg-wire";
 import { parseRouteKeyring, signRouteToken } from "@pgcf/contracts/route-token";
 import type { Env } from "./env.ts";
+import { decoyResponse } from "./decoy.ts";
 import { connectGateway } from "./gateway.ts";
 import { ADMISSION_DEADLINE_MS, connectionRateKey } from "./session-policy.ts";
 
@@ -13,9 +14,11 @@ interface Hints {
 
 class AdmissionFailure extends Error {
   readonly sqlstate: string;
-  constructor(sqlstate: string, message: string) {
+  readonly decoy: boolean;
+  constructor(sqlstate: string, message: string, decoy = false) {
     super(message);
     this.sqlstate = sqlstate;
+    this.decoy = decoy;
   }
 }
 
@@ -87,9 +90,17 @@ async function admit(
   if (!admitted.ok) {
     switch (admitted.sqlstate) {
       case "3D000":
-        throw new AdmissionFailure("3D000", "database does not exist");
+        throw new AdmissionFailure(
+          "28P01",
+          "password authentication failed",
+          true,
+        );
       case "28P01":
-        throw new AdmissionFailure("28P01", "authentication failed");
+        throw new AdmissionFailure(
+          "28P01",
+          "password authentication failed",
+          true,
+        );
       case "57P03":
         throw new AdmissionFailure(
           "57P03",
@@ -216,7 +227,9 @@ export default {
           ? error
           : new AdmissionFailure("08006", "gateway connection failed");
       outcome = failure.sqlstate;
-      return refused(failure);
+      return failure.decoy && hints
+        ? decoyResponse(hints, env.ROUTE_MASTER_KEYS, request.signal, ctx)
+        : refused(failure);
     } finally {
       console.log(
         JSON.stringify({

@@ -5,7 +5,13 @@ import {
   runInDurableObject,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import { newDatabaseId, newProjectId, newOperationId } from "@pgcf/contracts";
+import {
+  newDatabaseId,
+  newProjectId,
+  newOperationId,
+  isDatabaseId,
+  isRoleName,
+} from "@pgcf/contracts";
 import { encodeStartup, encodeSslRequest } from "@pgcf/contracts/pg-wire";
 import {
   deriveRegionKeyring,
@@ -98,18 +104,84 @@ async function open(
     socket.close();
   });
   live.push({ socket, ctx });
-  return { socket, messages, textMessages, closeCode: () => closeCode, ctx };
+  const parameters = new URLSearchParams(
+    options.query ??
+      new URLSearchParams({
+        database: options.database ?? database,
+        user: options.user ?? "app",
+      }),
+  );
+  return {
+    socket,
+    messages,
+    textMessages,
+    closeCode: () => closeCode,
+    ctx,
+    databaseHint: parameters.get("database"),
+    userHint: parameters.get("user"),
+  };
 }
 
 async function errorCode(
   connection: Awaited<ReturnType<typeof open>>,
 ): Promise<string> {
+  if (
+    connection.messages.length === 0 &&
+    connection.databaseHint &&
+    isDatabaseId(connection.databaseHint) &&
+    connection.userHint &&
+    isRoleName(connection.userHint)
+  ) {
+    try {
+      connection.socket.send(
+        encodeStartup({
+          database: connection.databaseHint,
+          user: connection.userHint,
+        }),
+      );
+    } catch {
+      /* Immediate failures may already be closed. */
+    }
+  }
   await expect.poll(() => connection.messages.length).toBeGreaterThan(0);
-  const bytes = connection.messages[0]!;
+  if (connection.messages[0]![0] === 0x52) {
+    expect(new DataView(connection.messages[0]!.buffer).getUint32(5)).toBe(10);
+    const first = new TextEncoder().encode(
+      `n,,n=,r=${crypto.randomUUID().replaceAll("-", "")}`,
+    );
+    const mechanism = new TextEncoder().encode("SCRAM-SHA-256\0");
+    const body = concat(mechanism, new Uint8Array(4), first);
+    new DataView(body.buffer).setInt32(mechanism.length, first.length);
+    connection.socket.send(passwordFrame(body));
+    await expect.poll(() => connection.messages.length).toBeGreaterThan(1);
+    expect(new DataView(connection.messages[1]!.buffer).getUint32(5)).toBe(11);
+    const challenge = new TextDecoder().decode(
+      connection.messages[1]!.subarray(9),
+    );
+    const nonce = challenge.split(",")[0]!.slice(2);
+    const proof = btoa(
+      String.fromCharCode(...crypto.getRandomValues(new Uint8Array(32))),
+    );
+    connection.socket.send(
+      passwordFrame(new TextEncoder().encode(`c=biws,r=${nonce},p=${proof}`)),
+    );
+  }
+  await expect
+    .poll(() => connection.messages.some((message) => message[0] === 0x45))
+    .toBe(true);
+  const bytes = connection.messages.find((message) => message[0] === 0x45)!;
   expect(bytes[0]).toBe(0x45);
   const text = new TextDecoder().decode(bytes.subarray(5));
   const fields = text.split("\0");
   return fields.find((field) => field.startsWith("C"))!.slice(1);
+}
+
+function passwordFrame(body: Uint8Array): Uint8Array {
+  const frame = new Uint8Array(5 + body.length);
+  frame[0] = 0x70;
+  new DataView(frame.buffer).setUint32(1, frame.length - 1);
+  frame.set(body, 5);
+  return frame;
 }
 
 async function setGatewayMode(mode: string): Promise<void> {
@@ -211,7 +283,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       Array.from({ length: 1_000 }, () => open({ database: newDatabaseId() })),
     );
     const codes = await Promise.all(unknown.map(errorCode));
-    expect(new Set(codes)).toEqual(new Set(["3D000"]));
+    expect(new Set(codes)).toEqual(new Set(["28P01"]));
     expect(actors).toHaveBeenCalledTimes(1_000);
     expect(queries).not.toHaveBeenCalled();
     expect(await stats()).toHaveLength(0);
@@ -254,7 +326,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     )
       .bind(new Date().toISOString(), database)
       .run();
-    expect(await errorCode(await open())).toBe("3D000");
+    expect(await errorCode(await open())).toBe("28P01");
     expect(await stats()).toHaveLength(0);
   });
 
@@ -409,7 +481,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
 
   it("distinguishes unknown database and role hints without contacting a gateway", async () => {
     const absentDatabase = await open({ database: newDatabaseId() });
-    expect(await errorCode(absentDatabase)).toBe("3D000");
+    expect(await errorCode(absentDatabase)).toBe("28P01");
     const absentRole = await open({ user: "missing" });
     expect(await errorCode(absentRole)).toBe("28P01");
     await testEnv.DB.prepare(
@@ -461,7 +533,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     };
     expect(
       await errorCode(await open({ bindings, database: newDatabaseId() })),
-    ).toBe("3D000");
+    ).toBe("28P01");
     expect(await errorCode(await open({ bindings, user: "missing" }))).toBe(
       "28P01",
     );
@@ -491,7 +563,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       .bind(new Date().toISOString(), database)
       .run();
     const deleted = await open();
-    expect(await errorCode(deleted)).toBe("3D000");
+    expect(await errorCode(deleted)).toBe("28P01");
     expect(await stats()).toHaveLength(0);
   });
 
@@ -678,6 +750,11 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const idle = await Promise.all(
       Array.from({ length: 1_000 }, () => open({ ip })),
     );
+    expect(await stats()).toHaveLength(1_000);
+    expect(logs.mock.calls).toHaveLength(1_000);
+    const denied = await open();
+    expect(await errorCode(denied)).toBe("53300");
+    expect(await stats()).toHaveLength(1_000);
     await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
     vi.useRealTimers();
     expect(
@@ -686,10 +763,6 @@ describe("native edge admission with real Workers D1 and route-token modules", (
           connection.closeCode() === null && connection.messages.length === 0,
       ),
     ).toBe(true);
-    expect(await stats()).toHaveLength(1_000);
-    expect(logs.mock.calls).toHaveLength(1_000);
-    const denied = await open();
-    expect(await errorCode(denied)).toBe("53300");
     expect(await stats()).toHaveLength(1_000);
   }, 30_000);
 
