@@ -662,6 +662,10 @@ function assertGatewayEntrypoint(
       },
     },
     PGCF_GATEWAY_PORT: { name: "PGCF_GATEWAY_PORT", value: "8080" },
+    PGCF_GATEWAY_POD_UID: {
+      name: "PGCF_GATEWAY_POD_UID",
+      valueFrom: { fieldRef: { apiVersion: "v1", fieldPath: "metadata.uid" } },
+    },
   };
   const environment = env.map((value) => {
     const row = { ...record(value) };
@@ -670,13 +674,15 @@ function assertGatewayEntrypoint(
       for (const name of ["configMapKeyRef", "secretKeyRef"])
         if (source[name] !== undefined)
           source[name] = defaulted(source[name], { optional: false });
+      if (source.fieldRef !== undefined)
+        source.fieldRef = defaulted(source.fieldRef, { apiVersion: "v1" });
       row.valueFrom = source;
     }
     return row;
   });
   if (
-    environment.length !== 3 ||
-    new Set(environment.map((row) => row.name)).size !== 3 ||
+    environment.length !== 4 ||
+    new Set(environment.map((row) => row.name)).size !== 4 ||
     environment.some(
       (row) => !sameStructuredValue(row, expectedEnvironment[string(row.name)]),
     )

@@ -230,6 +230,12 @@ function resources() {
         },
       },
       { name: "PGCF_GATEWAY_PORT", value: "8080" },
+      {
+        name: "PGCF_GATEWAY_POD_UID",
+        valueFrom: {
+          fieldRef: { apiVersion: "v1", fieldPath: "metadata.uid" },
+        },
+      },
     ],
     ports: [{ name: "http", containerPort: 8080, protocol: "TCP" }],
     livenessProbe: {
@@ -318,6 +324,35 @@ function resources() {
   };
   return { namespace, image, deployment, set: { ...set, spec: setSpec }, pod };
 }
+
+test("Gateway source proof accepts the exact downward Pod UID reference", () => {
+  const fixture = resources();
+  for (const spec of [
+    fixture.deployment.spec.template.spec,
+    fixture.set.spec.template.spec,
+    fixture.pod.spec,
+  ]) {
+    const container = (spec as { containers: Record<string, unknown>[] })
+      .containers[0]!;
+    const podUid = (
+      container.env as {
+        name: string;
+        valueFrom?: { fieldRef?: Record<string, unknown> };
+      }[]
+    ).find((row) => row.name === "PGCF_GATEWAY_POD_UID")!;
+    delete podUid.valueFrom!.fieldRef!.apiVersion;
+  }
+  assert.deepEqual(
+    clients.gatewayLogPods(
+      { items: [fixture.deployment] },
+      { items: [fixture.set] },
+      { items: [fixture.pod] },
+      fixture.namespace,
+      fixture.image,
+    ),
+    [fixture.pod.metadata.name],
+  );
+});
 
 test("Gateway log pod selection requires namespace, Deployment ownership and the approved source image", () => {
   const fixture = resources();
@@ -814,6 +849,39 @@ function changedGateway(
       fixture.image,
     );
 }
+
+test("Gateway source proof rejects missing or forged Pod UID sources", () => {
+  assert.throws(
+    changedGateway("pod", (container) => {
+      container.env = (container.env as { name: string }[]).filter(
+        (row) => row.name !== "PGCF_GATEWAY_POD_UID",
+      );
+    }),
+    { message: "gateway_log_environment_source_mismatch" },
+  );
+  assert.throws(
+    changedGateway("deployment", (container) => {
+      const env = container.env as Record<string, unknown>[];
+      env[env.findIndex((row) => row.name === "PGCF_GATEWAY_POD_UID")] = {
+        name: "PGCF_GATEWAY_POD_UID",
+        value: randomUUID(),
+      };
+    }),
+    { message: "gateway_log_environment_source_mismatch" },
+  );
+  assert.throws(
+    changedGateway("pod", (container) => {
+      const row = (
+        container.env as {
+          name: string;
+          valueFrom?: { fieldRef?: Record<string, unknown> };
+        }[]
+      ).find((row) => row.name === "PGCF_GATEWAY_POD_UID")!;
+      row.valueFrom!.fieldRef!.fieldPath = "metadata.name";
+    }),
+    { message: "gateway_log_environment_source_mismatch" },
+  );
+});
 
 test("approved Gateway image cannot prove source execution with an alternate Deployment command", () => {
   assert.throws(
