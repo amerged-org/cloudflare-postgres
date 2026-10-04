@@ -121,6 +121,8 @@ export class AgentLoop {
       while (!this.signal.aborted) {
         const db = desired.databases[index++];
         if (!db) return;
+        const waking =
+          db.desired_state === "running" && db.power?.mode === "running";
         const retry = this.retries.get(db.id);
         if (
           retry &&
@@ -128,6 +130,7 @@ export class AgentLoop {
           this.now() < retry.nextAt
         ) {
           nonterminal = true;
+          if (waking) this.wakePending = true;
           continue;
         }
         try {
@@ -137,11 +140,7 @@ export class AgentLoop {
           );
           this.retries.delete(db.id);
           if (observation) observations.push(observation);
-          if (
-            db.desired_state === "running" &&
-            db.power &&
-            (!observation || observation.state === "provisioning")
-          )
+          if (waking && (!observation || observation.state === "provisioning"))
             this.wakePending = true;
           if (
             !observation ||
@@ -151,12 +150,14 @@ export class AgentLoop {
         } catch {
           if (this.signal.aborted) return;
           nonterminal = true;
+          if (waking) this.wakePending = true;
           const attempt =
             retry?.generation === db.generation ? retry.attempt + 1 : 0;
           this.retries.set(db.id, {
             generation: db.generation,
             attempt,
-            nextAt: this.now() + backoff(attempt, 5_000, 300_000),
+            nextAt:
+              this.now() + backoff(attempt, waking ? 1_000 : 5_000, 300_000),
           });
           this.log("database_reconcile_failed", {
             database_id: db.id,
