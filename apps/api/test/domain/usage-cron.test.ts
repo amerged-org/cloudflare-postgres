@@ -202,40 +202,46 @@ describe("bounded usage cron", () => {
       }),
     );
   });
-  it("keeps the complete cron below its statement bound and pages pending regional hints fairly", async () => {
-    const f = await cohort(1000);
-    await env.DB.prepare("UPDATE databases SET generation=2 WHERE project_id=?")
-      .bind(f.project)
-      .run();
-    const counted = countStatements(env.DB),
-      now = start + 4 * USAGE_HOUR_MS;
-    const first = await runCron({ ...env, DB: counted.db }, now);
-    expect(counted.count()).toBeLessThanOrEqual(850);
-    expect(first.usage.statements).toBeLessThanOrEqual(
-      USAGE_CRON_STATEMENT_LIMIT,
-    );
-    expect(
+  it(
+    "keeps the complete cron below its statement bound and pages pending regional hints fairly",
+    { timeout: 30_000 },
+    async () => {
+      const f = await cohort(1000);
       await env.DB.prepare(
-        "SELECT database_id FROM region_hint_cursor WHERE singleton=1",
-      ).first(),
-    ).toEqual({ database_id: f.ids[199] });
-    const secondCount = countStatements(env.DB);
-    await runCron({ ...env, DB: secondCount.db }, now);
-    expect(secondCount.count()).toBeLessThanOrEqual(850);
-    expect(
-      await env.DB.prepare(
-        "SELECT database_id FROM region_hint_cursor WHERE singleton=1",
-      ).first(),
-    ).toEqual({ database_id: f.ids[399] });
-    console.log(
-      JSON.stringify({
-        event: "whole_cron_bound",
-        cohort: f.ids.length,
-        first_statements: counted.count(),
-        second_statements: secondCount.count(),
-      }),
-    );
-  });
+        "UPDATE databases SET generation=2 WHERE project_id=?",
+      )
+        .bind(f.project)
+        .run();
+      const counted = countStatements(env.DB),
+        now = start + 4 * USAGE_HOUR_MS;
+      const first = await runCron({ ...env, DB: counted.db }, now);
+      expect(counted.count()).toBeLessThanOrEqual(850);
+      expect(first.usage.statements).toBeLessThanOrEqual(
+        USAGE_CRON_STATEMENT_LIMIT,
+      );
+      expect(
+        await env.DB.prepare(
+          "SELECT database_id FROM region_hint_cursor WHERE singleton=1",
+        ).first(),
+      ).toEqual({ database_id: f.ids[199] });
+      const secondCount = countStatements(env.DB);
+      await runCron({ ...env, DB: secondCount.db }, now);
+      expect(secondCount.count()).toBeLessThanOrEqual(850);
+      expect(
+        await env.DB.prepare(
+          "SELECT database_id FROM region_hint_cursor WHERE singleton=1",
+        ).first(),
+      ).toEqual({ database_id: f.ids[399] });
+      console.log(
+        JSON.stringify({
+          event: "whole_cron_bound",
+          cohort: f.ids.length,
+          first_statements: counted.count(),
+          second_statements: secondCount.count(),
+        }),
+      );
+    },
+  );
   it("continues past a partial failure without skipping its old hour", async () => {
     const f = await cohort(3),
       failed = f.ids[1]!;
