@@ -42,8 +42,17 @@ the operation and revision; a held-client reconnect count was not measured. Stor
 resize is currently refused. The persistent gateway fence survived one gateway replacement,
 both replicas acknowledged release and rejected stale begin commands. A fresh CNPG database
 verified the private maintenance role's TLS, authentication and minimal catalog/WAL grants.
-Manual Dev suspend/resume preserved committed data, rollback absence, namespace/cluster/PVC/PV/volume/fence identities and storage generation. Suspend completed in 8,955 ms and zero PostgreSQL Pods remained; the exact closed WAL object was present in R2. A manually suspended connection returned SQLSTATE `57P03`. Resume connection took 19,830 ms, exceeding the Phase 2 ≤8 s target. PostgreSQL started at 2,449 ms, but 10-second startup/readiness probes delayed Pod readiness until 11,449 ms; agent wake polling is also being improved. Automatic Dev idle suspension is now confirmed. Ten simultaneous cold connections created exactly one wake operation and preserved committed/rollback markers; they took 11.080–11.143 s. Subsequent single cold connections measured 9.427, 9.703 and 9.071 s. The ≤8 s target and full twenty-cold-connection acceptance remain unmet. The live collector now samples each database at least 15 s apart; a real minute contained four allocation and eight gateway samples. Storage-used and backup samples remain unknown. The cost API is deployed, with null cost and an explicit node_rate gap until an actual source fact is recorded. Full usage-accuracy, retirement and phase acceptance remain in progress. The requested
-production-ready delivery through Phase 5 and complete Neon replacement are not complete.
+Manual Dev suspend/resume secured the closed WAL object in R2 and preserved data, rollback
+absence and every storage identity. Automatic idle suspension and one wake operation for ten
+concurrent connections are now confirmed. Those connections took 11.080–11.143 s; later single
+cold connections took 9.427, 9.703 and 9.071 s. The ≤8 s target and twenty-connection acceptance
+remain unmet. A real read-only transaction stayed ready for 74 s despite the 60 s idle policy.
+
+The live collector samples each database at least 15 s apart. A real minute contained four
+allocation and eight gateway samples. Storage-used and backup measurements remain unknown.
+The cost API reports null and a named node_rate gap until an actual contract/invoice fact is
+recorded. Usage accuracy and retirement still need full Dev acceptance. The production-ready
+release through Phase 5 and complete Neon replacement are not complete.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
 AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.
