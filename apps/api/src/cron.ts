@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DESIRED_PAGE_LIMIT_MAX } from "@pgcf/contracts";
 import type { Env } from "./env.ts";
+import { reconcileDatabaseActors } from "./domain/database-actor-sync.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
 
 export async function runCron(
@@ -31,5 +32,10 @@ export async function runCron(
       ids.length > DESIRED_PAGE_LIMIT_MAX ? undefined : ids,
     );
   }
+  let after: string | undefined;
+  do {
+    const page = await reconcileDatabaseActors(env, after);
+    after = page.next ?? undefined;
+  } while (after);
   return { failed: result.meta.changes, purged, hinted };
 }
