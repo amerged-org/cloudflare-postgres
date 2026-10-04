@@ -42,7 +42,7 @@ export async function desired(
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
     LEFT JOIN operations o ON o.id=substr(d.archive_path,-23) AND o.kind='database.create' AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation
     LEFT JOIN maintenance_credentials m ON m.database_id=d.id
-    WHERE d.region_id=? AND d.desired_state IN('running','deleted') AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
+    WHERE d.region_id=? AND d.desired_state IN('running','suspended','deleted') AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL) AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
     ${query.after ? "AND d.id>?" : ""} ORDER BY d.id LIMIT ?`,
   )
     .bind(region.id, ...(query.after ? [query.after] : []), query.limit + 1)
@@ -84,6 +84,19 @@ export async function desired(
         id: row.id,
         generation: row.generation,
         desired_state: row.desired_state,
+        ...(row.power_operation && row.desired_state !== "deleted"
+          ? {
+              power: {
+                operation: row.power_operation,
+                revision: row.generation,
+                mode: row.desired_state === "suspended" ? "quiesce" : "running",
+                reason:
+                  row.desired_state === "suspended"
+                    ? row.suspension_reason
+                    : null,
+              },
+            }
+          : {}),
         node: row.k8s_node_name,
         pg_major: row.pg_major,
         size: {

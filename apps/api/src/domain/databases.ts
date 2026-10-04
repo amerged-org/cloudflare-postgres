@@ -491,6 +491,9 @@ export async function deleteDatabase(
           `INSERT INTO operations (id,kind,status,project_id,database_id,generation,created_at,updated_at)
         SELECT ?,'database.delete','pending',project_id,id,generation,?,? FROM databases WHERE changes()=1 AND id=? AND project_id=? AND generation=?`,
         ).bind(op, now, now, id, row.project_id, generation),
+        c.env.DB.prepare(
+          `UPDATE operations SET status='failed',error_code='superseded',error_message='Power intent superseded by deletion',updated_at=?,completed_at=? WHERE database_id=? AND generation<? AND kind IN('database.suspend','database.resume','database.hibernate','database.wake') AND status IN('pending','running') AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=? AND generation=? AND kind='database.delete')`,
+        ).bind(now, now, id, generation, op, id, generation),
         lease.completeStatement(op, 202, {
           sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
           bindings: [op, row.project_id],

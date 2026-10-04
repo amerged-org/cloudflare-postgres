@@ -99,7 +99,15 @@ export const DesiredDatabase = z
   .strictObject({
     id: DatabaseId,
     generation: z.number().int().min(1),
-    desired_state: z.enum(["running", "deleted"]),
+    desired_state: z.enum(["running", "suspended", "deleted"]),
+    power: z
+      .strictObject({
+        operation: OperationId,
+        revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        mode: z.enum(["quiesce", "running"]),
+        reason: z.enum(["manual", "idle"]).nullable(),
+      })
+      .optional(),
     node: K8sNodeName,
     pg_major: z.literal(PG_MAJOR),
     size: DesiredSize,
@@ -113,6 +121,20 @@ export const DesiredDatabase = z
     }),
   })
   .superRefine((db, ctx) => {
+    if (
+      (db.desired_state === "suspended" && !db.power) ||
+      (db.power &&
+        (db.power.revision !== db.generation ||
+          (db.desired_state === "suspended"
+            ? db.power.mode !== "quiesce" || db.power.reason === null
+            : db.power.mode !== "running" || db.power.reason !== null)))
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["power"],
+        message:
+          "Power intent must match the current desired state and revision",
+      });
     const match = ARCHIVE_DESTINATION_PATTERN.exec(db.archive.destination_path);
     // Desired revisions advance for role changes and deletion without replacing the archive.
     if (match && (match[3] !== db.id || Number(match[4]) > db.generation)) {
@@ -165,7 +187,10 @@ export const DesiredDatabase = z
         }
       }
     }
-    if (owners > 1 || (db.desired_state === "running" && owners !== 1)) {
+    if (
+      owners > 1 ||
+      (["running", "suspended"].includes(db.desired_state) && owners !== 1)
+    ) {
       ctx.addIssue({
         code: "custom",
         path: ["roles"],
@@ -212,6 +237,7 @@ export type DesiredResponse = z.infer<typeof DesiredResponse>;
 
 export const DATABASE_OBSERVED_STATES = [
   "provisioning",
+  "hibernated",
   "ready",
   "error",
   "deleting",
@@ -229,16 +255,48 @@ export const NodeObservation = z.strictObject({
 });
 export type NodeObservation = z.infer<typeof NodeObservation>;
 
-export const DatabaseObservation = z.strictObject({
-  id: DatabaseId,
-  generation: z.number().int().min(1),
-  state: z.enum(DATABASE_OBSERVED_STATES),
-  message: z.string().max(TEXT_MAX_LENGTH).optional(),
-  archive: z.strictObject({
-    continuous: z.boolean(),
-    ready_wal_files: Count.nullable(),
-  }),
-});
+export const DatabaseObservation = z
+  .strictObject({
+    id: DatabaseId,
+    generation: z.number().int().min(1),
+    state: z.enum(DATABASE_OBSERVED_STATES),
+    power: z
+      .strictObject({
+        operation: OperationId,
+        revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+        state: z.enum(["hibernated", "awake"]),
+        refusal: z.enum(["busy", "archive", "unknown"]).optional(),
+      })
+      .optional(),
+    message: z.string().max(TEXT_MAX_LENGTH).optional(),
+    archive: z.strictObject({
+      continuous: z.boolean(),
+      ready_wal_files: Count.nullable(),
+    }),
+  })
+  .superRefine((db, ctx) => {
+    if (
+      db.power?.refusal &&
+      (db.state !== "error" || db.power.state !== "awake")
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["power", "refusal"],
+        message: "Refusal requires an awake error observation",
+      });
+    if (
+      (db.state === "hibernated" && !db.power) ||
+      (db.power &&
+        (db.power.revision !== db.generation ||
+          (db.state === "ready" && db.power.state !== "awake") ||
+          (db.state === "hibernated" && db.power.state !== "hibernated")))
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["power"],
+        message: "Observed power must match the observation revision and state",
+      });
+  });
 export type DatabaseObservation = z.infer<typeof DatabaseObservation>;
 
 /** A namespace labelled `pgcf.io/database-id` that desired state does not name; reported, never deleted. */
