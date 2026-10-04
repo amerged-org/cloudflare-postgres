@@ -8,6 +8,7 @@ import type { ApiContext, ApiEnv } from "./env.ts";
 import { registerDomain } from "./routes/domain.ts";
 import { registerPlatform } from "./routes/platform.ts";
 import { registerUsage } from "./routes/usage.ts";
+import { registerAgentMetrics } from "./routes/agent-metrics.ts";
 
 export type ApiApp = OpenAPIHono<ApiEnv>;
 export const REQUEST_ID_HEADER = "X-Request-Id";
@@ -46,6 +47,8 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/databases/:id/archive",
   "/agent/v1/desired",
   "/agent/v1/observations",
+  "/agent/v1/activity",
+  "/agent/v1/usage",
   "/agent/v1/link",
 ]);
 
@@ -243,6 +246,7 @@ export function createApp(): ApiApp {
   registerPlatform(app);
   registerDomain(app);
   registerUsage(app);
+  registerAgentMetrics(app);
   app.doc31("/v1/openapi.json", {
     openapi: "3.1.0",
     info: { title: "PGCF API", version },
