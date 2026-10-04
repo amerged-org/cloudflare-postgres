@@ -597,7 +597,8 @@ test("slow upstream readers propagate backpressure to local TCP", async (context
   await until(
     () =>
       sample.sessions[0]!.stream.writableNeedDrain &&
-      sample.sessions[0]!.upstream.bufferedAmount > 0,
+      sample.sessions[0]!.upstream.bufferedAmount > 0 &&
+      sample.sessions[0]!.local.isPaused(),
   );
   const session = sample.sessions[0]!;
   assert(session.stream.writableLength <= STREAM_BYTES * 2);
@@ -611,6 +612,7 @@ test("shutdown closes the listener and every owned client idempotently", async (
   const sample = await fixture(context, () => {});
   const a = await local(sample.bridge);
   const b = await local(sample.bridge);
+  await until(() => sample.bridge.clients === 2);
   const closing = [
     new Promise<void>((resolve) => a.once("close", () => resolve())),
     new Promise<void>((resolve) => b.once("close", () => resolve())),
