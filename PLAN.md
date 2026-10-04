@@ -57,12 +57,20 @@ rights remained unchanged. Barman's R2 credential and PGCF admin/agent keys also
 Short-lived routing and control tokens retain their security deadlines.
 
 The live collector samples each database at least 15 s apart. A real minute contained four
-allocation and eight gateway samples. Storage-used and backup measurements remain unknown.
+allocation and eight gateway samples.
+The API backup collector is now deployed from `2a66715b` (CI `37230046098`). In Dev,
+26 actual R2 objects, the recorded sample, archive summary and hourly API all agreed on
+7,515,287 bytes. A truncated listing remains unknown; the current limit is one complete page
+of at most 1,000 objects. Storage-used measurement remains unknown.
 Configuration changes now preserve the measurement checkpoint under the original UID/version
 guards. Its actual queue drained and the checkpoint survived five Dev idle/wake cycles.
 Hibernated allocation remains measured from the exact bound PVC without a primary Pod.
 Successful hibernation now reports inactive archiving as unknown rather than a false failure;
 this does not assert future R2 availability.
+For 19:00–20:00 UTC, the provisional usage row reports 422.748 awake seconds. Independent
+Kubernetes readiness/hibernation evidence bounds the reference to 403–431 seconds, including
+timestamp precision and one termination-to-next-creation bound. The maximum possible deviation
+is 19.748 seconds, below 60; the finalized row still needs a later readback.
 The cost API reports null and a named node_rate gap until an actual contract/invoice fact is
 recorded. The current E0–E5 run passed through agent-restarted deletion: 102,548 ms, zero volumes/archives, its routing marker removed and both gateways still Ready. Usage accuracy and the cold-wake target still need full Dev acceptance. The production-ready
 release through Phase 5 and complete Neon replacement are not complete.
