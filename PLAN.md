@@ -8,8 +8,8 @@ verified and PostgreSQL has no public port. The second EU VPS is untouched; no U
 bought and no customer or platform database has been migrated.
 
 The deployed regional image is
-`sha256:fe2cba3310daf0a48c3e9eafd88e6e86d010bc2d146fd95c4171f0a2d2cb40f2`
-from source `714e8c11`. CI `37219594528` passed. Full qualification scanned all 657,653,757
+`sha256:6b107998c9e6ea094c90b89d7d6368bb754fd0b6ab0e1cdb45944b74e983aaef`
+from source `b0b6710f`. CI `37224078904` passed. Full qualification scanned all 657,658,375
 expected bytes; all 26 reviewed upstream noncredentials resolved, with zero unresolved findings.
 Image signing remains Phase 5 work.
 
@@ -45,11 +45,19 @@ verified the private maintenance role's TLS, authentication and minimal catalog/
 Manual Dev suspend/resume secured the closed WAL object in R2 and preserved data, rollback
 absence and every storage identity. Automatic idle suspension and one wake operation for ten
 concurrent connections are now confirmed. Those connections took 11.080–11.143 s; later single
-cold connections took 9.427, 9.703 and 9.071 s. The ≤8 s target and twenty-connection acceptance
+cold connections took 9.427, 9.703 and 9.071 s. The latest instrumented wake took 11.209 s:
+PostgreSQL became Ready after about six seconds, but a prior cluster-status snapshot delayed
+admission by another reconciliation pass. The ≤8 s target and twenty-connection acceptance
 remain unmet. A real read-only transaction stayed ready for 74 s despite the 60 s idle policy.
+
+The operational Cloudflare token was updated in place with no expiry; its value and all 23
+rights remained unchanged. Barman's R2 credential and PGCF admin/agent keys also have no expiry.
+Short-lived routing and control tokens retain their security deadlines.
 
 The live collector samples each database at least 15 s apart. A real minute contained four
 allocation and eight gateway samples. Storage-used and backup measurements remain unknown.
+Review found that configuration changes can erase the pending measurement outbox from the
+shared storage ConfigMap; correction and live revalidation remain pending.
 The cost API reports null and a named node_rate gap until an actual contract/invoice fact is
 recorded. The current E0–E5 run passed through agent-restarted deletion: 102,548 ms, zero volumes/archives, its routing marker removed and both gateways still Ready. Usage accuracy and the cold-wake target still need full Dev acceptance. The production-ready
 release through Phase 5 and complete Neon replacement are not complete.
