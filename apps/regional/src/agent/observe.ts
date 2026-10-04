@@ -39,9 +39,18 @@ export function parseArchiveProgress(
     "cnpg_pg_stat_archiver_last_archived_time",
     true,
   );
+  return validateArchiveProgress(archivedCount, lastArchivedTime, now);
+}
+
+export function validateArchiveProgress(
+  archivedCount: number,
+  lastArchivedTime: number,
+  now: number,
+): ArchiveProgress {
   if (
     !Number.isSafeInteger(now) ||
     now < 0 ||
+    !Number.isFinite(lastArchivedTime) ||
     !Number.isSafeInteger(archivedCount) ||
     archivedCount < 0 ||
     (lastArchivedTime < 0 &&
