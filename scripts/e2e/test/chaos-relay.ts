@@ -153,6 +153,7 @@ export class ChaosRelay {
       }
       if (path === "/control/counts")
         return Response.json({
+          agent_key_configured: Boolean(this.env.AGENT_KEY),
           completed_responses: this.completedResponses,
           observations_after_response: this.observationsAfterResponse,
           failure_responses: this.cycleFailures,

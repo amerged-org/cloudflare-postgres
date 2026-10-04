@@ -932,6 +932,33 @@ export class Run {
         type: "secret_text",
       });
     }
+    const countsUrl = new URL("/control/counts", await this.relayUrl());
+    const readinessDeadline = Math.min(Date.now() + 15_000, this.deadline);
+    for (;;) {
+      if (Date.now() >= readinessDeadline)
+        throw new HarnessError("relay_readiness_timeout");
+      try {
+        const counts = await this.relay(
+          countsUrl,
+          undefined,
+          readinessDeadline,
+        );
+        if (Date.now() >= readinessDeadline)
+          throw new HarnessError("relay_readiness_timeout");
+        if (typeof counts.agent_key_configured !== "boolean")
+          throw new HarnessError("relay_readiness_invalid");
+        if (counts.agent_key_configured) break;
+      } catch (error) {
+        if (
+          !(error instanceof ProbeFailure) ||
+          ![500, 502, 503, 504].includes(error.httpStatus)
+        )
+          throw error;
+      }
+      if (Date.now() + 250 >= readinessDeadline)
+        throw new HarnessError("relay_readiness_timeout");
+      await new Promise((done) => setTimeout(done, 250));
+    }
     await this.relay("/control/capture-empty");
     await this.complete("chaos-empty-captured");
     await this.emit("chaos_start", { real_empty_snapshots: 1 });
@@ -946,20 +973,37 @@ export class Run {
       `https://${this.state.chaos.relay_name}.${subdomain}.workers.dev`,
     );
   }
-  async relay(path: string, body?: unknown): Promise<Record<string, unknown>> {
-    const reply = await fetch(new URL(path, await this.relayUrl()), {
+  async relay(
+    path: string | URL,
+    body?: unknown,
+    deadline = this.deadline,
+  ): Promise<Record<string, unknown>> {
+    const target =
+      path instanceof URL ? path : new URL(path, await this.relayUrl());
+    const remaining = Math.min(deadline, this.deadline) - Date.now();
+    if (remaining <= 0) throw new HarnessError("step_time_budget_exhausted");
+    const reply = await fetch(target, {
       method: "POST",
       redirect: "error",
-      signal: AbortSignal.timeout(Math.min(30_000, this.deadline - Date.now())),
+      signal: AbortSignal.timeout(Math.min(30_000, remaining)),
       headers: {
         Authorization: `Bearer ${this.c.values.PGCF_E2E_PROBE_BEARER}`,
         "Content-Type": "application/json",
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
     });
-    if (!reply.ok)
-      throw new HarnessError("real_chaos_snapshot_or_relay_unavailable");
-    return record(await reply.json());
+    if (!reply.ok) {
+      await reply.body?.cancel().catch(() => undefined);
+      throw new ProbeFailure(
+        "real_chaos_snapshot_or_relay_unavailable",
+        reply.status,
+      );
+    }
+    try {
+      return record(await reply.json());
+    } catch {
+      throw new HarnessError("relay_response_invalid");
+    }
   }
   async startChaos(): Promise<void> {
     this.requireStep("E1");
