@@ -105,7 +105,7 @@ rules:
     verbs: [get, list, create, update, patch, delete]
   - apiGroups: [""]
     resources: [secrets]
-    resourceNames: [pgcf-backup-s3]
+    resourceNames: [pgcf-backup-s3, pgcf-gateway]
     verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1

@@ -139,7 +139,12 @@ export class MemoryKubernetes implements Kubernetes {
           (namespace === undefined ||
             resource.metadata.namespace === namespace) &&
           (!labelSelector ||
-            resource.metadata.labels?.[labelSelector] !== undefined),
+            labelSelector.split(",").every((selector) => {
+              const [name, value] = selector.split("=");
+              return value === undefined
+                ? resource.metadata.labels?.[name!] !== undefined
+                : resource.metadata.labels?.[name!] === value;
+            })),
       )
       .map((resource) => structuredClone(resource));
   }

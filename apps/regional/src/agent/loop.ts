@@ -14,6 +14,7 @@ import {
 } from "./observe.ts";
 import { backupCredentials, Reconciler } from "./reconcile.ts";
 import type { Kubernetes, Log } from "./types.ts";
+import type { PowerCoordinator } from "./power.ts";
 import type { AuthenticationProbe } from "./readiness.ts";
 
 export interface ControlApi {
@@ -47,6 +48,7 @@ export class AgentLoop {
     now = Date.now,
     fetcher: typeof fetch = fetch,
     authenticate?: AuthenticationProbe,
+    power?: PowerCoordinator,
   ) {
     this.api = api;
     this.k8s = k8s;
@@ -54,10 +56,18 @@ export class AgentLoop {
     this.signal = signal;
     this.log = log;
     this.now = now;
-    this.reconcile = new Reconciler(k8s, signal, now, fetcher, authenticate);
+    this.reconcile = new Reconciler(
+      k8s,
+      signal,
+      now,
+      fetcher,
+      authenticate,
+      power,
+    );
   }
 
   hint(): void {
+    this.reconcile.hint();
     this.hinted = true;
     this.waiting?.();
   }
@@ -111,7 +121,10 @@ export class AgentLoop {
           );
           this.retries.delete(db.id);
           if (observation) observations.push(observation);
-          if (!observation || !["ready", "deleted"].includes(observation.state))
+          if (
+            !observation ||
+            !["ready", "deleted", "hibernated"].includes(observation.state)
+          )
             nonterminal = true;
         } catch {
           if (this.signal.aborted) return;

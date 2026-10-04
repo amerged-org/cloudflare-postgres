@@ -4,6 +4,7 @@ import { readConfig } from "./config.ts";
 import { kubernetesFromConfig } from "./kubernetes.ts";
 import { AgentLink } from "./link.ts";
 import { AgentLoop } from "./loop.ts";
+import { PowerCoordinator } from "./power.ts";
 import type { Log } from "./types.ts";
 
 export const log: Log = (event, fields = {}) =>
@@ -29,12 +30,22 @@ async function main(): Promise<void> {
       controller.signal,
       config.kubeconfigFile,
     );
+    const power = new PowerCoordinator({
+      k8s: (signal) => kubernetesFromConfig(signal, config.kubeconfigFile),
+      signal: controller.signal,
+      region: config.regionId,
+      replicas: config.gatewayReplicas,
+    });
     const loop = new AgentLoop(
       new AgentApi(config),
       kubernetes,
       config.postgresImage,
       controller.signal,
       log,
+      Date.now,
+      fetch,
+      undefined,
+      power,
     );
     const link = new AgentLink(config, () => loop.hint(), log);
     await Promise.all([loop.run(), link.run(controller.signal)]);

@@ -8,6 +8,7 @@ export interface AgentConfig {
   agentKey: string;
   postgresImage: string;
   kubeconfigFile?: string;
+  gatewayReplicas?: number;
 }
 
 export async function readConfig(
@@ -41,7 +42,18 @@ export async function readConfig(
     !/^[a-z0-9./:_-]+@sha256:[a-f0-9]{64}$/.test(postgresImage)
   )
     throw new Error("pinned_postgres_image_required");
+  const replicaValue = env.PGCF_GATEWAY_REPLICAS;
+  if (
+    replicaValue !== undefined &&
+    (!/^[0-9]{1,2}$/.test(replicaValue) ||
+      Number(replicaValue) < 1 ||
+      Number(replicaValue) > 64)
+  )
+    throw new Error("invalid_gateway_replica_count");
   return {
+    ...(replicaValue === undefined
+      ? {}
+      : { gatewayReplicas: Number(replicaValue) }),
     regionId,
     apiUrl: apiUrl.origin,
     agentKey,
