@@ -4,6 +4,7 @@ import test from "node:test";
 import { inventoryPages } from "../../src/agent/kubernetes.ts";
 import {
   nodeObservations,
+  parseArchiveProgress,
   parseReadyWalFiles,
   podMemoryRequest,
   quantity,
@@ -82,6 +83,37 @@ test("archive metric is measured exactly, refuses unavailable, negative and noni
     () =>
       parseReadyWalFiles(
         'cnpg_collector_pg_wal_archive_status{value="ready"} 1.5\n',
+      ),
+    /invalid/,
+  );
+});
+
+test("archive progress accepts real fractional scientific epoch samples and rejects ambiguous or future measurements", () => {
+  const now = Date.parse("2026-10-04T04:36:00Z");
+  const time = now / 1000 - 1893.679;
+  const text = `cnpg_pg_stat_archiver_archived_count{pod="primary"} 8\ncnpg_pg_stat_archiver_last_archived_time ${time.toExponential()}\n`;
+  assert.deepEqual(parseArchiveProgress(text, now), {
+    archivedCount: 8,
+    lastArchivedTime: time,
+  });
+  assert.throws(() => parseArchiveProgress("", now), /missing/);
+  assert.throws(
+    () => parseArchiveProgress(text + text, now),
+    /missing|invalid/,
+  );
+  assert.throws(
+    () => parseArchiveProgress(text.replace("} 8", "} 8.5"), now),
+    /invalid/,
+  );
+  assert.throws(
+    () => parseArchiveProgress(text.replace(time.toExponential(), "NaN"), now),
+    /invalid/,
+  );
+  assert.throws(
+    () =>
+      parseArchiveProgress(
+        text.replace(time.toExponential(), String(now / 1000 + 1)),
+        now,
       ),
     /invalid/,
   );

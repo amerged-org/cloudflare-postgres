@@ -11,6 +11,42 @@ export const GENERATION_ANNOTATION = "pgcf.io/generation";
 export const ACCEPTED_GENERATION_ANNOTATION = "pgcf.io/accepted-generation";
 export const ARCHIVE_FAILURE_MS = 10 * 60_000;
 export const WAL_BACKLOG_LIMIT = 32;
+export const ARCHIVE_OBSERVATION_ANNOTATION = "pgcf.io/archive-observation";
+
+export interface ArchiveProgress {
+  archivedCount: number;
+  lastArchivedTime: number;
+}
+
+export function parseArchiveProgress(
+  metrics: string,
+  now: number,
+): ArchiveProgress {
+  const metric = (name: string) => {
+    const lines = metrics
+      .split("\n")
+      .filter((line) => new RegExp(`^${name}(?:\\{|\\s)`).test(line));
+    if (lines.length !== 1) throw new Error("archive_progress_missing");
+    const match = new RegExp(
+      `^${name}(?:\\{[^}]*\\})?\\s+([0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)(?:\\s+[0-9]+)?\\s*$`,
+    ).exec(lines[0]!);
+    const value = match ? Number(match[1]) : NaN;
+    if (!Number.isFinite(value) || value < 0)
+      throw new Error("archive_progress_invalid");
+    return value;
+  };
+  const archivedCount = metric("cnpg_pg_stat_archiver_archived_count");
+  const lastArchivedTime = metric("cnpg_pg_stat_archiver_last_archived_time");
+  if (
+    !Number.isSafeInteger(now) ||
+    now < 0 ||
+    !Number.isSafeInteger(archivedCount) ||
+    lastArchivedTime > now / 1000 ||
+    (archivedCount > 0 && lastArchivedTime === 0)
+  )
+    throw new Error("archive_progress_invalid");
+  return { archivedCount, lastArchivedTime };
+}
 
 export function condition(
   resource: Resource,
@@ -199,6 +235,58 @@ export async function readyWalFiles(
   signal: AbortSignal,
   fetcher: typeof fetch = fetch,
 ): Promise<number> {
+  return parseReadyWalFiles(
+    await primaryMetrics(k8s, namespace, cluster, signal, fetcher),
+  );
+}
+
+export async function archiveMetrics(
+  k8s: Kubernetes,
+  namespace: string,
+  cluster: Resource,
+  signal: AbortSignal,
+  now: () => number,
+  fetcher: typeof fetch = fetch,
+): Promise<{
+  readyWalFiles: number;
+  progress: ArchiveProgress | null;
+  valid: boolean;
+}> {
+  const metrics = await primaryMetrics(
+    k8s,
+    namespace,
+    cluster,
+    signal,
+    fetcher,
+  );
+  const readyWalFiles = parseReadyWalFiles(metrics);
+  let progress: ArchiveProgress | null;
+  try {
+    progress = parseArchiveProgress(metrics, now());
+  } catch (error) {
+    progress = null;
+    // A measured empty queue needs no progress baseline; partially supplied or invalid samples remain uncertain.
+    const absent =
+      !/^cnpg_pg_stat_archiver_(?:archived_count|last_archived_time)(?:\{|\s)/m.test(
+        metrics,
+      );
+    const valid =
+      readyWalFiles === 0 &&
+      absent &&
+      error instanceof Error &&
+      error.message === "archive_progress_missing";
+    return { readyWalFiles, progress, valid };
+  }
+  return { readyWalFiles, progress, valid: true };
+}
+
+async function primaryMetrics(
+  k8s: Kubernetes,
+  namespace: string,
+  cluster: Resource,
+  signal: AbortSignal,
+  fetcher: typeof fetch,
+): Promise<string> {
   const primary = string(record(cluster.status).currentPrimary);
   if (
     !primary ||
@@ -228,5 +316,5 @@ export async function readyWalFiles(
     await response.body?.cancel();
     throw new Error("archive_metrics_unavailable");
   }
-  return parseReadyWalFiles(await boundedText(response, 1024 * 1024));
+  return boundedText(response, 1024 * 1024);
 }

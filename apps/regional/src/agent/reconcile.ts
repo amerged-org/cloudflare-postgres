@@ -18,13 +18,15 @@ import {
   acceptedGeneration,
   ACCEPTED_GENERATION_ANNOTATION,
   ARCHIVE_FAILURE_MS,
+  ARCHIVE_OBSERVATION_ANNOTATION,
+  archiveMetrics,
   condition,
   DATABASE_LABEL,
   GENERATION_ANNOTATION,
-  readyWalFiles,
   quantity,
   WAL_BACKLOG_LIMIT,
 } from "./observe.ts";
+import type { ArchiveProgress } from "./observe.ts";
 import { record, string, uid } from "./types.ts";
 import type { Kubernetes, Resource } from "./types.ts";
 import { probeRoles } from "./readiness.ts";
@@ -48,6 +50,9 @@ interface StorageState {
   clusterUid: string | null;
   node: string;
   archivePath: string;
+}
+interface ArchiveObservation extends ArchiveProgress {
+  pendingSince: number | null;
 }
 
 const LEDGER_PREFIX = "delete-";
@@ -561,23 +566,45 @@ export class Reconciler {
     if (uid(cluster) !== storage.clusterUid)
       return recoveryRequired(db, "database cluster identity changed");
     let count: number | null;
+    let progress: ArchiveProgress | null = null;
+    let measured = false;
     try {
-      count = await readyWalFiles(
+      const metrics = await archiveMetrics(
         this.k8s,
         namespaceName,
         cluster,
         this.signal,
+        this.now,
         this.fetcher,
       );
+      count = metrics.readyWalFiles;
+      progress = metrics.progress;
+      measured = metrics.valid;
     } catch {
       if (this.signal.aborted) throw new Error("agent_aborted");
       count = null;
     }
+    const now = this.now();
+    if (!Number.isSafeInteger(now) || now < 0)
+      throw new Error("archive_clock_invalid");
+    const stalled = await this.archiveStalled(
+      db,
+      fence,
+      measured ? count : null,
+      progress,
+      now,
+    );
     const archive = condition(cluster, "ContinuousArchiving");
     const backlog = count !== null && count >= WAL_BACKLOG_LIMIT;
-    const continuous = archive?.status === "True" && !backlog;
-    if (continuous) this.archiveFailures.delete(db.id);
-    else {
+    const continuous =
+      archive?.status === "True" &&
+      measured &&
+      count !== null &&
+      (count === 0 || (progress !== null && stalled !== null)) &&
+      !backlog &&
+      !stalled;
+    if (archive?.status === "True") this.archiveFailures.delete(db.id);
+    else if (archive?.status === "False") {
       const transition = Date.parse(string(archive?.lastTransitionTime) ?? "");
       const firstFailure =
         Number.isFinite(transition) && transition <= this.now()
@@ -609,9 +636,9 @@ export class Reconciler {
         ? await this.authenticate(db, ca, this.signal)
         : false;
     const unhealthy =
-      !continuous &&
-      this.now() - (this.archiveFailures.get(db.id) ?? this.now()) >=
-        ARCHIVE_FAILURE_MS;
+      stalled === true ||
+      (archive?.status === "False" &&
+        now - (this.archiveFailures.get(db.id) ?? now) >= ARCHIVE_FAILURE_MS);
     return {
       id: db.id,
       generation: db.generation,
@@ -631,6 +658,111 @@ export class Reconciler {
         : {}),
       archive: { continuous, ready_wal_files: count },
     };
+  }
+
+  private async archiveStalled(
+    db: DesiredDatabase,
+    fence: Resource,
+    count: number | null,
+    progress: ArchiveProgress | null,
+    now: number,
+  ): Promise<boolean | null> {
+    const saved = fence.metadata.annotations?.[ARCHIVE_OBSERVATION_ANNOTATION];
+    let previous: ArchiveObservation | undefined;
+    if (saved !== undefined) {
+      try {
+        const value = record(JSON.parse(saved));
+        if (
+          Object.keys(value).length !== 3 ||
+          (value.pendingSince !== null &&
+            (!Number.isSafeInteger(value.pendingSince) ||
+              (value.pendingSince as number) < 0 ||
+              (value.pendingSince as number) > now)) ||
+          !Number.isSafeInteger(value.archivedCount) ||
+          (value.archivedCount as number) < 0 ||
+          typeof value.lastArchivedTime !== "number" ||
+          !Number.isFinite(value.lastArchivedTime) ||
+          value.lastArchivedTime < 0 ||
+          value.lastArchivedTime > now / 1000 ||
+          ((value.archivedCount as number) > 0 && value.lastArchivedTime === 0)
+        )
+          throw new Error();
+        previous = value as unknown as ArchiveObservation;
+      } catch {
+        throw new Error("archive_observation_invalid");
+      }
+    }
+    if (count === null || (count > 0 && !progress)) return null;
+    if (count === 0 && !previous) return false;
+    if (
+      count > 0 &&
+      previous &&
+      progress &&
+      progress.lastArchivedTime <= previous.lastArchivedTime &&
+      (progress.archivedCount < previous.archivedCount ||
+        progress.lastArchivedTime < previous.lastArchivedTime)
+    )
+      return null;
+    const advanced =
+      previous &&
+      progress &&
+      (progress.lastArchivedTime > previous.lastArchivedTime ||
+        progress.archivedCount > previous.archivedCount);
+    const next: ArchiveObservation = {
+      ...(progress ?? previous!),
+      pendingSince:
+        count === 0
+          ? null
+          : !previous || previous.pendingSince === null || advanced
+            ? now
+            : previous.pendingSince,
+    };
+    const encoded = JSON.stringify(next);
+    if (saved !== encoded) {
+      assertOwned(fence, db.id, `${STORAGE_PREFIX}${db.id}`);
+      if (
+        fence.metadata.namespace !== SYSTEM_NAMESPACE ||
+        !fence.metadata.resourceVersion ||
+        appliedGeneration(fence) !== db.generation
+      )
+        throw new Error("archive_fence_invalid");
+      await this.k8s.patch("ConfigMap", SYSTEM_NAMESPACE, fence.metadata.name, [
+        { op: "test", path: "/metadata/uid", value: uid(fence) },
+        {
+          op: "test",
+          path: "/metadata/resourceVersion",
+          value: fence.metadata.resourceVersion,
+        },
+        { op: "test", path: "/data/state", value: record(fence.data).state },
+        {
+          op: "add",
+          path: "/metadata/annotations",
+          value: {
+            ...fence.metadata.annotations,
+            [ARCHIVE_OBSERVATION_ANNOTATION]: encoded,
+          },
+        },
+      ]);
+      const current = await this.k8s.read(
+        "ConfigMap",
+        SYSTEM_NAMESPACE,
+        fence.metadata.name,
+      );
+      if (!current) throw new Error("archive_fence_missing");
+      assertOwned(current, db.id, fence.metadata.name);
+      if (
+        uid(current) !== uid(fence) ||
+        appliedGeneration(current) !== db.generation ||
+        record(current.data).state !== record(fence.data).state ||
+        current.metadata.annotations?.[ARCHIVE_OBSERVATION_ANNOTATION] !==
+          encoded
+      )
+        throw new Error("archive_fence_changed");
+    }
+    return (
+      next.pendingSince !== null &&
+      now - next.pendingSince >= ARCHIVE_FAILURE_MS
+    );
   }
 
   private async applyRevision(
