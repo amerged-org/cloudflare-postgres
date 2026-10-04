@@ -11,7 +11,10 @@ import test from "node:test";
 import { createSecureContext, TLSSocket } from "node:tls";
 import { Client } from "pg";
 import type { ClientConfig } from "pg";
-import { probeRoles } from "../../src/agent/readiness.ts";
+import {
+  probeRoles,
+  READINESS_SETTINGS_QUERY,
+} from "../../src/agent/readiness.ts";
 import { fixture } from "./fixtures.ts";
 
 const int32 = (value: number) => {
@@ -121,32 +124,68 @@ async function postgresFixture(
               ]),
             );
           } else if (type === "Q") {
-            assert.equal(
-              packet.subarray(5, -1).toString(),
-              "SELECT 1 AS pgcf_ready",
-            );
+            const query = packet.subarray(5, -1).toString();
+            if (query !== "SELECT 1 AS pgcf_ready")
+              assert.equal(query, READINESS_SETTINGS_QUERY);
             if (abortOnQuery) {
               abortOnQuery();
               return;
             }
+            const values: [string, string, number][] =
+              query === "SELECT 1 AS pgcf_ready"
+                ? [["pgcf_ready", "1", 23]]
+                : [
+                    [
+                      "max_connections",
+                      String(database.size.max_connections),
+                      23,
+                    ],
+                    [
+                      "shared_buffers_bytes",
+                      String(
+                        Math.floor(database.size.memory_mib / 4) * 2 ** 20,
+                      ),
+                      25,
+                    ],
+                    [
+                      "effective_cache_size_bytes",
+                      String(
+                        Math.floor(database.size.memory_mib / 2) * 2 ** 20,
+                      ),
+                      25,
+                    ],
+                    [
+                      "archive_timeout_seconds",
+                      String(database.size.archive_timeout_seconds),
+                      23,
+                    ],
+                  ];
             secure.write(
               Buffer.concat([
                 frame(
                   "T",
                   Buffer.concat([
-                    int16(1),
-                    Buffer.from("pgcf_ready\0"),
-                    int32(0),
-                    int16(0),
-                    int32(23),
-                    int16(4),
-                    int32(-1),
-                    int16(0),
+                    int16(values.length),
+                    ...values.flatMap(([name, , type]) => [
+                      Buffer.from(name + "\0"),
+                      int32(0),
+                      int16(0),
+                      int32(type),
+                      int16(type === 23 ? 4 : -1),
+                      int32(-1),
+                      int16(0),
+                    ]),
                   ]),
                 ),
                 frame(
                   "D",
-                  Buffer.concat([int16(1), int32(1), Buffer.from("1")]),
+                  Buffer.concat([
+                    int16(values.length),
+                    ...values.flatMap(([, value]) => [
+                      int32(Buffer.byteLength(value)),
+                      Buffer.from(value),
+                    ]),
+                  ]),
                 ),
                 frame("C", Buffer.from("SELECT 1\0")),
                 frame("Z", Buffer.from("I")),
@@ -206,6 +245,28 @@ test("readiness authenticates every desired role over verified TLS and rejects a
     assert.equal(
       await probeRoles(
         changed,
+        server.ca,
+        new AbortController().signal,
+        server.factory,
+      ),
+      false,
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("authenticated old PostgreSQL settings cannot acknowledge a resized desired generation", async () => {
+  const { db } = fixture();
+  const server = await postgresFixture(db, `database-rw.pgcf-db-${db.id}.svc`);
+  const resized = structuredClone(db);
+  resized.generation++;
+  resized.size.memory_mib *= 2;
+  resized.size.max_connections += 50;
+  try {
+    assert.equal(
+      await probeRoles(
+        resized,
         server.ca,
         new AbortController().signal,
         server.factory,

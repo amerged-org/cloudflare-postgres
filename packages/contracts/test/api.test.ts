@@ -3,6 +3,8 @@ import { describe, expect, it } from "vitest";
 import {
   ApiKeyCreate,
   DatabasePatch,
+  DatabaseResize,
+  OperationKind,
   ERROR_CODES,
   ErrorBody,
   IDEMPOTENCY_KEY_PATTERN,
@@ -210,6 +212,15 @@ describe("request bodies", () => {
 
   it("requires a field in database patches", () => {
     expect(DatabasePatch.safeParse({}).success).toBe(false);
+    expect(DatabaseResize.safeParse({}).success).toBe(false);
+    expect(DatabaseResize.safeParse({ size_class_id: "small" }).success).toBe(
+      true,
+    );
+    expect(
+      DatabaseResize.safeParse({ size_class_id: "small", name: "rename" })
+        .success,
+    ).toBe(false);
+    expect(OperationKind.parse("database.resize")).toBe("database.resize");
     expect(DatabasePatch.safeParse({ size_class_id: "small" }).success).toBe(
       true,
     );
