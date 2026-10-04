@@ -39,6 +39,7 @@ const NS = "pgcf-system",
   HIBERNATION = "cnpg.io/hibernation";
 const POWER_REVISION = "pgcf.io/power-revision",
   POWER_OPERATION = "pgcf.io/power-operation";
+const GATEWAY_FENCE_UID = "pgcf.io/gateway-fence-uid";
 const MAX_WAIT = 10 * 60_000;
 interface GatewayPod {
   name: string;
@@ -67,6 +68,7 @@ interface Anchor {
 }
 interface Progress {
   target: GatewayIntent;
+  proofIntent?: GatewayIntent;
   phase:
     | "quiescing"
     | "switching"
@@ -85,15 +87,7 @@ interface Progress {
   keyVersion?: string;
   segment?: string;
 }
-export type PowerObservation = Omit<DatabaseObservation, "state"> & {
-  state: DatabaseObservation["state"] | "hibernated";
-  power?: {
-    operation: string;
-    revision: number;
-    state: "hibernated" | "awake";
-    refusal?: "busy" | "archive" | "unknown";
-  };
-};
+export type PowerObservation = DatabaseObservation;
 export function desiredPower(db: DesiredDatabase): GatewayIntent | undefined {
   const value = record(db).power;
   if (value === undefined) return undefined;
@@ -128,10 +122,12 @@ function owned(
   resource: Resource | null,
   name: string,
   database: string,
+  namespace?: string,
 ): Resource {
   if (
     !resource ||
     resource.metadata.name !== name ||
+    resource.metadata.namespace !== namespace ||
     resource.metadata.labels?.[DATABASE_LABEL] !== database ||
     resource.metadata.deletionTimestamp
   )
@@ -176,6 +172,22 @@ function progressFrom(map: Resource, now: number): Progress | undefined {
   const value = record(JSON.parse(text)),
     anchor = record(value.anchor);
   const target = gatewayIntentSchema.parse(value.target);
+  const proofIntent =
+    value.proofIntent === undefined
+      ? undefined
+      : gatewayIntentSchema.parse(value.proofIntent);
+  if (
+    proofIntent &&
+    (proofIntent.mode !== "quiesce" ||
+      proofIntent.database !== target.database ||
+      proofIntent.revision > target.revision)
+  )
+    throw new Recovery("power_proof_origin_invalid");
+  if (
+    value.refusal !== undefined &&
+    !["busy", "archive", "unknown"].includes(String(value.refusal))
+  )
+    throw new Recovery("power_refusal_invalid");
   if (
     !Number.isSafeInteger(value.startedAt) ||
     (value.startedAt as number) < 0 ||
@@ -232,7 +244,7 @@ function progressFrom(map: Resource, now: number): Progress | undefined {
     ["archive", "proved", "hibernating", "hibernated"].includes(
       String(value.phase),
     ) &&
-    !value.segment
+    (!value.segment || !proofIntent)
   )
     throw new Recovery("power_segment_missing");
   if (value.gateways !== undefined) {
@@ -266,7 +278,11 @@ function progressFrom(map: Resource, now: number): Progress | undefined {
     !value.gateways
   )
     throw new Recovery("power_continuity_missing");
-  return { ...value, target } as unknown as Progress;
+  return {
+    ...value,
+    target,
+    ...(proofIntent ? { proofIntent } : {}),
+  } as unknown as Progress;
 }
 
 export interface PowerOptions {
@@ -370,8 +386,8 @@ export class PowerCoordinator {
         step.k8s.list("LVMVolume"),
       ]);
     const ns = owned(nsValue, namespace, db.id),
-      cluster = owned(clusterValue, "database", db.id),
-      storage = owned(storageValue, `storage-${db.id}`, db.id);
+      cluster = owned(clusterValue, "database", db.id, namespace),
+      storage = owned(storageValue, `storage-${db.id}`, db.id, NS);
     if (appliedGeneration(storage) > db.generation) throw new Stale();
     const storedText = required(record(storage.data).state, 4096),
       stored = record(JSON.parse(storedText));
@@ -465,9 +481,15 @@ export class PowerCoordinator {
     step: Step,
     db: DesiredDatabase,
   ): Promise<Resource | null> {
-    const map = await step.k8s.read("ConfigMap", NS, gatewayFenceName(db.id));
+    const [map, storage] = await Promise.all([
+      step.k8s.read("ConfigMap", NS, gatewayFenceName(db.id)),
+      step.k8s.read("ConfigMap", NS, `storage-${db.id}`),
+    ]);
+    const expectedUid = storage?.metadata.annotations?.[GATEWAY_FENCE_UID];
+    if (expectedUid && (!map || uid(map) !== expectedUid))
+      throw new Recovery("gateway_fence_missing_or_replaced");
     if (!map) return null;
-    owned(map, gatewayFenceName(db.id), db.id);
+    owned(map, gatewayFenceName(db.id), db.id, NS);
     if (map.metadata.labels?.[GATEWAY_FENCE_LABEL] !== "true")
       throw new Recovery("gateway_fence_ownership_invalid");
     const value = record(map.data)["intent.json"];
@@ -546,6 +568,44 @@ export class PowerCoordinator {
     )
       throw new Stale();
     return next;
+  }
+  private async bindFence(
+    step: Step,
+    db: DesiredDatabase,
+    map: Resource,
+  ): Promise<void> {
+    const storage = owned(
+      await step.k8s.read("ConfigMap", NS, `storage-${db.id}`),
+      `storage-${db.id}`,
+      db.id,
+      NS,
+    );
+    if (appliedGeneration(storage) > db.generation) throw new Stale();
+    const previous = storage.metadata.annotations?.[GATEWAY_FENCE_UID];
+    if (previous !== undefined) {
+      if (previous !== uid(map)) throw new Recovery("gateway_fence_replaced");
+      return;
+    }
+    // This durable identity survives loss of the execution record and prevents another uncertain switch.
+    await this.mutate(step, () =>
+      step.k8s.patch("ConfigMap", NS, storage.metadata.name, [
+        { op: "test", path: "/metadata/uid", value: uid(storage) },
+        {
+          op: "test",
+          path: "/metadata/resourceVersion",
+          value: storage.metadata.resourceVersion,
+        },
+        { op: "test", path: "/data/state", value: record(storage.data).state },
+        {
+          op: "add",
+          path: "/metadata/annotations",
+          value: {
+            ...storage.metadata.annotations,
+            [GATEWAY_FENCE_UID]: uid(map),
+          },
+        },
+      ]),
+    );
   }
   private async gateways(step: Step): Promise<GatewayPod[]> {
     const expected = this.options.replicas;
@@ -761,16 +821,38 @@ export class PowerCoordinator {
         map = await this.fence(step, db);
         progress = map ? progressFrom(map, this.now) : undefined;
         if (progress) this.assertAnchor(physical.anchor, progress.anchor);
-        if (progress?.target.revision! > intent.revision) throw new Stale();
+        if ((progress?.target.revision ?? 0) > intent.revision)
+          throw new Stale();
         if (!progress || encoded(progress.target) !== encoded(intent)) {
-          progress = {
-            target: intent,
-            phase: "quiescing",
-            startedAt: this.now,
-            anchor: physical.anchor,
-          };
+          const alreadyOff =
+            progress &&
+            ["hibernating", "hibernated"].includes(progress.phase) &&
+            physical.cluster.metadata.annotations?.[HIBERNATION] === "on" &&
+            condition(physical.cluster, "cnpg.io/hibernation")?.status ===
+              "True" &&
+            condition(physical.cluster, "cnpg.io/hibernation")?.reason ===
+              "Hibernated" &&
+            (
+              await step.k8s.list(
+                "Pod",
+                `pgcf-db-${db.id}`,
+                "cnpg.io/cluster=database",
+              )
+            ).length === 0;
+          progress = alreadyOff
+            ? { ...progress!, target: intent, phase: "hibernated" }
+            : {
+                target: intent,
+                phase: "quiescing",
+                startedAt: this.now,
+                anchor: physical.anchor,
+              };
           map = await this.write(step, db, map, intent, progress);
+          if (alreadyOff)
+            await this.clusterIntent(step, db, intent, physical.cluster, "on");
         }
+        if (!map) throw new Recovery("gateway_fence_missing");
+        await this.bindFence(step, db, map);
         if (progress.phase === "refused")
           return this.observation(
             db,
@@ -785,9 +867,10 @@ export class PowerCoordinator {
           const currentPods = await this.gateways(step),
             currentKey = await this.keyring(step);
           if (
-            encoded(currentPods) !== encoded(progress.gateways) ||
-            currentKey.uid !== progress.keyUid ||
-            currentKey.version !== progress.keyVersion
+            progress.phase === "hibernating" &&
+            (encoded(currentPods) !== encoded(progress.gateways) ||
+              currentKey.uid !== progress.keyUid ||
+              currentKey.version !== progress.keyVersion)
           )
             return null;
           await this.controls(
@@ -805,11 +888,15 @@ export class PowerCoordinator {
           if (
             condition(physical.cluster, "cnpg.io/hibernation")?.status !==
               "True" ||
+            condition(physical.cluster, "cnpg.io/hibernation")?.reason !==
+              "Hibernated" ||
             pods.length !== 0
           )
             return null;
           const confirmed = await this.anchor(step, db);
           this.assertAnchor(confirmed.anchor, progress.anchor);
+          if (encoded(await this.gateways(step)) !== encoded(currentPods))
+            return null;
           progress.phase = "hibernated";
           await this.write(step, db, map, undefined, progress);
           return this.observation(db, intent, "hibernated");
@@ -837,6 +924,7 @@ export class PowerCoordinator {
           ),
           "maintenance-credentials",
           db.id,
+          `pgcf-db-${db.id}`,
         );
         if (
           decode(record(maintenance.data).username, 4096) !==
@@ -850,6 +938,7 @@ export class PowerCoordinator {
           await step.k8s.read("ConfigMap", NS, `ca-${db.id}`),
           `ca-${db.id}`,
           db.id,
+          NS,
         );
         const publicCa = string(record(ca.data)["ca.crt"]);
         if (!publicCa) throw new Unavailable("database_ca_missing");
@@ -863,6 +952,9 @@ export class PowerCoordinator {
             throw new Stale();
           const latest = await this.anchor(step, db);
           this.assertAnchor(latest.anchor, progress!.anchor);
+          const liveKey = await this.keyring(step);
+          if (liveKey.uid !== key.uid || liveKey.version !== key.version)
+            throw new Unavailable("keyring_continuity_lost");
           const inventory = await this.gateways(step);
           if (encoded(inventory) !== encoded(pods))
             throw new Unavailable("gateway_inventory_changed");
@@ -901,6 +993,7 @@ export class PowerCoordinator {
           progress = {
             ...progress,
             phase: "switching",
+            proofIntent: intent,
             gateways: pods,
             keyUid: key.uid,
             keyVersion: key.version,
@@ -1000,7 +1093,8 @@ export class PowerCoordinator {
         const physical = await this.anchor(step, db),
           previous = map ? progressFrom(map, this.now) : undefined;
         if (previous) this.assertAnchor(physical.anchor, previous.anchor);
-        if (previous?.target.revision! > intent.revision) throw new Stale();
+        if ((previous?.target.revision ?? 0) > intent.revision)
+          throw new Stale();
         const progress: Progress = {
           target: intent,
           phase: "wake",
@@ -1025,11 +1119,52 @@ export class PowerCoordinator {
       }
     });
   }
-  async finishRunning(
+  /** A ready-only measurement marker uses CREATE history, never suspension authority. */
+  async publishReadyFence(
     db: DesiredDatabase,
     observation: PowerObservation,
   ): Promise<PowerObservation | null> {
-    const intent = desiredPower(db)!;
+    if (
+      observation.state !== "ready" ||
+      db.desired_state !== "running" ||
+      !db.creation
+    )
+      return observation;
+    try {
+      const intent = await this.step(async (step) => {
+        const map = await this.fence(step, db);
+        const current = map
+          ? gatewayIntentSchema.parse(
+              JSON.parse(String(record(map.data)["intent.json"])),
+            )
+          : undefined;
+        if (current?.mode === "quiesce") return undefined;
+        if (current?.revision === db.generation) return current;
+        return gatewayIntentSchema.parse({
+          database: db.id,
+          operation: current?.operation ?? db.creation!.operation_id,
+          revision: db.generation,
+          mode: "running",
+        });
+      });
+      if (!intent) return null;
+      return await this.finishRunning(db, observation, intent);
+    } catch (error) {
+      return error instanceof Recovery
+        ? {
+            ...observation,
+            state: "error",
+            message: "running fence identity unavailable; recovery required",
+          }
+        : null;
+    }
+  }
+  async finishRunning(
+    db: DesiredDatabase,
+    observation: PowerObservation,
+    executionIntent?: GatewayIntent,
+  ): Promise<PowerObservation | null> {
+    const intent = executionIntent ?? desiredPower(db)!;
     if (observation.state !== "ready") return observation;
     return this.step(async (step) => {
       try {
@@ -1046,6 +1181,7 @@ export class PowerCoordinator {
           anchor: physical.anchor,
         };
         map = await this.write(step, db, map, intent, progress);
+        await this.bindFence(step, db, map);
         const pods = await this.gateways(step),
           key = await this.keyring(step);
         await this.controls(step, intent, pods, key.keyring, "release");
@@ -1057,14 +1193,16 @@ export class PowerCoordinator {
           record(current.data)["intent.json"] !== encoded(intent)
         )
           return null;
-        return {
-          ...observation,
-          power: {
-            operation: intent.operation,
-            revision: intent.revision,
-            state: "awake",
-          },
-        };
+        return db.power
+          ? {
+              ...observation,
+              power: {
+                operation: intent.operation,
+                revision: intent.revision,
+                state: "awake",
+              },
+            }
+          : observation;
       } catch (error) {
         if (error instanceof Recovery)
           return {

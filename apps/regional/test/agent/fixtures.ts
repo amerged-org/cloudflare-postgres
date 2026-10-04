@@ -363,7 +363,11 @@ export class MemoryKubernetes implements Kubernetes {
       if (op.op === "test") assert.deepEqual(parent[last], op.value);
       else parent[last] = structuredClone(op.value);
     }
-    if (kind === "Cluster") await this.write(resource, "patch");
+    if (
+      kind === "Cluster" &&
+      operations.some((op) => record(op).path === "/spec")
+    )
+      await this.write(resource, "patch");
     else {
       resource.metadata.resourceVersion = String(++this.revision);
       this.mutation(`patch:${kind}:${name}`);

@@ -742,8 +742,10 @@ export class Reconciler {
         : {}),
       archive: { continuous, ready_wal_files: count },
     };
-    return powerIntent && this.power
-      ? this.power.finishRunning(db, observation)
+    return this.power
+      ? powerIntent
+        ? this.power.finishRunning(db, observation)
+        : this.power.publishReadyFence(db, observation)
       : observation;
   }
 
