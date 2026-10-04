@@ -296,6 +296,11 @@ describe("encrypted internal maintenance credentials", () => {
       response = await f.create();
     expect(response.status).toBe(202);
     const created = (await response.json()) as { database: { id: string } };
+    await env.DB.prepare(
+      "DELETE FROM maintenance_credentials WHERE database_id=?",
+    )
+      .bind(created.database.id)
+      .run();
     const db = (await desired(f.agent)).databases.find(
       (db) => db.id === created.database.id,
     )!;

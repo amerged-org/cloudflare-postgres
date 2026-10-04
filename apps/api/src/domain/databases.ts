@@ -20,6 +20,10 @@ import { keyring } from "../crypto/keyring.ts";
 import { choosePlacement, placementNodes } from "./placement.ts";
 import { syncDatabaseActor } from "./database-actor-sync.ts";
 import {
+  generateMaintenanceCredential,
+  maintenanceCreationStatement,
+} from "./maintenance.ts";
+import {
   databaseForRequest,
   databaseView,
   isConstraintError,
@@ -136,6 +140,10 @@ export async function createDatabase(
         OWNER_ROLE_NAME,
         newRolePassword(),
       );
+      const maintenance = await generateMaintenanceCredential(
+        c.env.CREDENTIAL_KEYS,
+        id,
+      );
       for (let attempt = 0; attempt < 2; attempt++) {
         const node = choosePlacement(
           await placementNodes(c.env.DB, body.region_id),
@@ -170,6 +178,16 @@ export async function createDatabase(
               archivePath: archive,
               now,
             }),
+            maintenanceCreationStatement(
+              c.env.DB,
+              {
+                databaseId: id,
+                projectId: body.project_id,
+                createdAt: now,
+                creationGeneration: 1,
+              },
+              maintenance,
+            ),
             c.env.DB.prepare(
               `INSERT INTO roles (database_id,name,owner,password_ciphertext,password_iv,password_kid,password_revision,created_at,updated_at)
             SELECT id,?,1,?,?,?,1,?,? FROM databases WHERE id=? AND project_id=?`,

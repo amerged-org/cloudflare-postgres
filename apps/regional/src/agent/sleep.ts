@@ -8,14 +8,13 @@ import {
   gatewayControlReportSchema,
   gatewayPodUidSchema,
 } from "@pgcf/contracts";
+import {
+  MAINTENANCE_ROLE,
+  MAINTENANCE_BOOTSTRAP_SQL,
+} from "@pgcf/contracts/maintenance";
 
-export const MAINTENANCE_ROLE = "pgcf_maintenance";
-export const SLEEP_BOOTSTRAP_GRANTS = Object.freeze([
-  "CREATE ROLE pgcf_maintenance LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS",
-  "GRANT pg_read_all_stats TO pgcf_maintenance",
-  "GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal() TO pgcf_maintenance",
-  "GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_archive_statusdir() TO pgcf_maintenance",
-]);
+export { MAINTENANCE_ROLE };
+export const SLEEP_BOOTSTRAP_GRANTS = MAINTENANCE_BOOTSTRAP_SQL;
 
 export interface SleepProbeOptions {
   databaseId: string;
