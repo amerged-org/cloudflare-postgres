@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { isIP } from "node:net";
 import type { DatabaseObservation, DesiredDatabase } from "@pgcf/contracts";
-import { ARCHIVE_DESTINATION_PATTERN } from "@pgcf/contracts";
+import { ARCHIVE_DESTINATION_PATTERN, isDatabaseId } from "@pgcf/contracts";
 import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 import {
   parseRouteKeyring,
@@ -31,8 +31,91 @@ import {
   string,
   uid,
   type Kubernetes,
+  type Log,
   type Resource,
 } from "./types.ts";
+
+export const WAKE_PHASES = [
+  "wake_prepare",
+  "desired_apply",
+  "archive_metrics",
+  "ca_publication",
+  "desired_applied",
+  "role_runtime_auth",
+  "volume_identity",
+  "runtime_unchanged",
+  "fence_release",
+  "observation_post",
+] as const;
+export type WakePhase = (typeof WAKE_PHASES)[number];
+export type WakePhaseOutcome = "completed" | "pending" | "failed";
+export function beginWakePhase(
+  log: Log | undefined,
+  phase: WakePhase,
+  databaseId?: string,
+  now: () => number = () => performance.now(),
+): (outcome: WakePhaseOutcome) => void {
+  if (!log || !WAKE_PHASES.includes(phase)) return () => {};
+  let started: number;
+  try {
+    started = now();
+  } catch {
+    return () => {};
+  }
+  let finished = false;
+  return (outcome) => {
+    if (finished) return;
+    finished = true;
+    try {
+      const ended = now();
+      if (
+        !Number.isFinite(started) ||
+        !Number.isFinite(ended) ||
+        started < 0 ||
+        ended < started ||
+        !["completed", "pending", "failed"].includes(outcome)
+      )
+        return;
+      log("wake_phase", {
+        phase,
+        elapsedMs: Math.min(
+          600000,
+          Math.round((ended - started) * 1000) / 1000,
+        ),
+        outcome,
+        ...(databaseId && isDatabaseId(databaseId)
+          ? { database_id: databaseId }
+          : {}),
+      });
+    } catch {
+      /* Diagnostics cannot alter reconciliation or expose a logger failure. */
+    }
+  };
+}
+export async function measureWakePhase<T>(
+  log: Log | undefined,
+  phase: WakePhase,
+  databaseId: string | undefined,
+  work: () => Promise<T>,
+  now: () => number = () => performance.now(),
+): Promise<T> {
+  const finish = beginWakePhase(log, phase, databaseId, now);
+  let outcome: WakePhaseOutcome = "failed";
+  try {
+    const value = await work();
+    outcome = value === null || value === false ? "pending" : "completed";
+    try {
+      if (record(value).state === "error") outcome = "failed";
+      else if (record(value).state === "provisioning") outcome = "pending";
+    } catch {
+      /* A diagnostic classification cannot affect the returned value. */
+    }
+    finish(outcome);
+    return value;
+  } finally {
+    finish(outcome);
+  }
+}
 
 const NS = "pgcf-system",
   PROGRESS = "power.json",

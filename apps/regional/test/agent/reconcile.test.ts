@@ -2,6 +2,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
+import type { Log } from "../../src/agent/types.ts";
+import type { PowerCoordinator } from "../../src/agent/power.ts";
 import { Reconciler } from "../../src/agent/reconcile.ts";
 import {
   ARCHIVE_OBSERVATION_ANNOTATION,
@@ -1991,4 +1993,84 @@ test("foreign namespace is refused and foreign PV is never reclaimed", async () 
     /ownership/,
   );
   assert.equal(k8s.actions.length, 0);
+});
+
+test("wake phase timings whitelist fields and preserve ready output and resource metadata", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes(),
+    at = Date.now();
+  const baseline = await new Reconciler(
+    k8s,
+    signal(),
+    () => at,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  const before = structuredClone(k8s.resources);
+  const canary = randomUUID();
+  db.power = {
+    operation: db.creation!.operation_id,
+    revision: db.generation,
+    mode: "running",
+    reason: null,
+  };
+  const power = {
+    prepareRunning: async () => undefined,
+    finishRunning: async (_db: unknown, value: unknown) => value,
+  } as unknown as PowerCoordinator;
+  const logs: {
+    event: string;
+    fields: Record<string, string | number | boolean>;
+  }[] = [];
+  const log: Log = (event, fields = {}) => logs.push({ event, fields });
+  let ticks = 0;
+  const measured = await new Reconciler(
+    k8s,
+    signal(),
+    () => at,
+    metrics,
+    async (...args) => {
+      assert.ok(args[0].roles.length);
+      assert.ok(canary);
+      return authenticate();
+    },
+    power,
+    log,
+    () => ticks++,
+  ).reconcile(db, ctx);
+  assert.deepEqual(measured, baseline);
+  assert.deepEqual(k8s.resources, before);
+  assert.deepEqual(
+    logs.map((entry) => entry.fields.phase),
+    [
+      "wake_prepare",
+      "desired_apply",
+      "archive_metrics",
+      "ca_publication",
+      "desired_applied",
+      "role_runtime_auth",
+      "volume_identity",
+      "runtime_unchanged",
+      "fence_release",
+    ],
+  );
+  for (const entry of logs) {
+    assert.equal(entry.event, "wake_phase");
+    assert.deepEqual(Object.keys(entry.fields).sort(), [
+      "database_id",
+      "elapsedMs",
+      "outcome",
+      "phase",
+    ]);
+    assert.equal(entry.fields.database_id, db.id);
+    assert.equal(entry.fields.elapsedMs, 1);
+    assert.equal(entry.fields.outcome, "completed");
+  }
+  assert.equal(JSON.stringify(logs).includes(canary), false);
+  for (const role of db.roles)
+    assert.equal(JSON.stringify(logs).includes(role.password), false);
+  assert.equal(
+    JSON.stringify(logs).includes(ctx.backup.credentials.secretAccessKey),
+    false,
+  );
 });
