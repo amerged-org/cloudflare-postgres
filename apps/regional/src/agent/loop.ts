@@ -32,6 +32,7 @@ export class AgentLoop {
   private retries = new Map<string, Retry>();
   private waiting: (() => void) | undefined;
   private hinted = false;
+  private wakePending = false;
   private reconcile: Reconciler;
   private api: ControlApi;
   private k8s: Kubernetes;
@@ -73,6 +74,7 @@ export class AgentLoop {
   }
 
   async cycle(): Promise<boolean> {
+    this.wakePending = false;
     const desired = await this.api.desired(this.signal);
     let context: Promise<BuildContext> | undefined;
     const buildContext = () =>
@@ -121,6 +123,12 @@ export class AgentLoop {
           );
           this.retries.delete(db.id);
           if (observation) observations.push(observation);
+          if (
+            db.desired_state === "running" &&
+            db.power &&
+            (!observation || observation.state === "provisioning")
+          )
+            this.wakePending = true;
           if (
             !observation ||
             !["ready", "deleted", "hibernated"].includes(observation.state)
@@ -176,7 +184,11 @@ export class AgentLoop {
       this.hinted = false;
       let interval: number;
       try {
-        interval = (await this.cycle()) ? 5_000 : 60_000;
+        interval = (await this.cycle())
+          ? this.wakePending
+            ? 1_000
+            : 5_000
+          : 60_000;
         failures = 0;
       } catch {
         if (this.signal.aborted) break;
