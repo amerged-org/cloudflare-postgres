@@ -15,8 +15,9 @@ all 26 reviewed upstream noncredentials resolved, with zero unresolved findings.
 
 Real Dev transport checks passed 50 concurrent connections, transactions and rollback, negative
 SCRAM cases, 100 MiB and 1 GiB COPY/SELECT integrity, slow reception, disconnect cleanup and
-600,002 ms continuous idle without reconnect. Across 1,000 paired SELECT measurements, direct
-p95 was 29.093 ms and WebSocket p95 35.541 ms. These measurements establish neither sustained
+600,002 ms continuous idle without reconnect. Across 1,000 paired SELECT measurements, the
+operator's verified-TLS Kubernetes port-forward control had p95 29.093 ms and WebSocket p95
+35.541 ms. These measurements establish neither sustained
 maximum SQL throughput nor capacity for 1,000 customers. A separate 10-second read load on
 the current Dev database measured 7,403 exact parameterized SELECT results over 50 warmed
 connections: 735.604 SQL operations/s over the actual 10,063.836 ms including bounded drain,
@@ -60,12 +61,19 @@ fault responses, two transport failures and six subsequent observations, without
 or generation regression. The agent's original API URL and network policy were restored.
 Actual missing-ready-namespace proof passed: two fresh recovery-required observations straddled
 an agent restart, the persistent storage fence remained unchanged and sampled reads found no
-replacement namespace or cluster. The subsequent API deletion freed all storage and trial R2
-objects. An actual R2-only outage reproduced healthy status despite four waiting WAL files and
+replacement namespace or cluster. The subsequent API deletion freed all storage; the harness
+purged its own trial R2 archives separately. An actual R2-only outage reproduced healthy status
+despite four waiting WAL files and
 a confirmed marker unarchived for 1,002 seconds. Removing the exact policy drained the queue and
 preserved the marker. A persistent progress-aware archive timer is implemented and deployed;
-its corrected live alarm proof and full adopter compatibility remain
-before Phase 1 acceptance. Phase 2 has not begun. The second EU node is untouched, the US node
+the first corrected alarm proof passed after 619,301 ms despite an agent restart, and recovery
+drained five WAL files, cleared the timer and preserved the committed marker. A revised policy
+keeps established, physically verified databases ready through measured archive alarms; its
+new image and live connection-under-alarm proof remain pending. Full adopter migration
+compatibility remains a Phase 4 requirement; decoded binary assertions remain retained and
+failed. Phase 2 CLI preparation passed real psql, commit/rollback and 105,216,021 binary COPY
+bytes identical to the direct control in 2,614.726 ms. Serverless lifecycle and metrics have not
+started. Phase 1 is still unaccepted. The second EU node is untouched, the US node
 has not been bought, and existing production routes and databases have not changed. The owner
 has requested delivery through Phase 5 and full Neon replacement.
 
@@ -241,25 +249,25 @@ stream does not query D1. Measure connection creation separately from SQL reques
 Admission keys combine database, role and normalized source network; a separate database-wide
 counter bounds aggregate handshakes. A shared source address from cross-zone Workers never
 creates one installation-wide connection bucket. The current Dev starting limits are 6,000
-handshakes/minute for each combined key and 12,000/minute per database. They are configuration,
+handshakes/minute for each combined key and 12,000/minute per database. The binding counters
+apply per Cloudflare location and are eventually consistent, as described in the
+[Rate Limiting API](https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/).
+They are configuration,
 not a measured service throughput. The gateway budgets 192 MiB aggregate and 96 MiB per database,
 including fragmented and control traffic, with 16 MiB reserved for healthy traffic. The settings
 are `PGCF_GATEWAY_MEMORY_BYTES` and `PGCF_GATEWAY_DATABASE_MEMORY_BYTES`.
 
-Source inspection found that the current adopter uses node-postgres 8.22 and persistent Durable
-Object pools: query maximum 1, transaction maximum 2 and authentication maximum 2 per physical
-environment, with a bounded waiting queue. Requests reuse these pools. PGCF currently provides
-session forwarding; it has no transaction pooler. The Workers-compatible replacement must prove
-pool reuse, backend counts, identity isolation and actual application compatibility before the
-adapter changes. A Node-only custom stream passed the actual Dev text, preparation, transaction
-and reuse checks, but it is not a Workers-compatible client.
+Integrators use bounded reusable pools and waiting queues. PGCF currently provides session
+forwarding; it has no transaction pooler. Measure backend reuse, connection creation and actual
+application compatibility before changing an adapter. Adopter-specific inventory and pool
+settings belong in the adopter repository, not the generic platform plan.
 
 The initial density decision must follow measured active-memory and storage capacity. An adopter
 goal of 1,000 customers is not an assertion that the three initial VPS can host 1,000 simultaneously
-active databases. A read-only Neon metadata capture found 25 adopter projects, 26 branches,
-23 projects on PostgreSQL 17 and two on 18. The queried default-branch databases total
-489,480,192 bytes; extensions include `plpgsql`, `pgcrypto` and `btree_gist`. Full migration
-inventory, connection rates and downtime measurements remain pending.
+active databases. The current Dev node has 6,799 MiB allocatable memory, a measured 1,878 MiB
+platform reservation and a 1,152 MiB reservation for each small database including its sidecar.
+That admits four small database reservations; CPU scheduling and customer density still need
+measurement. Full migration inventory, connection rates and downtime measurements remain pending.
 
 ## 4. Data model and API v1
 
@@ -377,8 +385,9 @@ their own price lists and billing logic.
   - The transport is chosen by a Phase 1 spike behind one seam, preferring the existing path with
     the fewest parts that keeps TLS to PostgreSQL: Workers VPC TCP (`vpc_networks` binding), else
     a Workers VPC HTTP service to the gateway, else a Tunnel hostname with the routing token.
-    Every candidate must preserve the approved unopened-WebSocket native forwarding path; raw
-    TCP support alone does not prove that path. No live transport has been selected. An Access
+    The selected Dev path is a VPC HTTP service with unopened native forwarding, measured at
+    235 ms in the capability check. VPC TCP was rejected because its raw streams did not expose
+    the required native WebSocket. Tunnel with signed routing remains the fallback. An Access
     service token on a public Tunnel hostname needs the owner's consent to a Zero Trust
     organization first.
 - PostgreSQL:
@@ -442,6 +451,13 @@ Build:
   gateway. `ready` requires `ContinuousArchiving=True`; if archiving stays failed for more than
   10 minutes, the agent reports `health.archiving=failing`, which `GET /v1/databases/{id}` shows.
   The agent has no `pods/exec`.
+- Backup objects survive ordinary API deletion within retention; the acceptance harness
+  explicitly purges its own trial archives. Complete retention enforcement and restore after
+  source deletion are Phase 4 work.
+- Once a database has been ready, a measured archive alarm does not revoke connections when
+  its physical identity, current configuration, certificates and role authentication still pass.
+  Report `ready` with `health.archiving=failing`. Initial creation still requires verified
+  archiving; unavailable or invalid measurements never establish healthy status.
 - `cloudflared` and the regional image in the Flux platform; public GHCR images.
 - `apps/edge` on the single endpoint: D1 admission of URL hints, signed v2 database/user route,
   and unopened-WebSocket native forwarding. The gateway owns startup validation, preludes and
@@ -652,7 +668,8 @@ Publish public images instead.
 | Endpoint            | One hostname, `db.<domain>` (Worker custom domain). No per-database or per-region hostnames, no wildcard DNS; the region is routing data in D1                                    |
 | Routing             | Edge admits untrusted `database`/`user` URL hints against D1 and signs a v2 token with mandatory user; gateway requires the actual StartupMessage to match before PostgreSQL dial |
 | Client protocol     | PostgreSQL over WebSocket (`GET /v2?database=<id>&user=<role>`) via native Edge forwarding with `pipelineConnect=false`; native tools through `pgcf connect` (Phase 2) |
-| Edge to region      | Phase 1 spike behind one seam: Workers VPC TCP, else VPC HTTP, else Tunnel hostname; every candidate must preserve unopened-WebSocket native forwarding and signed v2 routing; live choice pending |
+| Archive alarm       | Separate archive health from established database availability after current physical/configuration/role checks; initial creation remains gated |
+| Edge to region      | VPC HTTP service with unopened native WebSocket forwarding selected in Dev (235 ms capability check); VPC TCP raw streams rejected; signed Tunnel route remains fallback |
 | Desired state       | Deletion is an explicit tombstone; absence from a pull never deletes; generations only increase and the agent ignores older ones                                                  |
 | Database topology   | One CNPG Cluster with 1 instance per database, namespace per database, pinned to a node                                                                                           |
 | Sleep               | CNPG declarative hibernation                                                                                                                                                      |

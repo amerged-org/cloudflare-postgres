@@ -37,9 +37,12 @@ initialize an empty database. A real R2 restore drill
 passed committed markers, rollback absence, TLS, separate target WAL and exact storage cleanup;
 measured WAL upload delay was 52.4 seconds for these writes. The deployed Workers client proved
 backend reuse, isolation between two actual identities and complete cancellation/cleanup.
-An actual R2 outage exposed a stalled-archive health defect; the corrected, qualified image is
-deployed in Dev and its live alarm verification remains pending.
-Phase 2 has not begun. The second EU node is untouched, the US node has not been bought, and
+An actual R2 outage exposed a stalled-archive health defect. The corrected alarm passed after
+619 seconds despite an agent restart, and recovery drained the queue and preserved the marker.
+The revised policy keeping established databases available during measured archive alarms still
+needs its new image and live connection test. CLI preparation passed real psql, commit/rollback
+and 105 MB binary COPY integrity; serverless lifecycle and metrics have not begun.
+The second EU node is untouched, the US node has not been bought, and
 existing production routes and databases have not changed. Image signing remains pending.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
@@ -132,13 +135,29 @@ and a `wsProxy` URL containing both URL-encoded hints. Requests to the bare `/v2
 missing or invalid hints are unsupported. Edge checks the database and role against D1, signs a
 v2 routing token with mandatory user, and returns the unopened upstream WebSocket for native
 forwarding. Admission failures return a small failure-only `101` WebSocket carrying a PostgreSQL
-SQLSTATE error before any gateway upgrade or PostgreSQL dial. The live Cloudflare transport is
-still unselected.
+SQLSTATE error before any gateway upgrade or PostgreSQL dial. Dev uses a VPC HTTP service with
+native forwarding; VPC TCP raw streams were unsuitable, and a signed Tunnel route is the fallback.
 
 The gateway checks the actual PostgreSQL StartupMessage database and user against the signed
 route before opening PostgreSQL. It owns SSL/GSS preludes, CancelRequest, startup parsing and the
 startup deadline, negotiates verified TLS to PostgreSQL, and measures stream bytes and connection
 events. SCRAM authentication runs end to end with PostgreSQL; uncertain writes are never replayed.
+
+### PostgreSQL tools
+
+Build the CLI from this checkout with `pnpm --filter @pgcf/cli build`, then run:
+
+```sh
+node packages/cli/dist/main.js connect --endpoint wss://db.your-domain --database <db-id> --user app
+```
+
+Use the printed loopback port in psql or migration tools, with `host=127.0.0.1`, your database
+and user, and `sslmode=disable`. Enter the password in the PostgreSQL tool. The local hop is
+plaintext; the public hop uses verified WSS and the gateway verifies PostgreSQL TLS. The CLI
+adapts only the SASL mechanism offer to plain SCRAM for libpq compatibility; channel binding
+requiring direct PostgreSQL TLS is unsupported. It never retries SQL. Limits are 16 local
+connections, 1 MiB per WebSocket message and a bounded 10-second FIN grace (at most 20 seconds
+during upstream startup). The packaged CLI includes the first-party and bundled-library licenses.
 
 ## Self-hosting requirements
 
