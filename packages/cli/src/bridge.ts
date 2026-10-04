@@ -5,6 +5,7 @@ import type { Duplex } from "node:stream";
 import WebSocket, { createWebSocketStream } from "ws";
 import { upstreamUrl, validateOptions } from "./options.ts";
 import type { ConnectOptions } from "./options.ts";
+import { BackendAuthentication, FrontendPrelude } from "./auth.ts";
 
 export const STREAM_BYTES = 64 * 1024;
 export const MESSAGE_BYTES = 1024 * 1024;
@@ -17,6 +18,8 @@ export interface Session {
   local: Socket;
   upstream: WebSocket;
   stream: Duplex;
+  authentication: BackendAuthentication;
+  frontend: FrontendPrelude;
 }
 export type Connector = (url: string) => WebSocket;
 export const UPSTREAM_OPTIONS: Readonly<WebSocket.ClientOptions> =
@@ -74,7 +77,9 @@ export async function startBridge(
       const stream = createWebSocketStream(upstream, {
         highWaterMark: STREAM_BYTES,
       });
-      const session = { local, upstream, stream };
+      const authentication = new BackendAuthentication();
+      const frontend = new FrontendPrelude(authentication);
+      const session = { local, upstream, stream, authentication, frontend };
       sessions.add(session);
       const ended = new Promise<void>((resolve) =>
         upstream.once("close", () => resolve()),
@@ -87,15 +92,21 @@ export async function startBridge(
         if (finished) return;
         finished = true;
         if (halfCloseTimer) clearTimeout(halfCloseTimer);
-        local.unpipe(stream);
-        stream.unpipe(local);
+        local.unpipe(frontend);
+        frontend.unpipe(stream);
+        stream.unpipe(authentication);
+        authentication.unpipe(local);
         local.destroy();
+        frontend.destroy();
+        authentication.destroy();
         stream.destroy();
         upstream.terminate();
         sessions.delete(session);
         hooks.disconnected?.();
       };
       stream.on("error", finish);
+      authentication.on("error", finish);
+      frontend.on("error", finish);
       upstream.on("error", finish);
       local.once("error", finish);
       local.once("close", finish);
@@ -113,7 +124,7 @@ export async function startBridge(
         // Let the readable stream flush admitted bytes before ending local TCP.
         if (local.destroyed) finish();
       });
-      stream.once("end", () => local.end());
+      authentication.once("end", () => local.end());
       upstream.prependListener("message", (_data, binary) => {
         if (!binary) finish();
       });
@@ -128,8 +139,9 @@ export async function startBridge(
       });
       local.setNoDelay(true);
       hooks.session?.(session);
-      local.pipe(stream, { end: false });
-      stream.pipe(local);
+      local.pipe(frontend);
+      frontend.pipe(stream, { end: false });
+      stream.pipe(authentication).pipe(local);
     },
   );
   server.maxConnections = CLIENT_LIMIT;
