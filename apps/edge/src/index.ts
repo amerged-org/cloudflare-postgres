@@ -3,30 +3,13 @@ import { isDatabaseId, isRoleName } from "@pgcf/contracts";
 import { encodeErrorResponse } from "@pgcf/contracts/pg-wire";
 import { parseRouteKeyring, signRouteToken } from "@pgcf/contracts/route-token";
 import type { Env } from "./env.ts";
-import { connectGateway, type GatewayRegion } from "./gateway.ts";
+import { connectGateway } from "./gateway.ts";
 import { ADMISSION_DEADLINE_MS, connectionRateKey } from "./session-policy.ts";
 
-interface RouteRow extends GatewayRegion {
-  readonly role_name: string | null;
-  readonly desired_state: string;
-  readonly observed_state: string;
-}
 interface Hints {
   readonly database: string;
   readonly user: string;
 }
-
-// Credentials never enter the data plane's read-only admission query.
-const ROUTE_QUERY = `
-  SELECT d.desired_state, d.observed_state,
-         roles.name AS role_name, regions.id, regions.gateway_url,
-         regions.gateway_binding
-    FROM databases d
-    JOIN regions ON regions.id = d.region_id
-    LEFT JOIN roles ON roles.database_id = d.id AND roles.name = ?
-                   AND roles.deleted_at IS NULL
-   WHERE d.id = ? AND d.deleted_at IS NULL
-   LIMIT 1`;
 
 class AdmissionFailure extends Error {
   readonly sqlstate: string;
@@ -78,14 +61,26 @@ async function admit(
     throw new AdmissionFailure("53300", "connection admission unavailable");
   }
   check();
-  const route = await env.DB.prepare(ROUTE_QUERY)
-    .bind(hints.user, hints.database)
-    .first<RouteRow>();
+  const admitted = await env.DATABASE_ACTOR.get(
+    env.DATABASE_ACTOR.idFromName(hints.database),
+  ).admit(hints.database, hints.user);
   check();
-  if (route === null)
-    throw new AdmissionFailure("3D000", "database does not exist");
-  if (route.role_name === null)
-    throw new AdmissionFailure("28P01", "authentication failed");
+  if (!admitted.ok) {
+    switch (admitted.sqlstate) {
+      case "3D000":
+        throw new AdmissionFailure("3D000", "database does not exist");
+      case "28P01":
+        throw new AdmissionFailure("28P01", "authentication failed");
+      case "57P03":
+        throw new AdmissionFailure(
+          "57P03",
+          "database is not accepting connections",
+        );
+      default:
+        throw new AdmissionFailure("08006", "gateway connection failed");
+    }
+  }
+  const route = admitted.region;
   // Unknown hints must not consume a real database's shared admission bucket.
   let databaseAllowed: boolean;
   try {
@@ -100,11 +95,6 @@ async function admit(
     throw new AdmissionFailure(
       "53300",
       "database connection rate limit exceeded",
-    );
-  if (route.desired_state !== "running" || route.observed_state !== "ready")
-    throw new AdmissionFailure(
-      "57P03",
-      "database is not accepting connections",
     );
   const token = await signRouteToken({
     keyring: parseRouteKeyring(env.ROUTE_MASTER_KEYS),

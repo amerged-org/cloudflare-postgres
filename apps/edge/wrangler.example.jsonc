@@ -12,13 +12,15 @@
       "custom_domain": true,
     },
   ],
-  "d1_databases": [
-    {
-      "binding": "DB",
-      "database_name": "<CONTROL_DATABASE_NAME>",
-      "database_id": "<CONTROL_DATABASE_ID>",
-    },
-  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DATABASE_ACTOR",
+        "class_name": "DatabaseActor",
+        "script_name": "<MANAGEMENT_API_WORKER>",
+      },
+    ],
+  },
   "ratelimits": [
     // Configure limits for the installation's new WebSocket handshakes.
     // SQL statements on an existing connection do not consume these buckets.

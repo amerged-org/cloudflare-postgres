@@ -1,7 +1,7 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
   "name": "pgcf-edge-test",
-  "main": "src/index.ts",
+  "main": "test/actor-entry.js",
   "compatibility_date": "2026-10-02",
   "d1_databases": [
     {
@@ -9,6 +9,10 @@
       "database_name": "pgcf-edge-test",
     },
   ],
+  "durable_objects": {
+    "bindings": [{ "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" }],
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DatabaseActor"] }],
   "ratelimits": [
     {
       "name": "DATABASE_CONNECTION_RATE_LIMITER",
