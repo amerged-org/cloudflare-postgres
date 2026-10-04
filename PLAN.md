@@ -8,10 +8,10 @@ verified gateway-to-PostgreSQL TLS. The provider quantity-normalization defect i
 first database reports Ready with continuous WAL archiving and a completed R2 base backup.
 
 The regional agent and gateway run the qualified immutable image
-`sha256:eb90f09f9b9c6cb25be7e1956b955a9bff4c818ec08f82bea10f7b2cca9c9296`
-from source `490a822`. Full image qualification scanned all 657,457,671 expected bytes;
-all 26 reviewed upstream noncredentials resolved, with zero unresolved findings. CI runs
-`37139678694` and `37144897211` passed. Image signing remains pending.
+`sha256:ada3a17ce80423fb3b1f5424fc7bef5ea972bbad08e58a7a84861d01afb5829a`
+from source `a22ff17c`. Full image qualification scanned all 657,463,303 expected bytes;
+all 26 reviewed upstream noncredentials resolved, with zero unresolved findings. CI
+`37179498961` passed. Image signing remains pending.
 
 Real Dev transport checks passed 50 concurrent connections, transactions and rollback, negative
 SCRAM cases, 100 MiB and 1 GiB COPY/SELECT integrity, slow reception, disconnect cleanup and
@@ -58,7 +58,13 @@ Five distinct create/delete runs and ten mid-operation agent restarts passed wit
 The real fault run also passed empty, failed, older and out-of-order responses: six completed
 fault responses, two transport failures and six subsequent observations, without database loss
 or generation regression. The agent's original API URL and network policy were restored.
-Archive-failure reporting, missing-ready-namespace proof and full adopter compatibility remain
+Actual missing-ready-namespace proof passed: two fresh recovery-required observations straddled
+an agent restart, the persistent storage fence remained unchanged and sampled reads found no
+replacement namespace or cluster. The subsequent API deletion freed all storage and trial R2
+objects. An actual R2-only outage reproduced healthy status despite four waiting WAL files and
+a confirmed marker unarchived for 1,002 seconds. Removing the exact policy drained the queue and
+preserved the marker. A persistent progress-aware archive timer is implemented and deployed;
+its corrected live alarm proof and full adopter compatibility remain
 before Phase 1 acceptance. Phase 2 has not begun. The second EU node is untouched, the US node
 has not been bought, and existing production routes and databases have not changed. The owner
 has requested delivery through Phase 5 and full Neon replacement.

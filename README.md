@@ -18,21 +18,27 @@ loss is recovered from R2.
 
 ## Status
 
-**Phase 0 accepted; Phase 1 live acceptance in progress (2026-10-03).** The first EU node and
+**Phase 0 accepted; Phase 1 live acceptance in progress (2026-10-04).** The first EU node and
 all five Flux releases are Ready, with 95 GiB storage. The complete Dev connection path through
 `db.ohmyho.st` reaches real PostgreSQL with verified TLS, WAL archiving and an R2 base backup.
 
 Real Dev checks passed transactions, rollback, 50 concurrent connections, 100 MiB and 1 GiB
 stream integrity, slow reception, disconnect cleanup and 600 seconds idle without reconnect.
-These results are not sustained throughput or 1,000-customer capacity claims. Strong
+An additional 10-second read load measured 735.604 SQL/s over 50 warm connections, p95 75.368 ms
+and zero errors. These results do not establish maximum throughput or 1,000-customer capacity. Strong
 binary-result client assertions remain failed, including on direct TCP with node-postgres 8.22.
 The raw transport checks pass.
 
-Formal E0–E2 passed, including an agent restart during creation. The remaining trace transport
-corrections await final integrated verification before E3–E6 can pass. A real R2 restore drill
+Formal E0–E6 passed, including all 65,535 ports from both network sources. Five create/delete
+runs survived ten agent restarts with complete cleanup. Empty, failed, stale and out-of-order
+desired-state pulls passed without data loss or generation regression. After the actual loss
+of a ready database namespace and an agent restart, PGCF reported recovery required and did not
+initialize an empty database. A real R2 restore drill
 passed committed markers, rollback absence, TLS, separate target WAL and exact storage cleanup;
 measured WAL upload delay was 52.4 seconds for these writes. The deployed Workers client proved
-backend reuse and complete cancellation/cleanup; a second actual identity remains untested.
+backend reuse, isolation between two actual identities and complete cancellation/cleanup.
+An actual R2 outage exposed a stalled-archive health defect; the corrected, qualified image is
+deployed in Dev and its live alarm verification remains pending.
 Phase 2 has not begun. The second EU node is untouched, the US node has not been bought, and
 existing production routes and databases have not changed. Image signing remains pending.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
