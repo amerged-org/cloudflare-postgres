@@ -2,6 +2,8 @@
 import { DatabaseId, Timestamp } from "@pgcf/contracts";
 import { USAGE_HOUR_MS } from "@pgcf/contracts/usage";
 import { rollupUsageHour } from "./usage-rollup.ts";
+import { measureBackupUsage } from "./backup-usage.ts";
+import type { Env } from "../env.ts";
 
 export const USAGE_CRON_PAGE_LIMIT = 24;
 export const USAGE_CRON_STATEMENT_LIMIT = 600;
@@ -21,6 +23,8 @@ export interface UsageCronResult {
   exhausted: boolean;
   overlap: boolean;
   next: string | null;
+  backupMeasured: number;
+  backupUnavailable: number;
 }
 
 function boundedDatabase(db: D1Database) {
@@ -102,6 +106,7 @@ const iso = (value: number) => new Date(value).toISOString();
 export async function runUsageCron(
   input: D1Database,
   now = Date.now(),
+  archive?: Pick<Env, "ARCHIVE" | "ARCHIVE_BUCKET_NAME">,
 ): Promise<UsageCronResult> {
   if (!Number.isSafeInteger(now) || now < 0)
     throw new Error("invalid_usage_cron_timestamp");
@@ -117,6 +122,8 @@ export async function runUsageCron(
     exhausted: false,
     overlap: false,
     next: null,
+    backupMeasured: 0,
+    backupUnavailable: 0,
   };
   await db
     .prepare(
@@ -150,6 +157,20 @@ export async function runUsageCron(
         row.terminal_at === null ? null : creationHour(row.terminal_at);
       if (terminal !== null && terminal < created)
         throw new Error("invalid_usage_deletion_timestamp");
+      let materializationNow = now;
+      if (archive) {
+        const measured = await measureBackupUsage(
+          { ...archive, DB: db },
+          row.id,
+        );
+        if (measured.status === "measured") result.backupMeasured++;
+        else result.backupUnavailable++;
+        if (measured.sample) {
+          const sampled = Date.parse(measured.sample.observed_at);
+          if (Math.floor(sampled / USAGE_HOUR_MS) * USAGE_HOUR_MS === current)
+            materializationNow = Math.max(now, sampled);
+        }
+      }
       await db
         .prepare(
           "INSERT INTO usage_rollup_progress(database_id,next_hour) VALUES(?,?) ON CONFLICT(database_id) DO NOTHING",
@@ -173,7 +194,12 @@ export async function runUsageCron(
       const visited = new Set<number>();
       for (let index = 0; index < USAGE_CRON_CATCHUP_HOURS; index++) {
         if (next > current || (terminal !== null && next > terminal)) break;
-        const metered = await rollupUsageHour(db, row.id, next, now);
+        const metered = await rollupUsageHour(
+          db,
+          row.id,
+          next,
+          next === current ? materializationNow : now,
+        );
         visited.add(next);
         result.hours++;
         if (metered.final) result.finalized++;
@@ -194,7 +220,12 @@ export async function runUsageCron(
           visited.has(recent)
         )
           continue;
-        await rollupUsageHour(db, row.id, recent, now);
+        await rollupUsageHour(
+          db,
+          row.id,
+          recent,
+          recent === current ? materializationNow : now,
+        );
         result.hours++;
       }
     } catch (error) {

@@ -117,6 +117,42 @@ async function getUsage(key: string, query: Record<string, string>) {
   return response;
 }
 describe("hourly usage", () => {
+  it("includes a point gauge at the actual current measurement end while excluding the next UTC hour", async () => {
+    const f = await setup();
+    const sample = (observed: number) => ({
+      payload: JSON.stringify({
+        source: "backup",
+        database_id: f.id,
+        producer_id: "archive",
+        sequence: observed,
+        observed_at: iso(observed),
+        backup_bytes: 41,
+      }),
+    });
+    const database = {
+      id: f.id,
+      project_id: f.project,
+      created_at: iso(epoch),
+    };
+    expect(
+      computeUsageHour(
+        database,
+        epoch,
+        [],
+        [sample(epoch + 1_800_000)],
+        epoch + 1_800_000,
+      ).metrics.backup_bytes_max,
+    ).toBe(41);
+    expect(
+      computeUsageHour(
+        database,
+        epoch,
+        [],
+        [sample(epoch + USAGE_HOUR_MS)],
+        epoch + USAGE_HOUR_MS,
+      ).metrics.backup_bytes_max,
+    ).toBeNull();
+  });
   it("meters actual create and accepted-ready API transitions from their immutable resource snapshots", async () => {
     const f = await fixture();
     const created = DatabaseWithOperation.parse(

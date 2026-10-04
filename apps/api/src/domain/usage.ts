@@ -40,11 +40,18 @@ export function usageLifecycleStatement(
 }
 
 /** Caller authenticates the recorder; producer_id identifies one process epoch, not a reusable replica name. */
+export interface BackupUsageIdentity {
+  archive_path: string;
+  region_id: string;
+  backup_bucket: string;
+  deleted_at: string | null;
+}
 export async function recordUsageSample(
   db: D1Database,
   principalInput: UsageRecorderPrincipal,
   input: UsageSample,
   now = Date.now(),
+  backupIdentity?: BackupUsageIdentity,
 ): Promise<"recorded" | "duplicate"> {
   const principal = UsageRecorderPrincipal.parse(principalInput),
     parsed = UsageSample.parse(input);
@@ -74,12 +81,40 @@ export async function recordUsageSample(
     sample.producer_id,
     sample.sequence,
   ] as const;
+  if (
+    backupIdentity &&
+    (sample.source !== "backup" ||
+      backupIdentity.region_id !== principal.region_id)
+  )
+    throw new ApiError(
+      "invalid_request",
+      "Backup identity is restricted to the authenticated backup recorder",
+    );
   const database = await db
-    .prepare("SELECT region_id FROM databases WHERE id=?")
+    .prepare(
+      backupIdentity
+        ? "SELECT d.region_id,d.archive_path,d.deleted_at,r.backup_bucket FROM databases d JOIN regions r ON r.id=d.region_id WHERE d.id=?"
+        : "SELECT region_id FROM databases WHERE id=?",
+    )
     .bind(sample.database_id)
-    .first<{ region_id: string }>();
+    .first<{
+      region_id: string;
+      archive_path?: string;
+      deleted_at?: string | null;
+      backup_bucket?: string;
+    }>();
   if (!database || database.region_id !== principal.region_id)
     throw new ApiError("not_found", "Metered database not found");
+  if (
+    backupIdentity &&
+    (database.archive_path !== backupIdentity.archive_path ||
+      database.deleted_at !== backupIdentity.deleted_at ||
+      database.backup_bucket !== backupIdentity.backup_bucket)
+  )
+    throw new ApiError(
+      "conflict",
+      "Backup archive identity changed during measurement",
+    );
   const duplicate = await db
     .prepare(
       "SELECT payload FROM usage_samples WHERE database_id=? AND source=? AND producer_id=? AND sequence=?",
@@ -100,7 +135,8 @@ export async function recordUsageSample(
     SELECT ?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM databases WHERE id=? AND region_id=?)
     AND NOT EXISTS(SELECT 1 FROM usage_hourly WHERE database_id=? AND hour=? AND final=1)
     AND (SELECT count(*) FROM usage_samples WHERE database_id=? AND interval_start>=? AND interval_start<?)<10000
-    AND (? <> 'gateway' OR NOT EXISTS(SELECT 1 FROM usage_samples WHERE database_id=? AND source='gateway' AND producer_id=? AND interval_start<? AND interval_end>?))`,
+    AND (? <> 'gateway' OR NOT EXISTS(SELECT 1 FROM usage_samples WHERE database_id=? AND source='gateway' AND producer_id=? AND interval_start<? AND interval_end>?))
+    AND (?=0 OR EXISTS(SELECT 1 FROM databases d JOIN regions r ON r.id=d.region_id WHERE d.id=? AND d.region_id=? AND d.archive_path=? AND d.deleted_at IS ? AND r.backup_bucket=?))`,
     )
     .bind(
       ...identity,
@@ -120,6 +156,12 @@ export async function recordUsageSample(
       sample.producer_id,
       end,
       start,
+      backupIdentity ? 1 : 0,
+      sample.database_id,
+      backupIdentity?.region_id ?? null,
+      backupIdentity?.archive_path ?? null,
+      backupIdentity?.deleted_at ?? null,
+      backupIdentity?.backup_bucket ?? null,
     )
     .run();
   if (result.meta.changes === 0) {
