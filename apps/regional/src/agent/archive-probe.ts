@@ -33,7 +33,7 @@ export type ArchiveProbeResult = {
 };
 export type ArchiveClientFactory = (config: ClientConfig) => Client;
 export const ARCHIVE_IDENTITY_QUERY = `SELECT pg_catalog.current_database() AS database,pg_catalog.current_setting('session_authorization') AS role,
- pg_catalog.pg_is_in_recovery() AS recovery,pg_catalog.inet_server_addr()::text AS server_address,
+ pg_catalog.pg_is_in_recovery() AS recovery,pg_catalog.host(pg_catalog.inet_server_addr()) AS server_address,
  (SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid=pg_catalog.pg_backend_pid()) AS tls,
  r.rolsuper,r.rolcreatedb,r.rolcreaterole,r.rolreplication,r.rolbypassrls,
  NOT EXISTS(SELECT 1 FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles granted ON granted.oid=m.roleid WHERE m.member=r.oid AND granted.rolname<>'pg_read_all_stats') AS only_stats,

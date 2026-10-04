@@ -102,6 +102,7 @@ function fake(
     tls?: boolean;
     peerName?: string;
     queryError?: boolean;
+    inetRepresentation?: boolean;
     abort?: AbortController;
   } = {},
 ) {
@@ -158,7 +159,20 @@ function fake(
           return new Promise(() => {});
         }
         return {
-          rows: [statement === ARCHIVE_IDENTITY_QUERY ? identity : sample],
+          rows: [
+            statement === ARCHIVE_IDENTITY_QUERY
+              ? change.inetRepresentation
+                ? {
+                    ...identity,
+                    server_address: statement.includes(
+                      "pg_catalog.host(pg_catalog.inet_server_addr())",
+                    )
+                      ? identity.server_address
+                      : `${identity.server_address}/32`,
+                  }
+                : identity
+              : sample,
+          ],
         };
       },
       end: async () => {
@@ -540,4 +554,20 @@ test("archiver reset remains a real new baseline rather than fabricated health",
     progress: { archivedCount: 0, lastArchivedTime: -1 },
     valid: true,
   });
+});
+
+test("the identity query requests host notation from PostgreSQL inet before strict Pod-IP comparison", async () => {
+  const client = fake({ inetRepresentation: true });
+  const result = await probeArchive(validOptions(), client.factory);
+  assert.equal(result.readyWalFiles, 4);
+  assert.equal(client.ended(), 1);
+  assert.deepEqual(client.queries, [ARCHIVE_IDENTITY_QUERY, ARCHIVE_QUERY]);
+});
+test("CIDR-formatted or arbitrary server input is still refused rather than trimmed", async () => {
+  const client = fake({
+    identity: { server_address: [10, 20, 0, 1].join(".") + "/32" },
+  });
+  await assert.rejects(probeArchive(validOptions(), client.factory));
+  assert.equal(client.queries.length, 1);
+  assert.equal(client.ended(), 1);
 });
