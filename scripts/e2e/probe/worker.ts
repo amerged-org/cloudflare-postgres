@@ -368,7 +368,7 @@ export default {
       }
       if (path === "/refusal") {
         await rejects(
-          `postgres://app@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`,
+          `postgres://app:${encodeURIComponent(crypto.randomUUID())}@${env.ENDPOINT_HOST}/${env.DATABASE_ID}`,
           marker,
         );
         return response({ pass: true });

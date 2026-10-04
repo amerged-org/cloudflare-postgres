@@ -4,6 +4,9 @@ import { randomBytes } from "node:crypto";
 import { registerHooks } from "node:module";
 import test from "node:test";
 import { neonConfig } from "@neondatabase/serverless";
+import { WebSocket, WebSocketServer } from "ws";
+import { once } from "node:events";
+import { StartupReader, encodeErrorResponse } from "@pgcf/contracts/pg-wire";
 
 const sockets = registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -28,6 +31,83 @@ function environment(expiresAt?: string) {
     RUN_EXPIRES_AT: expiresAt,
   };
 }
+
+test("deleted-database refusal completes SCRAM with a generated password before accepting PostgreSQL rejection", async () => {
+  const env = environment(new Date(Date.now() + 60_000).toISOString());
+  const server = new WebSocketServer({
+    host: [127, 0, 0, 1].join("."),
+    port: 0,
+  });
+  await once(server, "listening");
+  const port = (server.address() as { port: number }).port;
+  const original = neonConfig.webSocketConstructor;
+  let finalResponses = 0;
+  const auth = (code: number, text: string) => {
+    const body = Buffer.from(text),
+      out = Buffer.alloc(body.length + 9);
+    out[0] = 82;
+    out.writeUInt32BE(out.length - 1, 1);
+    out.writeUInt32BE(code, 5);
+    body.copy(out, 9);
+    return out;
+  };
+  server.on("connection", (socket) => {
+    let phase = "startup";
+    const reader = new StartupReader();
+    socket.on("message", (bytes) => {
+      const data = Buffer.from(bytes as Buffer);
+      if (phase === "startup") {
+        const event = reader.push(data);
+        assert.equal(event.kind, "startup");
+        phase = "first";
+        socket.send(auth(10, "SCRAM-SHA-256\0\0"));
+      } else if (phase === "first") {
+        const body = data.subarray(5),
+          end = body.indexOf(0);
+        const first = body.subarray(end + 5).toString();
+        const nonce = first
+          .split(",")
+          .find((field) => field.startsWith("r="))!
+          .slice(2);
+        phase = "final";
+        socket.send(
+          auth(
+            11,
+            `r=${nonce}${randomBytes(12).toString("base64")},s=${randomBytes(16).toString("base64")},i=4096`,
+          ),
+        );
+      } else {
+        finalResponses++;
+        socket.send(
+          encodeErrorResponse("28P01", "password authentication failed"),
+        );
+      }
+    });
+  });
+  class LocalSocket extends WebSocket {
+    constructor() {
+      super(`ws://${[127, 0, 0, 1].join(".")}:${port}`);
+    }
+  }
+  neonConfig.webSocketConstructor =
+    LocalSocket as typeof neonConfig.webSocketConstructor;
+  try {
+    const response = await probe.default.fetch(
+      new Request(`https://${["probe", "test"].join(".")}/refusal`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${env.PROBE_BEARER}` },
+      }),
+      env,
+    );
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { pass: true });
+    assert.equal(finalResponses, 1);
+  } finally {
+    neonConfig.webSocketConstructor = original;
+    for (const socket of server.clients) socket.terminate();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
 
 test("probe expires before any handler or authentication can cause side effects", async () => {
   const original = globalThis.fetch;
