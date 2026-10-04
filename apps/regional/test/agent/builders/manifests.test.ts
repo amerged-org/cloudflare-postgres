@@ -603,3 +603,28 @@ test("agent ingress permits authenticated readiness and archive metrics only", (
     },
   ]);
 });
+
+test("one-second startup and readiness cadence preserves the startup budget and inherited probe checks", () => {
+  const { db, ctx } = fixture();
+  const cluster = record(
+    object(buildDatabaseManifests(db, ctx), "Cluster").spec,
+  );
+  assert.deepEqual(cluster.probes, {
+    startup: { periodSeconds: 1, failureThreshold: 3600 },
+    readiness: { periodSeconds: 1 },
+  });
+  const probes = record(cluster.probes),
+    startup = record(probes.startup);
+  assert.equal(
+    Number(startup.periodSeconds) * Number(startup.failureThreshold),
+    3600,
+  );
+  assert.equal(probes.liveness, undefined);
+  assert.equal(record(probes.readiness).failureThreshold, undefined);
+  assert.equal(record(probes.readiness).type, undefined);
+  assert.equal(startup.type, undefined);
+  assert.equal(startup.timeoutSeconds, undefined);
+  assert.equal(record(probes.readiness).timeoutSeconds, undefined);
+  assert.equal(startup.successThreshold, undefined);
+  assert.equal(record(probes.readiness).successThreshold, undefined);
+});
