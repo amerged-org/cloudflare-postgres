@@ -42,7 +42,8 @@ clients, text byte fidelity, prepared statements, transactions, authentication, 
 cases, isolation between two actual databases with different users, cancellation and complete
 same-bank cleanup. All three native sockets and four auxiliary sockets closed, all pools ended
 and outstanding leases reached zero. The strong binary-result assertion remains failed on both
-WebSocket and direct TCP controls. Its exact upstream parser behavior is under investigation.
+WebSocket and direct TCP controls. The upstream parser decodes binary fields as UTF-8 before
+the type parser receives them; the retained assertions still fail and no dependency fix is shipped.
 
 The separate R2 restore drill passed two committed markers, rollback absence, verified TLS,
 promotion, target WAL archival, unchanged source and exact 5 GiB storage reclamation. Provider
@@ -53,7 +54,11 @@ operator-generated monitoring and service Endpoints after matching their source/
 a delayed capacity observation subsequently converged to the 97,706,311,680-byte baseline.
 Full Phase 4 PITR and disaster recovery workflows remain pending.
 
-Fault tests and full adopter compatibility are still required
+Five distinct create/delete runs and ten mid-operation agent restarts passed with full cleanup.
+The real fault run also passed empty, failed, older and out-of-order responses: six completed
+fault responses, two transport failures and six subsequent observations, without database loss
+or generation regression. The agent's original API URL and network policy were restored.
+Archive-failure reporting, missing-ready-namespace proof and full adopter compatibility remain
 before Phase 1 acceptance. Phase 2 has not begun. The second EU node is untouched, the US node
 has not been bought, and existing production routes and databases have not changed. The owner
 has requested delivery through Phase 5 and full Neon replacement.
@@ -747,3 +752,4 @@ Entries are chronological; later results supersede earlier pending work.
 | 2026-10-04 | 1 live | Formal E0–E5 and canary audit passed: create Ready in 29,027 ms, SQL cold connect 222 ms, commit 34 ms, rollback 35 ms, startup database/user refusal 294/73 ms with correlated gateway events, one base backup and four WAL objects, and deletion in 40,000 ms with zero remaining volumes or archive objects. Create and delete each survived an agent restart. D1 and Tail plaintext-secret counts were zero. Actual Workers client isolation passed across two databases and users with complete same-bank socket/pool cleanup; decoded binary results still fail. E6's native probe could not fetch anonymous GitHub metadata; authenticated GET returned 200. Phase 1 remains unaccepted pending E6, the remaining four restart cycles, faults and adopter checks. |
 | 2026-10-04 | 1 throughput / network | The real read load completed 7,403 exact parameterized SELECTs over 50 warmed connections in 10,063.836 ms including bounded drain: 735.604 SQL/s, p95 75.368 ms, zero errors, and all 50 clients and sockets closed. Native TCP proof run `37164694758` passed port 25 with positive controls before/after, a blocked target and source pool disjoint from the complete operator allowlist; the signed report was consumed successfully. The first full E6 attempt passed the operator's 65,535-port scan but aborted the Worker scan and cleaned all its resources. Actual probe closure acknowledgement delayed a single 400-ms check to 19.876 s; the exact nonawaited-close counterfactual returned in 548 ms and checked 255 ports in 17.336 s. The one-line correction and deterministic stalled-trigger regression are implemented; bounded parallel read batches and final E6 remain pending. Two create/delete cycles survived agent restarts with zero remaining volumes and trial archive objects. Phase 1 remains unaccepted. |
 | 2026-10-04 | 1 E0–E6 | The second run completed all E0–E6 stages. Sixteen bounded segments checked all 65,535 ports on the actual node address from Cloudflare, with no reachable port; the operator scan allowed only the Talos/Kubernetes API ports. Native run `37167838065`, bound to `2c228148`, supplied a verified fresh signed TCP/25 proof with adjacent positive controls and a source pool disjoint from the complete firewall allowlist. All segment commands exited 0; the last passed E6 and completed cleanup with zero failures. Three additional restart cycles and fault tests remain before Phase 1 acceptance. |
+| 2026-10-04 | 1 restarts / faults | Five distinct ledgers completed create/delete and ten agent restarts, with zero remaining trial volumes and archive objects. The fresh fault run created Ready in 27,029 ms, passed SQL/transactions/rollback/startup refusals and found one base backup plus three WAL objects. Empty, failed, older and out-of-order pulls passed in 132.665 s: six completed fault responses, two transport failures and six subsequent observations; namespace, credentials and configuration generations remained correct. The relay now persists its captured real responses and counters in authenticated run-bound encrypted Durable Object storage; two focused reviews and 24 tests passed. CI `37176489556` passed on `b007d909`. Agent API and policy inverse completed; the owned trial remains for backup-failure and namespace-loss tests. Phase 1 remains unaccepted. |
