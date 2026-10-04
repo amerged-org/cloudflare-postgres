@@ -1,0 +1,155 @@
+// SPDX-License-Identifier: Apache-2.0
+import { createServer } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
+import type { Duplex } from "node:stream";
+import WebSocket, { createWebSocketStream } from "ws";
+import { upstreamUrl, validateOptions } from "./options.ts";
+import type { ConnectOptions } from "./options.ts";
+
+export const STREAM_BYTES = 64 * 1024;
+export const MESSAGE_BYTES = 1024 * 1024;
+export const CLIENT_LIMIT = 16;
+export const HANDSHAKE_MS = 10_000;
+export const FRAGMENT_LIMIT = 128;
+
+export interface Session {
+  local: Socket;
+  upstream: WebSocket;
+  stream: Duplex;
+}
+export type Connector = (url: string) => WebSocket;
+export const UPSTREAM_OPTIONS: Readonly<WebSocket.ClientOptions> =
+  Object.freeze({
+    rejectUnauthorized: true,
+    followRedirects: false,
+    perMessageDeflate: false,
+    autoPong: false,
+    allowSynchronousEvents: false,
+    maxFragments: FRAGMENT_LIMIT,
+    maxBufferedChunks: 256,
+    maxPayload: MESSAGE_BYTES,
+    handshakeTimeout: HANDSHAKE_MS,
+  });
+export const connectUpstream: Connector = (url) => {
+  if (new URL(url).protocol !== "wss:") throw new Error("invalid_endpoint");
+  return new WebSocket(url, UPSTREAM_OPTIONS);
+};
+
+export interface Bridge {
+  readonly host: string;
+  readonly port: number;
+  readonly clients: number;
+  close(): Promise<void>;
+}
+export interface BridgeHooks {
+  connect?: Connector;
+  session?: (value: Session) => void;
+  disconnected?: () => void;
+}
+
+export async function startBridge(
+  raw: ConnectOptions,
+  hooks: BridgeHooks = {},
+): Promise<Bridge> {
+  const options = validateOptions(raw);
+  const sessions = new Set<Session>();
+  const endings = new Set<Promise<void>>();
+  let closing: Promise<void> | undefined;
+  const server = createServer(
+    { highWaterMark: STREAM_BYTES, allowHalfOpen: false },
+    (local) => {
+      local.on("error", () => {});
+      if (closing || sessions.size >= CLIENT_LIMIT) {
+        local.destroy();
+        return;
+      }
+      let upstream: WebSocket;
+      try {
+        upstream = (hooks.connect ?? connectUpstream)(upstreamUrl(options));
+      } catch {
+        local.destroy();
+        return;
+      }
+      const stream = createWebSocketStream(upstream, {
+        highWaterMark: STREAM_BYTES,
+      });
+      const session = { local, upstream, stream };
+      sessions.add(session);
+      const ended = new Promise<void>((resolve) =>
+        upstream.once("close", () => resolve()),
+      );
+      endings.add(ended);
+      void ended.then(() => endings.delete(ended));
+      let finished = false;
+      const finish = () => {
+        if (finished) return;
+        finished = true;
+        local.unpipe(stream);
+        stream.unpipe(local);
+        local.destroy();
+        stream.destroy();
+        upstream.terminate();
+        sessions.delete(session);
+        hooks.disconnected?.();
+      };
+      stream.on("error", finish);
+      upstream.on("error", finish);
+      local.once("error", finish);
+      local.once("close", finish);
+      stream.once("close", finish);
+      upstream.once("close", () => {
+        // Let the readable stream flush admitted bytes before ending local TCP.
+        if (local.destroyed) finish();
+      });
+      stream.once("end", () => local.end());
+      upstream.prependListener("message", (_data, binary) => {
+        if (!binary) finish();
+      });
+      upstream.on("ping", (data) => {
+        if (upstream.bufferedAmount >= STREAM_BYTES) {
+          finish();
+          return;
+        }
+        upstream.pong(data, true, (error) => {
+          if (error) finish();
+        });
+      });
+      local.setNoDelay(true);
+      hooks.session?.(session);
+      local.pipe(stream);
+      stream.pipe(local);
+    },
+  );
+  server.maxConnections = CLIENT_LIMIT;
+  await new Promise<void>((resolve, reject) => {
+    const failed = () => reject(new Error("listener_failed"));
+    server.once("error", failed);
+    server.listen(options.port, [127, 0, 0, 1].join("."), () => {
+      server.removeListener("error", failed);
+      resolve();
+    });
+  });
+  const address = server.address() as AddressInfo;
+  const bridge: Bridge = {
+    host: address.address,
+    port: address.port,
+    get clients() {
+      return sessions.size;
+    },
+    close() {
+      closing ??= (async () => {
+        const listener = new Promise<void>((resolve) =>
+          server.close(() => resolve()),
+        );
+        for (const session of [...sessions]) session.local.destroy();
+        await listener;
+        await Promise.all([...endings]);
+      })();
+      return closing;
+    },
+  };
+  server.on("error", () => {
+    void bridge.close();
+  });
+  return bridge;
+}

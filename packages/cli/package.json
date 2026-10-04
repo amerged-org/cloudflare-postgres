@@ -1,0 +1,31 @@
+{
+  "name": "@pgcf/cli",
+  "version": "0.0.0",
+  "description": "Loopback PostgreSQL bridge to the PGCF WebSocket endpoint",
+  "license": "Apache-2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24.6.0"
+  },
+  "bin": {
+    "pgcf": "dist/main.js"
+  },
+  "files": [
+    "dist/main.js",
+    "dist/licenses"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "build": "node build.ts",
+    "prepack": "pnpm build"
+  },
+  "dependencies": {
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "@pgcf/contracts": "workspace:*",
+    "@types/ws": "8.18.2",
+    "esbuild": "0.25.12"
+  }
+}

@@ -96,6 +96,22 @@ importers:
         specifier: ^0.25.0
         version: 0.25.12
 
+  packages/cli:
+    dependencies:
+      ws:
+        specifier: 8.22.0
+        version: 8.22.0
+    devDependencies:
+      '@pgcf/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@types/ws':
+        specifier: 8.18.2
+        version: 8.18.2
+      esbuild:
+        specifier: 0.25.12
+        version: 0.25.12
+
   packages/contracts:
     dependencies:
       zod:
