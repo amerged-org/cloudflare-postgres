@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
+import { gatewayActivityReportSchema } from "./gateway-activity.ts";
+import { UsageSample } from "./usage.ts";
 import {
   BucketName,
   OperationStatus,
@@ -359,3 +361,91 @@ export interface K8sObject {
   };
   [key: string]: unknown;
 }
+
+// ---------- Authenticated agent measurements ----------
+
+export const AGENT_MEASUREMENT_BATCH_MAX = 25;
+export const GATEWAY_ACTIVITY_FRESH_MS = 30_000;
+export const GATEWAY_ACTIVITY_FUTURE_MS = 5_000;
+const ActivityCount = z.number().int().nonnegative().max(1_000_000);
+
+/** A real observation-window start bounds earlier possible activity, including process restarts. */
+export function gatewayActivityBoundary(
+  report: z.infer<typeof gatewayActivityReportSchema>,
+): string {
+  return [
+    report.startedAt,
+    report.counterStartedAt,
+    report.countersSince,
+    report.lastActivityAt,
+  ]
+    .filter((time): time is string => time !== null)
+    .sort()
+    .at(-1)!;
+}
+export const AgentDatabaseActivity = z
+  .strictObject({
+    id: DatabaseId,
+    revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    observed_at: Timestamp,
+    last_activity_at: Timestamp,
+    connections: ActivityCount,
+    busy_connections: ActivityCount,
+    pending_dials: ActivityCount,
+    expected_gateway_pods: z.array(z.uuid()).min(1).max(16),
+    reports: z.array(gatewayActivityReportSchema).min(1).max(16),
+  })
+  .superRefine((activity, ctx) => {
+    const pods = new Set(activity.expected_gateway_pods);
+    const respondents = new Set(activity.reports.map((report) => report.pod));
+    const total = (field: "connections" | "busyConnections" | "pendingDials") =>
+      activity.reports.reduce((sum, report) => sum + report[field], 0);
+    if (
+      pods.size !== activity.expected_gateway_pods.length ||
+      respondents.size !== activity.reports.length ||
+      new Set(activity.reports.map((report) => report.processEpoch)).size !==
+        activity.reports.length ||
+      new Set(activity.reports.map((report) => report.epoch)).size !==
+        activity.reports.length ||
+      respondents.size !== pods.size ||
+      activity.reports.some(
+        (report) =>
+          !pods.has(report.pod) ||
+          report.database !== activity.id ||
+          report.revision !== activity.revision,
+      ) ||
+      activity.connections !== total("connections") ||
+      activity.busy_connections !== total("busyConnections") ||
+      activity.pending_dials !== total("pendingDials") ||
+      activity.busy_connections + activity.pending_dials > 1_000_000 ||
+      activity.observed_at !==
+        activity.reports
+          .map((report) => report.observedAt)
+          .sort()
+          .at(-1) ||
+      activity.last_activity_at !==
+        activity.reports.map(gatewayActivityBoundary).sort().at(-1)
+    )
+      ctx.addIssue({
+        code: "custom",
+        message: "Activity must match the complete measured gateway inventory",
+      });
+  });
+export type AgentDatabaseActivity = z.infer<typeof AgentDatabaseActivity>;
+export const AgentActivityRequest = z
+  .strictObject({
+    databases: z
+      .array(AgentDatabaseActivity)
+      .min(1)
+      .max(AGENT_MEASUREMENT_BATCH_MAX),
+  })
+  .refine(
+    (body) =>
+      new Set(body.databases.map((db) => db.id)).size === body.databases.length,
+    { message: "Duplicate activity subject" },
+  );
+export type AgentActivityRequest = z.infer<typeof AgentActivityRequest>;
+export const AgentUsageRequest = z.strictObject({
+  samples: z.array(UsageSample).min(1).max(AGENT_MEASUREMENT_BATCH_MAX),
+});
+export type AgentUsageRequest = z.infer<typeof AgentUsageRequest>;
