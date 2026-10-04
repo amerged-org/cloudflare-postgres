@@ -1,6 +1,6 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-03): **Phase 0 accepted; Phase 1 live acceptance in progress.** The first EU node
+Status (2026-10-04): **Phase 0 accepted; Phase 1 live acceptance in progress.** The first EU node
 and all five Flux platform releases are Ready, with 95 GiB measured and published storage.
 The Dev management API, fresh D1, region, agent, tunnel, VPC HTTP service and single endpoint
 `db.ohmyho.st` are deployed. PostgreSQL is reachable through the complete connection chain with
@@ -21,19 +21,22 @@ maximum SQL throughput nor capacity for 1,000 customers. Strong decoded-binary c
 remain failed and unchanged; the same failure was reproduced over direct verified TCP with
 node-postgres 8.22. The raw stream integrity checks pass.
 
-Formal E0, E1 and E2 passed in the latest completed run; E1 remained correct through an agent
-restart during creation. The Worker-to-management API path now uses supported manual redirects
-and public same-account routing. E3's SQL exercise reached its success guard, but live trace
-validation failed before the complete E3 result. Cloudflare returns valid UTC-second tail expiry
-and redacts long hexadecimal correlation IDs. The expiry parser is corrected; a segmented
-192-bit marker and real CLI-compatible trace transport are implemented, with a reproduced and
-fixed post-settle expiry boundary. Final integrated Dev verification remains pending.
+Formal E0–E5 and the secret canary audit passed in the current Dev run. E1 and E5
+remained correct through agent restarts. E3 proved two transactions, five negative cases and
+two startup mismatches with the corresponding gateway close events. E4 found one base backup
+and four WAL objects; E5 reclaimed the complete volume and removed the test backup objects.
+The canary audit found zero plaintext secrets in D1 or Tail output. The corrected real trace
+transport passed integrated HTTP and WebSocket checks; one earlier missing Tail event remains
+an observed intermittent failure with unconfirmed cause. No timeout was relaxed or trigger replayed.
+E6's independent GitHub-hosted TCP probe failed on a non-successful anonymous GitHub metadata
+response. Authenticated metadata returned 200; a focused correction and fresh live proof are pending.
 
 The actual deployed Workers client proved persistent backend reuse, three pools capped at 1/2/2
 clients, text byte fidelity, prepared statements, transactions, authentication, negative startup
-cases, cancellation and complete same-bank cleanup. All three native sockets closed, pools ended
-and outstanding leases reached zero. A second actual database/user identity is still required;
-the strong binary-result assertion remains failed on both WebSocket and direct TCP controls.
+cases, isolation between two actual databases with different users, cancellation and complete
+same-bank cleanup. All three native sockets and four auxiliary sockets closed, all pools ended
+and outstanding leases reached zero. The strong binary-result assertion remains failed on both
+WebSocket and direct TCP controls. Its exact upstream parser behavior is under investigation.
 
 The separate R2 restore drill passed two committed markers, rollback absence, verified TLS,
 promotion, target WAL archival, unchanged source and exact 5 GiB storage reclamation. Provider
@@ -44,7 +47,7 @@ operator-generated monitoring and service Endpoints after matching their source/
 a delayed capacity observation subsequently converged to the 97,706,311,680-byte baseline.
 Full Phase 4 PITR and disaster recovery workflows remain pending.
 
-E3–E6, remaining restart cycles, fault tests and full adopter compatibility are still required
+E6, four additional restart cycles, fault tests and full adopter compatibility are still required
 before Phase 1 acceptance. Phase 2 has not begun. The second EU node is untouched, the US node
 has not been bought, and existing production routes and databases have not changed. The owner
 has requested delivery through Phase 5 and full Neon replacement.
@@ -735,3 +738,4 @@ Entries are chronological; later results supersede earlier pending work.
 | 2026-10-04 | 1 actual Workers client | Native Cloudflare execution passed repeated backend reuse, three pools with maxima 1/2/2, 4,096-byte default-text bytea and checksum, two prepared executions, transaction/authentication and bad password/startup rejection. A real cleanup ordering defect was reproduced before correction. The corrected deployed candidate passed cancellation and same-bank cleanup: 3/3 native sockets closed, 3/3 pools ended, zero leases, clients and pending end promises. Binary result decoding remains failed; a second actual identity remains untested. No sustained throughput or 1,000-customer capacity is claimed. |
 | 2026-10-04 | 1 R2 restore drill | Two small committed markers written through the public endpoint were restored from the source base backup and archived WAL into a separate namespace/storage generation; the rolled-back marker remained absent. Verified TLS, promotion and target archive succeeded. R2 object last-modified timestamps measured maximum 52,427 ms after COMMIT acknowledgement; the late first poll gave only an upper bound of 701,848 ms. Target creation to verified result took 304,128 ms including operator pacing. Cleanup recorded exact identities of the matching CNPG monitoring ConfigMap and three Endpoints tied to owned Services/Pods, then removed the target namespace/PV/LVM and reclaimed 5 GiB. Source preserved; final free bytes exactly 97,706,311,680. This is a drill, not the complete Phase 4 recovery API. |
 | 2026-10-04 | 1 trace / cleanup | The real CF tail response uses UTC-second expiry; its normalized parser passed all original guards. Long hexadecimal URL markers are redacted. A segmented 192-bit marker and CLI wire initialization produced one correlated event in 9.587 s in the private counterfactual; the integrated transport still needs its real run. A deterministic post-settle expiry test failed before the final dispatch guard; no trigger runs after expiry. Two obsolete owned capability/metadata Workers were deleted with absence verified and all 78 other Workers unchanged. Phase 1 E3–E6 and Phase 2 remain unaccepted. |
+| 2026-10-04 | 1 live | Formal E0–E5 and canary audit passed: create Ready in 29,027 ms, SQL cold connect 222 ms, commit 34 ms, rollback 35 ms, startup database/user refusal 294/73 ms with correlated gateway events, one base backup and four WAL objects, and deletion in 40,000 ms with zero remaining volumes or archive objects. Create and delete each survived an agent restart. D1 and Tail plaintext-secret counts were zero. Actual Workers client isolation passed across two databases and users with complete same-bank socket/pool cleanup; decoded binary results still fail. E6's native probe could not fetch anonymous GitHub metadata; authenticated GET returned 200. Phase 1 remains unaccepted pending E6, the remaining four restart cycles, faults and adopter checks. |
