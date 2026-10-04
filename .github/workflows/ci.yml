@@ -191,6 +191,7 @@ jobs:
           node-version: 24.6.0
       - name: Probe the approved Dev targets without publishing their addresses
         env:
+          GH_TOKEN: ${{ github.token }}
           PGCF_E2E_EXTERNAL_PROBE_CONFIG: ${{ secrets.PGCF_E2E_EXTERNAL_PROBE_CONFIG }}
           NODE_DEBUG: ""
           NODE_OPTIONS: ""

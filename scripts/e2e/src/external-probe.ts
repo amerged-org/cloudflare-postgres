@@ -351,26 +351,72 @@ export async function nativeTcp(
     socket.once("close", () => finish("inconclusive"));
   });
 }
-async function sourcePool(): Promise<string[]> {
-  const response = await fetch("https://api.github.com/meta", {
-    redirect: "error",
-    signal: AbortSignal.timeout(10_000),
-    headers: { "User-Agent": "pgcf-e6-native-probe" },
-  });
-  if (!response.ok)
-    throw new HarnessError("external_probe_source_pool_unavailable");
-  const body = await response.text();
-  if (body.length > 1_000_000)
+class SourcePoolUnavailable extends HarnessError {
+  readonly httpStatus?: number;
+  constructor(status?: number) {
+    super("external_probe_source_pool_unavailable");
+    if (
+      typeof status === "number" &&
+      Number.isInteger(status) &&
+      status >= 100 &&
+      status <= 599
+    )
+      this.httpStatus = status;
+  }
+}
+
+export function externalProbeFailure(error: unknown): {
+  external_probe_report: false;
+  code: string;
+  http_status?: number;
+} {
+  return {
+    external_probe_report: false,
+    code: error instanceof HarnessError ? error.code : "external_probe_failed",
+    ...(error instanceof SourcePoolUnavailable && error.httpStatus !== undefined
+      ? { http_status: error.httpStatus }
+      : {}),
+  };
+}
+
+export async function sourcePool(
+  env: Pick<NodeJS.ProcessEnv, "GH_TOKEN"> = process.env,
+  fetcher: typeof fetch = fetch,
+): Promise<string[]> {
+  let response: Response;
+  try {
+    response = await fetcher("https://api.github.com/meta", {
+      redirect: "error",
+      signal: AbortSignal.timeout(10_000),
+      headers: {
+        "User-Agent": "pgcf-e6-native-probe",
+        ...(env.GH_TOKEN ? { Authorization: `Bearer ${env.GH_TOKEN}` } : {}),
+      },
+    });
+  } catch {
+    throw new SourcePoolUnavailable();
+  }
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    throw new SourcePoolUnavailable(response.status);
+  }
+  try {
+    const body = await response.text();
+    if (body.length > 1_000_000)
+      throw new HarnessError("external_probe_source_pool_invalid");
+    const pool = record(JSON.parse(body)).actions_macos;
+    if (
+      !Array.isArray(pool) ||
+      pool.some((v) => typeof v !== "string") ||
+      pool.some((v) => cidr(v as string).family !== 4)
+    )
+      throw new HarnessError("external_probe_source_pool_invalid");
+    normalizedCidrs(pool as string[]);
+    return pool as string[];
+  } catch (error) {
+    if (error instanceof HarnessError) throw error;
     throw new HarnessError("external_probe_source_pool_invalid");
-  const pool = record(JSON.parse(body)).actions_macos;
-  if (
-    !Array.isArray(pool) ||
-    pool.some((v) => typeof v !== "string") ||
-    pool.some((v) => cidr(v as string).family !== 4)
-  )
-    throw new HarnessError("external_probe_source_pool_invalid");
-  normalizedCidrs(pool as string[]);
-  return pool as string[];
+  }
 }
 export function assertExternalReport(
   value: unknown,
@@ -518,7 +564,7 @@ export async function consumeExternalProbe(
   root: string,
   targets: readonly string[],
   env: NodeJS.ProcessEnv = process.env,
-  io: ProbeIo = { command, sourcePool },
+  io: ProbeIo = { command, sourcePool: () => sourcePool(env) },
 ): Promise<Set<string>> {
   if (
     !env.PGCF_E2E_EXTERNAL_PROBE_CONFIG ||
@@ -677,12 +723,6 @@ if (
   pathToFileURL(resolve(process.argv[1])).href === import.meta.url
 )
   main().catch((error: unknown) => {
-    console.error(
-      JSON.stringify({
-        external_probe_report: false,
-        code:
-          error instanceof HarnessError ? error.code : "external_probe_failed",
-      }),
-    );
+    console.error(JSON.stringify(externalProbeFailure(error)));
     process.exitCode = 1;
   });
