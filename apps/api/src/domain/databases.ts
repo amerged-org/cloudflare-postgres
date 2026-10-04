@@ -15,6 +15,7 @@ import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "../platform/pagination.ts";
 import { keyring } from "../crypto/keyring.ts";
 import { choosePlacement, placementNodes } from "./placement.ts";
+import { syncDatabaseActor } from "./database-actor-sync.ts";
 import {
   databaseForRequest,
   databaseView,
@@ -38,6 +39,7 @@ export async function databaseOperationResponse(
 ): Promise<Response> {
   const operation = await operationForRequest(c, operationId);
   const database = await databaseForRequest(c, operation.database_id, true);
+  await syncDatabaseActor(c, database.id);
   c.header("Location", `/v1/operations/${operation.id}`);
   return Response.json(
     { database: databaseView(database), operation: operationView(operation) },

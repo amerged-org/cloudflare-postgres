@@ -10,6 +10,7 @@ import type { ApiContext } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { hint } from "./databases.ts";
+import { syncDatabaseActor } from "./database-actor-sync.ts";
 import {
   databaseForRequest,
   isConstraintError,
@@ -31,6 +32,16 @@ async function roleForRequest(
   if (!row) throw new ApiError("not_found", "Role not found");
   return row;
 }
+async function roleResponse(
+  c: ApiContext,
+  id: string,
+  name: string,
+  status: 200 | 201 = 200,
+): Promise<Response> {
+  const role = await roleForRequest(c, id, name);
+  await syncDatabaseActor(c, id);
+  return c.json(roleView(role), status);
+}
 export async function listRoles(c: ApiContext, id: string): Promise<Response> {
   await databaseForRequest(c, id);
   const result = await c.env.DB.prepare(
@@ -47,8 +58,7 @@ export async function createRole(
 ): Promise<Response> {
   const db = await databaseForRequest(c, id);
   return withIdempotency(c, {
-    replay: async (name) =>
-      c.json(roleView(await roleForRequest(c, id, name)), 201),
+    replay: async (name) => roleResponse(c, id, name, 201),
     execute: async (lease) => {
       const now = new Date().toISOString(),
         generation = db.generation + 1;
@@ -95,7 +105,7 @@ export async function createRole(
           "Database changed or role limit reached",
         );
       hint(c, db.region_id, [id]);
-      return c.json(roleView(await roleForRequest(c, id, body.name)), 201);
+      return roleResponse(c, id, body.name, 201);
     },
   });
 }
@@ -107,7 +117,7 @@ export async function resetPassword(
   const db = await databaseForRequest(c, id),
     row = await roleForRequest(c, id, name);
   return withIdempotency(c, {
-    replay: async (role) => c.json(roleView(await roleForRequest(c, id, role))),
+    replay: async (role) => roleResponse(c, id, role),
     execute: async (lease) => {
       const now = new Date().toISOString(),
         password = await keyring(c.env.CREDENTIAL_KEYS).encrypt(
@@ -151,7 +161,7 @@ export async function resetPassword(
           "Database or role changed; retry the request",
         );
       hint(c, db.region_id, [id]);
-      return c.json(roleView(await roleForRequest(c, id, name)));
+      return roleResponse(c, id, name);
     },
   });
 }

@@ -32,10 +32,21 @@ export async function runCron(
       ids.length > DESIRED_PAGE_LIMIT_MAX ? undefined : ids,
     );
   }
-  let after: string | undefined;
-  do {
-    const page = await reconcileDatabaseActors(env, after);
-    after = page.next ?? undefined;
-  } while (after);
+  await env.DB.prepare(
+    "INSERT INTO reconciliation_cursors(name,cursor) VALUES('database_actors',NULL) ON CONFLICT(name) DO NOTHING",
+  ).run();
+  const cursor = await env.DB.prepare(
+    "SELECT cursor FROM reconciliation_cursors WHERE name='database_actors'",
+  ).first<{ cursor: string | null }>();
+  if (!cursor) throw new Error("actor_reconciliation_cursor_missing");
+  const actorPage = await reconcileDatabaseActors(
+    env,
+    cursor.cursor ?? undefined,
+  );
+  await env.DB.prepare(
+    "UPDATE reconciliation_cursors SET cursor=? WHERE name='database_actors' AND cursor IS ?",
+  )
+    .bind(actorPage.next, cursor.cursor)
+    .run();
   return { failed: result.meta.changes, purged, hinted };
 }
