@@ -8,8 +8,8 @@ verified and PostgreSQL has no public port. The second EU VPS is untouched; no U
 bought and no customer or platform database has been migrated.
 
 The deployed regional image is
-`sha256:6b107998c9e6ea094c90b89d7d6368bb754fd0b6ab0e1cdb45944b74e983aaef`
-from source `b0b6710f`. CI `37224078904` passed. Full qualification scanned all 657,658,375
+`sha256:0391813b49eb52a59e562d322bf986ab07203838e73b4f0d7f4ae4b344c6c7f8`
+from source `f1b34b11`. CI `37227021208` passed. Full qualification scanned all 657,661,959
 expected bytes; all 26 reviewed upstream noncredentials resolved, with zero unresolved findings.
 Image signing remains Phase 5 work.
 
@@ -45,9 +45,11 @@ verified the private maintenance role's TLS, authentication and minimal catalog/
 Manual Dev suspend/resume secured the closed WAL object in R2 and preserved data, rollback
 absence and every storage identity. Automatic idle suspension and one wake operation for ten
 concurrent connections are now confirmed. Those connections took 11.080–11.143 s; later single
-cold connections took 9.427, 9.703 and 9.071 s. The latest instrumented wake took 11.209 s:
-PostgreSQL became Ready after about six seconds, but a prior cluster-status snapshot delayed
-admission by another reconciliation pass. The ≤8 s target and twenty-connection acceptance
+cold connections took 9.427, 9.703 and 9.071 s. A guarded fresh cluster-status read removed an
+observed extra reconciliation pass. Five subsequent instrumented cold connections took 9.411,
+9.473, 11.747, 11.096 and 9.634 s. Four runs also reported an HTTP 422 precondition failure while
+applying a manifest or cluster revision. The first successful archive-metrics scrape takes about
+1.5 s; a faster read-only measurement is being implemented. The ≤8 s target and twenty-connection acceptance
 remain unmet. A real read-only transaction stayed ready for 74 s despite the 60 s idle policy.
 
 The operational Cloudflare token was updated in place with no expiry; its value and all 23
@@ -56,8 +58,11 @@ Short-lived routing and control tokens retain their security deadlines.
 
 The live collector samples each database at least 15 s apart. A real minute contained four
 allocation and eight gateway samples. Storage-used and backup measurements remain unknown.
-Review found that configuration changes can erase the pending measurement outbox from the
-shared storage ConfigMap; correction and live revalidation remain pending.
+Configuration changes now preserve the measurement checkpoint under the original UID/version
+guards. Its actual queue drained and the checkpoint survived five Dev idle/wake cycles.
+Hibernated allocation remains measured from the exact bound PVC without a primary Pod.
+Successful hibernation now reports inactive archiving as unknown rather than a false failure;
+this does not assert future R2 availability.
 The cost API reports null and a named node_rate gap until an actual contract/invoice fact is
 recorded. The current E0–E5 run passed through agent-restarted deletion: 102,548 ms, zero volumes/archives, its routing marker removed and both gateways still Ready. Usage accuracy and the cold-wake target still need full Dev acceptance. The production-ready
 release through Phase 5 and complete Neon replacement are not complete.

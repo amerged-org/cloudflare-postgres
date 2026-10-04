@@ -43,10 +43,10 @@ gateway fences survived a gateway replacement, and a fresh database verified the
 maintenance role's TLS and minimal grants. Usage rollups and lifecycle API/Actor logic are
 implemented. Manual Dev suspend/resume preserved data and storage and verified closed WAL in R2.
 Automatic idle sleep and one wake for ten concurrent connections passed in Dev. Instrumented cold
-connections still take about 9–11 seconds, above the 8-second target; a stale readiness snapshot
-can add a reconciliation pass. The live collector emits measured samples at a bounded cadence.
-Preserving pending measurements across configuration changes still needs correction; absent
-storage/backup measurements and missing cost facts remain explicit gaps. Full Phase 2 acceptance
+connections still take about 9–12 seconds, above the 8-second target. The stale readiness snapshot
+is corrected; the first successful archive scrape still takes about 1.5 seconds. The live collector
+preserves its checkpoint across configuration changes and measures allocation while hibernated.
+Absent storage/backup measurements and missing cost facts remain explicit gaps. Full Phase 2 acceptance
 remains pending.
 The second EU node is untouched, the US node has not been bought and no customer or platform
 database has been migrated. Image signing and the complete production-ready release remain pending.

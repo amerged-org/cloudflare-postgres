@@ -12,7 +12,7 @@ resources:
 images:
   - name: pgcf-regional
     newName: ghcr.io/amerged-org/pgcf-regional
-    digest: sha256:6b107998c9e6ea094c90b89d7d6368bb754fd0b6ab0e1cdb45944b74e983aaef
+    digest: sha256:0391813b49eb52a59e562d322bf986ab07203838e73b4f0d7f4ae4b344c6c7f8
   - name: cloudflared
     newName: docker.io/cloudflare/cloudflared
     # cloudflared 2026.9.3 multi-arch index
