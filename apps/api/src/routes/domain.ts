@@ -32,6 +32,7 @@ import {
   listDatabases,
   resizeDatabase,
 } from "../domain/databases.ts";
+import { changePower } from "../domain/lifecycle.ts";
 import { desired } from "../domain/desired.ts";
 import { observations, truncateAgentText } from "../domain/observations.ts";
 import {
@@ -165,6 +166,19 @@ export function registerDomain(app: ApiApp): void {
         DatabaseResize.parse(await c.req.json()),
       ),
   );
+  for (const action of ["suspend", "resume"] as const)
+    register(
+      app,
+      {
+        method: "post",
+        path: `/v1/databases/{id}/${action}`,
+        security,
+        tags: ["Databases"],
+        request: { headers, params },
+        responses: responses(DatabaseWithOperation, 202),
+      },
+      async (c) => changePower(c, DatabaseId.parse(c.req.param("id")), action),
+    );
   register(
     app,
     {

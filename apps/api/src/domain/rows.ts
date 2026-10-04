@@ -30,6 +30,9 @@ export interface DatabaseRow {
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  suspension_reason?: "manual" | "idle" | null;
+  observed_power?: "awake" | "hibernated";
+  power_operation?: string | null;
 }
 export interface RoleRow {
   database_id: string;
@@ -74,7 +77,14 @@ export function databaseView(row: DatabaseRow): Database {
     name: row.name,
     size_class_id: row.size_class_id,
     desired_state: row.desired_state,
-    observed_state: row.observed_state,
+    observed_state:
+      row.desired_state === "suspended" &&
+      row.observed_state === "provisioning" &&
+      row.observed_generation === row.generation &&
+      row.observed_power === "hibernated"
+        ? "hibernated"
+        : row.observed_state,
+    suspension_reason: row.suspension_reason ?? null,
     generation: row.generation,
     observed_generation: row.observed_generation,
     status_message: row.status_message,

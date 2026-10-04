@@ -8,6 +8,8 @@ import {
 import { ApiError } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import { agentRegion } from "./agent-auth.ts";
+import { recoverQuiescence } from "./lifecycle.ts";
+import { hint } from "./databases.ts";
 import type { DatabaseRow } from "./rows.ts";
 
 export function truncateAgentText(value: string): string {
@@ -31,6 +33,18 @@ export function observationApplies(
     observation.generation < row.observed_generation ||
     receivedAt < row.updated_at
   )
+    return false;
+  if (
+    row.desired_state !== "deleted" &&
+    row.power_operation &&
+    (!observation.power ||
+      observation.power.operation !== row.power_operation ||
+      observation.power.revision !== row.generation)
+  )
+    return false;
+  if (row.desired_state === "suspended")
+    return ["provisioning", "error", "hibernated"].includes(observation.state);
+  if (observation.state === "hibernated" || observation.power?.refusal)
     return false;
   if (row.desired_state === "deleted")
     return (
@@ -113,26 +127,54 @@ export async function observations(
       .bind(observation.id, region.id)
       .first<DatabaseRow>();
     if (!row || !observationApplies(row, region.id, observation, now)) continue;
+    if (row.desired_state === "suspended" && observation.power?.refusal) {
+      const recovered = await recoverQuiescence(
+        c.env.DB,
+        {
+          databaseId: row.id,
+          operation: row.power_operation!,
+          revision: row.generation,
+        },
+        observation.power.refusal,
+        now,
+      );
+      if (recovered) {
+        accepted++;
+        hint(c, recovered.regionId, [row.id]);
+      }
+      continue;
+    }
     const health = observation.archive.continuous
       ? observation.archive.ready_wal_files === null
         ? "unknown"
         : "ok"
       : "failing";
     const applied =
-      observation.state === "ready" || observation.state === "deleted";
+      observation.state === "ready" ||
+      observation.state === "deleted" ||
+      observation.state === "hibernated";
     const event =
-      observation.state === "ready"
-        ? "ready"
-        : observation.state === "deleted"
-          ? "deleted"
-          : null;
+      observation.state === "hibernated"
+        ? row.suspension_reason === "idle"
+          ? "hibernated"
+          : "suspended"
+        : observation.state === "ready"
+          ? "ready"
+          : observation.state === "deleted"
+            ? "deleted"
+            : null;
     const statements = [
       c.env.DB.prepare(
-        `UPDATE databases SET observed_state=?,observed_generation=CASE WHEN ? THEN ? ELSE observed_generation END,status_message=?,
+        `UPDATE databases SET observed_state=?,observed_power=?,observed_generation=CASE WHEN ? THEN ? ELSE observed_generation END,status_message=?,
       archiving_health_since=CASE WHEN archiving_health<>? THEN ? ELSE archiving_health_since END,archiving_health=?,updated_at=?
       WHERE id=? AND region_id=? AND generation=? AND observed_generation<=? AND updated_at=? AND desired_state=? AND observed_state=?`,
       ).bind(
-        observation.state,
+        observation.state === "hibernated" ? "provisioning" : observation.state,
+        observation.state === "hibernated"
+          ? "hibernated"
+          : observation.state === "ready" || observation.state === "deleted"
+            ? "awake"
+            : row.observed_power,
         Number(applied),
         observation.generation,
         observation.message === undefined
@@ -173,7 +215,7 @@ export async function observations(
           observation.generation,
         ),
       );
-    if (applied)
+    if (observation.state === "ready" || observation.state === "deleted")
       statements.push(
         c.env.DB.prepare(
           `UPDATE operations SET status='succeeded',updated_at=?,completed_at=? WHERE database_id=? AND project_id=? AND generation<=? AND status IN('pending','running') AND kind=?
@@ -192,6 +234,40 @@ export async function observations(
           now,
         ),
       );
+    if (applied && row.power_operation && observation.state !== "deleted") {
+      if (observation.state === "ready")
+        statements.push(
+          c.env.DB.prepare(
+            `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
+        SELECT d.id,'woke',d.node_id,d.size_class_id,d.generation,?,json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',s.cpu_millicores+?,'storage_allocated_bytes',s.storage_gib*1073741824)
+        FROM databases d JOIN size_classes s ON s.id=d.size_class_id JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.generation=d.generation AND o.kind IN('database.resume','database.wake')
+        WHERE d.id=? AND d.generation=? AND d.observed_generation=d.generation AND d.observed_state='ready' AND d.observed_power='awake' AND d.updated_at=?
+        AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=d.id AND kind='woke' AND generation=d.generation)`,
+          ).bind(
+            body.observed_at,
+            SIDECAR.requestMemoryMib,
+            SIDECAR.requestCpuMillicores,
+            row.id,
+            row.generation,
+            now,
+          ),
+        );
+      statements.push(
+        c.env.DB.prepare(
+          `UPDATE operations SET status='succeeded',updated_at=?,completed_at=? WHERE id=? AND database_id=? AND generation=? AND status IN('pending','running') AND kind IN('database.suspend','database.hibernate','database.resume','database.wake')
+        AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.power_operation=operations.id AND d.generation=operations.generation AND d.observed_generation=d.generation AND d.updated_at=? AND d.desired_state=? AND d.observed_power=?)`,
+        ).bind(
+          now,
+          now,
+          row.power_operation,
+          row.id,
+          row.generation,
+          now,
+          row.desired_state,
+          observation.state === "hibernated" ? "hibernated" : "awake",
+        ),
+      );
+    }
     if (
       observation.state === "ready" &&
       row.observed_generation < observation.generation
@@ -234,7 +310,7 @@ export async function observations(
     if (!applied)
       statements.push(
         c.env.DB.prepare(
-          `UPDATE operations SET status='running',updated_at=? WHERE database_id=? AND project_id=? AND generation<=? AND status='pending'
+          `UPDATE operations SET status='running',updated_at=? WHERE database_id=? AND project_id=? AND generation<=? AND status='pending' AND kind NOT IN('database.suspend','database.resume','database.hibernate','database.wake')
       AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.region_id=? AND d.generation=? AND d.observed_state=? AND d.updated_at=?)`,
         ).bind(
           now,
@@ -244,6 +320,21 @@ export async function observations(
           region.id,
           observation.generation,
           observation.state,
+          now,
+        ),
+      );
+    if (!applied && row.power_operation)
+      statements.push(
+        c.env.DB.prepare(
+          `UPDATE operations SET status='running',updated_at=? WHERE id=? AND database_id=? AND generation=? AND status='pending' AND EXISTS(SELECT 1 FROM databases WHERE id=? AND generation=? AND power_operation=? AND updated_at=?)`,
+        ).bind(
+          now,
+          row.power_operation,
+          row.id,
+          row.generation,
+          row.id,
+          row.generation,
+          row.power_operation,
           now,
         ),
       );

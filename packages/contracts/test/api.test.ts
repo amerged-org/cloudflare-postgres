@@ -246,3 +246,10 @@ describe("request bodies", () => {
     expect(IDEMPOTENCY_KEY_PATTERN.test("a b")).toBe(false);
   });
 });
+
+it("publishes hibernation and explicit manual/automatic lifecycle operation kinds", () => {
+  expect(OperationKind.parse("database.suspend")).toBe("database.suspend");
+  expect(OperationKind.parse("database.resume")).toBe("database.resume");
+  expect(OperationKind.parse("database.hibernate")).toBe("database.hibernate");
+  expect(OperationKind.parse("database.wake")).toBe("database.wake");
+});

@@ -517,3 +517,53 @@ describe("link messages", () => {
     expect(ServerLinkMessage.safeParse({ type: "apply" }).success).toBe(false);
   });
 });
+
+it("carries an exact power intent while legacy desired pages stay awake", () => {
+  const power = {
+    operation: newOperationId(),
+    revision: 2,
+    mode: "quiesce",
+    reason: "idle",
+  };
+  const value = {
+    ...desired(),
+    generation: 2,
+    desired_state: "suspended",
+    power,
+  };
+  expect(DesiredDatabase.parse(value).power).toEqual(power);
+  expect(DesiredDatabase.parse(desired()).power).toBeUndefined();
+  expect(
+    DesiredDatabase.safeParse({ ...value, power: { ...power, revision: 1 } })
+      .success,
+  ).toBe(false);
+  expect(
+    DesiredDatabase.safeParse({
+      ...value,
+      power: { ...power, mode: "running" },
+    }).success,
+  ).toBe(false);
+});
+
+it("hibernation observations require an exact power identity and cannot claim ready", () => {
+  const value = observation();
+  const databases = value.databases as Record<string, unknown>[];
+  databases[0] = {
+    ...databases[0],
+    state: "hibernated",
+    power: { operation: newOperationId(), revision: 1, state: "hibernated" },
+  };
+  expect(ObservationRequest.safeParse(value).success).toBe(true);
+  expect(
+    ObservationRequest.safeParse({
+      ...value,
+      databases: [{ ...databases[0], power: undefined }],
+    }).success,
+  ).toBe(false);
+  expect(
+    ObservationRequest.safeParse({
+      ...value,
+      databases: [{ ...databases[0], state: "ready" }],
+    }).success,
+  ).toBe(false);
+});

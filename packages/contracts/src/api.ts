@@ -258,6 +258,7 @@ export type DesiredState = z.infer<typeof DesiredState>;
 export const OBSERVED_STATES = [
   "pending",
   "provisioning",
+  "hibernated",
   "ready",
   "error",
   "deleting",
@@ -289,6 +290,7 @@ export const Database = z
     size_class_id: SizeClassId,
     desired_state: DesiredState,
     observed_state: ObservedState,
+    suspension_reason: z.enum(["manual", "idle"]).nullable().optional(),
     generation: z.number().int().min(1),
     observed_generation: z.number().int().min(0),
     status_message: z.string().max(TEXT_MAX_LENGTH).nullable(),
@@ -368,6 +370,10 @@ export const OPERATION_KINDS = [
   "database.create",
   "database.delete",
   "database.resize",
+  "database.suspend",
+  "database.resume",
+  "database.hibernate",
+  "database.wake",
 ] as const;
 export const OperationKind = z
   .enum(OPERATION_KINDS)
