@@ -291,7 +291,14 @@ it("recovers the persisted wake after eviction without duplicating the operation
   expect(
     await actor(f.id).ensureAwake(f.id, "app", { deadline: Date.now() + 25 }),
   ).toEqual({ ok: false, sqlstate: "57P03" });
+  const waiterId = crypto.randomUUID();
+  const priming = actor(f.id).ensureAwake(f.id, "app", {
+    deadline: Date.now() + 3000,
+    waiterId,
+  });
   const row = await untilWake(f.id);
+  await actor(f.id).cancelWakeWaiter(f.id, waiterId);
+  expect(await priming).toEqual({ ok: false, sqlstate: "57P03" });
   await evictDurableObject(actor(f.id));
   const pending = actor(f.id).ensureAwake(f.id, "app", {
     deadline: Date.now() + 3000,
