@@ -19,12 +19,7 @@ import {
   type GatewayIntent,
 } from "@pgcf/contracts/gateway-control";
 import type { RouteKeyring } from "@pgcf/contracts/route-token";
-import {
-  record,
-  uid,
-  type Kubernetes,
-  type Resource,
-} from "./types.ts";
+import { record, uid, type Kubernetes, type Resource } from "./types.ts";
 
 const RECEIPT = "gateway-retirement.json",
   LABEL = "pgcf.io/database-id",
