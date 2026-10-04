@@ -10,6 +10,26 @@ import test from "node:test";
 import type { TestContext } from "node:test";
 import { ChaosRelay } from "./chaos-relay.ts";
 
+function memoryState() {
+  const values = new Map<string, unknown>();
+  return {
+    storage: {
+      async get<T>(key: string): Promise<T | undefined> {
+        return structuredClone(values.get(key)) as T | undefined;
+      },
+      async put<T>(key: string, value: T): Promise<void> {
+        values.set(key, structuredClone(value));
+      },
+      async delete(key: string): Promise<boolean> {
+        return values.delete(key);
+      },
+    },
+    async blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T> {
+      return callback();
+    },
+  };
+}
+
 const clientsUrl = new URL("../src/clients.ts", import.meta.url).href;
 const fixtureClients = `data:text/javascript,${encodeURIComponent(
   `export * from ${JSON.stringify(clientsUrl)}; export async function command() { return ""; }`,
@@ -293,18 +313,21 @@ test("real relay counts expose only configuration presence behind expiry and bea
         headers: authenticated ? { Authorization: `Bearer ${bearer}` } : {},
       },
     );
-  const missing = new ChaosRelay(undefined, env);
+  const missing = new ChaosRelay(memoryState(), env);
   assert.equal((await missing.fetch(request(false))).status, 401);
   assert.equal(
     (await (await missing.fetch(request(true))).json()).agent_key_configured,
     false,
   );
   const agent = randomBytes(32).toString("hex");
-  const configured = new ChaosRelay(undefined, { ...env, AGENT_KEY: agent });
+  const configured = new ChaosRelay(memoryState(), {
+    ...env,
+    AGENT_KEY: agent,
+  });
   const body = await (await configured.fetch(request(true))).json();
   assert.equal(body.agent_key_configured, true);
   assert.equal(JSON.stringify(body).includes(agent), false);
-  const expired = new ChaosRelay(undefined, {
+  const expired = new ChaosRelay(memoryState(), {
     ...env,
     RUN_EXPIRES_AT: new Date(Date.now() - 1).toISOString(),
   });

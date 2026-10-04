@@ -4,10 +4,30 @@ import { randomBytes } from "node:crypto";
 import test from "node:test";
 import { ChaosRelay } from "./chaos-relay.ts";
 
+function memoryState() {
+  const values = new Map<string, unknown>();
+  return {
+    storage: {
+      async get<T>(key: string): Promise<T | undefined> {
+        return structuredClone(values.get(key)) as T | undefined;
+      },
+      async put<T>(key: string, value: T): Promise<void> {
+        values.set(key, structuredClone(value));
+      },
+      async delete(key: string): Promise<boolean> {
+        return values.delete(key);
+      },
+    },
+    async blockConcurrencyWhile<T>(callback: () => Promise<T>): Promise<T> {
+      return callback();
+    },
+  };
+}
+
 test("relay completion waits for body consumption and subsequent successful observation", async () => {
   const bearer = randomBytes(32).toString("hex"),
     agent = randomBytes(32).toString("hex");
-  const relay = new ChaosRelay(undefined, {
+  const relay = new ChaosRelay(memoryState(), {
     API_URL: "https://pgcf-api.test.invalid",
     RUN_NAME: "pgcf-e2e-test",
     RUN_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
@@ -94,7 +114,7 @@ test("relay completion waits for body consumption and subsequent successful obse
 });
 
 test("expired relay refuses control and agent requests", async () => {
-  const relay = new ChaosRelay(undefined, {
+  const relay = new ChaosRelay(memoryState(), {
     API_URL: "https://pgcf-api.test.invalid",
     RUN_NAME: "pgcf-e2e-test",
     RUN_EXPIRES_AT: new Date(Date.now() - 1).toISOString(),
