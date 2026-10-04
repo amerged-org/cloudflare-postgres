@@ -76,6 +76,10 @@
           }
         ]
       },
+      "probes": {
+        "startup": { "periodSeconds": 1, "failureThreshold": 3600 },
+        "readiness": { "periodSeconds": 1 }
+      },
       "plugins": [
         {
           "name": "barman-cloud.cloudnative-pg.io",

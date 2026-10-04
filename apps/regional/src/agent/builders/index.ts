@@ -479,6 +479,10 @@ export function buildDatabaseManifests(
       metadata: metadata(CLUSTER_NAME),
       spec: {
         instances: 1,
+        probes: {
+          startup: { periodSeconds: 1, failureThreshold: 3600 },
+          readiness: { periodSeconds: 1 },
+        },
         imageName: ctx.postgresImage,
         inheritedMetadata: { labels: { ...labels } },
         enableSuperuserAccess: false,
