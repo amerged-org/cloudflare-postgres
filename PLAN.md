@@ -8,8 +8,8 @@ verified and PostgreSQL has no public port. The second EU VPS is untouched; no U
 bought and no customer or platform database has been migrated.
 
 The deployed regional image is
-`sha256:a6b6eccbf8f298bad2c0bf7319195b290765bf49acf09eb9b56489098536034d`
-from source `c163da52`. CI `37210430404` passed. Full qualification scanned all 657,594,883
+`sha256:fe2cba3310daf0a48c3e9eafd88e6e86d010bc2d146fd95c4171f0a2d2cb40f2`
+from source `714e8c11`. CI `37219594528` passed. Full qualification scanned all 657,653,757
 expected bytes; all 26 reviewed upstream noncredentials resolved, with zero unresolved findings.
 Image signing remains Phase 5 work.
 
@@ -42,8 +42,7 @@ the operation and revision; a held-client reconnect count was not measured. Stor
 resize is currently refused. The persistent gateway fence survived one gateway replacement,
 both replicas acknowledged release and rejected stale begin commands. A fresh CNPG database
 verified the private maintenance role's TLS, authentication and minimal catalog/WAL grants.
-Manual Dev suspend/resume preserved committed data, rollback absence, namespace/cluster/PVC/PV/volume/fence identities and storage generation. Suspend completed in 8,955 ms and zero PostgreSQL Pods remained; the exact closed WAL object was present in R2. A manually suspended connection returned SQLSTATE `57P03`. Resume connection took 19,830 ms, exceeding the Phase 2 ≤8 s target. PostgreSQL started at 2,449 ms, but 10-second startup/readiness probes delayed Pod readiness until 11,449 ms; agent wake polling is also being improved. Automatic/coalesced cold-wake acceptance,
-real usage collectors and costs remain in progress. The requested
+Manual Dev suspend/resume preserved committed data, rollback absence, namespace/cluster/PVC/PV/volume/fence identities and storage generation. Suspend completed in 8,955 ms and zero PostgreSQL Pods remained; the exact closed WAL object was present in R2. A manually suspended connection returned SQLSTATE `57P03`. Resume connection took 19,830 ms, exceeding the Phase 2 ≤8 s target. PostgreSQL started at 2,449 ms, but 10-second startup/readiness probes delayed Pod readiness until 11,449 ms; agent wake polling is also being improved. Automatic Dev idle suspension is now confirmed. Ten simultaneous cold connections created exactly one wake operation and preserved committed/rollback markers; they took 11.080–11.143 s. Subsequent single cold connections measured 9.427, 9.703 and 9.071 s. The ≤8 s target and full twenty-cold-connection acceptance remain unmet. The live collector now samples each database at least 15 s apart; a real minute contained four allocation and eight gateway samples. Storage-used and backup samples remain unknown. The cost API is deployed, with null cost and an explicit node_rate gap until an actual source fact is recorded. Full usage-accuracy, retirement and phase acceptance remain in progress. The requested
 production-ready delivery through Phase 5 and complete Neon replacement are not complete.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,

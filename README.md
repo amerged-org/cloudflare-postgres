@@ -41,7 +41,7 @@ CPU placement and Actor admission are deployed. A real resize to 512 MiB/250 mil
 in 28 seconds with unchanged storage and data; storage-changing resize is refused. Persistent
 gateway fences survived a gateway replacement, and a fresh database verified the internal
 maintenance role's TLS and minimal grants. Usage rollups and lifecycle API/Actor logic are
-implemented. Manual Dev suspend/resume preserved data and storage and verified closed WAL in R2; its 19.8-second resume connection exceeds the 8-second target. Faster wake checks, automatic sleep/wake acceptance, real collectors and costs remain pending.
+implemented. Manual Dev suspend/resume preserved data and storage and verified closed WAL in R2; its 19.8-second resume connection exceeds the 8-second target. Automatic idle sleep and one wake for ten concurrent connections passed in Dev. Latest single cold connections take about 9–10 seconds, above the 8-second target. The live collector emits measured traffic/allocation samples at a bounded cadence; absent storage/backup measurements and missing cost facts remain explicit gaps. Full Phase 2 acceptance remains pending.
 The second EU node is untouched, the US node has not been bought and no customer or platform
 database has been migrated. Image signing and the complete production-ready release remain pending.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
