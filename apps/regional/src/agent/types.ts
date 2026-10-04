@@ -33,6 +33,7 @@ export interface Kubernetes {
     namespace: string | undefined,
     name: string,
     uid: string,
+    resourceVersion?: string,
   ): Promise<void>;
 }
 

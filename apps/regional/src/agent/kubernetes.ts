@@ -319,11 +319,17 @@ export function kubernetesFromConfig(
           break;
       }
     },
-    async delete(kind, namespace, name, uid) {
+    async delete(kind, namespace, name, uid, resourceVersion) {
       const args = {
         name,
         namespace: namespace ?? "",
-        body: { preconditions: { uid }, propagationPolicy: "Foreground" },
+        body: {
+          preconditions: {
+            uid,
+            ...(resourceVersion === undefined ? {} : { resourceVersion }),
+          },
+          propagationPolicy: "Foreground",
+        },
       };
       try {
         if (kind === "Namespace") await core.deleteNamespace(args, options);

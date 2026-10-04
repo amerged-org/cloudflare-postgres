@@ -4,6 +4,7 @@ import { request as httpsRequest, type RequestOptions } from "node:https";
 import type { IncomingMessage } from "node:http";
 import { setTimeout as delay } from "node:timers/promises";
 import {
+  GATEWAY_RETIRE_HOLD_MS,
   GATEWAY_FENCE_NAMESPACE,
   GATEWAY_FENCE_LABEL,
   GATEWAY_FENCE_SELECTOR,
@@ -20,6 +21,7 @@ export const MAX_FENCE_EVENT_BYTES = 64 * 1024;
 interface FenceRecord {
   readonly uid: string;
   readonly intent: Readonly<GatewayIntent>;
+  readonly retiredAt?: number;
 }
 const object = (value: unknown): Record<string, unknown> => {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -31,7 +33,7 @@ function resourceVersion(value: unknown): string {
     throw new Error("invalid fence resource version");
   return value;
 }
-function parseFence(value: unknown): FenceRecord {
+function parseFence(value: unknown, deleted = false): FenceRecord {
   const map = object(value),
     metadata = object(map.metadata),
     labels = object(metadata.labels),
@@ -51,18 +53,47 @@ function parseFence(value: unknown): FenceRecord {
   if (
     metadata.name !== gatewayFenceName(intent.database) ||
     labels["pgcf.io/database-id"] !== intent.database ||
-    metadata.deletionTimestamp !== undefined
+    (metadata.deletionTimestamp !== undefined &&
+      !(deleted && intent.mode === "retired"))
   )
     throw new Error("invalid gateway fence identity");
-  return { uid, intent: Object.freeze(intent) };
+  let retiredAt: number | undefined;
+  if (intent.mode === "retired") {
+    const time = data["retired-at"];
+    if (
+      typeof time !== "string" ||
+      !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(time) ||
+      !Number.isFinite(Date.parse(time)) ||
+      new Date(Date.parse(time)).toISOString() !== time ||
+      Date.parse(time) > Date.now() + 5000
+    )
+      throw new Error("invalid gateway retirement time");
+    retiredAt = Date.parse(time);
+  }
+  return {
+    uid,
+    intent: Object.freeze(intent),
+    ...(retiredAt === undefined ? {} : { retiredAt }),
+  };
 }
 
 export class GatewayFenceStore {
   private records = new Map<string, FenceRecord>();
-  private readonly gateway: Pick<Gateway, "beginQuiesce" | "releaseQuiesce">;
+  private readonly gateway: Pick<Gateway, "beginQuiesce" | "releaseQuiesce"> &
+    Partial<
+      Pick<Gateway, "beginRetirement" | "retirementStatus" | "forgetRetirement">
+    >;
   ready = false;
   epoch = 0;
-  constructor(gateway: Pick<Gateway, "beginQuiesce" | "releaseQuiesce">) {
+  constructor(
+    gateway: Pick<Gateway, "beginQuiesce" | "releaseQuiesce"> &
+      Partial<
+        Pick<
+          Gateway,
+          "beginRetirement" | "retirementStatus" | "forgetRetirement"
+        >
+      >,
+  ) {
     this.gateway = gateway;
   }
   get(database: string): Readonly<GatewayIntent> | undefined {
@@ -80,6 +111,14 @@ export class GatewayFenceStore {
     if (!old) return;
     if (
       record.uid !== old.uid ||
+      (old.intent.mode === "retired" &&
+        (record.intent.mode !== "retired" ||
+          record.intent.revision !== old.intent.revision ||
+          record.intent.operation !== old.intent.operation ||
+          record.retiredAt !== old.retiredAt)) ||
+      (record.intent.mode === "retired" &&
+        old.intent.mode !== "retired" &&
+        record.intent.revision <= old.intent.revision) ||
       record.intent.revision < old.intent.revision ||
       (record.intent.revision === old.intent.revision &&
         (record.intent.operation !== old.intent.operation ||
@@ -90,6 +129,13 @@ export class GatewayFenceStore {
   private apply(record: FenceRecord): void {
     const old = this.records.get(record.intent.database)?.intent,
       next = record.intent;
+    if (next.mode === "retired") {
+      if (!this.gateway.beginRetirement)
+        throw new Error("gateway retirement unavailable");
+      this.gateway.beginRetirement(next.database, next.operation);
+      this.records.set(next.database, record);
+      return;
+    }
     if (
       old?.mode === "quiesce" &&
       (next.mode === "running" || next.operation !== old.operation)
@@ -99,20 +145,102 @@ export class GatewayFenceStore {
       this.gateway.beginQuiesce(next.database, next.operation);
     this.records.set(next.database, record);
   }
+  private parsed(value: unknown): FenceRecord {
+    const deleting =
+      object(object(value).metadata).deletionTimestamp !== undefined;
+    const record = parseFence(value, deleting);
+    if (deleting) {
+      const previous = this.records.get(record.intent.database);
+      this.validate(record);
+      if (
+        !previous ||
+        previous.intent.mode !== "retired" ||
+        !this.canRemove(previous)
+      )
+        throw new Error("unobserved gateway retirement deletion");
+    }
+    return record;
+  }
   load(values: unknown[]): void {
     this.disconnect();
     try {
       if (values.length > MAX_GATEWAY_FENCES)
         throw new Error("gateway fence capacity exhausted");
-      const parsed = values.map(parseFence),
+      const parsed = values.map((value) => this.parsed(value)),
         unique = new Set(parsed.map((record) => record.intent.database));
       if (
         unique.size !== parsed.length ||
-        [...this.records.keys()].some((database) => !unique.has(database))
+        [...this.records].some(
+          ([database, record]) =>
+            !unique.has(database) && !this.canRemove(record),
+        )
       )
         throw new Error("incomplete gateway fence snapshot");
       for (const record of parsed) this.validate(record);
+      for (const [database, record] of this.records)
+        if (!unique.has(database)) this.removeRecord(record);
       for (const record of parsed) this.apply(record);
+    } catch (error) {
+      this.disconnect();
+      throw error;
+    }
+  }
+  private canRemove(record: FenceRecord): boolean {
+    if (
+      record.intent.mode !== "retired" ||
+      record.retiredAt === undefined ||
+      Date.now() - record.retiredAt < GATEWAY_RETIRE_HOLD_MS ||
+      !this.gateway.retirementStatus ||
+      !this.gateway.forgetRetirement
+    )
+      return false;
+    const report = this.gateway.retirementStatus(
+      record.intent.database,
+      record.intent.operation,
+    );
+    return (
+      report.connections === 0 &&
+      report.busyConnections === 0 &&
+      report.pendingDials === 0 &&
+      report.status === "closed"
+    );
+  }
+  retirementReady(
+    database: string,
+    operation: string,
+    revision: number,
+  ): boolean {
+    const record = this.records.get(database);
+    return Boolean(
+      record &&
+      record.intent.operation === operation &&
+      record.intent.revision === revision &&
+      this.canRemove(record),
+    );
+  }
+  private removeRecord(record: FenceRecord): void {
+    if (!this.canRemove(record))
+      throw new Error("gateway retirement incomplete");
+    this.gateway.forgetRetirement!(
+      record.intent.database,
+      record.intent.operation,
+    );
+    this.records.delete(record.intent.database);
+  }
+  remove(value: unknown): void {
+    try {
+      const record = parseFence(value, true),
+        old = this.records.get(record.intent.database);
+      if (
+        !old ||
+        old.intent.mode !== "retired" ||
+        record.intent.mode !== "retired" ||
+        old.uid !== record.uid ||
+        old.retiredAt !== record.retiredAt ||
+        JSON.stringify(old.intent) !== JSON.stringify(record.intent)
+      )
+        throw new Error("gateway retirement history mismatch");
+      this.removeRecord(old);
     } catch (error) {
       this.disconnect();
       throw error;
@@ -120,7 +248,7 @@ export class GatewayFenceStore {
   }
   update(value: unknown): void {
     try {
-      const record = parseFence(value);
+      const record = this.parsed(value);
       this.validate(record);
       if (
         !this.records.has(record.intent.database) &&
@@ -249,6 +377,7 @@ async function readWatch(
       pending = pending.subarray(newline + 1);
       if (event.type === "ADDED" || event.type === "MODIFIED")
         store.update(event.object);
+      else if (event.type === "DELETED") store.remove(event.object);
       else if (event.type === "BOOKMARK")
         resourceVersion(object(object(event.object).metadata).resourceVersion);
       else throw new Error("fence watch lost authority");

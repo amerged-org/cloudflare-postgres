@@ -97,6 +97,9 @@ export interface Gateway {
   beginQuiesce(database: string, operation: string): QuiesceReport;
   releaseQuiesce(database: string, operation: string): void;
   closeQuiesced(database: string, operation: string): Promise<QuiesceReport>;
+  beginRetirement(database: string, operation: string): void;
+  retirementStatus(database: string, operation: string): QuiesceReport;
+  forgetRetirement(database: string, operation: string): void;
   activity(database: string): ReturnType<GatewayMeasurements["read"]> & {
     connections: number;
     authenticatedConnections: number;
@@ -137,7 +140,7 @@ export function createGateway(options: GatewayOptions): Gateway {
   const sessions = new Map<WebSocket, SessionControl>();
   const fences = new Map<
     string,
-    { operation: string; closing?: Promise<QuiesceReport> }
+    { operation: string; retired?: boolean; closing?: Promise<QuiesceReport> }
   >();
   const fenceEpochs = new Map<string, number>();
   let fenceEpoch = 0;
@@ -917,7 +920,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     beginQuiesce(database, operation) {
       validateFence(database, operation);
       const current = fences.get(database);
-      if (current && current.operation !== operation)
+      if (current && (current.retired || current.operation !== operation))
         throw new Error("quiescence fence mismatch");
       if (!current) {
         fences.set(database, { operation });
@@ -929,7 +932,8 @@ export function createGateway(options: GatewayOptions): Gateway {
     },
     releaseQuiesce(database, operation) {
       const current = matchingFence(database, operation);
-      if (current.closing) throw new Error("quiescence close in progress");
+      if (current.retired || current.closing)
+        throw new Error("quiescence close in progress");
       fences.delete(database);
       for (const session of sessions.values())
         if (session.database === database) session.resume();
@@ -956,6 +960,45 @@ export function createGateway(options: GatewayOptions): Gateway {
         },
       );
       return current.closing;
+    },
+    beginRetirement(database, operation) {
+      validateFence(database, operation);
+      const prior = fences.get(database);
+      if (prior?.retired && prior.operation !== operation)
+        throw new Error("retirement fence mismatch");
+      if (!prior?.retired) {
+        fences.set(database, { operation, retired: true });
+        fenceEpochs.set(database, ++fenceEpoch);
+      }
+      // Keep reading transport closure/control frames; the terminal fence blocks frontend forwarding and dials.
+    },
+    retirementStatus(database, operation) {
+      const fence = matchingFence(database, operation);
+      if (!fence.retired) throw new Error("retirement fence mismatch");
+      const value = report(database, operation);
+      const connections = Math.max(
+        value.connections,
+        counts.get(database) ?? 0,
+      );
+      return {
+        ...value,
+        connections,
+        status:
+          connections === 0 && value.pendingDials === 0 ? "closed" : "busy",
+      };
+    },
+    forgetRetirement(database, operation) {
+      const fence = matchingFence(database, operation);
+      const value = report(database, operation);
+      if (
+        !fence.retired ||
+        (counts.get(database) ?? 0) !== 0 ||
+        value.connections !== 0 ||
+        value.pendingDials !== 0
+      )
+        throw new Error("retirement sessions remain");
+      fences.delete(database);
+      fenceEpochs.delete(database);
     },
     drain() {
       if (drainPromise) return drainPromise;

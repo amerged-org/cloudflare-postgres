@@ -95,3 +95,73 @@ describe("gateway controls", () => {
     ).toBe(false);
   });
 });
+
+it("retirement controls and reports remain distinct from routing/activity purposes", async () => {
+  const { gatewayControlReportSchema } =
+    await import("../src/gateway-control.ts");
+  const { signGatewayActivity } = await import("../src/gateway-activity.ts");
+  const region = "test-region",
+    database = newDatabaseId(),
+    operation = newOperationId(),
+    pod = randomUUID();
+  const keyring = {
+    active: "fixture",
+    keys: new Map([["fixture", crypto.getRandomValues(new Uint8Array(32))]]),
+  };
+  const input = {
+    keyring,
+    region,
+    database,
+    operation,
+    revision: 2,
+    pod,
+    action: "retire" as const,
+    now: 100000,
+  };
+  const expected = {
+    keys: keyring.keys,
+    region,
+    pod,
+    action: "retire" as const,
+    now: 100000,
+  };
+  expect(
+    (await verifyGatewayControl(await signGatewayControl(input), expected)).ok,
+  ).toBe(true);
+  expect(
+    (
+      await verifyGatewayControl(
+        await signGatewayActivity({ ...input }),
+        expected,
+      )
+    ).ok,
+  ).toBe(false);
+  expect(
+    (
+      await verifyGatewayControl(
+        await signGatewayControl({ ...input, action: "begin" }),
+        expected,
+      )
+    ).ok,
+  ).toBe(false);
+  const report = {
+    database,
+    operation,
+    revision: 2,
+    pod,
+    mode: "retired",
+    status: "retired",
+    connections: 0,
+    busyConnections: 0,
+    pendingDials: 0,
+  };
+  expect(gatewayControlReportSchema.safeParse(report).success).toBe(true);
+  expect(
+    gatewayControlReportSchema.safeParse({ ...report, pendingDials: 1 })
+      .success,
+  ).toBe(false);
+  expect(
+    gatewayControlReportSchema.safeParse({ ...report, mode: "running" })
+      .success,
+  ).toBe(false);
+});
