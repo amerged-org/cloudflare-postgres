@@ -8,6 +8,12 @@ import {
   type PowerObservation,
 } from "./power.ts";
 import { createHash } from "node:crypto";
+import {
+  archiveProbeOptions,
+  probeArchive,
+  type ArchiveProbeOptions,
+  type ArchiveProbeResult,
+} from "./archive-probe.ts";
 import { ApiException } from "@kubernetes/client-node";
 import { gatewayFenceName } from "@pgcf/contracts/gateway-control";
 import { retireGatewayFence } from "./retire.ts";
@@ -350,6 +356,9 @@ export class Reconciler {
   private power?: PowerCoordinator;
   private log?: Log;
   private phaseNow: () => number;
+  private archiveProbe: (
+    options: ArchiveProbeOptions,
+  ) => Promise<ArchiveProbeResult>;
   constructor(
     k8s: Kubernetes,
     signal: AbortSignal,
@@ -359,6 +368,9 @@ export class Reconciler {
     power?: PowerCoordinator,
     log?: Log,
     phaseNow = () => performance.now(),
+    archiveProbe: (
+      options: ArchiveProbeOptions,
+    ) => Promise<ArchiveProbeResult> = probeArchive,
   ) {
     this.k8s = k8s;
     this.signal = signal;
@@ -368,6 +380,7 @@ export class Reconciler {
     this.power = power;
     this.log = log;
     this.phaseNow = phaseNow;
+    this.archiveProbe = archiveProbe;
   }
 
   hint(): void {
@@ -780,15 +793,26 @@ export class Reconciler {
         phaseLog,
         "archive_metrics",
         db.id,
-        () =>
-          archiveMetrics(
-            this.k8s,
-            namespaceName,
+        async () => {
+          const options = await archiveProbeOptions(
+            db,
             archiveSource,
+            fence!,
+            this.k8s,
             this.signal,
             this.now,
-            this.fetcher,
-          ),
+          );
+          return options
+            ? this.archiveProbe(options)
+            : archiveMetrics(
+                this.k8s,
+                namespaceName,
+                archiveSource,
+                this.signal,
+                this.now,
+                this.fetcher,
+              );
+        },
         this.phaseNow,
       );
       count = metrics.readyWalFiles;
