@@ -1,4 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
+import {
+  desiredPower,
+  type PowerCoordinator,
+  type PowerObservation,
+} from "./power.ts";
 import { createHash } from "node:crypto";
 import type {
   DatabaseObservation,
@@ -273,24 +278,31 @@ export class Reconciler {
   private now: () => number;
   private fetcher: typeof fetch;
   private authenticate: AuthenticationProbe;
+  private power?: PowerCoordinator;
   constructor(
     k8s: Kubernetes,
     signal: AbortSignal,
     now = Date.now,
     fetcher: typeof fetch = fetch,
     authenticate: AuthenticationProbe = probeRoles,
+    power?: PowerCoordinator,
   ) {
     this.k8s = k8s;
     this.signal = signal;
     this.now = now;
     this.fetcher = fetcher;
     this.authenticate = authenticate;
+    this.power = power;
+  }
+
+  hint(): void {
+    this.power?.interrupt();
   }
 
   async reconcile(
     db: DesiredDatabase,
     ctx?: BuildContext,
-  ): Promise<DatabaseObservation | null> {
+  ): Promise<PowerObservation | null> {
     const namespaceName = databaseNamespace(db.id);
     const namespace = await this.k8s.read(
       "Namespace",
@@ -334,7 +346,6 @@ export class Reconciler {
         throw new Error("delete_namespace_identity_changed");
       return this.delete(db, namespace, ledger, fence);
     }
-    if (!ctx) throw new Error("build_context_required");
     if (ledger) throw new Error("database_deletion_irreversible");
     if (namespace?.metadata.deletionTimestamp)
       throw new Error("database_namespace_deleting");
@@ -380,6 +391,8 @@ export class Reconciler {
           "missing namespace has prior storage evidence",
         );
     }
+    if (record(db).desired_state === "suspended" && !desiredPower(db))
+      return recoveryRequired(db, "suspension intent is missing");
     const priorCluster = namespace
       ? await this.k8s.read("Cluster", namespaceName, "database")
       : null;
@@ -392,6 +405,48 @@ export class Reconciler {
       return recoveryRequired(db, "database cluster identity changed");
     if (!priorCluster && (storage?.clusterUid || !pendingCreation(db)))
       return recoveryRequired(db, "database cluster is missing");
+    const powerIntent = desiredPower(db);
+    if (powerIntent?.mode === "quiesce") {
+      if (
+        !namespace ||
+        !priorCluster ||
+        !storage?.namespaceUid ||
+        !storage.clusterUid ||
+        !fence
+      )
+        return recoveryRequired(
+          db,
+          "suspended database storage history is missing",
+        );
+      if (!this.power)
+        return {
+          ...recoveryRequired(
+            db,
+            "power coordinator configuration is unavailable",
+          ),
+          power: {
+            operation: powerIntent.operation,
+            revision: powerIntent.revision,
+            state: "awake",
+            refusal: "unknown",
+          },
+        };
+      if (appliedGeneration(fence) < db.generation)
+        await this.saveStorage(db, storage, fence);
+      return this.power.suspend(db);
+    }
+    if (powerIntent) {
+      if (!this.power)
+        return recoveryRequired(
+          db,
+          "power coordinator configuration is unavailable",
+        );
+      if (storage && fence && appliedGeneration(fence) < db.generation)
+        fence = await this.saveStorage(db, storage, fence);
+      const pending = await this.power.prepareRunning(db);
+      if (pending !== undefined) return pending;
+    }
+    if (!ctx) throw new Error("build_context_required");
     storage = storage ?? {
       namespaceUid: null,
       clusterUid: null,
@@ -674,7 +729,7 @@ export class Reconciler {
       count !== null &&
       (continuous ||
         (db.creation?.ever_ready === true && measured && stalled !== null));
-    return {
+    const observation: PowerObservation = {
       id: db.id,
       generation: db.generation,
       state: databaseReady
@@ -687,6 +742,11 @@ export class Reconciler {
         : {}),
       archive: { continuous, ready_wal_files: count },
     };
+    return this.power
+      ? powerIntent
+        ? this.power.finishRunning(db, observation)
+        : this.power.publishReadyFence(db, observation)
+      : observation;
   }
 
   private async archiveStalled(

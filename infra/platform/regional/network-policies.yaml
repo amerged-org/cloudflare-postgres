@@ -46,7 +46,7 @@ spec:
             - port: "7844"
               protocol: UDP
 ---
-# Ingress only from cloudflared. Egress to DNS, the Kubernetes API (ConfigMap reads) and the
+# Ingress only from cloudflared and authenticated agent controls. Egress to DNS, the Kubernetes API (ConfigMap reads) and the
 # PostgreSQL port of database Pods in per-database namespaces.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
@@ -61,6 +61,14 @@ spec:
     - fromEndpoints:
         - matchLabels:
             app.kubernetes.io/name: pgcf-cloudflared
+      toPorts:
+        - ports:
+            - port: "8080"
+              protocol: TCP
+    - fromEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: pgcf-system
+            app.kubernetes.io/name: pgcf-agent
       toPorts:
         - ports:
             - port: "8080"
@@ -140,6 +148,14 @@ spec:
             - port: "5432"
               protocol: TCP
             - port: "9187"
+              protocol: TCP
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: pgcf-system
+            app.kubernetes.io/name: pgcf-gateway
+      toPorts:
+        - ports:
+            - port: "8080"
               protocol: TCP
     - toFQDNs:
         - matchName: "${PGCF_API_HOST}"

@@ -32,6 +32,9 @@ spec:
         - name: agent
           image: pgcf-regional
           command: [node, /app/agent.mjs]
+          env:
+            - name: PGCF_GATEWAY_REPLICAS
+              value: "2"
           envFrom:
             - configMapRef:
                 name: pgcf-regional
