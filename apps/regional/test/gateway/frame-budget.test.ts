@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { once } from "node:events";
 import { Duplex } from "node:stream";
+import { setImmediate as turn } from "node:timers/promises";
 import { newDatabaseId } from "@pgcf/contracts";
 import {
   BudgetedWebSocketSocket,
@@ -65,6 +66,99 @@ test("large assemblies cannot consume the space reserved for fifty concurrent sm
   assert.equal(budget.used, 0);
 });
 
+test("large holders leave per-database headroom for a healthy 1 MiB assembly and small query", () => {
+  const budget = new GatewayMemoryBudget(
+    DEFAULT_MEMORY_LIMIT_BYTES,
+    DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
+  );
+  const database = newDatabaseId();
+  const large = budget.owner(database).lease();
+  assert.equal(large.grow(88 * mib), true);
+  assert.equal(
+    large.grow(mib),
+    false,
+    "large holders cannot consume the database small-traffic reserve",
+  );
+  const healthy = budget.owner(database);
+  const moderate = healthy.lease();
+  assert.equal(moderate.grow(2 * mib + 4096, 2 * mib), true);
+  assert.equal(healthy.lease().grow(200 * 2 + 256), true);
+  assert.ok(
+    budget.databaseUsed(database) <= DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
+  );
+  healthy.close();
+  large.release();
+  assert.equal(budget.used, 0);
+});
+
+test("a doubled healthy 1 MiB assembly is protected by global headroom beside two large holders", () => {
+  const budget = new GatewayMemoryBudget(
+    DEFAULT_MEMORY_LIMIT_BYTES,
+    DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
+  );
+  const first = budget.owner(newDatabaseId());
+  const second = budget.owner(newDatabaseId());
+  assert.equal(first.lease().grow(88 * mib), true);
+  assert.equal(second.lease().grow(88 * mib), true);
+  const healthy = budget.owner(newDatabaseId());
+  assert.equal(
+    healthy.lease().grow(2 * mib + 4096, 2 * mib),
+    true,
+    "wire bytes, assembly copy and metadata fit the healthy reserve",
+  );
+  healthy.close();
+  first.close();
+  second.close();
+  assert.equal(budget.used, 0);
+});
+
+test("zero-payload fragment metadata cannot consume the reserve protected for received medium traffic", async () => {
+  const budget = new GatewayMemoryBudget(
+    DEFAULT_MEMORY_LIMIT_BYTES,
+    DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
+  );
+  const first = budget.owner(newDatabaseId());
+  const second = budget.owner(newDatabaseId());
+  assert.equal(first.lease().grow(88 * mib), true);
+  assert.equal(second.lease().grow(88 * mib), true);
+  const raw = new Duplex({
+    read() {},
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+  });
+  const guarded = new BudgetedWebSocketSocket(
+    raw,
+    budget.owner(newDatabaseId()),
+    32 * mib,
+    Buffer.alloc(0),
+  );
+  let rejected = 0;
+  guarded.on("rejected", (code) => {
+    rejected = code;
+  });
+  guarded.resume();
+  const frames = Array.from({ length: 513 }, (_, index) => {
+    const frame = Buffer.alloc(6);
+    frame[0] = index === 0 ? 2 : 0;
+    frame[1] = 0x80;
+    return frame;
+  });
+  raw.push(Buffer.concat(frames));
+  await turn();
+  assert.equal(
+    rejected,
+    1013,
+    "received payload eligibility must not widen the existing fragment metadata guard",
+  );
+  const closed = once(guarded, "close");
+  guarded.destroy();
+  await closed;
+  first.close();
+  second.close();
+  assert.equal(budget.used, 0);
+});
+
 test("invalid memory limits and noninteger reservations fail closed", () => {
   assert.throws(() => new GatewayMemoryBudget(0, 1), RangeError);
   assert.throws(() => new GatewayMemoryBudget(1, 2), RangeError);
@@ -72,6 +166,9 @@ test("invalid memory limits and noninteger reservations fail closed", () => {
   const lease = budget.owner(newDatabaseId()).lease();
   assert.throws(() => lease.grow(-1), RangeError);
   assert.throws(() => lease.grow(0.5), RangeError);
+  assert.throws(() => lease.grow(1, 2), RangeError);
+  assert.throws(() => lease.grow(1, -1), RangeError);
+  assert.throws(() => lease.grow(1, 0.5), RangeError);
   assert.equal(budget.used, 0);
 });
 

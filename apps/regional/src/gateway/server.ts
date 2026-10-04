@@ -210,7 +210,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     const ingress = new BudgetedWebSocketSocket(
       socket,
       memory.owner(claims.db),
-      MAX_PAYLOAD_BYTES,
+      MAX_STARTUP_BUFFER_BYTES,
       head,
     );
     try {
@@ -375,6 +375,7 @@ export function createGateway(options: GatewayOptions): Gateway {
           close(1012, "gateway_draining");
           return;
         }
+        socket.setMaxPayload(MAX_PAYLOAD_BYTES);
         handedOff = true;
         pending.delete(abort);
         clearTimeout(deadline);
@@ -471,7 +472,16 @@ export function createGateway(options: GatewayOptions): Gateway {
       }
     };
     const rejected = (code: number) =>
-      close(code, code === 1013 ? "memory_limit" : "payload_limit");
+      close(
+        code,
+        code === 1013 ? "memory_limit" : "payload_limit",
+        code === 1009
+          ? {
+              sqlstate: "08P01",
+              message: "too much data before database connection",
+            }
+          : undefined,
+      );
     socket.on("rejected", rejected);
     socket.once("close", disconnected);
     socket.once("end", disconnected);
@@ -612,7 +622,12 @@ export function createGateway(options: GatewayOptions): Gateway {
     postgres.on("data", (chunk: Buffer) => {
       postgres.pause();
       const lease = ingress.memory.lease();
-      if (!lease.grow(chunk.length * 2 + 256)) {
+      if (
+        !lease.grow(
+          chunk.length * 2 + 256,
+          chunk.length <= 1024 * 1024 ? chunk.length * 2 : 0,
+        )
+      ) {
         lease.release();
         ingress.rejectMemory();
         return;

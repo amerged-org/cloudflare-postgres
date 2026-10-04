@@ -5,6 +5,7 @@ export const DEFAULT_MEMORY_LIMIT_BYTES = 192 * 1024 * 1024;
 export const DEFAULT_DATABASE_MEMORY_LIMIT_BYTES = 96 * 1024 * 1024;
 
 const BUFFER_OVERHEAD_BYTES = 256;
+const MODERATE_MESSAGE_BYTES = 1024 * 1024;
 const SMALL_MESSAGE_BYTES = 128 * 1024;
 const SMALL_TRAFFIC_RESERVE_BYTES = 16 * 1024 * 1024;
 
@@ -12,6 +13,7 @@ export class GatewayMemoryBudget {
   readonly limit: number;
   readonly databaseLimit: number;
   readonly smallTrafficReserve: number;
+  readonly databaseSmallTrafficReserve: number;
   used = 0;
   peak = 0;
   private readonly databases = new Map<string, number>();
@@ -31,6 +33,14 @@ export class GatewayMemoryBudget {
       SMALL_TRAFFIC_RESERVE_BYTES,
       Math.floor(limit / 8),
     );
+    // Small installation limits must not increase the per-database reserve fraction.
+    this.databaseSmallTrafficReserve = Math.floor(
+      Math.min(
+        (this.smallTrafficReserve * databaseLimit) / limit,
+        (SMALL_TRAFFIC_RESERVE_BYTES * databaseLimit) /
+          DEFAULT_MEMORY_LIMIT_BYTES,
+      ),
+    );
   }
 
   owner(database: string): MemoryOwner {
@@ -46,7 +56,10 @@ export class GatewayMemoryBudget {
       throw new RangeError("invalid memory reservation");
     const databaseUsed = this.databaseUsed(database);
     if (
-      bytes > this.databaseLimit - databaseUsed ||
+      bytes >
+        this.databaseLimit -
+          databaseUsed -
+          (large ? this.databaseSmallTrafficReserve : 0) ||
       bytes > this.limit - this.used - (large ? this.smallTrafficReserve : 0)
     )
       return false;
@@ -106,6 +119,7 @@ export class MemoryOwner {
 export class MemoryLease {
   bytes = 0;
   private released = false;
+  private payloadBytes = 0;
 
   private readonly owner: MemoryOwner;
 
@@ -113,13 +127,25 @@ export class MemoryLease {
     this.owner = owner;
   }
 
-  grow(bytes: number): boolean {
+  grow(bytes: number, receivedPayloadBytes = 0): boolean {
+    if (
+      !Number.isSafeInteger(receivedPayloadBytes) ||
+      receivedPayloadBytes < 0 ||
+      receivedPayloadBytes > bytes
+    )
+      throw new RangeError("invalid received payload reservation");
+    const payload = this.payloadBytes + receivedPayloadBytes;
     if (
       this.released ||
-      !this.owner.claim(bytes, this.bytes + bytes > SMALL_MESSAGE_BYTES)
+      !this.owner.claim(
+        bytes,
+        payload > MODERATE_MESSAGE_BYTES * 2 ||
+          this.bytes + bytes - payload > SMALL_MESSAGE_BYTES,
+      )
     )
       return false;
     this.bytes += bytes;
+    this.payloadBytes = payload;
     return true;
   }
 
@@ -128,6 +154,7 @@ export class MemoryLease {
     if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > this.bytes)
       throw new RangeError("invalid memory credit");
     this.bytes -= bytes;
+    this.payloadBytes = Math.max(0, this.payloadBytes - bytes);
     this.owner.credit(bytes);
   }
 
@@ -136,6 +163,7 @@ export class MemoryLease {
     this.released = true;
     this.owner.release(this, this.bytes);
     this.bytes = 0;
+    this.payloadBytes = 0;
   }
 }
 
@@ -147,6 +175,7 @@ export class BudgetedWebSocketSocket extends Duplex {
   private payloadRemaining = 0;
   private messageBytes = 0;
   private finalDataFrame = false;
+  private deferredPayload = false;
   private messageLease: MemoryLease | undefined;
   private controlLease: MemoryLease | undefined;
   private readonly messages: MemoryLease[] = [];
@@ -156,7 +185,7 @@ export class BudgetedWebSocketSocket extends Duplex {
 
   private readonly socket: Duplex;
   readonly memory: MemoryOwner;
-  private readonly maxPayload: number;
+  private maxPayload: number;
   private readonly outgoing: MemoryLease;
 
   constructor(
@@ -195,6 +224,12 @@ export class BudgetedWebSocketSocket extends Duplex {
 
   takeMessage(): MemoryLease | undefined {
     return this.messages.shift();
+  }
+
+  setMaxPayload(maxPayload: number): void {
+    if (!Number.isSafeInteger(maxPayload) || maxPayload < this.maxPayload)
+      throw new RangeError("invalid payload limit");
+    this.maxPayload = maxPayload;
   }
 
   private hold(chunk: Buffer) {
@@ -246,8 +281,14 @@ export class BudgetedWebSocketSocket extends Duplex {
         return false;
       }
       this.messageLease ??= this.memory.lease();
+      this.deferredPayload = this.messageBytes <= MODERATE_MESSAGE_BYTES;
       // A receiver may transiently hold TCP pieces and the contiguous frame copy.
-      if (!this.messageLease.grow(length * 2 + BUFFER_OVERHEAD_BYTES)) {
+      // Moderate messages spend protected credit only as their payload actually arrives.
+      if (
+        !this.messageLease.grow(
+          (this.deferredPayload ? 0 : length * 2) + BUFFER_OVERHEAD_BYTES,
+        )
+      ) {
         this.reject(1013);
         return false;
       }
@@ -319,7 +360,14 @@ export class BudgetedWebSocketSocket extends Duplex {
           pending.chunk.length - pending.offset,
         );
         const lease = this.controlLease ?? this.messageLease;
-        if (!lease?.grow(BUFFER_OVERHEAD_BYTES)) {
+        const receivedPayloadBytes =
+          !this.controlLease && this.deferredPayload ? length * 2 : 0;
+        if (
+          !lease?.grow(
+            receivedPayloadBytes + BUFFER_OVERHEAD_BYTES,
+            receivedPayloadBytes,
+          )
+        ) {
           this.reject(1013);
           break;
         }
