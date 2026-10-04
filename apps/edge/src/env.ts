@@ -8,7 +8,12 @@ export type DatabaseAdmission =
 export interface DatabaseActorNamespace {
   idFromName(name: string): DurableObjectId;
   get(id: DurableObjectId): {
-    admit(databaseId: string, user: string): Promise<DatabaseAdmission>;
+    ensureAwake(
+      databaseId: string,
+      user: string,
+      options: { deadline: number; waiterId: string },
+    ): Promise<DatabaseAdmission>;
+    cancelWakeWaiter(databaseId: string, waiterId: string): Promise<boolean>;
   };
 }
 

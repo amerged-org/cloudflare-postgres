@@ -2,6 +2,7 @@
 import { env } from "cloudflare:workers";
 import {
   createExecutionContext,
+  runInDurableObject,
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { newDatabaseId, newProjectId, newOperationId } from "@pgcf/contracts";
@@ -18,7 +19,7 @@ import {
   ADMISSION_DEADLINE_MS,
 } from "../src/session-policy.ts";
 import type { Env, DatabaseAdmission } from "../src/env.ts";
-import { seedKnownDatabase } from "./actor-entry.js";
+import { seedKnownDatabase, publishPowerObservation } from "./actor-entry.js";
 
 const testEnv = env as unknown as Env & { DB: D1Database; GATEWAY: Fetcher };
 const origin = `https://${["edge", "invalid"].join(".")}`;
@@ -121,6 +122,8 @@ beforeEach(async () => {
   logs = vi.spyOn(console, "log").mockImplementation(() => {});
   await testEnv.GATEWAY.fetch(`${gatewayOrigin}/reset`);
   await testEnv.DB.batch([
+    testEnv.DB.prepare("DELETE FROM operations"),
+    testEnv.DB.prepare("DELETE FROM lifecycle_events"),
     testEnv.DB.prepare("DELETE FROM roles"),
     testEnv.DB.prepare("DELETE FROM databases"),
     testEnv.DB.prepare("DELETE FROM nodes"),
@@ -286,9 +289,10 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const actor = {
       idFromName: (name: string) => testEnv.DATABASE_ACTOR.idFromName(name),
       get: () => ({
-        admit: async (): Promise<DatabaseAdmission> => {
+        ensureAwake: async (): Promise<DatabaseAdmission> => {
           throw new Error(canary);
         },
+        cancelWakeWaiter: async () => false,
       }),
     };
     const connection = await open({
@@ -703,13 +707,19 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       get(id: DurableObjectId) {
         const stub = testEnv.DATABASE_ACTOR.get(id);
         return {
-          async admit(databaseId: string, user: string) {
-            const row = await stub.admit(databaseId, user);
+          async ensureAwake(
+            databaseId: string,
+            user: string,
+            options: { deadline: number; waiterId: string },
+          ) {
+            const row = await stub.ensureAwake(databaseId, user, options);
             expect(row.ok).toBe(true);
             queried();
             await resume;
             return row;
           },
+          cancelWakeWaiter: (id: string, waiterId: string) =>
+            stub.cancelWakeWaiter(id, waiterId),
         };
       },
     };
@@ -1229,4 +1239,213 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       .poll(() => [...concat(...connection.messages)])
       .toEqual([...packet]);
   });
+});
+
+async function sleeping(reason: "manual" | "idle") {
+  const operation = newOperationId(),
+    now = new Date().toISOString();
+  await testEnv.DB.batch([
+    testEnv.DB.prepare(
+      "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) SELECT ?,?,'pending',project_id,id,3,?,? FROM databases WHERE id=?",
+    ).bind(
+      operation,
+      reason === "manual" ? "database.suspend" : "database.hibernate",
+      now,
+      now,
+      database,
+    ),
+    testEnv.DB.prepare(
+      "UPDATE databases SET desired_state='suspended',suspension_reason=?,power_operation=?,generation=3,observed_state='provisioning',updated_at=? WHERE id=?",
+    ).bind(reason, operation, now, database),
+  ]);
+  const ctx = createExecutionContext();
+  const response = await publishPowerObservation(
+    testEnv,
+    ctx,
+    database,
+    3,
+    operation,
+    "hibernated",
+  );
+  expect(response.status).toBe(200);
+  await waitOnExecutionContext(ctx);
+  await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, database);
+}
+
+it("wakes an idle database with the real actor, contacts no gateway before exact observed readiness, and uses the fresh authoritative route", async () => {
+  await sleeping("idle");
+  await setGatewayMode("reject");
+  const pending = open();
+  await expect
+    .poll(async () =>
+      testEnv.DB.prepare("SELECT desired_state FROM databases WHERE id=?")
+        .bind(database)
+        .first("desired_state"),
+    )
+    .toBe("running");
+  expect(await stats()).toHaveLength(0);
+  const row = await testEnv.DB.prepare(
+    "SELECT generation,power_operation FROM databases WHERE id=?",
+  )
+    .bind(database)
+    .first<{ generation: number; power_operation: string }>();
+  expect(row!.generation).toBe(4);
+  await testEnv.DB.prepare("UPDATE regions SET gateway_url=? WHERE id=?")
+    .bind(`${gatewayOrigin}/fresh?mode=count`, region)
+    .run();
+  const ctx = createExecutionContext();
+  const response = await publishPowerObservation(
+    testEnv,
+    ctx,
+    database,
+    4,
+    row!.power_operation,
+    "awake",
+  );
+  expect(response.status).toBe(200);
+  await waitOnExecutionContext(ctx);
+  const connection = await pending;
+  expect((await stats())[0]!.path).toBe("/fresh");
+  const startup = encodeStartup({ user: "app", database });
+  connection.socket.send(startup);
+  await expect
+    .poll(async () => (await stats())[0]!.byte_count)
+    .toBe(startup.length);
+  expect(await stats()).toHaveLength(1);
+});
+
+it("keeps a real manually suspended actor refused without creating a wake or dialing gateway", async () => {
+  await sleeping("manual");
+  expect(await errorCode(await open())).toBe("57P03");
+  expect(
+    await testEnv.DB.prepare(
+      "SELECT COUNT(*) n FROM operations WHERE database_id=? AND kind='database.wake'",
+    )
+      .bind(database)
+      .first("n"),
+  ).toBe(0);
+  expect(await stats()).toHaveLength(0);
+});
+
+it("passes the connection cid and one absolute 30-second deadline to wake and cancels the same waiter on abort", async () => {
+  let reached!: () => void, release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const ensure = vi.fn(
+    async (
+      id: string,
+      user: string,
+      options: { deadline: number; waiterId: string },
+    ) => {
+      const response = await testEnv.DATABASE_ACTOR.get(
+        testEnv.DATABASE_ACTOR.idFromName(id),
+      ).ensureAwake(id, user, options);
+      reached();
+      await held;
+      return response;
+    },
+  );
+  const cancel = vi.fn(async () => true);
+  const actor = {
+    idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+    get: () => ({ ensureAwake: ensure, cancelWakeWaiter: cancel }),
+  };
+  const controller = new AbortController();
+  const before = Date.now();
+  const pending = open({
+    signal: controller.signal,
+    bindings: { ...testEnv, DATABASE_ACTOR: actor },
+  });
+  await started;
+  expect(await stats()).toHaveLength(0);
+  controller.abort();
+  const connection = await pending;
+  expect(await errorCode(connection)).toBe("08006");
+  expect(ensure).toHaveBeenCalledTimes(1);
+  const options = ensure.mock.calls[0]![2];
+  const cid = JSON.parse(logs.mock.calls.at(-1)![0] as string).cid;
+  expect(options.waiterId).toBe(cid);
+  expect(options.deadline).toBeGreaterThanOrEqual(before + 30_000);
+  expect(options.deadline).toBeLessThanOrEqual(Date.now() + 30_000);
+  expect(cancel).toHaveBeenCalledExactlyOnceWith(database, cid);
+  release();
+  await waitOnExecutionContext(connection.ctx);
+  expect(await stats()).toHaveLength(0);
+});
+
+it("a wake timeout cancels the waiter once, never forwards late success and keeps the total admission budget at 30 seconds", async () => {
+  let reached!: () => void, release!: () => void;
+  const started = new Promise<void>((resolve) => {
+    reached = resolve;
+  });
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const ensure = vi.fn(async () => {
+    reached();
+    await held;
+    return {
+      ok: true as const,
+      region: {
+        id: region,
+        gateway_url: `${gatewayOrigin}/pg`,
+        gateway_binding: "GATEWAY",
+      },
+    };
+  });
+  const cancel = vi.fn(async () => true);
+  const actor = {
+    idFromName: (id: string) => testEnv.DATABASE_ACTOR.idFromName(id),
+    get: () => ({ ensureAwake: ensure, cancelWakeWaiter: cancel }),
+  };
+  vi.useFakeTimers();
+  const pending = open({ bindings: { ...testEnv, DATABASE_ACTOR: actor } });
+  await started;
+  expect(ADMISSION_DEADLINE_MS).toBe(30_000);
+  await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
+  const connection = await pending;
+  vi.useRealTimers();
+  expect(await errorCode(connection)).toBe("08006");
+  const cid = JSON.parse(logs.mock.calls.at(-1)![0] as string).cid;
+  expect(cancel).toHaveBeenCalledExactlyOnceWith(database, cid);
+  expect(ensure).toHaveBeenCalledTimes(1);
+  release();
+  await waitOnExecutionContext(connection.ctx);
+  expect(await stats()).toHaveLength(0);
+});
+
+it("aborting an idle wake removes the actual durable actor waiter and never opens gateway", async () => {
+  await sleeping("idle");
+  const stub = testEnv.DATABASE_ACTOR.get(
+    testEnv.DATABASE_ACTOR.idFromName(database),
+  ) as unknown as DurableObjectStub;
+  const controller = new AbortController();
+  const pending = open({ signal: controller.signal });
+  await expect
+    .poll(() =>
+      runInDurableObject(
+        stub,
+        (instance) =>
+          (instance as unknown as { waiters: Map<string, unknown> }).waiters
+            .size,
+      ),
+    )
+    .toBe(1);
+  expect(await stats()).toHaveLength(0);
+  controller.abort();
+  const connection = await pending;
+  expect(await errorCode(connection)).toBe("08006");
+  await waitOnExecutionContext(connection.ctx);
+  expect(
+    await runInDurableObject(
+      stub,
+      (instance) =>
+        (instance as unknown as { waiters: Map<string, unknown> }).waiters.size,
+    ),
+  ).toBe(0);
+  expect(await stats()).toHaveLength(0);
 });

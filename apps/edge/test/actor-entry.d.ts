@@ -4,3 +4,12 @@ export function seedKnownDatabase(
   namespace: object,
   id: string,
 ): Promise<void>;
+
+export function publishPowerObservation(
+  env: object,
+  ctx: ExecutionContext,
+  database: string,
+  revision: number,
+  operation: string,
+  state: "awake" | "hibernated",
+): Promise<Response>;

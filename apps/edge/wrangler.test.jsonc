@@ -10,9 +10,14 @@
     },
   ],
   "durable_objects": {
-    "bindings": [{ "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" }],
+    "bindings": [
+      { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
+      { "name": "REGION_LINK", "class_name": "RegionLink" },
+    ],
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DatabaseActor"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["DatabaseActor", "RegionLink"] },
+  ],
   "ratelimits": [
     {
       "name": "DATABASE_CONNECTION_RATE_LIMITER",
