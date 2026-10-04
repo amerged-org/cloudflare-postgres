@@ -1,0 +1,316 @@
+// SPDX-License-Identifier: Apache-2.0
+import { env } from "cloudflare:workers";
+import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { DatabaseWithOperation, newDatabaseId } from "@pgcf/contracts";
+import { Hono } from "hono";
+import { afterEach, expect, it, vi } from "vitest";
+import type { ApiEnv } from "../../src/env.ts";
+import {
+  reconcileDatabaseActors,
+  readDatabasePresence,
+  syncDatabaseActor,
+} from "../../src/domain/database-actor-sync.ts";
+import { cleanupFixtures, fixture } from "./fixtures.ts";
+
+afterEach(async () => {
+  vi.restoreAllMocks();
+  await cleanupFixtures();
+});
+const actor = (id: string) =>
+  env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
+function admissionQueries() {
+  const spy = vi.spyOn(Object.getPrototypeOf(env.DB), "prepare");
+  return () => spy.mock.calls.length;
+}
+async function ready() {
+  const f = await fixture();
+  const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  const id = created.database.id;
+  await env.DB.prepare(
+    "UPDATE databases SET observed_state='ready',observed_generation=generation WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  return { ...f, id };
+}
+async function sync(id: string) {
+  const app = new Hono<ApiEnv>();
+  app.get("/sync", async (c) =>
+    c.json({ synced: await syncDatabaseActor(c, id) }),
+  );
+  const response = await app.fetch(
+    new Request(`https://${["api", "invalid"].join(".")}/sync`),
+    env,
+  );
+  expect(response.status).toBe(200);
+  return ((await response.json()) as { synced: boolean }).synced;
+}
+
+it("one thousand distinct unseeded hints make zero authoritative admission queries", async () => {
+  const count = admissionQueries();
+  for (let index = 0; index < 1000; index++) {
+    const id = newDatabaseId();
+    expect(await actor(id).admit(id, "app")).toEqual({
+      ok: false,
+      sqlstate: "3D000",
+    });
+  }
+  expect(count()).toBe(0);
+}, 30_000);
+
+it("a seeded unknown role makes no D1 admission query and a valid role reads real authoritative D1", async () => {
+  const f = await ready();
+  expect(await sync(f.id)).toBe(true);
+  const count = admissionQueries();
+  expect(await actor(f.id).admit(f.id, "unknown")).toEqual({
+    ok: false,
+    sqlstate: "28P01",
+  });
+  expect(count()).toBe(0);
+  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+    ok: true,
+    region: {
+      id: f.region,
+      gateway_url: `https://${["gateway", "invalid"].join(".")}`,
+      gateway_binding: null,
+    },
+  });
+  expect(count()).toBe(1);
+});
+
+it("stale positive snapshots never authorize deleted roles, databases or projects", async () => {
+  const f = await ready();
+  await sync(f.id);
+  const time = new Date().toISOString();
+  await env.DB.prepare("UPDATE roles SET deleted_at=? WHERE database_id=?")
+    .bind(time, f.id)
+    .run();
+  expect((await actor(f.id).admit(f.id, "app")).ok).toBe(false);
+  await env.DB.prepare("UPDATE roles SET deleted_at=NULL WHERE database_id=?")
+    .bind(f.id)
+    .run();
+  await env.DB.prepare("UPDATE projects SET deleted_at=? WHERE id=?")
+    .bind(time, f.project)
+    .run();
+  expect((await actor(f.id).admit(f.id, "app")).ok).toBe(false);
+  await env.DB.prepare("UPDATE projects SET deleted_at=NULL WHERE id=?")
+    .bind(f.project)
+    .run();
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='deleted',deleted_at=?,generation=generation+1 WHERE id=?",
+  )
+    .bind(time, f.id)
+    .run();
+  expect((await actor(f.id).admit(f.id, "app")).ok).toBe(false);
+});
+
+it("malformed, cross-actor and credential-bearing seeds or invalid roles are refused", async () => {
+  const f = await ready();
+  const snapshot = (await readDatabasePresence(env.DB, f.id))!;
+  await runInDurableObject(actor(f.id), async (instance) => {
+    await expect(
+      instance.seed({ ...snapshot, password: crypto.randomUUID() }),
+    ).rejects.toThrow("invalid_actor_snapshot");
+    await expect(
+      instance.seed({ ...snapshot, roles: ["pg_admin"] }),
+    ).rejects.toThrow("invalid_actor_snapshot");
+    await expect(
+      instance.seed({ ...snapshot, roles: Array<string>(101).fill("app") }),
+    ).rejects.toThrow("invalid_actor_snapshot");
+  });
+  await runInDurableObject(actor(newDatabaseId()), async (instance) => {
+    await expect(instance.seed(snapshot)).rejects.toThrow(
+      "actor_identity_mismatch",
+    );
+  });
+  const count = admissionQueries();
+  expect(await actor(f.id).admit(f.id, "pg_admin")).toEqual({
+    ok: false,
+    sqlstate: "28P01",
+  });
+  expect(count()).toBe(0);
+});
+
+it("durable negative snapshot survives actual actor eviction without storing credentials", async () => {
+  const f = await ready();
+  await sync(f.id);
+  const stub = actor(f.id);
+  await evictDurableObject(stub);
+  const count = admissionQueries();
+  expect(await stub.admit(f.id, "unknown")).toEqual({
+    ok: false,
+    sqlstate: "28P01",
+  });
+  expect(count()).toBe(0);
+  expect((await stub.admit(f.id, "app")).ok).toBe(true);
+  const rows = await runInDurableObject(stub, (_instance, state) =>
+    state.storage.sql.exec("SELECT * FROM database_presence").toArray(),
+  );
+  expect(Object.keys(rows[0]!).sort()).toEqual([
+    "database_id",
+    "deleted",
+    "revision",
+    "roles",
+    "singleton",
+    "updated_at",
+  ]);
+});
+
+it("older or equal-clock seeds cannot revive a durable deletion tombstone", async () => {
+  const f = await ready();
+  const old = (await readDatabasePresence(env.DB, f.id))!;
+  await actor(f.id).seed(old);
+  await actor(f.id).seed({ ...old, deleted: true, roles: [] });
+  await actor(f.id).seed(old);
+  await actor(f.id).seed({
+    ...old,
+    revision: old.revision + 1,
+    updated_at: new Date().toISOString(),
+  });
+  const count = admissionQueries();
+  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "3D000",
+  });
+  expect(count()).toBe(0);
+});
+
+it("equal revision/time conflicts converge current role additions and removals from D1", async () => {
+  const f = await ready();
+  const old = (await readDatabasePresence(env.DB, f.id))!;
+  await actor(f.id).seed(old);
+  await env.DB.prepare(
+    "UPDATE roles SET deleted_at=? WHERE database_id=? AND name='app'",
+  )
+    .bind(old.updated_at, f.id)
+    .run();
+  await sync(f.id);
+  await actor(f.id).seed(old);
+  const count = admissionQueries();
+  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "28P01",
+  });
+  expect(count()).toBe(0);
+  await env.DB.prepare(
+    "UPDATE roles SET deleted_at=NULL WHERE database_id=? AND name='app'",
+  )
+    .bind(f.id)
+    .run();
+  await sync(f.id);
+  expect((await actor(f.id).admit(f.id, "app")).ok).toBe(true);
+});
+
+it("keyset pages converge legacy databases and subsequent role/deletion snapshots", async () => {
+  const f = await ready();
+  const second = DatabaseWithOperation.parse(
+    await (await f.create("second")).json(),
+  ).database.id;
+  const seen: string[] = [];
+  let after: string | undefined;
+  do {
+    const page = await reconcileDatabaseActors(env, after, 1);
+    seen.push(...page.ids);
+    after = page.next ?? undefined;
+  } while (after);
+  expect(seen).toContain(f.id);
+  expect(seen).toContain(second);
+  expect(new Set(seen).size).toBe(seen.length);
+  expect((await actor(f.id).admit(f.id, "app")).ok).toBe(true);
+  await expect(reconcileDatabaseActors(env, undefined, 201)).rejects.toThrow(
+    "invalid_actor_page_limit",
+  );
+  const time = new Date().toISOString();
+  await env.DB.prepare(
+    "UPDATE databases SET desired_state='deleted',deleted_at=?,generation=generation+1 WHERE id=?",
+  )
+    .bind(time, f.id)
+    .run();
+  await reconcileDatabaseActors(env);
+  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "3D000",
+  });
+});
+
+it("known roles make independent authoritative requests and unavailable D1 never admits", async () => {
+  const f = await ready();
+  await sync(f.id);
+  const other = await ready();
+  await sync(other.id);
+  const count = admissionQueries();
+  const replies = await Promise.all(
+    Array.from({ length: 8 }, (_, index) => {
+      const id = index % 2 ? other.id : f.id;
+      return actor(id).admit(id, "app");
+    }),
+  );
+  expect(replies.every((reply) => reply.ok)).toBe(true);
+  expect(count()).toBe(8);
+  await runInDurableObject(actor(f.id), async (instance) => {
+    const db = (instance as unknown as { env: { DB: D1Database } }).env.DB;
+    const prepare = vi.spyOn(db, "prepare").mockImplementation(() => {
+      throw new Error("unavailable");
+    });
+    try {
+      expect(await instance.admit(f.id, "app")).toEqual({
+        ok: false,
+        sqlstate: "08006",
+      });
+    } finally {
+      prepare.mockRestore();
+    }
+  });
+});
+
+it("older revisions and timestamps cannot reintroduce roles while fresh sync repairs omissions", async () => {
+  const f = await ready();
+  const original = (await readDatabasePresence(env.DB, f.id))!;
+  const newer = {
+    ...original,
+    revision: original.revision + 1,
+    updated_at: new Date(Date.parse(original.updated_at) + 1).toISOString(),
+    roles: [],
+  };
+  await actor(f.id).seed(newer);
+  await actor(f.id).seed(original);
+  await actor(f.id).seed({
+    ...newer,
+    updated_at: original.updated_at,
+    roles: ["app"],
+  });
+  const count = admissionQueries();
+  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "28P01",
+  });
+  expect(count()).toBe(0);
+  await env.DB.prepare(
+    "UPDATE databases SET generation=?,updated_at=? WHERE id=?",
+  )
+    .bind(newer.revision, newer.updated_at, f.id)
+    .run();
+  await sync(f.id);
+  expect((await actor(f.id).admit(f.id, "app")).ok).toBe(true);
+});
+
+it("seeded running roles still require a currently ready database and live region metadata", async () => {
+  const f = await ready();
+  await sync(f.id);
+  await env.DB.prepare("UPDATE databases SET observed_state='error' WHERE id=?")
+    .bind(f.id)
+    .run();
+  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "57P03",
+  });
+  await env.DB.prepare(
+    "UPDATE databases SET observed_state='ready',desired_state='suspended' WHERE id=?",
+  )
+    .bind(f.id)
+    .run();
+  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "57P03",
+  });
+});
