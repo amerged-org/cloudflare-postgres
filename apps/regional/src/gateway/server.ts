@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
-import { createServer, type IncomingMessage, type Server } from "node:http";
+import {
+  createServer,
+  type IncomingMessage,
+  type Server,
+  type ServerResponse,
+} from "node:http";
 import type { Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import type { TLSSocket } from "node:tls";
@@ -37,6 +42,14 @@ export {
 
 export interface GatewayOptions {
   readonly region: string;
+  readonly fenceSynchronization?: {
+    readonly ready: boolean;
+    readonly epoch: number;
+  };
+  readonly control?: (
+    request: IncomingMessage,
+    response: ServerResponse,
+  ) => boolean;
   readonly keyring: RouteKeyring;
   readonly dial: PostgresDial;
   readonly databaseLimit?: number;
@@ -77,6 +90,7 @@ export interface Gateway {
     readonly memoryBytes: number;
     readonly peakMemoryBytes: number;
   };
+  quiesceStatus(database: string, operation: string): QuiesceReport;
   beginQuiesce(database: string, operation: string): QuiesceReport;
   releaseQuiesce(database: string, operation: string): void;
   closeQuiesced(database: string, operation: string): Promise<QuiesceReport>;
@@ -178,17 +192,28 @@ export function createGateway(options: GatewayOptions): Gateway {
     perMessageDeflate: false,
     allowSynchronousEvents: true,
   });
+  const synchronized = () => options.fenceSynchronization?.ready ?? true;
   const server = createServer((request, response) => {
+    if (options.control?.(request, response)) return;
     const path = request.url?.split("?", 1)[0];
     if (
       request.method === "GET" &&
       (path === "/healthz" || path === "/readyz")
     ) {
-      response.writeHead(path === "/readyz" && draining ? 503 : 200, {
-        "Content-Type": "text/plain",
-        "Cache-Control": "no-store",
-      });
-      response.end(draining && path === "/readyz" ? "draining\n" : "ok\n");
+      response.writeHead(
+        path === "/readyz" && (draining || !synchronized()) ? 503 : 200,
+        {
+          "Content-Type": "text/plain",
+          "Cache-Control": "no-store",
+        },
+      );
+      response.end(
+        path === "/readyz" && draining
+          ? "draining\n"
+          : path === "/readyz" && !synchronized()
+            ? "unsynchronized\n"
+            : "ok\n",
+      );
     } else {
       response.writeHead(path === "/pg" ? 400 : 404, {
         "Content-Type": "text/plain",
@@ -239,7 +264,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       rejectUpgrade(socket, 400);
       return;
     }
-    if (draining) {
+    if (draining || !synchronized()) {
       rejectUpgrade(socket, 503);
       return;
     }
@@ -247,6 +272,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     const token = typeof value === "string" ? value : undefined;
     const now = Date.now();
     const admissionEpoch = fenceEpoch;
+    const synchronizationEpoch = options.fenceSynchronization?.epoch;
     const verified = await verifyRouteToken(token, {
       region: options.region,
       keys: options.keyring.keys,
@@ -263,6 +289,8 @@ export function createGateway(options: GatewayOptions): Gateway {
     const claims = verified.claims;
     if (
       draining ||
+      !synchronized() ||
+      options.fenceSynchronization?.epoch !== synchronizationEpoch ||
       fenced(claims.db) ||
       (fenceEpochs.get(claims.db) ?? 0) > admissionEpoch
     ) {
@@ -450,6 +478,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       if (
         finished ||
         draining ||
+        !synchronized() ||
         abort.signal.aborted ||
         client.readyState !== WebSocket.OPEN ||
         socket.destroyed ||
@@ -497,6 +526,10 @@ export function createGateway(options: GatewayOptions): Gateway {
     };
     const connect = async () => {
       try {
+        if (!synchronized()) {
+          parkedFailure();
+          return;
+        }
         postgres = await options.dial(databaseTarget(claims.db), abort.signal);
         postgres.once("error", parkedFailure);
         postgres.once("close", parkedFailure);
@@ -828,6 +861,11 @@ export function createGateway(options: GatewayOptions): Gateway {
   return {
     server,
     metrics,
+    quiesceStatus(database, operation) {
+      validateFence(database, operation);
+      if (fenced(database)) matchingFence(database, operation);
+      return report(database, operation);
+    },
     beginQuiesce(database, operation) {
       validateFence(database, operation);
       const current = fences.get(database);

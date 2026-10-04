@@ -72,6 +72,11 @@ spec:
                 secretKeyRef:
                   name: pgcf-gateway
                   key: PGCF_ROUTE_KEY
+            - name: PGCF_GATEWAY_POD_UID
+              valueFrom:
+                fieldRef:
+                  apiVersion: v1
+                  fieldPath: metadata.uid
             - name: PGCF_GATEWAY_PORT
               value: "8080"
           ports:

@@ -7,3 +7,4 @@ export * from "./encoding.ts";
 export * from "./errors.ts";
 export * from "./ids.ts";
 export * from "./sizing.ts";
+export * from "./gateway-control.ts";
