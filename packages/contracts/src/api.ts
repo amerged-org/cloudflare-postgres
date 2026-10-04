@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
+import { MAINTENANCE_ROLE } from "./maintenance.ts";
 import {
   ApiKeyScope,
   ApiKeyString,
@@ -341,6 +342,10 @@ export type Role = z.infer<typeof Role>;
 
 export const RoleCreate = z
   .strictObject({ name: RoleName })
+  .refine((role) => role.name !== MAINTENANCE_ROLE, {
+    path: ["name"],
+    message: "Role name is reserved for internal maintenance",
+  })
   .meta({ id: "RoleCreate" });
 export type RoleCreate = z.infer<typeof RoleCreate>;
 

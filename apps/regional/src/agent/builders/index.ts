@@ -7,6 +7,8 @@ import {
   DatabaseId,
   DesiredDatabase,
   OWNER_ROLE_NAME,
+  MAINTENANCE_ROLE,
+  MAINTENANCE_BOOTSTRAP_SQL,
   RoleName,
   SIDECAR,
   gib,
@@ -40,6 +42,7 @@ const BARMAN_PLUGIN = "barman-cloud.cloudnative-pg.io";
 const CLUSTER_NAME = "database";
 const ARCHIVE_NAME = "archive";
 const ARCHIVE_SECRET = "archive-credentials";
+const MAINTENANCE_SECRET = "maintenance-credentials";
 
 function dnsName(value: string): boolean {
   return (
@@ -166,20 +169,39 @@ export function buildDatabaseManifests(
     cpu: millicores(db.size.cpu_millicores),
     memory: mib(db.size.memory_mib),
   };
-  const managedRoles = db.roles
-    .filter((role) => !role.owner)
-    .map((role) => ({
-      name: role.name,
-      ensure: "present",
-      login: true,
-      superuser: false,
-      createdb: false,
-      createrole: false,
-      replication: false,
-      bypassrls: false,
-      inherit: true,
-      passwordSecret: { name: roleSecretName(role.name) },
-    }));
+  const managedRoles = [
+    ...db.roles
+      .filter((role) => !role.owner)
+      .map((role) => ({
+        name: role.name,
+        ensure: "present",
+        login: true,
+        superuser: false,
+        createdb: false,
+        createrole: false,
+        replication: false,
+        bypassrls: false,
+        inherit: true,
+        passwordSecret: { name: roleSecretName(role.name) },
+      })),
+    ...(db.maintenance
+      ? [
+          {
+            name: MAINTENANCE_ROLE,
+            ensure: "present",
+            login: true,
+            superuser: false,
+            createdb: false,
+            createrole: false,
+            replication: false,
+            bypassrls: false,
+            inherit: true,
+            inRoles: ["pg_read_all_stats"],
+            passwordSecret: { name: MAINTENANCE_SECRET },
+          },
+        ]
+      : []),
+  ];
   return [
     {
       apiVersion: "v1",
@@ -380,6 +402,27 @@ export function buildDatabaseManifests(
         password: Buffer.from(role.password, "utf8").toString("base64"),
       },
     })),
+    ...(db.maintenance
+      ? [
+          {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: {
+              ...metadata(MAINTENANCE_SECRET),
+              labels: { ...labels, "cnpg.io/reload": "true" },
+            },
+            type: "kubernetes.io/basic-auth",
+            data: {
+              username: Buffer.from(MAINTENANCE_ROLE, "utf8").toString(
+                "base64",
+              ),
+              password: Buffer.from(db.maintenance.password, "utf8").toString(
+                "base64",
+              ),
+            },
+          },
+        ]
+      : []),
     {
       apiVersion: "v1",
       kind: "Secret",
@@ -444,6 +487,9 @@ export function buildDatabaseManifests(
             database: db.id,
             owner: OWNER_ROLE_NAME,
             secret: { name: roleSecretName(OWNER_ROLE_NAME) },
+            ...(db.maintenance
+              ? { postInitApplicationSQL: [...MAINTENANCE_BOOTSTRAP_SQL] }
+              : {}),
           },
         },
         affinity: { nodeSelector: { "kubernetes.io/hostname": db.node } },

@@ -12,6 +12,7 @@ import {
   newRolePassword,
   OWNER_ROLE_NAME,
   NodeObservation,
+  MAINTENANCE_ROLE,
 } from "../src/index.ts";
 
 const id = newDatabaseId();
@@ -76,6 +77,33 @@ function observation(): Record<string, unknown> {
     orphans: [],
   };
 }
+
+it("keeps maintenance separate and optional on desired pages", () => {
+  const old = desired();
+  expect(DesiredDatabase.parse(old).maintenance).toBeUndefined();
+  const maintenance = {
+    role: MAINTENANCE_ROLE,
+    password: newRolePassword(),
+    revision: 1,
+  };
+  expect(DesiredDatabase.parse({ ...old, maintenance }).maintenance).toEqual(
+    maintenance,
+  );
+  expect(
+    DesiredDatabase.safeParse({
+      ...old,
+      roles: [
+        ...(old.roles as unknown[]),
+        {
+          name: MAINTENANCE_ROLE,
+          password: maintenance.password,
+          revision: 1,
+          owner: false,
+        },
+      ],
+    }).success,
+  ).toBe(false);
+});
 
 describe("platform CPU observation compatibility", () => {
   it("keeps absent measurements unknown while accepting measured zero and null", () => {

@@ -7,6 +7,7 @@
   "exports": {
     ".": "./src/index.ts",
     "./usage": "./src/usage.ts",
+    "./maintenance": "./src/maintenance.ts",
     "./route-token": "./src/route-token.ts",
     "./pg-wire": "./src/pg-wire.ts",
     "./gateway-control": "./src/gateway-control.ts"

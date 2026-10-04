@@ -8,6 +8,10 @@ import {
   type DesiredSize,
 } from "@pgcf/contracts";
 import { keyring } from "../crypto/keyring.ts";
+import {
+  MAINTENANCE_ROLE,
+  type MaintenanceCredential,
+} from "@pgcf/contracts/maintenance";
 import type { ApiContext } from "../env.ts";
 import { agentRegion } from "./agent-auth.ts";
 import type { DatabaseRow, RoleRow } from "./rows.ts";
@@ -19,6 +23,10 @@ interface DesiredRow extends DatabaseRow, DesiredSize {
   creation_generation: number | null;
   creation_status: DesiredCreation["status"] | null;
   ever_ready: number;
+  maintenance_ciphertext: string | null;
+  maintenance_iv: string | null;
+  maintenance_kid: string | null;
+  maintenance_revision: number | null;
 }
 export async function desired(
   c: ApiContext,
@@ -29,9 +37,11 @@ export async function desired(
     `SELECT d.*,n.k8s_node_name,s.memory_mib,s.cpu_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json,
     o.id creation_operation_id,o.generation creation_generation,o.status creation_status,
-    EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready
+    EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready,
+    m.password_ciphertext maintenance_ciphertext,m.password_iv maintenance_iv,m.password_kid maintenance_kid,m.password_revision maintenance_revision
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
     LEFT JOIN operations o ON o.id=substr(d.archive_path,-23) AND o.kind='database.create' AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation
+    LEFT JOIN maintenance_credentials m ON m.database_id=d.id
     WHERE d.region_id=? AND d.desired_state IN('running','deleted') AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
     ${query.after ? "AND d.id>?" : ""} ORDER BY d.id LIMIT ?`,
   )
@@ -42,8 +52,20 @@ export async function desired(
   const credentials = keyring(c.env.CREDENTIAL_KEYS);
   for (const row of rows) {
     const roles: DesiredDatabase["roles"] = [];
+    let maintenance: MaintenanceCredential | undefined;
     // Deletion can recover even if a credential key has been retired.
     if (row.desired_state !== "deleted") {
+      if (row.maintenance_ciphertext !== null) {
+        maintenance = {
+          role: MAINTENANCE_ROLE,
+          revision: row.maintenance_revision!,
+          password: await credentials.decrypt(row.id, MAINTENANCE_ROLE, {
+            ciphertext: row.maintenance_ciphertext,
+            iv: row.maintenance_iv!,
+            kid: row.maintenance_kid!,
+          }),
+        };
+      }
       const stored = JSON.parse(row.roles_json) as RoleRow[];
       for (const role of stored.sort((a, b) => a.name.localeCompare(b.name)))
         roles.push({
@@ -73,6 +95,7 @@ export async function desired(
           backup_retention_days: row.backup_retention_days,
         },
         roles,
+        ...(maintenance === undefined ? {} : { maintenance }),
         creation:
           row.creation_operation_id === null
             ? null
