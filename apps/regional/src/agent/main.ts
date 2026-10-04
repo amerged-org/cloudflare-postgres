@@ -4,6 +4,7 @@ import { readConfig } from "./config.ts";
 import { kubernetesFromConfig } from "./kubernetes.ts";
 import { AgentLink } from "./link.ts";
 import { AgentLoop } from "./loop.ts";
+import { RegionalMeasurements } from "./measurements.ts";
 import { PowerCoordinator } from "./power.ts";
 import type { Log } from "./types.ts";
 
@@ -36,8 +37,16 @@ async function main(): Promise<void> {
       region: config.regionId,
       replicas: config.gatewayReplicas,
     });
+    const api = new AgentApi(config);
+    const measurements = new RegionalMeasurements({
+      k8s: (signal) => kubernetesFromConfig(signal, config.kubeconfigFile),
+      signal: controller.signal,
+      region: config.regionId,
+      snapshot: (signal) => power.gatewaySnapshot(signal),
+      api,
+    });
     const loop = new AgentLoop(
-      new AgentApi(config),
+      api,
       kubernetes,
       config.postgresImage,
       controller.signal,
@@ -46,9 +55,14 @@ async function main(): Promise<void> {
       fetch,
       undefined,
       power,
+      measurements,
     );
     const link = new AgentLink(config, () => loop.hint(), log);
-    await Promise.all([loop.run(), link.run(controller.signal)]);
+    await Promise.all([
+      loop.run(),
+      link.run(controller.signal),
+      measurements.run(),
+    ]);
   } finally {
     controller.abort();
     process.removeListener("SIGTERM", shutdown);
