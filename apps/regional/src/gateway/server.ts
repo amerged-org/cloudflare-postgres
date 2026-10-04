@@ -4,6 +4,8 @@ import type { Socket } from "node:net";
 import type { Duplex } from "node:stream";
 import type { TLSSocket } from "node:tls";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
+import { isDatabaseId, isOperationId } from "@pgcf/contracts";
+import { PostgresActivity, WebSocketInputActivity } from "./activity.ts";
 import {
   ReplayCache,
   ROUTE_TOKEN_HEADER,
@@ -48,6 +50,25 @@ export interface GatewayOptions {
   readonly log?: (event: Readonly<Record<string, string | number>>) => void;
 }
 
+/** Local transport acknowledgement; SQL transaction/prepared-work and WAL checks remain mandatory. */
+export interface QuiesceReport {
+  readonly database: string;
+  readonly operation: string;
+  readonly status: "idle" | "busy" | "closed";
+  readonly connections: number;
+  readonly busyConnections: number;
+  readonly pendingDials: number;
+}
+
+interface SessionControl {
+  readonly database: string;
+  pause(): void;
+  resume(): void;
+  busy(): boolean;
+  pendingDial(): boolean;
+  close(): Promise<void>;
+}
+
 export interface Gateway {
   readonly server: Server;
   readonly metrics: {
@@ -56,6 +77,9 @@ export interface Gateway {
     readonly memoryBytes: number;
     readonly peakMemoryBytes: number;
   };
+  beginQuiesce(database: string, operation: string): QuiesceReport;
+  releaseQuiesce(database: string, operation: string): void;
+  closeQuiesced(database: string, operation: string): Promise<QuiesceReport>;
   drain(): Promise<void>;
 }
 
@@ -84,6 +108,54 @@ export function createGateway(options: GatewayOptions): Gateway {
     ((event) => process.stdout.write(`${JSON.stringify(event)}\n`));
   const counts = new Map<string, number>();
   const pending = new Set<AbortController>();
+  const sessions = new Map<WebSocket, SessionControl>();
+  const fences = new Map<
+    string,
+    { operation: string; closing?: Promise<QuiesceReport> }
+  >();
+  const fenceEpochs = new Map<string, number>();
+  let fenceEpoch = 0;
+  const fenced = (database: string) => fences.has(database);
+  const validateFence = (database: string, operation: string) => {
+    if (!isDatabaseId(database) || !isOperationId(operation))
+      throw new RangeError("invalid quiescence identity");
+  };
+  const matchingFence = (database: string, operation: string) => {
+    validateFence(database, operation);
+    const fence = fences.get(database);
+    if (!fence || fence.operation !== operation)
+      throw new Error("quiescence fence mismatch");
+    return fence;
+  };
+  const report = (database: string, operation: string): QuiesceReport => {
+    const owned = [...sessions.values()].filter(
+      (session) => session.database === database,
+    );
+    const busyConnections = owned.filter((session) => session.busy()).length;
+    return {
+      database,
+      operation,
+      status: busyConnections === 0 ? "idle" : "busy",
+      connections: owned.length,
+      busyConnections,
+      pendingDials: owned.filter((session) => session.pendingDial()).length,
+    };
+  };
+  const closeClient = (client: WebSocket): Promise<void> =>
+    new Promise((resolve) => {
+      if (client.readyState === WebSocket.CLOSED) {
+        resolve();
+        return;
+      }
+      const deadline = setTimeout(() => client.terminate(), 500);
+      client.once("close", () => {
+        clearTimeout(deadline);
+        resolve();
+      });
+      if (client.readyState === WebSocket.OPEN)
+        client.close(1000, "database sleeping");
+      else client.terminate();
+    });
   const clients = new Set<WebSocket>();
   const sockets = new Set<Socket>();
   const metrics = {
@@ -174,6 +246,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     const value = request.headers[ROUTE_TOKEN_HEADER.toLowerCase()];
     const token = typeof value === "string" ? value : undefined;
     const now = Date.now();
+    const admissionEpoch = fenceEpoch;
     const verified = await verifyRouteToken(token, {
       region: options.region,
       keys: options.keyring.keys,
@@ -188,7 +261,11 @@ export function createGateway(options: GatewayOptions): Gateway {
       return;
     }
     const claims = verified.claims;
-    if (draining) {
+    if (
+      draining ||
+      fenced(claims.db) ||
+      (fenceEpochs.get(claims.db) ?? 0) > admissionEpoch
+    ) {
       rejectUpgrade(socket, 503);
       return;
     }
@@ -213,12 +290,14 @@ export function createGateway(options: GatewayOptions): Gateway {
       MAX_STARTUP_BUFFER_BYTES,
       head,
     );
+    const wire = new WebSocketInputActivity();
+    ingress.prependListener("data", (chunk: Buffer) => wire.observe(chunk));
     try {
       websockets.handleUpgrade(request, ingress, Buffer.alloc(0), (client) => {
         accepted = true;
         clients.add(client);
         client.binaryType = "fragments";
-        startup(client, ingress, request, claims, release);
+        startup(client, ingress, request, claims, release, wire);
       });
     } finally {
       if (!accepted) {
@@ -234,6 +313,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     request: IncomingMessage,
     claims: RouteTokenClaims,
     release: () => void,
+    wire: WebSocketInputActivity,
   ): void {
     const abort = new AbortController();
     const reader = new StartupReader(MAX_STARTUP_BUFFER_BYTES);
@@ -261,6 +341,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       postgres?.destroy();
       queue.length = 0;
       clients.delete(client);
+      sessions.delete(client);
       release();
       log({
         event: "conn_close",
@@ -327,6 +408,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     );
     deadline.unref();
     const heartbeat = setInterval(() => {
+      if (fenced(claims.db)) return;
       if (!alive) {
         finish("heartbeat_timeout");
         client.terminate();
@@ -358,52 +440,67 @@ export function createGateway(options: GatewayOptions): Gateway {
       );
       return true;
     };
+    const parkedFailure = () =>
+      close(1000, "postgres_connect_error", {
+        sqlstate: "08006",
+        message: "database connection failed",
+      });
+    const handoff = () => {
+      if (!postgres) return;
+      if (
+        finished ||
+        draining ||
+        abort.signal.aborted ||
+        client.readyState !== WebSocket.OPEN ||
+        socket.destroyed ||
+        socket.readableEnded ||
+        postgres.destroyed ||
+        postgres.readableEnded
+      ) {
+        postgres.destroy();
+        close(1012, "gateway_draining");
+        return;
+      }
+      if (fenced(claims.db)) return;
+      postgres.removeListener("error", parkedFailure);
+      postgres.removeListener("close", parkedFailure);
+      socket.setMaxPayload(MAX_PAYLOAD_BYTES);
+      handedOff = true;
+      pending.delete(abort);
+      clearTimeout(deadline);
+      clearInterval(heartbeat);
+      abort.signal.removeEventListener("abort", interrupted);
+      socket.removeListener("close", disconnected);
+      socket.removeListener("end", disconnected);
+      socket.removeListener("error", disconnected);
+      request.removeListener("aborted", disconnected);
+      client.removeListener("close", clientClosed);
+      client.removeListener("error", clientError);
+      client.removeListener("pong", pong);
+      client.removeListener("message", message);
+      socket.removeListener("rejected", rejected);
+      startupMemory.release();
+      const initial = queue.splice(0);
+      relay(
+        client,
+        socket,
+        postgres,
+        claims.db,
+        claims.cid,
+        release,
+        initial,
+        queueMemory,
+        started,
+        bytesOut,
+        wire,
+      );
+    };
     const connect = async () => {
       try {
         postgres = await options.dial(databaseTarget(claims.db), abort.signal);
-        if (
-          finished ||
-          draining ||
-          abort.signal.aborted ||
-          client.readyState !== WebSocket.OPEN ||
-          socket.destroyed ||
-          socket.readableEnded ||
-          postgres.destroyed ||
-          postgres.readableEnded
-        ) {
-          postgres.destroy();
-          close(1012, "gateway_draining");
-          return;
-        }
-        socket.setMaxPayload(MAX_PAYLOAD_BYTES);
-        handedOff = true;
-        pending.delete(abort);
-        clearTimeout(deadline);
-        clearInterval(heartbeat);
-        abort.signal.removeEventListener("abort", interrupted);
-        socket.removeListener("close", disconnected);
-        socket.removeListener("end", disconnected);
-        socket.removeListener("error", disconnected);
-        request.removeListener("aborted", disconnected);
-        client.removeListener("close", clientClosed);
-        client.removeListener("error", clientError);
-        client.removeListener("pong", pong);
-        client.removeListener("message", message);
-        socket.removeListener("rejected", rejected);
-        startupMemory.release();
-        const initial = queue.splice(0);
-        relay(
-          client,
-          socket,
-          postgres,
-          claims.db,
-          claims.cid,
-          release,
-          initial,
-          queueMemory,
-          started,
-          bytesOut,
-        );
+        postgres.once("error", parkedFailure);
+        postgres.once("close", parkedFailure);
+        handoff();
       } catch {
         close(1000, "postgres_connect_error", {
           sqlstate: "08006",
@@ -411,8 +508,21 @@ export function createGateway(options: GatewayOptions): Gateway {
         });
       }
     };
+    sessions.set(client, {
+      database: claims.db,
+      pause: () => client.pause(),
+      resume: () => {
+        alive = true;
+        if (postgres) handoff();
+        if (!finished && !handedOff) client.resume();
+      },
+      busy: () => true,
+      pendingDial: () => connecting && !postgres,
+      close: () => closeClient(client),
+    });
     const message = (data: RawData, binary: boolean) => {
       const lease = socket.takeMessage();
+      wire.consumeMessage();
       try {
         if (finished || handedOff) return;
         for (const chunk of toBuffers(data)) receive(chunk, binary);
@@ -493,6 +603,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     client.on("message", message);
     abort.signal.addEventListener("abort", interrupted, { once: true });
     if (draining) interrupted();
+    else if (fenced(claims.db)) client.pause();
     else if (socket.destroyed || socket.readableEnded || request.aborted)
       disconnected();
   }
@@ -508,13 +619,20 @@ export function createGateway(options: GatewayOptions): Gateway {
     initialMemory: MemoryLease,
     started: number,
     initialBytesOut: number,
+    wire: WebSocketInputActivity,
   ): void {
+    const activity = new PostgresActivity();
+    const held: { chunks: readonly Buffer[]; lease?: MemoryLease }[] = [];
+    let heldBytes = 0;
+    let pendingWrites = 0;
+    let outbound = 0;
     let bytesIn = 0;
     let bytesOut = initialBytesOut;
     let alive = true;
     let finished = false;
     let outcome = "closed";
     const heartbeat = setInterval(() => {
+      if (fenced(database)) return;
       if (!alive) {
         outcome = "heartbeat_timeout";
         client.terminate();
@@ -536,6 +654,9 @@ export function createGateway(options: GatewayOptions): Gateway {
       clearInterval(heartbeat);
       postgres.destroy();
       clients.delete(client);
+      sessions.delete(client);
+      for (const entry of held) entry.lease?.release();
+      held.length = 0;
       release();
       log({
         event: "conn_close",
@@ -583,8 +704,10 @@ export function createGateway(options: GatewayOptions): Gateway {
       bytesIn += length;
       client.pause();
       let remaining = chunks.length;
+      pendingWrites += chunks.length;
       for (const chunk of chunks) {
         postgres.write(chunk, (error) => {
+          pendingWrites--;
           if (--remaining === 0) lease?.release();
           if (error) {
             outcome = "postgres_error";
@@ -592,11 +715,12 @@ export function createGateway(options: GatewayOptions): Gateway {
           }
         });
       }
-      if (!postgres.writableNeedDrain) client.resume();
+      if (!postgres.writableNeedDrain && !fenced(database)) client.resume();
       buffered();
     };
     client.on("message", (data: RawData, binary: boolean) => {
       const lease = ingress.takeMessage();
+      wire.consumeMessage();
       if (!binary) {
         lease?.release();
         outcome = "text_frame";
@@ -604,10 +728,23 @@ export function createGateway(options: GatewayOptions): Gateway {
         client.close(1003, "binary frames required");
         return;
       }
-      forward(toBuffers(data), lease);
+      const chunks = toBuffers(data);
+      for (const chunk of chunks) activity.observeFrontend(chunk);
+      if (fenced(database)) {
+        const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
+        if (length > MAX_PAYLOAD_BYTES - heldBytes) {
+          lease?.release();
+          ingress.rejectMemory();
+          return;
+        }
+        heldBytes += length;
+        held.push({ chunks, lease });
+        client.pause();
+      } else forward(chunks, lease);
     });
     postgres.on("drain", () => {
-      if (client.readyState === WebSocket.OPEN) client.resume();
+      if (client.readyState === WebSocket.OPEN && !fenced(database))
+        client.resume();
     });
     postgres.on("error", () => {
       outcome = "postgres_error";
@@ -620,6 +757,8 @@ export function createGateway(options: GatewayOptions): Gateway {
       if (client.readyState === WebSocket.OPEN) client.close(1000);
     });
     postgres.on("data", (chunk: Buffer) => {
+      activity.observeBackend(chunk);
+      outbound++;
       postgres.pause();
       const lease = ingress.memory.lease();
       if (
@@ -639,6 +778,7 @@ export function createGateway(options: GatewayOptions): Gateway {
           return;
         }
         if (offset === chunk.length) {
+          outbound--;
           lease.release();
           postgres.resume();
           return;
@@ -658,6 +798,29 @@ export function createGateway(options: GatewayOptions): Gateway {
       };
       send();
     });
+    sessions.set(client, {
+      database,
+      // Keep consuming until a complete post-fence message is retained, so partial input remains visible.
+      pause: () => {},
+      resume: () => {
+        alive = true;
+        for (const entry of held.splice(0)) forward(entry.chunks, entry.lease);
+        heldBytes = 0;
+        if (!postgres.writableNeedDrain && !finished) client.resume();
+      },
+      busy: () =>
+        activity.busy ||
+        wire.busy ||
+        held.length !== 0 ||
+        pendingWrites !== 0 ||
+        outbound !== 0 ||
+        ingress.readableLength !== 0 ||
+        postgres.writableLength !== 0 ||
+        client.bufferedAmount !== 0,
+      pendingDial: () => false,
+      close: () => closeClient(client),
+    });
+    for (const chunk of initial.slice(1)) activity.observeFrontend(chunk);
     forward(initial, initialMemory);
     postgres.resume();
   }
@@ -665,6 +828,49 @@ export function createGateway(options: GatewayOptions): Gateway {
   return {
     server,
     metrics,
+    beginQuiesce(database, operation) {
+      validateFence(database, operation);
+      const current = fences.get(database);
+      if (current && current.operation !== operation)
+        throw new Error("quiescence fence mismatch");
+      if (!current) {
+        fences.set(database, { operation });
+        fenceEpochs.set(database, ++fenceEpoch);
+      }
+      for (const session of sessions.values())
+        if (session.database === database) session.pause();
+      return report(database, operation);
+    },
+    releaseQuiesce(database, operation) {
+      const current = matchingFence(database, operation);
+      if (current.closing) throw new Error("quiescence close in progress");
+      fences.delete(database);
+      for (const session of sessions.values())
+        if (session.database === database) session.resume();
+    },
+    closeQuiesced(database, operation) {
+      const current = matchingFence(database, operation);
+      if (current.closing) return current.closing;
+      const snapshot = report(database, operation);
+      if (snapshot.status === "busy") return Promise.resolve(snapshot);
+      current.closing = (async () => {
+        await Promise.all(
+          [...sessions.values()]
+            .filter((session) => session.database === database)
+            .map((session) => session.close()),
+        );
+        return { ...report(database, operation), status: "closed" as const };
+      })();
+      void current.closing.then(
+        () => {
+          current.closing = undefined;
+        },
+        () => {
+          current.closing = undefined;
+        },
+      );
+      return current.closing;
+    },
     drain() {
       if (drainPromise) return drainPromise;
       draining = true;
