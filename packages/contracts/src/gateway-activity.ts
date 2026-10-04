@@ -117,7 +117,7 @@ export const gatewayActivityReportSchema = z
   });
 export type GatewayActivityReport = z.infer<typeof gatewayActivityReportSchema>;
 const encoder = new TextEncoder(),
-  decoder = new TextDecoder("utf-8", { fatal: true });
+  decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 const keyPurpose = "pgcf-gateway-activity-key/v1\n",
   signingPurpose = "pgcf-gateway-activity/v1\n";
 async function hmac(key: Uint8Array, value: string): Promise<Uint8Array> {
