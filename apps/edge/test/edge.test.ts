@@ -312,6 +312,53 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(await stats()).toHaveLength(0);
   });
 
+  it("unknown users cannot exhaust the database bucket before a valid role is admitted", async () => {
+    let consumed = 0;
+    const databaseLimiter = {
+      limit: vi.fn(async ({ key }: { key: string }) => {
+        expect(key).toBe(database);
+        return { success: ++consumed <= 2 };
+      }),
+    } as RateLimit;
+    const bindings = {
+      ...testEnv,
+      DATABASE_CONNECTION_RATE_LIMITER: databaseLimiter,
+    };
+    for (let index = 0; index < 2; index++) {
+      const user = `r${crypto.randomUUID().replaceAll("-", "")}`;
+      const unknown = await open({ bindings, user });
+      expect(await errorCode(unknown)).toBe("28P01");
+    }
+    const valid = await open({ bindings });
+    expect(JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome).toBe(
+      "accepted",
+    );
+    expect(await stats()).toHaveLength(1);
+    expect(databaseLimiter.limit).toHaveBeenCalledTimes(1);
+    valid.socket.send(encodeStartup({ user: "app", database }));
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...encodeStartup({ user: "app", database })]);
+  });
+
+  it("unknown database and role hints never consume a database bucket or contact the gateway", async () => {
+    const databaseLimiter = {
+      limit: vi.fn(async () => ({ success: true })),
+    } as RateLimit;
+    const bindings = {
+      ...testEnv,
+      DATABASE_CONNECTION_RATE_LIMITER: databaseLimiter,
+    };
+    expect(
+      await errorCode(await open({ bindings, database: newDatabaseId() })),
+    ).toBe("3D000");
+    expect(await errorCode(await open({ bindings, user: "missing" }))).toBe(
+      "28P01",
+    );
+    expect(databaseLimiter.limit).not.toHaveBeenCalled();
+    expect(await stats()).toHaveLength(0);
+  });
+
   it("rejects suspended and non-ready databases before a gateway call", async () => {
     const states = [
       { desired: "suspended", observed: "ready", observedGeneration: 2 },
