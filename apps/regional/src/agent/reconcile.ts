@@ -8,6 +8,7 @@ import {
   type PowerObservation,
 } from "./power.ts";
 import { createHash } from "node:crypto";
+import { ApiException } from "@kubernetes/client-node";
 import { gatewayFenceName } from "@pgcf/contracts/gateway-control";
 import { retireGatewayFence } from "./retire.ts";
 import type {
@@ -41,6 +42,69 @@ import { record, string, uid } from "./types.ts";
 import type { Kubernetes, Resource, Log } from "./types.ts";
 import { probeRoles } from "./readiness.ts";
 import type { AuthenticationProbe } from "./readiness.ts";
+
+type ApplyStage =
+  | "storage_binding"
+  | "manifest_build"
+  | "namespace_patch"
+  | "namespace_create"
+  | "manifest_apply"
+  | "cluster_patch"
+  | "cluster_create"
+  | "namespace_readback"
+  | "namespace_complete";
+const DIAGNOSTIC_HTTP_STATUS = new Set([
+  400, 401, 403, 404, 408, 409, 410, 412, 413, 415, 422, 429, 500, 502, 503,
+  504,
+]);
+const APPLY_GUARD_ERRORS = new Set([
+  "resource_ownership_conflict",
+  "resource_identity_missing",
+  "storage_fence_version_missing",
+  "storage_fence_missing",
+  "storage_fence_identity_changed",
+  "database_namespace_version_missing",
+  "database_cluster_version_missing",
+  "database_namespace_deleting",
+  "builder_namespace_invalid",
+  "builder_resource_scope_invalid",
+]);
+function applyFailure(error: unknown): { category: string; status?: number } {
+  try {
+    const status = error instanceof ApiException ? error.code : undefined;
+    if (
+      typeof status === "number" &&
+      Number.isInteger(status) &&
+      DIAGNOSTIC_HTTP_STATUS.has(status)
+    ) {
+      return {
+        category:
+          status === 409
+            ? "api_conflict"
+            : [412, 422].includes(status)
+              ? "api_precondition"
+              : [401, 403].includes(status)
+                ? "api_authorization"
+                : status === 404
+                  ? "api_not_found"
+                  : status === 429 || status >= 500
+                    ? "api_unavailable"
+                    : "api_rejected",
+        status,
+      };
+    }
+    if (
+      error instanceof Error &&
+      typeof error.message === "string" &&
+      error.message.length <= 64 &&
+      APPLY_GUARD_ERRORS.has(error.message)
+    )
+      return { category: "guard" };
+  } catch {
+    /* Exception contents are untrusted diagnostics input. */
+  }
+  return { category: "unknown" };
+}
 
 interface VolumeIdentity {
   name: string;
@@ -482,6 +546,7 @@ export class Reconciler {
       this.phaseNow,
     );
     let applyOutcome: WakePhaseOutcome = "pending";
+    let applyStage: ApplyStage = "storage_binding";
     try {
       storage = storage ?? {
         namespaceUid: null,
@@ -494,6 +559,7 @@ export class Reconciler {
       fence = await this.saveStorage(db, storage, fence);
 
       if (db.generation > appliedGeneration(namespace)) {
+        applyStage = "manifest_build";
         const manifests = buildDatabaseManifests(db, ctx);
         // Accepted revisions fence out stale pulls before credentials can change. Completion advances last.
         const first = manifests[0];
@@ -513,6 +579,7 @@ export class Reconciler {
           .digest("hex");
         if (this.hashes.get(db.id) !== hash) {
           if (namespace) {
+            applyStage = "namespace_patch";
             if (!namespace.metadata.resourceVersion)
               throw new Error("database_namespace_version_missing");
             await this.k8s.patch("Namespace", undefined, namespaceName, [
@@ -536,7 +603,10 @@ export class Reconciler {
                 },
               },
             ]);
-          } else await this.k8s.create(first);
+          } else {
+            applyStage = "namespace_create";
+            await this.k8s.create(first);
+          }
           const active = await this.k8s.read(
             "Namespace",
             undefined,
@@ -551,12 +621,14 @@ export class Reconciler {
           if (storage.namespaceUid && uid(active) !== storage.namespaceUid)
             return recoveryRequired(db, "database namespace identity changed");
           storage.namespaceUid = uid(active);
+          applyStage = "storage_binding";
           fence = await this.saveStorage(db, storage, fence);
           if (record(active.status).phase !== "Active") return null;
           if (acceptedGeneration(active) !== db.generation) return null;
           if (active.metadata.deletionTimestamp)
             throw new Error("database_namespace_deleting");
           for (const manifest of manifests.slice(1)) {
+            applyStage = "manifest_apply";
             if (
               manifest.metadata.namespace !== namespaceName ||
               manifest.metadata.labels?.[DATABASE_LABEL] !== db.id
@@ -585,9 +657,11 @@ export class Reconciler {
                     "database cluster identity changed",
                   );
                 storage.clusterUid = uid(currentCluster);
+                applyStage = "storage_binding";
                 fence = await this.saveStorage(db, storage, fence);
                 if (!currentCluster.metadata.resourceVersion)
                   throw new Error("database_cluster_version_missing");
+                applyStage = "cluster_patch";
                 await this.k8s.patch("Cluster", namespaceName, "database", [
                   {
                     op: "test",
@@ -619,6 +693,7 @@ export class Reconciler {
               } else {
                 if (storage.clusterUid || !pendingCreation(db))
                   return recoveryRequired(db, "database cluster is missing");
+                applyStage = "cluster_create";
                 await this.k8s.create(manifest);
                 const created = await this.k8s.read(
                   "Cluster",
@@ -632,12 +707,14 @@ export class Reconciler {
                   );
                 assertOwned(created, db.id, "database");
                 storage.clusterUid = uid(created);
+                applyStage = "storage_binding";
                 fence = await this.saveStorage(db, storage, fence);
               }
             } else if (!(await this.applyRevision(db, manifest))) return null;
           }
           this.hashes.set(db.id, hash);
         }
+        applyStage = "namespace_readback";
         const current = await this.k8s.read(
           "Namespace",
           undefined,
@@ -653,6 +730,7 @@ export class Reconciler {
           acceptedGeneration(current) !== db.generation
         )
           return null;
+        applyStage = "namespace_complete";
         await this.k8s.patch("Namespace", undefined, namespaceName, [
           { op: "test", path: "/metadata/uid", value: uid(current) },
           {
@@ -673,6 +751,16 @@ export class Reconciler {
       applyOutcome = "completed";
     } catch (error) {
       applyOutcome = "failed";
+      try {
+        phaseLog?.("wake_apply_failed", {
+          phase: "desired_apply",
+          stage: applyStage,
+          ...applyFailure(error),
+          database_id: db.id,
+        });
+      } catch {
+        /* Logging cannot change the original failure. */
+      }
       throw error;
     } finally {
       finishApply(applyOutcome);
@@ -1277,7 +1365,7 @@ export class Reconciler {
     state: StorageState,
     previous: Resource | null,
   ): Promise<Resource> {
-    const data = { state: JSON.stringify(state) };
+    const data = { ...record(previous?.data), state: JSON.stringify(state) };
     if (
       previous &&
       appliedGeneration(previous) === db.generation &&
