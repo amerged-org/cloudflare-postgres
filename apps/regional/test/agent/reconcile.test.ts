@@ -34,6 +34,269 @@ function archiveSample(
     );
 }
 
+test("an already-ready database stays ready during an archive stall and still authenticates current roles", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  let now = Date.parse("2026-10-04T04:36:00Z");
+  const sample = archiveSample(4, 8, now / 1000 - 1893.679);
+  let probes = 0;
+  let accepted = true;
+  const probe = async () => {
+    probes++;
+    return accepted;
+  };
+  const reconciler = new Reconciler(k8s, signal(), () => now, sample, probe);
+  assert.equal((await reconciler.reconcile(db, ctx))?.state, "ready");
+  db.creation!.ever_ready = true;
+  now += 600_001;
+  const stalled = await reconciler.reconcile(db, ctx);
+  assert.equal(stalled?.state, "ready");
+  assert.equal(stalled?.archive.continuous, false);
+  assert.equal(stalled?.archive.ready_wal_files, 4);
+  assert.match(stalled?.message ?? "", /archiving is unhealthy/);
+  assert.equal(probes, 2);
+  accepted = false;
+  assert.notEqual((await reconciler.reconcile(db, ctx))?.state, "ready");
+  assert.equal(probes, 3);
+  const cluster = k8s.resources.get(
+    k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+  )!;
+  record(cluster.status).conditions = [
+    { type: "Ready", status: "False" },
+    { type: "ContinuousArchiving", status: "True" },
+  ];
+  accepted = true;
+  assert.notEqual((await reconciler.reconcile(db, ctx))?.state, "ready");
+  assert.equal(probes, 3);
+});
+
+test("never-archived sentinel starts a pending queue timer and survives restart without making CREATE healthy", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  const start = Date.parse("2026-10-04T04:36:00Z");
+  const sample = archiveSample(1, 0, -1);
+  const first = await new Reconciler(
+    k8s,
+    signal(),
+    () => start,
+    sample,
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(first?.state, "provisioning");
+  assert.equal(first?.archive.continuous, false);
+  const fence = await k8s.read("ConfigMap", "pgcf-system", `storage-${db.id}`);
+  assert.deepEqual(
+    JSON.parse(fence!.metadata.annotations![ARCHIVE_OBSERVATION_ANNOTATION]!),
+    { archivedCount: 0, lastArchivedTime: -1, pendingSince: start },
+  );
+  const stalled = await new Reconciler(
+    k8s,
+    signal(),
+    () => start + 600_001,
+    sample,
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(stalled?.state, "error");
+  assert.equal(stalled?.archive.continuous, false);
+  db.creation!.ever_ready = true;
+  const existing = await new Reconciler(
+    k8s,
+    signal(),
+    () => start + 600_002,
+    sample,
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(existing?.state, "ready");
+  assert.equal(existing?.archive.continuous, false);
+  const drained = await new Reconciler(
+    k8s,
+    signal(),
+    () => start + 86400_000,
+    archiveSample(0, 0, -1),
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(drained?.state, "ready");
+  assert.equal(drained?.archive.continuous, true);
+});
+
+test("exporter reset persists the new baseline without restarting pending time and later real progress resets it", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  let now = Date.parse("2026-10-04T04:36:00Z");
+  const start = now;
+  let archived = 8;
+  let last = now / 1000 - 1;
+  const sample: typeof fetch = (...args) =>
+    archiveSample(1, archived, last)(...args);
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        () => now,
+        sample,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "ready",
+  );
+  const identity = structuredClone(
+    (await k8s.read("ConfigMap", "pgcf-system", `storage-${db.id}`))?.data,
+  );
+  now += 599_999;
+  archived = 0;
+  last = -1;
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        () => now,
+        sample,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "provisioning",
+  );
+  const fence = await k8s.read("ConfigMap", "pgcf-system", `storage-${db.id}`);
+  assert.deepEqual(
+    JSON.parse(fence!.metadata.annotations![ARCHIVE_OBSERVATION_ANNOTATION]!),
+    { archivedCount: 0, lastArchivedTime: -1, pendingSince: start },
+  );
+  now += 2;
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        () => now,
+        sample,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "error",
+  );
+  archived = 1;
+  last = now / 1000;
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        () => now,
+        sample,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "ready",
+  );
+  const advanced = await k8s.read(
+    "ConfigMap",
+    "pgcf-system",
+    `storage-${db.id}`,
+  );
+  assert.equal(
+    JSON.parse(advanced!.metadata.annotations![ARCHIVE_OBSERVATION_ANNOTATION]!)
+      .pendingSince,
+    now,
+  );
+  assert.deepEqual(advanced?.data, identity);
+  now += 600_001;
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        () => now,
+        sample,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "error",
+  );
+});
+
+test("a counter-only reset cannot use a newer timestamp to discard the original pending deadline", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  const start = Date.parse("2026-10-04T04:36:00Z");
+  await new Reconciler(
+    k8s,
+    signal(),
+    () => start,
+    archiveSample(1, 8, start / 1000 - 2),
+    authenticate,
+  ).reconcile(db, ctx);
+  const reset = await new Reconciler(
+    k8s,
+    signal(),
+    () => start + 600_001,
+    archiveSample(1, 1, start / 1000 - 1),
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(reset?.state, "error");
+  assert.equal(reset?.archive.continuous, false);
+  const fence = await k8s.read("ConfigMap", "pgcf-system", `storage-${db.id}`);
+  assert.deepEqual(
+    JSON.parse(fence!.metadata.annotations![ARCHIVE_OBSERVATION_ANNOTATION]!),
+    {
+      archivedCount: 1,
+      lastArchivedTime: start / 1000 - 1,
+      pendingSince: start,
+    },
+  );
+});
+
+test("existing database readiness remains separate from measured CNPG failure and 32-file backlog health", async () => {
+  const { db, ctx } = fixture();
+  const k8s = new MemoryKubernetes();
+  const now = Date.parse("2026-10-04T04:36:00Z");
+  await new Reconciler(
+    k8s,
+    signal(),
+    () => now,
+    archiveSample(0, 8, now / 1000 - 1),
+    authenticate,
+  ).reconcile(db, ctx);
+  db.creation!.ever_ready = true;
+  const cluster = k8s.resources.get(
+    k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+  )!;
+  record(cluster.status).conditions = [
+    { type: "Ready", status: "True" },
+    {
+      type: "ContinuousArchiving",
+      status: "False",
+      lastTransitionTime: new Date(now - 600_001).toISOString(),
+    },
+  ];
+  const failed = await new Reconciler(
+    k8s,
+    signal(),
+    () => now,
+    archiveSample(0, 8, now / 1000 - 1),
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(failed?.state, "ready");
+  assert.equal(failed?.archive.continuous, false);
+  assert.match(failed?.message ?? "", /archiving is unhealthy/);
+  record(cluster.status).conditions = [
+    { type: "Ready", status: "True" },
+    { type: "ContinuousArchiving", status: "True" },
+  ];
+  const backlog = await new Reconciler(
+    k8s,
+    signal(),
+    () => now,
+    archiveSample(32, 8, now / 1000 - 1),
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(backlog?.state, "ready");
+  assert.equal(backlog?.archive.continuous, false);
+  assert.equal(backlog?.archive.ready_wal_files, 32);
+  assert.match(backlog?.message ?? "", /archiving is unhealthy/);
+});
+
 test("four pending WAL files with a successful CNPG condition become unhealthy when actual archival progress stalls", async () => {
   const { db, ctx } = fixture();
   const k8s = new MemoryKubernetes();
@@ -214,6 +477,12 @@ test("future metrics and regressing archive evidence never clear a persisted pen
   ).reconcile(db, ctx);
   assert.equal(future?.state, "provisioning");
   assert.equal(future?.archive.continuous, false);
+  assert.equal(
+    k8s.resources.get(key)!.metadata.annotations?.[
+      ARCHIVE_OBSERVATION_ANNOTATION
+    ],
+    before,
+  );
   const regression = await new Reconciler(
     k8s,
     signal(),
@@ -221,14 +490,16 @@ test("future metrics and regressing archive evidence never clear a persisted pen
     archiveSample(1, 7, now / 1000 - 2),
     authenticate,
   ).reconcile(db, ctx);
-  assert.equal(regression?.state, "provisioning");
+  assert.equal(regression?.state, "error");
   assert.equal(regression?.archive.continuous, false);
-  assert.equal(
-    k8s.resources.get(key)!.metadata.annotations?.[
+  const reset = JSON.parse(
+    k8s.resources.get(key)!.metadata.annotations![
       ARCHIVE_OBSERVATION_ANNOTATION
-    ],
-    before,
+    ]!,
   );
+  assert.equal(reset.pendingSince, JSON.parse(before!).pendingSince);
+  assert.equal(reset.archivedCount, 7);
+  assert.equal(reset.lastArchivedTime, now / 1000 - 2);
 });
 
 test("malformed or future durable observations and invalid clocks fail closed", async () => {

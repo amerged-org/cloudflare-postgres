@@ -22,25 +22,30 @@ export function parseArchiveProgress(
   metrics: string,
   now: number,
 ): ArchiveProgress {
-  const metric = (name: string) => {
+  const metric = (name: string, signed = false) => {
     const lines = metrics
       .split("\n")
       .filter((line) => new RegExp(`^${name}(?:\\{|\\s)`).test(line));
     if (lines.length !== 1) throw new Error("archive_progress_missing");
     const match = new RegExp(
-      `^${name}(?:\\{[^}]*\\})?\\s+([0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)(?:\\s+[0-9]+)?\\s*$`,
+      `^${name}(?:\\{[^}]*\\})?\\s+(${signed ? "-?" : ""}[0-9]+(?:\\.[0-9]+)?(?:[eE][+-]?[0-9]+)?)(?:\\s+[0-9]+)?\\s*$`,
     ).exec(lines[0]!);
     const value = match ? Number(match[1]) : NaN;
-    if (!Number.isFinite(value) || value < 0)
-      throw new Error("archive_progress_invalid");
+    if (!Number.isFinite(value)) throw new Error("archive_progress_invalid");
     return value;
   };
   const archivedCount = metric("cnpg_pg_stat_archiver_archived_count");
-  const lastArchivedTime = metric("cnpg_pg_stat_archiver_last_archived_time");
+  const lastArchivedTime = metric(
+    "cnpg_pg_stat_archiver_last_archived_time",
+    true,
+  );
   if (
     !Number.isSafeInteger(now) ||
     now < 0 ||
     !Number.isSafeInteger(archivedCount) ||
+    archivedCount < 0 ||
+    (lastArchivedTime < 0 &&
+      !(archivedCount === 0 && lastArchivedTime === -1)) ||
     lastArchivedTime > now / 1000 ||
     (archivedCount > 0 && lastArchivedTime === 0)
   )

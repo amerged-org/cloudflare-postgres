@@ -119,6 +119,32 @@ test("archive progress accepts real fractional scientific epoch samples and reje
   );
 });
 
+test("CNPG never-archived sentinel is accepted only with the exact zero archived count pair", () => {
+  const now = Date.parse("2026-10-04T04:36:00Z");
+  const sample =
+    "cnpg_pg_stat_archiver_archived_count 0\ncnpg_pg_stat_archiver_last_archived_time -1\n";
+  assert.deepEqual(parseArchiveProgress(sample, now), {
+    archivedCount: 0,
+    lastArchivedTime: -1,
+  });
+  assert.throws(
+    () => parseArchiveProgress(sample.replace("count 0", "count 1"), now),
+    /invalid/,
+  );
+  assert.throws(
+    () => parseArchiveProgress(sample.replace("time -1", "time -2"), now),
+    /invalid/,
+  );
+  assert.throws(
+    () => parseArchiveProgress(sample.replace("count 0", "count -1"), now),
+    /invalid/,
+  );
+  assert.throws(
+    () => parseArchiveProgress(sample.replace("time -1", "time -0.5"), now),
+    /invalid/,
+  );
+});
+
 test("inventory rejects repeated continuation tokens and changing snapshots instead of returning partial data", async () => {
   let page = 0;
   const value = {

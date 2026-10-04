@@ -600,7 +600,10 @@ export class Reconciler {
       archive?.status === "True" &&
       measured &&
       count !== null &&
-      (count === 0 || (progress !== null && stalled !== null)) &&
+      (count === 0 ||
+        (progress !== null &&
+          progress.lastArchivedTime !== -1 &&
+          stalled !== null)) &&
       !backlog &&
       !stalled;
     if (archive?.status === "True") this.archiveFailures.delete(db.id);
@@ -628,10 +631,8 @@ export class Reconciler {
     const ca = string(record(caMap?.data)["ca.crt"]);
     const credentialsApplied =
       condition(cluster, "Ready")?.status === "True" &&
-      continuous &&
       publicCa &&
       desiredApplied &&
-      count !== null &&
       ca
         ? await this.authenticate(db, ca, this.signal)
         : false;
@@ -639,20 +640,22 @@ export class Reconciler {
       stalled === true ||
       (archive?.status === "False" &&
         now - (this.archiveFailures.get(db.id) ?? now) >= ARCHIVE_FAILURE_MS);
+    const databaseReady =
+      condition(cluster, "Ready")?.status === "True" &&
+      publicCa &&
+      desiredApplied &&
+      credentialsApplied &&
+      count !== null &&
+      (continuous ||
+        (db.creation?.ever_ready === true && measured && stalled !== null));
     return {
       id: db.id,
       generation: db.generation,
-      state:
-        unhealthy || backlog
+      state: databaseReady
+        ? "ready"
+        : unhealthy || backlog
           ? "error"
-          : condition(cluster, "Ready")?.status === "True" &&
-              continuous &&
-              publicCa &&
-              desiredApplied &&
-              credentialsApplied &&
-              count !== null
-            ? "ready"
-            : "provisioning",
+          : "provisioning",
       ...(unhealthy || backlog
         ? { message: "continuous WAL archiving is unhealthy" }
         : {}),
@@ -682,7 +685,8 @@ export class Reconciler {
           (value.archivedCount as number) < 0 ||
           typeof value.lastArchivedTime !== "number" ||
           !Number.isFinite(value.lastArchivedTime) ||
-          value.lastArchivedTime < 0 ||
+          (value.lastArchivedTime < 0 &&
+            !(value.archivedCount === 0 && value.lastArchivedTime === -1)) ||
           value.lastArchivedTime > now / 1000 ||
           ((value.archivedCount as number) > 0 && value.lastArchivedTime === 0)
         )
@@ -694,18 +698,17 @@ export class Reconciler {
     }
     if (count === null || (count > 0 && !progress)) return null;
     if (count === 0 && !previous) return false;
-    if (
+    const reset = Boolean(
       count > 0 &&
       previous &&
       progress &&
-      progress.lastArchivedTime <= previous.lastArchivedTime &&
       (progress.archivedCount < previous.archivedCount ||
-        progress.lastArchivedTime < previous.lastArchivedTime)
-    )
-      return null;
+        progress.lastArchivedTime < previous.lastArchivedTime),
+    );
     const advanced =
       previous &&
       progress &&
+      !reset &&
       (progress.lastArchivedTime > previous.lastArchivedTime ||
         progress.archivedCount > previous.archivedCount);
     const next: ArchiveObservation = {
