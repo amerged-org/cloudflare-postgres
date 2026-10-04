@@ -10,7 +10,8 @@
     "./maintenance": "./src/maintenance.ts",
     "./route-token": "./src/route-token.ts",
     "./pg-wire": "./src/pg-wire.ts",
-    "./gateway-control": "./src/gateway-control.ts"
+    "./gateway-control": "./src/gateway-control.ts",
+    "./gateway-activity": "./src/gateway-activity.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

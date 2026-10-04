@@ -9,3 +9,4 @@ export * from "./ids.ts";
 export * from "./sizing.ts";
 export * from "./gateway-control.ts";
 export * from "./maintenance.ts";
+export * from "./gateway-activity.ts";
