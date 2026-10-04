@@ -37,6 +37,8 @@ async function admit(
   hints: Hints,
   cid: string,
   signal: AbortSignal,
+  deadline: number,
+  ctx: ExecutionContext,
 ): Promise<{ socket: WebSocket; region: string }> {
   const check = () => {
     if (signal.aborted)
@@ -61,9 +63,26 @@ async function admit(
     throw new AdmissionFailure("53300", "connection admission unavailable");
   }
   check();
-  const admitted = await env.DATABASE_ACTOR.get(
+  const actor = env.DATABASE_ACTOR.get(
     env.DATABASE_ACTOR.idFromName(hints.database),
-  ).admit(hints.database, hints.user);
+  );
+  const cancel = () =>
+    ctx.waitUntil(
+      Promise.resolve()
+        .then(() => actor.cancelWakeWaiter(hints.database, cid))
+        .catch(() => false),
+    );
+  signal.addEventListener("abort", cancel, { once: true });
+  let admitted;
+  try {
+    check();
+    admitted = await actor.ensureAwake(hints.database, hints.user, {
+      deadline,
+      waiterId: cid,
+    });
+  } finally {
+    signal.removeEventListener("abort", cancel);
+  }
   check();
   if (!admitted.ok) {
     switch (admitted.sqlstate) {
@@ -124,6 +143,7 @@ async function boundedAdmission(
   cid: string,
   ctx: ExecutionContext,
 ): Promise<{ socket: WebSocket; region: string }> {
+  const deadline = Date.now() + ADMISSION_DEADLINE_MS;
   const controller = new AbortController();
   const abort = () => controller.abort();
   request.signal.addEventListener("abort", abort, { once: true });
@@ -135,10 +155,10 @@ async function boundedAdmission(
     if (controller.signal.aborted) refuse();
     else controller.signal.addEventListener("abort", refuse, { once: true });
   });
-  const timer = setTimeout(abort, ADMISSION_DEADLINE_MS);
+  const timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
   const admission = Promise.race([
     interrupted,
-    admit(request, env, hints, cid, controller.signal),
+    admit(request, env, hints, cid, controller.signal, deadline, ctx),
   ]);
   ctx.waitUntil(
     admission.then(

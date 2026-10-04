@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-export const ADMISSION_DEADLINE_MS = 10_000;
+export const ADMISSION_DEADLINE_MS = 30_000;
 
 /** IPv4 admission is per address; IPv6 admission is per canonical /64. */
 export function connectionRateKey(ip: string | null): string | null {
