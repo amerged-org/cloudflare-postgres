@@ -11,6 +11,7 @@ export const MESSAGE_BYTES = 1024 * 1024;
 export const CLIENT_LIMIT = 16;
 export const HANDSHAKE_MS = 10_000;
 export const FRAGMENT_LIMIT = 128;
+export const HALF_CLOSE_MS = 10_000;
 
 export interface Session {
   local: Socket;
@@ -56,7 +57,7 @@ export async function startBridge(
   const endings = new Set<Promise<void>>();
   let closing: Promise<void> | undefined;
   const server = createServer(
-    { highWaterMark: STREAM_BYTES, allowHalfOpen: false },
+    { highWaterMark: STREAM_BYTES, allowHalfOpen: true },
     (local) => {
       local.on("error", () => {});
       if (closing || sessions.size >= CLIENT_LIMIT) {
@@ -81,9 +82,11 @@ export async function startBridge(
       endings.add(ended);
       void ended.then(() => endings.delete(ended));
       let finished = false;
+      let halfCloseTimer: ReturnType<typeof setTimeout> | undefined;
       const finish = () => {
         if (finished) return;
         finished = true;
+        if (halfCloseTimer) clearTimeout(halfCloseTimer);
         local.unpipe(stream);
         stream.unpipe(local);
         local.destroy();
@@ -96,6 +99,15 @@ export async function startBridge(
       upstream.on("error", finish);
       local.once("error", finish);
       local.once("close", finish);
+      local.once("end", () => {
+        if (finished) return;
+        // WebSocket has no half-close: retain its readable side while queued bytes drain.
+        halfCloseTimer = setTimeout(
+          finish,
+          HALF_CLOSE_MS +
+            (upstream.readyState === WebSocket.CONNECTING ? HANDSHAKE_MS : 0),
+        );
+      });
       stream.once("close", finish);
       upstream.once("close", () => {
         // Let the readable stream flush admitted bytes before ending local TCP.
@@ -116,7 +128,7 @@ export async function startBridge(
       });
       local.setNoDelay(true);
       hooks.session?.(session);
-      local.pipe(stream);
+      local.pipe(stream, { end: false });
       stream.pipe(local);
     },
   );
