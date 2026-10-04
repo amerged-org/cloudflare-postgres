@@ -51,7 +51,7 @@ remain unmet. A real read-only transaction stayed ready for 74 s despite the 60 
 The live collector samples each database at least 15 s apart. A real minute contained four
 allocation and eight gateway samples. Storage-used and backup measurements remain unknown.
 The cost API reports null and a named node_rate gap until an actual contract/invoice fact is
-recorded. Usage accuracy and retirement still need full Dev acceptance. The production-ready
+recorded. The current E0–E5 run passed through agent-restarted deletion: 102,548 ms, zero volumes/archives, its routing marker removed and both gateways still Ready. Usage accuracy and the cold-wake target still need full Dev acceptance. The production-ready
 release through Phase 5 and complete Neon replacement are not complete.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
