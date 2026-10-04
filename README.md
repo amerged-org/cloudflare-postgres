@@ -32,13 +32,12 @@ a rolled-back marker and reclaimed its target storage; full PITR and disaster re
 
 Raw 100 MiB and 1 GiB stream checks, slow reception and 600 seconds idle passed. A 10-second
 read load measured 735.604 SQL/s over 50 warmed connections, p95 75.368 ms and zero errors.
-These observations do not establish maximum throughput or 1,000-customer capacity. Random routing
-hints can still amplify D1 reads. Default-text clients and raw COPY pass; decoded binary-result
+These observations do not establish maximum throughput or 1,000-customer capacity. Deployed Actor admission rejects unregistered routing hints before D1; the Edge no longer has a D1 binding. Known routes still require current authoritative D1. Default-text clients and raw COPY pass; decoded binary-result
 assertions remain failed on WebSocket and direct TCP with node-postgres 8.22. Intermittent Tail
 correlation remains unresolved.
 
 The installable CLI passed real psql transactions, rollback and 105 MB binary COPY integrity.
-CPU placement and sleep-safety work are underway; hibernation, wake, usage and costs remain pending.
+CPU placement and Actor admission are deployed. Usage contracts and immutable lifecycle snapshots are implemented; real collectors, sleep/wake and costs remain pending.
 The second EU node is untouched, the US node has not been bought and no customer or platform
 database has been migrated. Image signing and the complete production-ready release remain pending.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
