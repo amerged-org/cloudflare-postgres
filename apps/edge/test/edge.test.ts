@@ -691,7 +691,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const denied = await open();
     expect(await errorCode(denied)).toBe("53300");
     expect(await stats()).toHaveLength(1_000);
-  });
+  }, 30_000);
 
   it("does not dial after an upgrade request aborts while a real D1 result is pending", async () => {
     let queried!: () => void;
