@@ -883,3 +883,78 @@ test("accepted lagging gateway time uses actual receipt cadence without changing
   await restarted.cycle();
   assert.equal(calls, 2);
 });
+
+test("hibernated zero-Pod databases retain measured allocation from their exact bound claim", async () => {
+  const state = await setup();
+  state.db.desired_state = "suspended";
+  state.db.generation = 2;
+  const cluster = state.k8s.resources.get(
+    state.k8s.key("Cluster", `pgcf-db-${state.db.id}`, "database"),
+  )!;
+  delete record(cluster.status).currentPrimary;
+  record(cluster.status).conditions = [
+    { type: "cnpg.io/hibernation", status: "True", reason: "Hibernated" },
+  ];
+  for (const [key, resource] of state.k8s.resources)
+    if (
+      resource.kind === "Pod" &&
+      resource.metadata.namespace === `pgcf-db-${state.db.id}`
+    )
+      state.k8s.resources.delete(key);
+  const fence = state.k8s.resources.get(
+    state.k8s.key("ConfigMap", "pgcf-system", gatewayFenceName(state.db.id)),
+  )!;
+  const intent = JSON.parse(String(record(fence.data)["intent.json"]));
+  intent.revision = 2;
+  intent.mode = "quiesce";
+  record(fence.data)["intent.json"] = JSON.stringify(intent);
+  const meter = new RegionalMeasurements({
+    k8s: state.k8s,
+    signal: state.signal,
+    region: "eu-test",
+    snapshot: async () => structuredClone(state.snapshot),
+    fetcher: async (input, options) => {
+      const response = await state.fetcher(input, options);
+      return Response.json({
+        ...((await response.json()) as object),
+        revision: 2,
+      });
+    },
+    api: state.api,
+    now: state.now,
+  });
+  meter.update([state.db]);
+  await meter.cycle();
+  const allocated = state.usages[0]!.samples.find(
+    (sample) => sample.source === "agent",
+  );
+  assert.equal(
+    allocated?.source === "agent" && allocated.storage_allocated_bytes,
+    state.db.size.storage_gib * 2 ** 30,
+  );
+  assert.equal(
+    allocated?.source === "agent" && allocated.storage_used_bytes,
+    null,
+  );
+  assert.equal(
+    (await state.k8s.list("Pod", `pgcf-db-${state.db.id}`)).length,
+    0,
+  );
+  const claim = state.k8s.resources.get(
+    state.k8s.key(
+      "PersistentVolumeClaim",
+      `pgcf-db-${state.db.id}`,
+      "database-1",
+    ),
+  )!;
+  claim.metadata.uid = randomUUID();
+  state.advance(15000);
+  await meter.cycle();
+  const changed = state.usages
+    .at(-1)!
+    .samples.find((sample) => sample.source === "agent");
+  assert.equal(
+    changed?.source === "agent" && changed.storage_allocated_bytes,
+    null,
+  );
+});

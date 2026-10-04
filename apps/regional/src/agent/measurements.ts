@@ -463,24 +463,43 @@ export class RegionalMeasurements {
         ),
       );
       const primary = string(record(cluster.status).currentPrimary);
-      if (primary) {
-        const claim = await k8s.read(
-          "PersistentVolumeClaim",
-          `pgcf-db-${db.id}`,
-          primary,
-        );
-        if (
-          claim &&
-          claim.metadata.uid === volumeIdentity.claimUid &&
-          claim.metadata.namespace === namespace.metadata.name &&
-          claim.metadata.name === primary &&
-          !claim.metadata.deletionTimestamp &&
-          record(claim.status).phase === "Bound" &&
-          record(claim.spec).storageClassName === "pgcf-lvm"
-        ) {
-          const value = quantity(record(record(claim.status).capacity).storage);
-          if (Number.isSafeInteger(value) && value >= 0) allocated = value;
-        }
+      const claims = primary
+        ? [
+            await k8s.read(
+              "PersistentVolumeClaim",
+              namespace.metadata.name,
+              primary,
+            ),
+          ]
+        : await k8s.list(
+            "PersistentVolumeClaim",
+            namespace.metadata.name,
+            "cnpg.io/cluster=database",
+          );
+      const matches = claims.filter(
+        (claim) => claim?.metadata.uid === volumeIdentity.claimUid,
+      );
+      const claim = matches.length === 1 ? matches[0] : undefined;
+      const owners = record(claim?.metadata).ownerReferences;
+      if (
+        claim &&
+        claim.metadata.namespace === namespace.metadata.name &&
+        (!primary || claim.metadata.name === primary) &&
+        claim.metadata.labels?.["cnpg.io/cluster"] === cluster.metadata.name &&
+        Array.isArray(owners) &&
+        owners.some(
+          (owner) =>
+            record(owner).uid === cluster.metadata.uid &&
+            record(owner).kind === cluster.kind &&
+            record(owner).name === cluster.metadata.name &&
+            record(owner).apiVersion === cluster.apiVersion,
+        ) &&
+        !claim.metadata.deletionTimestamp &&
+        record(claim.status).phase === "Bound" &&
+        record(claim.spec).storageClassName === "pgcf-lvm"
+      ) {
+        const value = quantity(record(record(claim.status).capacity).storage);
+        if (Number.isSafeInteger(value) && value >= 0) allocated = value;
       }
     } catch {
       /* Allocation remains unknown when its bound claim cannot be established. */
