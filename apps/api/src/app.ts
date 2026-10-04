@@ -2,6 +2,7 @@
 import { createRoute, OpenAPIHono, z } from "@hono/zod-openapi";
 import { ERROR_HTTP_STATUS, errorBody, type ErrorCode } from "@pgcf/contracts";
 import { HTTPException } from "hono/http-exception";
+import { routePath } from "hono/route";
 import { version } from "../package.json";
 import type { ApiContext, ApiEnv } from "./env.ts";
 import { registerDomain } from "./routes/domain.ts";
@@ -9,8 +10,40 @@ import { registerPlatform } from "./routes/platform.ts";
 
 export type ApiApp = OpenAPIHono<ApiEnv>;
 export const REQUEST_ID_HEADER = "X-Request-Id";
+export const DIAGNOSTIC_ID_HEADER = "X-PGCF-Diagnostic-Id";
 export const JSON_BODY_MAX_BYTES = 64 * 1024;
 const REQUEST_ID_PATTERN = /^[A-Za-z0-9._~-]{1,128}$/;
+const DIAGNOSTIC_METHODS = new Set([
+  "GET",
+  "HEAD",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+  "OPTIONS",
+]);
+const DIAGNOSTIC_ROUTES = new Set([
+  "/healthz",
+  "/v1/openapi.json",
+  "/v1/api-keys",
+  "/v1/api-keys/:id",
+  "/v1/projects",
+  "/v1/projects/:id",
+  "/v1/size-classes",
+  "/v1/size-classes/:id",
+  "/v1/regions",
+  "/v1/nodes",
+  "/v1/databases",
+  "/v1/databases/:id",
+  "/v1/databases/:id/roles",
+  "/v1/databases/:id/roles/:name/reset-password",
+  "/v1/databases/:id/roles/:name/connection-uri",
+  "/v1/operations/:id",
+  "/v1/databases/:id/archive",
+  "/agent/v1/desired",
+  "/agent/v1/observations",
+  "/agent/v1/link",
+]);
 
 export class ApiError extends Error {
   readonly code: ErrorCode;
@@ -116,6 +149,8 @@ export function createApp(): ApiApp {
   });
 
   app.use("*", async (c, next) => {
+    const diagnosticId = crypto.randomUUID();
+    const started = performance.now();
     const supplied = c.req.header(REQUEST_ID_HEADER);
     const requestId =
       supplied !== undefined && REQUEST_ID_PATTERN.test(supplied)
@@ -123,8 +158,23 @@ export function createApp(): ApiApp {
         : crypto.randomUUID();
     c.set("requestId", requestId);
     c.header(REQUEST_ID_HEADER, requestId);
+    c.header(DIAGNOSTIC_ID_HEADER, diagnosticId);
     await next();
     c.header(REQUEST_ID_HEADER, requestId);
+    c.header(DIAGNOSTIC_ID_HEADER, diagnosticId);
+    if (c.res.status >= 400) {
+      const matched = routePath(c, -1);
+      console.error(
+        JSON.stringify({
+          event: "api_request_failed",
+          diagnostic_id: diagnosticId,
+          method: DIAGNOSTIC_METHODS.has(c.req.method) ? c.req.method : "OTHER",
+          route: DIAGNOSTIC_ROUTES.has(matched) ? matched : "unmatched",
+          status: c.res.status,
+          elapsed_ms: Math.round(performance.now() - started),
+        }),
+      );
+    }
   });
 
   app.use("*", async (c, next) => {
