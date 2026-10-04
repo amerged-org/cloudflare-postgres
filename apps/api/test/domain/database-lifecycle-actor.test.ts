@@ -87,6 +87,20 @@ async function untilWake(id: string, generation = 3) {
   throw new Error("wake_not_started");
 }
 
+it("admits an already-ready route with one fresh authoritative read", async () => {
+  const f = await ready();
+  const prepare = vi.spyOn(Object.getPrototypeOf(env.DB), "prepare");
+  expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
+    ok: true,
+    region: {
+      id: f.region,
+      gateway_url: `https://${["gateway", "invalid"].join(".")}`,
+      gateway_binding: null,
+    },
+  });
+  expect(prepare).toHaveBeenCalledTimes(1);
+});
+
 it("coalesces ten idle wake waiters into one durable operation and hint, releasing only exact readiness", async () => {
   const f = await ready();
   await idle(f);

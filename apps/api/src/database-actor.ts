@@ -58,6 +58,17 @@ interface AdmissionRow {
   gateway_binding: string | null;
 }
 
+function admittedRoute(row: AdmissionRow): DatabaseAdmission {
+  const region = RegionRoute.safeParse({
+    id: row.id,
+    gateway_url: row.gateway_url,
+    gateway_binding: row.gateway_binding,
+  });
+  return region.success
+    ? { ok: true, region: region.data }
+    : { ok: false, sqlstate: "08006" };
+}
+
 export class DatabaseActor extends DurableObject<Env> {
   private waiters = new Map<
     string,
@@ -191,14 +202,7 @@ export class DatabaseActor extends DurableObject<Env> {
           row.observed_generation !== row.generation)
       )
         return { ok: false, sqlstate: "57P03" };
-      const region = RegionRoute.safeParse({
-        id: row.id,
-        gateway_url: row.gateway_url,
-        gateway_binding: row.gateway_binding,
-      });
-      return region.success
-        ? { ok: true, region: region.data }
-        : { ok: false, sqlstate: "08006" };
+      return admittedRoute(row);
     } catch {
       return { ok: false, sqlstate: "08006" };
     }
@@ -386,7 +390,7 @@ export class DatabaseActor extends DurableObject<Env> {
         (!current.power_operation ||
           current.observed_generation === current.generation)
       )
-        return this.admit(id.data, role.data);
+        return admittedRoute(current);
       if (
         current.desired_state === "suspended" &&
         current.suspension_reason !== "idle"
