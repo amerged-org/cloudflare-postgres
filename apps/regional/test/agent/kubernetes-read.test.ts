@@ -35,3 +35,32 @@ test("PVC reads use the core API and retain resource identity", async (t) => {
   assert.equal(claim?.apiVersion, "v1");
   assert.equal(claim?.metadata.uid, uid);
 });
+
+test("ConfigMap deletion routes exact UID and resourceVersion preconditions through the core client", async (t) => {
+  const namespace = "pgcf-system",
+    name = "fixture",
+    uid = randomUUID(),
+    resourceVersion = "12";
+  let deleted = 0;
+  t.mock.method(KubeConfig.prototype, "loadFromFile", () => {});
+  t.mock.method(KubeConfig.prototype, "makeApiClient", (type: unknown) =>
+    type === CoreV1Api
+      ? {
+          async deleteNamespacedConfigMap(input: unknown) {
+            assert.deepEqual(input, {
+              name,
+              namespace,
+              body: {
+                preconditions: { uid, resourceVersion },
+                propagationPolicy: "Foreground",
+              },
+            });
+            deleted++;
+          },
+        }
+      : {},
+  );
+  const k8s = kubernetesFromConfig(new AbortController().signal, "test-config");
+  await k8s.delete("ConfigMap", namespace, name, uid, resourceVersion);
+  assert.equal(deleted, 1);
+});

@@ -5,6 +5,8 @@ import {
   type PowerObservation,
 } from "./power.ts";
 import { createHash } from "node:crypto";
+import { gatewayFenceName } from "@pgcf/contracts/gateway-control";
+import { retireGatewayFence } from "./retire.ts";
 import type {
   DatabaseObservation,
   DesiredDatabase,
@@ -1246,7 +1248,35 @@ export class Reconciler {
   private async saveLedger(
     db: DesiredDatabase,
     state: DeleteState,
+    terminal = false,
   ): Promise<void> {
+    if (terminal) {
+      const name = `${LEDGER_PREFIX}${db.id}`;
+      const current = await this.k8s.read("ConfigMap", SYSTEM_NAMESPACE, name);
+      if (
+        !current ||
+        current.metadata.namespace !== SYSTEM_NAMESPACE ||
+        !current.metadata.resourceVersion ||
+        appliedGeneration(current) !== db.generation
+      )
+        throw new Error("delete_ledger_identity_changed");
+      assertOwned(current, db.id, name);
+      await this.k8s.patch("ConfigMap", SYSTEM_NAMESPACE, name, [
+        { op: "test", path: "/metadata/uid", value: uid(current) },
+        {
+          op: "test",
+          path: "/metadata/resourceVersion",
+          value: current.metadata.resourceVersion,
+        },
+        { op: "test", path: "/data", value: current.data },
+        {
+          op: "add",
+          path: "/data",
+          value: { ...record(current.data), state: JSON.stringify(state) },
+        },
+      ]);
+      return;
+    }
     const manifest: K8sObject = {
       apiVersion: "v1",
       kind: "ConfigMap",
@@ -1402,6 +1432,40 @@ export class Reconciler {
           : {}),
         archive: { continuous: false, ready_wal_files: null },
       };
+    const gatewayFence = await this.k8s.read(
+      "ConfigMap",
+      SYSTEM_NAMESPACE,
+      gatewayFenceName(db.id),
+    );
+    const deletionLedger = await this.k8s.read(
+      "ConfigMap",
+      SYSTEM_NAMESPACE,
+      `${LEDGER_PREFIX}${db.id}`,
+    );
+    if (
+      gatewayFence ||
+      fence?.metadata.annotations?.["pgcf.io/gateway-fence-uid"] ||
+      record(deletionLedger?.data)["gateway-retirement.json"] !== undefined
+    ) {
+      const retired = await retireGatewayFence(db, {
+        k8s: this.k8s,
+        signal: this.signal,
+        now: this.now,
+        fetcher: this.fetcher,
+        snapshot: async (signal) => {
+          if (!this.power)
+            throw new Error("gateway_retirement_configuration_missing");
+          return this.power.gatewaySnapshot(signal);
+        },
+      });
+      if (!retired)
+        return {
+          id: db.id,
+          generation: db.generation,
+          state: "deleting",
+          archive: { continuous: false, ready_wal_files: null },
+        };
+    }
     const ca = await this.k8s.read(
       "ConfigMap",
       SYSTEM_NAMESPACE,
@@ -1427,9 +1491,10 @@ export class Reconciler {
       state.completed = true;
       state.volumes = [];
       state.namespaceUid = null;
-      await this.saveLedger(db, state);
+      await this.saveLedger(db, state, true);
     }
     this.hashes.delete(db.id);
+    this.highWater.delete(db.id);
     return {
       id: db.id,
       generation: db.generation,
