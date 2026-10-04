@@ -9,6 +9,7 @@ import { registerDomain } from "./routes/domain.ts";
 import { registerPlatform } from "./routes/platform.ts";
 import { registerUsage } from "./routes/usage.ts";
 import { registerAgentMetrics } from "./routes/agent-metrics.ts";
+import { registerCosts } from "./routes/costs.ts";
 
 export type ApiApp = OpenAPIHono<ApiEnv>;
 export const REQUEST_ID_HEADER = "X-Request-Id";
@@ -25,6 +26,8 @@ const DIAGNOSTIC_METHODS = new Set([
   "OPTIONS",
 ]);
 const DIAGNOSTIC_ROUTES = new Set([
+  "/v1/costs",
+  "/v1/costs/node-facts",
   "/healthz",
   "/v1/openapi.json",
   "/v1/api-keys",
@@ -247,6 +250,7 @@ export function createApp(): ApiApp {
   registerDomain(app);
   registerUsage(app);
   registerAgentMetrics(app);
+  registerCosts(app);
   app.doc31("/v1/openapi.json", {
     openapi: "3.1.0",
     info: { title: "PGCF API", version },

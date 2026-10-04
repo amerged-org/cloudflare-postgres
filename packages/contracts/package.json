@@ -11,7 +11,8 @@
     "./route-token": "./src/route-token.ts",
     "./pg-wire": "./src/pg-wire.ts",
     "./gateway-control": "./src/gateway-control.ts",
-    "./gateway-activity": "./src/gateway-activity.ts"
+    "./gateway-activity": "./src/gateway-activity.ts",
+    "./costs": "./src/costs.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
