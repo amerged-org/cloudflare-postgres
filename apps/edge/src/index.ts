@@ -67,26 +67,17 @@ async function admit(
   // These untrusted hints scope admission; PostgreSQL authenticates the user.
   const key = JSON.stringify([hints.database, hints.user, network]);
   let connectionAllowed: boolean;
-  let databaseAllowed: boolean;
   try {
     connectionAllowed = (await env.CONNECTION_RATE_LIMITER.limit({ key }))
       .success;
     check();
     if (!connectionAllowed)
       throw new AdmissionFailure("53300", "connection rate limit exceeded");
-    databaseAllowed = (
-      await env.DATABASE_CONNECTION_RATE_LIMITER.limit({ key: hints.database })
-    ).success;
   } catch (error) {
     if (error instanceof AdmissionFailure) throw error;
     throw new AdmissionFailure("53300", "connection admission unavailable");
   }
   check();
-  if (!databaseAllowed)
-    throw new AdmissionFailure(
-      "53300",
-      "database connection rate limit exceeded",
-    );
   const route = await env.DB.prepare(ROUTE_QUERY)
     .bind(hints.user, hints.database)
     .first<RouteRow>();
@@ -95,6 +86,21 @@ async function admit(
     throw new AdmissionFailure("3D000", "database does not exist");
   if (route.role_name === null)
     throw new AdmissionFailure("28P01", "authentication failed");
+  // Unknown hints must not consume a real database's shared admission bucket.
+  let databaseAllowed: boolean;
+  try {
+    databaseAllowed = (
+      await env.DATABASE_CONNECTION_RATE_LIMITER.limit({ key: hints.database })
+    ).success;
+  } catch {
+    throw new AdmissionFailure("53300", "connection admission unavailable");
+  }
+  check();
+  if (!databaseAllowed)
+    throw new AdmissionFailure(
+      "53300",
+      "database connection rate limit exceeded",
+    );
   if (route.desired_state !== "running" || route.observed_state !== "ready")
     throw new AdmissionFailure(
       "57P03",
