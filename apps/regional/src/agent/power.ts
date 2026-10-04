@@ -41,7 +41,7 @@ const POWER_REVISION = "pgcf.io/power-revision",
   POWER_OPERATION = "pgcf.io/power-operation";
 const GATEWAY_FENCE_UID = "pgcf.io/gateway-fence-uid";
 const MAX_WAIT = 10 * 60_000;
-interface GatewayPod {
+export interface GatewayPod {
   name: string;
   uid: string;
   ip: string;
@@ -672,6 +672,40 @@ export class PowerCoordinator {
       ),
       uid: uid(secret),
       version: required(secret.metadata.resourceVersion),
+    };
+  }
+  /** Read-only inventory/key access shared by bounded measurement and retirement callers. */
+  async gatewaySnapshot(
+    signal: AbortSignal,
+  ): Promise<{
+    pods: GatewayPod[];
+    keyring: RouteKeyring;
+    keyUid: string;
+    keyVersion: string;
+  }> {
+    const scoped = AbortSignal.any([
+      this.options.signal,
+      signal,
+      AbortSignal.timeout(3000),
+    ]);
+    const step: Step = {
+      k8s:
+        typeof this.options.k8s === "function"
+          ? this.options.k8s(scoped)
+          : this.options.k8s,
+      signal: scoped,
+      mutations: [],
+    };
+    const [pods, key] = await Promise.all([
+      this.gateways(step),
+      this.keyring(step),
+    ]);
+    scoped.throwIfAborted();
+    return {
+      pods,
+      keyring: key.keyring,
+      keyUid: key.uid,
+      keyVersion: key.version,
     };
   }
   private async controls(
