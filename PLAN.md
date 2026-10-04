@@ -53,7 +53,7 @@ operator-generated monitoring and service Endpoints after matching their source/
 a delayed capacity observation subsequently converged to the 97,706,311,680-byte baseline.
 Full Phase 4 PITR and disaster recovery workflows remain pending.
 
-One additional restart cycle, fault tests and full adopter compatibility are still required
+Fault tests and full adopter compatibility are still required
 before Phase 1 acceptance. Phase 2 has not begun. The second EU node is untouched, the US node
 has not been bought, and existing production routes and databases have not changed. The owner
 has requested delivery through Phase 5 and full Neon replacement.
