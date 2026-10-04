@@ -17,6 +17,8 @@ import {
   nativeTcp,
   parseProbeConfig,
   probeReport,
+  sourcePool,
+  externalProbeFailure,
 } from "../src/external-probe.ts";
 import type { ProbeIo } from "../src/external-probe.ts";
 import { Run } from "../src/run.ts";
@@ -24,6 +26,129 @@ import { fingerprint } from "../src/core.ts";
 
 const host4 = (...octets: number[]) => octets.join(".");
 const host6 = (value: number) => `${value.toString(16)}::1`;
+
+test("fixed metadata fetch can authenticate while anonymous non-success remains refused", async () => {
+  const token = randomBytes(32).toString("base64url");
+  const pool = [`${host4(203, 0, 113, 0)}/24`];
+  let calls = 0;
+  const fetcher: typeof fetch = async (url, options) => {
+    calls++;
+    assert.equal(url, "https://api.github.com/meta");
+    assert.equal(options?.redirect, "error");
+    assert(options?.signal instanceof AbortSignal);
+    const authenticated =
+      new Headers(options?.headers).get("Authorization") === `Bearer ${token}`;
+    return authenticated
+      ? Response.json({ actions_macos: pool })
+      : new Response(token, { status: 403 });
+  };
+  await assert.rejects(sourcePool({}, fetcher), {
+    message: "external_probe_source_pool_unavailable",
+  });
+  assert.deepEqual(await sourcePool({ GH_TOKEN: token }, fetcher), pool);
+  assert.equal(calls, 2);
+});
+
+test("source pool errors retain numeric HTTP status without body, headers or credentials", async () => {
+  const token = randomBytes(32).toString("base64url");
+  let cancelled = 0;
+  let calls = 0;
+  const fetcher: typeof fetch = async () => {
+    calls++;
+    return new Response(
+      new ReadableStream({
+        cancel() {
+          cancelled++;
+        },
+      }),
+      { status: 401, headers: { "x-untrusted-detail": token } },
+    );
+  };
+  await assert.rejects(
+    sourcePool({ GH_TOKEN: token }, fetcher),
+    (error: unknown) => {
+      assert.deepEqual(externalProbeFailure(error), {
+        external_probe_report: false,
+        code: "external_probe_source_pool_unavailable",
+        http_status: 401,
+      });
+      assert.equal(String(error).includes(token), false);
+      assert.equal(
+        JSON.stringify(externalProbeFailure(error)).includes(token),
+        false,
+      );
+      return true;
+    },
+  );
+  assert.equal(calls, 1);
+  assert.equal(cancelled, 1);
+});
+
+test("metadata redirects and fetch failures remain refused without secret diagnostics", async () => {
+  const token = randomBytes(32).toString("base64url");
+  const redirect: typeof fetch = async (url, options) => {
+    assert.equal(url, "https://api.github.com/meta");
+    assert.equal(options?.redirect, "error");
+    return new Response(token, {
+      status: 307,
+      headers: {
+        Location: `https://${["elsewhere", "test"].join(".")}/${token}`,
+      },
+    });
+  };
+  await assert.rejects(
+    sourcePool({ GH_TOKEN: token }, redirect),
+    (error: unknown) => {
+      assert.deepEqual(externalProbeFailure(error), {
+        external_probe_report: false,
+        code: "external_probe_source_pool_unavailable",
+        http_status: 307,
+      });
+      assert.equal(String(error).includes(token), false);
+      return true;
+    },
+  );
+  const refused: typeof fetch = async (_url, options) => {
+    assert.equal(options?.redirect, "error");
+    throw new Error(token);
+  };
+  await assert.rejects(
+    sourcePool({ GH_TOKEN: token }, refused),
+    (error: unknown) => {
+      assert.deepEqual(externalProbeFailure(error), {
+        external_probe_report: false,
+        code: "external_probe_source_pool_unavailable",
+      });
+      assert.equal(String(error).includes(token), false);
+      return true;
+    },
+  );
+});
+
+test("metadata byte limits, malformed JSON and IPv4 source-pool validation remain strict", async () => {
+  const oversized: typeof fetch = async () =>
+    new Response(" ".repeat(1_000_001));
+  await assert.rejects(sourcePool({}, oversized), {
+    message: "external_probe_source_pool_invalid",
+  });
+  const token = randomBytes(32).toString("base64url");
+  const malformed: typeof fetch = async () => new Response(token);
+  await assert.rejects(
+    sourcePool({ GH_TOKEN: token }, malformed),
+    (error: unknown) =>
+      error instanceof Error &&
+      error.message === "external_probe_source_pool_invalid" &&
+      !String(error).includes(token),
+  );
+  const wrongFamily: typeof fetch = async () =>
+    Response.json({ actions_macos: [`${host6(0x2001)}/64`] });
+  await assert.rejects(sourcePool({}, wrongFamily), {
+    message: "external_probe_source_pool_invalid",
+  });
+  const malformedCidr: typeof fetch = async () =>
+    Response.json({ actions_macos: ["invalid"] });
+  await assert.rejects(sourcePool({}, malformedCidr));
+});
 const now = Date.now();
 function input() {
   return {
