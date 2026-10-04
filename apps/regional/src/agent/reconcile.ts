@@ -766,11 +766,12 @@ export class Reconciler {
       finishApply(applyOutcome);
     }
     // Equal revisions still observe asynchronous CNPG readiness, archiving and CA publication.
-    const cluster = await this.k8s.read("Cluster", namespaceName, "database");
+    let cluster = await this.k8s.read("Cluster", namespaceName, "database");
     if (!cluster) return recoveryRequired(db, "database cluster is missing");
     assertOwned(cluster, db.id, "database");
     if (uid(cluster) !== storage.clusterUid)
       return recoveryRequired(db, "database cluster identity changed");
+    const archiveSource = cluster;
     let count: number | null;
     let progress: ArchiveProgress | null = null;
     let measured = false;
@@ -783,7 +784,7 @@ export class Reconciler {
           archiveMetrics(
             this.k8s,
             namespaceName,
-            cluster,
+            archiveSource,
             this.signal,
             this.now,
             this.fetcher,
@@ -797,6 +798,31 @@ export class Reconciler {
       if (this.signal.aborted) throw new Error("agent_aborted");
       count = null;
     }
+    const refreshed = await this.k8s.read("Cluster", namespaceName, "database");
+    if (!refreshed) return recoveryRequired(db, "database cluster is missing");
+    assertOwned(refreshed, db.id, "database");
+    if (
+      refreshed.metadata.namespace !== namespaceName ||
+      !refreshed.metadata.resourceVersion ||
+      uid(refreshed) !== storage.clusterUid ||
+      uid(refreshed) !== uid(archiveSource)
+    )
+      return recoveryRequired(db, "database cluster identity changed");
+    if (refreshed.metadata.deletionTimestamp)
+      return recoveryRequired(db, "database cluster is deleting");
+    if (
+      appliedGeneration(refreshed) !== db.generation ||
+      acceptedGeneration(refreshed) > db.generation ||
+      string(record(refreshed.status).currentPrimary) !==
+        string(record(archiveSource.status).currentPrimary)
+    )
+      return {
+        id: db.id,
+        generation: db.generation,
+        state: "provisioning",
+        archive: { continuous: false, ready_wal_files: null },
+      };
+    cluster = refreshed;
     const now = this.now();
     if (!Number.isSafeInteger(now) || now < 0)
       throw new Error("archive_clock_invalid");

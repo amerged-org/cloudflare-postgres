@@ -2321,3 +2321,138 @@ test("a concurrent newer collector checkpoint is never replaced by a stale stora
   assert.equal(record(current!.data).state, identity);
   assert.equal(current!.metadata.uid, fence!.metadata.uid);
 });
+
+test("a real Ready transition during archive collection is verified in the same reconciliation", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  k8s.ready = false;
+  let authentications = 0,
+    scrapes = 0;
+  const sample: typeof fetch = async (...args) => {
+    scrapes++;
+    const cluster = k8s.resources.get(
+      k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+    )!;
+    record(cluster.status).conditions = [
+      { type: "Ready", status: "True" },
+      { type: "ContinuousArchiving", status: "True" },
+    ];
+    cluster.metadata.resourceVersion = String(
+      Number(cluster.metadata.resourceVersion) + 1,
+    );
+    const primary = String(record(cluster.status).currentPrimary),
+      pod = k8s.resources.get(k8s.key("Pod", `pgcf-db-${db.id}`, primary))!;
+    record(pod.status).conditions = [{ type: "Ready", status: "True" }];
+    pod.metadata.resourceVersion = String(
+      Number(pod.metadata.resourceVersion) + 1,
+    );
+    return metrics(...args);
+  };
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    sample,
+    async () => {
+      authentications++;
+      return true;
+    },
+  ).reconcile(db, ctx);
+  assert.equal(scrapes, 1);
+  assert.equal(observation?.state, "ready");
+  assert.equal(authentications, 1);
+  assert.equal(observation?.archive.continuous, true);
+});
+
+test("a replacement Cluster during metrics never authenticates or reports Ready", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  let authentications = 0;
+  const sample: typeof fetch = async (...args) => {
+    const cluster = k8s.resources.get(
+      k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+    )!;
+    cluster.metadata.uid = randomUUID();
+    return metrics(...args);
+  };
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    sample,
+    async () => {
+      authentications++;
+      return true;
+    },
+  ).reconcile(db, ctx);
+  assert.equal(observation?.state, "error");
+  assert.match(
+    observation?.message ?? "",
+    /identity changed; recovery required/,
+  );
+  assert.equal(authentications, 0);
+  assert.equal(
+    k8s.actions.filter((action) => action === "create:Cluster:database").length,
+    1,
+  );
+});
+
+test("a future Cluster revision after metrics stays pending instead of using the old archive sample", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  let authentications = 0;
+  const sample: typeof fetch = async (...args) => {
+    const cluster = k8s.resources.get(
+      k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+    )!;
+    cluster.metadata.annotations![GENERATION_ANNOTATION] = String(
+      db.generation + 1,
+    );
+    return metrics(...args);
+  };
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    sample,
+    async () => {
+      authentications++;
+      return true;
+    },
+  ).reconcile(db, ctx);
+  assert.equal(observation?.state, "provisioning");
+  assert.deepEqual(observation?.archive, {
+    continuous: false,
+    ready_wal_files: null,
+  });
+  assert.equal(authentications, 0);
+});
+
+test("a changed currentPrimary after metrics cannot reuse the previous primary archive proof", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  let authentications = 0;
+  const sample: typeof fetch = async (...args) => {
+    const cluster = k8s.resources.get(
+      k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+    )!;
+    record(cluster.status).currentPrimary = "database-later";
+    return metrics(...args);
+  };
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    sample,
+    async () => {
+      authentications++;
+      return true;
+    },
+  ).reconcile(db, ctx);
+  assert.equal(observation?.state, "provisioning");
+  assert.deepEqual(observation?.archive, {
+    continuous: false,
+    ready_wal_files: null,
+  });
+  assert.equal(authentications, 0);
+});
