@@ -8,7 +8,8 @@
     ".": "./src/index.ts",
     "./usage": "./src/usage.ts",
     "./route-token": "./src/route-token.ts",
-    "./pg-wire": "./src/pg-wire.ts"
+    "./pg-wire": "./src/pg-wire.ts",
+    "./gateway-control": "./src/gateway-control.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

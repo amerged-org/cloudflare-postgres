@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { gatewayPodUidSchema } from "@pgcf/contracts/gateway-control";
 import { REGION_ID_PATTERN } from "@pgcf/contracts";
 import {
   parseRouteKeyring,
@@ -64,4 +65,14 @@ function memoryLimit(
   )
     throw new Error(`${name} must be a positive safe integer`);
   return Number(value);
+}
+
+/** Required by the production entry point; supplied from the Pod downward API. */
+export function readGatewayPodUid(
+  env: NodeJS.ProcessEnv = process.env,
+): string {
+  const value = gatewayPodUidSchema.safeParse(env.PGCF_GATEWAY_POD_UID);
+  if (!value.success)
+    throw new Error("PGCF_GATEWAY_POD_UID must be a valid Pod UID");
+  return value.data;
 }
