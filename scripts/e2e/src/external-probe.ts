@@ -380,7 +380,7 @@ export function externalProbeFailure(error: unknown): {
 }
 
 export async function sourcePool(
-  env: Pick<NodeJS.ProcessEnv, "GH_TOKEN"> = process.env,
+  env: NodeJS.ProcessEnv = process.env,
   fetcher: typeof fetch = fetch,
 ): Promise<string[]> {
   let response: Response;
