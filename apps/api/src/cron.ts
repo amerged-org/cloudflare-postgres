@@ -1,13 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
-import { DESIRED_PAGE_LIMIT_MAX } from "@pgcf/contracts";
+import { DatabaseId, RegionId } from "@pgcf/contracts";
 import type { Env } from "./env.ts";
 import { reconcileDatabaseActors } from "./domain/database-actor-sync.ts";
+import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
 
 export async function runCron(
   env: Env,
   now = Date.now(),
-): Promise<{ failed: number; purged: number; hinted: number }> {
+): Promise<{
+  failed: number;
+  purged: number;
+  hinted: number;
+  usage: UsageCronResult;
+}> {
   const timestamp = new Date(now).toISOString(),
     cutoff = new Date(now - 20 * 60_000).toISOString();
   const result = await env.DB.prepare(
@@ -16,11 +22,36 @@ export async function runCron(
     .bind(timestamp, timestamp, cutoff)
     .run();
   const purged = await purgeIdempotency(env.DB, now);
+  await env.DB.prepare(
+    "INSERT INTO region_hint_cursor(singleton,region_id,database_id) VALUES(1,NULL,NULL) ON CONFLICT(singleton) DO NOTHING",
+  ).run();
+  const hintCursor = await env.DB.prepare(
+    "SELECT region_id,database_id FROM region_hint_cursor WHERE singleton=1",
+  ).first<{ region_id: string | null; database_id: string | null }>();
+  if (
+    !hintCursor ||
+    (hintCursor.region_id === null) !== (hintCursor.database_id === null)
+  )
+    throw new Error("invalid_region_hint_cursor");
+  if (hintCursor.region_id !== null) {
+    RegionId.parse(hintCursor.region_id);
+    DatabaseId.parse(hintCursor.database_id);
+  }
   const pending = await env.DB.prepare(
-    `SELECT DISTINCT d.region_id,d.id FROM databases d WHERE d.generation>d.observed_generation OR EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.status IN('pending','running')) ORDER BY d.region_id,d.id`,
-  ).all<{ region_id: string; id: string }>();
+    `SELECT d.region_id,d.id FROM databases d WHERE (d.generation>d.observed_generation OR EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.status IN('pending','running')))
+      AND (d.region_id>? OR (d.region_id=? AND d.id>?)) ORDER BY d.region_id,d.id LIMIT 201`,
+  )
+    .bind(
+      hintCursor.region_id ?? "",
+      hintCursor.region_id ?? "",
+      hintCursor.database_id ?? "",
+    )
+    .all<{ region_id: string; id: string }>();
+  const hintPage = pending.results.slice(0, 200);
   const regions = new Map<string, string[]>();
-  for (const db of pending.results) {
+  for (const db of hintPage) {
+    RegionId.parse(db.region_id);
+    DatabaseId.parse(db.id);
     const ids = regions.get(db.region_id) ?? [];
     ids.push(db.id);
     regions.set(db.region_id, ids);
@@ -28,10 +59,19 @@ export async function runCron(
   let hinted = 0;
   for (const [regionId, ids] of regions) {
     const stub = env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId));
-    hinted += await stub.notify(
-      ids.length > DESIRED_PAGE_LIMIT_MAX ? undefined : ids,
-    );
+    hinted += await stub.notify(ids);
   }
+  const lastHint = pending.results.length > 200 ? hintPage.at(-1)! : null;
+  await env.DB.prepare(
+    "UPDATE region_hint_cursor SET region_id=?,database_id=? WHERE singleton=1 AND region_id IS ? AND database_id IS ?",
+  )
+    .bind(
+      lastHint?.region_id ?? null,
+      lastHint?.id ?? null,
+      hintCursor.region_id,
+      hintCursor.database_id,
+    )
+    .run();
   await env.DB.prepare(
     "INSERT INTO reconciliation_cursors(name,cursor) VALUES('database_actors',NULL) ON CONFLICT(name) DO NOTHING",
   ).run();
@@ -48,5 +88,6 @@ export async function runCron(
   )
     .bind(actorPage.next, cursor.cursor)
     .run();
-  return { failed: result.meta.changes, purged, hinted };
+  const usage = await runUsageCron(env.DB, now);
+  return { failed: result.meta.changes, purged, hinted, usage };
 }
