@@ -328,7 +328,7 @@ async function scan(
             throw new Error("worker_scan_unavailable");
         } finally {
           if (timer) clearTimeout(timer);
-          await socket.close().catch(() => undefined);
+          void socket.close().catch(() => undefined);
         }
       }
     }),
