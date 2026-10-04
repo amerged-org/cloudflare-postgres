@@ -8,7 +8,12 @@ import { gatewayFenceName } from "@pgcf/contracts/gateway-control";
 import type { AuthenticationProbe } from "../../src/agent/readiness.ts";
 import type { SleepProbeOptions } from "../../src/agent/sleep.ts";
 import { record } from "../../src/agent/types.ts";
-import { PowerCoordinator } from "../../src/agent/power.ts";
+import {
+  PowerCoordinator,
+  beginWakePhase,
+  measureWakePhase,
+  type WakePhase,
+} from "../../src/agent/power.ts";
 import { Reconciler } from "../../src/agent/reconcile.ts";
 import {
   fixture,
@@ -947,5 +952,91 @@ test("resume from actual hibernation preserves every storage UID and gates new c
       )
       .map((value) => [value.kind, value.metadata.name, value.metadata.uid]),
     identities,
+  );
+});
+
+test("wake timing schema rejects untrusted names and invalid clocks, caps durations and emits once", () => {
+  const canary = randomUUID(),
+    events: {
+      event: string;
+      fields: Record<string, string | number | boolean>;
+    }[] = [];
+  const log = (
+    event: string,
+    fields: Record<string, string | number | boolean> = {},
+  ) => events.push({ event, fields });
+  let ticks = 0;
+  const finish = beginWakePhase(log, "volume_identity", canary, () =>
+    ticks++ === 0 ? 1 : 900001,
+  );
+  finish("completed");
+  finish("failed");
+  assert.deepEqual(events, [
+    {
+      event: "wake_phase",
+      fields: {
+        phase: "volume_identity",
+        elapsedMs: 600000,
+        outcome: "completed",
+      },
+    },
+  ]);
+  beginWakePhase(log, canary as WakePhase, undefined, () => 0)("completed");
+  beginWakePhase(log, "archive_metrics", undefined, () => NaN)("completed");
+  assert.equal(events.length, 1);
+  assert.equal(JSON.stringify(events).includes(canary), false);
+});
+
+test("wake diagnostics preserve returned objects and thrown exceptions without logging payloads", async () => {
+  const canary = randomUUID(),
+    events: {
+      event: string;
+      fields: Record<string, string | number | boolean>;
+    }[] = [];
+  const log = (
+    event: string,
+    fields: Record<string, string | number | boolean> = {},
+  ) => events.push({ event, fields });
+  const result = { state: "ready", payload: canary };
+  let ticks = 0;
+  assert.equal(
+    await measureWakePhase(
+      log,
+      "role_runtime_auth",
+      undefined,
+      async () => result,
+      () => ticks++,
+    ),
+    result,
+  );
+  const error = new Error(canary);
+  await assert.rejects(
+    measureWakePhase(
+      log,
+      "fence_release",
+      undefined,
+      async () => {
+        throw error;
+      },
+      () => ticks++,
+    ),
+    (value) => value === error,
+  );
+  assert.deepEqual(
+    events.map((entry) => entry.fields.outcome),
+    ["completed", "failed"],
+  );
+  assert.equal(JSON.stringify(events).includes(canary), false);
+  assert.equal(
+    await measureWakePhase(
+      () => {
+        throw error;
+      },
+      "desired_applied",
+      undefined,
+      async () => result,
+      () => ticks++,
+    ),
+    result,
   );
 });
