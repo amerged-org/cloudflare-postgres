@@ -235,6 +235,12 @@ export const Node = z
     allocatable_cpu_millicores: z.number().int().nonnegative(),
     storage_gib_total: z.number().int().nonnegative().nullable(),
     platform_reserved_memory_mib: z.number().int().nonnegative(),
+    platform_reserved_cpu_millicores: z
+      .number()
+      .int()
+      .nonnegative()
+      .nullable()
+      .optional(),
     last_observed_at: Timestamp.nullable(),
     created_at: Timestamp,
     updated_at: Timestamp,

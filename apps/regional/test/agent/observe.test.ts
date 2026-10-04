@@ -7,9 +7,11 @@ import {
   parseArchiveProgress,
   parseReadyWalFiles,
   podMemoryRequest,
+  podCpuRequestMillicores,
   quantity,
 } from "../../src/agent/observe.ts";
 import { fixture, MemoryKubernetes } from "./fixtures.ts";
+import { record } from "../../src/agent/types.ts";
 
 test("node capacity uses measured dedicated LVM annotation and live pod reservation", () => {
   const { db } = fixture();
@@ -54,6 +56,7 @@ test("node capacity uses measured dedicated LVM annotation and live pod reservat
     allocatable_memory_mib: 8192,
     allocatable_cpu_millicores: 3900,
     platform_reserved_memory_mib: 288,
+    platform_reserved_cpu_millicores: 0,
     storage_gib_total: 96,
   });
   node.metadata.annotations = {};
@@ -62,6 +65,84 @@ test("node capacity uses measured dedicated LVM annotation and live pod reservat
     null,
   );
   assert.equal(quantity("500m"), 0.5);
+});
+
+test("platform CPU measurement includes app, restartable init peak and overhead while excluding owned database and completed pods", () => {
+  const { db } = fixture();
+  const k8s = new MemoryKubernetes();
+  const namespace = k8s.ownedNamespace(db);
+  const node = k8s.put({
+    apiVersion: "v1",
+    kind: "Node",
+    metadata: { name: "test-node" },
+    status: {
+      allocatable: { memory: "8Gi", cpu: "3" },
+      conditions: [{ type: "Ready", status: "True" }],
+    },
+  });
+  const cpu = (value: string) => ({ resources: { requests: { cpu: value } } });
+  const platform = k8s.put({
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "platform", namespace: "pgcf-system" },
+    spec: {
+      nodeName: node.metadata.name,
+      containers: [cpu("1000m"), cpu("0.5")],
+      initContainers: [
+        { ...cpu("100m"), restartPolicy: "Always" },
+        cpu("2"),
+        { ...cpu("200m"), restartPolicy: "Always" },
+        cpu("600m"),
+      ],
+      overhead: { cpu: "50m" },
+    },
+    status: { phase: "Running" },
+  });
+  const databasePod = k8s.put({
+    ...platform,
+    metadata: { name: "database-1", namespace: namespace.metadata.name },
+  });
+  const completed = k8s.put({
+    ...platform,
+    metadata: { name: "completed", namespace: "pgcf-system" },
+    status: { phase: "Succeeded" },
+  });
+  const failed = k8s.put({
+    ...platform,
+    metadata: { name: "failed", namespace: "pgcf-system" },
+    status: { phase: "Failed" },
+  });
+  const missing = k8s.put({
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: { name: "without-request", namespace: "pgcf-system" },
+    spec: { nodeName: node.metadata.name, containers: [{}] },
+  });
+  const measured = nodeObservations(
+    [node],
+    [platform, databasePod, completed, failed, missing],
+    [namespace],
+  )[0]!;
+  assert.equal(measured.allocatable_cpu_millicores, 3000);
+  assert.equal(measured.platform_reserved_cpu_millicores, 2150);
+  assert.equal(podCpuRequestMillicores(platform), 2150);
+  const singleCpu = structuredClone(missing);
+  record(singleCpu.spec).containers = [cpu("1000m")];
+  assert.equal(podCpuRequestMillicores(singleCpu), 1000);
+  record(singleCpu.spec).containers = [cpu("1")];
+  assert.equal(podCpuRequestMillicores(singleCpu), 1000);
+  assert.equal(
+    nodeObservations([node], [missing], [])[0]
+      ?.platform_reserved_cpu_millicores,
+    0,
+  );
+  namespace.metadata.labels = {};
+  assert.equal(
+    nodeObservations([node], [databasePod], [namespace])[0]
+      ?.platform_reserved_cpu_millicores,
+    2150,
+    "namespace prefix alone cannot exclude reservations",
+  );
 });
 
 test("archive metric is measured exactly, refuses unavailable, negative and noninteger samples", () => {

@@ -82,9 +82,10 @@ export async function observations(
     throw new ApiError("invalid_request", "Duplicate observation subject");
   for (const node of body.nodes) {
     await c.env.DB.prepare(
-      `INSERT INTO nodes (id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,last_observed_at,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(region_id,k8s_node_name) DO UPDATE SET ready=excluded.ready,allocatable_memory_mib=excluded.allocatable_memory_mib,
+      `INSERT INTO nodes (id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(region_id,k8s_node_name) DO UPDATE SET ready=excluded.ready,allocatable_memory_mib=excluded.allocatable_memory_mib,
       allocatable_cpu_millicores=excluded.allocatable_cpu_millicores,storage_gib_total=excluded.storage_gib_total,platform_reserved_memory_mib=excluded.platform_reserved_memory_mib,
+      platform_reserved_cpu_millicores=excluded.platform_reserved_cpu_millicores,
       last_observed_at=excluded.last_observed_at,updated_at=excluded.updated_at WHERE excluded.updated_at>=nodes.updated_at`,
     )
       .bind(
@@ -96,6 +97,7 @@ export async function observations(
         node.allocatable_cpu_millicores,
         node.storage_gib_total,
         node.platform_reserved_memory_mib,
+        node.platform_reserved_cpu_millicores ?? null,
         body.observed_at,
         now,
         now,

@@ -64,6 +64,8 @@ export function databaseInsertStatement(
             JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id AND r.backup_bucket=?
             WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND n.storage_gib_total IS NOT NULL
             AND n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?
+            AND n.platform_reserved_cpu_millicores IS NOT NULL
+            AND n.allocatable_cpu_millicores-n.platform_reserved_cpu_millicores-COALESCE((SELECT SUM(sc.cpu_millicores+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.cpu_millicores+?
             AND n.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.storage_gib
             AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=? AND s.max_connections=?
             AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?`,
@@ -81,6 +83,8 @@ export function databaseInsertStatement(
       snapshot.body.region_id,
       SIDECAR.requestMemoryMib,
       SIDECAR.requestMemoryMib,
+      SIDECAR.requestCpuMillicores,
+      SIDECAR.requestCpuMillicores,
       snapshot.size.memory_mib,
       snapshot.size.storage_gib,
       snapshot.size.cpu_millicores,
@@ -136,7 +140,7 @@ export async function createDatabase(
         if (!node)
           throw new ApiError(
             "capacity_exhausted",
-            "No node has sufficient memory and storage",
+            "No node has sufficient memory, CPU and storage",
           );
         const archive = archiveDestinationPath(
           region.backup_bucket,
@@ -199,7 +203,7 @@ export async function createDatabase(
       }
       throw new ApiError(
         "capacity_exhausted",
-        "No node has sufficient memory and storage",
+        "No node has sufficient memory, CPU and storage",
       );
     },
   });

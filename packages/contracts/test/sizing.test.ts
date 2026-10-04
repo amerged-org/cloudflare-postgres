@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   SIDECAR,
   databaseMemoryReservationMib,
+  databaseCpuReservationMillicores,
   postgresParameters,
   resourceQuotaFor,
 } from "../src/index.ts";
@@ -24,6 +25,7 @@ describe("sizing", () => {
       limitMemoryMib: 512,
     });
     expect(databaseMemoryReservationMib(small)).toBe(640);
+    expect(databaseCpuReservationMillicores(small)).toBe(600);
   });
 
   it("sizes the quota for two slots including the sidecar", () => {
