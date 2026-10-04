@@ -117,7 +117,15 @@ async function fixture(
       target.port = String((server.address() as AddressInfo).port);
       return new WebSocket(target, UPSTREAM_OPTIONS);
     },
-    session: (value) => sessions.push(value),
+    session: (value) => {
+      // These transport-only peers begin after PostgreSQL authentication.
+      value.authentication.write(Buffer.from([0x52, 0, 0, 0, 8, 0, 0, 0, 0]));
+      assert.deepEqual(
+        value.authentication.read(9),
+        Buffer.from([0x52, 0, 0, 0, 8, 0, 0, 0, 0]),
+      );
+      sessions.push(value);
+    },
     disconnected: () => disconnections++,
   });
   context.after(async () => {
