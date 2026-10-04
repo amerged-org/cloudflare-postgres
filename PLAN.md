@@ -475,6 +475,13 @@ Live acceptance (`scripts/e2e` against Dev):
 
 ### Phase 2 — Serverless behavior and metrics
 
+For v1, integrators keep platform databases and latency-sensitive applications running with
+`sleep_after_seconds: null`, and choose longer idle windows for frequently used databases.
+Where the application provides enough lead time, authenticated early wake belongs in the
+adopter's application flow. A first-user-action target below one second must be measured in that
+flow; it is not a subsecond cold-start guarantee. CNPG hibernation removes Pods and retains
+volumes. Shared PostgreSQL processes and process/VM snapshots remain later research.
+
 Build:
 
 - `DatabaseActor`: idle timer, coalesced wake, traffic counters.

@@ -19,11 +19,11 @@ it("bounds actor reconciliation to one page per cron invocation", async () => {
   const f = await fixture();
   const now = new Date().toISOString();
   const ids = Array.from({ length: 202 }, () => newDatabaseId()).sort();
-  for (const id of ids) {
-    await env.DB.prepare(
-      "INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,observed_generation,archive_path,created_at,updated_at) VALUES(?,?,?,?,?,?,'running','ready',1,1,?,?,?)",
-    )
-      .bind(
+  await env.DB.batch(
+    ids.map((id) =>
+      env.DB.prepare(
+        "INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,observed_state,generation,observed_generation,archive_path,created_at,updated_at) VALUES(?,?,?,?,?,?,'running','ready',1,1,?,?,?)",
+      ).bind(
         id,
         f.project,
         f.region,
@@ -39,9 +39,9 @@ it("bounds actor reconciliation to one page per cron invocation", async () => {
         ),
         now,
         now,
-      )
-      .run();
-  }
+      ),
+    ),
+  );
   const spy = vi.spyOn(Object.getPrototypeOf(env.DB), "prepare");
   await runCron(env);
   const reads = spy.mock.calls.filter(
