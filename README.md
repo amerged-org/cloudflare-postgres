@@ -117,14 +117,14 @@ sequenceDiagram
   C->>P: gateway validates Startup; PostgreSQL SCRAM end to end
 ```
 
-| Part                  | Where                | Job                                                                                  |
-| --------------------- | -------------------- | ------------------------------------------------------------------------------------ |
-| API Worker            | Cloudflare           | `/v1` API, D1 state, Durable Objects, Workflows, usage rollups                       |
-| Edge Worker           | Cloudflare           | Database endpoint: D1 admission, wake, signed route, native forwarding |
-| Regional agent        | Kubernetes           | Reconciles databases into CNPG resources; hibernate/wake; reports status and samples |
+| Part                  | Where                | Job                                                                                    |
+| --------------------- | -------------------- | -------------------------------------------------------------------------------------- |
+| API Worker            | Cloudflare           | `/v1` API, D1 state, Durable Objects, Workflows, usage rollups                         |
+| Edge Worker           | Cloudflare           | Database endpoint: D1 admission, wake, signed route, native forwarding                 |
+| Regional agent        | Kubernetes           | Reconciles databases into CNPG resources; hibernate/wake; reports status and samples   |
 | Gateway + cloudflared | Kubernetes           | Entry from Cloudflare; startup validation before PostgreSQL dial, TLS, stream counters |
-| Node bootstrap        | Cloudflare Container | Turns a Contabo VPS into a Talos node                                                |
-| Platform              | Kubernetes (Flux)    | Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin        |
+| Node bootstrap        | Cloudflare Container | Turns a Contabo VPS into a Talos node                                                  |
+| Platform              | Kubernetes (Flux)    | Cilium, OpenEBS LocalPV LVM, cert-manager, CloudNativePG, Barman Cloud plugin          |
 
 The approved client endpoint is `GET /v2?database=<id>&user=<role>` on the single database hostname.
 Configure the Neon serverless driver's `Pool`/`Client` WebSocket mode with `pipelineConnect=false`
