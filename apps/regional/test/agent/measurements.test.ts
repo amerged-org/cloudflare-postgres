@@ -165,7 +165,7 @@ test("exact cumulative deltas are checkpointed and a lost usage response replays
   const meter = state.make();
   meter.update([state.db]);
   await meter.cycle();
-  state.advance(1000);
+  state.advance(15000);
   state.lose();
   await meter.cycle();
   const pending = state.usages.at(-1)!;
@@ -194,7 +194,7 @@ test("a changed Pod IP or restart inventory cannot reuse an old idle boundary", 
   meter.update([state.db]);
   await meter.cycle();
   const before = state.activities.length;
-  state.advance(1000);
+  state.advance(15000);
   state.snapshot.pods[0]!.ip = [10, 20, 1, 1].join(".");
   state.snapshot.pods[0]!.restarts++;
   await meter.cycle();
@@ -207,7 +207,7 @@ test("missing and partial histories withhold idle through recovery until a real 
   meter.update([state.db]);
   await meter.cycle();
   const before = state.activities.length;
-  state.advance(1000);
+  state.advance(15000);
   for (const report of state.reports.values()) {
     report.history = "unavailable";
     report.countersSince = null;
@@ -242,13 +242,14 @@ test("missing and partial histories withhold idle through recovery until a real 
     report.totalConnections = 1;
     report.connectionMilliseconds = 1000;
   }
-  state.advance(1000);
+  state.advance(15000);
   const recovered = state.make();
   recovered.update([state.db]);
   await recovered.cycle();
   assert.equal(state.activities.length, before);
   for (const report of state.reports.values())
     report.lastActivityAt = new Date(state.now()).toISOString();
+  state.advance(15000);
   await recovered.cycle();
   assert.equal(state.activities.length, before + 1);
 });
@@ -258,7 +259,7 @@ test("counter epoch changes produce a coverage gap and never subtract across pro
     meter = state.make();
   meter.update([state.db]);
   await meter.cycle();
-  state.advance(1000);
+  state.advance(15000);
   const report = state.reports.values().next().value!;
   report.processEpoch = randomUUID();
   report.epoch = randomUUID();
@@ -290,7 +291,7 @@ test("UTC hour straddles remain null fragments and never allocate traffic propor
   const meter = state.make();
   meter.update([state.db]);
   await meter.cycle();
-  state.advance(2000);
+  state.advance(15000);
   await meter.cycle();
   const samples = state.usages
     .at(-1)!
@@ -621,7 +622,7 @@ test("unpersisted deltas after a checkpoint CAS conflict never reach usage inges
   meter.update([state.db]);
   await meter.cycle();
   const before = state.usages.length;
-  state.advance(1000);
+  state.advance(15000);
   const patch = state.k8s.patch.bind(state.k8s);
   let conflict = true;
   state.k8s.patch = async (kind, namespace, name, operations) => {
@@ -658,7 +659,7 @@ test("backward respondent time never rewinds a baseline into overlapping interva
     meter = state.make();
   meter.update([state.db]);
   await meter.cycle();
-  state.advance(1000);
+  state.advance(15000);
   await meter.cycle();
   const storage = state.k8s.resources.get(
     state.k8s.key("ConfigMap", "pgcf-system", `storage-${state.db.id}`),
@@ -674,4 +675,211 @@ test("backward respondent time never rewinds a baseline into overlapping interva
     baseline,
   );
   assert.equal(state.activities.length, count);
+});
+
+test("one database samples at most every fifteen seconds over an hour of fast cohort ticks", async () => {
+  const state = await setup();
+  let reads = 0,
+    calls = 0;
+  const read = state.k8s.read.bind(state.k8s);
+  state.k8s.read = async (...args) => {
+    reads++;
+    return read(...args);
+  };
+  const meter = new RegionalMeasurements({
+    k8s: state.k8s,
+    signal: state.signal,
+    region: "eu-test",
+    snapshot: async () => structuredClone(state.snapshot),
+    fetcher: async (...args) => {
+      calls++;
+      return state.fetcher(...args);
+    },
+    api: state.api,
+    now: state.now,
+  });
+  meter.update([state.db]);
+  await meter.cycle();
+  const started = state.now();
+  let lastRead = reads;
+  for (let tick = 1; tick <= 14400; tick++) {
+    state.advance(250);
+    await meter.cycle();
+    assert.ok(calls <= 2 * (Math.floor((state.now() - started) / 15000) + 1));
+    if (tick % 60 !== 0) assert.equal(reads, lastRead);
+    lastRead = reads;
+  }
+  assert.equal(calls, 482);
+  assert.equal(state.activities.length, 241);
+  assert.ok(
+    state.usages.reduce((sum, batch) => sum + batch.samples.length, 0) <= 727,
+  );
+  const resumed = state.make();
+  resumed.update([state.db]);
+  state.advance(250);
+  const count = state.usages.length;
+  await resumed.cycle();
+  assert.equal(state.usages.length, count);
+});
+
+test("cooldown resumes from actual checkpoints but revision changes and missing checkpoints measure freshly", async () => {
+  const state = await setup();
+  let calls = 0;
+  const make = () =>
+    new RegionalMeasurements({
+      k8s: state.k8s,
+      signal: state.signal,
+      region: "eu-test",
+      snapshot: async () => structuredClone(state.snapshot),
+      fetcher: async (input, options) => {
+        calls++;
+        const response = await state.fetcher(input, options);
+        return Response.json({
+          ...((await response.json()) as object),
+          revision: state.db.generation,
+        });
+      },
+      api: state.api,
+      now: state.now,
+    });
+  const meter = make();
+  meter.update([state.db]);
+  await meter.cycle();
+  assert.equal(calls, 2);
+  state.advance(250);
+  const resumed = make();
+  resumed.update([state.db]);
+  await resumed.cycle();
+  assert.equal(calls, 2);
+  state.db.generation = 2;
+  const fence = state.k8s.resources.get(
+    state.k8s.key("ConfigMap", "pgcf-system", gatewayFenceName(state.db.id)),
+  )!;
+  const intent = JSON.parse(String(record(fence.data)["intent.json"]));
+  intent.revision = 2;
+  record(fence.data)["intent.json"] = JSON.stringify(intent);
+  resumed.update([state.db]);
+  await resumed.cycle();
+  assert.equal(calls, 4);
+  const storage = state.k8s.resources.get(
+    state.k8s.key("ConfigMap", "pgcf-system", `storage-${state.db.id}`),
+  )!;
+  delete record(storage.data)["measurements.json"];
+  const absent = make();
+  absent.update([state.db]);
+  await absent.cycle();
+  assert.equal(calls, 6);
+});
+
+test("immutable pending usage replays during cooldown without another gateway poll", async () => {
+  const state = await setup();
+  let calls = 0;
+  const make = () =>
+    new RegionalMeasurements({
+      k8s: state.k8s,
+      signal: state.signal,
+      region: "eu-test",
+      snapshot: async () => structuredClone(state.snapshot),
+      fetcher: async (...args) => {
+        calls++;
+        return state.fetcher(...args);
+      },
+      api: state.api,
+      now: state.now,
+    });
+  const meter = make();
+  meter.update([state.db]);
+  await meter.cycle();
+  state.advance(15000);
+  state.lose();
+  await meter.cycle();
+  const payload = structuredClone(state.usages.at(-1));
+  assert.equal(calls, 4);
+  state.advance(250);
+  const resumed = make();
+  resumed.update([state.db]);
+  state.lose();
+  await resumed.cycle();
+  assert.deepEqual(state.usages.at(-1), payload);
+  assert.equal(calls, 4);
+  state.advance(20000);
+  state.lose();
+  await resumed.cycle();
+  assert.deepEqual(state.usages.at(-1), payload);
+  assert.equal(calls, 4);
+  state.advance(250);
+  await resumed.cycle();
+  assert.equal(calls, 4);
+  state.advance(250);
+  await resumed.cycle();
+  assert.equal(calls, 6);
+});
+
+test("an accepted future gateway timestamp cannot bypass the fifteen-second sampling floor", async () => {
+  const state = await setup();
+  let calls = 0;
+  const meter = new RegionalMeasurements({
+    k8s: state.k8s,
+    signal: state.signal,
+    region: "eu-test",
+    snapshot: async () => structuredClone(state.snapshot),
+    fetcher: async (input, options) => {
+      calls++;
+      const response = await state.fetcher(input, options);
+      return Response.json({
+        ...((await response.json()) as object),
+        observedAt: new Date(state.now() + 5000).toISOString(),
+      });
+    },
+    api: state.api,
+    now: state.now,
+  });
+  meter.update([state.db]);
+  await meter.cycle();
+  state.advance(250);
+  await meter.cycle();
+  assert.equal(calls, 2);
+});
+
+test("accepted lagging gateway time uses actual receipt cadence without changing report coverage", async () => {
+  const state = await setup();
+  let calls = 0;
+  const meter = new RegionalMeasurements({
+    k8s: state.k8s,
+    signal: state.signal,
+    region: "eu-test",
+    snapshot: async () => structuredClone(state.snapshot),
+    fetcher: async (input, options) => {
+      calls++;
+      const response = await state.fetcher(input, options);
+      return Response.json({
+        ...((await response.json()) as object),
+        observedAt: new Date(state.now() - 30000).toISOString(),
+      });
+    },
+    api: state.api,
+    now: state.now,
+  });
+  meter.update([state.db]);
+  await meter.cycle();
+  const raw = state.activities[0]!.databases[0]!.reports[0]!.observedAt;
+  state.advance(250);
+  await meter.cycle();
+  assert.equal(calls, 2);
+  assert.equal(raw, new Date(state.now() - 30250).toISOString());
+  const restarted = new RegionalMeasurements({
+    k8s: state.k8s,
+    signal: state.signal,
+    region: "eu-test",
+    snapshot: async () => structuredClone(state.snapshot),
+    fetcher: async (...args) => {
+      calls++;
+      return state.fetcher(...args);
+    },
+    api: state.api,
+    now: state.now,
+  });
+  restarted.update([state.db]);
+  await restarted.cycle();
+  assert.equal(calls, 2);
 });
