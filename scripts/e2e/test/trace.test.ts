@@ -448,12 +448,16 @@ test("trace event timeout never replays its trigger and always terminates and de
   }
 });
 
-test("trace bounds a stalled trigger without replay or leaked tail", async () => {
+test("trace bounds a stalled trigger without replay or leaked tail", async (context) => {
+  context.mock.timers.enable({
+    apis: ["Date", "setTimeout"],
+    now: Date.UTC(2030, 0, 1),
+  });
   const value = fixture();
   const socket = installSocket();
   let calls = 0;
   try {
-    await assert.rejects(
+    const rejected = assert.rejects(
       capture(
         value.client,
         worker,
@@ -467,6 +471,9 @@ test("trace bounds a stalled trigger without replay or leaked tail", async () =>
       ),
       { message: "trace_event_missing" },
     );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    context.mock.timers.tick(1);
+    await rejected;
     assert.equal(calls, 1);
     assert.equal(socket.sockets[0]!.terminated, 1);
     assert.equal(value.deletes.length, 1);
