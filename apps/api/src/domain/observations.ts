@@ -149,6 +149,20 @@ export async function observations(
         ? "unknown"
         : "ok"
       : "failing";
+    const inactive =
+      row.desired_state === "suspended" &&
+      observation.state === "hibernated" &&
+      observation.power?.state === "hibernated" &&
+      observation.power.operation === row.power_operation &&
+      observation.power.revision === row.generation &&
+      !observation.power.refusal &&
+      (observation.archive.ready_wal_files === null ||
+        observation.archive.ready_wal_files === 0);
+    // Check operation authority in the update itself so a concurrent failure cannot clear an alarm.
+    const archiveHealth = `CASE WHEN ?=1 AND EXISTS(SELECT 1 FROM operations o WHERE o.id=databases.power_operation
+      AND o.database_id=databases.id AND o.project_id=databases.project_id AND o.generation<=databases.generation
+      AND o.status IN('pending','running','succeeded') AND ((databases.suspension_reason='idle' AND o.kind='database.hibernate')
+        OR (databases.suspension_reason='manual' AND o.kind='database.suspend'))) THEN 'unknown' ELSE ? END`;
     const applied =
       observation.state === "ready" ||
       observation.state === "deleted" ||
@@ -166,7 +180,7 @@ export async function observations(
     const statements = [
       c.env.DB.prepare(
         `UPDATE databases SET observed_state=?,observed_power=?,observed_generation=CASE WHEN ? THEN ? ELSE observed_generation END,status_message=?,
-      archiving_health_since=CASE WHEN archiving_health<>? THEN ? ELSE archiving_health_since END,archiving_health=?,updated_at=?
+      archiving_health_since=CASE WHEN archiving_health<>(${archiveHealth}) THEN ? ELSE archiving_health_since END,archiving_health=(${archiveHealth}),updated_at=?
       WHERE id=? AND region_id=? AND generation=? AND observed_generation<=? AND updated_at=? AND desired_state=? AND observed_state=?`,
       ).bind(
         observation.state === "hibernated" ? "provisioning" : observation.state,
@@ -180,8 +194,10 @@ export async function observations(
         observation.message === undefined
           ? null
           : truncateAgentText(observation.message),
+        Number(inactive),
         health,
         body.observed_at,
+        Number(inactive),
         health,
         now,
         row.id,
