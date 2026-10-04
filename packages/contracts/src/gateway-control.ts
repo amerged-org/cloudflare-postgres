@@ -7,6 +7,7 @@ import type { RouteKeyring } from "./route-token.ts";
 export const GATEWAY_CONTROL_PATH_PREFIX = "/_pgcf/gateway/";
 export const GATEWAY_CONTROL_HEADER = "X-PGCF-Control";
 export const GATEWAY_CONTROL_MAX_LENGTH = 1024;
+export const GATEWAY_RETIRE_HOLD_MS = 65_000;
 export const GATEWAY_FENCE_NAMESPACE = "pgcf-system";
 export const GATEWAY_FENCE_LABEL = "pgcf.io/gateway-fence";
 export const GATEWAY_FENCE_SELECTOR = `${GATEWAY_FENCE_LABEL}=true`;
@@ -16,6 +17,7 @@ export const gatewayControlActionSchema = z.enum([
   "status",
   "close",
   "release",
+  "retire",
 ]);
 export type GatewayControlAction = z.infer<typeof gatewayControlActionSchema>;
 /** Regional execution intent published from Cloudflare desired state; retain the running revision after resume. */
@@ -23,7 +25,7 @@ export const gatewayIntentSchema = z.strictObject({
   database: DatabaseId,
   operation: OperationId,
   revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
-  mode: z.enum(["quiesce", "running"]),
+  mode: z.enum(["quiesce", "running", "retired"]),
 });
 export type GatewayIntent = z.infer<typeof gatewayIntentSchema>;
 export const gatewayControlClaimsSchema = z.strictObject({
@@ -39,13 +41,28 @@ export const gatewayControlClaimsSchema = z.strictObject({
   exp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
 });
 export type GatewayControlClaims = z.infer<typeof gatewayControlClaimsSchema>;
-export const gatewayControlReportSchema = gatewayIntentSchema.extend({
-  pod: gatewayPodUidSchema,
-  status: z.enum(["idle", "busy", "closed", "running"]),
-  connections: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-  busyConnections: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-  pendingDials: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
-});
+export const gatewayControlReportSchema = gatewayIntentSchema
+  .extend({
+    pod: gatewayPodUidSchema,
+    status: z.enum(["idle", "busy", "closed", "running", "retired"]),
+    connections: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+    busyConnections: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER),
+    pendingDials: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  })
+  .refine(
+    (report) =>
+      report.mode === "retired"
+        ? report.status === "retired" &&
+          report.connections === 0 &&
+          report.busyConnections === 0 &&
+          report.pendingDials === 0
+        : report.status !== "retired",
+    { message: "Retirement requires zero database sessions" },
+  );
 export type GatewayControlReport = z.infer<typeof gatewayControlReportSchema>;
 export const gatewayFenceName = (database: string): string =>
   `gateway-fence-${DatabaseId.parse(database)}`;

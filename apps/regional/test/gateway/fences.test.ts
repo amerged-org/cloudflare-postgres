@@ -415,3 +415,207 @@ test("the real Kubernetes HTTPS transport authenticates, bounds one list/watch a
   await until(() => sockets.size === 0);
   assert.equal(store.ready, false);
 });
+
+test("a valid terminal retirement permits watch deletion and relist disappearance while regular loss remains fenced", () => {
+  const events: string[] = [];
+  const gateway = {
+    beginQuiesce() {
+      return {
+        database,
+        operation: newOperationId(),
+        status: "idle" as const,
+        connections: 0,
+        busyConnections: 0,
+        pendingDials: 0,
+      };
+    },
+    releaseQuiesce() {},
+    beginRetirement(db: string) {
+      events.push(`retire:${db}`);
+    },
+    retirementStatus(db: string, operation: string) {
+      return {
+        database: db,
+        operation,
+        status: "closed" as const,
+        connections: 0,
+        busyConnections: 0,
+        pendingDials: 0,
+      };
+    },
+    forgetRetirement(db: string) {
+      events.push(`forget:${db}`);
+    },
+  };
+  const store = new GatewayFenceStore(gateway);
+  const running = resource(database, newOperationId(), 1, "running");
+  store.load([running]);
+  store.connected();
+  const retired = resource(
+    database,
+    newOperationId(),
+    2,
+    "retired",
+    running.metadata.uid,
+  );
+  retired.data["retired-at" as "intent.json"] = new Date(
+    Date.now() - 66_000,
+  ).toISOString();
+  store.update(retired);
+  (store as unknown as { remove(value: unknown): void }).remove(retired);
+  assert.equal(store.get(database), undefined);
+  store.load([]);
+  store.connected();
+  assert.equal(store.ready, true);
+  assert.deepEqual(events, [`retire:${database}`, `forget:${database}`]);
+  const regular = resource(newDatabaseId(), newOperationId(), 1, "running");
+  store.update(regular);
+  assert.throws(() => store.load([]));
+  assert.equal(store.ready, false);
+});
+
+test("terminal disappearance rejects premature age, replaced UID, stale intents and sessions; successful churn releases capacity", () => {
+  let busy = false;
+  const gateway = {
+    beginQuiesce() {
+      return {
+        database,
+        operation: newOperationId(),
+        status: "idle" as const,
+        connections: 0,
+        busyConnections: 0,
+        pendingDials: 0,
+      };
+    },
+    releaseQuiesce() {},
+    beginRetirement() {},
+    retirementStatus(db: string, operation: string) {
+      return {
+        database: db,
+        operation,
+        status: busy ? ("busy" as const) : ("closed" as const),
+        connections: busy ? 1 : 0,
+        busyConnections: 0,
+        pendingDials: 0,
+      };
+    },
+    forgetRetirement() {},
+  };
+  const store = new GatewayFenceStore(gateway),
+    regular = resource(database, newOperationId(), 1, "running");
+  store.load([regular]);
+  const terminal = {
+    ...resource(database, newOperationId(), 2, "retired", regular.metadata.uid),
+    data: { "intent.json": "", "retired-at": new Date().toISOString() },
+  };
+  terminal.data["intent.json"] = JSON.stringify({
+    database,
+    operation: newOperationId(),
+    revision: 2,
+    mode: "retired",
+  });
+  store.update(terminal);
+  assert.throws(() => store.remove(terminal));
+  assert.equal(store.ready, false);
+  assert.throws(() => store.update(regular));
+  assert.throws(() =>
+    store.remove({
+      ...terminal,
+      metadata: { ...terminal.metadata, uid: randomUUID() },
+    }),
+  );
+  const other = new GatewayFenceStore(gateway);
+  for (let count = 0; count < 2100; count++) {
+    const id = newDatabaseId(),
+      map = resource(id, newOperationId(), 1, "running");
+    other.update(map);
+    const retired = {
+      ...resource(id, newOperationId(), 2, "retired", map.metadata.uid),
+      data: {
+        "intent.json": "",
+        "retired-at": new Date(Date.now() - 66_000).toISOString(),
+      },
+    };
+    retired.data["intent.json"] = JSON.stringify({
+      database: id,
+      operation: newOperationId(),
+      revision: 2,
+      mode: "retired",
+    });
+    other.update(retired);
+    if (count === 0) {
+      busy = true;
+      assert.throws(() => other.remove(retired));
+      busy = false;
+    }
+    other.remove(retired);
+    assert.equal(other.get(id), undefined);
+  }
+  other.load([]);
+  other.connected();
+  assert.equal(other.ready, true);
+});
+
+test("foreground deletion metadata stays synchronized only for a previously observed mature terminal", () => {
+  const gateway = {
+    beginQuiesce() {
+      return {
+        database,
+        operation: newOperationId(),
+        status: "idle" as const,
+        connections: 0,
+        busyConnections: 0,
+        pendingDials: 0,
+      };
+    },
+    releaseQuiesce() {},
+    beginRetirement() {},
+    retirementStatus(db: string, operation: string) {
+      return {
+        database: db,
+        operation,
+        status: "closed" as const,
+        connections: 0,
+        busyConnections: 0,
+        pendingDials: 0,
+      };
+    },
+    forgetRetirement() {},
+  };
+  const store = new GatewayFenceStore(gateway),
+    base = resource(database, newOperationId(), 1, "running");
+  store.load([base]);
+  const terminal = {
+    ...resource(database, newOperationId(), 2, "retired", base.metadata.uid),
+    data: {
+      "intent.json": "",
+      "retired-at": new Date(Date.now() - 66_000).toISOString(),
+    },
+  };
+  terminal.data["intent.json"] = JSON.stringify({
+    database,
+    operation: newOperationId(),
+    revision: 2,
+    mode: "retired",
+  });
+  store.update(terminal);
+  store.connected();
+  const dying = {
+    ...terminal,
+    metadata: {
+      ...terminal.metadata,
+      resourceVersion: "3",
+      deletionTimestamp: new Date().toISOString(),
+    },
+  };
+  store.update(dying);
+  assert.equal(store.ready, true);
+  store.load([dying]);
+  store.connected();
+  assert.equal(store.ready, true);
+  store.remove(dying);
+  assert.equal(store.get(database), undefined);
+  const unknown = new GatewayFenceStore(gateway);
+  assert.throws(() => unknown.load([dying]));
+  assert.equal(unknown.ready, false);
+});

@@ -106,22 +106,30 @@ export function createGatewayControl(options: {
       const intent = matches(verified.claims);
       if (
         !intent ||
-        (action.data === "release"
-          ? intent.mode !== "running"
-          : action.data !== "status" && intent.mode !== "quiesce")
+        (action.data === "retire"
+          ? intent.mode !== "retired"
+          : intent.mode === "retired" ||
+            (action.data === "release"
+              ? intent.mode !== "running"
+              : action.data !== "status" && intent.mode !== "quiesce"))
       ) {
         reply(response, 409, { error: "control_intent_mismatch" });
         return;
       }
       const report =
-        action.data === "close"
-          ? await options.gateway.closeQuiesced(
-              intent.database,
-              intent.operation,
-            )
-          : action.data === "begin"
-            ? options.gateway.beginQuiesce(intent.database, intent.operation)
-            : options.gateway.quiesceStatus(intent.database, intent.operation);
+        action.data === "retire"
+          ? options.gateway.retirementStatus(intent.database, intent.operation)
+          : action.data === "close"
+            ? await options.gateway.closeQuiesced(
+                intent.database,
+                intent.operation,
+              )
+            : action.data === "begin"
+              ? options.gateway.beginQuiesce(intent.database, intent.operation)
+              : options.gateway.quiesceStatus(
+                  intent.database,
+                  intent.operation,
+                );
       if (!options.store.ready) {
         reply(response, 503, { error: "fences_unsynchronized" });
         return;
@@ -130,10 +138,30 @@ export function createGatewayControl(options: {
         reply(response, 409, { error: "control_intent_mismatch" });
         return;
       }
+      if (
+        action.data === "retire" &&
+        (!options.store.retirementReady(
+          intent.database,
+          intent.operation,
+          intent.revision,
+        ) ||
+          report.connections !== 0 ||
+          report.busyConnections !== 0 ||
+          report.pendingDials !== 0 ||
+          report.status !== "closed")
+      ) {
+        reply(response, 409, { error: "retirement_sessions_remain" });
+        return;
+      }
       const output = gatewayControlReportSchema.parse({
         ...intent,
         pod: options.pod,
-        status: intent.mode === "running" ? "running" : report.status,
+        status:
+          intent.mode === "retired"
+            ? "retired"
+            : intent.mode === "running"
+              ? "running"
+              : report.status,
         connections: report.connections,
         busyConnections: report.busyConnections,
         pendingDials: report.pendingDials,
