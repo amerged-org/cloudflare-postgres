@@ -212,7 +212,11 @@ async function readList(
   )
     throw new Error("incomplete fence list");
   return {
-    items: list.items,
+    items: list.items.map((value) => ({
+      apiVersion: "v1",
+      kind: "ConfigMap",
+      ...object(value),
+    })),
     version: resourceVersion(metadata.resourceVersion),
   };
 }

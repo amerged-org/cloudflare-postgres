@@ -64,6 +64,33 @@ function resource(
     },
   };
 }
+
+test("real Kubernetes typed-list entries omit their own apiVersion and kind", async (t) => {
+  const upstream = await source();
+  const map = resource();
+  const entry = { metadata: map.metadata, data: map.data };
+  const store = new GatewayFenceStore({
+    beginQuiesce() {
+      return {
+        database,
+        operation: JSON.parse(map.data["intent.json"]).operation,
+        status: "idle",
+        connections: 0,
+        busyConnections: 0,
+        pendingDials: 0,
+      };
+    },
+    releaseQuiesce() {},
+  });
+  const watcher = watchGatewayFences(store, upstream.fetch);
+  t.after(async () => {
+    await watcher.stop();
+    await upstream.close();
+  });
+  upstream.unblock([entry]);
+  await until(() => store.ready);
+  assert.equal(store.get(database)?.mode, "quiesce");
+});
 async function source() {
   let maps: unknown[] = [];
   let blocked = true;
