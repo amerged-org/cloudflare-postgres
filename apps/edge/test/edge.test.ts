@@ -17,9 +17,10 @@ import {
   connectionRateKey,
   ADMISSION_DEADLINE_MS,
 } from "../src/session-policy.ts";
-import type { Env } from "../src/env.ts";
+import type { Env, DatabaseAdmission } from "../src/env.ts";
+import { seedKnownDatabase } from "./actor-entry.js";
 
-const testEnv = env as Env & { GATEWAY: Fetcher };
+const testEnv = env as unknown as Env & { DB: D1Database; GATEWAY: Fetcher };
 const origin = `https://${["edge", "invalid"].join(".")}`;
 const gatewayOrigin = `https://${["gateway", "invalid"].join(".")}`;
 const region = "eu-test";
@@ -176,6 +177,7 @@ beforeEach(async () => {
       password_iv, password_kid, created_at, updated_at) VALUES (?, 'app', 1, ?, ?, 'v1', ?, ?)`,
     ).bind(database, password, iv, now, now),
   ]);
+  await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, database);
 });
 
 afterEach(async () => {
@@ -192,9 +194,113 @@ afterEach(async () => {
   for (const { ctx } of connections) await waitOnExecutionContext(ctx);
   await testEnv.GATEWAY.fetch(`${gatewayOrigin}/reset`);
   logs.mockRestore();
+  vi.restoreAllMocks();
 });
 
 describe("native edge admission with real Workers D1 and route-token modules", () => {
+  it("one thousand distinct unseeded hints make no D1 admission query or gateway call", async () => {
+    const queries = vi.spyOn(Object.getPrototypeOf(testEnv.DB), "prepare");
+    const actors = vi.spyOn(
+      Object.getPrototypeOf(testEnv.DATABASE_ACTOR),
+      "get",
+    );
+    const unknown = await Promise.all(
+      Array.from({ length: 1_000 }, () => open({ database: newDatabaseId() })),
+    );
+    const codes = await Promise.all(unknown.map(errorCode));
+    expect(new Set(codes)).toEqual(new Set(["3D000"]));
+    expect(actors).toHaveBeenCalledTimes(1_000);
+    expect(queries).not.toHaveBeenCalled();
+    expect(await stats()).toHaveLength(0);
+  }, 30_000);
+
+  it("a seeded unknown role makes no authoritative D1 query or gateway call", async () => {
+    const queries = vi.spyOn(Object.getPrototypeOf(testEnv.DB), "prepare");
+    expect(await errorCode(await open({ user: "missing" }))).toBe("28P01");
+    expect(queries).not.toHaveBeenCalled();
+    expect(await stats()).toHaveLength(0);
+  });
+
+  it("uses the actual actor's authoritative D1 read without a data-plane D1 binding", async () => {
+    const queries = vi.spyOn(Object.getPrototypeOf(testEnv.DB), "prepare");
+    const bindings = { ...testEnv };
+    delete (bindings as { DB?: D1Database }).DB;
+    const connection = await open({ bindings });
+    expect(queries).toHaveBeenCalledTimes(1);
+    const startup = encodeStartup({ user: "app", database });
+    connection.socket.send(startup);
+    await expect
+      .poll(async () => (await stats())[0]?.bytes)
+      .toEqual([...startup]);
+    expect(await stats()).toHaveLength(1);
+  });
+
+  it("missing actor binding fails closed without falling back to D1 or Gateway", async () => {
+    const queries = vi.spyOn(Object.getPrototypeOf(testEnv.DB), "prepare");
+    const bindings = { ...testEnv };
+    delete (bindings as { DATABASE_ACTOR?: Env["DATABASE_ACTOR"] })
+      .DATABASE_ACTOR;
+    expect(await errorCode(await open({ bindings }))).toBe("08006");
+    expect(queries).not.toHaveBeenCalled();
+    expect(await stats()).toHaveLength(0);
+  });
+
+  it("a current project deletion overrides a stale positive actor snapshot", async () => {
+    await testEnv.DB.prepare(
+      "UPDATE projects SET deleted_at=? WHERE id=(SELECT project_id FROM databases WHERE id=?)",
+    )
+      .bind(new Date().toISOString(), database)
+      .run();
+    expect(await errorCode(await open())).toBe("3D000");
+    expect(await stats()).toHaveLength(0);
+  });
+
+  it("actual actor D1 failure returns a generic error without consuming the database limiter or contacting Gateway", async () => {
+    const canary = crypto.randomUUID();
+    const queries = vi
+      .spyOn(Object.getPrototypeOf(testEnv.DB), "prepare")
+      .mockImplementation(() => {
+        throw new Error(canary);
+      });
+    const databaseLimiter = {
+      limit: vi.fn(async () => ({ success: true })),
+    } as RateLimit;
+    const connection = await open({
+      bindings: {
+        ...testEnv,
+        DATABASE_CONNECTION_RATE_LIMITER: databaseLimiter,
+      },
+    });
+    expect(await errorCode(connection)).toBe("08006");
+    expect(queries).toHaveBeenCalledTimes(1);
+    expect(databaseLimiter.limit).not.toHaveBeenCalled();
+    expect(await stats()).toHaveLength(0);
+    expect(new TextDecoder().decode(connection.messages[0])).not.toContain(
+      canary,
+    );
+    expect(JSON.stringify(logs.mock.calls)).not.toContain(canary);
+  });
+
+  it("actor RPC errors fail closed without leaking exception text or contacting Gateway", async () => {
+    const canary = crypto.randomUUID();
+    const actor = {
+      idFromName: (name: string) => testEnv.DATABASE_ACTOR.idFromName(name),
+      get: () => ({
+        admit: async (): Promise<DatabaseAdmission> => {
+          throw new Error(canary);
+        },
+      }),
+    };
+    const connection = await open({
+      bindings: { ...testEnv, DATABASE_ACTOR: actor },
+    });
+    expect(await errorCode(connection)).toBe("08006");
+    expect(await stats()).toHaveLength(0);
+    expect(new TextDecoder().decode(connection.messages[0])).not.toContain(
+      canary,
+    );
+    expect(JSON.stringify(logs.mock.calls)).not.toContain(canary);
+  });
   it("returns the unopened gateway WebSocket directly without accepting or relaying it", async () => {
     let upstream: WebSocket | null = null;
     let accept: ReturnType<typeof vi.spyOn> | null = null;
@@ -592,27 +698,24 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const resume = new Promise<void>((resolve) => {
       release = resolve;
     });
-    const db = {
-      prepare(query: string) {
+    const actor = {
+      idFromName: (name: string) => testEnv.DATABASE_ACTOR.idFromName(name),
+      get(id: DurableObjectId) {
+        const stub = testEnv.DATABASE_ACTOR.get(id);
         return {
-          bind(...values: unknown[]) {
-            const statement = testEnv.DB.prepare(query).bind(...values);
-            return {
-              async first<T>() {
-                const row = await statement.first<T>();
-                expect(row).not.toBeNull();
-                queried();
-                await resume;
-                return row;
-              },
-            } as D1PreparedStatement;
+          async admit(databaseId: string, user: string) {
+            const row = await stub.admit(databaseId, user);
+            expect(row.ok).toBe(true);
+            queried();
+            await resume;
+            return row;
           },
-        } as D1PreparedStatement;
+        };
       },
-    } as D1Database;
+    };
     const controller = new AbortController();
     const pending = open({
-      bindings: { ...testEnv, DB: db },
+      bindings: { ...testEnv, DATABASE_ACTOR: actor },
       signal: controller.signal,
     });
     await lookupReached;
@@ -730,6 +833,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
         password_kid, created_at, updated_at FROM roles WHERE database_id = ?`,
       ).bind(other, database),
     ]);
+    await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, other);
     const ip = [0x2001, 0xdb8, 0xa, 0xb, 0, 0, 0, 1]
       .map((part) => part.toString(16))
       .join(":");
@@ -760,6 +864,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     )
       .bind(otherRole, database)
       .run();
+    await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, database);
     const first = await open({ bindings });
     first.socket.send(encodeStartup({ user: "app", database }));
     await expect.poll(async () => (await stats()).length).toBe(1);
@@ -850,6 +955,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     )
       .bind(otherRole, database)
       .run();
+    await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, database);
     const deniedRole = await open({ bindings, user: otherRole });
     expect(await errorCode(deniedRole)).toBe("53300");
     expect(await stats()).toHaveLength(1);
@@ -868,6 +974,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
         password_kid, created_at, updated_at FROM roles WHERE database_id = ?`,
       ).bind(other, database),
     ]);
+    await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, other);
     const independent = await open({ bindings, database: other });
     independent.socket.send(encodeStartup({ user: "app", database: other }));
     await expect.poll(async () => (await stats()).length).toBe(2);
