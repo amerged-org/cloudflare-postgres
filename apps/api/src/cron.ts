@@ -141,6 +141,6 @@ export async function runCron(
   )
     .bind(actorPage.next, cursor.cursor)
     .run();
-  const usage = await runUsageCron(env.DB, now);
+  const usage = await runUsageCron(env.DB, now, env);
   return { failed: result.meta.changes + recovered, purged, hinted, usage };
 }

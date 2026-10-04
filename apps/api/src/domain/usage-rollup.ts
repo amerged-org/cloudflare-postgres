@@ -182,7 +182,8 @@ export function computeUsageHour(
         (s) =>
           s.source === source &&
           Date.parse(s.observed_at) >= hour &&
-          Date.parse(s.observed_at) < measuredEnd,
+          (Date.parse(s.observed_at) < measuredEnd ||
+            (measuredEnd < end && Date.parse(s.observed_at) === measuredEnd)),
       )
       .map((s) => (s as unknown as Record<string, unknown>)[input]);
     const measured = values.filter((v): v is number => typeof v === "number");

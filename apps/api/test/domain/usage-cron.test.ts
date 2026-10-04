@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { newDatabaseId } from "@pgcf/contracts";
+import {
+  newDatabaseId,
+  archiveDestinationPath,
+  newOperationId,
+} from "@pgcf/contracts";
 import { USAGE_HOUR_MS } from "@pgcf/contracts/usage";
 import { afterEach, describe, expect, it } from "vitest";
 import { runCron } from "../../src/cron.ts";
@@ -457,5 +461,36 @@ describe("bounded usage cron", () => {
           .all()
       ).results,
     ).toEqual(before.results);
+  });
+  it("wires real R2 backup bytes through the bounded usage cron and hourly row", async () => {
+    const f = await cohort(),
+      id = f.ids[0]!,
+      now = Date.now(),
+      current = Math.floor(now / USAGE_HOUR_MS) * USAGE_HOUR_MS;
+    const archivePath = archiveDestinationPath(
+      env.ARCHIVE_BUCKET_NAME,
+      f.region,
+      id,
+      1,
+      newOperationId(),
+    );
+    await env.DB.prepare(
+      "UPDATE databases SET archive_path=?,created_at=? WHERE id=?",
+    )
+      .bind(archivePath, iso(current), id)
+      .run();
+    const prefix = `${f.region}/${id}/${archivePath.slice(archivePath.lastIndexOf("/") + 1)}/database/`,
+      key = `${prefix}fixture`;
+    await env.ARCHIVE.put(key, new Uint8Array(37));
+    try {
+      const result = await runUsageCron(env.DB, Date.now(), env);
+      expect(result.backupMeasured).toBe(1);
+      expect(result.backupUnavailable).toBe(0);
+      expect(result.statements).toBeLessThanOrEqual(USAGE_CRON_STATEMENT_LIMIT);
+      const saved = await rows(id);
+      expect(JSON.parse(saved[0]!.metrics).backup_bytes_max).toBe(37);
+    } finally {
+      await env.ARCHIVE.delete(key);
+    }
   });
 });

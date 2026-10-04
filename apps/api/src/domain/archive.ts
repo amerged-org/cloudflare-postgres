@@ -3,6 +3,29 @@ import { ARCHIVE_DESTINATION_PATTERN } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import { databaseForRequest } from "./rows.ts";
+import type { DatabaseRow } from "./rows.ts";
+
+export function validatedArchivePrefix(
+  row: Pick<DatabaseRow, "id" | "region_id" | "archive_path" | "generation">,
+  region: { backup_bucket: string } | null,
+  boundBucket: string,
+): string {
+  const path = ARCHIVE_DESTINATION_PATTERN.exec(row.archive_path);
+  if (
+    !region ||
+    !path ||
+    path[1] !== region.backup_bucket ||
+    path[2] !== row.region_id ||
+    path[3] !== row.id ||
+    Number(path[4]) > row.generation ||
+    boundBucket !== region.backup_bucket
+  )
+    throw new ApiError(
+      "internal",
+      "The region archive bucket is not bound to this installation",
+    );
+  return `${row.region_id}/${row.id}/${row.archive_path.slice(row.archive_path.lastIndexOf("/") + 1)}/database/`;
+}
 
 export async function archiveSummary(
   c: ApiContext,
@@ -14,21 +37,7 @@ export async function archiveSummary(
   )
     .bind(row.region_id)
     .first<{ backup_bucket: string }>();
-  const path = ARCHIVE_DESTINATION_PATTERN.exec(row.archive_path);
-  if (
-    !region ||
-    !path ||
-    path[1] !== region.backup_bucket ||
-    path[2] !== row.region_id ||
-    path[3] !== row.id ||
-    Number(path[4]) > row.generation ||
-    c.env.ARCHIVE_BUCKET_NAME !== region.backup_bucket
-  )
-    throw new ApiError(
-      "internal",
-      "The region archive bucket is not bound to this installation",
-    );
-  const prefix = `${row.region_id}/${row.id}/${row.archive_path.slice(row.archive_path.lastIndexOf("/") + 1)}/database/`;
+  const prefix = validatedArchivePrefix(row, region, c.env.ARCHIVE_BUCKET_NAME);
   let baseBackups = 0,
     walCount = 0,
     bytes = 0;
