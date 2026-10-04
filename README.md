@@ -18,32 +18,29 @@ loss is recovered from R2.
 
 ## Status
 
-**Phase 0 accepted; Phase 1 live acceptance in progress (2026-10-04).** The first EU node and
-all five Flux releases are Ready, with 95 GiB storage. The complete Dev connection path through
-`db.ohmyho.st` reaches real PostgreSQL with verified TLS, WAL archiving and an R2 base backup.
+**Phases 0 and 1 accepted in Dev; Phase 2 in progress (2026-10-04).** The first EU node and
+all five Flux releases are Ready, with 95 GiB storage. The complete Dev path through
+`db.ohmyho.st` reaches real PostgreSQL with verified TLS, continuous WAL archiving and R2 backups.
 
-Real Dev checks passed transactions, rollback, 50 concurrent connections, 100 MiB and 1 GiB
-stream integrity, slow reception, disconnect cleanup and 600 seconds idle without reconnect.
-An additional 10-second read load measured 735.604 SQL/s over 50 warm connections, p95 75.368 ms
-and zero errors. These results do not establish maximum throughput or 1,000-customer capacity. Strong
-binary-result client assertions remain failed, including on direct TCP with node-postgres 8.22.
-The raw transport checks pass.
+Real E0–E6 passed, including complete TCP port scans of the observed node IPv4 from both sources.
+Five create/delete runs survived ten agent restarts with complete storage cleanup. Empty, failed,
+stale and out-of-order desired-state responses preserved storage and configuration generations.
+Loss of a ready database namespace reported recovery required rather than creating empty storage.
+The R2 outage test proved two failing archive observations under the active block and a successful
+new connection during the alarm. A separate restore drill preserved committed markers, omitted
+a rolled-back marker and reclaimed its target storage; full PITR and disaster recovery remain pending.
 
-Formal E0–E6 passed, including all 65,535 ports from both network sources. Five create/delete
-runs survived ten agent restarts with complete cleanup. Empty, failed, stale and out-of-order
-desired-state pulls passed without data loss or generation regression. After the actual loss
-of a ready database namespace and an agent restart, PGCF reported recovery required and did not
-initialize an empty database. A real R2 restore drill
-passed committed markers, rollback absence, TLS, separate target WAL and exact storage cleanup;
-measured WAL upload delay was 52.4 seconds for these writes. The deployed Workers client proved
-backend reuse, isolation between two actual identities and complete cancellation/cleanup.
-An actual R2 outage exposed a stalled-archive health defect. The corrected alarm passed after
-619 seconds despite an agent restart, and recovery drained the queue and preserved the marker.
-The revised policy keeping established databases available during measured archive alarms still
-needs its new image and live connection test. CLI preparation passed real psql, commit/rollback
-and 105 MB binary COPY integrity; serverless lifecycle and metrics have not begun.
-The second EU node is untouched, the US node has not been bought, and
-existing production routes and databases have not changed. Image signing remains pending.
+Raw 100 MiB and 1 GiB stream checks, slow reception and 600 seconds idle passed. A 10-second
+read load measured 735.604 SQL/s over 50 warmed connections, p95 75.368 ms and zero errors.
+These observations do not establish maximum throughput or 1,000-customer capacity. Random routing
+hints can still amplify D1 reads. Default-text clients and raw COPY pass; decoded binary-result
+assertions remain failed on WebSocket and direct TCP with node-postgres 8.22. Intermittent Tail
+correlation remains unresolved.
+
+The installable CLI passed real psql transactions, rollback and 105 MB binary COPY integrity.
+CPU placement and sleep-safety work are underway; hibernation, wake, usage and costs remain pending.
+The second EU node is untouched, the US node has not been bought and no customer or platform
+database has been migrated. Image signing and the complete production-ready release remain pending.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture
