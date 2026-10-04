@@ -161,6 +161,12 @@ export function kubernetesFromConfig(
           case "Pod":
             value = await core.readNamespacedPod(namespaced, options);
             break;
+          case "PersistentVolumeClaim":
+            value = await core.readNamespacedPersistentVolumeClaim(
+              namespaced,
+              options,
+            );
+            break;
           case "PersistentVolume":
             value = await core.readPersistentVolume({ name }, options);
             break;

@@ -62,6 +62,9 @@ rules:
     verbs: [get, list, create, update, patch, delete]
   # Delete flow: find the PV bound to a database, set reclaim policy Delete, then wait for it.
   - apiGroups: [""]
+    resources: [persistentvolumeclaims]
+    verbs: [get]
+  - apiGroups: [""]
     resources: [persistentvolumes]
     verbs: [get, list, patch, delete]
   # Waiting for the LV to disappear after the PV is gone.
