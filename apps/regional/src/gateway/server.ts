@@ -11,6 +11,7 @@ import type { TLSSocket } from "node:tls";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { isDatabaseId, isOperationId } from "@pgcf/contracts";
 import { PostgresActivity, WebSocketInputActivity } from "./activity.ts";
+import { GatewayMeasurements, type MeasurementSession } from "./telemetry.ts";
 import {
   ReplayCache,
   ROUTE_TOKEN_HEADER,
@@ -60,6 +61,7 @@ export interface GatewayOptions {
   readonly heartbeatMs?: number;
   readonly drainMs?: number;
   readonly startupTimeoutMs?: number;
+  readonly activityRecordLimit?: number;
   readonly log?: (event: Readonly<Record<string, string | number>>) => void;
 }
 
@@ -79,6 +81,7 @@ interface SessionControl {
   resume(): void;
   busy(): boolean;
   pendingDial(): boolean;
+  authenticated(): boolean;
   close(): Promise<void>;
 }
 
@@ -94,6 +97,12 @@ export interface Gateway {
   beginQuiesce(database: string, operation: string): QuiesceReport;
   releaseQuiesce(database: string, operation: string): void;
   closeQuiesced(database: string, operation: string): Promise<QuiesceReport>;
+  activity(database: string): ReturnType<GatewayMeasurements["read"]> & {
+    connections: number;
+    authenticatedConnections: number;
+    busyConnections: number;
+    pendingDials: number;
+  };
   drain(): Promise<void>;
 }
 
@@ -116,6 +125,9 @@ export function createGateway(options: GatewayOptions): Gateway {
     options.memoryLimitBytes ?? DEFAULT_MEMORY_LIMIT_BYTES,
     options.databaseMemoryLimitBytes ?? DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
   );
+  const measurements = new GatewayMeasurements({
+    maxRecords: options.activityRecordLimit,
+  });
   const replay = options.replayCache ?? new ReplayCache();
   const log =
     options.log ??
@@ -346,6 +358,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     const abort = new AbortController();
     const reader = new StartupReader(MAX_STARTUP_BUFFER_BYTES);
     const started = Date.now();
+    const measurement = measurements.begin(claims.db);
     const queue: Buffer[] = [];
     const startupMemory = socket.memory.lease();
     const queueMemory = socket.memory.lease();
@@ -370,6 +383,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       queue.length = 0;
       clients.delete(client);
       sessions.delete(client);
+      measurement.close();
       release();
       log({
         event: "conn_close",
@@ -390,7 +404,10 @@ export function createGateway(options: GatewayOptions): Gateway {
       const packet = error
         ? encodeErrorResponse(error.sqlstate, error.message)
         : undefined;
-      if (packet) bytesOut += packet.byteLength;
+      if (packet) {
+        bytesOut += packet.byteLength;
+        measurement.egress(packet.byteLength);
+      }
       finish(outcome);
       closingDeadline = setTimeout(() => client.terminate(), 500);
       closingDeadline.unref();
@@ -522,6 +539,7 @@ export function createGateway(options: GatewayOptions): Gateway {
         started,
         bytesOut,
         wire,
+        measurement,
       );
     };
     const connect = async () => {
@@ -551,6 +569,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       },
       busy: () => true,
       pendingDial: () => connecting && !postgres,
+      authenticated: () => measurement.authenticated,
       close: () => closeClient(client),
     });
     const message = (data: RawData, binary: boolean) => {
@@ -569,6 +588,8 @@ export function createGateway(options: GatewayOptions): Gateway {
         close(1003, "text_frame");
         return;
       }
+      measurement.ingress(chunk.length);
+      if (chunk.length !== 0) measurement.clientActivity();
       if (connecting) {
         enqueue(chunk);
         return;
@@ -583,6 +604,7 @@ export function createGateway(options: GatewayOptions): Gateway {
         if (event.kind === "ssl" || event.kind === "gss") {
           const packet = encodeEncryptionDeclined();
           bytesOut += packet.byteLength;
+          measurement.egress(packet.byteLength);
           client.send(packet, { binary: true }, (error) => {
             if (error) clientError();
           });
@@ -653,6 +675,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     started: number,
     initialBytesOut: number,
     wire: WebSocketInputActivity,
+    measurement: MeasurementSession,
   ): void {
     const activity = new PostgresActivity();
     const held: { chunks: readonly Buffer[]; lease?: MemoryLease }[] = [];
@@ -688,6 +711,7 @@ export function createGateway(options: GatewayOptions): Gateway {
       postgres.destroy();
       clients.delete(client);
       sessions.delete(client);
+      measurement.close();
       for (const entry of held) entry.lease?.release();
       held.length = 0;
       release();
@@ -762,6 +786,12 @@ export function createGateway(options: GatewayOptions): Gateway {
         return;
       }
       const chunks = toBuffers(data);
+      const receivedBytes = chunks.reduce(
+        (sum, chunk) => sum + chunk.length,
+        0,
+      );
+      measurement.ingress(receivedBytes);
+      if (receivedBytes !== 0) measurement.clientActivity();
       for (const chunk of chunks) activity.observeFrontend(chunk);
       if (fenced(database)) {
         const length = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
@@ -791,6 +821,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     });
     postgres.on("data", (chunk: Buffer) => {
       activity.observeBackend(chunk);
+      if (activity.authenticated) measurement.authenticate();
       outbound++;
       postgres.pause();
       const lease = ingress.memory.lease();
@@ -819,6 +850,7 @@ export function createGateway(options: GatewayOptions): Gateway {
         const frame = chunk.subarray(offset, offset + MAX_FRAME_BYTES);
         offset += frame.length;
         bytesOut += frame.length;
+        measurement.egress(frame.length);
         client.send(frame, { binary: true }, (error) => {
           if (error) {
             outcome = "websocket_error";
@@ -851,6 +883,7 @@ export function createGateway(options: GatewayOptions): Gateway {
         postgres.writableLength !== 0 ||
         client.bufferedAmount !== 0,
       pendingDial: () => false,
+      authenticated: () => measurement.authenticated,
       close: () => closeClient(client),
     });
     for (const chunk of initial.slice(1)) activity.observeFrontend(chunk);
@@ -861,6 +894,21 @@ export function createGateway(options: GatewayOptions): Gateway {
   return {
     server,
     metrics,
+    activity(database) {
+      const value = measurements.read(database);
+      const owned = [...sessions.values()].filter(
+        (session) => session.database === database,
+      );
+      return {
+        ...value,
+        connections: owned.length,
+        authenticatedConnections: owned.filter((session) =>
+          session.authenticated(),
+        ).length,
+        busyConnections: owned.filter((session) => session.busy()).length,
+        pendingDials: owned.filter((session) => session.pendingDial()).length,
+      };
+    },
     quiesceStatus(database, operation) {
       validateFence(database, operation);
       if (fenced(database)) matchingFence(database, operation);

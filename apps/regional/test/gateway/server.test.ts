@@ -602,14 +602,22 @@ test("an established relay rejects an oversized WebSocket message without forwar
 test("marks readiness false, rejects new connections and drains existing connections with 1012", async (t) => {
   const postgres = await postgresServer();
   const { gateway, port } = await gatewayFor(postgres.port, { drainMs: 100 });
-  t.after(() => postgres.close());
+  let timersEnabled = false;
+  t.after(async () => {
+    if (timersEnabled) t.mock.timers.runAll();
+    await gateway.drain();
+    await postgres.close();
+  });
   const socket = await open(port);
   await start(socket);
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  timersEnabled = true;
   const closed = once(socket, "close");
   const drain = gateway.drain();
   assert.equal((await fetch(`http://${loopback}:${port}/readyz`)).status, 503);
   assert.equal((await fetch(`http://${loopback}:${port}/healthz`)).status, 200);
   assert.equal(await rejection(port, await token()), 503);
+  t.mock.timers.tick(75);
   assert.equal((await closed)[0], 1012);
   await drain;
   assert.equal(gateway.metrics.activeConnections, 0);
