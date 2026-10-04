@@ -104,7 +104,7 @@ it("admits an already-ready route with one fresh authoritative read", async () =
 it("does not wake for a role revoked after the authorization read", async () => {
   const f = await ready();
   await idle(f);
-  const prototype = Object.getPrototypeOf(env.DB);
+  const prototype = Object.getPrototypeOf(env.DB) as D1Database;
   const original = prototype.prepare;
   let reads = 0;
   vi.spyOn(prototype, "prepare").mockImplementation(function (
