@@ -17,7 +17,12 @@ Real Dev transport checks passed 50 concurrent connections, transactions and rol
 SCRAM cases, 100 MiB and 1 GiB COPY/SELECT integrity, slow reception, disconnect cleanup and
 600,002 ms continuous idle without reconnect. Across 1,000 paired SELECT measurements, direct
 p95 was 29.093 ms and WebSocket p95 35.541 ms. These measurements establish neither sustained
-maximum SQL throughput nor capacity for 1,000 customers. Strong decoded-binary client assertions
+maximum SQL throughput nor capacity for 1,000 customers. A separate 10-second read load on
+the current Dev database measured 7,403 exact parameterized SELECT results over 50 warmed
+connections: 735.604 SQL operations/s over the actual 10,063.836 ms including bounded drain,
+p50 66.831 ms, p95 75.368 ms and p99 95.575 ms. The client observed 50 distinct backends and closed all 50 clients and sockets
+cleanly, with zero query errors. This is a short workload observation, not a maximum or
+customer-density guarantee. Strong decoded-binary client assertions
 remain failed and unchanged; the same failure was reproduced over direct verified TCP with
 node-postgres 8.22. The raw stream integrity checks pass.
 
@@ -47,7 +52,7 @@ operator-generated monitoring and service Endpoints after matching their source/
 a delayed capacity observation subsequently converged to the 97,706,311,680-byte baseline.
 Full Phase 4 PITR and disaster recovery workflows remain pending.
 
-E6, four additional restart cycles, fault tests and full adopter compatibility are still required
+E6, three additional restart cycles, fault tests and full adopter compatibility are still required
 before Phase 1 acceptance. Phase 2 has not begun. The second EU node is untouched, the US node
 has not been bought, and existing production routes and databases have not changed. The owner
 has requested delivery through Phase 5 and full Neon replacement.
@@ -739,3 +744,4 @@ Entries are chronological; later results supersede earlier pending work.
 | 2026-10-04 | 1 R2 restore drill | Two small committed markers written through the public endpoint were restored from the source base backup and archived WAL into a separate namespace/storage generation; the rolled-back marker remained absent. Verified TLS, promotion and target archive succeeded. R2 object last-modified timestamps measured maximum 52,427 ms after COMMIT acknowledgement; the late first poll gave only an upper bound of 701,848 ms. Target creation to verified result took 304,128 ms including operator pacing. Cleanup recorded exact identities of the matching CNPG monitoring ConfigMap and three Endpoints tied to owned Services/Pods, then removed the target namespace/PV/LVM and reclaimed 5 GiB. Source preserved; final free bytes exactly 97,706,311,680. This is a drill, not the complete Phase 4 recovery API. |
 | 2026-10-04 | 1 trace / cleanup | The real CF tail response uses UTC-second expiry; its normalized parser passed all original guards. Long hexadecimal URL markers are redacted. A segmented 192-bit marker and CLI wire initialization produced one correlated event in 9.587 s in the private counterfactual; the integrated transport still needs its real run. A deterministic post-settle expiry test failed before the final dispatch guard; no trigger runs after expiry. Two obsolete owned capability/metadata Workers were deleted with absence verified and all 78 other Workers unchanged. Phase 1 E3–E6 and Phase 2 remain unaccepted. |
 | 2026-10-04 | 1 live | Formal E0–E5 and canary audit passed: create Ready in 29,027 ms, SQL cold connect 222 ms, commit 34 ms, rollback 35 ms, startup database/user refusal 294/73 ms with correlated gateway events, one base backup and four WAL objects, and deletion in 40,000 ms with zero remaining volumes or archive objects. Create and delete each survived an agent restart. D1 and Tail plaintext-secret counts were zero. Actual Workers client isolation passed across two databases and users with complete same-bank socket/pool cleanup; decoded binary results still fail. E6's native probe could not fetch anonymous GitHub metadata; authenticated GET returned 200. Phase 1 remains unaccepted pending E6, the remaining four restart cycles, faults and adopter checks. |
+| 2026-10-04 | 1 throughput / network | The real read load completed 7,403 exact parameterized SELECTs over 50 warmed connections in 10,063.836 ms including bounded drain: 735.604 SQL/s, p95 75.368 ms, zero errors, and all 50 clients and sockets closed. Native TCP proof run `37164694758` passed port 25 with positive controls before/after, a blocked target and source pool disjoint from the complete operator allowlist; the signed report was consumed successfully. The first full E6 attempt passed the operator's 65,535-port scan but aborted the Worker scan and cleaned all its resources. Actual probe closure acknowledgement delayed a single 400-ms check to 19.876 s; the exact nonawaited-close counterfactual returned in 548 ms and checked 255 ports in 17.336 s. The one-line correction and deterministic stalled-trigger regression are implemented; bounded parallel read batches and final E6 remain pending. Two create/delete cycles survived agent restarts with zero remaining volumes and trial archive objects. Phase 1 remains unaccepted. |
