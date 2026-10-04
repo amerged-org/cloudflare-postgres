@@ -68,7 +68,7 @@ class MessageReader {
 }
 
 export class PostgresActivity {
-  private authenticated = false;
+  private authenticationComplete = false;
   private readyCycles = 1;
   private completeReadyCycles = 1;
   private extended = false;
@@ -84,7 +84,7 @@ export class PostgresActivity {
       } else if ("PBEDCH".includes(tag)) this.extended = true;
       else if ("dcf".includes(tag)) this.copy = true;
       else if (tag !== "p") this.uncertain = true;
-      if (tag === "p" && this.authenticated) this.uncertain = true;
+      if (tag === "p" && this.authenticationComplete) this.uncertain = true;
     },
     (type) => {
       if (type === 81 || type === 83) this.completeReadyCycles++;
@@ -99,14 +99,15 @@ export class PostgresActivity {
       if (type === 82) {
         if (length < 8) this.uncertain = true;
         else if (prefix.readUInt32BE(0) === 0) {
-          if (length !== 8 || this.authenticated) this.uncertain = true;
-          this.authenticated = true;
+          if (length !== 8 || this.authenticationComplete)
+            this.uncertain = true;
+          this.authenticationComplete = true;
         }
       } else if (type === 90) {
         const state = prefix[0];
         if (
           length !== 5 ||
-          !this.authenticated ||
+          !this.authenticationComplete ||
           this.completeReadyCycles === 0 ||
           (state !== 73 && state !== 84 && state !== 69)
         ) {
@@ -124,13 +125,16 @@ export class PostgresActivity {
   observeFrontend(chunk: Buffer): void {
     this.frontend.push(chunk);
   }
+  get authenticated(): boolean {
+    return this.authenticationComplete;
+  }
   observeBackend(chunk: Buffer): void {
     this.backend.push(chunk);
   }
   get busy(): boolean {
     return (
       this.uncertain ||
-      !this.authenticated ||
+      !this.authenticationComplete ||
       this.transaction ||
       this.readyCycles !== 0 ||
       this.extended ||

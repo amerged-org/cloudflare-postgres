@@ -18,6 +18,7 @@ const ready = (state = "I") => frame("Z", Buffer.from(state));
 const query = frame("Q", Buffer.from("SELECT 1\0"));
 function idle(): PostgresActivity {
   const state = new PostgresActivity();
+  assert.equal(state.authenticated, false);
   state.observeBackend(Buffer.concat([auth, ready()]));
   assert.equal(state.busy, false);
   return state;
@@ -31,6 +32,7 @@ test("authentication and partial messages stay busy; pipelined ReadyForQuery can
     assert.equal(state.busy, true);
   }
   state.observeBackend(ready());
+  assert.equal(state.authenticated, true);
   assert.equal(state.busy, false);
   for (const byte of query.subarray(0, -1)) {
     state.observeFrontend(Buffer.from([byte]));
