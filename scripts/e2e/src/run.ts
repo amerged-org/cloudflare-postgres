@@ -200,6 +200,11 @@ export const REQUIRED_ENV = [
 
 export type CredentialExpiry =
   | { name: string; expires_at: string; expiry_source?: never }
+  | {
+      name: "CLOUDFLARE_API_TOKEN";
+      expires_at: null;
+      expiry_source: "provider";
+    }
   // Null explicitly confirms that the v1 API/agent key has no expiry; it is not unknown.
   | {
       name: "PGCF_E2E_ADMIN_KEY" | "PGCF_E2E_AGENT_KEY";
@@ -232,6 +237,11 @@ export function parseCredentialExpiries(
       throw new HarnessError("credential_expiry_invalid");
     if (names.has(name)) throw new HarnessError("credential_expiry_duplicate");
     names.add(name);
+    if (row.expiry_source === "provider") {
+      if (name !== "CLOUDFLARE_API_TOKEN" || row.expires_at !== null)
+        throw new HarnessError("credential_expiry_invalid");
+      return { name, expires_at: null, expiry_source: "provider" };
+    }
     if (row.expiry_source === "run") {
       if (name !== "PGCF_E2E_PROBE_BEARER" || "expires_at" in row)
         throw new HarnessError("credential_expiry_invalid");
@@ -739,6 +749,12 @@ export class Run {
   }
   async verify(): Promise<void> {
     await this.verifyIdentity();
+    if (
+      this.c.credentialExpiries.some(
+        (entry) => entry.expiry_source === "provider",
+      )
+    )
+      await this.cf.verifyNonexpiringToken();
     const regions = (await this.api.list("/v1/regions")).map((row) =>
       Region.parse(row),
     );

@@ -80,6 +80,55 @@ test("finite credential expiries retain their shape and normalize valid ISO offs
   );
 });
 
+test("Cloudflare nonexpiry requires an explicit provider verification source", () => {
+  const [cloudflare, admin, probe, kube] = datedInventory();
+  const confirmed = {
+    ...cloudflare,
+    expires_at: null,
+    expiry_source: "provider",
+  };
+  assert.deepEqual(
+    parseCredentialExpiries([confirmed, admin, probe, kube], now),
+    [confirmed, admin, probe, kube],
+  );
+});
+
+test("provider verification refuses dated, inactive or malformed token metadata", async (context) => {
+  const account = randomBytes(16).toString("hex");
+  const token = randomBytes(32).toString("hex");
+  const id = randomBytes(16).toString("hex");
+  let result: Record<string, unknown> = { id, status: "active" };
+  context.mock.method(
+    globalThis,
+    "fetch",
+    async (url: string, init: RequestInit) => {
+      assert.equal(
+        url,
+        `https://api.cloudflare.com/client/v4/accounts/${account}/tokens/verify`,
+      );
+      assert.equal(
+        new Headers(init.headers).get("Authorization"),
+        `Bearer ${token}`,
+      );
+      return Response.json({ success: true, result });
+    },
+  );
+  const client = new Cloudflare(account, token, "test-account");
+  await client.verifyNonexpiringToken();
+  result = { id, status: "active", expires_on: future };
+  await assert.rejects(client.verifyNonexpiringToken(), {
+    message: "credential_expiry_mismatch",
+  });
+  result = { id, status: "disabled", expires_on: null };
+  await assert.rejects(client.verifyNonexpiringToken(), {
+    message: "credential_expiry_mismatch",
+  });
+  result = { status: "active" };
+  await assert.rejects(client.verifyNonexpiringToken(), {
+    message: "credential_expiry_mismatch",
+  });
+});
+
 test("nonexpiring v1 keys and the run-bound probe keep distinct inventory meanings", () => {
   const entries = [
     { name: "CLOUDFLARE_API_TOKEN", expires_at: future },
@@ -104,7 +153,7 @@ test("nonexpiring v1 keys and the run-bound probe keep distinct inventory meanin
   ]);
 });
 
-test("Cloudflare and kubeclient expiry declarations must remain finite", () => {
+test("unverified Cloudflare nonexpiry and undated kubeclient certificates remain invalid", () => {
   const [cloudflare, admin, probe, kube] = datedInventory();
   assert.throws(
     () =>

@@ -132,6 +132,16 @@ export class Cloudflare {
     if (result.id !== this.account || result.name !== this.expectedName)
       throw new HarnessError("account_mismatch");
   }
+  async verifyNonexpiringToken(): Promise<void> {
+    const result = record((await this.request("/tokens/verify")).result);
+    if (
+      result.status !== "active" ||
+      typeof result.id !== "string" ||
+      !/^[a-f0-9]{32}$/.test(result.id) ||
+      (result.expires_on !== undefined && result.expires_on !== null)
+    )
+      throw new HarnessError("credential_expiry_mismatch");
+  }
   async list(path: string): Promise<Record<string, unknown>[]> {
     const output: Record<string, unknown>[] = [];
     for (let page = 1; page <= 1000; page++) {
