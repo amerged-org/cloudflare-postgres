@@ -44,6 +44,7 @@ const DATA = "measurements.json",
   CURSOR = "pgcf.io/measurement-cursor";
 export const MEASUREMENT_COHORT = 25,
   MEASUREMENT_BODY_BYTES = 64 * 1024;
+export const MEASUREMENT_INTERVAL_MS = 15_000;
 const CHECKPOINT_BYTES = 48 * 1024,
   MAX_OUTBOX = 64;
 type Snapshot = Awaited<ReturnType<PowerCoordinator["gatewaySnapshot"]>>;
@@ -59,6 +60,7 @@ interface Identity {
   state: string;
 }
 interface Baseline {
+  sampledAt?: string;
   inventory: GatewayPod[];
   keyUid: string;
   keyVersion: string;
@@ -173,7 +175,8 @@ function readCheckpoint(resource: Resource, identity: Identity): Checkpoint {
       !Array.isArray(rawBase.inventory) ||
       rawBase.inventory.length !== rawBase.reports.length ||
       typeof rawBase.keyUid !== "string" ||
-      typeof rawBase.keyVersion !== "string"
+      typeof rawBase.keyVersion !== "string" ||
+      (rawBase.sampledAt !== undefined && !validTime(rawBase.sampledAt))
     )
       throw new Error("measurement_checkpoint_invalid");
     const reports = rawBase.reports.map((report) =>
@@ -206,6 +209,9 @@ function readCheckpoint(resource: Resource, identity: Identity): Checkpoint {
     )
       throw new Error("measurement_checkpoint_invalid");
     baseline = {
+      ...(rawBase.sampledAt === undefined
+        ? {}
+        : { sampledAt: rawBase.sampledAt as string }),
       inventory,
       keyUid: rawBase.keyUid,
       keyVersion: rawBase.keyVersion,
@@ -294,6 +300,10 @@ export class RegionalMeasurements {
   private targets: Subject[] = [];
   private cursor = "";
   private cursorLoaded = false;
+  private sampling = new Map<
+    string,
+    { revision: number; observed: number; pending: boolean }
+  >();
   private active: Promise<void> | undefined;
   private readonly process = `agent_${randomUUID()}`;
   constructor(options: MeasurementOptions) {
@@ -316,6 +326,16 @@ export class RegionalMeasurements {
       new Set(databases.map((db) => db.id)).size !== databases.length
     )
       throw new Error("measurement_subjects_invalid");
+    for (const [id, sample] of this.sampling)
+      if (
+        !databases.some(
+          (db) =>
+            db.id === id &&
+            db.generation === sample.revision &&
+            db.desired_state !== "deleted",
+        )
+      )
+        this.sampling.delete(id);
     this.targets = databases
       .filter((db) => db.desired_state !== "deleted")
       .map((db) => ({
@@ -341,6 +361,34 @@ export class RegionalMeasurements {
     } finally {
       this.active = undefined;
     }
+  }
+  private cooled(db: Subject): boolean {
+    const sample = this.sampling.get(db.id);
+    return (
+      !!sample &&
+      sample.revision === db.generation &&
+      this.now - sample.observed < MEASUREMENT_INTERVAL_MS
+    );
+  }
+  private remember(work: Work): void {
+    // Only persisted reports set the cooldown; an unacknowledged checkpoint cannot suppress a fresh measurement.
+    const checkpoint = readCheckpoint(work.resource, work.checkpoint.identity);
+    const reports = checkpoint.baseline?.reports;
+    if (
+      !reports?.length ||
+      reports.some((report) => report.revision !== work.db.generation)
+    ) {
+      this.sampling.delete(work.db.id);
+      return;
+    }
+    this.sampling.set(work.db.id, {
+      revision: work.db.generation,
+      observed: Math.max(
+        ...reports.map((report) => Date.parse(report.observedAt)),
+        Date.parse(checkpoint.baseline?.sampledAt ?? reports[0]!.observedAt),
+      ),
+      pending: checkpoint.outbox.length > 0,
+    });
   }
   private async owner(k8s: Kubernetes, db: Subject): Promise<Work> {
     const [resource, namespace, cluster, fence] = await Promise.all([
@@ -583,10 +631,20 @@ export class RegionalMeasurements {
       0,
       this.options.cohort ?? MEASUREMENT_COHORT,
     );
+    const candidates = cohort.filter(
+      (db) => !this.cooled(db) || this.sampling.get(db.id)?.pending,
+    );
+    if (!candidates.length) {
+      const last = cohort.at(-1);
+      if (last) this.cursor = last.id;
+      return;
+    }
     const works: Work[] = [];
-    for (const db of cohort) {
+    for (const db of candidates) {
       try {
-        works.push(await this.owner(k8s, db));
+        const work = await this.owner(k8s, db);
+        this.remember(work);
+        works.push(work);
       } catch {
         /* A foreign or incomplete resource never becomes an idle measurement. */
       }
@@ -601,17 +659,21 @@ export class RegionalMeasurements {
         .filter((work) => work.checkpoint.outbox.length > 0)
         .map((work) => work.db.id),
     );
+    const measuring = works.filter(
+      (work) => !this.cooled(work.db) && !replaying.has(work.db.id),
+    );
+    const due = new Set(measuring.map((work) => work.db.id));
     let snapshot: Snapshot | undefined;
     try {
-      snapshot = await this.options.snapshot(signal);
+      if (measuring.length) snapshot = await this.options.snapshot(signal);
     } catch {
       /* Discovery failure marks a gap without manufacturing a respondent. */
     }
     const collected = new Map<string, GatewayActivityReport[]>();
     let index = 0;
     const worker = async () => {
-      while (index < works.length && !signal.aborted) {
-        const work = works[index++]!;
+      while (index < measuring.length && !signal.aborted) {
+        const work = measuring[index++]!;
         if (snapshot) {
           try {
             collected.set(
@@ -625,7 +687,7 @@ export class RegionalMeasurements {
       }
     };
     await Promise.all(
-      Array.from({ length: Math.min(4, works.length) }, worker),
+      Array.from({ length: Math.min(4, measuring.length) }, worker),
     );
     signal.throwIfAborted();
     if (snapshot) {
@@ -640,6 +702,7 @@ export class RegionalMeasurements {
     }
     const activities: AgentActivityRequest["databases"] = [];
     for (const work of works) {
+      if (!due.has(work.db.id)) continue;
       const reports = collected.get(work.db.id),
         checkpoint = work.checkpoint;
       if (!reports || !snapshot) {
@@ -777,6 +840,7 @@ export class RegionalMeasurements {
       ) {
         checkpoint.outbox = pending;
         checkpoint.baseline = {
+          sampledAt: new Date(this.now).toISOString(),
           inventory,
           keyUid: snapshot.keyUid,
           keyVersion: snapshot.keyVersion,
@@ -831,6 +895,7 @@ export class RegionalMeasurements {
         works.filter((work) => persisted.has(work.db.id)),
         signal,
       );
+    for (const work of works) this.remember(work);
     const last = cohort.at(-1);
     if (last) this.cursor = last.id;
     try {
