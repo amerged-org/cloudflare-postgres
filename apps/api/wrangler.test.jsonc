@@ -31,5 +31,5 @@
     { "tag": "v1", "new_sqlite_classes": ["RegionLink"] },
     { "tag": "v2", "new_sqlite_classes": ["DatabaseActor"] },
   ],
-  "triggers": { "crons": ["*/5 * * * *"] },
+  "triggers": { "crons": ["* * * * *"] },
 }
