@@ -7,6 +7,7 @@ import {
   TEXT_MAX_LENGTH,
 } from "./api.ts";
 import { RolePassword } from "./auth.ts";
+import { MaintenanceCredential, MAINTENANCE_ROLE } from "./maintenance.ts";
 import {
   DATABASE_ID_PATTERN,
   DatabaseId,
@@ -103,6 +104,7 @@ export const DesiredDatabase = z
     pg_major: z.literal(PG_MAJOR),
     size: DesiredSize,
     roles: z.array(DesiredRole).max(100).default([]),
+    maintenance: MaintenanceCredential.optional(),
     // Older desired pages omit this field; omission cannot authorize initial storage.
     creation: DesiredCreation.nullable().optional(),
     archive: z.strictObject({
@@ -138,6 +140,12 @@ export const DesiredDatabase = z
     const names = new Set<string>();
     let owners = 0;
     for (const role of db.roles) {
+      if (role.name === MAINTENANCE_ROLE)
+        ctx.addIssue({
+          code: "custom",
+          path: ["roles"],
+          message: "Internal maintenance role cannot be a customer role",
+        });
       if (names.has(role.name)) {
         ctx.addIssue({
           code: "custom",

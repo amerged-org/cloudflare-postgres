@@ -9,6 +9,8 @@ import {
   SIDECAR,
   archiveDestinationPath,
   newRolePassword,
+  MAINTENANCE_ROLE,
+  MAINTENANCE_BOOTSTRAP_SQL,
 } from "@pgcf/contracts";
 import type { DesiredDatabase, K8sObject } from "@pgcf/contracts";
 import {
@@ -161,6 +163,77 @@ function normalize(
   };
   return resources.map(walk);
 }
+
+test("maintenance has a separate Secret, minimal managed role and ordered application bootstrap", () => {
+  const { db, ctx } = fixture();
+  db.maintenance = {
+    role: MAINTENANCE_ROLE,
+    password: newRolePassword(),
+    revision: 1,
+  };
+  const manifests = buildDatabaseManifests(db, ctx);
+  const secret = object(manifests, "Secret", "maintenance-credentials");
+  assert.equal(secret.type, "kubernetes.io/basic-auth");
+  assert.equal(
+    Buffer.from(String(record(secret.data).username), "base64").toString(),
+    MAINTENANCE_ROLE,
+  );
+  assert.equal(
+    Buffer.from(String(record(secret.data).password), "base64").toString(),
+    db.maintenance.password,
+  );
+  assert.equal(secret.metadata.labels?.["cnpg.io/reload"], "true");
+  const spec = record(object(manifests, "Cluster").spec);
+  const managed = array(record(spec.managed).roles).map(record);
+  const role = managed.find((role) => role.name === MAINTENANCE_ROLE)!;
+  assert.deepEqual(role, {
+    name: MAINTENANCE_ROLE,
+    ensure: "present",
+    login: true,
+    superuser: false,
+    createdb: false,
+    createrole: false,
+    replication: false,
+    bypassrls: false,
+    inherit: true,
+    inRoles: ["pg_read_all_stats"],
+    passwordSecret: { name: "maintenance-credentials" },
+  });
+  const bootstrap = record(record(spec.bootstrap).initdb);
+  assert.deepEqual(bootstrap.postInitApplicationSQL, [
+    ...MAINTENANCE_BOOTSTRAP_SQL,
+  ]);
+  assert.equal(bootstrap.postInitSQL, undefined);
+  assert.equal(JSON.stringify(spec).includes(db.maintenance.password), false);
+  assert.equal(JSON.stringify(bootstrap).includes("TO app"), false);
+  assert.equal(
+    managed.filter((role) => role.name === MAINTENANCE_ROLE).length,
+    1,
+  );
+  assert.equal(spec.enableSuperuserAccess, false);
+});
+
+test("legacy pages add neither an internal Secret nor maintenance bootstrap grants", () => {
+  const { db, ctx } = fixture();
+  const manifests = buildDatabaseManifests(db, ctx);
+  assert.equal(
+    manifests.some(
+      (resource) => resource.metadata.name === "maintenance-credentials",
+    ),
+    false,
+  );
+  const spec = record(object(manifests, "Cluster").spec);
+  assert.equal(
+    record(record(spec.bootstrap).initdb).postInitApplicationSQL,
+    undefined,
+  );
+  assert.equal(
+    array(record(spec.managed).roles).some(
+      (role) => record(role).name === MAINTENANCE_ROLE,
+    ),
+    false,
+  );
+});
 
 test("golden normalization preserves image, roles, Secret names and archive layout", () => {
   const { db, ctx } = fixture();

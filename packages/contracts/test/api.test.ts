@@ -22,10 +22,19 @@ import {
   newDatabaseId,
   newProjectId,
   newNodeId,
+  RoleCreate,
+  MAINTENANCE_ROLE,
 } from "../src/index.ts";
 
 const encode = (text: string) =>
   bytesToBase64url(new TextEncoder().encode(text));
+
+it("reserves only the exact internal maintenance role in customer creation", () => {
+  expect(RoleCreate.safeParse({ name: MAINTENANCE_ROLE }).success).toBe(false);
+  expect(RoleCreate.parse({ name: "pgcf_customer" }).name).toBe(
+    "pgcf_customer",
+  );
+});
 
 describe("node CPU measurement compatibility", () => {
   it("keeps legacy views valid without inventing measured platform CPU", () => {
