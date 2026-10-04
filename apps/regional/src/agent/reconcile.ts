@@ -135,6 +135,47 @@ interface ArchiveObservation extends ArchiveProgress {
   pendingSince: number | null;
 }
 
+function mergeDesired(current: unknown, desired: unknown): unknown {
+  if (desired === null || typeof desired !== "object" || Array.isArray(desired))
+    return structuredClone(desired);
+  const merged = { ...record(current) };
+  for (const [key, value] of Object.entries(desired))
+    merged[key] = mergeDesired(merged[key], value);
+  return merged;
+}
+function managedContentUnchanged(
+  original: unknown,
+  current: unknown,
+  desired: unknown,
+): boolean {
+  if (Array.isArray(desired))
+    return (
+      Array.isArray(original) &&
+      Array.isArray(current) &&
+      original.length === current.length &&
+      original.every((value, index) =>
+        managedContentUnchanged(value, current[index], desired[index]),
+      )
+    );
+  if (desired !== null && typeof desired === "object")
+    return (
+      original !== null &&
+      typeof original === "object" &&
+      !Array.isArray(original) &&
+      current !== null &&
+      typeof current === "object" &&
+      !Array.isArray(current) &&
+      Object.entries(desired).every(([key, value]) =>
+        managedContentUnchanged(
+          record(original)[key],
+          record(current)[key],
+          value,
+        ),
+      )
+    );
+  return original === current;
+}
+
 function ownedByCluster(resource: Resource, cluster: Resource): boolean {
   const owners = record(resource.metadata).ownerReferences;
   return (
@@ -675,34 +716,42 @@ export class Reconciler {
                 if (!currentCluster.metadata.resourceVersion)
                   throw new Error("database_cluster_version_missing");
                 applyStage = "cluster_patch";
-                await this.k8s.patch("Cluster", namespaceName, "database", [
-                  {
-                    op: "test",
-                    path: "/metadata/uid",
-                    value: uid(currentCluster),
-                  },
-                  {
-                    op: "test",
-                    path: "/metadata/resourceVersion",
-                    value: currentCluster.metadata.resourceVersion,
-                  },
-                  {
-                    op: "add",
-                    path: "/metadata/annotations",
-                    value: {
-                      ...currentCluster.metadata.annotations,
-                      ...manifest.metadata.annotations,
+                await this.patchConfiguration(
+                  db,
+                  currentCluster,
+                  storage.namespaceUid!,
+                  manifest,
+                  (snapshot, retry) => [
+                    {
+                      op: "test",
+                      path: "/metadata/uid",
+                      value: uid(snapshot),
                     },
-                  },
-                  {
-                    op: "add",
-                    path: "/spec",
-                    value: {
-                      ...record(currentCluster.spec),
-                      ...record(manifest.spec),
+                    {
+                      op: "test",
+                      path: "/metadata/resourceVersion",
+                      value: snapshot.metadata.resourceVersion,
                     },
-                  },
-                ]);
+                    {
+                      op: "add",
+                      path: "/metadata/annotations",
+                      value: {
+                        ...snapshot.metadata.annotations,
+                        ...manifest.metadata.annotations,
+                      },
+                    },
+                    {
+                      op: "add",
+                      path: "/spec",
+                      value: retry
+                        ? mergeDesired(snapshot.spec, manifest.spec)
+                        : {
+                            ...record(snapshot.spec),
+                            ...record(manifest.spec),
+                          },
+                    },
+                  ],
+                );
               } else {
                 if (storage.clusterUid || !pendingCreation(db))
                   return recoveryRequired(db, "database cluster is missing");
@@ -723,7 +772,10 @@ export class Reconciler {
                 applyStage = "storage_binding";
                 fence = await this.saveStorage(db, storage, fence);
               }
-            } else if (!(await this.applyRevision(db, manifest))) return null;
+            } else if (
+              !(await this.applyRevision(db, manifest, storage.namespaceUid!))
+            )
+              return null;
           }
           this.hashes.set(db.id, hash);
         }
@@ -1077,9 +1129,103 @@ export class Reconciler {
     );
   }
 
+  private async patchConfiguration(
+    db: DesiredDatabase,
+    original: Resource,
+    namespaceUid: string,
+    manifest: K8sObject,
+    build: (snapshot: Resource, retry: boolean) => unknown[],
+  ): Promise<void> {
+    this.signal.throwIfAborted();
+    try {
+      await this.k8s.patch(
+        original.kind,
+        original.metadata.namespace,
+        original.metadata.name,
+        build(original, false),
+      );
+    } catch (error) {
+      if (
+        !(error instanceof ApiException) ||
+        error.code !== 422 ||
+        db.desired_state !== "running" ||
+        db.power?.mode !== "running" ||
+        this.signal.aborted ||
+        typeof original.metadata.resourceVersion !== "string" ||
+        original.metadata.resourceVersion.length < 1 ||
+        original.metadata.resourceVersion.length > 256 ||
+        typeof original.metadata.uid !== "string" ||
+        !original.metadata.uid ||
+        typeof namespaceUid !== "string" ||
+        !namespaceUid
+      )
+        throw error;
+      let current: Resource | null, namespace: Resource | null;
+      try {
+        [current, namespace] = await Promise.all([
+          this.k8s.read(
+            original.kind,
+            original.metadata.namespace,
+            original.metadata.name,
+          ),
+          this.k8s.read("Namespace", undefined, databaseNamespace(db.id)),
+        ]);
+        if (
+          this.signal.aborted ||
+          !current ||
+          !namespace ||
+          current.apiVersion !== original.apiVersion ||
+          current.kind !== original.kind ||
+          current.metadata.name !== original.metadata.name ||
+          current.metadata.namespace !== original.metadata.namespace ||
+          current.metadata.namespace !== databaseNamespace(db.id) ||
+          current.metadata.uid !== original.metadata.uid ||
+          !current.metadata.uid ||
+          typeof current.metadata.resourceVersion !== "string" ||
+          current.metadata.resourceVersion.length < 1 ||
+          current.metadata.resourceVersion.length > 256 ||
+          current.metadata.resourceVersion ===
+            original.metadata.resourceVersion ||
+          current.metadata.deletionTimestamp ||
+          original.metadata.deletionTimestamp ||
+          namespace.kind !== "Namespace" ||
+          namespace.metadata.namespace !== undefined ||
+          typeof namespace.metadata.resourceVersion !== "string" ||
+          !namespace.metadata.resourceVersion ||
+          namespace.metadata.uid !== namespaceUid ||
+          namespace.metadata.deletionTimestamp ||
+          namespace.metadata.name !== databaseNamespace(db.id) ||
+          appliedGeneration(current) > db.generation ||
+          acceptedGeneration(current) > db.generation ||
+          appliedGeneration(namespace) > db.generation ||
+          acceptedGeneration(namespace) !== db.generation ||
+          (this.highWater.get(db.id) ?? 0) > db.generation
+        )
+          throw error;
+        assertOwned(current, db.id, original.metadata.name);
+        assertOwned(namespace, db.id, databaseNamespace(db.id));
+        for (const [key, value] of Object.entries(manifest).filter(
+          ([key]) => !["apiVersion", "kind", "metadata"].includes(key),
+        ))
+          if (!managedContentUnchanged(original[key], current[key], value))
+            throw error;
+      } catch {
+        throw error;
+      }
+      this.signal.throwIfAborted();
+      await this.k8s.patch(
+        current.kind,
+        current.metadata.namespace,
+        current.metadata.name,
+        build(current, true),
+      );
+    }
+  }
+
   private async applyRevision(
     db: DesiredDatabase,
     manifest: K8sObject,
+    namespaceUid: string,
   ): Promise<boolean> {
     const { kind, metadata } = manifest;
     const current = await this.k8s.read(
@@ -1096,31 +1242,41 @@ export class Reconciler {
     if (appliedGeneration(current) > db.generation) return false;
     if (!current.metadata.resourceVersion)
       throw new Error("database_resource_version_missing");
-    await this.k8s.patch(kind, metadata.namespace, metadata.name, [
-      { op: "test", path: "/metadata/uid", value: uid(current) },
-      {
-        op: "test",
-        path: "/metadata/resourceVersion",
-        value: current.metadata.resourceVersion,
-      },
-      {
-        op: "add",
-        path: "/metadata/annotations",
-        value: { ...current.metadata.annotations, ...metadata.annotations },
-      },
-      {
-        op: "add",
-        path: "/metadata/labels",
-        value: { ...current.metadata.labels, ...metadata.labels },
-      },
-      ...Object.entries(manifest)
-        .filter(([key]) => !["apiVersion", "kind", "metadata"].includes(key))
-        .map(([key, value]) => ({
+    await this.patchConfiguration(
+      db,
+      current,
+      namespaceUid,
+      manifest,
+      (snapshot, retry) => [
+        { op: "test", path: "/metadata/uid", value: uid(snapshot) },
+        {
+          op: "test",
+          path: "/metadata/resourceVersion",
+          value: snapshot.metadata.resourceVersion,
+        },
+        {
           op: "add",
-          path: `/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`,
-          value,
-        })),
-    ]);
+          path: "/metadata/annotations",
+          value: { ...snapshot.metadata.annotations, ...metadata.annotations },
+        },
+        {
+          op: "add",
+          path: "/metadata/labels",
+          value: { ...snapshot.metadata.labels, ...metadata.labels },
+        },
+        ...Object.entries(manifest)
+          .filter(([key]) => !["apiVersion", "kind", "metadata"].includes(key))
+          .map(([key, value]) => ({
+            op: "add",
+            path: `/${key.replaceAll("~", "~0").replaceAll("/", "~1")}`,
+            value:
+              retry &&
+              (key === "spec" || key === "data" || key === "binaryData")
+                ? mergeDesired(snapshot[key], value)
+                : value,
+          })),
+      ],
+    );
     return true;
   }
 

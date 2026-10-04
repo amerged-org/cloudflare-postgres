@@ -2456,3 +2456,306 @@ test("a changed currentPrimary after metrics cannot reuse the previous primary a
   });
   assert.equal(authentications, 0);
 });
+
+async function wakeConfigurationFixture() {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  db.creation!.ever_ready = true;
+  db.generation++;
+  db.power = {
+    operation: db.creation!.operation_id,
+    revision: db.generation,
+    mode: "running",
+    reason: null,
+  };
+  const power = {
+    prepareRunning: async () => undefined,
+    finishRunning: async (_db: unknown, value: unknown) => value,
+  } as unknown as PowerCoordinator;
+  return {
+    db,
+    ctx,
+    k8s,
+    reconciler: new Reconciler(
+      k8s,
+      signal(),
+      Date.now,
+      metrics,
+      authenticate,
+      power,
+    ),
+  };
+}
+test("a wake manifest PATCH retries once after a same-UID metadata RV change without losing controller fields", async () => {
+  const f = await wakeConfigurationFixture(),
+    native = f.k8s.patch.bind(f.k8s),
+    namespace = `pgcf-db-${f.db.id}`;
+  let attempts = 0;
+  f.k8s.patch = async (kind, ns, name, operations) => {
+    if (kind === "ObjectStore" && name === "archive") {
+      attempts++;
+      if (attempts === 1) {
+        await native(kind, ns, name, [
+          {
+            op: "add",
+            path: "/metadata/annotations/controller",
+            value: "preserved",
+          },
+          {
+            op: "add",
+            path: "/spec/controllerSetting",
+            value: { enabled: true },
+          },
+        ]);
+        throw new ApiException(
+          422,
+          "opaque",
+          JSON.stringify({ reason: "Invalid" }),
+          {},
+        );
+      }
+    }
+    return native(kind, ns, name, operations);
+  };
+  assert.equal((await f.reconciler.reconcile(f.db, f.ctx))?.state, "ready");
+  assert.equal(attempts, 2);
+  const stored = await f.k8s.read("ObjectStore", namespace, "archive");
+  assert.equal(stored!.metadata.annotations!.controller, "preserved");
+  assert.deepEqual(record(stored!.spec).controllerSetting, { enabled: true });
+});
+test("a wake Cluster PATCH retries once after a same-UID status RV change and rebuilds fresh merged spec", async () => {
+  const f = await wakeConfigurationFixture(),
+    native = f.k8s.patch.bind(f.k8s),
+    namespace = `pgcf-db-${f.db.id}`;
+  let attempts = 0;
+  f.k8s.patch = async (kind, ns, name, operations) => {
+    if (
+      kind === "Cluster" &&
+      operations.some((value) => record(value).path === "/spec")
+    ) {
+      attempts++;
+      if (attempts === 1) {
+        await native(kind, ns, name, [
+          {
+            op: "add",
+            path: "/metadata/annotations/controller",
+            value: "preserved",
+          },
+          {
+            op: "add",
+            path: "/spec/controllerSetting",
+            value: { enabled: true },
+          },
+          { op: "add", path: "/status/controllerReady", value: true },
+        ]);
+        throw new ApiException(
+          422,
+          "opaque",
+          JSON.stringify({ reason: "Invalid" }),
+          {},
+        );
+      }
+    }
+    return native(kind, ns, name, operations);
+  };
+  assert.equal((await f.reconciler.reconcile(f.db, f.ctx))?.state, "ready");
+  assert.equal(attempts, 2);
+  const stored = await f.k8s.read("Cluster", namespace, "database");
+  assert.equal(stored!.metadata.annotations!.controller, "preserved");
+  assert.deepEqual(record(stored!.spec).controllerSetting, { enabled: true });
+});
+
+async function rejectedWakeRetry(
+  change: (
+    f: Awaited<ReturnType<typeof wakeConfigurationFixture>>,
+    native: MemoryKubernetes["patch"],
+    ns: string | undefined,
+    name: string,
+  ) => Promise<void>,
+  failure: Error = new ApiException(
+    422,
+    "opaque",
+    JSON.stringify({ reason: "Invalid" }),
+    {},
+  ),
+  secondFailure = false,
+  nonwake = false,
+) {
+  const f = await wakeConfigurationFixture(),
+    native = f.k8s.patch.bind(f.k8s);
+  if (nonwake) delete f.db.power;
+  let attempts = 0;
+  f.k8s.patch = async (kind, ns, name, operations) => {
+    if (kind === "ObjectStore" && name === "archive") {
+      attempts++;
+      if (attempts === 1) {
+        await change(f, native, ns, name);
+        throw failure;
+      }
+      if (secondFailure) throw failure;
+    }
+    return native(kind, ns, name, operations);
+  };
+  await assert.rejects(
+    f.reconciler.reconcile(f.db, f.ctx),
+    (error) => error === failure,
+  );
+  return { f, attempts };
+}
+test("wake CAS retry rejects a replacement UID", async () => {
+  const result = await rejectedWakeRetry(async (f, _native, ns, name) => {
+    const current = (await f.k8s.read("ObjectStore", ns, name))!;
+    f.k8s.put(current);
+  });
+  assert.equal(result.attempts, 1);
+});
+test("wake CAS retry rejects a deleting resource", async () => {
+  const result = await rejectedWakeRetry(async (_f, native, ns, name) =>
+    native("ObjectStore", ns, name, [
+      {
+        op: "add",
+        path: "/metadata/deletionTimestamp",
+        value: new Date().toISOString(),
+      },
+    ]),
+  );
+  assert.equal(result.attempts, 1);
+});
+test("wake CAS retry rejects a future resource revision", async () => {
+  const result = await rejectedWakeRetry(async (f, native, ns, name) =>
+    native("ObjectStore", ns, name, [
+      {
+        op: "add",
+        path: "/metadata/annotations/pgcf.io~1accepted-generation",
+        value: String(f.db.generation + 1),
+      },
+    ]),
+  );
+  assert.equal(result.attempts, 1);
+});
+test("wake CAS retry rejects a future namespace high-water mark", async () => {
+  const result = await rejectedWakeRetry(async (f, native, ns, name) => {
+    await native("ObjectStore", ns, name, [
+      { op: "add", path: "/metadata/annotations/controller", value: "new" },
+    ]);
+    await native("Namespace", undefined, `pgcf-db-${f.db.id}`, [
+      {
+        op: "add",
+        path: "/metadata/annotations/pgcf.io~1accepted-generation",
+        value: String(f.db.generation + 1),
+      },
+    ]);
+  });
+  assert.equal(result.attempts, 1);
+});
+test("wake CAS retry rejects a regressed local high-water mark", async () => {
+  const result = await rejectedWakeRetry(async (f, native, ns, name) => {
+    await native("ObjectStore", ns, name, [
+      { op: "add", path: "/metadata/annotations/controller", value: "new" },
+    ]);
+    (
+      f.reconciler as unknown as { highWater: Map<string, number> }
+    ).highWater.set(f.db.id, f.db.generation + 1);
+  });
+  assert.equal(result.attempts, 1);
+});
+test("wake CAS retry rejects unchanged resourceVersion and missing versions", async () => {
+  const unchanged = await rejectedWakeRetry(async () => {});
+  assert.equal(unchanged.attempts, 1);
+  const missing = await rejectedWakeRetry(async (f, _native, ns, name) => {
+    const current = f.k8s.resources.get(f.k8s.key("ObjectStore", ns, name))!;
+    delete current.metadata.resourceVersion;
+  });
+  assert.equal(missing.attempts, 1);
+});
+test("wake CAS retry cannot replace concurrently changed managed data", async () => {
+  const result = await rejectedWakeRetry(async (_f, native, ns, name) =>
+    native("ObjectStore", ns, name, [
+      { op: "add", path: "/spec/retentionPolicy", value: "different" },
+    ]),
+  );
+  assert.equal(result.attempts, 1);
+});
+test("uncertain transport outcomes never trigger a wake PATCH retry", async () => {
+  const result = await rejectedWakeRetry(
+    async (_f, native, ns, name) =>
+      native("ObjectStore", ns, name, [
+        { op: "add", path: "/metadata/annotations/controller", value: "new" },
+      ]),
+    new Error(randomUUID()),
+  );
+  assert.equal(result.attempts, 1);
+});
+test("a second wake PATCH failure escapes without a third attempt", async () => {
+  const result = await rejectedWakeRetry(
+    async (_f, native, ns, name) =>
+      native("ObjectStore", ns, name, [
+        { op: "add", path: "/metadata/annotations/controller", value: "new" },
+      ]),
+    new ApiException(422, "opaque", JSON.stringify({ reason: "Invalid" }), {}),
+    true,
+  );
+  assert.equal(result.attempts, 2);
+});
+test("ordinary non-wake configuration keeps its original single PATCH attempt", async () => {
+  const result = await rejectedWakeRetry(
+    async (_f, native, ns, name) =>
+      native("ObjectStore", ns, name, [
+        { op: "add", path: "/metadata/annotations/controller", value: "new" },
+      ]),
+    new ApiException(422, "opaque", JSON.stringify({ reason: "Invalid" }), {}),
+    false,
+    true,
+  );
+  assert.equal(result.attempts, 1);
+});
+test("aborted wake reconciliation never retries the rejected PATCH or authentication", async () => {
+  const f = await wakeConfigurationFixture(),
+    controller = new AbortController(),
+    native = f.k8s.patch.bind(f.k8s);
+  let attempts = 0,
+    auth = 0;
+  const failure = new ApiException(
+    422,
+    "opaque",
+    JSON.stringify({ reason: "Invalid" }),
+    {},
+  );
+  f.k8s.patch = async (kind, ns, name, operations) => {
+    if (kind === "ObjectStore" && name === "archive") {
+      attempts++;
+      await native(kind, ns, name, [
+        { op: "add", path: "/metadata/annotations/controller", value: "new" },
+      ]);
+      controller.abort();
+      throw failure;
+    }
+    return native(kind, ns, name, operations);
+  };
+  const power = {
+    prepareRunning: async () => undefined,
+  } as unknown as PowerCoordinator;
+  await assert.rejects(
+    new Reconciler(
+      f.k8s,
+      controller.signal,
+      Date.now,
+      metrics,
+      async () => {
+        auth++;
+        return true;
+      },
+      power,
+    ).reconcile(f.db, f.ctx),
+    (error) => error === failure,
+  );
+  assert.equal(attempts, 1);
+  assert.equal(auth, 0);
+});
