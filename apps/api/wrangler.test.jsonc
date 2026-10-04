@@ -22,8 +22,14 @@
     "ARCHIVE_BUCKET_NAME": "pgcf-api-test",
   },
   "durable_objects": {
-    "bindings": [{ "name": "REGION_LINK", "class_name": "RegionLink" }],
+    "bindings": [
+      { "name": "REGION_LINK", "class_name": "RegionLink" },
+      { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
+    ],
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RegionLink"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RegionLink"] },
+    { "tag": "v2", "new_sqlite_classes": ["DatabaseActor"] },
+  ],
   "triggers": { "crons": ["*/5 * * * *"] },
 }
