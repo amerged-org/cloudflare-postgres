@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
+import { ApiException } from "@kubernetes/client-node";
 import { randomUUID } from "node:crypto";
 import test from "node:test";
 import type { Log } from "../../src/agent/types.ts";
@@ -2073,4 +2074,385 @@ test("wake phase timings whitelist fields and preserve ready output and resource
     JSON.stringify(logs).includes(ctx.backup.credentials.secretAccessKey),
     false,
   );
+});
+
+test("desired-apply failure reports only a fixed stage/category and a recognized API status", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  const canary = randomUUID(),
+    failure = new ApiException(
+      422,
+      canary,
+      { payload: canary },
+      { Authorization: canary },
+    );
+  const create = k8s.create.bind(k8s);
+  k8s.create = async (resource) => {
+    if (resource.kind === "Namespace") throw failure;
+    return create(resource);
+  };
+  db.power = {
+    operation: db.creation!.operation_id,
+    revision: db.generation,
+    mode: "running",
+    reason: null,
+  };
+  const power = {
+    prepareRunning: async () => undefined,
+  } as unknown as PowerCoordinator;
+  const logs: {
+    event: string;
+    fields: Record<string, string | number | boolean>;
+  }[] = [];
+  const reconciler = new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+    power,
+    (event, fields = {}) => logs.push({ event, fields }),
+  );
+  await assert.rejects(
+    reconciler.reconcile(db, ctx),
+    (error) => error === failure,
+  );
+  assert.deepEqual(
+    logs.find((entry) => entry.event === "wake_apply_failed"),
+    {
+      event: "wake_apply_failed",
+      fields: {
+        phase: "desired_apply",
+        stage: "namespace_create",
+        category: "api_precondition",
+        status: 422,
+        database_id: db.id,
+      },
+    },
+  );
+  assert.equal(JSON.stringify(logs).includes(canary), false);
+});
+
+test("configuration generation advance preserves the exact collector checkpoint and unrelated storage data", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  const reconciler = new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  );
+  assert.equal((await reconciler.reconcile(db, ctx))?.state, "ready");
+  const fence = await k8s.read("ConfigMap", "pgcf-system", `storage-${db.id}`);
+  const checkpoint = JSON.stringify({
+    baseline: randomUUID(),
+    gapSince: Date.now(),
+    outbox: [{ immutable: randomUUID() }],
+  });
+  record(fence!.data)["measurements.json"] = checkpoint;
+  record(fence!.data).independent = randomUUID();
+  k8s.put(fence!);
+  const before = await k8s.read("ConfigMap", "pgcf-system", `storage-${db.id}`);
+  db.generation++;
+  assert.equal((await reconciler.reconcile(db, ctx))?.state, "ready");
+  const after = await k8s.read("ConfigMap", "pgcf-system", `storage-${db.id}`);
+  assert.equal(record(after!.data)["measurements.json"], checkpoint);
+  assert.equal(
+    record(after!.data).independent,
+    record(before!.data).independent,
+  );
+  assert.equal(record(after!.data).state, record(before!.data).state);
+  assert.equal(after!.metadata.uid, before!.metadata.uid);
+});
+
+test("unknown credential-shaped failures remain bounded and logger errors cannot change the original exception", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes(),
+    canary = randomUUID() + db.roles[0]!.password;
+  db.power = {
+    operation: db.creation!.operation_id,
+    revision: db.generation,
+    mode: "running",
+    reason: null,
+  };
+  const failure = Object.assign(new Error(canary.repeat(100)), {
+    code: 409,
+    headers: { Authorization: canary },
+  });
+  const create = k8s.create.bind(k8s);
+  k8s.create = async (resource) => {
+    if (resource.kind === "Namespace") throw failure;
+    return create(resource);
+  };
+  const power = {
+    prepareRunning: async () => undefined,
+  } as unknown as PowerCoordinator;
+  const logs: {
+    event: string;
+    fields: Record<string, string | number | boolean>;
+  }[] = [];
+  const log: Log = (event, fields = {}) => {
+    logs.push({ event, fields });
+    if (event === "wake_apply_failed") throw new Error(canary);
+  };
+  await assert.rejects(
+    new Reconciler(
+      k8s,
+      signal(),
+      Date.now,
+      metrics,
+      authenticate,
+      power,
+      log,
+    ).reconcile(db, ctx),
+    (error) => error === failure,
+  );
+  assert.deepEqual(
+    logs.find((entry) => entry.event === "wake_apply_failed"),
+    {
+      event: "wake_apply_failed",
+      fields: {
+        phase: "desired_apply",
+        stage: "namespace_create",
+        category: "unknown",
+        database_id: db.id,
+      },
+    },
+  );
+  assert.equal(JSON.stringify(logs).includes(canary), false);
+});
+
+test("an unrecognized API status is omitted rather than treated as trusted diagnostic data", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes(),
+    failure = new ApiException(450, randomUUID(), {}, {});
+  db.power = {
+    operation: db.creation!.operation_id,
+    revision: db.generation,
+    mode: "running",
+    reason: null,
+  };
+  const create = k8s.create.bind(k8s);
+  k8s.create = async (resource) => {
+    if (resource.kind === "Namespace") throw failure;
+    return create(resource);
+  };
+  const power = {
+      prepareRunning: async () => undefined,
+    } as unknown as PowerCoordinator,
+    logs: {
+      event: string;
+      fields: Record<string, string | number | boolean>;
+    }[] = [];
+  await assert.rejects(
+    new Reconciler(
+      k8s,
+      signal(),
+      Date.now,
+      metrics,
+      authenticate,
+      power,
+      (event, fields = {}) => logs.push({ event, fields }),
+    ).reconcile(db, ctx),
+    (error) => error === failure,
+  );
+  assert.equal(
+    logs.find((entry) => entry.event === "wake_apply_failed")!.fields.status,
+    undefined,
+  );
+  assert.equal(
+    logs.find((entry) => entry.event === "wake_apply_failed")!.fields.category,
+    "unknown",
+  );
+});
+
+test("a concurrent newer collector checkpoint is never replaced by a stale storage snapshot", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  const name = `storage-${db.id}`,
+    old = JSON.stringify({ outbox: [randomUUID()] }),
+    newer = JSON.stringify({ outbox: [randomUUID()], gapSince: Date.now() });
+  const fence = await k8s.read("ConfigMap", "pgcf-system", name);
+  await k8s.patch("ConfigMap", "pgcf-system", name, [
+    { op: "add", path: "/data/measurements.json", value: old },
+  ]);
+  const identity = record(fence!.data).state;
+  const patch = k8s.patch.bind(k8s);
+  let raced = false;
+  k8s.patch = async (kind, namespace, resource, operations) => {
+    if (
+      !raced &&
+      kind === "ConfigMap" &&
+      resource === name &&
+      operations.some((value) => record(value).path === "/data")
+    ) {
+      raced = true;
+      const latest = await k8s.read(kind, namespace, resource);
+      await patch(kind, namespace, resource, [
+        { op: "test", path: "/metadata/uid", value: latest!.metadata.uid },
+        {
+          op: "test",
+          path: "/metadata/resourceVersion",
+          value: latest!.metadata.resourceVersion,
+        },
+        { op: "add", path: "/data/measurements.json", value: newer },
+      ]);
+    }
+    return patch(kind, namespace, resource, operations);
+  };
+  db.generation++;
+  await assert.rejects(
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile(
+      db,
+      ctx,
+    ),
+  );
+  const current = await k8s.read("ConfigMap", "pgcf-system", name);
+  assert.equal(raced, true);
+  assert.equal(record(current!.data)["measurements.json"], newer);
+  assert.equal(record(current!.data).state, identity);
+  assert.equal(current!.metadata.uid, fence!.metadata.uid);
+});
+
+test("a real Ready transition during archive collection is verified in the same reconciliation", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  k8s.ready = false;
+  let authentications = 0,
+    scrapes = 0;
+  const sample: typeof fetch = async (...args) => {
+    scrapes++;
+    const cluster = k8s.resources.get(
+      k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+    )!;
+    record(cluster.status).conditions = [
+      { type: "Ready", status: "True" },
+      { type: "ContinuousArchiving", status: "True" },
+    ];
+    cluster.metadata.resourceVersion = String(
+      Number(cluster.metadata.resourceVersion) + 1,
+    );
+    const primary = String(record(cluster.status).currentPrimary),
+      pod = k8s.resources.get(k8s.key("Pod", `pgcf-db-${db.id}`, primary))!;
+    record(pod.status).conditions = [{ type: "Ready", status: "True" }];
+    pod.metadata.resourceVersion = String(
+      Number(pod.metadata.resourceVersion) + 1,
+    );
+    return metrics(...args);
+  };
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    sample,
+    async () => {
+      authentications++;
+      return true;
+    },
+  ).reconcile(db, ctx);
+  assert.equal(scrapes, 1);
+  assert.equal(observation?.state, "ready");
+  assert.equal(authentications, 1);
+  assert.equal(observation?.archive.continuous, true);
+});
+
+test("a replacement Cluster during metrics never authenticates or reports Ready", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  let authentications = 0;
+  const sample: typeof fetch = async (...args) => {
+    const cluster = k8s.resources.get(
+      k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+    )!;
+    cluster.metadata.uid = randomUUID();
+    return metrics(...args);
+  };
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    sample,
+    async () => {
+      authentications++;
+      return true;
+    },
+  ).reconcile(db, ctx);
+  assert.equal(observation?.state, "error");
+  assert.match(
+    observation?.message ?? "",
+    /identity changed; recovery required/,
+  );
+  assert.equal(authentications, 0);
+  assert.equal(
+    k8s.actions.filter((action) => action === "create:Cluster:database").length,
+    1,
+  );
+});
+
+test("a future Cluster revision after metrics stays pending instead of using the old archive sample", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  let authentications = 0;
+  const sample: typeof fetch = async (...args) => {
+    const cluster = k8s.resources.get(
+      k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+    )!;
+    cluster.metadata.annotations![GENERATION_ANNOTATION] = String(
+      db.generation + 1,
+    );
+    return metrics(...args);
+  };
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    sample,
+    async () => {
+      authentications++;
+      return true;
+    },
+  ).reconcile(db, ctx);
+  assert.equal(observation?.state, "provisioning");
+  assert.deepEqual(observation?.archive, {
+    continuous: false,
+    ready_wal_files: null,
+  });
+  assert.equal(authentications, 0);
+});
+
+test("a changed currentPrimary after metrics cannot reuse the previous primary archive proof", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  let authentications = 0;
+  const sample: typeof fetch = async (...args) => {
+    const cluster = k8s.resources.get(
+      k8s.key("Cluster", `pgcf-db-${db.id}`, "database"),
+    )!;
+    record(cluster.status).currentPrimary = "database-later";
+    return metrics(...args);
+  };
+  const observation = await new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    sample,
+    async () => {
+      authentications++;
+      return true;
+    },
+  ).reconcile(db, ctx);
+  assert.equal(observation?.state, "provisioning");
+  assert.deepEqual(observation?.archive, {
+    continuous: false,
+    ready_wal_files: null,
+  });
+  assert.equal(authentications, 0);
 });
