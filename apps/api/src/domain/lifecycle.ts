@@ -3,6 +3,7 @@ import {
   newOperationId,
   DatabaseId,
   OperationId,
+  RoleName,
   Timestamp,
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
@@ -18,15 +19,18 @@ export function powerTransitionStatements(
   action: PowerAction,
   operation: string,
   now: string,
+  wakeRole?: string,
 ): D1PreparedStatement[] {
   const sleeping = action === "suspend" || action === "hibernate";
+  const authorizedRole = action === "wake" ? RoleName.parse(wakeRole) : null;
   return [
     db
       .prepare(
         `UPDATE databases SET desired_state=?,suspension_reason=?,power_operation=?,generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
       WHERE id=? AND project_id=? AND generation=? AND desired_state=? AND observed_state=? AND updated_at=? AND power_operation IS ? AND suspension_reason IS ? AND observed_power=? AND observed_generation=? AND deleted_at IS NULL
       AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
-      AND (?=0 OR (observed_state='ready' AND observed_generation=generation AND observed_power='awake') OR (?='suspend' AND desired_state='suspended' AND suspension_reason='idle' AND observed_state='provisioning' AND observed_power='hibernated' AND observed_generation=generation))`,
+      AND (?=0 OR (observed_state='ready' AND observed_generation=generation AND observed_power='awake') OR (?='suspend' AND desired_state='suspended' AND suspension_reason='idle' AND observed_state='provisioning' AND observed_power='hibernated' AND observed_generation=generation))
+      AND (?=0 OR EXISTS(SELECT 1 FROM roles r WHERE r.database_id=databases.id AND r.name=? AND r.deleted_at IS NULL))`,
       )
       .bind(
         sleeping ? "suspended" : "running",
@@ -45,6 +49,8 @@ export function powerTransitionStatements(
         row.observed_generation,
         Number(sleeping),
         action,
+        Number(action === "wake"),
+        authorizedRole,
       ),
     db
       .prepare(

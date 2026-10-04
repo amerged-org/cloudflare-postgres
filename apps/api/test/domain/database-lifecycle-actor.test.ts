@@ -101,6 +101,111 @@ it("admits an already-ready route with one fresh authoritative read", async () =
   expect(prepare).toHaveBeenCalledTimes(1);
 });
 
+it("does not wake for a role revoked after the authorization read", async () => {
+  const f = await ready();
+  await idle(f);
+  const prototype = Object.getPrototypeOf(env.DB);
+  const original = prototype.prepare;
+  let reads = 0;
+  vi.spyOn(prototype, "prepare").mockImplementation(function (
+    this: D1Database,
+    sql: string,
+  ) {
+    const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+      new Proxy(statement, {
+        get(target, property) {
+          if (property === "bind")
+            return (...values: unknown[]) => wrap(target.bind(...values));
+          if (property === "first" && sql.includes("r.name role_name"))
+            return async (...args: unknown[]) => {
+              const result = await Reflect.apply(target.first, target, args);
+              if (++reads === 2) {
+                const now = new Date().toISOString();
+                await env.DB.batch([
+                  original
+                    .call(
+                      env.DB,
+                      "UPDATE roles SET deleted_at=? WHERE database_id=? AND name='app'",
+                    )
+                    .bind(now, f.id),
+                  original
+                    .call(
+                      env.DB,
+                      "UPDATE databases SET generation=generation+1,updated_at=? WHERE id=?",
+                    )
+                    .bind(now, f.id),
+                ]);
+              }
+              return result;
+            };
+          const value = Reflect.get(target, property);
+          return typeof value === "function" ? value.bind(target) : value;
+        },
+      });
+    return wrap(original.call(this, sql));
+  });
+  expect(
+    await actor(f.id).ensureAwake(f.id, "app", { deadline: Date.now() + 1000 }),
+  ).toEqual({ ok: false, sqlstate: "57P03" });
+  expect(
+    await env.DB.prepare(
+      "SELECT desired_state,generation FROM databases WHERE id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ desired_state: "suspended", generation: 3 });
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) n FROM operations WHERE database_id=? AND kind='database.wake'",
+    )
+      .bind(f.id)
+      .first("n"),
+  ).toBe(0);
+});
+
+it("rejects a duplicate waiter without cancelling its original connection", async () => {
+  const f = await ready();
+  await idle(f);
+  const waiterId = crypto.randomUUID();
+  const first = actor(f.id).ensureAwake(f.id, "app", {
+    waiterId,
+    deadline: Date.now() + 4000,
+  });
+  const row = await untilWake(f.id);
+  for (let i = 0; i < 100; i++) {
+    if (
+      await runInDurableObject(actor(f.id), (instance) =>
+        Reflect.get(instance, "waiters").has(waiterId),
+      )
+    )
+      break;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  expect(
+    await runInDurableObject(actor(f.id), (instance) =>
+      Reflect.get(instance, "waiters").has(waiterId),
+    ),
+  ).toBe(true);
+  expect(
+    await actor(f.id).ensureAwake(f.id, "app", {
+      waiterId,
+      deadline: Date.now() + 4000,
+    }),
+  ).toEqual({ ok: false, sqlstate: "57P03" });
+  await request(
+    "/agent/v1/observations",
+    f.agent,
+    "POST",
+    observedBody([
+      {
+        ...observation(f.id, 3),
+        power: { operation: row.power_operation, revision: 3, state: "awake" },
+      },
+    ]),
+  );
+  expect((await first).ok).toBe(true);
+});
+
 it("coalesces ten idle wake waiters into one durable operation and hint, releasing only exact readiness", async () => {
   const f = await ready();
   await idle(f);

@@ -72,7 +72,7 @@ function admittedRoute(row: AdmissionRow): DatabaseAdmission {
 export class DatabaseActor extends DurableObject<Env> {
   private waiters = new Map<
     string,
-    { deadline: number; resolve: (ready: boolean) => void }
+    { deadline: number; resolve: (ready: boolean) => void; owner: object }
   >();
   private polling = false;
   private wake: { operation: string; revision: number } | undefined;
@@ -257,7 +257,14 @@ export class DatabaseActor extends DurableObject<Env> {
           const operation = newOperationId(),
             now = new Date().toISOString();
           const result = await this.env.DB.batch(
-            powerTransitionStatements(this.env.DB, row, "wake", operation, now),
+            powerTransitionStatements(
+              this.env.DB,
+              row,
+              "wake",
+              operation,
+              now,
+              user,
+            ),
           );
           if (result[0]!.meta.changes !== 1) return undefined;
           row = await this.env.DB.prepare("SELECT * FROM databases WHERE id=?")
@@ -329,10 +336,11 @@ export class DatabaseActor extends DurableObject<Env> {
     );
     if (deadline <= Date.now()) return { ok: false, sqlstate: "57P03" };
     const waiterId = parsed.data.waiterId ?? crypto.randomUUID();
+    const owner = {};
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       return await Promise.race([
-        this.waitForAwake(databaseId, user, { deadline, waiterId }),
+        this.waitForAwake(databaseId, user, { deadline, waiterId }, owner),
         new Promise<DatabaseAdmission>((resolve) => {
           timer = setTimeout(
             () => resolve({ ok: false, sqlstate: "57P03" }),
@@ -343,7 +351,7 @@ export class DatabaseActor extends DurableObject<Env> {
     } finally {
       if (timer) clearTimeout(timer);
       const waiter = this.waiters.get(waiterId);
-      if (waiter) {
+      if (waiter?.owner === owner) {
         this.waiters.delete(waiterId);
         waiter.resolve(false);
         this.interruptPoll?.();
@@ -362,6 +370,7 @@ export class DatabaseActor extends DurableObject<Env> {
     databaseId: unknown,
     user: unknown,
     options: { deadline: number; waiterId: string },
+    owner: object,
   ): Promise<DatabaseAdmission> {
     const id = DatabaseId.safeParse(databaseId),
       role = RoleName.safeParse(user);
@@ -413,7 +422,7 @@ export class DatabaseActor extends DurableObject<Env> {
       const waiter = parsed.data.waiterId ?? crypto.randomUUID();
       if (this.waiters.has(waiter)) return { ok: false, sqlstate: "57P03" };
       const pending = new Promise<boolean>((resolve) =>
-        this.waiters.set(waiter, { deadline, resolve }),
+        this.waiters.set(waiter, { deadline, resolve, owner }),
       );
       if (!this.polling) this.startPolling(id.data);
       else this.interruptPoll?.();
