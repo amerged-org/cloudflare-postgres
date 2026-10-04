@@ -1935,29 +1935,39 @@ export class Run {
       const first = Math.max(1, ...ranges.map((range) => range[1] + 1));
       const last = Math.min(first + 4095, 65535);
       const segment = ports.slice(first - 1, last);
-      for (let offset = 0; offset < segment.length; offset += 256) {
-        const batch = segment.slice(offset, offset + 256);
-        // Workers cannot dial TCP/25. A signed, independent native probe must cover it.
-        if (batch.includes(25)) {
-          const proven = await this.nativeProof(
-            addresses.map((entry) => entry.host),
-          );
-          if (!proven.has(address.host))
-            throw new HarnessError("supplemental_external_tcp_probe_required");
-        }
-        const workerPorts = batch.filter((port) => port !== 25);
-        const result = await this.probe("/scan", {
-          host: address.host,
-          ports: workerPorts,
-        });
-        if (
-          !Array.isArray(result.open) ||
-          result.open.some((p) => typeof p !== "number") ||
-          result.checked !== workerPorts.length
-        )
-          throw new HarnessError("invalid_scan_result");
-        assertOpenSubset(result.open as number[], []);
+      // Workers cannot dial TCP/25. Prove it before any batch in its segment.
+      if (segment.includes(25)) {
+        const proven = await this.nativeProof(
+          addresses.map((entry) => entry.host),
+        );
+        if (!proven.has(address.host))
+          throw new HarnessError("supplemental_external_tcp_probe_required");
       }
+      const results = await Promise.allSettled(
+        Array.from(
+          { length: Math.ceil(segment.length / 256) },
+          async (_, batchIndex) => {
+            const workerPorts = segment
+              .slice(batchIndex * 256, (batchIndex + 1) * 256)
+              .filter((port) => port !== 25);
+            const result = await this.probe("/scan", {
+              host: address.host,
+              ports: workerPorts,
+            });
+            if (
+              !Array.isArray(result.open) ||
+              result.open.some((p) => typeof p !== "number") ||
+              result.checked !== workerPorts.length
+            )
+              throw new HarnessError("invalid_scan_result");
+            assertOpenSubset(result.open as number[], []);
+          },
+        ),
+      );
+      let failure: PromiseRejectedResult | undefined;
+      for (const result of results)
+        if (result.status === "rejected") failure ??= result;
+      if (failure) throw failure.reason;
       ranges.push([first, last]);
       this.state.scan_ranges[scanId] = ranges;
       if (last === 65535) this.state.scans.push(scanId);
