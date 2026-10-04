@@ -320,6 +320,11 @@ export const DatabasePatch = z
   .meta({ id: "DatabasePatch" });
 export type DatabasePatch = z.infer<typeof DatabasePatch>;
 
+export const DatabaseResize = z
+  .strictObject({ size_class_id: SizeClassId })
+  .meta({ id: "DatabaseResize" });
+export type DatabaseResize = z.infer<typeof DatabaseResize>;
+
 // ---------- Roles and connection URIs ----------
 
 export const Role = z
@@ -354,7 +359,11 @@ export type ConnectionUri = z.infer<typeof ConnectionUri>;
 
 // ---------- Operations ----------
 
-export const OPERATION_KINDS = ["database.create", "database.delete"] as const;
+export const OPERATION_KINDS = [
+  "database.create",
+  "database.delete",
+  "database.resize",
+] as const;
 export const OperationKind = z
   .enum(OPERATION_KINDS)
   .meta({ id: "OperationKind" });

@@ -2,6 +2,9 @@
 import {
   archiveDestinationPath,
   DatabaseCreate,
+  type DatabaseResize,
+  databaseMemoryReservationMib,
+  databaseCpuReservationMillicores,
   newDatabaseId,
   newOperationId,
   newRolePassword,
@@ -243,6 +246,202 @@ export async function listDatabases(c: ApiContext): Promise<Response> {
     .all<DatabaseRow>();
   return c.json(pagination.envelope(result.results.map(databaseView)));
 }
+
+export function databaseResizeStatement(
+  db: D1Database,
+  row: DatabaseRow,
+  size: SizeRow,
+  now: string,
+): D1PreparedStatement {
+  return db
+    .prepare(
+      `UPDATE databases SET size_class_id=?,generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
+    WHERE id=? AND project_id=? AND node_id IS ? AND generation=? AND size_class_id=? AND updated_at=?
+      AND desired_state='running' AND observed_state='ready' AND observed_generation=generation AND deleted_at IS NULL
+      AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
+      AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=? AND s.enabled=1
+        WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1
+          AND n.storage_gib_total IS NOT NULL AND n.platform_reserved_cpu_millicores IS NOT NULL
+          AND s.storage_gib=(SELECT old.storage_gib FROM size_classes old WHERE old.id=databases.size_class_id)
+          AND n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?
+          AND n.allocatable_cpu_millicores-n.platform_reserved_cpu_millicores-COALESCE((SELECT SUM(sc.cpu_millicores+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.cpu_millicores+?
+          AND n.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.storage_gib
+          AND s.memory_mib=? AND s.cpu_millicores=? AND s.storage_gib=? AND s.max_connections=?
+          AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?)`,
+    )
+    .bind(
+      size.id,
+      now,
+      row.id,
+      row.project_id,
+      row.node_id,
+      row.generation,
+      row.size_class_id,
+      row.updated_at,
+      size.id,
+      SIDECAR.requestMemoryMib,
+      SIDECAR.requestMemoryMib,
+      SIDECAR.requestCpuMillicores,
+      SIDECAR.requestCpuMillicores,
+      size.memory_mib,
+      size.cpu_millicores,
+      size.storage_gib,
+      size.max_connections,
+      size.sleep_after_seconds,
+      size.archive_timeout_seconds,
+      size.backup_retention_days,
+    );
+}
+
+export async function resizeDatabase(
+  c: ApiContext,
+  id: string,
+  body: DatabaseResize,
+): Promise<Response> {
+  await databaseForRequest(c, id, true);
+  return withIdempotency(c, {
+    replay: (op, status) => databaseOperationResponse(c, op, status),
+    execute: async (lease) => {
+      const row = await databaseForRequest(c, id, true);
+      if (row.deleted_at !== null || row.desired_state !== "running")
+        throw new ApiError("conflict", "Database is not running");
+      const [previous, target] = await Promise.all([
+        c.env.DB.prepare("SELECT * FROM size_classes WHERE id=?")
+          .bind(row.size_class_id)
+          .first<SizeRow>(),
+        c.env.DB.prepare("SELECT * FROM size_classes WHERE id=?")
+          .bind(body.size_class_id)
+          .first<SizeRow>(),
+      ]);
+      if (
+        !previous ||
+        !target ||
+        (target.id !== previous.id && target.enabled !== 1)
+      )
+        throw new ApiError("invalid_request", "Size class unavailable");
+      if (target.storage_gib < previous.storage_gib)
+        throw new ApiError(
+          "invalid_request",
+          "Storage shrink is not supported",
+        );
+      if (target.storage_gib !== previous.storage_gib)
+        throw new ApiError(
+          "invalid_request",
+          "Storage-changing resize is not supported",
+        );
+      const now = new Date().toISOString();
+      if (target.id === previous.id) {
+        const op = newOperationId();
+        await c.env.DB.prepare(
+          `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at)
+          SELECT ?,'database.resize','succeeded',project_id,id,generation,?,?,? FROM databases
+          WHERE id=? AND project_id=? AND generation=? AND size_class_id=? AND updated_at=? AND deleted_at IS NULL
+            AND desired_state='running' AND observed_state='ready' AND observed_generation=generation
+            AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
+          ON CONFLICT DO NOTHING`,
+        )
+          .bind(
+            op,
+            now,
+            now,
+            now,
+            id,
+            row.project_id,
+            row.generation,
+            row.size_class_id,
+            row.updated_at,
+          )
+          .run();
+        const existing = await c.env.DB.prepare(
+          `SELECT o.id FROM operations o JOIN databases d ON d.id=o.database_id AND d.project_id=o.project_id
+          WHERE o.database_id=? AND o.project_id=? AND o.kind='database.resize' AND o.generation=?
+            AND d.generation=? AND d.size_class_id=? AND d.desired_state='running' AND d.deleted_at IS NULL`,
+        )
+          .bind(
+            id,
+            row.project_id,
+            row.generation,
+            row.generation,
+            row.size_class_id,
+          )
+          .first<{ id: string }>();
+        if (!existing)
+          throw new ApiError("conflict", "Database changed; retry the request");
+        await lease
+          .completeStatement(existing.id, 202, {
+            sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
+            bindings: [existing.id, row.project_id],
+          })
+          .run();
+        return databaseOperationResponse(c, existing.id);
+      }
+      if (
+        row.observed_state !== "ready" ||
+        row.observed_generation !== row.generation ||
+        row.node_id === null
+      )
+        throw new ApiError("conflict", "Database configuration is not ready");
+      const node = (await placementNodes(c.env.DB, row.region_id)).find(
+        (value) => value.id === row.node_id,
+      );
+      if (
+        !node ||
+        !choosePlacement(
+          [
+            {
+              ...node,
+              reserved_memory_mib:
+                node.reserved_memory_mib -
+                databaseMemoryReservationMib(previous),
+              reserved_cpu_millicores:
+                node.reserved_cpu_millicores -
+                databaseCpuReservationMillicores(previous),
+              reserved_storage_gib:
+                node.reserved_storage_gib - previous.storage_gib,
+            },
+          ],
+          row.region_id,
+          target,
+        )
+      )
+        throw new ApiError(
+          "capacity_exhausted",
+          "Current node has insufficient memory, CPU or storage",
+        );
+      const op = newOperationId();
+      const generation = row.generation + 1;
+      const result = await c.env.DB.batch([
+        databaseResizeStatement(c.env.DB, row, target, now),
+        c.env.DB.prepare(
+          `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at)
+          SELECT ?,'database.resize','pending',project_id,id,generation,?,? FROM databases
+          WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND size_class_id=?`,
+        ).bind(op, now, now, id, row.project_id, generation, target.id),
+        lease.completeStatement(op, 202, {
+          sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
+          bindings: [op, row.project_id],
+        }),
+      ]);
+      if (result[0]!.meta.changes !== 1) {
+        const current = await databaseForRequest(c, id, true);
+        if (
+          current.generation !== row.generation ||
+          current.desired_state !== row.desired_state ||
+          current.size_class_id !== row.size_class_id ||
+          current.updated_at !== row.updated_at
+        )
+          throw new ApiError("conflict", "Database changed; retry the request");
+        throw new ApiError(
+          "capacity_exhausted",
+          "Current node capacity changed; retry the request",
+        );
+      }
+      hint(c, row.region_id, [id]);
+      return databaseOperationResponse(c, op);
+    },
+  });
+}
+
 export async function deleteDatabase(
   c: ApiContext,
   id: string,

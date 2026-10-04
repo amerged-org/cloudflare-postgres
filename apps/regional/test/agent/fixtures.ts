@@ -229,8 +229,24 @@ export class MemoryKubernetes implements Kubernetes {
           name: "database-1",
           namespace: resource.metadata.namespace,
           labels: { "cnpg.io/cluster": "database" },
+          ...{
+            ownerReferences: [
+              {
+                apiVersion: current.apiVersion,
+                kind: "Cluster",
+                name: current.metadata.name,
+                uid: current.metadata.uid,
+              },
+            ],
+          },
         },
         spec: {
+          volumes: [
+            {
+              name: "pgdata",
+              persistentVolumeClaim: { claimName: "database-1" },
+            },
+          ],
           nodeName: record(record(clusterSpec.affinity).nodeSelector)[
             "kubernetes.io/hostname"
           ],
@@ -247,6 +263,62 @@ export class MemoryKubernetes implements Kubernetes {
           conditions: [{ type: "Ready", status: "True" }],
         },
       });
+      const claimKey = this.key(
+        "PersistentVolumeClaim",
+        resource.metadata.namespace,
+        "database-1",
+      );
+      let claim = this.resources.get(claimKey);
+      if (!claim) {
+        claim = this.put({
+          apiVersion: "v1",
+          kind: "PersistentVolumeClaim",
+          metadata: {
+            name: "database-1",
+            namespace: resource.metadata.namespace,
+            labels: { "cnpg.io/cluster": "database" },
+            ...{
+              ownerReferences: [
+                {
+                  apiVersion: current.apiVersion,
+                  kind: "Cluster",
+                  name: current.metadata.name,
+                  uid: current.metadata.uid,
+                },
+              ],
+            },
+          },
+          spec: {
+            storageClassName: "pgcf-lvm",
+            resources: {
+              requests: { storage: record(clusterSpec.storage).size },
+            },
+          },
+          status: {
+            phase: "Bound",
+            capacity: { storage: record(clusterSpec.storage).size },
+          },
+        });
+        const handle = `pvc-${claim.metadata.uid}`;
+        record(claim.spec).volumeName = handle;
+        this.put({
+          apiVersion: "v1",
+          kind: "PersistentVolume",
+          metadata: { name: handle },
+          spec: {
+            storageClassName: "pgcf-lvm",
+            capacity: { storage: record(clusterSpec.storage).size },
+            persistentVolumeReclaimPolicy: "Retain",
+            csi: { driver: "local.csi.openebs.io", volumeHandle: handle },
+            claimRef: {
+              namespace: claim.metadata.namespace,
+              name: claim.metadata.name,
+              uid: claim.metadata.uid,
+            },
+          },
+          status: { phase: "Bound" },
+        });
+      }
       if (this.caPresent)
         this.put({
           apiVersion: "v1",
@@ -325,6 +397,18 @@ export class MemoryKubernetes implements Kubernetes {
     this.mutation(`delete:${kind}:${name}`);
   }
   addStorage(db: DesiredDatabase): void {
+    const claim = this.resources.get(
+      this.key("PersistentVolumeClaim", `pgcf-db-${db.id}`, "database-1"),
+    );
+    const existingHandle = record(claim?.spec).volumeName;
+    if (typeof existingHandle === "string") {
+      this.put({
+        apiVersion: "local.openebs.io/v1alpha1",
+        kind: "LVMVolume",
+        metadata: { name: existingHandle, namespace: "openebs" },
+      });
+      return;
+    }
     const handle = `pvc-${randomUUID()}`;
     this.put({
       apiVersion: "v1",

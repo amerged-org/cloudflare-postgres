@@ -4,6 +4,7 @@ import {
   ConnectionUri,
   Database,
   DatabaseCreate,
+  DatabaseResize,
   DatabaseId,
   DatabaseWithOperation,
   DesiredQuery,
@@ -29,6 +30,7 @@ import {
   createDatabase,
   deleteDatabase,
   listDatabases,
+  resizeDatabase,
 } from "../domain/databases.ts";
 import { desired } from "../domain/desired.ts";
 import { observations, truncateAgentText } from "../domain/observations.ts";
@@ -145,6 +147,23 @@ export function registerDomain(app: ApiApp): void {
         ),
       );
     },
+  );
+  register(
+    app,
+    {
+      method: "patch",
+      path: "/v1/databases/{id}",
+      security,
+      tags: ["Databases"],
+      request: { headers, params, body: body(DatabaseResize) },
+      responses: responses(DatabaseWithOperation, 202),
+    },
+    async (c) =>
+      resizeDatabase(
+        c,
+        DatabaseId.parse(c.req.param("id")),
+        DatabaseResize.parse(await c.req.json()),
+      ),
   );
   register(
     app,

@@ -55,9 +55,26 @@ interface ArchiveObservation extends ArchiveProgress {
   pendingSince: number | null;
 }
 
+function ownedByCluster(resource: Resource, cluster: Resource): boolean {
+  const owners = record(resource.metadata).ownerReferences;
+  return (
+    Array.isArray(owners) &&
+    owners.some((value) => {
+      const owner = record(value);
+      return (
+        owner.apiVersion === cluster.apiVersion &&
+        owner.kind === "Cluster" &&
+        owner.name === cluster.metadata.name &&
+        owner.uid === cluster.metadata.uid
+      );
+    })
+  );
+}
+
 const LEDGER_PREFIX = "delete-";
 const STORAGE_PREFIX = "storage-";
 const SYSTEM_NAMESPACE = "pgcf-system";
+const VOLUME_IDENTITY_ANNOTATION = "pgcf.io/volume-identity";
 const DELETE_TIMEOUT_MS = 10 * 60_000;
 const CLUSTER_QUANTITY_FIELDS = new Set([
   "resources.requests.cpu",
@@ -619,11 +636,13 @@ export class Reconciler {
       );
     }
     const publicCa = await this.publishCa(db, cluster, namespaceName);
+    const runtimeResources: Resource[] = [];
     const desiredApplied = await this.desiredApplied(
       db,
       ctx,
       cluster,
       namespaceName,
+      runtimeResources,
     );
     const caMap = publicCa
       ? await this.k8s.read("ConfigMap", SYSTEM_NAMESPACE, `ca-${db.id}`)
@@ -636,6 +655,11 @@ export class Reconciler {
       ca
         ? await this.authenticate(db, ca, this.signal)
         : false;
+    const storageVerified =
+      credentialsApplied &&
+      (await this.verifyVolumeIdentity(db, fence, runtimeResources));
+    const runtimeUnchanged =
+      storageVerified && (await this.runtimeUnchanged(runtimeResources));
     const unhealthy =
       stalled === true ||
       (archive?.status === "False" &&
@@ -645,6 +669,8 @@ export class Reconciler {
       publicCa &&
       desiredApplied &&
       credentialsApplied &&
+      runtimeUnchanged &&
+      storageVerified &&
       count !== null &&
       (continuous ||
         (db.creation?.ever_ready === true && measured && stalled !== null));
@@ -820,6 +846,7 @@ export class Reconciler {
     ctx: BuildContext,
     cluster: Resource,
     namespace: string,
+    identities: Resource[] = [],
   ): Promise<boolean> {
     assertOwned(cluster, db.id, "database");
     const manifests = buildDatabaseManifests(db, ctx);
@@ -891,6 +918,9 @@ export class Reconciler {
     const pod = await this.k8s.read("Pod", namespace, primary);
     if (
       !pod ||
+      !pod.metadata.uid ||
+      !pod.metadata.resourceVersion ||
+      !ownedByCluster(pod, cluster) ||
       pod.metadata.deletionTimestamp ||
       pod.metadata.namespace !== namespace ||
       pod.metadata.labels?.["cnpg.io/cluster"] !== "database" ||
@@ -914,7 +944,142 @@ export class Reconciler {
       )
         return false;
     }
+    const volumes = record(pod.spec).volumes;
+    const pgdata = Array.isArray(volumes)
+      ? volumes.map(record).find((value) => value.name === "pgdata")
+      : undefined;
+    const claimName = string(record(pgdata?.persistentVolumeClaim).claimName);
+    if (!claimName || claimName !== primary) return false;
+    const claim = await this.k8s.read(
+      "PersistentVolumeClaim",
+      namespace,
+      claimName,
+    );
+    if (
+      !claim ||
+      !claim.metadata.uid ||
+      !claim.metadata.resourceVersion ||
+      claim.metadata.deletionTimestamp ||
+      claim.metadata.namespace !== namespace ||
+      claim.metadata.labels?.["cnpg.io/cluster"] !== "database" ||
+      !ownedByCluster(claim, cluster) ||
+      record(claim.status).phase !== "Bound" ||
+      record(claim.spec).storageClassName !== ctx.storageClass ||
+      quantity(
+        record(record(record(claim.spec).resources).requests).storage,
+      ) !==
+        db.size.storage_gib * 2 ** 30 ||
+      quantity(record(record(claim.status).capacity).storage) !==
+        db.size.storage_gib * 2 ** 30
+    )
+      return false;
+    const volumeName = string(record(claim.spec).volumeName);
+    if (!volumeName) return false;
+    const volume = await this.k8s.read(
+      "PersistentVolume",
+      undefined,
+      volumeName,
+    );
+    const reference = record(record(volume?.spec).claimRef);
+    if (
+      !volume ||
+      !volume.metadata.uid ||
+      !volume.metadata.resourceVersion ||
+      volume.metadata.deletionTimestamp ||
+      reference.namespace !== namespace ||
+      reference.name !== claimName ||
+      reference.uid !== claim.metadata.uid ||
+      record(volume.spec).storageClassName !== ctx.storageClass ||
+      record(volume.status).phase !== "Bound" ||
+      record(record(volume.spec).csi).driver !== "local.csi.openebs.io" ||
+      quantity(record(record(volume.spec).capacity).storage) !==
+        db.size.storage_gib * 2 ** 30
+    )
+      return false;
+    identities.push(cluster, pod, claim, volume);
     return true;
+  }
+
+  private async runtimeUnchanged(resources: Resource[]): Promise<boolean> {
+    const current = await Promise.all(
+      resources.map((resource) =>
+        this.k8s.read(
+          resource.kind,
+          resource.metadata.namespace,
+          resource.metadata.name,
+        ),
+      ),
+    );
+    return current.every(
+      (resource, index) =>
+        resource &&
+        !resource.metadata.deletionTimestamp &&
+        resource.metadata.uid === resources[index]!.metadata.uid &&
+        resource.metadata.resourceVersion ===
+          resources[index]!.metadata.resourceVersion,
+    );
+  }
+
+  private async verifyVolumeIdentity(
+    db: DesiredDatabase,
+    fence: Resource,
+    resources: Resource[],
+  ): Promise<boolean> {
+    const claim = resources.find(
+      (resource) => resource.kind === "PersistentVolumeClaim",
+    );
+    const volume = resources.find(
+      (resource) => resource.kind === "PersistentVolume",
+    );
+    if (!claim || !volume) return false;
+    const handle = string(record(record(volume.spec).csi).volumeHandle);
+    if (!handle || handle.length > 253) return false;
+    const identity = JSON.stringify({
+      claimUid: claim.metadata.uid,
+      volumeUid: volume.metadata.uid,
+      handle,
+    });
+    const name = `${STORAGE_PREFIX}${db.id}`;
+    const current = await this.k8s.read("ConfigMap", SYSTEM_NAMESPACE, name);
+    if (!current) return false;
+    assertOwned(current, db.id, name);
+    if (
+      uid(current) !== uid(fence) ||
+      current.metadata.namespace !== SYSTEM_NAMESPACE ||
+      !current.metadata.resourceVersion ||
+      appliedGeneration(current) !== db.generation ||
+      record(current.data).state !== record(fence.data).state
+    )
+      return false;
+    const previous = current.metadata.annotations?.[VOLUME_IDENTITY_ANNOTATION];
+    if (previous !== undefined) return previous === identity;
+    await this.k8s.patch("ConfigMap", SYSTEM_NAMESPACE, name, [
+      { op: "test", path: "/metadata/uid", value: uid(current) },
+      {
+        op: "test",
+        path: "/metadata/resourceVersion",
+        value: current.metadata.resourceVersion,
+      },
+      { op: "test", path: "/data/state", value: record(current.data).state },
+      {
+        op: "add",
+        path: "/metadata/annotations",
+        value: {
+          ...current.metadata.annotations,
+          [VOLUME_IDENTITY_ANNOTATION]: identity,
+        },
+      },
+    ]);
+    const saved = await this.k8s.read("ConfigMap", SYSTEM_NAMESPACE, name);
+    if (saved) assertOwned(saved, db.id, name);
+    return (
+      saved !== null &&
+      saved.metadata.namespace === SYSTEM_NAMESPACE &&
+      uid(saved) === uid(current) &&
+      appliedGeneration(saved) === db.generation &&
+      record(saved.data).state === record(current.data).state &&
+      saved.metadata.annotations?.[VOLUME_IDENTITY_ANNOTATION] === identity
+    );
   }
 
   private async publishCa(

@@ -192,7 +192,46 @@ export async function observations(
           now,
         ),
       );
-    else
+    if (
+      observation.state === "ready" &&
+      row.observed_generation < observation.generation
+    ) {
+      statements.push(
+        c.env.DB.prepare(
+          `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
+          SELECT d.id,'resized',d.node_id,d.size_class_id,d.generation,?,json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,
+            'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',s.cpu_millicores+?,'storage_allocated_bytes',s.storage_gib*1073741824)
+          FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=? AND d.region_id=? AND d.generation=?
+            AND d.observed_generation=? AND d.observed_state='ready' AND d.updated_at=?
+            AND EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.project_id=d.project_id AND o.kind='database.resize' AND o.generation=d.generation)
+            AND NOT EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='resized' AND e.generation=d.generation)`,
+        ).bind(
+          body.observed_at,
+          SIDECAR.requestMemoryMib,
+          SIDECAR.requestCpuMillicores,
+          row.id,
+          region.id,
+          observation.generation,
+          observation.generation,
+          now,
+        ),
+        c.env.DB.prepare(
+          `UPDATE operations SET status='succeeded',updated_at=?,completed_at=?
+          WHERE database_id=? AND project_id=? AND kind='database.resize' AND generation=? AND status IN('pending','running')
+            AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.project_id=operations.project_id AND d.region_id=?
+              AND d.generation=operations.generation AND d.observed_generation=operations.generation AND d.observed_state='ready' AND d.updated_at=?)`,
+        ).bind(
+          now,
+          now,
+          row.id,
+          row.project_id,
+          observation.generation,
+          region.id,
+          now,
+        ),
+      );
+    }
+    if (!applied)
       statements.push(
         c.env.DB.prepare(
           `UPDATE operations SET status='running',updated_at=? WHERE database_id=? AND project_id=? AND generation<=? AND status='pending'
