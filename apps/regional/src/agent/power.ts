@@ -675,9 +675,7 @@ export class PowerCoordinator {
     };
   }
   /** Read-only inventory/key access shared by bounded measurement and retirement callers. */
-  async gatewaySnapshot(
-    signal: AbortSignal,
-  ): Promise<{
+  async gatewaySnapshot(signal: AbortSignal): Promise<{
     pods: GatewayPod[];
     keyring: RouteKeyring;
     keyUid: string;
