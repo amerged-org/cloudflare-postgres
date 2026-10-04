@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
-  USAGE_FINAL_DELAY_MS,
   USAGE_HOUR_MS,
   UsageLifecycleEvent,
   UsageQuery,
@@ -154,7 +153,6 @@ interface QueryHour {
 export async function queryUsage(
   c: ApiContext,
   input: UsageQuery,
-  now = Date.now(),
 ): Promise<UsageResponse> {
   const query = UsageQuery.parse(input);
   await getAuth(c);
@@ -223,10 +221,7 @@ export async function queryUsage(
         project_id: period.project_id,
         start: hour.hour,
         end,
-        final:
-          hour.final === 1 ||
-          (hour.metrics === null &&
-            now >= Date.parse(end) + USAGE_FINAL_DELAY_MS),
+        final: hour.final === 1,
         metrics:
           hour.metrics === null
             ? emptyUsageMetrics()

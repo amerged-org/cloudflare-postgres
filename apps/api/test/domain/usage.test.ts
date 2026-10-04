@@ -5,7 +5,7 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { afterEach, describe, expect, it } from "vitest";
-import { newDatabaseId } from "@pgcf/contracts";
+import { DatabaseWithOperation, newDatabaseId } from "@pgcf/contracts";
 import {
   USAGE_HOUR_MS,
   UsageQuery,
@@ -13,7 +13,6 @@ import {
   type UsageSample,
 } from "@pgcf/contracts/usage";
 import { createApp } from "../../src/app.ts";
-import { registerUsage } from "../../src/routes/usage.ts";
 import {
   recordUsageSample,
   usageLifecycleStatement,
@@ -23,7 +22,13 @@ import {
   computeUsageHour,
   rollupUsageHour,
 } from "../../src/domain/usage-rollup.ts";
-import { cleanupFixtures, fixture } from "./fixtures.ts";
+import {
+  cleanupFixtures,
+  fixture,
+  observedBody,
+  observation,
+  request,
+} from "./fixtures.ts";
 
 const epoch = Date.parse("2026-01-01T00:00:00.000Z"),
   iso = (value: number) => new Date(value).toISOString();
@@ -99,7 +104,6 @@ async function setup() {
 }
 async function getUsage(key: string, query: Record<string, string>) {
   const app = createApp();
-  registerUsage(app);
   const context = createExecutionContext();
   const response = await app.fetch(
     new Request(
@@ -113,6 +117,48 @@ async function getUsage(key: string, query: Record<string, string>) {
   return response;
 }
 describe("hourly usage", () => {
+  it("meters actual create and accepted-ready API transitions from their immutable resource snapshots", async () => {
+    const f = await fixture();
+    const created = DatabaseWithOperation.parse(
+      await (await f.create()).json(),
+    );
+    const id = created.database.id;
+    databaseIds.push(id);
+    const response = await request(
+      "/agent/v1/observations",
+      f.agent,
+      "POST",
+      observedBody([observation(id, 1)]),
+    );
+    expect(response.status).toBe(200);
+    const measuredAt = Date.now() + 2_000;
+    const hour = Math.floor(measuredAt / USAGE_HOUR_MS) * USAGE_HOUR_MS;
+    const usage = await rollupUsageHour(env.DB, id, hour, measuredAt);
+    expect(usage.metrics.awake_seconds).toBeGreaterThan(0);
+    expect(usage.metrics.memory_mib_seconds).toBe(
+      usage.metrics.awake_seconds! * 512,
+    );
+    expect(usage.metrics.cpu_millicore_seconds).toBe(
+      usage.metrics.awake_seconds! * 500,
+    );
+    expect(usage.gaps).not.toContain("resource_snapshot");
+    expect(usage.metrics.ingress_bytes).toBeNull();
+  });
+  it("keeps an uncomputed expired hour pending rather than claiming immutable final metrics", async () => {
+    const f = await setup();
+    const response = await getUsage(f.integrator, {
+      database_id: f.id,
+      from: iso(epoch),
+      to: iso(epoch + USAGE_HOUR_MS),
+      granularity: "hour",
+    });
+    expect(response.status).toBe(200);
+    const body = await response.json<{
+      data: { final: boolean; gaps: string[] }[];
+    }>();
+    expect(body.data[0]!.gaps).toContain("rollup_pending");
+    expect(body.data[0]!.final).toBe(false);
+  });
   it("splits create-ready-sleep-wake-delete across UTC hours", async () => {
     const f = await setup();
     await env.DB.batch([

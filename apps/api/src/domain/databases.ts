@@ -185,9 +185,21 @@ export async function createDatabase(
             SELECT ?,'database.create','pending',project_id,id,generation,?,? FROM databases WHERE id=? AND project_id=?`,
             ).bind(op, now, now, id, body.project_id),
             c.env.DB.prepare(
-              `INSERT INTO lifecycle_events (database_id,kind,node_id,size_class_id,generation,occurred_at)
-            SELECT id,'created',node_id,size_class_id,generation,? FROM databases WHERE id=? AND project_id=?`,
-            ).bind(now, id, body.project_id),
+              `INSERT INTO lifecycle_events (database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
+            SELECT id,'created',node_id,size_class_id,generation,?,? FROM databases WHERE id=? AND project_id=?`,
+            ).bind(
+              now,
+              JSON.stringify({
+                memory_mib: size.memory_mib,
+                cpu_millicores: size.cpu_millicores,
+                reserved_memory_mib: size.memory_mib + SIDECAR.requestMemoryMib,
+                reserved_cpu_millicores:
+                  size.cpu_millicores + SIDECAR.requestCpuMillicores,
+                storage_allocated_bytes: size.storage_gib * 2 ** 30,
+              }),
+              id,
+              body.project_id,
+            ),
             lease.completeStatement(op, 202, guard),
           ]);
         } catch (error) {

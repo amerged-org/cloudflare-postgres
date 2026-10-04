@@ -7,6 +7,7 @@ import { version } from "../package.json";
 import type { ApiContext, ApiEnv } from "./env.ts";
 import { registerDomain } from "./routes/domain.ts";
 import { registerPlatform } from "./routes/platform.ts";
+import { registerUsage } from "./routes/usage.ts";
 
 export type ApiApp = OpenAPIHono<ApiEnv>;
 export const REQUEST_ID_HEADER = "X-Request-Id";
@@ -39,6 +40,7 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/databases/:id/roles/:name/reset-password",
   "/v1/databases/:id/roles/:name/connection-uri",
   "/v1/operations/:id",
+  "/v1/usage",
   "/v1/databases/:id/archive",
   "/agent/v1/desired",
   "/agent/v1/observations",
@@ -238,6 +240,7 @@ export function createApp(): ApiApp {
 
   registerPlatform(app);
   registerDomain(app);
+  registerUsage(app);
   app.doc31("/v1/openapi.json", {
     openapi: "3.1.0",
     info: { title: "PGCF API", version },

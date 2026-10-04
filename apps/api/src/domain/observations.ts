@@ -2,6 +2,7 @@
 import {
   newNodeId,
   ObservationRequest,
+  SIDECAR,
   type DatabaseObservation,
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
@@ -153,12 +154,18 @@ export async function observations(
     if (event)
       statements.push(
         c.env.DB.prepare(
-          `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at)
-      SELECT id,?,node_id,size_class_id,generation,? FROM databases WHERE changes()=1 AND id=? AND region_id=?
+          `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
+      SELECT d.id,?,d.node_id,d.size_class_id,d.generation,?,
+        json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,
+          'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',s.cpu_millicores+?,
+          'storage_allocated_bytes',s.storage_gib*1073741824)
+      FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.region_id=?
       AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=? AND kind=? AND generation=?)`,
         ).bind(
           event,
           body.observed_at,
+          SIDECAR.requestMemoryMib,
+          SIDECAR.requestCpuMillicores,
           row.id,
           region.id,
           row.id,
