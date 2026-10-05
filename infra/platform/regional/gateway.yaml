@@ -42,6 +42,10 @@ spec:
     spec:
       serviceAccountName: pgcf-gateway
       enableServiceLinks: false
+      tolerations:
+        - key: pgcf.io/quarantine
+          operator: Exists
+          effect: NoSchedule
       # The gateway drains for up to 30 s after SIGTERM.
       terminationGracePeriodSeconds: 45
       securityContext:

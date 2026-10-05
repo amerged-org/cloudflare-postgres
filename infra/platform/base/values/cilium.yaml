@@ -37,3 +37,16 @@ bpf:
   hostLegacyRouting: true
 operator:
   replicas: 1
+  # Helm replaces arrays, so retain the pinned chart's existing operator tolerations.
+  tolerations:
+    - key: node-role.kubernetes.io/control-plane
+      operator: Exists
+    - key: node-role.kubernetes.io/master
+      operator: Exists
+    - key: node.kubernetes.io/not-ready
+      operator: Exists
+    - key: node.cloudprovider.kubernetes.io/uninitialized
+      operator: Exists
+    - key: pgcf.io/quarantine
+      operator: Exists
+      effect: NoSchedule
