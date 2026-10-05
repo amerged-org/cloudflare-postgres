@@ -14,6 +14,7 @@ import {
   type ArchiveProgress,
 } from "./observe.ts";
 import { record, string, type Kubernetes, type Resource } from "./types.ts";
+import { credentialSecretMatches } from "./readiness.ts";
 
 type ArchiveProbeStage =
   | "configuration"
@@ -196,13 +197,17 @@ export async function archiveProbeOptions(
     return refuse("cluster_revision");
   if (!owned(secret, "Secret", "maintenance-credentials", namespace, db.id))
     return refuse("maintenance_identity");
-  if (appliedGeneration(secret) !== db.generation)
+  if (
+    appliedGeneration(secret) < 1 ||
+    appliedGeneration(secret) > db.generation
+  )
     return refuse("maintenance_revision");
   if (
     record(secret.data).username !==
       Buffer.from(MAINTENANCE_ROLE).toString("base64") ||
     record(secret.data).password !==
-      Buffer.from(db.maintenance.password).toString("base64")
+      Buffer.from(db.maintenance.password).toString("base64") ||
+    !credentialSecretMatches(db, secret)
   )
     return refuse("maintenance_data");
   if (
@@ -284,6 +289,7 @@ export async function archiveProbeOptions(
       string(record(freshCluster!.status).currentPrimary) === primary &&
       freshSecret!.metadata.resourceVersion ===
         secret.metadata.resourceVersion &&
+      credentialSecretMatches(db, freshSecret!) &&
       freshCa!.metadata.resourceVersion === caSecret.metadata.resourceVersion &&
       record(record(roleStatus.passwordStatus)[MAINTENANCE_ROLE])
         .resourceVersion === secret.metadata.resourceVersion &&

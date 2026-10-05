@@ -23,6 +23,7 @@ import type {
   K8sObject,
 } from "@pgcf/contracts";
 import { ARCHIVE_DESTINATION_PATTERN } from "@pgcf/contracts";
+import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 import {
   buildCaConfigMap,
   buildDatabaseManifests,
@@ -46,7 +47,7 @@ import {
 import type { ArchiveProgress } from "./observe.ts";
 import { record, string, uid } from "./types.ts";
 import type { Kubernetes, Resource, Log } from "./types.ts";
-import { probeRoles } from "./readiness.ts";
+import { probeRoles, credentialSecretMatches } from "./readiness.ts";
 import type { AuthenticationProbe } from "./readiness.ts";
 
 type ApplyStage =
@@ -1251,6 +1252,35 @@ export class Reconciler {
     if (appliedGeneration(current) > db.generation) return false;
     if (!current.metadata.resourceVersion)
       throw new Error("database_resource_version_missing");
+    if (
+      manifest.kind === "Secret" &&
+      manifest.type === "kubernetes.io/basic-auth" &&
+      (current.kind !== manifest.kind ||
+        current.apiVersion !== manifest.apiVersion ||
+        current.metadata.namespace !== metadata.namespace ||
+        current.metadata.deletionTimestamp ||
+        acceptedGeneration(current) > db.generation)
+    )
+      return false;
+    if (
+      manifest.kind === "Secret" &&
+      credentialSecretMatches(db, current) &&
+      containsDesired(current.metadata.labels, metadata.labels) &&
+      containsDesired(
+        current.metadata.annotations,
+        Object.fromEntries(
+          Object.entries(metadata.annotations ?? {}).filter(
+            ([key]) => key !== GENERATION_ANNOTATION,
+          ),
+        ),
+      ) &&
+      Object.entries(manifest)
+        .filter(([key]) => key !== "metadata")
+        .every(([key, value]) => containsDesired(current[key], value))
+    ) {
+      this.signal.throwIfAborted();
+      return true;
+    }
     await this.patchConfiguration(
       db,
       current,
@@ -1321,6 +1351,14 @@ export class Reconciler {
       );
       if (!actual) return false;
       assertOwned(actual, db.id, manifest.metadata.name);
+      const credential =
+        manifest.kind === "Secret" &&
+        (db.roles.some(
+          (role) => roleSecretName(role.name) === manifest.metadata.name,
+        ) ||
+          (!!db.maintenance &&
+            manifest.metadata.name === "maintenance-credentials"));
+      if (credential && !credentialSecretMatches(db, actual)) return false;
       if (
         !containsDesired(
           actual.data ?? actual.spec,
@@ -1328,10 +1366,16 @@ export class Reconciler {
         )
       )
         return false;
+      if (credential) identities.push(actual);
       if (manifest.kind === "Secret") {
-        const role = db.roles.find(
-          (value) => roleSecretName(value.name) === manifest.metadata.name,
-        );
+        const role =
+          db.roles.find(
+            (value) => roleSecretName(value.name) === manifest.metadata.name,
+          ) ??
+          (db.maintenance &&
+          manifest.metadata.name === "maintenance-credentials"
+            ? { name: MAINTENANCE_ROLE, owner: false }
+            : undefined);
         if (role) {
           if (!actual.metadata.resourceVersion) return false;
           if (role.owner) {

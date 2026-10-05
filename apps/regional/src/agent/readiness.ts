@@ -2,7 +2,47 @@
 import { Client } from "pg";
 import type { ClientConfig } from "pg";
 import { DesiredDatabase } from "@pgcf/contracts";
-import { databaseNamespace } from "./builders/index.ts";
+import { databaseNamespace, roleSecretName } from "./builders/index.ts";
+import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
+import {
+  appliedGeneration,
+  acceptedGeneration,
+  DATABASE_LABEL,
+} from "./observe.ts";
+import { record, type Resource } from "./types.ts";
+
+export function credentialSecretMatches(
+  db: DesiredDatabase,
+  secret: Resource,
+): boolean {
+  const name = secret.metadata.name;
+  const role = db.roles.find((value) => roleSecretName(value.name) === name);
+  const credentials =
+    role ??
+    (db.maintenance && name === "maintenance-credentials"
+      ? { name: MAINTENANCE_ROLE, password: db.maintenance.password }
+      : undefined);
+  if (!credentials) return false;
+  const generation = appliedGeneration(secret),
+    data = record(secret.data);
+  return (
+    secret.apiVersion === "v1" &&
+    secret.kind === "Secret" &&
+    secret.metadata.namespace === databaseNamespace(db.id) &&
+    secret.metadata.labels?.[DATABASE_LABEL] === db.id &&
+    secret.metadata.labels?.["cnpg.io/reload"] === "true" &&
+    !!secret.metadata.uid &&
+    !!secret.metadata.resourceVersion &&
+    !secret.metadata.deletionTimestamp &&
+    generation > 0 &&
+    generation <= db.generation &&
+    acceptedGeneration(secret) <= db.generation &&
+    secret.type === "kubernetes.io/basic-auth" &&
+    Object.keys(data).length === 2 &&
+    data.username === Buffer.from(credentials.name).toString("base64") &&
+    data.password === Buffer.from(credentials.password).toString("base64")
+  );
+}
 
 export type AuthenticationProbe = (
   database: DesiredDatabase,

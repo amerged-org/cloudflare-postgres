@@ -18,6 +18,7 @@ import {
   authenticate,
 } from "./fixtures.ts";
 import { roleSecretName } from "../../src/agent/builders/index.ts";
+import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 
 const signal = () => new AbortController().signal;
 
@@ -2772,4 +2773,378 @@ test("aborted wake reconciliation never retries the rejected PATCH or authentica
   );
   assert.equal(attempts, 1);
   assert.equal(auth, 0);
+});
+
+async function unchangedCredentialWakeFixture() {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes(),
+    namespace = `pgcf-db-${db.id}`;
+  db.roles.push({
+    name: "reader",
+    owner: false,
+    revision: 1,
+    password: fixture().db.roles[0]!.password,
+  });
+  db.maintenance = {
+    role: MAINTENANCE_ROLE,
+    revision: 1,
+    password: fixture().db.roles[0]!.password,
+  };
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "ready",
+  );
+  const before = new Map(
+    (await k8s.list("Secret", namespace))
+      .filter((value) => value.type === "kubernetes.io/basic-auth")
+      .map((value) => [value.metadata.name, value]),
+  );
+  const oldCluster = (await k8s.read("Cluster", namespace, "database"))!;
+  const patch = k8s.patch.bind(k8s);
+  k8s.patch = async (kind, ns, name, operations) => {
+    await patch(kind, ns, name, operations);
+    if (
+      kind === "Cluster" &&
+      operations.some((raw) => record(raw).path === "/spec")
+    ) {
+      const current = k8s.resources.get(k8s.key(kind, ns, name))!;
+      record(current.status).secretsResourceVersion = structuredClone(
+        record(oldCluster.status).secretsResourceVersion,
+      );
+      record(record(current.status).managedRolesStatus).passwordStatus =
+        structuredClone(
+          record(record(oldCluster.status).managedRolesStatus).passwordStatus,
+        );
+    }
+  };
+  db.creation!.ever_ready = true;
+  db.generation = 2;
+  db.power = {
+    operation: db.creation!.operation_id,
+    revision: 2,
+    mode: "running",
+    reason: null,
+  };
+  const power = {
+    prepareRunning: async () => undefined,
+    finishRunning: async (_db: unknown, observation: unknown) => observation,
+  } as unknown as PowerCoordinator;
+  const actionStart = k8s.actions.length;
+  return { db, ctx, k8s, namespace, before, power, actionStart };
+}
+
+test("a power-only revision preserves exact application and maintenance Secret UID/RV without a credential PATCH", async () => {
+  const f = await unchangedCredentialWakeFixture();
+  await new Reconciler(
+    f.k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+    f.power,
+  ).reconcile(f.db, f.ctx);
+  for (const [name, original] of f.before) {
+    const actual = await f.k8s.read("Secret", f.namespace, name);
+    assert.deepEqual(actual, original);
+    assert.equal(
+      f.k8s.actions.slice(f.actionStart).includes(`patch:Secret:${name}`),
+      false,
+    );
+  }
+});
+
+test("an unchanged credential revision keeps exact CNPG acknowledgments and avoids an artificial controller wait", async () => {
+  const f = await unchangedCredentialWakeFixture();
+  let authentications = 0;
+  const observation = await new Reconciler(
+    f.k8s,
+    signal(),
+    Date.now,
+    metrics,
+    async (db) => {
+      assert.deepEqual(db.roles, f.db.roles);
+      authentications++;
+      return true;
+    },
+    f.power,
+  ).reconcile(f.db, f.ctx);
+  assert.equal(observation?.state, "ready");
+  assert.equal(authentications, 1);
+});
+
+test("a restarted agent preserves unchanged credential RVs while applying the current size", async () => {
+  const f = await unchangedCredentialWakeFixture();
+  f.db.size.memory_mib = 1024;
+  f.db.size.cpu_millicores = 1000;
+  f.db.size.max_connections = 200;
+  const restarted = new Reconciler(
+    f.k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+    f.power,
+  );
+  assert.equal((await restarted.reconcile(f.db, f.ctx))?.state, "ready");
+  const cluster = (await f.k8s.read("Cluster", f.namespace, "database"))!;
+  assert.deepEqual(record(record(cluster.spec).resources).requests, {
+    cpu: "1000m",
+    memory: "1024Mi",
+  });
+  assert.equal(
+    record(record(cluster.spec).postgresql).parameters &&
+      record(record(record(cluster.spec).postgresql).parameters)
+        .max_connections,
+    "200",
+  );
+  for (const [name, original] of f.before)
+    assert.deepEqual(await f.k8s.read("Secret", f.namespace, name), original);
+  const before = f.k8s.actions.length;
+  assert.equal(
+    (
+      await new Reconciler(
+        f.k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+        f.power,
+      ).reconcile(f.db, f.ctx)
+    )?.state,
+    "ready",
+  );
+  assert.equal(f.k8s.actions.length, before);
+});
+
+test("actual application and maintenance password rotations still PATCH under CAS and await exact new acknowledgments", async () => {
+  const f = await unchangedCredentialWakeFixture();
+  f.db.roles[0]!.password = fixture().db.roles[0]!.password;
+  f.db.roles[0]!.revision = 2;
+  f.db.maintenance!.password = fixture().db.roles[0]!.password;
+  f.db.maintenance!.revision = 2;
+  let auth = 0;
+  assert.equal(
+    (
+      await new Reconciler(
+        f.k8s,
+        signal(),
+        Date.now,
+        metrics,
+        async () => {
+          auth++;
+          return true;
+        },
+        f.power,
+      ).reconcile(f.db, f.ctx)
+    )?.state,
+    "provisioning",
+  );
+  assert.equal(auth, 0);
+  for (const name of [roleSecretName("app"), "maintenance-credentials"]) {
+    const actual = (await f.k8s.read("Secret", f.namespace, name))!;
+    assert.equal(actual.metadata.uid, f.before.get(name)!.metadata.uid);
+    assert.notEqual(
+      actual.metadata.resourceVersion,
+      f.before.get(name)!.metadata.resourceVersion,
+    );
+    assert.equal(actual.metadata.annotations![GENERATION_ANNOTATION], "2");
+    const password =
+      name === "maintenance-credentials"
+        ? f.db.maintenance!.password
+        : f.db.roles[0]!.password;
+    assert.equal(
+      record(actual.data).password,
+      Buffer.from(password).toString("base64"),
+    );
+    assert.ok(
+      f.k8s.actions.slice(f.actionStart).includes(`patch:Secret:${name}`),
+    );
+  }
+  const cluster = f.k8s.resources.get(
+    f.k8s.key("Cluster", f.namespace, "database"),
+  )!;
+  record(
+    record(cluster.status).secretsResourceVersion,
+  ).applicationSecretVersion = (await f.k8s.read(
+    "Secret",
+    f.namespace,
+    roleSecretName("app"),
+  ))!.metadata.resourceVersion;
+  record(record(record(cluster.status).managedRolesStatus).passwordStatus)[
+    MAINTENANCE_ROLE
+  ] = {
+    resourceVersion: (await f.k8s.read(
+      "Secret",
+      f.namespace,
+      "maintenance-credentials",
+    ))!.metadata.resourceVersion,
+  };
+  assert.equal(
+    (
+      await new Reconciler(
+        f.k8s,
+        signal(),
+        Date.now,
+        metrics,
+        authenticate,
+        f.power,
+      ).reconcile(f.db, f.ctx)
+    )?.state,
+    "ready",
+  );
+});
+
+test("required credential metadata is repaired rather than silently preserved", async () => {
+  const f = await unchangedCredentialWakeFixture(),
+    name = roleSecretName("reader");
+  const secret = f.k8s.resources.get(f.k8s.key("Secret", f.namespace, name))!;
+  secret.metadata.labels!["cnpg.io/reload"] = "false";
+  await new Reconciler(
+    f.k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+    f.power,
+  ).reconcile(f.db, f.ctx);
+  const actual = (await f.k8s.read("Secret", f.namespace, name))!;
+  assert.equal(actual.metadata.labels!["cnpg.io/reload"], "true");
+  assert.notEqual(
+    actual.metadata.resourceVersion,
+    f.before.get(name)!.metadata.resourceVersion,
+  );
+  assert.ok(
+    f.k8s.actions.slice(f.actionStart).includes(`patch:Secret:${name}`),
+  );
+});
+
+test("missing credential generation forces a guarded repair; explicit zero remains invalid", async () => {
+  const f = await unchangedCredentialWakeFixture(),
+    name = roleSecretName("app");
+  const secret = f.k8s.resources.get(f.k8s.key("Secret", f.namespace, name))!;
+  delete secret.metadata.annotations![GENERATION_ANNOTATION];
+  await new Reconciler(
+    f.k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+    f.power,
+  ).reconcile(f.db, f.ctx);
+  assert.ok(
+    f.k8s.actions.slice(f.actionStart).includes(`patch:Secret:${name}`),
+  );
+  assert.equal(
+    (await f.k8s.read("Secret", f.namespace, name))!.metadata.annotations![
+      GENERATION_ANNOTATION
+    ],
+    "2",
+  );
+  const zero = await unchangedCredentialWakeFixture();
+  zero.k8s.resources.get(
+    zero.k8s.key("Secret", zero.namespace, name),
+  )!.metadata.annotations![GENERATION_ANNOTATION] = "0";
+  await assert.rejects(
+    new Reconciler(
+      zero.k8s,
+      signal(),
+      Date.now,
+      metrics,
+      authenticate,
+      zero.power,
+    ).reconcile(zero.db, zero.ctx),
+    { message: "applied_generation_invalid" },
+  );
+  assert.equal(
+    zero.k8s.actions.slice(zero.actionStart).includes(`patch:Secret:${name}`),
+    false,
+  );
+});
+
+test("future credential revision and foreign ownership never use the unchanged Secret shortcut", async () => {
+  const f = await unchangedCredentialWakeFixture(),
+    name = roleSecretName("app");
+  const secret = f.k8s.resources.get(f.k8s.key("Secret", f.namespace, name))!;
+  secret.metadata.annotations![GENERATION_ANNOTATION] = "3";
+  const before = structuredClone(secret);
+  assert.equal(
+    await new Reconciler(
+      f.k8s,
+      signal(),
+      Date.now,
+      metrics,
+      authenticate,
+      f.power,
+    ).reconcile(f.db, f.ctx),
+    null,
+  );
+  assert.deepEqual(await f.k8s.read("Secret", f.namespace, name), before);
+  const foreign = await unchangedCredentialWakeFixture();
+  foreign.k8s.resources.get(
+    foreign.k8s.key("Secret", foreign.namespace, name),
+  )!.metadata.labels!["pgcf.io/database-id"] = fixture().db.id;
+  await assert.rejects(
+    new Reconciler(
+      foreign.k8s,
+      signal(),
+      Date.now,
+      metrics,
+      authenticate,
+      foreign.power,
+    ).reconcile(foreign.db, foreign.ctx),
+    { message: "resource_ownership_conflict" },
+  );
+  assert.equal(
+    foreign.k8s.actions
+      .slice(foreign.actionStart)
+      .includes(`patch:Secret:${name}`),
+    false,
+  );
+});
+
+test("deleting credentials remain pending and credential RV changes during authentication cannot report ready", async () => {
+  const f = await unchangedCredentialWakeFixture(),
+    name = roleSecretName("app");
+  f.k8s.resources.get(
+    f.k8s.key("Secret", f.namespace, name),
+  )!.metadata.deletionTimestamp = new Date().toISOString();
+  assert.equal(
+    await new Reconciler(
+      f.k8s,
+      signal(),
+      Date.now,
+      metrics,
+      authenticate,
+      f.power,
+    ).reconcile(f.db, f.ctx),
+    null,
+  );
+  assert.equal(
+    f.k8s.actions.slice(f.actionStart).includes(`patch:Secret:${name}`),
+    false,
+  );
+  const raced = await unchangedCredentialWakeFixture();
+  const observation = await new Reconciler(
+    raced.k8s,
+    signal(),
+    Date.now,
+    metrics,
+    async () => {
+      const secret = raced.k8s.resources.get(
+        raced.k8s.key("Secret", raced.namespace, name),
+      )!;
+      secret.metadata.resourceVersion = String(++raced.k8s.revision);
+      return true;
+    },
+    raced.power,
+  ).reconcile(raced.db, raced.ctx);
+  assert.notEqual(observation?.state, "ready");
 });

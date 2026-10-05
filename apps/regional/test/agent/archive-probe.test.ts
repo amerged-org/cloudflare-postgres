@@ -598,13 +598,13 @@ test("CIDR-formatted or arbitrary server input is still refused rather than trim
   assert.equal(client.ended(), 1);
 });
 
-test("archive selection reports only a fixed transport and eligibility reason without credentials", async () => {
+test("archive selection reports only a fixed future-credential revision reason without credentials", async () => {
   const f = await boundFixture(),
     events: { transport: string; reason: string }[] = [];
   const secret = f.k8s.resources.get(
     f.k8s.key("Secret", f.namespace, "maintenance-credentials"),
   )!;
-  secret.metadata.annotations![GENERATION_ANNOTATION] = "1";
+  secret.metadata.annotations![GENERATION_ANNOTATION] = "3";
   f.db.generation = 2;
   const ns = f.k8s.resources.get(
     f.k8s.key("Namespace", undefined, f.namespace),
@@ -850,4 +850,114 @@ test("an archive connection exception reports connect without its message or a q
   assert.equal(JSON.stringify(events).includes(canary), false);
   assert.equal(client.ended(), 1);
   assert.equal(client.queries.length, 0);
+});
+
+test("an unchanged older-positive maintenance Secret remains SQL-eligible only with its exact current RV acknowledgment", async () => {
+  const f = await boundFixture();
+  f.db.generation = 2;
+  f.db.power!.revision = 2;
+  const ns = f.k8s.resources.get(
+    f.k8s.key("Namespace", undefined, f.namespace),
+  )!;
+  ns.metadata.annotations![GENERATION_ANNOTATION] = "2";
+  ns.metadata.annotations!["pgcf.io/accepted-generation"] = "2";
+  f.cluster.metadata.annotations![GENERATION_ANNOTATION] = "2";
+  f.k8s.resources.set(
+    f.k8s.key("Cluster", f.namespace, "database"),
+    structuredClone(f.cluster),
+  );
+  f.fence.metadata.annotations![GENERATION_ANNOTATION] = "2";
+  f.k8s.resources.set(
+    f.k8s.key("ConfigMap", "pgcf-system", f.fence.metadata.name),
+    structuredClone(f.fence),
+  );
+  const secret = f.k8s.resources.get(
+    f.k8s.key("Secret", f.namespace, "maintenance-credentials"),
+  )!;
+  assert.equal(secret.metadata.annotations![GENERATION_ANNOTATION], "1");
+  const options = await archiveProbeOptions(
+    f.db,
+    f.cluster,
+    f.fence,
+    f.k8s,
+    new AbortController().signal,
+  );
+  assert.ok(options);
+  assert.equal(await options.verifyBinding(), true);
+  const ack = record(
+    record(record(f.cluster.status).managedRolesStatus).passwordStatus,
+  );
+  record(ack[MAINTENANCE_ROLE]).resourceVersion = randomUUID();
+  assert.equal(
+    await archiveProbeOptions(
+      f.db,
+      f.cluster,
+      f.fence,
+      f.k8s,
+      new AbortController().signal,
+    ),
+    null,
+  );
+});
+
+test("missing and zero maintenance credential generations cannot select SQL", async () => {
+  const f = await boundFixture(),
+    secret = f.k8s.resources.get(
+      f.k8s.key("Secret", f.namespace, "maintenance-credentials"),
+    )!;
+  delete secret.metadata.annotations![GENERATION_ANNOTATION];
+  assert.equal(
+    await archiveProbeOptions(
+      f.db,
+      f.cluster,
+      f.fence,
+      f.k8s,
+      new AbortController().signal,
+    ),
+    null,
+  );
+  secret.metadata.annotations![GENERATION_ANNOTATION] = "0";
+  await assert.rejects(
+    archiveProbeOptions(
+      f.db,
+      f.cluster,
+      f.fence,
+      f.k8s,
+      new AbortController().signal,
+    ),
+    { message: "applied_generation_invalid" },
+  );
+});
+
+test("older credential-generation eligibility never accepts changed data or replaced identity", async () => {
+  const f = await boundFixture();
+  const options = await archiveProbeOptions(
+    f.db,
+    f.cluster,
+    f.fence,
+    f.k8s,
+    new AbortController().signal,
+  );
+  assert.ok(options);
+  const secret = f.k8s.resources.get(
+    f.k8s.key("Secret", f.namespace, "maintenance-credentials"),
+  )!;
+  record(secret.data).password =
+    Buffer.from(newRolePassword()).toString("base64");
+  assert.equal(
+    await archiveProbeOptions(
+      f.db,
+      f.cluster,
+      f.fence,
+      f.k8s,
+      new AbortController().signal,
+    ),
+    null,
+  );
+  assert.equal(await options.verifyBinding(), false);
+  record(secret.data).password = Buffer.from(
+    f.db.maintenance!.password,
+  ).toString("base64");
+  secret.metadata.uid = randomUUID();
+  assert.equal(await options.verifyBinding(), false);
 });
