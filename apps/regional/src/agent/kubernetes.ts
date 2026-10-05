@@ -17,6 +17,7 @@ const CUSTOM: Record<
   { group: string; version: string; plural: string }
 > = {
   Cluster: { group: "postgresql.cnpg.io", version: "v1", plural: "clusters" },
+  Backup: { group: "postgresql.cnpg.io", version: "v1", plural: "backups" },
   ScheduledBackup: {
     group: "postgresql.cnpg.io",
     version: "v1",
