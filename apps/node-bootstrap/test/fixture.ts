@@ -9,11 +9,8 @@ import type {
   NodeBootstrapAuthority,
   NodeBootstrapInput,
   NodeBootstrapSpec,
-} from "../../../packages/contracts/src/node-bootstrap.ts";
-import {
-  newNodeId,
-  newOperationId,
-} from "../../../packages/contracts/src/ids.ts";
+} from "@pgcf/contracts/node-bootstrap";
+import { newNodeId, newOperationId } from "@pgcf/contracts";
 import { digest, initialCheckpoint, inputHash } from "../src/bootstrap.ts";
 
 export function fixture(): NodeBootstrapInput {

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import { test } from "node:test";
-import { NodeBootstrapCallback } from "../../../packages/contracts/src/node-bootstrap.ts";
+import { NodeBootstrapCallback } from "@pgcf/contracts/node-bootstrap";
 import { inputHash } from "../src/bootstrap.ts";
 import { LOOPBACK } from "../src/proxy-command.ts";
 import { authorized, createBootstrapServer } from "../src/server.ts";

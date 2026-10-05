@@ -6,7 +6,7 @@ import {
   type ServerResponse,
 } from "node:http";
 import { pathToFileURL } from "node:url";
-import { OperationId } from "../../../packages/contracts/src/ids.ts";
+import { OperationId } from "@pgcf/contracts";
 import {
   BootstrapError,
   BootstrapJob,

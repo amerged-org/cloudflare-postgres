@@ -12,7 +12,9 @@
     "./pg-wire": "./src/pg-wire.ts",
     "./gateway-control": "./src/gateway-control.ts",
     "./gateway-activity": "./src/gateway-activity.ts",
-    "./costs": "./src/costs.ts"
+    "./costs": "./src/costs.ts",
+    "./node-bootstrap": "./src/node-bootstrap.ts",
+    "./bootstrap-relay": "./src/bootstrap-relay.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
