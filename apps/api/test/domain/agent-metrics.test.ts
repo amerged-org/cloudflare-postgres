@@ -145,6 +145,26 @@ it("measured idle-open sockets may start one idle intent; ten repeated reports c
       .first("n"),
   ).toBe(1);
 });
+
+it("a recovered observation window delays idle despite older gateway activity", async () => {
+  const f = await ready(),
+    measured = activity(f),
+    floor = new Date(Date.now() - 15_000).toISOString();
+  const body = {
+    databases: measured.databases.map((value) => ({
+      ...value,
+      idle_observed_since: floor,
+      last_activity_at: floor,
+    })),
+  };
+  const response = await sendActivity(f, body);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ accepted: 1, idle_intents: 0 });
+  expect(await generation(f.id)).toBe(1);
+  expect(await activityRows(f.id)).toMatchObject([
+    { last_activity_at: floor, active_connections: 0 },
+  ]);
+});
 it("busy work and pending dials map conservatively instead of blocking every idle-open socket", async () => {
   const f = await ready();
   expect(await (await sendActivity(f, activity(f, 4, 1, 2))).json()).toEqual({
