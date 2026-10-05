@@ -11,6 +11,11 @@ import {
   serializeRouteKeyring,
 } from "@pgcf/contracts/route-token";
 import { ApiError } from "../app.ts";
+import {
+  agentKeyReference,
+  encryptAgentKey,
+  bootstrapCredentialInsert,
+} from "../crypto/bootstrap-credentials.ts";
 import type { ApiContext } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
 import {
@@ -29,6 +34,11 @@ export async function createRegion(
     replay: async () => refuseCredentialReplay(),
     execute: async (lease) => {
       const agentKey = newAgentKey(body.id);
+      const custody = await encryptAgentKey(
+        c.env.CREDENTIAL_KEYS,
+        agentKeyReference(body.id),
+        agentKey,
+      );
       const routeKeyring = JSON.parse(
         serializeRouteKeyring(
           await deriveRegionKeyring(
@@ -56,6 +66,7 @@ export async function createRegion(
             now,
             now,
           ),
+          bootstrapCredentialInsert(c.env.DB, custody, now),
           lease.completeStatement(body.id, 201),
         ]);
       } catch (error) {

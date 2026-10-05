@@ -37,16 +37,18 @@ describe("measured CPU admission on real Workers D1", () => {
     ).toBeNull();
   });
 
-  it("rejects database creation when CPU is exhausted despite spare memory and storage", async () => {
+  it("keeps creates pending when CPU is exhausted despite spare memory and storage", async () => {
     const f = await fixture(8192, 60);
     await env.DB.prepare(
       "UPDATE nodes SET allocatable_cpu_millicores=599 WHERE id=?",
     )
       .bind(f.node)
       .run();
-    expect((await f.create()).status).toBe(503);
+    expect((await f.create()).status).toBe(202);
     expect(
-      await env.DB.prepare("SELECT COUNT(*) FROM databases WHERE project_id=?")
+      await env.DB.prepare(
+        "SELECT COUNT(*) FROM databases WHERE project_id=? AND node_id IS NOT NULL",
+      )
         .bind(f.project)
         .first("COUNT(*)"),
     ).toBe(0);
@@ -103,7 +105,7 @@ describe("measured CPU admission on real Workers D1", () => {
     ).toBe(1);
   });
 
-  it("concurrent API creates consume one CPU reservation and produce only one operation", async () => {
+  it("concurrent API creates consume one CPU reservation and retain both operations", async () => {
     const f = await fixture(8192, 60);
     await env.DB.prepare(
       "UPDATE nodes SET allocatable_cpu_millicores=700 WHERE id=?",
@@ -114,7 +116,7 @@ describe("measured CPU admission on real Workers D1", () => {
       f.create("cpu-first"),
       f.create("cpu-second"),
     ]);
-    expect(results.map((result) => result.status).sort()).toEqual([202, 503]);
+    expect(results.map((result) => result.status).sort()).toEqual([202, 202]);
     for (const table of ["roles", "operations", "lifecycle_events"])
       expect(
         await env.DB.prepare(
@@ -122,7 +124,10 @@ describe("measured CPU admission on real Workers D1", () => {
         )
           .bind(f.project)
           .first("count"),
-      ).toBe(1);
+      ).toBe(table === "lifecycle_events" ? 1 : 2);
+    expect(
+      (await placementNodes(env.DB, f.region))[0]?.reserved_cpu_millicores,
+    ).toBe(600);
   });
 
   it("distinguishes unknown platform CPU from measured zero and keeps memory ordering among CPU-fitting nodes", () => {
@@ -188,7 +193,14 @@ describe("measured CPU admission on real Workers D1", () => {
       .run();
     const nodes = await placementNodes(env.DB, f.region);
     expect(nodes[0]?.platform_reserved_cpu_millicores).toBeNull();
-    expect((await f.create("unknown")).status).toBe(503);
+    expect((await f.create("unknown")).status).toBe(202);
+    expect(
+      await env.DB.prepare(
+        "SELECT node_id FROM databases WHERE project_id=? AND name=?",
+      )
+        .bind(f.project, "unknown")
+        .first("node_id"),
+    ).toBeNull();
     const size = (await env.DB.prepare("SELECT * FROM size_classes WHERE id=?")
       .bind(f.size)
       .first<SizeRow>())!;
@@ -257,7 +269,14 @@ describe("measured CPU admission on real Workers D1", () => {
         .bind(f.node)
         .first("platform_reserved_cpu_millicores"),
     ).toBeNull();
-    expect((await f.create("legacy-again")).status).toBe(503);
+    expect((await f.create("legacy-again")).status).toBe(202);
+    expect(
+      await env.DB.prepare(
+        "SELECT node_id FROM databases WHERE project_id=? AND name=?",
+      )
+        .bind(f.project, "legacy-again")
+        .first("node_id"),
+    ).toBeNull();
   });
 
   it("counts PostgreSQL plus sidecar CPU until a database is observed deleted", async () => {
@@ -278,7 +297,14 @@ describe("measured CPU admission on real Workers D1", () => {
     )
       .bind(new Date().toISOString(), body.database.id)
       .run();
-    expect((await f.create("still-held")).status).toBe(503);
+    expect((await f.create("still-held")).status).toBe(202);
+    expect(
+      await env.DB.prepare(
+        "SELECT node_id FROM databases WHERE project_id=? AND name=?",
+      )
+        .bind(f.project, "still-held")
+        .first("node_id"),
+    ).toBeNull();
     await env.DB.prepare(
       "UPDATE databases SET observed_state='deleted' WHERE id=?",
     )

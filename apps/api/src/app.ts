@@ -10,6 +10,10 @@ import { registerPlatform } from "./routes/platform.ts";
 import { registerUsage } from "./routes/usage.ts";
 import { registerAgentMetrics } from "./routes/agent-metrics.ts";
 import { registerCosts } from "./routes/costs.ts";
+import { registerNodes } from "./routes/nodes.ts";
+import { authenticateBootstrapCallback } from "./domain/bootstrap-jobs.ts";
+import { NodeStateError } from "./domain/node-state.ts";
+import { requireScope } from "./middleware/auth.ts";
 
 export type ApiApp = OpenAPIHono<ApiEnv>;
 export const REQUEST_ID_HEADER = "X-Request-Id";
@@ -38,6 +42,16 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/size-classes/:id",
   "/v1/regions",
   "/v1/nodes",
+  "/v1/nodes/additions",
+  "/v1/nodes/additions/:id",
+  "/v1/nodes/additions/:id/approve",
+  "/v1/nodes/additions/:id/cancel",
+  "/v1/nodes/additions/:id/bootstrap",
+  "/v1/nodes/additions/:id/verify",
+  "/v1/regions/:id/capacity-policy",
+  "/v1/regions/:id/capacity-decision",
+  "/internal/v1/node-bootstrap/:operation_id",
+  "/internal/v1/node-bootstrap/:operation_id/relay",
   "/v1/databases",
   "/v1/databases/:id",
   "/v1/databases/:id/suspend",
@@ -85,26 +99,33 @@ export function apiError(
 
 async function readJsonBody(
   request: Request,
+  maximum = JSON_BODY_MAX_BYTES,
 ): Promise<{ text: string; byteLength: number }> {
   const reader = request.body!.getReader();
-  const bytes = new Uint8Array(JSON_BODY_MAX_BYTES);
+  const bytes = new Uint8Array(maximum);
   let length = 0;
   try {
     const declared = request.headers.get("Content-Length");
     if (
       declared !== null &&
       /^\d+$/.test(declared) &&
-      Number(declared) > JSON_BODY_MAX_BYTES
+      Number(declared) > maximum
     ) {
       await reader.cancel();
-      throw new ApiError("invalid_request", "JSON body exceeds 64 KiB");
+      throw new ApiError(
+        "invalid_request",
+        `JSON body exceeds ${maximum / 1024} KiB`,
+      );
     }
     while (true) {
       const chunk = await reader.read();
       if (chunk.done) break;
-      if (chunk.value.byteLength > JSON_BODY_MAX_BYTES - length) {
+      if (chunk.value.byteLength > maximum - length) {
         await reader.cancel();
-        throw new ApiError("invalid_request", "JSON body exceeds 64 KiB");
+        throw new ApiError(
+          "invalid_request",
+          `JSON body exceeds ${maximum / 1024} KiB`,
+        );
       }
       bytes.set(chunk.value, length);
       length += chunk.value.byteLength;
@@ -195,6 +216,16 @@ export function createApp(): ApiApp {
   app.onError((error, c) => {
     if (error instanceof ApiError)
       return apiError(c, error.code, error.message, error.details);
+    if (error instanceof NodeStateError)
+      return apiError(
+        c,
+        error.code === "not_found"
+          ? "not_found"
+          : error.code === "capacity_unavailable"
+            ? "capacity_exhausted"
+            : "conflict",
+        error.message,
+      );
     if (error instanceof HTTPException) {
       const mapped = httpError(error);
       return apiError(c, mapped.code, mapped.message);
@@ -203,8 +234,23 @@ export function createApp(): ApiApp {
   });
 
   app.use("*", async (c, next) => {
+    const path = new URL(c.req.url).pathname;
+    const callback = /^\/internal\/v1\/node-bootstrap\/(op_[a-z0-9]{20})$/.exec(
+      path,
+    );
+    const privateBootstrap =
+      /^\/v1\/nodes\/additions\/op_[a-z0-9]{20}\/bootstrap$/.test(path) &&
+      c.req.method === "POST";
+    let maximum = JSON_BODY_MAX_BYTES;
+    if (callback && c.req.method === "POST") {
+      await authenticateBootstrapCallback(c, callback[1]!);
+      maximum = 512 * 1024;
+    } else if (privateBootstrap) {
+      await requireScope(c, "admin");
+      maximum = 512 * 1024;
+    }
     if (c.req.raw.body !== null) {
-      const { text, byteLength } = await readJsonBody(c.req.raw);
+      const { text, byteLength } = await readJsonBody(c.req.raw, maximum);
       // A bodyless HTTP request can arrive as a non-null zero-byte stream.
       if (byteLength !== 0) {
         const mediaType = c.req.header("Content-Type")?.split(";")[0]?.trim();
@@ -251,6 +297,7 @@ export function createApp(): ApiApp {
   registerUsage(app);
   registerAgentMetrics(app);
   registerCosts(app);
+  registerNodes(app);
   app.doc31("/v1/openapi.json", {
     openapi: "3.1.0",
     info: { title: "PGCF API", version },
