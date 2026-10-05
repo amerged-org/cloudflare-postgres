@@ -279,9 +279,21 @@ export const DatabaseObservation = z
     archive: z.strictObject({
       continuous: z.boolean(),
       ready_wal_files: Count.nullable(),
+      health: z.enum(["ok", "failing", "unknown"]).optional(),
     }),
   })
   .superRefine((db, ctx) => {
+    if (
+      db.archive.health !== undefined &&
+      ((db.archive.health === "ok" &&
+        (!db.archive.continuous || db.archive.ready_wal_files === null)) ||
+        (db.archive.health !== "ok" && db.archive.continuous))
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["archive", "health"],
+        message: "Explicit archive health must match continuous archive proof",
+      });
     if (
       db.power?.refusal &&
       (db.state !== "error" || db.power.state !== "awake")

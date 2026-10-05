@@ -20,6 +20,48 @@ afterEach(async () => {
   vi.restoreAllMocks();
   await cleanupFixtures();
 });
+
+it("a matching established wake completes with truthful unknown archive health", async () => {
+  const f = await suspended();
+  expect((await submit(f)).status).toBe(200);
+  const response = await request(
+    `/v1/databases/${f.id}/resume`,
+    f.integrator,
+    "POST",
+  );
+  expect(response.status).toBe(202);
+  const resumed = DatabaseWithOperation.parse(await response.json());
+  const sample = {
+    ...observation(f.id, resumed.database.generation),
+    archive: { continuous: false, ready_wal_files: null, health: "unknown" },
+    power: {
+      operation: resumed.operation.id,
+      revision: resumed.database.generation,
+      state: "awake",
+    },
+  };
+  const applied = await request(
+    "/agent/v1/observations",
+    f.agent,
+    "POST",
+    observedBody([sample]),
+  );
+  expect(applied.status).toBe(200);
+  expect(await applied.json()).toEqual({ accepted: 1 });
+  expect(await health(f.id)).toBe("unknown");
+  expect(
+    await env.DB.prepare(
+      "SELECT observed_state,observed_power FROM databases WHERE id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual({ observed_state: "ready", observed_power: "awake" });
+  expect(
+    await env.DB.prepare("SELECT status FROM operations WHERE id=?")
+      .bind(resumed.operation.id)
+      .first("status"),
+  ).toBe("succeeded");
+});
 async function suspended(action: "hibernate" | "suspend" = "hibernate") {
   const f = await fixture();
   const created = DatabaseWithOperation.parse(await (await f.create()).json()),

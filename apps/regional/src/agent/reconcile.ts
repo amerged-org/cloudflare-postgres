@@ -37,6 +37,7 @@ import {
   ACCEPTED_GENERATION_ANNOTATION,
   ARCHIVE_FAILURE_MS,
   ARCHIVE_OBSERVATION_ANNOTATION,
+  ARCHIVE_UNKNOWN_ANNOTATION,
   archiveMetrics,
   condition,
   DATABASE_LABEL,
@@ -1124,6 +1125,17 @@ export class Reconciler {
       stalled === true ||
       (archive?.status === "False" &&
         now - (this.archiveFailures.get(db.id) ?? now) >= ARCHIVE_FAILURE_MS);
+    const health = continuous
+      ? "ok"
+      : unhealthy || backlog || archive?.status === "False"
+        ? "failing"
+        : "unknown";
+    const unknownAlarm = await this.archiveUnknown(
+      db,
+      fence,
+      health === "unknown",
+      now,
+    );
     const databaseReady =
       condition(cluster, "Ready")?.status === "True" &&
       publicCa &&
@@ -1131,21 +1143,21 @@ export class Reconciler {
       credentialsApplied &&
       runtimeUnchanged &&
       storageVerified &&
-      count !== null &&
-      (continuous ||
-        (db.creation?.ever_ready === true && measured && stalled !== null));
+      (continuous || db.creation?.ever_ready === true);
     const observation: PowerObservation = {
       id: db.id,
       generation: db.generation,
       state: databaseReady
         ? "ready"
-        : unhealthy || backlog
+        : unhealthy || backlog || unknownAlarm
           ? "error"
           : "provisioning",
       ...(unhealthy || backlog
         ? { message: "continuous WAL archiving is unhealthy" }
-        : {}),
-      archive: { continuous, ready_wal_files: count },
+        : unknownAlarm
+          ? { message: "archive health remains unknown after 10 minutes" }
+          : {}),
+      archive: { continuous, ready_wal_files: count, health },
     };
     return this.power
       ? powerIntent
@@ -1158,6 +1170,73 @@ export class Reconciler {
           )
         : this.power.publishReadyFence(db, observation)
       : observation;
+  }
+
+  private async archiveUnknown(
+    db: DesiredDatabase,
+    fence: Resource,
+    unknown: boolean,
+    now: number,
+  ): Promise<boolean> {
+    const saved = fence.metadata.annotations?.[ARCHIVE_UNKNOWN_ANNOTATION];
+    let since: number | undefined;
+    if (saved !== undefined) {
+      since = Number(saved);
+      if (
+        !/^(0|[1-9][0-9]*)$/.test(saved) ||
+        !Number.isSafeInteger(since) ||
+        since < 0 ||
+        since > now
+      )
+        throw new Error("archive_unknown_observation_invalid");
+    }
+    const next = unknown ? String(since ?? now) : undefined;
+    if (saved !== next) {
+      const current = await this.k8s.read(
+        "ConfigMap",
+        SYSTEM_NAMESPACE,
+        fence.metadata.name,
+      );
+      if (!current) throw new Error("archive_fence_missing");
+      assertOwned(current, db.id, fence.metadata.name);
+      if (
+        uid(current) !== uid(fence) ||
+        current.metadata.namespace !== SYSTEM_NAMESPACE ||
+        !current.metadata.resourceVersion ||
+        appliedGeneration(current) !== db.generation ||
+        record(current.data).state !== record(fence.data).state ||
+        current.metadata.annotations?.[ARCHIVE_UNKNOWN_ANNOTATION] !== saved
+      )
+        throw new Error("archive_fence_changed");
+      const annotations = { ...current.metadata.annotations };
+      if (next === undefined) delete annotations[ARCHIVE_UNKNOWN_ANNOTATION];
+      else annotations[ARCHIVE_UNKNOWN_ANNOTATION] = next;
+      await this.k8s.patch("ConfigMap", SYSTEM_NAMESPACE, fence.metadata.name, [
+        { op: "test", path: "/metadata/uid", value: uid(current) },
+        {
+          op: "test",
+          path: "/metadata/resourceVersion",
+          value: current.metadata.resourceVersion,
+        },
+        { op: "test", path: "/data/state", value: record(current.data).state },
+        { op: "add", path: "/metadata/annotations", value: annotations },
+      ]);
+      const observed = await this.k8s.read(
+        "ConfigMap",
+        SYSTEM_NAMESPACE,
+        fence.metadata.name,
+      );
+      if (!observed) throw new Error("archive_fence_missing");
+      assertOwned(observed, db.id, fence.metadata.name);
+      if (
+        uid(observed) !== uid(current) ||
+        appliedGeneration(observed) !== db.generation ||
+        record(observed.data).state !== record(current.data).state ||
+        observed.metadata.annotations?.[ARCHIVE_UNKNOWN_ANNOTATION] !== next
+      )
+        throw new Error("archive_fence_changed");
+    }
+    return unknown && now - (since ?? now) >= ARCHIVE_FAILURE_MS;
   }
 
   private async archiveStalled(
