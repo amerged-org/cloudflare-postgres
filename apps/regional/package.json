@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "node --test 'test/**/*.test.ts'",
+    "test": "node --test --test-concurrency=1 'test/**/*.test.ts'",
     "build": "esbuild src/agent/main.ts src/gateway/main.ts src/bootstrap-relay-main.ts --bundle --platform=node --format=esm --target=node24 --external:@kubernetes/client-node --external:ws --external:pg --outdir=dist --out-extension:.js=.mjs"
   },
   "dependencies": {
