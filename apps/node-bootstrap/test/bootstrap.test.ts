@@ -709,6 +709,34 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
       }
       if (command.executable === "kubectl" && args.includes("namespace"))
         return { exit_code: 0, stdout: JSON.stringify({ metadata: { uid } }) };
+      if (command.executable === "kubectl" && args.includes("deployment"))
+        return {
+          exit_code: 0,
+          stdout: JSON.stringify({
+            apiVersion: "apps/v1",
+            kind: "Deployment",
+            metadata: {
+              name: "coredns",
+              namespace: "kube-system",
+              uid: randomUUID(),
+              resourceVersion: "41",
+            },
+            spec: {
+              template: {
+                spec: {
+                  tolerations: [
+                    {
+                      key: "pgcf.io/quarantine",
+                      operator: "Equal",
+                      value: "bootstrap",
+                      effect: "NoSchedule",
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+        };
       if (command.executable === "kubectl" && args.includes("node"))
         return {
           exit_code: 0,

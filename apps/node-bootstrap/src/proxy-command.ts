@@ -6,6 +6,7 @@ import type { Duplex } from "node:stream";
 import { pathToFileURL } from "node:url";
 import WebSocket, { createWebSocketStream } from "ws";
 import { z } from "zod";
+import { BOOTSTRAP_RELAY_HEADER } from "@pgcf/contracts/bootstrap-relay";
 import {
   BootstrapCapability,
   NodeBootstrapInput,
@@ -55,7 +56,7 @@ export async function openCapability(
     region_id: config.spec.region_id,
     input_hash: config.input_hash,
     request_id: randomUUID(),
-    payload: { capability, relay_epoch: config.spec.transport.relay_epoch },
+    payload: { capability },
   };
   const response = await request(config.callback.url, {
     method: "POST",
@@ -80,7 +81,7 @@ export async function openCapability(
     throw new Error("transport_target_mismatch");
   }
   const socket = new WebSocket(transport.websocket_url, {
-    headers: { authorization: `Bearer ${transport.token}` },
+    headers: { [BOOTSTRAP_RELAY_HEADER]: transport.token },
     handshakeTimeout: 15_000,
     followRedirects: false,
     perMessageDeflate: false,

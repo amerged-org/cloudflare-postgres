@@ -47,7 +47,7 @@ describe("private bootstrap contracts", () => {
       NodeBootstrapCallback.safeParse({
         ...identity,
         kind: "transport",
-        payload: { capability: "rescue_ssh", relay_epoch: randomUUID() },
+        payload: { capability: "rescue_ssh" },
       }).success,
     ).toBe(true);
     expect(
@@ -56,7 +56,6 @@ describe("private bootstrap contracts", () => {
         kind: "transport",
         payload: {
           capability: "rescue_ssh",
-          relay_epoch: randomUUID(),
           host: randomUUID(),
           command: "sh",
         },
