@@ -9,13 +9,13 @@ import {
   base64urlToBytes,
 } from "@pgcf/contracts";
 import { NodeAddition, NodeAdditionRequest } from "@pgcf/contracts/nodes";
-import { NodeBootstrapStatus } from "../../../../packages/contracts/src/node-bootstrap.ts";
+import { NodeBootstrapStatus } from "@pgcf/contracts/node-bootstrap";
 import {
   BOOTSTRAP_RELAY_HEADER,
   BOOTSTRAP_RELAY_PATH,
   BOOTSTRAP_RELAY_TOKEN_MAX_LENGTH,
   bootstrapRelayClaimsSchema,
-} from "../../../../packages/contracts/src/bootstrap-relay.ts";
+} from "@pgcf/contracts/bootstrap-relay";
 import type { ApiContext } from "../env.ts";
 import { ApiError, type ApiApp } from "../app.ts";
 import {

@@ -12,7 +12,7 @@ import {
   ProviderInstanceId,
   CostedNodeApproval,
 } from "@pgcf/contracts/nodes";
-import { importBootstrapVerificationKeys } from "../../../../packages/contracts/src/bootstrap-relay.ts";
+import { importBootstrapVerificationKeys } from "@pgcf/contracts/bootstrap-relay";
 import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";

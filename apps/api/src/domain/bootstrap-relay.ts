@@ -7,8 +7,8 @@ import {
   bootstrapRelayIdentitySchema,
   signBootstrapRelay,
   type BootstrapCapability,
-} from "../../../../packages/contracts/src/bootstrap-relay.ts";
-import { NodeBootstrapTransport } from "../../../../packages/contracts/src/node-bootstrap.ts";
+} from "@pgcf/contracts/bootstrap-relay";
+import { NodeBootstrapTransport } from "@pgcf/contracts/node-bootstrap";
 import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";

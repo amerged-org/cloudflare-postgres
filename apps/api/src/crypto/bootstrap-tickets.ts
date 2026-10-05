@@ -5,7 +5,7 @@ import {
   bytesToHex,
   OperationId,
 } from "@pgcf/contracts";
-import { NodeBootstrapInput } from "../../../../packages/contracts/src/node-bootstrap.ts";
+import { NodeBootstrapInput } from "@pgcf/contracts/node-bootstrap";
 import { z } from "zod";
 
 const KeyId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);

@@ -14,7 +14,7 @@ import {
   NodeBootstrapInput,
   NodeBootstrapSpec,
   NodeBootstrapStatus,
-} from "../../../../packages/contracts/src/node-bootstrap.ts";
+} from "@pgcf/contracts/node-bootstrap";
 import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
