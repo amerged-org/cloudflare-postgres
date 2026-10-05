@@ -17,7 +17,7 @@ import {
   type NodeBootstrapSpec,
   type NodeBootstrapStage,
   type NodeBootstrapStatus,
-} from "../../../packages/contracts/src/node-bootstrap.ts";
+} from "@pgcf/contracts/node-bootstrap";
 import { startNativeProxy, type ProxyConfig } from "./proxy-command.ts";
 
 export const TALOS_VERSION = "1.14.1";

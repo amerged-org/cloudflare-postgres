@@ -6,7 +6,7 @@ import { stringify } from "yaml";
 import {
   NodeBootstrapCallback,
   type NodeBootstrapAuthority,
-} from "../../../packages/contracts/src/node-bootstrap.ts";
+} from "@pgcf/contracts/node-bootstrap";
 import { BootstrapJob, type Command } from "../src/bootstrap.ts";
 import { authority, fixture } from "./fixture.ts";
 

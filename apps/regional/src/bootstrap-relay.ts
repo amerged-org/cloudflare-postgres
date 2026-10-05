@@ -13,7 +13,7 @@ import {
   importBootstrapVerificationKeys,
   verifyBootstrapRelay,
   type BootstrapVerificationKeys,
-} from "../../../packages/contracts/src/bootstrap-relay.ts";
+} from "@pgcf/contracts/bootstrap-relay";
 import {
   GatewayMemoryBudget,
   BudgetedWebSocketSocket,

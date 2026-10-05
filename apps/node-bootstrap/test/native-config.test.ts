@@ -6,7 +6,7 @@ import { chmod, mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { NodeBootstrapCallback } from "../../../packages/contracts/src/node-bootstrap.ts";
+import { NodeBootstrapCallback } from "@pgcf/contracts/node-bootstrap";
 import { BootstrapJob, canonical, runCommand } from "../src/bootstrap.ts";
 import { authority, fixture } from "./fixture.ts";
 

@@ -5,7 +5,7 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 import { test } from "node:test";
-import { NodeBootstrapCallback } from "../../../packages/contracts/src/node-bootstrap.ts";
+import { NodeBootstrapCallback } from "@pgcf/contracts/node-bootstrap";
 import { inputHash } from "../src/bootstrap.ts";
 import { LOOPBACK } from "../src/proxy-command.ts";
 import { authorized, createBootstrapServer } from "../src/server.ts";
