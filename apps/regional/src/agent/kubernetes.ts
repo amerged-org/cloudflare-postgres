@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import https from "node:https";
 import { isIP } from "node:net";
+import { createHash, X509Certificate } from "node:crypto";
+import { checkServerIdentity } from "node:tls";
 import {
   ApiException,
   CoreV1Api,
@@ -13,6 +15,7 @@ import type { ConfigurationOptions } from "@kubernetes/client-node";
 import type { K8sObject } from "@pgcf/contracts";
 import { record, string, uid } from "./types.ts";
 import type { Kubernetes, Resource } from "./types.ts";
+import { KubeletTrustReader, type KubeletTrust } from "./kubelet-trust.ts";
 
 const CUSTOM: Record<
   string,
@@ -50,6 +53,10 @@ export async function kubeletSummary(
   config: KubeConfig,
   node: Resource,
   signal: AbortSignal,
+  trust: Pick<
+    KubeletTrust,
+    "certificatePem" | "leafSha256" | "serverName"
+  > | null = null,
 ): Promise<unknown> {
   const addresses = record(node.status).addresses;
   const internal = Array.isArray(addresses)
@@ -79,12 +86,45 @@ export async function kubeletSummary(
     method: "GET",
     signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
   };
-  await config.applyToHTTPSOptions(options);
+  try {
+    await config.applyToHTTPSOptions(options);
+  } catch {
+    throw new Error("kubelet_tls_invalid");
+  }
   if (!options.ca) throw new Error("kubelet_tls_invalid");
   options.rejectUnauthorized = true;
   // The API client's reusable agent may carry the API server's TLS name; the kubelet must authenticate its own IP.
   options.agent = false;
   options.servername = "";
+  if (trust) {
+    if (trust.serverName !== node.metadata.name)
+      throw new Error("kubelet_trust_invalid");
+    options.ca = trust.certificatePem;
+    options.servername = trust.serverName;
+    options.checkServerIdentity = (host, certificate) => {
+      if (checkServerIdentity(host, certificate))
+        return new Error("kubelet_tls_identity_invalid");
+      try {
+        if (
+          !certificate.raw ||
+          new X509Certificate(certificate.raw).checkHost(trust.serverName, {
+            subject: "never",
+            wildcards: false,
+          }) !== trust.serverName
+        )
+          return new Error("kubelet_tls_identity_invalid");
+      } catch {
+        return new Error("kubelet_tls_identity_invalid");
+      }
+      if (
+        !certificate.raw ||
+        createHash("sha256").update(certificate.raw).digest("hex") !==
+          trust.leafSha256
+      )
+        return new Error("kubelet_pin_mismatch");
+      return undefined;
+    };
+  }
   return new Promise((resolve, reject) => {
     const request = https.request(options, (response) => {
       if (response.statusCode !== 200) {
@@ -111,7 +151,17 @@ export async function kubeletSummary(
         }
       });
     });
-    request.on("error", reject);
+    request.on("error", (error: Error) =>
+      reject(
+        new Error(
+          ["kubelet_pin_mismatch", "kubelet_tls_identity_invalid"].includes(
+            error.message,
+          )
+            ? error.message
+            : "kubelet_tls_failed",
+        ),
+      ),
+    );
     request.end();
   });
 }
@@ -208,8 +258,9 @@ export function kubernetesFromConfig(
     if (!type) throw new Error("unsupported_resource_kind");
     return type;
   };
-  return {
-    statsSummary: (node) => kubeletSummary(config, node, signal),
+  const k8s: VolumeStatsKubernetes = {
+    statsSummary: async (node) =>
+      kubeletSummary(config, node, signal, await trust.read(node)),
     async read(kind, namespace, name) {
       const namespaced = { namespace: namespace ?? "", name };
       try {
@@ -437,4 +488,6 @@ export function kubernetesFromConfig(
       }
     },
   };
+  const trust = new KubeletTrustReader((...args) => k8s.read(...args));
+  return k8s;
 }
