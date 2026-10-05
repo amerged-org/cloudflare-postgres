@@ -10,6 +10,7 @@ import {
   decryptHostedReport,
   assertHostedReport,
   parseHostedConfig,
+  hostedFailureCode,
 } from "../src/node-network-hosted.ts";
 const context = {
   repository: "test/repository",
@@ -17,6 +18,26 @@ const context = {
   run_id: "123",
   run_attempt: "1",
 };
+test("hosted failure output preserves bounded control diagnostics and refuses unsafe details", () => {
+  assert.equal(
+    hostedFailureCode(new Error("node_network_control_after_http_503")),
+    "node_network_control_after_http_503",
+  );
+  assert.equal(
+    hostedFailureCode(new Error("node_network_control_before_http_601")),
+    "node_network_hosted_failed",
+  );
+  assert.equal(
+    hostedFailureCode(new Error("node_network_control_after_socket_private")),
+    "node_network_hosted_failed",
+  );
+  assert.equal(
+    hostedFailureCode(
+      new Error("node_network_control_before_http_401\nprivate detail"),
+    ),
+    "node_network_hosted_failed",
+  );
+});
 test("hosted native evidence publishes encrypted bytes and binds exact run and nonce", () => {
   const key = randomBytes(32).toString("base64url"),
     nonce = randomBytes(32).toString("hex"),

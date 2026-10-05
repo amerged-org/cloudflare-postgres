@@ -21,6 +21,7 @@ import {
   canonical,
   hash,
   MAX_JSON_BYTES,
+  isControlDiagnosticCode,
   writeArtifact,
 } from "./node-network-native.ts";
 import {
@@ -385,15 +386,20 @@ async function main(): Promise<void> {
       "\n",
   );
 }
+export function hostedFailureCode(error: unknown): string {
+  const message = error instanceof Error ? error.message : "";
+  return isControlDiagnosticCode(message) ||
+    (!message.startsWith("node_network_control_") &&
+      /^(?:node_network|external_probe)_[a-z_]{1,80}$/.test(message))
+    ? message
+    : "node_network_hosted_failed";
+}
 if (
   process.argv[1] &&
   pathToFileURL(resolve(process.argv[1])).href === import.meta.url
 )
   main().catch((error: unknown) => {
-    const message = error instanceof Error ? error.message : "";
-    const code = /^(?:node_network|external_probe)_[a-z_]{1,80}$/.test(message)
-      ? message
-      : "node_network_hosted_failed";
+    const code = hostedFailureCode(error);
     process.stderr.write(
       JSON.stringify({ event: "node_network_hosted_failed", code }) + "\n",
     );

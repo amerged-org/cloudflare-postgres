@@ -7,7 +7,9 @@ import {
   createHash,
 } from "node:crypto";
 import { createServer } from "node:net";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
+import https from "node:https";
+import { syncBuiltinESMExports } from "node:module";
 import { mkdtemp, readFile, stat, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -22,6 +24,7 @@ import {
   completedScan,
   execute,
   hash,
+  httpsSourceControl,
   signed,
   sourceControl,
   sourceObservation,
@@ -296,7 +299,7 @@ test("scan measurement preserves a known rejected native worker reason", async (
   f.config.binding.plan_sha256 = hash(f.plan);
   await assert.rejects(
     measureScans(f.config, address(9), f.keys.privateKey, Date.now() + 10000),
-    { message: "node_network_family_mismatch" },
+    { message: "node_network_control_before_family_mismatch" },
   );
 });
 
@@ -328,11 +331,110 @@ test("scan worker diagnostics expose only a known internal reason", () => {
     new Error("connection failed https://private.example/key"),
     new Error("node_network_private_data"),
     new Error("node_network_deadline\nprivate detail"),
+    new Error("node_network_control_before_http_601"),
+    new Error("node_network_control_after_socket_private"),
+    new Error("node_network_control_before_http_401\n"),
     "node_network_deadline",
   ])
     assert.throws(() => assertScanWorkers([{ status: "rejected", reason }]), {
       message: "node_network_scan_incomplete",
     });
+});
+
+test("HTTPS control failures preserve only bounded status, socket, parse and scan phase diagnostics", async (context) => {
+  const f = fixture(),
+    source = address(9);
+  let failure: "http" | "socket" | "malformed" | "signature" | "timeout" =
+    "http";
+  const request = context.mock.method(https, "request", () => {
+    const req = new EventEmitter() as EventEmitter & {
+      end(): void;
+      destroy(): void;
+    };
+    req.destroy = () => {};
+    req.end = () => {
+      if (failure === "socket") {
+        req.emit(
+          "error",
+          Object.assign(new Error("private request detail"), {
+            code: "EMFILE",
+          }),
+        );
+        return;
+      }
+      if (failure === "timeout") return;
+      const response = Object.assign(new EventEmitter(), {
+        statusCode: failure === "http" ? 503 : 200,
+        socket: {
+          localAddress: source,
+          remoteAddress: f.plan.scan_control.ipv4,
+        },
+        destroy: () => {},
+      });
+      req.emit("response", response);
+      if (failure === "malformed") {
+        response.emit("data", Buffer.from("{private response detail}"));
+        response.emit("end");
+      }
+      if (failure === "signature") {
+        response.emit(
+          "data",
+          Buffer.from(
+            JSON.stringify({
+              kid: f.keys.kid,
+              payload: {},
+              signature: "invalid",
+            }),
+          ),
+        );
+        response.emit("end");
+      }
+    };
+    return req;
+  });
+  syncBuiltinESMExports();
+  const control = {
+    origin: "https://probe.example.com",
+    bearer: "private-test-bearer",
+    expires_at: new Date(Date.now() + 60000).toISOString(),
+  };
+  const observe = (duration = 10000) =>
+    httpsSourceControl(
+      f.plan.scan_control.ipv4,
+      source,
+      f.keys.trusted,
+      control,
+      Date.now() + duration,
+    );
+  try {
+    await assert.rejects(observe(), {
+      message: "node_network_control_http_503",
+    });
+    f.config.scan = { https_control: control, source_pool: [source + "/32"] };
+    await assert.rejects(
+      measureScans(f.config, source, f.keys.privateKey, Date.now() + 10000),
+      { message: "node_network_control_before_http_503" },
+    );
+    failure = "socket";
+    await assert.rejects(observe(), {
+      message: "node_network_control_socket_emfile",
+    });
+    failure = "malformed";
+    await assert.rejects(observe(), {
+      message: "node_network_control_response_malformed",
+    });
+    failure = "signature";
+    await assert.rejects(observe(), {
+      message: "node_network_control_signature_invalid",
+    });
+    failure = "timeout";
+    await assert.rejects(observe(10), {
+      message: "node_network_control_request_timeout",
+    });
+  } finally {
+    request.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
 
 test("canonical signatures match consumer domains and cannot cross purpose or survive tampering", () => {

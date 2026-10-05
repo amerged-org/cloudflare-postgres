@@ -39,6 +39,81 @@ const scanWorkerReasons = new Set([
   "node_network_stale_measurement",
   "node_network_tcp25_control_unproven",
 ]);
+const controlSocketErrors = new Set([
+  "EMFILE",
+  "ENFILE",
+  "ECONNRESET",
+  "ECONNREFUSED",
+  "ETIMEDOUT",
+  "EADDRNOTAVAIL",
+  "EADDRINUSE",
+  "ENETUNREACH",
+  "EHOSTUNREACH",
+  "ENETDOWN",
+  "EPIPE",
+  "ECONNABORTED",
+  "ENOBUFS",
+  "ENOMEM",
+]);
+const controlTlsErrors = new Set([
+  "ERR_TLS_CERT_ALTNAME_INVALID",
+  "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+  "DEPTH_ZERO_SELF_SIGNED_CERT",
+  "CERT_HAS_EXPIRED",
+  "ERR_SSL_WRONG_VERSION_NUMBER",
+  "ERR_TLS_CERT_SIGNATURE_ALGORITHM_UNSUPPORTED",
+]);
+const controlReasons = new Set([
+  "unproven",
+  "invalid",
+  "binding",
+  "request_timeout",
+  "peer_closed",
+  "response_aborted",
+  "response_too_large",
+  "response_malformed",
+  "signature_invalid",
+  "source_unproven",
+  "stale_measurement",
+  "address_invalid",
+  "tls_verification",
+  "family_mismatch",
+]);
+function safeControlReason(reason: string): boolean {
+  return (
+    controlReasons.has(reason) ||
+    /^http_[1-5][0-9]{2}$/.test(reason) ||
+    (reason.startsWith("socket_") &&
+      controlSocketErrors.has(reason.slice(7).toUpperCase()))
+  );
+}
+function controlFailure(reason: string): Error {
+  return new Error(
+    `node_network_control_${safeControlReason(reason) ? reason : "unproven"}`,
+  );
+}
+function controlErrorReason(error: unknown): string {
+  if (error instanceof Error) {
+    const match = /^node_network_(?:control_)?([a-z0-9_]+)$/.exec(
+      error.message,
+    );
+    if (match && match[0] === error.message && safeControlReason(match[1]!))
+      return match[1]!;
+  }
+  if (error && typeof error === "object" && "code" in error) {
+    const code = error.code;
+    if (typeof code === "string" && controlSocketErrors.has(code))
+      return `socket_${code.toLowerCase()}`;
+    if (typeof code === "string" && controlTlsErrors.has(code))
+      return "tls_verification";
+  }
+  return "unproven";
+}
+export function isControlDiagnosticCode(message: string): boolean {
+  const match =
+    /^node_network_control_(?:(?:before|after)_)?([a-z0-9_]+)$/.exec(message);
+  return !!match && match[0] === message && safeControlReason(match[1]!);
+}
 export function assertScanWorkers(
   workers: PromiseSettledResult<unknown>[],
 ): void {
@@ -46,7 +121,8 @@ export function assertScanWorkers(
   if (!rejected) return;
   if (
     rejected.reason instanceof Error &&
-    scanWorkerReasons.has(rejected.reason.message)
+    (scanWorkerReasons.has(rejected.reason.message) ||
+      isControlDiagnosticCode(rejected.reason.message))
   )
     throw new Error(rejected.reason.message);
   blocked("scan_incomplete");
@@ -404,21 +480,28 @@ export async function httpsSourceControl(
     });
     let settled = false;
     const timer = setTimeout(
-      () => fail(),
+      () => fail("request_timeout"),
       Math.max(1, Math.min(5000, deadline - Date.now())),
     );
-    const fail = () => {
+    const fail = (reason = "unproven") => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       request.destroy();
-      reject(new Error("node_network_control_unproven"));
+      reject(controlFailure(reason));
     };
-    request.once("error", fail);
+    request.once("error", (error) => fail(controlErrorReason(error)));
     request.once("response", (response) => {
       if (response.statusCode !== 200) {
+        const reason =
+          Number.isInteger(response.statusCode) &&
+          response.statusCode! >= 100 &&
+          response.statusCode! <= 599
+            ? `http_${response.statusCode}`
+            : "unproven";
+        fail(reason);
         response.destroy();
-        return fail();
+        return;
       }
       const socket = response.socket as TLSSocket,
         socketLocal = socket.localAddress ?? "",
@@ -428,34 +511,40 @@ export async function httpsSourceControl(
       response.on("data", (bytes: Buffer) => {
         size += bytes.length;
         if (size > 4096) {
+          fail("response_too_large");
           response.destroy();
-          fail();
         } else chunks.push(bytes);
       });
-      response.once("error", fail);
-      response.once("aborted", fail);
+      response.once("error", (error) => fail(controlErrorReason(error)));
+      response.once("aborted", () => fail("response_aborted"));
       response.once("end", () => {
         if (settled) return;
+        let envelope: Envelope<HttpsSourceObservation>;
         try {
-          const result = sourceObservation(
-            JSON.parse(Buffer.concat(chunks).toString("utf8")),
-            {
-              nonce,
-              origin: control.origin,
-              address,
-              port: 443,
-              localSource: source,
-              socketLocal,
-              socketRemote,
-              keys,
-            },
-          );
+          envelope = JSON.parse(
+            Buffer.concat(chunks).toString("utf8"),
+          ) as Envelope<HttpsSourceObservation>;
+        } catch {
+          fail("response_malformed");
+          return;
+        }
+        try {
+          const result = sourceObservation(envelope, {
+            nonce,
+            origin: control.origin,
+            address,
+            port: 443,
+            localSource: source,
+            socketLocal,
+            socketRemote,
+            keys,
+          });
           settled = true;
           clearTimeout(timer);
           request.destroy();
           resolve(result);
-        } catch {
-          fail();
+        } catch (error) {
+          fail(controlErrorReason(error));
         }
       });
     });
@@ -525,25 +614,25 @@ export async function sourceControl(
       });
       let text = "",
         settled = false;
-      const fail = () => {
+      const fail = (reason = "unproven") => {
         if (settled) return;
         settled = true;
         socket.destroy();
-        reject(new Error("node_network_control_unproven"));
+        reject(controlFailure(reason));
       };
       socket.setTimeout(
         Math.max(1, Math.min(5000, deadline - Date.now())),
-        fail,
+        () => fail("request_timeout"),
       );
-      socket.once("error", fail);
-      socket.once("end", fail);
+      socket.once("error", (error) => fail(controlErrorReason(error)));
+      socket.once("end", () => fail("peer_closed"));
       socket.once("connect", () => {
         if (ip(socket.localAddress ?? "") !== ip(source)) fail();
         else socket.write(nonce + "\n");
       });
       socket.on("data", (bytes) => {
         text += bytes.toString("utf8");
-        if (Buffer.byteLength(text) > 4096) return fail();
+        if (Buffer.byteLength(text) > 4096) return fail("response_too_large");
         if (!text.includes("\n")) return;
         try {
           const parsed = JSON.parse(
@@ -553,7 +642,7 @@ export async function sourceControl(
           socket.destroy();
           resolve(parsed);
         } catch {
-          fail();
+          fail("response_malformed");
         }
       });
     },
@@ -694,23 +783,30 @@ export async function scanAllPorts(
   )
     blocked("scan_bounds");
   if (control.https && control.port !== 443) blocked("control_invalid");
-  const observe = () =>
-    control.https
-      ? httpsSourceControl(
-          control.address,
-          source,
-          control.keys,
-          control.https,
-          deadline,
-        )
-      : sourceControl(
-          control.address,
-          control.port,
-          source,
-          control.keys,
-          deadline,
-        );
-  const before = await observe(),
+  const observe = async (phase: "before" | "after") => {
+    try {
+      return await (control.https
+        ? httpsSourceControl(
+            control.address,
+            source,
+            control.keys,
+            control.https,
+            deadline,
+          )
+        : sourceControl(
+            control.address,
+            control.port,
+            source,
+            control.keys,
+            deadline,
+          ));
+    } catch (error) {
+      throw new Error(
+        `node_network_control_${phase}_${controlErrorReason(error)}`,
+      );
+    }
+  };
+  const before = await observe("before"),
     started_at = new Date().toISOString();
   options.sourceCheck?.(before.source);
   const results: PortCompletion[] = [];
@@ -741,7 +837,7 @@ export async function scanAllPorts(
     }),
   );
   assertScanWorkers(workers);
-  const after = await observe();
+  const after = await observe("after");
   options.sourceCheck?.(after.source);
   return {
     public_source: before.source,
