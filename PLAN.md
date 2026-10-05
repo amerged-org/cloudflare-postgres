@@ -8,8 +8,8 @@ verified and PostgreSQL has no public port. The second EU VPS is untouched; no U
 bought and no customer or platform database has been migrated.
 
 The deployed regional image is
-`sha256:f4f354b0491a531b06b0bde1d25dd068342d5035b7c026dc1e6fad8829b818c5`
-from source `3d41a21a`. CI `37235344937` passed. Full qualification scanned all 657,679,359
+`sha256:eb1eb9a8519645acf37a79cb519a37ffdc91f73409dfb91ad97235726e3b186e`
+from source `7ef63733`. CI `37248424052` passed. Full qualification scanned all 657,686,023
 expected bytes; all 26 reviewed upstream noncredentials resolved, with zero unresolved findings.
 Image signing remains Phase 5 work.
 
@@ -53,8 +53,17 @@ Kubernetes version change; uncertain writes are not retried. The read-only SQL a
 deployed, and an actual control verified TLS, minimal privileges and exact agreement with exporter
 counters in 354.247 ms. Two later cold connections took 9.977 and 10.851 s, with exactly one wake
 and preserved data. The first complete archive check still took 1.739 s in the instrumented run.
+Unchanged role credentials now retain their exact UID and resource version across power-only
+revisions, with desired data, controller acknowledgement and authenticated runtime checks retained.
+A quiet gateway replacement reproduced a persistent measurement-gap floor; a conservative new
+observation window now recovers after two complete stable snapshots. The subsequent Dev database
+hibernated without customer SQL. Two new cold connections took 9.799 and 7.962 s, with one wake
+and preserved data each. A later idle attempt failed with visible `power_unknown`; exact
+compensation restored running state and the next idle attempt succeeded. Its cause remains open.
 The ≤8 s target and twenty-connection acceptance remain unmet. A real read-only transaction
-stayed ready for 74 s despite the 60 s idle policy.
+stayed ready for 74 s despite the 60 s idle policy. On one always-warm Dev database, twenty
+sequential new connections plus the first marker read had p50/p95/max 418.346/734.438/910.656 ms.
+This is a small warm-path measurement, not an application latency or load-capacity guarantee.
 
 The operational Cloudflare token was updated in place with no expiry; its value and all 23
 rights remained unchanged. Barman's R2 credential and PGCF admin/agent keys also have no expiry.
@@ -62,7 +71,7 @@ Short-lived routing and control tokens retain their security deadlines.
 
 The live collector samples each database at least 15 s apart. A real minute contained four
 allocation and eight gateway samples.
-The API backup collector is now deployed from `2a66715b` (CI `37230046098`). In Dev,
+The API and shared observation-window schema are deployed from `7ef63733`. In Dev,
 26 actual R2 objects, the recorded sample, archive summary and hourly API all agreed on
 7,515,287 bytes. A truncated listing remains unknown; the current limit is one complete page
 of at most 1,000 objects. Storage-used measurement remains unknown.

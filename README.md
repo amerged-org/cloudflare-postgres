@@ -47,6 +47,11 @@ connections still take about 9–12 seconds, above the 8-second target. The stal
 is corrected; a verified read-only SQL archive check is deployed, but the first complete cold
 archive check still took 1.74 seconds. The finalized hourly awake-time measurement differs by
 at most 19.748 seconds from independent Kubernetes evidence, within the 60-second requirement.
+Unchanged credentials retain their UID/version through power revisions. A conservative new
+observation window recovered actual idle sleep after a quiet gateway replacement. A later
+unknown refusal safely restored running state; its cause remains under investigation.
+Twenty sequential connections plus a marker read on an always-warm Dev database measured
+p95 734 ms and maximum 911 ms; this does not establish application or load-capacity latency.
 The live collector
 preserves its checkpoint across configuration changes and measures allocation while hibernated.
 Actual R2 listing, archive summary and hourly backup usage agreed on 7,515,287 bytes.
