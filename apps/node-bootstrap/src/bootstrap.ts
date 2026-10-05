@@ -22,6 +22,7 @@ import {
 import { startNativeProxy, type ProxyConfig } from "./proxy-command.ts";
 import { PlatformInstaller, readPlatformAssets } from "./platform.ts";
 import { publishKubeletTrust } from "./kubelet-trust.ts";
+import { prepareScratch } from "./rescue-scratch.ts";
 
 export const TALOS_VERSION = "1.14.1";
 export const KUBERNETES_VERSION = "1.36.3";
@@ -387,10 +388,49 @@ function array(value: unknown): Json[] {
   if (!Array.isArray(value)) throw new BootstrapError("readback_invalid");
   return value.map(record);
 }
+const RAM_FILESYSTEMS = new Set(["tmpfs", "ramfs", "rootfs"]);
+function rescueRecords(stdout: string) {
+  const parts = stdout.trim().split(RECORD);
+  if (![7, 8, 10].includes(parts.length))
+    throw new BootstrapError("rescue_readback_invalid");
+  return parts;
+}
+function rootOverlayPaths(root: Json): string[] {
+  if (root.fstype !== "overlay") return [];
+  const options =
+    typeof root.options === "string" ? root.options.split(",") : [];
+  return ["upperdir", "workdir"].map((key) => {
+    const values = options.filter((option) => option.startsWith(`${key}=`));
+    const path = values[0]?.slice(key.length + 1);
+    if (
+      root.target !== "/" ||
+      values.length !== 1 ||
+      !path ||
+      path.length > 4096 ||
+      !/^\/[A-Za-z0-9._/-]+$/.test(path) ||
+      path.split("/").some((part) => part === "." || part === "..")
+    )
+      throw new BootstrapError("rescue_overlay_unproven");
+    return path;
+  });
+}
+function verifyRamMount(stdout: string, path: string, code: string) {
+  const mounts = array(record(JSON.parse(stdout)).filesystems);
+  const mount = mounts[0];
+  const target = mount?.target;
+  if (
+    mounts.length !== 1 ||
+    !mount ||
+    !RAM_FILESYSTEMS.has(String(mount.fstype)) ||
+    typeof target !== "string" ||
+    !target.startsWith("/") ||
+    !(target === "/" || path === target || path.startsWith(`${target}/`))
+  )
+    throw new BootstrapError(code);
+}
 
 export function verifyRescue(spec: NodeBootstrapSpec, stdout: string) {
-  const parts = stdout.trim().split(RECORD);
-  if (parts.length !== 7) throw new BootstrapError("rescue_readback_invalid");
+  const parts = rescueRecords(stdout);
   const blocks = array(record(JSON.parse(parts[0]!)).blockdevices);
   const disks = blocks.filter((disk) => disk.type === "disk");
   const disk = disks[0];
@@ -436,17 +476,32 @@ export function verifyRescue(spec: NodeBootstrapSpec, stdout: string) {
     throw new BootstrapError("rescue_gateway_mismatch");
   }
   const roots = array(record(JSON.parse(parts[4]!)).filesystems);
-  if (
-    roots.length !== 1 ||
-    !["tmpfs", "ramfs", "rootfs"].includes(String(roots[0]?.fstype))
-  ) {
+  if (roots.length !== 1) {
     throw new BootstrapError("rescue_root_not_ram");
   }
-  const swap = record(JSON.parse(parts[5]!));
-  if (!Array.isArray(swap.swapdevices) || swap.swapdevices.length)
-    throw new BootstrapError("rescue_swap_active");
+  const overlay = rootOverlayPaths(roots[0]!);
+  if (overlay.length) {
+    if (parts.length !== 10)
+      throw new BootstrapError("rescue_overlay_unproven");
+    for (let index = 0; index < overlay.length; index++)
+      verifyRamMount(
+        parts[index + 8]!,
+        overlay[index]!,
+        "rescue_overlay_unproven",
+      );
+  } else if (!RAM_FILESYSTEMS.has(String(roots[0]!.fstype)))
+    throw new BootstrapError("rescue_root_not_ram");
+  else if (parts.length === 10)
+    throw new BootstrapError("rescue_readback_invalid");
+  if (parts.length >= 8)
+    verifyRamMount(
+      parts[7]!,
+      `/run/pgcf-bootstrap/${spec.operation_id}`,
+      "rescue_scratch_not_ram",
+    );
+  if (parts[5]!.trim()) throw new BootstrapError("rescue_swap_active");
   if (
-    !/^\d+$/.test(parts[6]!) ||
+    !/^\d+$/.test(parts[6]!.trim()) ||
     Number(parts[6]) < spec.hardware.rescue_ram_min_bytes
   ) {
     throw new BootstrapError("rescue_ram_insufficient");
@@ -661,12 +716,42 @@ export class BootstrapJob {
         "ip -json link",
         "ip -json -4 address",
         "ip -json -4 route show default",
-        "findmnt --json --target / --output FSTYPE",
-        "swapon --show --json --bytes",
+        "findmnt --json --target / --output TARGET,FSTYPE,SOURCE,OPTIONS",
+        "swapon --show --noheadings --raw --output NAME",
         'awk \'$1 == "MemTotal:" {printf "%.0f\\n", $2 * 1024}\' /proc/meminfo',
       ].join(`\nprintf ${shellQuote(RECORD)}\n`),
     );
-    verifyRescue(this.input.spec, result.stdout);
+    const parts = rescueRecords(result.stdout);
+    if (parts.length !== 7) throw new BootstrapError("rescue_readback_invalid");
+    const roots = array(record(JSON.parse(parts[4]!)).filesystems);
+    if (roots.length !== 1) throw new BootstrapError("rescue_root_not_ram");
+    const overlay = rootOverlayPaths(roots[0]!);
+    const directory = shellQuote(this.remotePath(""));
+    const proof = await this.ssh(
+      [
+        `if test -d ${directory}; then findmnt --json --target ${directory} --output TARGET,FSTYPE,SOURCE,OPTIONS; else findmnt --json --target /run --output TARGET,FSTYPE,SOURCE,OPTIONS; fi`,
+        ...overlay.map(
+          (path) =>
+            `findmnt --json --target ${shellQuote(path)} --output TARGET,FSTYPE,SOURCE,OPTIONS`,
+        ),
+      ].join(`\nprintf ${shellQuote(RECORD)}\n`),
+    );
+    verifyRescue(
+      this.input.spec,
+      result.stdout.trimEnd() + RECORD + proof.stdout,
+    );
+  }
+  private ramRootGuard() {
+    return [
+      'rescue_root="$(findmnt --noheadings --raw --target / --output FSTYPE)"',
+      'case "$rescue_root" in tmpfs|ramfs|rootfs) ;; overlay)',
+      'rescue_root_options="$(findmnt --noheadings --raw --target / --output OPTIONS)"',
+      "rescue_upper=; rescue_work=",
+      'IFS=, read -r -a rescue_options <<< "$rescue_root_options"',
+      'for rescue_option in "${rescue_options[@]}"; do case "$rescue_option" in upperdir=*) test -z "$rescue_upper"; rescue_upper="${rescue_option#upperdir=}";; workdir=*) test -z "$rescue_work"; rescue_work="${rescue_option#workdir=}";; esac; done',
+      'for rescue_path in "$rescue_upper" "$rescue_work"; do [[ "$rescue_path" =~ ^/[A-Za-z0-9._/-]+$ ]]; case "$rescue_path/" in */../*|*/./*) exit 41;; esac; rescue_backing="$(findmnt --noheadings --raw --target "$rescue_path" --output FSTYPE)"; case "$rescue_backing" in tmpfs|ramfs|rootfs) ;; *) exit 41;; esac; done',
+      ";; *) exit 41;; esac",
+    ].join("\n");
   }
   private guardScript() {
     const hardware = this.input.spec.hardware;
@@ -675,8 +760,11 @@ export class BootstrapJob {
       `test "$(blockdev --getsize64 ${disk})" = ${hardware.disk_bytes}`,
       `test "$(lsblk --noheadings --output TYPE ${disk} | head -n1 | tr -d ' ')" = disk`,
       `test -z "$(lsblk --noheadings --output MOUNTPOINTS ${disk} | tr -d '[:space:]')"`,
-      'test -z "$(swapon --show --noheadings)"',
-      'case "$(findmnt --noheadings --target / --output FSTYPE)" in tmpfs|ramfs|rootfs) ;; *) exit 41 ;; esac',
+      'rescue_swap="$(swapon --show --noheadings --raw --output NAME)"',
+      'test -z "$rescue_swap"',
+      this.ramRootGuard(),
+      `rescue_scratch="$(findmnt --noheadings --raw --target ${shellQuote(this.remotePath(""))} --output FSTYPE)"`,
+      'case "$rescue_scratch" in tmpfs|ramfs|rootfs) ;; *) exit 41;; esac',
     ].join("\n");
   }
   private async setup(rescue = true) {
@@ -772,12 +860,13 @@ export class BootstrapJob {
   }
   private async verifyImage() {
     const spec = this.input.spec;
+    await prepareScratch(this.input, (script) => this.ssh(script));
     const compressed = shellQuote(this.remotePath("image.raw.xz"));
     const raw = shellQuote(this.remotePath("image.raw"));
     const directory = shellQuote(this.remotePath(""));
     const identity = shellQuote(this.remotePath("identity"));
     await this.ssh(
-      `umask 077\ntest ! -L ${directory}\nmkdir -p ${directory}\nchmod 700 ${directory}\ncommand -v curl xz sfdisk sgdisk dd cmp sha256sum stat blockdev >/dev/null\ntest ! -L ${compressed}\ntest ! -L ${raw}\nif test -f ${identity}; then test "$(cat ${identity})" = ${shellQuote(this.input.input_hash)}; else printf '%s' ${shellQuote(this.input.input_hash)} > ${identity}; fi`,
+      `umask 077\ntest ! -L ${directory}\nmkdir -p ${directory}\nchmod 700 ${directory}\ncommand -v curl xz sfdisk sgdisk dd cmp sha256sum stat blockdev >/dev/null\ntest ! -L ${compressed}\ntest ! -L ${raw}\nif test -f ${identity}; then test "$(cat ${identity})" = ${shellQuote(this.input.input_hash)}; else printf '%s' ${shellQuote(this.input.input_hash)} > ${identity}; fi\nrm -f -- ${raw}.partial`,
     );
     let size = Number(
       (
@@ -816,7 +905,7 @@ export class BootstrapJob {
       });
     }
     await this.ssh(
-      `printf '%s  %s\\n' ${shellQuote(spec.image.compressed_sha256)} ${compressed} | sha256sum --check --status\nif ! test -f ${raw} || ! test "$(stat --format=%s ${raw})" = ${spec.image.raw_bytes} || ! printf '%s  %s\\n' ${shellQuote(spec.image.raw_sha256)} ${raw} | sha256sum --check --status; then\nrm -f -- ${raw}.partial\nxz --decompress --stdout --single-stream ${compressed} > ${raw}.partial\ntest "$(stat --format=%s ${raw}.partial)" = ${spec.image.raw_bytes}\nprintf '%s  %s\\n' ${shellQuote(spec.image.raw_sha256)} ${raw}.partial | sha256sum --check --status\nmv -- ${raw}.partial ${raw}\nfi`,
+      `printf '%s  %s\\n' ${shellQuote(spec.image.compressed_sha256)} ${compressed} | sha256sum --check --status\nif ! test -f ${raw} || ! test "$(stat --format=%s ${raw})" = ${spec.image.raw_bytes} || ! printf '%s  %s\\n' ${shellQuote(spec.image.raw_sha256)} ${raw} | sha256sum --check --status; then\nrm -f -- ${raw} ${raw}.partial\nxz --decompress --stdout --single-stream ${compressed} > ${raw}.partial\ntest "$(stat --format=%s ${raw}.partial)" = ${spec.image.raw_bytes}\nprintf '%s  %s\\n' ${shellQuote(spec.image.raw_sha256)} ${raw}.partial | sha256sum --check --status\nmv -- ${raw}.partial ${raw}\nfi`,
     );
     const layout = partitions((await this.ssh(`sfdisk --json ${raw}`)).stdout);
     for (const partition of layout) {

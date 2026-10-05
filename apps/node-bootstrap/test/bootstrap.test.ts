@@ -17,12 +17,14 @@ import {
 import {
   AuthorityClient,
   BootstrapJob,
+  BootstrapError,
   assertAuthority,
   canonical,
   inputHash,
   jsonRecords,
   networkKernelArg,
   partitions,
+  runCommand,
   shellQuote,
   validateInput,
   verifyRescue,
@@ -98,7 +100,7 @@ function rescueOutput(
     ],
     routes: [{ gateway: input.spec.hardware.gateway, dev: nic }],
     root: { filesystems: [{ fstype: "tmpfs" }] },
-    swaps: { swapdevices: [] },
+    swaps: "",
     ram: input.spec.hardware.rescue_ram_min_bytes,
     ...override,
   };
@@ -108,11 +110,33 @@ function rescueOutput(
     values.addresses,
     values.routes,
     values.root,
-    values.swaps,
   ]
     .map((value) => JSON.stringify(value))
-    .concat(String(values.ram))
+    .concat(String(values.swaps), String(values.ram))
     .join("\n__PGCF_RECORD__\n");
+}
+function ramMount(path: string, fstype = "tmpfs") {
+  return JSON.stringify({
+    filesystems: [{ target: path, source: fstype, fstype, options: "rw" }],
+  });
+}
+function overlayOutput(
+  input: NodeBootstrapInput,
+  upper = "/run/overlay/upper",
+  work = "/run/overlay/work",
+) {
+  return rescueOutput(input, {
+    root: {
+      filesystems: [
+        {
+          target: "/",
+          source: "overlay",
+          fstype: "overlay",
+          options: `rw,lowerdir=/run/lower,upperdir=${upper},workdir=${work}`,
+        },
+      ],
+    },
+  });
 }
 
 test("job identity binds hardware and rejects missing SSH host evidence", () => {
@@ -217,6 +241,202 @@ test("legacy schematic verification preserves the exact ip-only request", async 
   });
 });
 
+test("rescue inspection uses portable plaintext swap output and stops on a failed query", async () => {
+  const input = fixture();
+  let calls = 0;
+  const job = new BootstrapJob(input, {
+    run: async (command) => {
+      calls++;
+      if (calls === 1) {
+        assert.ok(
+          command.stdin?.includes(
+            "swapon --show --noheadings --raw --output NAME",
+          ),
+        );
+        assert.ok(!command.stdin?.includes("swapon --show --json"));
+        return { exit_code: 0, stdout: rescueOutput(input) };
+      }
+      return { exit_code: 0, stdout: ramMount("/run") };
+    },
+  });
+  await Reflect.get(job, "inspectRescue").call(job);
+  const unknown = new BootstrapJob(input, {
+    run: async () => ({ exit_code: 1, stdout: rescueOutput(input) }),
+  });
+  await assert.rejects(
+    Reflect.get(unknown, "inspectRescue").call(unknown),
+    /native_command_failed/,
+  );
+  verifyRescue(input.spec, rescueOutput(input, { swaps: " \n\t " }));
+  assert.throws(
+    () =>
+      verifyRescue(
+        input.spec,
+        rescueOutput(input, { swaps: "query result unknown" }),
+      ),
+    /rescue_swap_active/,
+  );
+});
+
+test("overlay rescue requires actual RAM readbacks for both writable paths and scratch", async () => {
+  const input = fixture();
+  const base = overlayOutput(input);
+  const proof = [
+    base,
+    ramMount("/run"),
+    ramMount("/run/overlay"),
+    ramMount("/run/overlay"),
+  ].join("\n__PGCF_RECORD__\n");
+  assert.throws(
+    () => verifyRescue(input.spec, base),
+    /rescue_overlay_unproven/,
+  );
+  verifyRescue(input.spec, proof);
+  assert.throws(
+    () =>
+      verifyRescue(
+        input.spec,
+        [
+          base,
+          ramMount("/run"),
+          ramMount("/run/overlay", "ext4"),
+          ramMount("/run/overlay"),
+        ].join("\n__PGCF_RECORD__\n"),
+      ),
+    /rescue_overlay_unproven/,
+  );
+  assert.throws(
+    () =>
+      verifyRescue(
+        input.spec,
+        [
+          base,
+          ramMount("/run"),
+          ramMount("/run/other"),
+          ramMount("/run/overlay"),
+        ].join("\n__PGCF_RECORD__\n"),
+      ),
+    /rescue_overlay_unproven/,
+  );
+  assert.throws(
+    () =>
+      verifyRescue(
+        input.spec,
+        [
+          base,
+          ramMount("/run", "ext4"),
+          ramMount("/run/overlay"),
+          ramMount("/run/overlay"),
+        ].join("\n__PGCF_RECORD__\n"),
+      ),
+    /rescue_scratch_not_ram/,
+  );
+  assert.throws(
+    () =>
+      verifyRescue(
+        input.spec,
+        [
+          overlayOutput(
+            input,
+            "/run/overlay/upper",
+            "/run/overlay/work,upperdir=/run/another",
+          ),
+          ramMount("/run"),
+          ramMount("/run/overlay"),
+          ramMount("/run/overlay"),
+        ].join("\n__PGCF_RECORD__\n"),
+      ),
+    /rescue_overlay_unproven/,
+  );
+});
+
+test("native overlay inspection queries the exact observed writable paths and retains seven hardware records", async () => {
+  const input = fixture();
+  let calls = 0;
+  const job = new BootstrapJob(input, {
+    run: async (command) => {
+      calls++;
+      if (calls === 1) return { exit_code: 0, stdout: overlayOutput(input) };
+      assert.ok(command.stdin?.includes("--target '/run/overlay/upper'"));
+      assert.ok(command.stdin?.includes("--target '/run/overlay/work'"));
+      return {
+        exit_code: 0,
+        stdout: [
+          ramMount("/run"),
+          ramMount("/run/overlay"),
+          ramMount("/run/overlay"),
+        ].join("\n__PGCF_RECORD__\n"),
+      };
+    },
+  });
+  await Reflect.get(job, "inspectRescue").call(job);
+  assert.equal(calls, 2);
+});
+
+test("image verification prepares bounded RAM scratch before staging files larger than the rescue parent", async () => {
+  const input = fixture();
+  const spec = {
+    ...input.spec,
+    hardware: { ...input.spec.hardware, rescue_ram_min_bytes: 8326418432 },
+    image: {
+      ...input.spec.image,
+      compressed_bytes: 232142156,
+      raw_bytes: 4453302272,
+    },
+  };
+  Object.assign(input, { spec, input_hash: inputHash(spec) });
+  const observedParentBytes = 832643072;
+  assert.ok(
+    spec.image.compressed_bytes + spec.image.raw_bytes > observedParentBytes,
+  );
+  let prepared = false;
+  const job = new BootstrapJob(input, {
+    request: async () => Response.json(authority(input)),
+    run: async (command) => {
+      const script = command.stdin ?? "";
+      if (script.includes("mount -t tmpfs")) {
+        assert.ok(script.includes(input.input_hash));
+        assert.ok(script.includes("scratch_limit_bytes=5222315340"));
+        prepared = true;
+        return { exit_code: 0, stdout: "pgcf_scratch_ready\n" };
+      }
+      if (script.includes("command -v curl"))
+        assert.ok(
+          prepared,
+          "832 MB /run cannot stage the 4.685 GB image files",
+        );
+      if (script.includes("stat --format=%s"))
+        return { exit_code: 0, stdout: "0" };
+      if (script.includes("curl --silent")) {
+        assert.ok(prepared);
+        throw new BootstrapError("probe_stopped_before_download");
+      }
+      return { exit_code: 0, stdout: "" };
+    },
+  });
+  await assert.rejects(
+    Reflect.get(job, "verifyImage").call(job),
+    /probe_stopped_before_download/,
+  );
+  assert.ok(prepared);
+});
+
+test("disk guards refuse an unknown swap query instead of accepting empty failed output", async () => {
+  const input = fixture();
+  const job = new BootstrapJob(input);
+  const script = Reflect.get(job, "guardScript").call(job);
+  const result = await runCommand({
+    executable: "bash",
+    args: ["-se"],
+    signal: AbortSignal.timeout(5000),
+    timeout_ms: 5000,
+    env: { PATH: process.env.PATH, LANG: "C" },
+    stdin: `set -euo pipefail\nblockdev() { printf '%s\\n' ${input.spec.hardware.disk_bytes}; }\nlsblk() { case "$*" in *TYPE*) printf 'disk\\n';; *) :;; esac; }\nfindmnt() { printf 'tmpfs\\n'; }\nswapon() { return 1; }\n${script}\nprintf 'unsafe_write_guard_passed'\n`,
+  });
+  assert.notEqual(result.exit_code, 0);
+  assert.equal(result.stdout, "");
+});
+
 test("rescue permits only the exact single unmounted disk, network and RAM root", () => {
   const input = fixture();
   verifyRescue(input.spec, rescueOutput(input));
@@ -270,9 +490,7 @@ test("rescue permits only the exact single unmounted disk, network and RAM root"
       verifyRescue(
         input.spec,
         rescueOutput(input, {
-          swaps: {
-            swapdevices: [{ filename: input.spec.hardware.install_disk }],
-          },
+          swaps: `${input.spec.hardware.install_disk}\n`,
         }),
       ),
     /rescue_swap_active/,
@@ -582,6 +800,10 @@ test("an uncertain GPT relocation resumes with partition readback and never repe
       scripts.push(script);
       if (script.includes("lsblk --bytes --json"))
         return { exit_code: 0, stdout: rescueOutput(input) };
+      if (script.includes("findmnt --json --target"))
+        return { exit_code: 0, stdout: ramMount("/run") };
+      if (script.includes("mount -t tmpfs"))
+        return { exit_code: 0, stdout: "pgcf_scratch_ready\n" };
       if (script.includes("if test -f") && script.includes("stat --format=%s"))
         return {
           exit_code: 0,

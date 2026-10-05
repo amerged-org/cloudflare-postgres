@@ -1,24 +1,30 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-05): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
+Status (2026-10-06): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
 The first EU node and five Flux platform releases are Ready, with 95 GiB measured storage.
-The second existing EU VPS is untouched; no US VPS has been bought and no customer or platform
+Its node identity, storage and protected cluster custody are preserved. The second existing EU
+VPS is in RAM rescue with its disk untouched; no US VPS has been bought and no customer or platform
 production database has been migrated. The initial topology remains two EU VPS and one US VPS.
 
 The current regional image is
 `sha256:692a6c508e274d695151ce064b52fd66c5f00d5ec701c7d2adb2de89a092fdbb`
 from `e9569169`, CI `37360915487`. Image qualification and anonymous manifest,
 configuration and every layer verification passed. Agent and both gateways remained continuously
-Ready for 62.768 s. The management API uses `bd14917e` and Edge uses `b196fbaa`; the private bootstrap
+Ready for 62.768 s. The management API uses `00619393` and Edge uses `b196fbaa`; the private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
-inputs are now bound. Actual EU2/US installation and signed network acceptance remain outstanding. Signing remains Phase 5 work.
+inputs are now bound. The current native bootstrap image is
+`sha256:a46d6824c342f9068af103558981ca1b0a033fedd2ccf0822f80a3f70df5d8d4`
+from `00619393`: qualification covered 711,899,012 bytes and 18 layers with zero unresolved
+findings, followed by exact private-registry manifest, configuration and layer readback.
+Latest CI `37378985882` is green. Actual EU2/US installation and fresh signed network acceptance
+remain outstanding. Release image signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
 API/D1/RegionLink/agent/Tunnel/VPC HTTP/gateway path through `db.ohmyho.st`, with verified
 PostgreSQL TLS and no public PostgreSQL port. Backup alarms, source-preserving R2 restore,
 missing-ready-namespace protection and full storage reclamation passed. Ordinary deletion retains
-archives; the harness purges only its own test objects. PITR, restore after source deletion and
-regional disaster recovery remain Phase 4 work.
+archives; the harness purges only its own test objects. API PITR and restore after source deletion
+have since passed as recorded below; node-loss and regional disaster recovery remain outstanding.
 
 Phase 2's last complete cold series measured p50/p95/max 8.412/9.160/9.708 s across twenty
 independent wakes, twenty distinct Pods and the same cluster/PVC. Each caused one wake and one
@@ -114,21 +120,33 @@ rescue host-identity checks pass reproducing local tests and are deployed in Dev
 
 The EU capacity path now has two actual small databases on the first node and one unplaced request:
 three 600-millicore reservations exceed the first node's 1,640-millicore headroom. An adoption of
-the existing second VPS is audited, with purchases disabled and the two-node cap. Both firewall
-rule requests were explicitly rejected because generated TCP/UDP peer rules shared a display
-name; no rescue or install was started. Cosmetic wire-label repair and exact readback acceptance
-pass reproducing tests; their deployment preserves the operation and immutable security plan. Signed HTTPS
-source controls passed real IPv4/NAT and direct IPv6 checks. Talos image hashes, GPT CRCs and
-installer digest are measured and pinned; the factory's published checksum service requires a
-paid tier, so these are explicitly official-HTTPS download measurements. GitHub-hosted runner
-assignment failures prevent fresh CI/native IPv4 evidence at this point. US remains unbought;
-the specific costed approval request is pending.
+the existing second VPS is audited, with purchases disabled and the two-node cap. The provider's
+duplicate TCP/UDP display-name rejection is repaired with cosmetic wire labels; both firewall
+assignments and exact rule readbacks now pass without changing the immutable security plan.
+RAM rescue started, with strict verification of the pre-established host key and registered client
+key. It reports one unmounted 161,061,273,600-byte disk, 8,326,418,432 bytes of RAM and no swap.
+The first node's same-subnet peer /32 route was applied without reboot, preserving its identity
+and readiness. The Talos image now includes the measured nonsecret early peer route while keeping
+the provider's actual prefix. Its image hashes, GPT CRCs and installer digest are pinned; the
+factory's published checksum service requires a paid tier, so these remain official-HTTPS
+download measurements. The rescue root is an overlay with measured RAM-backed upper/work
+directories, but its 832,643,072-byte `/run` cannot hold the 4,685,444,428 compressed/raw installer
+bytes. Native portable-swap, overlay verification and operation-specific RAM scratch fixes pass
+actual strict-SSH preflight. The isolated tmpfs measured 5,222,318,080 bytes with 5,222,313,984
+bytes free; fresh setup, matching resume and pre-write guards passed before guarded unmount.
+The corrected runtime still requires qualification and deployment; no EU2 disk write or join
+has occurred. Signed HTTPS source controls passed real
+IPv4/NAT and direct IPv6 checks. Hosted runner assignment has recovered and current CI is green;
+fresh complete outside scans and their signed preparation remain pending. EU2 join, US installation
+and lost-worker recovery are not accepted. US remains unbought; the specific costed approval
+request is pending.
 
 Operational Cloudflare, Barman R2 and PGCF admin/agent credentials have no configured expiry.
 Routing/control tokens retain their short security deadlines. Read-only adopter inventory remains
 private; ownership mapping, remaining extensions, peak connection rates and migration timing must
-be verified before migration. Operator readiness remains incomplete; adopter migration and public
-release follow separately.
+be verified before migration. Coordinated cluster credential rotation before Neon migration is
+outstanding. Operator readiness remains incomplete; adopter migration and public release follow
+separately.
 
 On 2026-10-05 the owner approved native Rust for the regional gateway, controller, bootstrap relay
 and node reclaimer, and Rust/Wasm for the Edge Worker. TypeScript remains the Cloudflare management
@@ -907,3 +925,4 @@ Earlier failed attempts and corrections remain in Git history.
 | 2026-10-04 | 2 local safety / metering | Real local PostgreSQL 18 proved transaction/prepared-work guards, exact closed-WAL acknowledgement, and gateway pipeline/transaction quiescence. The actual gateway replacement drill preserved the fence UID, loaded the persisted quiesce intent on the replacement, acknowledged release on both replicas and rejected stale begin on both. Readiness remained stable through two relists after correcting actual Kubernetes list-item metadata handling. A bounded one-minute metering cron is implemented and locally checked. A 1,000-DB local D1 fixture bounded metering to 600 submitted statements and the whole cron to 850. Uncomputed hours remain pending; missing samples stay null with named gaps. API/Actor lifecycle tests cover ten-waiter wake coalescing, exact observations, role changes, cancellations and timeout compensation. Real resize to 512 MiB/250 millicores completed in 28,046 ms with unchanged storage and data, one Pod replacement and idempotent replay; held-client reconnects were not counted. A fresh Dev database verified internal maintenance-role TLS, authentication and minimal grants, then complete trial cleanup passed. The manual shutdown/WAL/resume drill passed with preserved data and storage, but its 19,830 ms resume connection exceeds the ≤8 s target. Automatic idle/coalesced cold-wake acceptance, real collectors and infrastructure costs remain incomplete. |
 | 2026-10-05 | Operator recovery | CI `37360915487` and the fully qualified regional `e9569169` image are delivered; agent/two gateways and five platform releases stayed Ready for 62.768 s on the unchanged first EU node. API full restore / PITR / restore after source deletion passed in 82.531 / 65.562 / 75.328 s. Targets retained separate volumes, storage generation 2, configuration revision 1, SQL identity and nonsuperuser app access; temporary administration was removed. An isolated real DO admission probe refused registered excess with 53300 and unknown role with 28P01 before D1, with no writes/wake/state change; probe deleted. Fresh D1 export plus local migration rehearsal preserved 31 tables / 38,154 rows with clean integrity and foreign keys. EU2, US, lost-worker recovery and final operational protection acceptance remain pending. |
 | 2026-10-05 | Operator protection / EU expansion | Natural 351.928 s stale heartbeat excluded a physically Ready node; fresh observations placed the same pending database and it became Ready. A genuine Barman option rejection reported failing backup health while retaining the last completed backup; configuration and agent/Flux state restored, fault object and all recovery/stale namespaces removed, disposable API key revoked. Fresh migration rehearsal preserved 38,547 rows and three custody records; migration 0017 and capacity-policy/rescue-identity API fixes delivered. Live signed IPv4/NAT and direct IPv6 controls passed. EU has two real small reservations on EU1 and one pending demand; existing EU2 adoption audited under cap 2 with purchases disabled. Duplicate provider display-name rejection reproduced; cosmetic wire-label/readback fixes pass 44 tests. EU2 installation, dual-stack network proof, node-loss recovery and US remain unaccepted. Hosted CI/native runner jobs fail assignment during the reported GitHub Actions incident; US purchase approval pending. |
+| 2026-10-06 | EU2 rescue / installation preparation | Management API `00619393`, Edge `b196fbaa` and regional `e9569169` are deployed; CI `37378985882` is green and hosted runner assignment has recovered. Native bootstrap `sha256:a46d6824c342f9068af103558981ca1b0a033fedd2ccf0822f80a3f70df5d8d4` is qualified from `00619393`: 711,899,012 bytes, 18 layers, zero unresolved findings and complete registry readback. Cosmetic firewall labels were applied with exact assignment/rule readback. EU2 RAM rescue passed strict known-host/client-key verification and measured one unmounted 161,061,273,600-byte disk, 8,326,418,432 bytes RAM and no swap; the disk is untouched. EU1 peer /32 routing was applied without reboot, preserving node identity, custody and readiness; a corresponding early Talos image route is measured and pinned. The RAM-backed rescue overlay has only 832,643,072 bytes in `/run` for 4,685,444,428 installer bytes; portable-swap, overlay and operation-specific RAM scratch fixes passed actual strict-SSH inspection, fresh setup, matching resume and pre-write guards. The isolated tmpfs measured 5,222,318,080 total / 5,222,313,984 free bytes and was removed with source/identity guards; disk writes remained zero. Corrected runtime qualification/delivery, fresh full outside scans/signed preparation, EU2 join, US installation, lost-worker recovery and coordinated cluster credential rotation before Neon migration remain outstanding. US purchase requires the pending costed approval. |
