@@ -3,7 +3,7 @@ import type { GatewayRegion } from "./gateway.ts";
 
 export type DatabaseAdmission =
   | { ok: true; region: GatewayRegion }
-  | { ok: false; sqlstate: "3D000" | "28P01" | "57P03" | "08006" };
+  | { ok: false; sqlstate: "3D000" | "28P01" | "57P03" | "08006" | "53300" };
 
 export interface DatabaseActorNamespace {
   idFromName(name: string): DurableObjectId;
