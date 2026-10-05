@@ -476,6 +476,10 @@ test("eligible reconciliation uses the SQL sample and never scrapes exporter on 
   assert.equal(observation?.state, "ready");
   assert.equal(samples, 1);
   assert.equal(scrapes, 0);
+  const logs: {
+    event: string;
+    fields: Record<string, string | number | boolean>;
+  }[] = [];
   const failed = await new Reconciler(
     f.k8s,
     new AbortController().signal,
@@ -483,9 +487,10 @@ test("eligible reconciliation uses the SQL sample and never scrapes exporter on 
     exporter,
     authenticate,
     power,
+    (event, fields = {}) => logs.push({ event, fields }),
     undefined,
-    undefined,
-    async () => {
+    async (options) => {
+      options.reportFailure?.("binding");
       throw new Error(randomUUID());
     },
   ).reconcile(f.db, f.ctx);
@@ -495,6 +500,27 @@ test("eligible reconciliation uses the SQL sample and never scrapes exporter on 
     ready_wal_files: null,
   });
   assert.equal(scrapes, 0);
+  assert.deepEqual(
+    logs.filter(
+      (entry) =>
+        entry.event === "wake_archive_transport" ||
+        entry.event === "wake_archive_failed",
+    ),
+    [
+      {
+        event: "wake_archive_transport",
+        fields: { database_id: f.db.id, transport: "sql", reason: "eligible" },
+      },
+      {
+        event: "wake_archive_failed",
+        fields: { database_id: f.db.id, stage: "binding" },
+      },
+    ],
+  );
+  assert.equal(
+    JSON.stringify(logs).includes(f.db.maintenance!.password),
+    false,
+  );
 });
 test("a legacy reconciliation still obtains its real exporter sample", async () => {
   const f = await boundFixture();
@@ -670,4 +696,158 @@ test("a maintenance password acknowledgment mismatch reports its fixed predicate
   assert.deepEqual(events, [
     { transport: "exporter", reason: "maintenance_ack" },
   ]);
+});
+
+test("archive probe failure reports only the fixed identity stage", async () => {
+  const events: string[] = [],
+    client = fake({ identity: { role: "app" } });
+  const value = {
+    ...validOptions(),
+    reportFailure: (stage: string) => events.push(stage),
+  };
+  await assert.rejects(probeArchive(value, client.factory), {
+    message: "archive_probe_unavailable",
+  });
+  assert.deepEqual(events, ["identity"]);
+  assert.equal(client.ended(), 1);
+});
+
+test("archive query failure reports a fixed stage and isolates credential-shaped logger errors", async () => {
+  const canary = newRolePassword(),
+    events: string[] = [],
+    client = fake({ queryError: true });
+  await assert.rejects(
+    probeArchive(
+      {
+        ...validOptions(),
+        reportFailure: (stage) => {
+          events.push(stage);
+          throw new Error(canary);
+        },
+      },
+      client.factory,
+    ),
+    { message: "archive_probe_unavailable" },
+  );
+  assert.deepEqual(events, ["identity"]);
+  assert.equal(JSON.stringify(events).includes(canary), false);
+  assert.equal(client.ended(), 1);
+  assert.equal(client.queries.length, 1);
+});
+
+test("invalid probe configuration and TLS refusal have distinct fixed stages", async () => {
+  const configuration: string[] = [],
+    tls: string[] = [],
+    client = fake({ tls: false });
+  await assert.rejects(
+    probeArchive(
+      {
+        ...validOptions(),
+        ca: "invalid",
+        reportFailure: (stage) => configuration.push(stage),
+      },
+      client.factory,
+    ),
+  );
+  assert.deepEqual(configuration, ["configuration"]);
+  assert.equal(client.configs.length, 0);
+  await assert.rejects(
+    probeArchive(
+      { ...validOptions(), reportFailure: (stage) => tls.push(stage) },
+      client.factory,
+    ),
+  );
+  assert.deepEqual(tls, ["tls"]);
+  assert.equal(client.ended(), 1);
+  assert.equal(client.queries.length, 0);
+});
+
+test("archive sample and progress refusals identify the exact validation phase", async () => {
+  const sample: string[] = [],
+    progress: string[] = [];
+  const malformed = fake({ sample: { ready_wal_files: undefined } });
+  await assert.rejects(
+    probeArchive(
+      { ...validOptions(), reportFailure: (stage) => sample.push(stage) },
+      malformed.factory,
+    ),
+  );
+  assert.deepEqual(sample, ["sample"]);
+  assert.equal(malformed.ended(), 1);
+  const future = fake({
+    sample: { last_archived_time: String(Date.now() / 1000 + 600) },
+  });
+  await assert.rejects(
+    probeArchive(
+      { ...validOptions(), reportFailure: (stage) => progress.push(stage) },
+      future.factory,
+    ),
+  );
+  assert.deepEqual(progress, ["progress"]);
+  assert.equal(future.ended(), 1);
+});
+
+test("archive binding refusal identifies its phase while a valid sample emits no failure event", async () => {
+  const events: string[] = [],
+    client = fake();
+  const value = {
+    ...validOptions(),
+    reportFailure: (stage: string) => events.push(stage),
+  };
+  const result = await probeArchive(value, client.factory);
+  assert.equal(result.valid, true);
+  assert.deepEqual(events, []);
+  await assert.rejects(
+    probeArchive(
+      { ...value, verifyBinding: async () => false },
+      client.factory,
+    ),
+  );
+  assert.deepEqual(events, ["binding"]);
+  assert.equal(client.ended(), 2);
+});
+
+test("expired and aborted probes report bounded deadline failures and retain cleanup", async () => {
+  const events: string[] = [],
+    abort = new AbortController(),
+    client = fake({ abort });
+  const value = {
+    ...validOptions(),
+    reportFailure: (stage: string) => events.push(stage),
+  };
+  await assert.rejects(
+    probeArchive({ ...value, deadline: Date.now() - 1 }, client.factory),
+  );
+  assert.deepEqual(events, ["deadline"]);
+  assert.equal(client.configs.length, 0);
+  await assert.rejects(
+    probeArchive({ ...value, signal: abort.signal }, client.factory),
+  );
+  assert.deepEqual(events, ["deadline", "deadline"]);
+  assert.equal(client.ended(), 1);
+  assert.ok(client.destroyed() >= 1);
+});
+
+test("an archive connection exception reports connect without its message or a query retry", async () => {
+  const events: string[] = [],
+    client = fake(),
+    canary = newRolePassword();
+  const factory = (config: ClientConfig) => {
+    const value = client.factory(config);
+    value.connect = async () => {
+      throw new Error(canary);
+    };
+    return value;
+  };
+  await assert.rejects(
+    probeArchive(
+      { ...validOptions(), reportFailure: (stage) => events.push(stage) },
+      factory,
+    ),
+    { message: "archive_probe_unavailable" },
+  );
+  assert.deepEqual(events, ["connect"]);
+  assert.equal(JSON.stringify(events).includes(canary), false);
+  assert.equal(client.ended(), 1);
+  assert.equal(client.queries.length, 0);
 });

@@ -15,6 +15,15 @@ import {
 } from "./observe.ts";
 import { record, string, type Kubernetes, type Resource } from "./types.ts";
 
+type ArchiveProbeStage =
+  | "configuration"
+  | "connect"
+  | "tls"
+  | "identity"
+  | "sample"
+  | "progress"
+  | "binding"
+  | "deadline";
 export interface ArchiveProbeOptions {
   databaseId: string;
   namespace: string;
@@ -25,6 +34,7 @@ export interface ArchiveProbeOptions {
   deadline: number;
   now?: () => number;
   verifyBinding(): Promise<boolean>;
+  reportFailure?(stage: ArchiveProbeStage): void;
 }
 export type ArchiveProbeResult = {
   readyWalFiles: number;
@@ -339,6 +349,14 @@ export async function probeArchive(
   options: ArchiveProbeOptions,
   createClient: ArchiveClientFactory = (config) => new Client(config),
 ): Promise<ArchiveProbeResult> {
+  const fail = (stage: ArchiveProbeStage): never => {
+    try {
+      options.reportFailure?.(stage);
+    } catch {
+      /* Diagnostics cannot change probe failure or cleanup. */
+    }
+    return unavailable();
+  };
   const db = DesiredDatabase.shape.id.safeParse(options.databaseId),
     host = `database-rw.${options.namespace}.svc`;
   if (
@@ -358,17 +376,22 @@ export async function probeArchive(
     options.ca.length > 128 * 1024 ||
     typeof options.verifyBinding !== "function"
   )
-    unavailable();
+    fail(
+      Number.isSafeInteger(options.deadline) && options.deadline <= Date.now()
+        ? "deadline"
+        : "configuration",
+    );
   try {
     if (!new X509Certificate(options.ca).ca) unavailable();
   } catch {
-    unavailable();
+    fail("configuration");
   }
   const signal = AbortSignal.any([
     options.signal,
     AbortSignal.timeout(Math.max(1, options.deadline - Date.now())),
   ]);
-  let client: Client | undefined;
+  let client: Client | undefined,
+    stage: ArchiveProbeStage = "configuration";
   const abort = () => client?.connection.stream.destroy();
   try {
     if (signal.aborted) unavailable();
@@ -387,7 +410,9 @@ export async function probeArchive(
     });
     client.on("error", () => {});
     signal.addEventListener("abort", abort, { once: true });
+    stage = "connect";
     await bounded(client.connect(), signal);
+    stage = "tls";
     const stream = client.connection.stream as unknown as {
       encrypted?: boolean;
       authorized?: boolean;
@@ -400,6 +425,7 @@ export async function probeArchive(
       checkServerIdentity(host, stream.getPeerCertificate())
     )
       unavailable();
+    stage = "identity";
     const identity = await bounded(
         client.query(ARCHIVE_IDENTITY_QUERY, [MAINTENANCE_ROLE]),
         signal,
@@ -425,6 +451,7 @@ export async function probeArchive(
       ].some((key) => row[key] !== false)
     )
       unavailable();
+    stage = "sample";
     const sample = await bounded(client.query(ARCHIVE_QUERY), signal),
       values = sample.rows[0];
     if (sample.rows.length !== 1 || !values) unavailable();
@@ -437,11 +464,13 @@ export async function probeArchive(
       failed < 0
     )
       unavailable();
+    stage = "progress";
     const progress = validateArchiveProgress(
       numeric(values.archived_count),
       numeric(values.last_archived_time, true),
       (options.now ?? Date.now)(),
     );
+    stage = "binding";
     if (
       signal.aborted ||
       Date.now() >= options.deadline ||
@@ -450,7 +479,9 @@ export async function probeArchive(
       unavailable();
     return { readyWalFiles, progress, valid: true };
   } catch {
-    return unavailable();
+    return fail(
+      signal.aborted || Date.now() >= options.deadline ? "deadline" : stage,
+    );
   } finally {
     signal.removeEventListener("abort", abort);
     if (client) await close(client);

@@ -860,6 +860,9 @@ export class Reconciler {
                 reason,
               }),
           );
+          if (options)
+            options.reportFailure = (stage) =>
+              phaseLog?.("wake_archive_failed", { database_id: db.id, stage });
           return options
             ? this.archiveProbe(options)
             : archiveMetrics(
