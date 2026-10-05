@@ -180,6 +180,16 @@ it("marks a node lost with its exact UID, keeps recovery identity and releases o
       .bind(f.node)
       .run(),
   ).rejects.toThrow("lost_node_identity_immutable");
+  await expect(
+    reserveNodeAddition(env.DB, {
+      request_key: crypto.randomUUID(),
+      request: {
+        region_id: f.region,
+        mode: "adopt",
+        provider_instance_id: provider,
+      },
+    }),
+  ).rejects.toMatchObject({ code: "capacity_unavailable" });
   await reserveNodeAddition(env.DB, {
     request_key: crypto.randomUUID(),
     request: {
@@ -196,6 +206,18 @@ it("marks a node lost with its exact UID, keeps recovery identity and releases o
     reason: "replayed",
   });
   expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(1);
+  await expect(
+    reserveNodeAddition(env.DB, {
+      request_key: crypto.randomUUID(),
+      request: {
+        region_id: f.region,
+        mode: "adopt",
+        provider_instance_id: String(
+          1 + crypto.getRandomValues(new Uint32Array(1))[0]!,
+        ),
+      },
+    }),
+  ).rejects.toMatchObject({ code: "capacity_unavailable" });
 });
 
 it("does not turn stale observations into automatic paid replacement intent", async () => {

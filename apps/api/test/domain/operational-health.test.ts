@@ -15,7 +15,14 @@ import {
 import { registerOperationalHealth } from "../../src/routes/health.ts";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
 
-afterEach(cleanupFixtures);
+const sampled: string[] = [];
+afterEach(async () => {
+  for (const id of sampled.splice(0))
+    await env.DB.prepare("DELETE FROM usage_samples WHERE database_id=?")
+      .bind(id)
+      .run();
+  await cleanupFixtures();
+});
 
 it("keeps unavailable health unknown and reports only fresh measured backup and disk state", () => {
   const now = Date.now(),
@@ -97,6 +104,7 @@ async function healthRequest(path: string, key: string) {
 it("exposes bounded administrator health from real D1 samples and preserves missing metrics", async () => {
   const f = await fixture();
   const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  sampled.push(created.database.id);
   expect(
     (await healthRequest("/v1/operational-health", f.integrator)).status,
   ).toBe(403);
@@ -158,4 +166,23 @@ it("exposes bounded administrator health from real D1 samples and preserves miss
   expect(regions.data.every((row) => row.agent.status === "unknown")).toBe(
     true,
   );
+  const second = DatabaseWithOperation.parse(
+    await (await f.create("second")).json(),
+  );
+  const firstPage = await (
+    await healthRequest("/v1/operational-health?limit=1", f.admin)
+  ).json<{ data: { id: string }[]; next_cursor: string | null }>();
+  expect(firstPage.data).toHaveLength(1);
+  expect(firstPage.next_cursor).not.toBeNull();
+  const nextPage = await (
+    await healthRequest(
+      `/v1/operational-health?limit=1&cursor=${encodeURIComponent(firstPage.next_cursor!)}`,
+      f.admin,
+    )
+  ).json<{ data: { id: string }[]; next_cursor: string | null }>();
+  expect(nextPage.data).toHaveLength(1);
+  expect(nextPage.next_cursor).toBeNull();
+  expect(
+    new Set([...firstPage.data, ...nextPage.data].map((row) => row.id)),
+  ).toEqual(new Set([created.database.id, second.database.id]));
 });
