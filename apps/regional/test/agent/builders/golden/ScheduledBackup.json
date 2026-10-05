@@ -12,7 +12,7 @@
     "spec": {
       "schedule": "0 0 3 * * *",
       "immediate": true,
-      "backupOwnerReference": "none",
+      "backupOwnerReference": "cluster",
       "cluster": {
         "name": "database"
       },

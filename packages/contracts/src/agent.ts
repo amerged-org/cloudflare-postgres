@@ -286,6 +286,9 @@ export const NodeObservation = z.strictObject({
 });
 export type NodeObservation = z.infer<typeof NodeObservation>;
 
+export const BackupObservation=z.strictObject({health:z.enum(["ok","failing","unknown"]),observed_at:Timestamp,last_completed_at:Timestamp.nullable(),last_failed_at:Timestamp.nullable()});
+export type BackupObservation=z.infer<typeof BackupObservation>;
+
 export const DatabaseObservation = z
   .strictObject({
     id: DatabaseId,
@@ -301,6 +304,7 @@ export const DatabaseObservation = z
       })
       .optional(),
     message: z.string().max(TEXT_MAX_LENGTH).optional(),
+    backup: BackupObservation.optional(),
     archive: z.strictObject({
       continuous: z.boolean(),
       ready_wal_files: Count.nullable(),

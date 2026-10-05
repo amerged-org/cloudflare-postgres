@@ -89,6 +89,7 @@ export async function observations(
     now = new Date(receivedAt).toISOString();
   if (Date.parse(body.observed_at) > receivedAt + 300_000)
     throw new ApiError("invalid_request", "Observation time is in the future");
+  if(body.databases.some(d=>d.backup && (d.backup.observed_at>body.observed_at || (d.backup.last_completed_at!==null && d.backup.last_completed_at>d.backup.observed_at) || (d.backup.last_failed_at!==null && d.backup.last_failed_at>d.backup.observed_at)))) throw new ApiError("invalid_request","Backup observation time is inconsistent");
   const names = new Set<string>(),
     ids = new Set<string>();
   if (
