@@ -853,3 +853,46 @@ it("constructs OAuth and provider requests in the actual Workers runtime without
   expect(instance.id).toBe(f.instanceId);
   expect(f.calls).toHaveLength(2);
 });
+
+it("preserves a null instance display name returned by the actual firewall inventory", async () => {
+  const f = setup(),
+    firewallId = value(),
+    wire = firewall(f, firewallId, []);
+  f.set(() =>
+    Response.json({
+      data: [
+        {
+          ...wire,
+          instances: wire.instances.map((instance) => ({
+            ...instance,
+            displayName: null,
+          })),
+        },
+      ],
+      _links: { self: `/v1/firewalls/${firewallId}` },
+    }),
+  );
+  const actual = await f.client.getFirewall(firewallId, {
+    requestId: f.requestId,
+  });
+  expect(actual.instances).toHaveLength(1);
+  expect(actual.instances[0]!.displayName).toBeNull();
+});
+
+it("retains every additional provider address for complete network verification", async () => {
+  const f = setup(),
+    additionalIps = [
+      { v4: { ...f.instance.ipConfig.v4, ip: [198, 51, 100, 240].join(".") } },
+      { v4: { ...f.instance.ipConfig.v4, ip: [198, 51, 100, 241].join(".") } },
+    ];
+  f.set(() =>
+    Response.json({
+      data: [{ ...f.instance, additionalIps }],
+      _links: { self: `/v1/compute/instances/${f.instanceId}` },
+    }),
+  );
+  const actual = await f.client.getInstance(f.instanceId, {
+    requestId: f.requestId,
+  });
+  expect(Reflect.get(actual, "additionalIps")).toEqual(additionalIps);
+});

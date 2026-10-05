@@ -9,6 +9,7 @@ import net, { type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { getCACertificates, setDefaultCACertificates } from "node:tls";
+import type { Duplex } from "node:stream";
 import { test, type TestContext } from "node:test";
 import { WebSocket } from "ws";
 import {
@@ -92,19 +93,37 @@ async function localRelay(t: TestContext) {
     keys,
   };
   let relay = createBootstrapRelay(relayConfig);
-  const tlsSockets = new Set<Socket>();
+  const tlsSockets = new Set<Duplex>();
+  const publicRelayPath = `/internal/v1/node-bootstrap/${spec.operation_id}/relay`;
+  let upgrades = 0;
   const listener = createHttpsServer({ cert, key });
   listener.on("connection", (socket) => {
     tlsSockets.add(socket);
     socket.once("close", () => tlsSockets.delete(socket));
   });
-  listener.on("upgrade", (request, socket, head) =>
-    relay.server.emit("upgrade", request, socket, head),
-  );
+  listener.on("upgrade", (request, socket, head) => {
+    upgrades++;
+    if (
+      request.url !== publicRelayPath ||
+      request.headers.authorization !== `Bearer ${config.callback.bearer}`
+    ) {
+      socket.end(
+        "HTTP/1.1 401 Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+      );
+      return;
+    }
+    delete request.headers.authorization;
+    request.url = BOOTSTRAP_RELAY_PATH;
+    relay.server.emit("upgrade", request, socket, head);
+  });
   listener.listen(0, LOOPBACK);
   await once(listener, "listening");
   const port = (listener.address() as net.AddressInfo).port;
-  const websocket_url = `wss://${LOOPBACK}:${port}${BOOTSTRAP_RELAY_PATH}`;
+  config.callback = {
+    ...config.callback,
+    url: `https://${LOOPBACK}:${port}/internal/v1/node-bootstrap/${spec.operation_id}`,
+  };
+  const websocket_url = `wss://${LOOPBACK}:${port}${publicRelayPath}`;
   const token = (epoch = relay.identity.relay_epoch) =>
     signBootstrapRelay({
       privateKey: pair.privateKey,
@@ -131,6 +150,7 @@ async function localRelay(t: TestContext) {
     config,
     websocket_url,
     token,
+    upgrades: () => upgrades,
     restart: async () => {
       const previous = relay.identity.relay_epoch;
       await relay.close();
@@ -140,7 +160,7 @@ async function localRelay(t: TestContext) {
   };
 }
 
-test("native capability bridges binary bytes through the real TLS relay using its required raw token header", async (t) => {
+test("native capability bridges bytes through an authenticated TLS API front and the real raw-token relay", async (t) => {
   const relay = await localRelay(t);
   const abort = new AbortController();
   const bridge = await openCapability(
@@ -173,7 +193,10 @@ test("a relay restart rejects its old audience while the immutable job requests 
   await relay.restart();
   const rejected = await new Promise<number>((resolve, reject) => {
     const client = new WebSocket(relay.websocket_url, {
-      headers: { [BOOTSTRAP_RELAY_HEADER]: oldToken },
+      headers: {
+        [BOOTSTRAP_RELAY_HEADER]: oldToken,
+        authorization: `Bearer ${relay.config.callback.bearer}`,
+      },
     });
     client.on("error", () => {});
     client.once("open", () => {
@@ -218,4 +241,44 @@ test("a relay restart rejects its old audience while the immutable job requests 
     abort.abort();
   }
   assert.equal(relay.config.input_hash, originalHash);
+});
+
+test("native capability rejects a different WebSocket origin or operation path before opening a socket", async (t) => {
+  const relay = await localRelay(t);
+  const response: typeof fetch = async () =>
+    Response.json({
+      websocket_url: relay.websocket_url,
+      token: await relay.token(),
+      expectedTarget: { ip: LOOPBACK, port: 6443 },
+    });
+  const config = {
+    ...relay.config,
+    callback: { ...relay.config.callback, url: fixture().callback.url },
+  };
+  await assert.rejects(
+    openCapability(
+      config,
+      "kubernetes_api",
+      AbortSignal.timeout(1000),
+      response,
+    ),
+    /transport_endpoint_mismatch/,
+  );
+  assert.equal(relay.upgrades(), 0);
+  const pathResponse: typeof fetch = async () =>
+    Response.json({
+      websocket_url: `${new URL(relay.websocket_url).origin}/internal/v1/node-bootstrap/${fixture().spec.operation_id}/relay`,
+      token: await relay.token(),
+      expectedTarget: { ip: LOOPBACK, port: 6443 },
+    });
+  await assert.rejects(
+    openCapability(
+      relay.config,
+      "kubernetes_api",
+      AbortSignal.timeout(1000),
+      pathResponse,
+    ),
+    /transport_endpoint_mismatch/,
+  );
+  assert.equal(relay.upgrades(), 0);
 });

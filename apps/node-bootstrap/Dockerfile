@@ -25,7 +25,7 @@ RUN node -e "const f='apps/node-bootstrap/package.json',p=JSON.parse(require('fs
 
 FROM node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS clients
 ARG TARGETARCH
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates=20250419~deb12u1 curl=7.88.1-10+deb12u15 \
  && rm -rf /var/lib/apt/lists/*
 RUN set -eu; \
  case "$TARGETARCH" in \
@@ -44,7 +44,7 @@ RUN set -eu; \
  chmod 755 /kubectl
 
 FROM node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates openssh-client \
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates=20250419~deb12u1 openssh-client=1:9.2p1-2+deb12u10 \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV NODE_ENV=production
