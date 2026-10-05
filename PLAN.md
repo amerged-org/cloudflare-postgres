@@ -71,6 +71,24 @@ stayed ready for 74 s despite the 60 s idle policy. On one always-warm Dev datab
 sequential new connections plus the first marker read had p50/p95/max 418.346/734.438/910.656 ms.
 This is a small warm-path measurement, not an application latency or load-capacity guarantee.
 
+Phase 3 preparation is being integrated locally; it is not live acceptance. Durable node
+reservations, one-time purchase dispatch claims and actual provider identity observations are
+implemented. The Contabo adapter passed 29 actual Workers-runtime tests; read-only Dev instance
+and firewall requests passed after preserving the provider's nullable fields and using supported
+redirect handling. No provider mutation or purchase was performed for these checks.
+The native installer passed 27 tests, including checksum-verified Talos configuration generation,
+an authenticated TLS API front proxy with the real relay, stale-capability rejection and an
+actual bundled entry-point launch. Three shared bootstrap contract tests passed. Relay process
+epochs belong to fresh capabilities, not immutable jobs; disconnects do not replay commands.
+All five pinned platform charts rendered, and all 14 platform workloads tolerate quarantine
+while customer PostgreSQL placement remains blocked. The optional fixed-source relay deployment,
+native package pins and separate image qualification job are prepared. The local Linux bootstrap
+image builds and passes all runtime checks. Its full scan covered 433,348,963 payload bytes and
+643,272,838 detector bytes without a coverage gap. Twenty previously reviewed base findings
+resolved; 19 new findings in the two checksum-verified native binaries remain under independent
+review. Publication is blocked until every finding is resolved. Final composed API checks,
+protected network preflight and real node bootstrap remain outstanding.
+
 The operational Cloudflare token was updated in place with no expiry; its value and all 23
 rights remained unchanged. Barman's R2 credential and PGCF admin/agent keys also have no expiry.
 Short-lived routing and control tokens retain their security deadlines.
