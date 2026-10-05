@@ -11,3 +11,7 @@ monitoring:
   podMonitorEnabled: false
   grafanaDashboard:
     create: false
+tolerations:
+  - key: pgcf.io/quarantine
+    operator: Exists
+    effect: NoSchedule

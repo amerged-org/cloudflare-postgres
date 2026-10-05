@@ -5,3 +5,22 @@ prometheus:
   enabled: true
   servicemonitor:
     enabled: false
+tolerations:
+  - key: pgcf.io/quarantine
+    operator: Exists
+    effect: NoSchedule
+cainjector:
+  tolerations:
+    - key: pgcf.io/quarantine
+      operator: Exists
+      effect: NoSchedule
+webhook:
+  tolerations:
+    - key: pgcf.io/quarantine
+      operator: Exists
+      effect: NoSchedule
+startupapicheck:
+  tolerations:
+    - key: pgcf.io/quarantine
+      operator: Exists
+      effect: NoSchedule
