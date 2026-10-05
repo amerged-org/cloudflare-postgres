@@ -5,7 +5,10 @@ import { once } from "node:events";
 import { networkInterfaces } from "node:os";
 import { randomBytes, randomUUID } from "node:crypto";
 import { AgentApi } from "../../src/agent/api-client.ts";
-import { measurementBatches } from "../../src/agent/measurements.ts";
+import {
+  measurementBatches,
+  volumeUsedBytes,
+} from "../../src/agent/measurements.ts";
 import { newDatabaseId } from "@pgcf/contracts";
 import { test } from "node:test";
 import { RegionalMeasurements } from "../../src/agent/measurements.ts";
@@ -24,6 +27,133 @@ import {
 } from "@pgcf/contracts/gateway-activity";
 import type { GatewayActivityReport } from "@pgcf/contracts/gateway-activity";
 import type { AgentActivityRequest, AgentUsageRequest } from "@pgcf/contracts";
+
+test("volume use is an exact fresh filesystem gauge including WAL, with ambiguous or stale stats unknown", () => {
+  const now = Date.parse("2026-01-02T12:00:00.000Z"),
+    podUid = randomUUID();
+  const binding = {
+    node: "worker",
+    namespace: "pgcf-test",
+    pod: "database-1",
+    podUid,
+    volume: "pgdata",
+    claim: "database-1",
+    allocated: 5 * 1024 ** 3,
+  };
+  const volume = {
+    name: "pgdata",
+    pvcRef: { name: binding.claim, namespace: binding.namespace },
+    time: new Date(now - 30_000).toISOString(),
+    usedBytes: 1024 ** 3,
+    capacityBytes: 4 * 1024 ** 3,
+  };
+  const pod = {
+    podRef: { name: binding.pod, namespace: binding.namespace, uid: podUid },
+    volume: [volume],
+  };
+  const summary = { node: { nodeName: binding.node }, pods: [pod] };
+  assert.equal(volumeUsedBytes(summary, binding, now), 1024 ** 3);
+  assert.equal(
+    volumeUsedBytes(
+      {
+        ...summary,
+        pods: [{ ...pod, volume: [{ ...volume, usedBytes: 512 }] }],
+      },
+      binding,
+      now,
+    ),
+    512,
+  );
+  assert.equal(
+    volumeUsedBytes({ ...summary, pods: [pod, pod] }, binding, now),
+    null,
+  );
+  assert.equal(
+    volumeUsedBytes(
+      {
+        ...summary,
+        pods: [{ ...pod, podRef: { ...pod.podRef, uid: randomUUID() } }],
+      },
+      binding,
+      now,
+    ),
+    null,
+  );
+  assert.equal(
+    volumeUsedBytes(
+      { ...summary, pods: [{ ...pod, volume: [volume, volume] }] },
+      binding,
+      now,
+    ),
+    null,
+  );
+  assert.equal(
+    volumeUsedBytes(
+      {
+        ...summary,
+        pods: [
+          {
+            ...pod,
+            volume: [
+              { ...volume, time: new Date(now - 120_001).toISOString() },
+            ],
+          },
+        ],
+      },
+      binding,
+      now,
+    ),
+    null,
+  );
+  assert.equal(
+    volumeUsedBytes(
+      {
+        ...summary,
+        pods: [{ ...pod, volume: [{ ...volume, usedBytes: Number.NaN }] }],
+      },
+      binding,
+      now,
+    ),
+    null,
+  );
+  assert.equal(
+    volumeUsedBytes(
+      {
+        ...summary,
+        pods: [
+          {
+            ...pod,
+            volume: [
+              {
+                ...volume,
+                pvcRef: { ...volume.pvcRef, namespace: "pgcf-other" },
+              },
+            ],
+          },
+        ],
+      },
+      binding,
+      now,
+    ),
+    null,
+  );
+  assert.equal(
+    volumeUsedBytes(
+      {
+        ...summary,
+        pods: [
+          {
+            ...pod,
+            volume: [{ ...volume, usedBytes: volume.capacityBytes + 1 }],
+          },
+        ],
+      },
+      binding,
+      now,
+    ),
+    null,
+  );
+});
 
 async function setup() {
   const { db, ctx } = fixture();
@@ -159,6 +289,105 @@ async function setup() {
     },
   };
 }
+
+test("agent samples actual bound PVC use and a replaced storage identity becomes unknown", async () => {
+  const state = await setup();
+  const namespace = `pgcf-db-${state.db.id}`;
+  const pod = state.k8s.resources.get(
+    state.k8s.key("Pod", namespace, "database-1"),
+  )!;
+  const claim = state.k8s.resources.get(
+    state.k8s.key("PersistentVolumeClaim", namespace, "database-1"),
+  )!;
+  const volume = state.k8s.resources.get(
+    state.k8s.key(
+      "PersistentVolume",
+      undefined,
+      String(record(claim.spec).volumeName),
+    ),
+  )!;
+  const storage = state.k8s.resources.get(
+    state.k8s.key("ConfigMap", "pgcf-system", `storage-${state.db.id}`),
+  )!;
+  const originalVolumeUid = volume.metadata.uid;
+  storage.metadata.annotations = {
+    ...storage.metadata.annotations,
+    "pgcf.io/volume-identity": JSON.stringify({
+      claimUid: claim.metadata.uid,
+      volumeUid: volume.metadata.uid,
+      handle: record(record(volume.spec).csi).volumeHandle,
+    }),
+  };
+  state.k8s.put({
+    apiVersion: "v1",
+    kind: "Node",
+    metadata: { name: state.db.node },
+    status: {
+      addresses: [{ type: "InternalIP", address: [10, 20, 1, 2].join(".") }],
+    },
+  });
+  let summaries = 0,
+    replace = false;
+  Object.assign(state.k8s, {
+    async statsSummary() {
+      summaries++;
+      if (replace) volume.metadata.uid = randomUUID();
+      return {
+        node: { nodeName: state.db.node },
+        pods: [
+          {
+            podRef: {
+              name: pod.metadata.name,
+              namespace,
+              uid: pod.metadata.uid,
+            },
+            volume: [
+              {
+                name: "pgdata",
+                pvcRef: { namespace, name: claim.metadata.name },
+                time: new Date(state.now()).toISOString(),
+                usedBytes: 64 * 1024 ** 2,
+                capacityBytes: state.db.size.storage_gib * 1024 ** 3,
+              },
+            ],
+          },
+        ],
+      };
+    },
+  });
+  const meter = state.make();
+  meter.update([state.db]);
+  await meter.cycle();
+  const first = state.usages
+    .flatMap((value) => value.samples)
+    .find((sample) => sample.source === "agent");
+  assert.equal(
+    first?.source === "agent" && first.storage_used_bytes,
+    64 * 1024 ** 2,
+  );
+  await meter.cycle();
+  assert.equal(summaries, 1);
+  replace = true;
+  state.advance(15000);
+  await meter.cycle();
+  const last = state.usages
+    .at(-1)!
+    .samples.find((sample) => sample.source === "agent");
+  assert.equal(last?.source === "agent" && last.storage_used_bytes, null);
+  volume.metadata.uid = originalVolumeUid;
+  const owners = record(pod.metadata).ownerReferences as unknown[];
+  record(owners[0]).uid = randomUUID();
+  state.advance(15000);
+  await meter.cycle();
+  assert.equal(summaries, 2);
+  const foreignOwner = state.usages
+    .at(-1)!
+    .samples.find((sample) => sample.source === "agent");
+  assert.equal(
+    foreignOwner?.source === "agent" && foreignOwner.storage_used_bytes,
+    null,
+  );
+});
 
 test("exact cumulative deltas are checkpointed and a lost usage response replays the identical payload", async () => {
   const state = await setup();

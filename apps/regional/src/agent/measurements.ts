@@ -39,6 +39,7 @@ import {
   type Resource,
 } from "./types.ts";
 import { boundedText } from "./api-client.ts";
+import type { VolumeStatsKubernetes } from "./kubernetes.ts";
 
 const DATA = "measurements.json",
   CURSOR = "pgcf.io/measurement-cursor";
@@ -83,6 +84,220 @@ interface Work {
   resource: Resource;
   checkpoint: Checkpoint;
   allocated: number | null;
+  namespace: Resource;
+  cluster: Resource;
+  volumeIdentity: string | undefined;
+}
+
+interface VolumeStatsBinding {
+  node: string;
+  namespace: string;
+  pod: string;
+  podUid: string;
+  volume: string;
+  claim: string;
+  allocated: number;
+}
+
+export function volumeUsedBytes(
+  summary: unknown,
+  binding: VolumeStatsBinding,
+  now: number,
+): number | null {
+  const value = record(summary),
+    pods = value.pods;
+  if (
+    !Number.isSafeInteger(now) ||
+    record(value.node).nodeName !== binding.node ||
+    !Array.isArray(pods) ||
+    pods.length > 10_000
+  )
+    return null;
+  const selected = pods
+    .map(record)
+    .filter(
+      (pod) =>
+        record(pod.podRef).name === binding.pod &&
+        record(pod.podRef).namespace === binding.namespace,
+    );
+  if (
+    selected.length !== 1 ||
+    record(selected[0]!.podRef).uid !== binding.podUid
+  )
+    return null;
+  const volumes = selected[0]!.volume;
+  if (!Array.isArray(volumes) || volumes.length > 64) return null;
+  const matched = volumes
+    .map(record)
+    .filter((volume) => volume.name === binding.volume);
+  if (matched.length !== 1) return null;
+  const volume = matched[0]!,
+    timestamp = typeof volume.time === "string" ? Date.parse(volume.time) : NaN;
+  if (
+    record(volume.pvcRef).name !== binding.claim ||
+    record(volume.pvcRef).namespace !== binding.namespace ||
+    !Number.isSafeInteger(timestamp) ||
+    timestamp < now - 120_000 ||
+    timestamp > now + 5000 ||
+    !Number.isSafeInteger(volume.usedBytes) ||
+    Number(volume.usedBytes) < 0 ||
+    !Number.isSafeInteger(volume.capacityBytes) ||
+    Number(volume.capacityBytes) <= 0 ||
+    Number(volume.usedBytes) > Number(volume.capacityBytes) ||
+    Number(volume.capacityBytes) > binding.allocated
+  )
+    return null;
+  return Number(volume.usedBytes);
+}
+
+const physicalSignature = (resource: Resource) =>
+  text({ metadata: resource.metadata, spec: resource.spec });
+function clusterOwner(resource: Resource, cluster: Resource): boolean {
+  const owners = record(resource.metadata).ownerReferences;
+  const matches = Array.isArray(owners)
+    ? owners.map(record).filter((owner) => owner.kind === cluster.kind)
+    : [];
+  return (
+    matches.length === 1 &&
+    matches[0]!.apiVersion === cluster.apiVersion &&
+    matches[0]!.name === cluster.metadata.name &&
+    matches[0]!.uid === uid(cluster)
+  );
+}
+
+async function storageUsed(
+  k8s: VolumeStatsKubernetes,
+  work: Work,
+  summaries: Map<string, Promise<unknown>>,
+  now: () => number,
+): Promise<number | null> {
+  if (!k8s.statsSummary || work.allocated === null || !work.volumeIdentity)
+    return null;
+  try {
+    const identity = record(JSON.parse(work.volumeIdentity));
+    const primary = string(record(work.cluster.status).currentPrimary);
+    const namespace = work.namespace.metadata.name;
+    if (
+      !primary ||
+      primary.length > 63 ||
+      !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(primary)
+    )
+      return null;
+    const [pod, claim, node] = await Promise.all([
+      k8s.read("Pod", namespace, primary),
+      k8s.read("PersistentVolumeClaim", namespace, primary),
+      k8s.read("Node", undefined, work.db.node),
+    ]);
+    if (
+      !pod ||
+      !claim ||
+      !node ||
+      pod.metadata.deletionTimestamp ||
+      claim.metadata.deletionTimestamp ||
+      node.metadata.deletionTimestamp ||
+      pod.metadata.name !== primary ||
+      pod.metadata.namespace !== namespace ||
+      pod.metadata.labels?.["cnpg.io/cluster"] !== work.cluster.metadata.name ||
+      !clusterOwner(pod, work.cluster) ||
+      record(pod.spec).nodeName !== work.db.node ||
+      node.metadata.name !== work.db.node ||
+      claim.metadata.namespace !== namespace ||
+      claim.metadata.name !== primary ||
+      claim.metadata.uid !== identity.claimUid ||
+      !clusterOwner(claim, work.cluster) ||
+      record(claim.status).phase !== "Bound" ||
+      record(claim.spec).storageClassName !== "pgcf-lvm"
+    )
+      return null;
+    const volumeName = string(record(claim.spec).volumeName);
+    if (
+      !volumeName ||
+      volumeName.length > 253 ||
+      !/^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$/.test(volumeName)
+    )
+      return null;
+    const volume = await k8s.read("PersistentVolume", undefined, volumeName);
+    const reference = record(record(volume?.spec).claimRef),
+      csi = record(record(volume?.spec).csi);
+    if (
+      !volume ||
+      volume.metadata.name !== volumeName ||
+      volume.metadata.uid !== identity.volumeUid ||
+      volume.metadata.deletionTimestamp ||
+      reference.uid !== uid(claim) ||
+      reference.namespace !== namespace ||
+      reference.name !== primary ||
+      csi.driver !== "local.csi.openebs.io" ||
+      csi.volumeHandle !== identity.handle ||
+      record(volume.status).phase !== "Bound"
+    )
+      return null;
+    const mounts = record(pod.spec).volumes;
+    const mounted = Array.isArray(mounts)
+      ? mounts
+          .map(record)
+          .filter(
+            (mount) =>
+              record(mount.persistentVolumeClaim).claimName === primary,
+          )
+      : [];
+    if (mounted.length !== 1 || !string(mounted[0]!.name)) return null;
+    const before = [pod, claim, volume, node].map(physicalSignature);
+    const key = `${uid(node)}_${node.metadata.resourceVersion}`;
+    let summary = summaries.get(key);
+    if (!summary) {
+      summary = k8s.statsSummary(node);
+      summaries.set(key, summary);
+    }
+    const used = volumeUsedBytes(
+      await summary,
+      {
+        node: work.db.node,
+        namespace,
+        pod: primary,
+        podUid: uid(pod),
+        volume: String(mounted[0]!.name),
+        claim: primary,
+        allocated: work.allocated,
+      },
+      now(),
+    );
+    if (used === null) return null;
+    const current = await Promise.all([
+      k8s.read("Pod", namespace, primary),
+      k8s.read("PersistentVolumeClaim", namespace, primary),
+      k8s.read("PersistentVolume", undefined, volumeName),
+      k8s.read("Node", undefined, work.db.node),
+      k8s.read("Namespace", undefined, namespace),
+      k8s.read("Cluster", namespace, work.cluster.metadata.name),
+      k8s.read("ConfigMap", "pgcf-system", work.resource.metadata.name),
+    ]);
+    if (
+      current
+        .slice(0, 4)
+        .some(
+          (resource, index) =>
+            !resource ||
+            resource.metadata.deletionTimestamp ||
+            physicalSignature(resource) !== before[index],
+        ) ||
+      current[4]?.metadata.uid !== uid(work.namespace) ||
+      current[4]?.metadata.deletionTimestamp ||
+      current[4]?.metadata.labels?.[DATABASE_LABEL] !== work.db.id ||
+      current[5]?.metadata.uid !== uid(work.cluster) ||
+      current[5]?.metadata.deletionTimestamp ||
+      record(current[5]?.status).currentPrimary !== primary ||
+      current[6]?.metadata.uid !== uid(work.resource) ||
+      current[6]?.metadata.deletionTimestamp ||
+      record(current[6]?.data).state !== work.checkpoint.identity.state ||
+      current[6]?.metadata.annotations?.["pgcf.io/volume-identity"] !==
+        work.volumeIdentity
+    )
+      return null;
+    return used;
+  } catch {
+    return null;
+  }
 }
 export interface MeasurementOptions {
   k8s: Kubernetes | ((signal: AbortSignal) => Kubernetes);
@@ -518,7 +733,16 @@ export class RegionalMeasurements {
     } catch {
       /* Allocation remains unknown when its bound claim cannot be established. */
     }
-    return { db, resource, checkpoint, allocated };
+    return {
+      db,
+      resource,
+      checkpoint,
+      allocated,
+      namespace,
+      cluster,
+      volumeIdentity:
+        resource.metadata.annotations?.["pgcf.io/volume-identity"],
+    };
   }
   private async save(k8s: Kubernetes, work: Work): Promise<void> {
     const encoded = text(work.checkpoint);
@@ -536,6 +760,15 @@ export class RegionalMeasurements {
         path: "/data/state",
         value: record(work.resource.data).state,
       },
+      ...(work.volumeIdentity === undefined
+        ? []
+        : [
+            {
+              op: "test",
+              path: "/metadata/annotations/pgcf.io~1volume-identity",
+              value: work.volumeIdentity,
+            },
+          ]),
       { op: "add", path: `/data/${DATA}`, value: encoded },
     ]);
     const current = await k8s.read(
@@ -703,11 +936,17 @@ export class RegionalMeasurements {
       /* Discovery failure marks a gap without manufacturing a respondent. */
     }
     const collected = new Map<string, GatewayActivityReport[]>();
+    const usedStorage = new Map<string, number | null>();
+    const summaries = new Map<string, Promise<unknown>>();
     let index = 0;
     const worker = async () => {
       while (index < measuring.length && !signal.aborted) {
         const work = measuring[index++]!;
         if (snapshot) {
+          usedStorage.set(
+            work.db.id,
+            await storageUsed(k8s, work, summaries, () => this.now),
+          );
           try {
             collected.set(
               work.db.id,
@@ -923,7 +1162,7 @@ export class RegionalMeasurements {
           producer_id: this.process,
           sequence: this.now,
           observed_at: new Date(this.now).toISOString(),
-          storage_used_bytes: null,
+          storage_used_bytes: usedStorage.get(work.db.id) ?? null,
           storage_allocated_bytes: work.allocated,
         }),
       );
