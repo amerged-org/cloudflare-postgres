@@ -476,6 +476,59 @@ describe("DesiredDatabase", () => {
 });
 
 describe("ObservationRequest", () => {
+  it("accepts truthful explicit archive health while retaining legacy observations", () => {
+    const value = observation();
+    value.databases = [
+      {
+        id,
+        generation: 1,
+        state: "ready",
+        archive: {
+          continuous: false,
+          ready_wal_files: null,
+          health: "unknown",
+        },
+      },
+    ];
+    expect(ObservationRequest.safeParse(value).success).toBe(true);
+    value.databases = [
+      {
+        id,
+        generation: 1,
+        state: "ready",
+        archive: { continuous: false, ready_wal_files: 4, health: "failing" },
+      },
+    ];
+    expect(ObservationRequest.safeParse(value).success).toBe(true);
+    value.databases = [
+      {
+        id,
+        generation: 1,
+        state: "ready",
+        archive: { continuous: true, ready_wal_files: 0, health: "ok" },
+      },
+    ];
+    expect(ObservationRequest.safeParse(value).success).toBe(true);
+    expect(ObservationRequest.safeParse(observation()).success).toBe(true);
+    value.databases = [
+      {
+        id,
+        generation: 1,
+        state: "ready",
+        archive: { continuous: true, ready_wal_files: null, health: "unknown" },
+      },
+    ];
+    expect(ObservationRequest.safeParse(value).success).toBe(false);
+    value.databases = [
+      {
+        id,
+        generation: 1,
+        state: "ready",
+        archive: { continuous: false, ready_wal_files: null, health: "ok" },
+      },
+    ];
+    expect(ObservationRequest.safeParse(value).success).toBe(false);
+  });
   it("records unavailable WAL samples as null and rejects invalid counts", () => {
     const value = observation();
     value.databases = [

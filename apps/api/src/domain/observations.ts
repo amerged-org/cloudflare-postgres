@@ -179,11 +179,13 @@ export async function observations(
       }
       continue;
     }
-    const health = observation.archive.continuous
-      ? observation.archive.ready_wal_files === null
-        ? "unknown"
-        : "ok"
-      : "failing";
+    const health =
+      observation.archive.health ??
+      (observation.archive.continuous
+        ? observation.archive.ready_wal_files === null
+          ? "unknown"
+          : "ok"
+        : "failing");
     const inactive =
       row.desired_state === "suspended" &&
       observation.state === "hibernated" &&

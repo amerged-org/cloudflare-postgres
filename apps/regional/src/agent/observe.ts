@@ -12,6 +12,7 @@ export const ACCEPTED_GENERATION_ANNOTATION = "pgcf.io/accepted-generation";
 export const ARCHIVE_FAILURE_MS = 10 * 60_000;
 export const WAL_BACKLOG_LIMIT = 32;
 export const ARCHIVE_OBSERVATION_ANNOTATION = "pgcf.io/archive-observation";
+export const ARCHIVE_UNKNOWN_ANNOTATION = "pgcf.io/archive-unknown-since";
 
 export interface ArchiveProgress {
   archivedCount: number;

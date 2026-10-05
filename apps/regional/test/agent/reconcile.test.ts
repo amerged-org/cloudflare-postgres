@@ -22,6 +22,230 @@ import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 
 const signal = () => new AbortController().signal;
 
+test("established availability survives unavailable archive measurements only with current runtime authentication", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  const now = Date.parse("2026-10-05T10:00:00Z");
+  assert.equal(
+    (
+      await new Reconciler(
+        k8s,
+        signal(),
+        () => now,
+        metrics,
+        authenticate,
+      ).reconcile(db, ctx)
+    )?.state,
+    "ready",
+  );
+  db.creation!.ever_ready = true;
+  let accepted = true,
+    probes = 0;
+  const unavailable: typeof fetch = async () => {
+    throw new Error("archive_sample_unavailable");
+  };
+  const probe = async () => {
+    probes++;
+    return accepted;
+  };
+  const reconciler = new Reconciler(
+    k8s,
+    signal(),
+    () => now,
+    unavailable,
+    probe,
+  );
+  const observation = await reconciler.reconcile(db, ctx);
+  assert.equal(observation?.state, "ready");
+  assert.deepEqual(observation?.archive, {
+    continuous: false,
+    ready_wal_files: null,
+    health: "unknown",
+  });
+  assert.equal(probes, 1);
+  accepted = false;
+  assert.notEqual((await reconciler.reconcile(db, ctx))?.state, "ready");
+  assert.equal(probes, 2);
+  const fresh = fixture();
+  const initial = await new Reconciler(
+    new MemoryKubernetes(),
+    signal(),
+    () => now,
+    unavailable,
+    authenticate,
+  ).reconcile(fresh.db, fresh.ctx);
+  assert.equal(initial?.state, "provisioning");
+  assert.equal(initial?.archive.continuous, false);
+});
+
+test("unknown archive telemetry alarms after ten minutes across restart without withholding established availability", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  const start = Date.parse("2026-10-05T10:00:00Z");
+  await new Reconciler(
+    k8s,
+    signal(),
+    () => start,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  db.creation!.ever_ready = true;
+  const unavailable: typeof fetch = async () => {
+    throw new Error("archive_sample_unavailable");
+  };
+  const first = await new Reconciler(
+    k8s,
+    signal(),
+    () => start,
+    unavailable,
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(first?.state, "ready");
+  assert.equal(first?.message, undefined);
+  const before = await new Reconciler(
+    k8s,
+    signal(),
+    () => start + 599_999,
+    unavailable,
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(before?.state, "ready");
+  assert.equal(before?.message, undefined);
+  const alarm = await new Reconciler(
+    k8s,
+    signal(),
+    () => start + 600_001,
+    unavailable,
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(alarm?.state, "ready");
+  assert.equal(alarm?.archive.health, "unknown");
+  assert.equal(alarm?.archive.continuous, false);
+  assert.equal(alarm?.archive.ready_wal_files, null);
+  assert.match(alarm?.message ?? "", /archive.*unknown/);
+  const fence = await k8s.read("ConfigMap", "pgcf-system", `storage-${db.id}`);
+  assert.equal(
+    fence!.metadata.annotations!["pgcf.io/archive-unknown-since"],
+    String(start),
+  );
+  const recovered = await new Reconciler(
+    k8s,
+    signal(),
+    () => start + 600_002,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  assert.equal(recovered?.state, "ready");
+  assert.equal(recovered?.archive.health, "ok");
+  const current = await k8s.read(
+    "ConfigMap",
+    "pgcf-system",
+    `storage-${db.id}`,
+  );
+  assert.equal(
+    current!.metadata.annotations!["pgcf.io/archive-unknown-since"],
+    undefined,
+  );
+});
+
+test("an established wake reaches fence release with unknown archive telemetry", async () => {
+  const f = await wakeConfigurationFixture();
+  let releases = 0;
+  const power = {
+    prepareRunning: async () => undefined,
+    finishRunning: async (_db: unknown, value: unknown) => {
+      const observation = value as {
+        state: string;
+        archive: {
+          continuous: boolean;
+          ready_wal_files: number | null;
+          health: string;
+        };
+      };
+      if (observation.state === "ready") releases++;
+      return observation;
+    },
+  } as unknown as PowerCoordinator;
+  const unavailable: typeof fetch = async () => {
+    throw new Error("archive_sample_unavailable");
+  };
+  const observation = await new Reconciler(
+    f.k8s,
+    signal(),
+    Date.now,
+    unavailable,
+    authenticate,
+    power,
+  ).reconcile(f.db, f.ctx);
+  assert.equal(observation?.state, "ready");
+  assert.equal(observation?.archive.health, "unknown");
+  assert.equal(releases, 1);
+});
+
+test("unknown archive timers reject future records and concurrent fence versions without inventing archive counters", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes(),
+    now = Date.parse("2026-10-05T10:00:00Z");
+  await new Reconciler(
+    k8s,
+    signal(),
+    () => now,
+    metrics,
+    authenticate,
+  ).reconcile(db, ctx);
+  db.creation!.ever_ready = true;
+  const fence = k8s.resources.get(
+    k8s.key("ConfigMap", "pgcf-system", `storage-${db.id}`),
+  )!;
+  fence.metadata.annotations!["pgcf.io/archive-unknown-since"] = String(
+    now + 1,
+  );
+  const unavailable: typeof fetch = async () => {
+    throw new Error("archive_sample_unavailable");
+  };
+  await assert.rejects(
+    new Reconciler(
+      k8s,
+      signal(),
+      () => now,
+      unavailable,
+      authenticate,
+    ).reconcile(db, ctx),
+    /archive_unknown_observation_invalid/,
+  );
+  delete fence.metadata.annotations!["pgcf.io/archive-unknown-since"];
+  const native = k8s.patch.bind(k8s);
+  k8s.patch = async (kind, namespace, name, operations) => {
+    if (
+      name === fence.metadata.name &&
+      operations.some(
+        (op) =>
+          record(record(op).value)["pgcf.io/archive-unknown-since"] !==
+          undefined,
+      )
+    )
+      fence.metadata.resourceVersion = String(++k8s.revision);
+    return native(kind, namespace, name, operations);
+  };
+  await assert.rejects(
+    new Reconciler(
+      k8s,
+      signal(),
+      () => now,
+      unavailable,
+      authenticate,
+    ).reconcile(db, ctx),
+  );
+  assert.equal(
+    fence.metadata.annotations!["pgcf.io/archive-unknown-since"],
+    undefined,
+  );
+  assert.equal(
+    fence.metadata.annotations![ARCHIVE_OBSERVATION_ANNOTATION],
+    undefined,
+  );
+});
+
 function archiveSample(
   pending: number,
   archived: number,
