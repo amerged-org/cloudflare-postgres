@@ -482,6 +482,8 @@ export function kubernetesFromConfig(
         if (kind === "Namespace") await core.deleteNamespace(args, options);
         else if (kind === "ConfigMap")
           await core.deleteNamespacedConfigMap(args, options);
+        else if (kind === "Secret")
+          await core.deleteNamespacedSecret(args, options);
         else throw new Error("unsupported_delete_kind");
       } catch (error) {
         if (!(error instanceof ApiException && error.code === 404)) throw error;
