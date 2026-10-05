@@ -7,7 +7,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "node --test 'test/**/*.test.ts'",
-    "build": "esbuild src/server.ts src/proxy-command.ts --bundle --platform=node --format=esm --target=node24 --external:ws --outdir=dist --out-extension:.js=.mjs"
+    "build": "esbuild src/server.ts src/proxy-command.ts --bundle --platform=node --format=esm --target=node24 --external:ws --banner:js=\"import { createRequire } from 'node:module'; const require = createRequire(import.meta.url);\" --outdir=dist --out-extension:.js=.mjs"
   },
   "dependencies": {
     "@pgcf/contracts": "workspace:*",

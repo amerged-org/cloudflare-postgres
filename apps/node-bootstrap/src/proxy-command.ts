@@ -225,7 +225,9 @@ async function main() {
 
 if (
   process.argv[1] &&
-  import.meta.url === pathToFileURL(process.argv[1]).href
+  import.meta.url === pathToFileURL(process.argv[1]).href &&
+  (new URL(import.meta.url).pathname.endsWith("/proxy-command.ts") ||
+    new URL(import.meta.url).pathname.endsWith("/proxy-command.mjs"))
 ) {
   main().catch(() => {
     process.stderr.write("bootstrap_proxy_failed\n");

@@ -33,6 +33,31 @@ test("actual child entry emits only the fixed JSON event for invalid private con
   assert.ok(!result.stderr.includes(canary));
 });
 
+test("the actual bundled entry starts far enough to emit the sanitized configuration event", () => {
+  const built = spawnSync("pnpm", ["run", "build"], {
+    cwd: fileURLToPath(new URL("../", import.meta.url)),
+    encoding: "utf8",
+    timeout: 60_000,
+    env: { PATH: process.env.PATH, LANG: "C", CI: "true" },
+  });
+  assert.equal(built.status, 0);
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL("../dist/server.mjs", import.meta.url))],
+    {
+      encoding: "utf8",
+      timeout: 60_000,
+      env: { PATH: process.env.PATH, LANG: "C" },
+    },
+  );
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(
+    result.stderr,
+    `${JSON.stringify({ event: "bootstrap_invalid_configuration" })}\n`,
+  );
+});
+
 test("private HTTP authenticates before parsing and exposes only durable bounded status", async () => {
   const input = fixture();
   let current = authority(input);
