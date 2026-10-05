@@ -38,6 +38,7 @@ export class AgentLoop {
   private waiting: (() => void) | undefined;
   private hinted = false;
   private wakePending = false;
+  private wakeRetryPending = false;
   private reconcile: Reconciler;
   private api: ControlApi;
   private k8s: Kubernetes;
@@ -46,6 +47,7 @@ export class AgentLoop {
   private log: Log;
   private now: () => number;
   private phaseNow: () => number;
+  private cadenceNow: () => number;
   private measurements?: Pick<RegionalMeasurements, "update">;
   constructor(
     api: ControlApi,
@@ -59,6 +61,7 @@ export class AgentLoop {
     power?: PowerCoordinator,
     measurements?: Pick<RegionalMeasurements, "update">,
     phaseNow = () => performance.now(),
+    cadenceNow = () => performance.now(),
   ) {
     this.api = api;
     this.k8s = k8s;
@@ -68,6 +71,7 @@ export class AgentLoop {
     this.now = now;
     this.measurements = measurements;
     this.phaseNow = phaseNow;
+    this.cadenceNow = cadenceNow;
     this.reconcile = new Reconciler(
       k8s,
       signal,
@@ -88,6 +92,7 @@ export class AgentLoop {
 
   async cycle(): Promise<boolean> {
     this.wakePending = false;
+    this.wakeRetryPending = false;
     const desired = await this.api.desired(this.signal);
     this.measurements?.update(desired.databases);
     let context: Promise<BuildContext> | undefined;
@@ -130,7 +135,10 @@ export class AgentLoop {
           this.now() < retry.nextAt
         ) {
           nonterminal = true;
-          if (waking) this.wakePending = true;
+          if (waking) {
+            this.wakePending = true;
+            this.wakeRetryPending = true;
+          }
           continue;
         }
         try {
@@ -150,7 +158,10 @@ export class AgentLoop {
         } catch {
           if (this.signal.aborted) return;
           nonterminal = true;
-          if (waking) this.wakePending = true;
+          if (waking) {
+            this.wakePending = true;
+            this.wakeRetryPending = true;
+          }
           const attempt =
             retry?.generation === db.generation ? retry.attempt + 1 : 0;
           this.retries.set(db.id, {
@@ -215,12 +226,24 @@ export class AgentLoop {
     while (!this.signal.aborted) {
       this.hinted = false;
       let interval: number;
+      const started = this.cadenceTimestamp();
       try {
         interval = (await this.cycle())
           ? this.wakePending
             ? 1_000
             : 5_000
           : 60_000;
+        if (this.wakePending && !this.wakeRetryPending) {
+          const finished = this.cadenceTimestamp();
+          if (
+            Number.isFinite(started) &&
+            Number.isFinite(finished) &&
+            started >= 0 &&
+            finished >= started &&
+            finished <= Number.MAX_SAFE_INTEGER
+          )
+            interval = Math.max(0, Math.ceil(1_000 - (finished - started)));
+        }
         failures = 0;
       } catch {
         if (this.signal.aborted) break;
@@ -229,6 +252,14 @@ export class AgentLoop {
       }
       if (this.hinted) continue;
       await this.wait(interval);
+    }
+  }
+
+  private cadenceTimestamp(): number {
+    try {
+      return this.cadenceNow();
+    } catch {
+      return NaN;
     }
   }
 

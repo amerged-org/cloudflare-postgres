@@ -125,6 +125,9 @@ test("pending wake polls in one second and verified ready restores the sixty-sec
     metrics,
     authenticate,
     power,
+    undefined,
+    undefined,
+    () => 0,
   );
   const running = loop.run();
   t.after(async () => {
@@ -285,6 +288,9 @@ test("a wake exception retries in one second, skipped retry remains fast and ver
     metrics,
     authenticate,
     power,
+    undefined,
+    undefined,
+    () => 0,
   );
   const running = loop.run();
   t.after(async () => {
@@ -366,6 +372,10 @@ test("ordinary creation exceptions retain the five-second retry base and cancell
     () => now,
     metrics,
     authenticate,
+    undefined,
+    undefined,
+    undefined,
+    () => 0,
   );
   const running = loop.run();
   t.after(async () => {
