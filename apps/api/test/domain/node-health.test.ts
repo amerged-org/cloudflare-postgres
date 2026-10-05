@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { DatabaseWithOperation } from "@pgcf/contracts";
+import { DatabaseWithOperation, newNodeId } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { choosePlacement } from "../../src/domain/placement.ts";
 import {
@@ -119,6 +119,14 @@ it("marks a node lost with its exact UID, keeps recovery identity and releases o
   });
   expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(1);
   const path = `/v1/nodes/${f.node}/mark-lost`;
+  expect(
+    (
+      await request(`/v1/nodes/${newNodeId()}/mark-lost`, f.admin, "POST", {
+        expected_node_uid: uid,
+        reason: "confirmed loss",
+      })
+    ).status,
+  ).toBe(404);
   expect(
     (
       await request(path, f.integrator, "POST", {

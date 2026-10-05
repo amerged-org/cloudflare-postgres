@@ -78,7 +78,7 @@ it("fresh unknown actors reject hints without creating application tables or que
 
 it("rejects a known hint flood at the durable aggregate allowance before D1 or wake", async () => {
   const f = await ready();
-  vi.spyOn(Date, "now").mockReturnValue(Date.now());
+  const clock = vi.spyOn(Date, "now").mockReturnValue(Date.now());
   await runInDurableObject(actor(f.id), (_instance, state) => {
     state.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS database_admission(singleton INTEGER PRIMARY KEY CHECK(singleton=1),minute INTEGER NOT NULL,attempts INTEGER NOT NULL)",
@@ -108,6 +108,38 @@ it("rejects a known hint flood at the durable aggregate allowance before D1 or w
     sqlstate: "53300",
   });
   expect(count()).toBe(0);
+  clock.mockReturnValue(Date.now() + 60000);
+  expect((await actor(f.id).ensureAwake(f.id, "app")).ok).toBe(true);
+  expect(
+    await runInDurableObject(actor(f.id), (_instance, state) =>
+      state.storage.sql.exec("SELECT attempts FROM database_admission").one(),
+    ),
+  ).toEqual({ attempts: 1 });
+});
+
+it("a fresh authoritative node loss overrides a warm seeded route without waking it", async () => {
+  const f = await ready();
+  expect((await actor(f.id).ensureAwake(f.id, "app")).ok).toBe(true);
+  await env.DB.prepare(
+    "UPDATE nodes SET lost_at=?,lost_reason='confirmed loss',ready=0,schedulable=0 WHERE id=?",
+  )
+    .bind(new Date().toISOString(), f.node)
+    .run();
+  expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "57P03",
+  });
+  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "57P03",
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) count FROM operations WHERE database_id=? AND kind='database.wake'",
+    )
+      .bind(f.id)
+      .first("count"),
+  ).toBe(0);
 });
 
 it("atomically bounds a configured aggregate across valid roles and refuses invalid policy", async () => {

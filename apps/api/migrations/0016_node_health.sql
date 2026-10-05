@@ -9,3 +9,8 @@ WHEN OLD.lost_at IS NOT NULL AND (
   OR NEW.k8s_node_name IS NOT OLD.k8s_node_name OR NEW.region_id<>OLD.region_id
   OR NEW.ready<>0 OR NEW.schedulable<>0)
 BEGIN SELECT RAISE(ABORT,'lost_node_identity_immutable'); END;
+ALTER TABLE databases ADD COLUMN backup_observed_at TEXT;
+ALTER TABLE databases ADD COLUMN backup_health TEXT NOT NULL DEFAULT 'unknown' CHECK(backup_health IN('ok','failing','unknown'));
+ALTER TABLE databases ADD COLUMN backup_last_completed_at TEXT;
+ALTER TABLE databases ADD COLUMN backup_last_failed_at TEXT;
+CREATE INDEX usage_samples_health_idx ON usage_samples(database_id,source,observed_at DESC);
