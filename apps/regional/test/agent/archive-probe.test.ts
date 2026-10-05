@@ -571,3 +571,103 @@ test("CIDR-formatted or arbitrary server input is still refused rather than trim
   assert.equal(client.queries.length, 1);
   assert.equal(client.ended(), 1);
 });
+
+test("archive selection reports only a fixed transport and eligibility reason without credentials", async () => {
+  const f = await boundFixture(),
+    events: { transport: string; reason: string }[] = [];
+  const secret = f.k8s.resources.get(
+    f.k8s.key("Secret", f.namespace, "maintenance-credentials"),
+  )!;
+  secret.metadata.annotations![GENERATION_ANNOTATION] = "1";
+  f.db.generation = 2;
+  const ns = f.k8s.resources.get(
+    f.k8s.key("Namespace", undefined, f.namespace),
+  )!;
+  ns.metadata.annotations![GENERATION_ANNOTATION] = "2";
+  ns.metadata.annotations!["pgcf.io/accepted-generation"] = "2";
+  f.cluster.metadata.annotations![GENERATION_ANNOTATION] = "2";
+  f.fence.metadata.annotations![GENERATION_ANNOTATION] = "2";
+  f.db.power!.revision = 2;
+  const options = await archiveProbeOptions(
+    f.db,
+    f.cluster,
+    f.fence,
+    f.k8s,
+    new AbortController().signal,
+    Date.now,
+    (transport, reason) => events.push({ transport, reason }),
+  );
+  assert.equal(options, null);
+  assert.deepEqual(events, [
+    { transport: "exporter", reason: "maintenance_revision" },
+  ]);
+  assert.equal(
+    JSON.stringify(events).includes(f.db.maintenance!.password),
+    false,
+  );
+});
+
+test("eligible archive selection reports SQL once and ignores a failing diagnostic logger", async () => {
+  const f = await boundFixture(),
+    events: { transport: string; reason: string }[] = [];
+  const options = await archiveProbeOptions(
+    f.db,
+    f.cluster,
+    f.fence,
+    f.k8s,
+    new AbortController().signal,
+    Date.now,
+    (transport, reason) => {
+      events.push({ transport, reason });
+      throw new Error(f.db.maintenance!.password);
+    },
+  );
+  assert.ok(options);
+  assert.equal(await options.verifyBinding(), true);
+  assert.deepEqual(events, [{ transport: "sql", reason: "eligible" }]);
+  assert.equal(
+    JSON.stringify(events).includes(f.db.maintenance!.password),
+    false,
+  );
+});
+
+test("a stale local storage fence still refuses SQL and names only its revision predicate", async () => {
+  const f = await boundFixture(),
+    events: { transport: string; reason: string }[] = [];
+  f.db.generation = 2;
+  f.fence.metadata.annotations![GENERATION_ANNOTATION] = "1";
+  const options = await archiveProbeOptions(
+    f.db,
+    f.cluster,
+    f.fence,
+    f.k8s,
+    new AbortController().signal,
+    Date.now,
+    (transport, reason) => events.push({ transport, reason }),
+  );
+  assert.equal(options, null);
+  assert.deepEqual(events, [
+    { transport: "exporter", reason: "storage_revision" },
+  ]);
+});
+
+test("a maintenance password acknowledgment mismatch reports its fixed predicate without an RV", async () => {
+  const f = await boundFixture(),
+    events: { transport: string; reason: string }[] = [];
+  const roles = record(record(f.cluster.status).managedRolesStatus);
+  record(record(roles.passwordStatus)[MAINTENANCE_ROLE]).resourceVersion =
+    randomUUID();
+  const options = await archiveProbeOptions(
+    f.db,
+    f.cluster,
+    f.fence,
+    f.k8s,
+    new AbortController().signal,
+    Date.now,
+    (transport, reason) => events.push({ transport, reason }),
+  );
+  assert.equal(options, null);
+  assert.deepEqual(events, [
+    { transport: "exporter", reason: "maintenance_ack" },
+  ]);
+});

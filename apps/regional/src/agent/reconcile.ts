@@ -853,6 +853,12 @@ export class Reconciler {
             this.k8s,
             this.signal,
             this.now,
+            (transport, reason) =>
+              phaseLog?.("wake_archive_transport", {
+                database_id: db.id,
+                transport,
+                reason,
+              }),
           );
           return options
             ? this.archiveProbe(options)

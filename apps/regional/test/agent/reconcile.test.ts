@@ -2041,8 +2041,9 @@ test("wake phase timings whitelist fields and preserve ready output and resource
   ).reconcile(db, ctx);
   assert.deepEqual(measured, baseline);
   assert.deepEqual(k8s.resources, before);
+  const phases = logs.filter((entry) => entry.event === "wake_phase");
   assert.deepEqual(
-    logs.map((entry) => entry.fields.phase),
+    phases.map((entry) => entry.fields.phase),
     [
       "wake_prepare",
       "desired_apply",
@@ -2055,7 +2056,7 @@ test("wake phase timings whitelist fields and preserve ready output and resource
       "fence_release",
     ],
   );
-  for (const entry of logs) {
+  for (const entry of phases) {
     assert.equal(entry.event, "wake_phase");
     assert.deepEqual(Object.keys(entry.fields).sort(), [
       "database_id",
@@ -2067,6 +2068,19 @@ test("wake phase timings whitelist fields and preserve ready output and resource
     assert.equal(entry.fields.elapsedMs, 1);
     assert.equal(entry.fields.outcome, "completed");
   }
+  assert.deepEqual(
+    logs.filter((entry) => entry.event === "wake_archive_transport"),
+    [
+      {
+        event: "wake_archive_transport",
+        fields: {
+          database_id: db.id,
+          transport: "exporter",
+          reason: "legacy_or_missing_maintenance",
+        },
+      },
+    ],
+  );
   assert.equal(JSON.stringify(logs).includes(canary), false);
   for (const role of db.roles)
     assert.equal(JSON.stringify(logs).includes(role.password), false);

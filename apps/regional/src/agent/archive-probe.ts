@@ -88,6 +88,22 @@ function clusterOwned(value: Resource, cluster: Resource): boolean {
     )
   );
 }
+type ArchiveEligibilityReason =
+  | "legacy_or_missing_maintenance"
+  | "primary_or_ca_name"
+  | "storage_identity"
+  | "storage_revision"
+  | "namespace_identity"
+  | "namespace_revision"
+  | "cluster_identity"
+  | "cluster_revision"
+  | "maintenance_identity"
+  | "maintenance_revision"
+  | "maintenance_data"
+  | "maintenance_ack"
+  | "ca_binding"
+  | "primary_binding"
+  | "eligible";
 export async function archiveProbeOptions(
   db: DesiredDatabase,
   cluster: Resource,
@@ -95,13 +111,31 @@ export async function archiveProbeOptions(
   k8s: Kubernetes,
   signal: AbortSignal,
   now = Date.now,
+  report?: (
+    transport: "sql" | "exporter",
+    reason: ArchiveEligibilityReason,
+  ) => void,
 ): Promise<ArchiveProbeOptions | null> {
+  const selection = (
+    transport: "sql" | "exporter",
+    reason: ArchiveEligibilityReason,
+  ) => {
+    try {
+      report?.(transport, reason);
+    } catch {
+      /* Diagnostics cannot change archive selection. */
+    }
+  };
+  const refuse = (reason: ArchiveEligibilityReason): null => {
+    selection("exporter", reason);
+    return null;
+  };
   if (
     db.desired_state !== "running" ||
     db.power?.mode !== "running" ||
     !db.maintenance
   )
-    return null;
+    return refuse("legacy_or_missing_maintenance");
   const namespace = databaseNamespace(db.id),
     primary = string(record(cluster.status).currentPrimary),
     caName = string(record(record(cluster.status).certificates).serverCASecret);
@@ -113,7 +147,7 @@ export async function archiveProbeOptions(
         /^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(name) && name.length <= 63,
     )
   )
-    return null;
+    return refuse("primary_or_ca_name");
   const [ns, secret, caSecret, pod] = await Promise.all([
     k8s.read("Namespace", undefined, namespace),
     k8s.read("Secret", namespace, "maintenance-credentials"),
@@ -124,35 +158,61 @@ export async function archiveProbeOptions(
   const roles = record(record(cluster.status).managedRolesStatus),
     reconciled = record(roles.byStatus).reconciled;
   const ca = decodedCertificate(record(caSecret?.data)["ca.crt"]);
+  if (!owned(fence, "ConfigMap", `storage-${db.id}`, "pgcf-system", db.id))
+    return refuse("storage_identity");
+  if (appliedGeneration(fence) !== db.generation)
+    return refuse("storage_revision");
   if (
-    !owned(fence, "ConfigMap", `storage-${db.id}`, "pgcf-system", db.id) ||
-    appliedGeneration(fence) !== db.generation ||
     state.node !== db.node ||
-    state.archivePath !== db.archive.destination_path ||
+    state.archivePath !== db.archive.destination_path
+  )
+    return refuse("storage_identity");
+  if (
     !owned(ns, "Namespace", namespace, undefined, db.id) ||
-    ns.metadata.uid !== state.namespaceUid ||
+    ns.metadata.uid !== state.namespaceUid
+  )
+    return refuse("namespace_identity");
+  if (
     appliedGeneration(ns) !== db.generation ||
-    acceptedGeneration(ns) > db.generation ||
+    acceptedGeneration(ns) > db.generation
+  )
+    return refuse("namespace_revision");
+  if (
     !owned(cluster, "Cluster", "database", namespace, db.id) ||
-    cluster.metadata.uid !== state.clusterUid ||
-    appliedGeneration(cluster) !== db.generation ||
-    !owned(secret, "Secret", "maintenance-credentials", namespace, db.id) ||
-    appliedGeneration(secret) !== db.generation ||
+    cluster.metadata.uid !== state.clusterUid
+  )
+    return refuse("cluster_identity");
+  if (appliedGeneration(cluster) !== db.generation)
+    return refuse("cluster_revision");
+  if (!owned(secret, "Secret", "maintenance-credentials", namespace, db.id))
+    return refuse("maintenance_identity");
+  if (appliedGeneration(secret) !== db.generation)
+    return refuse("maintenance_revision");
+  if (
     record(secret.data).username !==
       Buffer.from(MAINTENANCE_ROLE).toString("base64") ||
     record(secret.data).password !==
-      Buffer.from(db.maintenance.password).toString("base64") ||
+      Buffer.from(db.maintenance.password).toString("base64")
+  )
+    return refuse("maintenance_data");
+  if (
     !Array.isArray(reconciled) ||
     !reconciled.includes(MAINTENANCE_ROLE) ||
     record(record(roles.passwordStatus)[MAINTENANCE_ROLE]).resourceVersion !==
-      secret.metadata.resourceVersion ||
+      secret.metadata.resourceVersion
+  )
+    return refuse("maintenance_ack");
+  if (
     !caSecret ||
     caSecret.metadata.namespace !== namespace ||
     !caSecret.metadata.uid ||
     !caSecret.metadata.resourceVersion ||
     caSecret.metadata.deletionTimestamp ||
     !clusterOwned(caSecret, cluster) ||
-    !ca ||
+    !ca
+  )
+    return refuse("ca_binding");
+  if (
     !pod ||
     pod.metadata.namespace !== namespace ||
     !pod.metadata.uid ||
@@ -163,7 +223,8 @@ export async function archiveProbeOptions(
     record(pod.spec).nodeName !== db.node ||
     !isIP(String(record(pod.status).podIP))
   )
-    return null;
+    return refuse("primary_binding");
+  selection("sql", "eligible");
   const resources = [ns, cluster, secret, caSecret, pod, fence];
   const verifyBinding = async () => {
     const current = await Promise.all(
