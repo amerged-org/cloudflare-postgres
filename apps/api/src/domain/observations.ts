@@ -28,6 +28,7 @@ export function observationApplies(
   receivedAt: string,
 ): boolean {
   if (
+    row.node_id === null ||
     row.region_id !== regionId ||
     observation.generation !== row.generation ||
     observation.generation < row.observed_generation ||

@@ -57,7 +57,7 @@ export interface DatabaseInsertSnapshot {
   body: DatabaseCreate;
   size: SizeRow;
   region: RegionRow;
-  nodeId: string;
+  nodeId: string | null;
   id: string;
   archivePath: string;
   now: string;
@@ -66,6 +66,34 @@ export function databaseInsertStatement(
   db: D1Database,
   snapshot: DatabaseInsertSnapshot,
 ): D1PreparedStatement {
+  if (snapshot.nodeId === null) {
+    return db
+      .prepare(
+        `INSERT INTO databases(id,project_id,region_id,node_id,name,size_class_id,desired_state,generation,archive_path,status_message,created_at,updated_at)
+      SELECT ?,p.id,r.id,NULL,?,s.id,'running',1,?,'Waiting for verified regional capacity',?,?
+      FROM projects p JOIN regions r ON r.id=? AND r.backup_bucket=? JOIN size_classes s ON s.id=? AND s.enabled=1
+      WHERE p.id=? AND p.deleted_at IS NULL AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=?
+      AND s.max_connections=? AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?`,
+      )
+      .bind(
+        snapshot.id,
+        snapshot.body.name,
+        snapshot.archivePath,
+        snapshot.now,
+        snapshot.now,
+        snapshot.body.region_id,
+        snapshot.region.backup_bucket,
+        snapshot.body.size_class_id,
+        snapshot.body.project_id,
+        snapshot.size.memory_mib,
+        snapshot.size.storage_gib,
+        snapshot.size.cpu_millicores,
+        snapshot.size.max_connections,
+        snapshot.size.sleep_after_seconds,
+        snapshot.size.archive_timeout_seconds,
+        snapshot.size.backup_retention_days,
+      );
+  }
   return db
     .prepare(
       `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,desired_state,generation,archive_path,created_at,updated_at)
@@ -144,17 +172,15 @@ export async function createDatabase(
         c.env.CREDENTIAL_KEYS,
         id,
       );
-      for (let attempt = 0; attempt < 2; attempt++) {
-        const node = choosePlacement(
-          await placementNodes(c.env.DB, body.region_id),
-          body.region_id,
-          size,
-        );
-        if (!node)
-          throw new ApiError(
-            "capacity_exhausted",
-            "No node has sufficient memory, CPU and storage",
-          );
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const node =
+          attempt === 2
+            ? null
+            : choosePlacement(
+                await placementNodes(c.env.DB, body.region_id),
+                body.region_id,
+                size,
+              );
         const archive = archiveDestinationPath(
           region.backup_bucket,
           region.id,
@@ -173,7 +199,7 @@ export async function createDatabase(
               body,
               size,
               region,
-              nodeId: node.id,
+              nodeId: node?.id ?? null,
               id,
               archivePath: archive,
               now,
@@ -207,17 +233,20 @@ export async function createDatabase(
             ).bind(op, now, now, id, body.project_id),
             c.env.DB.prepare(
               `INSERT INTO lifecycle_events (database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-            SELECT id,'created',node_id,size_class_id,generation,?,? FROM databases WHERE id=? AND project_id=?`,
+            SELECT id,'created',node_id,size_class_id,generation,?,? FROM databases WHERE id=? AND project_id=? AND node_id IS NOT NULL`,
             ).bind(
               now,
-              JSON.stringify({
-                memory_mib: size.memory_mib,
-                cpu_millicores: size.cpu_millicores,
-                reserved_memory_mib: size.memory_mib + SIDECAR.requestMemoryMib,
-                reserved_cpu_millicores:
-                  size.cpu_millicores + SIDECAR.requestCpuMillicores,
-                storage_allocated_bytes: size.storage_gib * 2 ** 30,
-              }),
+              node === null
+                ? null
+                : JSON.stringify({
+                    memory_mib: size.memory_mib,
+                    cpu_millicores: size.cpu_millicores,
+                    reserved_memory_mib:
+                      size.memory_mib + SIDECAR.requestMemoryMib,
+                    reserved_cpu_millicores:
+                      size.cpu_millicores + SIDECAR.requestCpuMillicores,
+                    storage_allocated_bytes: size.storage_gib * 2 ** 30,
+                  }),
               id,
               body.project_id,
             ),
@@ -232,13 +261,13 @@ export async function createDatabase(
           throw error;
         }
         if (result[0]!.meta.changes === 1) {
-          hint(c, region.id, [id]);
+          if (node !== null) hint(c, region.id, [id]);
           return databaseOperationResponse(c, op);
         }
       }
       throw new ApiError(
-        "capacity_exhausted",
-        "No node has sufficient memory, CPU and storage",
+        "conflict",
+        "Project, region or size class changed; retry the request",
       );
     },
   });
@@ -494,6 +523,19 @@ export async function deleteDatabase(
         c.env.DB.prepare(
           `UPDATE operations SET status='failed',error_code='superseded',error_message='Power intent superseded by deletion',updated_at=?,completed_at=? WHERE database_id=? AND generation<? AND kind IN('database.suspend','database.resume','database.hibernate','database.wake') AND status IN('pending','running') AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=? AND generation=? AND kind='database.delete')`,
         ).bind(now, now, id, generation, op, id, generation),
+        c.env.DB.prepare(
+          `UPDATE databases SET observed_state='deleted',observed_generation=generation,status_message=NULL
+          WHERE id=? AND project_id=? AND generation=? AND desired_state='deleted' AND node_id IS NULL
+          AND EXISTS(SELECT 1 FROM operations WHERE id=? AND database_id=databases.id AND kind='database.delete')`,
+        ).bind(id, row.project_id, generation, op),
+        c.env.DB.prepare(
+          `UPDATE operations SET status='succeeded',completed_at=?,updated_at=? WHERE id=? AND kind='database.delete'
+          AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.node_id IS NULL AND d.observed_state='deleted' AND d.observed_generation=operations.generation)`,
+        ).bind(now, now, op),
+        c.env.DB.prepare(
+          `UPDATE operations SET status='failed',completed_at=?,updated_at=?,error_code='superseded',error_message='Unplaced creation cancelled by deletion'
+          WHERE database_id=? AND kind='database.create' AND status='pending' AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.node_id IS NULL AND d.observed_state='deleted')`,
+        ).bind(now, now, id),
         lease.completeStatement(op, 202, {
           sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
           bindings: [op, row.project_id],
