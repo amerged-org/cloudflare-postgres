@@ -461,4 +461,63 @@ test("an authenticated kubelet certificate pin enables real TLS for the bound no
     }),
     /kubelet_tls_identity_invalid/,
   );
+  server.setSecureContext({ cert: certificatePem, key });
+  const data = map.data as Record<string, string>;
+  data.certificate_pem = certificatePem;
+  data.certificate_sha256 = createHash("sha256")
+    .update(certificatePem, "utf8")
+    .digest("hex");
+  let artifactReads = 0;
+  t.mock.method(KubeConfig.prototype, "loadFromFile", () => {});
+  t.mock.method(KubeConfig.prototype, "getCurrentCluster", () => ({
+    name: "fixture",
+    server: "https://kubernetes",
+    caData: Buffer.from(randomUUID()).toString("base64"),
+  }));
+  t.mock.method(
+    KubeConfig.prototype,
+    "applyToHTTPSOptions",
+    async (options: https.RequestOptions) => {
+      options.ca = Buffer.from(randomUUID());
+    },
+  );
+  t.mock.method(KubeConfig.prototype, "makeApiClient", (type: unknown) =>
+    type === CoreV1Api
+      ? {
+          async readNamespace(input: { name: string }) {
+            assert.equal(input.name, "kube-system");
+            return {
+              metadata: {
+                name: input.name,
+                uid: clusterUid,
+                resourceVersion: "1",
+              },
+            };
+          },
+          async readNamespacedConfigMap(input: {
+            namespace: string;
+            name: string;
+          }) {
+            assert.deepEqual(input, {
+              namespace: "pgcf-system",
+              name: map.metadata.name,
+            });
+            artifactReads++;
+            return structuredClone(map);
+          },
+        }
+      : {},
+  );
+  const adapter = kubernetesFromConfig(
+    new AbortController().signal,
+    "test-config",
+  );
+  assert.deepEqual(await adapter.statsSummary!(node), { pods: [] });
+  assert.equal(artifactReads, 1);
+  data.cluster_uid = randomUUID();
+  const foreign = kubernetesFromConfig(
+    new AbortController().signal,
+    "test-config",
+  );
+  await assert.rejects(foreign.statsSummary!(node), /kubelet_trust_invalid/);
 });
