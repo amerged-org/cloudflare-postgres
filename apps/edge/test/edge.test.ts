@@ -13,7 +13,11 @@ import {
   isDatabaseId,
   isRoleName,
 } from "@pgcf/contracts";
-import { encodeStartup, encodeSslRequest } from "@pgcf/contracts/pg-wire";
+import {
+  encodeStartup,
+  encodeSslRequest,
+  encodeErrorResponse,
+} from "@pgcf/contracts/pg-wire";
 import {
   deriveRegionKeyring,
   parseRouteKeyring,
@@ -185,6 +189,66 @@ function passwordFrame(body: Uint8Array): Uint8Array {
   return frame;
 }
 
+function idleUpgradeDiagnostics(
+  connections: Pick<
+    Awaited<ReturnType<typeof open>>,
+    "closeCode" | "messages" | "textMessages"
+  >[],
+) {
+  const closeCodes: Record<string, number> = {},
+    sqlstates: Record<string, number> = {};
+  let binaryMessages = 0,
+    textMessages = 0,
+    errorFrames = 0;
+  for (const connection of connections) {
+    const code = connection.closeCode();
+    if (code !== null)
+      closeCodes[String(code)] = (closeCodes[String(code)] ?? 0) + 1;
+    binaryMessages += connection.messages.length;
+    textMessages += connection.textMessages.length;
+    for (const frame of connection.messages) {
+      if (frame[0] !== 0x45) continue;
+      errorFrames++;
+      for (let i = 5; i < frame.length && frame[i] !== 0;) {
+        const field = frame[i++]!;
+        const end = frame.indexOf(0, i);
+        if (end < 0) break;
+        if (field === 0x43 && end - i === 5) {
+          const value = String.fromCharCode(...frame.subarray(i, end));
+          if (/^[A-Z0-9]{5}$/.test(value))
+            sqlstates[value] = (sqlstates[value] ?? 0) + 1;
+        }
+        i = end + 1;
+      }
+    }
+  }
+  const outcomes: Record<string, number> = {};
+  for (const [value] of logs.mock.calls) {
+    let outcome = "unclassified";
+    try {
+      const parsed = JSON.parse(value as string) as { outcome?: unknown };
+      if (
+        parsed.outcome === "accepted" ||
+        (typeof parsed.outcome === "string" &&
+          /^[A-Z0-9]{5}$/.test(parsed.outcome))
+      )
+        outcome = parsed.outcome;
+    } catch {
+      /* Diagnostics retain counts only. */
+    }
+    outcomes[outcome] = (outcomes[outcome] ?? 0) + 1;
+  }
+  return {
+    connections: connections.length,
+    closeCodes,
+    binaryMessages,
+    textMessages,
+    errorFrames,
+    sqlstates,
+    outcomes,
+  };
+}
+
 async function setGatewayMode(mode: string): Promise<void> {
   await testEnv.DB.prepare("UPDATE regions SET gateway_url = ? WHERE id = ?")
     .bind(`${gatewayOrigin}/pg?mode=${mode}`, region)
@@ -282,6 +346,29 @@ afterEach(async () => {
 });
 
 describe("native edge admission with real Workers D1 and route-token modules", () => {
+  it("idle-upgrade diagnostics retain counts and SQLSTATE without message or log contents", () => {
+    const marker = crypto.randomUUID();
+    logs.mock.calls.push([
+      JSON.stringify({ outcome: marker, message: marker }),
+    ]);
+    const diagnostic = idleUpgradeDiagnostics([
+      {
+        closeCode: () => 1000,
+        messages: [encodeErrorResponse("08006", marker)],
+        textMessages: [marker],
+      },
+    ]);
+    expect(diagnostic).toEqual({
+      connections: 1,
+      closeCodes: { "1000": 1 },
+      binaryMessages: 1,
+      textMessages: 1,
+      errorFrames: 1,
+      sqlstates: { "08006": 1 },
+      outcomes: { unclassified: 1 },
+    });
+    expect(JSON.stringify(diagnostic).includes(marker)).toBe(false);
+  });
   it("one thousand distinct unseeded hints make no D1 admission query or gateway call", async () => {
     const queries = vi.spyOn(Object.getPrototypeOf(testEnv.DB), "prepare");
     const actors = vi.spyOn(
@@ -764,13 +851,22 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const denied = await open();
     expect(await errorCode(denied)).toBe("53300");
     expect(await stats()).toHaveLength(1_000);
+    const beforeAdvance = idleUpgradeDiagnostics(idle);
+    const timersBeforeAdvance = vi.getTimerCount();
     await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
+    const timersAfterAdvance = vi.getTimerCount();
     vi.useRealTimers();
     expect(
       idle.every(
         (connection) =>
           connection.closeCode() === null && connection.messages.length === 0,
       ),
+      JSON.stringify({
+        beforeAdvance,
+        afterAdvance: idleUpgradeDiagnostics(idle),
+        timersBeforeAdvance,
+        timersAfterAdvance,
+      }),
     ).toBe(true);
     expect(await stats()).toHaveLength(1_000);
   }, 30_000);
