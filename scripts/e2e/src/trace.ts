@@ -8,11 +8,22 @@ import {
 } from "./trace-transport.ts";
 import type { TailSocket, TailSocketFactory } from "./trace-transport.ts";
 
+export interface TraceFailureSummary {
+  readonly phase: "socket" | "open" | "settle" | "await_event";
+  readonly messages: number;
+  readonly bytes: number;
+  readonly parsed_request_events: number;
+  readonly correlated_events: number;
+  readonly trigger_dispatched: boolean;
+  readonly trigger_completed: boolean;
+}
+
 export interface TraceOptions {
   socketFactory?: TailSocketFactory;
   settleMs?: number;
   openTimeoutMs?: number;
   eventTimeoutMs?: number;
+  onFailure?: (summary: TraceFailureSummary) => void | Promise<void>;
 }
 
 function requestMatches(value: unknown, marker: string): boolean {
@@ -62,6 +73,32 @@ function correlated(data: string, marker: string): boolean {
   }
 }
 
+function requestCounts(data: string, marker: string) {
+  let requests = 0;
+  let matches = 0;
+  try {
+    const value: unknown = JSON.parse(data);
+    for (const candidate of Array.isArray(value) ? value : [value]) {
+      if (
+        !candidate ||
+        typeof candidate !== "object" ||
+        Array.isArray(candidate)
+      )
+        continue;
+      const event = (candidate as Record<string, unknown>).event;
+      if (!event || typeof event !== "object" || Array.isArray(event)) continue;
+      const request = (event as Record<string, unknown>).request;
+      if (!request || typeof request !== "object" || Array.isArray(request))
+        continue;
+      requests++;
+      if (requestMatches(candidate, marker)) matches++;
+    }
+  } catch {
+    // Malformed frames contribute bytes and messages, but no request events.
+  }
+  return { requests, matches };
+}
+
 /** Trace bodies live only in memory until the deployed probe checks the canary. */
 export async function captureTrace(
   cf: Cloudflare,
@@ -93,6 +130,13 @@ export async function captureTrace(
     throw new HarnessError("invalid_trace_timeout");
   let socket: TailSocket | undefined;
   let accepting = true;
+  let phase: TraceFailureSummary["phase"] = "socket";
+  let messageCount = 0;
+  let size = 0;
+  let requestCount = 0;
+  let matchCount = 0;
+  let triggerDispatched = false;
+  let triggerCompleted = false;
   const tail = record(
     (
       await cf.request(`/workers/scripts/${worker}/tails`, "POST", {
@@ -134,7 +178,6 @@ export async function captureTrace(
       throw new HarnessError("trace_failed");
     }
     const messages: string[] = [];
-    let size = 0;
     let received: (() => void) | undefined, failed: (() => void) | undefined;
     const event = new Promise<void>((resolve, reject) => {
       received = resolve;
@@ -144,6 +187,7 @@ export async function captureTrace(
     const pending: Promise<void>[] = [];
     socket.addEventListener("message", (message) => {
       if (!accepting) return;
+      messageCount = Math.min(Number.MAX_SAFE_INTEGER, messageCount + 1);
       const operation = (async () => {
         const data =
           typeof message.data === "string"
@@ -158,12 +202,22 @@ export async function captureTrace(
           return;
         }
         messages.push(data);
+        const counts = requestCounts(data, marker);
+        requestCount = Math.min(
+          Number.MAX_SAFE_INTEGER,
+          requestCount + counts.requests,
+        );
+        matchCount = Math.min(
+          Number.MAX_SAFE_INTEGER,
+          matchCount + counts.matches,
+        );
         if (correlated(data, marker)) received?.();
       })().catch(() => failed?.());
       pending.push(operation);
     });
     socket.addEventListener("error", () => failed?.(), { once: true });
     socket.addEventListener("close", () => failed?.(), { once: true });
+    phase = "open";
     const openDeadline = Math.min(Date.now() + openTimeoutMs, expiry);
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(
@@ -215,6 +269,7 @@ export async function captureTrace(
         reject(new HarnessError("trace_failed"));
       }
     });
+    phase = "settle";
     if (Date.now() + settleMs >= expiry)
       throw new HarnessError("invalid_tail_expiry");
     if (settleMs) {
@@ -231,6 +286,7 @@ export async function captureTrace(
       }
     }
     if (socket.readyState !== 1) throw new HarnessError("trace_failed");
+    phase = "await_event";
     let timer: ReturnType<typeof setTimeout> | undefined;
     const eventDeadline = Math.min(Date.now() + eventTimeoutMs, expiry);
     try {
@@ -241,7 +297,9 @@ export async function captureTrace(
             throw new HarnessError("invalid_tail_expiry");
           if (dispatchedAt >= eventDeadline)
             throw new HarnessError("trace_event_missing");
+          triggerDispatched = true;
           await trigger();
+          triggerCompleted = true;
           await event;
         })(),
         new Promise<void>((_, reject) => {
@@ -257,6 +315,24 @@ export async function captureTrace(
     await Promise.all(pending);
     if (!messages.length) throw new HarnessError("trace_event_missing");
     return messages;
+  } catch (error) {
+    if (options.onFailure) {
+      const summary: TraceFailureSummary = Object.freeze({
+        phase,
+        messages: messageCount,
+        bytes: Math.min(size, TRACE_BYTES_MAX),
+        parsed_request_events: requestCount,
+        correlated_events: matchCount,
+        trigger_dispatched: triggerDispatched,
+        trigger_completed: triggerCompleted,
+      });
+      try {
+        void Promise.resolve(options.onFailure(summary)).catch(() => undefined);
+      } catch {
+        // Diagnostics must not replace the original error or delay cleanup.
+      }
+    }
+    throw error;
   } finally {
     accepting = false;
     try {

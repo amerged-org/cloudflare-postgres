@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
 import test from "node:test";
 import type { Cloudflare } from "../src/clients.ts";
-import { captureTrace } from "../src/trace.ts";
+import { captureTrace, type TraceFailureSummary } from "../src/trace.ts";
 import type { TailSocket, TailSocketFactory } from "../src/trace-transport.ts";
 
 type Tail = { id: string; url: string; expires_at: string };
@@ -485,6 +485,7 @@ test("trace bounds a stalled trigger without replay or leaked tail", async (cont
 test("trace counts UTF-8 bytes before retaining oversized metadata", async () => {
   const value = fixture();
   const socket = installSocket();
+  let summary: TraceFailureSummary | undefined;
   try {
     await assert.rejects(
       capture(
@@ -495,11 +496,19 @@ test("trace counts UTF-8 bytes before retaining oversized metadata", async () =>
           socket.sockets[0]!.emit("é".repeat(1_000_001));
         },
         async () => {},
+        {
+          onFailure: (value) => {
+            summary = value;
+          },
+        },
       ),
       { message: "trace_failed" },
     );
     assert.equal(socket.sockets[0]!.terminated, 1);
     assert.equal(value.deletes.length, 1);
+    assert.equal(summary?.bytes, 2_000_000);
+    assert.equal(summary?.messages, 1);
+    assert.equal(summary?.parsed_request_events, 0);
   } finally {
     socket.restore();
   }
@@ -631,5 +640,254 @@ test("trace never dispatches a trigger when settling resumes after expiry", asyn
   } finally {
     socket.restore();
     context.mock.timers.reset();
+  }
+});
+
+test("zero-event failure exposes only bounded capture counters and lifecycle flags", async (context) => {
+  context.mock.timers.enable({
+    apis: ["Date", "setTimeout"],
+    now: Date.UTC(2030, 0, 1),
+  });
+  const value = fixture(),
+    socket = installSocket();
+  let summary: unknown;
+  let triggers = 0;
+  try {
+    const rejected = assert.rejects(
+      capture(
+        value.client,
+        worker,
+        value.marker,
+        async () => {
+          triggers++;
+        },
+        async () => {},
+        {
+          eventTimeoutMs: 100,
+          onFailure: (value: unknown) => {
+            summary = value;
+          },
+        },
+      ),
+      { message: "trace_event_missing" },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    context.mock.timers.tick(100);
+    await rejected;
+    assert.deepEqual(summary, {
+      phase: "await_event",
+      messages: 0,
+      bytes: 0,
+      parsed_request_events: 0,
+      correlated_events: 0,
+      trigger_dispatched: true,
+      trigger_completed: true,
+    });
+    assert.equal(triggers, 1);
+    assert.equal(socket.sockets[0]!.terminated, 1);
+    assert.equal(value.deletes.length, 1);
+  } finally {
+    socket.restore();
+  }
+});
+test("uncorrelated-event failure exposes counts without any Tail metadata or canary text", async (context) => {
+  context.mock.timers.enable({
+    apis: ["Date", "setTimeout"],
+    now: Date.UTC(2030, 0, 1),
+  });
+  const value = fixture(),
+    socket = installSocket(),
+    canary = randomBytes(32).toString("base64url");
+  let summary: unknown;
+  const frame = event(
+    {
+      url: `https://${authority}/${canary}?marker=other${value.marker}`,
+      headers: { Authorization: `Bearer ${value.token}`, "x-name": worker },
+    },
+    [{ message: [canary, value.marker] }],
+  );
+  try {
+    const rejected = assert.rejects(
+      capture(
+        value.client,
+        worker,
+        value.marker,
+        async () => {
+          socket.sockets[0]!.emit(frame);
+          socket.sockets[0]!.emit(canary);
+        },
+        async () => {},
+        {
+          eventTimeoutMs: 100,
+          onFailure: (value: unknown) => {
+            summary = value;
+          },
+        },
+      ),
+      { message: "trace_event_missing" },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    context.mock.timers.tick(100);
+    await rejected;
+    assert.deepEqual(summary, {
+      phase: "await_event",
+      messages: 2,
+      bytes: Buffer.byteLength(frame) + Buffer.byteLength(canary),
+      parsed_request_events: 1,
+      correlated_events: 0,
+      trigger_dispatched: true,
+      trigger_completed: true,
+    });
+    for (const forbidden of [
+      canary,
+      value.marker,
+      value.token,
+      value.tail.url,
+      authority,
+      worker,
+      "Authorization",
+    ])
+      assert.equal(JSON.stringify(summary).includes(forbidden), false);
+    assert.equal(socket.sockets[0]!.terminated, 1);
+    assert.equal(value.deletes.length, 1);
+  } finally {
+    socket.restore();
+  }
+});
+
+test("correlated event cannot hide an unfinished trigger in failure diagnostics", async (context) => {
+  context.mock.timers.enable({
+    apis: ["Date", "setTimeout"],
+    now: Date.UTC(2030, 0, 1),
+  });
+  const value = fixture(),
+    socket = installSocket();
+  let summary: TraceFailureSummary | undefined;
+  let triggers = 0;
+  try {
+    const rejected = assert.rejects(
+      capture(
+        value.client,
+        worker,
+        value.marker,
+        () => {
+          triggers++;
+          socket.sockets[0]!.emit(
+            event({ headers: { "x-pgcf-trace": value.marker } }),
+          );
+          return new Promise(() => {});
+        },
+        async () => {},
+        {
+          eventTimeoutMs: 100,
+          onFailure: (value) => {
+            summary = value;
+          },
+        },
+      ),
+      { message: "trace_event_missing" },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    context.mock.timers.tick(100);
+    await rejected;
+    assert.equal(summary?.phase, "await_event");
+    assert.equal(summary?.trigger_dispatched, true);
+    assert.equal(summary?.trigger_completed, false);
+    assert.equal(summary?.parsed_request_events, 1);
+    assert.equal(summary?.correlated_events, 1);
+    assert.equal(triggers, 1);
+    assert.equal(socket.sockets[0]!.terminated, 1);
+    assert.equal(value.deletes.length, 1);
+  } finally {
+    socket.restore();
+  }
+});
+
+test("throwing failure diagnostics preserve the original error and exact cleanup", async () => {
+  const value = fixture(),
+    socket = installSocket();
+  const expected = new Error("ledger_refused");
+  const canary = randomBytes(32).toString("base64url");
+  let callbacks = 0;
+  let summary: TraceFailureSummary | undefined;
+  try {
+    await assert.rejects(
+      capture(
+        value.client,
+        worker,
+        value.marker,
+        async () => {
+          assert.fail("unexpected_trigger");
+        },
+        async () => {
+          throw expected;
+        },
+        {
+          onFailure: (value) => {
+            callbacks++;
+            summary = value;
+            throw new Error(canary);
+          },
+        },
+      ),
+      (error) => error === expected,
+    );
+    assert.equal(callbacks, 1);
+    assert.equal(Object.isFrozen(summary), true);
+    assert.deepEqual(summary, {
+      phase: "socket",
+      messages: 0,
+      bytes: 0,
+      parsed_request_events: 0,
+      correlated_events: 0,
+      trigger_dispatched: false,
+      trigger_completed: false,
+    });
+    assert.equal(socket.sockets.length, 0);
+    assert.deepEqual(value.deletes, [
+      `/workers/scripts/${worker}/tails/${value.tail.id}`,
+    ]);
+  } finally {
+    socket.restore();
+  }
+});
+
+test("rejected asynchronous failure diagnostics never delay termination or tail deletion", async (context) => {
+  context.mock.timers.enable({
+    apis: ["Date", "setTimeout"],
+    now: Date.UTC(2030, 0, 1),
+  });
+  const value = fixture(),
+    socket = installSocket();
+  let callbacks = 0;
+  try {
+    const rejected = assert.rejects(
+      capture(
+        value.client,
+        worker,
+        value.marker,
+        async () => {},
+        async () => {},
+        {
+          eventTimeoutMs: 100,
+          onFailure: async () => {
+            callbacks++;
+            throw new Error(randomBytes(32).toString("base64url"));
+          },
+        },
+      ),
+      { message: "trace_event_missing" },
+    );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    context.mock.timers.tick(100);
+    await rejected;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(callbacks, 1);
+    assert.equal(socket.sockets[0]!.terminated, 1);
+    assert.deepEqual(value.deletes, [
+      `/workers/scripts/${worker}/tails/${value.tail.id}`,
+    ]);
+  } finally {
+    socket.restore();
   }
 });
