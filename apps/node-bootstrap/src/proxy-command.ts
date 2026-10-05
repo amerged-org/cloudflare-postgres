@@ -80,8 +80,21 @@ export async function openCapability(
   ) {
     throw new Error("transport_target_mismatch");
   }
+  const callback = new URL(config.callback.url);
+  const endpoint = new URL(transport.websocket_url);
+  callback.protocol = "wss:";
+  if (
+    endpoint.origin !== callback.origin ||
+    endpoint.pathname !==
+      `/internal/v1/node-bootstrap/${config.spec.operation_id}/relay`
+  ) {
+    throw new Error("transport_endpoint_mismatch");
+  }
   const socket = new WebSocket(transport.websocket_url, {
-    headers: { [BOOTSTRAP_RELAY_HEADER]: transport.token },
+    headers: {
+      authorization: `Bearer ${config.callback.bearer}`,
+      [BOOTSTRAP_RELAY_HEADER]: transport.token,
+    },
     handshakeTimeout: 15_000,
     followRedirects: false,
     perMessageDeflate: false,
