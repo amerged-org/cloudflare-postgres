@@ -16,6 +16,7 @@
       "bucket_name": "pgcf-api-test",
       "jurisdiction": "eu",
     },
+    { "binding": "ARCHIVE_US", "bucket_name": "pgcf-api-us-test" },
   ],
   "vars": {
     "BOOTSTRAP_FIREWALL_BINDINGS": "<PROVIDER_INSTANCE_FIREWALL_UUID_MAP_JSON>",

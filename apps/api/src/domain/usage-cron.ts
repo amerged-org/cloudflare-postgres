@@ -3,7 +3,7 @@ import { DatabaseId, Timestamp } from "@pgcf/contracts";
 import { USAGE_HOUR_MS } from "@pgcf/contracts/usage";
 import { rollupUsageHour } from "./usage-rollup.ts";
 import { measureBackupUsage } from "./backup-usage.ts";
-import type { Env } from "../env.ts";
+import type { ArchiveEnvironment } from "./archive-bindings.ts";
 
 export const USAGE_CRON_PAGE_LIMIT = 24;
 export const USAGE_CRON_STATEMENT_LIMIT = 600;
@@ -106,7 +106,7 @@ const iso = (value: number) => new Date(value).toISOString();
 export async function runUsageCron(
   input: D1Database,
   now = Date.now(),
-  archive?: Pick<Env, "ARCHIVE" | "ARCHIVE_BUCKET_NAME">,
+  archive?: ArchiveEnvironment,
 ): Promise<UsageCronResult> {
   if (!Number.isSafeInteger(now) || now < 0)
     throw new Error("invalid_usage_cron_timestamp");

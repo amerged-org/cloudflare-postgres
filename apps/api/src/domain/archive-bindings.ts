@@ -2,11 +2,13 @@
 import { z } from "zod";
 import { BucketName, RegionId } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
-import type { Env } from "../env.ts";
-export type ArchiveEnvironment = Pick<
-  Env,
-  "ARCHIVE" | "ARCHIVE_BUCKET_NAME" | "ARCHIVE_BINDINGS"
->;
+export interface ArchiveEnvironment {
+  ARCHIVE: R2Bucket;
+  ARCHIVE_BUCKET_NAME: string;
+  ARCHIVE_BINDINGS?: string;
+  ARCHIVE_EU?: R2Bucket;
+  ARCHIVE_US?: R2Bucket;
+}
 const mapping = z.record(
   RegionId,
   z.strictObject({
