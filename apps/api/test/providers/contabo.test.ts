@@ -878,3 +878,21 @@ it("preserves a null instance display name returned by the actual firewall inven
   expect(actual.instances).toHaveLength(1);
   expect(actual.instances[0]!.displayName).toBeNull();
 });
+
+it("retains every additional provider address for complete network verification", async () => {
+  const f = setup(),
+    additionalIps = [
+      { v4: { ...f.instance.ipConfig.v4, ip: [198, 51, 100, 240].join(".") } },
+      { v4: { ...f.instance.ipConfig.v4, ip: [198, 51, 100, 241].join(".") } },
+    ];
+  f.set(() =>
+    Response.json({
+      data: [{ ...f.instance, additionalIps }],
+      _links: { self: `/v1/compute/instances/${f.instanceId}` },
+    }),
+  );
+  const actual = await f.client.getInstance(f.instanceId, {
+    requestId: f.requestId,
+  });
+  expect(Reflect.get(actual, "additionalIps")).toEqual(additionalIps);
+});

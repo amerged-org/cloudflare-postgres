@@ -99,6 +99,7 @@ export interface ContaboInstance {
   imageId?: string | null;
   defaultUser?: "root" | "admin" | "administrator";
   ipConfig: z.infer<typeof InstanceWire>["ipConfig"];
+  additionalIps: z.infer<typeof InstanceWire>["additionalIps"];
   ramMb: number;
   cpuCores: number;
   diskMb: number;
@@ -128,6 +129,7 @@ const toInstance = (value: z.infer<typeof InstanceWire>): Instance => ({
     ? {}
     : { defaultUser: value.defaultUser }),
   ipConfig: value.ipConfig,
+  additionalIps: value.additionalIps,
   ramMb: value.ramMb,
   cpuCores: value.cpuCores,
   diskMb: value.diskMb,
