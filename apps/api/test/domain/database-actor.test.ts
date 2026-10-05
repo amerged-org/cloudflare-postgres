@@ -76,6 +76,83 @@ it("fresh unknown actors reject hints without creating application tables or que
   expect(count()).toBe(0);
 });
 
+it("rejects a known hint flood at the durable aggregate allowance before D1 or wake", async () => {
+  const f = await ready();
+  vi.spyOn(Date, "now").mockReturnValue(Date.now());
+  await runInDurableObject(actor(f.id), (_instance, state) => {
+    state.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS database_admission(singleton INTEGER PRIMARY KEY CHECK(singleton=1),minute INTEGER NOT NULL,attempts INTEGER NOT NULL)",
+    );
+    state.storage.sql.exec(
+      "INSERT INTO database_admission VALUES(1,?,12000)",
+      Math.floor(Date.now() / 60000),
+    );
+  });
+  const count = admissionQueries();
+  const result = await actor(f.id).ensureAwake(f.id, "app");
+  expect(result).toEqual({ ok: false, sqlstate: "53300" });
+  expect(count()).toBe(0);
+  expect(await actor(f.id).ensureAwake(f.id, "unknown_role")).toEqual({
+    ok: false,
+    sqlstate: "28P01",
+  });
+  expect(count()).toBe(0);
+  expect(
+    await runInDurableObject(actor(f.id), (_instance, state) =>
+      state.storage.sql.exec("SELECT attempts FROM database_admission").one(),
+    ),
+  ).toEqual({ attempts: 12000 });
+  await evictDurableObject(actor(f.id));
+  expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "53300",
+  });
+  expect(count()).toBe(0);
+});
+
+it("atomically bounds a configured aggregate across valid roles and refuses invalid policy", async () => {
+  const f = await ready();
+  vi.spyOn(Date, "now").mockReturnValue(Date.now());
+  await env.DB.prepare(
+    `INSERT INTO roles(database_id,name,owner,password_ciphertext,password_iv,password_kid,created_at,updated_at)
+    SELECT database_id,'reader',0,password_ciphertext,password_iv,password_kid,created_at,updated_at FROM roles WHERE database_id=? AND name='app'`,
+  )
+    .bind(f.id)
+    .run();
+  await actor(f.id).seed(await readDatabasePresence(env.DB, f.id));
+  await runInDurableObject(actor(f.id), (instance) => {
+    Reflect.get(instance, "env").DATABASE_CONNECTION_LIMIT_PER_MINUTE = "2";
+  });
+  const allowed = await Promise.all(
+    ["app", "reader", "app", "reader"].map((role) =>
+      actor(f.id).ensureAwake(f.id, role),
+    ),
+  );
+  expect(allowed.filter((value) => value.ok)).toHaveLength(2);
+  expect(allowed.filter((value) => !value.ok)).toEqual([
+    { ok: false, sqlstate: "53300" },
+    { ok: false, sqlstate: "53300" },
+  ]);
+  expect(
+    await runInDurableObject(actor(f.id), (_instance, state) =>
+      state.storage.sql
+        .exec(
+          "SELECT count(*) count,MAX(attempts) attempts FROM database_admission",
+        )
+        .one(),
+    ),
+  ).toEqual({ count: 1, attempts: 2 });
+  await runInDurableObject(actor(f.id), (instance) => {
+    Reflect.get(instance, "env").DATABASE_CONNECTION_LIMIT_PER_MINUTE = "12001";
+  });
+  const count = admissionQueries();
+  expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
+    ok: false,
+    sqlstate: "53300",
+  });
+  expect(count()).toBe(0);
+});
+
 it("only a validated management seed for the exact actor creates its persistent schema", async () => {
   const id = newDatabaseId();
   const snapshot = {

@@ -106,6 +106,11 @@ async function admit(
           "57P03",
           "database is not accepting connections",
         );
+      case "53300":
+        throw new AdmissionFailure(
+          "53300",
+          "database connection rate limit exceeded",
+        );
       default:
         throw new AdmissionFailure("08006", "gateway connection failed");
     }
