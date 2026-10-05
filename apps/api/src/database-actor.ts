@@ -70,6 +70,7 @@ function admittedRoute(row: AdmissionRow): DatabaseAdmission {
 }
 
 export class DatabaseActor extends DurableObject<Env> {
+  private hasSchema: boolean | undefined;
   private waiters = new Map<
     string,
     { deadline: number; resolve: (ready: boolean) => void; owner: object }
@@ -78,23 +79,31 @@ export class DatabaseActor extends DurableObject<Env> {
   private wake: { operation: string; revision: number } | undefined;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
   private interruptPoll: (() => void) | undefined;
-  constructor(ctx: DurableObjectState, env: Env) {
-    super(ctx, env);
-    ctx.storage.sql.exec(
+  private initializeSchema(): void {
+    if (this.hasSchema) return;
+    this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS database_presence(singleton INTEGER PRIMARY KEY CHECK(singleton=1),database_id TEXT NOT NULL,revision INTEGER NOT NULL,updated_at TEXT NOT NULL,roles TEXT NOT NULL,deleted INTEGER NOT NULL CHECK(deleted IN(0,1)))",
     );
-    ctx.storage.sql.exec(
+    this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS database_wake(singleton INTEGER PRIMARY KEY CHECK(singleton=1),operation TEXT NOT NULL,revision INTEGER NOT NULL,hint_claimed INTEGER NOT NULL CHECK(hint_claimed IN(0,1)))",
     );
-    ctx.storage.sql.exec(
+    this.ctx.storage.sql.exec(
       "CREATE TABLE IF NOT EXISTS database_activity(singleton INTEGER PRIMARY KEY CHECK(singleton=1),revision INTEGER NOT NULL,observed_at TEXT NOT NULL,last_activity_at TEXT NOT NULL,active_connections INTEGER NOT NULL)",
     );
+    this.hasSchema = true;
   }
   private identity(id: string): void {
     if (!this.env.DATABASE_ACTOR.idFromName(id).equals(this.ctx.id))
       throw new Error("actor_identity_mismatch");
   }
   private presence(): DatabasePresence | undefined {
+    this.hasSchema ??=
+      this.ctx.storage.sql
+        .exec<{ count: number }>(
+          "SELECT count(*) count FROM sqlite_master WHERE type='table' AND name IN('database_presence','database_wake','database_activity')",
+        )
+        .toArray()[0]!.count === 3;
+    if (!this.hasSchema) return undefined;
     const row = this.ctx.storage.sql
       .exec<{
         database_id: string;
@@ -121,6 +130,7 @@ export class DatabaseActor extends DurableObject<Env> {
     if (!parsed.success) throw new Error("invalid_actor_snapshot");
     this.identity(parsed.data.database_id);
     await this.ctx.blockConcurrencyWhile(async () => {
+      this.initializeSchema();
       let next = parsed.data;
       const previous = this.presence();
       if (previous?.deleted) return;
