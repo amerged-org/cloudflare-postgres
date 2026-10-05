@@ -611,9 +611,9 @@ export class Reconciler {
       return recoveryRequired(db, "storage history is invalid");
     }
     const recoveryIntent=db.recovery ? JSON.stringify([db.recovery.operation_id,db.recovery.source_database_id,db.recovery.source_archive_path,db.recovery.source_storage_generation,db.recovery.backup_id,db.recovery.target_time ?? null]) : undefined;
-    if(storage?.recoveryIntent!==undefined && storage.recoveryIntent!==recoveryIntent)return recoveryRequired(db,"recovery source identity changed");
+    if(db.desired_state!=="deleted" && storage?.recoveryIntent!==undefined && storage.recoveryIntent!==recoveryIntent)return recoveryRequired(db,"recovery source identity changed");
     if(db.recovery && storage && storage.recoveryIntent===undefined && (storage.namespaceUid||storage.clusterUid))return recoveryRequired(db,"recovery source authority is missing");
-    if(storage?.recoveryMappedOperation && storage.recoveryMappedOperation!==db.recovery?.operation_id) return recoveryRequired(db,"recovery storage authority changed");
+    if(db.desired_state!=="deleted" && storage?.recoveryMappedOperation && storage.recoveryMappedOperation!==db.recovery?.operation_id) return recoveryRequired(db,"recovery storage authority changed");
     if(db.recovery && ctx)ctx={...ctx,recoveryFinalized:storage?.recoveryMappedOperation===db.recovery.operation_id};
     if (db.desired_state === "deleted") {
       if (
