@@ -12,7 +12,7 @@ import { open, stat } from "node:fs/promises";
 import { createConnection, createServer, isIP } from "node:net";
 import type { Socket } from "node:net";
 import { isAbsolute } from "node:path";
-import { request as httpsRequest } from "node:https";
+import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { checkServerIdentity } from "node:tls";
 import type { TLSSocket } from "node:tls";
 
@@ -78,6 +78,7 @@ const controlReasons = new Set([
   "address_invalid",
   "tls_verification",
   "family_mismatch",
+  "session_changed",
 ]);
 function safeControlReason(reason: string): boolean {
   return (
@@ -398,6 +399,7 @@ export function sourceObservation(
     keys: Record<string, string>;
   },
 ): ControlObservation {
+  const receivedAt = Date.now();
   const result = authenticated(HTTPS_CONTROL_DOMAIN, envelope, expected.keys);
   if (
     Object.keys(result).sort().join(",") !==
@@ -415,15 +417,15 @@ export function sourceObservation(
     blocked("source_unproven");
   fresh(
     result.observed_at,
-    new Date(Date.now() - 10_000).toISOString(),
-    Date.now(),
+    new Date(receivedAt - 10_000).toISOString(),
+    receivedAt,
     10_000,
   );
   return {
     address: ip(expected.socketRemote),
     port: expected.port,
     source: ip(result.source),
-    observed_at: result.observed_at,
+    observed_at: new Date(receivedAt).toISOString(),
     nonce: result.nonce,
   };
 }
@@ -433,6 +435,20 @@ export async function httpsSourceControl(
   keys: Record<string, string>,
   control: HttpsControl,
   deadline: number,
+): Promise<ControlObservation> {
+  return requestHttpsSourceControl(address, source, keys, control, deadline);
+}
+interface HttpsControlConnection {
+  agent: HttpsAgent;
+  socket?: TLSSocket;
+}
+async function requestHttpsSourceControl(
+  address: string,
+  source: string,
+  keys: Record<string, string>,
+  control: HttpsControl,
+  deadline: number,
+  connection?: HttpsControlConnection,
 ): Promise<ControlObservation> {
   let origin: URL;
   try {
@@ -466,7 +482,7 @@ export async function httpsSourceControl(
       family: isIP(source),
       localAddress: source,
       servername: origin.hostname,
-      agent: false,
+      agent: connection?.agent ?? false,
       method: "POST",
       path: "/source-control",
       checkServerIdentity: (_host, certificate) =>
@@ -506,6 +522,16 @@ export async function httpsSourceControl(
       const socket = response.socket as TLSSocket,
         socketLocal = socket.localAddress ?? "",
         socketRemote = socket.remoteAddress ?? "";
+      if (
+        connection &&
+        (socket.authorized !== true ||
+          socket.remotePort !== 443 ||
+          (connection.socket && socket !== connection.socket))
+      ) {
+        fail("session_changed");
+        response.destroy();
+        return;
+      }
       const chunks: Buffer[] = [];
       let size = 0;
       response.on("data", (bytes: Buffer) => {
@@ -541,7 +567,8 @@ export async function httpsSourceControl(
           });
           settled = true;
           clearTimeout(timer);
-          request.destroy();
+          if (connection) connection.socket = socket;
+          else request.destroy();
           resolve(result);
         } catch (error) {
           fail(controlErrorReason(error));
@@ -550,6 +577,71 @@ export async function httpsSourceControl(
     });
     request.end(body);
   });
+}
+export function createHttpsControlSession(
+  address: string,
+  source: string,
+  keys: Record<string, string>,
+  control: HttpsControl,
+  deadline: number,
+  sourceCheck: (source: string) => void,
+) {
+  const connection: HttpsControlConnection = {
+    agent: new HttpsAgent({
+      keepAlive: true,
+      maxSockets: 1,
+      maxFreeSockets: 1,
+      rejectUnauthorized: true,
+    }),
+  };
+  let closed = false,
+    failure: unknown = null,
+    publicSource: string | null = null;
+  let heartbeat: Promise<void> | null = null;
+  const observe = async () => {
+    if (failure) throw failure;
+    if (closed) blocked("control_invalid");
+    const observation = await requestHttpsSourceControl(
+      address,
+      source,
+      keys,
+      control,
+      deadline,
+      connection,
+    );
+    sourceCheck(observation.source);
+    if (publicSource !== null && publicSource !== ip(observation.source))
+      blocked("source_changed");
+    publicSource = ip(observation.source);
+    return observation;
+  };
+  const interval = setInterval(() => {
+    if (closed || heartbeat) return;
+    heartbeat = observe()
+      .then(
+        () => {},
+        (error) => {
+          failure = error;
+        },
+      )
+      .finally(() => {
+        heartbeat = null;
+      });
+  }, 20000);
+  interval.unref();
+  return {
+    observe,
+    close: async () => {
+      closed = true;
+      clearInterval(interval);
+      try {
+        await heartbeat;
+        if (failure) throw failure;
+      } finally {
+        connection.agent.destroy();
+      }
+    },
+  };
 }
 export async function routeSource(
   address: string,
@@ -604,6 +696,7 @@ export async function sourceControl(
   if (isIP(address) !== isIP(source) || !isIP(source))
     blocked("family_mismatch");
   const nonce = randomBytes(32).toString("hex");
+  let receivedAt = 0;
   const envelope = await new Promise<Envelope<ControlObservation>>(
     (resolve, reject) => {
       const socket = createConnection({
@@ -640,6 +733,7 @@ export async function sourceControl(
           ) as Envelope<ControlObservation>;
           settled = true;
           socket.destroy();
+          receivedAt = Date.now();
           resolve(parsed);
         } catch {
           fail("response_malformed");
@@ -657,11 +751,11 @@ export async function sourceControl(
     blocked("source_unproven");
   fresh(
     result.observed_at,
-    new Date(Date.now() - 10_000).toISOString(),
-    Date.now(),
+    new Date(receivedAt - 10_000).toISOString(),
+    receivedAt,
     10_000,
   );
-  return result;
+  return { ...result, observed_at: new Date(receivedAt).toISOString() };
 }
 export async function serveSourceControl(
   address: string,
@@ -762,6 +856,7 @@ export async function scanAllPorts(
     port: number;
     keys: Record<string, string>;
     https?: HttpsControl;
+    httpsSession?: ReturnType<typeof createHttpsControlSession>;
   },
   deadline: number,
   options: {
@@ -785,21 +880,23 @@ export async function scanAllPorts(
   if (control.https && control.port !== 443) blocked("control_invalid");
   const observe = async (phase: "before" | "after") => {
     try {
-      return await (control.https
-        ? httpsSourceControl(
-            control.address,
-            source,
-            control.keys,
-            control.https,
-            deadline,
-          )
-        : sourceControl(
-            control.address,
-            control.port,
-            source,
-            control.keys,
-            deadline,
-          ));
+      return await (control.httpsSession
+        ? control.httpsSession.observe()
+        : control.https
+          ? httpsSourceControl(
+              control.address,
+              source,
+              control.keys,
+              control.https,
+              deadline,
+            )
+          : sourceControl(
+              control.address,
+              control.port,
+              source,
+              control.keys,
+              deadline,
+            ));
     } catch (error) {
       throw new Error(
         `node_network_control_${phase}_${controlErrorReason(error)}`,

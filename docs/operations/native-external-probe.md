@@ -28,6 +28,13 @@ it refuses Worker subrequests and ambiguous/pseudo IPv4 headers. Select and reco
 Cloudflare IPv4 and IPv6 destination from that origin's DNS. The native helper pins each literal,
 TLS hostname and actual socket endpoints. The Worker does not claim to observe its CDN address.
 
+The helper validates the signed server time, then records local receipt time for scan ordering.
+A single verified TLS connection serves both targets, with fresh signed controls every twenty
+seconds and before/after each scan. Changed sources, a replacement socket or a failed heartbeat
+leave the measurement unproven. The connection is closed when collection ends. These HTTPS
+controls witness the live observer channel; the separate SMTP controls still establish new
+TCP/25 connections immediately around that port's measurement.
+
 Prepare `PGCF_NETWORK_HOSTED_CONFIG` privately as version `1`, with a random 64-hex `nonce`,
 `created_at`, `expires_at` (a maximum ten-minute interval), a random 32-byte `encryption_key`
 in canonical base64url, an independent measurement `signing_jwk`, and `network`. The latter is

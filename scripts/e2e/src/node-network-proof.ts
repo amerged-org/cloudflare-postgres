@@ -17,6 +17,7 @@ import {
   assertScanWorkers,
   blocked,
   canonical,
+  createHttpsControlSession,
   execute,
   fresh,
   hash,
@@ -457,65 +458,80 @@ export async function measureScans(
     member.addresses[family].map((address) => ({ member, address })),
   );
   let next = 0;
-  const workers = await Promise.allSettled(
-    Array.from({ length: Math.min(2, targets.length) }, async () => {
-      while (next < targets.length) {
-        const index = next++,
-          { member, address } = targets[index]!;
-        const scan = await scanAllPorts(
-          address,
-          source,
-          {
-            address: config.plan.scan_control[family],
-            port: config.plan.scan_control.port,
-            keys: config.control_keys,
-            ...(config.scan?.https_control
-              ? { https: config.scan.https_control }
-              : {}),
-          },
-          deadline,
-          {
-            sourceCheck: (observed) => assertScanSource(config, observed),
-            ...(config.scan?.tcp25_control
-              ? { tcp25Control: config.scan.tcp25_control }
-              : {}),
-          },
-        );
-        if (publicSource !== null && ip(scan.public_source) !== publicSource)
-          blocked("source_changed");
-        publicSource = ip(scan.public_source);
-        scans[index] = {
-          provider_instance_id: member.provider_instance_id,
-          address,
-          protocol: "tcp",
-          first_port: 1,
-          last_port: 65535,
-          scanned_ports: scan.scanned_ports,
-          open_ports: scan.open_ports,
-          started_at: scan.started_at,
-          observed_at: scan.observed_at,
-          before: scan.before,
-          after: scan.after,
-        };
-      }
-    }),
-  );
-  assertScanWorkers(workers);
-  if (!scans.length) blocked("scan_family_unavailable");
-  return signed(
-    MEASUREMENT_DOMAIN,
-    {
-      purpose: "pgcf-node-measurement/v1",
-      kind: "scan",
-      binding_sha256: scope(config.binding),
-      observed_at: new Date().toISOString(),
-      family,
-      source: publicSource!,
-      scans,
-    } as Measurement,
-    config.kid,
-    key,
-  );
+  const session = config.scan?.https_control
+    ? createHttpsControlSession(
+        config.plan.scan_control[family],
+        source,
+        config.control_keys,
+        config.scan.https_control,
+        deadline,
+        (observed) => assertScanSource(config, observed),
+      )
+    : null;
+  try {
+    const workers = await Promise.allSettled(
+      Array.from({ length: Math.min(2, targets.length) }, async () => {
+        while (next < targets.length) {
+          const index = next++,
+            { member, address } = targets[index]!;
+          const scan = await scanAllPorts(
+            address,
+            source,
+            {
+              address: config.plan.scan_control[family],
+              port: config.plan.scan_control.port,
+              keys: config.control_keys,
+              ...(config.scan?.https_control
+                ? { https: config.scan.https_control }
+                : {}),
+              ...(session ? { httpsSession: session } : {}),
+            },
+            deadline,
+            {
+              sourceCheck: (observed) => assertScanSource(config, observed),
+              ...(config.scan?.tcp25_control
+                ? { tcp25Control: config.scan.tcp25_control }
+                : {}),
+            },
+          );
+          if (publicSource !== null && ip(scan.public_source) !== publicSource)
+            blocked("source_changed");
+          publicSource = ip(scan.public_source);
+          scans[index] = {
+            provider_instance_id: member.provider_instance_id,
+            address,
+            protocol: "tcp",
+            first_port: 1,
+            last_port: 65535,
+            scanned_ports: scan.scanned_ports,
+            open_ports: scan.open_ports,
+            started_at: scan.started_at,
+            observed_at: scan.observed_at,
+            before: scan.before,
+            after: scan.after,
+          };
+        }
+      }),
+    );
+    assertScanWorkers(workers);
+    if (!scans.length) blocked("scan_family_unavailable");
+    return signed(
+      MEASUREMENT_DOMAIN,
+      {
+        purpose: "pgcf-node-measurement/v1",
+        kind: "scan",
+        binding_sha256: scope(config.binding),
+        observed_at: new Date().toISOString(),
+        family,
+        source: publicSource!,
+        scans,
+      } as Measurement,
+      config.kid,
+      key,
+    );
+  } finally {
+    await session?.close();
+  }
 }
 export function verifyMeasurements(
   config: CommonConfig,

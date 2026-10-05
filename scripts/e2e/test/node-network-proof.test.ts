@@ -25,6 +25,8 @@ import {
   execute,
   hash,
   httpsSourceControl,
+  HTTPS_CONTROL_DOMAIN,
+  createHttpsControlSession,
   signed,
   sourceControl,
   sourceObservation,
@@ -523,7 +525,7 @@ test("native sockets and source controls use actual same-family peer observation
           address: socket.localAddress!,
           port: socket.localPort!,
           source: socket.remoteAddress!,
-          observed_at: new Date().toISOString(),
+          observed_at: new Date(Date.now() + 30).toISOString(),
           nonce: nonce.trim(),
         };
         socket.end(
@@ -543,18 +545,15 @@ test("native sockets and source controls use actual same-family peer observation
   await once(server, "listening");
   const port = (server.address() as import("node:net").AddressInfo).port;
   try {
-    assert.equal(
-      (
-        await sourceControl(
-          loopback,
-          port,
-          loopback,
-          keys.trusted,
-          Date.now() + 10000,
-        )
-      ).source,
+    const observed = await sourceControl(
       loopback,
+      port,
+      loopback,
+      keys.trusted,
+      Date.now() + 10000,
     );
+    assert.equal(observed.source, loopback);
+    assert.ok(Date.parse(observed.observed_at) <= Date.now());
     assert.equal(
       await tcp(loopback, port, loopback, 1000, Date.now() + 10000),
       "connected",
@@ -656,6 +655,196 @@ test("HTTPS observer refuses signed family, origin, nonce, freshness and IPv6 so
     () => check({ observed_at: new Date(Date.now() - 20000).toISOString() }),
     /stale_measurement/,
   );
+});
+
+test("signed server clock skew is checked while HTTPS observation records local receipt time", (context) => {
+  const receivedAt = Date.now(),
+    keys = keyring(),
+    nonce = randomBytes(32).toString("hex"),
+    origin = "https://probe.example.com";
+  context.mock.method(Date, "now", () => receivedAt);
+  const expected = {
+    nonce,
+    origin,
+    address: ipv6(5),
+    port: 443,
+    localSource: ipv6(4),
+    socketLocal: ipv6(4),
+    socketRemote: ipv6(5),
+    keys: keys.trusted,
+  };
+  const observe = (serverAt: number) =>
+    sourceObservation(
+      signed(
+        HTTPS_CONTROL_DOMAIN,
+        {
+          nonce,
+          origin,
+          source: ipv6(4),
+          observed_at: new Date(serverAt).toISOString(),
+        },
+        keys.kid,
+        keys.privateKey,
+      ),
+      expected,
+    );
+  assert.equal(
+    observe(receivedAt + 30).observed_at,
+    new Date(receivedAt).toISOString(),
+  );
+  assert.throws(() => observe(receivedAt - 10001), /stale_measurement/);
+  assert.throws(() => observe(receivedAt + 5001), /stale_measurement/);
+});
+
+test("one pinned HTTPS session stays alive with fresh controls and closes after the scan", async (context) => {
+  const f = fixture(),
+    source = address(9),
+    origin = "https://probe.example.com",
+    socket = {
+      authorized: true,
+      remotePort: 443,
+      localAddress: source,
+      remoteAddress: f.plan.scan_control.ipv4,
+    };
+  const agents: unknown[] = [],
+    nonces = new Set<string>();
+  let destroyedRequests = 0,
+    sourceChecks = 0,
+    replaceSocket = false,
+    rejectHeartbeat = false;
+  const request = context.mock.method(
+    https,
+    "request",
+    (options: import("node:https").RequestOptions) => {
+      agents.push(options.agent);
+      assert.equal(options.localAddress, source);
+      assert.equal(options.hostname, f.plan.scan_control.ipv4);
+      assert.equal(options.servername, "probe.example.com");
+      assert.equal(typeof options.checkServerIdentity, "function");
+      const req = Object.assign(new EventEmitter(), {
+        destroy: () => {
+          destroyedRequests++;
+        },
+        end: (body: string) => {
+          const nonce = JSON.parse(body).nonce as string;
+          assert.equal(nonces.has(nonce), false);
+          nonces.add(nonce);
+          const response = Object.assign(new EventEmitter(), {
+            statusCode: rejectHeartbeat ? 503 : 200,
+            socket: replaceSocket ? { ...socket } : socket,
+            destroy: () => {},
+          });
+          req.emit("response", response);
+          response.emit(
+            "data",
+            Buffer.from(
+              JSON.stringify(
+                signed(
+                  HTTPS_CONTROL_DOMAIN,
+                  {
+                    nonce,
+                    source,
+                    origin,
+                    observed_at: new Date(Date.now() + 30).toISOString(),
+                  },
+                  f.keys.kid,
+                  f.keys.privateKey,
+                ),
+              ),
+            ),
+          );
+          response.emit("end");
+        },
+      });
+      return req;
+    },
+  );
+  syncBuiltinESMExports();
+  context.mock.timers.enable({ apis: ["setInterval"] });
+  const session = createHttpsControlSession(
+    f.plan.scan_control.ipv4,
+    source,
+    f.keys.trusted,
+    {
+      origin,
+      bearer: "private-test-bearer",
+      expires_at: new Date(Date.now() + 60000).toISOString(),
+    },
+    Date.now() + 60000,
+    () => {
+      sourceChecks++;
+    },
+  );
+  try {
+    await Promise.all([session.observe(), session.observe()]);
+    assert.ok(agents[0] instanceof https.Agent);
+    assert.equal(agents[1], agents[0]);
+    const agent = agents[0] as import("node:https").Agent;
+    assert.equal(agent.options.keepAlive, true);
+    assert.equal(agent.maxSockets, 1);
+    assert.equal(agent.options.rejectUnauthorized, true);
+    assert.equal(destroyedRequests, 0);
+    context.mock.timers.tick(20000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(sourceChecks, 3);
+    assert.equal(agents[2], agents[0]);
+    await session.close();
+    context.mock.timers.tick(20000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(sourceChecks, 3);
+    const replacement = createHttpsControlSession(
+      f.plan.scan_control.ipv4,
+      source,
+      f.keys.trusted,
+      {
+        origin,
+        bearer: "private-test-bearer",
+        expires_at: new Date(Date.now() + 60000).toISOString(),
+      },
+      Date.now() + 60000,
+      () => {},
+    );
+    try {
+      await replacement.observe();
+      replaceSocket = true;
+      await assert.rejects(replacement.observe(), {
+        message: "node_network_control_session_changed",
+      });
+    } finally {
+      replaceSocket = false;
+      await replacement.close();
+    }
+    const failedHeartbeat = createHttpsControlSession(
+      f.plan.scan_control.ipv4,
+      source,
+      f.keys.trusted,
+      {
+        origin,
+        bearer: "private-test-bearer",
+        expires_at: new Date(Date.now() + 60000).toISOString(),
+      },
+      Date.now() + 60000,
+      () => {},
+    );
+    await failedHeartbeat.observe();
+    rejectHeartbeat = true;
+    context.mock.timers.tick(20000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await assert.rejects(failedHeartbeat.observe(), {
+      message: "node_network_control_http_503",
+    });
+    await assert.rejects(failedHeartbeat.close(), {
+      message: "node_network_control_http_503",
+    });
+    const closedRequests = agents.length;
+    context.mock.timers.tick(20000);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(agents.length, closedRequests);
+  } finally {
+    await session.close();
+    request.mock.restore();
+    syncBuiltinESMExports();
+  }
 });
 
 test("reviewed process bytes are pinned and private artifact outputs are exclusive mode 0600", async () => {

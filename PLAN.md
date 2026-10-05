@@ -138,8 +138,12 @@ The corrected runtime is qualified, deployed and exactly bound in Cloudflare. Th
 EU2 job is configured at checkpoint zero; no EU2 disk write or join has occurred. Signed HTTPS source controls passed real
 IPv4/NAT and direct IPv6 checks. Hosted runner assignment has recovered and current CI is green;
 full 65,535-port IPv6 scans on both EU members and allowed-source management access passed.
-The hosted IPv4 trial failed with an initially masked scanner reason; bounded diagnostics now
-preserve known internal failure codes without exposing raw errors. Fresh combined signed
+The hosted IPv4 trials exposed masked control failures. Bounded diagnostics now retain the
+control phase and safe timeout/status/socket reasons. Three actual HTTPS controls measured the
+signed server clock 30/33/30 ms ahead of local receipt; control ordering now uses actual local
+receipt after validating signed server freshness. A pinned control connection with fresh signed
+heartbeats addresses the observed after-scan reconnection timeout. Focused regressions pass;
+the combined proof is not yet accepted. Fresh combined signed
 preparation remains pending. EU2 join, US installation
 and lost-worker recovery are not accepted. US remains unbought; the specific costed approval
 request is pending.
