@@ -809,3 +809,36 @@ it("instance detail exposes actual MAC and disk/network metadata without filling
   expect(instance.ipConfig.v4).toEqual(f.instance.ipConfig.v4);
   expect(instance.ipConfig).not.toHaveProperty("v6");
 });
+it("instance detail preserves actual absent SSH keys and nullable cancellation/application fields", async () => {
+  const f = setup(),
+    { sshKeys, ...instance } = f.instance;
+  expect(sshKeys).toEqual([]);
+  const body = { ...instance, cancelDate: null, applicationId: null };
+  f.set(() =>
+    Response.json({
+      data: [body],
+      _links: { self: "/v1/compute/instances/" + f.instanceId },
+    }),
+  );
+  const actual = await f.client.getInstance(f.instanceId, {
+    requestId: f.requestId,
+  });
+  expect(actual).toMatchObject({
+    id: f.instanceId,
+    cancelDate: null,
+    applicationId: null,
+    macAddress: f.instance.macAddress,
+    diskMb: f.instance.diskMb,
+    ipConfig: f.instance.ipConfig,
+  });
+  expect(actual).not.toHaveProperty("sshKeys");
+  f.set(() =>
+    Response.json({
+      data: [{ ...body, sshKeys: null }],
+      _links: { self: "/v1/compute/instances/" + f.instanceId },
+    }),
+  );
+  await expect(
+    f.client.getInstance(f.instanceId, { requestId: value() }),
+  ).rejects.toMatchObject({ code: "invalid_response" });
+});
