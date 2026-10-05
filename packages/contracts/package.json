@@ -12,7 +12,8 @@
     "./pg-wire": "./src/pg-wire.ts",
     "./gateway-control": "./src/gateway-control.ts",
     "./gateway-activity": "./src/gateway-activity.ts",
-    "./costs": "./src/costs.ts"
+    "./costs": "./src/costs.ts",
+    "./nodes": "./src/nodes.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
