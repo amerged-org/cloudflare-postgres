@@ -21,3 +21,13 @@ preUpgradeHook:
 lvm-localpv:
   analytics:
     enabled: false
+  lvmNode:
+    tolerations:
+      - key: pgcf.io/quarantine
+        operator: Exists
+        effect: NoSchedule
+  lvmController:
+    tolerations:
+      - key: pgcf.io/quarantine
+        operator: Exists
+        effect: NoSchedule
