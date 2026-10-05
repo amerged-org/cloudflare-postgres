@@ -185,6 +185,19 @@ during upstream startup). The packaged CLI includes the first-party and bundled-
 
 An install path is part of the open-source release phase in [PLAN.md](PLAN.md#phase-5--open-source-release).
 
+## Development checks
+
+The native configuration test requires the checksum-verified Talos 1.14.1 client for your
+operating system from the [official release](https://github.com/siderolabs/talos/releases/tag/v1.14.1):
+
+```sh
+export PGCF_TEST_TALOSCTL=/absolute/path/to/verified/talosctl
+CI=true pnpm test
+```
+
+CI downloads and verifies its Linux client before running this test. Missing native test
+configuration fails explicitly. Unit tests do not replace the live phase acceptance in PLAN.md.
+
 ## Documents
 
 - [PLAN.md](PLAN.md): scope, architecture, phases, decisions and status.
