@@ -45,6 +45,22 @@ const ARCHIVE_NAME = "archive";
 const ARCHIVE_SECRET = "archive-credentials";
 const MAINTENANCE_SECRET = "maintenance-credentials";
 
+function barmanSidecarConfiguration(ctx: BuildContext) {
+  return {
+    env: [{ name: "AWS_DEFAULT_REGION", value: ctx.backup.region }],
+    resources: {
+      requests: {
+        cpu: millicores(SIDECAR.requestCpuMillicores),
+        memory: mib(SIDECAR.requestMemoryMib),
+      },
+      limits: {
+        cpu: millicores(SIDECAR.limitCpuMillicores),
+        memory: mib(SIDECAR.limitMemoryMib),
+      },
+    },
+  };
+}
+
 function dnsName(value: string): boolean {
   return (
     value.length <= 253 &&
@@ -469,19 +485,7 @@ export function buildDatabaseManifests(
           data: { compression: "gzip" },
         },
         retentionPolicy: `${db.size.backup_retention_days}d`,
-        instanceSidecarConfiguration: {
-          env: [{ name: "AWS_DEFAULT_REGION", value: ctx.backup.region }],
-          resources: {
-            requests: {
-              cpu: millicores(SIDECAR.requestCpuMillicores),
-              memory: mib(SIDECAR.requestMemoryMib),
-            },
-            limits: {
-              cpu: millicores(SIDECAR.limitCpuMillicores),
-              memory: mib(SIDECAR.limitMemoryMib),
-            },
-          },
-        },
+        instanceSidecarConfiguration: barmanSidecarConfiguration(ctx),
       },
     },
     ...(db.recovery
@@ -507,6 +511,9 @@ export function buildDatabaseManifests(
                 wal: { compression: "gzip" },
                 data: { compression: "gzip" },
               },
+              // Barman v0.15.0 recovery Jobs take resources from the source
+              // ObjectStore rather than the target WAL archive ObjectStore.
+              instanceSidecarConfiguration: barmanSidecarConfiguration(ctx),
             },
           },
         ]

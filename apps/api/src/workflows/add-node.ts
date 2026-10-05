@@ -140,8 +140,8 @@ export async function reconcileNodeProvider(
     const audits = await provider.instanceAudits(
       {
         requestId: addition.dispatch_request_id,
-        startDate: addition.created_at,
-        endDate: new Date().toISOString(),
+        startDate: addition.created_at.slice(0, 10),
+        endDate: new Date().toISOString().slice(0, 10),
       },
       { requestId: crypto.randomUUID() },
     );

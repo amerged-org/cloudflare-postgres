@@ -44,7 +44,9 @@ maintenance role's TLS and minimal grants. Usage rollups and lifecycle API/Actor
 implemented. Manual Dev suspend/resume preserved data and storage and verified closed WAL in R2.
 Automatic idle sleep and one wake for ten concurrent connections passed in Dev. Instrumented cold
 connections have a twenty-run p50/p95/max of 8.412/9.160/9.708 seconds, accepted by the owner for v1.
-Cold-start optimization is later work. All twenty starts preserved data, the original cluster/claim and credential
+The owner-approved [Rust runtime and cold-start architecture](docs/architecture/rust-runtime-and-cold-starts.md)
+defines native regional services, a Rust/Wasm Edge and per-database warm reclaim; implementation
+and Dev acceptance are pending. All twenty starts preserved data, the original cluster/claim and credential
 UIDs/versions, and each caused one wake. The stale readiness snapshot
 is corrected; a verified read-only SQL archive check is deployed, but the first complete cold
 archive check still took 1.74 seconds. The finalized hourly awake-time measurement differs by
@@ -225,6 +227,8 @@ configuration fails explicitly. Unit tests do not replace the live phase accepta
 ## Documents
 
 - [PLAN.md](PLAN.md): scope, architecture, phases, decisions and status.
+- [Rust runtime and cold starts](docs/architecture/rust-runtime-and-cold-starts.md): approved
+  target architecture, migration sequence, warm routing and warm-reclaim acceptance.
 - [AGENTS.md](AGENTS.md): contributor and coding-agent brief.
 - [THIRD_PARTY.md](THIRD_PARTY.md): upstream components and licenses.
 - [infra/](infra/README.md): Talos, platform and backup recipes.

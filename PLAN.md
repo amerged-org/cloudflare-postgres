@@ -1,17 +1,17 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-05): **Phases 0 and 1 accepted in Dev; Phase 2 live checks are finishing.**
+Status (2026-10-05): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
 The first EU node and five Flux platform releases are Ready, with 95 GiB measured storage.
 The second existing EU VPS is untouched; no US VPS has been bought and no customer or platform
 production database has been migrated. The initial topology remains two EU VPS and one US VPS.
 
 The current regional image is
-`sha256:4440a19a0fb444aabda6c1ebb3fdc495753eac2bb92984c25d87efada20e103c`
-from `476eb655`, CI `37288330122`. All 658,538,044 expected detector bytes were scanned; all 26
-reviewed upstream noncredentials resolved, with zero unresolved findings. Anonymous manifest,
-configuration and all ten layer checks passed. Agent and both gateways remained continuously
-Ready for 61.856 s. The management API uses the same source with its existing bindings;
-node Workflows/Containers have not been activated. Signing remains Phase 5 work.
+`sha256:89039ba17f904bd90f41c3843389a41b84f509e2aee3e1a92d070ae66a2f77f9`
+from `2c3ba526`, CI `37325296426`. Local image qualification and anonymous manifest,
+configuration and every layer verification passed. Agent and both gateways remained continuously
+Ready for 62.641 s. The management API and Edge use `b196fbaa`; the private bootstrap
+Workflow, Container and VPC bindings are activated. Actual node firewall/rescue/operator-source
+inputs and live EU2/US acceptance remain outstanding. Signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
 API/D1/RegionLink/agent/Tunnel/VPC HTTP/gateway path through `db.ohmyho.st`, with verified
@@ -24,13 +24,16 @@ Phase 2's last complete cold series measured p50/p95/max 8.412/9.160/9.708 s acr
 independent wakes, twenty distinct Pods and the same cluster/PVC. Each caused one wake and one
 configuration revision, preserving data, rollback absence and role Secret identities. On 2026-10-05
 the owner accepted the current cold-start times for v1. The original ≤8 s p95 target no longer
-blocks current acceptance; revisit cold-start performance later. Ten simultaneous cold connections coalesced to one wake. A real
+blocks current acceptance. The approved Rust runtime and cold-start workstream is described below
+and in [the architecture proposal](docs/architecture/rust-runtime-and-cold-starts.md).
+Ten simultaneous cold connections coalesced to one wake. A real
 read-only transaction prevented idle sleep for 74 s. An always-warm diagnostic measured new
 connection plus first read p95 734.438 ms; it is not an application or load-capacity guarantee.
 Suspend/resume secured the closed WAL in R2. Hourly awake-time deviation was at most 19.748 s,
 below the 60 s target. Resize preserved storage/data in 28.046 s; held-client reconnect counts
-remain unmeasured. RAM/storage allocation and connection usage are measured; storage-used bytes
-remain an explicit gap. Cost attribution is deferred: the owner supplied 13.55 EUR per existing
+remain unmeasured. RAM/storage allocation and connection usage are measured. The new authenticated
+kubelet collector measured 185,159,680 used bytes of a 5,368,709,120-byte volume on the recovery
+source; missing volume observations remain unknown. Cost attribution is deferred: the owner supplied 13.55 EUR per existing
 VPS per month. PGCF supplies resource/consumption metrics; adopter pricing and billing remain
 exclusively in the adopter repository.
 
@@ -70,19 +73,27 @@ AuthenticationOk). The ten-minute unknown alarm is locally tested, not yet live-
 Actor schema patch passed all 304 API tests: unknown hints create no application tables, while
 validated management seeding preserves existing persistent state. Its live delivery remains pending.
 
-Phase 3 software and native images are prepared, not live-accepted. The Dev D1 export restored
+Phase 3 software and native images are delivered, not live-accepted. The Dev D1 export restored
 locally with clean integrity/foreign-key checks; four additive bootstrap migrations rehearsed
 against that export and applied in Dev. The existing first-node provider/Kubernetes identity and
 three encrypted agent/seed/join custody records are now imported with fresh provider checks,
 exact ciphertext readback and UID-guarded node labels. The existing agent key was retained;
 no provider mutation, order or VPS bootstrap was triggered. The native
-bootstrap image is qualified but private under GitHub organization policy. Fixed-source transport,
-signed network evidence, real EU2 join and new-region platform installation remain outstanding.
-The existing Flux source and both Kustomizations now use reviewed `476eb655`; all five
-HelmReleases remained Ready for 61.824 s after the quarantine-toleration upgrades. The approved
-regional image digest was preserved and EU2 remains untouched. CI `37292188983` later failed the
-1,000-idle-upgrade assertion; focused and ordered local reruns pass. Its cause is unproven;
-count-only diagnostics preserve the original count, deadlines and assertions for the next CI run.
+bootstrap image is qualified and mirrored into the private Cloudflare registry with a complete
+readback comparison. A real Worker reached the first-node relay through the dedicated private
+Tunnel/VPC service; anonymous calls were refused and the temporary probe was deleted.
+The additive recovery migrations and API Workflow/Container bindings are delivered. All five
+HelmReleases remain Ready on the preserved first node. Signed network evidence, real EU2 join
+and new-region platform installation remain outstanding. The latest CI is green; fixed-port
+regional test files now run serially with their original assertions.
+
+The recovery source has two confirmed SQL markers and a real R2 base backup. The first API
+restore recovered PostgreSQL but could not delete its temporary administration Secret; the
+bound-identity delete fix is deployed. Its retry failed because the Barman recovery Job's sidecar
+lacked CPU/memory limits required by the namespace quota. Both failed targets were deleted
+through the API with the source preserved. Recovery-source sidecar configuration and uncertain
+Contabo-order audit date fixes pass reproducing local tests; their delivery and the successful
+full/PITR/deleted-source recovery proofs remain pending.
 
 Operational Cloudflare, Barman R2 and PGCF admin/agent credentials have no configured expiry.
 Routing/control tokens retain their short security deadlines. Read-only adopter inventory remains
@@ -90,8 +101,15 @@ private; ownership mapping, remaining extensions, peak connection rates and migr
 be verified before migration. Operator readiness remains incomplete; adopter migration and public
 release follow separately.
 
+On 2026-10-05 the owner approved native Rust for the regional gateway, controller, bootstrap relay
+and node reclaimer, and Rust/Wasm for the Edge Worker. TypeScript remains the Cloudflare management
+and orchestration language. This is the accepted target architecture; runtime migration and its
+Dev acceptance are pending. The existing deployed TypeScript runtime and measured v1 acceptance
+remain the current implementation. See the [Rust runtime and cold-start proposal](docs/architecture/rust-runtime-and-cold-starts.md).
+
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
-AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.
+AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses. Detailed
+architecture proposals live in `docs/architecture/`; measured phase results remain in this file.
 
 ## 1. Goal
 
@@ -136,7 +154,12 @@ scope, first in Dev and then in production. US remains the default and EU remain
 
 ## 3. Architecture
 
-The diagrams are in [README.md](README.md#architecture).
+The diagrams are in [README.md](README.md#architecture). The component table and flows below
+describe the current implementation. The owner-approved Rust target replaces the regional
+gateway, agent/controller and bootstrap relay with native services, adds an isolated node
+reclaimer, and moves the Edge Worker to Rust/Wasm. Management APIs, Durable Objects and Workflows
+remain TypeScript. The [architecture proposal](docs/architecture/rust-runtime-and-cold-starts.md)
+defines the warm route cache, direct Pod-IP/TLS path, configuration fingerprints and migration.
 
 | Component                 | Runs on                              | Responsibility                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | ------------------------- | ------------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -158,7 +181,9 @@ The diagrams are in [README.md](README.md#architecture).
 - CNPG `Cluster`:
   - 1 instance, pinned PostgreSQL 18 image.
   - StorageClass `pgcf-lvm` with the size class storage.
-  - Memory requests = limits from the size class.
+  - Current memory requests = limits from the size class. The approved warm-reclaim design
+    introduces an explicit class policy with a PostgreSQL memory request below its limit,
+    configured before idle transitions; full placement reservations remain in force initially.
   - `nodeSelector` on the placed node; `enableSuperuserAccess: false`.
   - `initdb` database named after the database ID (the PostgreSQL database name equals the ID),
     owned by role `app`; additional roles via `managed.roles`.
@@ -547,7 +572,9 @@ For v1, integrators keep platform databases and latency-sensitive applications r
 Where the application provides enough lead time, authenticated early wake belongs in the
 adopter's application flow. A first-user-action target below one second must be measured in that
 flow; it is not a subsecond cold-start guarantee. CNPG hibernation removes Pods and retains
-volumes. Shared PostgreSQL processes and process/VM snapshots remain later research.
+volumes. The approved Rust runtime workstream below adds per-database warm idle with bounded
+memory reclaim while keeping the same PostgreSQL process and volume. Warm idle remains awake
+for metering. Shared PostgreSQL processes and process/VM snapshots remain separate later research.
 
 Build:
 
@@ -563,7 +590,9 @@ Live acceptance:
 - The database hibernates after its idle window.
 - Record p50/p95/max for 20 cold connects. The owner accepted the measured current startup
   times for v1 on 2026-10-05: p95 9.160 s in the completed series, with subsequent diagnostics
-  at 8.645–9.772 s. Reevaluate cold starts later; ≤8 s remains a future optimization target.
+  at 8.645–9.772 s. The historical cold timer ends at connection completion; the warm diagnostic
+  includes the first read, so their percentiles are not interchangeable. The approved Rust runtime
+  workstream measures both endpoints explicitly; ≤8 s remains a future cold-connect target.
   Integrators must choose connection timeouts covering cold starts or use early wake/warm classes.
 - 10 parallel connects to a sleeping database cause exactly one wake.
 - Usage `awake_seconds` matches the lifecycle within 60 s per hour.
@@ -652,13 +681,50 @@ Build:
 Acceptance: a fresh Cloudflare account and a fresh VPS reach Phase 1 acceptance by following only
 the docs.
 
+### Rust runtime and fast compute lifecycle — approved architecture (2026-10-05)
+
+The owner selected Rust as the target for the regional server applications and the Edge data
+path. Measurements validate the resulting implementation and latency; a CPU profile is not an
+entry gate for this architecture choice. The detailed design is in
+[docs/architecture/rust-runtime-and-cold-starts.md](docs/architecture/rust-runtime-and-cold-starts.md).
+
+Implement in this order, with separate binaries/images in a shared Rust workspace:
+
+1. Replace the regional gateway while preserving routing, PostgreSQL/TLS, bounded streams,
+   authenticated activity, quiescence and persistent fence contracts.
+2. Replace the regional controller and bootstrap relay. Use targeted desired-state pulls,
+   serialized per-database reconciliation, wake-priority queues, Kubernetes watches and immediate
+   database observations; collect inventories, backup statistics and usage independently.
+3. Publish verified versioned Pod-IP routes with separate TLS identities. Cache them in the
+   gateway, bind admission to route revisions, and avoid configuration reapplication when its
+   fingerprint and runtime identity are unchanged. A new Pod receives fresh runtime verification.
+4. Move the full Edge Worker to Rust/Wasm while preserving Durable Object bindings, VPC HTTP and
+   unopened native WebSocket forwarding. Versioned Actor snapshots and mutation barriers keep D1
+   authority while shortening warm admission.
+5. Add a scoped Rust node reclaimer and test `warm_reclaim` on an isolated accepted Dev worker
+   using encrypted Talos swap/zswap. PostgreSQL, CNPG probes and Barman continue running. Explicit
+   suspend still requires resume; full placement reservations remain unchanged initially.
+6. Separately develop proxy-side SCRAM, snapshot/freezing research and native CLI connection reuse.
+
+Keep one controller during handoff, preserve persisted execution state and Secrets, and delete
+replaced TypeScript code after successful Dev acceptance. Initial SCRAM remains end to end;
+proxy authentication requires its own versioned credential contract. Partial database observations
+must preserve complete node/orphan inventory; ready notifications follow guarded D1 acceptance.
+
+Acceptance covers actual Dev SQL, transactions, COPY, role and Pod changes, watch loss, restarts,
+fences and hibernation in the existing single CI/Dev workflow. Measure connection completion and
+first successful read separately. Warm-reclaim acceptance uses twenty independent five-minute
+idle runs and separate thirty-/120-minute soaks. The prepared/warm path targets a first successful
+read below one second; true Pod cold starts are reported separately. This workstream does not
+reopen the accepted v1 latency or claim that the target runtime is already deployed.
+
 ### Later
 
-Cold-start optimization/readiness push, density tuning/additional classes/sleeping factors,
+Density tuning/additional classes/sleeping factors,
 maximum-throughput stress matrices, an additional pooler, cost attribution and scheduled rotation.
 Public release polish and blank foreign-account installation acceptance follow operator readiness.
 
-Später Backup und Replikation so erweitern, dass bei Serververlust keine bestätigten Daten verloren gehen.
+Later, extend backups and replication so that losing a server does not lose acknowledged transactions.
 Relocation of sleeping databases, branching, other VPS providers, an HTTP SQL endpoint, PostgREST,
 a Studio workbench.
 
@@ -726,11 +792,14 @@ Publish public images instead.
   supported.
 - Xata OSS (Apache-2.0, CNPG-based) is active. Its SNI gateway is not needed in this design.
 
-## 9. Decisions (do not reopen without a measured reason)
+## 9. Decisions (owner-approved changes or a measured reason)
+
+The runtime target was explicitly approved by the owner on 2026-10-05. Current deployed behavior
+is distinguished from that target below; selecting Rust is not conditional on a profiling result.
 
 | Topic               | Decision                                                                                                                                                                          |
 | ------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Language            | TypeScript everywhere (Workers, agent and gateway on Node 24), shared zod contracts                                                                                               |
+| Language            | Approved target: native Rust regional gateway/controller/relay/reclaimer and Rust/Wasm Edge; TypeScript API, Durable Objects and Workflows; CLI/provisioning initially Node; shared zod contracts with Rust conformance. Runtime migration pending. |
 | API                 | Hono + `@hono/zod-openapi`; OpenAPI and client generated from code                                                                                                                |
 | Region link         | Agent opens an outbound WebSocket to `RegionLink`, plus a 60 s full-state pull; desired state in D1 is the truth                                                                  |
 | Endpoint            | One hostname, `db.<domain>` (Worker custom domain). No per-database or per-region hostnames, no wildcard DNS; the region is routing data in D1                                    |
@@ -740,18 +809,19 @@ Publish public images instead.
 | Edge to region      | VPC HTTP service with unopened native WebSocket forwarding selected in Dev (235 ms capability check); VPC TCP raw streams rejected; signed Tunnel route remains fallback          |
 | Desired state       | Deletion is an explicit tombstone; absence from a pull never deletes; generations only increase and the agent ignores older ones                                                  |
 | Database topology   | One CNPG Cluster with 1 instance per database, namespace per database, pinned to a node                                                                                           |
-| Sleep               | CNPG declarative hibernation                                                                                                                                                      |
+| Sleep               | Current: CNPG declarative hibernation. Approved addition: per-database warm reclaim with PostgreSQL running; explicit suspend remains gated until resume.                            |
 | Backups             | Barman Cloud plugin to R2; daily base backup, continuous WAL, retention per size class                                                                                            |
 | Metering            | Hourly; derived from lifecycle events, samples and gateway stream counters; no per-minute billing                                                                                 |
 | Budgets             | None in PGCF; integrators suspend and resume                                                                                                                                      |
 | Compute autoscaling | None; manual resize by size class                                                                                                                                                 |
 | Cluster             | One Talos/Kubernetes cluster per region                                                                                                                                           |
 | Initial topology    | Two EU VPS (control plane + worker, plus worker) and one US VPS (control plane + worker); recovery from R2                                                                        |
-| Tests               | vitest with the Cloudflare vitest plugin for Workers, `node:test` for regional code, `scripts/e2e` live against Dev                                                               |
+| Tests               | Current: Workers vitest and regional `node:test`; Rust unit/conformance checks join the existing single CI as services migrate; `scripts/e2e` provides live Dev acceptance.         |
 
 Open questions with defaults:
 
-- **Wake time:** measure in Phase 2.
+- **Wake time:** current v1 cold-connect latency is accepted. The Rust workstream measures
+  connect and first read separately, targeting subsecond prepared/warm reads.
 - **`archive_timeout`:** default 300 s for the smallest class and 60 s for larger ones. R2 Class A
   operations scale with WAL segments.
 - **Sleeping reservation factor:** 1.0 until Phase 4 measurement.
@@ -769,15 +839,17 @@ Open questions with defaults:
   run.
 - The repository is public. Never print or commit secrets, `.env*`, kubeconfigs or Talos configs.
 - New paid resources (VPS, plans) and production writes need the owner's explicit, costed go.
-- Documentation lives in PLAN.md, README.md, AGENTS.md, THIRD_PARTY.md, the infra READMEs and,
-  later, `docs/operations/` runbooks.
+- Repository documentation is written in English; owner discussions may be in German.
+- Documentation lives in PLAN.md, README.md, AGENTS.md, THIRD_PARTY.md, the infra READMEs,
+  `docs/operations/` runbooks and `docs/architecture/` proposals. Architecture proposals describe
+  approved targets; phase results and measured numbers remain in section 11.
 
-Target layout:
+Current implementation layout (the approved Rust workspace/binaries follow the architecture proposal):
 
 ```text
 apps/api              Cloudflare Worker: /v1 API, Durable Objects, Workflows, cron
-apps/edge             Cloudflare Worker: database WebSocket proxy
-apps/regional         Node image: `agent` and `gateway` commands
+apps/edge             current TypeScript Worker; approved target is full Rust/Wasm Edge
+apps/regional         current Node image; regional services migrate to separate Rust binaries/images
 apps/node-bootstrap   Cloudflare Container image: Contabo → Talos node bootstrap (Phase 3)
 packages/contracts    shared zod schemas
 scripts/ci            image qualification, scanner and registry CI helpers
@@ -785,6 +857,8 @@ scripts/e2e           live end-to-end acceptance
 infra/talos           Talos patches and Contabo rescue install recipe
 infra/platform        Flux platform baseline (pinned)
 infra/backups         CNPG/Barman/R2 backup and restore reference
+docs/architecture     approved architecture proposals, including Rust runtime and cold starts
+docs/operations       operator installation, recovery and credential runbooks
 ```
 
 ## 11. Status

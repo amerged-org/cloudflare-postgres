@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { newNodeId, randomString } from "@pgcf/contracts";
 import { NodeAddition } from "@pgcf/contracts/nodes";
+import { ContaboClient } from "../../src/providers/contabo.ts";
 import {
   approveNodePurchase,
   configureNodeRegionPolicy,
@@ -338,9 +339,42 @@ describe("node composition with actual Workers/D1", () => {
     await dispatchNodeOrder(settings, addition.intent.operation_id, {
       order: post,
     });
+    const auditQueries: URLSearchParams[] = [];
+    const client = new ContaboClient({
+      clientId: crypto.randomUUID(),
+      clientSecret: crypto.randomUUID(),
+      username: crypto.randomUUID(),
+      password: crypto.randomUUID(),
+      fetcher: async (input, init) => {
+        const url = new URL(String(input));
+        if (url.hostname === "auth.contabo.com")
+          return Response.json({
+            access_token: crypto.randomUUID(),
+            token_type: "Bearer",
+            expires_in: 60,
+          });
+        expect(init?.method).toBe("GET");
+        expect(url.pathname).toBe("/v1/compute/instances/audits");
+        auditQueries.push(url.searchParams);
+        return Response.json({
+          data: [],
+          _pagination: {
+            page: 1,
+            size: 100,
+            totalElements: 0,
+            totalPages: 0,
+          },
+          _links: {
+            self: url.pathname,
+            first: url.pathname,
+            last: url.pathname,
+          },
+        });
+      },
+    });
     await reconcileNodeProvider(settings, addition.intent.operation_id, {
       getInstance: vi.fn(),
-      instanceAudits: vi.fn(async () => []),
+      instanceAudits: client.instanceAudits.bind(client),
     });
     const resumed = await readNodeAddition(
       env.DB,
@@ -350,6 +384,16 @@ describe("node composition with actual Workers/D1", () => {
     expect(resumed.status).toBe("unknown");
     expect(resumed.dispatch_request_id).toBe(dispatched.dispatch_request_id);
     expect(resumed.slot_held).toBe(true);
+    expect(auditQueries).toHaveLength(1);
+    expect(auditQueries[0]!.get("requestId")).toBe(
+      dispatched.dispatch_request_id,
+    );
+    expect(auditQueries[0]!.get("startDate")).toBe(
+      dispatched.created_at.slice(0, 10),
+    );
+    expect(auditQueries[0]!.get("endDate")).toBe(
+      new Date().toISOString().slice(0, 10),
+    );
   });
   it("makes an autoscale dry run from real headroom without creating a reservation", async () => {
     const f = await configured();

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import test from "node:test";
+import { SIDECAR } from "@pgcf/contracts";
 import { recoveryFixture } from "./recovery-fixture.ts";
 import { Reconciler } from "../../src/agent/reconcile.ts";
 import { buildDatabaseManifests } from "../../src/agent/builders/index.ts";
@@ -33,6 +34,39 @@ test("uses source database recovery and distinct archive rather than creating an
     record(record(source.spec).configuration).destinationPath,
     db.recovery!.source_archive_path,
   );
+});
+
+test("recovery Job Barman sidecar meets namespace CPU and memory limit requirements", () => {
+  const { db, ctx } = recoveryFixture();
+  const manifests = buildDatabaseManifests(db, ctx);
+  const cluster = manifests.find((o) => o.kind === "Cluster")!;
+  const external = record(cluster.spec).externalClusters;
+  assert.ok(Array.isArray(external));
+  // v0.15.0 recovery Jobs read the external source ObjectStore resources,
+  // independently of the ObjectStore used by the instance's WAL archiver.
+  const sourceName = record(record(external[0]).plugin).parameters;
+  const source = manifests.find(
+    (o) =>
+      o.kind === "ObjectStore" &&
+      o.metadata.name === record(sourceName).barmanObjectName,
+  )!;
+  assert.ok(source);
+  const spec = record(source.spec);
+  const sidecar = record(spec.instanceSidecarConfiguration);
+  assert.deepEqual(sidecar.resources, {
+    requests: {
+      cpu: `${SIDECAR.requestCpuMillicores}m`,
+      memory: `${SIDECAR.requestMemoryMib}Mi`,
+    },
+    limits: {
+      cpu: `${SIDECAR.limitCpuMillicores}m`,
+      memory: `${SIDECAR.limitMemoryMib}Mi`,
+    },
+  });
+  assert.deepEqual(sidecar.env, [
+    { name: "AWS_DEFAULT_REGION", value: ctx.backup.region },
+  ]);
+  assert.equal(spec.retentionPolicy, undefined);
 });
 test("SQL failure never publishes a target and restart can resume the same recovery storage", async () => {
   const { db, ctx } = recoveryFixture(),

@@ -17,8 +17,13 @@ Delete unused code, files and branches; no parked, held or frozen work. Git hist
 No mocks, stubs or hardcoded data in product code; acceptance only from real Dev systems.
 Test the logic you write; write the failing test first for bug fixes; no test matrices; one CI workflow.
 Record phase results and measured numbers in PLAN.md Status; no per-change evidence documents.
-Docs live in PLAN.md, README.md, THIRD_PARTY.md, infra READMEs and docs/operations runbooks.
-TypeScript everywhere (Workers, regional agent and gateway) with shared zod contracts.
+Repository documentation is written in English; discussion with the owner may be in German.
+Docs live in PLAN.md, README.md, THIRD_PARTY.md, infra READMEs, docs/operations runbooks and docs/architecture proposals.
+Approved runtime target: native Rust for the regional gateway, controller, bootstrap relay and node reclaimer; Rust/Wasm for the Edge Worker.
+TypeScript remains for the management API, Durable Objects and Workflows; CLI and provisioning tools initially remain on Node.js.
+Shared zod contracts remain authoritative initially; Rust consumers use generated schemas/constants and behavioral conformance tests.
+Read docs/architecture/rust-runtime-and-cold-starts.md for the approved migration sequence and cold-start design; the deployed runtime remains TypeScript until replacement passes Dev acceptance.
+Rust is an owner-approved architecture choice; measurements validate its implementation, rather than being a prerequisite for choosing it.
 First-party code is Apache-2.0; upstream components keep their own licenses.
 Pin upstream versions and digests; record licenses and notices in THIRD_PARTY.md.
 The repository is public: never print or commit secrets, .env* files, kubeconfigs or Talos configs.
