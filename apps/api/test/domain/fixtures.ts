@@ -34,6 +34,15 @@ export async function cleanupFixtures(): Promise<void> {
       env.DB.prepare(
         "DELETE FROM node_provider_mutations WHERE operation_id IN(SELECT operation_id FROM node_additions WHERE region_id IN(?,?))",
       ).bind(region, foreign),
+      env.DB.prepare(
+        "DELETE FROM node_network_mutations WHERE operation_id IN(SELECT operation_id FROM node_additions WHERE region_id IN(?,?))",
+      ).bind(region, foreign),
+      env.DB.prepare(
+        "DELETE FROM node_network_firewalls WHERE operation_id IN(SELECT operation_id FROM node_additions WHERE region_id IN(?,?))",
+      ).bind(region, foreign),
+      env.DB.prepare(
+        "DELETE FROM node_network_preparations WHERE operation_id IN(SELECT operation_id FROM node_additions WHERE region_id IN(?,?))",
+      ).bind(region, foreign),
       env.DB.prepare("DELETE FROM node_additions WHERE region_id IN(?,?)").bind(
         region,
         foreign,

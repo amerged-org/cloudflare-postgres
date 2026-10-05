@@ -13,7 +13,6 @@ import {
 } from "@pgcf/contracts";
 import {
   NodeBootstrapAuthority,
-  NodeBootstrapInput,
   NodeBootstrapSpec,
 } from "../../../../packages/contracts/src/node-bootstrap.ts";
 import {

@@ -12,6 +12,7 @@ import { contaboClient } from "../domain/bootstrap-relay.ts";
 import {
   readBootstrapJob,
   finalizeNodeAdmission,
+  type BootstrapJobRow,
 } from "../domain/bootstrap-jobs.ts";
 import {
   claimNodeDispatch,
@@ -24,6 +25,7 @@ import {
   NodeStateError,
 } from "../domain/node-state.ts";
 import { placePendingDatabases } from "../domain/node-capacity.ts";
+import { ensureNodeNetwork } from "../domain/node-network.ts";
 
 function orderInput(
   env: Env,
@@ -195,35 +197,39 @@ export async function reconcileNodeProvider(
 export async function ensureNodeRescue(
   env: Env,
   operationId: string,
-  provider: Pick<
-    ContaboClient,
-    "getInstance" | "rescue" | "actionAudits"
-  > = contaboClient(env),
+  provider?: Pick<ContaboClient, "getInstance" | "rescue" | "actionAudits">,
 ): Promise<boolean> {
-  const addition = await readNodeAddition(env.DB, operationId),
-    job = await readBootstrapJob(env.DB, operationId);
+  const addition = await readNodeAddition(env.DB, operationId);
+  const job = await env.DB.prepare(
+    "SELECT * FROM node_bootstrap_jobs WHERE operation_id=?",
+  )
+    .bind(operationId)
+    .first<BootstrapJobRow>();
   if (
     !addition.provider_instance_id ||
     !addition.audit ||
-    !job.authorized ||
-    job.admitted ||
-    job.cancelled
+    !["audited", "bootstrapping"].includes(addition.status) ||
+    (job !== null && (!job.authorized || job.admitted || job.cancelled))
   )
     return false;
-  const checkpoint = JSON.parse(job.checkpoint_json) as { stage: string };
-  if (checkpoint.stage !== "created") return Boolean(job.rescue_active);
-  if (addition.checkpoint?.stage !== "network_protected") return false;
-  const actual = await provider.getInstance(addition.provider_instance_id, {
+  if (job !== null && JSON.parse(job.checkpoint_json).stage !== "created")
+    return Boolean(job.rescue_active);
+  if (!(await ensureNodeNetwork(env, operationId))) return false;
+  const client = provider ?? contaboClient(env);
+  const actual = await client.getInstance(addition.provider_instance_id, {
     requestId: crypto.randomUUID(),
   });
   if (actual.status === "rescue") {
-    await env.DB.prepare(
-      "UPDATE node_bootstrap_jobs SET rescue_active=1 WHERE operation_id=? AND input_hash=? AND authorized=1 AND admitted=0 AND cancelled=0",
-    )
-      .bind(operationId, job.input_hash)
-      .run();
+    if (job !== null)
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET rescue_active=1 WHERE operation_id=? AND input_hash=? AND authorized=1 AND admitted=0 AND cancelled=0",
+      )
+        .bind(operationId, job.input_hash)
+        .run();
     return true;
   }
+  if (!["running", "stopped", "uninstalled"].includes(actual.status))
+    return false;
   const sshKeys = z
     .array(z.string().regex(/^[1-9]\d{0,18}$/))
     .min(1)
@@ -249,7 +255,7 @@ export async function ensureNodeRescue(
     let state = "unknown",
       code = "provider_unknown";
     try {
-      const result = await provider.rescue(
+      const result = await client.rescue(
         addition.provider_instance_id,
         { sshKeys },
         { requestId },
@@ -271,7 +277,7 @@ export async function ensureNodeRescue(
       .bind(operationId)
       .first<{ request_id: string }>();
     if (mutation)
-      await provider.actionAudits(
+      await client.actionAudits(
         {
           requestId: mutation.request_id,
           instanceId: addition.provider_instance_id,
@@ -353,6 +359,14 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
       }
       addition = await readNodeAddition(this.env.DB, id);
       if (["audited", "bootstrapping"].includes(addition.status)) {
+        await step.do(
+          `network-rescue-${cycle}`,
+          { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" },
+          async () => {
+            await ensureNodeRescue(this.env, id);
+            return { operation_id: id };
+          },
+        );
         const job = await this.env.DB.prepare(
           "SELECT input_hash FROM node_bootstrap_jobs WHERE operation_id=?",
         )
@@ -371,7 +385,12 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
                   ).admit(id);
                   await finalizeNodeAdmission(this.env, id);
                 }
-              } else if (await ensureNodeRescue(this.env, id)) {
+              } else if (
+                job.rescue_active &&
+                job.authorized &&
+                !job.admitted &&
+                !job.cancelled
+              ) {
                 const current = await readNodeAddition(this.env.DB, id);
                 if (current.checkpoint === null)
                   await saveNodeBootstrapCheckpoint(
