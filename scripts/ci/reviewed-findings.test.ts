@@ -7,6 +7,8 @@ import {
   readPackageProvenance,
   reviewedFiles,
   reviewedBase,
+  reviewedManifestPaths,
+  imageProfile,
 } from "./reviewed-findings.ts";
 import type { CanonicalFinding } from "./scanner.ts";
 
@@ -254,5 +256,70 @@ test("repacked application layers retain only the six exact package-proven spans
       repacked,
     ).unresolved,
     1,
+  );
+});
+
+test("only the explicit bootstrap profile permits proven absent reviewed runtime packages", async () => {
+  assert.equal(imageProfile(), "regional");
+  assert.throws(() => imageProfile("other"));
+  assert.throws(() => imageProfile(null));
+  assert.deepEqual(reviewedManifestPaths([], "node-bootstrap"), []);
+  assert.throws(() =>
+    reviewedManifestPaths(
+      ["app/node_modules/@kubernetes/client-node/package.json"],
+      "node-bootstrap",
+    ),
+  );
+  assert.throws(() => reviewedManifestPaths([], "regional"));
+  const file = reviewedFiles.find((file) => file.package)!,
+    manifest = file.path.replace(/https\.d\.ts$/, "package.json");
+  assert.throws(() => reviewedManifestPaths([file.path], "node-bootstrap"));
+  assert.deepEqual(
+    reviewedManifestPaths([file.path, manifest], "node-bootstrap"),
+    [manifest],
+  );
+  const lock = await readFile("pnpm-lock.yaml", "utf8");
+  assert.deepEqual(readPackageProvenance(lock, [], "node-bootstrap"), []);
+  assert.throws(() =>
+    readPackageProvenance(
+      lock,
+      [{ name: file.package!.name, version: "changed" }],
+      "node-bootstrap",
+    ),
+  );
+  assert.throws(() => readPackageProvenance(lock, [], "regional"));
+  assert.throws(() =>
+    readPackageProvenance(
+      lock.replace(file.package!.integrity, "changed"),
+      [{ name: file.package!.name, version: file.package!.version }],
+      "node-bootstrap",
+    ),
+  );
+});
+
+test("bootstrap subset provenance never waives a shipped package or a new finding", async () => {
+  const file = reviewedFiles.find((file) => file.package)!,
+    value = finding(file),
+    proof = await provenance();
+  assert.deepEqual(classifyReviewed([value], { ...proof, packages: [] }), {
+    resolved: 0,
+    unresolved: 1,
+  });
+  const lock = await readFile("pnpm-lock.yaml", "utf8"),
+    packages = readPackageProvenance(
+      lock,
+      [{ name: file.package!.name, version: file.package!.version }],
+      "node-bootstrap",
+    );
+  assert.deepEqual(classifyReviewed([value], { ...proof, packages }), {
+    resolved: 1,
+    unresolved: 0,
+  });
+  assert.deepEqual(
+    classifyReviewed([{ ...value, RuleID: "new-unreviewed" }], {
+      ...proof,
+      packages,
+    }),
+    { resolved: 0, unresolved: 1 },
   );
 });
