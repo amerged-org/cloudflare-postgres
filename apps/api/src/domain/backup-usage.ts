@@ -26,7 +26,7 @@ export interface BackupMeasurementResult {
   sample?: Extract<UsageSample, { source: "backup" }>;
   recorded?: "recorded" | "duplicate";
 }
-type BackupEnvironment = Pick<Env,"DB"> & ArchiveEnvironment;
+type BackupEnvironment = Pick<Env, "DB"> & ArchiveEnvironment;
 const rowFor = (db: D1Database, id: string) =>
   db
     .prepare(
@@ -53,8 +53,11 @@ export async function measureBackupUsage(
   let bytes: number | null = null,
     objects: number | null = null;
   try {
-    const selected = regionArchive(env,{id:row.region_id,backup_bucket:row.backup_bucket});
-    const prefix = validatedArchivePrefix(row,row,selected.bucketName);
+    const selected = regionArchive(env, {
+      id: row.region_id,
+      backup_bucket: row.backup_bucket,
+    });
+    const prefix = validatedArchivePrefix(row, row, selected.bucketName);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let expired = false;
     const deadline = Date.now() + BACKUP_LIST_DEADLINE_MS;

@@ -169,7 +169,23 @@ export function registerDomain(app: ApiApp): void {
         DatabaseResize.parse(await c.req.json()),
       ),
   );
-  register(app,{ method:"post",path:"/v1/databases/{id}/restore",security,tags:["Backups"],request:{headers,params,body:body(DatabaseRestore)},responses:responses(DatabaseRestored,202)},async c=>restoreDatabase(c,DatabaseId.parse(c.req.param("id")),DatabaseRestore.parse(await c.req.json())));
+  register(
+    app,
+    {
+      method: "post",
+      path: "/v1/databases/{id}/restore",
+      security,
+      tags: ["Backups"],
+      request: { headers, params, body: body(DatabaseRestore) },
+      responses: responses(DatabaseRestored, 202),
+    },
+    async (c) =>
+      restoreDatabase(
+        c,
+        DatabaseId.parse(c.req.param("id")),
+        DatabaseRestore.parse(await c.req.json()),
+      ),
+  );
   for (const action of ["suspend", "resume"] as const)
     register(
       app,

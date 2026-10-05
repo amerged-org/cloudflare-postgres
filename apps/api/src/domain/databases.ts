@@ -17,7 +17,12 @@ import { assertProjectAccess, getAuth } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "../platform/pagination.ts";
 import { keyring } from "../crypto/keyring.ts";
-import { choosePlacement, placementNodes, nodePlacementGuard, nodePlacementBindings } from "./placement.ts";
+import {
+  choosePlacement,
+  placementNodes,
+  nodePlacementGuard,
+  nodePlacementBindings,
+} from "./placement.ts";
 import { syncDatabaseActor } from "./database-actor-sync.ts";
 import { runNodeCapacity } from "./node-capacity.ts";
 import {
@@ -62,7 +67,7 @@ export interface DatabaseInsertSnapshot {
   id: string;
   archivePath: string;
   now: string;
-  authority?: {sql:string;bindings:(string|number|null)[]};
+  authority?: { sql: string; bindings: (string | number | null)[] };
 }
 export function databaseInsertStatement(
   db: D1Database,
@@ -523,11 +528,13 @@ export async function deleteDatabase(
           `UPDATE databases SET desired_state='deleted',generation=generation+1,deleted_at=?,updated_at=?
         WHERE id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)`,
         ).bind(now, now, id, row.project_id, row.generation),
-        c.env.DB.prepare(`INSERT INTO retained_archives(source_database_id,project_id,region_id,archive_path,storage_generation,roles_json,deleted_at,expires_at)
+        c.env.DB.prepare(
+          `INSERT INTO retained_archives(source_database_id,project_id,region_id,archive_path,storage_generation,roles_json,deleted_at,expires_at)
           SELECT d.id,d.project_id,d.region_id,d.archive_path,d.storage_generation,
           (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'password_revision',r.password_revision,'updated_at',r.updated_at)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL),
           d.deleted_at,strftime('%Y-%m-%dT%H:%M:%fZ',d.deleted_at,'+'||s.backup_retention_days||' days')
-          FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.project_id=? AND d.generation=? AND d.deleted_at=?`).bind(id,row.project_id,generation,now),
+          FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.project_id=? AND d.generation=? AND d.deleted_at=?`,
+        ).bind(id, row.project_id, generation, now),
         c.env.DB.prepare(
           `INSERT INTO operations (id,kind,status,project_id,database_id,generation,created_at,updated_at)
         SELECT ?,'database.delete','pending',project_id,id,generation,?,? FROM databases WHERE changes()=1 AND id=? AND project_id=? AND generation=?`,

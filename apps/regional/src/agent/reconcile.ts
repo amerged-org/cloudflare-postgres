@@ -7,6 +7,7 @@ import {
   type PowerCoordinator,
   type PowerObservation,
 } from "./power.ts";
+import { BackupHealthCollector } from "./backup-health.ts";
 import { administerRecovery, type RecoveryAdministrator } from "./recovery.ts";
 import { createHash } from "node:crypto";
 import {
@@ -458,7 +459,18 @@ function stateFromStorage(fence: Resource): StorageState {
 }
 
 function pendingCreation(db: DesiredDatabase): boolean {
-  if(db.recovery) {const archive=ARCHIVE_DESTINATION_PATTERN.exec(db.archive.destination_path);return !db.recovery.ever_ready && ["pending","running"].includes(db.recovery.status) && archive?.[3]===db.id && Number(archive?.[4])===(db.storage_generation??1) && archive?.[5]===db.recovery.operation_id;}
+  if (db.recovery) {
+    const archive = ARCHIVE_DESTINATION_PATTERN.exec(
+      db.archive.destination_path,
+    );
+    return (
+      !db.recovery.ever_ready &&
+      ["pending", "running"].includes(db.recovery.status) &&
+      archive?.[3] === db.id &&
+      Number(archive?.[4]) === (db.storage_generation ?? 1) &&
+      archive?.[5] === db.recovery.operation_id
+    );
+  }
 
   const creation = db.creation;
   const archive = ARCHIVE_DESTINATION_PATTERN.exec(db.archive.destination_path);
@@ -529,6 +541,7 @@ export class Reconciler {
   private log?: Log;
   private phaseNow: () => number;
   private recoveryAdministrator: RecoveryAdministrator;
+  private readonly backupHealth = new BackupHealthCollector();
   private archiveProbe: (
     options: ArchiveProbeOptions,
   ) => Promise<ArchiveProbeResult>;
@@ -555,7 +568,7 @@ export class Reconciler {
     this.log = log;
     this.phaseNow = phaseNow;
     this.archiveProbe = archiveProbe;
-    this.recoveryAdministrator=recoveryAdministrator;
+    this.recoveryAdministrator = recoveryAdministrator;
   }
 
   hint(): void {
@@ -610,11 +623,41 @@ export class Reconciler {
     } catch {
       return recoveryRequired(db, "storage history is invalid");
     }
-    const recoveryIntent=db.recovery ? JSON.stringify([db.recovery.operation_id,db.recovery.source_database_id,db.recovery.source_archive_path,db.recovery.source_storage_generation,db.recovery.backup_id,db.recovery.target_time ?? null]) : undefined;
-    if(db.desired_state!=="deleted" && storage?.recoveryIntent!==undefined && storage.recoveryIntent!==recoveryIntent)return recoveryRequired(db,"recovery source identity changed");
-    if(db.recovery && storage && storage.recoveryIntent===undefined && (storage.namespaceUid||storage.clusterUid))return recoveryRequired(db,"recovery source authority is missing");
-    if(db.desired_state!=="deleted" && storage?.recoveryMappedOperation && storage.recoveryMappedOperation!==db.recovery?.operation_id) return recoveryRequired(db,"recovery storage authority changed");
-    if(db.recovery && ctx)ctx={...ctx,recoveryFinalized:storage?.recoveryMappedOperation===db.recovery.operation_id};
+    const recoveryIntent = db.recovery
+      ? JSON.stringify([
+          db.recovery.operation_id,
+          db.recovery.source_database_id,
+          db.recovery.source_archive_path,
+          db.recovery.source_storage_generation,
+          db.recovery.backup_id,
+          db.recovery.target_time ?? null,
+        ])
+      : undefined;
+    if (
+      db.desired_state !== "deleted" &&
+      storage?.recoveryIntent !== undefined &&
+      storage.recoveryIntent !== recoveryIntent
+    )
+      return recoveryRequired(db, "recovery source identity changed");
+    if (
+      db.recovery &&
+      storage &&
+      storage.recoveryIntent === undefined &&
+      (storage.namespaceUid || storage.clusterUid)
+    )
+      return recoveryRequired(db, "recovery source authority is missing");
+    if (
+      db.desired_state !== "deleted" &&
+      storage?.recoveryMappedOperation &&
+      storage.recoveryMappedOperation !== db.recovery?.operation_id
+    )
+      return recoveryRequired(db, "recovery storage authority changed");
+    if (db.recovery && ctx)
+      ctx = {
+        ...ctx,
+        recoveryFinalized:
+          storage?.recoveryMappedOperation === db.recovery.operation_id,
+      };
     if (db.desired_state === "deleted") {
       if (
         namespace &&
@@ -648,7 +691,11 @@ export class Reconciler {
     if (!namespace) {
       if (storage?.namespaceUid)
         return recoveryRequired(db, "database namespace is missing");
-      if (!pendingCreation(db) || db.generation !== (db.creation?.generation ?? (db.recovery ? 1 : undefined)))
+      if (
+        !pendingCreation(db) ||
+        db.generation !==
+          (db.creation?.generation ?? (db.recovery ? 1 : undefined))
+      )
         return recoveryRequired(
           db,
           "missing namespace has no initial CREATE authority",
@@ -746,7 +793,7 @@ export class Reconciler {
         clusterUid: null,
         node: db.node,
         archivePath: db.archive.destination_path,
-        ...(recoveryIntent ? {recoveryIntent} : {}),
+        ...(recoveryIntent ? { recoveryIntent } : {}),
       };
       if (namespace) storage.namespaceUid = uid(namespace);
       if (priorCluster) storage.clusterUid = uid(priorCluster);
@@ -1097,35 +1144,108 @@ export class Reconciler {
       "desired_applied",
       db.id,
       () =>
-        this.desiredApplied(db, ctx!, cluster!, namespaceName, runtimeResources),
+        this.desiredApplied(
+          db,
+          ctx!,
+          cluster!,
+          namespaceName,
+          runtimeResources,
+        ),
       this.phaseNow,
     );
     const caMap = publicCa
       ? await this.k8s.read("ConfigMap", SYSTEM_NAMESPACE, `ca-${db.id}`)
       : null;
     const ca = string(record(caMap?.data)["ca.crt"]);
-    let recoveryVerified=!db.recovery;
-    if(db.recovery && ca && publicCa && condition(cluster,"Ready")?.status==="True" && db.recovery.status!=="failed") {
-      if(storage.recoveryMappedOperation!==db.recovery.operation_id && desiredApplied && await this.recoveryAdministrator(db,ctx,ca,this.signal,"map_database")) {
-        storage.recoveryMappedOperation=db.recovery.operation_id;
-        fence=await this.saveStorage(db,storage,fence);
+    let recoveryVerified = !db.recovery;
+    if (
+      db.recovery &&
+      ca &&
+      publicCa &&
+      condition(cluster, "Ready")?.status === "True" &&
+      db.recovery.status !== "failed"
+    ) {
+      if (
+        storage.recoveryMappedOperation !== db.recovery.operation_id &&
+        desiredApplied &&
+        (await this.recoveryAdministrator(
+          db,
+          ctx,
+          ca,
+          this.signal,
+          "map_database",
+        ))
+      ) {
+        storage.recoveryMappedOperation = db.recovery.operation_id;
+        fence = await this.saveStorage(db, storage, fence);
       }
-      if(storage.recoveryMappedOperation===db.recovery.operation_id) {
-        ctx={...ctx,recoveryFinalized:true};
-        const expected=buildDatabaseManifests(db,ctx).find(m=>m.kind==="Cluster")!;
-        if(record(cluster.spec).enableSuperuserAccess!==false || record(cluster.spec).superuserSecret!==undefined || record(record(record(cluster.spec).bootstrap).recovery).database!==db.id) {
-          expected.metadata.annotations={[GENERATION_ANNOTATION]:String(db.generation)};
-          if(!await this.applyRevision(db,expected,storage.namespaceUid!))return recoveryRequired(db,"recovery finalization lost authority");
-          const final=await this.k8s.read("Cluster",namespaceName,"database");
-          if(!final || uid(final)!==storage.clusterUid)return recoveryRequired(db,"recovery cluster identity changed");
-          cluster=final;
+      if (storage.recoveryMappedOperation === db.recovery.operation_id) {
+        ctx = { ...ctx, recoveryFinalized: true };
+        const expected = buildDatabaseManifests(db, ctx).find(
+          (m) => m.kind === "Cluster",
+        )!;
+        if (
+          record(cluster.spec).enableSuperuserAccess !== false ||
+          record(cluster.spec).superuserSecret !== undefined ||
+          record(record(record(cluster.spec).bootstrap).recovery).database !==
+            db.id
+        ) {
+          expected.metadata.annotations = {
+            [GENERATION_ANNOTATION]: String(db.generation),
+          };
+          if (!(await this.applyRevision(db, expected, storage.namespaceUid!)))
+            return recoveryRequired(db, "recovery finalization lost authority");
+          const final = await this.k8s.read(
+            "Cluster",
+            namespaceName,
+            "database",
+          );
+          if (!final || uid(final) !== storage.clusterUid)
+            return recoveryRequired(db, "recovery cluster identity changed");
+          cluster = final;
         }
-        const secret=await this.k8s.read("Secret",namespaceName,"restore-superuser");
-        if(secret){assertOwned(secret,db.id,"restore-superuser");if(!secret.metadata.resourceVersion)throw new Error("resource_identity_missing");await this.k8s.delete("Secret",namespaceName,"restore-superuser",uid(secret),secret.metadata.resourceVersion);}
-        if(await this.k8s.read("Secret",namespaceName,"restore-superuser")===null && record(cluster.spec).enableSuperuserAccess===false && record(cluster.spec).superuserSecret===undefined && await this.recoveryAdministrator(db,ctx,ca,this.signal,"verify_admin_disabled")) {
-          runtimeResources.length=0;
-          desiredApplied=await this.desiredApplied(db,ctx,cluster,namespaceName,runtimeResources);
-          recoveryVerified=desiredApplied;
+        const secret = await this.k8s.read(
+          "Secret",
+          namespaceName,
+          "restore-superuser",
+        );
+        if (secret) {
+          assertOwned(secret, db.id, "restore-superuser");
+          if (!secret.metadata.resourceVersion)
+            throw new Error("resource_identity_missing");
+          await this.k8s.delete(
+            "Secret",
+            namespaceName,
+            "restore-superuser",
+            uid(secret),
+            secret.metadata.resourceVersion,
+          );
+        }
+        if (
+          (await this.k8s.read(
+            "Secret",
+            namespaceName,
+            "restore-superuser",
+          )) === null &&
+          record(cluster.spec).enableSuperuserAccess === false &&
+          record(cluster.spec).superuserSecret === undefined &&
+          (await this.recoveryAdministrator(
+            db,
+            ctx,
+            ca,
+            this.signal,
+            "verify_admin_disabled",
+          ))
+        ) {
+          runtimeResources.length = 0;
+          desiredApplied = await this.desiredApplied(
+            db,
+            ctx,
+            cluster,
+            namespaceName,
+            runtimeResources,
+          );
+          recoveryVerified = desiredApplied;
         }
       }
     }
@@ -1152,6 +1272,21 @@ export class Reconciler {
         () => this.verifyVolumeIdentity(db, fence, runtimeResources),
         this.phaseNow,
       ));
+    const backupNamespace = await this.k8s.read(
+      "Namespace",
+      undefined,
+      namespaceName,
+    );
+    const backup =
+      backupNamespace && uid(backupNamespace) === storage.namespaceUid
+        ? await this.backupHealth.collect(
+            this.k8s,
+            db,
+            backupNamespace,
+            cluster,
+            now,
+          )
+        : undefined;
     const runtimeUnchanged =
       storageVerified &&
       (await measureWakePhase(
@@ -1183,11 +1318,21 @@ export class Reconciler {
       credentialsApplied &&
       runtimeUnchanged &&
       storageVerified &&
-      (continuous || db.creation?.ever_ready === true || db.recovery?.ever_ready===true);
+      (continuous ||
+        db.creation?.ever_ready === true ||
+        db.recovery?.ever_ready === true);
     const observation: PowerObservation = {
       id: db.id,
       generation: db.generation,
-      ...(databaseReady && db.recovery ? {recovery:{operation_id:db.recovery.operation_id,storage_generation:db.storage_generation??1,verified:true as const}} : {}),
+      ...(databaseReady && db.recovery
+        ? {
+            recovery: {
+              operation_id: db.recovery.operation_id,
+              storage_generation: db.storage_generation ?? 1,
+              verified: true as const,
+            },
+          }
+        : {}),
       state: databaseReady
         ? "ready"
         : unhealthy || backlog || unknownAlarm
@@ -1199,6 +1344,7 @@ export class Reconciler {
           ? { message: "archive health remains unknown after 10 minutes" }
           : {}),
       archive: { continuous, ready_wal_files: count, health },
+      ...(backup ? { backup } : {}),
     };
     return this.power
       ? powerIntent

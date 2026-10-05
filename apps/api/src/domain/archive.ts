@@ -7,7 +7,10 @@ import type { DatabaseRow } from "./rows.ts";
 import { regionArchive } from "./archive-bindings.ts";
 
 export function validatedArchivePrefix(
-  row: Pick<DatabaseRow, "id" | "region_id" | "archive_path" | "storage_generation">,
+  row: Pick<
+    DatabaseRow,
+    "id" | "region_id" | "archive_path" | "storage_generation"
+  >,
   region: { backup_bucket: string } | null,
   boundBucket: string,
 ): string {
@@ -38,7 +41,10 @@ export async function archiveSummary(
   )
     .bind(row.region_id)
     .first<{ backup_bucket: string }>();
-  const selected = regionArchive(c.env, {id:row.region_id,backup_bucket:region?.backup_bucket ?? ""});
+  const selected = regionArchive(c.env, {
+    id: row.region_id,
+    backup_bucket: region?.backup_bucket ?? "",
+  });
   const prefix = validatedArchivePrefix(row, region, selected.bucketName);
   let baseBackups = 0,
     walCount = 0,

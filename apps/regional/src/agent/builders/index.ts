@@ -142,9 +142,14 @@ export function roleSecretName(role: string): string {
   return `role-h-${createHash("sha256").update(role).digest("hex").slice(0, 56)}`;
 }
 
-export function restoreAdministrationPassword(db: DesiredDatabase,ctx:BuildContext):string {
-  if(!db.recovery)throw new TypeError("recovery intent is missing");
-  return createHmac("sha256",ctx.backup.credentials.secretAccessKey).update(`pgcf-restore|${db.id}|${db.recovery.operation_id}`).digest("base64url");
+export function restoreAdministrationPassword(
+  db: DesiredDatabase,
+  ctx: BuildContext,
+): string {
+  if (!db.recovery) throw new TypeError("recovery intent is missing");
+  return createHmac("sha256", ctx.backup.credentials.secretAccessKey)
+    .update(`pgcf-restore|${db.id}|${db.recovery.operation_id}`)
+    .digest("base64url");
 }
 
 export function buildDatabaseManifests(
@@ -479,8 +484,49 @@ export function buildDatabaseManifests(
         },
       },
     },
-    ...(db.recovery ? [{apiVersion:"barmancloud.cnpg.io/v1",kind:"ObjectStore",metadata:metadata("recovery-source"),spec:{configuration:{destinationPath:db.recovery.source_archive_path,endpointURL:ctx.backup.endpointUrl,s3Credentials:{accessKeyId:{name:ARCHIVE_SECRET,key:"AWS_ACCESS_KEY_ID"},secretAccessKey:{name:ARCHIVE_SECRET,key:"AWS_SECRET_ACCESS_KEY"}},wal:{compression:"gzip"},data:{compression:"gzip"}}}}] : []),
-    ...(db.recovery && !ctx.recoveryFinalized ? [{apiVersion:"v1",kind:"Secret",metadata:metadata("restore-superuser"),type:"kubernetes.io/basic-auth",data:{username:Buffer.from("postgres").toString("base64"),password:Buffer.from(restoreAdministrationPassword(db,ctx)).toString("base64")}}] : []),
+    ...(db.recovery
+      ? [
+          {
+            apiVersion: "barmancloud.cnpg.io/v1",
+            kind: "ObjectStore",
+            metadata: metadata("recovery-source"),
+            spec: {
+              configuration: {
+                destinationPath: db.recovery.source_archive_path,
+                endpointURL: ctx.backup.endpointUrl,
+                s3Credentials: {
+                  accessKeyId: {
+                    name: ARCHIVE_SECRET,
+                    key: "AWS_ACCESS_KEY_ID",
+                  },
+                  secretAccessKey: {
+                    name: ARCHIVE_SECRET,
+                    key: "AWS_SECRET_ACCESS_KEY",
+                  },
+                },
+                wal: { compression: "gzip" },
+                data: { compression: "gzip" },
+              },
+            },
+          },
+        ]
+      : []),
+    ...(db.recovery && !ctx.recoveryFinalized
+      ? [
+          {
+            apiVersion: "v1",
+            kind: "Secret",
+            metadata: metadata("restore-superuser"),
+            type: "kubernetes.io/basic-auth",
+            data: {
+              username: Buffer.from("postgres").toString("base64"),
+              password: Buffer.from(
+                restoreAdministrationPassword(db, ctx),
+              ).toString("base64"),
+            },
+          },
+        ]
+      : []),
     {
       apiVersion: "postgresql.cnpg.io/v1",
       kind: "Cluster",
@@ -494,18 +540,52 @@ export function buildDatabaseManifests(
         imageName: ctx.postgresImage,
         inheritedMetadata: { labels: { ...labels } },
         enableSuperuserAccess: Boolean(db.recovery && !ctx.recoveryFinalized),
-        ...(db.recovery && !ctx.recoveryFinalized ? {superuserSecret:{name:"restore-superuser"}} : {}),
-        ...(db.recovery ? {externalClusters:[{name:"origin",plugin:{name:BARMAN_PLUGIN,parameters:{barmanObjectName:"recovery-source",serverName:"database"}}}]} : {}),
-        bootstrap: db.recovery ? {recovery:{source:"origin",database:ctx.recoveryFinalized?db.id:db.recovery.source_database_id,owner:OWNER_ROLE_NAME,secret:{name:roleSecretName(OWNER_ROLE_NAME)},recoveryTarget:{backupID:db.recovery.backup_id,...(db.recovery.target_time?{targetTime:db.recovery.target_time}: {})}}} : {
-          initdb: {
-            database: db.id,
-            owner: OWNER_ROLE_NAME,
-            secret: { name: roleSecretName(OWNER_ROLE_NAME) },
-            ...(db.maintenance
-              ? { postInitApplicationSQL: [...MAINTENANCE_BOOTSTRAP_SQL] }
-              : {}),
-          },
-        },
+        ...(db.recovery && !ctx.recoveryFinalized
+          ? { superuserSecret: { name: "restore-superuser" } }
+          : {}),
+        ...(db.recovery
+          ? {
+              externalClusters: [
+                {
+                  name: "origin",
+                  plugin: {
+                    name: BARMAN_PLUGIN,
+                    parameters: {
+                      barmanObjectName: "recovery-source",
+                      serverName: "database",
+                    },
+                  },
+                },
+              ],
+            }
+          : {}),
+        bootstrap: db.recovery
+          ? {
+              recovery: {
+                source: "origin",
+                database: ctx.recoveryFinalized
+                  ? db.id
+                  : db.recovery.source_database_id,
+                owner: OWNER_ROLE_NAME,
+                secret: { name: roleSecretName(OWNER_ROLE_NAME) },
+                recoveryTarget: {
+                  backupID: db.recovery.backup_id,
+                  ...(db.recovery.target_time
+                    ? { targetTime: db.recovery.target_time }
+                    : {}),
+                },
+              },
+            }
+          : {
+              initdb: {
+                database: db.id,
+                owner: OWNER_ROLE_NAME,
+                secret: { name: roleSecretName(OWNER_ROLE_NAME) },
+                ...(db.maintenance
+                  ? { postInitApplicationSQL: [...MAINTENANCE_BOOTSTRAP_SQL] }
+                  : {}),
+              },
+            },
         affinity: { nodeSelector: { "kubernetes.io/hostname": db.node } },
         resources: { requests: { ...compute }, limits: { ...compute } },
         seccompProfile: { type: "RuntimeDefault" },

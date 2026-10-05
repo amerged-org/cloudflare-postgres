@@ -332,10 +332,16 @@ export const DatabaseResize = z
   .meta({ id: "DatabaseResize" });
 export type DatabaseResize = z.infer<typeof DatabaseResize>;
 
-export const DatabaseRestore = z.discriminatedUnion("mode", [
-  z.strictObject({ mode: z.literal("full"), name: DatabaseName }),
-  z.strictObject({ mode: z.literal("pitr"), name: DatabaseName, target_time: Timestamp }),
-]).meta({ id: "DatabaseRestore" });
+export const DatabaseRestore = z
+  .discriminatedUnion("mode", [
+    z.strictObject({ mode: z.literal("full"), name: DatabaseName }),
+    z.strictObject({
+      mode: z.literal("pitr"),
+      name: DatabaseName,
+      target_time: Timestamp,
+    }),
+  ])
+  .meta({ id: "DatabaseRestore" });
 export type DatabaseRestore = z.infer<typeof DatabaseRestore>;
 
 // ---------- Roles and connection URIs ----------
@@ -467,5 +473,7 @@ export const ApiKeyCreated = z
   .meta({ id: "ApiKeyCreated" });
 export type ApiKeyCreated = z.infer<typeof ApiKeyCreated>;
 
-export const DatabaseRestored = z.strictObject({ target_database: Database, operation: Operation }).meta({ id: "DatabaseRestored" });
+export const DatabaseRestored = z
+  .strictObject({ target_database: Database, operation: Operation })
+  .meta({ id: "DatabaseRestored" });
 export type DatabaseRestored = z.infer<typeof DatabaseRestored>;

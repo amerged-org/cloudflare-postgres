@@ -146,6 +146,6 @@ export async function runCron(
     .run();
   const usage = await runUsageCron(env.DB, now, env);
   await runNodeCapacityCron(env);
-  await cleanupRetainedArchives(env,now);
+  await cleanupRetainedArchives(env, now);
   return { failed: result.meta.changes + recovered, purged, hinted, usage };
 }

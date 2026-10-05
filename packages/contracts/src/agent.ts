@@ -155,7 +155,10 @@ export const DesiredDatabase = z
       });
     const match = ARCHIVE_DESTINATION_PATTERN.exec(db.archive.destination_path);
     // Desired revisions advance for role changes and deletion without replacing the archive.
-    if (match && (match[3] !== db.id || Number(match[4]) !== (db.storage_generation ?? 1))) {
+    if (
+      match &&
+      (match[3] !== db.id || Number(match[4]) !== (db.storage_generation ?? 1))
+    ) {
       ctx.addIssue({
         code: "custom",
         path: ["archive", "destination_path"],
@@ -178,13 +181,25 @@ export const DesiredDatabase = z
       });
     }
     if (db.recovery) {
-      const source = ARCHIVE_DESTINATION_PATTERN.exec(db.recovery.source_archive_path);
-      if (!source || source[3] !== db.recovery.source_database_id ||
-          Number(source[4]) !== db.recovery.source_storage_generation ||
-          source[1] !== match?.[1] || source[2] !== match?.[2] ||
-          db.recovery.source_database_id === db.id ||
-          db.recovery.operation_id !== match?.[5] || db.creation) {
-        ctx.addIssue({code:"custom", path:["recovery"], message:"Recovery must use a separate target in the same archive region and bucket"});
+      const source = ARCHIVE_DESTINATION_PATTERN.exec(
+        db.recovery.source_archive_path,
+      );
+      if (
+        !source ||
+        source[3] !== db.recovery.source_database_id ||
+        Number(source[4]) !== db.recovery.source_storage_generation ||
+        source[1] !== match?.[1] ||
+        source[2] !== match?.[2] ||
+        db.recovery.source_database_id === db.id ||
+        db.recovery.operation_id !== match?.[5] ||
+        db.creation
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["recovery"],
+          message:
+            "Recovery must use a separate target in the same archive region and bucket",
+        });
       }
     }
     const names = new Set<string>();
@@ -286,15 +301,26 @@ export const NodeObservation = z.strictObject({
 });
 export type NodeObservation = z.infer<typeof NodeObservation>;
 
-export const BackupObservation=z.strictObject({health:z.enum(["ok","failing","unknown"]),observed_at:Timestamp,last_completed_at:Timestamp.nullable(),last_failed_at:Timestamp.nullable()});
-export type BackupObservation=z.infer<typeof BackupObservation>;
+export const BackupObservation = z.strictObject({
+  health: z.enum(["ok", "failing", "unknown"]),
+  observed_at: Timestamp,
+  last_completed_at: Timestamp.nullable(),
+  last_failed_at: Timestamp.nullable(),
+});
+export type BackupObservation = z.infer<typeof BackupObservation>;
 
 export const DatabaseObservation = z
   .strictObject({
     id: DatabaseId,
     generation: z.number().int().min(1),
     state: z.enum(DATABASE_OBSERVED_STATES),
-    recovery: z.strictObject({ operation_id: OperationId, storage_generation: z.number().int().positive(), verified: z.literal(true) }).optional(),
+    recovery: z
+      .strictObject({
+        operation_id: OperationId,
+        storage_generation: z.number().int().positive(),
+        verified: z.literal(true),
+      })
+      .optional(),
     power: z
       .strictObject({
         operation: OperationId,

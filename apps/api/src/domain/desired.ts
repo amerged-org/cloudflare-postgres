@@ -95,7 +95,20 @@ export async function desired(
         id: row.id,
         generation: row.generation,
         storage_generation: row.storage_generation ?? 1,
-        ...(row.restore_operation_id && row.desired_state!=="deleted" ? {recovery:{operation_id:row.restore_operation_id,source_database_id:row.source_database_id,source_archive_path:row.source_archive_path,source_storage_generation:row.source_storage_generation,backup_id:row.backup_id,...(row.target_time?{target_time:row.target_time}:{}),status:row.restore_status,ever_ready:Boolean(row.ever_ready)}} : {}),
+        ...(row.restore_operation_id && row.desired_state !== "deleted"
+          ? {
+              recovery: {
+                operation_id: row.restore_operation_id,
+                source_database_id: row.source_database_id,
+                source_archive_path: row.source_archive_path,
+                source_storage_generation: row.source_storage_generation,
+                backup_id: row.backup_id,
+                ...(row.target_time ? { target_time: row.target_time } : {}),
+                status: row.restore_status,
+                ever_ready: Boolean(row.ever_ready),
+              },
+            }
+          : {}),
         desired_state: row.desired_state,
         ...(row.power_operation && row.desired_state !== "deleted"
           ? {
