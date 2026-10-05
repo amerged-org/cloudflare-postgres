@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   DesiredDatabase,
@@ -9,6 +10,7 @@ import {
   archiveDestinationPath,
   newDatabaseId,
   newOperationId,
+  newNodeId,
   newRolePassword,
   OWNER_ROLE_NAME,
   NodeObservation,
@@ -103,6 +105,56 @@ it("keeps maintenance separate and optional on desired pages", () => {
       ],
     }).success,
   ).toBe(false);
+});
+
+describe("node observation identity", () => {
+  it("accepts the actual node, provider and Kubernetes identity without changing legacy pages", () => {
+    const old = (observation().nodes as Record<string, unknown>[])[0]!;
+    expect(NodeObservation.parse(old)).toEqual(old);
+    const identity = {
+      node_id: newNodeId(),
+      provider_instance_id: String(BigInt(Number.MAX_SAFE_INTEGER) + 2n),
+      node_uid: randomUUID(),
+    };
+    const identified = { ...old, ...identity };
+    expect(NodeObservation.parse(identified)).toEqual(identified);
+    expect(
+      ObservationRequest.parse({ ...observation(), nodes: [identified] }).nodes,
+    ).toEqual([identified]);
+  });
+
+  it("refuses malformed identity and imprecise numeric provider IDs", () => {
+    const node = (observation().nodes as Record<string, unknown>[])[0]!;
+    expect(
+      NodeObservation.safeParse({ ...node, node_id: "invalid" }).success,
+    ).toBe(false);
+    expect(
+      NodeObservation.safeParse({ ...node, node_uid: "invalid" }).success,
+    ).toBe(false);
+    expect(
+      NodeObservation.safeParse({
+        ...node,
+        provider_instance_id: Number.MAX_SAFE_INTEGER + 2,
+      }).success,
+    ).toBe(false);
+    expect(
+      NodeObservation.safeParse({ ...node, provider_instance_id: "01" })
+        .success,
+    ).toBe(false);
+    expect(
+      NodeObservation.safeParse({ ...node, provider_instance_id: "invalid" })
+        .success,
+    ).toBe(false);
+    expect(
+      NodeObservation.safeParse({
+        ...node,
+        provider_instance_id: String(2n ** 64n),
+      }).success,
+    ).toBe(false);
+    expect(NodeObservation.safeParse({ ...node, extra: true }).success).toBe(
+      false,
+    );
+  });
 });
 
 describe("platform CPU observation compatibility", () => {

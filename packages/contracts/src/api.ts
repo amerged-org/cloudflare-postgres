@@ -218,6 +218,7 @@ export type RegionCreated = z.infer<typeof RegionCreated>;
 export const Node = z
   .strictObject({
     id: NodeId,
+    node_uid: z.uuid().nullable().optional(),
     region_id: RegionId,
     k8s_node_name: z.string().min(1).max(253),
     provider_instance_id: z.string().min(1).max(128).nullable(),
