@@ -72,9 +72,9 @@ const InstanceWire = z.object({
   cpuCores: Count,
   diskMb: z.number().finite().nonnegative(),
   osType: Text,
-  sshKeys: z.array(Id).max(100),
+  sshKeys: z.array(Id).max(100).optional(),
   createdDate: DateTime,
-  cancelDate: z.union([z.iso.date(), z.literal("")]),
+  cancelDate: z.union([z.iso.date(), z.literal("")]).nullable(),
   status: Status,
   additionalIps: z.array(z.object({ v4: V4 })).max(100),
   macAddress: Text,
@@ -83,7 +83,7 @@ const InstanceWire = z.object({
   vHostName: Text,
   addOns: z.array(AddOn).max(100),
   productType: z.enum(["hdd", "ssd", "vds", "nvme", "performance", "gpu"]),
-  applicationId: Text,
+  applicationId: Text.nullable(),
 });
 export interface ContaboInstance {
   id: string;
@@ -104,9 +104,10 @@ export interface ContaboInstance {
   diskMb: number;
   macAddress: string;
   osType: string;
-  sshKeys: string[];
+  applicationId: string | null;
+  sshKeys?: string[];
   createdDate: string;
-  cancelDate: string;
+  cancelDate: string | null;
   status: z.infer<typeof Status>;
   addOns: z.infer<typeof AddOn>[];
 }
@@ -132,7 +133,8 @@ const toInstance = (value: z.infer<typeof InstanceWire>): Instance => ({
   diskMb: value.diskMb,
   macAddress: value.macAddress,
   osType: value.osType,
-  sshKeys: value.sshKeys,
+  applicationId: value.applicationId,
+  ...(value.sshKeys === undefined ? {} : { sshKeys: value.sshKeys }),
   createdDate: value.createdDate,
   cancelDate: value.cancelDate,
   status: value.status,
