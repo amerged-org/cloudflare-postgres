@@ -6,6 +6,7 @@ import type { Duplex } from "node:stream";
 import { pathToFileURL } from "node:url";
 import WebSocket, { createWebSocketStream } from "ws";
 import { z } from "zod";
+import { BOOTSTRAP_RELAY_HEADER } from "@pgcf/contracts/bootstrap-relay";
 import {
   BootstrapCapability,
   NodeBootstrapInput,
@@ -55,7 +56,7 @@ export async function openCapability(
     region_id: config.spec.region_id,
     input_hash: config.input_hash,
     request_id: randomUUID(),
-    payload: { capability, relay_epoch: config.spec.transport.relay_epoch },
+    payload: { capability },
   };
   const response = await request(config.callback.url, {
     method: "POST",
@@ -79,8 +80,21 @@ export async function openCapability(
   ) {
     throw new Error("transport_target_mismatch");
   }
+  const callback = new URL(config.callback.url);
+  const endpoint = new URL(transport.websocket_url);
+  callback.protocol = "wss:";
+  if (
+    endpoint.origin !== callback.origin ||
+    endpoint.pathname !==
+      `/internal/v1/node-bootstrap/${config.spec.operation_id}/relay`
+  ) {
+    throw new Error("transport_endpoint_mismatch");
+  }
   const socket = new WebSocket(transport.websocket_url, {
-    headers: { authorization: `Bearer ${transport.token}` },
+    headers: {
+      authorization: `Bearer ${config.callback.bearer}`,
+      [BOOTSTRAP_RELAY_HEADER]: transport.token,
+    },
     handshakeTimeout: 15_000,
     followRedirects: false,
     perMessageDeflate: false,
@@ -211,7 +225,9 @@ async function main() {
 
 if (
   process.argv[1] &&
-  import.meta.url === pathToFileURL(process.argv[1]).href
+  import.meta.url === pathToFileURL(process.argv[1]).href &&
+  (new URL(import.meta.url).pathname.endsWith("/proxy-command.ts") ||
+    new URL(import.meta.url).pathname.endsWith("/proxy-command.mjs"))
 ) {
   main().catch(() => {
     process.stderr.write("bootstrap_proxy_failed\n");

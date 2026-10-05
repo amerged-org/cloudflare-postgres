@@ -145,15 +145,22 @@ if (
   process.argv[1] &&
   import.meta.url === pathToFileURL(process.argv[1]).href
 ) {
-  const bearer = process.env.PGCF_BOOTSTRAP_SERVER_BEARER;
-  const port = Number(process.env.PORT ?? 8080);
-  if (!bearer || !Number.isInteger(port) || port < 1 || port > 65535)
-    throw new BootstrapError("server_configuration_invalid");
-  const runtime = createBootstrapServer(bearer, {
-    operator_direct:
-      process.env.PGCF_BOOTSTRAP_ALLOW_OPERATOR_DIRECT === "true",
-  });
-  process.once("SIGTERM", runtime.stop);
-  process.once("SIGINT", runtime.stop);
-  runtime.server.listen(port);
+  try {
+    const bearer = process.env.PGCF_BOOTSTRAP_SERVER_BEARER;
+    const port = Number(process.env.PORT ?? 8080);
+    if (!bearer || !Number.isInteger(port) || port < 1 || port > 65535)
+      throw new BootstrapError("server_configuration_invalid");
+    const runtime = createBootstrapServer(bearer, {
+      operator_direct:
+        process.env.PGCF_BOOTSTRAP_ALLOW_OPERATOR_DIRECT === "true",
+    });
+    process.once("SIGTERM", runtime.stop);
+    process.once("SIGINT", runtime.stop);
+    runtime.server.listen(port);
+  } catch {
+    process.stderr.write(
+      `${JSON.stringify({ event: "bootstrap_invalid_configuration" })}\n`,
+    );
+    process.exitCode = 1;
+  }
 }

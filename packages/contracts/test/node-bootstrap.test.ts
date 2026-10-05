@@ -7,9 +7,33 @@ import {
   NodeBootstrapCheckpoint,
   NodeBootstrapMaterial,
   NodeBootstrapTransport,
+  NodeRegionSeed,
+  NodeJoinBundle,
 } from "../src/node-bootstrap.ts";
 
 describe("private bootstrap contracts", () => {
+  it("bounds the entire encrypted material to 256 KiB instead of allowing oversized field combinations", () => {
+    const cluster = {
+      version: 1,
+      cluster_name: `cluster-${randomUUID()}`,
+      cluster_endpoint: `https://${[192, 0, 2, 5].join(".")}:6443/`,
+      talos_version: "1.14.1",
+      kubernetes_version: "1.36.3",
+    };
+    const material = {
+      ...cluster,
+      talos_machine_secrets_yaml: randomUUID().repeat(3800),
+      talos_admin_config: randomUUID().repeat(3800),
+    };
+    expect(NodeRegionSeed.safeParse(material).success).toBe(false);
+    expect(
+      NodeJoinBundle.safeParse({
+        ...material,
+        kube_system_uid: randomUUID(),
+        kubeconfig: randomUUID(),
+      }).success,
+    ).toBe(false);
+  });
   it("refuses arbitrary commands, hosts, ports and checkpoint stdout", () => {
     const identity = {
       version: 1,
@@ -23,7 +47,7 @@ describe("private bootstrap contracts", () => {
       NodeBootstrapCallback.safeParse({
         ...identity,
         kind: "transport",
-        payload: { capability: "rescue_ssh", relay_epoch: randomUUID() },
+        payload: { capability: "rescue_ssh" },
       }).success,
     ).toBe(true);
     expect(
@@ -32,7 +56,6 @@ describe("private bootstrap contracts", () => {
         kind: "transport",
         payload: {
           capability: "rescue_ssh",
-          relay_epoch: randomUUID(),
           host: randomUUID(),
           command: "sh",
         },

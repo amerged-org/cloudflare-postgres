@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { randomBytes } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { once } from "node:events";
 import { test } from "node:test";
 import { NodeBootstrapCallback } from "@pgcf/contracts/node-bootstrap";
@@ -8,6 +10,53 @@ import { inputHash } from "../src/bootstrap.ts";
 import { LOOPBACK } from "../src/proxy-command.ts";
 import { authorized, createBootstrapServer } from "../src/server.ts";
 import { authority, fixture } from "./fixture.ts";
+
+test("actual child entry emits only the fixed JSON event for invalid private configuration", () => {
+  const canary = randomBytes(32).toString("base64url");
+  const entry = fileURLToPath(new URL("../src/server.ts", import.meta.url));
+  const result = spawnSync(process.execPath, [entry], {
+    encoding: "utf8",
+    timeout: 60_000,
+    env: {
+      PATH: process.env.PATH,
+      LANG: "C",
+      PGCF_BOOTSTRAP_SERVER_BEARER: canary,
+      PORT: "0",
+    },
+  });
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(
+    result.stderr,
+    `${JSON.stringify({ event: "bootstrap_invalid_configuration" })}\n`,
+  );
+  assert.ok(!result.stderr.includes(canary));
+});
+
+test("the actual bundled entry starts far enough to emit the sanitized configuration event", () => {
+  const built = spawnSync("pnpm", ["run", "build"], {
+    cwd: fileURLToPath(new URL("../", import.meta.url)),
+    encoding: "utf8",
+    timeout: 60_000,
+    env: { PATH: process.env.PATH, LANG: "C", CI: "true" },
+  });
+  assert.equal(built.status, 0);
+  const result = spawnSync(
+    process.execPath,
+    [fileURLToPath(new URL("../dist/server.mjs", import.meta.url))],
+    {
+      encoding: "utf8",
+      timeout: 60_000,
+      env: { PATH: process.env.PATH, LANG: "C" },
+    },
+  );
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.equal(
+    result.stderr,
+    `${JSON.stringify({ event: "bootstrap_invalid_configuration" })}\n`,
+  );
+});
 
 test("private HTTP authenticates before parsing and exposes only durable bounded status", async () => {
   const input = fixture();

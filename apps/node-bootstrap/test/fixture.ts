@@ -61,7 +61,6 @@ export function fixture(): NodeBootstrapInput {
     transport: {
       mode: "relay",
       issuer_region_id: "region-dev",
-      relay_epoch: randomUUID(),
     },
   };
   return {
