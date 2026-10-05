@@ -577,12 +577,11 @@ async function action(
       .bind(preparation.operation_id, member.firewall_id, kind)
       .first<Claim>();
   const previous = await read();
-  if (previous?.state === "rejected") return false;
   if (matches) {
     if (previous && previous.state !== "confirmed")
       await db
         .prepare(
-          "UPDATE node_network_mutations SET state='confirmed',revision=revision+1 WHERE operation_id=? AND firewall_id=? AND action=? AND revision=? AND state<>'rejected'",
+          "UPDATE node_network_mutations SET state='confirmed',revision=revision+1 WHERE operation_id=? AND firewall_id=? AND action=? AND revision=?",
         )
         .bind(
           preparation.operation_id,
@@ -862,10 +861,19 @@ export async function ensureNodeNetwork(
         "rules",
         exactRules(firewall, member),
         (requestId) =>
-          client.putFirewallRules(member.firewall_id, member.rules, {
-            requestId,
-            deadline,
-          }),
+          client.putFirewallRules(
+            member.firewall_id,
+            {
+              rules: {
+                // Cosmetic provider labels must be distinct; the immutable security plan is unchanged.
+                inbound: member.rules.rules.inbound.map((rule) => ({
+                  ...rule,
+                  displayName: `${rule.displayName} (${rule.protocol})`,
+                })),
+              },
+            },
+            { requestId, deadline },
+          ),
       );
       if (!rulesReady) {
         ready = false;

@@ -199,8 +199,14 @@ async function setup(ipv6 = true) {
   ])) as CryptoKeyPair;
   const calls: { method: string; path: string; requestId: string | null }[] =
     [];
+  const sentRules: Array<{
+    rules: {
+      inbound: Array<Record<string, unknown> & { displayName: string }>;
+    };
+  }> = [];
   let lost = false,
-    apply = true;
+    apply = true,
+    reject = false;
   const fetcher: typeof fetch = async (input, options) => {
     const url = new URL(String(input)),
       method = options?.method ?? "GET";
@@ -233,11 +239,21 @@ async function setup(ipv6 = true) {
         .bind(new Headers(options?.headers).get("x-request-id"))
         .first("state");
       expect(claim).toBe("claimed");
-      if (apply)
-        firewall.rules.inbound = [
-          ...JSON.parse(String(options?.body)).rules.inbound,
-          drop,
-        ];
+      const sent = JSON.parse(String(options?.body));
+      sentRules.push(sent);
+      if (
+        reject ||
+        new Set(
+          sent.rules.inbound.map(
+            (rule: { displayName: string }) => rule.displayName,
+          ),
+        ).size !== sent.rules.inbound.length
+      )
+        return Response.json(
+          { message: "Rule display name is already used" },
+          { status: 400 },
+        );
+      if (apply) firewall.rules.inbound = [...sent.rules.inbound, drop];
       if (lost) {
         lost = false;
         throw new Error(value());
@@ -393,6 +409,7 @@ async function setup(ipv6 = true) {
     settle,
     settings,
     calls,
+    sentRules,
     firewalls,
     bindings,
     instances,
@@ -402,8 +419,94 @@ async function setup(ipv6 = true) {
       lost = true;
       apply = applied;
     },
+    rejectRules() {
+      reject = true;
+    },
   };
 }
+it("uses distinct provider rule labels while retaining the immutable security plan", async () => {
+  const f = await setup();
+  expect(await f.run()).toBe(false);
+  expect(f.sentRules).toHaveLength(2);
+  for (const sent of f.sentRules)
+    expect(sent.rules.inbound.map((rule) => rule.displayName)).toEqual([
+      "PGCF approved management (tcp)",
+      "PGCF exact regional peers (tcp)",
+      "PGCF exact regional peers (udp)",
+    ]);
+  const row = await env.DB.prepare(
+    "SELECT plan_json,plan_sha256 FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .first<{ plan_json: string; plan_sha256: string }>();
+  const plan = JSON.parse(row!.plan_json);
+  for (const member of plan.members)
+    expect(
+      member.rules.rules.inbound.map(
+        (rule: { displayName: string }) => rule.displayName,
+      ),
+    ).toEqual([
+      "PGCF approved management",
+      "PGCF exact regional peers",
+      "PGCF exact regional peers",
+    ]);
+  expect(await f.run()).toBe(false);
+  await f.sign();
+  expect(await f.run()).toBe(true);
+  expect(
+    await env.DB.prepare(
+      "SELECT plan_json,plan_sha256 FROM node_network_preparations WHERE operation_id=?",
+    )
+      .bind(f.addition.intent.operation_id)
+      .first(),
+  ).toEqual(row);
+  expect(f.calls.filter((call) => call.method === "PUT")).toHaveLength(2);
+});
+
+it("acknowledges exact owned policy readback after explicit rejection without redispatching", async () => {
+  const f = await setup();
+  f.rejectRules();
+  expect(await f.run()).toBe(false);
+  expect(await f.run()).toBe(false);
+  expect(f.calls.filter((call) => call.method === "PUT")).toHaveLength(2);
+  const states = async () =>
+    (
+      await env.DB.prepare(
+        "SELECT request_id,state FROM node_network_mutations WHERE operation_id=? AND action='rules' ORDER BY firewall_id",
+      )
+        .bind(f.addition.intent.operation_id)
+        .all<{ request_id: string; state: string }>()
+    ).results;
+  const rejected = await states();
+  expect(rejected.map((row) => row.state)).toEqual(["rejected", "rejected"]);
+  const row = await env.DB.prepare(
+    "SELECT plan_json FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .first<{ plan_json: string }>();
+  const plan = JSON.parse(row!.plan_json);
+  for (const member of plan.members) {
+    const firewall = f.firewalls.get(member.firewall_id)!;
+    const terminal = firewall.rules.inbound.at(-1);
+    firewall.rules.inbound = [
+      ...member.rules.rules.inbound.map(
+        (rule: Record<string, unknown>, index: number) => ({
+          ...rule,
+          displayName: `Operator confirmed rule ${index}`,
+        }),
+      ),
+      terminal,
+    ];
+  }
+  expect(await f.run()).toBe(false);
+  expect(await states()).toEqual(
+    rejected.map((row) => ({ ...row, state: "confirmed" })),
+  );
+  await f.sign();
+  expect(await f.run()).toBe(true);
+  expect(f.calls.filter((call) => call.method === "PUT")).toHaveLength(2);
+});
+
 it("preparation cannot authorize rescue without signed proof or reassign an already attached processing firewall", async () => {
   const f = await setup();
   await f.settle();
