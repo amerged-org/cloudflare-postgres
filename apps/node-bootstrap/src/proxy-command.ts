@@ -11,7 +11,7 @@ import {
   NodeBootstrapInput,
   NodeBootstrapTransport,
   type NodeBootstrapCallback,
-} from "../../../packages/contracts/src/node-bootstrap.ts";
+} from "@pgcf/contracts/node-bootstrap";
 
 export const LOOPBACK = [127, 0, 0, 1].join(".");
 export const ProxyConfig = z.strictObject({

@@ -22,6 +22,10 @@ spec:
     spec:
       serviceAccountName: pgcf-agent
       enableServiceLinks: false
+      tolerations:
+        - key: pgcf.io/quarantine
+          operator: Exists
+          effect: NoSchedule
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000

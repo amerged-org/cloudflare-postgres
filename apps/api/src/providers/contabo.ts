@@ -667,7 +667,7 @@ export class ContaboClient {
       const response = await bounded(
         (o.fetcher ?? fetch)(OAUTH, {
           method: "POST",
-          redirect: "error",
+          redirect: "manual",
           signal: own,
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
           body: new URLSearchParams({
@@ -763,7 +763,7 @@ export class ContaboClient {
     const result = await bounded(
       (this.#options.fetcher ?? fetch)(url.href, {
         method,
-        redirect: "error",
+        redirect: "manual",
         headers,
         signal,
         ...(body === undefined ? {} : { body }),

@@ -7,3 +7,7 @@ crds:
   create: true
 certificate:
   createClientCertificate: true
+tolerations:
+  - key: pgcf.io/quarantine
+    operator: Exists
+    effect: NoSchedule

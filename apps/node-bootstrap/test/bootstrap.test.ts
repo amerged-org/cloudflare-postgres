@@ -11,7 +11,7 @@ import {
   NodeBootstrapInput,
   NodeBootstrapSpec,
   NodeJoinBundle,
-} from "../../../packages/contracts/src/node-bootstrap.ts";
+} from "@pgcf/contracts/node-bootstrap";
 import {
   AuthorityClient,
   BootstrapJob,
