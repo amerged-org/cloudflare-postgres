@@ -21,6 +21,7 @@ import type { ApiContext, Env } from "../env.ts";
 import { bearer } from "../middleware/auth.ts";
 import {
   bootstrapSpecHash,
+  bootstrapPlatformHash,
   openBootstrapInput,
   sealBootstrapInput,
 } from "../crypto/bootstrap-tickets.ts";
@@ -45,6 +46,7 @@ export const NodeBootstrapConfiguration = z.strictObject({
   expected_revision: z.number().int().positive(),
   spec: NodeBootstrapSpec,
   rescue: NodeBootstrapInput.shape.rescue,
+  platform: NodeBootstrapInput.shape.platform,
 });
 export type NodeBootstrapConfiguration = z.infer<
   typeof NodeBootstrapConfiguration
@@ -128,6 +130,18 @@ export async function configureBootstrapJob(
       "Bootstrap identity must match the immutable audited node intent",
     );
   const inputHash = await bootstrapSpecHash(spec);
+  if (
+    value.platform &&
+    (spec.role !== "controlplane" ||
+      value.platform.region_id !== spec.region_id ||
+      !spec.platform ||
+      (await bootstrapPlatformHash(value.platform)) !==
+        spec.platform.configuration_sha256)
+  )
+    throw new ApiError(
+      "conflict",
+      "Platform configuration differs from the reviewed node intent",
+    );
   const previous = await env.DB.prepare(
     "SELECT * FROM node_bootstrap_jobs WHERE operation_id=?",
   )
@@ -140,6 +154,11 @@ export async function configureBootstrapJob(
   }
   if (addition.revision !== value.expected_revision)
     throw new ApiError("conflict", "Node inventory revision changed");
+  if (spec.role === "controlplane" && (!spec.platform || !value.platform))
+    throw new ApiError(
+      "invalid_request",
+      "A new region requires reviewed platform configuration",
+    );
   if (spec.transport.mode !== "relay")
     throw new ApiError(
       "invalid_request",
@@ -207,6 +226,7 @@ export async function configureBootstrapJob(
     input_hash: inputHash,
     rescue: value.rescue,
     join_bundle: joinBundle,
+    ...(value.platform ? { platform: value.platform } : {}),
     callback: {
       url: new URL(
         `/internal/v1/node-bootstrap/${operationId}`,

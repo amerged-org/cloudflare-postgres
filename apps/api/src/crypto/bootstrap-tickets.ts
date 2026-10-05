@@ -5,7 +5,10 @@ import {
   bytesToHex,
   OperationId,
 } from "@pgcf/contracts";
-import { NodeBootstrapInput } from "@pgcf/contracts/node-bootstrap";
+import {
+  NodeBootstrapInput,
+  type NodePlatformConfiguration,
+} from "@pgcf/contracts/node-bootstrap";
 import { z } from "zod";
 
 const KeyId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/);
@@ -51,9 +54,7 @@ async function key(secret: string, kid: string, usage: "encrypt" | "decrypt") {
     [usage],
   );
 }
-export async function bootstrapSpecHash(
-  spec: NodeBootstrapInput["spec"],
-): Promise<string> {
+async function canonicalHash(value: unknown): Promise<string> {
   const canonical = (value: unknown): string => {
     if (value === null || typeof value !== "object")
       return JSON.stringify(value);
@@ -66,9 +67,34 @@ export async function bootstrapSpecHash(
   };
   return bytesToHex(
     new Uint8Array(
-      await crypto.subtle.digest("SHA-256", encoder.encode(canonical(spec))),
+      await crypto.subtle.digest("SHA-256", encoder.encode(canonical(value))),
     ),
   );
+}
+export async function bootstrapSpecHash(
+  spec: NodeBootstrapInput["spec"],
+): Promise<string> {
+  return canonicalHash(spec);
+}
+export async function bootstrapPlatformHash(
+  platform: NodePlatformConfiguration,
+): Promise<string> {
+  return canonicalHash(platform);
+}
+async function verifyPlatformBinding(input: NodeBootstrapInput): Promise<void> {
+  if (
+    input.platform &&
+    (!input.spec.platform || input.spec.role !== "controlplane")
+  )
+    throw new Error("bootstrap_platform_binding_invalid");
+  if (
+    input.spec.platform &&
+    (!input.platform ||
+      input.platform.region_id !== input.spec.region_id ||
+      (await bootstrapPlatformHash(input.platform)) !==
+        input.spec.platform.configuration_sha256)
+  )
+    throw new Error("bootstrap_platform_binding_invalid");
 }
 export async function sealBootstrapInput(
   secret: string,
@@ -76,6 +102,7 @@ export async function sealBootstrapInput(
   revision = 1,
 ): Promise<BootstrapTicket> {
   const parsed = NodeBootstrapInput.parse(input);
+  await verifyPlatformBinding(parsed);
   if (
     parsed.rescue.ssh_host_fingerprint !== parsed.spec.rescue_host_fingerprint
   )
@@ -130,6 +157,7 @@ export async function openBootstrapInput(
       new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
     ),
   );
+  await verifyPlatformBinding(input);
   if (
     input.rescue.ssh_host_fingerprint !== input.spec.rescue_host_fingerprint ||
     input.spec.operation_id !== ticket.operation_id ||

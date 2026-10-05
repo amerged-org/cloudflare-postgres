@@ -9,11 +9,13 @@ import {
   bytesToBase64url,
   bytesToHex,
   newNodeId,
+  newAgentKey,
   randomString,
 } from "@pgcf/contracts";
 import {
   NodeBootstrapAuthority,
   NodeBootstrapSpec,
+  NodePlatformConfiguration,
 } from "../../../../packages/contracts/src/node-bootstrap.ts";
 import {
   configureNodeRegionPolicy,
@@ -55,7 +57,19 @@ const exportBytes = (bytes: ArrayBuffer | JsonWebKey) => {
   return new Uint8Array(bytes);
 };
 const standard64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
-async function prepared() {
+const canonicalConfiguration = (value: unknown): string =>
+  value === null || typeof value !== "object"
+    ? JSON.stringify(value)
+    : Array.isArray(value)
+      ? `[${value.map(canonicalConfiguration).join(",")}]`
+      : `{${Object.keys(value)
+          .sort()
+          .map(
+            (key) =>
+              `${JSON.stringify(key)}:${canonicalConfiguration((value as Record<string, unknown>)[key])}`,
+          )
+          .join(",")}}`;
+async function prepared(withPlatform = true) {
   const f = await fixture();
   await env.DB.prepare("DELETE FROM nodes WHERE id=?").bind(f.node).run();
   await env.DB.prepare("UPDATE regions SET provider_region='EU' WHERE id=?")
@@ -131,6 +145,26 @@ async function prepared() {
     ssh_host_key: "ssh-ed25519 " + standard64(keyBlob),
     ssh_host_fingerprint: fingerprint,
   };
+  const platform = withPlatform
+    ? NodePlatformConfiguration.parse({
+        version: 1,
+        region_id: f.region,
+        api_host: ["api", "invalid"].join("."),
+        agent_key: newAgentKey(f.region),
+        route_keyring: env.ROUTE_MASTER_KEYS,
+        tunnel_token: randomString("abcdefghijklmnopqrstuvwxyz0123456789", 64),
+        backup_s3: {
+          access_key_id: randomString(
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+            32,
+          ),
+          secret_access_key: randomString(
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+            64,
+          ),
+        },
+      })
+    : undefined;
   const spec = NodeBootstrapSpec.parse({
     version: 1,
     operation_id: addition.intent.operation_id,
@@ -166,6 +200,24 @@ async function prepared() {
     cluster_endpoint: `https://${address}:6443`,
     cluster_uid: null,
     join_bundle_sha256: null,
+    ...(platform
+      ? {
+          platform: {
+            reviewed_commit: bytesToHex(
+              crypto.getRandomValues(new Uint8Array(20)),
+            ),
+            regional_image: "registry.invalid/pgcf@sha256:" + hash(),
+            configuration_sha256: bytesToHex(
+              new Uint8Array(
+                await crypto.subtle.digest(
+                  "SHA-256",
+                  new TextEncoder().encode(canonicalConfiguration(platform)),
+                ),
+              ),
+            ),
+          },
+        }
+      : {}),
     transport: {
       mode: "relay",
       issuer_region_id: f.region,
@@ -179,6 +231,7 @@ async function prepared() {
     expected_revision: addition.revision,
     spec,
     rescue,
+    ...(platform ? { platform } : {}),
   });
   const job = await readBootstrapJob(env.DB, addition.intent.operation_id),
     input = await bootstrapJobInput(bindings, job);
@@ -215,6 +268,30 @@ async function callback(
   return response;
 }
 describe("protected bootstrap authority", () => {
+  it("seals first-region platform secrets and rejects an altered private configuration", async () => {
+    const f = await prepared(true);
+    expect(f.input.platform?.region_id).toBe(f.region);
+    expect(f.input.platform?.agent_key).toMatch(/^pgcf_ak_/);
+    expect(JSON.stringify(f.job)).not.toContain(f.input.platform!.agent_key);
+    await expect(
+      configureBootstrapJob(f.bindings, f.identity.operation_id, {
+        expected_revision: f.addition.revision,
+        spec: f.spec,
+        rescue: f.input.rescue,
+        ...{
+          platform: {
+            ...f.input.platform!,
+            tunnel_token: randomString(
+              "abcdefghijklmnopqrstuvwxyz0123456789",
+              64,
+            ),
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    const persisted = await readBootstrapJob(env.DB, f.identity.operation_id);
+    expect(persisted.input_ciphertext).toBe(f.job.input_ciphertext);
+  });
   it("seals private input with operation, digest, revision and key domain separation", async () => {
     const f = await prepared();
     const ticket = await sealBootstrapInput(env.CREDENTIAL_KEYS, f.input);
