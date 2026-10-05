@@ -992,9 +992,9 @@
       "path": "usr/local/bin/helm",
       "sha256": "57ce7fc4ea77b28ee6fa91ae071abcade74d3f524e80c9decff5877a5ac8eda4",
       "size": 65908896,
-      "layer": null,
-      "tarEntry": null,
-      "boundDigest": null,
+      "layer": 7,
+      "tarEntry": 3,
+      "boundDigest": "sha256:fccaf84864818a7933e3be5d1cc1b2bfe32d46d6b9ac87940f38be7f27174fc9",
       "officialBaseMembership": false,
       "nativeArtifact": {
         "name": "helm",
@@ -1005,7 +1005,296 @@
         "sha256": "57ce7fc4ea77b28ee6fa91ae071abcade74d3f524e80c9decff5877a5ac8eda4",
         "size": 65908896
       },
-      "findings": []
+      "findings": [
+        {
+          "rule": "generic-api-key",
+          "startLine": 86242,
+          "endLine": 86242,
+          "startColumn": 19,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 34088427,
+            "byteEndExclusive": 34088489,
+            "size": 62,
+            "sha256": "e0d5ff5d156e5844ec5660ea797b61196c82e6ec62ff629d31662314a5c4d4e3"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 434,
+            "module": "golang.org/x/oauth2",
+            "version": "v0.36.0",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "0bb00ef77a8c97e44fed7ac4456f03b7a397ccb296e3cb29d63b7805882d4ab8"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 86251,
+          "endLine": 86251,
+          "startColumn": 13,
+          "endColumn": 71,
+          "span": {
+            "byteStart": 34089174,
+            "byteEndExclusive": 34089233,
+            "size": 59,
+            "sha256": "1b686c05bacd8042d0abfe4aff813a761ae012c78c505edf96572f2c7978773b"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 517,
+            "module": "k8s.io/api",
+            "version": "v0.37.0",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "0677ee5d84dff85410c8955ea3f911e6b729cd0eab4d2abe7b5a03546b0aef00"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 86252,
+          "endLine": 86252,
+          "startColumn": 13,
+          "endColumn": 91,
+          "span": {
+            "byteStart": 34089245,
+            "byteEndExclusive": 34089324,
+            "size": 79,
+            "sha256": "0d35edae5ac890b0b3e088458b696d796ec7022168f92f2e12b1c4c62cb39606"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 519,
+            "module": "k8s.io/apiextensions-apiserver",
+            "version": "v0.37.0",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "537534898288853f4ab1bfe2211edc56ebacab71d2112970a05fa7d9b30e328c"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 86253,
+          "endLine": 86253,
+          "startColumn": 13,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 34089336,
+            "byteEndExclusive": 34089404,
+            "size": 68,
+            "sha256": "569b5962689f2fcac510c8912f90b08ff234b5244ed5658c97cb6fccaf54a87b"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 521,
+            "module": "k8s.io/apimachinery",
+            "version": "v0.37.0",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "9e82b740a89ae464e7897127082e4de7f4565090516eb4dd964f87ceb02d6b7f"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 86254,
+          "endLine": 86254,
+          "startColumn": 13,
+          "endColumn": 77,
+          "span": {
+            "byteStart": 34089416,
+            "byteEndExclusive": 34089481,
+            "size": 65,
+            "sha256": "a74e4370dfcb83640023a909516e922f49c0a1588b4e902c1238f7a7575bbfba"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 523,
+            "module": "k8s.io/apiserver",
+            "version": "v0.37.0",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "856136993c4961e186cdcd2d815f29117a29c210cce4078c5791393fb68c1548"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 86265,
+          "endLine": 86265,
+          "startColumn": 28,
+          "endColumn": 86,
+          "span": {
+            "byteStart": 34090379,
+            "byteEndExclusive": 34090438,
+            "size": 59,
+            "sha256": "ba98d425c441a9f2f05dcf9a08607880229c2804a8c2f06b6ffa91b1d88f0c9a"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 545,
+            "module": "sigs.k8s.io/kustomize/api",
+            "version": "v0.21.1",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "ffdc84fa404382ff057a985c06d656c0b847b6654c5440159ef2e7d9a7611aba"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 262605,
+          "endLine": 262605,
+          "startColumn": 19,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 64774134,
+            "byteEndExclusive": 64774196,
+            "size": 62,
+            "sha256": "e0d5ff5d156e5844ec5660ea797b61196c82e6ec62ff629d31662314a5c4d4e3"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 434,
+            "module": "golang.org/x/oauth2",
+            "version": "v0.36.0",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "0bb00ef77a8c97e44fed7ac4456f03b7a397ccb296e3cb29d63b7805882d4ab8"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 262614,
+          "endLine": 262614,
+          "startColumn": 13,
+          "endColumn": 71,
+          "span": {
+            "byteStart": 64774881,
+            "byteEndExclusive": 64774940,
+            "size": 59,
+            "sha256": "1b686c05bacd8042d0abfe4aff813a761ae012c78c505edf96572f2c7978773b"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 517,
+            "module": "k8s.io/api",
+            "version": "v0.37.0",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "0677ee5d84dff85410c8955ea3f911e6b729cd0eab4d2abe7b5a03546b0aef00"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 262615,
+          "endLine": 262615,
+          "startColumn": 13,
+          "endColumn": 91,
+          "span": {
+            "byteStart": 64774952,
+            "byteEndExclusive": 64775031,
+            "size": 79,
+            "sha256": "0d35edae5ac890b0b3e088458b696d796ec7022168f92f2e12b1c4c62cb39606"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 519,
+            "module": "k8s.io/apiextensions-apiserver",
+            "version": "v0.37.0",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "537534898288853f4ab1bfe2211edc56ebacab71d2112970a05fa7d9b30e328c"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 262616,
+          "endLine": 262616,
+          "startColumn": 13,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 64775043,
+            "byteEndExclusive": 64775111,
+            "size": 68,
+            "sha256": "569b5962689f2fcac510c8912f90b08ff234b5244ed5658c97cb6fccaf54a87b"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 521,
+            "module": "k8s.io/apimachinery",
+            "version": "v0.37.0",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "9e82b740a89ae464e7897127082e4de7f4565090516eb4dd964f87ceb02d6b7f"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 262617,
+          "endLine": 262617,
+          "startColumn": 13,
+          "endColumn": 77,
+          "span": {
+            "byteStart": 64775123,
+            "byteEndExclusive": 64775188,
+            "size": 65,
+            "sha256": "a74e4370dfcb83640023a909516e922f49c0a1588b4e902c1238f7a7575bbfba"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 523,
+            "module": "k8s.io/apiserver",
+            "version": "v0.37.0",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "856136993c4961e186cdcd2d815f29117a29c210cce4078c5791393fb68c1548"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 262628,
+          "endLine": 262628,
+          "startColumn": 28,
+          "endColumn": 86,
+          "span": {
+            "byteStart": 64776086,
+            "byteEndExclusive": 64776145,
+            "size": 59,
+            "sha256": "ba98d425c441a9f2f05dcf9a08607880229c2804a8c2f06b6ffa91b1d88f0c9a"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+            "sourceSha256": "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+            "sourceLine": 545,
+            "module": "sigs.k8s.io/kustomize/api",
+            "version": "v0.21.1",
+            "compilerMetadataDuplicateVerified": true,
+            "compilerMetadataLineSha256": "ffdc84fa404382ff057a985c06d656c0b847b6654c5440159ef2e7d9a7611aba"
+          }
+        }
+      ]
     }
   ],
   "nativeReviewProjectionSha256": "3d6f068892ccb31857d6aed6de43f7c4db2de1d63ebf500eeac95f241fa28d9a"

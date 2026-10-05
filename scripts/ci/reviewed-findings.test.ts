@@ -262,13 +262,19 @@ test("repacked application layers retain only the six exact package-proven spans
   );
 });
 
-test("bootstrap resolves exactly the nineteen source-reviewed native spans and rejects an additional finding", async () => {
+test("bootstrap resolves exactly the thirty-one source-reviewed native spans and rejects an additional finding", async () => {
   const native = reviewedFiles.filter((file) => file.nativeArtifact);
   assert.equal(native.length, 3);
   const values = native.flatMap((file) =>
-    file.findings.map((_span, index) => finding(file, index)),
+    file.findings.map((_span, index) => {
+      const value = finding(file, index);
+      return {
+        ...value,
+        input: { ...value.input, boundDigest: native[0]!.boundDigest! },
+      };
+    }),
   );
-  assert.equal(values.length, 19);
+  assert.equal(values.length, 31);
   const proof = {
     ...(await provenance()),
     profile: "node-bootstrap" as const,
@@ -284,7 +290,7 @@ test("bootstrap resolves exactly the nineteen source-reviewed native spans and r
     })),
   };
   assert.deepEqual(classifyReviewed(values, proof), {
-    resolved: 19,
+    resolved: 31,
     unresolved: 0,
   });
   assert.deepEqual(
@@ -292,8 +298,74 @@ test("bootstrap resolves exactly the nineteen source-reviewed native spans and r
       [...values, { ...values[0]!, RuleID: "unreviewed-native" }],
       proof,
     ),
-    { resolved: 19, unresolved: 1 },
+    { resolved: 31, unresolved: 1 },
   );
+});
+
+test("Helm resolves only twelve exact pinned public Go checksum spans and rejects changed bytes or another finding", async () => {
+  const helm = reviewedFiles.find(
+    (file) => file.path === "usr/local/bin/helm",
+  )!;
+  assert.equal(helm.findings.length, 12);
+  const values = helm.findings.map((_span, index) => finding(helm, index));
+  const native = reviewedFiles.filter((file) => file.nativeArtifact);
+  const proof = {
+    ...(await provenance()),
+    profile: "node-bootstrap" as const,
+    imageDiffIDs: [
+      ...reviewedBase.diffIDs,
+      "sha256:" + "a".repeat(64),
+      "sha256:" + "b".repeat(64),
+      helm.boundDigest!,
+    ],
+    nativeArtifacts: verifyNativeArtifacts(native, "node-bootstrap"),
+  };
+  assert.deepEqual(classifyReviewed(values, proof), {
+    resolved: 12,
+    unresolved: 0,
+  });
+  assert.equal(
+    classifyReviewed(
+      [
+        {
+          ...values[0]!,
+          span: { ...values[0]!.span!, sha256: "0".repeat(64) },
+        },
+      ],
+      proof,
+    ).unresolved,
+    1,
+  );
+  assert.deepEqual(
+    classifyReviewed(
+      [...values, { ...values[0]!, StartLine: values[0]!.StartLine + 1 }],
+      proof,
+    ),
+    { resolved: 12, unresolved: 1 },
+  );
+  for (const value of helm.findings) {
+    assert.equal(
+      value.classification,
+      "go_dependency_artifact_checksum_metadata",
+    );
+    assert.ok("sourceProof" in value);
+    const source = value.sourceProof;
+    assert.ok(
+      source &&
+        "sourceUrl" in source &&
+        "sourceSha256" in source &&
+        "compilerMetadataDuplicateVerified" in source,
+    );
+    assert.equal(
+      source.sourceUrl,
+      "https://raw.githubusercontent.com/helm/helm/bec5b06ed841fe5269972d864d5177944fd5970f/go.sum",
+    );
+    assert.equal(
+      source.sourceSha256,
+      "e7105c82ef112e8ebb0fa2e02295b814ab6b85d404a947908c3dd999bd0b9909",
+    );
+    assert.equal(source.compilerMetadataDuplicateVerified, true);
+  }
 });
 
 test("native spans require the bootstrap profile and exact public-artifact provenance", async () => {
