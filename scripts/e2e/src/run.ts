@@ -587,7 +587,15 @@ export class Run {
     dryRun: boolean,
     traceOptions?: TraceOptions,
   ) {
-    this.traceOptions = traceOptions;
+    this.traceOptions = {
+      ...traceOptions,
+      onFailure: (summary) => {
+        console.error(
+          JSON.stringify({ event: "trace_capture_failed", ...summary }),
+        );
+        return traceOptions?.onFailure?.(summary);
+      },
+    };
     this.c = c;
     this.root = root;
     this.state = state;
