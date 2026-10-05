@@ -113,6 +113,130 @@ function applyFailure(error: unknown): { category: string; status?: number } {
   return { category: "unknown" };
 }
 
+const STATUS_REASONS = new Set([
+  "Unauthorized",
+  "Forbidden",
+  "NotFound",
+  "AlreadyExists",
+  "Conflict",
+  "Gone",
+  "Invalid",
+  "ServerTimeout",
+  "Timeout",
+  "TooManyRequests",
+  "BadRequest",
+  "MethodNotAllowed",
+  "NotAcceptable",
+  "RequestEntityTooLarge",
+  "UnsupportedMediaType",
+  "InternalError",
+  "Expired",
+  "ServiceUnavailable",
+]);
+const CAUSE_REASONS = new Set([
+  "FieldValueNotFound",
+  "FieldValueRequired",
+  "FieldValueDuplicate",
+  "FieldValueInvalid",
+  "FieldValueNotSupported",
+  "FieldValueForbidden",
+  "FieldValueTooLong",
+  "FieldValueTooMany",
+  "InternalError",
+  "UnexpectedServerResponse",
+  "FieldManagerConflict",
+  "ResourceVersionTooLarge",
+]);
+const CAUSE_FIELDS = new Set([
+  "metadata.resourceVersion",
+  "metadata.uid",
+  "metadata.name",
+  "metadata.namespace",
+  "metadata.annotations",
+  "metadata.annotations[pgcf.io/generation]",
+  "metadata.annotations[pgcf.io/accepted-generation]",
+  "spec",
+  "data",
+  "binaryData",
+  "type",
+]);
+function patchStatus(error: unknown): {
+  statusReason: string;
+  causeField: string;
+  causeReason: string;
+} {
+  const unknown = {
+    statusReason: "unknown",
+    causeField: "unknown",
+    causeReason: "unknown",
+  };
+  try {
+    if (
+      !(error instanceof ApiException) ||
+      typeof error.body !== "string" ||
+      error.body.length > 16384
+    )
+      return unknown;
+    const body = record(JSON.parse(error.body)),
+      causes = record(body.details).causes;
+    const cause = Array.isArray(causes) ? record(causes[0]) : {};
+    const known = (value: unknown, whitelist: ReadonlySet<string>) =>
+      typeof value === "string" && value.length <= 64 && whitelist.has(value)
+        ? value
+        : "unknown";
+    return {
+      statusReason: known(body.reason, STATUS_REASONS),
+      causeField: known(cause.field, CAUSE_FIELDS),
+      causeReason: known(cause.reason, CAUSE_REASONS),
+    };
+  } catch {
+    return unknown;
+  }
+}
+function patchTimestamp(): number {
+  try {
+    return performance.now();
+  } catch {
+    return NaN;
+  }
+}
+function patchInterval(started: number): { getToPatchMs?: number } {
+  const finished = patchTimestamp(),
+    elapsed = finished - started;
+  return Number.isFinite(started) &&
+    started >= 0 &&
+    Number.isFinite(finished) &&
+    finished >= started &&
+    elapsed <= Number.MAX_SAFE_INTEGER
+    ? { getToPatchMs: elapsed }
+    : {};
+}
+type PatchRefusal =
+  | "eligible"
+  | "not_retryable"
+  | "not_wake"
+  | "aborted"
+  | "original_identity_invalid"
+  | "reread_failed"
+  | "resource_missing"
+  | "namespace_missing"
+  | "scope_changed"
+  | "uid_changed"
+  | "invalid_version"
+  | "unchanged_version"
+  | "deleting"
+  | "namespace_scope"
+  | "namespace_version"
+  | "namespace_uid"
+  | "namespace_deleting"
+  | "invalid_revision"
+  | "future_revision"
+  | "namespace_revision"
+  | "high_water"
+  | "ownership"
+  | "managed_content_changed"
+  | "retry_limit";
+
 interface VolumeIdentity {
   name: string;
   uid: string;
@@ -699,6 +823,7 @@ export class Reconciler {
                 namespaceName,
                 "database",
               );
+              const clusterReadAt = patchTimestamp();
               if (currentCluster) {
                 assertOwned(currentCluster, db.id, "database");
                 if (appliedGeneration(currentCluster) > db.generation)
@@ -722,6 +847,7 @@ export class Reconciler {
                   currentCluster,
                   storage.namespaceUid!,
                   manifest,
+                  clusterReadAt,
                   (snapshot, retry) => [
                     {
                       op: "test",
@@ -1139,14 +1265,59 @@ export class Reconciler {
     );
   }
 
+  private patchDiagnostic(
+    db: DesiredDatabase,
+    original: Resource,
+    attempt: "initial" | "retry",
+    error: unknown,
+    retryRefusal: PatchRefusal,
+    gap: { getToPatchMs?: number },
+    current?: Resource | null,
+  ): void {
+    if (db.desired_state !== "running" || db.power?.mode !== "running") return;
+    try {
+      const facts: { sameUid?: boolean; newResourceVersion?: boolean } = {};
+      if (
+        current &&
+        typeof current.metadata.uid === "string" &&
+        current.metadata.uid
+      )
+        facts.sameUid = current.metadata.uid === original.metadata.uid;
+      if (
+        current &&
+        typeof current.metadata.resourceVersion === "string" &&
+        current.metadata.resourceVersion.length >= 1 &&
+        current.metadata.resourceVersion.length <= 256
+      )
+        facts.newResourceVersion =
+          current.metadata.resourceVersion !==
+          original.metadata.resourceVersion;
+      this.log?.("wake_patch_failed", {
+        phase: "desired_apply",
+        database_id: db.id,
+        resource: original.kind === "Cluster" ? "cluster" : "manifest",
+        attempt,
+        retryRefusal,
+        ...applyFailure(error),
+        ...patchStatus(error),
+        ...gap,
+        ...facts,
+      });
+    } catch {
+      /* Diagnostics cannot change the original failure or retry decision. */
+    }
+  }
+
   private async patchConfiguration(
     db: DesiredDatabase,
     original: Resource,
     namespaceUid: string,
     manifest: K8sObject,
+    readAt: number,
     build: (snapshot: Resource, retry: boolean) => unknown[],
   ): Promise<void> {
     this.signal.throwIfAborted();
+    const gap = patchInterval(readAt);
     try {
       await this.k8s.patch(
         original.kind,
@@ -1155,12 +1326,20 @@ export class Reconciler {
         build(original, false),
       );
     } catch (error) {
+      let refusal: PatchRefusal = "not_retryable";
+      if (!(error instanceof ApiException) || error.code !== 422) {
+        this.patchDiagnostic(db, original, "initial", error, refusal, gap);
+        throw error;
+      }
+      if (db.desired_state !== "running" || db.power?.mode !== "running") {
+        this.patchDiagnostic(db, original, "initial", error, "not_wake", gap);
+        throw error;
+      }
+      if (this.signal.aborted) {
+        this.patchDiagnostic(db, original, "initial", error, "aborted", gap);
+        throw error;
+      }
       if (
-        !(error instanceof ApiException) ||
-        error.code !== 422 ||
-        db.desired_state !== "running" ||
-        db.power?.mode !== "running" ||
-        this.signal.aborted ||
         typeof original.metadata.resourceVersion !== "string" ||
         original.metadata.resourceVersion.length < 1 ||
         original.metadata.resourceVersion.length > 256 ||
@@ -1168,67 +1347,147 @@ export class Reconciler {
         !original.metadata.uid ||
         typeof namespaceUid !== "string" ||
         !namespaceUid
-      )
+      ) {
+        this.patchDiagnostic(
+          db,
+          original,
+          "initial",
+          error,
+          "original_identity_invalid",
+          gap,
+        );
         throw error;
-      let current: Resource | null, namespace: Resource | null;
+      }
+      let current: Resource | null = null,
+        namespace: Resource | null,
+        retryReadAt = NaN;
+      function refuse(reason: PatchRefusal): never {
+        refusal = reason;
+        throw error;
+      }
       try {
+        refusal = "reread_failed";
         [current, namespace] = await Promise.all([
-          this.k8s.read(
-            original.kind,
-            original.metadata.namespace,
-            original.metadata.name,
-          ),
+          this.k8s
+            .read(
+              original.kind,
+              original.metadata.namespace,
+              original.metadata.name,
+            )
+            .then((value) => {
+              retryReadAt = patchTimestamp();
+              return value;
+            }),
           this.k8s.read("Namespace", undefined, databaseNamespace(db.id)),
         ]);
+        if (this.signal.aborted) refuse("aborted");
+        if (!current) refuse("resource_missing");
+        if (!namespace) refuse("namespace_missing");
         if (
-          this.signal.aborted ||
-          !current ||
-          !namespace ||
           current.apiVersion !== original.apiVersion ||
           current.kind !== original.kind ||
           current.metadata.name !== original.metadata.name ||
           current.metadata.namespace !== original.metadata.namespace ||
-          current.metadata.namespace !== databaseNamespace(db.id) ||
+          current.metadata.namespace !== databaseNamespace(db.id)
+        )
+          refuse("scope_changed");
+        if (
           current.metadata.uid !== original.metadata.uid ||
-          !current.metadata.uid ||
+          !current.metadata.uid
+        )
+          refuse("uid_changed");
+        if (
           typeof current.metadata.resourceVersion !== "string" ||
           current.metadata.resourceVersion.length < 1 ||
-          current.metadata.resourceVersion.length > 256 ||
-          current.metadata.resourceVersion ===
-            original.metadata.resourceVersion ||
+          current.metadata.resourceVersion.length > 256
+        )
+          refuse("invalid_version");
+        if (
+          current.metadata.resourceVersion === original.metadata.resourceVersion
+        )
+          refuse("unchanged_version");
+        if (
           current.metadata.deletionTimestamp ||
-          original.metadata.deletionTimestamp ||
+          original.metadata.deletionTimestamp
+        )
+          refuse("deleting");
+        if (
           namespace.kind !== "Namespace" ||
           namespace.metadata.namespace !== undefined ||
-          typeof namespace.metadata.resourceVersion !== "string" ||
-          !namespace.metadata.resourceVersion ||
-          namespace.metadata.uid !== namespaceUid ||
-          namespace.metadata.deletionTimestamp ||
-          namespace.metadata.name !== databaseNamespace(db.id) ||
-          appliedGeneration(current) > db.generation ||
-          acceptedGeneration(current) > db.generation ||
-          appliedGeneration(namespace) > db.generation ||
-          acceptedGeneration(namespace) !== db.generation ||
-          (this.highWater.get(db.id) ?? 0) > db.generation
+          namespace.metadata.name !== databaseNamespace(db.id)
         )
-          throw error;
+          refuse("namespace_scope");
+        if (
+          typeof namespace.metadata.resourceVersion !== "string" ||
+          !namespace.metadata.resourceVersion
+        )
+          refuse("namespace_version");
+        if (namespace.metadata.uid !== namespaceUid) refuse("namespace_uid");
+        if (namespace.metadata.deletionTimestamp) refuse("namespace_deleting");
+        refusal = "invalid_revision";
+        if (
+          appliedGeneration(current) > db.generation ||
+          acceptedGeneration(current) > db.generation
+        )
+          refuse("future_revision");
+        if (
+          appliedGeneration(namespace) > db.generation ||
+          acceptedGeneration(namespace) !== db.generation
+        )
+          refuse("namespace_revision");
+        if ((this.highWater.get(db.id) ?? 0) > db.generation)
+          refuse("high_water");
+        refusal = "ownership";
         assertOwned(current, db.id, original.metadata.name);
         assertOwned(namespace, db.id, databaseNamespace(db.id));
+        refusal = "managed_content_changed";
         for (const [key, value] of Object.entries(manifest).filter(
           ([key]) => !["apiVersion", "kind", "metadata"].includes(key),
         ))
           if (!managedContentUnchanged(original[key], current[key], value))
-            throw error;
+            refuse("managed_content_changed");
       } catch {
+        this.patchDiagnostic(
+          db,
+          original,
+          "initial",
+          error,
+          refusal,
+          gap,
+          current,
+        );
         throw error;
       }
-      this.signal.throwIfAborted();
-      await this.k8s.patch(
-        current.kind,
-        current.metadata.namespace,
-        current.metadata.name,
-        build(current, true),
+      this.patchDiagnostic(
+        db,
+        original,
+        "initial",
+        error,
+        "eligible",
+        gap,
+        current,
       );
+      const retryGap = patchInterval(retryReadAt);
+      try {
+        this.signal.throwIfAborted();
+        await this.k8s.patch(
+          current.kind,
+          current.metadata.namespace,
+          current.metadata.name,
+          build(current, true),
+        );
+      } catch (retryError) {
+        this.patchDiagnostic(
+          db,
+          original,
+          "retry",
+          retryError,
+          this.signal.aborted ? "aborted" : "retry_limit",
+          retryGap,
+          current,
+        );
+        throw retryError;
+      }
     }
   }
 
@@ -1243,6 +1502,7 @@ export class Reconciler {
       metadata.namespace,
       metadata.name,
     );
+    const readAt = patchTimestamp();
     if (!current) {
       await this.k8s.create(manifest);
       return true;
@@ -1286,6 +1546,7 @@ export class Reconciler {
       current,
       namespaceUid,
       manifest,
+      readAt,
       (snapshot, retry) => [
         { op: "test", path: "/metadata/uid", value: uid(snapshot) },
         {

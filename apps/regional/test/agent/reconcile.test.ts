@@ -2472,7 +2472,7 @@ test("a changed currentPrimary after metrics cannot reuse the previous primary a
   assert.equal(authentications, 0);
 });
 
-async function wakeConfigurationFixture() {
+async function wakeConfigurationFixture(log?: Log) {
   const { db, ctx } = fixture(),
     k8s = new MemoryKubernetes();
   await new Reconciler(
@@ -2505,6 +2505,7 @@ async function wakeConfigurationFixture() {
       metrics,
       authenticate,
       power,
+      log,
     ),
   };
 }
@@ -3147,4 +3148,279 @@ test("deleting credentials remain pending and credential RV changes during authe
     raced.power,
   ).reconcile(raced.db, raced.ctx);
   assert.notEqual(observation?.state, "ready");
+});
+
+test("wake PATCH diagnostics distinguish initial and retry failures using only sanitized Status fields", async () => {
+  const logs: {
+    event: string;
+    fields: Record<string, string | number | boolean>;
+  }[] = [];
+  const f = await wakeConfigurationFixture((event, fields = {}) =>
+      logs.push({ event, fields }),
+    ),
+    native = f.k8s.patch.bind(f.k8s),
+    canary = fixture().db.roles[0]!.password;
+  let attempts = 0;
+  const failure = new ApiException(
+    422,
+    canary,
+    JSON.stringify({
+      reason: "Invalid",
+      message: canary,
+      details: {
+        name: canary,
+        causes: [
+          {
+            field: "metadata.resourceVersion",
+            reason: "FieldValueInvalid",
+            message: canary,
+          },
+        ],
+      },
+    }),
+    { Authorization: canary },
+  );
+  f.k8s.patch = async (kind, ns, name, operations) => {
+    if (kind === "ObjectStore") {
+      attempts++;
+      if (attempts === 1)
+        await native(kind, ns, name, [
+          {
+            op: "add",
+            path: "/metadata/annotations/controller",
+            value: "preserved",
+          },
+        ]);
+      throw failure;
+    }
+    await native(kind, ns, name, operations);
+  };
+  await assert.rejects(
+    f.reconciler.reconcile(f.db, f.ctx),
+    (error) => error === failure,
+  );
+  const failed = logs.filter((entry) => entry.event === "wake_patch_failed");
+  assert.deepEqual(
+    failed.map((entry) => entry.fields.attempt),
+    ["initial", "retry"],
+  );
+  for (const entry of failed) {
+    assert.equal(entry.fields.status, 422);
+    assert.equal(entry.fields.statusReason, "Invalid");
+    assert.equal(entry.fields.causeField, "metadata.resourceVersion");
+    assert.equal(entry.fields.causeReason, "FieldValueInvalid");
+    assert.equal(entry.fields.sameUid, true);
+    assert.equal(entry.fields.newResourceVersion, true);
+  }
+  assert.equal(attempts, 2);
+  assert.equal(JSON.stringify(logs).includes(canary), false);
+});
+
+test("wake PATCH diagnostics identify the exact unchanged-version retry refusal", async () => {
+  const logs: {
+    event: string;
+    fields: Record<string, string | number | boolean>;
+  }[] = [];
+  const f = await wakeConfigurationFixture((event, fields = {}) =>
+      logs.push({ event, fields }),
+    ),
+    native = f.k8s.patch.bind(f.k8s);
+  let attempts = 0;
+  const failure = new ApiException(
+    422,
+    "opaque",
+    JSON.stringify({ reason: "Invalid" }),
+    {},
+  );
+  f.k8s.patch = async (kind, ns, name, operations) => {
+    if (kind === "ObjectStore") {
+      attempts++;
+      throw failure;
+    }
+    await native(kind, ns, name, operations);
+  };
+  await assert.rejects(
+    f.reconciler.reconcile(f.db, f.ctx),
+    (error) => error === failure,
+  );
+  const failed = logs.filter((entry) => entry.event === "wake_patch_failed");
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0]!.fields.retryRefusal, "unchanged_version");
+  assert.equal(failed[0]!.fields.sameUid, true);
+  assert.equal(failed[0]!.fields.newResourceVersion, false);
+  assert.equal(attempts, 1);
+});
+
+test("wake PATCH diagnostics measure the Cluster GET-to-PATCH interval independently of request outcome", async (t) => {
+  const logs: {
+    event: string;
+    fields: Record<string, string | number | boolean>;
+  }[] = [];
+  const f = await wakeConfigurationFixture((event, fields = {}) =>
+      logs.push({ event, fields }),
+    ),
+    read = f.k8s.read.bind(f.k8s),
+    native = f.k8s.patch.bind(f.k8s);
+  let afterCluster = false,
+    clockReads = 0;
+  t.mock.method(performance, "now", () =>
+    !afterCluster ? 0 : clockReads++ === 0 ? 100 : 600,
+  );
+  f.k8s.read = async (kind, ns, name) => {
+    const value = await read(kind, ns, name);
+    if (kind === "Cluster") {
+      afterCluster = true;
+      clockReads = 0;
+    }
+    return value;
+  };
+  const failure = new ApiException(
+    422,
+    "opaque",
+    JSON.stringify({ reason: "Invalid" }),
+    {},
+  );
+  f.k8s.patch = async (kind, ns, name, operations) => {
+    if (kind === "Cluster") throw failure;
+    await native(kind, ns, name, operations);
+  };
+  await assert.rejects(
+    f.reconciler.reconcile(f.db, f.ctx),
+    (error) => error === failure,
+  );
+  const failed = logs.filter((entry) => entry.event === "wake_patch_failed");
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0]!.fields.getToPatchMs, 500);
+});
+
+test("PATCH diagnostics sanitize arbitrary Status fields and isolate logger failures from the retry cap", async () => {
+  const logs: {
+      event: string;
+      fields: Record<string, string | number | boolean>;
+    }[] = [],
+    canary = fixture().db.roles[0]!.password;
+  const f = await wakeConfigurationFixture((event, fields = {}) => {
+      logs.push({ event, fields });
+      if (event === "wake_patch_failed") throw new Error(canary);
+    }),
+    native = f.k8s.patch.bind(f.k8s);
+  const failure = new ApiException(
+    422,
+    canary,
+    JSON.stringify({
+      reason: canary,
+      message: canary,
+      details: {
+        causes: [{ field: `data.${canary}`, reason: canary, message: canary }],
+      },
+    }),
+    { Authorization: canary },
+  );
+  let attempts = 0;
+  f.k8s.patch = async (kind, ns, name, operations) => {
+    if (kind === "ObjectStore") {
+      attempts++;
+      if (attempts === 1)
+        await native(kind, ns, name, [
+          {
+            op: "add",
+            path: "/metadata/annotations/controller",
+            value: "preserved",
+          },
+        ]);
+      throw failure;
+    }
+    await native(kind, ns, name, operations);
+  };
+  await assert.rejects(
+    f.reconciler.reconcile(f.db, f.ctx),
+    (error) => error === failure,
+  );
+  const failed = logs.filter((entry) => entry.event === "wake_patch_failed");
+  assert.equal(failed.length, 2);
+  for (const entry of failed) {
+    assert.equal(entry.fields.statusReason, "unknown");
+    assert.equal(entry.fields.causeField, "unknown");
+    assert.equal(entry.fields.causeReason, "unknown");
+  }
+  assert.equal(attempts, 2);
+  assert.equal(failed[1]!.fields.retryRefusal, "retry_limit");
+  assert.equal(JSON.stringify(logs).includes(canary), false);
+});
+
+test("oversized Status bodies remain unknown and invalid diagnostic clocks never fabricate a zero interval", async (t) => {
+  const logs: {
+    event: string;
+    fields: Record<string, string | number | boolean>;
+  }[] = [];
+  const f = await wakeConfigurationFixture((event, fields = {}) =>
+      logs.push({ event, fields }),
+    ),
+    native = f.k8s.patch.bind(f.k8s),
+    canary = fixture().db.roles[0]!.password;
+  t.mock.method(performance, "now", () => NaN);
+  const failure = new ApiException(
+    422,
+    canary,
+    JSON.stringify({
+      reason: "Invalid",
+      message: canary.repeat(500),
+      details: {
+        causes: [{ field: "metadata.uid", reason: "FieldValueInvalid" }],
+      },
+    }),
+    {},
+  );
+  f.k8s.patch = async (kind, ns, name, operations) => {
+    if (kind === "ObjectStore") throw failure;
+    await native(kind, ns, name, operations);
+  };
+  await assert.rejects(
+    f.reconciler.reconcile(f.db, f.ctx),
+    (error) => error === failure,
+  );
+  const failed = logs.filter((entry) => entry.event === "wake_patch_failed");
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0]!.fields.statusReason, "unknown");
+  assert.equal(failed[0]!.fields.causeField, "unknown");
+  assert.equal(Object.hasOwn(failed[0]!.fields, "getToPatchMs"), false);
+  assert.equal(JSON.stringify(logs).includes(canary), false);
+});
+
+test("PATCH diagnostics report UID replacement without retrying or attributing it to a version race", async () => {
+  const logs: {
+    event: string;
+    fields: Record<string, string | number | boolean>;
+  }[] = [];
+  const f = await wakeConfigurationFixture((event, fields = {}) =>
+      logs.push({ event, fields }),
+    ),
+    native = f.k8s.patch.bind(f.k8s);
+  let attempts = 0;
+  const failure = new ApiException(
+    422,
+    "opaque",
+    JSON.stringify({ reason: "Invalid" }),
+    {},
+  );
+  f.k8s.patch = async (kind, ns, name, operations) => {
+    if (kind === "ObjectStore") {
+      attempts++;
+      const current = f.k8s.resources.get(f.k8s.key(kind, ns, name))!;
+      current.metadata.uid = randomUUID();
+      current.metadata.resourceVersion = String(++f.k8s.revision);
+      throw failure;
+    }
+    await native(kind, ns, name, operations);
+  };
+  await assert.rejects(
+    f.reconciler.reconcile(f.db, f.ctx),
+    (error) => error === failure,
+  );
+  const failed = logs.filter((entry) => entry.event === "wake_patch_failed");
+  assert.equal(failed.length, 1);
+  assert.equal(failed[0]!.fields.retryRefusal, "uid_changed");
+  assert.equal(failed[0]!.fields.sameUid, false);
+  assert.equal(failed[0]!.fields.newResourceVersion, true);
+  assert.equal(attempts, 1);
 });
