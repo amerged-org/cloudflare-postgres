@@ -16,7 +16,193 @@ import {
   assertScanResult,
   validateImageIdentity,
   validateManifestBinding,
+  parseQualificationArguments,
+  validateDockerfile,
+  runtimeChecks,
+  validateRuntimeResult,
 } from "./image-qualification.ts";
+import {
+  reviewedBase,
+  reviewedFiles,
+  reviewedManifestPaths,
+} from "./reviewed-findings.ts";
+
+test("qualification profiles default to regional and reject ambiguous or malformed options", () => {
+  assert.deepEqual(
+    parseQualificationArguments(["runtime", "fixture:qualified"]),
+    { profile: "regional", args: ["runtime", "fixture:qualified"] },
+  );
+  assert.deepEqual(
+    parseQualificationArguments([
+      "runtime",
+      "fixture:qualified",
+      "--profile",
+      "node-bootstrap",
+    ]),
+    { profile: "node-bootstrap", args: ["runtime", "fixture:qualified"] },
+  );
+  assert.throws(() => parseQualificationArguments(["runtime", "--profile"]));
+  assert.throws(() =>
+    parseQualificationArguments(["runtime", "--profile", "other"]),
+  );
+  assert.throws(() =>
+    parseQualificationArguments([
+      "--profile",
+      "regional",
+      "--profile",
+      "node-bootstrap",
+    ]),
+  );
+  assert.throws(() =>
+    parseQualificationArguments(["runtime", "--profile=node-bootstrap"]),
+  );
+});
+
+test("the single CI workflow qualifies both image profiles before independent publication", async () => {
+  const workflow = await readFile(".github/workflows/ci.yml", "utf8"),
+    regional = workflow
+      .split("\n  image:\n")[1]!
+      .split("\n  node_bootstrap_image:\n")[0]!,
+    bootstrap = workflow
+      .split("\n  node_bootstrap_image:\n")[1]!
+      .split("\n  external_probe:\n")[0]!;
+  assert.match(regional, /IMAGE: ghcr\.io\/amerged-org\/pgcf-regional/);
+  assert.match(bootstrap, /IMAGE: ghcr\.io\/amerged-org\/pgcf-node-bootstrap/);
+  assert.match(bootstrap, /--file apps\/node-bootstrap\/Dockerfile/);
+  assert.match(bootstrap, /needs: check/);
+  assert.doesNotMatch(bootstrap, /matrix:/);
+  const actions = [
+    ...bootstrap.matchAll(
+      /image-qualification\.ts --profile node-bootstrap (\w+)/g,
+    ),
+  ].map((match) => match[1]!);
+  assert.deepEqual([...new Set(actions)].sort(), [
+    "promote",
+    "qualify",
+    "registry",
+    "runtime",
+    "verify",
+  ]);
+  assert.ok(
+    bootstrap.indexOf("--profile node-bootstrap qualify") <
+      bootstrap.indexOf("docker push"),
+  );
+  assert.ok(
+    bootstrap.indexOf("--profile node-bootstrap verify") <
+      bootstrap.indexOf("docker push"),
+  );
+  assert.ok(
+    bootstrap.indexOf("--profile node-bootstrap registry") <
+      bootstrap.indexOf("--profile node-bootstrap promote"),
+  );
+  assert.match(regional, /--profile regional runtime/);
+});
+
+test("Dockerfile profiles bind every FROM and the exact pinned stage topology", () => {
+  const regional = `FROM ${reviewedBase.image} AS build\nFROM ${reviewedBase.image}\n`,
+    bootstrap = `FROM ${reviewedBase.image} AS build\nFROM ${reviewedBase.image} AS clients\nFROM ${reviewedBase.image}\n`;
+  assert.equal(validateDockerfile(regional, "regional"), reviewedBase.image);
+  assert.equal(
+    validateDockerfile(bootstrap, "node-bootstrap"),
+    reviewedBase.image,
+  );
+  assert.throws(() => validateDockerfile(regional, "node-bootstrap"));
+  assert.throws(() => validateDockerfile(bootstrap, "regional"));
+  assert.throws(() =>
+    validateDockerfile(regional + "FROM scratch\n", "regional"),
+  );
+  assert.throws(() =>
+    validateDockerfile(
+      bootstrap.replace("AS clients", "AS other"),
+      "node-bootstrap",
+    ),
+  );
+  assert.throws(() =>
+    validateDockerfile(
+      regional.replace(reviewedBase.image, "node:24-slim"),
+      "regional",
+    ),
+  );
+});
+
+test("runtime profiles invoke every shipped entry and exact native client version checks", () => {
+  const regional = runtimeChecks("regional"),
+    bootstrap = runtimeChecks("node-bootstrap");
+  assert.ok(
+    regional.some((check) => check.args[0] === "/app/bootstrap-relay.mjs"),
+  );
+  assert.ok(bootstrap.some((check) => check.args[0] === "/app/server.mjs"));
+  assert.ok(
+    bootstrap.some((check) => check.args[0] === "/app/proxy-command.mjs"),
+  );
+  assert.ok(
+    bootstrap.some(
+      (check) =>
+        check.stage === "runtime_bootstrap_modules" &&
+        check.args.join(" ").includes("import('/app/server.mjs')") &&
+        check.args.join(" ").includes("import('/app/proxy-command.mjs')"),
+    ),
+  );
+  const talos = bootstrap.find((check) => check.entrypoint === "talosctl")!;
+  assert.deepEqual(talos.args, ["version", "--client"]);
+  assert.doesNotThrow(() =>
+    validateRuntimeResult(talos, {
+      exit: 0,
+      stdout: "Client:\n\tTag: v1.14.1\n\tOS/Arch: linux/amd64\n",
+      stderr: "",
+    }),
+  );
+  assert.throws(() =>
+    validateRuntimeResult(talos, {
+      exit: 0,
+      stdout: "Client:\n\tTag: v1.14.0\n\tOS/Arch: linux/amd64\n",
+      stderr: "",
+    }),
+  );
+  const kube = bootstrap.find((check) => check.entrypoint === "kubectl")!;
+  assert.deepEqual(kube.args, ["version", "--client=true", "-o=json"]);
+  assert.doesNotThrow(() =>
+    validateRuntimeResult(kube, {
+      exit: 0,
+      stdout: JSON.stringify({
+        clientVersion: { gitVersion: "v1.36.3", platform: "linux/amd64" },
+      }),
+      stderr: "",
+    }),
+  );
+  assert.throws(() =>
+    validateRuntimeResult(kube, {
+      exit: 0,
+      stdout: JSON.stringify({
+        clientVersion: { gitVersion: "v1.36.3", platform: "linux/arm64" },
+      }),
+      stderr: "",
+    }),
+  );
+  assert.ok(
+    bootstrap.some(
+      (check) => check.entrypoint === "ssh" && check.args[0] === "-V",
+    ),
+  );
+  const server = bootstrap.find(
+    (check) => check.stage === "runtime_bootstrap_server",
+  )!;
+  assert.doesNotThrow(() =>
+    validateRuntimeResult(server, {
+      exit: 1,
+      stdout: "",
+      stderr:
+        JSON.stringify({ event: "bootstrap_invalid_configuration" }) + "\n",
+    }),
+  );
+  assert.throws(() =>
+    validateRuntimeResult(server, {
+      exit: 1,
+      stdout: "",
+      stderr: "uncaught exception stack",
+    }),
+  );
+});
 
 test("rejects archive traversal, ambiguous paths and link writes", async () => {
   for (const name of [
@@ -77,6 +263,22 @@ test("fails closed on malformed or truncated layer archives", async () => {
     await assert.rejects(
       extractLayer(Readable.from([Buffer.alloc(10)]), directory, 0),
     );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("bootstrap package absence cannot be inferred from link-only package roots", async () => {
+  const file = reviewedFiles.find((file) => file.package)!,
+    root = file.path.slice(0, file.path.lastIndexOf("/")),
+    pack = tar.pack(),
+    paths: string[] = [];
+  pack.entry({ name: root, type: "symlink", linkname: "elsewhere" });
+  pack.finalize();
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-layer-test-"));
+  try {
+    await extractLayer(Readable.from(pack), directory, 0, paths);
+    assert.throws(() => reviewedManifestPaths(paths, "node-bootstrap"));
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
@@ -244,6 +446,8 @@ async function inspectionProbe(
     capabilityFailure?: boolean;
     toolOverflow?: boolean;
     invalidJson?: boolean;
+    profile?: string;
+    reportProfile?: string;
   } = {},
 ): Promise<{
   status: number | null;
@@ -287,6 +491,7 @@ async function inspectionProbe(
       report,
       JSON.stringify({
         version: 2,
+        ...(options.reportProfile ? { profile: options.reportProfile } : {}),
         imageId,
         revision,
         source,
@@ -306,6 +511,7 @@ async function inspectionProbe(
         revision,
         source,
         report,
+        ...(options.profile ? ["--profile", options.profile] : []),
       ],
       {
         env: { ...process.env, PATH: directory },
@@ -318,9 +524,10 @@ async function inspectionProbe(
     assert.ok(!result.stderr.includes(credentialShaped));
     return {
       ...result,
-      calls: (await readFile(calls, "utf8"))
+      calls: (await readFile(calls, "utf8").catch(() => ""))
         .trim()
         .split("\n")
+        .filter(Boolean)
         .map((line) => JSON.parse(line) as string[]),
     };
   } finally {
@@ -339,6 +546,20 @@ test("verification supports the Ubuntu Docker 28.0.4 inspect flags", async () =>
   const result = await inspectionProbe([inspectedImage]);
   assert.equal(result.status, 0, result.stderr);
   assert.ok(result.calls.every((args) => !args.includes("--platform")));
+});
+
+test("publication verification cannot reuse a report from another image profile", async () => {
+  const wrong = await inspectionProbe([inspectedImage], {
+    profile: "node-bootstrap",
+    reportProfile: "regional",
+  });
+  assert.equal(wrong.status, 1);
+  assert.deepEqual(wrong.calls, []);
+  const correct = await inspectionProbe([inspectedImage], {
+    profile: "node-bootstrap",
+    reportProfile: "node-bootstrap",
+  });
+  assert.equal(correct.status, 0, correct.stderr);
 });
 
 test("plain inspection rejects wrong platforms, ambiguous data and invalid diffIDs", async () => {
