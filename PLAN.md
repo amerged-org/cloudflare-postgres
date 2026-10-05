@@ -84,12 +84,13 @@ All five pinned platform charts rendered, and all 14 platform workloads tolerate
 while customer PostgreSQL placement remains blocked. The optional fixed-source relay deployment,
 native package pins and separate image qualification job are prepared. The local Linux bootstrap
 image builds and passes all runtime checks. Its full scan covered 433,348,963 payload bytes and
-643,272,838 detector bytes without a coverage gap. Twenty previously reviewed base findings
-resolved; 19 new findings in the two checksum-verified native binaries remain under independent
-review. Publication is blocked until every finding is resolved. Final composed API checks,
-protected network preflight and real node bootstrap remain outstanding. The composed local
+643,272,838 detector bytes without a coverage gap. All 39 findings resolved after independent
+public-source review of the 19 native-binary findings; no unresolved findings remain. Native
+artifact checks bind whole-file SHA-256, size, profile and exact reviewed byte spans. Modified
+binaries, changed provenance and extra findings remain fatal. The repository secret check is
+clean. Published CI images, protected network preflight and real node bootstrap remain outstanding. The composed local
 checks now pass: contracts 127, API 288, Edge 78, regional 367, native bootstrap 27, CLI 28,
-acceptance harness 198, infrastructure 21 and image/CI logic 54 tests, with zero skipped tests.
+acceptance harness 198, infrastructure 21 and image/CI logic 58 tests, with zero skipped tests.
 The native Talos configuration check is mandatory in CI. Existing ready-database Edge fixtures
 now include actual node allocation; unplaced requests retain their distinct pending semantics.
 Read-only live inventory confirms that the initial EU node still needs a verified legacy
