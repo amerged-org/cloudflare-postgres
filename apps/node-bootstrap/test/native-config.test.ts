@@ -7,7 +7,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { NodeBootstrapCallback } from "@pgcf/contracts/node-bootstrap";
-import { BootstrapJob, canonical, runCommand } from "../src/bootstrap.ts";
+import {
+  BootstrapJob,
+  canonical,
+  runCommand,
+  TALOS_VERSION,
+} from "../src/bootstrap.ts";
 import { authority, fixture } from "./fixture.ts";
 
 const client = process.env.PGCF_TEST_TALOSCTL;
@@ -17,6 +22,27 @@ test("pinned native client generates and validates both roles while recovered se
     "PGCF_TEST_TALOSCTL must select the checksum-verified Talos 1.14.1 client",
   );
   const input = fixture();
+  const clientVersion = await runCommand({
+    executable: client,
+    args: [
+      "version",
+      "--client",
+      "--short",
+      "--talosconfig",
+      "/dev/null",
+      "--endpoints",
+      input.spec.hardware.ipv4,
+    ],
+    signal: AbortSignal.timeout(15_000),
+    timeout_ms: 15_000,
+    env: { PATH: process.env.PATH, LANG: "C" },
+  });
+  assert.equal(clientVersion.exit_code, 0);
+  assert.equal(
+    clientVersion.stdout.trim(),
+    `Client:\nTalos v${TALOS_VERSION}`,
+    `native test client must be Talos ${TALOS_VERSION}`,
+  );
   let current = authority(input);
   let generated = 0;
   const directory = await mkdtemp(join(tmpdir(), "pgcf-native-test-"));
@@ -46,7 +72,11 @@ test("pinned native client generates and validates both roles while recovered se
       assert.equal(command.executable, "talosctl");
       if (command.args.includes("secrets")) generated++;
       const result = await runCommand({ ...command, executable: client });
-      if (result.exit_code && command.args.includes("validate")) {
+      if (
+        result.exit_code &&
+        (command.args.includes("validate") ||
+          (command.args[0] === "gen" && command.args[1] === "config"))
+      ) {
         const diagnostic = spawnSync(client, command.args, {
           encoding: "utf8",
           timeout: 60_000,
@@ -79,9 +109,32 @@ test("pinned native client generates and validates both roles while recovered se
           "san",
           "registry",
           "error",
+          "exists",
+          "overwrite",
+          "decode",
+          "parse",
+          "secrets",
+          "permission",
+          "read",
+          "unmarshal",
+          "mapping",
+          "string",
+          "taints",
+          "cannot",
+          "type",
+          "duplicate",
+          "registered",
+          "already",
+          "conflict",
+          "merge",
+          "delete",
+          "document",
+          "unsupported",
+          "not found",
+          "not registered",
         ];
         assert.fail(
-          `native validation diagnostic categories: ${names.filter((name) => (diagnostic.stderr + diagnostic.stdout).includes(name)).join(",")}`,
+          `native ${command.args.includes("validate") ? "validation" : "generation"} diagnostic categories: ${names.filter((name) => (diagnostic.stderr + diagnostic.stdout).includes(name)).join(",")}`,
         );
       }
       return result;
