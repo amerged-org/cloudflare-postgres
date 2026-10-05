@@ -5,6 +5,8 @@ import {
   Database,
   DatabaseCreate,
   DatabaseResize,
+  DatabaseRestore,
+  DatabaseRestored,
   DatabaseId,
   DatabaseWithOperation,
   DesiredQuery,
@@ -25,6 +27,7 @@ import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import { getAuth } from "../middleware/auth.ts";
 import { agentRegion } from "../domain/agent-auth.ts";
+import { restoreDatabase } from "../domain/restore.ts";
 import { archiveSummary } from "../domain/archive.ts";
 import {
   createDatabase,
@@ -166,6 +169,7 @@ export function registerDomain(app: ApiApp): void {
         DatabaseResize.parse(await c.req.json()),
       ),
   );
+  register(app,{ method:"post",path:"/v1/databases/{id}/restore",security,tags:["Backups"],request:{headers,params,body:body(DatabaseRestore)},responses:responses(DatabaseRestored,202)},async c=>restoreDatabase(c,DatabaseId.parse(c.req.param("id")),DatabaseRestore.parse(await c.req.json())));
   for (const action of ["suspend", "resume"] as const)
     register(
       app,

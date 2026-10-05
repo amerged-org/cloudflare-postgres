@@ -133,7 +133,7 @@ export async function observations(
       platform_reserved_cpu_millicores=excluded.platform_reserved_cpu_millicores,
       provider_instance_id=CASE WHEN nodes.schedulable=0 AND nodes.id=excluded.id AND excluded.provider_instance_id IS NOT NULL THEN excluded.provider_instance_id ELSE nodes.provider_instance_id END,
       node_uid=CASE WHEN nodes.node_uid IS NULL AND excluded.node_uid IS NOT NULL AND nodes.id=excluded.id THEN excluded.node_uid ELSE nodes.node_uid END,
-      last_observed_at=excluded.last_observed_at,updated_at=excluded.updated_at WHERE excluded.updated_at>=nodes.updated_at
+      last_observed_at=excluded.last_observed_at,updated_at=excluded.updated_at WHERE excluded.updated_at>=nodes.updated_at AND nodes.lost_at IS NULL
       AND (excluded.node_uid IS NULL OR (nodes.id=excluded.id AND (nodes.provider_instance_id IS NULL OR nodes.provider_instance_id=excluded.provider_instance_id)))`,
     )
       .bind(
@@ -157,11 +157,13 @@ export async function observations(
   let accepted = 0;
   for (const observation of body.databases) {
     const row = await c.env.DB.prepare(
-      "SELECT * FROM databases WHERE id=? AND region_id=?",
+      "SELECT d.* FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id WHERE d.id=? AND d.region_id=? AND n.lost_at IS NULL",
     )
       .bind(observation.id, region.id)
       .first<DatabaseRow>();
     if (!row || !observationApplies(row, region.id, observation, now)) continue;
+    const restoration=await c.env.DB.prepare("SELECT x.operation_id,o.status FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.target_database_id=? AND o.kind='database.restore'").bind(row.id).first<{operation_id:string;status:string}>();
+    if(observation.state==="ready" && restoration && (restoration.status==="failed" || observation.recovery?.operation_id!==restoration.operation_id || observation.recovery.storage_generation!==(row.storage_generation??1) || !observation.recovery.verified)) continue;
     if (row.desired_state === "suspended" && observation.power?.refusal) {
       const recovered = await recoverQuiescence(
         c.env.DB,
@@ -218,7 +220,10 @@ export async function observations(
       c.env.DB.prepare(
         `UPDATE databases SET observed_state=?,observed_power=?,observed_generation=CASE WHEN ? THEN ? ELSE observed_generation END,status_message=?,
       archiving_health_since=CASE WHEN archiving_health<>(${archiveHealth}) THEN ? ELSE archiving_health_since END,archiving_health=(${archiveHealth}),updated_at=?
-      WHERE id=? AND region_id=? AND generation=? AND observed_generation<=? AND updated_at=? AND desired_state=? AND observed_state=?`,
+      WHERE id=? AND region_id=? AND generation=? AND observed_generation<=? AND updated_at=? AND desired_state=? AND observed_state=?
+      AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND n.lost_at IS NULL)
+      AND (?<>'ready' OR NOT EXISTS(SELECT 1 FROM database_restores x WHERE x.target_database_id=databases.id)
+        OR EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.target_database_id=databases.id AND x.operation_id=? AND o.status IN('pending','running','succeeded') AND ?=databases.storage_generation))`,
       ).bind(
         observation.state === "hibernated" ? "provisioning" : observation.state,
         observation.state === "hibernated"
@@ -244,6 +249,7 @@ export async function observations(
         row.updated_at,
         row.desired_state,
         row.observed_state,
+        observation.state,observation.recovery?.operation_id ?? null,observation.recovery?.storage_generation ?? null,
       ),
     ];
     if (event)
@@ -279,7 +285,7 @@ export async function observations(
           row.id,
           row.project_id,
           observation.generation,
-          observation.state === "ready" ? "database.create" : "database.delete",
+          observation.state === "ready" ? restoration ? "database.restore" : "database.create" : "database.delete",
           region.id,
           observation.generation,
           observation.generation,
@@ -287,6 +293,7 @@ export async function observations(
           now,
         ),
       );
+    if(observation.state==="ready" && restoration) statements.push(c.env.DB.prepare("UPDATE database_restores SET verified_at=COALESCE(verified_at,?) WHERE target_database_id=? AND operation_id=? AND EXISTS(SELECT 1 FROM databases d WHERE d.id=database_restores.target_database_id AND d.observed_state='ready' AND d.observed_generation=d.generation AND d.updated_at=?)").bind(now,row.id,restoration.operation_id,now));
     if (applied && row.power_operation && observation.state !== "deleted") {
       if (observation.state === "ready")
         statements.push(

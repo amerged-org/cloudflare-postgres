@@ -2,6 +2,7 @@
 import { DatabaseId, bytesToHex } from "@pgcf/contracts";
 import type { UsageSample } from "@pgcf/contracts/usage";
 import { validatedArchivePrefix } from "./archive.ts";
+import { regionArchive, type ArchiveEnvironment } from "./archive-bindings.ts";
 import { recordUsageSample, type BackupUsageIdentity } from "./usage.ts";
 import type { Env } from "../env.ts";
 
@@ -15,7 +16,7 @@ interface ArchiveRow {
   id: string;
   region_id: string;
   archive_path: string;
-  generation: number;
+  storage_generation: number;
   deleted_at: string | null;
   backup_bucket: string;
 }
@@ -25,11 +26,11 @@ export interface BackupMeasurementResult {
   sample?: Extract<UsageSample, { source: "backup" }>;
   recorded?: "recorded" | "duplicate";
 }
-type BackupEnvironment = Pick<Env, "DB" | "ARCHIVE" | "ARCHIVE_BUCKET_NAME">;
+type BackupEnvironment = Pick<Env,"DB"> & ArchiveEnvironment;
 const rowFor = (db: D1Database, id: string) =>
   db
     .prepare(
-      "SELECT d.id,d.region_id,d.archive_path,d.generation,d.deleted_at,r.backup_bucket FROM databases d JOIN regions r ON r.id=d.region_id WHERE d.id=?",
+      "SELECT d.id,d.region_id,d.archive_path,d.storage_generation,d.deleted_at,r.backup_bucket FROM databases d JOIN regions r ON r.id=d.region_id WHERE d.id=?",
     )
     .bind(id)
     .first<ArchiveRow>();
@@ -38,6 +39,7 @@ const sameIdentity = (a: ArchiveRow, b: ArchiveRow | null): boolean =>
   a.id === b.id &&
   a.region_id === b.region_id &&
   a.archive_path === b.archive_path &&
+  a.storage_generation === b.storage_generation &&
   a.deleted_at === b.deleted_at &&
   a.backup_bucket === b.backup_bucket;
 
@@ -51,7 +53,8 @@ export async function measureBackupUsage(
   let bytes: number | null = null,
     objects: number | null = null;
   try {
-    const prefix = validatedArchivePrefix(row, row, env.ARCHIVE_BUCKET_NAME);
+    const selected = regionArchive(env,{id:row.region_id,backup_bucket:row.backup_bucket});
+    const prefix = validatedArchivePrefix(row,row,selected.bucketName);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let expired = false;
     const deadline = Date.now() + BACKUP_LIST_DEADLINE_MS;
@@ -74,7 +77,7 @@ export async function measureBackupUsage(
         keyBytes = 0;
       for (let page = 0; page < BACKUP_LIST_PAGE_LIMIT; page++) {
         checkDeadline();
-        const listing = await env.ARCHIVE.list({
+        const listing = await selected.bucket.list({
           prefix,
           limit: BACKUP_LIST_OBJECT_LIMIT,
           ...(cursor === undefined ? {} : { cursor }),

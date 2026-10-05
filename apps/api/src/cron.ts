@@ -4,6 +4,7 @@ import type { Env } from "./env.ts";
 import { reconcileDatabaseActors } from "./domain/database-actor-sync.ts";
 import { recoverQuiescence } from "./domain/lifecycle.ts";
 import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
+import { cleanupRetainedArchives } from "./domain/retained-archives.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
 import { runNodeCapacityCron } from "./domain/node-capacity.ts";
 
@@ -66,7 +67,7 @@ export async function runCron(
     .run();
   const result = await env.DB.prepare(
     `UPDATE operations SET status='failed',error_code='operation_timeout',error_message='Regional operation exceeded 20 minutes',updated_at=?,completed_at=? WHERE status IN('pending','running') AND updated_at<?
-      AND NOT EXISTS(SELECT 1 FROM databases u WHERE u.id=operations.database_id AND u.node_id IS NULL AND u.desired_state='running' AND u.deleted_at IS NULL AND operations.kind='database.create')
+      AND NOT EXISTS(SELECT 1 FROM databases u WHERE u.id=operations.database_id AND u.node_id IS NULL AND u.desired_state='running' AND u.deleted_at IS NULL AND operations.kind IN('database.create','database.restore'))
       AND NOT EXISTS(SELECT 1 FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL
         WHERE d.power_operation=operations.id AND d.id=operations.database_id AND d.project_id=operations.project_id
         AND d.desired_state='suspended' AND d.deleted_at IS NULL AND operations.generation<=d.generation
@@ -145,5 +146,6 @@ export async function runCron(
     .run();
   const usage = await runUsageCron(env.DB, now, env);
   await runNodeCapacityCron(env);
+  await cleanupRetainedArchives(env,now);
   return { failed: result.meta.changes + recovered, purged, hinted, usage };
 }
