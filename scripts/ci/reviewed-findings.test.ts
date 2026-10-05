@@ -9,6 +9,7 @@ import {
   reviewedBase,
   reviewedManifestPaths,
   imageProfile,
+  verifyNativeArtifacts,
 } from "./reviewed-findings.ts";
 import type { CanonicalFinding } from "./scanner.ts";
 
@@ -57,10 +58,11 @@ async function provenance() {
   };
 }
 test("resolves only the 26 independently reviewed spans across eight exact files", async () => {
-  const values = reviewedFiles.flatMap((file) =>
+  const legacy = reviewedFiles.filter((file) => !file.nativeArtifact);
+  const values = legacy.flatMap((file) =>
     file.findings.map((_span, index) => finding(file, index)),
   );
-  assert.equal(reviewedFiles.length, 8);
+  assert.equal(legacy.length, 8);
   assert.equal(classifyReviewed(values, await provenance()).resolved, 26);
   assert.equal(classifyReviewed(values, await provenance()).unresolved, 0);
 });
@@ -215,7 +217,7 @@ test("repacked application layers retain only the six exact package-proven spans
   const proof = await provenance();
   const digest = "sha256:" + "e".repeat(64);
   const values = reviewedFiles
-    .filter((file) => !file.officialBaseMembership)
+    .filter((file) => file.package)
     .flatMap((file) =>
       file.findings.map((_span, index) => {
         const value = finding(file, index);
@@ -257,6 +259,135 @@ test("repacked application layers retain only the six exact package-proven spans
     ).unresolved,
     1,
   );
+});
+
+test("bootstrap resolves exactly the nineteen source-reviewed native spans and rejects an additional finding", async () => {
+  const native = reviewedFiles.filter((file) => file.nativeArtifact);
+  assert.equal(native.length, 2);
+  const values = native.flatMap((file) =>
+    file.findings.map((_span, index) => finding(file, index)),
+  );
+  assert.equal(values.length, 19);
+  const proof = {
+    ...(await provenance()),
+    profile: "node-bootstrap" as const,
+    imageDiffIDs: [
+      ...reviewedBase.diffIDs,
+      "sha256:" + "a".repeat(64),
+      "sha256:" + "b".repeat(64),
+      native[0]!.boundDigest,
+    ],
+    nativeArtifacts: native.map((file) => ({
+      path: file.path,
+      ...file.nativeArtifact!,
+    })),
+  };
+  assert.deepEqual(classifyReviewed(values, proof), {
+    resolved: 19,
+    unresolved: 0,
+  });
+  assert.deepEqual(
+    classifyReviewed(
+      [...values, { ...values[0]!, RuleID: "unreviewed-native" }],
+      proof,
+    ),
+    { resolved: 19, unresolved: 1 },
+  );
+});
+
+test("native spans require the bootstrap profile and exact public-artifact provenance", async () => {
+  const native = reviewedFiles.filter((file) => file.nativeArtifact),
+    value = finding(native[0]!);
+  const artifacts = verifyNativeArtifacts(native, "node-bootstrap"),
+    proof = {
+      ...(await provenance()),
+      profile: "node-bootstrap" as const,
+      imageDiffIDs: [
+        ...reviewedBase.diffIDs,
+        "sha256:" + "a".repeat(64),
+        "sha256:" + "b".repeat(64),
+        native[0]!.boundDigest,
+      ],
+      nativeArtifacts: artifacts,
+    };
+  assert.equal(
+    classifyReviewed([value], { ...proof, profile: "regional" }).unresolved,
+    1,
+  );
+  assert.equal(
+    classifyReviewed([value], { ...proof, nativeArtifacts: [] }).unresolved,
+    1,
+  );
+  assert.equal(
+    classifyReviewed([value], {
+      ...proof,
+      nativeArtifacts: artifacts.map((item) => ({
+        ...item,
+        releaseUrl: "https://github.com/public/changed",
+      })),
+    }).unresolved,
+    1,
+  );
+  assert.equal(
+    classifyReviewed([value], {
+      ...proof,
+      baseDiffIDs: [...proof.baseDiffIDs].reverse(),
+    }).unresolved,
+    1,
+  );
+  assert.equal(
+    classifyReviewed(
+      [{ ...value, input: { ...value.input, sha256: "0".repeat(64) } }],
+      proof,
+    ).unresolved,
+    1,
+  );
+  assert.equal(
+    classifyReviewed(
+      [{ ...value, span: { ...value.span!, sha256: "0".repeat(64) } }],
+      proof,
+    ).unresolved,
+    1,
+  );
+  assert.equal(
+    classifyReviewed(
+      [
+        {
+          ...value,
+          span: { ...value.span!, byteStart: value.span!.byteStart + 1 },
+        },
+      ],
+      proof,
+    ).unresolved,
+    1,
+  );
+});
+
+test("both native whole-file identities are mandatory even without scanner findings", () => {
+  const native = reviewedFiles.filter((file) => file.nativeArtifact);
+  assert.equal(verifyNativeArtifacts(native, "node-bootstrap").length, 2);
+  assert.throws(() =>
+    verifyNativeArtifacts(native.slice(0, 1), "node-bootstrap"),
+  );
+  assert.throws(() =>
+    verifyNativeArtifacts(
+      native.map((file) => ({ ...file, sha256: "0".repeat(64) })),
+      "node-bootstrap",
+    ),
+  );
+  assert.throws(() =>
+    verifyNativeArtifacts(
+      native.map((file) => ({ ...file, size: file.size + 1 })),
+      "node-bootstrap",
+    ),
+  );
+  assert.throws(() =>
+    verifyNativeArtifacts(
+      [...native, { ...native[0]!, sha256: "0".repeat(64) }],
+      "node-bootstrap",
+    ),
+  );
+  assert.deepEqual(verifyNativeArtifacts(native, "regional"), []);
 });
 
 test("only the explicit bootstrap profile permits proven absent reviewed runtime packages", async () => {

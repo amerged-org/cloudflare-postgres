@@ -46,11 +46,75 @@ interface PackageProvenance {
   version: string;
   integrity: string;
 }
+export interface NativeArtifactProvenance {
+  path: string;
+  name: string;
+  version: string;
+  architecture: string;
+  releaseUrl: string;
+  checksumUrl: string;
+  sha256: string;
+  size: number;
+}
+export function verifyNativeArtifacts(
+  files: readonly { path: string; sha256: string; size: number }[],
+  profileInput: ImageProfile = "regional",
+): NativeArtifactProvenance[] {
+  if (imageProfile(profileInput) !== "node-bootstrap") return [];
+  const native = reviewedFiles.filter((file) => file.nativeArtifact);
+  if (native.length !== 2) throw new Error("Native artifact review incomplete");
+  return native.map((file) => {
+    const artifact = file.nativeArtifact!,
+      matches = files.filter((value) => value.path === file.path);
+    if (
+      artifact.architecture !== "linux/amd64" ||
+      artifact.sha256 !== file.sha256 ||
+      artifact.size !== file.size ||
+      !matches.length ||
+      matches.some(
+        (value) =>
+          value.sha256 !== artifact.sha256 || value.size !== artifact.size,
+      )
+    )
+      throw new Error("Native artifact checksum or size mismatch");
+    return { path: file.path, ...artifact };
+  });
+}
+function sameNativeArtifact(
+  item: NativeArtifactProvenance,
+  expected: NativeArtifactProvenance,
+): boolean {
+  return (
+    item.path === expected.path &&
+    item.name === expected.name &&
+    item.version === expected.version &&
+    item.architecture === expected.architecture &&
+    item.releaseUrl === expected.releaseUrl &&
+    item.checksumUrl === expected.checksumUrl &&
+    item.sha256 === expected.sha256 &&
+    item.size === expected.size
+  );
+}
+export function validateNativeProvenance(
+  values: readonly NativeArtifactProvenance[],
+  profile: ImageProfile,
+): void {
+  const expected = verifyNativeArtifacts(values, profile);
+  if (
+    values.length !== expected.length ||
+    expected.some(
+      (item) => !values.some((value) => sameNativeArtifact(value, item)),
+    )
+  )
+    throw new Error("Native artifact provenance mismatch");
+}
 interface Provenance {
   baseImage: string;
   baseDiffIDs: string[];
   imageDiffIDs: string[];
   packages: PackageProvenance[];
+  profile?: ImageProfile;
+  nativeArtifacts?: NativeArtifactProvenance[];
 }
 
 export function readPackageProvenance(
@@ -151,6 +215,17 @@ export function classifyReviewed(
         input.tarEntry !== file.tarEntry ||
         input.boundDigest !== file.boundDigest ||
         file.layer >= reviewedBase.diffIDs.length
+      )
+        continue;
+    } else if (file.nativeArtifact) {
+      const expected = file.nativeArtifact;
+      if (
+        provenance.profile !== "node-bootstrap" ||
+        !exactBase ||
+        input.layer < provenance.baseDiffIDs.length ||
+        !provenance.nativeArtifacts?.some((item) =>
+          sameNativeArtifact(item, { path: file.path, ...expected }),
+        )
       )
         continue;
     } else if (
