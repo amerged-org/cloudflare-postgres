@@ -62,17 +62,27 @@ now walks up to 16 pages/16,000 objects within one two-second deadline and a 4 M
 incomplete or oversized walks remain unknown. The scan is an interval observation, not an atomic
 R2 snapshot. Tests pass: contracts 129, API 302, Edge 78, regional 385, native 27, CLI 30, harness
 204, infrastructure 21 and CI logic 68, with zero skipped tests. API and regional delivery are
-complete; their fresh E0–E3 passed. Targeted live proof of these fixes continues. The later lazy
+complete; their fresh E0–E5 passed, with deletion in 101.563 s and zero trial volumes/archives.
+Two actual unknown archive-health observations preserved ready state and successful SQL;
+the temporary metrics-only deny was removed and health recovered. An unauthenticated SCRAM
+session with WebSocket pings did not prevent idle hibernation (82.635 s; no password or
+AuthenticationOk). The ten-minute unknown alarm is locally tested, not yet live-proven. The later lazy
 Actor schema patch passed all 304 API tests: unknown hints create no application tables, while
 validated management seeding preserves existing persistent state. Its live delivery remains pending.
 
 Phase 3 software and native images are prepared, not live-accepted. The Dev D1 export restored
 locally with clean integrity/foreign-key checks; four additive bootstrap migrations rehearsed
-against that export and applied in Dev. Their eight new tables remain empty; no provider mutation,
-order or bootstrap was triggered. Existing first-node provider identity and protected seed/join
-custody were validated and encrypted locally; their live import remains pending. The native
+against that export and applied in Dev. The existing first-node provider/Kubernetes identity and
+three encrypted agent/seed/join custody records are now imported with fresh provider checks,
+exact ciphertext readback and UID-guarded node labels. The existing agent key was retained;
+no provider mutation, order or VPS bootstrap was triggered. The native
 bootstrap image is qualified but private under GitHub organization policy. Fixed-source transport,
 signed network evidence, real EU2 join and new-region platform installation remain outstanding.
+The existing Flux source and both Kustomizations now use reviewed `476eb655`; all five
+HelmReleases remained Ready for 61.824 s after the quarantine-toleration upgrades. The approved
+regional image digest was preserved and EU2 remains untouched. CI `37292188983` later failed the
+1,000-idle-upgrade assertion; focused and ordered local reruns pass. Its cause is unproven;
+count-only diagnostics preserve the original count, deadlines and assertions for the next CI run.
 
 Operational Cloudflare, Barman R2 and PGCF admin/agent credentials have no configured expiry.
 Routing/control tokens retain their short security deadlines. Read-only adopter inventory remains
@@ -412,7 +422,8 @@ their own price lists and billing logic.
   anything. From Phase 2 an unauthenticated client that knows a database ID and a role name could
   wake a sleeping database. That is bounded by unguessable IDs, the D1 role lookup before any wake,
   and per-database rate limits. The integrated idle fix counts activity only after `AuthenticationOk`
-  and drains pre-auth sessions at quiescence; its live rollout is pending. Known-hint wake abuse
+  and drains pre-auth sessions at quiescence. Live unauthenticated pings did not prevent sleep.
+  Known-hint wake abuse
   still requires explicit measured admission protection. Unknown databases and roles use decoy
   SCRAM and return the same 28P01 error form as a wrong password; their timing is not equal. Edge-side
   SCRAM verification before a wake is a Phase 4 decision.
