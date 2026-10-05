@@ -5,6 +5,11 @@
 !pnpm-lock.yaml
 !pnpm-workspace.yaml
 !tsconfig.base.json
+!infra/
+!infra/platform/
+!infra/platform/base/
+!infra/platform/base/values/
+!infra/platform/base/values/cilium.yaml
 !LICENSE
 !apps/
 !apps/**
