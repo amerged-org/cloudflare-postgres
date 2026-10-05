@@ -333,7 +333,7 @@ const Firewall = z.object({
     .array(
       z.object({
         instanceId: Id,
-        displayName: Text,
+        displayName: Text.nullable(),
         name: Text,
         productId: Short,
         ipConfig: z.object({ v4: V4, v6: V6 }),

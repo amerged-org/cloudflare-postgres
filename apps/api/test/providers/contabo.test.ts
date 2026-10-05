@@ -853,3 +853,28 @@ it("constructs OAuth and provider requests in the actual Workers runtime without
   expect(instance.id).toBe(f.instanceId);
   expect(f.calls).toHaveLength(2);
 });
+
+it("preserves a null instance display name returned by the actual firewall inventory", async () => {
+  const f = setup(),
+    firewallId = value(),
+    wire = firewall(f, firewallId, []);
+  f.set(() =>
+    Response.json({
+      data: [
+        {
+          ...wire,
+          instances: wire.instances.map((instance) => ({
+            ...instance,
+            displayName: null,
+          })),
+        },
+      ],
+      _links: { self: `/v1/firewalls/${firewallId}` },
+    }),
+  );
+  const actual = await f.client.getFirewall(firewallId, {
+    requestId: f.requestId,
+  });
+  expect(actual.instances).toHaveLength(1);
+  expect(actual.instances[0]!.displayName).toBeNull();
+});
