@@ -778,8 +778,19 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
         current.protected_material.material.kube_system_uid === uid,
     );
   });
+  let trust_calls = 0;
+  Reflect.set(job, "publishKubeletTrust", async () => {
+    trust_calls++;
+    assert.equal(installation_calls, 1);
+    assert.equal(current.checkpoint.stage, "kubernetes_joined");
+    assert.ok(
+      current.protected_material?.purpose === "join_bundle" &&
+        current.protected_material.material.kube_system_uid === uid,
+    );
+  });
   await job.start();
   assert.equal(installation_calls, 1);
+  assert.equal(trust_calls, 1);
   assert.ok(
     !calls.some(
       (args) =>
