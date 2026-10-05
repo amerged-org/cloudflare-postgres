@@ -3,6 +3,10 @@ import type { ApiKey } from "@pgcf/contracts";
 import type { Context } from "hono";
 
 export type Env = Cloudflare.Env & {
+  DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
+  ARCHIVE_BINDINGS?: string;
+  ARCHIVE_EU?: R2Bucket;
+  ARCHIVE_US?: R2Bucket;
   NODE_BOOTSTRAP_CALLBACK_URL: string;
   BOOTSTRAP_RELAY_URL: string;
   BOOTSTRAP_RELAY_SERVICE?: Fetcher;

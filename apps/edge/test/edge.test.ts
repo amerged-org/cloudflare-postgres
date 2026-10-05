@@ -392,6 +392,42 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(await stats()).toHaveLength(0);
   });
 
+  it("a known hint flood is refused by the actual actor before D1, wake or the Edge database bucket", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.now());
+    const actor = testEnv.DATABASE_ACTOR.get(
+      testEnv.DATABASE_ACTOR.idFromName(database),
+    );
+    await runInDurableObject(
+      actor as unknown as DurableObjectStub,
+      (_instance, state) => {
+        state.storage.sql.exec(
+          "CREATE TABLE IF NOT EXISTS database_admission(singleton INTEGER PRIMARY KEY CHECK(singleton=1),minute INTEGER NOT NULL,attempts INTEGER NOT NULL)",
+        );
+        state.storage.sql.exec(
+          "INSERT INTO database_admission VALUES(1,?,12000)",
+          Math.floor(Date.now() / 60000),
+        );
+      },
+    );
+    const queries = vi.spyOn(Object.getPrototypeOf(testEnv.DB), "prepare");
+    const databaseLimiter = {
+      limit: vi.fn(async () => ({ success: true })),
+    } as RateLimit;
+    expect(
+      await errorCode(
+        await open({
+          bindings: {
+            ...testEnv,
+            DATABASE_CONNECTION_RATE_LIMITER: databaseLimiter,
+          },
+        }),
+      ),
+    ).toBe("53300");
+    expect(queries).not.toHaveBeenCalled();
+    expect(databaseLimiter.limit).not.toHaveBeenCalled();
+    expect(await stats()).toHaveLength(0);
+  });
+
   it("uses the actual actor's authoritative D1 read without a data-plane D1 binding", async () => {
     const queries = vi.spyOn(Object.getPrototypeOf(testEnv.DB), "prepare");
     const bindings = { ...testEnv };
@@ -1009,9 +1045,9 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const other = newDatabaseId();
     await testEnv.DB.batch([
       testEnv.DB.prepare(
-        `INSERT INTO databases (id, project_id, region_id, name, size_class_id,
+        `INSERT INTO databases (id, project_id, region_id, node_id, name, size_class_id,
         desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at)
-        SELECT ?, project_id, region_id, 'second', size_class_id, desired_state, observed_state,
+        SELECT ?, project_id, region_id, node_id, 'second', size_class_id, desired_state, observed_state,
         generation, observed_generation, replace(archive_path, id, ?), created_at, updated_at
         FROM databases WHERE id = ?`,
       ).bind(other, other, database),
@@ -1150,9 +1186,9 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const other = newDatabaseId();
     await testEnv.DB.batch([
       testEnv.DB.prepare(
-        `INSERT INTO databases (id, project_id, region_id, name, size_class_id,
+        `INSERT INTO databases (id, project_id, region_id, node_id, name, size_class_id,
         desired_state, observed_state, generation, observed_generation, archive_path, created_at, updated_at)
-        SELECT ?, project_id, region_id, 'second', size_class_id, desired_state, observed_state,
+        SELECT ?, project_id, region_id, node_id, 'second', size_class_id, desired_state, observed_state,
         generation, observed_generation, replace(archive_path, id, ?), created_at, updated_at
         FROM databases WHERE id = ?`,
       ).bind(other, other, database),

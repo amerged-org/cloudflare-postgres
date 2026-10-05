@@ -37,10 +37,11 @@ const RegionRoute = z.strictObject({
 });
 export type DatabaseAdmission =
   | { ok: true; region: z.infer<typeof RegionRoute> }
-  | { ok: false; sqlstate: "3D000" | "28P01" | "57P03" | "08006" };
+  | { ok: false; sqlstate: "3D000" | "28P01" | "57P03" | "08006" | "53300" };
 export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
-  r.name role_name,g.id,g.gateway_url,g.gateway_binding
+  r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
+  LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
   LEFT JOIN roles r ON r.database_id=d.id AND r.name=? AND r.deleted_at IS NULL WHERE d.id=? LIMIT 1`;
 interface AdmissionRow {
   generation: number;
@@ -56,6 +57,8 @@ interface AdmissionRow {
   id: string;
   gateway_url: string;
   gateway_binding: string | null;
+  node_id: string | null;
+  lost_at: string | null;
 }
 
 function admittedRoute(row: AdmissionRow): DatabaseAdmission {
@@ -205,6 +208,8 @@ export class DatabaseActor extends DurableObject<Env> {
         return { ok: false, sqlstate: "3D000" };
       if (row.role_name !== role.data) return { ok: false, sqlstate: "28P01" };
       if (
+        row.node_id === null ||
+        row.lost_at !== null ||
         row.desired_state !== "running" ||
         row.observed_state !== "ready" ||
         row.observed_power !== "awake" ||
@@ -235,7 +240,41 @@ export class DatabaseActor extends DurableObject<Env> {
     )
       return { ok: false, sqlstate: "3D000" };
     if (row.role_name !== user) return { ok: false, sqlstate: "28P01" };
+    if (row.node_id === null || row.lost_at !== null)
+      return { ok: false, sqlstate: "57P03" };
     return row;
+  }
+  private earlyAdmission(
+    databaseId: unknown,
+    user: unknown,
+  ): DatabaseAdmission | undefined {
+    const id = DatabaseId.safeParse(databaseId),
+      role = RoleName.safeParse(user);
+    if (!id.success) return { ok: false, sqlstate: "3D000" };
+    if (!role.success) return { ok: false, sqlstate: "28P01" };
+    this.identity(id.data);
+    const snapshot = this.presence();
+    if (!snapshot || snapshot.deleted) return { ok: false, sqlstate: "3D000" };
+    if (!snapshot.roles.includes(role.data))
+      return { ok: false, sqlstate: "28P01" };
+    const configured = this.env.DATABASE_CONNECTION_LIMIT_PER_MINUTE ?? "12000";
+    if (!/^[1-9][0-9]{0,4}$/.test(configured) || Number(configured) > 12000)
+      return { ok: false, sqlstate: "53300" };
+    // Only a trusted seeded role can allocate this single bounded admission row.
+    this.ctx.storage.sql.exec(
+      "CREATE TABLE IF NOT EXISTS database_admission(singleton INTEGER PRIMARY KEY CHECK(singleton=1),minute INTEGER NOT NULL,attempts INTEGER NOT NULL)",
+    );
+    const allowed = this.ctx.storage.sql
+      .exec(
+        `INSERT INTO database_admission(singleton,minute,attempts) VALUES(1,?,1)
+       ON CONFLICT(singleton) DO UPDATE SET minute=excluded.minute,
+       attempts=CASE WHEN database_admission.minute=excluded.minute THEN database_admission.attempts+1 ELSE 1 END
+       WHERE database_admission.minute<>excluded.minute OR database_admission.attempts<? RETURNING attempts`,
+        Math.floor(Date.now() / 60_000),
+        Number(configured),
+      )
+      .toArray();
+    return allowed.length === 1 ? undefined : { ok: false, sqlstate: "53300" };
   }
   private async claimWake(
     id: string,
@@ -345,6 +384,12 @@ export class DatabaseActor extends DurableObject<Env> {
       Date.now() + 30_000,
     );
     if (deadline <= Date.now()) return { ok: false, sqlstate: "57P03" };
+    try {
+      const failure = this.earlyAdmission(databaseId, user);
+      if (failure) return failure;
+    } catch {
+      return { ok: false, sqlstate: "08006" };
+    }
     const waiterId = parsed.data.waiterId ?? crypto.randomUUID();
     const owner = {};
     let timer: ReturnType<typeof setTimeout> | undefined;

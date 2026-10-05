@@ -99,10 +99,24 @@ export const DesiredCreation = z.strictObject({
 });
 export type DesiredCreation = z.infer<typeof DesiredCreation>;
 
+export const DesiredRecovery = z.strictObject({
+  operation_id: OperationId,
+  source_database_id: DatabaseId,
+  source_archive_path: z.string().regex(ARCHIVE_DESTINATION_PATTERN),
+  source_storage_generation: z.number().int().positive(),
+  backup_id: z.string().regex(/^[0-9]{8}T[0-9]{6}$/),
+  target_time: Timestamp.optional(),
+  status: OperationStatus,
+  ever_ready: z.boolean(),
+});
+export type DesiredRecovery = z.infer<typeof DesiredRecovery>;
+
 export const DesiredDatabase = z
   .strictObject({
     id: DatabaseId,
     generation: z.number().int().min(1),
+    storage_generation: z.number().int().positive().optional(),
+    recovery: DesiredRecovery.optional(),
     desired_state: z.enum(["running", "suspended", "deleted"]),
     power: z
       .strictObject({
@@ -141,12 +155,15 @@ export const DesiredDatabase = z
       });
     const match = ARCHIVE_DESTINATION_PATTERN.exec(db.archive.destination_path);
     // Desired revisions advance for role changes and deletion without replacing the archive.
-    if (match && (match[3] !== db.id || Number(match[4]) > db.generation)) {
+    if (
+      match &&
+      (match[3] !== db.id || Number(match[4]) !== (db.storage_generation ?? 1))
+    ) {
       ctx.addIssue({
         code: "custom",
         path: ["archive", "destination_path"],
         message:
-          "archive path must name this database and not a future generation",
+          "archive path must match this database and physical storage generation",
       });
     }
     if (match && db.creation && match[5] !== db.creation.operation_id) {
@@ -162,6 +179,28 @@ export const DesiredDatabase = z
         path: ["creation", "generation"],
         message: "creation must not name a future desired revision",
       });
+    }
+    if (db.recovery) {
+      const source = ARCHIVE_DESTINATION_PATTERN.exec(
+        db.recovery.source_archive_path,
+      );
+      if (
+        !source ||
+        source[3] !== db.recovery.source_database_id ||
+        Number(source[4]) !== db.recovery.source_storage_generation ||
+        source[1] !== match?.[1] ||
+        source[2] !== match?.[2] ||
+        db.recovery.source_database_id === db.id ||
+        db.recovery.operation_id !== match?.[5] ||
+        db.creation
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["recovery"],
+          message:
+            "Recovery must use a separate target in the same archive region and bucket",
+        });
+      }
     }
     const names = new Set<string>();
     let owners = 0;
@@ -262,11 +301,26 @@ export const NodeObservation = z.strictObject({
 });
 export type NodeObservation = z.infer<typeof NodeObservation>;
 
+export const BackupObservation = z.strictObject({
+  health: z.enum(["ok", "failing", "unknown"]),
+  observed_at: Timestamp,
+  last_completed_at: Timestamp.nullable(),
+  last_failed_at: Timestamp.nullable(),
+});
+export type BackupObservation = z.infer<typeof BackupObservation>;
+
 export const DatabaseObservation = z
   .strictObject({
     id: DatabaseId,
     generation: z.number().int().min(1),
     state: z.enum(DATABASE_OBSERVED_STATES),
+    recovery: z
+      .strictObject({
+        operation_id: OperationId,
+        storage_generation: z.number().int().positive(),
+        verified: z.literal(true),
+      })
+      .optional(),
     power: z
       .strictObject({
         operation: OperationId,
@@ -276,6 +330,7 @@ export const DatabaseObservation = z
       })
       .optional(),
     message: z.string().max(TEXT_MAX_LENGTH).optional(),
+    backup: BackupObservation.optional(),
     archive: z.strictObject({
       continuous: z.boolean(),
       ready_wal_files: Count.nullable(),

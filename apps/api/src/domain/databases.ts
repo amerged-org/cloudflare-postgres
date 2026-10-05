@@ -17,7 +17,12 @@ import { assertProjectAccess, getAuth } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "../platform/pagination.ts";
 import { keyring } from "../crypto/keyring.ts";
-import { choosePlacement, placementNodes } from "./placement.ts";
+import {
+  choosePlacement,
+  placementNodes,
+  nodePlacementGuard,
+  nodePlacementBindings,
+} from "./placement.ts";
 import { syncDatabaseActor } from "./database-actor-sync.ts";
 import { runNodeCapacity } from "./node-capacity.ts";
 import {
@@ -62,6 +67,7 @@ export interface DatabaseInsertSnapshot {
   id: string;
   archivePath: string;
   now: string;
+  authority?: { sql: string; bindings: (string | number | null)[] };
 }
 export function databaseInsertStatement(
   db: D1Database,
@@ -74,7 +80,7 @@ export function databaseInsertStatement(
       SELECT ?,p.id,r.id,NULL,?,s.id,'running',1,?,'Waiting for verified regional capacity',?,?
       FROM projects p JOIN regions r ON r.id=? AND r.backup_bucket=? JOIN size_classes s ON s.id=? AND s.enabled=1
       WHERE p.id=? AND p.deleted_at IS NULL AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=?
-      AND s.max_connections=? AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?`,
+      AND s.max_connections=? AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=? AND (${snapshot.authority?.sql ?? "1=1"})`,
       )
       .bind(
         snapshot.id,
@@ -93,6 +99,7 @@ export function databaseInsertStatement(
         snapshot.size.sleep_after_seconds,
         snapshot.size.archive_timeout_seconds,
         snapshot.size.backup_retention_days,
+        ...(snapshot.authority?.bindings ?? []),
       );
   }
   return db
@@ -100,13 +107,13 @@ export function databaseInsertStatement(
       `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,desired_state,generation,archive_path,created_at,updated_at)
             SELECT ?,p.id,n.region_id,n.id,?,s.id,'running',1,?,?,? FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
             JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id AND r.backup_bucket=?
-            WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND n.storage_gib_total IS NOT NULL
+            WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")} AND n.storage_gib_total IS NOT NULL
             AND n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?
             AND n.platform_reserved_cpu_millicores IS NOT NULL
             AND n.allocatable_cpu_millicores-n.platform_reserved_cpu_millicores-COALESCE((SELECT SUM(sc.cpu_millicores+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.cpu_millicores+?
             AND n.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.storage_gib
             AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=? AND s.max_connections=?
-            AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?`,
+            AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=? AND (${snapshot.authority?.sql ?? "1=1"})`,
     )
     .bind(
       snapshot.id,
@@ -119,6 +126,7 @@ export function databaseInsertStatement(
       snapshot.region.backup_bucket,
       snapshot.nodeId,
       snapshot.body.region_id,
+      ...nodePlacementBindings(Date.parse(snapshot.now)),
       SIDECAR.requestMemoryMib,
       SIDECAR.requestMemoryMib,
       SIDECAR.requestCpuMillicores,
@@ -130,6 +138,7 @@ export function databaseInsertStatement(
       snapshot.size.sleep_after_seconds,
       snapshot.size.archive_timeout_seconds,
       snapshot.size.backup_retention_days,
+      ...(snapshot.authority?.bindings ?? []),
     );
 }
 export async function createDatabase(
@@ -309,7 +318,7 @@ export function databaseResizeStatement(
       AND desired_state='running' AND observed_state='ready' AND observed_generation=generation AND deleted_at IS NULL
       AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
       AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=? AND s.enabled=1
-        WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1
+        WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")}
           AND n.storage_gib_total IS NOT NULL AND n.platform_reserved_cpu_millicores IS NOT NULL
           AND s.storage_gib=(SELECT old.storage_gib FROM size_classes old WHERE old.id=databases.size_class_id)
           AND n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?
@@ -328,6 +337,7 @@ export function databaseResizeStatement(
       row.size_class_id,
       row.updated_at,
       size.id,
+      ...nodePlacementBindings(Date.parse(now)),
       SIDECAR.requestMemoryMib,
       SIDECAR.requestMemoryMib,
       SIDECAR.requestCpuMillicores,
@@ -518,6 +528,13 @@ export async function deleteDatabase(
           `UPDATE databases SET desired_state='deleted',generation=generation+1,deleted_at=?,updated_at=?
         WHERE id=? AND project_id=? AND generation=? AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)`,
         ).bind(now, now, id, row.project_id, row.generation),
+        c.env.DB.prepare(
+          `INSERT INTO retained_archives(source_database_id,project_id,region_id,archive_path,storage_generation,roles_json,deleted_at,expires_at)
+          SELECT d.id,d.project_id,d.region_id,d.archive_path,d.storage_generation,
+          (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid,'password_revision',r.password_revision,'updated_at',r.updated_at)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL),
+          d.deleted_at,strftime('%Y-%m-%dT%H:%M:%fZ',d.deleted_at,'+'||s.backup_retention_days||' days')
+          FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.project_id=? AND d.generation=? AND d.deleted_at=?`,
+        ).bind(id, row.project_id, generation, now),
         c.env.DB.prepare(
           `INSERT INTO operations (id,kind,status,project_id,database_id,generation,created_at,updated_at)
         SELECT ?,'database.delete','pending',project_id,id,generation,?,? FROM databases WHERE changes()=1 AND id=? AND project_id=? AND generation=?`,

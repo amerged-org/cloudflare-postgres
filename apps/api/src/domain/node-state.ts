@@ -4,6 +4,7 @@ import {
   newNodeId,
   newOperationId,
   OperationId,
+  NodeId,
 } from "@pgcf/contracts";
 import {
   NodeAddition,
@@ -17,7 +18,10 @@ import {
   NodeNetworkVerification,
   NodeCapacityVerification,
   nodeAdditionHostname,
+  NodeMarkLost,
+  NodeLoss,
 } from "@pgcf/contracts/nodes";
+import { nodePlacementBindings, nodePlacementGuard } from "./placement.ts";
 
 export class NodeStateError extends Error {
   readonly code:
@@ -153,7 +157,7 @@ export async function configureNodeRegionPolicy(
       "Configured Contabo region not found",
     );
 }
-const slotCount = `(SELECT count(*) FROM nodes WHERE region_id=p.region_id)+
+const slotCount = `(SELECT count(*) FROM nodes WHERE region_id=p.region_id AND lost_at IS NULL)+
   (SELECT count(*) FROM node_additions a WHERE a.region_id=p.region_id AND a.slot_held=1 AND NOT EXISTS(
     SELECT 1 FROM nodes n WHERE n.id=a.node_id AND n.region_id=a.region_id AND n.k8s_node_name=json_extract(a.intent_json,'$.requested_hostname') AND n.provider_instance_id=a.provider_instance_id))`;
 export async function nodeRegionOccupiedSlots(
@@ -172,6 +176,34 @@ export async function nodeRegionOccupiedSlots(
       "Region node cap has not been configured",
     );
   return row.occupied;
+}
+export async function markNodeLost(
+  db: D1Database,
+  nodeId: string,
+  value: NodeMarkLost,
+): Promise<NodeLoss> {
+  NodeId.parse(nodeId);
+  const request = NodeMarkLost.parse(value);
+  const now = new Date().toISOString();
+  await db
+    .prepare(
+      "UPDATE nodes SET lost_at=?,lost_reason=?,ready=0,schedulable=0,updated_at=? WHERE id=? AND node_uid=? AND lost_at IS NULL",
+    )
+    .bind(now, request.reason, now, nodeId, request.expected_node_uid)
+    .run();
+  const row = await db
+    .prepare(
+      "SELECT id node_id,region_id,node_uid,provider_instance_id,lost_at,lost_reason reason FROM nodes WHERE id=?",
+    )
+    .bind(nodeId)
+    .first<NodeLoss>();
+  if (!row) throw new NodeStateError("not_found", "Node not found");
+  if (row.node_uid !== request.expected_node_uid || row.lost_at === null)
+    throw new NodeStateError(
+      "conflict",
+      "Loss requires the exact observed node UID",
+    );
+  return NodeLoss.parse(row);
 }
 export async function reserveNodeAddition(
   db: D1Database,
@@ -573,13 +605,14 @@ interface ObservedNode {
 const observedNode = (db: D1Database, addition: NodeAddition) =>
   db
     .prepare(
-      "SELECT * FROM nodes WHERE id=? AND region_id=? AND k8s_node_name=? AND provider_instance_id=? AND ready=1",
+      `SELECT * FROM nodes n WHERE id=? AND region_id=? AND k8s_node_name=? AND provider_instance_id=? AND ready=1 AND ${nodePlacementGuard()}`,
     )
     .bind(
       addition.intent.node_id,
       addition.intent.request.region_id,
       addition.intent.requested_hostname,
       addition.provider_instance_id,
+      ...nodePlacementBindings(),
     )
     .first<ObservedNode>();
 function matchesCapacity(
@@ -641,15 +674,16 @@ export async function completeNodeAddition(
   const results = await db.batch([
     db
       .prepare(
-        `UPDATE nodes SET schedulable=1 WHERE id=? AND region_id=? AND k8s_node_name=? AND provider_instance_id=? AND ready=1
+        `UPDATE nodes AS n SET schedulable=1 WHERE id=? AND region_id=? AND k8s_node_name=? AND provider_instance_id=? AND ready=1 AND ${nodePlacementGuard()}
       AND last_observed_at=? AND allocatable_memory_mib=? AND allocatable_cpu_millicores=? AND storage_gib_total=? AND platform_reserved_memory_mib=? AND platform_reserved_cpu_millicores=?
-      AND EXISTS(SELECT 1 FROM node_additions a WHERE a.operation_id=? AND a.node_id=nodes.id AND a.revision=? AND a.status='bootstrapping' AND a.network_json=? AND a.capacity_json=? AND a.checkpoint_json=?)`,
+      AND EXISTS(SELECT 1 FROM node_additions a WHERE a.operation_id=? AND a.node_id=n.id AND a.revision=? AND a.status='bootstrapping' AND a.network_json=? AND a.capacity_json=? AND a.checkpoint_json=?)`,
       )
       .bind(
         addition.intent.node_id,
         addition.intent.request.region_id,
         addition.intent.requested_hostname,
         addition.provider_instance_id,
+        ...nodePlacementBindings(),
         capacity.observed_at,
         capacity.allocatable_memory_mib,
         capacity.allocatable_cpu_millicores,

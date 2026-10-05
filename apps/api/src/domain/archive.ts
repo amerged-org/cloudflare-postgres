@@ -4,9 +4,13 @@ import { ApiError } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import { databaseForRequest } from "./rows.ts";
 import type { DatabaseRow } from "./rows.ts";
+import { regionArchive } from "./archive-bindings.ts";
 
 export function validatedArchivePrefix(
-  row: Pick<DatabaseRow, "id" | "region_id" | "archive_path" | "generation">,
+  row: Pick<
+    DatabaseRow,
+    "id" | "region_id" | "archive_path" | "storage_generation"
+  >,
   region: { backup_bucket: string } | null,
   boundBucket: string,
 ): string {
@@ -17,7 +21,7 @@ export function validatedArchivePrefix(
     path[1] !== region.backup_bucket ||
     path[2] !== row.region_id ||
     path[3] !== row.id ||
-    Number(path[4]) > row.generation ||
+    Number(path[4]) !== (row.storage_generation ?? 1) ||
     boundBucket !== region.backup_bucket
   )
     throw new ApiError(
@@ -37,13 +41,17 @@ export async function archiveSummary(
   )
     .bind(row.region_id)
     .first<{ backup_bucket: string }>();
-  const prefix = validatedArchivePrefix(row, region, c.env.ARCHIVE_BUCKET_NAME);
+  const selected = regionArchive(c.env, {
+    id: row.region_id,
+    backup_bucket: region?.backup_bucket ?? "",
+  });
+  const prefix = validatedArchivePrefix(row, region, selected.bucketName);
   let baseBackups = 0,
     walCount = 0,
     bytes = 0;
   let cursor: string | undefined;
   do {
-    const listing = await c.env.ARCHIVE.list({
+    const listing = await selected.bucket.list({
       prefix,
       delimiter: "/",
       ...(cursor ? { cursor } : {}),
@@ -52,7 +60,7 @@ export async function archiveSummary(
     for (const child of listing.delimitedPrefixes) {
       let childCursor: string | undefined;
       do {
-        const contents = await c.env.ARCHIVE.list({
+        const contents = await selected.bucket.list({
           prefix: child,
           ...(childCursor ? { cursor: childCursor } : {}),
         });

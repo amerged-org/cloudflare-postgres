@@ -5,10 +5,16 @@ import {
   ListQuery,
   OperationId,
   RegionId,
+  NodeId,
   listEnvelope,
   base64urlToBytes,
 } from "@pgcf/contracts";
-import { NodeAddition, NodeAdditionRequest } from "@pgcf/contracts/nodes";
+import {
+  NodeAddition,
+  NodeAdditionRequest,
+  NodeMarkLost,
+  NodeLoss,
+} from "@pgcf/contracts/nodes";
 import { NodeBootstrapStatus } from "@pgcf/contracts/node-bootstrap";
 import {
   BOOTSTRAP_RELAY_HEADER,
@@ -40,6 +46,7 @@ import {
   requestNodeAddition,
   setCapacityPolicy,
   verifyNodeProof,
+  markLostNode,
 } from "../platform/nodes.ts";
 
 const json = (schema: z.ZodType) => ({ "application/json": { schema } });
@@ -73,6 +80,23 @@ function register(
   app.openapi(createRoute(route), handler);
 }
 export function registerNodes(app: ApiApp): void {
+  register(
+    app,
+    {
+      method: "post",
+      path: "/v1/nodes/{id}/mark-lost",
+      security,
+      tags: ["Nodes"],
+      request: { params: z.object({ id: NodeId }), body: body(NodeMarkLost) },
+      responses: responses(NodeLoss),
+    },
+    async (c) =>
+      markLostNode(
+        c,
+        NodeId.parse(c.req.param("id")),
+        NodeMarkLost.parse(await c.req.json()),
+      ),
+  );
   register(
     app,
     {

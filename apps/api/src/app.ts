@@ -10,6 +10,7 @@ import { registerPlatform } from "./routes/platform.ts";
 import { registerUsage } from "./routes/usage.ts";
 import { registerAgentMetrics } from "./routes/agent-metrics.ts";
 import { registerCosts } from "./routes/costs.ts";
+import { registerOperationalHealth } from "./routes/health.ts";
 import { registerNodes } from "./routes/nodes.ts";
 import { authenticateBootstrapCallback } from "./domain/bootstrap-jobs.ts";
 import { NodeStateError } from "./domain/node-state.ts";
@@ -31,6 +32,8 @@ const DIAGNOSTIC_METHODS = new Set([
 ]);
 const DIAGNOSTIC_ROUTES = new Set([
   "/v1/costs",
+  "/v1/operational-health",
+  "/v1/nodes/:id/mark-lost",
   "/v1/costs/node-facts",
   "/healthz",
   "/v1/openapi.json",
@@ -55,6 +58,7 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/databases",
   "/v1/databases/:id",
   "/v1/databases/:id/suspend",
+  "/v1/databases/:id/restore",
   "/v1/databases/:id/resume",
   "/v1/databases/:id/roles",
   "/v1/databases/:id/roles/:name/reset-password",
@@ -298,6 +302,7 @@ export function createApp(): ApiApp {
   registerAgentMetrics(app);
   registerCosts(app);
   registerNodes(app);
+  registerOperationalHealth(app);
   app.doc31("/v1/openapi.json", {
     openapi: "3.1.0",
     info: { title: "PGCF API", version },

@@ -2,7 +2,11 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
-import { CoreV1Api, KubeConfig } from "@kubernetes/client-node";
+import {
+  CoreV1Api,
+  CustomObjectsApi,
+  KubeConfig,
+} from "@kubernetes/client-node";
 import { kubernetesFromConfig } from "../../src/agent/kubernetes.ts";
 
 test("PVC reads use the core API and retain resource identity", async (t) => {
@@ -63,4 +67,69 @@ test("ConfigMap deletion routes exact UID and resourceVersion preconditions thro
   const k8s = kubernetesFromConfig(new AbortController().signal, "test-config");
   await k8s.delete("ConfigMap", namespace, name, uid, resourceVersion);
   assert.equal(deleted, 1);
+});
+
+test("Backup reads and lists use the pinned CNPG API and bounded namespaced pagination", async (t) => {
+  const namespace = "pgcf-test",
+    name = "base-backup",
+    uid = randomUUID();
+  let pages = 0;
+  t.mock.method(KubeConfig.prototype, "loadFromFile", () => {});
+  t.mock.method(KubeConfig.prototype, "makeApiClient", (type: unknown) =>
+    type === CustomObjectsApi
+      ? {
+          async getNamespacedCustomObject(input: unknown) {
+            assert.deepEqual(input, {
+              group: "postgresql.cnpg.io",
+              version: "v1",
+              plural: "backups",
+              namespace,
+              name,
+            });
+            return { metadata: { name, namespace, uid, resourceVersion: "2" } };
+          },
+          async listNamespacedCustomObject(input: { _continue?: string }) {
+            pages++;
+            assert.deepEqual(input, {
+              group: "postgresql.cnpg.io",
+              version: "v1",
+              plural: "backups",
+              namespace,
+              limit: 100,
+              labelSelector: "cnpg.io/cluster=database",
+              _continue: pages === 1 ? undefined : "next",
+            });
+            return {
+              metadata: {
+                resourceVersion: "2",
+                ...(pages === 1 ? { continue: "next" } : {}),
+              },
+              items:
+                pages === 1
+                  ? [
+                      {
+                        metadata: {
+                          name,
+                          namespace,
+                          uid,
+                          resourceVersion: "2",
+                        },
+                      },
+                    ]
+                  : [],
+            };
+          },
+        }
+      : {},
+  );
+  const k8s = kubernetesFromConfig(new AbortController().signal, "test-config");
+  assert.equal((await k8s.read("Backup", namespace, name))?.metadata.uid, uid);
+  const backups = await k8s.list(
+    "Backup",
+    namespace,
+    "cnpg.io/cluster=database",
+  );
+  assert.equal(backups[0]?.kind, "Backup");
+  assert.equal(backups[0]?.apiVersion, "postgresql.cnpg.io/v1");
+  assert.equal(pages, 2);
 });

@@ -4,6 +4,7 @@ import {
   DesiredDatabase,
   DesiredResponse,
   type DesiredCreation,
+  type DesiredRecovery,
   type DesiredQuery,
   type DesiredSize,
 } from "@pgcf/contracts";
@@ -27,6 +28,13 @@ interface DesiredRow extends DatabaseRow, DesiredSize {
   maintenance_iv: string | null;
   maintenance_kid: string | null;
   maintenance_revision: number | null;
+  restore_operation_id: string | null;
+  source_database_id: string | null;
+  source_archive_path: string | null;
+  source_storage_generation: number | null;
+  backup_id: string | null;
+  target_time: string | null;
+  restore_status: DesiredRecovery["status"] | null;
 }
 export async function desired(
   c: ApiContext,
@@ -38,11 +46,14 @@ export async function desired(
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json,
     o.id creation_operation_id,o.generation creation_generation,o.status creation_status,
     EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready,
-    m.password_ciphertext maintenance_ciphertext,m.password_iv maintenance_iv,m.password_kid maintenance_kid,m.password_revision maintenance_revision
+    m.password_ciphertext maintenance_ciphertext,m.password_iv maintenance_iv,m.password_kid maintenance_kid,m.password_revision maintenance_revision,
+    x.operation_id restore_operation_id,x.source_database_id,x.source_archive_path,x.source_storage_generation,x.backup_id,x.target_time,ro.status restore_status
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
     LEFT JOIN operations o ON o.id=substr(d.archive_path,-23) AND o.kind='database.create' AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation
     LEFT JOIN maintenance_credentials m ON m.database_id=d.id
-    WHERE d.region_id=? AND d.node_id IS NOT NULL AND n.schedulable=1 AND d.desired_state IN('running','suspended','deleted') AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL) AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
+    LEFT JOIN database_restores x ON x.target_database_id=d.id
+    LEFT JOIN operations ro ON ro.id=x.operation_id AND ro.database_id=d.id AND ro.kind='database.restore'
+    WHERE d.region_id=? AND d.node_id IS NOT NULL AND n.schedulable=1 AND n.lost_at IS NULL AND d.desired_state IN('running','suspended','deleted') AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL) AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
     ${query.after ? "AND d.id>?" : ""} ORDER BY d.id LIMIT ?`,
   )
     .bind(region.id, ...(query.after ? [query.after] : []), query.limit + 1)
@@ -83,6 +94,21 @@ export async function desired(
       DesiredDatabase.parse({
         id: row.id,
         generation: row.generation,
+        storage_generation: row.storage_generation ?? 1,
+        ...(row.restore_operation_id && row.desired_state !== "deleted"
+          ? {
+              recovery: {
+                operation_id: row.restore_operation_id,
+                source_database_id: row.source_database_id,
+                source_archive_path: row.source_archive_path,
+                source_storage_generation: row.source_storage_generation,
+                backup_id: row.backup_id,
+                ...(row.target_time ? { target_time: row.target_time } : {}),
+                status: row.restore_status,
+                ever_ready: Boolean(row.ever_ready),
+              },
+            }
+          : {}),
         desired_state: row.desired_state,
         ...(row.power_operation && row.desired_state !== "deleted"
           ? {

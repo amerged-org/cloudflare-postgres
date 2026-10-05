@@ -263,6 +263,7 @@ test("golden normalization preserves image, roles, Secret names and archive layo
   assert.equal(archive.endpointURL, "https://$ENDPOINT_HOST");
   const later = structuredClone(db);
   later.generation = 2;
+  later.storage_generation = 2;
   later.archive.destination_path = archiveDestinationPath(
     bucket,
     region,
