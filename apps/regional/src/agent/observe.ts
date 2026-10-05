@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { isIP } from "node:net";
-import { DatabaseId } from "@pgcf/contracts";
-import type { NodeObservation, Orphan } from "@pgcf/contracts";
+import { DatabaseId, NodeObservation } from "@pgcf/contracts";
+import type { Orphan } from "@pgcf/contracts";
 import { boundedText } from "./api-client.ts";
 import { record, string } from "./types.ts";
 import type { Kubernetes, Resource } from "./types.ts";
@@ -198,6 +198,23 @@ export function nodeObservations(
       .map((namespace) => namespace.metadata.name),
   );
   return nodes.map((node) => {
+    const nodeId = NodeObservation.shape.node_id
+      .unwrap()
+      .safeParse(node.metadata.labels?.["pgcf.io/node-id"]);
+    const providerId = NodeObservation.shape.provider_instance_id
+      .unwrap()
+      .safeParse(node.metadata.labels?.["pgcf.io/provider-instance-id"]);
+    const nodeUid = NodeObservation.shape.node_uid
+      .unwrap()
+      .safeParse(node.metadata.uid);
+    const identity =
+      nodeId.success && providerId.success && nodeUid.success
+        ? {
+            node_id: nodeId.data,
+            provider_instance_id: providerId.data,
+            node_uid: nodeUid.data,
+          }
+        : {};
     const allocatable = record(record(node.status).allocatable);
     const storage = node.metadata.annotations?.["pgcf.io/storage-gib-total"];
     const storageGiB =
@@ -225,6 +242,7 @@ export function nodeObservations(
     if (!Number.isSafeInteger(cpu))
       throw new Error("resource_quantity_invalid");
     return {
+      ...identity,
       name: node.metadata.name,
       ready:
         condition(node, "Ready")?.status === "True" &&
