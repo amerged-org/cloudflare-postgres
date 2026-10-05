@@ -1,10 +1,21 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { randomUUID } from "node:crypto";
+import {
+  createHash,
+  generateKeyPairSync,
+  randomUUID,
+  X509Certificate,
+} from "node:crypto";
 import { test } from "node:test";
 import https from "node:https";
+import type { IncomingMessage } from "node:http";
 import { PassThrough } from "node:stream";
 import { EventEmitter } from "node:events";
+import { once } from "node:events";
+import { networkInterfaces, tmpdir } from "node:os";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import {
   CoreV1Api,
   CustomObjectsApi,
@@ -15,6 +26,7 @@ import {
   kubeletSummary,
 } from "../../src/agent/kubernetes.ts";
 import type { Resource } from "../../src/agent/types.ts";
+import { validateKubeletTrust } from "../../src/agent/kubelet-trust.ts";
 
 test("PVC reads use the core API and retain resource identity", async (t) => {
   const namespace = "pgcf-test";
@@ -297,4 +309,156 @@ test("kubelet summaries reject responses beyond the fixed byte bound and retain 
     /kubelet_stats_too_large/,
   );
   assert.equal(destroyed, true);
+});
+
+test("an authenticated kubelet certificate pin enables real TLS for the bound node hostname and refuses a replacement leaf", async (t) => {
+  const address = Object.values(networkInterfaces())
+    .flat()
+    .find((entry) => entry?.internal && entry.family === "IPv4")?.address;
+  assert.ok(address);
+  const directory = mkdtempSync(join(tmpdir(), "pgcf-kubelet-cert-"));
+  const key = generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+    .privateKey.export({ type: "pkcs8", format: "pem" })
+    .toString();
+  const keyPath = join(directory, "credential");
+  writeFileSync(keyPath, key, { mode: 0o600 });
+  let certificatePem: string;
+  let noSanCertificatePem: string;
+  try {
+    certificatePem = execFileSync(
+      "openssl",
+      [
+        "req",
+        "-new",
+        "-x509",
+        "-key",
+        keyPath,
+        "-days",
+        "1",
+        "-subj",
+        "/CN=pgcf-test",
+        "-addext",
+        "subjectAltName=DNS:kubernetes",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+      ],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000 },
+    );
+    noSanCertificatePem = execFileSync(
+      "openssl",
+      [
+        "req",
+        "-new",
+        "-x509",
+        "-key",
+        keyPath,
+        "-days",
+        "1",
+        "-subj",
+        "/CN=kubernetes",
+        "-addext",
+        "basicConstraints=critical,CA:TRUE",
+      ],
+      { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10_000 },
+    );
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
+  const server = https.createServer(
+    { cert: certificatePem, key },
+    (_request, response) => response.end(JSON.stringify({ pods: [] })),
+  );
+  server.listen(0, address);
+  await once(server, "listening");
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  });
+  const port = (server.address() as { port: number }).port;
+  const original = https.request.bind(https);
+  t.mock.method(
+    https,
+    "request",
+    (
+      options: https.RequestOptions,
+      callback: (response: IncomingMessage) => void,
+    ) => original({ ...options, port }, callback),
+  );
+  const config = new KubeConfig();
+  t.mock.method(config, "getCurrentCluster", () => ({
+    name: "fixture",
+    server: "https://kubernetes",
+    caData: Buffer.from(randomUUID()).toString("base64"),
+  }));
+  t.mock.method(
+    config,
+    "applyToHTTPSOptions",
+    async (options: https.RequestOptions) => {
+      options.ca = Buffer.from(randomUUID());
+    },
+  );
+  const node: Resource = {
+    apiVersion: "v1",
+    kind: "Node",
+    metadata: { name: "kubernetes", uid: randomUUID() },
+    status: { addresses: [{ type: "InternalIP", address }] },
+  };
+  const pin = {
+    certificatePem,
+    leafSha256: createHash("sha256")
+      .update(new X509Certificate(certificatePem).raw)
+      .digest("hex"),
+    serverName: node.metadata.name,
+  };
+  assert.deepEqual(
+    await kubeletSummary(config, node, new AbortController().signal, pin),
+    { pods: [] },
+  );
+  await assert.rejects(
+    kubeletSummary(config, node, new AbortController().signal, {
+      ...pin,
+      leafSha256: createHash("sha256").update(randomUUID()).digest("hex"),
+    }),
+    /kubelet_pin_mismatch/,
+  );
+  await assert.rejects(
+    kubeletSummary(config, node, new AbortController().signal),
+    /kubelet_tls_failed/,
+  );
+  const clusterUid = randomUUID();
+  const map: Resource = {
+    apiVersion: "v1",
+    kind: "ConfigMap",
+    metadata: {
+      name: `kubelet-${node.metadata.uid}`,
+      namespace: "pgcf-system",
+      uid: randomUUID(),
+      resourceVersion: "1",
+      labels: { "pgcf.io/kubelet-node-uid": node.metadata.uid! },
+    },
+    data: {
+      node_name: node.metadata.name,
+      node_uid: node.metadata.uid,
+      cluster_uid: clusterUid,
+      certificate_pem: noSanCertificatePem,
+      certificate_sha256: createHash("sha256")
+        .update(noSanCertificatePem, "utf8")
+        .digest("hex"),
+    },
+  };
+  assert.throws(
+    () => validateKubeletTrust(map, node, clusterUid, Date.now()),
+    /kubelet_trust_invalid/,
+  );
+  server.setSecureContext({ cert: noSanCertificatePem, key });
+  await assert.rejects(
+    kubeletSummary(config, node, new AbortController().signal, {
+      ...pin,
+      certificatePem: noSanCertificatePem,
+      leafSha256: createHash("sha256")
+        .update(new X509Certificate(noSanCertificatePem).raw)
+        .digest("hex"),
+    }),
+    /kubelet_tls_identity_invalid/,
+  );
 });
