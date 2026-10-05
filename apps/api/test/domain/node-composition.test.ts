@@ -14,6 +14,7 @@ import {
 import {
   dispatchNodeOrder,
   reconcileNodeProvider,
+  ensureNodeRescue,
 } from "../../src/workflows/add-node.ts";
 import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
 import { cleanupFixtures, fixture, observedBody, request } from "./fixtures.ts";
@@ -46,6 +47,58 @@ async function configured() {
   return { ...f, selection };
 }
 describe("node composition with actual Workers/D1", () => {
+  it("blocks rescue without verified network preparation even before a private job exists", async () => {
+    const f = await configured(),
+      instance = providerId();
+    let addition = await reserveNodeAddition(env.DB, {
+      request_key: crypto.randomUUID(),
+      request: {
+        region_id: f.region,
+        mode: "adopt",
+        provider_instance_id: instance,
+      },
+    });
+    addition = await recordNodeReceipt(
+      env.DB,
+      addition.intent.operation_id,
+      addition.revision,
+      {
+        provider_instance_id: instance,
+        request_id: null,
+        reference: crypto.randomUUID(),
+        received_at: new Date().toISOString(),
+      },
+    );
+    addition = await recordNodeAudit(
+      env.DB,
+      addition.intent.operation_id,
+      addition.revision,
+      {
+        provider_instance_id: instance,
+        provider_region: "EU",
+        product_id: crypto.randomUUID(),
+        image_id: crypto.randomUUID(),
+        reference: crypto.randomUUID(),
+        observed_at: new Date().toISOString(),
+      },
+    );
+    const get = vi.fn(async () => {
+        throw new Error("unexpected_provider_get");
+      }),
+      rescue = vi.fn(async () => {
+        throw new Error("unexpected_rescue_dispatch");
+      }),
+      audits = vi.fn(async () => []);
+    expect(
+      await ensureNodeRescue(env, addition.intent.operation_id, {
+        getInstance: get,
+        rescue,
+        actionAudits: audits,
+      }),
+    ).toBe(false);
+    expect(get).not.toHaveBeenCalled();
+    expect(rescue).not.toHaveBeenCalled();
+  });
   it("enforces administrator scope and canonical request replay without purchase", async () => {
     const f = await configured(),
       body = { region_id: f.region, mode: "order", order: f.selection };

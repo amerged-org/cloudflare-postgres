@@ -258,9 +258,15 @@ describe("manual in-place resize on real Workers D1", () => {
       resize(f, target, "race-resize"),
       f.create("race-create", f.integrator, "race-create"),
     ]);
-    expect(responses.map((response) => response.status).sort()).toEqual([
-      202, 503,
-    ]);
+    expect(responses[1]!.status).toBe(202);
+    expect([202, 503]).toContain(responses[0]!.status);
+    const created = DatabaseWithOperation.parse(await responses[1]!.json());
+    const placed = await env.DB.prepare(
+      "SELECT node_id FROM databases WHERE id=?",
+    )
+      .bind(created.database.id)
+      .first("node_id");
+    expect(placed).toBe(responses[0]!.status === 202 ? null : f.node);
     const reserved = await env.DB.prepare(
       "SELECT SUM(s.cpu_millicores+100) n FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.node_id=? AND d.observed_state<>'deleted'",
     )
@@ -273,7 +279,7 @@ describe("manual in-place resize on real Workers D1", () => {
       )
         .bind(f.project)
         .first("n"),
-    ).toBe(1);
+    ).toBe(responses[0]!.status === 202 ? 2 : 1);
     expect(
       await env.DB.prepare(
         "SELECT COUNT(*) n FROM idempotency_keys WHERE state='in_progress'",
