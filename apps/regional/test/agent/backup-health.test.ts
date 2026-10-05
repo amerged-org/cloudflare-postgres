@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { BackupHealthCollector } from "../../src/agent/backup-health.ts";
-import { record, type Resource } from "../../src/agent/types.ts";
+import { record } from "../../src/agent/types.ts";
 import { fixture, MemoryKubernetes } from "./fixtures.ts";
 
 function setup() {
@@ -96,10 +96,7 @@ test("completed plugin backups and later failures retain actual timestamps with 
   state.k8s.list = async (...args) => {
     if (args[0] === "Backup") {
       inventories++;
-      assert.deepEqual(args.slice(1), [
-        state.namespace.metadata.name,
-        "cnpg.io/cluster=database",
-      ]);
+      assert.deepEqual(args.slice(1), [state.namespace.metadata.name]);
     }
     return original(...args);
   };
@@ -328,4 +325,37 @@ test("bounded inventory errors are an unknown sample and retain no fabricated te
     last_completed_at: null,
     last_failed_at: null,
   });
+});
+
+test("manual Backup CRs are observed without scheduler labels and status version churn does not bypass the minute cache", async () => {
+  const state = setup();
+  const backup = state.backup("completed");
+  delete backup.metadata.labels;
+  let inventories = 0;
+  const original = state.k8s.list.bind(state.k8s);
+  state.k8s.list = async (...args) => {
+    inventories++;
+    return original(...args);
+  };
+  const collector = new BackupHealthCollector();
+  const first = await collector.collect(
+    state.k8s,
+    state.db,
+    state.namespace,
+    state.cluster,
+    state.now,
+  );
+  assert.equal(first.health, "ok");
+  state.cluster.metadata.resourceVersion = "changed-status";
+  assert.deepEqual(
+    await collector.collect(
+      state.k8s,
+      state.db,
+      state.namespace,
+      state.cluster,
+      state.now + 15_000,
+    ),
+    first,
+  );
+  assert.equal(inventories, 1);
 });

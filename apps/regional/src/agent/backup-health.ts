@@ -36,8 +36,7 @@ function owned(
 const fingerprint = (resource: Resource) =>
   JSON.stringify({
     uid: uid(resource),
-    version: resource.metadata.resourceVersion,
-    metadata: resource.metadata,
+    metadata: { ...resource.metadata, resourceVersion: undefined },
     spec: resource.spec,
   });
 function time(value: unknown, now: number): string {
@@ -130,13 +129,20 @@ export class BackupHealthCollector {
         prior?.binding === binding &&
         now >= Date.parse(prior.result.observed_at) &&
         now - Date.parse(prior.result.observed_at) < INTERVAL_MS
-      )
+      ) {
+        const [currentNamespace, currentCluster] = await Promise.all([
+          k8s.read("Namespace", undefined, namespace.metadata.name),
+          k8s.read("Cluster", namespace.metadata.name, cluster.metadata.name),
+        ]);
+        if (
+          fingerprint(owned(currentNamespace, db)) !== namespaceBefore ||
+          fingerprint(owned(currentCluster, db, namespace.metadata.name)) !==
+            clusterBefore
+        )
+          throw new Error("backup_identity_changed");
         return { ...prior.result };
-      const backups = await k8s.list(
-        "Backup",
-        namespace.metadata.name,
-        `cnpg.io/cluster=${cluster.metadata.name}`,
-      );
+      }
+      const backups = await k8s.list("Backup", namespace.metadata.name);
       if (
         backups.length > 10_000 ||
         new Set(backups.map((backup) => uid(backup))).size !== backups.length
@@ -150,8 +156,13 @@ export class BackupHealthCollector {
           backup.apiVersion !== cluster.apiVersion ||
           backup.metadata.namespace !== namespace.metadata.name ||
           backup.metadata.deletionTimestamp ||
-          !backup.metadata.resourceVersion ||
-          record(record(backup.spec).cluster).name !== cluster.metadata.name ||
+          !backup.metadata.resourceVersion
+        )
+          throw new Error("backup_identity_unknown");
+        const source = string(record(record(backup.spec).cluster).name);
+        if (!source) throw new Error("backup_identity_unknown");
+        if (source !== cluster.metadata.name) continue;
+        if (
           record(backup.spec).method !== "plugin" ||
           record(record(backup.spec).pluginConfiguration).name !== PLUGIN
         )
