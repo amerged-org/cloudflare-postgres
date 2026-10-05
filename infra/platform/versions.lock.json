@@ -118,5 +118,26 @@
       "note": "Pinned image retained from the earlier lab; the new live chain has not been qualified."
     }
   },
-  "verificationScope": "Official chart versions, chart/app mappings, registry manifest digests, archive checksums, offline Helm lint/render and Kustomize build. Container image tag references remain as shipped by the pinned charts except digest defaults already shipped by Cilium; image signature and tag-to-digest verification are not claimed."
+  "verificationScope": "Official chart versions, chart/app mappings, registry manifest digests, archive checksums, offline Helm lint/render and Kustomize build. Container image tag references remain as shipped by the pinned charts except digest defaults already shipped by Cilium; image signature and tag-to-digest verification are not claimed.",
+  "bootstrapClients": {
+    "helm": {
+      "version": "4.3.0",
+      "releaseURL": "https://github.com/helm/helm/releases/tag/v4.3.0",
+      "license": "Apache-2.0",
+      "archives": [
+        {
+          "os": "linux",
+          "architecture": "amd64",
+          "url": "https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz",
+          "sha256": "86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb"
+        },
+        {
+          "os": "linux",
+          "architecture": "arm64",
+          "url": "https://get.helm.sh/helm-v4.3.0-linux-arm64.tar.gz",
+          "sha256": "31c5794dd55c66a51e6b7d2e2ac7a114ae8b1de41ff1d9ba51748ac973b06a08"
+        }
+      ]
+    }
+  }
 }

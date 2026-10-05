@@ -42,18 +42,34 @@ RUN set -eu; \
  curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 480 --output /kubectl "https://dl.k8s.io/release/v1.36.3/bin/linux/$TARGETARCH/kubectl"; \
  printf '%s  /kubectl\n' "$kube_sum" | sha256sum --check --status; \
  chmod 755 /kubectl
+RUN set -eu; \
+ case "$TARGETARCH" in \
+ amd64) helm_sum=86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb ;; \
+ arm64) helm_sum=31c5794dd55c66a51e6b7d2e2ac7a114ae8b1de41ff1d9ba51748ac973b06a08 ;; \
+ *) exit 1 ;; esac; \
+ curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --connect-timeout 15 --max-time 480 --output /helm.tgz "https://get.helm.sh/helm-v4.3.0-linux-$TARGETARCH.tar.gz"; \
+ printf '%s  /helm.tgz\n' "$helm_sum" | sha256sum --check --status; \
+ tar --extract --gzip --file=/helm.tgz --directory=/ "linux-$TARGETARCH/helm"; \
+ mv "/linux-$TARGETARCH/helm" /helm; chmod 755 /helm; rm /helm.tgz
+COPY apps/node-bootstrap/src/build-assets.ts apps/node-bootstrap/src/platform-artifacts.ts /bootstrap-assets/
+COPY infra/platform/base/values/cilium.yaml /assets/cilium-values.yaml
+RUN node /bootstrap-assets/build-assets.ts /assets
 
 FROM node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates=20250419~deb12u1 openssh-client=1:9.2p1-2+deb12u10 \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV NODE_ENV=production
-COPY --from=clients --chown=root:root /talosctl /kubectl /usr/local/bin/
+COPY --from=clients --chown=root:root /talosctl /kubectl /helm /usr/local/bin/
+COPY --from=clients --chown=root:root /assets /app/assets
 COPY --from=build --chown=root:root /out/node_modules ./node_modules
 COPY --from=build --chown=root:root /out/package.json /out/server.mjs /out/proxy-command.mjs ./
 COPY --from=build --chown=root:root /licenses /app/licenses
 COPY --chown=root:root apps/node-bootstrap/assets/talos.LICENSE /app/licenses/talos/LICENSE
 COPY --chown=root:root apps/node-bootstrap/assets/kubernetes.LICENSE /app/licenses/kubernetes/LICENSE
+COPY --chown=root:root apps/node-bootstrap/assets/helm.LICENSE /app/licenses/helm/LICENSE
+COPY --chown=root:root apps/node-bootstrap/assets/flux.LICENSE /app/licenses/flux/LICENSE
+COPY --chown=root:root apps/node-bootstrap/assets/cilium.LICENSE /app/licenses/cilium/LICENSE
 COPY --from=build --chown=root:root /workspace/LICENSE ./LICENSE
 USER node
 EXPOSE 8080

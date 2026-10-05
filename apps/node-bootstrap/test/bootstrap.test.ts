@@ -26,7 +26,7 @@ import {
   verifyRescue,
 } from "../src/bootstrap.ts";
 
-import { authority, fixture } from "./fixture.ts";
+import { authority, fixture, platformFixture } from "./fixture.ts";
 
 async function installationMustRemainReadOnly(
   stage: "quarantine_release_intent" | "quarantine_released",
@@ -472,7 +472,7 @@ test("clean reboot verification refuses the old boot ID and accepts an observed 
 });
 
 test("an uncertain GPT relocation resumes with partition readback and never repeats the destructive command", async () => {
-  const input = fixture();
+  const input = platformFixture();
   let current = authority(input);
   current.checkpoint = {
     ...current.checkpoint,
@@ -545,7 +545,7 @@ test("an uncertain GPT relocation resumes with partition readback and never repe
 });
 
 test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and reads back without another bootstrap", async () => {
-  const input = fixture();
+  const input = platformFixture();
   let current = authority(input);
   const uid = randomUUID();
   const oldBoot = randomUUID();
@@ -768,7 +768,18 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
       throw new Error("unexpected command");
     },
   });
+  let installation_calls = 0;
+  Reflect.set(job, "installPlatform", async () => {
+    installation_calls++;
+    assert.equal(current.checkpoint.stage, "kubernetes_joined");
+    assert.equal(current.protected_material?.purpose, "join_bundle");
+    assert.ok(
+      current.protected_material?.purpose === "join_bundle" &&
+        current.protected_material.material.kube_system_uid === uid,
+    );
+  });
   await job.start();
+  assert.equal(installation_calls, 1);
   assert.ok(
     !calls.some(
       (args) =>
