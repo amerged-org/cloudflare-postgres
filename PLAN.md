@@ -39,11 +39,27 @@ connection limit. Raw 100 MiB/1 GiB integrity, slow reception and 600 s idle pas
 735.604 SQL/s read test is a bounded measurement, not maximum throughput or customer density.
 Decoded binary-result mode remains unsupported; raw COPY and default-text clients pass.
 
-The current image's fresh E0–E2 passed, but E3 failed its required Tail correlation event. The
-harness cleaned up that trial successfully. A separate diagnostic trial verified transactions and
-exact 28P01 for wrong password, unknown database and unknown role using the deployed strict
-probe. This does not pass E3 or establish equal rejection timing. Fresh cold diagnostics and the
-Tail failure investigation continue; archive-availability and authenticated-idle fixes are pending.
+The current image's first fresh E3 failed its required Tail event and was cleaned up. A second
+trial passed E0–E5, including exact 28P01 negative authentication, both correlated startup
+mismatches, real R2 backup and zero remaining volumes/archives. Deletion took 103.498 s;
+separate run cleanup passed. The earlier missing Tail event remains unexplained; bounded failure
+diagnostics now retain counts and stages without trace content. Four diagnostic cold starts took
+8.645/9.772/9.057/9.695 s with one wake and preserved data. Two initial Cluster PATCH failures
+reported Invalid, unchanged UID and changed resource version; a server-only stale-version dry-run
+also returned generic Invalid. The exact live rejection cause remains unproven. These four runs
+do not replace the required twenty-run p95 acceptance.
+
+Archive-availability and authenticated-idle fixes are integrated and pass local checks, with API
+delivery required before the new regional producer. Established readiness keeps every physical,
+configuration, TLS, role and post-authentication identity guard but no longer depends on available
+archive telemetry. Unknown health remains explicit and alarms after ten minutes across restart.
+Only AuthenticationOk starts idle activity; quiescence drains pre-auth transports through bounded
+actual close, preserving raw transport counts, authenticated transactions and SQL/WAL safety.
+Unknown pipelined outcomes surface as transport failure and are never replayed. Backup metering
+now walks up to 16 pages/16,000 objects within one two-second deadline and a 4 MiB key budget;
+incomplete or oversized walks remain unknown. The scan is an interval observation, not an atomic
+R2 snapshot. Tests pass: contracts 129, API 302, Edge 78, regional 385, native 27, CLI 30, harness
+204, infrastructure 21 and CI logic 68, with zero skipped tests. Live proof of these fixes remains pending.
 
 Phase 3 software and native images are prepared, not live-accepted. The Dev D1 export restored
 locally with clean integrity/foreign-key checks; four additive bootstrap migrations rehearsed
@@ -390,8 +406,10 @@ their own price lists and billing logic.
 - **Wake before authentication:** in Phase 1 databases always run, so no connection wakes
   anything. From Phase 2 an unauthenticated client that knows a database ID and a role name could
   wake a sleeping database. That is bounded by unguessable IDs, the D1 role lookup before any wake,
-  per-database rate limits and counting traffic only after `AuthenticationOk`. Phase 2 adds a
-  decoy SCRAM exchange so that unknown databases and roles look like a wrong password. Edge-side
+  and per-database rate limits. The integrated idle fix counts activity only after `AuthenticationOk`
+  and drains pre-auth sessions at quiescence; its live rollout is pending. Known-hint wake abuse
+  still requires explicit measured admission protection. Unknown databases and roles use decoy
+  SCRAM and return the same 28P01 error form as a wrong password; their timing is not equal. Edge-side
   SCRAM verification before a wake is a Phase 4 decision.
 
 ## 7. Phases

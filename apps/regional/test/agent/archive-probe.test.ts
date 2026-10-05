@@ -494,10 +494,11 @@ test("eligible reconciliation uses the SQL sample and never scrapes exporter on 
       throw new Error(randomUUID());
     },
   ).reconcile(f.db, f.ctx);
-  assert.equal(failed?.state, "provisioning");
+  assert.equal(failed?.state, "ready");
   assert.deepEqual(failed?.archive, {
     continuous: false,
     ready_wal_files: null,
+    health: "unknown",
   });
   assert.equal(scrapes, 0);
   assert.deepEqual(
