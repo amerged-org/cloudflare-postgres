@@ -32,7 +32,11 @@ import { verifyRegistry, promotionArguments } from "./registry.ts";
 import {
   classifyReviewed,
   readPackageProvenance,
+  reviewedBase,
   reviewedFiles,
+  reviewedManifestPaths,
+  imageProfile,
+  type ImageProfile,
 } from "./reviewed-findings.ts";
 
 const scannerVersion = "8.30.1";
@@ -57,6 +61,51 @@ class QualificationFailure extends Error {}
 
 function requireCheck(condition: unknown, message: string): asserts condition {
   if (!condition) throw new QualificationFailure(message);
+}
+
+export function parseQualificationArguments(input: string[]): {
+  profile: ImageProfile;
+  args: string[];
+} {
+  const args = [...input],
+    index = args.indexOf("--profile");
+  let profile: ImageProfile = "regional";
+  if (index !== -1) {
+    requireCheck(
+      index + 1 < args.length,
+      "Missing image qualification profile",
+    );
+    profile = imageProfile(args[index + 1]);
+    args.splice(index, 2);
+  }
+  requireCheck(
+    !args.some((value) => value.startsWith("--")),
+    "Invalid image qualification options",
+  );
+  return { profile, args };
+}
+
+export function validateDockerfile(
+  source: string,
+  profileInput: ImageProfile = "regional",
+): string {
+  const profile = imageProfile(profileInput),
+    from = source
+      .split(/\r?\n/)
+      .filter((line) => /^\s*FROM\b/i.test(line))
+      .map((line) => line.trim()),
+    expected = [
+      `FROM ${reviewedBase.image} AS build`,
+      ...(profile === "node-bootstrap"
+        ? [`FROM ${reviewedBase.image} AS clients`]
+        : []),
+      `FROM ${reviewedBase.image}`,
+    ];
+  requireCheck(
+    JSON.stringify(from) === JSON.stringify(expected),
+    "Dockerfile base or stage topology differs from the pinned profile",
+  );
+  return reviewedBase.image;
 }
 
 export function safeArchivePath(name: string): string {
@@ -140,6 +189,7 @@ export async function extractLayer(
   input: AsyncIterable<Uint8Array>,
   directory: string,
   layer: number,
+  paths?: string[],
 ): Promise<LayerFile[]> {
   const files: LayerFile[] = [];
   const links = new Set<string>();
@@ -148,6 +198,7 @@ export async function extractLayer(
   await readTar(input, async (header, stream) => {
     const entry = tarEntry++;
     const path = safeArchivePath(header.name);
+    paths?.push(path);
     const parts = path.split("/");
     requireCheck(
       !parts.some((_part, index) =>
@@ -324,6 +375,13 @@ type ToolStage =
   | "runtime_help"
   | "runtime_agent"
   | "runtime_gateway"
+  | "runtime_relay"
+  | "runtime_bootstrap_modules"
+  | "runtime_bootstrap_server"
+  | "runtime_bootstrap_proxy"
+  | "runtime_talos"
+  | "runtime_kubectl"
+  | "runtime_ssh"
   | "scanner_version"
   | "inspect_help"
   | "docker_api"
@@ -376,54 +434,176 @@ async function command(
   });
 }
 
-export async function qualifyRuntime(image: string): Promise<void> {
-  const args = [
-    "run",
-    "--rm",
-    "--platform",
-    "linux/amd64",
-    "--cpus",
-    "2",
-    "--memory",
-    "2g",
-    "--network",
-    "none",
-    "--entrypoint",
-    "node",
-    image,
+export interface RuntimeCheck {
+  stage: ToolStage;
+  entrypoint: string;
+  args: string[];
+  exit: number;
+  stdout?: string;
+  stderr?: string;
+  version?: "talos" | "kubectl" | "ssh";
+}
+export function runtimeChecks(
+  profileInput: ImageProfile = "regional",
+): RuntimeCheck[] {
+  const profile = imageProfile(profileInput);
+  if (profile === "regional")
+    return [
+      {
+        stage: "runtime_help",
+        entrypoint: "node",
+        args: ["/app/agent.mjs", "--help"],
+        exit: 0,
+        stderr: "",
+      },
+      {
+        stage: "runtime_agent",
+        entrypoint: "node",
+        args: ["/app/agent.mjs"],
+        exit: 1,
+        stdout: JSON.stringify({ event: "agent_startup_failed" }),
+        stderr: "",
+      },
+      {
+        stage: "runtime_gateway",
+        entrypoint: "node",
+        args: ["/app/gateway.mjs"],
+        exit: 1,
+        stdout: "",
+        stderr: JSON.stringify({ event: "gateway_invalid_configuration" }),
+      },
+      {
+        stage: "runtime_relay",
+        entrypoint: "node",
+        args: ["/app/bootstrap-relay.mjs"],
+        exit: 1,
+        stdout: "",
+        stderr: JSON.stringify({
+          event: "bootstrap_relay_invalid_configuration",
+        }),
+      },
+    ];
+  return [
+    {
+      stage: "runtime_bootstrap_modules",
+      entrypoint: "node",
+      args: [
+        "--input-type=module",
+        "-e",
+        "await import('/app/server.mjs'); await import('/app/proxy-command.mjs');",
+      ],
+      exit: 0,
+      stdout: "",
+      stderr: "",
+    },
+    {
+      stage: "runtime_bootstrap_server",
+      entrypoint: "node",
+      args: ["/app/server.mjs"],
+      exit: 1,
+      stdout: "",
+      stderr: JSON.stringify({ event: "bootstrap_invalid_configuration" }),
+    },
+    {
+      stage: "runtime_bootstrap_proxy",
+      entrypoint: "node",
+      args: ["/app/proxy-command.mjs"],
+      exit: 1,
+      stdout: "",
+      stderr: "bootstrap_proxy_failed",
+    },
+    {
+      stage: "runtime_talos",
+      entrypoint: "talosctl",
+      args: ["version", "--client"],
+      exit: 0,
+      stderr: "",
+      version: "talos",
+    },
+    {
+      stage: "runtime_kubectl",
+      entrypoint: "kubectl",
+      args: ["version", "--client=true", "-o=json"],
+      exit: 0,
+      stderr: "",
+      version: "kubectl",
+    },
+    {
+      stage: "runtime_ssh",
+      entrypoint: "ssh",
+      args: ["-V"],
+      exit: 0,
+      stdout: "",
+      version: "ssh",
+    },
   ];
-  await command("runtime_help", "docker", [
-    ...args,
-    "/app/agent.mjs",
-    "--help",
-  ]);
-  const agent = await command(
-    "runtime_agent",
-    "docker",
-    [...args, "/app/agent.mjs"],
-    undefined,
-    process.env,
-    [1],
-  );
+}
+export function validateRuntimeResult(
+  check: RuntimeCheck,
+  result: { stdout: string; stderr: string; exit: number | null },
+): void {
   requireCheck(
-    agent.stdout.trim() === JSON.stringify({ event: "agent_startup_failed" }) &&
-      !agent.stderr.trim(),
-    "Agent runtime did not reject missing configuration cleanly",
+    result.exit === check.exit &&
+      (check.stdout === undefined || result.stdout.trim() === check.stdout) &&
+      (check.stderr === undefined || result.stderr.trim() === check.stderr),
+    `runtime_result_invalid:${check.stage}`,
   );
-  const gateway = await command(
-    "runtime_gateway",
-    "docker",
-    [...args, "/app/gateway.mjs"],
-    undefined,
-    process.env,
-    [1],
-  );
-  requireCheck(
-    gateway.stderr.trim() ===
-      JSON.stringify({ event: "gateway_invalid_configuration" }) &&
-      !gateway.stdout.trim(),
-    "Gateway runtime did not reject missing configuration cleanly",
-  );
+  if (check.version === "talos")
+    requireCheck(
+      /^Client:\r?\n/.test(result.stdout) &&
+        /(?:^|\n)\s*Tag:\s*v1\.14\.1\s*(?:\n|$)/.test(result.stdout) &&
+        /(?:^|\n)\s*OS\/Arch:\s*linux\/amd64\s*(?:\n|$)/.test(result.stdout),
+      "runtime_version_invalid:runtime_talos",
+    );
+  if (check.version === "kubectl") {
+    let version: { clientVersion?: { gitVersion?: string; platform?: string } };
+    try {
+      version = JSON.parse(result.stdout) as typeof version;
+    } catch {
+      throw new QualificationFailure("runtime_version_invalid:runtime_kubectl");
+    }
+    requireCheck(
+      version?.clientVersion?.gitVersion === "v1.36.3" &&
+        version.clientVersion.platform === "linux/amd64",
+      "runtime_version_invalid:runtime_kubectl",
+    );
+  }
+  if (check.version === "ssh")
+    requireCheck(
+      /^OpenSSH_[0-9][^\r\n]*$/.test(result.stderr.trim()),
+      "runtime_version_invalid:runtime_ssh",
+    );
+}
+export async function qualifyRuntime(
+  image: string,
+  profile: ImageProfile = "regional",
+): Promise<void> {
+  for (const check of runtimeChecks(profile)) {
+    const result = await command(
+      check.stage,
+      "docker",
+      [
+        "run",
+        "--rm",
+        "--platform",
+        "linux/amd64",
+        "--cpus",
+        "2",
+        "--memory",
+        "2g",
+        "--network",
+        "none",
+        "--entrypoint",
+        check.entrypoint,
+        image,
+        ...check.args,
+      ],
+      undefined,
+      process.env,
+      [check.exit],
+    );
+    validateRuntimeResult(check, result);
+  }
 }
 
 async function hashFile(path: string): Promise<string> {
@@ -510,6 +690,7 @@ export async function readLayerArchive(
   directory: string,
   layer: number,
   expectedDiffID: string,
+  paths?: string[],
 ): Promise<{ files: LayerFile[]; metadata: ScanInput }> {
   const scratch = await mkdtemp(join(directory, "decompression-"));
   const raw = join(scratch, "layer.tar");
@@ -536,7 +717,12 @@ export async function readLayerArchive(
       "sha256:" + hash.digest("hex") === expectedDiffID,
       "Saved layer digest differs from config diffID",
     );
-    const files = await extractLayer(createReadStream(raw), directory, layer);
+    const files = await extractLayer(
+      createReadStream(raw),
+      directory,
+      layer,
+      paths,
+    );
     const rawSize = (await stat(raw)).size;
     let offset = 0;
     async function* metadataBytes() {
@@ -589,6 +775,7 @@ export async function readLayerArchive(
 
 interface QualificationReport {
   version: 2;
+  profile?: ImageProfile;
   canonicalFindings: number;
   opaqueExpectedBytes: number;
   opaqueDetectorBytes: number;
@@ -686,12 +873,14 @@ export async function qualify(
   revision: string,
   source: string,
   reportPath: string,
+  profileInput: ImageProfile = "regional",
 ): Promise<QualificationReport> {
   requireCheck(
     /^[a-f0-9]{40}$/.test(revision) &&
       /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(source),
     "Invalid qualification identity",
   );
+  const profile = imageProfile(profileInput);
   const directory = await mkdtemp(join(tmpdir(), "pgcf-image-qualification-"));
   await chmod(directory, 0o700);
   try {
@@ -699,17 +888,11 @@ export async function qualify(
       (await inspectImage(image)).Id === imageId,
       "Tag does not refer to the built image",
     );
-    const dockerfile = await readFile("apps/regional/Dockerfile", "utf8");
-    const bases = [
-      ...dockerfile.matchAll(
-        /^FROM (node:[^\s]+@sha256:[a-f0-9]{64})(?: AS \w+)?$/gm,
-      ),
-    ].map((match) => match[1]!);
-    requireCheck(
-      bases.length === 2 && bases[0] === bases[1],
-      "Dockerfile base is not an identical pinned official Node image",
+    const dockerfile = await readFile(
+      `apps/${profile === "regional" ? "regional" : "node-bootstrap"}/Dockerfile`,
+      "utf8",
     );
-    const baseImage = bases[1]!;
+    const baseImage = validateDockerfile(dockerfile, profile);
     await command("base_pull", "docker", [
       "pull",
       "--platform",
@@ -794,6 +977,7 @@ export async function qualify(
     const scanDirectory = join(directory, "files");
     await mkdir(scanDirectory, { mode: 0o700 });
     const files: LayerFile[] = [];
+    const layerPaths: string[] = [];
     const inputs: ScanInput[] = await metadataInputs(
       configBytes,
       "image-config",
@@ -831,6 +1015,7 @@ export async function qualify(
         scanDirectory,
         index,
         config.rootfs.diff_ids[index]!,
+        layerPaths,
       );
       files.push(...result.files);
       inputs.push(result.metadata);
@@ -863,19 +1048,31 @@ export async function qualify(
       ...(await mapFindings(family.findings, prepared.family.aliases)),
     ]);
     const manifests: { name: string; version: string }[] = [];
-    for (const reviewed of reviewedFiles) {
-      if (!reviewed.package) continue;
-      const path = reviewed.path.replace(/https\.d\.ts$/, "package.json");
-      const file = files.find((file) => file.path === path);
-      requireCheck(file, "Reviewed runtime package manifest missing");
-      const manifest = JSON.parse(
-        await readFile(join(scanDirectory, file.scanPath), "utf8"),
-      ) as { name: string; version: string };
-      manifests.push({ name: manifest.name, version: manifest.version });
+    for (const path of reviewedManifestPaths(layerPaths, profile)) {
+      const matching = files.filter((file) => file.path === path),
+        expected = reviewedFiles.find(
+          (file) => file.path.replace(/https\.d\.ts$/, "package.json") === path,
+        )?.package;
+      requireCheck(
+        matching.length && expected,
+        "Reviewed runtime package manifest missing",
+      );
+      for (const file of matching) {
+        const manifest = JSON.parse(
+          await readFile(join(scanDirectory, file.scanPath), "utf8"),
+        ) as { name: string; version: string };
+        requireCheck(
+          manifest.name === expected.name &&
+            manifest.version === expected.version,
+          "Reviewed runtime package manifest identity changed",
+        );
+        manifests.push({ name: manifest.name, version: manifest.version });
+      }
     }
     const packages = readPackageProvenance(
       await readFile("pnpm-lock.yaml", "utf8"),
       manifests,
+      profile,
     );
     const classification = classifyReviewed(canonical, {
       baseImage,
@@ -905,6 +1102,7 @@ export async function qualify(
     }
     const report: QualificationReport = {
       version: 2,
+      profile,
       imageId,
       configDigest,
       archiveSha256,
@@ -945,6 +1143,7 @@ export async function qualify(
       reportPath + ".provenance.json",
       JSON.stringify({
         candidate: {
+          profile,
           imageId,
           configDigest,
           archiveSha256,
@@ -1006,6 +1205,7 @@ export async function qualify(
 }
 
 async function main(): Promise<void> {
+  const { profile, args } = parseQualificationArguments(process.argv.slice(2));
   const [
     action,
     image,
@@ -1014,10 +1214,10 @@ async function main(): Promise<void> {
     source,
     reportPath,
     registryReportPath,
-  ] = process.argv.slice(2);
+  ] = args;
   if (action === "runtime") {
     requireCheck(image, "Missing runtime image");
-    await qualifyRuntime(image);
+    await qualifyRuntime(image, profile);
     return;
   }
   requireCheck(
@@ -1025,7 +1225,14 @@ async function main(): Promise<void> {
     "Missing qualification arguments",
   );
   if (action === "qualify") {
-    const report = await qualify(image, imageId, revision, source, reportPath);
+    const report = await qualify(
+      image,
+      imageId,
+      revision,
+      source,
+      reportPath,
+      profile,
+    );
     console.log(JSON.stringify(report));
   } else if (
     action === "verify" ||
@@ -1036,7 +1243,8 @@ async function main(): Promise<void> {
       await readFile(reportPath, "utf8"),
     ) as QualificationReport;
     requireCheck(
-      report.version === 2 &&
+      imageProfile(report.profile) === profile &&
+        report.version === 2 &&
         report.imageId === imageId &&
         report.revision === revision &&
         report.source === source &&
