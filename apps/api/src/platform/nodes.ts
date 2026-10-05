@@ -38,6 +38,7 @@ import {
   readBootstrapJob,
 } from "../domain/bootstrap-jobs.ts";
 import { contaboClient } from "../domain/bootstrap-relay.ts";
+import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
 import { runNodeCapacity } from "../domain/node-capacity.ts";
 import {
   loadRegionJoinBundle,
@@ -253,6 +254,7 @@ export async function configureNodeBootstrap(
       "conflict",
       "Bootstrap requires audited provider inventory",
     );
+  await validateRescueConfiguration(c.env, addition.provider_instance_id, body);
   const actual = await contaboClient(c.env).getInstance(
     addition.provider_instance_id,
     { requestId: crypto.randomUUID() },

@@ -19,6 +19,7 @@ export type Env = Cloudflare.Env & {
   CONTABO_ORDER_DEFAULT_USER: string;
   CONTABO_ORDER_SSH_KEY_IDS: string;
   CONTABO_RESCUE_SSH_KEY_IDS: string;
+  CONTABO_RESCUE_CONFIGURATION?: string;
 };
 export type AuthPrincipal = Pick<ApiKey, "id" | "scope" | "project_id">;
 

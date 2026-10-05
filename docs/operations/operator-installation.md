@@ -17,6 +17,17 @@ the fixed-source VPC relay binding. Start from `apps/api/wrangler.example.jsonc`
 placeholder. Import secret values from private custody and preserve the existing four root
 secrets. Export D1 before applying additive migrations and rehearse them against the export.
 
+For console-free rescue, optionally configure the private Worker secret
+`CONTABO_RESCUE_CONFIGURATION` as a JSON map keyed by exact provider instance ID. Each entry contains
+`ssh_host_key`, its `ssh_host_fingerprint`, and `user_data` beginning with `#cloud-config` as plain
+YAML. Retain the generated host private key in that private cloud-config and custody. The public
+key must be a valid OpenSSH Ed25519 blob with its computed SHA256 fingerprint, and the configured
+identity must match both the bootstrap specification and private rescue input. A configured map
+requires a valid entry for the target before rescue can be dispatched. The provider receives the
+exact plain YAML once under the existing persisted mutation claim. Confirm the actual rescue
+host presents that retained key through strict SSH verification before any installation writes;
+the provider honoring cloud-init remains a live installation check.
+
 The EU archive uses the EU-jurisdiction binding and EU S3 endpoint. US has a separate bucket and
 the account's general S3 endpoint. Choose a North America location hint when creating that bucket;
 the hint does not guarantee jurisdiction. `ARCHIVE_BINDINGS` must map each exact region ID to its

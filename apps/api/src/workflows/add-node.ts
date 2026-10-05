@@ -13,6 +13,7 @@ import {
   readBootstrapJob,
   finalizeNodeAdmission,
   type BootstrapJobRow,
+  bootstrapJobInput,
 } from "../domain/bootstrap-jobs.ts";
 import {
   claimNodeDispatch,
@@ -27,6 +28,7 @@ import {
 } from "../domain/node-state.ts";
 import { placePendingDatabases } from "../domain/node-capacity.ts";
 import { ensureNodeNetwork } from "../domain/node-network.ts";
+import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
 
 function orderInput(
   env: Env,
@@ -214,6 +216,13 @@ export async function ensureNodeRescue(
     (job !== null && (!job.authorized || job.admitted || job.cancelled))
   )
     return false;
+  const rescueConfiguration = await validateRescueConfiguration(
+    env,
+    addition.provider_instance_id,
+    env.CONTABO_RESCUE_CONFIGURATION !== undefined && job !== null
+      ? await bootstrapJobInput(env, job)
+      : undefined,
+  );
   if (job !== null && JSON.parse(job.checkpoint_json).stage !== "created")
     return Boolean(job.rescue_active);
   await assertNodeRecoveryAuthority(env.DB, addition);
@@ -260,7 +269,12 @@ export async function ensureNodeRescue(
     try {
       const result = await client.rescue(
         addition.provider_instance_id,
-        { sshKeys },
+        {
+          sshKeys,
+          ...(rescueConfiguration
+            ? { userData: rescueConfiguration.user_data }
+            : {}),
+        },
         { requestId },
       );
       state = result.kind;
