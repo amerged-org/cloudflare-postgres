@@ -102,11 +102,28 @@ export async function observations(
     )
       .bind(region.id, node.name)
       .first<{ node_id: string; provider_instance_id: string | null }>();
+    const existing = await c.env.DB.prepare(
+      "SELECT id,provider_instance_id FROM nodes WHERE id=? AND region_id=? AND k8s_node_name=?",
+    )
+      .bind(node.node_id ?? "", region.id, node.name)
+      .first<{ id: string; provider_instance_id: string | null }>();
     const verifiedIdentity =
-      reserved !== null &&
-      node.node_id === reserved.node_id &&
-      node.provider_instance_id === reserved.provider_instance_id &&
-      node.node_uid !== undefined;
+      node.node_uid !== undefined &&
+      ((reserved !== null &&
+        node.node_id === reserved.node_id &&
+        node.provider_instance_id === reserved.provider_instance_id) ||
+        (existing !== null &&
+          existing.provider_instance_id !== null &&
+          node.node_id === existing.id &&
+          node.provider_instance_id === existing.provider_instance_id));
+    if (
+      reserved === null &&
+      !verifiedIdentity &&
+      (node.node_id !== undefined ||
+        node.provider_instance_id !== undefined ||
+        node.node_uid !== undefined)
+    )
+      continue;
     await c.env.DB.prepare(
       `INSERT INTO nodes (id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,schedulable,provider_instance_id,node_uid)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?) ON CONFLICT(region_id,k8s_node_name) DO UPDATE SET ready=CASE WHEN nodes.node_uid IS NOT NULL AND excluded.node_uid IS NOT NULL AND nodes.node_uid<>excluded.node_uid THEN 0 ELSE excluded.ready END,
@@ -116,7 +133,8 @@ export async function observations(
       platform_reserved_cpu_millicores=excluded.platform_reserved_cpu_millicores,
       provider_instance_id=CASE WHEN nodes.schedulable=0 AND nodes.id=excluded.id AND excluded.provider_instance_id IS NOT NULL THEN excluded.provider_instance_id ELSE nodes.provider_instance_id END,
       node_uid=CASE WHEN nodes.node_uid IS NULL AND excluded.node_uid IS NOT NULL AND nodes.id=excluded.id THEN excluded.node_uid ELSE nodes.node_uid END,
-      last_observed_at=excluded.last_observed_at,updated_at=excluded.updated_at WHERE excluded.updated_at>=nodes.updated_at`,
+      last_observed_at=excluded.last_observed_at,updated_at=excluded.updated_at WHERE excluded.updated_at>=nodes.updated_at
+      AND (excluded.node_uid IS NULL OR (nodes.id=excluded.id AND (nodes.provider_instance_id IS NULL OR nodes.provider_instance_id=excluded.provider_instance_id)))`,
     )
       .bind(
         reserved?.node_id ?? node.node_id ?? newNodeId(),
