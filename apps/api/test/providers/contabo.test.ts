@@ -95,7 +95,9 @@ function setup(pageSize = 100) {
   const fetcher: typeof fetch = async (input, init = {}) => {
     const url = new URL(String(input));
     calls.push({ url: url.href, init });
-    expect(init.redirect).toBe("error");
+    const native = new Request(input, init);
+    expect(native.redirect).toBe("manual");
+    expect(init.redirect).toBe("manual");
     if (url.hostname === "auth.contabo.com") {
       const form = new URLSearchParams(String(init.body));
       expect(form.get("password") === credentials.password).toBe(true);
@@ -841,4 +843,13 @@ it("instance detail preserves actual absent SSH keys and nullable cancellation/a
   await expect(
     f.client.getInstance(f.instanceId, { requestId: value() }),
   ).rejects.toMatchObject({ code: "invalid_response" });
+});
+
+it("constructs OAuth and provider requests in the actual Workers runtime without following redirects", async () => {
+  const f = setup();
+  const instance = await f.client.getInstance(f.instanceId, {
+    requestId: f.requestId,
+  });
+  expect(instance.id).toBe(f.instanceId);
+  expect(f.calls).toHaveLength(2);
 });
