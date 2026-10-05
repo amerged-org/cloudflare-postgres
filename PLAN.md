@@ -87,7 +87,13 @@ image builds and passes all runtime checks. Its full scan covered 433,348,963 pa
 643,272,838 detector bytes without a coverage gap. Twenty previously reviewed base findings
 resolved; 19 new findings in the two checksum-verified native binaries remain under independent
 review. Publication is blocked until every finding is resolved. Final composed API checks,
-protected network preflight and real node bootstrap remain outstanding.
+protected network preflight and real node bootstrap remain outstanding. The composed local
+checks now pass: contracts 127, API 288, Edge 78, regional 367, native bootstrap 27, CLI 28,
+acceptance harness 198, infrastructure 21 and image/CI logic 54 tests, with zero skipped tests.
+The native Talos configuration check is mandatory in CI. Existing ready-database Edge fixtures
+now include actual node allocation; unplaced requests retain their distinct pending semantics.
+Read-only live inventory confirms that the initial EU node still needs a verified legacy
+provider-identity and protected join-custody import before the second node is admitted.
 
 The operational Cloudflare token was updated in place with no expiry; its value and all 23
 rights remained unchanged. Barman's R2 credential and PGCF admin/agent keys also have no expiry.
