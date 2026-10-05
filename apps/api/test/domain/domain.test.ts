@@ -36,6 +36,7 @@ async function created(
 describe("database domain on real Workers D1", () => {
   it("places by free memory, includes sidecar and rejects unknown storage", () => {
     const base = {
+      last_observed_at: new Date().toISOString(),
       region_id: "eu-1",
       ready: true,
       schedulable: true,

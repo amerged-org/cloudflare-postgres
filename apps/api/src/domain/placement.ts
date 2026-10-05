@@ -6,6 +6,19 @@ import {
   type SizeResources,
 } from "@pgcf/contracts";
 
+export const NODE_OBSERVATION_MAX_AGE_MS = 180_000;
+export function nodePlacementGuard(alias = "n"): string {
+  if (!/^[a-z][a-z0-9_]*$/.test(alias))
+    throw new Error("invalid_node_placement_alias");
+  return `${alias}.lost_at IS NULL AND ${alias}.last_observed_at>=? AND ${alias}.last_observed_at<=?`;
+}
+export function nodePlacementBindings(now = Date.now()): [string, string] {
+  return [
+    new Date(now - NODE_OBSERVATION_MAX_AGE_MS).toISOString(),
+    new Date(now + 5000).toISOString(),
+  ];
+}
+
 export interface PlacementNode {
   id: string;
   region_id: string;
@@ -19,11 +32,14 @@ export interface PlacementNode {
   storage_gib_total: number | null;
   reserved_memory_mib: number;
   reserved_storage_gib: number;
+  last_observed_at?: string | null;
+  lost_at?: string | null;
 }
 export function choosePlacement(
   nodes: readonly PlacementNode[],
   regionId: string,
   size: SizeResources,
+  now = Date.now(),
 ): PlacementNode | null {
   const needed = databaseMemoryReservationMib(size);
   return (
@@ -33,6 +49,10 @@ export function choosePlacement(
           n.region_id === regionId &&
           n.ready &&
           n.schedulable &&
+          n.lost_at == null &&
+          n.last_observed_at != null &&
+          Date.parse(n.last_observed_at) >= now - NODE_OBSERVATION_MAX_AGE_MS &&
+          Date.parse(n.last_observed_at) <= now + 5000 &&
           Number.isSafeInteger(n.platform_reserved_cpu_millicores) &&
           n.platform_reserved_cpu_millicores! >= 0 &&
           n.allocatable_cpu_millicores -
