@@ -34,6 +34,19 @@ async function created(
   return DatabaseWithOperation.parse(await response.json());
 }
 describe("database domain on real Workers D1", () => {
+  it("keeps generation-one desired state compatible with the deployed legacy agent", async () => {
+    const f = await fixture();
+    const result = await created(f);
+    const response = await request("/agent/v1/desired", f.agent);
+    expect(response.status).toBe(200);
+    const body = await response.json<{
+      databases: Record<string, unknown>[];
+    }>();
+    const database = body.databases.find((d) => d.id === result.database.id);
+    expect(database).toBeDefined();
+    expect(database).not.toHaveProperty("storage_generation");
+    expect(database).not.toHaveProperty("recovery");
+  });
   it("places by free memory, includes sidecar and rejects unknown storage", () => {
     const base = {
       last_observed_at: new Date().toISOString(),

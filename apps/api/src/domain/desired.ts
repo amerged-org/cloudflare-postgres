@@ -94,7 +94,10 @@ export async function desired(
       DesiredDatabase.parse({
         id: row.id,
         generation: row.generation,
-        storage_generation: row.storage_generation ?? 1,
+        // Preserve the deployed generation-one wire shape during consumer-first upgrades.
+        ...((row.storage_generation ?? 1) === 1
+          ? {}
+          : { storage_generation: row.storage_generation }),
         ...(row.restore_operation_id && row.desired_state !== "deleted"
           ? {
               recovery: {
