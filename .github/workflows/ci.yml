@@ -54,7 +54,7 @@ jobs:
       - name: Render the Kubernetes manifests
         run: |
           command -v kubectl >/dev/null || { echo "kubectl not available on this runner"; exit 1; }
-          for dir in infra/platform infra/platform/regional; do
+          for dir in infra/platform infra/platform/regional infra/platform/bootstrap-relay; do
             if [ -f "$dir/kustomization.yaml" ]; then
               echo "kubectl kustomize $dir"
               kubectl kustomize "$dir" > /dev/null
