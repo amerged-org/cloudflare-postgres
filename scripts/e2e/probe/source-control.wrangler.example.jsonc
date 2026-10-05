@@ -1,0 +1,16 @@
+{
+  "$schema": "../node_modules/wrangler/config-schema.json",
+  "name": "pgcf-node-source-control",
+  "main": "source-control-worker.ts",
+  "compatibility_date": "2026-10-01",
+  "workers_dev": true,
+  "observability": { "enabled": false },
+  "vars": {
+    "SOURCE_CONTROL_ORIGIN": "https://pgcf-node-source-control.example.invalid",
+    "SOURCE_CONTROL_KID": "acceptance-observer",
+  },
+  // Set PROBE_BEARER, SOURCE_CONTROL_SIGNING_JWK (private Ed25519 JWK), and
+  // RUN_EXPIRES_AT as secrets. Expiry must be canonical UTC and <=10 minutes
+  // ahead. Use a native client IP configuration without Pseudo IPv4 override.
+  // Delete this temporary acceptance Worker and its secrets after the run.
+}

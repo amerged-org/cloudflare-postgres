@@ -13,6 +13,70 @@ are free for public repositories under the
 This procedure needs no extra VPS or paid runner. It is an acceptance tool, not a completed live
 acceptance result.
 
+## Complete node installation proof
+
+The same workflow's opt-in `node_network_probe` dispatch uses that free native runner to scan
+all 65,535 TCP ports on each approved IPv4 node address. It does not run the ordinary build or
+publish jobs. This is the full IPv4 measurement for node preparation/post-join, separate from
+the supplemental E6 report described below.
+
+Deploy the temporary `scripts/e2e/probe/source-control-worker.ts` observer from its adjacent
+example configuration. Give it a new Ed25519 signing key and bearer, its exact HTTPS origin,
+and a canonical UTC expiry no more than ten minutes ahead. Keep logging disabled. Its signed
+receipt observes the actual `CF-Connecting-IP` and binds a fresh nonce, timestamp and origin;
+it refuses Worker subrequests and ambiguous/pseudo IPv4 headers. Select and record one actual
+Cloudflare IPv4 and IPv6 destination from that origin's DNS. The native helper pins each literal,
+TLS hostname and actual socket endpoints. The Worker does not claim to observe its CDN address.
+
+Prepare `PGCF_NETWORK_HOSTED_CONFIG` privately as version `1`, with a random 64-hex `nonce`,
+`created_at`, `expires_at` (a maximum ten-minute interval), a random 32-byte `encryption_key`
+in canonical base64url, an independent measurement `signing_jwk`, and `network`. The latter is
+the existing `CommonConfig` from `node-network-proof.ts`: exact plan/readback binding, key ID,
+measurement/control public keyrings, and `scan.https_control` containing the observer's
+`origin`, private `bearer` and `expires_at`. `scan.tcp25_control` is the independently authorized
+public IPv4 SMTP control used by the supplemental probe. Its address is distinct from every
+node. The full scan connects to that control on TCP/25 immediately before and after testing
+the node's TCP/25; either failed control keeps the entire measurement unproven.
+
+Set only the temporary Actions secret `PGCF_NETWORK_HOSTED_CONFIG` and dispatch:
+
+```sh
+gh workflow run ci.yml --repo "$PGCF_E2E_REPOSITORY" --ref main -f node_network_probe=true
+```
+
+The runner determines its actual local IPv4 route, binds every scanner/control socket to it,
+and obtains its public source from the signed observer. Since NAT may choose different public
+addresses for different destinations, it additionally requires the entire fresh published
+`actions_macos` pool to be disjoint from every effective node firewall source rule, and requires
+the observer's source to be within that pool. Refusals/timeouts with socket errors, incomplete
+coverage, changed sources or failed controls do not become a passing scan.
+
+Download the `pgcf-node-network` artifact into an ignored private directory. It contains
+`pgcf-node-network.enc.json`, AES-256-GCM encrypted with the one-time configuration key and
+attested as its exact encrypted bytes. No raw address or signing key is uploaded. Retain the
+same private configuration locally and supply `PGCF_NETWORK_HOSTED_EXPECTATION` with exact
+`repository`, `commit`, `run_id` and `run_attempt`; set `PGCF_NETWORK_HOSTED_ARTIFACT` to the
+downloaded absolute filename and `PGCF_NETWORK_OUTPUT` to a fresh private receipt filename.
+Then run `node scripts/e2e/src/node-network-hosted.ts consume`. Consumption verifies the hosted
+main-workflow attestation, exact successful run/artifact and current checkout, decrypts with
+bound run/nonce data, rechecks the current source pool and verifies the signed full measurement.
+Its original two-minute freshness requirement remains in force; prepare consumption promptly.
+
+IPv6 uses `node-network-proof.ts scan` locally with an actual bound global interface address
+outside the complete effective allowlist, and the same `scan.https_control` configuration.
+Omit the hosted IPv4 `scan.tcp25_control` from this IPv6 configuration: an IPv4 SMTP control
+cannot establish IPv6 egress, and the native helper refuses mixed-family control connections.
+Only an independently authorized same-family IPv6 SMTP control can populate that field for IPv6.
+The signed observed public IPv6 must equal the bound local IPv6 exactly. An operator sibling
+is outside only after the actual firewall uses the reviewed exact `/128`, never while a broader
+allow rule still includes it. Supply both independently verified family receipts to the existing
+`prepare`/`verify` flow. Every node address still needs a complete 65,535-port measurement.
+
+After success or failure, delete the temporary Actions configuration secret, encrypted GitHub
+artifact and observer Worker, and destroy the one-time encryption/signing/bearer inputs. Upload
+only the existing final signed preparation/verification artifact to its operation-owned R2 key.
+The product proof schema and its allowlist, identity, freshness and quarantine guards are unchanged.
+
 ## Prepare the approved Dev run
 
 The operator holding the serial live lane performs the following steps after the relevant live

@@ -23,6 +23,7 @@ import {
   recordNodeReceipt,
   saveNodeBootstrapCheckpoint,
   NodeStateError,
+  assertNodeRecoveryAuthority,
 } from "../domain/node-state.ts";
 import { placePendingDatabases } from "../domain/node-capacity.ts";
 import { ensureNodeNetwork } from "../domain/node-network.ts";
@@ -118,9 +119,10 @@ export async function reconcileNodeProvider(
       addition.revision,
     );
   if (
-    addition.intent.request.mode === "adopt" &&
+    addition.intent.request.mode !== "order" &&
     addition.status === "reserved"
   ) {
+    await assertNodeRecoveryAuthority(env.DB, addition);
     const actual = await provider.getInstance(
       addition.intent.request.provider_instance_id,
       { requestId: crypto.randomUUID() },
@@ -128,7 +130,7 @@ export async function reconcileNodeProvider(
     addition = await recordNodeReceipt(env.DB, operationId, addition.revision, {
       provider_instance_id: actual.id,
       request_id: null,
-      reference: `provider-adoption:${actual.id}`,
+      reference: `provider-${addition.intent.request.mode}:${actual.id}`,
       received_at: new Date().toISOString(),
     });
   }
@@ -214,6 +216,7 @@ export async function ensureNodeRescue(
     return false;
   if (job !== null && JSON.parse(job.checkpoint_json).stage !== "created")
     return Boolean(job.rescue_active);
+  await assertNodeRecoveryAuthority(env.DB, addition);
   if (!(await ensureNodeNetwork(env, operationId))) return false;
   const client = provider ?? contaboClient(env);
   const actual = await client.getInstance(addition.provider_instance_id, {
@@ -345,7 +348,7 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
           "provider_bound",
           "failed",
         ].includes(addition.status) &&
-        (addition.intent.request.mode === "adopt" ||
+        (addition.intent.request.mode !== "order" ||
           addition.dispatch_request_id !== null)
       ) {
         await step.do(

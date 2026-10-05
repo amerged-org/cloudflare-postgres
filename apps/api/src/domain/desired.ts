@@ -53,7 +53,7 @@ export async function desired(
     LEFT JOIN maintenance_credentials m ON m.database_id=d.id
     LEFT JOIN database_restores x ON x.target_database_id=d.id
     LEFT JOIN operations ro ON ro.id=x.operation_id AND ro.database_id=d.id AND ro.kind='database.restore'
-    WHERE d.region_id=? AND d.node_id IS NOT NULL AND n.schedulable=1 AND n.lost_at IS NULL AND d.desired_state IN('running','suspended','deleted') AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL) AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
+    WHERE d.region_id=? AND d.node_id IS NOT NULL AND (d.desired_state='deleted' OR (n.schedulable=1 AND n.lost_at IS NULL)) AND d.desired_state IN('running','suspended','deleted') AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL) AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
     ${query.after ? "AND d.id>?" : ""} ORDER BY d.id LIMIT ?`,
   )
     .bind(region.id, ...(query.after ? [query.after] : []), query.limit + 1)

@@ -10,7 +10,7 @@ import {
 } from "@pgcf/contracts";
 import { ProviderInstanceId } from "@pgcf/contracts/nodes";
 import { importBootstrapVerificationKeys } from "@pgcf/contracts/bootstrap-relay";
-import { readNodeAddition } from "./node-state.ts";
+import { readNodeAddition, assertNodeRecoveryAuthority } from "./node-state.ts";
 import {
   ContaboClient,
   type ContaboInstance,
@@ -341,6 +341,7 @@ async function makePlan(
   request: () => { requestId: string; deadline: number },
 ): Promise<Plan> {
   const addition = await readNodeAddition(env.DB, operationId);
+  await assertNodeRecoveryAuthority(env.DB, addition);
   if (
     !addition.slot_held ||
     !["audited", "bootstrapping", "ready"].includes(addition.status) ||
@@ -356,7 +357,7 @@ async function makePlan(
   if (!region || region.provider !== "contabo") fail();
   const nodes = (
     await env.DB.prepare(
-      "SELECT id,provider_instance_id FROM nodes WHERE region_id=? AND id<>? ORDER BY id LIMIT 17",
+      "SELECT id,provider_instance_id FROM nodes WHERE region_id=? AND id<>? AND lost_at IS NULL ORDER BY id LIMIT 17",
     )
       .bind(addition.intent.request.region_id, addition.intent.node_id)
       .all<{ id: string; provider_instance_id: string | null }>()

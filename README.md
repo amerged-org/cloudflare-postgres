@@ -60,8 +60,10 @@ p95 734 ms and maximum 911 ms; this does not establish application or load-capac
 The live collector
 preserves its checkpoint across configuration changes and measures allocation while hibernated.
 Actual R2 listing, archive summary and hourly backup usage agreed on 7,515,287 bytes.
-Actual filesystem-use and backup-health collectors, isolated API restore/PITR, lost-node protection
-and early admission limits are implemented; their composed delivery and live acceptance remain pending.
+The filesystem collector measured actual volume use in Dev. API full restore, PITR and restore
+after source deletion passed with separate volumes, verified SQL and removed temporary admin access.
+An isolated real Cloudflare admission probe refused excess registered attempts before D1 or wake.
+Lost-worker rebuild and the complete EU/US installation still need live acceptance.
 Missing samples stay unknown. Cost attribution is deferred.
 The second EU node is untouched, the US node has not been bought and no customer or platform
 database has been migrated. EU/US operator acceptance comes first; Neon migration and public-release

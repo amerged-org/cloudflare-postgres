@@ -417,6 +417,53 @@ it("binds provider receipts/audits to the exact saved request and refuses stale 
     ).status,
   ).toBe("audited");
 });
+
+it("refuses a receipt for an instance already claimed by another pending adoption", async () => {
+  const f = await setup(true);
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: 3,
+    purchases_enabled: true,
+    order: f.order,
+  });
+  const approved = await approve(await f.reserve());
+  const dispatch = await claimNodeDispatch(
+    env.DB,
+    approved.intent.operation_id,
+    approved.revision,
+  );
+  if (!dispatch.claimed) throw new Error("expected_owned_dispatch");
+  const instance = providerId();
+  const adoption = await reserveNodeAddition(env.DB, {
+    request_key: crypto.randomUUID(),
+    request: {
+      mode: "adopt",
+      region_id: f.region,
+      provider_instance_id: instance,
+    },
+  });
+  await expect(
+    recordNodeReceipt(
+      env.DB,
+      approved.intent.operation_id,
+      dispatch.addition.revision,
+      {
+        provider_instance_id: instance,
+        request_id: dispatch.request_id,
+        reference: reference(),
+        received_at: new Date().toISOString(),
+      },
+    ),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(
+    (await readNodeAddition(env.DB, approved.intent.operation_id))
+      .provider_instance_id,
+  ).toBeNull();
+  expect(
+    (await readNodeAddition(env.DB, adoption.intent.operation_id))
+      .provider_instance_id,
+  ).toBeNull();
+});
 it("counts a bound actual node once, never by hostname alone, and publishes only measured verified capacity", async () => {
   const f = await setup();
   let addition = await joined(await audited(f));

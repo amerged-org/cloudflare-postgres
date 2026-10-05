@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it } from "vitest";
-import { bytesToBase64url } from "@pgcf/contracts";
+import { bytesToBase64url, newNodeId } from "@pgcf/contracts";
 import {
   configureNodeRegionPolicy,
   reserveNodeAddition,
@@ -412,6 +412,37 @@ it("preparation cannot authorize rescue without signed proof or reassign an alre
   expect(await f.run()).toBe(false);
   expect(f.calls.filter((call) => call.method === "POST")).toHaveLength(0);
   expect(f.calls.some((call) => call.path.includes("/rescue"))).toBe(false);
+});
+
+it("excludes a lost historical peer from firewall preparation and outside-allowlist scan inventory", async () => {
+  const f = await setup();
+  const lost = newNodeId();
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO nodes(id,region_id,k8s_node_name,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid,lost_at,lost_reason)
+      SELECT ?,region_id,?,0,0,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,?,?,?,?,'confirmed loss' FROM nodes WHERE id=?`,
+  )
+    .bind(
+      lost,
+      `lost-${lost}`,
+      now,
+      now,
+      crypto.randomUUID(),
+      now,
+      f.state.node,
+    )
+    .run();
+  expect(await f.run()).toBe(false);
+  const row = await env.DB.prepare(
+    "SELECT plan_json FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .first<{ plan_json: string }>();
+  expect(row).not.toBeNull();
+  const plan = JSON.parse(row!.plan_json);
+  expect(
+    plan.members.map((member: { node_id: string }) => member.node_id).sort(),
+  ).toEqual([f.state.node, f.addition.intent.node_id].sort());
 });
 
 it("updates target and every existing peer bidirectionally and requires a real signed fresh bound artifact", async () => {

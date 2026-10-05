@@ -47,6 +47,13 @@ export const NodeAdditionRequest = z.discriminatedUnion("mode", [
   }),
   z.strictObject({
     region_id: RegionId,
+    mode: z.literal("recover"),
+    provider_instance_id: ProviderInstanceId,
+    predecessor_node_id: NodeId,
+    expected_node_uid: z.uuid(),
+  }),
+  z.strictObject({
+    region_id: RegionId,
     mode: z.literal("order"),
     order: NodeOrderConfiguration,
   }),

@@ -172,7 +172,7 @@ export async function observations(
   let accepted = 0;
   for (const observation of body.databases) {
     const row = await c.env.DB.prepare(
-      "SELECT d.* FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id WHERE d.id=? AND d.region_id=? AND n.lost_at IS NULL",
+      "SELECT d.* FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id WHERE d.id=? AND d.region_id=? AND (d.desired_state='deleted' OR n.lost_at IS NULL)",
     )
       .bind(observation.id, region.id)
       .first<DatabaseRow>();
@@ -269,7 +269,7 @@ export async function observations(
         `UPDATE databases SET observed_state=?,observed_power=?,observed_generation=CASE WHEN ? THEN ? ELSE observed_generation END,status_message=?,
       archiving_health_since=CASE WHEN archiving_health<>(${archiveHealth}) THEN ? ELSE archiving_health_since END,archiving_health=(${archiveHealth}),${backupUpdate},updated_at=?
       WHERE id=? AND region_id=? AND generation=? AND observed_generation<=? AND updated_at=? AND desired_state=? AND observed_state=?
-      AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND n.lost_at IS NULL)
+      AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND (databases.desired_state='deleted' OR n.lost_at IS NULL))
       AND (?<>'ready' OR NOT EXISTS(SELECT 1 FROM database_restores x WHERE x.target_database_id=databases.id)
         OR EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.target_database_id=databases.id AND x.operation_id=? AND o.status IN('pending','running','succeeded') AND ?=databases.storage_generation))`,
       ).bind(

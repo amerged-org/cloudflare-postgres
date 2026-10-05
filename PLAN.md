@@ -6,10 +6,10 @@ The second existing EU VPS is untouched; no US VPS has been bought and no custom
 production database has been migrated. The initial topology remains two EU VPS and one US VPS.
 
 The current regional image is
-`sha256:89039ba17f904bd90f41c3843389a41b84f509e2aee3e1a92d070ae66a2f77f9`
-from `2c3ba526`, CI `37325296426`. Local image qualification and anonymous manifest,
+`sha256:692a6c508e274d695151ce064b52fd66c5f00d5ec701c7d2adb2de89a092fdbb`
+from `e9569169`, CI `37360915487`. Image qualification and anonymous manifest,
 configuration and every layer verification passed. Agent and both gateways remained continuously
-Ready for 62.641 s. The management API and Edge use `b196fbaa`; the private bootstrap
+Ready for 62.768 s. The management API and Edge use `b196fbaa`; the private bootstrap
 Workflow, Container and VPC bindings are activated. Actual node firewall/rescue/operator-source
 inputs and live EU2/US acceptance remain outstanding. Signing remains Phase 5 work.
 
@@ -87,13 +87,22 @@ HelmReleases remain Ready on the preserved first node. Signed network evidence, 
 and new-region platform installation remain outstanding. The latest CI is green; fixed-port
 regional test files now run serially with their original assertions.
 
-The recovery source has two confirmed SQL markers and a real R2 base backup. The first API
-restore recovered PostgreSQL but could not delete its temporary administration Secret; the
-bound-identity delete fix is deployed. Its retry failed because the Barman recovery Job's sidecar
-lacked CPU/memory limits required by the namespace quota. Both failed targets were deleted
-through the API with the source preserved. Recovery-source sidecar configuration and uncertain
-Contabo-order audit date fixes pass reproducing local tests; their delivery and the successful
-full/PITR/deleted-source recovery proofs remain pending.
+API recovery now passes in Dev. Full restore recovered both confirmed markers in 82.531 s;
+PITR recovered only the earlier marker in 65.562 s. After ordinary source deletion, another full
+restore recovered both markers in 75.328 s from retained R2 data. All three targets have separate
+PVCs, storage generation 2 and configuration revision 1, the correct SQL database mapping, a
+nonsuperuser app role and no temporary administration Secret. The namespace quota and Barman
+recovery-sidecar limits remain enforced. Earlier failed targets were deleted with the source
+preserved before the final successful sequence. Node-loss recovery and regional installation
+remain outstanding.
+
+An isolated real Cloudflare Durable Object using the deployed DatabaseActor implementation and
+real Dev D1 reads passed a two-attempt admission probe. The third registered-role attempt returned
+53300 with zero D1 prepares; an unknown role returned 28P01 with zero D1 prepares. There were no
+D1 writes, wake operations or lifecycle changes. This exercises the actual algorithm in a separate
+namespace, not saturation of the main 12,000-attempt limit. The temporary Worker was deleted and
+its absence verified. A fresh D1 export rehearsed the node-recovery migration locally: 31 tables
+and 38,154 rows were preserved, including first-node identity, with clean integrity and foreign keys.
 
 Operational Cloudflare, Barman R2 and PGCF admin/agent credentials have no configured expiry.
 Routing/control tokens retain their short security deadlines. Read-only adopter inventory remains
@@ -876,3 +885,4 @@ Earlier failed attempts and corrections remain in Git history.
 | 2026-10-04 | 2 in progress             | Installable CLI passed 28 local checks and real psql commit/rollback plus 105,216,021 raw binary COPY bytes in 2,614.726 ms with control checksum equality. CPU placement, bounded metering and local lifecycle logic are implemented; full hibernation/wake, collector and cost acceptance remains pending.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | 2026-10-04 | 2 admission / density     | Deployed Actor admission, external Edge binding and immutable usage snapshots passed a fresh E0–E5: Ready 23,989 ms, cold connect 645 ms, commit/rollback 41/46 ms, one base backup and nine WAL objects; delete 35,140 ms, agent restarts at create/delete and complete cleanup. Stable node: 3,000 CPU millicores, 1,260 platform reserve, 6,799 MiB RAM and 1,878 MiB platform reserve; small fits twice by CPU and four times by RAM. On one real small database, sampled PSS maxima for PostgreSQL/Barman were 116.442/49.832 MiB idle, 127.419/49.832 MiB under 20 s paced read load and 131.351/173.293 MiB during a completed base backup, with no Pod restart. RSS sums double-count shared pages; these sampled PSS maxima exclude the sampler, while cgroup values include it. No smaller class, exact backup-only peak or 1,000-customer density is accepted from this workload.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | 2026-10-04 | 2 local safety / metering | Real local PostgreSQL 18 proved transaction/prepared-work guards, exact closed-WAL acknowledgement, and gateway pipeline/transaction quiescence. The actual gateway replacement drill preserved the fence UID, loaded the persisted quiesce intent on the replacement, acknowledged release on both replicas and rejected stale begin on both. Readiness remained stable through two relists after correcting actual Kubernetes list-item metadata handling. A bounded one-minute metering cron is implemented and locally checked. A 1,000-DB local D1 fixture bounded metering to 600 submitted statements and the whole cron to 850. Uncomputed hours remain pending; missing samples stay null with named gaps. API/Actor lifecycle tests cover ten-waiter wake coalescing, exact observations, role changes, cancellations and timeout compensation. Real resize to 512 MiB/250 millicores completed in 28,046 ms with unchanged storage and data, one Pod replacement and idempotent replay; held-client reconnects were not counted. A fresh Dev database verified internal maintenance-role TLS, authentication and minimal grants, then complete trial cleanup passed. The manual shutdown/WAL/resume drill passed with preserved data and storage, but its 19,830 ms resume connection exceeds the ≤8 s target. Automatic idle/coalesced cold-wake acceptance, real collectors and infrastructure costs remain incomplete. |
+| 2026-10-05 | Operator recovery | CI `37360915487` and the fully qualified regional `e9569169` image are delivered; agent/two gateways and five platform releases stayed Ready for 62.768 s on the unchanged first EU node. API full restore / PITR / restore after source deletion passed in 82.531 / 65.562 / 75.328 s. Targets retained separate volumes, storage generation 2, configuration revision 1, SQL identity and nonsuperuser app access; temporary administration was removed. An isolated real DO admission probe refused registered excess with 53300 and unknown role with 28P01 before D1, with no writes/wake/state change; probe deleted. Fresh D1 export plus local migration rehearsal preserved 31 tables / 38,154 rows with clean integrity and foreign keys. EU2, US, lost-worker recovery and final operational protection acceptance remain pending. |

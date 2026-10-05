@@ -7,7 +7,18 @@ import {
   DatabaseWithOperation,
   type DatabaseCreate,
 } from "../src/api.ts";
-import { newDatabaseId, newOperationId, newProjectId } from "../src/ids.ts";
+import {
+  newDatabaseId,
+  newNodeId,
+  newOperationId,
+  newProjectId,
+} from "../src/ids.ts";
+import {
+  NodeAddition,
+  NodeLoss,
+  nodeAdditionHostname,
+  type NodeAdditionRequest,
+} from "../src/nodes.ts";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -58,6 +69,171 @@ function fixtures() {
     idempotencyKey: crypto.randomUUID(),
   };
 }
+
+function nodeFixtures() {
+  const nodeId = newNodeId(),
+    predecessorId = newNodeId(),
+    uid = crypto.randomUUID(),
+    now = new Date().toISOString();
+  const request: NodeAdditionRequest = {
+    region_id: "eu-test",
+    mode: "recover",
+    provider_instance_id: "123456",
+    predecessor_node_id: predecessorId,
+    expected_node_uid: uid,
+  };
+  const addition = NodeAddition.parse({
+    intent: {
+      node_id: nodeId,
+      operation_id: newOperationId(),
+      requested_hostname: nodeAdditionHostname(nodeId),
+      request,
+    },
+    request_key: crypto.randomUUID(),
+    request_hash: "a".repeat(64),
+    intent_hash: "b".repeat(64),
+    revision: 1,
+    status: "reserved",
+    slot_held: true,
+    dispatch_request_id: null,
+    provider_instance_id: null,
+    approval: null,
+    receipt: null,
+    audit: null,
+    checkpoint: null,
+    network: null,
+    capacity: null,
+    failure_code: null,
+    created_at: now,
+    updated_at: now,
+  });
+  const loss = NodeLoss.parse({
+    node_id: predecessorId,
+    region_id: request.region_id,
+    node_uid: uid,
+    provider_instance_id: request.provider_instance_id,
+    lost_at: now,
+    reason: "confirmed loss",
+  });
+  return { request, addition, loss };
+}
+
+it("uses the admin loss and node-addition contracts with the exact recovery identity", async () => {
+  const f = fixtures(),
+    n = nodeFixtures();
+  const fetcher = vi
+    .fn<typeof fetch>()
+    .mockResolvedValueOnce(Response.json(n.loss))
+    .mockResolvedValueOnce(Response.json(n.addition, { status: 202 }))
+    .mockResolvedValueOnce(Response.json(n.addition));
+  const client = new PgcfClient({ baseUrl, apiKey: f.apiKey, fetch: fetcher });
+  expect(
+    await client.markNodeLost(n.loss.node_id, {
+      expected_node_uid: n.loss.node_uid,
+      reason: "  confirmed loss  ",
+    }),
+  ).toEqual(n.loss);
+  expect(
+    await client.requestNodeAddition(n.request, n.addition.request_key),
+  ).toEqual(n.addition);
+  expect(await client.getNodeAddition(n.addition.intent.operation_id)).toEqual(
+    n.addition,
+  );
+  expect(
+    fetcher.mock.calls.map(([url, init]) => [
+      new URL(String(url)).pathname,
+      init!.method,
+      init!.redirect,
+    ]),
+  ).toEqual([
+    [`/v1/nodes/${n.loss.node_id}/mark-lost`, "POST", "manual"],
+    ["/v1/nodes/additions", "POST", "manual"],
+    [`/v1/nodes/additions/${n.addition.intent.operation_id}`, "GET", "manual"],
+  ]);
+  const lossInit = fetcher.mock.calls[0]![1]!,
+    additionInit = fetcher.mock.calls[1]![1]!,
+    readInit = fetcher.mock.calls[2]![1]!;
+  expect(JSON.parse(String(lossInit.body))).toEqual({
+    expected_node_uid: n.loss.node_uid,
+    reason: n.loss.reason,
+  });
+  expect(JSON.parse(String(additionInit.body))).toEqual(n.request);
+  expect(new Headers(additionInit.headers).get("Idempotency-Key")).toBe(
+    n.addition.request_key,
+  );
+  expect(new Headers(lossInit.headers).has("Idempotency-Key")).toBe(false);
+  expect(readInit.body).toBeUndefined();
+  expect(new Headers(readInit.headers).has("Idempotency-Key")).toBe(false);
+  for (const [, init] of fetcher.mock.calls)
+    expect(new Headers(init!.headers).get("Authorization")).toBe(
+      `Bearer ${f.apiKey}`,
+    );
+});
+
+it("refuses invalid recovery identity, node paths and mutation keys before sending", () => {
+  const f = fixtures(),
+    n = nodeFixtures(),
+    fetcher = vi.fn<typeof fetch>();
+  const client = new PgcfClient({ baseUrl, apiKey: f.apiKey, fetch: fetcher });
+  expect(() =>
+    client.requestNodeAddition(
+      { ...n.request, expected_node_uid: "invalid" },
+      n.addition.request_key,
+    ),
+  ).toThrow(PgcfClientError);
+  expect(() =>
+    client.requestNodeAddition(
+      { ...n.request, provider_instance_id: "0" },
+      n.addition.request_key,
+    ),
+  ).toThrow(PgcfClientError);
+  expect(() =>
+    client.requestNodeAddition(n.request, undefined as unknown as string),
+  ).toThrow(PgcfClientError);
+  expect(() =>
+    client.getNodeAddition(`${n.addition.intent.operation_id}/bootstrap`),
+  ).toThrow(PgcfClientError);
+  expect(() =>
+    client.markNodeLost("invalid", {
+      expected_node_uid: n.loss.node_uid,
+      reason: n.loss.reason,
+    }),
+  ).toThrow(PgcfClientError);
+  expect(() =>
+    client.markNodeLost(n.loss.node_id, {
+      expected_node_uid: n.loss.node_uid,
+      reason: " ",
+    }),
+  ).toThrow(PgcfClientError);
+  expect(fetcher).not.toHaveBeenCalled();
+});
+
+it("never retries uncertain recovery or exposes a malformed addition acknowledgement", async () => {
+  const f = fixtures(),
+    n = nodeFixtures();
+  const fetcher = vi
+    .fn<typeof fetch>()
+    .mockRejectedValueOnce(new Error(f.apiKey))
+    .mockResolvedValueOnce(
+      Response.json({ ...n.addition, secret: f.apiKey }, { status: 202 }),
+    );
+  const client = new PgcfClient({ baseUrl, apiKey: f.apiKey, fetch: fetcher });
+  const transportError = await client
+    .requestNodeAddition(n.request, n.addition.request_key)
+    .catch((value: unknown) => value);
+  expect(transportError).toMatchObject({ code: "transport_error" });
+  expect(fetcher).toHaveBeenCalledTimes(1);
+  expect(JSON.stringify(transportError)).not.toContain(f.apiKey);
+  const acknowledgementError = await client
+    .requestNodeAddition(n.request, n.addition.request_key)
+    .catch((value: unknown) => value);
+  expect(acknowledgementError).toMatchObject({
+    code: "invalid_response",
+    status: 202,
+  });
+  expect(fetcher).toHaveBeenCalledTimes(2);
+  expect(JSON.stringify(acknowledgementError)).not.toContain(f.apiKey);
+});
 
 it("validates a create before sending and parses the same asynchronous response contract", async () => {
   const f = fixtures();

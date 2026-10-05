@@ -39,6 +39,7 @@ import {
   saveNodeBootstrapCheckpoint,
   verifyNodeCapacity,
   completeNodeAddition,
+  assertNodeRecoveryAuthority,
 } from "./node-state.ts";
 import { issueBootstrapTransport } from "./bootstrap-relay.ts";
 
@@ -117,6 +118,12 @@ export async function configureBootstrapJob(
       "Bootstrap requires actual audited provider inventory",
     );
   const spec = value.spec;
+  await assertNodeRecoveryAuthority(env.DB, addition);
+  if (addition.intent.request.mode === "recover" && spec.role !== "worker")
+    throw new ApiError(
+      "conflict",
+      "Existing-instance recovery requires a surviving regional cluster",
+    );
   if (
     spec.operation_id !== operationId ||
     spec.node_id !== addition.intent.node_id ||
@@ -168,7 +175,7 @@ export async function configureBootstrapJob(
   let joinBundle: NodeBootstrapInput["join_bundle"] = null;
   if (spec.role === "worker") {
     const existing = await env.DB.prepare(
-      "SELECT 1 present FROM nodes WHERE region_id=? AND id<>? LIMIT 1",
+      "SELECT 1 present FROM nodes WHERE region_id=? AND id<>? AND lost_at IS NULL LIMIT 1",
     )
       .bind(spec.region_id, spec.node_id)
       .first();

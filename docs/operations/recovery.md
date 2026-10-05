@@ -33,17 +33,99 @@ missing or ambiguous coverage is refused rather than creating an empty database.
 
 ## Lost node
 
+Node-loss and node-addition endpoints require an admin API key.
+
 1. Read `/v1/operational-health?scope=nodes` and verify the actual node UID. A stale heartbeat
    excludes placement after 180 seconds; it does not automatically authorize a replacement order.
 2. Submit `POST /v1/nodes/{id}/mark-lost` with
    `{"expected_node_uid":"<verified UID>","reason":"<short incident description>"}`.
    Loss is terminal and repeated calls preserve the original record. Metadata, archives and
    historical provider receipts remain available. Heartbeats cannot make the node healthy again.
-3. Restore affected databases onto available healthy capacity using the restore procedure.
-   A missing namespace for an established database must report recovery required.
-4. Keep the lost server isolated until recovery and data comparison finish. Ordinary adoption
-   of the same historical provider instance remains refused; in-place reinstall requires an
-   explicitly verified recovery procedure. Do not erase historical identity to bypass that guard.
+3. Restore affected databases onto available healthy capacity using the separate-target restore
+   procedure above. A missing namespace for an established database must report recovery required.
+4. To reinstall the same provider instance, verify its provider ID, the lost predecessor's node ID
+   and original Kubernetes UID, and the surviving regional cluster. Submit
+   `POST /v1/nodes/additions` using an admin API key and a persistent `Idempotency-Key`:
+
+   ```json
+   {
+     "region_id": "<original region>",
+     "mode": "recover",
+     "provider_instance_id": "<verified provider instance ID>",
+     "predecessor_node_id": "<lost node ID>",
+     "expected_node_uid": "<original verified UID>"
+   }
+   ```
+
+   Recovery reserves a new node, addition operation and bootstrap identity. It retains the lost
+   predecessor tombstone, provider receipts and encrypted custody records. Ordinary `mode:"adopt"`
+   still refuses reuse of a historical provider instance; do not erase identity to bypass that guard.
+5. Save the new node and operation IDs and poll `GET /v1/nodes/additions/{operation-id}`. Continue
+   the [reviewed bootstrap procedure](operator-installation.md#existing-eu-worker-and-new-us-region)
+   with the new identity and `spec.role:"worker"`; repeating the same recovery request and key
+   returns the same addition. An uncertain response does not authorize another operation or an
+   automatic reinstall. Current recovery supports a worker joining a surviving regional cluster;
+   it does not rebuild a lost regional control plane.
+6. Keep the lost server isolated until bootstrap verification, database restoration and SQL data
+   comparison finish. Open traffic only after the new worker passes network/capacity verification
+   and restored database targets pass the checks above.
+
+### Remove the lost worker's Kubernetes identity before reinstall
+
+The native installer creates a new hostname and Node UID. The operator removes the old worker
+identity before starting rescue or installation; the installer does not delete Kubernetes Nodes.
+
+1. Stop and fence the exact provider instance. Confirm the surviving cluster's `kube-system` UID
+   against its retained join custody. Match the old Node name, UID and `pgcf.io/node-id` /
+   `pgcf.io/provider-instance-id` labels to the terminal D1 loss record. Save the current Node,
+   CiliumNode, OpenEBS LVMNode and source Cluster/PVC/PV identities privately.
+   Before a planned loss drill, also record every source PV/claim UID, CSI volume handle,
+   LVMVolume UID and the actual LV and volume-group UUIDs from an authenticated physical LVM
+   inventory on that provider. Keep this inventory alongside the regional deletion ledger.
+2. Read the Node immediately before removal. Send `DELETE /api/v1/nodes/{old-hostname}` through
+   the authenticated Kubernetes API with this body, using the just-read resource version:
+
+   ```json
+   {
+     "apiVersion": "v1",
+     "kind": "DeleteOptions",
+     "preconditions": {
+       "uid": "<lost Kubernetes Node UID>",
+       "resourceVersion": "<just-read Node resource version>"
+     }
+   }
+   ```
+
+3. Resolve a lost response through authenticated readback. Continue only when the old hostname
+   is absent. Wait for the controllers to remove its CiliumNode and LVMNode; verify their absence
+   too. If an old CR remains, inspect its saved UID, resource version and exact ownership by the
+   deleted Node. Remove only that verified CR with its own UID/version preconditions; stop on a
+   foreign or ambiguous identity.
+4. Preserve the source CNPG Cluster, PVCs and PVs, including their old node affinity. Keep D1
+   loss/addition records, archives and credential custody. Start the new recovery operation's
+   rescue/install steps only after the old network/storage node identities are absent. Verify the
+   new hostname, Node UID, volume-group identity and measured storage before admitting capacity.
+   Restore database contents through the separate-target API procedure above.
+
+### Verify physical storage reclamation after worker loss
+
+Pinned OpenEBS LVM LocalPV 1.10.1 can remove a missing node's volume finalizers without deleting
+its physical LV. The bootstrap installer writes its verified image extent and GPT; that does not
+prove that every old LVM extent or volume disappeared. Kubernetes Namespace/PV/LVMVolume absence
+is therefore insufficient evidence of reclaimed storage after a node loss.
+
+Before accepting lost-source cleanup, obtain a fresh, authenticated physical LVM inventory on the
+exact recovered provider and verify the relevant original and current volume-group identities.
+Match it against the privately retained source handles and actual LV UUIDs. Every recorded old LV
+must be absent, with measured storage confirming the reclaimed capacity. Keep the original
+placement and deletion-ledger identities throughout this check. A partial inventory, unavailable
+original identity or missing physical observation remains an unverified reclamation result.
+
+If an exact recorded old LV persists, stop cleanup acceptance and reclaim only that owned LV
+through an authenticated operation guarded by its provider, volume-group UUID and LV UUID, then
+read back actual absence and capacity. Preserve unrelated LVs and retained R2 archives. Removing
+finalizers or deleting a Kubernetes record cannot substitute for this physical proof, and missing
+metadata never means zero physical storage use.
 
 ## Control plane and regional infrastructure
 

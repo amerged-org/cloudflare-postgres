@@ -205,6 +205,36 @@ export async function markNodeLost(
     );
   return NodeLoss.parse(row);
 }
+/** A new install may reuse an instance only under its immutable, exact lost-node intent. */
+export async function assertNodeRecoveryAuthority(
+  db: D1Database,
+  addition: NodeAddition,
+): Promise<void> {
+  const request = addition.intent.request;
+  if (request.mode !== "recover") return;
+  const row = await db
+    .prepare(
+      `SELECT 1 authorized FROM nodes predecessor
+     WHERE predecessor.id=? AND predecessor.region_id=? AND predecessor.node_uid=?
+       AND predecessor.provider_instance_id=? AND predecessor.lost_at IS NOT NULL
+       AND predecessor.ready=0 AND predecessor.schedulable=0
+       AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.provider_instance_id=predecessor.provider_instance_id
+         AND n.id<>? AND (n.lost_at IS NULL OR n.region_id<>predecessor.region_id))`,
+    )
+    .bind(
+      request.predecessor_node_id,
+      request.region_id,
+      request.expected_node_uid,
+      request.provider_instance_id,
+      addition.intent.node_id,
+    )
+    .first();
+  if (!row)
+    throw new NodeStateError(
+      "conflict",
+      "Recovery requires the exact lost predecessor and exclusive instance authority",
+    );
+}
 export async function reserveNodeAddition(
   db: D1Database,
   input: { request_key: string; request: NodeAdditionRequest },
@@ -255,14 +285,37 @@ export async function reserveNodeAddition(
     requested_hostname: nodeAdditionHostname(nodeId),
     request,
   });
+  const provider =
+    request.mode === "order" ? null : request.provider_instance_id;
+  const authority =
+    request.mode === "recover"
+      ? `EXISTS(SELECT 1 FROM nodes predecessor WHERE predecessor.id=? AND predecessor.region_id=p.region_id
+        AND predecessor.node_uid=? AND predecessor.provider_instance_id=? AND predecessor.lost_at IS NOT NULL
+        AND predecessor.ready=0 AND predecessor.schedulable=0
+        AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.provider_instance_id=predecessor.provider_instance_id
+          AND (n.lost_at IS NULL OR n.region_id<>predecessor.region_id)))
+       AND NOT EXISTS(SELECT 1 FROM node_additions a WHERE a.slot_held=1
+         AND json_extract(a.intent_json,'$.request.mode')='recover'
+         AND json_extract(a.intent_json,'$.request.predecessor_node_id')=?)`
+      : `(? IS NULL OR NOT EXISTS(SELECT 1 FROM nodes WHERE provider_instance_id=?))`;
+  const authorityBindings =
+    request.mode === "recover"
+      ? [
+          request.predecessor_node_id,
+          request.expected_node_uid,
+          provider,
+          request.predecessor_node_id,
+        ]
+      : [provider, provider];
   let changed = 0;
   try {
     const result = await db
       .prepare(
         `INSERT INTO node_additions(operation_id,node_id,region_id,request_key,request_hash,intent_hash,intent_json,status,requested_instance_id,created_at,updated_at)
       SELECT ?,?,p.region_id,?,?,?,?,'reserved',?,?,? FROM node_region_policies p JOIN regions r ON r.id=p.region_id AND r.provider='contabo'
-      WHERE p.region_id=? AND ${slotCount}<p.max_nodes AND (?='adopt' OR p.order_config=?)
-      AND (? IS NULL OR (NOT EXISTS(SELECT 1 FROM nodes WHERE provider_instance_id=?) AND NOT EXISTS(SELECT 1 FROM node_additions WHERE slot_held=1 AND (requested_instance_id=? OR provider_instance_id=?))))
+      WHERE p.region_id=? AND ${slotCount}<p.max_nodes AND (?<>'order' OR p.order_config=?)
+      AND ${authority}
+      AND (? IS NULL OR NOT EXISTS(SELECT 1 FROM node_additions WHERE slot_held=1 AND status<>'ready' AND (requested_instance_id=? OR provider_instance_id=?)))
       ON CONFLICT(region_id,request_key) DO NOTHING`,
       )
       .bind(
@@ -272,16 +325,16 @@ export async function reserveNodeAddition(
         requestHash,
         await digest(intent),
         canonical(intent),
-        request.mode === "adopt" ? request.provider_instance_id : null,
+        provider,
         now,
         now,
         request.region_id,
         request.mode,
         request.mode === "order" ? canonical(request.order) : null,
-        request.mode === "adopt" ? request.provider_instance_id : null,
-        request.mode === "adopt" ? request.provider_instance_id : null,
-        request.mode === "adopt" ? request.provider_instance_id : null,
-        request.mode === "adopt" ? request.provider_instance_id : null,
+        ...authorityBindings,
+        provider,
+        provider,
+        provider,
       )
       .run();
     changed = result.meta.changes;
@@ -453,7 +506,7 @@ export async function recordNodeReceipt(
   }
   revision(addition, expectedRevision);
   if (
-    request.mode === "adopt"
+    request.mode !== "order"
       ? addition.status !== "reserved" ||
         receipt.request_id !== null ||
         receipt.provider_instance_id !== request.provider_instance_id
@@ -465,13 +518,35 @@ export async function recordNodeReceipt(
       "conflict",
       "Provider receipt does not match the original dispatch/adoption",
     );
+  await assertNodeRecoveryAuthority(db, addition);
+  const receiptGuard =
+    request.mode === "recover"
+      ? `AND EXISTS(SELECT 1 FROM nodes predecessor WHERE predecessor.id=? AND predecessor.region_id=node_additions.region_id
+        AND predecessor.node_uid=? AND predecessor.provider_instance_id=? AND predecessor.lost_at IS NOT NULL
+        AND predecessor.ready=0 AND predecessor.schedulable=0)
+       AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.provider_instance_id=? AND n.id<>node_additions.node_id
+         AND (n.lost_at IS NULL OR n.region_id<>node_additions.region_id))`
+      : "AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.provider_instance_id=? AND n.id<>node_additions.node_id)";
   return changed(
     db,
     addition,
     "status='provider_bound',provider_instance_id=?,receipt_json=?,failure_code=NULL",
     [receipt.provider_instance_id, canonical(receipt)],
-    "AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.provider_instance_id=? AND n.id<>node_additions.node_id)",
-    [receipt.provider_instance_id],
+    `${receiptGuard} AND NOT EXISTS(SELECT 1 FROM node_additions other
+      WHERE other.operation_id<>node_additions.operation_id AND other.slot_held=1 AND other.status<>'ready'
+        AND (other.requested_instance_id=? OR other.provider_instance_id=?))`,
+    [
+      ...(request.mode === "recover"
+        ? [
+            request.predecessor_node_id,
+            request.expected_node_uid,
+            receipt.provider_instance_id,
+            receipt.provider_instance_id,
+          ]
+        : [receipt.provider_instance_id]),
+      receipt.provider_instance_id,
+      receipt.provider_instance_id,
+    ],
   );
 }
 export async function recordNodeAudit(

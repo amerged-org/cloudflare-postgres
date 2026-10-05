@@ -21,6 +21,7 @@ import {
   hash,
   ip,
   scanAllPorts,
+  routeSource,
   serveSourceControl,
   signed,
   tcp,
@@ -31,7 +32,9 @@ import type {
   ControlObservation,
   Envelope,
   ReviewedCommand,
+  HttpsControl,
 } from "./node-network-native.ts";
+import { cidrPoolsDisjoint } from "./external-probe.ts";
 import {
   capturePackets,
   packetEvidence,
@@ -116,6 +119,11 @@ export interface CommonConfig {
   measurement_keys: Record<string, string>;
   control_keys: Record<string, string>;
   kid: string;
+  scan?: {
+    https_control?: HttpsControl;
+    source_pool?: string[];
+    tcp25_control?: string;
+  };
 }
 const object = (value: unknown): Record<string, unknown> => {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -349,9 +357,37 @@ function outside(plan: NetworkPlan, source: string): void {
     ...plan.operators[family].map((cidr) => ip(cidr.split("/")[0]!)),
     ...plan.relay.addresses[family].map(ip),
     ...plan.members.flatMap((member) => member.addresses[family]).map(ip),
+    ...plan.members
+      .flatMap((member) =>
+        member.rules.rules.inbound.flatMap(
+          (rule) => rule.srcCidr[family] ?? [],
+        ),
+      )
+      .map((cidr) => ip(cidr.split("/")[0]!)),
     ip(plan.scan_control[family]),
   ];
   if (allowed.includes(ip(source))) blocked("source_inside_allowlist");
+}
+export function assertScanSource(config: CommonConfig, source: string): void {
+  outside(config.plan, source);
+  if (config.scan?.https_control && isIP(source) === 4) {
+    const pool = config.scan.source_pool;
+    const allowlist = config.plan.members.flatMap((member) =>
+      member.rules.rules.inbound.flatMap((rule) => [
+        ...(rule.srcCidr.ipv4 ?? []),
+        ...(rule.srcCidr.ipv6 ?? []),
+      ]),
+    );
+    // NAT can choose another public source for another destination. Prove the
+    // entire hosted runner pool is outside the actual firewall's source rules.
+    if (
+      !pool?.length ||
+      !allowlist.length ||
+      !cidrPoolsDisjoint(pool, allowlist) ||
+      cidrPoolsDisjoint(pool, [`${source}/32`])
+    )
+      blocked("source_pool_unproven");
+  }
 }
 export async function measureAccess(
   config: CommonConfig,
@@ -401,9 +437,15 @@ export async function measureScans(
   deadline: number,
 ): Promise<Envelope<Measurement>> {
   validateBinding(config.binding, config.plan);
-  outside(config.plan, source);
+  if (source === "auto") {
+    if (!config.scan?.https_control || !config.scan.source_pool)
+      blocked("source_unproven");
+    source = await routeSource(config.plan.scan_control.ipv4, 443, deadline);
+  }
+  if (!config.scan?.https_control) outside(config.plan, source);
   const family = isIP(source) === 4 ? "ipv4" : "ipv6",
     scans: ScanObservation[] = [];
+  let publicSource: string | null = null;
   const members =
     config.binding.verification === null
       ? config.plan.members
@@ -426,16 +468,33 @@ export async function measureScans(
             address: config.plan.scan_control[family],
             port: config.plan.scan_control.port,
             keys: config.control_keys,
+            ...(config.scan?.https_control
+              ? { https: config.scan.https_control }
+              : {}),
           },
           deadline,
+          {
+            sourceCheck: (observed) => assertScanSource(config, observed),
+            ...(config.scan?.tcp25_control
+              ? { tcp25Control: config.scan.tcp25_control }
+              : {}),
+          },
         );
+        if (publicSource !== null && ip(scan.public_source) !== publicSource)
+          blocked("source_unproven");
+        publicSource = ip(scan.public_source);
         scans[index] = {
           provider_instance_id: member.provider_instance_id,
           address,
           protocol: "tcp",
           first_port: 1,
           last_port: 65535,
-          ...scan,
+          scanned_ports: scan.scanned_ports,
+          open_ports: scan.open_ports,
+          started_at: scan.started_at,
+          observed_at: scan.observed_at,
+          before: scan.before,
+          after: scan.after,
         };
       }
     }),
@@ -451,7 +510,7 @@ export async function measureScans(
       binding_sha256: scope(config.binding),
       observed_at: new Date().toISOString(),
       family,
-      source: ip(source),
+      source: publicSource!,
       scans,
     } as Measurement,
     config.kid,
@@ -542,7 +601,7 @@ export function verifyMeasurements(
         isIP(payload.source) !== (family === "ipv4" ? 4 : 6)
       )
         blocked("family_mismatch");
-      outside(config.plan, payload.source);
+      assertScanSource(config, payload.source);
       const members =
         config.binding.verification === null
           ? config.plan.members
@@ -1048,6 +1107,7 @@ export async function main(mode = process.argv[2]): Promise<void> {
     kid,
     measurement_keys: object(config.measurement_keys) as Record<string, string>,
     control_keys: object(config.control_keys) as Record<string, string>,
+    ...(config.scan ? { scan: config.scan as CommonConfig["scan"] } : {}),
   };
   let artifact: unknown;
   if (mode === "access")

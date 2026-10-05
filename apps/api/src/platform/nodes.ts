@@ -483,7 +483,7 @@ export async function verifyNodeProof(
       "Additional provider addresses require complete verified outside-allowlist scan coverage",
     );
   const peers = await c.env.DB.prepare(
-    "SELECT id,provider_instance_id FROM nodes WHERE region_id=? AND id<>?",
+    "SELECT id,provider_instance_id FROM nodes WHERE region_id=? AND id<>? AND lost_at IS NULL",
   )
     .bind(row.region_id, row.node_id)
     .all<{ id: string; provider_instance_id: string | null }>();

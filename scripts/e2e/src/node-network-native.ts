@@ -12,6 +12,9 @@ import { open, stat } from "node:fs/promises";
 import { createConnection, createServer, isIP } from "node:net";
 import type { Socket } from "node:net";
 import { isAbsolute } from "node:path";
+import { request as httpsRequest } from "node:https";
+import { checkServerIdentity } from "node:tls";
+import type { TLSSocket } from "node:tls";
 
 export const MAX_COMMAND_BYTES = 32 * 1024 * 1024;
 export const MAX_JSON_BYTES = 256 * 1024;
@@ -260,9 +263,211 @@ export async function tcp(
     socket.once("error", (error: NodeJS.ErrnoException) =>
       finish(error.code === "ECONNREFUSED" ? "refused" : "inconclusive"),
     );
+    socket.once("close", () => finish("inconclusive"));
   });
 }
 const CONTROL_DOMAIN = "pgcf-node-source-control/v1\n";
+export const HTTPS_CONTROL_DOMAIN = "pgcf-node-https-source-control/v1\n";
+export interface HttpsSourceObservation {
+  nonce: string;
+  source: string;
+  observed_at: string;
+  origin: string;
+}
+export interface HttpsControl {
+  origin: string;
+  bearer: string;
+  expires_at: string;
+}
+export function sourceObservation(
+  envelope: Envelope<HttpsSourceObservation>,
+  expected: {
+    nonce: string;
+    origin: string;
+    address: string;
+    port: number;
+    localSource: string;
+    socketLocal: string;
+    socketRemote: string;
+    keys: Record<string, string>;
+  },
+): ControlObservation {
+  const result = authenticated(HTTPS_CONTROL_DOMAIN, envelope, expected.keys);
+  if (
+    Object.keys(result).sort().join(",") !==
+      "nonce,observed_at,origin,source" ||
+    result.nonce !== expected.nonce ||
+    result.origin !== expected.origin ||
+    isIP(result.source) !== isIP(expected.localSource) ||
+    isIP(expected.address) !== isIP(expected.localSource) ||
+    ip(expected.socketLocal) !== ip(expected.localSource) ||
+    ip(expected.socketRemote) !== ip(expected.address) ||
+    // IPv6 here is direct, with no translated or inferred public source.
+    (isIP(expected.localSource) === 6 &&
+      ip(result.source) !== ip(expected.localSource))
+  )
+    blocked("source_unproven");
+  fresh(
+    result.observed_at,
+    new Date(Date.now() - 10_000).toISOString(),
+    Date.now(),
+    10_000,
+  );
+  return {
+    address: ip(expected.socketRemote),
+    port: expected.port,
+    source: ip(result.source),
+    observed_at: result.observed_at,
+    nonce: result.nonce,
+  };
+}
+export async function httpsSourceControl(
+  address: string,
+  source: string,
+  keys: Record<string, string>,
+  control: HttpsControl,
+  deadline: number,
+): Promise<ControlObservation> {
+  let origin: URL;
+  try {
+    origin = new URL(control.origin);
+  } catch {
+    return blocked("control_invalid");
+  }
+  if (
+    origin.protocol !== "https:" ||
+    origin.origin !== control.origin ||
+    origin.username ||
+    origin.password ||
+    origin.port ||
+    isIP(origin.hostname) ||
+    !control.bearer ||
+    control.bearer.length > 256 ||
+    Date.parse(control.expires_at) <= Date.now() ||
+    Date.parse(control.expires_at) > Date.now() + 600_000 ||
+    !Number.isFinite(Date.parse(control.expires_at)) ||
+    isIP(address) !== isIP(source) ||
+    !isIP(source) ||
+    Date.now() >= deadline
+  )
+    blocked("control_invalid");
+  const nonce = randomBytes(32).toString("hex"),
+    body = JSON.stringify({ nonce });
+  return new Promise((resolve, reject) => {
+    const request = httpsRequest({
+      hostname: address,
+      port: 443,
+      family: isIP(source),
+      localAddress: source,
+      servername: origin.hostname,
+      agent: false,
+      method: "POST",
+      path: "/source-control",
+      checkServerIdentity: (_host, certificate) =>
+        checkServerIdentity(origin.hostname, certificate),
+      headers: {
+        Host: origin.hostname,
+        Authorization: `Bearer ${control.bearer}`,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(body),
+      },
+    });
+    let settled = false;
+    const timer = setTimeout(
+      () => fail(),
+      Math.max(1, Math.min(5000, deadline - Date.now())),
+    );
+    const fail = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      request.destroy();
+      reject(new Error("node_network_control_unproven"));
+    };
+    request.once("error", fail);
+    request.once("response", (response) => {
+      if (response.statusCode !== 200) {
+        response.destroy();
+        return fail();
+      }
+      const socket = response.socket as TLSSocket,
+        socketLocal = socket.localAddress ?? "",
+        socketRemote = socket.remoteAddress ?? "";
+      const chunks: Buffer[] = [];
+      let size = 0;
+      response.on("data", (bytes: Buffer) => {
+        size += bytes.length;
+        if (size > 4096) {
+          response.destroy();
+          fail();
+        } else chunks.push(bytes);
+      });
+      response.once("error", fail);
+      response.once("aborted", fail);
+      response.once("end", () => {
+        if (settled) return;
+        try {
+          const result = sourceObservation(
+            JSON.parse(Buffer.concat(chunks).toString("utf8")),
+            {
+              nonce,
+              origin: control.origin,
+              address,
+              port: 443,
+              localSource: source,
+              socketLocal,
+              socketRemote,
+              keys,
+            },
+          );
+          settled = true;
+          clearTimeout(timer);
+          request.destroy();
+          resolve(result);
+        } catch {
+          fail();
+        }
+      });
+    });
+    request.end(body);
+  });
+}
+export async function routeSource(
+  address: string,
+  port: number,
+  deadline: number,
+): Promise<string> {
+  if (!isIP(address) || Date.now() >= deadline) blocked("control_invalid");
+  return new Promise((resolve, reject) => {
+    const socket = createConnection({
+      host: address,
+      family: isIP(address),
+      port,
+    });
+    const timer = setTimeout(
+      () => fail(),
+      Math.max(1, Math.min(5000, deadline - Date.now())),
+    );
+    const fail = () => {
+      clearTimeout(timer);
+      socket.destroy();
+      reject(new Error("node_network_source_unavailable"));
+    };
+    socket.once("error", fail);
+    socket.once("connect", () => {
+      clearTimeout(timer);
+      if (
+        !socket.localAddress ||
+        !socket.remoteAddress ||
+        ip(socket.remoteAddress) !== ip(address)
+      )
+        return fail();
+      const source = ip(socket.localAddress);
+      socket.destroy();
+      resolve(source);
+    });
+  });
+}
 export interface ControlObservation {
   address: string;
   port: number;
@@ -427,9 +632,19 @@ export function completedScan(
 export async function scanAllPorts(
   address: string,
   source: string,
-  control: { address: string; port: number; keys: Record<string, string> },
+  control: {
+    address: string;
+    port: number;
+    keys: Record<string, string>;
+    https?: HttpsControl;
+  },
   deadline: number,
-  options: { concurrency?: number; timeoutMs?: number } = {},
+  options: {
+    concurrency?: number;
+    timeoutMs?: number;
+    sourceCheck?: (source: string) => void;
+    tcp25Control?: string;
+  } = {},
 ) {
   const concurrency = options.concurrency ?? 512,
     timeout = options.timeoutMs ?? 500;
@@ -442,37 +657,59 @@ export async function scanAllPorts(
     timeout > 5000
   )
     blocked("scan_bounds");
-  const before = await sourceControl(
-      control.address,
-      control.port,
-      source,
-      control.keys,
-      deadline,
-    ),
+  if (control.https && control.port !== 443) blocked("control_invalid");
+  const observe = () =>
+    control.https
+      ? httpsSourceControl(
+          control.address,
+          source,
+          control.keys,
+          control.https,
+          deadline,
+        )
+      : sourceControl(
+          control.address,
+          control.port,
+          source,
+          control.keys,
+          deadline,
+        );
+  const before = await observe(),
     started_at = new Date().toISOString();
+  options.sourceCheck?.(before.source);
   const results: PortCompletion[] = [];
   let next = 1;
   const workers = await Promise.allSettled(
     Array.from({ length: concurrency }, async () => {
       while (next <= 65535) {
         const port = next++;
+        if (
+          port === 25 &&
+          options.tcp25Control &&
+          (await tcp(options.tcp25Control, 25, source, 5000, deadline)) !==
+            "connected"
+        )
+          blocked("tcp25_control_unproven");
         results.push({
           port,
           outcome: await tcp(address, port, source, timeout, deadline),
         });
+        if (
+          port === 25 &&
+          options.tcp25Control &&
+          (await tcp(options.tcp25Control, 25, source, 5000, deadline)) !==
+            "connected"
+        )
+          blocked("tcp25_control_unproven");
       }
     }),
   );
   if (workers.some((worker) => worker.status === "rejected"))
     blocked("scan_incomplete");
-  const after = await sourceControl(
-    control.address,
-    control.port,
-    source,
-    control.keys,
-    deadline,
-  );
+  const after = await observe();
+  options.sourceCheck?.(after.source);
   return {
+    public_source: before.source,
     ...completedScan(results, { before, after }, address, started_at),
     started_at,
     observed_at: after.observed_at,

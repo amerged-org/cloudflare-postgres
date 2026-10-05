@@ -88,7 +88,7 @@ function ipValue(host: string): { family: 4 | 6; value: bigint } {
   return { family, value };
 }
 
-function publicIPv4(host: string): boolean {
+export function publicIPv4(host: string): boolean {
   const address = ipValue(host);
   if (address.family !== 4) return false;
   // IANA special-purpose registry, verified 2026-10-02; unknown reachability fails closed.

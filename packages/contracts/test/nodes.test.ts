@@ -63,3 +63,30 @@ it("accepts explicit adoption or configured Contabo order intent without region 
       .success,
   ).toBe(false);
 });
+
+it("requires an exact predecessor UID and provider for explicit existing-instance recovery", () => {
+  const request = {
+    region_id: "eu-test",
+    mode: "recover",
+    provider_instance_id: "17",
+    predecessor_node_id: newNodeId(),
+    expected_node_uid: crypto.randomUUID(),
+  };
+  expect(NodeAdditionRequest.parse(request)).toEqual(request);
+  expect(
+    NodeAdditionRequest.safeParse({ ...request, expected_node_uid: undefined })
+      .success,
+  ).toBe(false);
+  expect(
+    NodeAdditionRequest.safeParse({
+      ...request,
+      predecessor_node_id: undefined,
+    }).success,
+  ).toBe(false);
+  expect(
+    NodeAdditionRequest.safeParse({
+      ...request,
+      provider_instance_id: undefined,
+    }).success,
+  ).toBe(false);
+});

@@ -16,7 +16,13 @@ import {
 } from "./api.ts";
 import { ApiKeyString } from "./auth.ts";
 import { ErrorBody, type ErrorCode } from "./errors.ts";
-import { DatabaseId, OperationId, RoleName } from "./ids.ts";
+import { DatabaseId, NodeId, OperationId, RoleName } from "./ids.ts";
+import {
+  NodeAddition,
+  NodeAdditionRequest,
+  NodeLoss,
+  NodeMarkLost,
+} from "./nodes.ts";
 
 export type PgcfClientErrorCode =
   | ErrorCode
@@ -357,6 +363,36 @@ export class PgcfClient {
       "GET",
       200,
       Operation,
+    );
+  }
+  requestNodeAddition(
+    body: NodeAdditionRequest,
+    idempotencyKey: string,
+  ): Promise<NodeAddition> {
+    return this.#request(
+      "/v1/nodes/additions",
+      "POST",
+      202,
+      NodeAddition,
+      input(NodeAdditionRequest, body),
+      input(IdempotencyKey, idempotencyKey),
+    );
+  }
+  getNodeAddition(operationId: string): Promise<NodeAddition> {
+    return this.#request(
+      `/v1/nodes/additions/${input(OperationId, operationId)}`,
+      "GET",
+      200,
+      NodeAddition,
+    );
+  }
+  markNodeLost(nodeId: string, body: NodeMarkLost): Promise<NodeLoss> {
+    return this.#request(
+      `/v1/nodes/${input(NodeId, nodeId)}/mark-lost`,
+      "POST",
+      200,
+      NodeLoss,
+      input(NodeMarkLost, body),
     );
   }
 }

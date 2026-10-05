@@ -23,6 +23,7 @@ import {
   hash,
   signed,
   sourceControl,
+  sourceObservation,
   tcp,
   writeArtifact,
 } from "../src/node-network-native.ts";
@@ -35,6 +36,7 @@ import {
   firewallEvidence,
   parsePlan,
   verifyMeasurements,
+  assertScanSource,
   PREPARATION_DOMAIN,
   VERIFICATION_DOMAIN,
 } from "../src/node-network-proof.ts";
@@ -240,6 +242,42 @@ test("signed measurements reject stale, changed-plan, source-family and partial 
   );
 });
 
+test("hosted NAT source requires membership in a complete pool disjoint from every effective firewall rule", () => {
+  const f = fixture(),
+    source = [203, 0, 113, 9].join("."),
+    pool = [[203, 0, 113, 0].join(".") + "/24"];
+  f.config.scan = {
+    https_control: {
+      origin: "https://probe.example.com",
+      bearer: "private-test-bearer",
+      expires_at: new Date(Date.now() + 60000).toISOString(),
+    },
+    source_pool: pool,
+  };
+  assert.doesNotThrow(() => assertScanSource(f.config, source));
+  assert.throws(
+    () => assertScanSource(f.config, address(9)),
+    /source_pool_unproven/,
+  );
+  f.config.scan.source_pool = [...pool, address(0) + "/24"];
+  assert.throws(
+    () => assertScanSource(f.config, source),
+    /source_pool_unproven/,
+  );
+  f.config.scan.source_pool = pool;
+  // An additional real allow rule matters even when its address is absent from operators/peers.
+  f.plan.members[0]!.rules.rules.inbound[0]!.srcCidr.ipv4!.push(source + "/32");
+  assert.throws(
+    () => assertScanSource(f.config, source),
+    /source_inside_allowlist/,
+  );
+  delete f.config.scan.source_pool;
+  assert.throws(
+    () => assertScanSource(f.config, [203, 0, 113, 10].join(".")),
+    /source_pool_unproven/,
+  );
+});
+
 test("canonical signatures match consumer domains and cannot cross purpose or survive tampering", () => {
   const keys = keyring(),
     payload = { z: [3, { b: 2, a: 1 }], a: randomUUID() };
@@ -369,6 +407,86 @@ test("native sockets and source controls use actual same-family peer observation
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test("HTTPS control separates a bound NAT interface from the signed public source", () => {
+  const keys = keyring(),
+    nonce = randomBytes(32).toString("hex"),
+    origin = "https://probe.example.com",
+    publicSource = address(4),
+    localSource = [192, 168, 1, 10].join("."),
+    observation = signed(
+      "pgcf-node-https-source-control/v1\n",
+      {
+        nonce,
+        source: publicSource,
+        observed_at: new Date().toISOString(),
+        origin,
+      },
+      keys.kid,
+      keys.privateKey,
+    );
+  const verify = (local = localSource, remote = address(5)) =>
+    sourceObservation(observation, {
+      nonce,
+      origin,
+      address: address(5),
+      port: 443,
+      localSource,
+      socketLocal: local,
+      socketRemote: remote,
+      keys: keys.trusted,
+    });
+  assert.equal(verify().source, publicSource);
+  assert.throws(() => verify(address(6)), /source_unproven/);
+  assert.throws(() => verify(localSource, address(6)), /source_unproven/);
+  observation.payload.source = ipv6(4);
+  assert.throws(() => verify(), /signature_invalid/);
+});
+
+test("HTTPS observer refuses signed family, origin, nonce, freshness and IPv6 source mismatches", () => {
+  const keys = keyring(),
+    nonce = randomBytes(32).toString("hex"),
+    origin = "https://probe.example.com",
+    localSource = ipv6(4),
+    payload = {
+      nonce,
+      origin,
+      source: localSource,
+      observed_at: new Date().toISOString(),
+    },
+    expected = {
+      nonce,
+      origin,
+      address: ipv6(5),
+      port: 443,
+      localSource,
+      socketLocal: localSource,
+      socketRemote: ipv6(5),
+      keys: keys.trusted,
+    };
+  const check = (changes = {}) =>
+    sourceObservation(
+      signed(
+        "pgcf-node-https-source-control/v1\n",
+        { ...payload, ...changes },
+        keys.kid,
+        keys.privateKey,
+      ),
+      expected,
+    );
+  assert.equal(check().source, localSource);
+  for (const change of [
+    { source: address(4) },
+    { source: ipv6(6) },
+    { origin: "https://foreign.example.com" },
+    { nonce: randomBytes(32).toString("hex") },
+  ])
+    assert.throws(() => check(change), /source_unproven/);
+  assert.throws(
+    () => check({ observed_at: new Date(Date.now() - 20000).toISOString() }),
+    /stale_measurement/,
+  );
 });
 
 test("reviewed process bytes are pinned and private artifact outputs are exclusive mode 0600", async () => {
