@@ -57,6 +57,10 @@ rules:
   - apiGroups: [postgresql.cnpg.io]
     resources: [clusters, scheduledbackups]
     verbs: [get, list, create, update, patch, delete]
+  # Backup health is observed from operator-owned Backup objects, never inferred from scheduling.
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [backups]
+    verbs: [get, list]
   - apiGroups: [barmancloud.cnpg.io]
     resources: [objectstores]
     verbs: [get, list, create, update, patch, delete]
@@ -74,6 +78,10 @@ rules:
   - apiGroups: [""]
     resources: [nodes, pods]
     verbs: [get, list]
+  # Verified kubelet summaries measure whole-filesystem use, including WAL; no node proxy access.
+  - apiGroups: [""]
+    resources: [nodes/stats]
+    verbs: [get]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

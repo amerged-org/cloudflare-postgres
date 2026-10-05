@@ -106,7 +106,7 @@ spec:
             - port: "5432"
               protocol: TCP
 ---
-# No ingress. Egress to DNS, Kubernetes/API Worker, and scoped CNPG archive metrics.
+# No ingress. Egress to DNS, Kubernetes/API Worker, CNPG metrics and authenticated node statistics.
 apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -117,6 +117,11 @@ spec:
     matchLabels:
       app.kubernetes.io/name: pgcf-agent
   egress:
+    - toEntities: [host, remote-node]
+      toPorts:
+        - ports:
+            - port: "10250"
+              protocol: TCP
     - toEndpoints:
         - matchLabels:
             k8s:io.kubernetes.pod.namespace: kube-system

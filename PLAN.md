@@ -87,7 +87,8 @@ count-only diagnostics preserve the original count, deadlines and assertions for
 Operational Cloudflare, Barman R2 and PGCF admin/agent credentials have no configured expiry.
 Routing/control tokens retain their short security deadlines. Read-only adopter inventory remains
 private; ownership mapping, remaining extensions, peak connection rates and migration timing must
-be verified before migration. The production release through Phase 5 is incomplete.
+be verified before migration. Operator readiness remains incomplete; adopter migration and public
+release follow separately.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
 AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.
@@ -430,8 +431,42 @@ their own price lists and billing logic.
 
 ## 7. Phases
 
-Each phase ends with its live acceptance run in Dev. The result and the measured numbers go into
-section 11.
+### Current operator-ready scope (owner decision, 2026-10-05)
+
+Finish PGCF for our own Cloudflare account and two EU/one US VPS first. Neon migration and public
+release are separate later steps. Retain the accepted core, first node, custody and platform;
+do not rebuild them or repeat their unchanged acceptance suites.
+
+Three implementation tracks run in parallel, with one serial Git lane and one serial live lane:
+
+- Installation: private relay/Tunnel/VPC, complete Workflow/Container wiring, actual bootstrap
+  inputs and signed network-evidence production; EU2 adoption and first-region platform setup.
+- Recovery: API full restore/PITR into a separate target database, distinct physical storage
+  generation, actual SQL/role/config verification before route publication, deleted-source
+  retention and validated regional R2 binding selection.
+- Operations: observation freshness in placement and allocation guards, explicit lost-node and
+  recovery authority, pre-D1/wake admission for registered hints, real backup/disk health and
+  short control-state/credential recovery and rotation procedures.
+
+Completion requires the real EU capacity/adoption path and US first installation, database
+lifecycle per region, PITR and deleted-source restore, one existing-resource node-loss recovery,
+and targeted health/overload checks. Record recovery time and last recoverable transaction.
+Use regression tests for changes, scoped package checks and one composed CI; repeat old live
+checks only when their behavior changed. No additional cold-start optimization or twenty-start
+series is required. Current approximately nine-second starts are accepted for v1.
+
+Before customer data, document measured capacity and visible metric gaps; do not promise the
+initial three VPS can host 1,000 simultaneously active databases. Cost attribution is deferred;
+commercial RAM/storage prices, wallets and billing remain with the adopter.
+
+There is no PGCF SaaS account. A self-hoster supplies Cloudflare/Contabo accounts, installs the
+Cloudflare components and uses the images for the regional/native components. Public signing,
+release/version polish, a convenient install CLI, detailed API publication and a blank foreign
+Cloudflare-account installation proof belong to the later public-release gate.
+
+The historical phases below preserve the implementation roadmap. Their migration, public-release,
+density/performance and week-long adopter checks are not extra prerequisites for the initially
+customer-free operator deployment. Phase results and measured numbers remain in section 11.
 
 ### Phase 0 — Reset
 
@@ -566,7 +601,7 @@ Live acceptance:
 - A pending US database with no allocatable capacity triggers a real US VPS order and the full
   install/bootstrap path, after the owner's costed go. Interrupt and resume without a duplicate order.
 
-### Phase 4 — Production readiness
+### Phase 4 — Operator readiness and subsequent adopter migration
 
 - PITR restore through the API, retention enforcement, backup freshness checks.
 - Health reporting and alerting through Cloudflare: WAL archive age, disk usage, failed backups,
@@ -577,10 +612,13 @@ Live acceptance:
   distinct. Verify the restored database before atomically changing its active route.
 - Isolation tests: cross-tenant network and SQL, disk-full containment, CPU noisy neighbor.
 - Credential and API key rotation.
-- Density measurement per size class, which decides `sleeping_reservation_factor` and relocation
-  of sleeping databases.
-- Decision on edge-side SCRAM verification before a wake, based on observed wake abuse.
-- Security review and public-image secret scan.
+- Keep full, measured placement reservations for v1. Density optimization, sleeping reservation
+  factors and relocation are later work.
+- Bound registered-hint admission before D1/wake. Edge-side SCRAM before wake is later work.
+- Qualify deployment images and the changed security boundaries; public signing is Phase 5.
+
+Second step, after operator product acceptance:
+
 - OMH Dev on PGCF (adapter in the OMH repository) for one week, then migrate customer and internal
   platform databases during a maintenance window: stop writes, dump/restore, compare data and roles,
   verify the target, switch connections, then reopen writes. Preserve US/EU and shared/isolated data
@@ -596,7 +634,7 @@ Acceptance:
 - PITR to a timestamp through the API, including after the source is deleted.
 - Recover a database and its regional infrastructure from R2 after a node-loss exercise; record
   recovery time and the last recoverable transaction.
-- OMH Dev is stable for a week.
+- OMH Dev stability belongs to the subsequent migration gate, not the customer-free product gate.
 
 ### Phase 5 — Open-source release
 
@@ -613,6 +651,10 @@ Acceptance: a fresh Cloudflare account and a fresh VPS reach Phase 1 acceptance 
 the docs.
 
 ### Later
+
+Cold-start optimization/readiness push, density tuning/additional classes/sleeping factors,
+maximum-throughput stress matrices, an additional pooler, cost attribution and scheduled rotation.
+Public release polish and blank foreign-account installation acceptance follow operator readiness.
 
 Später Backup und Replikation so erweitern, dass bei Serververlust keine bestätigten Daten verloren gehen.
 Relocation of sleeping databases, branching, other VPS providers, an HTTP SQL endpoint, PostgREST,
