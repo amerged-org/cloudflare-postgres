@@ -120,8 +120,10 @@ recorded. The completed instrumented trial had one base backup, 93 WAL objects a
 bytes verified against R2 and the API. Agent-restarted deletion took 104,099 ms and reclaimed
 all trial volumes and archive objects. Ordinary deletion retains archives; the harness purges
 its own objects separately. Awake-time accuracy passes; the cold-wake target and cost attribution
-remain open. Contabo's invoice portal requires a separate active browser login before actual
-invoice facts can be read. The production-ready
+remain open. The owner supplied a monthly Contabo amount of 13.55; it is recorded locally as
+owner-provided information. Its per-node assignment is being confirmed before writing immutable
+cost facts. Portal login is no longer a prerequisite for obtaining that supplied amount.
+The production-ready
 release through Phase 5 and complete Neon replacement are not complete.
 
 CI `37269991675` passed on `efcdb759`; both images built, passed runtime and full payload
@@ -137,6 +139,15 @@ unresolved. Anonymous access is blocked: GitHub's package page disables public v
 organization policy. This remains a Phase 5 publication prerequisite, not a passed public release.
 The existing first-EU agent key, machine seed and join bundle have been encrypted locally with
 successful decryption checks; no replacement keys, D1 writes or VPS changes were made.
+
+Read-only Neon inventory for project names matching the adopter found 25 projects, 26 branches,
+26 databases and 97 password-authenticated roles. Project versions are 23 on PostgreSQL 17 and
+two on 18; project regions are 22 US East and three EU Central. Branch logical-size metadata
+totals 1,162,018,816 bytes. Eight already-active databases were inspected in explicit read-only
+transactions: 370,491,392 database bytes, 476 user tables and only `plpgsql` extensions.
+Seventeen idle endpoints were not queried through SQL. One endpoint-metadata request failed;
+adopter ownership mapping, remaining extensions, peak connection rates and migration timing are
+still unverified. These inventory counts are not a throughput or 1,000-customer capacity proof.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
 AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.
