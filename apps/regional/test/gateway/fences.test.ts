@@ -619,3 +619,17 @@ test("foreground deletion metadata stays synchronized only for a previously obse
   assert.throws(() => unknown.load([dying]));
   assert.equal(unknown.ready, false);
 });
+
+test("an asynchronous quiescence-drain failure disconnects the fence observer without an unhandled rejection", async () => {
+  const map = resource();
+  const store = new GatewayFenceStore({
+    beginQuiesce: () => Promise.reject(new Error("fixture close failure")),
+    releaseQuiesce() {},
+  });
+  store.load([map]);
+  store.connected();
+  assert.equal(store.ready, true);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(store.ready, false);
+  assert.equal(store.get(database)?.mode, "quiesce");
+});

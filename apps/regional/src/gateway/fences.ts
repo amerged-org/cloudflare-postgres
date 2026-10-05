@@ -141,8 +141,10 @@ export class GatewayFenceStore {
       (next.mode === "running" || next.operation !== old.operation)
     )
       this.gateway.releaseQuiesce(next.database, old.operation);
-    if (next.mode === "quiesce")
-      this.gateway.beginQuiesce(next.database, next.operation);
+    if (next.mode === "quiesce") {
+      const begun = this.gateway.beginQuiesce(next.database, next.operation);
+      void Promise.resolve(begun).catch(() => this.disconnect());
+    }
     this.records.set(next.database, record);
   }
   private parsed(value: unknown): FenceRecord {

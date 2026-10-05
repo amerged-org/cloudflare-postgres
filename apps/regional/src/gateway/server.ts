@@ -82,7 +82,7 @@ interface SessionControl {
   busy(): boolean;
   pendingDial(): boolean;
   authenticated(): boolean;
-  close(): Promise<void>;
+  close(authenticationInterrupted?: boolean): Promise<void>;
 }
 
 export interface Gateway {
@@ -94,7 +94,10 @@ export interface Gateway {
     readonly peakMemoryBytes: number;
   };
   quiesceStatus(database: string, operation: string): QuiesceReport;
-  beginQuiesce(database: string, operation: string): QuiesceReport;
+  beginQuiesce(
+    database: string,
+    operation: string,
+  ): QuiesceReport | Promise<QuiesceReport>;
   releaseQuiesce(database: string, operation: string): void;
   closeQuiesced(database: string, operation: string): Promise<QuiesceReport>;
   beginRetirement(database: string, operation: string): void;
@@ -140,7 +143,12 @@ export function createGateway(options: GatewayOptions): Gateway {
   const sessions = new Map<WebSocket, SessionControl>();
   const fences = new Map<
     string,
-    { operation: string; retired?: boolean; closing?: Promise<QuiesceReport> }
+    {
+      operation: string;
+      retired?: boolean;
+      closing?: Promise<QuiesceReport>;
+      preAuthClosing?: Promise<QuiesceReport>;
+    }
   >();
   const fenceEpochs = new Map<string, number>();
   let fenceEpoch = 0;
@@ -170,7 +178,11 @@ export function createGateway(options: GatewayOptions): Gateway {
       pendingDials: owned.filter((session) => session.pendingDial()).length,
     };
   };
-  const closeClient = (client: WebSocket): Promise<void> =>
+  const closeClient = (
+    client: WebSocket,
+    code = 1000,
+    reason = "database sleeping",
+  ): Promise<void> =>
     new Promise((resolve) => {
       if (client.readyState === WebSocket.CLOSED) {
         resolve();
@@ -181,8 +193,7 @@ export function createGateway(options: GatewayOptions): Gateway {
         clearTimeout(deadline);
         resolve();
       });
-      if (client.readyState === WebSocket.OPEN)
-        client.close(1000, "database sleeping");
+      if (client.readyState === WebSocket.OPEN) client.close(code, reason);
       else client.terminate();
     });
   const clients = new Set<WebSocket>();
@@ -573,7 +584,14 @@ export function createGateway(options: GatewayOptions): Gateway {
       busy: () => true,
       pendingDial: () => connecting && !postgres,
       authenticated: () => measurement.authenticated,
-      close: () => closeClient(client),
+      close: (authenticationInterrupted = false) =>
+        closeClient(
+          client,
+          authenticationInterrupted ? 1012 : 1000,
+          authenticationInterrupted
+            ? "authentication interrupted"
+            : "database sleeping",
+        ),
     });
     const message = (data: RawData, binary: boolean) => {
       const lease = socket.takeMessage();
@@ -887,7 +905,14 @@ export function createGateway(options: GatewayOptions): Gateway {
         client.bufferedAmount !== 0,
       pendingDial: () => false,
       authenticated: () => measurement.authenticated,
-      close: () => closeClient(client),
+      close: (authenticationInterrupted = false) =>
+        closeClient(
+          client,
+          authenticationInterrupted ? 1012 : 1000,
+          authenticationInterrupted
+            ? "authentication interrupted"
+            : "database sleeping",
+        ),
     });
     for (const chunk of initial.slice(1)) activity.observeFrontend(chunk);
     forward(initial, initialMemory);
@@ -908,7 +933,9 @@ export function createGateway(options: GatewayOptions): Gateway {
         authenticatedConnections: owned.filter((session) =>
           session.authenticated(),
         ).length,
-        busyConnections: owned.filter((session) => session.busy()).length,
+        busyConnections: owned.filter(
+          (session) => session.authenticated() && session.busy(),
+        ).length,
         pendingDials: owned.filter((session) => session.pendingDial()).length,
       };
     },
@@ -919,20 +946,41 @@ export function createGateway(options: GatewayOptions): Gateway {
     },
     beginQuiesce(database, operation) {
       validateFence(database, operation);
-      const current = fences.get(database);
+      let current = fences.get(database);
       if (current && (current.retired || current.operation !== operation))
         throw new Error("quiescence fence mismatch");
       if (!current) {
-        fences.set(database, { operation });
+        current = { operation };
+        fences.set(database, current);
         fenceEpochs.set(database, ++fenceEpoch);
       }
       for (const session of sessions.values())
         if (session.database === database) session.pause();
-      return report(database, operation);
+      if (current.preAuthClosing) return current.preAuthClosing;
+      const unauthenticated = [...sessions.values()].filter(
+        (session) => session.database === database && !session.authenticated(),
+      );
+      if (!unauthenticated.length)
+        return Promise.resolve(report(database, operation));
+      const pendingClose = Promise.all(
+        unauthenticated.map((session) => session.close(true)),
+      ).then(() => report(database, operation));
+      const fence = current;
+      fence.preAuthClosing = pendingClose;
+      void pendingClose.then(
+        () => {
+          if (fence.preAuthClosing === pendingClose)
+            fence.preAuthClosing = undefined;
+        },
+        () => {
+          // A failed transport close retains the fence; it is not a successful begin or safe release.
+        },
+      );
+      return pendingClose;
     },
     releaseQuiesce(database, operation) {
       const current = matchingFence(database, operation);
-      if (current.retired || current.closing)
+      if (current.retired || current.closing || current.preAuthClosing)
         throw new Error("quiescence close in progress");
       fences.delete(database);
       for (const session of sessions.values())

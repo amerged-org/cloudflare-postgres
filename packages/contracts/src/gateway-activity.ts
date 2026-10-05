@@ -77,7 +77,7 @@ export const gatewayActivityReportSchema = z
       });
     if (
       report.authenticatedConnections > report.connections ||
-      report.busyConnections > report.connections ||
+      report.busyConnections > report.authenticatedConnections ||
       report.pendingDials > report.connections
     )
       context.addIssue({
@@ -106,9 +106,8 @@ export const gatewayActivityReportSchema = z
       report.history === "current_process_absence" &&
       (activity !== null ||
         metrics.some((value) => value !== 0) ||
-        report.connections !== 0 ||
-        report.busyConnections !== 0 ||
-        report.pendingDials !== 0)
+        report.authenticatedConnections !== 0 ||
+        report.busyConnections !== 0)
     )
       context.addIssue({
         code: "custom",

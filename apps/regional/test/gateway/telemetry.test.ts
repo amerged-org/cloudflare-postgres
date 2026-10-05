@@ -20,6 +20,7 @@ import {
   signGatewayControl,
 } from "@pgcf/contracts/gateway-control";
 import { GatewayMeasurements } from "../../src/gateway/telemetry.ts";
+import { PostgresActivity } from "../../src/gateway/activity.ts";
 import { createGatewayControl } from "../../src/gateway/control.ts";
 import { GatewayFenceStore } from "../../src/gateway/fences.ts";
 import { DatabaseCaCache } from "../../src/gateway/ca.ts";
@@ -169,7 +170,11 @@ test("pending real PostgreSQL dials stay busy and contribute no authenticated us
   await until(() => gateway.activity(database).pendingDials === 1);
   const pending = gateway.activity(database);
   assert.equal(pending.connections, 1);
-  assert.equal(pending.busyConnections, 1);
+  assert.equal(pending.busyConnections, 0);
+  assert.equal(
+    gateway.quiesceStatus(database, newOperationId()).busyConnections,
+    1,
+  );
   assert.equal(pending.authenticatedConnections, 0);
   assert.equal(pending.totalConnections, 0);
   assert.equal(pending.ingressBytes, 0);
@@ -382,4 +387,184 @@ test("active record saturation remains explicitly unavailable without evicting a
   first.close();
   second.close();
   assert.equal(measurements.read(secondId).totalConnections, null);
+});
+
+test("an unauthenticated startup, client bytes, server challenge and close never start idle activity or usage", () => {
+  let now = Date.now();
+  const measurements = new GatewayMeasurements({ now: () => now }),
+    id = newDatabaseId();
+  const session = measurements.begin(id),
+    activity = new PostgresActivity();
+  const challengeCode = Buffer.alloc(4);
+  challengeCode.writeUInt32BE(10);
+  const challenge = frame(
+    "R",
+    Buffer.concat([challengeCode, Buffer.from("SCRAM-SHA-256\0\0")]),
+  );
+  session.ingress(100);
+  session.clientActivity();
+  activity.observeBackend(challenge);
+  session.egress(challenge.length);
+  assert.equal(activity.authenticated, false);
+  assert.equal(session.authenticated, false);
+  assert.equal(measurements.read(id).lastActivityAt, null);
+  assert.equal(measurements.read(id).totalConnections, 0);
+  assert.equal(measurements.read(id).connectionMilliseconds, 0);
+  assert.equal(measurements.size, 0);
+  now += 10000;
+  session.clientActivity();
+  session.close();
+  assert.equal(measurements.read(id).lastActivityAt, null);
+  assert.equal(measurements.size, 0);
+});
+
+test("unauthenticated clients cannot replace authenticated last activity or evict its retained measurement window", () => {
+  let now = Date.now();
+  const measurements = new GatewayMeasurements({
+      now: () => now,
+      maxRecords: 1,
+    }),
+    id = newDatabaseId();
+  const authenticated = measurements.begin(id);
+  authenticated.authenticate();
+  authenticated.ingress(17);
+  authenticated.close();
+  const before = measurements.read(id);
+  now += 60000;
+  const unauthenticated = measurements.begin(newDatabaseId());
+  unauthenticated.ingress(100);
+  unauthenticated.egress(200);
+  unauthenticated.clientActivity();
+  assert.equal(measurements.read(id).lastActivityAt, before.lastActivityAt);
+  assert.equal(measurements.read(id).history, before.history);
+  assert.equal(measurements.read(id).countersSince, before.countersSince);
+  assert.equal(measurements.read(id).ingressBytes, 17);
+  unauthenticated.close();
+  assert.equal(measurements.read(id).history, "complete");
+});
+
+test("actual fragmented AuthenticationOk starts the authenticated idle lifetime exactly once", () => {
+  let now = Date.now();
+  const measurements = new GatewayMeasurements({ now: () => now }),
+    id = newDatabaseId(),
+    session = measurements.begin(id),
+    activity = new PostgresActivity();
+  session.ingress(10);
+  session.egress(20);
+  session.clientActivity();
+  const ok = frame("R", Buffer.alloc(4));
+  activity.observeBackend(ok.subarray(0, 7));
+  assert.equal(activity.authenticated, false);
+  assert.equal(measurements.read(id).lastActivityAt, null);
+  now += 1000;
+  activity.observeBackend(ok.subarray(7));
+  assert.equal(activity.authenticated, true);
+  session.authenticate();
+  assert.equal(
+    measurements.read(id).lastActivityAt,
+    new Date(now).toISOString(),
+  );
+  assert.equal(measurements.read(id).totalConnections, 1);
+  now += 1000;
+  session.ingress(7);
+  session.egress(11);
+  session.clientActivity();
+  session.authenticate();
+  const last = new Date(now).toISOString();
+  assert.equal(measurements.read(id).lastActivityAt, last);
+  session.close();
+  session.close();
+  session.clientActivity();
+  session.authenticate();
+  now += 1000;
+  const final = measurements.read(id);
+  assert.equal(final.lastActivityAt, last);
+  assert.equal(final.totalConnections, 1);
+  assert.equal(final.ingressBytes, 17);
+  assert.equal(final.egressBytes, 31);
+  assert.equal(final.connectionMilliseconds, 1000);
+});
+
+test("an actual signed gateway activity read excludes pre-auth challenge traffic while raw quiescence stays busy", async (t) => {
+  const code = Buffer.alloc(4);
+  code.writeUInt32BE(10);
+  const challenge = frame(
+    "R",
+    Buffer.concat([code, Buffer.from("SCRAM-SHA-256\0\0")]),
+  );
+  const postgres = await postgresServer(undefined, (socket) =>
+      socket.once("data", () => socket.write(challenge)),
+    ),
+    pod = randomUUID(),
+    operation = newOperationId();
+  const { gateway, port } = await gatewayFor(postgres.port, {
+    control: (req, res) => controls?.(req, res) ?? false,
+  });
+  const store = new GatewayFenceStore(gateway);
+  const controls = createGatewayControl({
+    gateway,
+    store,
+    pod,
+    region,
+    keyring: derived,
+  });
+  store.load([
+    {
+      apiVersion: "v1",
+      kind: "ConfigMap",
+      metadata: {
+        name: gatewayFenceName(database),
+        namespace: "pgcf-system",
+        uid: randomUUID(),
+        resourceVersion: "1",
+        labels: {
+          [GATEWAY_FENCE_LABEL]: "true",
+          "pgcf.io/database-id": database,
+        },
+      },
+      data: {
+        "intent.json": JSON.stringify({
+          database,
+          operation,
+          revision: 1,
+          mode: "running",
+        }),
+      },
+    },
+  ]);
+  store.connected();
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const client = await open(port),
+    response = once(client, "message");
+  client.send(Buffer.from(encodeStartup({ user: "app", database })));
+  await response;
+  const value = await signGatewayActivity({
+    keyring: derived,
+    region,
+    database,
+    revision: 1,
+    pod,
+  });
+  const result = await fetch(
+    `http://${loopback}:${port}${GATEWAY_ACTIVITY_PATH}`,
+    { method: "POST", headers: { [GATEWAY_ACTIVITY_HEADER]: value } },
+  );
+  assert.equal(result.status, 200);
+  const report = gatewayActivityReportSchema.parse(await result.json());
+  assert.equal(report.lastActivityAt, null);
+  assert.equal(report.history, "current_process_absence");
+  assert.equal(report.connections, 1);
+  assert.equal(report.authenticatedConnections, 0);
+  assert.equal(report.busyConnections, 0);
+  assert.equal(report.totalConnections, 0);
+  assert.equal(report.ingressBytes, 0);
+  assert.equal(report.egressBytes, 0);
+  assert.equal(gateway.quiesceStatus(database, operation).busyConnections, 1);
+  assert.equal(gateway.metrics.activeConnections, 1);
+  client.terminate();
+  await until(() => gateway.activity(database).connections === 0);
+  assert.equal(gateway.activity(database).lastActivityAt, null);
 });
