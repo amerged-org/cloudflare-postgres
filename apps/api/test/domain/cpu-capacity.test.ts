@@ -15,6 +15,7 @@ afterEach(cleanupFixtures);
 describe("measured CPU admission on real Workers D1", () => {
   it("does not place a CPU-exhausted node with spare memory and storage", () => {
     const node = {
+      last_observed_at: new Date().toISOString(),
       id: "test-node",
       region_id: "eu-test",
       ready: true,
@@ -132,6 +133,7 @@ describe("measured CPU admission on real Workers D1", () => {
 
   it("distinguishes unknown platform CPU from measured zero and keeps memory ordering among CPU-fitting nodes", () => {
     const base = {
+      last_observed_at: new Date().toISOString(),
       region_id: "eu-test",
       ready: true,
       schedulable: true,
