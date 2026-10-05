@@ -189,7 +189,25 @@ The current target is the operator deployment on existing accounts and three VPS
 Public-release installation polish follows separately; see [PLAN.md](PLAN.md#7-phases).
 
 The API reference is generated at `/v1/openapi.json` from the shared contracts. Operator runbooks
-cover [recovery](docs/operations/recovery.md) and [credential changes](docs/operations/credentials.md).
+cover [installation](docs/operations/operator-installation.md), [recovery](docs/operations/recovery.md)
+and [credential changes](docs/operations/credentials.md).
+
+The small TypeScript management client uses these same request and response contracts:
+
+```ts
+import { PgcfClient } from "@pgcf/contracts/client";
+
+const client = new PgcfClient({
+  baseUrl: process.env.PGCF_API_URL!,
+  apiKey: process.env.PGCF_API_KEY!,
+});
+const restored = await client.restoreDatabase(sourceId,
+  { mode: "full", name: "recovered" }, logicalOperationKey);
+```
+
+Keep `logicalOperationKey` stable for retries of that management operation. The client does not
+retry uncertain writes or expose server response bodies in errors. PostgreSQL client pooling
+remains the integrator's responsibility.
 
 ## Development checks
 

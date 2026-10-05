@@ -15,7 +15,8 @@
     "./costs": "./src/costs.ts",
     "./node-bootstrap": "./src/node-bootstrap.ts",
     "./bootstrap-relay": "./src/bootstrap-relay.ts",
-    "./nodes": "./src/nodes.ts"
+    "./nodes": "./src/nodes.ts",
+    "./client": "./src/client.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
