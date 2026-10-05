@@ -268,6 +268,83 @@ async function callback(
   return response;
 }
 describe("protected bootstrap authority", () => {
+  it("lets a joined worker skip platform installation while a control plane cannot", async () => {
+    const f = await prepared();
+    const previous = {
+      ...JSON.parse(f.job.checkpoint_json),
+      stage: "kubernetes_joined",
+    };
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+    )
+      .bind(JSON.stringify(previous), f.job.operation_id)
+      .run();
+    const next = {
+      ...previous,
+      stage: "awaiting_verification",
+      status: "awaiting_verification",
+    };
+    const envelope = {
+      ...f.identity,
+      kind: "checkpoint",
+      expected_revision: 0,
+      payload: next,
+    };
+    expect((await callback(f, envelope)).status).toBe(409);
+    const workerData = {
+      ...f.spec,
+      role: "worker",
+      cluster_uid: crypto.randomUUID(),
+      join_bundle_sha256: hash(),
+    };
+    delete workerData.platform;
+    const workerSpec = NodeBootstrapSpec.parse(workerData);
+    const inputHash = await bootstrapSpecHash(workerSpec);
+    const workerInput = {
+      ...f.input,
+      spec: workerSpec,
+      input_hash: inputHash,
+      join_bundle: {
+        version: 1 as const,
+        cluster_name: workerSpec.cluster_name,
+        cluster_endpoint: workerSpec.cluster_endpoint,
+        talos_version: "1.14.1" as const,
+        kubernetes_version: "1.36.3" as const,
+        talos_machine_secrets_yaml: randomString(
+          "abcdefghijklmnopqrstuvwxyz",
+          32,
+        ),
+        talos_admin_config: randomString("abcdefghijklmnopqrstuvwxyz", 32),
+        kube_system_uid: workerSpec.cluster_uid!,
+        kubeconfig: randomString("abcdefghijklmnopqrstuvwxyz", 32),
+      },
+    };
+    delete workerInput.platform;
+    const ticket = await sealBootstrapInput(env.CREDENTIAL_KEYS, workerInput);
+    const workerRow = {
+      ...f.job,
+      checkpoint_json: JSON.stringify(previous),
+      input_hash: inputHash,
+      input_ciphertext: ticket.ciphertext,
+      input_iv: ticket.iv,
+      input_kid: ticket.kid,
+    };
+    await env.DB.batch([
+      env.DB.prepare(
+        "DELETE FROM node_bootstrap_jobs WHERE operation_id=?",
+      ).bind(f.job.operation_id),
+      env.DB.prepare(
+        `INSERT INTO node_bootstrap_jobs(${Object.keys(workerRow).join(",")}) VALUES(${Object.keys(
+          workerRow,
+        )
+          .map(() => "?")
+          .join(",")})`,
+      ).bind(...Object.values(workerRow)),
+    ]);
+    expect(
+      (await callback(f, { ...envelope, input_hash: inputHash })).status,
+    ).toBe(200);
+  });
   it("seals first-region platform secrets and rejects an altered private configuration", async () => {
     const f = await prepared(true);
     expect(f.input.platform?.region_id).toBe(f.region);
@@ -648,6 +725,26 @@ describe("protected bootstrap authority", () => {
       ).ok,
     ).toBe(true);
     expect(first.token).not.toBe(second.token);
+    const platformTransport = await issueBootstrapTransport(
+      settings,
+      {
+        ...row,
+        checkpoint_json: JSON.stringify({
+          ...JSON.parse(row.checkpoint_json),
+          stage: "cilium_install_intent",
+        }),
+      },
+      { capability: "kubernetes_api" },
+      provider,
+    );
+    expect(
+      (
+        await verifyBootstrapRelay(platformTransport.token, {
+          ...expected,
+          relay_epoch: secondEpoch,
+        })
+      ).ok,
+    ).toBe(true);
     expect(
       (await readBootstrapJob(env.DB, f.job.operation_id)).input_hash,
     ).toBe(f.job.input_hash);

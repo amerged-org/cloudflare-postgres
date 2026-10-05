@@ -472,8 +472,10 @@ export async function bootstrapCallback(
       (stages.indexOf(next.stage) > stages.indexOf(checkpoint.stage) + 1 &&
         !(
           input.spec.role === "worker" &&
-          checkpoint.stage === "talos_authenticated" &&
-          next.stage === "kubernetes_joined"
+          ((checkpoint.stage === "talos_authenticated" &&
+            next.stage === "kubernetes_joined") ||
+            (checkpoint.stage === "kubernetes_joined" &&
+              next.stage === "awaiting_verification"))
         )) ||
       next.written_bytes < checkpoint.written_bytes ||
       next.downloaded_bytes < checkpoint.downloaded_bytes ||
