@@ -858,6 +858,35 @@ export class BootstrapJob {
       throw new BootstrapError("schematic_identity_mismatch");
     }
   }
+  private imageToolsScript() {
+    return [
+      'for image_tool in curl sfdisk sgdisk dd cmp sha256sum stat blockdev; do command -v "$image_tool" >/dev/null; done',
+      'if ! command -v xz >/dev/null 2>&1; then command -v python3 >/dev/null; python3 -c "import lzma"; fi',
+    ].join("\n");
+  }
+  private imageDecompressScript() {
+    const compressed = shellQuote(this.remotePath("image.raw.xz"));
+    const partial = shellQuote(this.remotePath("image.raw.partial"));
+    return [
+      "if command -v xz >/dev/null 2>&1; then",
+      `xz --decompress --stdout --single-stream ${compressed} > ${partial}`,
+      "else",
+      `python3 - ${compressed} ${partial} ${this.input.spec.image.raw_bytes} <<'PGCF_LZMA_PY'`,
+      "import lzma, sys",
+      "expected = int(sys.argv[3])",
+      "written = 0",
+      "with lzma.open(sys.argv[1], 'rb') as source, open(sys.argv[2], 'xb') as target:",
+      "    while chunk := source.read(1024 * 1024):",
+      "        written += len(chunk)",
+      "        if written > expected:",
+      "            raise RuntimeError('decoded_image_size_invalid')",
+      "        target.write(chunk)",
+      "    if written != expected:",
+      "        raise RuntimeError('decoded_image_size_invalid')",
+      "PGCF_LZMA_PY",
+      "fi",
+    ].join("\n");
+  }
   private async verifyImage() {
     const spec = this.input.spec;
     await prepareScratch(this.input, (script) => this.ssh(script));
@@ -866,7 +895,7 @@ export class BootstrapJob {
     const directory = shellQuote(this.remotePath(""));
     const identity = shellQuote(this.remotePath("identity"));
     await this.ssh(
-      `umask 077\ntest ! -L ${directory}\nmkdir -p ${directory}\nchmod 700 ${directory}\ncommand -v curl xz sfdisk sgdisk dd cmp sha256sum stat blockdev >/dev/null\ntest ! -L ${compressed}\ntest ! -L ${raw}\nif test -f ${identity}; then test "$(cat ${identity})" = ${shellQuote(this.input.input_hash)}; else printf '%s' ${shellQuote(this.input.input_hash)} > ${identity}; fi\nrm -f -- ${raw}.partial`,
+      `umask 077\ntest ! -L ${directory}\nmkdir -p ${directory}\nchmod 700 ${directory}\n${this.imageToolsScript()}\ntest ! -L ${compressed}\ntest ! -L ${raw}\nif test -f ${identity}; then test "$(cat ${identity})" = ${shellQuote(this.input.input_hash)}; else printf '%s' ${shellQuote(this.input.input_hash)} > ${identity}; fi\nrm -f -- ${raw}.partial`,
     );
     let size = Number(
       (
@@ -905,7 +934,7 @@ export class BootstrapJob {
       });
     }
     await this.ssh(
-      `printf '%s  %s\\n' ${shellQuote(spec.image.compressed_sha256)} ${compressed} | sha256sum --check --status\nif ! test -f ${raw} || ! test "$(stat --format=%s ${raw})" = ${spec.image.raw_bytes} || ! printf '%s  %s\\n' ${shellQuote(spec.image.raw_sha256)} ${raw} | sha256sum --check --status; then\nrm -f -- ${raw} ${raw}.partial\nxz --decompress --stdout --single-stream ${compressed} > ${raw}.partial\ntest "$(stat --format=%s ${raw}.partial)" = ${spec.image.raw_bytes}\nprintf '%s  %s\\n' ${shellQuote(spec.image.raw_sha256)} ${raw}.partial | sha256sum --check --status\nmv -- ${raw}.partial ${raw}\nfi`,
+      `printf '%s  %s\\n' ${shellQuote(spec.image.compressed_sha256)} ${compressed} | sha256sum --check --status\nif ! test -f ${raw} || ! test "$(stat --format=%s ${raw})" = ${spec.image.raw_bytes} || ! printf '%s  %s\\n' ${shellQuote(spec.image.raw_sha256)} ${raw} | sha256sum --check --status; then\nrm -f -- ${raw} ${raw}.partial\n${this.imageDecompressScript()}\ntest "$(stat --format=%s ${raw}.partial)" = ${spec.image.raw_bytes}\nprintf '%s  %s\\n' ${shellQuote(spec.image.raw_sha256)} ${raw}.partial | sha256sum --check --status\nmv -- ${raw}.partial ${raw}\nfi`,
     );
     const layout = partitions((await this.ssh(`sfdisk --json ${raw}`)).stdout);
     for (const partition of layout) {

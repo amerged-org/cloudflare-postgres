@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { randomBytes, randomUUID } from "node:crypto";
+import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { test } from "node:test";
-import { writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
 import { parse } from "yaml";
@@ -435,6 +437,83 @@ test("disk guards refuse an unknown swap query instead of accepting empty failed
   });
   assert.notEqual(result.exit_code, 0);
   assert.equal(result.stdout, "");
+});
+
+test("image tool checks stop at an unavailable required tool rather than masking it", async () => {
+  const job = new BootstrapJob(fixture());
+  const script = Reflect.get(job, "imageToolsScript").call(job);
+  const result = await runCommand({
+    executable: "bash",
+    args: ["-se"],
+    signal: AbortSignal.timeout(5000),
+    timeout_ms: 5000,
+    env: { PATH: process.env.PATH, LANG: "C" },
+    stdin: `set -euo pipefail\ncommand() { local status=0; shift; for tool; do if test "$tool" = sfdisk; then status=1; else status=0; fi; done; return "$status"; }\n${script}\nprintf 'unsafe_prerequisite_passed'\n`,
+  });
+  assert.notEqual(result.exit_code, 0);
+  assert.equal(result.stdout, "");
+});
+
+test("missing xz uses actual Python stdlib streaming with exact raw bytes and bounds", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-python-lzma-"));
+  try {
+    const raw = Buffer.alloc(2 * 1024 ** 2 + 512, 0x6f);
+    const compressed = execFileSync(
+      "python3",
+      [
+        "-I",
+        "-c",
+        "import lzma,sys;sys.stdout.buffer.write(lzma.compress(sys.stdin.buffer.read()))",
+      ],
+      { input: raw, maxBuffer: 4 * 1024 ** 2 },
+    );
+    const input = fixture();
+    const spec = {
+      ...input.spec,
+      image: {
+        ...input.spec.image,
+        compressed_bytes: compressed.length,
+        raw_bytes: raw.length,
+        compressed_sha256: createHash("sha256")
+          .update(compressed)
+          .digest("hex"),
+        raw_sha256: createHash("sha256").update(raw).digest("hex"),
+      },
+    };
+    Object.assign(input, { spec, input_hash: inputHash(spec) });
+    await writeFile(join(directory, "image.raw.xz"), compressed, {
+      mode: 0o600,
+    });
+    const job = new BootstrapJob(input);
+    Reflect.set(job, "remotePath", (name: string) => join(directory, name));
+    const script = Reflect.get(job, "imageDecompressScript").call(job);
+    const run = (body: string) =>
+      runCommand({
+        executable: "bash",
+        args: ["-se"],
+        signal: AbortSignal.timeout(15000),
+        timeout_ms: 15000,
+        env: { PATH: process.env.PATH, LANG: "C" },
+        stdin: `set -euo pipefail\numask 077\ncommand() { if test "$1" = -v && test "$2" = xz; then return 1; fi; builtin command "$@"; }\nxz() { return 127; }\n${body}\n`,
+      });
+    assert.equal((await run(script)).exit_code, 0);
+    assert.deepEqual(await readFile(join(directory, "image.raw.partial")), raw);
+    await rm(join(directory, "image.raw.partial"));
+    const tooShort = {
+      ...spec,
+      image: { ...spec.image, raw_bytes: raw.length - 512 },
+    };
+    Object.assign(input, { spec: tooShort, input_hash: inputHash(tooShort) });
+    const bounded = new BootstrapJob(input);
+    Reflect.set(bounded, "remotePath", (name: string) => join(directory, name));
+    assert.notEqual(
+      (await run(Reflect.get(bounded, "imageDecompressScript").call(bounded)))
+        .exit_code,
+      0,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("rescue permits only the exact single unmounted disk, network and RAM root", () => {

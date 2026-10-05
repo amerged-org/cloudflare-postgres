@@ -16,7 +16,7 @@ inputs are now bound. The current native bootstrap image is
 `sha256:c4a0fc39989dcdee33854ce1dbfc2d60ae4e92a7bc1334f558f64bd05b1ed1f7`
 from `269ca6c6`: qualification covered 711,909,770 bytes and 18 layers with zero unresolved
 findings, followed by exact private-registry manifest, configuration and layer readback.
-Latest complete CI `37384157373` is green. Actual EU2/US installation and fresh signed network acceptance
+Latest complete CI `37389903577` is green. Actual EU2/US installation and fresh signed network acceptance
 remain outstanding. Release image signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
@@ -143,8 +143,13 @@ control phase and safe timeout/status/socket reasons. Three actual HTTPS control
 signed server clock 30/33/30 ms ahead of local receipt; control ordering now uses actual local
 receipt after validating signed server freshness. A pinned control connection with fresh signed
 heartbeats addresses the observed after-scan reconnection timeout. Focused regressions pass;
-the combined proof is not yet accepted. Fresh combined signed
-preparation remains pending. EU2 join, US installation
+the combined proof passed in hosted run `37389964563`, with complete IPv4/IPv6 coverage,
+attestation, actual access and current firewall readbacks. The proof was published and the native
+job downloaded the exact 232,142,156-byte compressed image. Rescue has no `xz` executable;
+Python 3.11.2 with its LZMA module is available. The job stopped before decompression or any disk
+write. The portable xz/Python decoder passes 61 native tests; actual Python/LZMA decoding
+produced the exact 4,453,302,272-byte RAW hash in RAM in 52.403 s with zero disk writes.
+Runtime qualification/delivery and a fresh proof for resume remain pending. EU2 join, US installation
 and lost-worker recovery are not accepted. US remains unbought; the specific costed approval
 request is pending.
 
