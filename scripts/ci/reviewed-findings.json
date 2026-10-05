@@ -1013,10 +1013,10 @@
           "startColumn": 19,
           "endColumn": 80,
           "span": {
-            "byteStart": 34088427,
-            "byteEndExclusive": 34088489,
+            "byteStart": 34088426,
+            "byteEndExclusive": 34088488,
             "size": 62,
-            "sha256": "e0d5ff5d156e5844ec5660ea797b61196c82e6ec62ff629d31662314a5c4d4e3"
+            "sha256": "2ee58281b483f82f4c533e8af8d7172ac3f67d2144db64c45373ce0d40cf0ea4"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1027,7 +1027,8 @@
             "module": "golang.org/x/oauth2",
             "version": "v0.36.0",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "0bb00ef77a8c97e44fed7ac4456f03b7a397ccb296e3cb29d63b7805882d4ab8"
+            "compilerMetadataLineSha256": "0bb00ef77a8c97e44fed7ac4456f03b7a397ccb296e3cb29d63b7805882d4ab8",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         },
         {
@@ -1037,10 +1038,10 @@
           "startColumn": 13,
           "endColumn": 71,
           "span": {
-            "byteStart": 34089174,
-            "byteEndExclusive": 34089233,
+            "byteStart": 34089173,
+            "byteEndExclusive": 34089232,
             "size": 59,
-            "sha256": "1b686c05bacd8042d0abfe4aff813a761ae012c78c505edf96572f2c7978773b"
+            "sha256": "0dc6416576ad20cc049ed318a3c908a88bb22efdc607f700f0c1fdf4ef3f9631"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1051,7 +1052,8 @@
             "module": "k8s.io/api",
             "version": "v0.37.0",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "0677ee5d84dff85410c8955ea3f911e6b729cd0eab4d2abe7b5a03546b0aef00"
+            "compilerMetadataLineSha256": "0677ee5d84dff85410c8955ea3f911e6b729cd0eab4d2abe7b5a03546b0aef00",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         },
         {
@@ -1061,10 +1063,10 @@
           "startColumn": 13,
           "endColumn": 91,
           "span": {
-            "byteStart": 34089245,
-            "byteEndExclusive": 34089324,
+            "byteStart": 34089244,
+            "byteEndExclusive": 34089323,
             "size": 79,
-            "sha256": "0d35edae5ac890b0b3e088458b696d796ec7022168f92f2e12b1c4c62cb39606"
+            "sha256": "87aa14161fbf37f6b772ff6be2bdd4d78db6869d879a688c48d99790319c2c20"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1075,7 +1077,8 @@
             "module": "k8s.io/apiextensions-apiserver",
             "version": "v0.37.0",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "537534898288853f4ab1bfe2211edc56ebacab71d2112970a05fa7d9b30e328c"
+            "compilerMetadataLineSha256": "537534898288853f4ab1bfe2211edc56ebacab71d2112970a05fa7d9b30e328c",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         },
         {
@@ -1085,10 +1088,10 @@
           "startColumn": 13,
           "endColumn": 80,
           "span": {
-            "byteStart": 34089336,
-            "byteEndExclusive": 34089404,
+            "byteStart": 34089335,
+            "byteEndExclusive": 34089403,
             "size": 68,
-            "sha256": "569b5962689f2fcac510c8912f90b08ff234b5244ed5658c97cb6fccaf54a87b"
+            "sha256": "00b2d785540fa388711025f8fd8e728befa3be9ec187412d69bb3a1172e8ae0e"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1099,7 +1102,8 @@
             "module": "k8s.io/apimachinery",
             "version": "v0.37.0",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "9e82b740a89ae464e7897127082e4de7f4565090516eb4dd964f87ceb02d6b7f"
+            "compilerMetadataLineSha256": "9e82b740a89ae464e7897127082e4de7f4565090516eb4dd964f87ceb02d6b7f",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         },
         {
@@ -1109,10 +1113,10 @@
           "startColumn": 13,
           "endColumn": 77,
           "span": {
-            "byteStart": 34089416,
-            "byteEndExclusive": 34089481,
+            "byteStart": 34089415,
+            "byteEndExclusive": 34089480,
             "size": 65,
-            "sha256": "a74e4370dfcb83640023a909516e922f49c0a1588b4e902c1238f7a7575bbfba"
+            "sha256": "49e265dbe8d2e632340a167a2a92f7ec482d9b9a6ab89f766648ae40cebf667f"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1123,7 +1127,8 @@
             "module": "k8s.io/apiserver",
             "version": "v0.37.0",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "856136993c4961e186cdcd2d815f29117a29c210cce4078c5791393fb68c1548"
+            "compilerMetadataLineSha256": "856136993c4961e186cdcd2d815f29117a29c210cce4078c5791393fb68c1548",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         },
         {
@@ -1133,10 +1138,10 @@
           "startColumn": 28,
           "endColumn": 86,
           "span": {
-            "byteStart": 34090379,
-            "byteEndExclusive": 34090438,
+            "byteStart": 34090378,
+            "byteEndExclusive": 34090437,
             "size": 59,
-            "sha256": "ba98d425c441a9f2f05dcf9a08607880229c2804a8c2f06b6ffa91b1d88f0c9a"
+            "sha256": "5637374c185013d9f498eef88cbcf9c04f9ec68e8f87fc4b41de575763c16a6d"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1147,7 +1152,8 @@
             "module": "sigs.k8s.io/kustomize/api",
             "version": "v0.21.1",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "ffdc84fa404382ff057a985c06d656c0b847b6654c5440159ef2e7d9a7611aba"
+            "compilerMetadataLineSha256": "ffdc84fa404382ff057a985c06d656c0b847b6654c5440159ef2e7d9a7611aba",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         },
         {
@@ -1157,10 +1163,10 @@
           "startColumn": 19,
           "endColumn": 80,
           "span": {
-            "byteStart": 64774134,
-            "byteEndExclusive": 64774196,
+            "byteStart": 64774133,
+            "byteEndExclusive": 64774195,
             "size": 62,
-            "sha256": "e0d5ff5d156e5844ec5660ea797b61196c82e6ec62ff629d31662314a5c4d4e3"
+            "sha256": "2ee58281b483f82f4c533e8af8d7172ac3f67d2144db64c45373ce0d40cf0ea4"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1171,7 +1177,8 @@
             "module": "golang.org/x/oauth2",
             "version": "v0.36.0",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "0bb00ef77a8c97e44fed7ac4456f03b7a397ccb296e3cb29d63b7805882d4ab8"
+            "compilerMetadataLineSha256": "0bb00ef77a8c97e44fed7ac4456f03b7a397ccb296e3cb29d63b7805882d4ab8",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         },
         {
@@ -1181,10 +1188,10 @@
           "startColumn": 13,
           "endColumn": 71,
           "span": {
-            "byteStart": 64774881,
-            "byteEndExclusive": 64774940,
+            "byteStart": 64774880,
+            "byteEndExclusive": 64774939,
             "size": 59,
-            "sha256": "1b686c05bacd8042d0abfe4aff813a761ae012c78c505edf96572f2c7978773b"
+            "sha256": "0dc6416576ad20cc049ed318a3c908a88bb22efdc607f700f0c1fdf4ef3f9631"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1195,7 +1202,8 @@
             "module": "k8s.io/api",
             "version": "v0.37.0",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "0677ee5d84dff85410c8955ea3f911e6b729cd0eab4d2abe7b5a03546b0aef00"
+            "compilerMetadataLineSha256": "0677ee5d84dff85410c8955ea3f911e6b729cd0eab4d2abe7b5a03546b0aef00",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         },
         {
@@ -1205,10 +1213,10 @@
           "startColumn": 13,
           "endColumn": 91,
           "span": {
-            "byteStart": 64774952,
-            "byteEndExclusive": 64775031,
+            "byteStart": 64774951,
+            "byteEndExclusive": 64775030,
             "size": 79,
-            "sha256": "0d35edae5ac890b0b3e088458b696d796ec7022168f92f2e12b1c4c62cb39606"
+            "sha256": "87aa14161fbf37f6b772ff6be2bdd4d78db6869d879a688c48d99790319c2c20"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1219,7 +1227,8 @@
             "module": "k8s.io/apiextensions-apiserver",
             "version": "v0.37.0",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "537534898288853f4ab1bfe2211edc56ebacab71d2112970a05fa7d9b30e328c"
+            "compilerMetadataLineSha256": "537534898288853f4ab1bfe2211edc56ebacab71d2112970a05fa7d9b30e328c",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         },
         {
@@ -1229,10 +1238,10 @@
           "startColumn": 13,
           "endColumn": 80,
           "span": {
-            "byteStart": 64775043,
-            "byteEndExclusive": 64775111,
+            "byteStart": 64775042,
+            "byteEndExclusive": 64775110,
             "size": 68,
-            "sha256": "569b5962689f2fcac510c8912f90b08ff234b5244ed5658c97cb6fccaf54a87b"
+            "sha256": "00b2d785540fa388711025f8fd8e728befa3be9ec187412d69bb3a1172e8ae0e"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1243,7 +1252,8 @@
             "module": "k8s.io/apimachinery",
             "version": "v0.37.0",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "9e82b740a89ae464e7897127082e4de7f4565090516eb4dd964f87ceb02d6b7f"
+            "compilerMetadataLineSha256": "9e82b740a89ae464e7897127082e4de7f4565090516eb4dd964f87ceb02d6b7f",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         },
         {
@@ -1253,10 +1263,10 @@
           "startColumn": 13,
           "endColumn": 77,
           "span": {
-            "byteStart": 64775123,
-            "byteEndExclusive": 64775188,
+            "byteStart": 64775122,
+            "byteEndExclusive": 64775187,
             "size": 65,
-            "sha256": "a74e4370dfcb83640023a909516e922f49c0a1588b4e902c1238f7a7575bbfba"
+            "sha256": "49e265dbe8d2e632340a167a2a92f7ec482d9b9a6ab89f766648ae40cebf667f"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1267,7 +1277,8 @@
             "module": "k8s.io/apiserver",
             "version": "v0.37.0",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "856136993c4961e186cdcd2d815f29117a29c210cce4078c5791393fb68c1548"
+            "compilerMetadataLineSha256": "856136993c4961e186cdcd2d815f29117a29c210cce4078c5791393fb68c1548",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         },
         {
@@ -1277,10 +1288,10 @@
           "startColumn": 28,
           "endColumn": 86,
           "span": {
-            "byteStart": 64776086,
-            "byteEndExclusive": 64776145,
+            "byteStart": 64776085,
+            "byteEndExclusive": 64776144,
             "size": 59,
-            "sha256": "ba98d425c441a9f2f05dcf9a08607880229c2804a8c2f06b6ffa91b1d88f0c9a"
+            "sha256": "5637374c185013d9f498eef88cbcf9c04f9ec68e8f87fc4b41de575763c16a6d"
           },
           "classification": "go_dependency_artifact_checksum_metadata",
           "sourceProof": {
@@ -1291,7 +1302,8 @@
             "module": "sigs.k8s.io/kustomize/api",
             "version": "v0.21.1",
             "compilerMetadataDuplicateVerified": true,
-            "compilerMetadataLineSha256": "ffdc84fa404382ff057a985c06d656c0b847b6654c5440159ef2e7d9a7611aba"
+            "compilerMetadataLineSha256": "ffdc84fa404382ff057a985c06d656c0b847b6654c5440159ef2e7d9a7611aba",
+            "coordinateConvention": "canonical_preceding_lf_index"
           }
         }
       ]
