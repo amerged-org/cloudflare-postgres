@@ -11,6 +11,7 @@ import {
   NodeRegionPolicy,
   ProviderInstanceId,
   CostedNodeApproval,
+  NodeMarkLost,
 } from "@pgcf/contracts/nodes";
 import { importBootstrapVerificationKeys } from "@pgcf/contracts/bootstrap-relay";
 import { z } from "zod";
@@ -27,6 +28,7 @@ import {
   reserveNodeAddition,
   verifyNodeCapacity,
   verifyNodeNetwork,
+  markNodeLost,
 } from "../domain/node-state.ts";
 import {
   bootstrapJobInput,
@@ -124,6 +126,14 @@ export async function getNodeAddition(
 ): Promise<Response> {
   await requireScope(c, "admin");
   return c.json(await readNodeAddition(c.env.DB, id));
+}
+export async function markLostNode(
+  c: ApiContext,
+  id: string,
+  raw: NodeMarkLost,
+): Promise<Response> {
+  await requireScope(c, "admin");
+  return c.json(await markNodeLost(c.env.DB, id, raw));
 }
 export async function listNodeAdditions(c: ApiContext): Promise<Response> {
   await requireScope(c, "admin");

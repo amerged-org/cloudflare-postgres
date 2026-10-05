@@ -14,6 +14,20 @@ export const ProviderInstanceId = z
     (value) =>
       /^[1-9]\d{0,19}$/.test(value) && BigInt(value) <= 18446744073709551615n,
   );
+export const NodeMarkLost = z.strictObject({
+  expected_node_uid: z.uuid(),
+  reason: z.string().trim().min(1).max(500),
+});
+export type NodeMarkLost = z.infer<typeof NodeMarkLost>;
+export const NodeLoss = z.strictObject({
+  node_id: NodeId,
+  region_id: RegionId,
+  node_uid: z.uuid(),
+  provider_instance_id: z.string().min(1).max(128).nullable(),
+  lost_at: Timestamp,
+  reason: z.string().min(1).max(500),
+});
+export type NodeLoss = z.infer<typeof NodeLoss>;
 const Selector = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/);
 const Hash = z.string().regex(/^[a-f0-9]{64}$/);
 const Reference = z.string().min(1).max(512);
