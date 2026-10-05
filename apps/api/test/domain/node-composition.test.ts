@@ -48,7 +48,7 @@ async function configured() {
   return { ...f, selection };
 }
 describe("node composition with actual Workers/D1", () => {
-  it("blocks rescue without verified network preparation even before a private job exists", async () => {
+  it("blocks RAM rescue without owned firewall readback even before a private job exists", async () => {
     const f = await configured(),
       instance = providerId();
     let addition = await reserveNodeAddition(env.DB, {

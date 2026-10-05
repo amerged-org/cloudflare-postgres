@@ -4,6 +4,7 @@ import { createHash, createPrivateKey, randomUUID } from "node:crypto";
 import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { constants, zstdCompressSync } from "node:zlib";
 import { parse, stringify } from "yaml";
 import {
   NodeBootstrapAuthority,
@@ -452,9 +453,47 @@ export function verifyRescue(spec: NodeBootstrapSpec, stdout: string) {
   }
 }
 
-export function networkKernelArg(spec: NodeBootstrapSpec) {
+type BootstrapNetworkSpec = Pick<NodeBootstrapSpec, "peer_ipv4"> & {
+  hardware: Pick<
+    NodeBootstrapSpec["hardware"],
+    "ipv4" | "gateway" | "prefix_length" | "dns"
+  >;
+};
+export function networkKernelArg(spec: BootstrapNetworkSpec) {
   const hardware = spec.hardware;
   return `ip=${hardware.ipv4}::${hardware.gateway}:${hardware.prefix_length}::eth0:off:${hardware.dns.join(":")}`;
+}
+function peerRoutes(spec: BootstrapNetworkSpec) {
+  const hardware = spec.hardware;
+  const prefix = (address: string) =>
+    address
+      .split(".")
+      .reduce((value, octet) => value * 256 + Number(octet), 0) >>>
+    (32 - hardware.prefix_length);
+  return (spec.peer_ipv4 ?? [])
+    .filter((address) => prefix(address) === prefix(hardware.ipv4))
+    .toSorted()
+    .map((address) => ({
+      destination: `${address}/32`,
+      gateway: hardware.gateway,
+    }));
+}
+export function bootstrapSchematic(spec: BootstrapNetworkSpec) {
+  const extraKernelArgs = [networkKernelArg(spec)];
+  const routes = peerRoutes(spec);
+  if (routes.length) {
+    const document = stringify({
+      apiVersion: "v1alpha1",
+      kind: "LinkConfig",
+      name: "eth0",
+      routes,
+    });
+    const compressed = zstdCompressSync(Buffer.from(document), {
+      params: { [constants.ZSTD_c_compressionLevel]: 3 },
+    });
+    extraKernelArgs.push(`talos.config.early=${compressed.toString("base64")}`);
+  }
+  return { customization: { extraKernelArgs } };
 }
 export function imageURL(spec: NodeBootstrapSpec) {
   return `https://factory.talos.dev/image/${spec.image.schematic_id}/v${TALOS_VERSION}/nocloud-amd64.raw.xz`;
@@ -714,11 +753,7 @@ export class BootstrapJob {
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          customization: {
-            extraKernelArgs: [networkKernelArg(this.input.spec)],
-          },
-        }),
+        body: JSON.stringify(bootstrapSchematic(this.input.spec)),
         signal: AbortSignal.any([
           this.abort.signal,
           AbortSignal.timeout(15_000),
@@ -940,7 +975,13 @@ export class BootstrapJob {
               {
                 deviceSelector: { hardwareAddr: hardware.mac },
                 addresses: [`${hardware.ipv4}/${hardware.prefix_length}`],
-                routes: [{ network: `${zero}/0`, gateway: hardware.gateway }],
+                routes: [
+                  { network: `${zero}/0`, gateway: hardware.gateway },
+                  ...peerRoutes(spec).map(({ destination, gateway }) => ({
+                    network: destination,
+                    gateway,
+                  })),
+                ],
                 dhcp: false,
               },
             ],

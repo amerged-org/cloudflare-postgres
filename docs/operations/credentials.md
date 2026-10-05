@@ -48,3 +48,36 @@ not change it during an unfinished restore.
 Record changed key IDs, dates and successful checks in private custody. Refresh the encrypted
 operator backup and its independent offline copy. Do not record secret values in `PLAN.md`, Git,
 logs or incident messages.
+
+## Talos and Kubernetes material
+
+Treat the complete Talos machine configuration as a secret. In Talos 1.14, the resource's `spec`
+is a YAML multi-document string. Parse it with strict type checks and inspect every document;
+the Kubernetes API/aggregator CAs, service-account signer, discovery secret and Secret-at-rest
+encryption key may live outside the legacy `machine`/`cluster` document. Emit field names and
+validation booleans only. A missing legacy field does not establish absence of the credential.
+
+The pinned [Talos CA command](https://github.com/siderolabs/talos/blob/v1.14.1/cmd/talosctl/cmd/talos/rotate-ca.go)
+supports separate Talos and Kubernetes API CA rotation. For Talos only, explicitly set
+`--talos=true --kubernetes=false`; both default to true. Start with `--dry-run=true` and an explicit
+current node topology. Capture **both** output streams directly to owner-only private files even
+in dry-run: the [Talos rotator](https://github.com/siderolabs/talos/blob/v1.14.1/pkg/rotate/pki/talos/talos.go)
+prints CA private keys and a new admin configuration. Dry-run skips configuration changes and
+actual new-key connectivity checks, so it is not rotation acceptance. Use `--dry-run=false` only
+for the planned live change, retaining the original configuration in encrypted offline custody.
+
+API CA rotation does not rotate etcd, node bootstrap/trustd tokens, discovery, aggregator,
+service-account or Secret-at-rest material. Plan these as separate targeted configuration changes.
+Etcd CA replacement can interrupt the control plane; retain a verified etcd snapshot and rehearse
+the exact change before applying it to an occupied node. Aggregator and service-account documents
+support accepted trust during a transition. For Secret-at-rest encryption, retain the old decrypt
+key until all stored Secrets have been rewritten with the new first key and verified readable;
+old etcd snapshots still need their original decrypt key in offline custody. Follow the
+[Kubernetes encryption procedure](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/).
+
+Coordinate any Talos/Kubernetes change with the encrypted region seed and join bundle before
+allowing another node to bootstrap. The current worker path selects join revision 1; replacing
+live trust alone leaves its retained bundle stale. Revision selection and exact readback must be
+implemented and checked before a coordinated rotation. Preserve the original ciphertext and all
+referenced credential-encryption keys, the region's cluster identity, existing Node/storage UIDs
+and the independent PGCF agent, R2 and Worker secrets.

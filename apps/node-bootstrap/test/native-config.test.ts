@@ -2,16 +2,18 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { chmod, mkdtemp, rm } from "node:fs/promises";
+import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { NodeBootstrapCallback } from "@pgcf/contracts/node-bootstrap";
+import { parseAllDocuments } from "yaml";
 import {
   BootstrapJob,
   canonical,
   runCommand,
   TALOS_VERSION,
+  inputHash,
 } from "../src/bootstrap.ts";
 import { authority, fixture } from "./fixture.ts";
 
@@ -22,6 +24,14 @@ test("pinned native client generates and validates both roles while recovered se
     "PGCF_TEST_TALOSCTL must select the checksum-verified Talos 1.14.1 client",
   );
   const input = fixture();
+  const samePrefixPeer = [192, 0, 3, 42].join(".");
+  const outsidePrefixPeer = [192, 0, 4, 42].join(".");
+  const spec = {
+    ...input.spec,
+    peer_ipv4: [outsidePrefixPeer, samePrefixPeer],
+    hardware: { ...input.spec.hardware, prefix_length: 23 },
+  };
+  Object.assign(input, { spec, input_hash: inputHash(spec) });
   const clientVersion = await runCommand({
     executable: client,
     args: [
@@ -148,6 +158,16 @@ test("pinned native client generates and validates both roles while recovered se
   });
   try {
     await Reflect.get(job, "prepareConfig").call(job, current);
+    const network = parseAllDocuments(
+      await readFile(join(directory, "network"), "utf8"),
+    )[0]!.toJSON();
+    assert.deepEqual(network.machine.network.interfaces[0].routes, [
+      {
+        network: Array(4).fill(0).join(".") + "/0",
+        gateway: spec.hardware.gateway,
+      },
+      { network: samePrefixPeer + "/32", gateway: spec.hardware.gateway },
+    ]);
     assert.equal(current.protected_material?.purpose, "region_seed");
     const first = current.protected_material;
     await Reflect.get(job, "prepareConfig").call(job, current);

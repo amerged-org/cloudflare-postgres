@@ -9,9 +9,10 @@ import {
   admissionAuthority,
 } from "./domain/bootstrap-jobs.ts";
 import { readNodeAddition } from "./domain/node-state.ts";
+import { hasVerifiedNodePreparation } from "./domain/node-network.ts";
 
 export class NodeBootstrap extends DurableObject<Env> {
-  async #register(operationId: string) {
+  async #register(operationId: string, admission = false) {
     OperationId.parse(operationId);
     if (!this.ctx.id.equals(this.env.NODE_BOOTSTRAP.idFromName(operationId)))
       throw new Error("bootstrap_container_identity_mismatch");
@@ -24,6 +25,15 @@ export class NodeBootstrap extends DurableObject<Env> {
       !["audited", "bootstrapping"].includes(addition.status)
     )
       throw new Error("bootstrap_job_closed");
+    if (
+      !admission &&
+      !(await hasVerifiedNodePreparation(
+        this.env.DB,
+        operationId,
+        addition.intent_hash,
+      ))
+    )
+      throw new Error("bootstrap_network_preparation_required");
     const input = await bootstrapJobInput(this.env, row),
       container = this.ctx.container;
     if (!container) throw new Error("bootstrap_container_unavailable");
@@ -75,7 +85,7 @@ export class NodeBootstrap extends DurableObject<Env> {
     const row = await readBootstrapJob(this.env.DB, operationId);
     if (!(await admissionAuthority(this.env, row)).admission_authorized)
       throw new Error("bootstrap_admission_not_authorized");
-    const { input, container } = await this.#register(operationId);
+    const { input, container } = await this.#register(operationId, true);
     const response = await container.getTcpPort(8080).fetch(
       new Request(`http://localhost:8080/v1/jobs/${operationId}/admit`, {
         method: "POST",

@@ -831,6 +831,80 @@ export async function ensureNodeNetwork(
   operationId: string,
   options: NodeNetworkOptions = {},
 ): Promise<boolean> {
+  return ensureNodePreparation(env, operationId, options, true);
+}
+
+/** Owned firewall readback permits only the provider's RAM-rescue action. */
+export async function ensureNodeFirewall(
+  env: NodeNetworkEnv,
+  operationId: string,
+  options: NodeNetworkOptions = {},
+): Promise<boolean> {
+  return ensureNodePreparation(env, operationId, options, false);
+}
+
+export async function hasVerifiedNodePreparation(
+  db: D1Database,
+  operationId: string,
+  intentHash: string,
+  now = Date.now(),
+): Promise<boolean> {
+  try {
+    if (
+      !OperationId.safeParse(operationId).success ||
+      !Hash.safeParse(intentHash).success ||
+      !Number.isSafeInteger(now)
+    )
+      return false;
+    const row = await db
+      .prepare(
+        `SELECT p.plan_json,p.plan_sha256,p.proof_sha256,p.proof_expires_at,p.readback_at,a.node_id,a.region_id,a.provider_instance_id
+       FROM node_network_preparations p JOIN node_additions a ON a.operation_id=p.operation_id
+       WHERE p.operation_id=? AND p.intent_hash=? AND p.intent_hash=a.intent_hash
+         AND p.status='verified' AND a.slot_held=1 AND a.status IN('audited','bootstrapping','ready')`,
+      )
+      .bind(operationId, intentHash)
+      .first<{
+        plan_json: string;
+        plan_sha256: string;
+        proof_sha256: string | null;
+        proof_expires_at: string | null;
+        readback_at: string | null;
+        node_id: string;
+        region_id: string;
+        provider_instance_id: string | null;
+      }>();
+    if (
+      !row ||
+      !Hash.safeParse(row.plan_sha256).success ||
+      !Hash.safeParse(row.proof_sha256).success ||
+      !Timestamp.safeParse(row.proof_expires_at).success ||
+      !Timestamp.safeParse(row.readback_at).success ||
+      Date.parse(row.proof_expires_at!) <= now ||
+      Date.parse(row.readback_at!) > now + 5000
+    )
+      return false;
+    const plan = JSON.parse(row.plan_json) as Plan;
+    return (
+      plan.version === 1 &&
+      plan.operation_id === operationId &&
+      plan.intent_hash === intentHash &&
+      plan.node_id === row.node_id &&
+      plan.region_id === row.region_id &&
+      plan.provider_instance_id === row.provider_instance_id &&
+      (await digest(plan)) === row.plan_sha256
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function ensureNodePreparation(
+  env: NodeNetworkEnv,
+  operationId: string,
+  options: NodeNetworkOptions,
+  requireProof: boolean,
+): Promise<boolean> {
   try {
     OperationId.parse(operationId);
     const now = options.now ?? Date.now,
@@ -913,8 +987,6 @@ export async function ensureNodeNetwork(
       preparation.readback_at = timestamp;
       preparation.revision++;
     }
-    const verified = await proof(env, preparation, plan, now());
-    if (!verified) return false;
     if (
       canonical(await makePlan(env, client, operationId, request)) !==
       canonical(plan)
@@ -939,6 +1011,14 @@ export async function ensureNodeNetwork(
       )
         return false;
     }
+    if (!requireProof)
+      return (
+        Number.isSafeInteger(now()) &&
+        now() >= started &&
+        Date.now() <= deadline
+      );
+    const verified = await proof(env, preparation, plan, now());
+    if (!verified) return false;
     const validAt = (time: number) =>
       Number.isSafeInteger(time) &&
       time >= started &&

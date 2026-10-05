@@ -90,6 +90,14 @@ export const NodeBootstrapSpec = z
     rescue_host_fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9+/]{43}$/),
     role: z.enum(["worker", "controlplane"]),
     hostname: z.string().regex(/^[a-z][a-z0-9-]{0,61}[a-z0-9]$/),
+    peer_ipv4: z
+      .array(z.ipv4())
+      .max(64)
+      .refine(
+        (peers) => new Set(peers).size === peers.length,
+        "peer addresses must be distinct",
+      )
+      .optional(),
     hardware: z.strictObject({
       mac: z.string().regex(/^(?:[a-f0-9]{2}:){5}[a-f0-9]{2}$/),
       ipv4: z.ipv4(),
@@ -131,6 +139,12 @@ export const NodeBootstrapSpec = z
     ]),
   })
   .superRefine((value, context) => {
+    if (value.peer_ipv4?.includes(value.hardware.ipv4)) {
+      context.addIssue({
+        code: "custom",
+        message: "peer routes cannot include the node's own address",
+      });
+    }
     if (value.role === "worker" && value.platform) {
       context.addIssue({
         code: "custom",

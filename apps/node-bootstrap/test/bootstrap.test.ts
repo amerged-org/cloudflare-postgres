@@ -5,6 +5,8 @@ import { test } from "node:test";
 import { writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { stringify } from "yaml";
+import { parse } from "yaml";
+import { zstdDecompressSync } from "node:zlib";
 import {
   NodeBootstrapCallback,
   NodeBootstrapAuthority,
@@ -149,6 +151,70 @@ test("job identity binds hardware and rejects missing SSH host evidence", () => 
     inputHash({ ...input.spec, hardware: { ...input.spec.hardware } }),
     input.input_hash,
   );
+});
+
+test("peer routes retain legacy input identity and refuse the node's own address", () => {
+  const input = fixture();
+  assert.deepEqual(NodeBootstrapSpec.parse(input.spec), input.spec);
+  assert.throws(() =>
+    NodeBootstrapSpec.parse({
+      ...input.spec,
+      peer_ipv4: [input.spec.hardware.ipv4],
+    }),
+  );
+});
+
+test("schematic verification puts only approved same-prefix peer routes in nonsecret early config", async () => {
+  const input = fixture();
+  const peer = [192, 0, 3, 42].join(".");
+  const outside = [192, 0, 4, 42].join(".");
+  const spec = {
+    ...input.spec,
+    peer_ipv4: [outside, peer],
+    hardware: { ...input.spec.hardware, prefix_length: 23 },
+  };
+  Object.assign(input, { spec, input_hash: inputHash(spec) });
+  let sent: { customization: { extraKernelArgs: string[] } } | undefined;
+  const job = new BootstrapJob(input, {
+    request: async (url, init) => {
+      assert.equal(String(url), "https://factory.talos.dev/schematics");
+      sent = JSON.parse(String(init?.body));
+      return Response.json({ id: input.spec.image.schematic_id });
+    },
+  });
+  await Reflect.get(job, "verifySchematic").call(job);
+  assert.equal(sent!.customization.extraKernelArgs[0], networkKernelArg(spec));
+  const early = sent!.customization.extraKernelArgs.find((argument) =>
+    argument.startsWith("talos.config.early="),
+  );
+  assert.ok(early, "same-prefix peers need a first-boot return route");
+  const document = parse(
+    zstdDecompressSync(
+      Buffer.from(early.slice("talos.config.early=".length), "base64"),
+    ).toString("utf8"),
+  );
+  assert.deepEqual(document, {
+    apiVersion: "v1alpha1",
+    kind: "LinkConfig",
+    name: "eth0",
+    routes: [{ destination: `${peer}/32`, gateway: spec.hardware.gateway }],
+  });
+  assert.ok(!JSON.stringify(sent).includes(input.rescue.ssh_private_key));
+});
+
+test("legacy schematic verification preserves the exact ip-only request", async () => {
+  const input = fixture();
+  let sent: unknown;
+  const job = new BootstrapJob(input, {
+    request: async (_url, init) => {
+      sent = JSON.parse(String(init?.body));
+      return Response.json({ id: input.spec.image.schematic_id });
+    },
+  });
+  await Reflect.get(job, "verifySchematic").call(job);
+  assert.deepEqual(sent, {
+    customization: { extraKernelArgs: [networkKernelArg(input.spec)] },
+  });
 });
 
 test("rescue permits only the exact single unmounted disk, network and RAM root", () => {

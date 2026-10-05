@@ -64,9 +64,14 @@ certificates end to end. Broken transport never replays a native command.
    canonical configuration hash, exact region, existing issued agent key, regional routing
    keyring, Tunnel token and scoped R2 credentials. These values are sealed, not returned in status.
    EU workers use the retained join bundle and do not install a second platform.
-5. Let the Workflow enforce firewall readback and bound network evidence before installation.
-   The node stays quarantined. Native checkpoints record an intent before disk writes or platform
-   mutations; resume reads exact owned state and does not blindly reinstall.
+5. Let the Workflow verify exact owned firewall rules, assignment and current readback before
+   requesting the provider's RAM rescue. RAM rescue supplies the retained host key and route
+   configuration so authenticated rescue access and actual network measurements can be collected.
+   Full fresh signed outside-allowlist scans and relay access controls remain required before
+   native installation starts. Direct Container start, authority callbacks, transport grants and
+   destructive checkpoints enforce that separate verified preparation. The node stays quarantined.
+   Native checkpoints record an intent before disk writes or platform mutations; resume reads exact
+   owned state and does not blindly reinstall.
 6. For US, the native flow installs Cilium, Flux, the five platform releases and regional services,
    and verifies the LVM/CSI registration. Retain the issued regional identity on retries.
 7. Generate actual preparation/post-join artifacts with
@@ -82,6 +87,13 @@ certificates end to end. Broken transport never replays a native command.
 For an interrupted native apply with missing resources, repair only the exact operation-owned
 resources, then resume readback. Do not reset checkpoints, replace immutable job input, erase
 receipts, rotate the agent key or repeat a disk-write intent to make the job advance.
+
+Preparation proofs have a short expiry. A multi-minute install can pause when its proof expires;
+collect fresh measurements and a signed artifact for the same operation and immutable network
+plan, then let normal verification renew the recorded proof. Resume with the same sealed input,
+credentials and native checkpoint, including saved write offsets. A renewed proof does not
+authorize restarting a disk write or resetting an uncertain checkpoint. Quarantine release keeps
+its separate fresh post-join network, Node identity and capacity proofs.
 
 ## Acceptance
 

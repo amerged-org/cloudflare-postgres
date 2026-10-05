@@ -28,6 +28,7 @@ import {
   bootstrapJobInput,
   configureBootstrapJob,
   readBootstrapJob,
+  type NodeBootstrapConfiguration,
 } from "../../src/domain/bootstrap-jobs.ts";
 import {
   bootstrapSpecHash,
@@ -69,7 +70,15 @@ const canonicalConfiguration = (value: unknown): string =>
               `${JSON.stringify(key)}:${canonicalConfiguration((value as Record<string, unknown>)[key])}`,
           )
           .join(",")}}`;
-async function prepared(withPlatform = true) {
+type BeforeBootstrapConfiguration = (value: {
+  addition: Awaited<ReturnType<typeof reserveNodeAddition>>;
+  configuration: NodeBootstrapConfiguration;
+  bindings: Env;
+}) => Promise<void>;
+async function prepared(
+  withPlatform = true,
+  beforeConfigure?: BeforeBootstrapConfiguration,
+) {
   const f = await fixture();
   await env.DB.prepare("DELETE FROM nodes WHERE id=?").bind(f.node).run();
   await env.DB.prepare("UPDATE regions SET provider_region='EU' WHERE id=?")
@@ -227,12 +236,24 @@ async function prepared(withPlatform = true) {
     ...env,
     NODE_BOOTSTRAP_CALLBACK_URL: `https://${["api", "invalid"].join(".")}/`,
   } as Env;
-  await configureBootstrapJob(bindings, addition.intent.operation_id, {
+  const configuration = {
     expected_revision: addition.revision,
     spec,
     rescue,
     ...(platform ? { platform } : {}),
-  });
+  };
+  if (!beforeConfigure) {
+    const value = { addition, configuration, bindings };
+    const plan = peerPlan(value);
+    delete configuration.spec.peer_ipv4;
+    await storePeerPlan(value, plan, { status: "verified" });
+  }
+  await beforeConfigure?.({ addition, configuration, bindings });
+  await configureBootstrapJob(
+    bindings,
+    addition.intent.operation_id,
+    configuration,
+  );
   const job = await readBootstrapJob(env.DB, addition.intent.operation_id),
     input = await bootstrapJobInput(bindings, job);
   const identity = {
@@ -245,6 +266,185 @@ async function prepared(withPlatform = true) {
   };
   return { ...f, addition, job, input, spec, bindings, identity };
 }
+type PeerConfiguration = Parameters<BeforeBootstrapConfiguration>[0];
+const approvedPeers = ["192.0.2.2", "198.51.100.3", "198.51.100.4"];
+function peerPlan(value: PeerConfiguration) {
+  const { addition, configuration, bindings } = value;
+  const target = configuration.spec;
+  bindings.BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID = "10001";
+  bindings.BOOTSTRAP_RELAY_ISSUER_REGION = target.region_id;
+  configuration.spec = NodeBootstrapSpec.parse({
+    ...target,
+    peer_ipv4: approvedPeers,
+  });
+  const addresses = (ipv4: string[]) => ({ ipv4, ipv6: [] });
+  const member = (
+    node_id: string,
+    provider_instance_id: string,
+    ipv4: string[],
+  ) => ({
+    node_id,
+    provider_instance_id,
+    firewall_id: crypto.randomUUID(),
+    addresses: addresses(ipv4),
+    primary: addresses(ipv4.slice(0, 1)),
+    ownership_sha256: hash(),
+    rules: { rules: { inbound: [] } },
+    rules_sha256: hash(),
+  });
+  return {
+    version: 1,
+    operation_id: target.operation_id,
+    node_id: target.node_id,
+    region_id: target.region_id,
+    provider_instance_id: target.provider_instance_id,
+    intent_hash: addition.intent_hash,
+    operators: addresses(["203.0.113.1/32"]),
+    relay: {
+      provider_instance_id: bindings.BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID,
+      addresses: addresses(["192.0.2.2", "198.51.100.3"]),
+    },
+    scan_control: { ipv4: "203.0.113.2", ipv6: "2001:db8::2", port: 443 },
+    members: [
+      member(target.node_id, target.provider_instance_id, [
+        target.hardware.ipv4,
+      ]),
+      member(newNodeId(), "10002", ["198.51.100.4", "198.51.100.3"]),
+    ],
+  };
+}
+async function storePeerPlan(
+  value: PeerConfiguration,
+  plan: ReturnType<typeof peerPlan>,
+  options: { status?: string; digest?: string } = {},
+) {
+  const json = canonicalConfiguration(plan);
+  const digest =
+    options.digest ??
+    bytesToHex(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(json)),
+      ),
+    );
+  const now = new Date().toISOString();
+  const verified = options.status === "verified";
+  await env.DB.prepare(
+    "INSERT INTO node_network_preparations(operation_id,intent_hash,plan_sha256,plan_json,status,readback_at,proof_sha256,proof_expires_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
+  )
+    .bind(
+      value.addition.intent.operation_id,
+      value.addition.intent_hash,
+      digest,
+      json,
+      options.status ?? "awaiting_proof",
+      verified ? now : null,
+      verified ? hash() : null,
+      verified ? new Date(Date.now() + 300_000).toISOString() : null,
+      now,
+      now,
+    )
+    .run();
+}
+describe("bootstrap peer routes", () => {
+  it("seals exactly the immutable regional and relay IPv4 peers", async () => {
+    const f = await prepared(true, async (value) => {
+      await storePeerPlan(value, peerPlan(value));
+    });
+    expect(f.input.spec.peer_ipv4).toEqual(approvedPeers);
+  });
+  it("refuses peer routes when the immutable network plan is missing", async () => {
+    let operation = "";
+    await expect(
+      prepared(true, async (value) => {
+        operation = value.addition.intent.operation_id;
+        peerPlan(value);
+      }),
+    ).rejects.toThrow("Peer routes require the immutable network preparation");
+    expect(
+      await env.DB.prepare(
+        "SELECT 1 present FROM node_bootstrap_jobs WHERE operation_id=?",
+      )
+        .bind(operation)
+        .first(),
+    ).toBeNull();
+  });
+  it("refuses an omitted approved peer before sealing", async () => {
+    await expect(
+      prepared(true, async (value) => {
+        await storePeerPlan(value, peerPlan(value));
+        value.configuration.spec.peer_ipv4 = approvedPeers.slice(0, -1);
+      }),
+    ).rejects.toThrow(
+      "Peer routes differ from the immutable network preparation",
+    );
+  });
+  it("refuses a forged peer outside the approved plan", async () => {
+    await expect(
+      prepared(true, async (value) => {
+        await storePeerPlan(value, peerPlan(value));
+        value.configuration.spec.peer_ipv4 = [
+          ...approvedPeers,
+          "203.0.113.200",
+        ];
+      }),
+    ).rejects.toThrow(
+      "Peer routes differ from the immutable network preparation",
+    );
+  });
+  it("refuses a blocked preparation", async () => {
+    await expect(
+      prepared(true, async (value) => {
+        await storePeerPlan(value, peerPlan(value), { status: "blocked" });
+      }),
+    ).rejects.toThrow("Peer routes require the immutable network preparation");
+  });
+  it("checks the full canonical plan digest", async () => {
+    await expect(
+      prepared(true, async (value) => {
+        await storePeerPlan(value, peerPlan(value), { digest: hash() });
+      }),
+    ).rejects.toThrow("Peer routes require the immutable network preparation");
+  });
+  it("binds the plan to the node addition intent", async () => {
+    await expect(
+      prepared(true, async (value) => {
+        const plan = peerPlan(value);
+        plan.intent_hash = hash();
+        await storePeerPlan(value, plan);
+      }),
+    ).rejects.toThrow("Peer routes require the immutable network preparation");
+  });
+  it("binds the relay to the configured provider identity", async () => {
+    await expect(
+      prepared(true, async (value) => {
+        await storePeerPlan(value, peerPlan(value));
+        value.bindings.BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID = "10003";
+      }),
+    ).rejects.toThrow("Peer routes require the immutable network preparation");
+  });
+  it("requires the actual target IPv4 in its network member", async () => {
+    await expect(
+      prepared(true, async (value) => {
+        const plan = peerPlan(value);
+        plan.members[0]!.addresses.ipv4 = ["203.0.113.250"];
+        await storePeerPlan(value, plan);
+      }),
+    ).rejects.toThrow("Peer routes require the immutable network preparation");
+  });
+  it("bounds the number of IPv4 addresses parsed per member", async () => {
+    await expect(
+      prepared(true, async (value) => {
+        const plan = peerPlan(value);
+        plan.members[1]!.addresses.ipv4.push(
+          "198.51.100.5",
+          "198.51.100.6",
+          "198.51.100.7",
+        );
+        await storePeerPlan(value, plan);
+      }),
+    ).rejects.toThrow("Peer routes require the immutable network preparation");
+  });
+});
 async function callback(
   f: Awaited<ReturnType<typeof prepared>>,
   value: unknown,

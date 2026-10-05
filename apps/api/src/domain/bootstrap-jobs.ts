@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   hashApiKey,
+  NodeId,
   OperationId,
+  RegionId,
   timingSafeEqual,
   bytesToHex,
 } from "@pgcf/contracts";
@@ -15,6 +17,7 @@ import {
   NodeBootstrapSpec,
   NodeBootstrapStatus,
 } from "@pgcf/contracts/node-bootstrap";
+import { ProviderInstanceId } from "@pgcf/contracts/nodes";
 import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
@@ -42,6 +45,7 @@ import {
   assertNodeRecoveryAuthority,
 } from "./node-state.ts";
 import { issueBootstrapTransport } from "./bootstrap-relay.ts";
+import { hasVerifiedNodePreparation } from "./node-network.ts";
 
 export const NodeBootstrapConfiguration = z.strictObject({
   expected_revision: z.number().int().positive(),
@@ -136,6 +140,7 @@ export async function configureBootstrapJob(
       "conflict",
       "Bootstrap identity must match the immutable audited node intent",
     );
+  await assertPeerRoutes(env, spec, addition);
   const inputHash = await bootstrapSpecHash(spec);
   if (
     value.platform &&
@@ -287,6 +292,116 @@ export async function configureBootstrapJob(
     );
   return bootstrapJobStatus(saved);
 }
+const PeerRouteAddresses = z.strictObject({
+  ipv4: z.array(z.ipv4()).max(4),
+  ipv6: z.array(z.ipv6()).max(4),
+});
+const PeerRoutePlan = z.looseObject({
+  version: z.literal(1),
+  operation_id: OperationId,
+  node_id: NodeId,
+  region_id: RegionId,
+  provider_instance_id: ProviderInstanceId,
+  intent_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  relay: z.looseObject({
+    provider_instance_id: ProviderInstanceId,
+    addresses: PeerRouteAddresses,
+  }),
+  members: z
+    .array(
+      z.looseObject({
+        node_id: NodeId,
+        provider_instance_id: ProviderInstanceId,
+        addresses: PeerRouteAddresses,
+      }),
+    )
+    .min(1)
+    .max(16),
+});
+async function assertPeerRoutes(
+  env: Env,
+  spec: NodeBootstrapSpec,
+  addition: Awaited<ReturnType<typeof readNodeAddition>>,
+): Promise<void> {
+  if (spec.peer_ipv4 === undefined) return;
+  const fail = (): never => {
+    throw new ApiError(
+      "conflict",
+      "Peer routes require the immutable network preparation",
+    );
+  };
+  const row = await env.DB.prepare(
+    "SELECT operation_id,intent_hash,plan_sha256,plan_json,status FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(spec.operation_id)
+    .first<{
+      operation_id: string;
+      intent_hash: string;
+      plan_sha256: string;
+      plan_json: string;
+      status: string;
+    }>();
+  if (
+    !row ||
+    row.status === "blocked" ||
+    row.intent_hash !== addition.intent_hash ||
+    new TextEncoder().encode(row.plan_json).length > 65536
+  )
+    return fail();
+  let document: unknown;
+  try {
+    document = JSON.parse(row.plan_json);
+  } catch {
+    return fail();
+  }
+  const parsed = PeerRoutePlan.safeParse(document);
+  // The digest covers every field of the retained plan, including firewall rules.
+  if (!parsed.success || (await materialHash(document)) !== row.plan_sha256)
+    return fail();
+  const plan = parsed.data;
+  if (
+    row.operation_id !== spec.operation_id ||
+    plan.operation_id !== spec.operation_id ||
+    plan.node_id !== spec.node_id ||
+    plan.region_id !== spec.region_id ||
+    plan.provider_instance_id !== spec.provider_instance_id ||
+    plan.intent_hash !== addition.intent_hash ||
+    spec.transport.mode !== "relay" ||
+    spec.transport.issuer_region_id !== env.BOOTSTRAP_RELAY_ISSUER_REGION ||
+    plan.relay.provider_instance_id !==
+      env.BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID ||
+    plan.relay.provider_instance_id === spec.provider_instance_id ||
+    new Set(plan.members.map((member) => member.node_id)).size !==
+      plan.members.length ||
+    new Set(plan.members.map((member) => member.provider_instance_id)).size !==
+      plan.members.length
+  )
+    return fail();
+  const target = plan.members.find(
+    (member) =>
+      member.node_id === spec.node_id &&
+      member.provider_instance_id === spec.provider_instance_id,
+  );
+  if (!target?.addresses.ipv4.includes(spec.hardware.ipv4)) return fail();
+  const expected = [
+    ...new Set([
+      ...plan.members
+        .filter((member) => member.node_id !== spec.node_id)
+        .flatMap((member) => member.addresses.ipv4),
+      ...plan.relay.addresses.ipv4,
+    ]),
+  ]
+    .filter((address) => address !== spec.hardware.ipv4)
+    .sort();
+  if (
+    expected.length !== spec.peer_ipv4.length ||
+    expected.some((address, index) => address !== spec.peer_ipv4![index])
+  )
+    throw new ApiError(
+      "conflict",
+      "Peer routes differ from the immutable network preparation",
+    );
+}
 async function materialHash(material: unknown) {
   const canonical = (value: unknown): string => {
     if (value === null || typeof value !== "object")
@@ -349,6 +464,19 @@ async function authority(
     ["ready", "cancelled"].includes(addition.status)
   )
     throw new ApiError("forbidden", "Bootstrap job is closed");
+  const admission = await admissionAuthority(env, row);
+  if (
+    !admission.admission_authorized &&
+    !(await hasVerifiedNodePreparation(
+      env.DB,
+      row.operation_id,
+      addition.intent_hash,
+    ))
+  )
+    throw new ApiError(
+      "forbidden",
+      "Verified network preparation is required for native installation",
+    );
   let material: NodeBootstrapAuthority["protected_material"] = null;
   if (row.material_ref_json) {
     const ref = JSON.parse(row.material_ref_json) as BootstrapCredentialRef;
@@ -414,6 +542,9 @@ export async function bootstrapCallback(
   if (envelope.kind === "read") return c.json(await authority(c.env, row));
   if (envelope.kind === "transport")
     return c.json(await issueBootstrapTransport(c.env, row, envelope.payload));
+  const currentAuthority = await authority(c.env, row);
+  if (!currentAuthority.authorized)
+    throw new ApiError("forbidden", "Bootstrap job is closed");
   if (envelope.expected_revision !== row.revision)
     throw new ApiError("conflict", "Bootstrap checkpoint revision changed");
   const input = await bootstrapJobInput(c.env, row);

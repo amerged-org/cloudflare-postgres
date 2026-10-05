@@ -10,6 +10,7 @@ import {
 } from "../../src/domain/node-state.ts";
 import {
   ensureNodeNetwork,
+  ensureNodeFirewall,
   canonicalNodePreparationProof,
   NODE_PREPARATION_SIGNATURE_DOMAIN,
   type NodeNetworkEnv,
@@ -296,6 +297,8 @@ async function setup(ipv6 = true) {
         ? {}
         : { now: typeof time === "function" ? time : () => time }),
     });
+  const firewall = () =>
+    ensureNodeFirewall(settings, addition.intent.operation_id, { fetcher });
   const settle = async () => {
     expect(await run()).toBe(false);
     expect(await run()).toBe(false);
@@ -406,6 +409,7 @@ async function setup(ipv6 = true) {
     state,
     addition,
     run,
+    firewall,
     settle,
     settings,
     calls,
@@ -507,13 +511,40 @@ it("acknowledges exact owned policy readback after explicit rejection without re
   expect(f.calls.filter((call) => call.method === "PUT")).toHaveLength(2);
 });
 
-it("preparation cannot authorize rescue without signed proof or reassign an already attached processing firewall", async () => {
+it("installation preparation requires signed proof and refuses an already attached processing firewall", async () => {
   const f = await setup();
   await f.settle();
   for (const firewall of f.firewalls.values())
     firewall.instanceStatus[0]!.status = "processing";
   expect(await f.run()).toBe(false);
   expect(f.calls.filter((call) => call.method === "POST")).toHaveLength(0);
+  expect(f.calls.some((call) => call.path.includes("/rescue"))).toBe(false);
+});
+
+it("separates fully read-back owned firewalls for RAM rescue from signed native installation authority", async () => {
+  const f = await setup();
+  await f.settle();
+  expect(await f.firewall()).toBe(true);
+  expect(await f.run()).toBe(false);
+  const row = await env.DB.prepare(
+    "SELECT status,proof_sha256,proof_expires_at,readback_at FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .first<{
+      status: string;
+      proof_sha256: string | null;
+      proof_expires_at: string | null;
+      readback_at: string | null;
+    }>();
+  expect(row).toMatchObject({
+    status: "awaiting_proof",
+    proof_sha256: null,
+    proof_expires_at: null,
+  });
+  expect(row?.readback_at).not.toBeNull();
+  for (const value of f.firewalls.values())
+    value.instanceStatus[0]!.status = "processing";
+  expect(await f.firewall()).toBe(false);
   expect(f.calls.some((call) => call.path.includes("/rescue"))).toBe(false);
 });
 

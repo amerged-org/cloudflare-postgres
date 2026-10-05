@@ -13,8 +13,13 @@ import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import { ContaboClient } from "../providers/contabo.ts";
-import { bootstrapJobInput, type BootstrapJobRow } from "./bootstrap-jobs.ts";
+import {
+  bootstrapJobInput,
+  admissionAuthority,
+  type BootstrapJobRow,
+} from "./bootstrap-jobs.ts";
 import { readNodeAddition } from "./node-state.ts";
+import { hasVerifiedNodePreparation } from "./node-network.ts";
 
 export function contaboClient(env: Env) {
   return new ContaboClient({
@@ -55,6 +60,18 @@ export async function issueBootstrapTransport(
   provider?: Pick<ContaboClient, "getInstance">,
 ): Promise<NodeBootstrapTransport> {
   const addition = await readNodeAddition(env.DB, row.operation_id);
+  if (
+    !(await admissionAuthority(env, row)).admission_authorized &&
+    !(await hasVerifiedNodePreparation(
+      env.DB,
+      row.operation_id,
+      addition.intent_hash,
+    ))
+  )
+    throw new ApiError(
+      "forbidden",
+      "Verified network preparation is required for native installation",
+    );
   if (
     !row.authorized ||
     row.admitted ||

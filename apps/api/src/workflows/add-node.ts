@@ -27,7 +27,10 @@ import {
   assertNodeRecoveryAuthority,
 } from "../domain/node-state.ts";
 import { placePendingDatabases } from "../domain/node-capacity.ts";
-import { ensureNodeNetwork } from "../domain/node-network.ts";
+import {
+  ensureNodeFirewall,
+  ensureNodeNetwork,
+} from "../domain/node-network.ts";
 import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
 
 function orderInput(
@@ -226,7 +229,7 @@ export async function ensureNodeRescue(
   if (job !== null && JSON.parse(job.checkpoint_json).stage !== "created")
     return Boolean(job.rescue_active);
   await assertNodeRecoveryAuthority(env.DB, addition);
-  if (!(await ensureNodeNetwork(env, operationId))) return false;
+  if (!(await ensureNodeFirewall(env, operationId))) return false;
   const client = provider ?? contaboClient(env);
   const actual = await client.getInstance(addition.provider_instance_id, {
     requestId: crypto.randomUUID(),
@@ -408,6 +411,8 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
                 !job.admitted &&
                 !job.cancelled
               ) {
+                if (!(await ensureNodeNetwork(this.env, id)))
+                  return { operation_id: id };
                 const current = await readNodeAddition(this.env.DB, id);
                 if (current.checkpoint === null)
                   await saveNodeBootstrapCheckpoint(

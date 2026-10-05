@@ -11,9 +11,28 @@ import {
   NodeJoinBundle,
   NodePlatformConfiguration,
   NodePlatformSpec,
+  NodeBootstrapSpec,
 } from "../src/node-bootstrap.ts";
 
 describe("private bootstrap contracts", () => {
+  it("keeps peer routes optional and bounds them to distinct IPv4 addresses", () => {
+    const peers = NodeBootstrapSpec.shape.peer_ipv4;
+    expect(peers.safeParse(undefined).success).toBe(true);
+    expect(peers.safeParse([[192, 0, 2, 44].join(".")]).success).toBe(true);
+    expect(
+      peers.safeParse(Array(2).fill([192, 0, 2, 44].join("."))).success,
+    ).toBe(false);
+    expect(peers.safeParse([["2001", "db8", "", "44"].join(":")]).success).toBe(
+      false,
+    );
+    expect(
+      peers.safeParse(
+        Array.from({ length: 65 }, (_, index) =>
+          [192, 0, 2, index + 1].join("."),
+        ),
+      ).success,
+    ).toBe(false);
+  });
   it("keeps regional configuration private and requires immutable platform sources", () => {
     const region = "region-dev";
     const kid = randomBytes(8).toString("hex");

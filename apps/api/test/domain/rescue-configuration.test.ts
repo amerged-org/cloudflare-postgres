@@ -74,7 +74,7 @@ async function setup() {
       observed_at: new Date().toISOString(),
     },
   );
-  vi.spyOn(network, "ensureNodeNetwork").mockResolvedValue(true);
+  vi.spyOn(network, "ensureNodeFirewall").mockResolvedValue(true);
   const calls: ContaboRescueInput[] = [];
   const get = vi.fn(async () => ({ id: instance, status: "running" }) as never);
   const rescue = vi.fn<ContaboClient["rescue"]>(async (_id, input) => {
