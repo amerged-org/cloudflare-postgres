@@ -22,6 +22,7 @@ export interface DatabaseRow {
   desired_state: DesiredState;
   observed_state: ObservedState;
   generation: number;
+  storage_generation?: number;
   observed_generation: number;
   status_message: string | null;
   archive_path: string;
@@ -86,6 +87,7 @@ export function databaseView(row: DatabaseRow): Database {
         : row.observed_state,
     suspension_reason: row.suspension_reason ?? null,
     generation: row.generation,
+    storage_generation: row.storage_generation ?? 1,
     observed_generation: row.observed_generation,
     status_message: row.status_message,
     health: {

@@ -219,6 +219,8 @@ export const Node = z
   .strictObject({
     id: NodeId,
     node_uid: z.uuid().nullable().optional(),
+    lost_at: Timestamp.nullable().optional(),
+    lost_reason: z.string().max(TEXT_MAX_LENGTH).nullable().optional(),
     region_id: RegionId,
     k8s_node_name: z.string().min(1).max(253),
     provider_instance_id: z.string().min(1).max(128).nullable(),
@@ -293,6 +295,7 @@ export const Database = z
     observed_state: ObservedState,
     suspension_reason: z.enum(["manual", "idle"]).nullable().optional(),
     generation: z.number().int().min(1),
+    storage_generation: z.number().int().positive().optional(),
     observed_generation: z.number().int().min(0),
     status_message: z.string().max(TEXT_MAX_LENGTH).nullable(),
     health: DatabaseHealth,
@@ -328,6 +331,12 @@ export const DatabaseResize = z
   .strictObject({ size_class_id: SizeClassId })
   .meta({ id: "DatabaseResize" });
 export type DatabaseResize = z.infer<typeof DatabaseResize>;
+
+export const DatabaseRestore = z.discriminatedUnion("mode", [
+  z.strictObject({ mode: z.literal("full"), name: DatabaseName }),
+  z.strictObject({ mode: z.literal("pitr"), name: DatabaseName, target_time: Timestamp }),
+]).meta({ id: "DatabaseRestore" });
+export type DatabaseRestore = z.infer<typeof DatabaseRestore>;
 
 // ---------- Roles and connection URIs ----------
 
@@ -369,6 +378,7 @@ export type ConnectionUri = z.infer<typeof ConnectionUri>;
 
 export const OPERATION_KINDS = [
   "database.create",
+  "database.restore",
   "database.delete",
   "database.resize",
   "database.suspend",
@@ -456,3 +466,6 @@ export const ApiKeyCreated = z
   .strictObject({ api_key: ApiKey, key: ApiKeyString })
   .meta({ id: "ApiKeyCreated" });
 export type ApiKeyCreated = z.infer<typeof ApiKeyCreated>;
+
+export const DatabaseRestored = z.strictObject({ target_database: Database, operation: Operation }).meta({ id: "DatabaseRestored" });
+export type DatabaseRestored = z.infer<typeof DatabaseRestored>;
