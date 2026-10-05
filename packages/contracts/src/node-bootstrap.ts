@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import { NodeId, OperationId, RegionId } from "./ids.ts";
+import { parseRouteKeyring } from "./route-token.ts";
 
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);
 const PrivateText = z
@@ -21,6 +22,62 @@ const Endpoint = z.url().refine((value) => {
     !url.password
   );
 });
+
+export const NodePlatformSpec = z.strictObject({
+  reviewed_commit: z.string().regex(/^[a-f0-9]{40}$/),
+  regional_image: z
+    .string()
+    .max(512)
+    .regex(/^[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}$/),
+  configuration_sha256: Digest,
+});
+export type NodePlatformSpec = z.infer<typeof NodePlatformSpec>;
+const RegionalCredential = z
+  .string()
+  .min(16)
+  .max(4096)
+  .refine(
+    (value) => !/\s/.test(value) && !value.includes(String.fromCharCode(0)),
+  );
+export const NodePlatformConfiguration = z
+  .strictObject({
+    version: z.literal(1),
+    region_id: RegionId,
+    api_host: z
+      .string()
+      .max(253)
+      .regex(
+        /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?$/,
+      ),
+    agent_key: RegionalCredential,
+    route_keyring: z
+      .string()
+      .min(1)
+      .max(16 * 1024)
+      .refine((value) => {
+        try {
+          parseRouteKeyring(value);
+          return true;
+        } catch {
+          return false;
+        }
+      }),
+    tunnel_token: RegionalCredential,
+    backup_s3: z.strictObject({
+      access_key_id: RegionalCredential,
+      secret_access_key: RegionalCredential,
+    }),
+  })
+  .refine(
+    (value) =>
+      new RegExp(`^pgcf_ak_${value.region_id}_[A-Za-z0-9_-]{43}$`).test(
+        value.agent_key,
+      ),
+    "regional agent identity mismatch",
+  );
+export type NodePlatformConfiguration = z.infer<
+  typeof NodePlatformConfiguration
+>;
 
 export const NodeBootstrapSpec = z
   .strictObject({
@@ -61,6 +118,7 @@ export const NodeBootstrapSpec = z
     cluster_endpoint: Endpoint,
     cluster_uid: z.string().min(1).max(128).nullable(),
     join_bundle_sha256: Digest.nullable(),
+    platform: NodePlatformSpec.optional(),
     transport: z.discriminatedUnion("mode", [
       z.strictObject({
         mode: z.literal("relay"),
@@ -73,6 +131,12 @@ export const NodeBootstrapSpec = z
     ]),
   })
   .superRefine((value, context) => {
+    if (value.role === "worker" && value.platform) {
+      context.addIssue({
+        code: "custom",
+        message: "workers join an existing platform",
+      });
+    }
     if (
       value.role === "worker" &&
       (!value.cluster_uid || !value.join_bundle_sha256)
@@ -166,6 +230,7 @@ export const NodeBootstrapInput = z.strictObject({
     ssh_host_fingerprint: z.string().regex(/^SHA256:[A-Za-z0-9+/]{43}$/),
   }),
   join_bundle: NodeJoinBundle.nullable(),
+  platform: NodePlatformConfiguration.optional(),
 });
 export type NodeBootstrapInput = z.infer<typeof NodeBootstrapInput>;
 
@@ -217,6 +282,14 @@ export const NodeBootstrapStage = z.enum([
   "talos_authenticated",
   "kubernetes_bootstrap_intent",
   "kubernetes_joined",
+  "cilium_install_intent",
+  "cilium_installed",
+  "flux_install_intent",
+  "flux_installed",
+  "platform_sync_intent",
+  "platform_ready",
+  "regional_install_intent",
+  "regional_ready",
   "awaiting_verification",
   "quarantine_release_intent",
   "quarantine_released",
