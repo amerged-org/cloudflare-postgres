@@ -28,6 +28,40 @@ import {
 
 import { authority, fixture } from "./fixture.ts";
 
+async function installationMustRemainReadOnly(
+  stage: "quarantine_release_intent" | "quarantine_released",
+) {
+  const input = fixture();
+  const current = authority(input);
+  current.checkpoint = { ...current.checkpoint, stage, status: "running" };
+  let commands = 0;
+  let writes = 0;
+  const job = new BootstrapJob(input, {
+    request: async (_url, init) => {
+      const message = NodeBootstrapCallback.parse(
+        JSON.parse(String(init?.body)),
+      );
+      if (message.kind !== "read") writes++;
+      return Response.json(current);
+    },
+    run: async () => {
+      commands++;
+      throw new Error("installation resumed after admission");
+    },
+  });
+  await job.start();
+  assert.equal(commands, 0);
+  assert.equal(writes, 0);
+}
+
+test("installation remains read-only when a restarted Container has a persisted quarantine release intent", async () => {
+  await installationMustRemainReadOnly("quarantine_release_intent");
+});
+
+test("installation remains read-only after quarantine release even if its status was later changed", async () => {
+  await installationMustRemainReadOnly("quarantine_released");
+});
+
 function rescueOutput(
   input: NodeBootstrapInput,
   override: Record<string, unknown> = {},
@@ -675,6 +709,34 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
       }
       if (command.executable === "kubectl" && args.includes("namespace"))
         return { exit_code: 0, stdout: JSON.stringify({ metadata: { uid } }) };
+      if (command.executable === "kubectl" && args.includes("deployment"))
+        return {
+          exit_code: 0,
+          stdout: JSON.stringify({
+            apiVersion: "apps/v1",
+            kind: "Deployment",
+            metadata: {
+              name: "coredns",
+              namespace: "kube-system",
+              uid: randomUUID(),
+              resourceVersion: "41",
+            },
+            spec: {
+              template: {
+                spec: {
+                  tolerations: [
+                    {
+                      key: "pgcf.io/quarantine",
+                      operator: "Equal",
+                      value: "bootstrap",
+                      effect: "NoSchedule",
+                    },
+                  ],
+                },
+              },
+            },
+          }),
+        };
       if (command.executable === "kubectl" && args.includes("node"))
         return {
           exit_code: 0,
