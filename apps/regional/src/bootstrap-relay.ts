@@ -8,6 +8,7 @@ import {
   BOOTSTRAP_RELAY_PATH,
   BOOTSTRAP_RELAY_IDENTITY_PATH,
   bootstrapRelayIdentitySchema,
+  bootstrapCapabilitySchema,
   bootstrapLiteralIpSchema,
   importBootstrapVerificationKeys,
   verifyBootstrapRelay,
@@ -35,6 +36,7 @@ export const BOOTSTRAP_RELAY_LIMITS = Object.freeze({
 export interface BootstrapRelayConfiguration {
   region: string;
   issuerRegion: string;
+  allowedTargetRegions: readonly string[];
   host: string;
   port: number;
   keys: BootstrapVerificationKeys;
@@ -64,6 +66,7 @@ export async function readBootstrapRelayConfiguration(
     "PGCF_BOOTSTRAP_RELAY_HOST",
     "PGCF_BOOTSTRAP_RELAY_PORT",
     "PGCF_BOOTSTRAP_RELAY_PUBLIC_KEYS",
+    "PGCF_BOOTSTRAP_RELAY_ALLOWED_TARGET_REGIONS",
   ];
   if (
     Object.keys(env).some(
@@ -76,11 +79,16 @@ export async function readBootstrapRelayConfiguration(
   const host = bootstrapLiteralIpSchema.parse(env.PGCF_BOOTSTRAP_RELAY_HOST);
   if (!/^[1-9][0-9]{0,4}$/.test(env.PGCF_BOOTSTRAP_RELAY_PORT!)) invalid();
   const port = boundedInteger(Number(env.PGCF_BOOTSTRAP_RELAY_PORT), 1, 65535);
+  if (env.PGCF_BOOTSTRAP_RELAY_ALLOWED_TARGET_REGIONS!.length > 2048) invalid();
   const identity = bootstrapRelayIdentitySchema.parse({
     v: 1,
     region: env.PGCF_BOOTSTRAP_RELAY_REGION,
     issuer_region: env.PGCF_BOOTSTRAP_RELAY_ISSUER_REGION,
     relay_epoch: randomUUID(),
+    allowed_target_regions: JSON.parse(
+      env.PGCF_BOOTSTRAP_RELAY_ALLOWED_TARGET_REGIONS!,
+    ),
+    capabilities: bootstrapCapabilitySchema.options,
   });
   if (env.PGCF_BOOTSTRAP_RELAY_PUBLIC_KEYS!.length > 2048) invalid();
   const keys = await importBootstrapVerificationKeys(
@@ -89,6 +97,7 @@ export async function readBootstrapRelayConfiguration(
   return {
     region: identity.region,
     issuerRegion: identity.issuer_region,
+    allowedTargetRegions: identity.allowed_target_regions,
     host,
     port,
     keys,
@@ -120,6 +129,7 @@ export function createBootstrapRelay(
         ![
           "region",
           "issuerRegion",
+          "allowedTargetRegions",
           "host",
           "port",
           "keys",
@@ -136,6 +146,8 @@ export function createBootstrapRelay(
     region: configuration.region,
     issuer_region: configuration.issuerRegion,
     relay_epoch: randomUUID(),
+    allowed_target_regions: configuration.allowedTargetRegions,
+    capabilities: bootstrapCapabilitySchema.options,
   });
   bootstrapLiteralIpSchema.parse(configuration.host);
   boundedInteger(configuration.port, 0, 65535);
@@ -246,6 +258,7 @@ export function createBootstrapRelay(
         region: identity.region,
         issuer_region: identity.issuer_region,
         relay_epoch: identity.relay_epoch,
+        allowedTargetRegions: identity.allowed_target_regions,
       });
       if (!checked.ok) {
         reject(socket, 401);

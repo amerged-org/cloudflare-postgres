@@ -32,7 +32,7 @@ async function fixture() {
     operation: newOperationId(),
     node: newNodeId(),
     region: "eu-test",
-    issuer_region: "eu-control",
+    issuer_region: "eu-test",
     relay_epoch: randomUUID(),
     revision: 1,
     capability: "rescue_ssh" as const,
@@ -47,6 +47,7 @@ async function fixture() {
       region: input.region,
       issuer_region: input.issuer_region,
       relay_epoch: input.relay_epoch,
+      allowedTargetRegions: [input.region],
       now: input.now,
     },
   };
@@ -251,4 +252,94 @@ test("verification-key import refuses empty, oversized, private-key-shaped and u
       ]),
     }),
   );
+});
+
+test("an EU issuer may use its own relay epoch for an explicitly allowed US target", async () => {
+  const f = await fixture();
+  const token = await signBootstrapRelay({
+    ...f.input,
+    region: "us-test",
+    issuer_region: "eu-test",
+  });
+  const expected = {
+    ...f.expected,
+    region: "eu-test",
+    issuer_region: "eu-test",
+    allowedTargetRegions: ["eu-test", "us-test"],
+  };
+  assert.equal((await verifyBootstrapRelay(token, expected)).ok, true);
+});
+
+test("a signed target in an unconfigured third region is refused", async () => {
+  const f = await fixture(),
+    token = await signBootstrapRelay({ ...f.input, region: "ap-test" });
+  assert.equal(
+    (
+      await verifyBootstrapRelay(token, {
+        ...f.expected,
+        allowedTargetRegions: ["eu-test", "us-test"],
+      })
+    ).ok,
+    false,
+  );
+});
+test("cross-region permission does not admit a mismatched issuer, epoch or signature", async () => {
+  const f = await fixture(),
+    expected = { ...f.expected, allowedTargetRegions: ["eu-test", "us-test"] };
+  const wrongIssuer = await signBootstrapRelay({
+    ...f.input,
+    region: "us-test",
+    issuer_region: "us-test",
+  });
+  assert.equal((await verifyBootstrapRelay(wrongIssuer, expected)).ok, false);
+  const wrongEpoch = await signBootstrapRelay({
+    ...f.input,
+    region: "us-test",
+    relay_epoch: randomUUID(),
+  });
+  assert.equal((await verifyBootstrapRelay(wrongEpoch, expected)).ok, false);
+  const other = await fixture(),
+    wrongSignature = await signBootstrapRelay({
+      ...f.input,
+      region: "us-test",
+      privateKey: other.pair.privateKey,
+    });
+  assert.equal(
+    (await verifyBootstrapRelay(wrongSignature, expected)).ok,
+    false,
+  );
+});
+test("missing, empty, duplicate and wildcard target allowlists never grant implicit access", async () => {
+  const f = await fixture(),
+    token = await signBootstrapRelay(f.input);
+  assert.equal(
+    (
+      await verifyBootstrapRelay(token, {
+        ...f.expected,
+        allowedTargetRegions: [],
+      })
+    ).ok,
+    false,
+  );
+  assert.equal(
+    (
+      await verifyBootstrapRelay(token, {
+        ...f.expected,
+        allowedTargetRegions: ["*"],
+      })
+    ).ok,
+    false,
+  );
+  assert.equal(
+    (
+      await verifyBootstrapRelay(token, {
+        ...f.expected,
+        allowedTargetRegions: ["eu-test", "eu-test"],
+      })
+    ).ok,
+    false,
+  );
+  const missing = { ...f.expected };
+  delete (missing as Partial<typeof missing>).allowedTargetRegions;
+  assert.equal((await verifyBootstrapRelay(token, missing)).ok, false);
 });

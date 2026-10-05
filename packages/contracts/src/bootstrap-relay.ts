@@ -20,14 +20,33 @@ const kid = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/);
 export const bootstrapLiteralIpSchema = z
   .union([z.ipv4(), z.ipv6()])
   .refine((value) => !value.includes("%"));
-export const bootstrapRelayIdentitySchema = z.strictObject({
+export const bootstrapTargetRegionsSchema = z
+  .array(RegionId)
+  .min(1)
+  .max(16)
+  .refine((regions) => new Set(regions).size === regions.length);
+const relayScopeFields = {
   v: z.literal(1),
   region: RegionId,
   issuer_region: RegionId,
   relay_epoch: z.uuid(),
-});
-export const bootstrapRelayClaimsSchema = bootstrapRelayIdentitySchema
-  .extend({
+};
+export const bootstrapRelayIdentitySchema = z
+  .strictObject({
+    ...relayScopeFields,
+    allowed_target_regions: bootstrapTargetRegionsSchema,
+    capabilities: z
+      .array(bootstrapCapabilitySchema)
+      .min(1)
+      .max(3)
+      .refine(
+        (capabilities) => new Set(capabilities).size === capabilities.length,
+      ),
+  })
+  .refine((identity) => identity.issuer_region === identity.region);
+export const bootstrapRelayClaimsSchema = z
+  .strictObject({
+    ...relayScopeFields,
     purpose: z.literal("bootstrap"),
     operation: OperationId,
     node: NodeId,
@@ -143,9 +162,11 @@ export async function verifyBootstrapRelay(
   token: unknown,
   expected: {
     keys: BootstrapVerificationKeys;
+    /** Actual relay/issuer region; claims.region is the target region. */
     region: string;
     issuer_region: string;
     relay_epoch: string;
+    allowedTargetRegions: readonly string[];
     now?: number;
   },
 ): Promise<{ ok: true; claims: BootstrapRelayClaims } | { ok: false }> {
@@ -184,9 +205,6 @@ export async function verifyBootstrapRelay(
       key.type !== "public" ||
       key.algorithm.name !== "Ed25519" ||
       !key.usages.includes("verify") ||
-      claims.region !== expected.region ||
-      claims.issuer_region !== expected.issuer_region ||
-      claims.relay_epoch !== expected.relay_epoch ||
       now / 1000 < claims.iat ||
       now / 1000 >= claims.exp
     )
@@ -198,6 +216,17 @@ export async function verifyBootstrapRelay(
         Uint8Array.from(signature),
         encoder.encode(purpose + parts[1]),
       ))
+    )
+      return { ok: false };
+    const allowed = bootstrapTargetRegionsSchema.safeParse(
+      expected.allowedTargetRegions,
+    );
+    if (
+      !allowed.success ||
+      expected.issuer_region !== expected.region ||
+      claims.issuer_region !== expected.region ||
+      claims.relay_epoch !== expected.relay_epoch ||
+      !allowed.data.includes(claims.region)
     )
       return { ok: false };
     return { ok: true, claims };
