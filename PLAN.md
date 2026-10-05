@@ -88,13 +88,19 @@ image builds and passes all runtime checks. Its full scan covered 433,348,963 pa
 public-source review of the 19 native-binary findings; no unresolved findings remain. Native
 artifact checks bind whole-file SHA-256, size, profile and exact reviewed byte spans. Modified
 binaries, changed provenance and extra findings remain fatal. The repository secret check is
-clean. Published CI images, protected network preflight and real node bootstrap remain outstanding. The composed local
+clean. Protected network preflight and real node bootstrap remain outstanding. The composed local
 checks now pass: contracts 127, API 288, Edge 78, regional 367, native bootstrap 27, CLI 28,
 acceptance harness 198, infrastructure 21 and image/CI logic 58 tests, with zero skipped tests.
 The native Talos configuration check is mandatory in CI. Existing ready-database Edge fixtures
 now include actual node allocation; unplaced requests retain their distinct pending semantics.
 Read-only live inventory confirms that the initial EU node still needs a verified legacy
 provider-identity and protected join-custody import before the second node is admitted.
+The actual Dev D1 export restored locally with clean integrity and foreign-key checks. All four
+additive node-bootstrap migrations passed rehearsal against that export, then applied in Dev;
+all eight new tables remain empty, the existing node remains and no database is active. No
+provider mutation, order or server bootstrap was triggered. Bounded wake-PATCH diagnostics passed
+83 focused reconciliation tests; they preserve all retry and identity guards. Deployment and
+fresh cold-start measurements remain pending.
 
 The operational Cloudflare token was updated in place with no expiry; its value and all 23
 rights remained unchanged. Barman's R2 credential and PGCF admin/agent keys also have no expiry.
@@ -120,9 +126,10 @@ recorded. The completed instrumented trial had one base backup, 93 WAL objects a
 bytes verified against R2 and the API. Agent-restarted deletion took 104,099 ms and reclaimed
 all trial volumes and archive objects. Ordinary deletion retains archives; the harness purges
 its own objects separately. Awake-time accuracy passes; the cold-wake target and cost attribution
-remain open. The owner supplied a monthly Contabo amount of 13.55; it is recorded locally as
-owner-provided information. Its per-node assignment is being confirmed before writing immutable
-cost facts. Portal login is no longer a prerequisite for obtaining that supplied amount.
+remain open. The owner supplied 13.55 EUR per existing VPS per month; it remains an owner
+statement, with no invoice verification implied. Cost attribution is deferred and does not block
+the existing-node expansion. PGCF reports RAM, storage and consumption; adopter pricing and
+billing remain exclusively in the adopter repository.
 The production-ready
 release through Phase 5 and complete Neon replacement are not complete.
 
@@ -140,14 +147,8 @@ organization policy. This remains a Phase 5 publication prerequisite, not a pass
 The existing first-EU agent key, machine seed and join bundle have been encrypted locally with
 successful decryption checks; no replacement keys, D1 writes or VPS changes were made.
 
-Read-only Neon inventory for project names matching the adopter found 25 projects, 26 branches,
-26 databases and 97 password-authenticated roles. Project versions are 23 on PostgreSQL 17 and
-two on 18; project regions are 22 US East and three EU Central. Branch logical-size metadata
-totals 1,162,018,816 bytes. Eight already-active databases were inspected in explicit read-only
-transactions: 370,491,392 database bytes, 476 user tables and only `plpgsql` extensions.
-Seventeen idle endpoints were not queried through SQL. One endpoint-metadata request failed;
-adopter ownership mapping, remaining extensions, peak connection rates and migration timing are
-still unverified. These inventory counts are not a throughput or 1,000-customer capacity proof.
+Read-only adopter inventory is retained privately. Ownership mapping, remaining extensions,
+peak connection rates and migration timing still require verification before migration.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
 AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.
@@ -302,9 +303,9 @@ A node's allocatable resources are the Kubernetes allocatable values minus a mea
 reservation. Each database reserves:
 
 - **Storage:** its size class storage.
-- **Memory:** its size class memory, multiplied by `sleeping_reservation_factor` while it sleeps.
-  The default factor is 1.0, so a wake never fails for capacity reasons. Lowering it is a Phase 4
-  density decision, made after measurement and only together with relocation.
+- **Memory and CPU:** full size-class and sidecar reservations, including sleeping databases.
+  A sleeping reservation factor is not implemented. Reducing reservations requires measured
+  density and an explicit capacity check before wake; it must not silently overcommit a node.
 
 Placement picks the node with the most free memory in the region that fits. Contabo contracts are
 monthly, so scale-in only cancels at the end of a term, and autoscaling uses hysteresis.
@@ -712,10 +713,10 @@ Publish public images instead.
 
 **Cloudflare:**
 
-- Workers VPC is beta. HTTP services work through `fetch`. Raw TCP is documented through a
-  `vpc_networks` binding and `connect()`, which is plaintext, so TLS to PostgreSQL must be
-  negotiated by the caller; Hyperdrive is not required. Neither path has been tested in this
-  project yet; the Phase 1 transport spike decides. Only public CAs and Origin CA are trusted.
+- Workers VPC HTTP through the regional Tunnel is the accepted Dev transport, with native
+  WebSocket forwarding. VPC TCP was rejected for this path because the tested interface exposes
+  raw streams rather than a native WebSocket handoff. The gateway independently verifies
+  PostgreSQL TLS; the public PostgreSQL port remains closed. Tunnel routing tokens are the fallback.
 - Hyperdrive allows 25 configurations per account, so there is no Hyperdrive per database.
 - D1 strings and rows are limited to 2 MB.
 - Some tokens failed Wrangler D1 queries with error 7403 while REST and the dashboard worked.
