@@ -603,6 +603,29 @@ test("startup mismatch proof requires the exact Gateway SQLSTATE and error messa
   }
 });
 
+test("negative authentication acceptance requires exactly 28P01", () => {
+  assert.equal(typeof probe.passwordAuthenticationRejection, "function");
+  assert.doesNotThrow(() =>
+    probe.passwordAuthenticationRejection(
+      Object.assign(new Error("authentication rejected"), { code: "28P01" }),
+    ),
+  );
+  assert.throws(
+    () =>
+      probe.passwordAuthenticationRejection(
+        Object.assign(new Error("database absent"), { code: "3D000" }),
+      ),
+    { message: "negative_not_rejected_by_postgres" },
+  );
+  assert.throws(
+    () =>
+      probe.passwordAuthenticationRejection(
+        Object.assign(new Error("database unavailable"), { code: "57P03" }),
+      ),
+    { message: "negative_not_rejected_by_postgres" },
+  );
+});
+
 test("named startup mismatch handlers require authentication and a trace marker before metadata", async () => {
   const env = environment(new Date(Date.now() + 60_000).toISOString());
   const original = globalThis.fetch;

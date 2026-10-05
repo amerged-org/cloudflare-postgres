@@ -212,6 +212,11 @@ async function rejectsStartupMismatch(
   }
 }
 
+export function passwordAuthenticationRejection(error: unknown): void {
+  if ((error as { code?: unknown } | undefined)?.code !== "28P01")
+    throw new Error("negative_not_rejected_by_postgres");
+}
+
 async function rejects(uri: string, marker?: string): Promise<void> {
   const db = probePool(uri, marker);
   try {
@@ -219,9 +224,8 @@ async function rejects(uri: string, marker?: string): Promise<void> {
     try {
       await db.query("SELECT 1");
     } catch (error: unknown) {
-      // PostgreSQL errors prove protocol rejection; a network timeout does not.
-      const code = (error as { code?: string }).code;
-      rejected = ["28P01", "28000", "3D000", "57P03"].includes(code ?? "");
+      passwordAuthenticationRejection(error);
+      rejected = true;
     }
     if (!rejected) throw new Error("negative_not_rejected_by_postgres");
   } finally {
