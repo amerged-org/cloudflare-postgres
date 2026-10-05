@@ -32,6 +32,7 @@ const address = [127, 0, 0, 1].join(".");
 async function fixture(
   t: TestContext,
   options: {
+    allowedTargetRegions?: readonly string[];
     connections?: number;
     memoryBytes?: number;
     connectionMemoryBytes?: number;
@@ -61,10 +62,11 @@ async function fixture(
   await once(backend, "listening");
   const relay = createBootstrapRelay({
     region: "eu-test",
-    issuerRegion: "eu-control",
+    issuerRegion: "eu-test",
     host: address,
     port: 0,
     keys,
+    allowedTargetRegions: ["eu-test"],
     ...options,
   });
   relay.server.listen(0, address);
@@ -154,16 +156,50 @@ async function fixture(
   };
 }
 async function echo(client: WebSocket, value: Buffer) {
-  const response = once(client, "message");
+  const response = new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let received = 0;
+    const clean = () => {
+      client.off("message", message);
+      client.off("close", close);
+      client.off("error", error);
+    };
+    const error = () => {
+      clean();
+      reject(new Error("transport_failed"));
+    };
+    const close = () => {
+      clean();
+      reject(new Error("transport_truncated"));
+    };
+    const message = (bytes: Buffer, binary: boolean) => {
+      try {
+        assert.equal(binary, true);
+        assert.ok(Buffer.isBuffer(bytes));
+        received += bytes.length;
+        assert.ok(received <= value.length);
+        chunks.push(bytes);
+        if (received === value.length) {
+          clean();
+          resolve(Buffer.concat(chunks));
+        }
+      } catch (failure) {
+        clean();
+        reject(failure);
+      }
+    };
+    client.on("message", message);
+    client.once("close", close);
+    client.once("error", error);
+  });
   await new Promise<void>((resolve, reject) =>
     client.send(value, { binary: true, compress: false }, (error) =>
       error ? reject(error) : resolve(),
     ),
   );
-  const [bytes, binary] = await response;
-  assert.equal(binary, true);
-  assert.deepEqual(bytes, value);
+  assert.deepEqual(await response, value);
 }
+
 async function closed(client: WebSocket) {
   if (client.readyState === WebSocket.CLOSED) return;
   await new Promise<void>((resolve) => client.once("close", () => resolve()));
@@ -239,10 +275,11 @@ test("a used token cannot reconnect after disconnect and a fresh server epoch re
   assert.equal(f.dials(), 1);
   const replacement = createBootstrapRelay({
     region: "eu-test",
-    issuerRegion: "eu-control",
+    issuerRegion: "eu-test",
     host: address,
     port: 0,
     keys: f.keys,
+    allowedTargetRegions: ["eu-test"],
   });
   t.after(() => replacement.close());
   replacement.server.listen(0, address);
@@ -383,10 +420,11 @@ test("configuration and CLI reject private keys, unknown options and missing inp
   assert.throws(() =>
     createBootstrapRelay({
       region: "eu-test",
-      issuerRegion: "eu-control",
+      issuerRegion: "eu-test",
       host: address,
       port: 0,
       keys: new Map([["current", pair.privateKey]]),
+      allowedTargetRegions: ["eu-test"],
     }),
   );
   await assert.rejects(readBootstrapRelayConfiguration({}));
@@ -405,13 +443,36 @@ test("configuration and CLI reject private keys, unknown options and missing inp
   };
   const environment = {
     PGCF_BOOTSTRAP_RELAY_REGION: "eu-test",
-    PGCF_BOOTSTRAP_RELAY_ISSUER_REGION: "eu-control",
+    PGCF_BOOTSTRAP_RELAY_ISSUER_REGION: "eu-test",
     PGCF_BOOTSTRAP_RELAY_HOST: address,
     PGCF_BOOTSTRAP_RELAY_PORT: "50001",
     PGCF_BOOTSTRAP_RELAY_PUBLIC_KEYS: JSON.stringify(publicKeys),
+    PGCF_BOOTSTRAP_RELAY_ALLOWED_TARGET_REGIONS: JSON.stringify(["eu-test"]),
   };
   const configuration = await readBootstrapRelayConfiguration(environment);
   assert.equal(configuration.keys.get("current")!.type, "public");
+  await assert.rejects(
+    readBootstrapRelayConfiguration({
+      ...environment,
+      PGCF_BOOTSTRAP_RELAY_ALLOWED_TARGET_REGIONS: "[]",
+    }),
+  );
+  await assert.rejects(
+    readBootstrapRelayConfiguration({
+      ...environment,
+      PGCF_BOOTSTRAP_RELAY_ALLOWED_TARGET_REGIONS: JSON.stringify(["*"]),
+    }),
+  );
+  const missing = { ...environment };
+  delete (missing as Partial<typeof missing>)
+    .PGCF_BOOTSTRAP_RELAY_ALLOWED_TARGET_REGIONS;
+  await assert.rejects(readBootstrapRelayConfiguration(missing));
+  await assert.rejects(
+    readBootstrapRelayConfiguration({
+      ...environment,
+      PGCF_BOOTSTRAP_RELAY_ISSUER_REGION: "us-test",
+    }),
+  );
   await assert.rejects(
     readBootstrapRelayConfiguration({
       ...environment,
@@ -464,4 +525,64 @@ test("control-frame floods close only their admitted offender within the same me
   healthy.terminate();
   await closed(healthy);
   await drained(f.relay);
+});
+
+test("an EU relay advertises explicit US permission and forwards only that signed target scope", async (t) => {
+  const f = await fixture(t, { allowedTargetRegions: ["eu-test", "us-test"] });
+  const identity = (await fetch(f.base + BOOTSTRAP_RELAY_IDENTITY_PATH).then(
+    (response) => response.json(),
+  )) as typeof f.relay.identity;
+  assert.equal(identity.region, "eu-test");
+  assert.equal(identity.issuer_region, "eu-test");
+  assert.deepEqual(identity.allowed_target_regions, ["eu-test", "us-test"]);
+  assert.deepEqual(identity.capabilities, [
+    "rescue_ssh",
+    "talos_api",
+    "kubernetes_api",
+  ]);
+  const client = await f.open(
+    await signBootstrapRelay({ ...f.input, region: "us-test" }),
+  );
+  await echo(client, randomBytes(200));
+  assert.equal(f.dials(), 1);
+  client.terminate();
+  await closed(client);
+  await drained(f.relay);
+  assert.equal(
+    await f.rejected(
+      await signBootstrapRelay({ ...f.input, region: "ap-test" }),
+    ),
+    401,
+  );
+  assert.equal(
+    await f.rejected(
+      await signBootstrapRelay({
+        ...f.input,
+        region: "us-test",
+        issuer_region: "us-test",
+      }),
+    ),
+    401,
+  );
+  assert.equal(
+    await f.rejected(
+      await signBootstrapRelay({
+        ...f.input,
+        region: "us-test",
+        relay_epoch: randomUUID(),
+      }),
+    ),
+    401,
+  );
+  assert.equal(f.dials(), 1);
+});
+test("an EU-only relay refuses an unconfigured US target without contacting upstream", async (t) => {
+  const f = await fixture(t);
+  assert.equal(
+    await f.rejected(
+      await signBootstrapRelay({ ...f.input, region: "us-test" }),
+    ),
+    401,
+  );
+  assert.equal(f.dials(), 0);
 });
