@@ -32,6 +32,7 @@ const scanWorkerReasons = new Set([
   "node_network_scan_incomplete",
   "node_network_scan_inconclusive",
   "node_network_signature_invalid",
+  "node_network_source_changed",
   "node_network_source_inside_allowlist",
   "node_network_source_pool_unproven",
   "node_network_source_unproven",
@@ -635,13 +636,14 @@ export function completedScan(
     !family ||
     isIP(controls.before.source) !== family ||
     isIP(controls.before.address) !== family ||
-    ip(controls.before.source) !== ip(controls.after.source) ||
     ip(controls.before.address) !== ip(controls.after.address) ||
     controls.before.port !== controls.after.port ||
     controls.before.observed_at > startedAt ||
     controls.after.observed_at < startedAt
   )
     blocked("control_binding");
+  if (ip(controls.before.source) !== ip(controls.after.source))
+    blocked("source_changed");
   const open: number[] = [];
   let inconclusive = false;
   for (const result of results) {

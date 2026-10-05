@@ -186,6 +186,16 @@ test("complete native port completions require unique full coverage and bound ad
     65535,
   );
   assert.throws(
+    () =>
+      completedScan(
+        results,
+        { before: f.before, after: { ...f.after, source: address(9) } },
+        address(2),
+        started,
+      ),
+    { message: "node_network_source_changed" },
+  );
+  assert.throws(
     () => completedScan(results.slice(1), controls, address(2), started),
     /scan_incomplete/,
   );
@@ -303,6 +313,16 @@ test("scan worker diagnostics expose only a known internal reason", () => {
         },
       ]),
     { message: "node_network_tcp25_control_unproven" },
+  );
+  assert.throws(
+    () =>
+      assertScanWorkers([
+        {
+          status: "rejected",
+          reason: new Error("node_network_source_changed"),
+        },
+      ]),
+    { message: "node_network_source_changed" },
   );
   for (const reason of [
     new Error("connection failed https://private.example/key"),

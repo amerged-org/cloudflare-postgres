@@ -482,7 +482,7 @@ export async function measureScans(
           },
         );
         if (publicSource !== null && ip(scan.public_source) !== publicSource)
-          blocked("source_unproven");
+          blocked("source_changed");
         publicSource = ip(scan.public_source);
         scans[index] = {
           provider_instance_id: member.provider_instance_id,
