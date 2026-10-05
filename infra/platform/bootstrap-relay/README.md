@@ -3,8 +3,7 @@
 This optional deployment belongs on one explicitly selected existing VPS. It forwards native
 bootstrap connections from Cloudflare to approved VPS targets; Cloudflare remains the authority.
 Install it only after CI has qualified a regional image containing `/app/bootstrap-relay.mjs`,
-and replace the Kustomization's image digest with that qualified immutable digest. The existing
-regional image digest is a baseline, not proof that its relay entry point exists.
+and replace the Kustomization's image digest with that qualified immutable digest. The checked-in relay digest is the regional image qualified by CI run `37269991675`.
 
 The relay and its outbound cloudflared sidecar share host networking. The relay listens only on
 `127.0.0.1:8082`; the tunnel metrics listen only on `127.0.0.1:20242`. Host networking gives native
