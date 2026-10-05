@@ -1202,6 +1202,128 @@ export class BootstrapJob {
     if (!before || (await this.bootId()) === before)
       throw new BootstrapError("talos_reboot_unconfirmed");
   }
+  private async ensureCoreDNSQuarantineToleration(kube_system_uid: string) {
+    if (this.input.spec.role !== "controlplane") return;
+    const authority = await this.authority.read(this.abort.signal);
+    if (
+      authority.protected_material?.purpose !== "join_bundle" ||
+      authority.protected_material.material.kube_system_uid !== kube_system_uid
+    ) {
+      throw new BootstrapError("coredns_bundle_unsealed");
+    }
+    const namespace = record(
+      JSON.parse(
+        (await this.kube(["get", "namespace", "kube-system", "--output=json"]))
+          .stdout,
+      ),
+    );
+    if (record(namespace.metadata).uid !== kube_system_uid)
+      throw new BootstrapError("cluster_uid_mismatch");
+    const expected = {
+      key: "pgcf.io/quarantine",
+      operator: "Equal",
+      value: "bootstrap",
+      effect: "NoSchedule",
+    };
+    const read = async () => {
+      const deployment = record(
+        JSON.parse(
+          (
+            await this.kube([
+              "--namespace",
+              "kube-system",
+              "get",
+              "deployment",
+              "coredns",
+              "--output=json",
+            ])
+          ).stdout,
+        ),
+      );
+      const metadata = record(deployment.metadata);
+      if (
+        deployment.apiVersion !== "apps/v1" ||
+        deployment.kind !== "Deployment" ||
+        metadata.name !== "coredns" ||
+        metadata.namespace !== "kube-system" ||
+        typeof metadata.uid !== "string" ||
+        !metadata.uid ||
+        typeof metadata.resourceVersion !== "string" ||
+        !/^[0-9]+$/.test(metadata.resourceVersion)
+      ) {
+        throw new BootstrapError("coredns_identity_mismatch");
+      }
+      const value = record(
+        record(record(deployment.spec).template).spec,
+      ).tolerations;
+      const tolerations = value === undefined ? [] : array(value);
+      const scoped = tolerations.filter(
+        (toleration) => toleration.key === expected.key,
+      );
+      if (
+        scoped.length > 1 ||
+        scoped.some(
+          (toleration) => canonical(toleration) !== canonical(expected),
+        )
+      ) {
+        throw new BootstrapError("coredns_toleration_mismatch");
+      }
+      return {
+        uid: metadata.uid,
+        resource_version: metadata.resourceVersion,
+        tolerations,
+        defined: value !== undefined,
+        present: scoped.length === 1,
+      };
+    };
+    const before = await read();
+    if (before.present) return;
+    await this.authority.read(this.abort.signal);
+    const patch = [
+      { op: "test", path: "/metadata/uid", value: before.uid },
+      {
+        op: "test",
+        path: "/metadata/resourceVersion",
+        value: before.resource_version,
+      },
+      {
+        op: "add",
+        path: before.defined
+          ? "/spec/template/spec/tolerations/-"
+          : "/spec/template/spec/tolerations",
+        value: before.defined ? expected : [expected],
+      },
+    ];
+    try {
+      await this.kube(
+        [
+          "--namespace",
+          "kube-system",
+          "patch",
+          "deployment",
+          "coredns",
+          "--type=json",
+          "--patch-file=/dev/stdin",
+          "--output=json",
+        ],
+        true,
+        JSON.stringify(patch),
+      );
+    } catch {
+      /* A lost response is resolved by an authenticated read, without replay. */
+    }
+    const after = await read();
+    if (after.uid !== before.uid)
+      throw new BootstrapError("coredns_identity_mismatch");
+    if (
+      !after.present ||
+      canonical(
+        after.tolerations.filter((item) => item.key !== expected.key),
+      ) !== canonical(before.tolerations)
+    ) {
+      throw new BootstrapError("coredns_patch_unconfirmed");
+    }
+  }
   private async admissionNode(node_uid: string, kube_system_uid: string) {
     const namespace = record(
       JSON.parse(
@@ -1385,6 +1507,11 @@ export class BootstrapJob {
   async start() {
     let authority = await this.authority.read(this.abort.signal);
     if (
+      authority.checkpoint.stage === "quarantine_release_intent" ||
+      authority.checkpoint.stage === "quarantine_released"
+    )
+      return;
+    if (
       authority.checkpoint.status === "awaiting_verification" ||
       authority.checkpoint.status === "released"
     )
@@ -1508,6 +1635,7 @@ export class BootstrapJob {
           { purpose: "join_bundle", material: bundle },
           this.abort.signal,
         );
+        await this.ensureCoreDNSQuarantineToleration(uid);
       } else {
         const namespace = record(
           JSON.parse(

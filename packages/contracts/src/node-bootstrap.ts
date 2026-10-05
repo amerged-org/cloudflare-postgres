@@ -65,7 +65,6 @@ export const NodeBootstrapSpec = z
       z.strictObject({
         mode: z.literal("relay"),
         issuer_region_id: RegionId,
-        relay_epoch: z.uuid(),
       }),
       z.strictObject({
         mode: z.literal("operator_direct"),
@@ -119,13 +118,19 @@ const ClusterMaterial = {
   talos_machine_secrets_yaml: PrivateText,
   talos_admin_config: PrivateText,
 };
-export const NodeRegionSeed = z.strictObject(ClusterMaterial);
+const materialWithinLimit = (value: unknown) =>
+  new TextEncoder().encode(JSON.stringify(value)).length <= 256 * 1024;
+export const NodeRegionSeed = z
+  .strictObject(ClusterMaterial)
+  .refine(materialWithinLimit, "cluster material exceeds 256 KiB");
 export type NodeRegionSeed = z.infer<typeof NodeRegionSeed>;
-export const NodeJoinBundle = z.strictObject({
-  ...ClusterMaterial,
-  kube_system_uid: z.string().min(1).max(128),
-  kubeconfig: PrivateText,
-});
+export const NodeJoinBundle = z
+  .strictObject({
+    ...ClusterMaterial,
+    kube_system_uid: z.string().min(1).max(128),
+    kubeconfig: PrivateText,
+  })
+  .refine(materialWithinLimit, "cluster material exceeds 256 KiB");
 export type NodeJoinBundle = z.infer<typeof NodeJoinBundle>;
 export const NodeBootstrapMaterial = z.discriminatedUnion("purpose", [
   z.strictObject({
@@ -281,7 +286,6 @@ export const NodeBootstrapCallback = z.discriminatedUnion("kind", [
     kind: z.literal("transport"),
     payload: z.strictObject({
       capability: BootstrapCapability,
-      relay_epoch: z.uuid(),
     }),
   }),
 ]);
