@@ -8,8 +8,8 @@ verified and PostgreSQL has no public port. The second EU VPS is untouched; no U
 bought and no customer or platform database has been migrated.
 
 The deployed regional image is
-`sha256:905f3931af9b594b9fb9d90fedfc03f728ec3627e0f89626c1fde0db475dabb1`
-from source `100b78dc`. CI `37251067401` passed. Full qualification scanned all 657,689,605
+`sha256:14191e73d2bde4897856f1be7eeccca30a9d41f52e1665a818c6ecab2ba1483a`
+from source `efcdb759`. CI `37269991675` passed. Full qualification scanned all 658,527,296
 expected bytes; all 26 reviewed upstream noncredentials resolved, with zero unresolved findings.
 Image signing remains Phase 5 work.
 
@@ -71,6 +71,31 @@ stayed ready for 74 s despite the 60 s idle policy. On one always-warm Dev datab
 sequential new connections plus the first marker read had p50/p95/max 418.346/734.438/910.656 ms.
 This is a small warm-path measurement, not an application latency or load-capacity guarantee.
 
+Phase 3 preparation is being integrated locally; it is not live acceptance. Durable node
+reservations, one-time purchase dispatch claims and actual provider identity observations are
+implemented. The Contabo adapter passed 29 actual Workers-runtime tests; read-only Dev instance
+and firewall requests passed after preserving the provider's nullable fields and using supported
+redirect handling. No provider mutation or purchase was performed for these checks.
+The native installer passed 27 tests, including checksum-verified Talos configuration generation,
+an authenticated TLS API front proxy with the real relay, stale-capability rejection and an
+actual bundled entry-point launch. Three shared bootstrap contract tests passed. Relay process
+epochs belong to fresh capabilities, not immutable jobs; disconnects do not replay commands.
+All five pinned platform charts rendered, and all 14 platform workloads tolerate quarantine
+while customer PostgreSQL placement remains blocked. The optional fixed-source relay deployment,
+native package pins and separate image qualification job are prepared. The local Linux bootstrap
+image builds and passes all runtime checks. Its full scan covered 433,348,963 payload bytes and
+643,272,838 detector bytes without a coverage gap. All 39 findings resolved after independent
+public-source review of the 19 native-binary findings; no unresolved findings remain. Native
+artifact checks bind whole-file SHA-256, size, profile and exact reviewed byte spans. Modified
+binaries, changed provenance and extra findings remain fatal. The repository secret check is
+clean. Published CI images, protected network preflight and real node bootstrap remain outstanding. The composed local
+checks now pass: contracts 127, API 288, Edge 78, regional 367, native bootstrap 27, CLI 28,
+acceptance harness 198, infrastructure 21 and image/CI logic 58 tests, with zero skipped tests.
+The native Talos configuration check is mandatory in CI. Existing ready-database Edge fixtures
+now include actual node allocation; unplaced requests retain their distinct pending semantics.
+Read-only live inventory confirms that the initial EU node still needs a verified legacy
+provider-identity and protected join-custody import before the second node is admitted.
+
 The operational Cloudflare token was updated in place with no expiry; its value and all 23
 rights remained unchanged. Barman's R2 credential and PGCF admin/agent keys also have no expiry.
 Short-lived routing and control tokens retain their security deadlines.
@@ -98,6 +123,20 @@ its own objects separately. Awake-time accuracy passes; the cold-wake target and
 remain open. Contabo's invoice portal requires a separate active browser login before actual
 invoice facts can be read. The production-ready
 release through Phase 5 and complete Neon replacement are not complete.
+
+CI `37269991675` passed on `efcdb759`; both images built, passed runtime and full payload
+qualification, and were published. The new regional digest is
+`sha256:14191e73d2bde4897856f1be7eeccca30a9d41f52e1665a818c6ecab2ba1483a`.
+Anonymous manifest/config binding and all ten layer HEAD checks passed. Its full scan covered
+658,527,296 detector bytes with 26 resolved and zero unresolved findings. The first-EU agent and both gateway replicas now use this digest and remained
+continuously Ready for 62.150 seconds. The cluster still has one node and zero database namespaces.
+The native bootstrap digest is
+`sha256:7e9f45e90dfcf455bfe889dd43fb3bfe57c1af049f3bd3faad9796eca0811c6e`.
+Its published full scan covered 643,403,365 detector bytes, all 39 findings resolved and zero
+unresolved. Anonymous access is blocked: GitHub's package page disables public visibility by
+organization policy. This remains a Phase 5 publication prerequisite, not a passed public release.
+The existing first-EU agent key, machine seed and join bundle have been encrypted locally with
+successful decryption checks; no replacement keys, D1 writes or VPS changes were made.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
 AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.

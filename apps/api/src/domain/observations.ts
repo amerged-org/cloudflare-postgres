@@ -28,6 +28,7 @@ export function observationApplies(
   receivedAt: string,
 ): boolean {
   if (
+    row.node_id === null ||
     row.region_id !== regionId ||
     observation.generation !== row.generation ||
     observation.generation < row.observed_generation ||
@@ -96,18 +97,32 @@ export async function observations(
   )
     throw new ApiError("invalid_request", "Duplicate observation subject");
   for (const node of body.nodes) {
+    const reserved = await c.env.DB.prepare(
+      `SELECT node_id,provider_instance_id FROM node_additions WHERE region_id=? AND json_extract(intent_json,'$.requested_hostname')=? AND slot_held=1`,
+    )
+      .bind(region.id, node.name)
+      .first<{ node_id: string; provider_instance_id: string | null }>();
+    const verifiedIdentity =
+      reserved !== null &&
+      node.node_id === reserved.node_id &&
+      node.provider_instance_id === reserved.provider_instance_id &&
+      node.node_uid !== undefined;
     await c.env.DB.prepare(
-      `INSERT INTO nodes (id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(region_id,k8s_node_name) DO UPDATE SET ready=excluded.ready,allocatable_memory_mib=excluded.allocatable_memory_mib,
+      `INSERT INTO nodes (id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,schedulable,provider_instance_id,node_uid)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?) ON CONFLICT(region_id,k8s_node_name) DO UPDATE SET ready=CASE WHEN nodes.node_uid IS NOT NULL AND excluded.node_uid IS NOT NULL AND nodes.node_uid<>excluded.node_uid THEN 0 ELSE excluded.ready END,
+      schedulable=CASE WHEN nodes.node_uid IS NOT NULL AND excluded.node_uid IS NOT NULL AND nodes.node_uid<>excluded.node_uid THEN 0 ELSE nodes.schedulable END,
+      allocatable_memory_mib=excluded.allocatable_memory_mib,
       allocatable_cpu_millicores=excluded.allocatable_cpu_millicores,storage_gib_total=excluded.storage_gib_total,platform_reserved_memory_mib=excluded.platform_reserved_memory_mib,
       platform_reserved_cpu_millicores=excluded.platform_reserved_cpu_millicores,
+      provider_instance_id=CASE WHEN nodes.schedulable=0 AND nodes.id=excluded.id AND excluded.provider_instance_id IS NOT NULL THEN excluded.provider_instance_id ELSE nodes.provider_instance_id END,
+      node_uid=CASE WHEN nodes.node_uid IS NULL AND excluded.node_uid IS NOT NULL AND nodes.id=excluded.id THEN excluded.node_uid ELSE nodes.node_uid END,
       last_observed_at=excluded.last_observed_at,updated_at=excluded.updated_at WHERE excluded.updated_at>=nodes.updated_at`,
     )
       .bind(
-        newNodeId(),
+        reserved?.node_id ?? node.node_id ?? newNodeId(),
         region.id,
         node.name,
-        Number(node.ready),
+        Number(node.ready && (reserved === null || verifiedIdentity)),
         node.allocatable_memory_mib,
         node.allocatable_cpu_millicores,
         node.storage_gib_total,
@@ -116,6 +131,8 @@ export async function observations(
         body.observed_at,
         now,
         now,
+        verifiedIdentity ? node.provider_instance_id! : null,
+        verifiedIdentity ? node.node_uid! : null,
       )
       .run();
   }

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { newNodeId } from "@pgcf/contracts";
 import test from "node:test";
 import { inventoryPages } from "../../src/agent/kubernetes.ts";
 import {
@@ -65,6 +67,65 @@ test("node capacity uses measured dedicated LVM annotation and live pod reservat
     null,
   );
   assert.equal(quantity("500m"), 0.5);
+});
+
+test("node observations project only complete actual audited labels and Kubernetes UID", () => {
+  const nodeId = newNodeId();
+  const providerId = String(BigInt(Number.MAX_SAFE_INTEGER) + 2n);
+  const nodeUid = randomUUID();
+  const k8s = new MemoryKubernetes();
+  const node = k8s.put({
+    apiVersion: "v1",
+    kind: "Node",
+    metadata: {
+      name: "test-node",
+      labels: {
+        "pgcf.io/node-id": nodeId,
+        "pgcf.io/provider-instance-id": providerId,
+      },
+    },
+    status: {
+      allocatable: { memory: "8Gi", cpu: "3" },
+      conditions: [{ type: "Ready", status: "True" }],
+    },
+  });
+  node.metadata.uid = nodeUid;
+  const legacy = {
+    name: "test-node",
+    ready: true,
+    allocatable_memory_mib: 8192,
+    allocatable_cpu_millicores: 3000,
+    platform_reserved_memory_mib: 0,
+    platform_reserved_cpu_millicores: 0,
+    storage_gib_total: null,
+  };
+  assert.deepEqual(nodeObservations([node], [], [])[0], {
+    ...legacy,
+    node_id: nodeId,
+    provider_instance_id: providerId,
+    node_uid: nodeUid,
+  });
+  node.metadata.labels = {};
+  assert.deepEqual(nodeObservations([node], [], [])[0], legacy);
+  node.metadata.labels = { "pgcf.io/node-id": nodeId };
+  assert.deepEqual(nodeObservations([node], [], [])[0], legacy);
+  node.metadata.labels = {
+    "pgcf.io/node-id": "invalid",
+    "pgcf.io/provider-instance-id": providerId,
+  };
+  assert.deepEqual(nodeObservations([node], [], [])[0], legacy);
+  node.metadata.labels = {
+    "pgcf.io/node-id": nodeId,
+    "pgcf.io/provider-instance-id": "01",
+  };
+  assert.deepEqual(nodeObservations([node], [], [])[0], legacy);
+  node.metadata.labels["pgcf.io/provider-instance-id"] = String(2n ** 64n);
+  assert.deepEqual(nodeObservations([node], [], [])[0], legacy);
+  node.metadata.labels["pgcf.io/provider-instance-id"] = providerId;
+  node.metadata.uid = "invalid";
+  assert.deepEqual(nodeObservations([node], [], [])[0], legacy);
+  delete node.metadata.uid;
+  assert.deepEqual(nodeObservations([node], [], [])[0], legacy);
 });
 
 test("platform CPU measurement includes app, restartable init peak and overhead while excluding owned database and completed pods", () => {

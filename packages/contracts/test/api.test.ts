@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   ApiKeyCreate,
@@ -57,6 +58,13 @@ describe("node CPU measurement compatibility", () => {
       created_at: now,
       updated_at: now,
     };
+    expect(Node.parse(node).node_uid).toBeUndefined();
+    const uid = randomUUID();
+    expect(Node.parse({ ...node, node_uid: uid }).node_uid).toBe(uid);
+    expect(Node.parse({ ...node, node_uid: null }).node_uid).toBeNull();
+    expect(Node.safeParse({ ...node, node_uid: "invalid" }).success).toBe(
+      false,
+    );
     expect(Node.parse(node).platform_reserved_cpu_millicores).toBeUndefined();
     expect(
       Node.parse({ ...node, platform_reserved_cpu_millicores: null })

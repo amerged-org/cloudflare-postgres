@@ -2,6 +2,7 @@
 import { z } from "zod";
 import { gatewayActivityReportSchema } from "./gateway-activity.ts";
 import { UsageSample } from "./usage.ts";
+import { ProviderInstanceId } from "./nodes.ts";
 import {
   BucketName,
   OperationStatus,
@@ -15,6 +16,7 @@ import {
   DatabaseId,
   OPERATION_ID_PATTERN,
   OperationId,
+  NodeId,
   OWNER_ROLE_NAME,
   REGION_ID_PATTERN,
   RegionId,
@@ -247,6 +249,9 @@ export const DATABASE_OBSERVED_STATES = [
 ] as const;
 
 export const NodeObservation = z.strictObject({
+  node_id: NodeId.optional(),
+  provider_instance_id: ProviderInstanceId.optional(),
+  node_uid: z.uuid().optional(),
   name: K8sNodeName,
   ready: z.boolean(),
   allocatable_memory_mib: Count,

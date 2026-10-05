@@ -472,6 +472,522 @@
           "classification": "fixed_upstream_cryptographic_self_test_vector"
         }
       ]
+    },
+    {
+      "path": "usr/local/bin/talosctl",
+      "sha256": "7233ece94c94296a033a6ddb5efe0baf508a94c71de7e6c7b286500705924208",
+      "size": 118333602,
+      "layer": 7,
+      "tarEntry": 4,
+      "boundDigest": "sha256:904d7ff1de8ee66c8a6970fc6b7e6b1933ec0032e000a182d57fa0ecb0c56975",
+      "officialBaseMembership": false,
+      "nativeArtifact": {
+        "name": "talosctl",
+        "version": "1.14.1",
+        "architecture": "linux/amd64",
+        "releaseUrl": "https://github.com/siderolabs/talos/releases/download/v1.14.1/talosctl-linux-amd64",
+        "checksumUrl": "https://github.com/siderolabs/talos/releases/download/v1.14.1/sha256sum.txt",
+        "sha256": "7233ece94c94296a033a6ddb5efe0baf508a94c71de7e6c7b286500705924208",
+        "size": 118333602
+      },
+      "findings": [
+        {
+          "rule": "generic-api-key",
+          "startLine": 92235,
+          "endLine": 92235,
+          "startColumn": 3261,
+          "endColumn": 3305,
+          "span": {
+            "byteStart": 67440476,
+            "byteEndExclusive": 67440521,
+            "size": 45,
+            "sha256": "b023b1d0ff63e4c772a580d8a813040b429ef4f710c3e82129da1b74b63037c5"
+          },
+          "classification": "static_structural_error_literal_crosses_compiler_string_boundary",
+          "sourceProof": {
+            "sourceUrl": "https://raw.githubusercontent.com/ProtonMail/go-crypto/2e73b118bb72881b92b292f85cb2d057c3d7bef0/openpgp/packet/public_key.go",
+            "sourceSha256": "da3c885b946c792055a36bbfbeccabc65d51278f73854b788a954dda265af0e6",
+            "sourceLine": 326,
+            "literalSha256": "4bc01cd4e4a7e890f94e4adcb9bc712bc7971f60336b05c502ec2ca3647d86d0",
+            "literalSize": 60,
+            "compiledLiteralStart": 67440457,
+            "compiledLiteralEnd": 67440517,
+            "findingBytesWithinLiteral": 41,
+            "findingBytesBeyondLiteral": 4
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 107950,
+          "endLine": 107950,
+          "startColumn": 62,
+          "endColumn": 122,
+          "span": {
+            "byteStart": 70687991,
+            "byteEndExclusive": 70688052,
+            "size": 61,
+            "sha256": "a53e45c3465e78ab55519759688d798971983a9eacb55f10792f5e7f4bff8c51"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 45,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 107962,
+          "endLine": 107962,
+          "startColumn": 35,
+          "endColumn": 102,
+          "span": {
+            "byteStart": 70689162,
+            "byteEndExclusive": 70689230,
+            "size": 68,
+            "sha256": "2c67f2ae343140cce352feb312ef867438b6cbae572219d4d3bde940afe28b83"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://sum.golang.org/lookup/github.com/aws/aws-sdk-go-v2/credentials@v1.19.35",
+            "sourceSha256": "3aa2ca7d0f1b95133bf6a1317029da1d6b12b4a5db0369a1e3074056e6f282d4",
+            "sourceLine": 2,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 108000,
+          "endLine": 108000,
+          "startColumn": 24,
+          "endColumn": 103,
+          "span": {
+            "byteStart": 70692901,
+            "byteEndExclusive": 70692981,
+            "size": 80,
+            "sha256": "d694eedceb03bfe23c388c4eff7087528f206df0c90af47fcfaaa7b812f34e70"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 226,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 108088,
+          "endLine": 108088,
+          "startColumn": 27,
+          "endColumn": 85,
+          "span": {
+            "byteStart": 70700873,
+            "byteEndExclusive": 70700932,
+            "size": 59,
+            "sha256": "9e7c495d8d837958acb6245b90ebf32485fb89dc753ff1708510a6409b7d6ea6"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 645,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 108184,
+          "endLine": 108184,
+          "startColumn": 19,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 70709604,
+            "byteEndExclusive": 70709666,
+            "size": 62,
+            "sha256": "2ee58281b483f82f4c533e8af8d7172ac3f67d2144db64c45373ce0d40cf0ea4"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 1140,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 108203,
+          "endLine": 108203,
+          "startColumn": 13,
+          "endColumn": 71,
+          "span": {
+            "byteStart": 70711195,
+            "byteEndExclusive": 70711254,
+            "size": 59,
+            "sha256": "0dc6416576ad20cc049ed318a3c908a88bb22efdc607f700f0c1fdf4ef3f9631"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 1380,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 108204,
+          "endLine": 108204,
+          "startColumn": 13,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 70711266,
+            "byteEndExclusive": 70711334,
+            "size": 68,
+            "sha256": "00b2d785540fa388711025f8fd8e728befa3be9ec187412d69bb3a1172e8ae0e"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 1384,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 108217,
+          "endLine": 108217,
+          "startColumn": 28,
+          "endColumn": 86,
+          "span": {
+            "byteStart": 70712393,
+            "byteEndExclusive": 70712452,
+            "size": 59,
+            "sha256": "5637374c185013d9f498eef88cbcf9c04f9ec68e8f87fc4b41de575763c16a6d"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".rodata",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 1430,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 372755,
+          "endLine": 372755,
+          "startColumn": 62,
+          "endColumn": 122,
+          "span": {
+            "byteStart": 116556835,
+            "byteEndExclusive": 116556896,
+            "size": 61,
+            "sha256": "a53e45c3465e78ab55519759688d798971983a9eacb55f10792f5e7f4bff8c51"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 45,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 372767,
+          "endLine": 372767,
+          "startColumn": 35,
+          "endColumn": 102,
+          "span": {
+            "byteStart": 116558006,
+            "byteEndExclusive": 116558074,
+            "size": 68,
+            "sha256": "2c67f2ae343140cce352feb312ef867438b6cbae572219d4d3bde940afe28b83"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://sum.golang.org/lookup/github.com/aws/aws-sdk-go-v2/credentials@v1.19.35",
+            "sourceSha256": "3aa2ca7d0f1b95133bf6a1317029da1d6b12b4a5db0369a1e3074056e6f282d4",
+            "sourceLine": 2,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 372805,
+          "endLine": 372805,
+          "startColumn": 24,
+          "endColumn": 103,
+          "span": {
+            "byteStart": 116561745,
+            "byteEndExclusive": 116561825,
+            "size": 80,
+            "sha256": "d694eedceb03bfe23c388c4eff7087528f206df0c90af47fcfaaa7b812f34e70"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 226,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 372893,
+          "endLine": 372893,
+          "startColumn": 27,
+          "endColumn": 85,
+          "span": {
+            "byteStart": 116569717,
+            "byteEndExclusive": 116569776,
+            "size": 59,
+            "sha256": "9e7c495d8d837958acb6245b90ebf32485fb89dc753ff1708510a6409b7d6ea6"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 645,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 372989,
+          "endLine": 372989,
+          "startColumn": 19,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 116578448,
+            "byteEndExclusive": 116578510,
+            "size": 62,
+            "sha256": "2ee58281b483f82f4c533e8af8d7172ac3f67d2144db64c45373ce0d40cf0ea4"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 1140,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 373008,
+          "endLine": 373008,
+          "startColumn": 13,
+          "endColumn": 71,
+          "span": {
+            "byteStart": 116580039,
+            "byteEndExclusive": 116580098,
+            "size": 59,
+            "sha256": "0dc6416576ad20cc049ed318a3c908a88bb22efdc607f700f0c1fdf4ef3f9631"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 1380,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 373009,
+          "endLine": 373009,
+          "startColumn": 13,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 116580110,
+            "byteEndExclusive": 116580178,
+            "size": 68,
+            "sha256": "00b2d785540fa388711025f8fd8e728befa3be9ec187412d69bb3a1172e8ae0e"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 1384,
+            "compilerMetadataDuplicateVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 373022,
+          "endLine": 373022,
+          "startColumn": 28,
+          "endColumn": 86,
+          "span": {
+            "byteStart": 116581237,
+            "byteEndExclusive": 116581296,
+            "size": 59,
+            "sha256": "5637374c185013d9f498eef88cbcf9c04f9ec68e8f87fc4b41de575763c16a6d"
+          },
+          "classification": "go_dependency_artifact_checksum_metadata",
+          "sourceProof": {
+            "elfSection": ".go.buildinfo",
+            "sourceUrl": "https://raw.githubusercontent.com/siderolabs/talos/v1.14.1/go.sum",
+            "sourceSha256": "d4ef3991263015cfead9c71c4a690e15a8b71c05bf2a70537f40b627b3898cd1",
+            "sourceLine": 1430,
+            "compilerMetadataDuplicateVerified": true
+          }
+        }
+      ]
+    },
+    {
+      "path": "usr/local/bin/kubectl",
+      "sha256": "ebbd080e7c2e275093b55915722043257eb24004363e20acb3c4d71919f88336",
+      "size": 59556002,
+      "layer": 7,
+      "tarEntry": 3,
+      "boundDigest": "sha256:904d7ff1de8ee66c8a6970fc6b7e6b1933ec0032e000a182d57fa0ecb0c56975",
+      "officialBaseMembership": false,
+      "nativeArtifact": {
+        "name": "kubectl",
+        "version": "1.36.3",
+        "architecture": "linux/amd64",
+        "releaseUrl": "https://dl.k8s.io/release/v1.36.3/bin/linux/amd64/kubectl",
+        "checksumUrl": "https://dl.k8s.io/release/v1.36.3/bin/linux/amd64/kubectl.sha256",
+        "sha256": "ebbd080e7c2e275093b55915722043257eb24004363e20acb3c4d71919f88336",
+        "size": 59556002
+      },
+      "findings": [
+        {
+          "rule": "generic-api-key",
+          "startLine": 45323,
+          "endLine": 45323,
+          "startColumn": 149,
+          "endColumn": 201,
+          "span": {
+            "byteStart": 33134034,
+            "byteEndExclusive": 33134087,
+            "size": 53,
+            "sha256": "a9b8522ba6ceb94014c32956488232f149a7955657b9810bf55f0681e8a59cc0"
+          },
+          "classification": "compiler_packed_independent_protocol_and_display_literals",
+          "sourceProof": {
+            "sourceCommit": "0f29094e5b73085e3802ecc1298ecae13866bfe6",
+            "constantSize": 7,
+            "sourceParts": [
+              {
+                "partStart": 21,
+                "partEnd": 28,
+                "sourcePath": "cmd/kubeadm/app/phases/copycerts/copycerts.go",
+                "sourceLine": 133,
+                "sourceSha256": "c358cce7bca1a3418ead35006502180aaf01c2f46837390674385cd5b125f80c",
+                "literalSha256": "20e8cdb5b4093e18eb565f0a0c148e44da1f0b8c5447f27c47881675bfa86c10",
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/cmd/kubeadm/app/phases/copycerts/copycerts.go"
+              },
+              {
+                "partStart": 0,
+                "partEnd": 7,
+                "sourcePath": "pkg/apis/core/types.go",
+                "sourceLine": 6273,
+                "sourceSha256": "598aae11c7c8bea62e52d4d7d9270a6252d3d436d1176e898ac43b0215daa69b",
+                "literalSha256": "e981ddae45d8f4ca53f1ccbe613ad254a041dacf65a06026099a6302d332113b",
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/pkg/apis/core/types.go"
+              },
+              {
+                "partStart": 7,
+                "partEnd": 14,
+                "sourcePath": "pkg/kubelet/cm/pod_container_manager_linux.go",
+                "sourceLine": 184,
+                "sourceSha256": "73797b23f60f0f13fd412813116ebb76d8e187ffe76f3c55884c946a852d4ae6",
+                "literalSha256": "c7ce66d0fb14e3c2d4d920918cc6cc7e488668b08dddeb7b85e44de3b9f3eb01",
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/pkg/kubelet/cm/pod_container_manager_linux.go"
+              },
+              {
+                "partStart": 28,
+                "partEnd": 35,
+                "sourcePath": "pkg/kubelet/container/runtime.go",
+                "sourceLine": 298,
+                "sourceSha256": "09b8744deac0d9c00a2a7286f740fffc2c495f1cc471f439124fa9d539242977",
+                "literalSha256": "406effb1e9c59672c66a598c2b21e331b23b16c54024e96d6df3e7c173549791",
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/pkg/kubelet/container/runtime.go"
+              },
+              {
+                "partStart": 42,
+                "partEnd": 49,
+                "sourcePath": "plugin/pkg/admission/certificates/approval/admission.go",
+                "sourceLine": 91,
+                "sourceSha256": "acde2f0489c47914dae1bef012f95a89b60665f6a5e145c7f9a1c4d714c4b193",
+                "literalSha256": "74e21680eac7385ca408cb01878465fd693b37e58eb0c0c32663a2d8f15d8136",
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/plugin/pkg/admission/certificates/approval/admission.go"
+              },
+              {
+                "partStart": 35,
+                "partEnd": 42,
+                "sourcePath": "staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/group_version.go",
+                "sourceLine": 93,
+                "sourceSha256": "ba37179999eb022b3a66e8b421a7803c8c609596e3d8d7fe52970867150d91d3",
+                "literalSha256": "c431bcf2d8f643b0d4cf0d14827191f2b4a8dfec53189ab33552e4e93c0ad5a6",
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/group_version.go"
+              },
+              {
+                "partStart": 14,
+                "partEnd": 21,
+                "sourcePath": "staging/src/k8s.io/kubectl/pkg/cmd/apiresources/apiresources.go",
+                "sourceLine": 112,
+                "sourceSha256": "d99728bc0ccc11f0e6674c2933a46ac699d580218fff6a63f34dcfd127597ad7",
+                "literalSha256": "dddc693e07b79c14eafe145ef79c72fc5f8548ac9454a98b0a9564280ca84946",
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/staging/src/k8s.io/kubectl/pkg/cmd/apiresources/apiresources.go"
+              },
+              {
+                "partStart": 49,
+                "partEnd": 56,
+                "sourcePath": "staging/src/k8s.io/kubectl/pkg/cmd/auth/whoami.go",
+                "sourceLine": 238,
+                "sourceSha256": "361bc5cd473c82ebd7b6e42c505c707216817311bcc60bc09eb5d73969348407",
+                "literalSha256": "e5f911f0dc022751c45601728d45679a313c2a39df43ee82163ce51e6aa11953",
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/staging/src/k8s.io/kubectl/pkg/cmd/auth/whoami.go"
+              }
+            ],
+            "compiledPointerAndLengthReferencesVerified": true
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 49969,
+          "endLine": 49969,
+          "startColumn": 66,
+          "endColumn": 91,
+          "span": {
+            "byteStart": 34489501,
+            "byteEndExclusive": 34489527,
+            "size": 26,
+            "sha256": "6d3fadad371230610bc0c88ba99d4d64da90c3b4057cb4e49eab943896443733"
+          },
+          "classification": "non_actual_cli_usage_example",
+          "sourceProof": {
+            "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/staging/src/k8s.io/kubectl/pkg/cmd/config/set_credentials.go",
+            "sourceSha256": "6cfb579f337de3972810ba5e654510c30183483d39be3534f721ea454dcc2535",
+            "sourceLine": 89,
+            "literalSha256": "700792cb97cd08eef920cabfcdabbdc24b46201c6f40d17ab98d0f399cc752f2",
+            "usedOnlyAsCobraHelpExample": true
+          }
+        }
+      ]
     }
-  ]
+  ],
+  "nativeReviewProjectionSha256": "3d6f068892ccb31857d6aed6de43f7c4db2de1d63ebf500eeac95f241fa28d9a"
 }

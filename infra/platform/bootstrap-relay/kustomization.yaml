@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - namespace.yaml
+  - config.yaml
+  - relay.yaml
+# Install only on the explicitly selected existing relay node. Update the image after full CI qualification.
+images:
+  - name: pgcf-regional
+    newName: ghcr.io/amerged-org/pgcf-regional
+    digest: sha256:14191e73d2bde4897856f1be7eeccca30a9d41f52e1665a818c6ecab2ba1483a
+  - name: cloudflared
+    newName: docker.io/cloudflare/cloudflared
+    digest: sha256:072c067d25ccbe61d46e18f0d0723255f2bb5304f7317caa95b27031520ff92c

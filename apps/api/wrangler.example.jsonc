@@ -18,7 +18,24 @@
       "jurisdiction": "eu",
     },
   ],
+  "vpc_services": [
+    {
+      "binding": "BOOTSTRAP_RELAY_SERVICE",
+      "service_id": "<BOOTSTRAP_RELAY_VPC_SERVICE_ID>",
+    },
+  ],
   "vars": {
+    "BOOTSTRAP_FIREWALL_BINDINGS": "<PROVIDER_INSTANCE_FIREWALL_UUID_MAP_JSON>",
+    "BOOTSTRAP_OPERATOR_SOURCES": "<OPERATOR_HOST_CIDRS_JSON>",
+    "BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID": "<RELAY_PROVIDER_INSTANCE_ID>",
+    "BOOTSTRAP_SCAN_CONTROL": "<DUAL_STACK_SCAN_POSITIVE_CONTROL_JSON>",
+    "NODE_BOOTSTRAP_CALLBACK_URL": "<NODE_BOOTSTRAP_CALLBACK_URL>",
+    "BOOTSTRAP_RELAY_URL": "<BOOTSTRAP_RELAY_URL>",
+    "BOOTSTRAP_RELAY_ISSUER_REGION": "<BOOTSTRAP_RELAY_ISSUER_REGION>",
+    "BOOTSTRAP_VERIFIER_KEYS": "<DEDICATED_VERIFIER_PUBLIC_KEYS_JSON>",
+    "CONTABO_ORDER_DEFAULT_USER": "<CONTABO_ORDER_DEFAULT_USER>",
+    "CONTABO_ORDER_SSH_KEY_IDS": "<CONTABO_ORDER_SSH_KEY_IDS_JSON>",
+    "CONTABO_RESCUE_SSH_KEY_IDS": "<CONTABO_RESCUE_SSH_KEY_IDS_JSON>",
     "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>",
     "ARCHIVE_BUCKET_NAME": "replace-r2-backup-bucket",
   },
@@ -26,11 +43,25 @@
     "bindings": [
       { "name": "REGION_LINK", "class_name": "RegionLink" },
       { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
+      { "name": "NODE_BOOTSTRAP", "class_name": "NodeBootstrap" },
     ],
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["RegionLink"] },
     { "tag": "v2", "new_sqlite_classes": ["DatabaseActor"] },
+    { "tag": "v3", "new_sqlite_classes": ["NodeBootstrap"] },
+  ],
+  "containers": [
+    {
+      "class_name": "NodeBootstrap",
+      "image": "../node-bootstrap/Dockerfile",
+      "image_build_context": "../..",
+      "instance_type": "standard-1",
+      "max_instances": 1,
+    },
+  ],
+  "workflows": [
+    { "binding": "ADD_NODE", "name": "pgcf-add-node", "class_name": "AddNode" },
   ],
   "triggers": { "crons": ["* * * * *"] },
   "secrets": {
@@ -39,6 +70,11 @@
       "CREDENTIAL_KEYS",
       "ROUTE_MASTER_KEYS",
       "BOOTSTRAP_TOKEN",
+      "CONTABO_CLIENT_ID",
+      "CONTABO_CLIENT_SECRET",
+      "CONTABO_USERNAME",
+      "CONTABO_PASSWORD",
+      "BOOTSTRAP_RELAY_SIGNING_KEYS",
     ],
   },
 }

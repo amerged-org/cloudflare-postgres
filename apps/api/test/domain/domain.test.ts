@@ -80,7 +80,7 @@ describe("database domain on real Workers D1", () => {
       }),
     ).toBeNull();
   });
-  it("guards concurrent creates and leaves no orphan rows after capacity rejection", async () => {
+  it("guards concurrent placement and retains complete pending creates", async () => {
     const f = await fixture(1408, 10); // 128 platform + exactly two (512 + 128) reservations.
     const results = await Promise.all([
       f.create("one"),
@@ -88,7 +88,7 @@ describe("database domain on real Workers D1", () => {
       f.create("three"),
       f.create("four"),
     ]);
-    expect(results.map((r) => r.status).sort()).toEqual([202, 202, 503, 503]);
+    expect(results.map((r) => r.status).sort()).toEqual([202, 202, 202, 202]);
     for (const table of [
       "databases",
       "roles",
@@ -101,9 +101,21 @@ describe("database domain on real Workers D1", () => {
         )
           .bind(f.project)
           .first("count"),
-      ).toBe(2);
+      ).toBe(table === "lifecycle_events" ? 2 : 4);
+    expect(
+      await env.DB.prepare(
+        "SELECT COUNT(*) count FROM databases WHERE project_id=? AND node_id IS NOT NULL",
+      )
+        .bind(f.project)
+        .first("count"),
+    ).toBe(2);
     const noStorage = await fixture(4096, null);
-    expect((await noStorage.create()).status).toBe(503);
+    expect((await noStorage.create()).status).toBe(202);
+    expect(
+      await env.DB.prepare("SELECT node_id FROM databases WHERE project_id=?")
+        .bind(noStorage.project)
+        .first("node_id"),
+    ).toBeNull();
   });
   it("rejects a changed class snapshot before the first guarded insert", async () => {
     const f = await fixture();

@@ -1,6 +1,6 @@
 # Third-party components
 
-Reviewed: 2026-10-02 (reset). The repository's [Apache License 2.0](LICENSE) covers original
+Reviewed: 2026-10-05. The repository's [Apache License 2.0](LICENSE) covers original
 project work only. Upstream components keep their own licenses, notices and source obligations.
 No upstream source is vendored in the repository. The regional image bundles zod and ships its MIT
 notice at `/app/licenses/zod/LICENSE`, copied from the lockfile-resolved installed package.
@@ -40,6 +40,22 @@ to these upstream licenses. Node's `/usr/local/LICENSE`, Debian package copyrigh
 `/usr/share/doc` and the other notices present in the pinned base remain in the regional image.
 Redistributors must retain those notices and satisfy each component's applicable obligations.
 
+**Node bootstrap image:** `apps/node-bootstrap/Dockerfile` uses the same pinned Node base.
+It bundles yaml 2.9.1 (ISC) and zod 4.6.5 (MIT), with their installed license files under
+`/app/licenses`. The unmodified Talos CLI 1.14.1 (MPL-2.0) and Kubernetes CLI 1.36.3
+(Apache-2.0) are downloaded from their official releases and checked against the recorded
+SHA-256 for each supported architecture. Their license files are retained in the image.
+The matching source releases are [Talos v1.14.1](https://github.com/siderolabs/talos/tree/v1.14.1)
+and [Kubernetes v1.36.3](https://github.com/kubernetes/kubernetes/tree/v1.36.3).
+
+The actual base runs Debian Bookworm. Added direct Debian packages are pinned to
+ca-certificates `20250419~deb12u1`, curl `7.88.1-10+deb12u15` (build stage only) and
+openssh-client `1:9.2p1-2+deb12u10`. Their Debian copyright and source references remain
+under `/usr/share/doc`; these packages and their dependencies keep their own licenses.
+See the primary package records for [ca-certificates](https://packages.debian.org/bookworm/ca-certificates),
+[curl](https://packages.debian.org/bookworm/curl) and [OpenSSH](https://packages.debian.org/bookworm/openssh-client).
+Full payload qualification and immutable release digests bind the actual shipped dependency set.
+
 **Barman plugin issue:** the R2 restore failure reported in
 [plugin-barman-cloud issue #411](https://github.com/cloudnative-pg/plugin-barman-cloud/issues/411#issuecomment-3572945793)
 was a naming conflict between archives. Every restore target needs its own archive path and server
@@ -58,6 +74,7 @@ read from the installed package manifests.
 | [@kubernetes/client-node](https://github.com/kubernetes-client/javascript)                              | 2.0.0   | Apache-2.0        | Regional Kubernetes API client.                                                           |
 | [wrangler](https://github.com/cloudflare/workers-sdk)                                                   | 4.145.0 | MIT OR Apache-2.0 | Worker build, type generation and deployment tooling.                                     |
 | [ws](https://github.com/websockets/ws)                                                                  | 8.22.0  | MIT               | Gateway server, agent link and CLI WebSocket client; CLI installs the upstream runtime package with its notice. |
+| [yaml](https://github.com/eemeli/yaml) | 2.9.1 | ISC | Parses and generates protected native bootstrap configuration; its installed license ships in the bootstrap image. |
 | [esbuild](https://github.com/evanw/esbuild)                                                             | 0.25.12 | MIT               | Bundles regional entry points and the installable CLI (build only).                  |
 | [@neondatabase/serverless](https://github.com/neondatabase/serverless)                                  | 1.2.0   | MIT               | Client driver used by the live acceptance run (also listed above).                        |
 | [pg](https://github.com/brianc/node-postgres)                                                           | 8.23.1  | MIT               | Authenticated TLS readiness probes in the regional agent and PostgreSQL acceptance tools. |

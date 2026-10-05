@@ -1,0 +1,845 @@
+// SPDX-License-Identifier: Apache-2.0
+import { env } from "cloudflare:workers";
+import {
+  createExecutionContext,
+  waitOnExecutionContext,
+} from "cloudflare:test";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import {
+  bytesToBase64url,
+  bytesToHex,
+  newNodeId,
+  randomString,
+} from "@pgcf/contracts";
+import {
+  NodeBootstrapAuthority,
+  NodeBootstrapSpec,
+} from "../../../../packages/contracts/src/node-bootstrap.ts";
+import {
+  configureNodeRegionPolicy,
+  recordNodeAudit,
+  recordNodeReceipt,
+  reserveNodeAddition,
+  saveNodeBootstrapCheckpoint,
+} from "../../src/domain/node-state.ts";
+import {
+  bootstrapJobInput,
+  configureBootstrapJob,
+  readBootstrapJob,
+} from "../../src/domain/bootstrap-jobs.ts";
+import {
+  bootstrapSpecHash,
+  openBootstrapInput,
+  sealBootstrapInput,
+} from "../../src/crypto/bootstrap-tickets.ts";
+import { createApp } from "../../src/app.ts";
+import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+import type { Env } from "../../src/env.ts";
+import { issueBootstrapTransport } from "../../src/domain/bootstrap-relay.ts";
+import {
+  importBootstrapVerificationKeys,
+  verifyBootstrapRelay,
+} from "../../../../packages/contracts/src/bootstrap-relay.ts";
+import type { ContaboInstance } from "../../src/providers/contabo.ts";
+import { finalizeNodeAdmission } from "../../src/domain/bootstrap-jobs.ts";
+import {
+  verifyNodeCapacity,
+  verifyNodeNetwork,
+} from "../../src/domain/node-state.ts";
+
+afterEach(cleanupFixtures);
+const hash = () => bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
+const exportBytes = (bytes: ArrayBuffer | JsonWebKey) => {
+  if (!(bytes instanceof ArrayBuffer))
+    throw new Error("test_key_export_invalid");
+  return new Uint8Array(bytes);
+};
+const standard64 = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes));
+async function prepared() {
+  const f = await fixture();
+  await env.DB.prepare("DELETE FROM nodes WHERE id=?").bind(f.node).run();
+  await env.DB.prepare("UPDATE regions SET provider_region='EU' WHERE id=?")
+    .bind(f.region)
+    .run();
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: 1,
+    purchases_enabled: false,
+    order: null,
+  });
+  const instance = String(BigInt("1" + randomString("0123456789", 9)));
+  let addition = await reserveNodeAddition(env.DB, {
+    request_key: crypto.randomUUID(),
+    request: {
+      region_id: f.region,
+      mode: "adopt",
+      provider_instance_id: instance,
+    },
+  });
+  addition = await recordNodeReceipt(
+    env.DB,
+    addition.intent.operation_id,
+    addition.revision,
+    {
+      provider_instance_id: instance,
+      request_id: null,
+      reference: crypto.randomUUID(),
+      received_at: new Date().toISOString(),
+    },
+  );
+  addition = await recordNodeAudit(
+    env.DB,
+    addition.intent.operation_id,
+    addition.revision,
+    {
+      provider_instance_id: instance,
+      provider_region: "EU",
+      product_id: crypto.randomUUID(),
+      image_id: crypto.randomUUID(),
+      reference: crypto.randomUUID(),
+      observed_at: new Date().toISOString(),
+    },
+  );
+  const address = [
+      192,
+      0,
+      2,
+      17 + (crypto.getRandomValues(new Uint8Array(1))[0]! % 200),
+    ].join("."),
+    gateway = [192, 0, 2, 1].join(".");
+  const keyBlob = new Uint8Array(51),
+    view = new DataView(keyBlob.buffer);
+  view.setUint32(0, 11);
+  keyBlob.set(new TextEncoder().encode("ssh-ed25519"), 4);
+  view.setUint32(15, 32);
+  keyBlob.set(crypto.getRandomValues(new Uint8Array(32)), 19);
+  const fingerprint =
+    "SHA256:" +
+    standard64(
+      new Uint8Array(await crypto.subtle.digest("SHA-256", keyBlob)),
+    ).replaceAll("=", "");
+  const pair = await crypto.subtle.generateKey("Ed25519", true, [
+    "sign",
+    "verify",
+  ]);
+  if (!("privateKey" in pair)) throw new Error("test_key_pair_invalid");
+  const privateKey = standard64(
+    exportBytes(await crypto.subtle.exportKey("pkcs8", pair.privateKey)),
+  );
+  const rescue = {
+    ssh_private_key: `-----BEGIN PRIVATE KEY-----\n${privateKey}\n-----END PRIVATE KEY-----`,
+    ssh_host_key: "ssh-ed25519 " + standard64(keyBlob),
+    ssh_host_fingerprint: fingerprint,
+  };
+  const spec = NodeBootstrapSpec.parse({
+    version: 1,
+    operation_id: addition.intent.operation_id,
+    node_id: addition.intent.node_id,
+    region_id: f.region,
+    provider_instance_id: instance,
+    inventory_revision: addition.revision,
+    role: "controlplane",
+    hostname: addition.intent.requested_hostname,
+    rescue_host_fingerprint: fingerprint,
+    hardware: {
+      mac: Array.from(crypto.getRandomValues(new Uint8Array(6)), (byte) =>
+        byte.toString(16).padStart(2, "0"),
+      ).join(":"),
+      ipv4: address,
+      prefix_length: 24,
+      gateway,
+      dns: [gateway],
+      install_disk: "/dev/sda",
+      disk_bytes: 64 * 2 ** 30,
+      rescue_ram_min_bytes: 2 ** 30,
+    },
+    image: {
+      schematic_id: hash(),
+      compressed_sha256: hash(),
+      compressed_bytes: 512,
+      raw_sha256: hash(),
+      raw_bytes: 1024,
+      installer_digest: "sha256:" + hash(),
+    },
+    storage: { ephemeral_gib: 4, lvm_gib: 8 },
+    cluster_name: "cluster-" + randomString("abcdefghijklmnopqrstuvwxyz", 8),
+    cluster_endpoint: `https://${address}:6443`,
+    cluster_uid: null,
+    join_bundle_sha256: null,
+    transport: {
+      mode: "relay",
+      issuer_region_id: f.region,
+    },
+  });
+  const bindings = {
+    ...env,
+    NODE_BOOTSTRAP_CALLBACK_URL: `https://${["api", "invalid"].join(".")}/`,
+  } as Env;
+  await configureBootstrapJob(bindings, addition.intent.operation_id, {
+    expected_revision: addition.revision,
+    spec,
+    rescue,
+  });
+  const job = await readBootstrapJob(env.DB, addition.intent.operation_id),
+    input = await bootstrapJobInput(bindings, job);
+  const identity = {
+    version: 1,
+    operation_id: job.operation_id,
+    node_id: job.node_id,
+    region_id: job.region_id,
+    input_hash: job.input_hash,
+    request_id: crypto.randomUUID(),
+  };
+  return { ...f, addition, job, input, spec, bindings, identity };
+}
+async function callback(
+  f: Awaited<ReturnType<typeof prepared>>,
+  value: unknown,
+  key = f.input.callback.bearer,
+  bindings = f.bindings,
+) {
+  const context = createExecutionContext();
+  const response = await createApp().fetch(
+    new Request(f.input.callback.url, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(value),
+    }),
+    bindings,
+    context,
+  );
+  await waitOnExecutionContext(context);
+  return response;
+}
+describe("protected bootstrap authority", () => {
+  it("seals private input with operation, digest, revision and key domain separation", async () => {
+    const f = await prepared();
+    const ticket = await sealBootstrapInput(env.CREDENTIAL_KEYS, f.input);
+    expect(JSON.stringify(ticket)).not.toContain(
+      f.input.rescue.ssh_private_key,
+    );
+    expect(await openBootstrapInput(env.CREDENTIAL_KEYS, ticket)).toEqual(
+      f.input,
+    );
+    await expect(
+      openBootstrapInput(env.CREDENTIAL_KEYS, {
+        ...ticket,
+        operation_id:
+          f.addition.intent.operation_id.slice(0, -1) +
+          (f.addition.intent.operation_id.endsWith("a") ? "b" : "a"),
+      }),
+    ).rejects.toThrow();
+    await expect(
+      openBootstrapInput(env.CREDENTIAL_KEYS, {
+        ...ticket,
+        revision: ticket.revision + 1,
+      }),
+    ).rejects.toThrow();
+    await expect(
+      sealBootstrapInput(env.CREDENTIAL_KEYS, {
+        ...f.input,
+        spec: { ...f.spec, hostname: "node-" + crypto.randomUUID() },
+      }),
+    ).rejects.toThrow();
+    expect(await bootstrapSpecHash(f.spec)).toBe(f.input.input_hash);
+  });
+  it("authenticates before private body collection and binds the exact admitted operation", async () => {
+    const f = await prepared();
+    const large = {
+      ...f.identity,
+      kind: "read",
+      padding: crypto.randomUUID().repeat(16_000),
+    };
+    expect((await callback(f, large, crypto.randomUUID())).status).toBe(401);
+    expect(
+      (await callback(f, { ...f.identity, kind: "read", node_id: newNodeId() }))
+        .status,
+    ).toBe(403);
+    const response = await callback(f, { ...f.identity, kind: "read" });
+    expect(response.status).toBe(200);
+    const authority = NodeBootstrapAuthority.parse(await response.json());
+    expect(authority.input_hash).toBe(f.input.input_hash);
+    expect(authority.admission_authorized).toBe(false);
+    expect(authority.protected_material).toBeNull();
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET authorized=0 WHERE operation_id=?",
+    )
+      .bind(f.job.operation_id)
+      .run();
+    expect((await callback(f, { ...f.identity, kind: "read" })).status).toBe(
+      403,
+    );
+  });
+  it("accepts a bounded protected seal above the public 64 KiB limit and returns only a custody reference", async () => {
+    const f = await prepared(),
+      canary = crypto.randomUUID().repeat(2200);
+    const material = {
+      version: 1,
+      cluster_name: f.spec.cluster_name,
+      cluster_endpoint: f.spec.cluster_endpoint,
+      talos_version: "1.14.1",
+      kubernetes_version: "1.36.3",
+      talos_machine_secrets_yaml: canary,
+      talos_admin_config: crypto.randomUUID(),
+    };
+    const response = await callback(f, {
+      ...f.identity,
+      kind: "seal",
+      expected_revision: 0,
+      payload: { purpose: "region_seed", material },
+    });
+    expect(response.status).toBe(200);
+    expect(JSON.stringify(await response.json())).not.toContain(canary);
+    const authority = NodeBootstrapAuthority.parse(
+      await (await callback(f, { ...f.identity, kind: "read" })).json(),
+    );
+    expect(authority.revision).toBe(1);
+    expect(
+      authority.protected_material?.material.talos_machine_secrets_yaml,
+    ).toBe(canary);
+    const publicStatus = await (
+      await request(
+        `/v1/nodes/additions/${f.job.operation_id}/bootstrap`,
+        f.admin,
+      )
+    ).text();
+    expect(publicStatus).not.toContain(canary);
+    expect(publicStatus).not.toContain(f.input.callback.bearer);
+    expect(publicStatus).not.toContain(f.input.rescue.ssh_private_key);
+    expect(
+      (
+        await callback(f, {
+          ...f.identity,
+          kind: "checkpoint",
+          expected_revision: 0,
+          payload: authority.checkpoint,
+        })
+      ).status,
+    ).toBe(409);
+  });
+  it("refuses arbitrary transport targets and untrusted relay identity", async () => {
+    const f = await prepared();
+    const service = {
+      fetch: vi.fn(async () =>
+        Response.json({
+          v: 1,
+          region: f.foreign,
+          issuer_region: f.foreign,
+          relay_epoch: crypto.randomUUID(),
+          allowed_target_regions: [f.region],
+          capabilities: ["rescue_ssh", "talos_api", "kubernetes_api"],
+        }),
+      ),
+    };
+    const settings = {
+      ...f.bindings,
+      BOOTSTRAP_RELAY_SERVICE: service as unknown as Fetcher,
+      BOOTSTRAP_RELAY_URL: `https://${["relay", "invalid"].join(".")}/_pgcf/bootstrap-relay`,
+      BOOTSTRAP_RELAY_ISSUER_REGION: f.region,
+    };
+    expect(
+      (
+        await callback(
+          f,
+          {
+            ...f.identity,
+            kind: "transport",
+            payload: {
+              capability: "rescue_ssh",
+              host: "forged-" + crypto.randomUUID(),
+            },
+          },
+          undefined,
+          settings,
+        )
+      ).status,
+    ).toBe(400);
+    expect(service.fetch).not.toHaveBeenCalled();
+    await expect(
+      issueBootstrapTransport(settings, f.job, { capability: "rescue_ssh" }),
+    ).rejects.toThrow(
+      "Trusted relay identity is outside the configured operation scope",
+    );
+    service.fetch.mockClear();
+    expect(
+      (
+        await callback(
+          f,
+          {
+            ...f.identity,
+            kind: "transport",
+            payload: {
+              capability: "rescue_ssh",
+            },
+          },
+          undefined,
+          settings,
+        )
+      ).status,
+    ).toBe(409);
+    expect(service.fetch).toHaveBeenCalledTimes(1);
+  });
+  it("authenticates operation relay upgrades before touching the private VPC binding", async () => {
+    const f = await prepared(),
+      forward = vi.fn(async (request: Request) => {
+        expect(request.headers.get("Upgrade")).toBe("websocket");
+        return new Response(null, { status: 204 });
+      });
+    const claims = {
+      v: 1,
+      purpose: "bootstrap",
+      operation: f.job.operation_id,
+      node: f.job.node_id,
+      region: f.region,
+      issuer_region: f.region,
+      relay_epoch: crypto.randomUUID(),
+      revision: 1,
+      capability: "rescue_ssh",
+      target: { address: f.spec.hardware.ipv4, port: 22 },
+      nonce: bytesToBase64url(crypto.getRandomValues(new Uint8Array(24))),
+      kid: "test",
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + 30,
+    };
+    const token = `br1.${bytesToBase64url(new TextEncoder().encode(JSON.stringify(claims)))}.${bytesToBase64url(crypto.getRandomValues(new Uint8Array(64)))}`;
+    const settings = {
+      ...f.bindings,
+      BOOTSTRAP_RELAY_SERVICE: { fetch: forward } as unknown as Fetcher,
+      BOOTSTRAP_RELAY_URL: `https://${["relay", "invalid"].join(".")}/_pgcf/bootstrap-relay`,
+    };
+    const upgrade = async (key: string) => {
+      const context = createExecutionContext();
+      const response = await createApp().fetch(
+        new Request(
+          new URL(
+            `/internal/v1/node-bootstrap/${f.job.operation_id}/relay`,
+            f.input.callback.url,
+          ),
+          {
+            headers: {
+              Authorization: `Bearer ${key}`,
+              Upgrade: "websocket",
+              "X-PGCF-Bootstrap": token,
+            },
+          },
+        ),
+        settings,
+        context,
+      );
+      await waitOnExecutionContext(context);
+      return response;
+    };
+    expect((await upgrade(crypto.randomUUID())).status).toBe(401);
+    expect(forward).not.toHaveBeenCalled();
+    expect((await upgrade(f.input.callback.bearer)).status).toBe(204);
+    expect(forward).toHaveBeenCalledTimes(1);
+    const forwarded = forward.mock.calls[0]![0] as Request;
+    expect(forwarded.headers.get("X-PGCF-Bootstrap")).toBe(token);
+    expect(forwarded.headers.has("Authorization")).toBe(false);
+    forward.mockClear();
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET admitted=1,authorized=0 WHERE operation_id=?",
+    )
+      .bind(f.job.operation_id)
+      .run();
+    expect((await upgrade(f.input.callback.bearer)).status).toBe(403);
+    expect(forward).not.toHaveBeenCalled();
+  });
+  it("signs a fresh trusted relay epoch after replacement while preserving the same immutable job hash", async () => {
+    const f = await prepared(),
+      firstEpoch = crypto.randomUUID(),
+      secondEpoch = crypto.randomUUID();
+    let epoch = firstEpoch;
+    const service = {
+      fetch: vi.fn(async () =>
+        Response.json({
+          v: 1,
+          region: f.region,
+          issuer_region: f.region,
+          relay_epoch: epoch,
+          allowed_target_regions: [f.region],
+          capabilities: ["rescue_ssh", "talos_api", "kubernetes_api"],
+        }),
+      ),
+    };
+    const pair = await crypto.subtle.generateKey("Ed25519", true, [
+      "sign",
+      "verify",
+    ]);
+    if (!("privateKey" in pair)) throw new Error("test_key_pair_invalid");
+    const privateKey = bytesToBase64url(
+        exportBytes(await crypto.subtle.exportKey("pkcs8", pair.privateKey)),
+      ),
+      publicKey = bytesToBase64url(
+        exportBytes(await crypto.subtle.exportKey("raw", pair.publicKey)),
+      );
+    const settings = {
+      ...f.bindings,
+      BOOTSTRAP_RELAY_SERVICE: service as unknown as Fetcher,
+      BOOTSTRAP_RELAY_URL: `https://${["relay", "invalid"].join(".")}/_pgcf/bootstrap-relay`,
+      BOOTSTRAP_RELAY_ISSUER_REGION: f.region,
+      BOOTSTRAP_RELAY_SIGNING_KEYS: JSON.stringify({
+        active: "test",
+        keys: { test: privateKey },
+      }),
+    };
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET rescue_active=1 WHERE operation_id=?",
+    )
+      .bind(f.job.operation_id)
+      .run();
+    const row = await readBootstrapJob(env.DB, f.job.operation_id);
+    const actual: ContaboInstance = {
+      id: f.spec.provider_instance_id,
+      tenantId: crypto.randomUUID(),
+      customerId: crypto.randomUUID(),
+      name: f.spec.hostname,
+      displayName: f.spec.hostname,
+      dataCenter: crypto.randomUUID(),
+      region: "EU",
+      regionName: crypto.randomUUID(),
+      productId: f.addition.audit!.product_id,
+      productName: crypto.randomUUID(),
+      imageId: f.addition.audit!.image_id,
+      ipConfig: {
+        v4: {
+          ip: f.spec.hardware.ipv4,
+          gateway: f.spec.hardware.gateway,
+          netmaskCidr: f.spec.hardware.prefix_length,
+        },
+        v6: { ip: "", gateway: "", netmaskCidr: 0 },
+      },
+      ramMb: 8192,
+      cpuCores: 4,
+      diskMb: 64000,
+      macAddress: f.spec.hardware.mac,
+      osType: "Linux",
+      sshKeys: [],
+      createdDate: new Date().toISOString(),
+      cancelDate: "",
+      status: "rescue",
+      addOns: [],
+      applicationId: null,
+      additionalIps: [],
+    };
+    const provider = { getInstance: vi.fn(async () => actual) };
+    const first = await issueBootstrapTransport(
+      settings,
+      row,
+      { capability: "rescue_ssh" },
+      provider,
+    );
+    epoch = secondEpoch;
+    const second = await issueBootstrapTransport(
+      settings,
+      row,
+      { capability: "rescue_ssh" },
+      provider,
+    );
+    const keys = await importBootstrapVerificationKeys({ test: publicKey }),
+      expected = {
+        keys,
+        region: f.region,
+        issuer_region: f.region,
+        allowedTargetRegions: [f.region],
+      };
+    expect(
+      (
+        await verifyBootstrapRelay(first.token, {
+          ...expected,
+          relay_epoch: firstEpoch,
+        })
+      ).ok,
+    ).toBe(true);
+    expect(
+      (
+        await verifyBootstrapRelay(first.token, {
+          ...expected,
+          relay_epoch: secondEpoch,
+        })
+      ).ok,
+    ).toBe(false);
+    expect(
+      (
+        await verifyBootstrapRelay(second.token, {
+          ...expected,
+          relay_epoch: secondEpoch,
+        })
+      ).ok,
+    ).toBe(true);
+    expect(first.token).not.toBe(second.token);
+    expect(
+      (await readBootstrapJob(env.DB, f.job.operation_id)).input_hash,
+    ).toBe(f.job.input_hash);
+    const url = new URL(second.websocket_url);
+    expect(url.origin).toBe(
+      new URL(f.input.callback.url).origin.replace(/^https:/, "wss:"),
+    );
+    expect(url.pathname).toBe(
+      `/internal/v1/node-bootstrap/${f.job.operation_id}/relay`,
+    );
+    expect(url.search).toBe("");
+  });
+  it("refuses unsigned verification artifacts before any provider request or quarantine release", async () => {
+    const f = await prepared();
+    const addition = await saveNodeBootstrapCheckpoint(
+      env.DB,
+      f.job.operation_id,
+      f.addition.revision,
+      {
+        stage: "joined",
+        reference: `${f.job.input_hash}:0`,
+        saved_at: new Date(Date.now() - 1000).toISOString(),
+      },
+    );
+    const now = new Date().toISOString(),
+      artifact = {
+        kid: "test",
+        payload: {
+          purpose: "pgcf-node-verification/v1",
+          operation_id: f.job.operation_id,
+          node_id: f.job.node_id,
+          region_id: f.region,
+          provider_instance_id: f.spec.provider_instance_id,
+          intent_hash: addition.intent_hash,
+          input_hash: f.job.input_hash,
+          checkpoint_reference: addition.checkpoint!.reference,
+          cluster_uid: crypto.randomUUID(),
+          node_uid: crypto.randomUUID(),
+          node_resource_version: "1",
+          observed_at: now,
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+          addresses: { ipv4: f.spec.hardware.ipv4, ipv6: null },
+          wireguard: { mode: "wireguard", peers: [], packet_observations: [] },
+          scans: [
+            {
+              family: "ipv4",
+              address: f.spec.hardware.ipv4,
+              source: [198, 51, 100, 1].join("."),
+              observed_at: now,
+              scanned_ports: 65535,
+              open_ports: [],
+              control: {
+                address: [198, 51, 100, 2].join("."),
+                port: 443,
+                connected: true,
+              },
+            },
+          ],
+        },
+        signature: bytesToBase64url(crypto.getRandomValues(new Uint8Array(64))),
+      };
+    const pair = await crypto.subtle.generateKey("Ed25519", true, [
+        "sign",
+        "verify",
+      ]),
+      publicKey = bytesToBase64url(
+        exportBytes(
+          await crypto.subtle.exportKey(
+            "raw",
+            "publicKey" in pair
+              ? pair.publicKey
+              : (() => {
+                  throw new Error("test_key_pair_invalid");
+                })(),
+          ),
+        ),
+      );
+    const proofKey = `node-verification/${f.job.operation_id}/${addition.checkpoint!.reference}/proof.json`,
+      bytes = new TextEncoder().encode(JSON.stringify(artifact));
+    await env.ARCHIVE.put(proofKey, bytes);
+    try {
+      const context = createExecutionContext();
+      const response = await createApp().fetch(
+        new Request(
+          new URL(
+            `/v1/nodes/additions/${f.job.operation_id}/verify`,
+            f.input.callback.url,
+          ),
+          {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${f.admin}`,
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+              expected_revision: addition.revision,
+              sha256: bytesToHex(
+                new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
+              ),
+            }),
+          },
+        ),
+        {
+          ...f.bindings,
+          BOOTSTRAP_VERIFIER_KEYS: JSON.stringify({ test: publicKey }),
+        },
+        context,
+      );
+      await waitOnExecutionContext(context);
+      expect(response.status).toBe(403);
+      expect(
+        (await readBootstrapJob(env.DB, f.job.operation_id))
+          .admission_authorized,
+      ).toBe(0);
+    } finally {
+      await env.ARCHIVE.delete(proofKey);
+    }
+  });
+  it("publishes only after an exact persisted native release receipt and closes callback custody", async () => {
+    const f = await prepared(),
+      uid = crypto.randomUUID(),
+      clusterUid = crypto.randomUUID(),
+      now = new Date().toISOString();
+    await env.DB.prepare(
+      "INSERT INTO nodes(id,region_id,k8s_node_name,provider_instance_id,node_uid,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,1,0,4096,2000,30,128,100,?,?,?)",
+    )
+      .bind(
+        f.job.node_id,
+        f.region,
+        f.spec.hostname,
+        f.spec.provider_instance_id,
+        uid,
+        now,
+        now,
+        now,
+      )
+      .run();
+    let addition = await saveNodeBootstrapCheckpoint(
+      env.DB,
+      f.job.operation_id,
+      f.addition.revision,
+      { stage: "joined", reference: `${f.job.input_hash}:0`, saved_at: now },
+    );
+    const scope = {
+      operation_id: f.job.operation_id,
+      node_id: f.job.node_id,
+      intent_hash: addition.intent_hash,
+      checkpoint_reference: addition.checkpoint!.reference,
+      proof_reference: crypto.randomUUID(),
+    };
+    addition = await verifyNodeNetwork(
+      env.DB,
+      f.job.operation_id,
+      addition.revision,
+      { ...scope, verified_at: now },
+    );
+    await verifyNodeCapacity(env.DB, f.job.operation_id, addition.revision, {
+      ...scope,
+      observed_at: now,
+      allocatable_memory_mib: 4096,
+      allocatable_cpu_millicores: 2000,
+      storage_gib_total: 30,
+      platform_reserved_memory_mib: 128,
+      platform_reserved_cpu_millicores: 100,
+    });
+    const binding = {
+      checkpoint_revision: 0,
+      node_uid: uid,
+      resource_version: "12",
+      kube_system_uid: clusterUid,
+      quarantine: {
+        key: "pgcf.io/quarantine",
+        value: "bootstrap",
+        effect: "NoSchedule",
+      },
+    };
+    const checkpoint = {
+      ...JSON.parse(f.job.checkpoint_json),
+      stage: "awaiting_verification",
+      status: "awaiting_verification",
+    };
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET checkpoint_json=?,admission_authorized=1,admission_binding_json=?,admission_expires_at=? WHERE operation_id=?",
+    )
+      .bind(
+        JSON.stringify(checkpoint),
+        JSON.stringify(binding),
+        new Date(Date.now() + 60_000).toISOString(),
+        f.job.operation_id,
+      )
+      .run();
+    expect(await finalizeNodeAdmission(f.bindings, f.job.operation_id)).toBe(
+      false,
+    );
+    const intent = {
+      ...checkpoint,
+      stage: "quarantine_release_intent",
+      status: "running",
+      release_node_uid: uid,
+      release_resource_version: binding.resource_version,
+    };
+    expect(
+      (
+        await callback(f, {
+          ...f.identity,
+          kind: "checkpoint",
+          expected_revision: 0,
+          payload: intent,
+        })
+      ).status,
+    ).toBe(200);
+    const receipt = {
+      version: 1,
+      operation_id: f.job.operation_id,
+      node_id: f.job.node_id,
+      region_id: f.region,
+      input_hash: f.job.input_hash,
+      checkpoint_revision: 0,
+      node_uid: uid,
+      kube_system_uid: clusterUid,
+      previous_resource_version: binding.resource_version,
+      resource_version: "13",
+      quarantine_removed: true,
+    };
+    expect(
+      (
+        await callback(f, {
+          ...f.identity,
+          kind: "checkpoint",
+          expected_revision: 1,
+          payload: {
+            ...intent,
+            stage: "quarantine_released",
+            status: "released",
+            admission_receipt: { ...receipt, node_uid: crypto.randomUUID() },
+          },
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      await env.DB.prepare("SELECT schedulable FROM nodes WHERE id=?")
+        .bind(f.job.node_id)
+        .first("schedulable"),
+    ).toBe(0);
+    expect(
+      (
+        await callback(f, {
+          ...f.identity,
+          kind: "checkpoint",
+          expected_revision: 1,
+          payload: {
+            ...intent,
+            stage: "quarantine_released",
+            status: "released",
+            admission_receipt: receipt,
+          },
+        })
+      ).status,
+    ).toBe(200);
+    expect(await finalizeNodeAdmission(f.bindings, f.job.operation_id)).toBe(
+      true,
+    );
+    expect(
+      await env.DB.prepare("SELECT schedulable FROM nodes WHERE id=?")
+        .bind(f.job.node_id)
+        .first("schedulable"),
+    ).toBe(1);
+    expect((await callback(f, { ...f.identity, kind: "read" })).status).toBe(
+      403,
+    );
+  });
+});
