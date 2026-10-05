@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { DatabaseWithOperation, newOperationId } from "@pgcf/contracts";
+import {
+  DatabaseWithOperation,
+  newOperationId,
+  newNodeId,
+} from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { powerTransitionStatements } from "../../src/domain/lifecycle.ts";
 import type { DatabaseRow } from "../../src/domain/rows.ts";
@@ -226,4 +230,128 @@ it("a refused quiesce preserves archive failure and cannot claim inactive", asyn
   const stale = await submit(f);
   expect(await stale.json()).toEqual({ accepted: 0 });
   expect(await health(f.id)).toBe("failing");
+});
+
+async function legacyNodeFixture() {
+  const f = await fixture(),
+    uid = crypto.randomUUID(),
+    provider = String(crypto.getRandomValues(new Uint32Array(1))[0]! + 1000);
+  await env.DB.prepare(
+    "UPDATE nodes SET provider_instance_id=?,node_uid=?,ready=1,schedulable=1 WHERE id=?",
+  )
+    .bind(provider, uid, f.node)
+    .run();
+  const sample = {
+    name: f.nodeName,
+    node_id: f.node,
+    provider_instance_id: provider,
+    node_uid: uid,
+    ready: true,
+    allocatable_memory_mib: 4096,
+    allocatable_cpu_millicores: 4000,
+    storage_gib_total: 30,
+    platform_reserved_memory_mib: 512,
+    platform_reserved_cpu_millicores: 100,
+  };
+  const read = () =>
+    env.DB.prepare(
+      "SELECT id,region_id,k8s_node_name,provider_instance_id,node_uid,ready,schedulable,allocatable_memory_mib FROM nodes WHERE id=?",
+    )
+      .bind(f.node)
+      .first();
+  const send = (node: typeof sample) =>
+    request(
+      "/agent/v1/observations",
+      f.agent,
+      "POST",
+      observedBody([], [node]),
+    );
+  return { ...f, uid, provider, sample, read, send };
+}
+it("a complete legacy tuple without an addition reservation trips the pinned UID fence on replacement", async () => {
+  const f = await legacyNodeFixture();
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) count FROM node_additions WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first("count"),
+  ).toBe(0);
+  expect((await f.send(f.sample)).status).toBe(200);
+  expect(await f.read()).toMatchObject({
+    id: f.node,
+    region_id: f.region,
+    k8s_node_name: f.nodeName,
+    provider_instance_id: f.provider,
+    node_uid: f.uid,
+    ready: 1,
+    schedulable: 1,
+  });
+  expect(
+    (await f.send({ ...f.sample, node_uid: crypto.randomUUID() })).status,
+  ).toBe(200);
+  expect(await f.read()).toMatchObject({
+    id: f.node,
+    provider_instance_id: f.provider,
+    node_uid: f.uid,
+    ready: 0,
+    schedulable: 0,
+  });
+});
+it("forged legacy identities cannot change a registered node or substitute another known node", async () => {
+  const f = await legacyNodeFixture(),
+    other = newNodeId(),
+    otherProvider = String(
+      crypto.getRandomValues(new Uint32Array(1))[0]! + 1000,
+    ),
+    otherUid = crypto.randomUUID();
+  await env.DB.prepare(
+    "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,created_at,updated_at,schedulable,provider_instance_id,node_uid) SELECT ?,region_id,?,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,created_at,updated_at,schedulable,?,? FROM nodes WHERE id=?",
+  )
+    .bind(
+      other,
+      "other-" + crypto.randomUUID(),
+      otherProvider,
+      otherUid,
+      f.node,
+    )
+    .run();
+  const before = await f.read();
+  expect(
+    (
+      await f.send({
+        ...f.sample,
+        node_id: other,
+        provider_instance_id: otherProvider,
+        node_uid: otherUid,
+        ready: false,
+        allocatable_memory_mib: 1,
+      })
+    ).status,
+  ).toBe(200);
+  expect(await f.read()).toEqual(before);
+  expect(
+    (
+      await f.send({
+        ...f.sample,
+        provider_instance_id: otherProvider,
+        ready: false,
+        allocatable_memory_mib: 1,
+      })
+    ).status,
+  ).toBe(200);
+  expect(await f.read()).toEqual(before);
+  expect(
+    await env.DB.prepare(
+      "SELECT id,provider_instance_id,node_uid,ready,schedulable FROM nodes WHERE id=?",
+    )
+      .bind(other)
+      .first(),
+  ).toEqual({
+    id: other,
+    provider_instance_id: otherProvider,
+    node_uid: otherUid,
+    ready: 1,
+    schedulable: 1,
+  });
 });
