@@ -21,10 +21,21 @@ export const ProxyConfig = z.strictObject({
 });
 export type ProxyConfig = z.infer<typeof ProxyConfig>;
 
-export function capabilityTarget(config: ProxyConfig, capability: BootstrapCapability) {
+export function capabilityTarget(
+  config: ProxyConfig,
+  capability: BootstrapCapability,
+) {
   return {
-    ip: capability === "kubernetes_api" ? new URL(config.spec.cluster_endpoint).hostname : config.spec.hardware.ipv4,
-    port: capability === "rescue_ssh" ? 22 : capability === "talos_api" ? 50000 : 6443,
+    ip:
+      capability === "kubernetes_api"
+        ? new URL(config.spec.cluster_endpoint).hostname
+        : config.spec.hardware.ipv4,
+    port:
+      capability === "rescue_ssh"
+        ? 22
+        : capability === "talos_api"
+          ? 50000
+          : 6443,
   };
 }
 
@@ -48,17 +59,24 @@ export async function openCapability(
   };
   const response = await request(config.callback.url, {
     method: "POST",
-    headers: { authorization: `Bearer ${config.callback.bearer}`, "content-type": "application/json" },
+    headers: {
+      authorization: `Bearer ${config.callback.bearer}`,
+      "content-type": "application/json",
+    },
     body: JSON.stringify(envelope),
     signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
     redirect: "error",
   });
   if (!response.ok) throw new Error("transport_authority_refused");
   const body = await response.text();
-  if (Buffer.byteLength(body) > 16_384) throw new Error("transport_response_limit");
+  if (Buffer.byteLength(body) > 16_384)
+    throw new Error("transport_response_limit");
   const transport = NodeBootstrapTransport.parse(JSON.parse(body));
   const expected = capabilityTarget(config, capability);
-  if (transport.expectedTarget.ip !== expected.ip || transport.expectedTarget.port !== expected.port) {
+  if (
+    transport.expectedTarget.ip !== expected.ip ||
+    transport.expectedTarget.port !== expected.port
+  ) {
     throw new Error("transport_target_mismatch");
   }
   const socket = new WebSocket(transport.websocket_url, {
@@ -87,11 +105,17 @@ export async function openCapability(
   });
   const lifetime = setTimeout(abort, 600_000);
   lifetime.unref();
-  stream.once("close", () => { clearTimeout(lifetime); socket.terminate(); });
+  stream.once("close", () => {
+    clearTimeout(lifetime);
+    socket.terminate();
+  });
   return stream;
 }
 
-export async function startNativeProxy(config: ProxyConfig, signal: AbortSignal) {
+export async function startNativeProxy(
+  config: ProxyConfig,
+  signal: AbortSignal,
+) {
   if (config.spec.transport.mode !== "relay") throw new Error("relay_required");
   const sockets = new Set<Duplex>();
   const server = createServer((_request, response) => {
@@ -101,37 +125,50 @@ export async function startNativeProxy(config: ProxyConfig, signal: AbortSignal)
   server.headersTimeout = 10_000;
   server.requestTimeout = 15_000;
   server.on("connect", (request, socket, head) => {
-    const capability = (["talos_api", "kubernetes_api"] as const).find((candidate) => {
-      const target = capabilityTarget(config, candidate);
-      return request.url === `${target.ip}:${target.port}`;
-    });
-    if (!capability || head.length > 64 * 1024 || sockets.size >= 8 || signal.aborted) {
+    const capability = (["talos_api", "kubernetes_api"] as const).find(
+      (candidate) => {
+        const target = capabilityTarget(config, candidate);
+        return request.url === `${target.ip}:${target.port}`;
+      },
+    );
+    if (
+      !capability ||
+      head.length > 64 * 1024 ||
+      sockets.size >= 8 ||
+      signal.aborted
+    ) {
       socket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
       return;
     }
     socket.pause();
     sockets.add(socket);
     socket.once("close", () => sockets.delete(socket));
-    void openCapability(config, capability, signal).then((bridge) => {
-      sockets.add(bridge);
-      bridge.once("close", () => sockets.delete(bridge));
-      const close = () => { socket.destroy(); bridge.destroy(); };
-      bridge.once("error", close);
-      socket.once("error", close);
-      bridge.once("close", () => socket.destroy());
-      socket.once("close", () => bridge.destroy());
-      socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
-      if (head.length) bridge.write(head);
-      socket.pipe(bridge).pipe(socket);
-      socket.resume();
-    }).catch(() => socket.destroy());
+    void openCapability(config, capability, signal)
+      .then((bridge) => {
+        sockets.add(bridge);
+        bridge.once("close", () => sockets.delete(bridge));
+        const close = () => {
+          socket.destroy();
+          bridge.destroy();
+        };
+        bridge.once("error", close);
+        socket.once("error", close);
+        bridge.once("close", () => socket.destroy());
+        socket.once("close", () => bridge.destroy());
+        socket.write("HTTP/1.1 200 Connection Established\r\n\r\n");
+        if (head.length) bridge.write(head);
+        socket.pipe(bridge).pipe(socket);
+        socket.resume();
+      })
+      .catch(() => socket.destroy());
   });
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
     server.listen(0, LOOPBACK, resolve);
   });
   const address = server.address();
-  if (!address || typeof address === "string") throw new Error("proxy_listener_failed");
+  if (!address || typeof address === "string")
+    throw new Error("proxy_listener_failed");
   const close = () => {
     for (const socket of sockets) socket.destroy();
     server.close();
@@ -152,14 +189,19 @@ export async function startNativeProxy(config: ProxyConfig, signal: AbortSignal)
 
 async function main() {
   const path = process.argv[2];
-  if (!path || process.argv.length !== 3) throw new Error("proxy_configuration_required");
+  if (!path || process.argv.length !== 3)
+    throw new Error("proxy_configuration_required");
   const config = ProxyConfig.parse(JSON.parse(await readFile(path, "utf8")));
   const abort = new AbortController();
   process.once("SIGTERM", () => abort.abort());
   process.once("SIGINT", () => abort.abort());
   const bridge = await openCapability(config, "rescue_ssh", abort.signal);
   await new Promise<void>((resolve, reject) => {
-    const close = () => { process.stdin.unpipe(bridge); process.stdin.pause(); resolve(); };
+    const close = () => {
+      process.stdin.unpipe(bridge);
+      process.stdin.pause();
+      resolve();
+    };
     bridge.once("error", () => reject(new Error("relay_stream_failed")));
     bridge.once("close", close);
     bridge.once("end", close);
@@ -167,6 +209,12 @@ async function main() {
   }).finally(() => bridge.destroy());
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  main().catch(() => { process.stderr.write("bootstrap_proxy_failed\n"); process.exitCode = 1; });
+if (
+  process.argv[1] &&
+  import.meta.url === pathToFileURL(process.argv[1]).href
+) {
+  main().catch(() => {
+    process.stderr.write("bootstrap_proxy_failed\n");
+    process.exitCode = 1;
+  });
 }
