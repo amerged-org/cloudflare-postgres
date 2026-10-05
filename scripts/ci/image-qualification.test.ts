@@ -25,6 +25,7 @@ import {
   reviewedBase,
   reviewedFiles,
   reviewedManifestPaths,
+  verifyNativeArtifacts,
 } from "./reviewed-findings.ts";
 
 test("qualification profiles default to regional and reject ambiguous or malformed options", () => {
@@ -448,6 +449,7 @@ async function inspectionProbe(
     invalidJson?: boolean;
     profile?: string;
     reportProfile?: string;
+    nativeArtifacts?: unknown;
   } = {},
 ): Promise<{
   status: number | null;
@@ -492,6 +494,16 @@ async function inspectionProbe(
       JSON.stringify({
         version: 2,
         ...(options.reportProfile ? { profile: options.reportProfile } : {}),
+        ...(options.reportProfile === "node-bootstrap"
+          ? {
+              nativeArtifacts:
+                options.nativeArtifacts ??
+                verifyNativeArtifacts(
+                  reviewedFiles.filter((file) => file.nativeArtifact),
+                  "node-bootstrap",
+                ),
+            }
+          : {}),
         imageId,
         revision,
         source,
@@ -560,6 +572,40 @@ test("publication verification cannot reuse a report from another image profile"
     reportProfile: "node-bootstrap",
   });
   assert.equal(correct.status, 0, correct.stderr);
+});
+
+test("bootstrap publication refuses missing or changed artifact proofs even with zero findings", async () => {
+  const missing = await inspectionProbe([inspectedImage], {
+    profile: "node-bootstrap",
+    reportProfile: "node-bootstrap",
+    nativeArtifacts: [],
+  });
+  assert.equal(missing.status, 1);
+  assert.deepEqual(missing.calls, []);
+  const native = verifyNativeArtifacts(
+    reviewedFiles.filter((file) => file.nativeArtifact),
+    "node-bootstrap",
+  );
+  const changed = await inspectionProbe([inspectedImage], {
+    profile: "node-bootstrap",
+    reportProfile: "node-bootstrap",
+    nativeArtifacts: native.map((item) => ({
+      ...item,
+      sha256: "0".repeat(64),
+    })),
+  });
+  assert.equal(changed.status, 1);
+  assert.deepEqual(changed.calls, []);
+  const wrongSource = await inspectionProbe([inspectedImage], {
+    profile: "node-bootstrap",
+    reportProfile: "node-bootstrap",
+    nativeArtifacts: native.map((item) => ({
+      ...item,
+      releaseUrl: "https://github.com/public/changed",
+    })),
+  });
+  assert.equal(wrongSource.status, 1);
+  assert.deepEqual(wrongSource.calls, []);
 });
 
 test("plain inspection rejects wrong platforms, ambiguous data and invalid diffIDs", async () => {

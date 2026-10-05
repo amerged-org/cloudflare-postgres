@@ -36,6 +36,9 @@ import {
   reviewedFiles,
   reviewedManifestPaths,
   imageProfile,
+  verifyNativeArtifacts,
+  validateNativeProvenance,
+  type NativeArtifactProvenance,
   type ImageProfile,
 } from "./reviewed-findings.ts";
 
@@ -776,6 +779,7 @@ export async function readLayerArchive(
 interface QualificationReport {
   version: 2;
   profile?: ImageProfile;
+  nativeArtifacts?: NativeArtifactProvenance[];
   canonicalFindings: number;
   opaqueExpectedBytes: number;
   opaqueDetectorBytes: number;
@@ -1074,11 +1078,14 @@ export async function qualify(
       manifests,
       profile,
     );
+    const nativeArtifacts = verifyNativeArtifacts(files, profile);
     const classification = classifyReviewed(canonical, {
       baseImage,
       baseDiffIDs: base.RootFS.Layers,
       imageDiffIDs: config.rootfs.diff_ids,
       packages,
+      profile,
+      nativeArtifacts,
     });
     // Retain the already-reviewed V8 redacted-report consistency check as an additional guard.
     for (const finding of canonical.filter(
@@ -1103,6 +1110,7 @@ export async function qualify(
     const report: QualificationReport = {
       version: 2,
       profile,
+      nativeArtifacts,
       imageId,
       configDigest,
       archiveSha256,
@@ -1144,6 +1152,7 @@ export async function qualify(
       JSON.stringify({
         candidate: {
           profile,
+          nativeArtifacts,
           imageId,
           configDigest,
           archiveSha256,
@@ -1156,6 +1165,8 @@ export async function qualify(
           implementationSha256: createHash("sha256")
             .update(await readFile("scripts/ci/image-qualification.ts"))
             .update(await readFile("scripts/ci/scanner.ts"))
+            .update(await readFile("scripts/ci/reviewed-findings.ts"))
+            .update(await readFile("scripts/ci/reviewed-findings.json"))
             .digest("hex"),
         },
         findings: canonical.map((finding) => ({
@@ -1242,6 +1253,7 @@ async function main(): Promise<void> {
     const report = JSON.parse(
       await readFile(reportPath, "utf8"),
     ) as QualificationReport;
+    validateNativeProvenance(report.nativeArtifacts ?? [], profile);
     requireCheck(
       imageProfile(report.profile) === profile &&
         report.version === 2 &&
