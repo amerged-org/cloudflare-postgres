@@ -24,8 +24,6 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || !inputs.external_probe
     runs-on: ubuntu-24.04
     timeout-minutes: 15
-    env:
-      PGCF_TEST_TALOSCTL: ${{ runner.temp }}/pgcf-test-talosctl
     steps:
       - name: Check out the revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -42,6 +40,7 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Verify the native Talos test client
         run: |
+          PGCF_TEST_TALOSCTL="$RUNNER_TEMP/pgcf-test-talosctl"
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --connect-timeout 15 --max-time 120 \
             --output "$PGCF_TEST_TALOSCTL" \
@@ -49,6 +48,7 @@ jobs:
           printf '%s  %s\n' 7233ece94c94296a033a6ddb5efe0baf508a94c71de7e6c7b286500705924208 \
             "$PGCF_TEST_TALOSCTL" | sha256sum --check --status
           chmod 755 "$PGCF_TEST_TALOSCTL"
+          printf 'PGCF_TEST_TALOSCTL=%s\n' "$PGCF_TEST_TALOSCTL" >> "$GITHUB_ENV"
       - name: Lint
         run: pnpm lint
       - name: Check formatting
