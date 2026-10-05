@@ -10,11 +10,11 @@ export async function downloadBootstrapAssets(
   request: typeof fetch = fetch,
 ) {
   await mkdir(directory, { recursive: true });
+  const signal = AbortSignal.timeout(480_000);
   for (const [filename, artifact] of [
     ["cilium-1.20.2.tgz", PLATFORM_ARTIFACTS.cilium],
     ["flux-install.yaml", PLATFORM_ARTIFACTS.flux],
   ] as const) {
-    const signal = AbortSignal.timeout(480_000);
     const response = await request(artifact.url, {
       signal,
       redirect: "follow",
