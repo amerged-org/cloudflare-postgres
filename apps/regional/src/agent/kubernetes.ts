@@ -1,4 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
+import https from "node:https";
+import { isIP } from "node:net";
 import {
   ApiException,
   CoreV1Api,
@@ -9,7 +11,7 @@ import {
 } from "@kubernetes/client-node";
 import type { ConfigurationOptions } from "@kubernetes/client-node";
 import type { K8sObject } from "@pgcf/contracts";
-import { record, string } from "./types.ts";
+import { record, string, uid } from "./types.ts";
 import type { Kubernetes, Resource } from "./types.ts";
 
 const CUSTOM: Record<
@@ -39,6 +41,80 @@ const CUSTOM: Record<
     plural: "lvmvolumes",
   },
 };
+
+export interface VolumeStatsKubernetes extends Kubernetes {
+  statsSummary?(node: Resource): Promise<unknown>;
+}
+
+export async function kubeletSummary(
+  config: KubeConfig,
+  node: Resource,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const addresses = record(node.status).addresses;
+  const internal = Array.isArray(addresses)
+    ? addresses.map(record).filter((address) => address.type === "InternalIP")
+    : [];
+  if (
+    node.kind !== "Node" ||
+    !uid(node) ||
+    node.metadata.deletionTimestamp ||
+    !internal.length ||
+    internal.length > 2 ||
+    internal.some(
+      (address) =>
+        typeof address.address !== "string" || !isIP(address.address),
+    ) ||
+    new Set(internal.map((address) => isIP(String(address.address)))).size !==
+      internal.length
+  )
+    throw new Error("kubelet_node_invalid");
+  const cluster = config.getCurrentCluster();
+  if (!cluster || cluster.skipTLSVerify || (!cluster.caData && !cluster.caFile))
+    throw new Error("kubelet_tls_invalid");
+  const options: https.RequestOptions = {
+    hostname: String(internal[0]!.address),
+    port: 10250,
+    path: "/stats/summary",
+    method: "GET",
+    signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
+  };
+  await config.applyToHTTPSOptions(options);
+  if (!options.ca) throw new Error("kubelet_tls_invalid");
+  options.rejectUnauthorized = true;
+  // The API client's reusable agent may carry the API server's TLS name; the kubelet must authenticate its own IP.
+  options.agent = false;
+  options.servername = "";
+  return new Promise((resolve, reject) => {
+    const request = https.request(options, (response) => {
+      if (response.statusCode !== 200) {
+        response.destroy();
+        reject(new Error("kubelet_stats_unavailable"));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      response.on("error", reject);
+      response.on("data", (chunk: Buffer) => {
+        bytes += chunk.length;
+        if (bytes > 8 * 1024 * 1024) {
+          response.destroy(new Error("kubelet_stats_too_large"));
+          return;
+        }
+        chunks.push(chunk);
+      });
+      response.on("end", () => {
+        try {
+          resolve(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+        } catch {
+          reject(new Error("kubelet_stats_invalid"));
+        }
+      });
+    });
+    request.on("error", reject);
+    request.end();
+  });
+}
 
 export function requestOptions(
   signal: AbortSignal,
@@ -116,7 +192,7 @@ export async function inventoryPages(
 export function kubernetesFromConfig(
   signal: AbortSignal,
   explicitFile?: string,
-): Kubernetes {
+): VolumeStatsKubernetes {
   const config = new KubeConfig();
   if (explicitFile) config.loadFromFile(explicitFile);
   else if (process.env.KUBERNETES_SERVICE_HOST) config.loadFromCluster();
@@ -133,6 +209,7 @@ export function kubernetesFromConfig(
     return type;
   };
   return {
+    statsSummary: (node) => kubeletSummary(config, node, signal),
     async read(kind, namespace, name) {
       const namespaced = { namespace: namespace ?? "", name };
       try {
@@ -140,6 +217,9 @@ export function kubernetesFromConfig(
         switch (kind) {
           case "Namespace":
             value = await core.readNamespace({ name }, options);
+            break;
+          case "Node":
+            value = await core.readNode({ name }, options);
             break;
           case "Secret":
             value = await core.readNamespacedSecret(namespaced, options);
@@ -220,6 +300,21 @@ export function kubernetesFromConfig(
           return inventoryPages(
             (_continue) =>
               core.listPersistentVolume({ ...page, _continue }, options),
+            kind,
+            "v1",
+          );
+        case "PersistentVolumeClaim":
+          return inventoryPages(
+            (_continue) =>
+              namespace
+                ? core.listNamespacedPersistentVolumeClaim(
+                    { ...page, namespace, _continue },
+                    options,
+                  )
+                : core.listPersistentVolumeClaimForAllNamespaces(
+                    { ...page, _continue },
+                    options,
+                  ),
             kind,
             "v1",
           );
