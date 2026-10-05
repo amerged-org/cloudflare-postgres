@@ -46,6 +46,95 @@ async function sync(id: string) {
   return ((await response.json()) as { synced: boolean }).synced;
 }
 
+async function applicationTables(id: string) {
+  return runInDurableObject(actor(id), (_instance, state) =>
+    state.storage.sql
+      .exec<{ name: string }>(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'database_%' ORDER BY name",
+      )
+      .toArray()
+      .map((row) => row.name),
+  );
+}
+
+it("fresh unknown actors reject hints without creating application tables or querying D1", async () => {
+  const id = newDatabaseId();
+  const count = admissionQueries();
+  const before = await applicationTables(id);
+  const admitted = await actor(id).admit(id, "app");
+  const awake = await actor(id).ensureAwake(id, "app");
+  const after = await applicationTables(id);
+  expect(admitted).toEqual({ ok: false, sqlstate: "3D000" });
+  expect(awake).toEqual({ ok: false, sqlstate: "3D000" });
+  expect(count()).toBe(0);
+  expect({ before, after }).toEqual({ before: [], after: [] });
+  await evictDurableObject(actor(id));
+  expect(await applicationTables(id)).toEqual([]);
+  expect((await actor(id).admit(id, "app")).ok).toBe(false);
+  expect((await actor(id).ensureAwake(id, "app")).ok).toBe(false);
+  expect(await applicationTables(id)).toEqual([]);
+  expect(count()).toBe(0);
+});
+
+it("only a validated management seed for the exact actor creates its persistent schema", async () => {
+  const id = newDatabaseId();
+  const snapshot = {
+    database_id: id,
+    revision: 1,
+    updated_at: new Date().toISOString(),
+    roles: ["app"],
+    deleted: false,
+  };
+  await runInDurableObject(actor(id), async (instance) => {
+    await expect(
+      instance.seed({ ...snapshot, password: crypto.randomUUID() }),
+    ).rejects.toThrow("invalid_actor_snapshot");
+    await expect(
+      instance.seed({ ...snapshot, database_id: newDatabaseId() }),
+    ).rejects.toThrow("actor_identity_mismatch");
+  });
+  expect(await applicationTables(id)).toEqual([]);
+  const count = admissionQueries();
+  expect(await actor(id).admit(id, "app")).toEqual({
+    ok: false,
+    sqlstate: "3D000",
+  });
+  expect(await actor(id).ensureAwake(id, "app")).toEqual({
+    ok: false,
+    sqlstate: "3D000",
+  });
+  expect(await applicationTables(id)).toEqual([]);
+  await actor(id).seed(snapshot);
+  expect(count()).toBe(0);
+  expect(await applicationTables(id)).toEqual([
+    "database_activity",
+    "database_presence",
+    "database_wake",
+  ]);
+  const persisted = await runInDurableObject(actor(id), (_instance, state) =>
+    state.storage.sql.exec("SELECT * FROM database_presence").toArray(),
+  );
+  expect(persisted).toEqual([
+    {
+      ...snapshot,
+      singleton: 1,
+      roles: JSON.stringify(snapshot.roles),
+      deleted: 0,
+    },
+  ]);
+  await evictDurableObject(actor(id));
+  expect(
+    await runInDurableObject(actor(id), (_instance, state) =>
+      state.storage.sql.exec("SELECT * FROM database_presence").toArray(),
+    ),
+  ).toEqual(persisted);
+  expect(await actor(id).admit(id, "unknown")).toEqual({
+    ok: false,
+    sqlstate: "28P01",
+  });
+  expect(count()).toBe(0);
+});
+
 it("one thousand distinct unseeded hints make zero authoritative admission queries", async () => {
   const count = admissionQueries();
   for (let index = 0; index < 1000; index++) {
