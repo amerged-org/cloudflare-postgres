@@ -31,16 +31,18 @@ export interface SleepProbeOptions {
   verifyQuiescence(signal: AbortSignal): Promise<unknown>;
   onClosedSegment?(segment: string): Promise<void>;
 }
-export type SleepRefusal =
-  | "invalid_input"
-  | "not_quiescent"
-  | "sql_busy"
-  | "prepared_work"
-  | "sql_unknown"
-  | "probe_unavailable"
-  | "switch_unknown"
-  | "archive_timeout"
-  | "aborted";
+export const SLEEP_REFUSALS = [
+  "invalid_input",
+  "not_quiescent",
+  "sql_busy",
+  "prepared_work",
+  "sql_unknown",
+  "probe_unavailable",
+  "switch_unknown",
+  "archive_timeout",
+  "aborted",
+] as const;
+export type SleepRefusal = (typeof SLEEP_REFUSALS)[number];
 export type SleepSafetyResult =
   | { safe: true; segment: string }
   | { safe: false; reason: SleepRefusal; segment?: string };

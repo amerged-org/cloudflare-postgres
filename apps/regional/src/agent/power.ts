@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { isIP } from "node:net";
+import { ApiException } from "@kubernetes/client-node";
 import type { DatabaseObservation, DesiredDatabase } from "@pgcf/contracts";
 import { ARCHIVE_DESTINATION_PATTERN, isDatabaseId } from "@pgcf/contracts";
 import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
@@ -24,6 +25,8 @@ import {
   resumeSleepSafety,
   type SleepProbeOptions,
   type SleepSafetyResult,
+  type SleepRefusal,
+  SLEEP_REFUSALS,
 } from "./sleep.ts";
 import { appliedGeneration, condition, DATABASE_LABEL } from "./observe.ts";
 import {
@@ -195,6 +198,33 @@ class Stale extends Error {}
 class Recovery extends Error {}
 class Busy extends Error {}
 class Unavailable extends Error {}
+const UNAVAILABLE_DIAGNOSTICS = new Set([
+  "gateway_private_address_unavailable",
+  "protected_credentials_unavailable",
+  "gateway_replica_configuration_missing",
+  "gateway_inventory_incomplete",
+  "gateway_inventory_invalid",
+  "gateway_inventory_duplicate",
+  "gateway_continuity_unknown",
+  "regional_keyring_missing",
+  "gateway_ack_unavailable",
+  "gateway_report_overflow",
+  "gateway_ack_identity_mismatch",
+  "gateway_release_unacknowledged",
+  "fence_continuity_lost",
+  "switch_result_unknown",
+  "maintenance_capability_missing",
+  "maintenance_credentials_unacknowledged",
+  "database_ca_missing",
+  "keyring_continuity_lost",
+  "gateway_inventory_changed",
+  "closed_segment_not_persisted",
+]);
+const DIAGNOSTIC_HTTP_STATUS = new Set([
+  400, 401, 403, 404, 408, 409, 410, 412, 413, 415, 422, 429, 500, 502, 503,
+  504,
+]);
+
 const encoded = (value: unknown): string => JSON.stringify(value);
 function required(value: unknown, maximum = 253): string {
   if (typeof value !== "string" || value.length < 1 || value.length > maximum)
@@ -373,6 +403,7 @@ export interface PowerOptions {
   signal: AbortSignal;
   region: string;
   replicas?: number;
+  log?: Log;
   now?: () => number;
   fetcher?: typeof fetch;
   probe?: (options: SleepProbeOptions) => Promise<SleepSafetyResult>;
@@ -391,6 +422,60 @@ export class PowerCoordinator {
   private readonly current = new Set<AbortController>();
   constructor(options: PowerOptions) {
     this.options = options;
+  }
+  private logSleepRefusal(
+    phase: Progress["phase"] | undefined,
+    reason?: SleepRefusal,
+    error?: unknown,
+  ): void {
+    if (!this.options.log) return;
+    const fields: Record<string, string | number | boolean> = {
+      phase:
+        phase &&
+        [
+          "quiescing",
+          "switching",
+          "archive",
+          "proved",
+          "hibernating",
+          "hibernated",
+          "refused",
+        ].includes(phase)
+          ? phase
+          : "prepare",
+      category: reason === undefined ? "unknown" : "probe",
+      reason: "unknown",
+    };
+    try {
+      if (reason !== undefined && SLEEP_REFUSALS.includes(reason))
+        fields.reason = reason;
+      else if (
+        error instanceof Unavailable &&
+        UNAVAILABLE_DIAGNOSTICS.has(error.message)
+      ) {
+        fields.category = "unavailable";
+        fields.reason = error.message;
+      } else if (error instanceof Busy) {
+        fields.category = "busy";
+        fields.reason = "gateway_busy";
+      } else if (
+        error instanceof ApiException &&
+        typeof error.code === "number" &&
+        DIAGNOSTIC_HTTP_STATUS.has(error.code)
+      ) {
+        fields.category = "kubernetes_http";
+        fields.status = error.code;
+      }
+    } catch {
+      /* Exception metadata is untrusted diagnostic input. */
+    }
+    try {
+      void Promise.resolve(this.options.log("sleep_refused", fields)).catch(
+        () => {},
+      );
+    } catch {
+      /* Logging cannot change refusal, cleanup or compensation. */
+    }
   }
   interrupt(): void {
     for (const controller of this.current) controller.abort();
@@ -1125,6 +1210,7 @@ export class PowerCoordinator {
             this.now - progress.startedAt < MAX_WAIT
           )
             return null;
+          this.logSleepRefusal(progress.phase, safe.reason);
           const refusal = [
             "sql_busy",
             "prepared_work",
@@ -1174,6 +1260,7 @@ export class PowerCoordinator {
           this.now - progress.startedAt < 30000
         )
           return null;
+        this.logSleepRefusal(progress?.phase, undefined, error);
         if (progress && map) {
           progress.phase = "refused";
           progress.refusal = error instanceof Busy ? "busy" : "unknown";

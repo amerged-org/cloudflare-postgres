@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
+import { ApiException } from "@kubernetes/client-node";
 import { randomBytes, randomUUID } from "node:crypto";
 import { test } from "node:test";
 import { newOperationId, newRolePassword } from "@pgcf/contracts";
@@ -1039,4 +1040,149 @@ test("wake diagnostics preserve returned objects and thrown exceptions without l
     ),
     result,
   );
+});
+
+test("sleep refusal logs a bounded probe reason without credentials, CA, SQL or WAL data", async () => {
+  const state = await readyFixture(),
+    target = suspended(state.db);
+  const segment = randomBytes(12).toString("hex").toUpperCase(),
+    logs: unknown[] = [];
+  const result = await reconciler(state, {
+    probe: async () => ({ safe: false, reason: "probe_unavailable", segment }),
+    log: (event, fields) => logs.push({ event, fields }),
+  }).reconcile(target);
+  assert.equal(result?.state, "error");
+  assert.equal(result?.power?.refusal, "unknown");
+  assert.deepEqual(logs, [
+    {
+      event: "sleep_refused",
+      fields: {
+        phase: "switching",
+        category: "probe",
+        reason: "probe_unavailable",
+      },
+    },
+  ]);
+  const encoded = JSON.stringify(logs);
+  assert.equal(encoded.includes(state.db.maintenance!.password), false);
+  assert.equal(encoded.includes(segment), false);
+  assert.equal(
+    clusterFor(state).metadata.annotations?.["cnpg.io/hibernation"],
+    undefined,
+  );
+});
+
+test("a throwing sleep diagnostic logger preserves the refusal and one probe attempt", async () => {
+  const state = await readyFixture(),
+    target = suspended(state.db);
+  let probes = 0,
+    logs = 0;
+  const result = await reconciler(state, {
+    probe: async () => {
+      probes++;
+      return { safe: false, reason: "sql_unknown" };
+    },
+    log: () => {
+      logs++;
+      throw new Error(newRolePassword());
+    },
+  }).reconcile(target);
+  assert.equal(logs, 1);
+  assert.equal(probes, 1);
+  assert.equal(result?.power?.refusal, "unknown");
+  assert.equal(progress(state).phase, "refused");
+  assert.equal(
+    clusterFor(state).metadata.annotations?.["cnpg.io/hibernation"],
+    undefined,
+  );
+});
+
+test("typed Kubernetes sleep failures expose only safe status and unrelated errors remain unknown", async () => {
+  const state = await readyFixture(),
+    target = suspended(state.db),
+    canary = newRolePassword(),
+    logs: unknown[] = [];
+  let failure: Error = new ApiException(
+    403,
+    canary,
+    { body: canary },
+    { Authorization: canary },
+  );
+  const list = state.k8s.list.bind(state.k8s);
+  state.k8s.list = async (...args) => {
+    if (args[0] === "PersistentVolume") throw failure;
+    return list(...args);
+  };
+  const coordinator = new PowerCoordinator({
+    k8s: state.k8s,
+    signal: state.signal,
+    region: "eu-test",
+    replicas: 2,
+    fetcher: state.fetcher,
+    log: (event, fields) => logs.push({ event, fields }),
+  });
+  assert.equal((await coordinator.suspend(target))?.power?.refusal, "unknown");
+  failure = Object.assign(new Error("maintenance_capability_missing"), {
+    code: 403,
+    statusCode: 403,
+  });
+  assert.equal((await coordinator.suspend(target))?.power?.refusal, "unknown");
+  assert.deepEqual(logs, [
+    {
+      event: "sleep_refused",
+      fields: {
+        phase: "prepare",
+        category: "kubernetes_http",
+        reason: "unknown",
+        status: 403,
+      },
+    },
+    {
+      event: "sleep_refused",
+      fields: { phase: "prepare", category: "unknown", reason: "unknown" },
+    },
+  ]);
+  assert.equal(JSON.stringify(logs).includes(canary), false);
+  assert.equal(
+    clusterFor(state).metadata.annotations?.["cnpg.io/hibernation"],
+    undefined,
+  );
+});
+
+test("a typed maintenance refusal is distinguishable and an async logger failure cannot alter it", async () => {
+  const state = await readyFixture(),
+    target = suspended(state.db),
+    logs: unknown[] = [];
+  delete target.maintenance;
+  const first = await reconciler(state, {
+    log: (event, fields) => logs.push({ event, fields }),
+  }).reconcile(target);
+  assert.equal(first?.power?.refusal, "unknown");
+  assert.deepEqual(logs, [
+    {
+      event: "sleep_refused",
+      fields: {
+        phase: "quiescing",
+        category: "unavailable",
+        reason: "maintenance_capability_missing",
+      },
+    },
+  ]);
+  target.generation = 3;
+  target.power!.revision = 3;
+  target.power!.operation = newOperationId();
+  let attempts = 0;
+  const second = await reconciler(state, {
+    log: async () => {
+      attempts++;
+      throw new Error(newRolePassword());
+    },
+  }).reconcile(target);
+  assert.equal(attempts, 1);
+  assert.equal(second?.power?.refusal, "unknown");
+  assert.equal(
+    clusterFor(state).metadata.annotations?.["cnpg.io/hibernation"],
+    undefined,
+  );
+  assert.equal(progress(state).phase, "refused");
 });

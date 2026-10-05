@@ -36,6 +36,7 @@ async function main(): Promise<void> {
       signal: controller.signal,
       region: config.regionId,
       replicas: config.gatewayReplicas,
+      log,
     });
     const api = new AgentApi(config);
     const measurements = new RegionalMeasurements({
