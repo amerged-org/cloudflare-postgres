@@ -143,6 +143,20 @@ test("plain SCRAM, nonauthentication frames and wrong-password errors remain byt
   );
 });
 
+test("MD5 authentication is refused before the loopback client can answer", async () => {
+  await assert.rejects(
+    transform([authentication(5, randomBytes(4))]),
+    /unsupported_authentication/,
+  );
+});
+
+test("unknown authentication methods are refused before AuthenticationOk", async () => {
+  await assert.rejects(
+    transform([authentication(2)]),
+    /unsupported_authentication/,
+  );
+});
+
 test("PLUS-only, duplicate offers, malformed mechanisms, cleartext and oversized authentication fail closed", async () => {
   await assert.rejects(
     transform([offer("SCRAM-SHA-256-PLUS")]),

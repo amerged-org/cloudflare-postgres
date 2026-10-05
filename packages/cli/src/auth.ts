@@ -29,6 +29,8 @@ export class BackendAuthentication extends Transform {
     if (frame.length < 9) throw new Error("invalid_auth_frame");
     const code = frame.readUInt32BE(5);
     if (code === 3) throw new Error("cleartext_auth_refused");
+    if (code !== 0 && code !== 10 && code !== 11 && code !== 12)
+      throw new Error("unsupported_authentication");
     if (code === 0) {
       if (frame.length !== 9) throw new Error("invalid_auth_frame");
       this.authenticated = true;
