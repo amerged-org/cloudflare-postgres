@@ -45,6 +45,12 @@ It bundles yaml 2.9.1 (ISC) and zod 4.6.5 (MIT), with their installed license fi
 `/app/licenses`. The unmodified Talos CLI 1.14.1 (MPL-2.0) and Kubernetes CLI 1.36.3
 (Apache-2.0) are downloaded from their official releases and checked against the recorded
 SHA-256 for each supported architecture. Their license files are retained in the image.
+Helm `4.3.0` (Apache-2.0) is downloaded from the [official release](https://github.com/helm/helm/releases/tag/v4.3.0)
+with architecture-specific archive checksums in `infra/platform/versions.lock.json`; its license
+is retained at `/app/licenses/helm/LICENSE`. The qualified amd64 binary is extracted from the
+verified official archive and additionally bound by its whole-file SHA-256 and size. Pinned
+Cilium `1.20.2` chart and Flux `2.9.5` install assets retain their Apache-2.0 notices under
+`/app/licenses/cilium` and `/app/licenses/flux`.
 The matching source releases are [Talos v1.14.1](https://github.com/siderolabs/talos/tree/v1.14.1)
 and [Kubernetes v1.36.3](https://github.com/kubernetes/kubernetes/tree/v1.36.3).
 

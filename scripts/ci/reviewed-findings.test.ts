@@ -15,6 +15,7 @@ import type { CanonicalFinding } from "./scanner.ts";
 
 function finding(file = reviewedFiles[0]!, index = 0): CanonicalFinding {
   const span = file.findings[index]!;
+  assert.ok(file.boundDigest && file.layer !== null && file.tarEntry !== null);
   return {
     File: file.path,
     RuleID: span.rule,
@@ -52,7 +53,7 @@ async function provenance() {
     imageDiffIDs: [
       ...reviewedBase.diffIDs,
       "sha256:" + "a".repeat(64),
-      reviewedFiles.find((file) => !file.officialBaseMembership)!.boundDigest,
+      reviewedFiles.find((file) => !file.officialBaseMembership)!.boundDigest!,
     ],
     packages,
   };
@@ -263,7 +264,7 @@ test("repacked application layers retain only the six exact package-proven spans
 
 test("bootstrap resolves exactly the nineteen source-reviewed native spans and rejects an additional finding", async () => {
   const native = reviewedFiles.filter((file) => file.nativeArtifact);
-  assert.equal(native.length, 2);
+  assert.equal(native.length, 3);
   const values = native.flatMap((file) =>
     file.findings.map((_span, index) => finding(file, index)),
   );
@@ -275,7 +276,7 @@ test("bootstrap resolves exactly the nineteen source-reviewed native spans and r
       ...reviewedBase.diffIDs,
       "sha256:" + "a".repeat(64),
       "sha256:" + "b".repeat(64),
-      native[0]!.boundDigest,
+      native[0]!.boundDigest!,
     ],
     nativeArtifacts: native.map((file) => ({
       path: file.path,
@@ -306,7 +307,7 @@ test("native spans require the bootstrap profile and exact public-artifact prove
         ...reviewedBase.diffIDs,
         "sha256:" + "a".repeat(64),
         "sha256:" + "b".repeat(64),
-        native[0]!.boundDigest,
+        native[0]!.boundDigest!,
       ],
       nativeArtifacts: artifacts,
     };
@@ -363,9 +364,16 @@ test("native spans require the bootstrap profile and exact public-artifact prove
   );
 });
 
-test("both native whole-file identities are mandatory even without scanner findings", () => {
+test("all three native whole-file identities are mandatory even without scanner findings", () => {
   const native = reviewedFiles.filter((file) => file.nativeArtifact);
-  assert.equal(verifyNativeArtifacts(native, "node-bootstrap").length, 2);
+  assert.equal(verifyNativeArtifacts(native, "node-bootstrap").length, 3);
+  assert.ok(native.some((file) => file.path === "usr/local/bin/helm"));
+  assert.throws(() =>
+    verifyNativeArtifacts(
+      native.filter((file) => file.path !== "usr/local/bin/helm"),
+      "node-bootstrap",
+    ),
+  );
   assert.throws(() =>
     verifyNativeArtifacts(native.slice(0, 1), "node-bootstrap"),
   );

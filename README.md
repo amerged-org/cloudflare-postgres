@@ -18,7 +18,7 @@ loss is recovered from R2.
 
 ## Status
 
-**Phases 0 and 1 accepted in Dev; Phase 2 in progress (2026-10-04).** The first EU node and
+**Phases 0 and 1 accepted in Dev; operator completion in progress (2026-10-05).** The first EU node and
 all five Flux releases are Ready, with 95 GiB storage. The complete Dev path through
 `db.ohmyho.st` reaches real PostgreSQL with verified TLS, continuous WAL archiving and R2 backups.
 
@@ -43,8 +43,8 @@ gateway fences survived a gateway replacement, and a fresh database verified the
 maintenance role's TLS and minimal grants. Usage rollups and lifecycle API/Actor logic are
 implemented. Manual Dev suspend/resume preserved data and storage and verified closed WAL in R2.
 Automatic idle sleep and one wake for ten concurrent connections passed in Dev. Instrumented cold
-connections now have a twenty-run p50/p95/max of 8.412/9.160/9.708 seconds, above the
-8-second p95 target. All twenty starts preserved data, the original cluster/claim and credential
+connections have a twenty-run p50/p95/max of 8.412/9.160/9.708 seconds, accepted by the owner for v1.
+Cold-start optimization is later work. All twenty starts preserved data, the original cluster/claim and credential
 UIDs/versions, and each caused one wake. The stale readiness snapshot
 is corrected; a verified read-only SQL archive check is deployed, but the first complete cold
 archive check still took 1.74 seconds. The finalized hourly awake-time measurement differs by
@@ -58,10 +58,12 @@ p95 734 ms and maximum 911 ms; this does not establish application or load-capac
 The live collector
 preserves its checkpoint across configuration changes and measures allocation while hibernated.
 Actual R2 listing, archive summary and hourly backup usage agreed on 7,515,287 bytes.
-Absent storage-used measurements and missing cost facts remain explicit gaps. Full Phase 2 acceptance
-remains pending.
+Actual filesystem-use and backup-health collectors, isolated API restore/PITR, lost-node protection
+and early admission limits are implemented; their composed delivery and live acceptance remain pending.
+Missing samples stay unknown. Cost attribution is deferred.
 The second EU node is untouched, the US node has not been bought and no customer or platform
-database has been migrated. Image signing and the complete production-ready release remain pending.
+database has been migrated. EU/US operator acceptance comes first; Neon migration and public-release
+polish follow separately.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture
@@ -79,7 +81,7 @@ flowchart LR
     API["API Worker<br/>/v1"]
     DBA["DatabaseActor DO<br/>per database: wake, idle, usage"]
     RL["RegionLink DO<br/>per region"]
-    WF["Workflows<br/>restore, add node"]
+    WF["Workflow<br/>add node"]
     D1[("D1<br/>state and usage")]
     R2[("R2<br/>backups and WAL")]
     Boot["Container<br/>node bootstrap"]
@@ -183,7 +185,11 @@ during upstream startup). The packaged CLI includes the first-party and bundled-
   (`db.your-domain`): Workers, D1, Durable Objects, Workflows, R2, Tunnel and Containers.
 - A Contabo account with API credentials. The lab uses Cloud VPS with 4 vCPU and 8 GiB.
 
-An install path is part of the open-source release phase in [PLAN.md](PLAN.md#phase-5--open-source-release).
+The current target is the operator deployment on existing accounts and three VPS in total.
+Public-release installation polish follows separately; see [PLAN.md](PLAN.md#7-phases).
+
+The API reference is generated at `/v1/openapi.json` from the shared contracts. Operator runbooks
+cover [recovery](docs/operations/recovery.md) and [credential changes](docs/operations/credentials.md).
 
 ## Development checks
 

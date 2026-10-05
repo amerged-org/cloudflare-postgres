@@ -384,6 +384,7 @@ type ToolStage =
   | "runtime_bootstrap_proxy"
   | "runtime_talos"
   | "runtime_kubectl"
+  | "runtime_helm"
   | "runtime_ssh"
   | "scanner_version"
   | "inspect_help"
@@ -444,7 +445,7 @@ export interface RuntimeCheck {
   exit: number;
   stdout?: string;
   stderr?: string;
-  version?: "talos" | "kubectl" | "ssh";
+  version?: "talos" | "kubectl" | "helm" | "ssh";
 }
 export function runtimeChecks(
   profileInput: ImageProfile = "regional",
@@ -532,6 +533,14 @@ export function runtimeChecks(
       version: "kubectl",
     },
     {
+      stage: "runtime_helm",
+      entrypoint: "helm",
+      args: ["version", "--template={{.Version}}"],
+      exit: 0,
+      stderr: "",
+      version: "helm",
+    },
+    {
       stage: "runtime_ssh",
       entrypoint: "ssh",
       args: ["-V"],
@@ -571,6 +580,11 @@ export function validateRuntimeResult(
       "runtime_version_invalid:runtime_kubectl",
     );
   }
+  if (check.version === "helm")
+    requireCheck(
+      result.stdout.trim() === "v4.3.0",
+      "runtime_version_invalid:runtime_helm",
+    );
   if (check.version === "ssh")
     requireCheck(
       /^OpenSSH_[0-9][^\r\n]*$/.test(result.stderr.trim()),

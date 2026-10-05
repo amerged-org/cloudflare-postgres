@@ -162,6 +162,14 @@ test("runtime profiles invoke every shipped entry and exact native client versio
   );
   const kube = bootstrap.find((check) => check.entrypoint === "kubectl")!;
   assert.deepEqual(kube.args, ["version", "--client=true", "-o=json"]);
+  const helm = bootstrap.find((check) => check.entrypoint === "helm")!;
+  assert.ok(helm, "The shipped installer Helm client must be qualified");
+  assert.doesNotThrow(() =>
+    validateRuntimeResult(helm, { exit: 0, stdout: "v4.3.0", stderr: "" }),
+  );
+  assert.throws(() =>
+    validateRuntimeResult(helm, { exit: 0, stdout: "v4.2.0", stderr: "" }),
+  );
   assert.doesNotThrow(() =>
     validateRuntimeResult(kube, {
       exit: 0,

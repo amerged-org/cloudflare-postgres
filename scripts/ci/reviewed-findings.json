@@ -987,6 +987,25 @@
           }
         }
       ]
+    },
+    {
+      "path": "usr/local/bin/helm",
+      "sha256": "57ce7fc4ea77b28ee6fa91ae071abcade74d3f524e80c9decff5877a5ac8eda4",
+      "size": 65908896,
+      "layer": null,
+      "tarEntry": null,
+      "boundDigest": null,
+      "officialBaseMembership": false,
+      "nativeArtifact": {
+        "name": "helm",
+        "version": "4.3.0",
+        "architecture": "linux/amd64",
+        "releaseUrl": "https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz",
+        "checksumUrl": "https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz.sha256sum",
+        "sha256": "57ce7fc4ea77b28ee6fa91ae071abcade74d3f524e80c9decff5877a5ac8eda4",
+        "size": 65908896
+      },
+      "findings": []
     }
   ],
   "nativeReviewProjectionSha256": "3d6f068892ccb31857d6aed6de43f7c4db2de1d63ebf500eeac95f241fa28d9a"

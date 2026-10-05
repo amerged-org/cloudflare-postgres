@@ -49,7 +49,7 @@ diagnostics now retain counts and stages without trace content. Four diagnostic 
 8.645/9.772/9.057/9.695 s with one wake and preserved data. Two initial Cluster PATCH failures
 reported Invalid, unchanged UID and changed resource version; a server-only stale-version dry-run
 also returned generic Invalid. The exact live rejection cause remains unproven. These four runs
-do not replace the required twenty-run p95 acceptance.
+do not replace the historical twenty-run measurement; its current latency is accepted for v1.
 
 Archive-availability and authenticated-idle fixes are integrated and pass local checks, with API
 delivery required before the new regional producer. Established readiness keeps every physical,
@@ -224,9 +224,11 @@ The diagrams are in [README.md](README.md#architecture).
      `Retain`.
   3. It deletes the namespace, then waits until the PV and the `LVMVolume` are gone, so the logical
      volume is not leaked, and reports `deleted`. R2 objects follow the retention policy.
-- **Restore (PITR, Phase 4):** `POST /v1/databases/{id}/restore {target_time}` creates storage generation
-  g+1 from the g archive with a new archive path. Verify the restored database before changing
-  its active route; retire the old storage generation afterward. Configuration revision is separate.
+- **Restore (PITR, Phase 4):** `POST /v1/databases/{id}/restore` accepts `{mode:"full",name}` or
+  `{mode:"pitr",name,target_time}`. It creates a separate target ID in the source's project and region,
+  with storage generation g+1 and its own archive path; the source remains unchanged. Publish the
+  target only after SQL, role and storage checks and removal of temporary restore administration.
+  The caller then changes its connection explicitly. Configuration revision is separate.
 - **Add node (Phase 3):**
   1. The cron sees region headroom below the threshold. Autoscaling must be enabled and within the
      caps for maximum nodes and maximum monthly spend.
@@ -608,8 +610,8 @@ Live acceptance:
   node down.
 - Production uses the initial two-EU/one-US topology. Keep etcd snapshots, regular D1 exports to
   R2 and documented recovery of Worker Secrets and regional infrastructure.
-- Restore uses a separate storage generation; configuration revision and storage generation are
-  distinct. Verify the restored database before atomically changing its active route.
+- Restore creates a separate target and storage generation; configuration revision and storage
+  generation are distinct. Verify the target before the adopter changes its active connection.
 - Isolation tests: cross-tenant network and SQL, disk-full containment, CPU noisy neighbor.
 - Credential and API key rotation.
 - Keep full, measured placement reservations for v1. Density optimization, sleeping reservation

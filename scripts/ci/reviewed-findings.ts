@@ -62,7 +62,7 @@ export function verifyNativeArtifacts(
 ): NativeArtifactProvenance[] {
   if (imageProfile(profileInput) !== "node-bootstrap") return [];
   const native = reviewedFiles.filter((file) => file.nativeArtifact);
-  if (native.length !== 2) throw new Error("Native artifact review incomplete");
+  if (native.length !== 3) throw new Error("Native artifact review incomplete");
   return native.map((file) => {
     const artifact = file.nativeArtifact!,
       matches = files.filter((value) => value.path === file.path);
@@ -211,6 +211,7 @@ export function classifyReviewed(
     if (file.officialBaseMembership) {
       if (
         !exactBase ||
+        file.layer === null ||
         input.layer !== file.layer ||
         input.tarEntry !== file.tarEntry ||
         input.boundDigest !== file.boundDigest ||

@@ -17,6 +17,10 @@
       "bucket_name": "replace-r2-backup-bucket",
       "jurisdiction": "eu",
     },
+    {
+      "binding": "ARCHIVE_US",
+      "bucket_name": "replace-r2-us-backup-bucket",
+    },
   ],
   "vpc_services": [
     {
@@ -25,6 +29,8 @@
     },
   ],
   "vars": {
+    "DATABASE_CONNECTION_LIMIT_PER_MINUTE": "12000",
+    "ARCHIVE_BINDINGS": "{\"<EU_REGION_ID>\":{\"binding\":\"ARCHIVE\",\"bucket\":\"replace-r2-backup-bucket\"},\"<US_REGION_ID>\":{\"binding\":\"ARCHIVE_US\",\"bucket\":\"replace-r2-us-backup-bucket\"}}",
     "BOOTSTRAP_FIREWALL_BINDINGS": "<PROVIDER_INSTANCE_FIREWALL_UUID_MAP_JSON>",
     "BOOTSTRAP_OPERATOR_SOURCES": "<OPERATOR_HOST_CIDRS_JSON>",
     "BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID": "<RELAY_PROVIDER_INSTANCE_ID>",
