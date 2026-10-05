@@ -1,16 +1,17 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-05): **Phases 0 and 1 accepted in Dev; Phase 2 remains unaccepted.**
+Status (2026-10-05): **Phases 0 and 1 accepted in Dev; Phase 2 live checks are finishing.**
 The first EU node and five Flux platform releases are Ready, with 95 GiB measured storage.
 The second existing EU VPS is untouched; no US VPS has been bought and no customer or platform
 production database has been migrated. The initial topology remains two EU VPS and one US VPS.
 
 The current regional image is
-`sha256:3fa83c598d772efbda8d06dc0d4a978028c680e27e25027dc9fe740ca1f3d184`
-from `02c093fa`, CI `37281058286`. All 658,532,926 expected detector bytes were scanned; all 26
+`sha256:4440a19a0fb444aabda6c1ebb3fdc495753eac2bb92984c25d87efada20e103c`
+from `476eb655`, CI `37288330122`. All 658,538,044 expected detector bytes were scanned; all 26
 reviewed upstream noncredentials resolved, with zero unresolved findings. Anonymous manifest,
 configuration and all ten layer checks passed. Agent and both gateways remained continuously
-Ready for 60.369 s. Signing remains Phase 5 work.
+Ready for 61.856 s. The management API uses the same source with its existing bindings;
+node Workflows/Containers have not been activated. Signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
 API/D1/RegionLink/agent/Tunnel/VPC HTTP/gateway path through `db.ohmyho.st`, with verified
@@ -21,8 +22,9 @@ regional disaster recovery remain Phase 4 work.
 
 Phase 2's last complete cold series measured p50/p95/max 8.412/9.160/9.708 s across twenty
 independent wakes, twenty distinct Pods and the same cluster/PVC. Each caused one wake and one
-configuration revision, preserving data, rollback absence and role Secret identities. The ≤8 s
-p95 target remains unmet. Ten simultaneous cold connections coalesced to one wake. A real
+configuration revision, preserving data, rollback absence and role Secret identities. On 2026-10-05
+the owner accepted the current cold-start times for v1. The original ≤8 s p95 target no longer
+blocks current acceptance; revisit cold-start performance later. Ten simultaneous cold connections coalesced to one wake. A real
 read-only transaction prevented idle sleep for 74 s. An always-warm diagnostic measured new
 connection plus first read p95 734.438 ms; it is not an application or load-capacity guarantee.
 Suspend/resume secured the closed WAL in R2. Hourly awake-time deviation was at most 19.748 s,
@@ -59,7 +61,10 @@ Unknown pipelined outcomes surface as transport failure and are never replayed. 
 now walks up to 16 pages/16,000 objects within one two-second deadline and a 4 MiB key budget;
 incomplete or oversized walks remain unknown. The scan is an interval observation, not an atomic
 R2 snapshot. Tests pass: contracts 129, API 302, Edge 78, regional 385, native 27, CLI 30, harness
-204, infrastructure 21 and CI logic 68, with zero skipped tests. Live proof of these fixes remains pending.
+204, infrastructure 21 and CI logic 68, with zero skipped tests. API and regional delivery are
+complete; their fresh E0–E3 passed. Targeted live proof of these fixes continues. The later lazy
+Actor schema patch passed all 304 API tests: unknown hints create no application tables, while
+validated management seeding preserves existing persistent state. Its live delivery remains pending.
 
 Phase 3 software and native images are prepared, not live-accepted. The Dev D1 export restored
 locally with clean integrity/foreign-key checks; four additive bootstrap migrations rehearsed
@@ -508,12 +513,14 @@ Build:
 Live acceptance:
 
 - The database hibernates after its idle window.
-- 20 cold connects: p50/p95/max are recorded, with a target p95 ≤ 8 s so that a 10 s client
-  timeout holds. If the target is missed, reduce startup time (pre-pulled images, probe tuning)
-  before changing defaults.
+- Record p50/p95/max for 20 cold connects. The owner accepted the measured current startup
+  times for v1 on 2026-10-05: p95 9.160 s in the completed series, with subsequent diagnostics
+  at 8.645–9.772 s. Reevaluate cold starts later; ≤8 s remains a future optimization target.
+  Integrators must choose connection timeouts covering cold starts or use early wake/warm classes.
 - 10 parallel connects to a sleeping database cause exactly one wake.
 - Usage `awake_seconds` matches the lifecycle within 60 s per hour.
-- `/v1/costs` attributes node and R2 cost.
+- Resource/consumption metrics retain explicit gaps. Cost attribution is deferred by the owner;
+  commercial resource prices and billing remain solely in the adopter.
 - Resize applies with one reconnect.
 - psql works through `pgcf connect`.
 
