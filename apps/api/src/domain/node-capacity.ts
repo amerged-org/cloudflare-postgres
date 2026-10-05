@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DatabaseId, RegionId, SIDECAR } from "@pgcf/contracts";
-import { choosePlacement, placementNodes } from "./placement.ts";
+import {
+  choosePlacement,
+  placementNodes,
+  nodePlacementGuard,
+  nodePlacementBindings,
+} from "./placement.ts";
 import type { DatabaseRow, SizeRow } from "./rows.ts";
 import type { Env } from "../env.ts";
 import {
@@ -56,6 +61,7 @@ export async function placePendingDatabases(
         AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
         AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=databases.size_class_id AND s.enabled=1
           WHERE n.id=? AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1
+          AND ${nodePlacementGuard()}
           AND n.platform_reserved_cpu_millicores IS NOT NULL AND n.storage_gib_total IS NOT NULL
           AND n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?
           AND n.allocatable_cpu_millicores-n.platform_reserved_cpu_millicores-COALESCE((SELECT SUM(sc.cpu_millicores+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.cpu_millicores+?
@@ -72,6 +78,7 @@ export async function placePendingDatabases(
           row.updated_at,
           row.size_class_id,
           node.id,
+          ...nodePlacementBindings(),
           SIDECAR.requestMemoryMib,
           SIDECAR.requestMemoryMib,
           SIDECAR.requestCpuMillicores,
@@ -177,6 +184,12 @@ export async function runNodeCapacity(
       operation_id: active.operation_id,
     };
   }
+  const stale = await env.DB.prepare(
+    `SELECT id FROM nodes n WHERE region_id=? AND lost_at IS NULL AND NOT COALESCE((${nodePlacementGuard()}),0) LIMIT 1`,
+  )
+    .bind(regionId, ...nodePlacementBindings())
+    .first();
+  if (stale) return { ...result, action: "observations_stale" };
   if (!policy.autoscale_enabled) return { ...result, action: "disabled" };
   if ((await nodeRegionOccupiedSlots(env.DB, regionId)) >= policy.max_nodes)
     return { ...result, action: "cap_reached" };

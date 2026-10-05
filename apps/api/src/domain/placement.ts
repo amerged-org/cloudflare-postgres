@@ -10,7 +10,9 @@ export const NODE_OBSERVATION_MAX_AGE_MS = 180_000;
 export function nodePlacementGuard(alias = "n"): string {
   if (!/^[a-z][a-z0-9_]*$/.test(alias))
     throw new Error("invalid_node_placement_alias");
-  return `${alias}.lost_at IS NULL AND ${alias}.last_observed_at>=? AND ${alias}.last_observed_at<=?`;
+  return `${alias}.lost_at IS NULL AND ${alias}.last_observed_at>=? AND ${alias}.last_observed_at<=?
+    AND julianday(${alias}.last_observed_at)>=julianday('now','-180 seconds')
+    AND julianday(${alias}.last_observed_at)<=julianday('now','+5 seconds')`;
 }
 export function nodePlacementBindings(now = Date.now()): [string, string] {
   return [
