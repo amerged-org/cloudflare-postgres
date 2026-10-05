@@ -202,7 +202,8 @@ export async function getCapacityPolicy(
     throw new ApiError("not_found", "Region capacity policy is not configured");
   return c.json(
     NodeCapacityPolicy.parse({
-      ...row,
+      region_id: row.region_id,
+      max_nodes: row.max_nodes,
       purchases_enabled: Boolean(row.purchases_enabled),
       autoscale_enabled: Boolean(row.autoscale_enabled),
       order: row.order_config === null ? null : JSON.parse(row.order_config),
