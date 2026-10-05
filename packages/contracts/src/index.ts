@@ -11,3 +11,5 @@ export * from "./gateway-control.ts";
 export * from "./maintenance.ts";
 export * from "./gateway-activity.ts";
 export * from "./costs.ts";
+
+export * from "./nodes.ts";

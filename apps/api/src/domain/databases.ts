@@ -19,6 +19,7 @@ import { page } from "../platform/pagination.ts";
 import { keyring } from "../crypto/keyring.ts";
 import { choosePlacement, placementNodes } from "./placement.ts";
 import { syncDatabaseActor } from "./database-actor-sync.ts";
+import { runNodeCapacity } from "./node-capacity.ts";
 import {
   generateMaintenanceCredential,
   maintenanceCreationStatement,
@@ -262,6 +263,7 @@ export async function createDatabase(
         }
         if (result[0]!.meta.changes === 1) {
           if (node !== null) hint(c, region.id, [id]);
+          else c.executionCtx.waitUntil(runNodeCapacity(c.env, region.id));
           return databaseOperationResponse(c, op);
         }
       }

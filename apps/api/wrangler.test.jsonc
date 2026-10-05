@@ -18,6 +18,13 @@
     },
   ],
   "vars": {
+    "NODE_BOOTSTRAP_CALLBACK_URL": "<NODE_BOOTSTRAP_CALLBACK_URL>",
+    "BOOTSTRAP_RELAY_URL": "<BOOTSTRAP_RELAY_URL>",
+    "BOOTSTRAP_RELAY_ISSUER_REGION": "<BOOTSTRAP_RELAY_ISSUER_REGION>",
+    "BOOTSTRAP_VERIFIER_KEYS": "<DEDICATED_VERIFIER_PUBLIC_KEYS_JSON>",
+    "CONTABO_ORDER_DEFAULT_USER": "<CONTABO_ORDER_DEFAULT_USER>",
+    "CONTABO_ORDER_SSH_KEY_IDS": "<CONTABO_ORDER_SSH_KEY_IDS_JSON>",
+    "CONTABO_RESCUE_SSH_KEY_IDS": "<CONTABO_RESCUE_SSH_KEY_IDS_JSON>",
     "DB_ENDPOINT_HOST": "<DB_ENDPOINT_HOST>",
     "ARCHIVE_BUCKET_NAME": "pgcf-api-test",
   },
@@ -25,11 +32,16 @@
     "bindings": [
       { "name": "REGION_LINK", "class_name": "RegionLink" },
       { "name": "DATABASE_ACTOR", "class_name": "DatabaseActor" },
+      { "name": "NODE_BOOTSTRAP", "class_name": "NodeBootstrap" },
     ],
   },
   "migrations": [
     { "tag": "v1", "new_sqlite_classes": ["RegionLink"] },
     { "tag": "v2", "new_sqlite_classes": ["DatabaseActor"] },
+    { "tag": "v3", "new_sqlite_classes": ["NodeBootstrap"] },
+  ],
+  "workflows": [
+    { "binding": "ADD_NODE", "name": "pgcf-add-node", "class_name": "AddNode" },
   ],
   "triggers": { "crons": ["* * * * *"] },
 }

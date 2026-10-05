@@ -28,6 +28,19 @@ export async function cleanupFixtures(): Promise<void> {
     const databaseScope =
       "database_id IN(SELECT id FROM databases WHERE project_id IN(?,?))";
     await env.DB.batch([
+      env.DB.prepare(
+        "DELETE FROM node_bootstrap_jobs WHERE region_id IN(?,?)",
+      ).bind(region, foreign),
+      env.DB.prepare(
+        "DELETE FROM node_provider_mutations WHERE operation_id IN(SELECT operation_id FROM node_additions WHERE region_id IN(?,?))",
+      ).bind(region, foreign),
+      env.DB.prepare("DELETE FROM node_additions WHERE region_id IN(?,?)").bind(
+        region,
+        foreign,
+      ),
+      env.DB.prepare(
+        "DELETE FROM node_region_policies WHERE region_id IN(?,?)",
+      ).bind(region, foreign),
       env.DB.prepare(`DELETE FROM operations WHERE ${databaseScope}`).bind(
         project,
         other,
