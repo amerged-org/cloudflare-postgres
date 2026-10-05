@@ -168,5 +168,6 @@ test("joining workers never query or patch the existing CoreDNS Deployment", asy
     job,
     state.clusterUID,
   );
+  await Reflect.get(job, "installPlatform").call(job);
   assert.equal(calls, 0);
 });

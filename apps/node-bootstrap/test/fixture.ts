@@ -11,7 +11,12 @@ import type {
   NodeBootstrapSpec,
 } from "@pgcf/contracts/node-bootstrap";
 import { newNodeId, newOperationId } from "@pgcf/contracts";
-import { digest, initialCheckpoint, inputHash } from "../src/bootstrap.ts";
+import {
+  canonical,
+  digest,
+  initialCheckpoint,
+  inputHash,
+} from "../src/bootstrap.ts";
 
 export function fixture(): NodeBootstrapInput {
   const address = [192, 0, 2, 17].join(".");
@@ -99,4 +104,33 @@ export function authority(input: NodeBootstrapInput): NodeBootstrapAuthority {
     checkpoint: initialCheckpoint(),
     protected_material: null,
   };
+}
+
+export function platformFixture() {
+  const input = fixture();
+  const kid = randomBytes(8).toString("hex");
+  const platform = {
+    version: 1 as const,
+    region_id: input.spec.region_id,
+    api_host: `${randomUUID()}.invalid`,
+    agent_key: `pgcf_ak_${input.spec.region_id}_${randomBytes(32).toString("base64url")}`,
+    route_keyring: JSON.stringify({
+      active: kid,
+      keys: { [kid]: randomBytes(32).toString("base64url") },
+    }),
+    tunnel_token: randomBytes(64).toString("base64url"),
+    backup_s3: {
+      access_key_id: randomBytes(16).toString("hex"),
+      secret_access_key: randomBytes(32).toString("hex"),
+    },
+  };
+  const spec = {
+    ...input.spec,
+    platform: {
+      reviewed_commit: randomBytes(20).toString("hex"),
+      regional_image: `registry-${randomBytes(4).toString("hex")}.invalid/pgcf@sha256:${randomBytes(32).toString("hex")}`,
+      configuration_sha256: digest(canonical(platform)),
+    },
+  };
+  return { ...input, spec, input_hash: inputHash(spec), platform };
 }

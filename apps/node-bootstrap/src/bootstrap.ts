@@ -19,6 +19,7 @@ import {
   type NodeBootstrapStatus,
 } from "@pgcf/contracts/node-bootstrap";
 import { startNativeProxy, type ProxyConfig } from "./proxy-command.ts";
+import { PlatformInstaller, readPlatformAssets } from "./platform.ts";
 
 export const TALOS_VERSION = "1.14.1";
 export const KUBERNETES_VERSION = "1.36.3";
@@ -44,6 +45,14 @@ const STAGES: NodeBootstrapStage[] = [
   "talos_authenticated",
   "kubernetes_bootstrap_intent",
   "kubernetes_joined",
+  "cilium_install_intent",
+  "cilium_installed",
+  "flux_install_intent",
+  "flux_installed",
+  "platform_sync_intent",
+  "platform_ready",
+  "regional_install_intent",
+  "regional_ready",
   "awaiting_verification",
   "quarantine_release_intent",
   "quarantine_released",
@@ -209,6 +218,16 @@ export function validateInput(value: unknown): NodeBootstrapInput {
       throw new BootstrapError("cluster_uid_mismatch");
   } else if (input.join_bundle)
     assertBundleIdentity(input.spec, input.join_bundle);
+  if (input.spec.platform) {
+    if (
+      !input.platform ||
+      input.platform.region_id !== input.spec.region_id ||
+      digest(canonical(input.platform)) !==
+        input.spec.platform.configuration_sha256
+    )
+      throw new BootstrapError("platform_configuration_mismatch");
+  } else if (input.platform)
+    throw new BootstrapError("platform_configuration_mismatch");
   return input;
 }
 
@@ -479,6 +498,7 @@ export interface BootstrapOptions {
   request?: typeof fetch;
   operator_direct?: boolean;
   proxy_command_path?: string;
+  platform_assets_directory?: string;
 }
 
 export class BootstrapJob {
@@ -1324,6 +1344,57 @@ export class BootstrapJob {
       throw new BootstrapError("coredns_patch_unconfirmed");
     }
   }
+  private async installPlatform() {
+    if (this.input.spec.role !== "controlplane") return;
+    if (!this.input.spec.platform || !this.input.platform)
+      throw new BootstrapError("platform_installation_missing");
+    const assets = await readPlatformAssets(
+      this.options.platform_assets_directory ?? "/app/assets",
+      this.input,
+    );
+    const installer = new PlatformInstaller(this.input, assets, {
+      kube: (args, permit_failure, stdin) =>
+        this.kube(args, permit_failure, stdin),
+      helm: (args, permit_failure) =>
+        this.execute(
+          "helm",
+          ["--kubeconfig", join(this.directory, "kubeconfig"), ...args],
+          undefined,
+          permit_failure,
+        ),
+      authorize: async () => {
+        const authority = await this.authority.read(this.abort.signal);
+        const material = authority.protected_material;
+        if (
+          !authority.checkpoint.sealed_ref ||
+          material?.purpose !== "join_bundle"
+        )
+          throw new BootstrapError("platform_bundle_unsealed");
+        const namespace = record(
+          JSON.parse(
+            (
+              await this.kube([
+                "get",
+                "namespace",
+                "kube-system",
+                "--output=json",
+              ])
+            ).stdout,
+          ),
+        );
+        if (
+          record(namespace.metadata).uid !== material.material.kube_system_uid
+        )
+          throw new BootstrapError("cluster_uid_mismatch");
+        return authority.checkpoint.stage;
+      },
+      checkpoint: async (stage) => {
+        await this.checkpoint(stage);
+      },
+    });
+    await installer.install();
+    await this.authenticatedReadback();
+  }
   private async admissionNode(node_uid: string, kube_system_uid: string) {
     const namespace = record(
       JSON.parse(
@@ -1517,6 +1588,11 @@ export class BootstrapJob {
     )
       return;
     try {
+      if (
+        this.input.spec.role === "controlplane" &&
+        (!this.input.spec.platform || !this.input.platform)
+      )
+        throw new BootstrapError("platform_installation_missing");
       await this.setup();
       const position = () => STAGES.indexOf(authority.checkpoint.stage);
       const at = (stage: NodeBootstrapStage) => STAGES.indexOf(stage);
@@ -1688,7 +1764,9 @@ export class BootstrapJob {
       ) {
         throw new BootstrapError("kubernetes_node_identity_mismatch");
       }
-      authority = await this.checkpoint("kubernetes_joined");
+      if (position() < at("kubernetes_joined"))
+        authority = await this.checkpoint("kubernetes_joined");
+      await this.installPlatform();
       await this.checkpoint("awaiting_verification", {
         status: "awaiting_verification",
       });
