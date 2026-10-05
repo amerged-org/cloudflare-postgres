@@ -788,3 +788,24 @@ it("inventory memory is bounded across individually valid pages without returnin
     client.listInstances({}, { requestId: f.requestId }),
   ).rejects.toMatchObject({ code: "pagination_incomplete" });
 });
+it("instance detail exposes actual MAC and disk/network metadata without filling absent IPv6", async () => {
+  const f = setup();
+  expect(
+    await f.client.getInstance(f.instanceId, { requestId: f.requestId }),
+  ).toMatchObject({
+    macAddress: f.instance.macAddress,
+    diskMb: f.instance.diskMb,
+    ipConfig: { v4: f.instance.ipConfig.v4 },
+  });
+  f.set(() =>
+    Response.json({
+      data: [{ ...f.instance, ipConfig: { v4: f.instance.ipConfig.v4 } }],
+      _links: { self: "/v1/compute/instances/" + f.instanceId },
+    }),
+  );
+  const instance = await f.client.getInstance(f.instanceId, {
+    requestId: value(),
+  });
+  expect(instance.ipConfig.v4).toEqual(f.instance.ipConfig.v4);
+  expect(instance.ipConfig).not.toHaveProperty("v6");
+});

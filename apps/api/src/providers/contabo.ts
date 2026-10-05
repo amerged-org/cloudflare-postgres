@@ -67,7 +67,7 @@ const InstanceWire = z.object({
   productName: Short,
   imageId: Text.nullable().optional(),
   defaultUser: z.enum(["root", "admin", "administrator"]).optional(),
-  ipConfig: z.object({ v4: V4, v6: V6 }),
+  ipConfig: z.object({ v4: V4, v6: V6.optional() }),
   ramMb: z.number().finite().nonnegative(),
   cpuCores: Count,
   diskMb: z.number().finite().nonnegative(),
@@ -102,6 +102,7 @@ export interface ContaboInstance {
   ramMb: number;
   cpuCores: number;
   diskMb: number;
+  macAddress: string;
   osType: string;
   sshKeys: string[];
   createdDate: string;
@@ -129,6 +130,7 @@ const toInstance = (value: z.infer<typeof InstanceWire>): Instance => ({
   ramMb: value.ramMb,
   cpuCores: value.cpuCores,
   diskMb: value.diskMb,
+  macAddress: value.macAddress,
   osType: value.osType,
   sshKeys: value.sshKeys,
   createdDate: value.createdDate,
