@@ -1,7 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { Buffer } from "node:buffer";
+import { PostgresActivity } from "../../../regional/src/gateway/activity.ts";
 import { runInDurableObject } from "cloudflare:test";
 import { DatabaseWithOperation } from "@pgcf/contracts";
+import {
+  signGatewayActivity,
+  verifyGatewayActivity,
+  gatewayActivityReportSchema,
+} from "@pgcf/contracts/gateway-activity";
 import { afterEach, expect, it, vi } from "vitest";
 import {
   cleanupFixtures,
@@ -62,7 +69,7 @@ function activity(
     totalConnections: connections,
     connectionMilliseconds: 0,
     connections,
-    authenticatedConnections: connections,
+    authenticatedConnections: connections - pending,
     busyConnections: busy,
     pendingDials: pending,
     lastActivityAt: last,
@@ -165,14 +172,14 @@ it("a recovered observation window delays idle despite older gateway activity", 
     { last_activity_at: floor, active_connections: 0 },
   ]);
 });
-it("busy work and pending dials map conservatively instead of blocking every idle-open socket", async () => {
+it("authenticated busy work blocks idle while pending transports remain separately reported", async () => {
   const f = await ready();
   expect(await (await sendActivity(f, activity(f, 4, 1, 2))).json()).toEqual({
     accepted: 1,
     idle_intents: 0,
   });
   expect((await activityRows(f.id))[0]).toMatchObject({
-    active_connections: 6,
+    active_connections: 2,
   });
   expect(await generation(f.id)).toBe(1);
 });
@@ -434,4 +441,88 @@ it("usage preflight and the existing recorder keep D1 work bounded for repeated 
     duplicates: 0,
   });
   expect(prepare.mock.calls.length).toBeLessThanOrEqual(8);
+});
+
+it("signed gateway scope with zero authenticated activity stays known despite an open pre-auth transport", async () => {
+  const f = await ready(),
+    body = activity(f, 1, 0, 1);
+  const keyring = {
+    active: "fixture",
+    keys: new Map([["fixture", crypto.getRandomValues(new Uint8Array(32))]]),
+  };
+  for (const report of body.databases[0]!.reports) {
+    const token = await signGatewayActivity({
+      keyring,
+      region: f.region,
+      database: f.id,
+      revision: 1,
+      pod: report.pod,
+    });
+    const checked = await verifyGatewayActivity(token, {
+      keys: keyring.keys,
+      region: f.region,
+      pod: report.pod,
+    });
+    expect(checked.ok).toBe(true);
+    if (!checked.ok) throw new Error("fixture_scope_invalid");
+    expect(checked.claims.database).toBe(f.id);
+    expect(checked.claims.revision).toBe(1);
+    Object.assign(report, {
+      history: "current_process_absence",
+      lastActivityAt: null,
+      authenticatedConnections: 0,
+      ingressBytes: 0,
+      egressBytes: 0,
+      totalConnections: 0,
+      connectionMilliseconds: 0,
+    });
+    expect(gatewayActivityReportSchema.safeParse(report).success).toBe(true);
+  }
+  body.databases[0]!.last_activity_at =
+    body.databases[0]!.reports[0]!.counterStartedAt;
+  const response = await sendActivity(f, body);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ accepted: 1, idle_intents: 1 });
+  expect((await activityRows(f.id))[0]).toMatchObject({
+    active_connections: 0,
+  });
+});
+
+it("pre-auth pending dials do not become idle-active after earlier authenticated activity", async () => {
+  const f = await ready(),
+    body = activity(f, 1, 0, 1);
+  for (const report of body.databases[0]!.reports)
+    report.authenticatedConnections = 0;
+  const response = await sendActivity(f, body);
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ accepted: 1, idle_intents: 1 });
+  expect((await activityRows(f.id))[0]).toMatchObject({
+    active_connections: 0,
+  });
+});
+
+it("an authenticated held transaction remains idle-active despite an old client-activity timestamp", async () => {
+  const f = await ready(),
+    observer = new PostgresActivity();
+  const frame = (tag: string, body: Buffer) => {
+    const bytes = Buffer.alloc(5 + body.length);
+    bytes[0] = tag.charCodeAt(0);
+    bytes.writeUInt32BE(4 + body.length, 1);
+    body.copy(bytes, 5);
+    return bytes;
+  };
+  observer.observeBackend(
+    Buffer.concat([frame("R", Buffer.alloc(4)), frame("Z", Buffer.from("I"))]),
+  );
+  observer.observeFrontend(frame("Q", Buffer.from("SELECT 1\0")));
+  observer.observeBackend(frame("Z", Buffer.from("T")));
+  expect(observer.authenticated).toBe(true);
+  expect(observer.busy).toBe(true);
+  const response = await sendActivity(f, activity(f, 1, observer.busy ? 1 : 0));
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ accepted: 1, idle_intents: 0 });
+  expect((await activityRows(f.id))[0]).toMatchObject({
+    active_connections: 2,
+  });
+  expect(await generation(f.id)).toBe(1);
 });

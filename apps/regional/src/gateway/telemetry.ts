@@ -53,8 +53,7 @@ export class GatewayMeasurements {
   get size(): number {
     return this.records.size;
   }
-  begin(database: string): MeasurementSession {
-    DatabaseId.parse(database);
+  private authenticatedRecord(database: string): RecordState | undefined {
     let record = this.records.get(database);
     if (!record) {
       if (this.records.size >= this.maxRecords) {
@@ -82,11 +81,12 @@ export class GatewayMeasurements {
         this.records.set(database, record);
       }
     }
-    if (record) {
-      record.active++;
-      record.lastActivity = this.now();
-    }
-    const active: ActiveSession = { record, closed: false };
+    return record;
+  }
+  begin(database: string): MeasurementSession {
+    DatabaseId.parse(database);
+    let record: RecordState | undefined;
+    const active: ActiveSession = { closed: false };
     this.sessions.add(active);
     let ingress = 0,
       egress = 0;
@@ -130,6 +130,9 @@ export class GatewayMeasurements {
       egress: (amount) => bytes(amount, false),
       authenticate: () => {
         if (active.closed || active.authenticatedAt !== undefined) return;
+        record = this.authenticatedRecord(database);
+        active.record = record;
+        if (record) record.active++;
         active.authenticatedAt = this.now();
         add("ingressBytes", ingress);
         add("egressBytes", egress);
@@ -137,7 +140,7 @@ export class GatewayMeasurements {
         touch();
       },
       clientActivity: () => {
-        if (!active.closed) touch();
+        if (!active.closed && active.authenticatedAt !== undefined) touch();
       },
       close: () => {
         if (active.closed) return;

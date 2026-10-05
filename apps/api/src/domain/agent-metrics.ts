@@ -67,10 +67,8 @@ export async function ingestAgentActivity(c: ApiContext, raw: unknown) {
         (report.history === "complete" && report.lastActivityAt === null) ||
         (report.history === "current_process_absence" &&
           (report.lastActivityAt !== null ||
-            report.connections !== 0 ||
             report.authenticatedConnections !== 0 ||
             report.busyConnections !== 0 ||
-            report.pendingDials !== 0 ||
             report.ingressBytes !== 0 ||
             report.egressBytes !== 0 ||
             report.totalConnections !== 0 ||
@@ -102,7 +100,8 @@ export async function ingestAgentActivity(c: ApiContext, raw: unknown) {
       revision: activity.revision,
       observed_at: activity.observed_at,
       last_activity_at: boundary,
-      active_connections: activity.busy_connections + activity.pending_dials,
+      // Idle activity is authenticated work; physical quiescence retains its separate transport barrier.
+      active_connections: activity.busy_connections,
     });
     if (!recorded) continue;
     accepted++;

@@ -99,7 +99,10 @@ test("quiescence isolates one database, refuses stale routes and preserves queue
   const other = await session(port, otherId);
   const stale = await token();
   const operation = newOperationId();
-  assert.equal(gateway.beginQuiesce(database, operation).status, "idle");
+  assert.equal(
+    (await gateway.beginQuiesce(database, operation)).status,
+    "idle",
+  );
   assert.equal(await rejection(port, stale), 503);
   const queued = Buffer.concat([query(), query()]);
   target.socket.send(queued);
@@ -108,7 +111,7 @@ test("quiescence isolates one database, refuses stale routes and preserves queue
   postgres.peers[1]!.socket.write(ready());
   await until(() => Buffer.concat(other.chunks).equals(ready()));
   await until(
-    () => gateway.beginQuiesce(database, operation).status === "busy",
+    () => gateway.quiesceStatus(database, operation).status === "busy",
   );
   assert.equal(Buffer.concat(postgres.peers[0]!.bytes).length, 0);
   assert.equal(
@@ -123,7 +126,10 @@ test("quiescence isolates one database, refuses stale routes and preserves queue
     Buffer.concat(target.chunks).equals(Buffer.concat([ready(), ready()])),
   );
   assert.equal(postgres.handshakes(), 2);
-  assert.equal(gateway.beginQuiesce(database, operation).status, "idle");
+  assert.equal(
+    (await gateway.beginQuiesce(database, operation)).status,
+    "idle",
+  );
   assert.equal(
     (await gateway.closeQuiesced(database, operation)).status,
     "closed",
@@ -133,7 +139,7 @@ test("quiescence isolates one database, refuses stale routes and preserves queue
   gateway.releaseQuiesce(database, operation);
 });
 
-test("pending startup/dial remains fenced and resumes its original bytes without redial", async (t) => {
+test("pending startup/dial closes under the fence and never redials or replays its original bytes", async (t) => {
   const postgres = await backend();
   const actual = createPostgresDial(
     new DatabaseCaCache(async () => validCertificate.cert),
@@ -171,23 +177,18 @@ test("pending startup/dial remains fenced and resumes its original bytes without
   socket.send(Buffer.from(encodeStartup({ database, user: "app" })));
   await begun;
   const operation = newOperationId();
-  assert.equal(gateway.beginQuiesce(database, operation).pendingDials, 1);
-  assert.equal(
-    (await gateway.closeQuiesced(database, operation)).status,
-    "busy",
-  );
+  assert.equal(gateway.quiesceStatus(database, operation).pendingDials, 1);
+  const result = await gateway.beginQuiesce(database, operation);
+  assert.equal(result.pendingDials, 0);
+  assert.equal(result.connections, 0);
   proceed();
-  await until(
-    () => gateway.beginQuiesce(database, operation).pendingDials === 0,
-  );
   await until(() => postgres.peers.length === 1);
+  await until(() => gateway.metrics.activeConnections === 0);
   assert.equal(chunks.length, 0);
   assert.equal(postgres.peers[0]!.bytes.length, 0);
-  assert.equal(gateway.beginQuiesce(database, operation).status, "busy");
   gateway.releaseQuiesce(database, operation);
-  await until(() =>
-    Buffer.concat(chunks).equals(Buffer.concat([auth, ready()])),
-  );
+  await delay(1);
+  assert.equal(chunks.length, 0);
   assert.equal(calls, 1);
 });
 
@@ -204,7 +205,10 @@ test("transactions, authentication and fragmented/pipelined input refuse closing
   await until(() => Buffer.concat(postgres.peers[0]!.bytes).equals(query()));
   postgres.peers[0]!.socket.write(ready("T"));
   await until(() => Buffer.concat(client.chunks).equals(ready("T")));
-  assert.equal(gateway.beginQuiesce(database, operation).status, "busy");
+  assert.equal(
+    (await gateway.beginQuiesce(database, operation)).status,
+    "busy",
+  );
   assert.equal(
     (await gateway.closeQuiesced(database, operation)).status,
     "busy",
@@ -221,8 +225,9 @@ test("transactions, authentication and fragmented/pipelined input refuse closing
   await until(() => Buffer.concat(client.chunks).equals(ready()));
   const packet = query();
   client.socket.send(packet.subarray(0, 1), { fin: false });
+  await gateway.beginQuiesce(database, operation);
   await until(
-    () => gateway.beginQuiesce(database, operation).status === "busy",
+    () => gateway.quiesceStatus(database, operation).status === "busy",
   );
   assert.equal(
     (await gateway.closeQuiesced(database, operation)).status,
@@ -235,12 +240,16 @@ test("transactions, authentication and fragmented/pipelined input refuse closing
       Buffer.concat([query(), query(), query()]),
     ),
   );
-  postgres.peers[0]!.socket.write(ready());
+  postgres.peers[0]!.socket.write(ready("T"));
+  await until(() => gateway.activity(database).busyConnections === 1);
   const unauthenticated = await open(port);
   const otherOperation = newOperationId();
   assert.throws(() => gateway.beginQuiesce("invalid", otherOperation));
   assert.throws(() => gateway.beginQuiesce(database, "invalid"));
-  assert.equal(gateway.beginQuiesce(database, operation).status, "busy");
+  assert.equal(
+    (await gateway.beginQuiesce(database, operation)).status,
+    "busy",
+  );
   assert.equal(
     (await gateway.closeQuiesced(database, operation)).status,
     "busy",
@@ -277,7 +286,7 @@ test("an upgrade spanning begin/release cannot admit its pre-fence route", async
   const denied = rejection(port, route);
   await begun;
   const operation = newOperationId();
-  gateway.beginQuiesce(database, operation);
+  await gateway.beginQuiesce(database, operation);
   gateway.releaseQuiesce(database, operation);
   proceed();
   assert.equal(await denied, 503);
@@ -296,13 +305,16 @@ test("partial PG input in an otherwise complete WS message stays busy across sta
   const packet = query();
   client.socket.send(packet.subarray(0, 5));
   await until(() => Buffer.concat(postgres.peers[0]!.bytes).length === 5);
-  assert.equal(gateway.beginQuiesce(database, operation).status, "busy");
+  assert.equal(
+    (await gateway.beginQuiesce(database, operation)).status,
+    "busy",
+  );
   postgres.peers[0]!.socket.write(ready());
   await until(() => Buffer.concat(client.chunks).equals(ready()));
   gateway.releaseQuiesce(database, operation);
   client.socket.send(packet.subarray(5));
   await until(() => Buffer.concat(postgres.peers[0]!.bytes).equals(packet));
-  gateway.beginQuiesce(database, operation);
+  await gateway.beginQuiesce(database, operation);
   assert.equal(
     (await gateway.closeQuiesced(database, operation)).status,
     "busy",
@@ -340,15 +352,164 @@ test("a parked TLS result handles errors and releases its original reservation o
   socket.send(Buffer.from(encodeStartup({ database, user: "app" })));
   await until(() => heldSocket !== undefined);
   const operation = newOperationId();
-  gateway.beginQuiesce(database, operation);
+  await gateway.beginQuiesce(database, operation);
   proceed();
   await until(
-    () => gateway.beginQuiesce(database, operation).pendingDials === 0,
+    () => gateway.quiesceStatus(database, operation).pendingDials === 0,
   );
+  await until(() => heldSocket!.listenerCount("error") > 0);
   assert.doesNotThrow(() =>
     heldSocket!.emit("error", new Error("fixture transport failure")),
   );
   await until(() => gateway.metrics.activeConnections === 0);
   assert.equal(logs.length, 1);
   assert.equal(postgres.peers[0]!.bytes.length, 0);
+});
+
+test("begin quiescence closes a held pre-auth transport and keeps raw counts until actual cleanup", async (t) => {
+  const code = Buffer.alloc(4);
+  code.writeUInt32BE(10);
+  const challenge = frame(
+    "R",
+    Buffer.concat([code, Buffer.from("SCRAM-SHA-256\0\0")]),
+  );
+  const postgres = await postgresServer(undefined, (socket) =>
+    socket.once("data", () => socket.write(challenge)),
+  );
+  const { gateway, port } = await gatewayFor(postgres.port);
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const client = await open(port),
+    chunks: Buffer[] = [];
+  client.on("message", (value) => chunks.push(Buffer.from(value as Buffer)));
+  client.send(Buffer.from(encodeStartup({ database, user: "app" })));
+  await until(() => Buffer.concat(chunks).equals(challenge));
+  const operation = newOperationId(),
+    pending = gateway.beginQuiesce(database, operation);
+  assert.equal(gateway.quiesceStatus(database, operation).connections, 1);
+  assert.throws(() => gateway.releaseQuiesce(database, operation));
+  const result = await pending;
+  assert.equal(result.connections, 0);
+  assert.equal(result.busyConnections, 0);
+  assert.equal(result.pendingDials, 0);
+  assert.equal(gateway.metrics.activeConnections, 0);
+  assert.equal(gateway.activity(database).totalConnections, 0);
+  assert.equal(await rejection(port, await token()), 503);
+  assert.throws(() => gateway.releaseQuiesce(database, newOperationId()));
+  gateway.releaseQuiesce(database, operation);
+});
+
+test("lost pre-auth close acknowledgement is bounded and cannot bypass an operation-bound drain", async (t) => {
+  const original = globalThis.setTimeout,
+    timers: NodeJS.Timeout[] = [],
+    deadlines: (() => void)[] = [];
+  t.mock.method(
+    globalThis,
+    "setTimeout",
+    (
+      callback: (...args: unknown[]) => void,
+      ms?: number,
+      ...args: unknown[]
+    ) => {
+      if (ms === 500) {
+        const timer = original(() => {}, 600000);
+        timer.unref();
+        timers.push(timer);
+        deadlines.push(() => callback(...args));
+        return timer;
+      }
+      return original(callback, ms, ...args);
+    },
+  );
+  t.after(() => {
+    for (const timer of timers) clearTimeout(timer);
+  });
+  const code = Buffer.alloc(4);
+  code.writeUInt32BE(10);
+  const challenge = frame(
+    "R",
+    Buffer.concat([code, Buffer.from("SCRAM-SHA-256\0\0")]),
+  );
+  const postgres = await postgresServer(undefined, (socket) =>
+    socket.once("data", () => socket.write(challenge)),
+  );
+  const { gateway, port } = await gatewayFor(postgres.port);
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const client = await open(port),
+    chunks: Buffer[] = [];
+  client.on("message", (value) => chunks.push(Buffer.from(value as Buffer)));
+  client.send(Buffer.from(encodeStartup({ database, user: "app" })));
+  await until(() => Buffer.concat(chunks).equals(challenge));
+  client.pause();
+  const operation = newOperationId(),
+    pending = gateway.beginQuiesce(database, operation);
+  assert.equal(gateway.beginQuiesce(database, operation), pending);
+  assert.equal(deadlines.length, 1);
+  assert.equal(gateway.quiesceStatus(database, operation).connections, 1);
+  assert.throws(() => gateway.releaseQuiesce(database, operation));
+  assert.throws(() => gateway.beginQuiesce(database, newOperationId()));
+  assert.equal(
+    (await gateway.closeQuiesced(database, operation)).status,
+    "busy",
+  );
+  deadlines[0]!();
+  const result = await pending;
+  assert.equal(result.connections, 0);
+  assert.equal(result.pendingDials, 0);
+  assert.equal(gateway.metrics.activeConnections, 0);
+  client.resume();
+  assert.throws(() => gateway.releaseQuiesce(database, newOperationId()));
+  gateway.releaseQuiesce(database, operation);
+});
+
+test("pre-auth pipelined bytes have an unknown outcome, surface transport failure and are never replayed", async (t) => {
+  const code = Buffer.alloc(4);
+  code.writeUInt32BE(10);
+  const challenge = frame(
+    "R",
+    Buffer.concat([code, Buffer.from("SCRAM-SHA-256\0\0")]),
+  );
+  const forwarded: Buffer[] = [];
+  const postgres = await postgresServer(undefined, (socket) => {
+    let first = true;
+    socket.on("data", (bytes) => {
+      if (first) {
+        first = false;
+        socket.write(challenge);
+      } else forwarded.push(bytes);
+    });
+  });
+  const { gateway, port } = await gatewayFor(postgres.port);
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  const client = await open(port),
+    chunks: Buffer[] = [];
+  client.on("message", (value) => chunks.push(Buffer.from(value as Buffer)));
+  client.send(Buffer.from(encodeStartup({ database, user: "app" })));
+  await until(() => Buffer.concat(chunks).equals(challenge));
+  const input = Buffer.concat([
+    frame("p", Buffer.from("fixture-response")),
+    query(),
+  ]);
+  client.send(input);
+  await until(() => Buffer.concat(forwarded).equals(input));
+  const close = new Promise<number>((resolve) =>
+      client.once("close", (code) => resolve(code)),
+    ),
+    operation = newOperationId();
+  const result = await gateway.beginQuiesce(database, operation);
+  assert.equal(result.connections, 0);
+  assert.equal(await close, 1012);
+  gateway.releaseQuiesce(database, operation);
+  await delay(1);
+  assert.deepEqual(Buffer.concat(forwarded), input);
+  assert.equal(postgres.handshakes(), 1);
+  assert.equal(gateway.activity(database).totalConnections, 0);
 });

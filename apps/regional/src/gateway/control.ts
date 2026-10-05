@@ -125,7 +125,10 @@ export function createGatewayControl(options: {
                 intent.operation,
               )
             : action.data === "begin"
-              ? options.gateway.beginQuiesce(intent.database, intent.operation)
+              ? await options.gateway.beginQuiesce(
+                  intent.database,
+                  intent.operation,
+                )
               : options.gateway.quiesceStatus(
                   intent.database,
                   intent.operation,

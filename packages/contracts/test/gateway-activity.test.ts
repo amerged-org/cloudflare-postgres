@@ -109,3 +109,44 @@ it("keeps missing history and current-process absence distinct with bounded time
     }).success,
   ).toBe(true);
 });
+
+it("known zero authenticated activity permits separately visible unauthenticated transports", () => {
+  const now = new Date().toISOString();
+  const report = {
+    region: "test-region",
+    database: newDatabaseId(),
+    revision: 1,
+    pod: randomUUID(),
+    processEpoch: randomUUID(),
+    epoch: randomUUID(),
+    startedAt: now,
+    counterStartedAt: now,
+    observedAt: now,
+    history: "current_process_absence",
+    countersSince: now,
+    ingressBytes: 0,
+    egressBytes: 0,
+    totalConnections: 0,
+    connectionMilliseconds: 0,
+    connections: 2,
+    authenticatedConnections: 0,
+    busyConnections: 0,
+    pendingDials: 1,
+    lastActivityAt: null,
+  };
+  expect(gatewayActivityReportSchema.safeParse(report).success).toBe(true);
+  expect(
+    gatewayActivityReportSchema.safeParse({ ...report, busyConnections: 1 })
+      .success,
+  ).toBe(false);
+  expect(
+    gatewayActivityReportSchema.safeParse({
+      ...report,
+      authenticatedConnections: 1,
+    }).success,
+  ).toBe(false);
+  expect(
+    gatewayActivityReportSchema.safeParse({ ...report, ingressBytes: 1 })
+      .success,
+  ).toBe(false);
+});
