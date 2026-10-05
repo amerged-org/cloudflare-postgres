@@ -38,6 +38,8 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Check public plan privacy
+        run: node scripts/ci/plan-privacy.ts
       - name: Verify the native Talos test client
         run: |
           PGCF_TEST_TALOSCTL="$RUNNER_TEMP/pgcf-test-talosctl"

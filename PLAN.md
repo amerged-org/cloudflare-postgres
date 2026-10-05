@@ -1,154 +1,62 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-05): **Phases 0 and 1 accepted in Dev; Phase 2 in progress.**
-The first EU node and all five Flux platform releases are Ready, with 95 GiB measured storage.
-The management API, D1, RegionLink, regional agent, Tunnel, VPC HTTP service and single endpoint
-`db.ohmyho.st` run the complete database create/connect/backup/delete path. PostgreSQL TLS is
-verified and PostgreSQL has no public port. The second EU VPS is untouched; no US VPS has been
-bought and no customer or platform database has been migrated.
+Status (2026-10-05): **Phases 0 and 1 accepted in Dev; Phase 2 remains unaccepted.**
+The first EU node and five Flux platform releases are Ready, with 95 GiB measured storage.
+The second existing EU VPS is untouched; no US VPS has been bought and no customer or platform
+production database has been migrated. The initial topology remains two EU VPS and one US VPS.
 
-The deployed regional image is
-`sha256:14191e73d2bde4897856f1be7eeccca30a9d41f52e1665a818c6ecab2ba1483a`
-from source `efcdb759`. CI `37269991675` passed. Full qualification scanned all 658,527,296
-expected bytes; all 26 reviewed upstream noncredentials resolved, with zero unresolved findings.
-Image signing remains Phase 5 work.
+The current regional image is
+`sha256:3fa83c598d772efbda8d06dc0d4a978028c680e27e25027dc9fe740ca1f3d184`
+from `02c093fa`, CI `37281058286`. All 658,532,926 expected detector bytes were scanned; all 26
+reviewed upstream noncredentials resolved, with zero unresolved findings. Anonymous manifest,
+configuration and all ten layer checks passed. Agent and both gateways remained continuously
+Ready for 60.369 s. Signing remains Phase 5 work.
 
-Phase 1 passed real E0–E6, five distinct create/delete runs with ten agent restarts, empty/failed/
-stale/out-of-order response faults, missing-ready-namespace protection and complete storage
-reclamation. Its R2 outage proof obtained two failing archive-health observations while the deny
-policy remained active, with a successful new connection during the alarm. Established databases
-remain ready when their physical identity, configuration, TLS and role authentication still pass.
-Ordinary API deletion retains archives; the test harness separately purged its trial objects.
-The separate R2 restore drill verified committed markers and rollback absence, preserved the
-source and reclaimed the restore volume. Full PITR, restore after source deletion and disaster
-recovery remain Phase 4 work.
+Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
+API/D1/RegionLink/agent/Tunnel/VPC HTTP/gateway path through `db.ohmyho.st`, with verified
+PostgreSQL TLS and no public PostgreSQL port. Backup alarms, source-preserving R2 restore,
+missing-ready-namespace protection and full storage reclamation passed. Ordinary deletion retains
+archives; the harness purges only its own test objects. PITR, restore after source deletion and
+regional disaster recovery remain Phase 4 work.
 
-Raw 100 MiB and 1 GiB stream checks, slow reception and 600,002 ms idle passed. A 10-second
-read workload measured 735.604 SQL operations/s over 50 warmed connections with zero errors;
-this is neither maximum throughput nor capacity for 1,000 customers. The deployed DatabaseActor rejects unregistered database/role hints before D1 admission.
-A real 1,000-unknown-ID test passed; local instrumentation of the actual Actor counted zero D1
-queries and zero gateway contacts. Known routes still require a fresh authoritative D1 read.
-The Edge no longer has a D1 binding or an installation-wide limit on shared Worker addresses. Decoded binary result
-mode remains unsupported: its retained assertions fail on both WebSocket and direct verified
-TCP with node-postgres 8.22. Raw COPY integrity and default-text clients pass. The intermittent
-missing Tail event has an unconfirmed cause; the latest unchanged bounded captures passed.
-Full adopter compatibility and migration remain Phase 4 requirements.
+Phase 2's last complete cold series measured p50/p95/max 8.412/9.160/9.708 s across twenty
+independent wakes, twenty distinct Pods and the same cluster/PVC. Each caused one wake and one
+configuration revision, preserving data, rollback absence and role Secret identities. The ≤8 s
+p95 target remains unmet. Ten simultaneous cold connections coalesced to one wake. A real
+read-only transaction prevented idle sleep for 74 s. An always-warm diagnostic measured new
+connection plus first read p95 734.438 ms; it is not an application or load-capacity guarantee.
+Suspend/resume secured the closed WAL in R2. Hourly awake-time deviation was at most 19.748 s,
+below the 60 s target. Resize preserved storage/data in 28.046 s; held-client reconnect counts
+remain unmeasured. RAM/storage allocation and connection usage are measured; storage-used bytes
+remain an explicit gap. Cost attribution is deferred: the owner supplied 13.55 EUR per existing
+VPS per month. PGCF supplies resource/consumption metrics; adopter pricing and billing remain
+exclusively in the adopter repository.
 
-Phase 2's installable `pgcf connect` bridge passed actual psql transactions, rollback and
-105,216,021 binary COPY bytes identical to the direct control in 2,614.726 ms. A real resize to
-512 MiB/250 millicores completed in 28,046 ms, replaced the PostgreSQL Pod once and preserved
-namespace, cluster, PVC, PV, volume handle, archive path and data. Its idempotent repeat preserved
-the operation and revision; a held-client reconnect count was not measured. Storage-changing
-resize is currently refused. The persistent gateway fence survived one gateway replacement,
-both replicas acknowledged release and rejected stale begin commands. A fresh CNPG database
-verified the private maintenance role's TLS, authentication and minimal catalog/WAL grants.
-Manual Dev suspend/resume secured the closed WAL object in R2 and preserved data, rollback
-absence and every storage identity. Automatic idle suspension and one wake operation for ten
-concurrent connections are now confirmed. Those connections took 11.080–11.143 s; later single
-cold connections took 9.427, 9.703 and 9.071 s. A guarded fresh cluster-status read removed an
-observed extra reconciliation pass. Five subsequent instrumented cold connections took 9.411,
-9.473, 11.747, 11.096 and 9.634 s. Four runs also reported an HTTP 422 precondition failure while
-applying a manifest or cluster revision. A guarded single retry now handles only a proven
-Kubernetes version change; uncertain writes are not retried. The read-only SQL archive probe is
-deployed, and an actual control verified TLS, minimal privileges and exact agreement with exporter
-counters in 354.247 ms. Two later cold connections took 9.977 and 10.851 s, with exactly one wake
-and preserved data. The first complete archive check still took 1.739 s in the instrumented run.
-Unchanged role credentials now retain their exact UID and resource version across power-only
-revisions, with desired data, controller acknowledgement and authenticated runtime checks retained.
-A quiet gateway replacement reproduced a persistent measurement-gap floor; a conservative new
-observation window now recovers after two complete stable snapshots. The subsequent Dev database
-hibernated without customer SQL. Two new cold connections took 9.799 and 7.962 s, with one wake
-and preserved data each. A later idle attempt failed with visible `power_unknown`; exact
-compensation restored running state and the next idle attempt succeeded. Its cause remains open.
-Twenty independent Dev cold starts on the same cluster and claim, with twenty distinct Pods,
-measured p50/p95/max 8.412/9.160/9.708 s (nearest-rank; minimum 6.690 s). Every connection caused
-one wake, advanced configuration once and preserved committed data and rollback absence.
-Both credential Secret UIDs, versions and data remained unchanged through the complete series.
-Successful wake cycles now include their own runtime in the one-second polling cadence;
-failed/retry-skipped cycles retain backoff. The ≤8 s p95 target is still unmet, so Phase 2 remains
-unaccepted. A real read-only transaction
-stayed ready for 74 s despite the 60 s idle policy. On one always-warm Dev database, twenty
-sequential new connections plus the first marker read had p50/p95/max 418.346/734.438/910.656 ms.
-This is a small warm-path measurement, not an application latency or load-capacity guarantee.
+`pgcf connect` passed actual psql transactions, rollback and 105,216,021 identical binary COPY
+bytes. The bridge now refuses MD5 and unknown authentication methods; all 30 CLI tests passed.
+Unknown hints avoid D1 and gateway work. A shared Worker source address has no installation-wide
+connection limit. Raw 100 MiB/1 GiB integrity, slow reception and 600 s idle passed. The earlier
+735.604 SQL/s read test is a bounded measurement, not maximum throughput or customer density.
+Decoded binary-result mode remains unsupported; raw COPY and default-text clients pass.
 
-Phase 3 preparation is being integrated locally; it is not live acceptance. Durable node
-reservations, one-time purchase dispatch claims and actual provider identity observations are
-implemented. The Contabo adapter passed 29 actual Workers-runtime tests; read-only Dev instance
-and firewall requests passed after preserving the provider's nullable fields and using supported
-redirect handling. No provider mutation or purchase was performed for these checks.
-The native installer passed 27 tests, including checksum-verified Talos configuration generation,
-an authenticated TLS API front proxy with the real relay, stale-capability rejection and an
-actual bundled entry-point launch. Three shared bootstrap contract tests passed. Relay process
-epochs belong to fresh capabilities, not immutable jobs; disconnects do not replay commands.
-All five pinned platform charts rendered, and all 14 platform workloads tolerate quarantine
-while customer PostgreSQL placement remains blocked. The optional fixed-source relay deployment,
-native package pins and separate image qualification job are prepared. The local Linux bootstrap
-image builds and passes all runtime checks. Its full scan covered 433,348,963 payload bytes and
-643,272,838 detector bytes without a coverage gap. All 39 findings resolved after independent
-public-source review of the 19 native-binary findings; no unresolved findings remain. Native
-artifact checks bind whole-file SHA-256, size, profile and exact reviewed byte spans. Modified
-binaries, changed provenance and extra findings remain fatal. The repository secret check is
-clean. Protected network preflight and real node bootstrap remain outstanding. The composed local
-checks now pass: contracts 127, API 288, Edge 78, regional 367, native bootstrap 27, CLI 28,
-acceptance harness 198, infrastructure 21 and image/CI logic 58 tests, with zero skipped tests.
-The native Talos configuration check is mandatory in CI. Existing ready-database Edge fixtures
-now include actual node allocation; unplaced requests retain their distinct pending semantics.
-Read-only live inventory confirms that the initial EU node still needs a verified legacy
-provider-identity and protected join-custody import before the second node is admitted.
-The actual Dev D1 export restored locally with clean integrity and foreign-key checks. All four
-additive node-bootstrap migrations passed rehearsal against that export, then applied in Dev;
-all eight new tables remain empty, the existing node remains and no database is active. No
-provider mutation, order or server bootstrap was triggered. Bounded wake-PATCH diagnostics passed
-83 focused reconciliation tests; they preserve all retry and identity guards. Deployment and
-fresh cold-start measurements remain pending.
+The current image's fresh E0–E2 passed, but E3 failed its required Tail correlation event. The
+harness cleaned up that trial successfully. A separate diagnostic trial verified transactions and
+exact 28P01 for wrong password, unknown database and unknown role using the deployed strict
+probe. This does not pass E3 or establish equal rejection timing. Fresh cold diagnostics and the
+Tail failure investigation continue; archive-availability and authenticated-idle fixes are pending.
 
-The operational Cloudflare token was updated in place with no expiry; its value and all 23
-rights remained unchanged. Barman's R2 credential and PGCF admin/agent keys also have no expiry.
-Short-lived routing and control tokens retain their security deadlines.
+Phase 3 software and native images are prepared, not live-accepted. The Dev D1 export restored
+locally with clean integrity/foreign-key checks; four additive bootstrap migrations rehearsed
+against that export and applied in Dev. Their eight new tables remain empty; no provider mutation,
+order or bootstrap was triggered. Existing first-node provider identity and protected seed/join
+custody were validated and encrypted locally; their live import remains pending. The native
+bootstrap image is qualified but private under GitHub organization policy. Fixed-source transport,
+signed network evidence, real EU2 join and new-region platform installation remain outstanding.
 
-The live collector samples each database at least 15 s apart. A real minute contained four
-allocation and eight gateway samples.
-The API and shared observation-window schema are deployed from `7ef63733`. In Dev,
-26 actual R2 objects, the recorded sample, archive summary and hourly API all agreed on
-7,515,287 bytes. A truncated listing remains unknown; the current limit is one complete page
-of at most 1,000 objects. Storage-used measurement remains unknown.
-Configuration changes now preserve the measurement checkpoint under the original UID/version
-guards. Its actual queue drained and the checkpoint survived five Dev idle/wake cycles.
-Hibernated allocation remains measured from the exact bound PVC without a primary Pod.
-Successful hibernation now reports inactive archiving as unknown rather than a false failure;
-this does not assert future R2 availability.
-For 19:00–20:00 UTC, the finalized usage row reports 422.748 awake seconds. Independent
-Kubernetes readiness/hibernation evidence bounds the reference to 403–431 seconds, including
-timestamp precision and one termination-to-next-creation bound. The maximum possible deviation
-is 19.748 seconds, below 60; a later readback confirmed the finalized value unchanged.
-The cost API reports null and a named node_rate gap until an actual contract/invoice fact is
-recorded. The completed instrumented trial had one base backup, 93 WAL objects and 8,762,008
-bytes verified against R2 and the API. Agent-restarted deletion took 104,099 ms and reclaimed
-all trial volumes and archive objects. Ordinary deletion retains archives; the harness purges
-its own objects separately. Awake-time accuracy passes; the cold-wake target and cost attribution
-remain open. The owner supplied 13.55 EUR per existing VPS per month; it remains an owner
-statement, with no invoice verification implied. Cost attribution is deferred and does not block
-the existing-node expansion. PGCF reports RAM, storage and consumption; adopter pricing and
-billing remain exclusively in the adopter repository.
-The production-ready
-release through Phase 5 and complete Neon replacement are not complete.
-
-CI `37269991675` passed on `efcdb759`; both images built, passed runtime and full payload
-qualification, and were published. The new regional digest is
-`sha256:14191e73d2bde4897856f1be7eeccca30a9d41f52e1665a818c6ecab2ba1483a`.
-Anonymous manifest/config binding and all ten layer HEAD checks passed. Its full scan covered
-658,527,296 detector bytes with 26 resolved and zero unresolved findings. The first-EU agent and both gateway replicas now use this digest and remained
-continuously Ready for 62.150 seconds. The cluster still has one node and zero database namespaces.
-The native bootstrap digest is
-`sha256:7e9f45e90dfcf455bfe889dd43fb3bfe57c1af049f3bd3faad9796eca0811c6e`.
-Its published full scan covered 643,403,365 detector bytes, all 39 findings resolved and zero
-unresolved. Anonymous access is blocked: GitHub's package page disables public visibility by
-organization policy. This remains a Phase 5 publication prerequisite, not a passed public release.
-The existing first-EU agent key, machine seed and join bundle have been encrypted locally with
-successful decryption checks; no replacement keys, D1 writes or VPS changes were made.
-
-Read-only adopter inventory is retained privately. Ownership mapping, remaining extensions,
-peak connection rates and migration timing still require verification before migration.
+Operational Cloudflare, Barman R2 and PGCF admin/agent credentials have no configured expiry.
+Routing/control tokens retain their short security deadlines. Read-only adopter inventory remains
+private; ownership mapping, remaining extensions, peak connection rates and migration timing must
+be verified before migration. The production release through Phase 5 is incomplete.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
 AGENTS.md is the contributor brief and THIRD_PARTY.md records component licenses.
