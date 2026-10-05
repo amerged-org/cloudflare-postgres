@@ -283,3 +283,265 @@ it("rejects duplicated keys and invalid object sizes without publishing a partia
   );
   expect((await measureBackupUsage(env, f.id)).sample?.backup_bytes).toBeNull();
 });
+
+async function pageFixture() {
+  const f = await setup();
+  await put(f.prefix, "fixture", 3);
+  const page = await env.ARCHIVE.list({ prefix: f.prefix });
+  return { ...f, page, object: page.objects[0]! };
+}
+it("walks more than one thousand real-shaped objects and records only after valid completion", async () => {
+  const f = await pageFixture();
+  const first = Array.from({ length: 1000 }, (_, index) => ({
+    ...f.object,
+    key: `${f.prefix}wal/${index}`,
+    size: 2,
+  }));
+  const list = vi
+    .spyOn(Object.getPrototypeOf(env.ARCHIVE), "list")
+    .mockResolvedValueOnce({
+      ...f.page,
+      objects: first,
+      truncated: true,
+      cursor: "second-page",
+    })
+    .mockResolvedValueOnce({
+      ...f.page,
+      objects: [{ ...f.object, key: `${f.prefix}wal/1000`, size: 7 }],
+      truncated: false,
+    });
+  const result = await measureBackupUsage(env, f.id);
+  expect(list).toHaveBeenCalledTimes(2);
+  expect(list.mock.calls[1]![0]).toEqual({
+    prefix: f.prefix,
+    limit: 1000,
+    cursor: "second-page",
+  });
+  expect(result.status).toBe("measured");
+  expect(result.objects).toBe(1001);
+  expect(result.sample?.backup_bytes).toBe(2007);
+  const stored = await env.DB.prepare(
+    "SELECT payload FROM usage_samples WHERE database_id=? AND source='backup'",
+  )
+    .bind(f.id)
+    .first<string>("payload");
+  expect(JSON.parse(stored!).backup_bytes).toBe(2007);
+});
+it("refuses missing or repeated page cursors without a partial gauge", async () => {
+  const f = await pageFixture();
+  vi.spyOn(Object.getPrototypeOf(env.ARCHIVE), "list").mockResolvedValueOnce({
+    ...f.page,
+    truncated: true,
+    cursor: "",
+  });
+  const missing = await measureBackupUsage(env, f.id);
+  expect(missing.status).toBe("unavailable");
+  expect(missing.sample?.backup_bytes).toBeNull();
+  const list = vi
+    .spyOn(Object.getPrototypeOf(env.ARCHIVE), "list")
+    .mockReset()
+    .mockResolvedValueOnce({ ...f.page, truncated: true, cursor: "repeated" })
+    .mockResolvedValueOnce({
+      ...f.page,
+      objects: [{ ...f.object, key: `${f.prefix}second` }],
+      truncated: true,
+      cursor: "repeated",
+    });
+  const repeated = await measureBackupUsage(env, f.id);
+  expect(repeated.status).toBe("unavailable");
+  expect(repeated.sample?.backup_bytes).toBeNull();
+  expect(list.mock.calls.at(-1)![0]).toMatchObject({ cursor: "repeated" });
+});
+it("rejects cross-page duplicate and foreign keys even when the final page completes", async () => {
+  const f = await pageFixture();
+  vi.spyOn(Object.getPrototypeOf(env.ARCHIVE), "list")
+    .mockResolvedValueOnce({
+      ...f.page,
+      truncated: true,
+      cursor: "duplicate-page",
+    })
+    .mockResolvedValueOnce(f.page);
+  const duplicate = await measureBackupUsage(env, f.id);
+  expect(duplicate.status).toBe("unavailable");
+  expect(duplicate.sample?.backup_bytes).toBeNull();
+  vi.spyOn(Object.getPrototypeOf(env.ARCHIVE), "list")
+    .mockReset()
+    .mockResolvedValueOnce({
+      ...f.page,
+      truncated: true,
+      cursor: "foreign-page",
+    })
+    .mockResolvedValueOnce({
+      ...f.page,
+      objects: [{ ...f.object, key: "outside/fixture" }],
+    });
+  const foreign = await measureBackupUsage(env, f.id);
+  expect(foreign.status).toBe("unavailable");
+  expect(foreign.sample?.backup_bytes).toBeNull();
+});
+it("drops all accumulated bytes when a later page fails", async () => {
+  const f = await pageFixture();
+  const list = vi
+    .spyOn(Object.getPrototypeOf(env.ARCHIVE), "list")
+    .mockResolvedValueOnce({
+      ...f.page,
+      truncated: true,
+      cursor: "failed-page",
+    })
+    .mockRejectedValueOnce(new Error("fixture later page failure"));
+  const result = await measureBackupUsage(env, f.id);
+  expect(list).toHaveBeenCalledTimes(2);
+  expect(result.status).toBe("unavailable");
+  expect(result.sample?.backup_bytes).toBeNull();
+});
+it("uses one total deadline for the walk and stops after a late later page", async () => {
+  const f = await pageFixture();
+  let enterFirst!: () => void, enterSecond!: () => void;
+  let finishFirst!: (value: R2Objects) => void,
+    finishSecond!: (value: R2Objects) => void;
+  const firstEntered = new Promise<void>((resolve) => {
+    enterFirst = resolve;
+  });
+  const secondEntered = new Promise<void>((resolve) => {
+    enterSecond = resolve;
+  });
+  const firstPending = new Promise<R2Objects>((resolve) => {
+    finishFirst = resolve;
+  });
+  const secondPending = new Promise<R2Objects>((resolve) => {
+    finishSecond = resolve;
+  });
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  const list = vi
+    .spyOn(Object.getPrototypeOf(env.ARCHIVE), "list")
+    .mockImplementationOnce(() => {
+      enterFirst();
+      return firstPending;
+    })
+    .mockImplementationOnce(() => {
+      enterSecond();
+      return secondPending;
+    });
+  try {
+    const measurement = measureBackupUsage(env, f.id);
+    await firstEntered;
+    await vi.advanceTimersByTimeAsync(1500);
+    finishFirst({ ...f.page, truncated: true, cursor: "late-page" });
+    await Promise.race([
+      secondEntered,
+      measurement.then(() => {
+        throw new Error("walk completed before second page");
+      }),
+    ]);
+    await vi.advanceTimersByTimeAsync(BACKUP_LIST_DEADLINE_MS - 1500 + 1);
+    const result = await measurement;
+    expect(result.status).toBe("unavailable");
+    expect(result.sample?.backup_bytes).toBeNull();
+    finishSecond({
+      ...f.page,
+      objects: [],
+      truncated: true,
+      cursor: "never-requested",
+    });
+    await secondPending;
+    await Promise.resolve();
+    expect(list).toHaveBeenCalledTimes(2);
+    const stored = await env.DB.prepare(
+      "SELECT payload FROM usage_samples WHERE database_id=? AND source='backup'",
+    )
+      .bind(f.id)
+      .first<string>("payload");
+    expect(JSON.parse(stored!).backup_bytes).toBeNull();
+  } finally {
+    finishFirst(f.page);
+    finishSecond(f.page);
+    vi.useRealTimers();
+  }
+});
+it("bounds page count even when every page supplies a fresh cursor", async () => {
+  const f = await pageFixture();
+  let calls = 0;
+  vi.spyOn(Object.getPrototypeOf(env.ARCHIVE), "list").mockImplementation(
+    async () => ({
+      ...f.page,
+      objects: [{ ...f.object, key: `${f.prefix}page-${++calls}` }],
+      truncated: true,
+      cursor: `page-${calls}`,
+    }),
+  );
+  const result = await measureBackupUsage(env, f.id);
+  expect(calls).toBe(16);
+  expect(result.status).toBe("unavailable");
+  expect(result.sample?.backup_bytes).toBeNull();
+});
+
+it("bounds retained key memory and opaque cursor size without partial samples", async () => {
+  const f = await pageFixture();
+  let pages = 0;
+  const list = vi
+    .spyOn(Object.getPrototypeOf(env.ARCHIVE), "list")
+    .mockImplementation(async () => {
+      const page = ++pages;
+      return {
+        ...f.page,
+        objects: Array.from({ length: 1000 }, (_, index) => ({
+          ...f.object,
+          key: `${f.prefix}${page}-${index}-${"x".repeat(900)}`,
+        })),
+        truncated: true,
+        cursor: `page-${page}`,
+      };
+    });
+  const bounded = await measureBackupUsage(env, f.id);
+  expect(pages).toBeLessThan(16);
+  expect(bounded.status).toBe("unavailable");
+  expect(bounded.sample?.backup_bytes).toBeNull();
+  list.mockReset().mockResolvedValueOnce({
+    ...f.page,
+    truncated: true,
+    cursor: "x".repeat(2049),
+  });
+  const oversized = await measureBackupUsage(env, f.id);
+  expect(list).toHaveBeenCalledTimes(1);
+  expect(oversized.status).toBe("unavailable");
+  expect(oversized.sample?.backup_bytes).toBeNull();
+});
+it("accepts the finite object ceiling only with a completing page and safe byte sum", async () => {
+  const f = await pageFixture();
+  let pages = 0;
+  const list = vi
+    .spyOn(Object.getPrototypeOf(env.ARCHIVE), "list")
+    .mockImplementation(async () => {
+      const page = ++pages;
+      return {
+        ...f.page,
+        objects: Array.from({ length: 1000 }, (_, index) => ({
+          ...f.object,
+          key: `${f.prefix}${page}-${index}`,
+          size: 1,
+        })),
+        truncated: page < 16,
+        cursor: `page-${page}`,
+      };
+    });
+  const complete = await measureBackupUsage(env, f.id);
+  expect(pages).toBe(16);
+  expect(complete.status).toBe("measured");
+  expect(complete.objects).toBe(16000);
+  expect(complete.sample?.backup_bytes).toBe(16000);
+  list
+    .mockReset()
+    .mockResolvedValueOnce({
+      ...f.page,
+      objects: [{ ...f.object, size: Number.MAX_SAFE_INTEGER }],
+      truncated: true,
+      cursor: "overflow",
+    })
+    .mockResolvedValueOnce({
+      ...f.page,
+      objects: [{ ...f.object, key: `${f.prefix}overflow`, size: 1 }],
+    });
+  const overflow = await measureBackupUsage(env, f.id);
+  expect(overflow.status).toBe("unavailable");
+  expect(overflow.sample?.backup_bytes).toBeNull();
+});
