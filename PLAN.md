@@ -10,13 +10,13 @@ The current regional image is
 `sha256:692a6c508e274d695151ce064b52fd66c5f00d5ec701c7d2adb2de89a092fdbb`
 from `e9569169`, CI `37360915487`. Image qualification and anonymous manifest,
 configuration and every layer verification passed. Agent and both gateways remained continuously
-Ready for 62.768 s. The management API uses `00619393` and Edge uses `b196fbaa`; the private bootstrap
+Ready for 62.768 s. The management API uses `269ca6c6` and Edge uses `b196fbaa`; the private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
 inputs are now bound. The current native bootstrap image is
-`sha256:a46d6824c342f9068af103558981ca1b0a033fedd2ccf0822f80a3f70df5d8d4`
-from `00619393`: qualification covered 711,899,012 bytes and 18 layers with zero unresolved
+`sha256:c4a0fc39989dcdee33854ce1dbfc2d60ae4e92a7bc1334f558f64bd05b1ed1f7`
+from `269ca6c6`: qualification covered 711,909,770 bytes and 18 layers with zero unresolved
 findings, followed by exact private-registry manifest, configuration and layer readback.
-Latest CI `37378985882` is green. Actual EU2/US installation and fresh signed network acceptance
+Latest complete CI `37384157373` is green. Actual EU2/US installation and fresh signed network acceptance
 remain outstanding. Release image signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
@@ -134,10 +134,13 @@ directories, but its 832,643,072-byte `/run` cannot hold the 4,685,444,428 compr
 bytes. Native portable-swap, overlay verification and operation-specific RAM scratch fixes pass
 actual strict-SSH preflight. The isolated tmpfs measured 5,222,318,080 bytes with 5,222,313,984
 bytes free; fresh setup, matching resume and pre-write guards passed before guarded unmount.
-The corrected runtime still requires qualification and deployment; no EU2 disk write or join
-has occurred. Signed HTTPS source controls passed real
+The corrected runtime is qualified, deployed and exactly bound in Cloudflare. The immutable
+EU2 job is configured at checkpoint zero; no EU2 disk write or join has occurred. Signed HTTPS source controls passed real
 IPv4/NAT and direct IPv6 checks. Hosted runner assignment has recovered and current CI is green;
-fresh complete outside scans and their signed preparation remain pending. EU2 join, US installation
+full 65,535-port IPv6 scans on both EU members and allowed-source management access passed.
+The hosted IPv4 trial failed with an initially masked scanner reason; bounded diagnostics now
+preserve known internal failure codes without exposing raw errors. Fresh combined signed
+preparation remains pending. EU2 join, US installation
 and lost-worker recovery are not accepted. US remains unbought; the specific costed approval
 request is pending.
 
@@ -926,3 +929,5 @@ Earlier failed attempts and corrections remain in Git history.
 | 2026-10-05 | Operator recovery | CI `37360915487` and the fully qualified regional `e9569169` image are delivered; agent/two gateways and five platform releases stayed Ready for 62.768 s on the unchanged first EU node. API full restore / PITR / restore after source deletion passed in 82.531 / 65.562 / 75.328 s. Targets retained separate volumes, storage generation 2, configuration revision 1, SQL identity and nonsuperuser app access; temporary administration was removed. An isolated real DO admission probe refused registered excess with 53300 and unknown role with 28P01 before D1, with no writes/wake/state change; probe deleted. Fresh D1 export plus local migration rehearsal preserved 31 tables / 38,154 rows with clean integrity and foreign keys. EU2, US, lost-worker recovery and final operational protection acceptance remain pending. |
 | 2026-10-05 | Operator protection / EU expansion | Natural 351.928 s stale heartbeat excluded a physically Ready node; fresh observations placed the same pending database and it became Ready. A genuine Barman option rejection reported failing backup health while retaining the last completed backup; configuration and agent/Flux state restored, fault object and all recovery/stale namespaces removed, disposable API key revoked. Fresh migration rehearsal preserved 38,547 rows and three custody records; migration 0017 and capacity-policy/rescue-identity API fixes delivered. Live signed IPv4/NAT and direct IPv6 controls passed. EU has two real small reservations on EU1 and one pending demand; existing EU2 adoption audited under cap 2 with purchases disabled. Duplicate provider display-name rejection reproduced; cosmetic wire-label/readback fixes pass 44 tests. EU2 installation, dual-stack network proof, node-loss recovery and US remain unaccepted. Hosted CI/native runner jobs fail assignment during the reported GitHub Actions incident; US purchase approval pending. |
 | 2026-10-06 | EU2 rescue / installation preparation | Management API `00619393`, Edge `b196fbaa` and regional `e9569169` are deployed; CI `37378985882` is green and hosted runner assignment has recovered. Native bootstrap `sha256:a46d6824c342f9068af103558981ca1b0a033fedd2ccf0822f80a3f70df5d8d4` is qualified from `00619393`: 711,899,012 bytes, 18 layers, zero unresolved findings and complete registry readback. Cosmetic firewall labels were applied with exact assignment/rule readback. EU2 RAM rescue passed strict known-host/client-key verification and measured one unmounted 161,061,273,600-byte disk, 8,326,418,432 bytes RAM and no swap; the disk is untouched. EU1 peer /32 routing was applied without reboot, preserving node identity, custody and readiness; a corresponding early Talos image route is measured and pinned. The RAM-backed rescue overlay has only 832,643,072 bytes in `/run` for 4,685,444,428 installer bytes; portable-swap, overlay and operation-specific RAM scratch fixes passed actual strict-SSH inspection, fresh setup, matching resume and pre-write guards. The isolated tmpfs measured 5,222,318,080 total / 5,222,313,984 free bytes and was removed with source/identity guards; disk writes remained zero. Corrected runtime qualification/delivery, fresh full outside scans/signed preparation, EU2 join, US installation, lost-worker recovery and coordinated cluster credential rotation before Neon migration remain outstanding. US purchase requires the pending costed approval. |
+
+| 2026-10-06 | Native rescue runtime / network proof | Bootstrap source `269ca6c6` passes all 59 native tests and actual strict-SSH RAM staging/guard preflight. Qualified image `sha256:c4a0fc39989dcdee33854ce1dbfc2d60ae4e92a7bc1334f558f64bd05b1ed1f7` covers 711,909,770 bytes / 18 layers with zero unresolved findings; private-registry readback verified 161,610,900 compressed bytes. API and exact Container image/namespace binding are deployed, original secret names retained, CI `37384157373` green. EU2 immutable input is configured at checkpoint zero with zero downloaded/written bytes. Full 65,535-port IPv6 scans passed for both members; actual relay access passed all three management ports per member using bounded RAM-only rescue listeners, which were removed. Hosted IPv4 run `37384991932` failed with a masked scanner reason; reproducing tests pass for bounded diagnostic propagation. Combined signed preparation and installation remain pending. |

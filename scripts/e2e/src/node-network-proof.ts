@@ -14,6 +14,7 @@ import { nodeObservations } from "../../../apps/regional/src/agent/observe.ts";
 import type { Resource } from "../../../apps/regional/src/agent/types.ts";
 import {
   authenticated,
+  assertScanWorkers,
   blocked,
   canonical,
   execute,
@@ -499,8 +500,7 @@ export async function measureScans(
       }
     }),
   );
-  if (workers.some((worker) => worker.status === "rejected"))
-    blocked("scan_incomplete");
+  assertScanWorkers(workers);
   if (!scans.length) blocked("scan_family_unavailable");
   return signed(
     MEASUREMENT_DOMAIN,

@@ -17,6 +17,7 @@ import { nodeAdditionHostname } from "@pgcf/contracts/nodes";
 import type { Resource } from "../../../apps/regional/src/agent/types.ts";
 import {
   authenticated,
+  assertScanWorkers,
   canonical,
   completedScan,
   execute,
@@ -24,6 +25,7 @@ import {
   signed,
   sourceControl,
   sourceObservation,
+  scanAllPorts,
   tcp,
   writeArtifact,
 } from "../src/node-network-native.ts";
@@ -37,6 +39,7 @@ import {
   parsePlan,
   verifyMeasurements,
   assertScanSource,
+  measureScans,
   PREPARATION_DOMAIN,
   VERIFICATION_DOMAIN,
 } from "../src/node-network-proof.ts";
@@ -192,10 +195,9 @@ test("complete native port completions require unique full coverage and bound ad
     /scan_incomplete/,
   );
   results[0] = { port: 1, outcome: "inconclusive" };
-  assert.throws(
-    () => completedScan(results, controls, address(2), started),
-    /scan_incomplete/,
-  );
+  assert.throws(() => completedScan(results, controls, address(2), started), {
+    message: "node_network_scan_inconclusive",
+  });
   assert.throws(
     () =>
       completedScan(
@@ -276,6 +278,41 @@ test("hosted NAT source requires membership in a complete pool disjoint from eve
     () => assertScanSource(f.config, [203, 0, 113, 10].join(".")),
     /source_pool_unproven/,
   );
+});
+
+test("scan measurement preserves a known rejected native worker reason", async () => {
+  const f = fixture();
+  f.plan.scan_control.ipv4 = ipv6(5);
+  f.config.binding.plan_sha256 = hash(f.plan);
+  await assert.rejects(
+    measureScans(f.config, address(9), f.keys.privateKey, Date.now() + 10000),
+    { message: "node_network_family_mismatch" },
+  );
+});
+
+test("scan worker diagnostics expose only a known internal reason", () => {
+  assert.doesNotThrow(() =>
+    assertScanWorkers([{ status: "fulfilled", value: 1 }]),
+  );
+  assert.throws(
+    () =>
+      assertScanWorkers([
+        {
+          status: "rejected",
+          reason: new Error("node_network_tcp25_control_unproven"),
+        },
+      ]),
+    { message: "node_network_tcp25_control_unproven" },
+  );
+  for (const reason of [
+    new Error("connection failed https://private.example/key"),
+    new Error("node_network_private_data"),
+    new Error("node_network_deadline\nprivate detail"),
+    "node_network_deadline",
+  ])
+    assert.throws(() => assertScanWorkers([{ status: "rejected", reason }]), {
+      message: "node_network_scan_incomplete",
+    });
 });
 
 test("canonical signatures match consumer domains and cannot cross purpose or survive tampering", () => {
@@ -403,6 +440,16 @@ test("native sockets and source controls use actual same-family peer observation
     await assert.rejects(
       sourceControl(loopback, port, ipv6(4), keys.trusted, Date.now() + 10000),
       /family_mismatch/,
+    );
+    await assert.rejects(
+      scanAllPorts(
+        loopback,
+        loopback,
+        { address: loopback, port, keys: keys.trusted },
+        Date.now() + 10000,
+        { concurrency: 1, timeoutMs: 1, tcp25Control: ipv6(4) },
+      ),
+      { message: "node_network_family_mismatch" },
     );
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));

@@ -21,6 +21,35 @@ export const MAX_JSON_BYTES = 256 * 1024;
 export function blocked(code: string): never {
   throw new Error(`node_network_${code}`);
 }
+const scanWorkerReasons = new Set([
+  "node_network_address_invalid",
+  "node_network_control_binding",
+  "node_network_control_invalid",
+  "node_network_control_unproven",
+  "node_network_deadline",
+  "node_network_family_mismatch",
+  "node_network_scan_bounds",
+  "node_network_scan_incomplete",
+  "node_network_scan_inconclusive",
+  "node_network_signature_invalid",
+  "node_network_source_inside_allowlist",
+  "node_network_source_pool_unproven",
+  "node_network_source_unproven",
+  "node_network_stale_measurement",
+  "node_network_tcp25_control_unproven",
+]);
+export function assertScanWorkers(
+  workers: PromiseSettledResult<unknown>[],
+): void {
+  const rejected = workers.find((worker) => worker.status === "rejected");
+  if (!rejected) return;
+  if (
+    rejected.reason instanceof Error &&
+    scanWorkerReasons.has(rejected.reason.message)
+  )
+    throw new Error(rejected.reason.message);
+  blocked("scan_incomplete");
+}
 export function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -614,19 +643,24 @@ export function completedScan(
   )
     blocked("control_binding");
   const open: number[] = [];
+  let inconclusive = false;
   for (const result of results) {
     if (
       !Number.isInteger(result.port) ||
       result.port < 1 ||
       result.port > 65535 ||
       seen.has(result.port) ||
-      !["connected", "refused", "timed_out"].includes(result.outcome)
+      !["connected", "refused", "timed_out", "inconclusive"].includes(
+        result.outcome,
+      )
     )
       blocked("scan_incomplete");
     seen.add(result.port);
+    if (result.outcome === "inconclusive") inconclusive = true;
     if (result.outcome === "connected") open.push(result.port);
   }
   if (seen.size !== 65535) blocked("scan_incomplete");
+  if (inconclusive) blocked("scan_inconclusive");
   return { scanned_ports: 65535, open_ports: open.sort((a, b) => a - b) };
 }
 export async function scanAllPorts(
@@ -704,8 +738,7 @@ export async function scanAllPorts(
       }
     }),
   );
-  if (workers.some((worker) => worker.status === "rejected"))
-    blocked("scan_incomplete");
+  assertScanWorkers(workers);
   const after = await observe();
   options.sourceCheck?.(after.source);
   return {
