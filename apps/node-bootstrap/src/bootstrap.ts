@@ -20,6 +20,7 @@ import {
 } from "@pgcf/contracts/node-bootstrap";
 import { startNativeProxy, type ProxyConfig } from "./proxy-command.ts";
 import { PlatformInstaller, readPlatformAssets } from "./platform.ts";
+import { publishKubeletTrust } from "./kubelet-trust.ts";
 
 export const TALOS_VERSION = "1.14.1";
 export const KUBERNETES_VERSION = "1.36.3";
@@ -1395,6 +1396,33 @@ export class BootstrapJob {
     await installer.install();
     await this.authenticatedReadback();
   }
+  private async publishKubeletTrust() {
+    await publishKubeletTrust(this.input, {
+      kube: (args, permit_failure, stdin) =>
+        this.kube(args, permit_failure, stdin),
+      talos: (args) => this.talos(args),
+      authorize: async () => {
+        const authority = await this.authority.read(this.abort.signal);
+        const bundle =
+          authority.protected_material?.purpose === "join_bundle"
+            ? authority.protected_material.material
+            : this.input.join_bundle;
+        if (
+          !bundle ||
+          (this.input.spec.role === "controlplane" &&
+            !authority.checkpoint.sealed_ref)
+        )
+          throw new BootstrapError("kubelet_trust_bundle_unsealed");
+        assertBundleIdentity(this.input.spec, bundle);
+        if (
+          this.input.spec.role === "worker" &&
+          bundle.kube_system_uid !== this.input.spec.cluster_uid
+        )
+          throw new BootstrapError("cluster_uid_mismatch");
+        return bundle.kube_system_uid;
+      },
+    });
+  }
   private async admissionNode(node_uid: string, kube_system_uid: string) {
     const namespace = record(
       JSON.parse(
@@ -1767,6 +1795,7 @@ export class BootstrapJob {
       if (position() < at("kubernetes_joined"))
         authority = await this.checkpoint("kubernetes_joined");
       await this.installPlatform();
+      await this.publishKubeletTrust();
       await this.checkpoint("awaiting_verification", {
         status: "awaiting_verification",
       });
