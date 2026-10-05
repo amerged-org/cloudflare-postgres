@@ -958,3 +958,173 @@ test("hibernated zero-Pod databases retain measured allocation from their exact 
     null,
   );
 });
+
+test("quiet replacement gateways recover idle from a durable complete snapshot without historical zeros", async () => {
+  const state = await setup();
+  const fetcher: typeof fetch = async (input, options) => {
+    const response = await state.fetcher(input, options);
+    const report = (await response.json()) as GatewayActivityReport;
+    return Response.json(
+      report.history === "current_process_absence"
+        ? { ...report, ingressBytes: 0, egressBytes: 0 }
+        : report,
+    );
+  };
+  const make = () =>
+    new RegionalMeasurements({
+      k8s: state.k8s,
+      signal: state.signal,
+      region: "eu-test",
+      snapshot: async () => structuredClone(state.snapshot),
+      fetcher,
+      api: state.api,
+      now: state.now,
+    });
+  const meter = make();
+  meter.update([state.db]);
+  await meter.cycle();
+  const before = state.activities.length;
+  state.advance(15000);
+  for (const pod of state.snapshot.pods) {
+    const previous = state.reports.get(pod.uid)!;
+    state.reports.delete(pod.uid);
+    pod.uid = randomUUID();
+    const started = new Date(state.now() - 5000).toISOString();
+    state.reports.set(pod.uid, {
+      ...previous,
+      pod: pod.uid,
+      processEpoch: randomUUID(),
+      epoch: randomUUID(),
+      startedAt: started,
+      counterStartedAt: started,
+      countersSince: started,
+      history: "current_process_absence",
+      ingressBytes: 0,
+      egressBytes: 0,
+      totalConnections: 0,
+      connectionMilliseconds: 0,
+      connections: 0,
+      authenticatedConnections: 0,
+      busyConnections: 0,
+      pendingDials: 0,
+      lastActivityAt: null,
+    });
+  }
+  const firstComplete = new Date(state.now()).toISOString();
+  await meter.cycle();
+  assert.equal(state.activities.length, before);
+  const resumed = make();
+  resumed.update([state.db]);
+  state.advance(15000);
+  await resumed.cycle();
+  assert.equal(state.activities.length, before + 1);
+  const activity = state.activities.at(-1)!.databases[0]!;
+  assert.equal(
+    (activity as unknown as { idle_observed_since?: string })
+      .idle_observed_since,
+    firstComplete,
+  );
+  assert.equal(activity.last_activity_at, firstComplete);
+  assert.ok(
+    activity.reports.every(
+      (report) =>
+        report.lastActivityAt === null &&
+        report.ingressBytes === 0 &&
+        report.egressBytes === 0,
+    ),
+  );
+  for (const batch of state.usages)
+    for (const sample of batch.samples)
+      if (sample.source === "gateway")
+        assert.ok(
+          sample.interval_start >= firstComplete ||
+            sample.ingress_bytes === null,
+        );
+});
+
+test("recovery restarts on key or epoch changes and never hides busy sessions or pending dials", async () => {
+  const state = await setup();
+  let missing = false;
+  const fetcher: typeof fetch = async (input, options) => {
+    if (missing) return new Response(null, { status: 503 });
+    const response = await state.fetcher(input, options),
+      value = (await response.json()) as GatewayActivityReport;
+    const report = [...state.reports.values()].find(
+      (report) => report.pod === value.pod,
+    )!;
+    return Response.json({
+      ...value,
+      ingressBytes: report.ingressBytes,
+      egressBytes: report.egressBytes,
+    });
+  };
+  const meter = new RegionalMeasurements({
+    k8s: state.k8s,
+    signal: state.signal,
+    region: "eu-test",
+    snapshot: async () => structuredClone(state.snapshot),
+    fetcher,
+    api: state.api,
+    now: state.now,
+  });
+  meter.update([state.db]);
+  await meter.cycle();
+  const before = state.activities.length;
+  state.advance(15000);
+  missing = true;
+  await meter.cycle();
+  missing = false;
+  state.advance(15000);
+  await meter.cycle();
+  assert.equal(state.activities.length, before);
+  state.advance(15000);
+  state.snapshot.keyVersion = "2";
+  const keyBoundary = new Date(state.now()).toISOString();
+  await meter.cycle();
+  assert.equal(state.activities.length, before);
+  for (const report of state.reports.values()) {
+    report.connections = 2;
+    report.busyConnections = 1;
+    report.pendingDials = 1;
+  }
+  state.advance(15000);
+  await meter.cycle();
+  assert.equal(state.activities.length, before + 1);
+  const busy = state.activities.at(-1)!.databases[0]!;
+  assert.equal(busy.idle_observed_since, keyBoundary);
+  assert.equal(busy.busy_connections, 2);
+  assert.equal(busy.pending_dials, 2);
+  state.advance(15000);
+  const epochBoundary = new Date(state.now()).toISOString();
+  const report = state.reports.values().next().value!;
+  report.processEpoch = randomUUID();
+  report.epoch = randomUUID();
+  report.startedAt = epochBoundary;
+  report.counterStartedAt = epochBoundary;
+  report.countersSince = epochBoundary;
+  report.lastActivityAt = epochBoundary;
+  await meter.cycle();
+  assert.equal(state.activities.length, before + 1);
+  state.advance(15000);
+  await meter.cycle();
+  const restored = state.activities.at(-1)!.databases[0]!;
+  assert.equal(state.activities.length, before + 2);
+  assert.equal(restored.idle_observed_since, epochBoundary);
+  assert.equal(restored.busy_connections, 2);
+  assert.equal(restored.pending_dials, 2);
+  const epochSamples = state.usages
+    .flatMap((batch) => batch.samples)
+    .filter(
+      (sample) =>
+        sample.source === "gateway" && sample.observed_at === epochBoundary,
+    );
+  assert.ok(
+    epochSamples.length > 0 &&
+      epochSamples.every(
+        (sample) =>
+          sample.source === "gateway" &&
+          sample.ingress_bytes === null &&
+          sample.egress_bytes === null,
+      ),
+  );
+});

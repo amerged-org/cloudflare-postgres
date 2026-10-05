@@ -83,3 +83,71 @@ it("one process epoch cannot masquerade as two distinct gateway pods", () => {
     }).success,
   ).toBe(false);
 });
+
+it("an explicit idle recovery window can only delay the raw gateway boundary and cannot exceed the oldest report", () => {
+  const id = contracts.newDatabaseId(),
+    now = Date.now(),
+    start = new Date(now - 120000).toISOString(),
+    floor = new Date(now - 15000).toISOString();
+  const reports = [0, 1000].map((offset) => ({
+    region: "eu-test",
+    database: id,
+    revision: 1,
+    pod: crypto.randomUUID(),
+    processEpoch: crypto.randomUUID(),
+    epoch: crypto.randomUUID(),
+    startedAt: start,
+    counterStartedAt: start,
+    observedAt: new Date(now - offset).toISOString(),
+    history: "current_process_absence",
+    countersSince: start,
+    ingressBytes: 0,
+    egressBytes: 0,
+    totalConnections: 0,
+    connectionMilliseconds: 0,
+    connections: 0,
+    authenticatedConnections: 0,
+    busyConnections: 0,
+    pendingDials: 0,
+    lastActivityAt: null,
+  }));
+  const legacy = {
+    id,
+    revision: 1,
+    observed_at: reports[0]!.observedAt,
+    last_activity_at: start,
+    connections: 0,
+    busy_connections: 0,
+    pending_dials: 0,
+    expected_gateway_pods: reports.map((report) => report.pod),
+    reports,
+  };
+  expect(contracts.AgentDatabaseActivity.safeParse(legacy).success).toBe(true);
+  const recovered = {
+    ...legacy,
+    idle_observed_since: floor,
+    last_activity_at: floor,
+  };
+  expect(contracts.AgentDatabaseActivity.safeParse(recovered).success).toBe(
+    true,
+  );
+  expect(
+    contracts.AgentDatabaseActivity.safeParse({
+      ...recovered,
+      idle_observed_since: reports[0]!.observedAt,
+      last_activity_at: reports[0]!.observedAt,
+    }).success,
+  ).toBe(false);
+  expect(
+    contracts.AgentDatabaseActivity.safeParse({
+      ...recovered,
+      last_activity_at: start,
+    }).success,
+  ).toBe(false);
+  expect(
+    contracts.AgentDatabaseActivity.safeParse({
+      ...recovered,
+      last_activity_at: new Date(now - 5000).toISOString(),
+    }).success,
+  ).toBe(false);
+});

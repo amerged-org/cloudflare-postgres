@@ -389,6 +389,7 @@ export const AgentDatabaseActivity = z
     revision: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     observed_at: Timestamp,
     last_activity_at: Timestamp,
+    idle_observed_since: Timestamp.optional(),
     connections: ActivityCount,
     busy_connections: ActivityCount,
     pending_dials: ActivityCount,
@@ -398,6 +399,17 @@ export const AgentDatabaseActivity = z
   .superRefine((activity, ctx) => {
     const pods = new Set(activity.expected_gateway_pods);
     const respondents = new Set(activity.reports.map((report) => report.pod));
+    const boundary = [
+      ...activity.reports.map(gatewayActivityBoundary),
+      ...(activity.idle_observed_since === undefined
+        ? []
+        : [activity.idle_observed_since]),
+    ]
+      .sort()
+      .at(-1);
+    const oldest = activity.reports
+      .map((report) => report.observedAt)
+      .sort()[0]!;
     const total = (field: "connections" | "busyConnections" | "pendingDials") =>
       activity.reports.reduce((sum, report) => sum + report[field], 0);
     if (
@@ -423,8 +435,9 @@ export const AgentDatabaseActivity = z
           .map((report) => report.observedAt)
           .sort()
           .at(-1) ||
-      activity.last_activity_at !==
-        activity.reports.map(gatewayActivityBoundary).sort().at(-1)
+      (activity.idle_observed_since !== undefined &&
+        activity.idle_observed_since > oldest) ||
+      activity.last_activity_at !== boundary
     )
       ctx.addIssue({
         code: "custom",

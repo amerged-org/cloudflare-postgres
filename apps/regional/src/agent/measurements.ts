@@ -71,6 +71,7 @@ interface Checkpoint {
   identity: Identity;
   baseline?: Baseline;
   gapSince?: string;
+  idleObservedSince?: string;
   outbox: Sample[];
 }
 type Subject = Pick<
@@ -161,7 +162,9 @@ function readCheckpoint(resource: Resource, identity: Identity): Checkpoint {
     text(value.identity) !== text(identity) ||
     !Array.isArray(value.outbox) ||
     value.outbox.length > MAX_OUTBOX ||
-    (value.gapSince !== undefined && !validTime(value.gapSince))
+    (value.gapSince !== undefined && !validTime(value.gapSince)) ||
+    (value.idleObservedSince !== undefined &&
+      !validTime(value.idleObservedSince))
   )
     throw new Error("measurement_checkpoint_invalid");
   const outbox = value.outbox.map((sample) => UsageSample.parse(sample));
@@ -218,10 +221,21 @@ function readCheckpoint(resource: Resource, identity: Identity): Checkpoint {
       reports,
     };
   }
+  if (
+    value.idleObservedSince !== undefined &&
+    (!baseline?.sampledAt ||
+      (value.idleObservedSince as string) > baseline.sampledAt ||
+      (value.gapSince !== undefined &&
+        (value.idleObservedSince as string) < (value.gapSince as string)))
+  )
+    throw new Error("measurement_checkpoint_invalid");
   return {
     version: 1,
     identity,
     outbox,
+    ...(value.idleObservedSince === undefined
+      ? {}
+      : { idleObservedSince: value.idleObservedSince as string }),
     ...(baseline ? { baseline } : {}),
     ...(value.gapSince === undefined
       ? {}
@@ -726,6 +740,7 @@ export class RegionalMeasurements {
         checkpoint = work.checkpoint;
       if (!reports || !snapshot) {
         checkpoint.gapSince = new Date(this.now).toISOString();
+        delete checkpoint.idleObservedSince;
         try {
           await this.save(k8s, work);
         } catch {
@@ -743,6 +758,7 @@ export class RegionalMeasurements {
         )
       ) {
         checkpoint.gapSince = new Date(this.now).toISOString();
+        delete checkpoint.idleObservedSince;
         collected.delete(work.db.id);
         try {
           await this.save(k8s, work);
@@ -785,11 +801,60 @@ export class RegionalMeasurements {
             })
           );
         });
-      if (!complete || (prior && !continuous) || !monotonic)
+      const epochsMatch =
+        !!prior &&
+        reports.every((report) => {
+          const previous = prior.reports.find(
+            (value) => value.pod === report.pod,
+          );
+          return (
+            !!previous &&
+            sameEpoch(previous, report) &&
+            previous.revision === report.revision
+          );
+        });
+      const later =
+        !!prior &&
+        reports.every((report) => {
+          const previous = prior.reports.find(
+            (value) => value.pod === report.pod,
+          );
+          return (
+            !!previous &&
+            history(previous) &&
+            report.observedAt > previous.observedAt
+          );
+        });
+      const hadGap = checkpoint.gapSince !== undefined;
+      const gapDetected =
+        !complete || (!!prior && (!continuous || !epochsMatch)) || !monotonic;
+      if (gapDetected) {
         checkpoint.gapSince = new Date(this.now).toISOString();
-      const boundary = reports.map(gatewayActivityBoundary).sort().at(-1)!;
-      if (checkpoint.gapSince && boundary >= checkpoint.gapSince && complete)
-        delete checkpoint.gapSince;
+        delete checkpoint.idleObservedSince;
+      }
+      const oldest = reports.map((report) => report.observedAt).sort()[0]!;
+      const recovered =
+        complete &&
+        continuous &&
+        epochsMatch &&
+        monotonic &&
+        later &&
+        !!checkpoint.idleObservedSince &&
+        checkpoint.idleObservedSince <= oldest;
+      if (checkpoint.gapSince && complete) {
+        if (recovered) delete checkpoint.gapSince;
+        else if (
+          !checkpoint.idleObservedSince &&
+          this.now >= Date.parse(checkpoint.gapSince)
+        )
+          checkpoint.idleObservedSince = new Date(this.now).toISOString();
+      }
+      const boundary = [
+        ...reports.map(gatewayActivityBoundary),
+        ...(checkpoint.idleObservedSince ? [checkpoint.idleObservedSince] : []),
+      ]
+        .sort()
+        .at(-1)!;
       if (complete && !checkpoint.gapSince) {
         try {
           activities.push(
@@ -801,6 +866,9 @@ export class RegionalMeasurements {
                 .sort()
                 .at(-1),
               last_activity_at: boundary,
+              ...(checkpoint.idleObservedSince
+                ? { idle_observed_since: checkpoint.idleObservedSince }
+                : {}),
               connections: reports.reduce(
                 (sum, report) => sum + report.connections,
                 0,
@@ -838,7 +906,14 @@ export class RegionalMeasurements {
             (value) => value.pod === report.pod,
           );
           if (last)
-            pending.push(...differences(last, report, expected, !!continuous));
+            pending.push(
+              ...differences(
+                last,
+                report,
+                expected,
+                !!continuous && ((!hadGap && !gapDetected) || !!recovered),
+              ),
+            );
         }
       }
       pending.push(
