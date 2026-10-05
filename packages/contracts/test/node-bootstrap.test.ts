@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { randomUUID } from "node:crypto";
+import { randomBytes, randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { newNodeId, newOperationId } from "../src/ids.ts";
 import {
@@ -9,9 +9,70 @@ import {
   NodeBootstrapTransport,
   NodeRegionSeed,
   NodeJoinBundle,
+  NodePlatformConfiguration,
+  NodePlatformSpec,
 } from "../src/node-bootstrap.ts";
 
 describe("private bootstrap contracts", () => {
+  it("keeps regional configuration private and requires immutable platform sources", () => {
+    const region = "region-dev";
+    const kid = randomBytes(8).toString("hex");
+    const configuration = {
+      version: 1,
+      region_id: region,
+      api_host: `${randomUUID()}.invalid`,
+      agent_key: `pgcf_ak_${region}_${randomBytes(32).toString("base64url")}`,
+      route_keyring: JSON.stringify({
+        active: kid,
+        keys: { [kid]: randomBytes(32).toString("base64url") },
+      }),
+      tunnel_token: randomBytes(64).toString("base64url"),
+      backup_s3: {
+        access_key_id: randomBytes(16).toString("hex"),
+        secret_access_key: randomBytes(32).toString("hex"),
+      },
+    };
+    expect(NodePlatformConfiguration.safeParse(configuration).success).toBe(
+      true,
+    );
+    expect(
+      NodePlatformConfiguration.safeParse({
+        ...configuration,
+        region_id: "region-other",
+      }).success,
+    ).toBe(false);
+    expect(
+      NodePlatformConfiguration.safeParse({
+        ...configuration,
+        api_host: "${PGCF_API_HOST}",
+      }).success,
+    ).toBe(false);
+    expect(
+      NodePlatformConfiguration.safeParse({
+        ...configuration,
+        route_keyring: randomUUID(),
+      }).success,
+    ).toBe(false);
+    const spec = {
+      reviewed_commit: randomBytes(20).toString("hex"),
+      regional_image: `registry-${randomBytes(4).toString("hex")}.invalid/pgcf@sha256:${randomBytes(32).toString("hex")}`,
+      configuration_sha256: randomBytes(32).toString("hex"),
+    };
+    expect(NodePlatformSpec.safeParse(spec).success).toBe(true);
+    expect(
+      NodePlatformSpec.safeParse({ ...spec, regional_image: "pgcf:latest" })
+        .success,
+    ).toBe(false);
+    expect(
+      NodePlatformSpec.safeParse({ ...spec, reviewed_commit: "main" }).success,
+    ).toBe(false);
+    expect(
+      NodePlatformSpec.safeParse({
+        ...spec,
+        agent_key: configuration.agent_key,
+      }).success,
+    ).toBe(false);
+  });
   it("bounds the entire encrypted material to 256 KiB instead of allowing oversized field combinations", () => {
     const cluster = {
       version: 1,
