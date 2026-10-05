@@ -43,13 +43,16 @@ gateway fences survived a gateway replacement, and a fresh database verified the
 maintenance role's TLS and minimal grants. Usage rollups and lifecycle API/Actor logic are
 implemented. Manual Dev suspend/resume preserved data and storage and verified closed WAL in R2.
 Automatic idle sleep and one wake for ten concurrent connections passed in Dev. Instrumented cold
-connections still take about 9–12 seconds, above the 8-second target. The stale readiness snapshot
+connections now have a twenty-run p50/p95/max of 8.412/9.160/9.708 seconds, above the
+8-second p95 target. All twenty starts preserved data, the original cluster/claim and credential
+UIDs/versions, and each caused one wake. The stale readiness snapshot
 is corrected; a verified read-only SQL archive check is deployed, but the first complete cold
 archive check still took 1.74 seconds. The finalized hourly awake-time measurement differs by
 at most 19.748 seconds from independent Kubernetes evidence, within the 60-second requirement.
 Unchanged credentials retain their UID/version through power revisions. A conservative new
 observation window recovered actual idle sleep after a quiet gateway replacement. A later
-unknown refusal safely restored running state; its cause remains under investigation.
+unknown refusal safely restored running state; fixed-enum diagnostics now identify subsequent
+refusals without copying exception bodies.
 Twenty sequential connections plus a marker read on an always-warm Dev database measured
 p95 734 ms and maximum 911 ms; this does not establish application or load-capacity latency.
 The live collector

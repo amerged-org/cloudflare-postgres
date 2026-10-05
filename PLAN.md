@@ -8,8 +8,8 @@ verified and PostgreSQL has no public port. The second EU VPS is untouched; no U
 bought and no customer or platform database has been migrated.
 
 The deployed regional image is
-`sha256:eb1eb9a8519645acf37a79cb519a37ffdc91f73409dfb91ad97235726e3b186e`
-from source `7ef63733`. CI `37248424052` passed. Full qualification scanned all 657,686,023
+`sha256:905f3931af9b594b9fb9d90fedfc03f728ec3627e0f89626c1fde0db475dabb1`
+from source `100b78dc`. CI `37251067401` passed. Full qualification scanned all 657,689,605
 expected bytes; all 26 reviewed upstream noncredentials resolved, with zero unresolved findings.
 Image signing remains Phase 5 work.
 
@@ -60,7 +60,13 @@ observation window now recovers after two complete stable snapshots. The subsequ
 hibernated without customer SQL. Two new cold connections took 9.799 and 7.962 s, with one wake
 and preserved data each. A later idle attempt failed with visible `power_unknown`; exact
 compensation restored running state and the next idle attempt succeeded. Its cause remains open.
-The ≤8 s target and twenty-connection acceptance remain unmet. A real read-only transaction
+Twenty independent Dev cold starts on the same cluster and claim, with twenty distinct Pods,
+measured p50/p95/max 8.412/9.160/9.708 s (nearest-rank; minimum 6.690 s). Every connection caused
+one wake, advanced configuration once and preserved committed data and rollback absence.
+Both credential Secret UIDs, versions and data remained unchanged through the complete series.
+Successful wake cycles now include their own runtime in the one-second polling cadence;
+failed/retry-skipped cycles retain backoff. The ≤8 s p95 target is still unmet, so Phase 2 remains
+unaccepted. A real read-only transaction
 stayed ready for 74 s despite the 60 s idle policy. On one always-warm Dev database, twenty
 sequential new connections plus the first marker read had p50/p95/max 418.346/734.438/910.656 ms.
 This is a small warm-path measurement, not an application latency or load-capacity guarantee.
@@ -85,7 +91,12 @@ Kubernetes readiness/hibernation evidence bounds the reference to 403–431 seco
 timestamp precision and one termination-to-next-creation bound. The maximum possible deviation
 is 19.748 seconds, below 60; a later readback confirmed the finalized value unchanged.
 The cost API reports null and a named node_rate gap until an actual contract/invoice fact is
-recorded. The earlier E0–E5 run passed through agent-restarted deletion: 102,548 ms, zero volumes/archives, its routing marker removed and both gateways still Ready. The current instrumented trial remains available for cold-wake diagnosis. Awake-time accuracy passes; the cold-wake target and cost attribution remain open. The production-ready
+recorded. The completed instrumented trial had one base backup, 93 WAL objects and 8,762,008
+bytes verified against R2 and the API. Agent-restarted deletion took 104,099 ms and reclaimed
+all trial volumes and archive objects. Ordinary deletion retains archives; the harness purges
+its own objects separately. Awake-time accuracy passes; the cold-wake target and cost attribution
+remain open. Contabo's invoice portal requires a separate active browser login before actual
+invoice facts can be read. The production-ready
 release through Phase 5 and complete Neon replacement are not complete.
 
 This file is the canonical scope, architecture, roadmap and status. README.md summarizes it,
