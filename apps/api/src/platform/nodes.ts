@@ -14,6 +14,10 @@ import {
   NodeMarkLost,
 } from "@pgcf/contracts/nodes";
 import { importBootstrapVerificationKeys } from "@pgcf/contracts/bootstrap-relay";
+import {
+  NodeBootstrapAdmissionBinding,
+  NodeBootstrapCheckpoint,
+} from "@pgcf/contracts/node-bootstrap";
 import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
@@ -585,6 +589,44 @@ export async function verifyNodeProof(
       "conflict",
       "Current actual node identity and measured capacity are required",
     );
+  let admissionBinding = NodeBootstrapAdmissionBinding.parse({
+    checkpoint_revision: Number(
+      addition.checkpoint.reference.split(":").at(-1),
+    ),
+    node_uid: proof.node_uid,
+    resource_version: proof.node_resource_version,
+    kube_system_uid: proof.cluster_uid,
+    quarantine: {
+      key: "pgcf.io/quarantine",
+      value: "bootstrap",
+      effect: "NoSchedule",
+    },
+  });
+  if (row.admission_binding_json !== null) {
+    const saved = NodeBootstrapAdmissionBinding.parse(
+      JSON.parse(row.admission_binding_json),
+    );
+    if (
+      saved.checkpoint_revision !== admissionBinding.checkpoint_revision ||
+      saved.node_uid !== admissionBinding.node_uid ||
+      saved.kube_system_uid !== admissionBinding.kube_system_uid ||
+      canonical(saved.quarantine) !== canonical(admissionBinding.quarantine)
+    )
+      throw new ApiError(
+        "conflict",
+        "Original quarantine release identity cannot change",
+      );
+    const checkpoint = NodeBootstrapCheckpoint.parse(
+      JSON.parse(row.checkpoint_json),
+    );
+    if (
+      checkpoint.stage !== "awaiting_verification" ||
+      checkpoint.release_node_uid !== null ||
+      checkpoint.release_resource_version !== null ||
+      checkpoint.admission_receipt !== null
+    )
+      admissionBinding = saved;
+  }
   const scope = {
     operation_id: id,
     node_id: row.node_id,
@@ -605,45 +647,43 @@ export async function verifyNodeProof(
     platform_reserved_memory_mib: node.platform_reserved_memory_mib,
     platform_reserved_cpu_millicores: node.platform_reserved_cpu_millicores,
   });
-  let admissionBinding = {
-    checkpoint_revision: Number(
-      addition.checkpoint.reference.split(":").at(-1),
-    ),
-    node_uid: proof.node_uid,
-    resource_version: proof.node_resource_version,
-    kube_system_uid: proof.cluster_uid,
-    quarantine: {
-      key: "pgcf.io/quarantine",
-      value: "bootstrap",
-      effect: "NoSchedule",
-    },
-  };
-  if (row.admission_binding_json !== null) {
-    const saved = JSON.parse(
-      row.admission_binding_json,
-    ) as typeof admissionBinding;
-    if (
-      saved.checkpoint_revision !== admissionBinding.checkpoint_revision ||
-      saved.node_uid !== admissionBinding.node_uid ||
-      saved.kube_system_uid !== admissionBinding.kube_system_uid
-    )
-      throw new ApiError(
-        "conflict",
-        "Original quarantine release identity cannot change",
-      );
-    admissionBinding = saved;
-  }
-  await c.env.DB.prepare(
-    "UPDATE node_bootstrap_jobs SET admission_authorized=1,admission_binding_json=?,admission_expires_at=?,updated_at=? WHERE operation_id=? AND input_hash=? AND authorized=1 AND admitted=0 AND cancelled=0",
+  if (Date.parse(proof.expires_at) <= Date.now())
+    throw new ApiError("conflict", "Node proof expired before admission");
+  const serializedBinding = JSON.stringify(admissionBinding);
+  const updated = await c.env.DB.prepare(
+    `UPDATE node_bootstrap_jobs SET admission_authorized=1,admission_binding_json=?,admission_expires_at=?,updated_at=?
+     WHERE operation_id=? AND input_hash=? AND revision=? AND checkpoint_json=? AND admission_binding_json IS ?
+     AND authorized=1 AND admitted=0 AND cancelled=0`,
   )
     .bind(
-      JSON.stringify(admissionBinding),
+      serializedBinding,
       proof.expires_at,
       new Date().toISOString(),
       id,
       row.input_hash,
+      row.revision,
+      row.checkpoint_json,
+      row.admission_binding_json,
     )
     .run();
+  if (updated.meta.changes !== 1)
+    throw new ApiError(
+      "conflict",
+      "Bootstrap admission changed while verification was in progress",
+    );
+  const admitted = await readBootstrapJob(c.env.DB, id);
+  if (
+    admitted.admission_binding_json !== serializedBinding ||
+    admitted.admission_expires_at !== proof.expires_at ||
+    !admitted.authorized ||
+    !admitted.admission_authorized ||
+    admitted.admitted ||
+    admitted.cancelled
+  )
+    throw new ApiError(
+      "conflict",
+      "Bootstrap admission changed before authorization readback",
+    );
   c.executionCtx.waitUntil(startAddNode(c.env, id));
   return c.json(next, 202);
 }

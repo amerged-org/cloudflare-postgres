@@ -22,6 +22,7 @@ import {
   recordNodeAudit,
   recordNodeReceipt,
   reserveNodeAddition,
+  readNodeAddition,
   saveNodeBootstrapCheckpoint,
 } from "../../src/domain/node-state.ts";
 import {
@@ -1070,7 +1071,7 @@ describe("protected bootstrap authority", () => {
       await env.ARCHIVE.delete(proofKey);
     }
   });
-  it("compares signed verification addresses by IP identity while rejecting changed or missing inventory", async () => {
+  it("compares signed inventory and refreshes admission revisions only before release intent", async () => {
     const f = await prepared(),
       uid = crypto.randomUUID(),
       clusterUid = crypto.randomUUID(),
@@ -1132,7 +1133,11 @@ describe("protected bootstrap authority", () => {
         .mockResolvedValue(actual),
       workflow = { create: vi.fn(async () => ({})) },
       proofKey = `node-verification/${f.job.operation_id}/${addition.checkpoint!.reference}/proof.json`;
-    const submit = async (ipv6: string | null = "2001:db8::42") => {
+    let expectedRevision = addition.revision;
+    const submit = async (
+      ipv6: string | null = "2001:db8::42",
+      resourceVersion = "12",
+    ) => {
       const payload = {
         purpose: "pgcf-node-verification/v1",
         operation_id: f.job.operation_id,
@@ -1144,7 +1149,7 @@ describe("protected bootstrap authority", () => {
         checkpoint_reference: addition.checkpoint!.reference,
         cluster_uid: clusterUid,
         node_uid: uid,
-        node_resource_version: "12",
+        node_resource_version: resourceVersion,
         observed_at: now,
         expires_at: new Date(Date.now() + 60_000).toISOString(),
         addresses: { ipv4: f.spec.hardware.ipv4, ipv6 },
@@ -1190,7 +1195,7 @@ describe("protected bootstrap authority", () => {
                 "Content-Type": "application/json",
               },
               body: JSON.stringify({
-                expected_revision: addition.revision,
+                expected_revision: expectedRevision,
                 sha256: bytesToHex(
                   new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
                 ),
@@ -1215,6 +1220,10 @@ describe("protected bootstrap authority", () => {
           context,
         );
       await waitOnExecutionContext(context);
+      if (response.status === 202)
+        expectedRevision = (
+          (await response.clone().json()) as { revision: number }
+        ).revision;
       return response;
     };
     const reject = async (
@@ -1276,6 +1285,134 @@ describe("protected bootstrap authority", () => {
           .bind(f.job.node_id)
           .first<{ schedulable: number }>())!.schedulable,
       ).toBe(0);
+      const before = await readBootstrapJob(env.DB, f.job.operation_id);
+      const checkpoint = {
+        ...JSON.parse(before.checkpoint_json),
+        stage: "awaiting_verification",
+        status: "awaiting_verification",
+      };
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+      )
+        .bind(JSON.stringify(checkpoint), f.job.operation_id)
+        .run();
+      expect((await submit(undefined, "13")).status).toBe(202);
+      const refreshed = await readBootstrapJob(env.DB, f.job.operation_id);
+      const binding = JSON.parse(refreshed.admission_binding_json!);
+      expect(binding.resource_version).toBe("13");
+      expect(binding.node_uid).toBe(uid);
+      expect(binding.kube_system_uid).toBe(clusterUid);
+      expect(binding.checkpoint_revision).toBe(0);
+
+      const differentIdentity = { ...binding, node_uid: crypto.randomUUID() };
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET admission_binding_json=? WHERE operation_id=?",
+      )
+        .bind(JSON.stringify(differentIdentity), f.job.operation_id)
+        .run();
+      expect((await submit(undefined, "14")).status).toBe(409);
+      expect(
+        JSON.parse(
+          (await readBootstrapJob(env.DB, f.job.operation_id))
+            .admission_binding_json!,
+        ),
+      ).toEqual(differentIdentity);
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET admission_binding_json=? WHERE operation_id=?",
+      )
+        .bind(JSON.stringify(binding), f.job.operation_id)
+        .run();
+
+      const release = {
+        ...checkpoint,
+        stage: "quarantine_release_intent",
+        release_node_uid: uid,
+        release_resource_version: "13",
+      };
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET checkpoint_json=?,revision=revision+1 WHERE operation_id=?",
+      )
+        .bind(JSON.stringify(release), f.job.operation_id)
+        .run();
+      expect((await submit(undefined, "14")).status).toBe(202);
+      expect(
+        (await readBootstrapJob(env.DB, f.job.operation_id))
+          .admission_binding_json,
+      ).toBe(JSON.stringify(binding));
+
+      const released = {
+        ...release,
+        stage: "quarantine_released",
+        status: "released",
+        admission_receipt: {
+          version: 1,
+          operation_id: f.job.operation_id,
+          node_id: f.job.node_id,
+          region_id: f.region,
+          input_hash: f.job.input_hash,
+          checkpoint_revision: 0,
+          node_uid: uid,
+          kube_system_uid: clusterUid,
+          previous_resource_version: "13",
+          resource_version: "14",
+          quarantine_removed: true,
+        },
+      };
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET checkpoint_json=?,revision=revision+1 WHERE operation_id=?",
+      )
+        .bind(JSON.stringify(released), f.job.operation_id)
+        .run();
+      expect((await submit(undefined, "15")).status).toBe(202);
+      const completedRelease = await readBootstrapJob(
+        env.DB,
+        f.job.operation_id,
+      );
+      expect(completedRelease.admission_binding_json).toBe(
+        JSON.stringify(binding),
+      );
+      expect(
+        JSON.parse(completedRelease.checkpoint_json).admission_receipt,
+      ).toEqual(released.admission_receipt);
+
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+      )
+        .bind(JSON.stringify(checkpoint), f.job.operation_id)
+        .run();
+      provider.mockImplementationOnce(async () => {
+        await env.DB.prepare(
+          "UPDATE node_bootstrap_jobs SET checkpoint_json=?,revision=revision+1 WHERE operation_id=?",
+        )
+          .bind(JSON.stringify(release), f.job.operation_id)
+          .run();
+        return actual;
+      });
+      expect((await submit(undefined, "15")).status).toBe(409);
+      const raced = await readBootstrapJob(env.DB, f.job.operation_id);
+      expect(raced.admission_binding_json).toBe(JSON.stringify(binding));
+      expect(JSON.parse(raced.checkpoint_json).stage).toBe(
+        "quarantine_release_intent",
+      );
+      expectedRevision = (await readNodeAddition(env.DB, f.job.operation_id))
+        .revision;
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+      )
+        .bind(JSON.stringify(checkpoint), f.job.operation_id)
+        .run();
+      provider.mockImplementationOnce(async () => {
+        await env.DB.prepare(
+          "UPDATE node_bootstrap_jobs SET cancelled=1 WHERE operation_id=?",
+        )
+          .bind(f.job.operation_id)
+          .run();
+        return actual;
+      });
+      expect((await submit(undefined, "16")).status).toBe(409);
+      const cancelled = await readBootstrapJob(env.DB, f.job.operation_id);
+      expect(cancelled.cancelled).toBe(1);
+      expect(cancelled.admission_binding_json).toBe(JSON.stringify(binding));
     } finally {
       provider.mockRestore();
       await env.ARCHIVE.delete(proofKey);

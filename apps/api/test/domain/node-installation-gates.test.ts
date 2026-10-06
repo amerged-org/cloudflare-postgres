@@ -5,18 +5,24 @@ import {
   runInDurableObject,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { bytesToBase64url, bytesToHex } from "@pgcf/contracts";
 import {
   NodeBootstrapAuthority,
   NodeBootstrapCheckpoint,
 } from "@pgcf/contracts/node-bootstrap";
 import { createApp } from "../../src/app.ts";
+import { NodeBootstrap } from "../../src/bootstrap-container.ts";
 import {
   bootstrapJobInput,
   configureBootstrapJob,
   readBootstrapJob,
 } from "../../src/domain/bootstrap-jobs.ts";
+import {
+  saveNodeBootstrapCheckpoint,
+  verifyNodeCapacity,
+  verifyNodeNetwork,
+} from "../../src/domain/node-state.ts";
 import {
   canonicalNodePreparationProof,
   NODE_PREPARATION_SIGNATURE_DOMAIN,
@@ -28,8 +34,232 @@ import { auditedRescueConfiguration } from "./rescue-fixtures.ts";
 
 const artifacts: string[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const key of artifacts.splice(0)) await env.ARCHIVE.delete(key);
   await cleanupFixtures();
+});
+
+describe("Container startup readiness", () => {
+  async function startup(fetch: (request: Request) => Promise<Response>) {
+    const f = await sealedRescueJob();
+    await networkPreparation(f);
+    const start = vi.fn(),
+      port = { fetch: vi.fn(fetch) },
+      container = {
+        running: false,
+        start,
+        getTcpPort: () => port,
+        setInactivityTimeout: async () => {},
+      },
+      invoke = (method: "start" | "admit", operationId: string) =>
+        runInDurableObject(
+          env.NODE_BOOTSTRAP.get(
+            env.NODE_BOOTSTRAP.idFromName(f.job.operation_id),
+          ),
+          async (_instance, state) => {
+            const previous = Object.getOwnPropertyDescriptor(
+              state,
+              "container",
+            );
+            Object.defineProperty(state, "container", {
+              value: container,
+              configurable: true,
+            });
+            try {
+              return await new NodeBootstrap(state, f.bindings)[method](
+                operationId,
+              );
+            } finally {
+              if (previous) Object.defineProperty(state, "container", previous);
+              else delete (state as { container?: unknown }).container;
+            }
+          },
+        ),
+      instance = {
+        start: (operationId: string) => invoke("start", operationId),
+        admit: (operationId: string) => invoke("admit", operationId),
+      };
+    return { f, instance, port, start };
+  }
+
+  it("waits for the actual port before sending one registration POST", async () => {
+    let ready = false,
+      probes = 0;
+    const methods: string[] = [];
+    const { f, instance, start } = await startup(async (request) => {
+      methods.push(request.method);
+      if (request.method === "POST") {
+        if (!ready) throw new Error("container not listening TCP8080");
+        return new Response(null, { status: 202 });
+      }
+      expect(new URL(request.url).pathname).toBe("/");
+      expect(request.headers.has("Authorization")).toBe(false);
+      if (++probes === 1) throw new Error("container not listening TCP8080");
+      ready = true;
+      return new Response(null, { status: 401 });
+    });
+    await expect(instance.start(f.job.operation_id)).resolves.toMatchObject({
+      operation_id: f.job.operation_id,
+    });
+    expect(start).toHaveBeenCalledOnce();
+    expect(methods).toEqual(["GET", "GET", "POST"]);
+    await expectJobPreserved(f);
+  });
+
+  it("ends the port wait at its deadline without sending a registration POST", async () => {
+    const base = Date.now();
+    let now = base;
+    const { f, instance, port } = await startup(async (request) => {
+      expect(request.method).toBe("GET");
+      now = base + 30_000;
+      throw new Error("container not listening TCP8080");
+    });
+    vi.spyOn(Date, "now").mockImplementation(() => now);
+    await expect(instance.start(f.job.operation_id)).rejects.toThrow(
+      "bootstrap_container_port_timeout",
+    );
+    expect(port.fetch).toHaveBeenCalledOnce();
+    await expectJobPreserved(f);
+  });
+
+  it("does not replay a registration POST with an uncertain response", async () => {
+    const methods: string[] = [];
+    const { f, instance } = await startup(async (request) => {
+      methods.push(request.method);
+      if (request.method === "POST")
+        throw new Error("registration_response_lost");
+      return new Response(null, { status: 401 });
+    });
+    await expect(instance.start(f.job.operation_id)).rejects.toThrow(
+      "registration_response_lost",
+    );
+    expect(methods).toEqual(["GET", "POST"]);
+    await expectJobPreserved(f);
+  });
+
+  it("refuses a job cancelled while the port becomes ready", async () => {
+    const methods: string[] = [];
+    const { f, instance } = await startup(async (request) => {
+      methods.push(request.method);
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET cancelled=1 WHERE operation_id=?",
+      )
+        .bind(f.job.operation_id)
+        .run();
+      return new Response(null, { status: 401 });
+    });
+    await expect(instance.start(f.job.operation_id)).rejects.toThrow(
+      "bootstrap_job_closed",
+    );
+    expect(methods).toEqual(["GET"]);
+    await expectJobPreserved(f);
+  });
+
+  it("refuses preparation that expires while the port becomes ready", async () => {
+    const methods: string[] = [];
+    const { f, instance } = await startup(async (request) => {
+      methods.push(request.method);
+      await env.DB.prepare(
+        "UPDATE node_network_preparations SET proof_expires_at=? WHERE operation_id=?",
+      )
+        .bind(new Date(Date.now() - 1).toISOString(), f.job.operation_id)
+        .run();
+      return new Response(null, { status: 401 });
+    });
+    await expect(instance.start(f.job.operation_id)).rejects.toThrow(
+      "bootstrap_network_preparation_required",
+    );
+    expect(methods).toEqual(["GET"]);
+    await expectJobPreserved(f);
+  });
+
+  it("refuses admission that expires while the port becomes ready", async () => {
+    const methods: string[] = [];
+    const { f, instance } = await startup(async (request) => {
+      methods.push(request.method);
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET admission_expires_at=? WHERE operation_id=?",
+      )
+        .bind(new Date(Date.now() - 1).toISOString(), f.job.operation_id)
+        .run();
+      return new Response(null, { status: 401 });
+    });
+    const now = new Date().toISOString(),
+      uid = crypto.randomUUID();
+    await env.DB.prepare(
+      "INSERT INTO nodes(id,region_id,k8s_node_name,provider_instance_id,node_uid,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,1,0,4096,2000,30,128,100,?,?,?)",
+    )
+      .bind(
+        f.job.node_id,
+        f.job.region_id,
+        f.body.spec.hostname,
+        f.providerId,
+        uid,
+        now,
+        now,
+        now,
+      )
+      .run();
+    let addition = await saveNodeBootstrapCheckpoint(
+      env.DB,
+      f.job.operation_id,
+      f.addition.revision,
+      {
+        stage: "joined",
+        reference: `${f.job.input_hash}:${f.job.revision}`,
+        saved_at: now,
+      },
+    );
+    const scope = {
+      operation_id: f.job.operation_id,
+      node_id: f.job.node_id,
+      intent_hash: addition.intent_hash,
+      checkpoint_reference: addition.checkpoint!.reference,
+      proof_reference: crypto.randomUUID(),
+    };
+    addition = await verifyNodeNetwork(
+      env.DB,
+      f.job.operation_id,
+      addition.revision,
+      {
+        ...scope,
+        verified_at: now,
+      },
+    );
+    await verifyNodeCapacity(env.DB, f.job.operation_id, addition.revision, {
+      ...scope,
+      observed_at: now,
+      allocatable_memory_mib: 4096,
+      allocatable_cpu_millicores: 2000,
+      storage_gib_total: 30,
+      platform_reserved_memory_mib: 128,
+      platform_reserved_cpu_millicores: 100,
+    });
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET admission_authorized=1,admission_binding_json=?,admission_expires_at=? WHERE operation_id=?",
+    )
+      .bind(
+        JSON.stringify({
+          checkpoint_revision: f.job.revision,
+          node_uid: uid,
+          resource_version: "12",
+          kube_system_uid: crypto.randomUUID(),
+          quarantine: {
+            key: "pgcf.io/quarantine",
+            value: "bootstrap",
+            effect: "NoSchedule",
+          },
+        }),
+        new Date(Date.now() + 60_000).toISOString(),
+        f.job.operation_id,
+      )
+      .run();
+    await expect(instance.admit(f.job.operation_id)).rejects.toThrow(
+      "bootstrap_admission_not_authorized",
+    );
+    expect(methods).toEqual(["GET"]);
+    await expectJobPreserved(f);
+  });
 });
 const canonical = (value: unknown): string =>
   value === null || typeof value !== "object"
