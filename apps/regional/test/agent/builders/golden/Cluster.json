@@ -11,7 +11,7 @@
     },
     "spec": {
       "instances": 1,
-      "imageName": "ghcr.io/cloudnative-pg/postgresql:18.4-standard-trixie@sha256:ebf3919504d7523a63e8e2fee9b051211de714644b36469275558c624afd50ec",
+      "imageName": "ghcr.io/amerged-org/pgcf-postgres@sha256:2c0b286e616191e5103f972181fee2fa7481102bf1a8c0d19154d37f961f3d2d",
       "inheritedMetadata": {
         "labels": {
           "pgcf.io/database-id": "$DATABASE_ID"

@@ -116,10 +116,10 @@
       }
     ],
     "postgresImage": {
-      "reference": "ghcr.io/cloudnative-pg/postgresql:18.4-standard-trixie@sha256:ebf3919504d7523a63e8e2fee9b051211de714644b36469275558c624afd50ec",
-      "version": "18.4",
-      "source": "https://github.com/cloudnative-pg/postgres-containers",
-      "note": "Pinned image retained from the earlier lab; the new live chain has not been qualified."
+      "reference": "ghcr.io/amerged-org/pgcf-postgres@sha256:2c0b286e616191e5103f972181fee2fa7481102bf1a8c0d19154d37f961f3d2d",
+      "version": "18.6",
+      "source": "https://github.com/amerged-org/cloudflare-postgres/tree/901b3228fd933530a801ed2c6de69e3cee57d16f/infra/postgres",
+      "note": "Unmodified official PostgreSQL 18.6 engine with checksum-pinned pgvector 0.8.7. Single-layer assembly removes the unused upstream snakeoil pair. Full qualification and registry readback passed in CI 37506713888."
     }
   },
   "verificationScope": "Official chart versions, chart/app mappings, registry manifest digests, archive checksums, offline Helm lint/render and Kustomize build. Container image tag references remain as shipped by the pinned charts except digest defaults already shipped by Cilium; image signature and tag-to-digest verification are not claimed.",

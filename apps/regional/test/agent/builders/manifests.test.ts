@@ -81,7 +81,7 @@ function fixture(): { db: DesiredDatabase; ctx: BuildContext } {
         },
       },
       postgresImage:
-        "ghcr.io/cloudnative-pg/postgresql:18.4-standard-trixie@sha256:ebf3919504d7523a63e8e2fee9b051211de714644b36469275558c624afd50ec",
+        "ghcr.io/amerged-org/pgcf-postgres@sha256:2c0b286e616191e5103f972181fee2fa7481102bf1a8c0d19154d37f961f3d2d",
       systemNamespace: "pgcf-system",
       cnpgNamespace: "cnpg-system",
       gatewaySelector: {

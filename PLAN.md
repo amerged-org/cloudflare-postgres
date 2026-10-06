@@ -41,6 +41,26 @@ The exact application/namespace binding and completed rollout retain that image.
 instance was verified during EU2 admission; the application is currently inactive with zero
 instances. The deployed runtime's complete CI `37419289338` is green. US installation and cross-region node-loss
 recovery remain outstanding.
+The complete headless implementation is committed from `781a48c3`, with clean-checkout test
+asset generation and the proof signing alias in `901b3228`. Full CI `37506713888` passed all
+software checks and three image jobs. Source `901b3228` produces regional
+`sha256:eeaa6ab0c1fc182e9e050d6f104565ec0a3dc4e7482b1950287c31b62ebe607a`
+(10 layers, 658,637,376 bytes), native bootstrap
+`sha256:c68fe4375dd72c27d4d75fe3ef8d595da2b402d44f938e10bf3c7f96304c1089`
+(18 layers, 715,162,096 bytes), and PostgreSQL
+`sha256:2c0b286e616191e5103f972181fee2fa7481102bf1a8c0d19154d37f961f3d2d`
+(one layer, 1,002,669,632 bytes), all with zero unresolved scanner findings. CI verified actual
+SQL/pgvector, the unchanged engine and full registry bytes. Local checks passed contracts 151,
+API 502, Edge 80, regional 425, native 148, CLI 30, harness 237, infrastructure 21 and CI logic 71.
+The new images, migrations, profiles and actual-RAM policy are not yet delivered/live-accepted.
+The first common CI failed because source tests needed their compiled portable scanner; the test
+command now builds it. The next PostgreSQL job failed on Docker 28's unsupported inspect platform
+flag; explicit inspected architecture and configuration validation now use its supported command.
+The retained relay key's kid collides with the legacy verifier's different public key. A tested
+optional proof alias permits retaining both existing identities; deployment adds only its matching
+public key and identifier, with no private-key rotation. Provider NVMe selection and real US-first /
+EU automatic inspection, proof renewal, storage publication, installation and admission remain open.
+
 Release image signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
