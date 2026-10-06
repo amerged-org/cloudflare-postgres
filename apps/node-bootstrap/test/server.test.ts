@@ -144,3 +144,97 @@ test("private HTTP authenticates before parsing and exposes only durable bounded
   assert.equal(authorized(`Bearer ${bearer}`, bearer), true);
   assert.equal(authorized(`Bearer ${bearer.slice(1)}`, bearer), false);
 });
+
+test(
+  "admission registration skips installation and preserves a running admission",
+  { timeout: 5000 },
+  async () => {
+    const input = fixture();
+    const current = {
+      ...authority(input),
+      checkpoint: {
+        ...authority(input).checkpoint,
+        stage: "awaiting_verification" as const,
+        status: "awaiting_verification" as const,
+      },
+    };
+    let releaseRead!: () => void;
+    const blockedRead = new Promise<void>((resolve) => {
+      releaseRead = resolve;
+    });
+    let admissionEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      admissionEntered = resolve;
+    });
+    let reads = 0;
+    let commands = 0;
+    const bearer = randomBytes(32).toString("base64url");
+    const runtime = createBootstrapServer(bearer, {
+      run: async () => {
+        commands++;
+        throw new Error("installation_must_not_run");
+      },
+      request: async (_url, init) => {
+        const message = NodeBootstrapCallback.parse(
+          JSON.parse(String(init?.body)),
+        );
+        if (message.kind === "read" && ++reads === 2) await blockedRead;
+        return Response.json(current);
+      },
+    });
+    runtime.server.on("request", (request) => {
+      if (request.url?.endsWith("/admit")) admissionEntered();
+    });
+    runtime.server.listen(0, LOOPBACK);
+    await once(runtime.server, "listening");
+    const address = runtime.server.address();
+    assert.ok(address && typeof address !== "string");
+    const url = `http://${LOOPBACK}:${address.port}`;
+    const headers = {
+      authorization: `Bearer ${bearer}`,
+      "content-type": "application/json",
+    };
+    try {
+      const registered = await fetch(`${url}/v1/jobs`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(input),
+      });
+      assert.equal(registered.status, 202);
+      await registered.body?.cancel();
+      const pending = fetch(`${url}/v1/jobs/${input.spec.operation_id}/admit`, {
+        method: "POST",
+        headers,
+      });
+      await entered;
+      const repeated = await fetch(`${url}/v1/jobs`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(input),
+      });
+      assert.equal(repeated.status, 202);
+      await repeated.body?.cancel();
+      const overlapping = await fetch(
+        `${url}/v1/jobs/${input.spec.operation_id}/admit`,
+        { method: "POST", headers },
+      );
+      assert.equal(overlapping.status, 409);
+      assert.deepEqual(await overlapping.json(), {
+        error_code: "container_busy",
+      });
+      releaseRead();
+      const admission = await pending;
+      assert.equal(admission.status, 400);
+      assert.deepEqual(await admission.json(), {
+        error_code: "admission_not_authorized",
+      });
+      assert.equal(commands, 0);
+      assert.equal(reads, 3);
+    } finally {
+      releaseRead();
+      runtime.stop();
+      runtime.server.closeAllConnections();
+      if (runtime.server.listening) await once(runtime.server, "close");
+    }
+  },
+);

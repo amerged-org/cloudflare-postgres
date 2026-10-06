@@ -66,15 +66,21 @@ export function createBootstrapServer(
           throw new BootstrapError("container_busy");
         const job = new BootstrapJob(input, options);
         const status = await job.status();
-        const entry = { job, running: true };
+        const installation = ![
+          "awaiting_verification",
+          "quarantine_release_intent",
+          "quarantine_released",
+        ].includes(status.checkpoint.stage);
+        const entry = { job, running: installation };
         jobs.set(input.spec.operation_id, entry);
         // The HTTP request starts work; every meaningful progress point is external and durable.
-        void job
-          .start()
-          .catch(() => {})
-          .finally(() => {
-            entry.running = false;
-          });
+        if (installation)
+          void job
+            .start()
+            .catch(() => {})
+            .finally(() => {
+              entry.running = false;
+            });
         reply(response, 202, status);
         return;
       }
