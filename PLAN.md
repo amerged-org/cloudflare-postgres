@@ -1,6 +1,6 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-06): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
+Status (2026-10-07): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
 
 Latest owner topology overrides the earlier V155 replacement/removal plan: retain the existing
 EU control/relay VPS and the already-admitted EU worker, now customer **EU1**. Both customer
@@ -27,9 +27,19 @@ A fresh adoption of the same paid US1 returned202, with no new order. Cloudflare
 confirmed its owned free firewall, sealed one installation binding, verified network readback and
 received one accepted rescue response. Hardware inspection has not yet reported, so there is
 still no bootstrap job, admitted US Node or installation disk write. A bounded administrator
-inspection status getter is implemented and tested; delivery and the actual failure diagnosis
-remain pending. The new Workflow is being paused at this pre-installer boundary for that API-only
-diagnostic update. The retained EU control node's UID-guarded new-database placement flag is now
+inspection status getter is delivered from `4b8dd167`, full CI `37534977719`;34 scoped tests,
+types, lint, formatting and independent review passed. Its once-only publication preserved the
+full native configuration and namespace, EU data/custody and US immutable input/claims. The same
+US Workflow was paused and resumed; native inspection then reported `inspection_image_gpt_invalid`.
+The exact official Talos1.14.1 image has232,141,432 compressed bytes and4,453,302,272 raw bytes,
+raw SHA-256 `b915cdcdb1a6de6e8754a287c688083187eaab45d775917384a727df125d1064`.
+Independent local verification passed both header and partition-array CRCs, reciprocal/end-of-file
+header locations and four non-overlapping partitions. Linux `sgdisk`1.0.9 returned0, with a valid
+success banner preceded only by its advisory about the gap from sector33 to first-usable2048.
+The bytes remained unchanged. The current parser wrongly rejects that benign advisory; its narrow
+regression/fix and a qualified native-image update are in progress. The same US Workflow is paused
+again with zero bootstrap jobs and no installation disk write; retain all original identities and
+resume that operation after delivery. The retained EU control node's UID-guarded new-database placement flag is now
 false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.
 Actual-RAM mode and automatic purchases remain disabled pending accepted US/recovery tests,
 reviewed test cleanup and explicit finite numeric standing limits.

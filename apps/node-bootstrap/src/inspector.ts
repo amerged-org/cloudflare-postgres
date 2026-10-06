@@ -30,6 +30,12 @@ const RECORD = "\n__PGCF_INSPECTION_RECORD__\n";
 const RESERVE = 512 * 1024 ** 2;
 const LIMIT = 512 * 1024;
 const RAM = new Set(["tmpfs", "ramfs", "rootfs"]);
+// sgdisk reports this valid reserved gap before its GPT verification result.
+const GPT_RESERVED_GAP_ADVISORY = `Warning: There is a gap between the main partition table (ending sector 33)
+and the first usable sector (2048). This is helpful in some exotic configurations,
+but is unusual. The util-linux fdisk program often creates disks like this.
+Using 'j' on the experts' menu can adjust this gap.
+`;
 type Json = Record<string, unknown>;
 export interface InspectionOptions {
   run?: CommandRunner;
@@ -709,9 +715,18 @@ PGCF_INSPECTION_IMAGE_PY`);
         throw new BootstrapError("inspection_image_partition_bounds");
       previous = end;
     }
-    const verification = await this.ssh(`sgdisk --verify ${raw} 2>&1`);
+    let verification = (
+      await this.ssh(`sgdisk --verify ${raw} 2>&1`)
+    ).trimStart();
     if (
-      !verification.trimStart().startsWith("No problems found.") ||
+      layout.every((partition) => partition.start >= 2048) &&
+      verification.startsWith(GPT_RESERVED_GAP_ADVISORY)
+    )
+      verification = verification
+        .slice(GPT_RESERVED_GAP_ADVISORY.length)
+        .trimStart();
+    if (
+      !verification.startsWith("No problems found.") ||
       /warning|caution|error|invalid|mismatch/i.test(verification)
     )
       throw new BootstrapError("inspection_image_gpt_invalid");

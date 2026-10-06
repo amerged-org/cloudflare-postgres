@@ -14,6 +14,17 @@ import { digest, runCommand, type Command } from "../src/bootstrap.ts";
 import { inspectNode, runInspection } from "../src/inspector.ts";
 
 const separator = "\n__PGCF_INSPECTION_RECORD__\n";
+// Exact sgdisk 1.0.9 output from the official Talos 1.14.1 image; independent
+// primary/backup header and partition-array CRCs and all four bounds passed.
+const officialGptVerification = `
+Warning: There is a gap between the main partition table (ending sector 33)
+and the first usable sector (2048). This is helpful in some exotic configurations,
+but is unusual. The util-linux fdisk program often creates disks like this.
+Using 'j' on the experts' menu can adjust this gap.
+
+No problems found. 292831 free sectors (143.0 MiB) available in 1
+segments, the largest of which is 292831 (143.0 MiB) in size.
+`;
 async function input(): Promise<NodeInspectionInput> {
   const host = await createNodeRescueHostIdentity();
   const client = await createNodeRescueHostIdentity();
@@ -219,6 +230,46 @@ function scenario(value: NodeInspectionInput) {
   };
 }
 
+function officialImageScenario(
+  value: NodeInspectionInput,
+  verification = officialGptVerification,
+) {
+  const state = scenario(value);
+  const run = async (command: Command) => {
+    const result = await state.run(command);
+    if (command.stdin?.includes("__PGCF_INSPECTION_IMAGE__"))
+      return {
+        exit_code: 0,
+        stdout: JSON.stringify({
+          compressed_sha256:
+            "16759f5f97cc2370833130a8e962ea6b8648aa9383861e38a0c92c6ea2582037",
+          compressed_bytes: 232141432,
+          raw_sha256:
+            "b915cdcdb1a6de6e8754a287c688083187eaab45d775917384a727df125d1064",
+          raw_bytes: 4453302272,
+        }),
+      };
+    if (command.stdin?.includes("sfdisk --json"))
+      return {
+        exit_code: 0,
+        stdout: JSON.stringify({
+          partitiontable: {
+            partitions: [
+              { start: 2048, size: 4302848 },
+              { start: 4304896, size: 2048 },
+              { start: 4306944, size: 4096000 },
+              { start: 8402944, size: 2048 },
+            ].map((p) => ({ ...p, type: "type", uuid: "uuid" })),
+          },
+        }),
+      };
+    if (command.stdin?.includes("sgdisk --verify"))
+      return { exit_code: 0, stdout: verification };
+    return result;
+  };
+  return { ...state, run };
+}
+
 test("measures unknown hardware and image in RAM, cleans up and rereads identity before its single report", async () => {
   const value = await input(),
     state = scenario(value);
@@ -235,6 +286,49 @@ test("measures unknown hardware and image in RAM, cleans up and rereads identity
   assert.ok(image.includes("nocloud-amd64.raw.xz"));
   assert.ok(image.includes("--retry 0"));
   assert.ok(!image.includes("--continue-at"));
+});
+
+test("accepts the verified official image's reserved first-usable-sector advisory without altering GPT", async () => {
+  const value = await input(),
+    state = officialImageScenario(value);
+  const report = await runInspection(value, state);
+  assert.equal(report.image.raw_bytes, 4453302272);
+  assert.equal(
+    report.image.raw_sha256,
+    "b915cdcdb1a6de6e8754a287c688083187eaab45d775917384a727df125d1064",
+  );
+  assert.equal(state.reports(), 1);
+  assert.equal(state.hardwareReads(), 2);
+  assert.equal(state.cleaned(), true);
+});
+
+test("still rejects a real GPT corruption warning alongside a success banner and cleans without reporting", async () => {
+  const value = await input(),
+    state = officialImageScenario(
+      value,
+      officialGptVerification +
+        "Warning! Main partition table CRC is invalid.\n",
+    );
+  await assert.rejects(
+    runInspection(value, state),
+    /inspection_image_gpt_invalid/,
+  );
+  assert.equal(state.cleaned(), true);
+  assert.equal(state.reports(), 0);
+});
+
+test("does not treat the benign GPT advisory alone as a successful verification", async () => {
+  const value = await input(),
+    state = officialImageScenario(
+      value,
+      officialGptVerification.split("No problems found.")[0]!,
+    );
+  await assert.rejects(
+    runInspection(value, state),
+    /inspection_image_gpt_invalid/,
+  );
+  assert.equal(state.cleaned(), true);
+  assert.equal(state.reports(), 0);
 });
 
 test("rejects a mounted install disk before image download or scratch allocation", async () => {
