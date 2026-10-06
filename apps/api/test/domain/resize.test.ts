@@ -78,6 +78,55 @@ function resize(
 }
 
 describe("manual in-place resize on real Workers D1", () => {
+  it("resizes an assigned database after new placement is closed while refusing a new allocation", async () => {
+    const f = await ready();
+    const uid = crypto.randomUUID();
+    await env.DB.prepare("UPDATE nodes SET node_uid=? WHERE id=?")
+      .bind(uid, f.node)
+      .run();
+    const closed = await request(
+      `/v1/nodes/${f.node}/database-placement`,
+      f.admin,
+      "PUT",
+      { expected_node_uid: uid, database_placement_enabled: false },
+    );
+    expect(closed.status).toBe(200);
+    const pending = DatabaseWithOperation.parse(
+      await (await f.create("closed-placement-new-database")).json(),
+    );
+    expect(pending.database.observed_state).toBe("pending");
+    expect(
+      await env.DB.prepare("SELECT node_id FROM databases WHERE id=?")
+        .bind(pending.database.id)
+        .first("node_id"),
+    ).toBeNull();
+    const before = await env.DB.prepare(
+      "SELECT node_id,archive_path,storage_generation FROM databases WHERE id=?",
+    )
+      .bind(f.id)
+      .first();
+    const target = await size(f);
+    const resized = await resize(f, target, "existing-on-control-node");
+    expect(resized.status).toBe(202);
+    const result = DatabaseWithOperation.parse(await resized.json());
+    expect(result.database.size_class_id).toBe(target);
+    expect(result.database.generation).toBe(2);
+    expect(
+      await env.DB.prepare(
+        "SELECT node_id,archive_path,storage_generation FROM databases WHERE id=?",
+      )
+        .bind(f.id)
+        .first(),
+    ).toEqual(before);
+    expect(
+      await env.DB.prepare(
+        "SELECT ready,schedulable,database_placement_enabled FROM nodes WHERE id=?",
+      )
+        .bind(f.node)
+        .first(),
+    ).toEqual({ ready: 1, schedulable: 1, database_placement_enabled: 0 });
+  });
+
   it("preserves historical operations, errors, timestamps, indexes and foreign keys through the actual migration", async () => {
     const f = await ready();
     const now = new Date().toISOString();

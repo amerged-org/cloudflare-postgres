@@ -23,10 +23,13 @@ export function nodePlacementBindings(now = Date.now()): [string, string] {
   ];
 }
 export function nodeDatabasePlacementGuard(alias = "n"): string {
+  return `${alias}.database_placement_enabled=1 AND ${alias}.database_placement_closed_at IS NULL
+    AND ${nodeDatabaseCapacityGuard(alias)}`;
+}
+export function nodeDatabaseCapacityGuard(alias = "n"): string {
   if (!/^[a-z][a-z0-9_]*$/.test(alias))
     throw new Error("invalid_node_placement_alias");
-  return `${alias}.database_placement_enabled=1 AND ${alias}.database_placement_closed_at IS NULL
-    AND (COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=${alias}.region_id),'reserved')='reserved'
+  return `(COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=${alias}.region_id),'reserved')='reserved'
       OR (${alias}.node_uid IS NOT NULL
         AND ${startupPhysicalFitSql(alias, "s")}
         AND s.memory_mib%256=0
@@ -133,6 +136,7 @@ export function choosePlacement(
   regionId: string,
   size: SizeResources,
   now = Date.now(),
+  existingNodeId?: string,
 ): PlacementNode | null {
   const needed = databaseMemoryReservationMib(size);
   return (
@@ -142,9 +146,11 @@ export function choosePlacement(
           n.region_id === regionId &&
           n.ready &&
           n.schedulable &&
-          n.database_placement_enabled !== 0 &&
-          n.database_placement_enabled !== false &&
-          n.database_placement_closed_at == null &&
+          (existingNodeId === undefined
+            ? n.database_placement_enabled !== 0 &&
+              n.database_placement_enabled !== false &&
+              n.database_placement_closed_at == null
+            : n.id === existingNodeId) &&
           n.lost_at == null &&
           n.last_observed_at != null &&
           Date.parse(n.last_observed_at) >= now - NODE_OBSERVATION_MAX_AGE_MS &&

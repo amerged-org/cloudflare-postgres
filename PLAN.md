@@ -9,8 +9,12 @@ Exactly one new EU and one new US-central Cloud VPS 8 were ordered through the C
 After payment, both original instances were allocated with 8 vCPU, 24,576 MiB RAM and
 307,200 MiB SSD. The owner cancelled these incorrect storage orders; provider readback records
 a 2026-11-05 cancellation date while both remain in rescue. Neither has an installer job or disk
-write. Replacement EU1 and US1 must use Cloud VPS 8 with 150 GB NVMe; exact API storage selection
-is unverified in the published API; the owner’s choice of web-shop ordering is pending. Neither replacement has passed installation/admission yet.
+write. Replacement EU1 and US1 must use Cloud VPS 8 with 150 GB NVMe; the owner requires API-only
+ordering. One further owner-authorized EU V155 / one-month request with the NVMe ExtraStorage
+array returned201 and a matching original-request CREATED audit, but final hardware is
+8 vCPU, 24,576 MiB RAM and614,400 MiB SSD. It fails the required150 GB NVMe selection.
+No US counterpart, installer job or disk write has been triggered for this test. Neither
+replacement has passed installation/admission yet.
 The original SSD additions are now logically cancelled through the reviewed API: their claims,
 receipts, audits and protected EU source/custody remain unchanged, and both reserved slots are
 released. The exact original EU Workflow is errored and US is terminated; neither target has
@@ -57,7 +61,7 @@ SQL/pgvector, the unchanged engine and manifest/configuration bindings. Separate
 readback verifies every compressed and uncompressed registry layer. Local checks passed contracts 151,
 API 502, Edge 80, regional 425, native 148, CLI 30, harness 237, infrastructure 21 and CI logic 71.
 The headless API/native and regional/relay images and four additive migrations are delivered.
-PostgreSQL delivery, profile activation, actual-RAM policy and fresh-node live acceptance remain outstanding.
+PostgreSQL delivery is complete. Profile activation, actual-RAM policy and fresh-node live acceptance remain outstanding.
 The regional image’s anonymous readback verified 89,781,987 compressed bytes and all ten raw
 layer hashes. Native and PostgreSQL private GHCR namespaces return HTTP 401 to anonymous token
 requests. Native uses an independently qualified clean `901b3228` build in the private Cloudflare
@@ -86,9 +90,9 @@ and the complete single layer passed: 219,937,973 compressed bytes, 660,822,016 
 exact CI hashes, zero unresolved findings. Its public immutable digest is
 `sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115`.
 GitHub owner login is therefore no longer a dependency for these artifact access paths.
-PostgreSQL delivery, profile activation and fresh VPS acceptance remain outstanding.
+PostgreSQL delivery is complete; profile activation and fresh VPS acceptance remain outstanding.
 NVMe API selection is
-still unverified and the owner's web-shop choice is pending.
+still unverified; the owner explicitly requires API-only ordering.
 
 Headless API/native delivery from exact consumer `26ab9ee1` is complete. A fresh D1 export
 rehearsed migrations 0018–0021 against 31 tables and 105,617 rows, preserving every previous
@@ -108,12 +112,25 @@ confirms all three databases on18.4, no installed vector extension, zero/zero/on
 relations and both original recovery markers. The first image-only Cluster patch was explicitly
 rejected by CloudNativePG with `invalid version tag`: the public `postgres-sha` tag needs a
 PostgreSQL version prefix. Readback confirms zero image patches applied, all three physical
-databases healthy and protected identities unchanged; correction is in progress.
+databases healthy and protected identities unchanged. The corrected version-prefixed reference
+passed actual server dry-run, and full CI `37520820885` passed source `eb995eb8`. One guarded Flux
+source update, one non-overlapping Recreate-agent reload and three new UID/RV-guarded image-only
+patches completed. All three databases now run PostgreSQL18.6 from the same qualified digest,
+with Vector0.8.7 actually available and none installed. Read-only SQL compared the original
+application schema/row SHA-256 fingerprints and both recovery markers exactly; no extension
+update was needed. Both old Nodes, all database/storage/role/Secret and encrypted custody
+identities remain unchanged, and all three physical databases are healthy.
 
 The owner reiterated API-only ordering. Three deliberately unorderable schema-validation probes
 used the NVMe shop slug as product ID and snake/camel storage keys. All returned the same HTTP400
 base-field validation; the complete provider inventory remained unchanged. These responses do
 not prove that any storage selector is supported, and no replacement order was accepted.
+
+The subsequent explicit EU purchase authorization produced exactly one accepted API order using
+`addOns.extraStorage.nvme: [{ "sizeTB": 0.15, "quantity": 1 }]`. Its correlated CREATED audit and
+allocated hardware confirm **600 GiB SSD**, not150 GB NVMe, with8 vCPU and24 GiB RAM. No US
+copy or installation was started. This is a failed variant-selection test despite HTTP201;
+physical admission and automatic purchase activation remain blocked on a supported NVMe offer.
 
 Release image signing remains Phase 5 work.
 

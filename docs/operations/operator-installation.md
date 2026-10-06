@@ -91,12 +91,14 @@ The automatic sequence is:
    under hard RAM/CPU/storage and full PostgreSQL/Barman startup-peak admission. There is no 81%
    placement cutoff. Failed starts/timeouts do not silently release unknown peak reservations.
 
-Contabo's documented public API currently lists V155 as 300 GB SSD and does not expose the free
-150 GB NVMe selector used by its web shop. Do not activate a standing NVMe purchase profile with
-an unverified payload, an additional-storage expansion or a different hardware product. The
-owner's current replacement request is specifically 8 vCPU, 24 GB RAM and 150 GB NVMe. Until the
-provider's API selection is confirmed, ordering remains an explicit limitation; complete image
-installation is a separate acceptance gate.
+Contabo lists V155 as 300 GB SSD. On 2026-10-06, the owner-authorized API test submitted
+`productId: "V155"`, `region: "EU"`, `period: 1` and
+`addOns.extraStorage.nvme: [{ "sizeTB": 0.15, "quantity": 1 }]`. One POST returned201 and its
+original-request CREATED audit matched. Final allocation was **8 vCPU, 24,576 MiB RAM and
+614,400 MiB SSD (600 GiB)**, so this payload does **not** select the included 150 GB NVMe
+variant. No installer or disk write ran. Do not use it for US or standing regional expansion.
+The V155 free-NVMe selector remains unverified; choose only a confirmed API offer with explicit
+owner-approved costs before activating automatic purchases.
 
 ## Legacy manual evidence and recovery path
 

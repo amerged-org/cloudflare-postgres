@@ -23,6 +23,7 @@ import {
   nodePlacementGuard,
   nodePlacementBindings,
   nodeDatabasePlacementGuard,
+  nodeDatabaseCapacityGuard,
   nodeMemoryReservationGuard,
   databaseMemoryPolicyAllows,
 } from "./placement.ts";
@@ -350,7 +351,7 @@ export function databaseResizeStatement(
       AND desired_state='running' AND observed_state='ready' AND observed_generation=generation AND deleted_at IS NULL
       AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
       AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=? AND s.enabled=1
-        WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")} AND ${nodeDatabasePlacementGuard("n")}
+        WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")} AND ${nodeDatabaseCapacityGuard("n")}
           AND ${startupHeadroomSql()}
           AND n.storage_gib_total IS NOT NULL AND n.platform_reserved_cpu_millicores IS NOT NULL
           AND s.storage_gib=(SELECT old.storage_gib FROM size_classes old WHERE old.id=databases.size_class_id)
@@ -505,6 +506,8 @@ export async function resizeDatabase(
           ],
           row.region_id,
           target,
+          Date.parse(now),
+          row.node_id,
         )
       )
         throw new ApiError(
