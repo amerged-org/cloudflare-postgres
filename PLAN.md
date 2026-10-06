@@ -28,18 +28,19 @@ zero unresolved findings. Anonymous manifest, configuration and every compressed
 layer verification passed, with 89,764,233 compressed bytes read back. Agent, both gateways and
 five platform releases remained Ready for 69.78 s. Both EU Node UIDs, all three test databases'
 namespace/Cluster/PVC/PV/Secret identities and three EU encrypted custody records are preserved.
-The management API uses cancellation source `9a1ae0c4`, CI `37497225836`; Edge and the regional
+The management API now uses headless source `26ab9ee1`, CI `37510045964`; Edge and the regional
 image remain at `ab678993`. Complete pending-payment inventory now parses without fabricating
 hardware, and configuration, network, relay and proof consumers reject unallocated resources.
 Both purchases have original-request-correlated D1 receipts; no order was replayed. The private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
 inputs are now bound. The current native bootstrap image is
-`sha256:1b9a38a4e43ba87ef997eab71ed6799a3c4377cca00485f842e693ebac371923`
-from `cf6d5d55`: qualification covered 711,913,354 bytes and 18 layers with zero unresolved
+`sha256:06a1a6c938f78e64250883d6f3f063a76d029a3ee961b9a4a2456d0c4800e248`
+from exact clean `901b3228`: qualification covered 714,834,399 bytes and 18 layers with zero unresolved
 findings, followed by exact private-registry manifest, configuration and layer readback.
-The exact application/namespace binding and completed rollout retain that image. Its running
-instance was verified during EU2 admission; the application is currently inactive with zero
-instances. The deployed runtime's complete CI `37419289338` is green. US installation and cross-region node-loss
+Direct application readback confirms version 10, the same application/namespace and the completed
+exact-image rollout. The earlier `cf6d5d55` runtime was exercised during EU2 admission; the new
+headless runtime still requires fresh-node execution. Regional runtime CI `37419289338` and
+headless consumer CI `37510045964` are green. US installation and cross-region node-loss
 recovery remain outstanding.
 The complete headless implementation is committed from `781a48c3`, with clean-checkout test
 asset generation and the proof signing alias in `901b3228`. Full CI `37506713888` passed all
@@ -53,15 +54,13 @@ software checks and three image jobs. Source `901b3228` produces regional
 SQL/pgvector, the unchanged engine and manifest/configuration bindings. Separate deployment
 readback verifies every compressed and uncompressed registry layer. Local checks passed contracts 151,
 API 502, Edge 80, regional 425, native 148, CLI 30, harness 237, infrastructure 21 and CI logic 71.
-The new images, migrations, profiles and actual-RAM policy are not yet delivered/live-accepted.
+The headless API/native images and four additive migrations are delivered. Regional/PG delivery,
+profile activation, actual-RAM policy and fresh-node live acceptance remain outstanding.
 The regional image’s anonymous readback verified 89,781,987 compressed bytes and all ten raw
 layer hashes. Native and PostgreSQL private GHCR namespaces return HTTP 401 to anonymous token
-requests. Native does not require public access: an independent local build from exact clean
-`901b3228` passed all runtime checks and 18-layer qualification (714,834,399 bytes, zero unresolved
-findings) for transfer into the private Cloudflare registry. The CI transfer will copy the same qualified PostgreSQL
-manifest into the existing public package under a distinct `postgres-sha-<commit>` tag;
-regional tags remain untouched. Actual credential-free pull/readback is still required before
-Talos/CNPG delivery. No package visibility or account permission was changed.
+requests. Native uses an independently qualified clean `901b3228` build in the private Cloudflare
+registry; PostgreSQL uses the exact qualified public copy and credential-free readback recorded
+below. Regional tags, package visibility and account permissions were unchanged.
 The first common CI failed because source tests needed their compiled portable scanner; the test
 command now builds it. The next PostgreSQL job failed on Docker 28's unsupported inspect platform
 flag; explicit inspected architecture and configuration validation now use its supported command.
@@ -75,7 +74,8 @@ The private native transfer is complete from exact clean source `901b3228`: immu
 config `sha256:1ac27808be59f3cacf2ee872a6199deb1424cb183829a8a9f8eac531d79b2aa4`,
 18 layers, 162,106,066 compressed and 502,782,976 raw tar bytes read back exactly. Full local
 qualification covered 714,834,399 bytes with zero unresolved findings; full source CI passed.
-One registry push occurred, with no Worker/application rollout or server action. The attachment
+One registry push occurred; the later API/native rollout below is complete, with no server action.
+The attachment
 permits private bootstrap storage; anonymous native access is not an acceptance gate.
 Full CI `37511566358` passed source `0cf76655`. The exact qualified PostgreSQL manifest was
 copied to the existing public runtime package under its distinct immutable `postgres-sha` tag,
@@ -83,9 +83,21 @@ without touching regional tags or changing package permissions. Anonymous manife
 and the complete single layer passed: 219,937,973 compressed bytes, 660,822,016 raw tar bytes,
 exact CI hashes, zero unresolved findings. Its public immutable digest is
 `sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115`.
-GitHub owner login is therefore no longer a dependency for these artifact access paths. Live
-runtime, profile activation and fresh VPS acceptance remain outstanding; NVMe API selection is
+GitHub owner login is therefore no longer a dependency for these artifact access paths.
+Regional/PG runtime delivery, profile activation and fresh VPS acceptance remain outstanding.
+NVMe API selection is
 still unverified and the owner's web-shop choice is pending.
+
+Headless API/native delivery from exact consumer `26ab9ee1` is complete. A fresh D1 export
+rehearsed migrations 0018–0021 against 31 tables and 105,617 rows, preserving every previous
+column/value fingerprint with clean integrity and foreign keys. One migration apply and one
+API/native publish succeeded. Direct Container application/version readback confirms version 10
+and the exact qualified native digest above; the collection endpoint still reported version 9,
+so final verification used the direct endpoint without repeating either write. Both old EU Node
+UIDs, all three database namespace/Cluster/PVC/PV/Secret identities, role rows, admitted job and
+three encrypted EU custody records remain exact, with physical database health confirmed. All
+existing policies remain reserved; no profile, provider order, rescue dispatch or disk write ran.
+Full consumer CI `37514069179` passed `b8238bf2`, including all three image jobs.
 
 Release image signing remains Phase 5 work.
 
@@ -733,7 +745,8 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   consumption are separate. Safe concurrent-start admission and explicit smaller Kubernetes
   memory requests are required for intentional overbooking.
 - Actual-RAM placement, standing approvals and the complete headless bootstrap producer are
-  implementation/live-acceptance work. The deployed path still uses full reservations.
+  implemented and software/image checked. API/native delivery is complete; fresh-node live
+  acceptance remains open. Live policies retain full reservations until explicit activation.
 - The first EU order was dispatched once. Its exact CREATED audit matches the original request
   and selected region/product/image/hostname. Both initial instances first reported PENDING_PAYMENT
   with unallocated hardware. On the owner’s paid-continue instruction, actual reads confirmed both
@@ -758,12 +771,14 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   regional policies while the NVMe ordering path is unresolved.
 - A fresh 74,178,541-byte Dev D1 export restored 31 tables and 98,738 rows. Migrations 0018–0021
   rehearsed locally with every pre-existing column/value fingerprint preserved, clean integrity
-  and foreign keys, and compatibility-default reserved placement. No live migration was applied.
+  and foreign keys, and compatibility-default reserved placement. A later fresh export preserved
+  31 tables / 105,617 rows; all four migrations and the headless API/native runtime are now
+  applied in Dev. Original identities, custody and reserved policies remain preserved.
 - Latest rollout requirement (2026-10-06): use new 150 GB NVMe EU/US targets to accept the
   complete programmed Cloudflare purchase/install/join process with a qualified pinned image.
   Manual per-node bootstrap configuration and disk writes are on hold; no new installer job or
-  target disk write has occurred. Both RAM-rescue systems and exact new target image/GPT hashes
-  are measured. Software release preparation, security-patch review, source/image
+  target disk write has occurred. Hardware/host observations from the cancelled SSD pair must
+  not be reused for the future NVMe replacements. Software release preparation, security-patch review, source/image
   qualification and the actual network/port/isolation checks are part of the programmed path.
   Installed Talos has no SSH daemon; rescue permits only the controlled registered-key path.
   The current host identities and uploaded user data are automatically imported into sealed
@@ -786,9 +801,9 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   harness cleanup and before customer migration. Existing class assignments must fit the configured
   quantum/maximum. Cost/node-cap changes with unchanged request geometry remain available.
 - Protected installation profiles, per-node host identities, dynamic free-firewall definition
-  allocation, inspection authentication and input composition are implemented in the isolated
-  worktree. The native physical inspection, measured storage publication and complete proof
-  orchestration are still being connected; they have not passed Dev acceptance.
+  allocation, inspection authentication, input composition, native physical inspection, measured
+  storage publication and complete proof orchestration are merged and software/image checked.
+  API/native delivery is complete; the new NVMe targets still need complete Dev acceptance.
 - Reset-readiness audit (2026-10-06): native `cf6d5d55` is present locally with its exact source
   label and qualified private-registry readback; regional `ab678993` manifest/configuration and
   pinned Cilium/Flux assets are available over HTTPS. Both EU servers/nodes are Running/Ready;
@@ -800,8 +815,8 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   route before the owner resets EU1. New model compatibility and rebuild time require actual
   hardware checks and a live run; the current RAM-staged installer cannot fit a nominal 4 GiB VPS.
 - Confirmed topology (2026-10-06): the current EU1 remains the Kubernetes/platform and
-  bootstrap-relay host, with no new customer databases. The newly ordered EU worker becomes
-  customer EU1; the newly purchased US regional host becomes customer US1. Do not reset the
+  bootstrap-relay host, with no new customer databases. The replacement EU worker becomes
+  customer EU1; the replacement US regional host becomes customer US1. Do not reset the
   retained EU control server. Decommission old EU2 only after both replacements are Ready and
   its disposable source data has been restored and verified. Preserve or deliberately remove
   existing EU control-host test databases after their archives and data have been verified.
