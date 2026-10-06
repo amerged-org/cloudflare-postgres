@@ -20,9 +20,11 @@ import {
 } from "@pgcf/contracts/node-installation";
 import {
   NodeProofExecutionInput,
-  type NodeProofMode,
+  NodeProofMode,
+  NodeProofStatus,
 } from "@pgcf/contracts/node-proof";
 import { prepareNodeProofInput } from "./domain/node-proof-execution.ts";
+import { installationHash } from "./domain/node-installation.ts";
 
 const nativeAdmissionCodes = new Set([
   "container_busy",
@@ -108,6 +110,14 @@ const nativeInspectionStatus = NodeInstallationInspectionStatus.pick({
     NodeInstallationInspectionStatus.shape.inspection_generation,
   network_plan_sha256:
     NodeInstallationInspectionStatus.shape.network_plan_sha256.unwrap(),
+  status: z.enum(["running", "reported", "failed"]),
+});
+const nativeProofStatus = NodeProofStatus.pick({
+  operation_id: true,
+  mode: true,
+  error_code: true,
+}).safeExtend({
+  session_id: NodeProofStatus.shape.session_id.unwrap(),
   status: z.enum(["running", "reported", "failed"]),
 });
 async function inspectionStatusBody(response: Response, signal: AbortSignal) {
@@ -440,6 +450,192 @@ export class NodeBootstrap extends DurableObject<Env> {
         error instanceof Error && error.message === "inspection_status_invalid"
           ? "inspection_status_invalid"
           : "inspection_status_unavailable",
+      );
+    } finally {
+      if (abort) signal.removeEventListener("abort", abort);
+      void response?.body?.cancel().catch(() => {});
+    }
+  }
+  /** Read only the existing proof session; never start, mint or register proof work. */
+  async proofStatus(operationId: string, mode: NodeProofMode) {
+    OperationId.parse(operationId);
+    NodeProofMode.parse(mode);
+    if (!this.ctx.id.equals(this.env.NODE_BOOTSTRAP.idFromName(operationId)))
+      throw new Error("proof_container_identity_mismatch");
+    const binding = await loadNodeInstallationBinding(this.env, operationId);
+    if (!binding)
+      throw new ApiError("not_found", "Installation binding unavailable");
+    const plan = await this.env.DB.prepare(
+      "SELECT intent_hash,plan_sha256,status,readback_at FROM node_network_preparations WHERE operation_id=?",
+    )
+      .bind(operationId)
+      .first<{
+        intent_hash: string;
+        plan_sha256: string;
+        status: string;
+        readback_at: string | null;
+      }>();
+    const session = NodeProofStatus.shape.session_id.safeParse(
+      (await this.ctx.storage.get<string>(`proof_current:${mode}`)) ?? null,
+    );
+    const raw =
+      session.success && session.data
+        ? await this.ctx.storage.get<NodeProofExecutionInput>(
+            `proof_input:${session.data}`,
+          )
+        : undefined;
+    const parsed = NodeProofExecutionInput.safeParse(raw);
+    const base = {
+      operation_id: operationId,
+      mode,
+      session_id: session.success ? session.data : null,
+      binding_sha256: binding.row.binding_sha256,
+      plan_sha256: plan?.plan_sha256 ?? null,
+      input_hash: parsed.success ? parsed.data.claims.input_hash : null,
+    };
+    const unavailable = (
+      error_code:
+        | "proof_status_invalid"
+        | "proof_status_unavailable"
+        | "proof_input_required"
+        | "proof_server_identity_changed"
+        | "proof_authority_closed",
+    ) => NodeProofStatus.parse({ ...base, status: "unavailable", error_code });
+    if (!session.success) return unavailable("proof_status_invalid");
+    if (!session.data || raw === undefined)
+      return unavailable("proof_input_required");
+    if (!parsed.success || !plan) return unavailable("proof_status_invalid");
+    const input = parsed.data,
+      claims = input.claims,
+      inputDigest = await installationHash(input);
+    const authority = async () => {
+      const current = await loadNodeInstallationBinding(this.env, operationId),
+        addition = await readNodeAddition(this.env.DB, operationId),
+        currentPlan = await this.env.DB.prepare(
+          "SELECT intent_hash,plan_sha256,status,readback_at FROM node_network_preparations WHERE operation_id=?",
+        )
+          .bind(operationId)
+          .first<typeof plan>(),
+        job = await this.env.DB.prepare(
+          "SELECT node_id,region_id,input_hash,authorized,admitted,cancelled FROM node_bootstrap_jobs WHERE operation_id=?",
+        )
+          .bind(operationId)
+          .first<{
+            node_id: string;
+            region_id: string;
+            input_hash: string;
+            authorized: number;
+            admitted: number;
+            cancelled: number;
+          }>();
+      if (
+        !addition.slot_held ||
+        !["audited", "bootstrapping"].includes(addition.status) ||
+        !job?.authorized ||
+        job.admitted ||
+        job.cancelled
+      )
+        return "proof_authority_closed" as const;
+      if (
+        !current ||
+        !currentPlan ||
+        currentPlan.status === "blocked" ||
+        !currentPlan.readback_at ||
+        claims.operation_id !== operationId ||
+        claims.mode !== mode ||
+        claims.session_id !== session.data ||
+        current.row.binding_sha256 !== binding.row.binding_sha256 ||
+        current.row.inspection_generation !== claims.inspection_generation ||
+        claims.binding_sha256 !== current.row.binding_sha256 ||
+        claims.node_id !== current.row.node_id ||
+        claims.region_id !== current.row.region_id ||
+        claims.provider_instance_id !== current.row.provider_instance_id ||
+        current.row.node_id !== addition.intent.node_id ||
+        current.row.region_id !== addition.intent.request.region_id ||
+        current.row.provider_instance_id !== addition.provider_instance_id ||
+        currentPlan.intent_hash !== addition.intent_hash ||
+        currentPlan.plan_sha256 !== plan.plan_sha256 ||
+        claims.plan_sha256 !== currentPlan.plan_sha256 ||
+        input.binding.plan_sha256 !== currentPlan.plan_sha256 ||
+        input.binding.readback_at !== currentPlan.readback_at ||
+        job.node_id !== claims.node_id ||
+        job.region_id !== claims.region_id ||
+        job.input_hash !== claims.input_hash ||
+        input.bootstrap.input_hash !== job.input_hash ||
+        (mode === "postjoin" &&
+          (addition.checkpoint?.stage !== "joined" ||
+            addition.checkpoint.reference !== claims.checkpoint_reference)) ||
+        (await this.ctx.storage.get<string>(`proof_current:${mode}`)) !==
+          session.data ||
+        (await installationHash(
+          await this.ctx.storage.get(`proof_input:${session.data}`),
+        )) !== inputDigest
+      )
+        return "proof_status_invalid" as const;
+      if (
+        (await this.ctx.storage.get<string>(
+          "inspection_server_binding_sha256",
+        )) !== binding.row.binding_sha256
+      )
+        return "proof_server_identity_changed" as const;
+      return null;
+    };
+    const initial = await authority();
+    if (initial) return unavailable(initial);
+    const container = this.ctx.container;
+    if (!container?.running) return unavailable("proof_status_unavailable");
+    const signal = AbortSignal.timeout(5000);
+    let response: Response | undefined;
+    let abort: (() => void) | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+      abort = () => reject(new Error("proof_status_unavailable"));
+      signal.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      response = await Promise.race([
+        container.getTcpPort(8080).fetch(
+          new Request(
+            `http://localhost:8080/v1/proofs/${operationId}/${mode}`,
+            {
+              headers: { Authorization: `Bearer ${binding.inspection_token}` },
+              signal,
+            },
+          ),
+        ),
+        aborted,
+      ]);
+      const body = await inspectionStatusBody(response, signal),
+        changed = await authority();
+      if (changed) return unavailable(changed);
+      if (
+        response.status === 404 &&
+        z
+          .strictObject({ error_code: z.literal("proof_input_required") })
+          .safeParse(body).success
+      )
+        return unavailable("proof_input_required");
+      const native = nativeProofStatus.safeParse(body);
+      if (
+        response.status !== 200 ||
+        !native.success ||
+        native.data.operation_id !== operationId ||
+        native.data.mode !== mode ||
+        native.data.session_id !== session.data ||
+        (native.data.status === "failed"
+          ? native.data.error_code === null
+          : native.data.error_code !== null)
+      )
+        return unavailable("proof_status_invalid");
+      return NodeProofStatus.parse({
+        ...base,
+        status: native.data.status,
+        error_code: native.data.error_code,
+      });
+    } catch (error) {
+      return unavailable(
+        error instanceof Error && error.message === "inspection_status_invalid"
+          ? "proof_status_invalid"
+          : "proof_status_unavailable",
       );
     } finally {
       if (abort) signal.removeEventListener("abort", abort);

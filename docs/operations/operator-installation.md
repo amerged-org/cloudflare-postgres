@@ -66,6 +66,11 @@ with a bounded response and returns its verified identity, status and fixed erro
 starts a Container, registers another inspection, requests rescue or writes a disk. A stored
 `reported` result means inspection completed; it does not mean the node is installed or admitted.
 An unavailable inspector remains unknown rather than being treated as healthy.
+For network evidence, read
+`GET /v1/nodes/additions/{operation-id}/proof/{preparation|postjoin}` with administrator scope.
+This observes the retained native proof session and its fixed error code; it never starts a scan,
+creates a session, registers work or refreshes its expiry. A reported proof still requires the
+separate signed-artifact and admission checks.
 
 For the current deployment, bind US1's existing original-request-correlated purchase receipt
 before preparing its bootstrap; do not issue another order. EU1 is already admitted and needs no

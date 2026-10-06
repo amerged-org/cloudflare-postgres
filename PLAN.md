@@ -36,10 +36,21 @@ raw SHA-256 `b915cdcdb1a6de6e8754a287c688083187eaab45d775917384a727df125d1064`.
 Independent local verification passed both header and partition-array CRCs, reciprocal/end-of-file
 header locations and four non-overlapping partitions. Linux `sgdisk`1.0.9 returned0, with a valid
 success banner preceded only by its advisory about the gap from sector33 to first-usable2048.
-The bytes remained unchanged. The current parser wrongly rejects that benign advisory; its narrow
-regression/fix and a qualified native-image update are in progress. The same US Workflow is paused
-again with zero bootstrap jobs and no installation disk write; retain all original identities and
-resume that operation after delivery. The retained EU control node's UID-guarded new-database placement flag is now
+The bytes remained unchanged. Source `51e35a70`, full CI `37538558462`, corrects only that known
+advisory;151 native cases, types, lint and formatting passed. Local qualification covered
+714,909,269 bytes and18 layers with zero unresolved findings. One private-registry push followed
+by complete readback verified162,107,967 compressed and502,792,192 raw bytes. The new immutable
+native manifest is `sha256:cdd073e15d520924f108cbb6b24c4cecfcc29086b1b142856fda89be2fecbe36`.
+One publication and completed rollout preserved the full existing configuration except this
+image, both EU Nodes/data/custody and the same US sealed input, firewall, rescue receipt and plan.
+Actual running placement/image/version was separately verified. The original US Workflow resumed;
+hardware inspection reported successfully at generation1, then the programmed installer job was
+created and authorized. Its checkpoint remains `created`, before any installation disk write.
+Preparation network proof is still pending; repeated wait cycles currently hide its native
+failure code. A bounded administrator proof-status getter is implemented and under final checks.
+The same Workflow is paused at the exact unchanged created-job checkpoint for that API-only
+diagnostic delivery; never reset or replace its job or sealed input.
+The retained EU control node's UID-guarded new-database placement flag is now
 false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.
 Actual-RAM mode and automatic purchases remain disabled pending accepted US/recovery tests,
 reviewed test cleanup and explicit finite numeric standing limits.

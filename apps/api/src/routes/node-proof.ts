@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
+import { createRoute, z } from "@hono/zod-openapi";
+import type { Next } from "hono";
 import {
   NodeProofNonce,
   NodeProofBinding,
   NodeProofReport,
+  NodeProofMode,
+  NodeProofStatus,
 } from "@pgcf/contracts/node-proof";
+import { ErrorBody, OperationId } from "@pgcf/contracts";
 import {
   BootstrapCapability,
   NodeBootstrapMaintenanceObservation,
 } from "@pgcf/contracts/node-bootstrap";
-import { z } from "zod";
 import { ApiError, type ApiApp } from "../app.ts";
+import type { ApiContext } from "../env.ts";
 import { nodeProofSourceControl } from "../domain/node-proof-session.ts";
 import { authenticateNodeProofRequest } from "../domain/node-proof-session.ts";
 import {
@@ -19,7 +24,7 @@ import {
 } from "../domain/node-proof-execution.ts";
 import { acceptNodeProofReport } from "../domain/node-proof-artifacts.ts";
 import { startAddNode } from "../platform/nodes.ts";
-import { bearer } from "../middleware/auth.ts";
+import { bearer, requireScope } from "../middleware/auth.ts";
 
 function proofBody<T>(schema: z.ZodType<T>, value: unknown): T {
   const parsed = schema.safeParse(value);
@@ -28,6 +33,61 @@ function proofBody<T>(schema: z.ZodType<T>, value: unknown): T {
   return parsed.data;
 }
 export function registerNodeProof(app: ApiApp) {
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/v1/nodes/additions/{id}/proof/{mode}",
+      security: [{ bearerAuth: [] }],
+      tags: ["Nodes"],
+      middleware: async (c: ApiContext, next: Next) => {
+        await requireScope(c, "admin");
+        await next();
+      },
+      request: { params: z.object({ id: OperationId, mode: NodeProofMode }) },
+      responses: {
+        200: {
+          description: "Read-only proof status",
+          content: { "application/json": { schema: NodeProofStatus } },
+        },
+        400: {
+          description: "Invalid request",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        401: {
+          description: "Invalid credentials",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        403: {
+          description: "Administrator scope required",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        404: {
+          description: "Installation binding unavailable",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        500: {
+          description: "Invalid status response",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+      },
+    }),
+    async (c) => {
+      await requireScope(c, "admin");
+      const id = OperationId.parse(c.req.param("id")),
+        mode = NodeProofMode.parse(c.req.param("mode"));
+      const binding = await c.env.DB.prepare(
+        "SELECT 1 present FROM node_installation_bindings WHERE operation_id=?",
+      )
+        .bind(id)
+        .first<{ present: number }>();
+      if (!binding)
+        throw new ApiError("not_found", "Installation binding unavailable");
+      const status = await c.env.NODE_BOOTSTRAP.get(
+        c.env.NODE_BOOTSTRAP.idFromName(id),
+      ).proofStatus(id, mode);
+      return c.json(NodeProofStatus.parse(status), 200);
+    },
+  );
   app.post("/source-control", async (c) => {
     const body = NodeProofNonce.safeParse(await c.req.json());
     if (!body.success)
