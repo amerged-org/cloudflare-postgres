@@ -1,6 +1,19 @@
 # cloudflare-postgres — Plan
 
 Status (2026-10-06): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
+
+Latest owner topology overrides the earlier V155 replacement/removal plan: retain the existing
+EU control/relay VPS and the already-admitted EU worker, now customer **EU1**. Both customer
+servers use **V159 / Cloud VPS Plus 4: 4 vCPU, 8 GiB RAM, 150 GiB NVMe**, not the prior 8-vCPU /
+24-GiB V155 offer. Exactly one matching **US1** was purchased through the API with a one-month
+term and no storage add-ons. HTTP201, the original-request CREATED audit and allocated
+4 vCPU / 8,192 MiB / 153,600 MiB hardware are verified; provider state is Running. Advertised
+US-central cost is EUR16.60 net/month and EUR0 setup (EUR20.09 at21% VAT). EU1 received only a
+provider display-name update; its hardware, network, status, existing Node/data/custody remain
+protected. Do not reset, re-adopt, decommission or wipe this retained customer EU1. US1 still
+requires the programmed Cloudflare installation profile, bootstrap and admission; provider
+Running is not Kubernetes/customer readiness. The 76% rolling-ten-minute purchase rule and
+continued placement under hard capacity/startup guards remain unchanged.
 The first EU node and five Flux platform releases are Ready, with 95 GiB measured storage.
 Its node identity, storage and protected cluster custody are preserved. The second existing EU
 VPS has passed signed network verification and admission, with 95 GiB measured capacity.
@@ -20,8 +33,9 @@ receipts, audits and protected EU source/custody remain unchanged, and both rese
 released. The exact original EU Workflow is errored and US is terminated; neither target has
 a job, node or disk write. Provider cancellation remains scheduled for 2026-11-05.
 No customer or platform production database has been migrated. The approved final topology is
-the retained EU control/relay server, one new EU customer worker and one new US regional/customer server.
-The old EU2 remains healthy until replacement readiness and verified data recovery permit removal.
+the retained EU control/relay server, the retained admitted customer EU1 (formerly EU2) and one
+new US regional/customer server. Existing EU1 is retained; earlier EU2 decommissioning and
+destructive loss-drill instructions are superseded by the latest owner topology.
 The US Cloudflare region, separate archive bucket, scoped S3 credentials, private data Tunnel
 and gateway VPC service are configured. The private bootstrap relay now allows both EU and US.
 
@@ -388,10 +402,11 @@ scope, first in Dev and then in production. US remains the default and EU remain
 5. **Generic.** No adopter names, plans or defaults in code. Size classes and policies are
    installation configuration.
 6. **Initial topology and recovery.** Retain the existing EU control-plane/relay VPS and exclude
-   it from new customer database placement. A new EU customer worker joins that cluster; a new
-   US control-plane/customer VPS starts the US region. Both customer servers use Cloud VPS 8.
-   Recover the old EU2 test data from R2 before decommissioning it. System and platform resources
-   remain separately protected and measured.
+   it from new customer database placement. The already-admitted EU worker becomes customer EU1
+   and remains in that cluster. A matching V159 / Cloud VPS Plus 4 US control-plane/customer VPS
+   starts the US region: 4 vCPU, 8 GiB RAM and 150 GiB NVMe. Preserve existing EU1 and validate
+   source-preserving R2 recovery into US before customer migration. Do not reuse the superseded
+   EU2 decommission/wipe drill. System and platform resources remain separately protected.
 7. **Smallest thing that works end to end.** Add machinery only for an observed problem.
 8. **Delete, don't park.** Unused code, files and branches are deleted. Git history is the archive.
 9. **Real systems.** No mocks or hardcoded data in product code. A phase passes only through its
@@ -847,12 +862,13 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   independently retained etcd/cluster and database custody and verify an alternate bootstrap
   route before the owner resets EU1. New model compatibility and rebuild time require actual
   hardware checks and a live run; the current RAM-staged installer cannot fit a nominal 4 GiB VPS.
-- Confirmed topology (2026-10-06): the current EU1 remains the Kubernetes/platform and
-  bootstrap-relay host, with no new customer databases. The replacement EU worker becomes
-  customer EU1; the replacement US regional host becomes customer US1. Do not reset the
-  retained EU control server. Decommission old EU2 only after both replacements are Ready and
-  its disposable source data has been restored and verified. Preserve or deliberately remove
-  existing EU control-host test databases after their archives and data have been verified.
+- Latest confirmed topology (2026-10-06): the original EU control server remains the
+  Kubernetes/platform and bootstrap-relay host, with no new customer databases. The existing
+  admitted EU worker (formerly EU2) is now customer EU1; its exact provider V159 hardware is
+  the template for the once-purchased US1. Both have 4 vCPU, 8 GiB RAM and 150 GiB NVMe. Retain
+  the control server and customer EU1 without reset, re-adoption, deletion or physical wipe.
+  The US order is audited and allocated; installation/admission and source-preserving recovery
+  remain required. Preserve owned test archives/data until reviewed harness cleanup.
 
 Use regression tests for changes, scoped package checks and one composed CI; repeat old live
 checks only when their behavior changed. No additional cold-start optimization or twenty-start
@@ -991,9 +1007,9 @@ Build:
 - Before join, apply the peer-address firewall allowlist for API, Talos, kubelet, control-plane
   etcd and CNI traffic, and configure Cilium WireGuard Pod encryption. Keep the new node out of
   database placement until the encrypted inter-node path and network isolation are verified.
-- Capacity cron with an autoscale policy and hard caps. The initial transition temporarily permits
-  three EU nodes while old EU2 is replaced; US initially permits one. Configure additional headroom
-  and the standing cost profile before enabling customer expansion.
+- Capacity cron with an autoscale policy and hard caps. The initial installation retains two
+  EU nodes (control and admitted customer EU1); US initially permits one. Configure additional
+  headroom and the V159 standing cost profile before enabling customer expansion.
 - Owner clarification (2026-10-06): capacity expansion must run headless through
   `https://api.contabo.com/` after one-time account, offer and cost/node-cap configuration.
   The Cloudflare workflow must compose provider-bound bootstrap inputs and produce the required

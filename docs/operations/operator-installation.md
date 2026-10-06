@@ -1,9 +1,12 @@
 # Existing-account installation
 
 This guide completes the operator's existing Cloudflare/Contabo installation. Preserve the first
-EU control/relay node and its imported credentials. The final topology has one EU customer worker
-and one US control-plane/customer node. Retain the old EU2 until replacement and recovery
-acceptance; temporary node caps must include that retained source. Public
+EU control/relay node and its imported credentials. Retain the already-admitted second EU node as
+customer EU1 (formerly EU2), with its installation, Node identity, data and custody unchanged.
+Exactly one new US1 control-plane/customer node was purchased through the API for one month.
+Both customer nodes use V159 / Cloud VPS Plus 4: 4 vCPU, 8 GiB RAM and 150 GiB NVMe. Provider
+Running is not installation or admission. No new EU worker, EU1 re-adoption, reset or
+decommissioning is part of this completion. Public
 distribution and installation in a foreign Cloudflare account are separate release work.
 
 ## Reviewed deployment inputs
@@ -57,12 +60,18 @@ The first node of a region additionally needs its reviewed platform source/image
 regional credentials; an EU worker uses the retained cluster join custody. Profiles and per-node
 rescue identities are encrypted in D1. Status never returns their private keys.
 
+For the current deployment, bind US1's existing original-request-correlated purchase receipt
+before preparing its bootstrap; do not issue another order. EU1 is already admitted and needs no
+bootstrap or adoption operation. The installation sequence below applies to US1 and future
+authorized additions, not to the retained EU nodes.
+
 For actual-RAM placement, configure the policy explicitly: 256 MiB assignment steps, maximum
 4096 MiB, and the reviewed PostgreSQL request (128 MiB in this installation). Keep CPU and storage
 checks enabled. Changing reservation geometry requires an empty assigned live cohort and no
 unsettled startups; a normal cost/node-cap change does not reset existing database state. Mark the
 retained control server ineligible through its UID-guarded database-placement endpoint, while
-preserving Kubernetes/platform operation and existing data until cleanup.
+preserving Kubernetes/platform operation and existing data. The flag excludes new placement;
+existing assigned databases must continue to serve, wake, resize and delete normally.
 
 The automatic sequence is:
 
@@ -91,19 +100,24 @@ The automatic sequence is:
    under hard RAM/CPU/storage and full PostgreSQL/Barman startup-peak admission. There is no 81%
    placement cutoff. Failed starts/timeouts do not silently release unknown peak reservations.
 
-Contabo lists V155 as 300 GB SSD. On 2026-10-06, the owner-authorized API test submitted
+The following is a historical failed selection, not the current V159 offer. Contabo lists V155
+as 300 GB SSD. On 2026-10-06, the owner-authorized API test submitted
 `productId: "V155"`, `region: "EU"`, `period: 1` and
 `addOns.extraStorage.nvme: [{ "sizeTB": 0.15, "quantity": 1 }]`. One POST returned201 and its
 original-request CREATED audit matched. Final allocation was **8 vCPU, 24,576 MiB RAM and
 614,400 MiB SSD (600 GiB)**, so this payload does **not** select the included 150 GB NVMe
 variant. No installer or disk write ran. Do not use it for US or standing regional expansion.
-The V155 free-NVMe selector remains unverified; choose only a confirmed API offer with explicit
-owner-approved costs before activating automatic purchases.
+The V155 free-NVMe selector remains unverified. The current owner-approved V159 offer supplies
+150 GiB NVMe without a storage add-on; its one US purchase and actual allocation are verified.
+Use only that confirmed offer and its reviewed costs for the current installation profile and
+standing policy. Do not repeat the V155 test or order another EU worker.
 
 ## Legacy manual evidence and recovery path
 
 The following procedure documents the earlier accepted EU2 path and explicit recovery inputs.
-It is not the normal per-server setup once the programmed producer has passed acceptance.
+That same node is now retained customer EU1. Do not rerun its adoption, rescue or installation.
+This historical procedure remains a reference for separately authorized recovery; it does not
+authorize a loss drill or removal of EU1 during the current completion.
 
 1. Configure `/v1/regions/{id}/capacity-policy` with the explicit node maximum. EU lists the second
    existing provider instance in `adopt_instance_ids`; US may order only its configured approved
@@ -155,7 +169,10 @@ its separate fresh post-join network, Node identity and capacity proofs.
 
 ## Acceptance
 
-Use the combined EU expansion, interrupted US installation, full restore/PITR/deleted-source,
-server-loss and operational-protection scenarios in `PLAN.md`. Keep unchanged prior proofs and
-record new measured results there. Approximately nine-second cold starts are accepted for v1.
+Complete US1 installation and admission, then restore an EU1 test database into a separate US1
+target from R2 while keeping the EU source healthy. Compare SQL data and committed markers,
+verify target backup/WAL and retain the EU Node, volume, role and encrypted custody identities.
+Earlier loss, deletion and decommissioning kits are withheld; any later loss drill needs a
+separately reviewed scope that preserves or recovers the same customer EU1. Keep unchanged prior
+proofs and record new measured results in `PLAN.md`. Approximately nine-second cold starts are accepted for v1.
 Do not migrate Neon or call the product finished until EU and US plus recovery have passed.

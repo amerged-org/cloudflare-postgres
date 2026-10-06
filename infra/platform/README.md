@@ -18,10 +18,12 @@ follows the current HTTP index. Images keep the exact references shipped by the 
 
 The earlier platform baseline ran in the Contabo lab; live acceptance of this updated baseline
 is recorded in [PLAN.md](../../PLAN.md). The approved deployment retains the EU control/relay
-node without new customer database placement. A new EU customer worker joins that cluster;
-a new US control-plane/customer node bootstraps its own regional platform. System and platform
-resources remain reserved. Keep the old EU2 until replacement readiness and verified R2 recovery
-permit its removal. Node loss is recovered from R2.
+node without new customer database placement and preserves the already-admitted EU worker as
+customer EU1 (formerly EU2). One new US1 control-plane/customer node bootstraps its own regional
+platform. Both customer nodes use V159 / Cloud VPS Plus 4 with 4 vCPU, 8 GiB RAM and 150 GiB NVMe;
+US1 was purchased for one month. EU1 requires no new join, re-adoption or reinstallation. System
+and platform resources remain reserved. Verify an R2 restore into admitted US1 while retaining
+the healthy EU source; the earlier EU1 removal drill is withheld. Node loss is recovered from R2.
 
 ## Ownership and prerequisites
 

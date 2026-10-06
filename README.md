@@ -2,10 +2,12 @@
 
 Open-source, Neon-style serverless PostgreSQL that runs on **your Cloudflare account** and **your
 Contabo VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
-The VPS run real, unmodified PostgreSQL under CloudNativePG. The approved initial deployment retains one EU control/relay VPS, adds one EU customer worker
-and one US control-plane/customer VPS. Both customer servers must be Cloud VPS 8 with 8 vCPU, 24 GB RAM and 150 GB NVMe; the old EU worker
-is removed after verified recovery. System and platform resources remain protected; server loss
-is recovered from R2.
+The VPS run real, unmodified PostgreSQL under CloudNativePG. The approved initial deployment
+retains the EU control/relay VPS and the already-admitted EU customer worker, now **EU1**
+(formerly EU2), and adds one US control-plane/customer VPS, **US1**. Both customer servers use
+**V159 / Cloud VPS Plus 4: 4 vCPU, 8 GiB RAM and 150 GiB NVMe**. US1 was purchased through the
+API for one month. EU1 keeps its existing installation, identity and data. System and platform
+resources remain protected; server loss is recovered from R2.
 
 - Create, resize, suspend, restore and delete databases through a versioned API.
 - Connect through Cloudflare: PostgreSQL over WebSocket. The VPS expose no database port.
@@ -30,7 +32,8 @@ The R2 outage test proved two failing archive observations under the active bloc
 new connection during the alarm. A separate restore drill preserved committed markers, omitted
 a rolled-back marker and reclaimed its target storage. API full restore, PITR and restore after
 source deletion have passed. EU capacity expansion, signed network verification and placement on
-both nodes have passed. US installation and cross-region lost-worker recovery remain pending.
+both nodes have passed. US installation and cross-region recovery with the EU source preserved
+remain pending.
 
 Raw 100 MiB and 1 GiB stream checks, slow reception and 600 seconds idle passed. A 10-second
 read load measured 735.604 SQL/s over 50 warmed connections, p95 75.368 ms and zero errors.
@@ -65,14 +68,19 @@ Actual R2 listing, archive summary and hourly backup usage agreed on 7,515,287 b
 The filesystem collector measured actual volume use in Dev. API full restore, PITR and restore
 after source deletion passed with separate volumes, verified SQL and removed temporary admin access.
 An isolated real Cloudflare admission probe refused excess registered attempts before D1 or wake.
-US installation and lost-worker recovery still need live acceptance.
+US installation and cross-region recovery still need live acceptance.
 Missing samples stay unknown. Cost attribution is deferred.
-The second EU node is admitted and serves a real capacity-test database. Automatic US purchase
-is approved within the specific cost cap recorded in PLAN.md. Its Cloudflare archive, scoped
+The already-admitted second EU node is retained as customer EU1 and serves a real capacity-test
+database. One matching V159 US1 was purchased through the API; its original-request audit and
+allocated 4 vCPU, 8,192 MiB RAM and 153,600 MiB NVMe were verified. Provider Running still requires
+Talos installation, Kubernetes admission and actual customer readiness. Its Cloudflare archive, scoped
 credentials, private Tunnel, gateway service and regional identity are configured. Cross-region
 restore is implemented and delivered, with live acceptance pending. The original EU/US 300 GB SSD
-orders were paid, then cancelled by the owner. Their 150 GB NVMe replacements await a verified
-ordering path: the documented API defaults V155 to SSD, while the shop exposes the NVMe choice.
+V155 orders were paid, then cancelled by the owner. A later V155 NVMe-selector API test also
+allocated SSD and did not run an installer. Those failed selections are historical; the current
+V159 offer supplies the required 150 GiB NVMe without a storage add-on. No new EU worker is needed,
+and EU1 is not reset, re-adopted or decommissioned. First verify an R2 restore into US1 while
+preserving the healthy EU source; the earlier destructive loss and deletion kits are withheld.
 No customer or platform database has been migrated. EU/US operator acceptance comes first; Neon
 migration and public-release polish follow separately.
 
@@ -80,8 +88,9 @@ The approved actual-RAM policy buys regional capacity at 76% average physical RA
 ten rolling minutes. Existing capacity remains eligible during rollout under hard RAM, CPU and
 storage guards. Missing observations remain unknown. Admin assignments use 256 MiB steps, with
 a 4096 MiB PostgreSQL cap in this installation; transient PostgreSQL/Barman startup peaks are
-admitted separately. This policy and the complete headless producer are implemented locally
-and still require delivery and live acceptance.
+admitted separately. The headless API, bootstrap image and regional producer are delivered;
+installation-profile activation, this policy's activation and fresh-node live acceptance remain
+outstanding.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture

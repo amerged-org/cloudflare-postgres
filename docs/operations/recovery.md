@@ -5,6 +5,14 @@ from R2; the last recoverable commit depends on the WAL that actually reached R2
 synchronous replica or zero-loss promise. Record both recovery duration and the last restored
 commit in `PLAN.md` after each real drill.
 
+The current operator topology retains the EU control/relay server and already-admitted customer
+EU1 (formerly EU2), and adds one US1 using the same V159 / Cloud VPS Plus 4 model: 4 vCPU, 8 GiB
+RAM and 150 GiB NVMe, with a one-month term. US1 is provider Running but still needs installation
+and admission. Current completion first restores from the healthy EU1 source into a separate
+US1 target. Do not reset, re-adopt, fence, delete or decommission EU1 for this drill; the earlier
+loss and deletion kits are withheld. The incident procedures below apply to an actual loss or
+a separately reviewed drill that preserves or recovers the same customer EU1.
+
 ## Restore or PITR
 
 1. Check `/v1/operational-health?scope=databases` and the source's archive summary. Missing
@@ -90,7 +98,7 @@ Node-loss and node-addition endpoints require an admin API key.
    predecessor tombstone, provider receipts and encrypted custody records. Ordinary `mode:"adopt"`
    still refuses reuse of a historical provider instance; do not erase identity to bypass that guard.
 5. Save the new node and operation IDs and poll `GET /v1/nodes/additions/{operation-id}`. Continue
-   the [reviewed bootstrap procedure](operator-installation.md#existing-eu-worker-and-new-us-region)
+   the [reviewed bootstrap procedure](operator-installation.md#programmed-installation-path)
    with the new identity and `spec.role:"worker"`; repeating the same recovery request and key
    returns the same addition. An uncertain response does not authorize another operation or an
    automatic reinstall. Current recovery supports a worker joining a surviving regional cluster;
@@ -173,12 +181,13 @@ An etcd snapshot helps recover Kubernetes configuration, but it does not recreat
 PostgreSQL volumes. Validate SQL and routing before opening traffic.
 
 The D1 export/local restore rehearsal and API full restore/PITR/deleted-source acceptance are
-recorded in `PLAN.md`. The current completion drill installs and admits US1, then fences the exact
-EU2 worker and restores its disposable source from the EU R2 archive into a separate US1 target.
-Verify SQL, recovered markers, recovery duration and the last recoverable transaction. Admit the
-new EU customer worker into the retained EU cluster before retiring the old EU2; the final
-topology retains the EU control/relay server, new EU customer worker and US1. Old EU2 cleanup
-requires authenticated physical absence of the exact old LV identities, as described above;
-provider cancellation or Kubernetes metadata removal alone is insufficient. Keep the source
-healthy until US1 is Ready and the scoped source-read credential map is installed.
+recorded in `PLAN.md`. The current completion drill installs and admits US1, then restores the
+customer EU1 test source from the EU R2 archive into a separate US1 target.
+Verify SQL, recovered markers, recovery duration and the last recoverable transaction. Keep EU1
+healthy throughout the restore and retain its Node, namespace, Cluster, PVC/PV, role and encrypted
+custody identities. The final topology retains the EU control/relay server, existing customer EU1
+and new US1; it requires no new EU worker or EU1 removal. The earlier destructive loss and cleanup
+kits are withheld. Install the scoped source-read credential map only after US1 is Ready; its
+credentials must not alter the EU source archive. A later separately authorized incident or
+loss drill must preserve or recover this same customer EU1.
 A complete regional control-plane loss drill remains outside this customer-free completion gate.

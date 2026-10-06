@@ -19,10 +19,13 @@ Ownership:
 - **Talos** owns host and Kubernetes upgrades.
 
 The approved deployment retains the existing EU control/relay VPS, excludes it from new customer
-database placement, and adds one EU customer worker and one US control-plane/customer VPS.
-The two new customer servers require Cloud VPS 8 with 8 vCPU, 24 GB RAM and 150 GB NVMe.
-Keep the old EU2 worker until replacement readiness and verified R2 recovery permit its removal.
-System and platform resources remain reserved; node loss is recovered from R2.
+database placement, and retains the already-admitted EU worker as customer EU1 (formerly EU2).
+Exactly one new US1 control-plane/customer VPS uses the same V159 / Cloud VPS Plus 4 model:
+4 vCPU, 8 GiB RAM and 150 GiB NVMe, purchased through the API for one month. Preserve EU1's
+installation, Node identity, data and custody; no new EU worker or EU1 reinstallation is required.
+Install and admit US1 before verifying an R2 restore with the EU source preserved. Earlier EU1
+loss, deletion and decommissioning kits are withheld. System and platform resources remain
+reserved; node loss is recovered from R2.
 
 The programmed bootstrap owns worker join and new-region platform installation. These recipes
 also document the earlier manual installation and recovery path. Software checks do not establish
