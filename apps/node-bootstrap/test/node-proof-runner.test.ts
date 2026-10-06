@@ -504,6 +504,53 @@ test("preparation runs both complete outside families, cleans exact source resou
   );
   assert.equal(f.seen.at(-1), "http:report");
 });
+test("a sealed default kubeconfig namespace is removed only from the derived private proof config", async () => {
+  const f = commands();
+  assert.equal(f.input.source.kind, "pod");
+  if (f.input.source.kind !== "pod") throw new Error("fixture_source_required");
+  const bundle = f.input.source.access.join_bundle,
+    config = obj(parse(bundle.kubeconfig)),
+    context = obj(obj((config.contexts as Json[])[0]).context);
+  context.namespace = "default";
+  bundle.kubeconfig = stringify(config);
+  const sealed = bundle.kubeconfig,
+    originalRun = f.options.run!;
+  f.options.run = async (command) => {
+    const path = command.args[command.args.indexOf("--kubeconfig") + 1]!,
+      derived = obj(parse(await readFile(path, "utf8"))),
+      derivedContext = obj(obj((derived.contexts as Json[])[0]).context);
+    assert.equal(derivedContext.namespace, undefined);
+    assert.deepEqual(derived.users, config.users);
+    assert.equal(derived["current-context"], config["current-context"]);
+    const cluster = obj(obj((derived.clusters as Json[])[0]).cluster),
+      original = obj(obj((config.clusters as Json[])[0]).cluster);
+    assert.equal(cluster.server, original.server);
+    assert.equal(
+      cluster["certificate-authority-data"],
+      original["certificate-authority-data"],
+    );
+    return originalRun(command);
+  };
+  await runNodeProof(f.input, f.options);
+  assert.equal(bundle.kubeconfig, sealed);
+  assert.equal(f.reports(), 1);
+  assert.equal(f.objects.size, 0);
+});
+test("a non-default kubeconfig namespace still fails before any Kubernetes command or scan", async () => {
+  const f = commands();
+  if (f.input.source.kind !== "pod") throw new Error("fixture_source_required");
+  const bundle = f.input.source.access.join_bundle,
+    config = obj(parse(bundle.kubeconfig));
+  obj(obj((config.contexts as Json[])[0]).context).namespace = "foreign";
+  bundle.kubeconfig = stringify(config);
+  await assert.rejects(
+    runNodeProof(f.input, f.options),
+    /node_proof_kubeconfig_identity_changed/,
+  );
+  assert.equal(f.configPaths.size, 0);
+  assert.equal(f.objects.size, 0);
+  assert.equal(f.reports(), 0);
+});
 test("an installed-image anchor is reported only after actual scoped Talos version and disk reads", async () => {
   const f = commands(),
     input = f.input.bootstrap;

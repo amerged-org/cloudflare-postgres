@@ -46,10 +46,16 @@ image, both EU Nodes/data/custody and the same US sealed input, firewall, rescue
 Actual running placement/image/version was separately verified. The original US Workflow resumed;
 hardware inspection reported successfully at generation1, then the programmed installer job was
 created and authorized. Its checkpoint remains `created`, before any installation disk write.
-Preparation network proof is still pending; repeated wait cycles currently hide its native
-failure code. A bounded administrator proof-status getter is implemented and under final checks.
-The same Workflow is paused at the exact unchanged created-job checkpoint for that API-only
-diagnostic delivery; never reset or replace its job or sealed input.
+Preparation network proof is still pending. The bounded administrator proof-status getter
+was delivered from `794ea48e`, full CI `37544949566`; its one API-only publication preserved
+the native image/configuration, all EU identities/data/custody, US profile and the whole sealed
+authorized created job. A single controlled resume of the same Workflow exposed
+`node_proof_kubeconfig_identity_changed`. Authenticated offline decryption of the retained EU
+join-bundle revision1 confirms that its entire clear object, kubeconfig, endpoint and cluster UID
+match the protected source. Every identity/TLS predicate passes; only its ordinary
+`context.namespace: default` is rejected by the native guard. The same Workflow is paused again
+at the unchanged created-job checkpoint, before any installation disk write, for a narrow
+default-namespace correction. Never reset or replace its job, sealed input or source custody.
 The retained EU control node's UID-guarded new-database placement flag is now
 false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.
 Actual-RAM mode and automatic purchases remain disabled pending accepted US/recovery tests,

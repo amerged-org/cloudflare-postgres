@@ -437,9 +437,10 @@ class ProofRunner {
       context.cluster !== clusters[0]!.name ||
       context.user !== users[0]!.name ||
       config["current-context"] !== contexts[0]!.name ||
-      context.namespace !== undefined
+      (context.namespace !== undefined && context.namespace !== "default")
     )
       return fail("kubeconfig_identity_changed");
+    delete context.namespace;
     delete cluster["tls-server-name"];
     cluster["proxy-url"] = this.proxies.get(direction)!.url;
     const filename = join(this.directory, `${direction}-kubeconfig`);
