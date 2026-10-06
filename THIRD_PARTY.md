@@ -67,6 +67,16 @@ Full payload qualification and immutable release digests bind the actual shipped
 was a naming conflict between archives. Every restore target needs its own archive path and server
 name.
 
+**Operator network-capture image:** post-join acceptance uses the unmodified `linux/amd64`
+image `docker.io/jonlabelle/network-tools:sha-6257a44@sha256:0c4de3370f8c19aa7c9577ea9ab9bb72063db807efe88a8a7bbead9482b89732`,
+from [source revision `6257a444384726c3e0093ba1cf37d5780fda4637`](https://github.com/jonlabelle/docker-network-tools/tree/6257a444384726c3e0093ba1cf37d5780fda4637).
+Its [MIT license](https://github.com/jonlabelle/docker-network-tools/blob/6257a444384726c3e0093ba1cf37d5780fda4637/LICENSE.txt)
+covers the image recipe. The verified installed tools are Bash `5.3.9-r1` and GNU coreutils
+`9.11-r0` (`GPL-3.0-or-later`), tcpdump `4.99.6-r1` and libpcap `1.10.7-r0` (`BSD-3-Clause`).
+Other Alpine packages retain their individual licenses. Preserve upstream notices and satisfy
+applicable source obligations when redistributing. This temporary image is operator acceptance
+tooling, separate from the product runtime.
+
 ## Application dependencies
 
 Direct npm dependencies at the versions resolved in [pnpm-lock.yaml](pnpm-lock.yaml). Licenses are

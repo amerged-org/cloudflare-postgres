@@ -3,20 +3,21 @@
 Status (2026-10-06): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
 The first EU node and five Flux platform releases are Ready, with 95 GiB measured storage.
 Its node identity, storage and protected cluster custody are preserved. The second existing EU
-VPS is in RAM rescue with checkpointed image installation in progress; no US VPS has been bought and no customer or platform
+VPS has passed image/GPT verification and booted Talos maintenance; native configuration and
+network acceptance remain in progress. No US VPS has been bought and no customer or platform
 production database has been migrated. The initial topology remains two EU VPS and one US VPS.
 
 The current regional image is
 `sha256:692a6c508e274d695151ce064b52fd66c5f00d5ec701c7d2adb2de89a092fdbb`
 from `e9569169`, CI `37360915487`. Image qualification and anonymous manifest,
 configuration and every layer verification passed. Agent and both gateways remained continuously
-Ready for 62.768 s. The management API uses `425eae95` and Edge uses `b196fbaa`; the private bootstrap
+Ready for 62.768 s. The management API uses `bc04153d` and Edge uses `b196fbaa`; the private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
 inputs are now bound. The current native bootstrap image is
-`sha256:e2a11d2bfe2efc5462a5ff004ff4d0aa5aac284b55369482e6448e3ce174b51f`
-from `425eae95`: qualification covered 711,910,794 bytes and 18 layers with zero unresolved
+`sha256:70372eacfcc2d71dfa0f6103faa617715155ddd046a235eaaa4a3c893dd73954`
+from `bc04153d`: qualification covered 711,911,304 bytes and 18 layers with zero unresolved
 findings, followed by exact private-registry manifest, configuration and layer readback.
-Latest complete CI `37391500131` is green. EU2 join, US installation and post-join network acceptance
+Latest complete CI `37395016762` is green. EU2 join, US installation and post-join network acceptance
 remain outstanding. Release image signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
@@ -154,7 +155,16 @@ instance image readback. Fresh full proofs resumed the same job through 536,870,
 disk bytes. Proof expiry paused it safely; every resume rechecked prior chunks through separate
 connections. A single full-prefix comparison now preserves all-byte verification and passes 64
 native tests plus actual 536,870,912-byte readback in 0.917 s with zero extra disk writes.
-Its runtime qualification/delivery and EU2 join, US installation
+Its `bc04153d` runtime is qualified and delivered, with completed Cloudflare rollout and exact
+instance image readback. The same job has acknowledged all 4,453,302,272 disk bytes, verified
+every partition and GPT, and recorded the rescue reboot. Actual operator maintenance reads
+confirm Talos 1.14.1, the exact disk and the intended peer route. The native CLI currently places
+the command-local `--insecure` flag before the subcommand, which the pinned client rejects;
+the exact commands succeed with the flag after the subcommand. A reproducing regression and
+corrected ordering pass all 65 native tests; runtime qualification and delivery are pending.
+Relay access remains inconclusive and requires actual diagnosis before fresh proof publication.
+Expired preparation pauses progress and fresh full outside proofs resume it. The unchanged first
+node, agent, both gateways and five platform releases remain Ready. EU2 join, US installation
 and lost-worker recovery are not accepted. US remains unbought; the specific costed approval
 request is pending.
 

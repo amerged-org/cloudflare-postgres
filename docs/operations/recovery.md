@@ -143,5 +143,8 @@ on verified replacement infrastructure; recover PostgreSQL through R2 into separ
 An etcd snapshot helps recover Kubernetes configuration, but it does not recreate lost local
 PostgreSQL volumes. Validate SQL and routing before opening traffic.
 
-The initial D1 export/local restore rehearsal is recorded in `PLAN.md`. A complete fresh regional
-loss drill and live API recovery acceptance remain required before operator product acceptance.
+The D1 export/local restore rehearsal and API full restore/PITR/deleted-source acceptance are
+recorded in `PLAN.md`. Operator completion still requires one real existing-resource worker-loss
+recovery, including infrastructure rejoin, SQL verification, physical storage reclamation,
+recovery duration and the last recoverable transaction. A complete regional control-plane loss
+drill is outside the current customer-free completion gate.

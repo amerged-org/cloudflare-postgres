@@ -35,6 +35,44 @@ import {
 
 import { authority, fixture, platformFixture } from "./fixture.ts";
 
+test("Talos maintenance flags follow command arguments and authenticated calls preserve talosconfig", async () => {
+  const input = fixture();
+  const directory = join(tmpdir(), `pgcf-talos-flags-${randomUUID()}`);
+  const calls: string[][] = [];
+  const job = new BootstrapJob(input, {
+    run: async (command) => {
+      assert.equal(command.executable, "talosctl");
+      calls.push(command.args);
+      return { exit_code: 0, stdout: "" };
+    },
+  });
+  Reflect.set(job, "directory", directory);
+  const talos = Reflect.get(job, "talos").bind(job);
+  const config = join(directory, "controlplane.yaml");
+  await talos(["get", "disks", "--output", "json"], true);
+  await talos(["version", "--json"], true);
+  await talos(["apply-config", "--file", config], true, true);
+  await talos(["version", "--json"]);
+  const target = [
+    "--nodes",
+    input.spec.hardware.ipv4,
+    "--endpoints",
+    input.spec.hardware.ipv4,
+  ];
+  assert.deepEqual(calls, [
+    [...target, "get", "disks", "--output", "json", "--insecure"],
+    [...target, "version", "--json", "--insecure"],
+    [...target, "apply-config", "--file", config, "--insecure"],
+    [
+      ...target,
+      "--talosconfig",
+      join(directory, "talosconfig"),
+      "version",
+      "--json",
+    ],
+  ]);
+});
+
 test("native failures expose only a known executable and bounded exit code", async () => {
   const input = fixture();
   const sensitive = input.rescue.ssh_private_key;

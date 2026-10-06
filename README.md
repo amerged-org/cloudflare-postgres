@@ -28,7 +28,8 @@ stale and out-of-order desired-state responses preserved storage and configurati
 Loss of a ready database namespace reported recovery required rather than creating empty storage.
 The R2 outage test proved two failing archive observations under the active block and a successful
 new connection during the alarm. A separate restore drill preserved committed markers, omitted
-a rolled-back marker and reclaimed its target storage; full PITR and disaster recovery remain pending.
+a rolled-back marker and reclaimed its target storage. API full restore, PITR and restore after
+source deletion have passed. Lost-worker recovery and EU/US installation acceptance remain pending.
 
 Raw 100 MiB and 1 GiB stream checks, slow reception and 600 seconds idle passed. A 10-second
 read load measured 735.604 SQL/s over 50 warmed connections, p95 75.368 ms and zero errors.
@@ -65,8 +66,8 @@ after source deletion passed with separate volumes, verified SQL and removed tem
 An isolated real Cloudflare admission probe refused excess registered attempts before D1 or wake.
 Lost-worker rebuild and the complete EU/US installation still need live acceptance.
 Missing samples stay unknown. Cost attribution is deferred.
-The second EU node is untouched, the US node has not been bought and no customer or platform
-database has been migrated. EU/US operator acceptance comes first; Neon migration and public-release
+The second EU node's checkpointed installation is in progress. The US node has not been bought
+and no customer or platform database has been migrated. EU/US operator acceptance comes first; Neon migration and public-release
 polish follow separately.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 

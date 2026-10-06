@@ -1041,9 +1041,10 @@ export class BootstrapJob {
         "--endpoints",
         this.input.spec.hardware.ipv4,
         ...(insecure
-          ? ["--insecure"]
+          ? []
           : ["--talosconfig", join(this.directory, "talosconfig")]),
         ...args,
+        ...(insecure ? ["--insecure"] : []),
       ],
       undefined,
       permit_failure,
