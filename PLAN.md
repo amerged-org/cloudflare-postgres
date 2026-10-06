@@ -628,6 +628,23 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   €20.09 gross/month and €0 setup ceiling remains; it is not permission to bypass this later
   approval condition. The proposed 80% reservation threshold plus actual-load protection is
   not approved or implemented. Keep purchases disabled until the owner approves the proposal.
+- Latest owner decision (2026-10-06): use actual average RAM utilization with intentional
+  overbooking, superseding the proposed 80% reservation-based rule and the per-purchase approval
+  wait above. At 80% average actual RAM on a node, stop placing every new database on that node,
+  regardless of adopter free/paid plan, and automatically purchase/install the next server under
+  the configured regional offer and cost profile. Purchases within that profile have standing
+  owner authorization; do not request approval for each capacity addition. PostgreSQL for the
+  adopter's free plan has a 256 MiB RAM limit; platform and Barman overhead remain separately
+  measured. The averaging window and actual-RAM denominator are still to be specified.
+  Actual-load placement, safe wake admission under overbooking and the full headless producer
+  remain implementation/live-acceptance work; the deployed reservation-based path is unchanged.
+- The owner intends to test different EU/US VPS models and asks about resetting the existing
+  servers. Exact replacement product IDs/hardware and reset targets are pending. Qualified
+  installer/runtime artifacts are reusable, but they are not VM/data snapshots. Preserve/export
+  Cloudflare custody, real R2 database backups and cluster configuration, and establish an
+  independent bootstrap route before resetting EU1, which currently hosts the sole control plane
+  and relay. Existing-instance recovery currently requires a surviving regional cluster; full
+  regional control-plane loss/rebuild is not live-accepted. No reset is executed by this decision.
 
 Use regression tests for changes, scoped package checks and one composed CI; repeat old live
 checks only when their behavior changed. No additional cold-start optimization or twenty-start
