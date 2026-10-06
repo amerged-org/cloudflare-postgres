@@ -9,6 +9,7 @@ import type {
   ContaboMutationResult,
   ContaboRequest,
 } from "../../src/providers/contabo.ts";
+import { ContaboError } from "../../src/providers/contabo.ts";
 import {
   configureNodeRegionPolicy,
   reserveNodeAddition,
@@ -221,6 +222,63 @@ it("retains the original creation result when a concurrent read confirms it befo
   expect(claim.state).toBe("confirmed");
   expect(f.provider.createFirewall).toHaveBeenCalledTimes(1);
 });
+it("retains a never-dispatched claim after a failed preflight read and creates once with its original UUID", async () => {
+  const f = await setup();
+  f.provider.listFirewalls.mockRejectedValueOnce(
+    new ContaboError("invalid_response"),
+  );
+  expect(await f.ensure()).toBeNull();
+  const original = (await f.claim())!;
+  expect(original).toMatchObject({
+    state: "claimed",
+    failure_code: "readback_unavailable",
+    result_json: null,
+    firewall_id: null,
+  });
+  expect(f.provider.createFirewall).not.toHaveBeenCalled();
+  expect(await f.ensure()).toBe(f.firewalls[0]!.firewallId);
+  expect(f.provider.createFirewall).toHaveBeenCalledTimes(1);
+  expect(f.provider.createFirewall.mock.calls[0]![1].requestId).toBe(
+    original.request_id,
+  );
+  expect((await f.claim())!.request_id).toBe(original.request_id);
+});
+it("reconciles a legacy blocked readback only by its original owned firewall and never recreates an absent one", async () => {
+  const f = await setup();
+  f.provider.listFirewalls.mockRejectedValueOnce(
+    new ContaboError("invalid_response"),
+  );
+  expect(await f.ensure()).toBeNull();
+  await env.DB.prepare(
+    "UPDATE node_firewall_allocations SET state='blocked',failure_code='readback_unavailable' WHERE operation_id=?",
+  )
+    .bind(f.operationId)
+    .run();
+  const original = (await f.claim())!;
+  expect(await f.ensure()).toBeNull();
+  expect(f.provider.createFirewall).not.toHaveBeenCalled();
+  expect((await f.claim())!.state).toBe("blocked");
+  f.firewalls.push({
+    tenantId: f.actual.tenantId,
+    customerId: f.actual.customerId,
+    firewallId: value(),
+    name: String(original.name),
+    description: String(original.description),
+    status: "active",
+    instances: [],
+    instanceStatus: [],
+    rules: { inbound: [] },
+    createdDate: new Date().toISOString(),
+    updatedDate: new Date().toISOString(),
+  });
+  expect(await f.ensure()).toBe(f.firewalls[0]!.firewallId);
+  expect(f.provider.createFirewall).not.toHaveBeenCalled();
+  expect((await f.claim())!).toMatchObject({
+    state: "confirmed",
+    request_id: original.request_id,
+    result_json: null,
+  });
+});
 it("resolves a lost response using exact controlled name and owned readback without another POST", async () => {
   const f = await setup(),
     create = f.provider.createFirewall.getMockImplementation()!;
@@ -242,6 +300,16 @@ it("resolves a lost response using exact controlled name and owned readback with
   expect(await f.ensure()).toBeNull();
   const original = (await f.claim())!;
   expect(original.state).toBe("unknown");
+  f.provider.listFirewalls.mockRejectedValueOnce(
+    new ContaboError("invalid_response"),
+  );
+  expect(await f.ensure()).toBeNull();
+  expect((await f.claim())!).toMatchObject({
+    state: "unknown",
+    request_id: original.request_id,
+    result_json: original.result_json,
+    failure_code: "readback_unavailable",
+  });
   expect(await f.ensure()).toBeNull();
   visible = true;
   expect(await f.ensure()).toBe(f.firewalls[0]!.firewallId);

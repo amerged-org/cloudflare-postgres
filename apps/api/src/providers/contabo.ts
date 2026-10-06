@@ -983,11 +983,22 @@ export class ContaboClient {
           .object({
             data: z.array(schema).max(this.size),
             _pagination: Pagination,
-            _links: Links.extend({ first: Text.min(1), last: Text.min(1) }),
+            _links: Links.extend({ first: Text.min(1), last: Text }),
           })
           .safeParse(raw);
       if (!page.success) throw new ContaboError("invalid_response");
       const { data, _pagination: meta, _links: links } = page.data;
+      if (
+        !links.last &&
+        !(
+          data.length === 0 &&
+          meta.totalElements === 0 &&
+          meta.totalPages === 0 &&
+          !links.previous &&
+          !links.next
+        )
+      )
+        throw new ContaboError("invalid_response");
       inventoryBytes += new TextEncoder().encode(JSON.stringify(data)).length;
       if (inventoryBytes > this.bodyLimit)
         throw new ContaboError("pagination_incomplete");

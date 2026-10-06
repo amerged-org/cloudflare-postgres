@@ -648,6 +648,37 @@ it("creates an empty unattached firewall definition without purchase fields and 
   ).rejects.toMatchObject({ code: "invalid_input" });
   expect(f.posts()).toHaveLength(1);
 });
+it("accepts the actual empty filtered firewall page with an empty last link", async () => {
+  const f = setup(),
+    name = value();
+  f.set((url) =>
+    Response.json({
+      data: [],
+      _pagination: { size: 100, totalElements: 0, totalPages: 0, page: 1 },
+      _links: {
+        first: url.pathname + url.search,
+        previous: "",
+        next: "",
+        last: "",
+        self: url.pathname,
+      },
+    }),
+  );
+  expect(
+    await f.client.listFirewalls({ name }, { requestId: f.requestId }),
+  ).toEqual([]);
+  expect(f.posts()).toHaveLength(0);
+  f.set((url) =>
+    Response.json({
+      data: [],
+      _pagination: { size: 100, totalElements: 1, totalPages: 1, page: 1 },
+      _links: { first: url.pathname, last: "", self: url.pathname },
+    }),
+  );
+  await expect(
+    f.client.listFirewalls({ name }, { requestId: value() }),
+  ).rejects.toMatchObject({ code: "invalid_response" });
+});
 it("treats firewall entitlement rejection as definite and a lost creation response as unknown without replay", async () => {
   const f = setup(),
     input = {

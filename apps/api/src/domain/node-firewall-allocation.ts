@@ -42,6 +42,7 @@ interface Allocation {
     | "confirmed"
     | "blocked";
   firewall_id: string | null;
+  failure_code: string | null;
 }
 const refuse = (message: string): never => {
   throw new ApiError("conflict", message);
@@ -155,7 +156,20 @@ async function readFailure(db: D1Database, claim: Allocation, error: unknown) {
       (error.code === "unexpected_status" &&
         [400, 402, 403, 404, 405].includes(error.status ?? 0)))
   )
-    await blocked(db, claim, "readback_unavailable");
+    // Preserve the dispatch boundary: claimed can still make its first POST; later phases only read.
+    await db
+      .prepare(
+        `UPDATE node_firewall_allocations SET failure_code='readback_unavailable',updated_at=?
+         WHERE operation_id=? AND request_id=? AND state=?
+           AND state IN('claimed','dispatching','accepted','unknown')`,
+      )
+      .bind(
+        new Date().toISOString(),
+        claim.operation_id,
+        claim.request_id,
+        claim.state,
+      )
+      .run();
 }
 
 /** An uncertain creation is reconciled only by reads; x-request-id is not an idempotency guarantee. */
@@ -288,7 +302,11 @@ export async function ensureNodeInstallationFirewall(
     if (!claim) return null;
     sameClaim(claim, addition, actual);
   }
-  if (["rejected", "blocked"].includes(claim.state)) return null;
+  if (
+    claim.state === "rejected" ||
+    (claim.state === "blocked" && claim.failure_code !== "readback_unavailable")
+  )
+    return null;
   if (claim.state === "confirmed") return confirmedFirewall(claim);
   if (claim.state === "claimed") {
     const name = claim.name;
@@ -417,7 +435,9 @@ export async function ensureNodeInstallationFirewall(
       return null;
     }
     const confirmed = await env.DB.prepare(
-      `UPDATE node_firewall_allocations SET state='confirmed',firewall_id=?,failure_code=NULL,updated_at=? WHERE operation_id=? AND request_id=? AND state IN('dispatching','accepted','unknown') AND (firewall_id IS NULL OR firewall_id=?) AND ${authority}`,
+      `UPDATE node_firewall_allocations SET state='confirmed',firewall_id=?,failure_code=NULL,updated_at=? WHERE operation_id=? AND request_id=?
+        AND (state IN('dispatching','accepted','unknown') OR (state='blocked' AND failure_code='readback_unavailable'))
+        AND (firewall_id IS NULL OR firewall_id=?) AND ${authority}`,
     )
       .bind(
         firewall.firewallId,

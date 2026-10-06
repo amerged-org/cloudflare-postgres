@@ -990,6 +990,76 @@ export async function markNodeAdditionFailed(
     );
   return changed(db, addition, "status='failed',failure_code=?", [code]);
 }
+/** Tombstone only an audited adoption before any provider-host, installation or cluster progress. */
+export async function cancelAuditedNodeAdoption(
+  db: D1Database,
+  addition: NodeAddition,
+  expectedRevision: number,
+  owner: { tenant_id: string; customer_id: string },
+): Promise<NodeAddition> {
+  revision(addition, expectedRevision);
+  if (
+    addition.intent.request.mode !== "adopt" ||
+    addition.status !== "audited" ||
+    !addition.slot_held ||
+    addition.dispatch_request_id !== null ||
+    !addition.provider_instance_id ||
+    !addition.receipt ||
+    !addition.audit ||
+    addition.intent.request.provider_instance_id !==
+      addition.provider_instance_id ||
+    addition.receipt.provider_instance_id !== addition.provider_instance_id ||
+    addition.receipt.request_id !== null ||
+    addition.audit.provider_instance_id !== addition.provider_instance_id ||
+    addition.checkpoint ||
+    addition.network ||
+    addition.capacity
+  )
+    throw new NodeStateError(
+      "conflict",
+      "Cancellation requires the untouched audited adoption",
+    );
+  return changed(
+    db,
+    addition,
+    "status='cancelled',slot_held=0",
+    [],
+    `AND status='audited' AND slot_held=1 AND node_id=? AND region_id=? AND intent_hash=? AND intent_json=?
+      AND dispatch_request_id IS NULL AND requested_instance_id=? AND provider_instance_id=?
+      AND receipt_json=? AND audit_json=? AND approval_json IS ?
+      AND checkpoint_json IS NULL AND network_json IS NULL AND capacity_json IS NULL
+      AND EXISTS(SELECT 1 FROM regions r WHERE r.id=node_additions.region_id AND r.provider='contabo' AND r.provider_region=?)
+      AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs j WHERE j.operation_id=node_additions.operation_id OR j.node_id=node_additions.node_id)
+      AND NOT EXISTS(SELECT 1 FROM node_installation_bindings b WHERE b.operation_id=node_additions.operation_id OR b.node_id=node_additions.node_id OR b.provider_instance_id=node_additions.provider_instance_id)
+      AND NOT EXISTS(SELECT 1 FROM node_network_preparations p WHERE p.operation_id=node_additions.operation_id)
+      AND NOT EXISTS(SELECT 1 FROM node_provider_mutations m WHERE m.operation_id=node_additions.operation_id)
+      AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.id=node_additions.node_id OR n.provider_instance_id=node_additions.provider_instance_id)
+      AND NOT EXISTS(SELECT 1 FROM region_bootstrap_credentials c WHERE c.region_id=node_additions.region_id AND c.purpose IN('region_seed','join_bundle'))
+      AND NOT EXISTS(SELECT 1 FROM node_firewall_allocations f WHERE f.operation_id=node_additions.operation_id AND
+        (f.node_id<>node_additions.node_id OR f.region_id<>node_additions.region_id OR f.intent_hash<>node_additions.intent_hash
+          OR f.provider_instance_id<>node_additions.provider_instance_id OR f.provider_region<>? OR f.product_id<>? OR f.image_id<>?
+          OR f.tenant_id<>? OR f.customer_id<>? OR f.firewall_id IS NOT NULL OR f.result_json IS NOT NULL
+          OR f.state NOT IN('claimed','blocked') OR (f.state='blocked' AND f.failure_code IS NOT 'readback_unavailable')))`,
+    [
+      addition.intent.node_id,
+      addition.intent.request.region_id,
+      addition.intent_hash,
+      canonical(addition.intent),
+      addition.provider_instance_id,
+      addition.provider_instance_id,
+      canonical(addition.receipt),
+      canonical(addition.audit),
+      addition.approval === null ? null : canonical(addition.approval),
+      addition.audit.provider_region,
+      addition.audit.provider_region,
+      addition.audit.product_id,
+      addition.audit.image_id,
+      owner.tenant_id,
+      owner.customer_id,
+    ],
+  );
+}
+
 /** Release only an empty paid addition after its authenticated provider cancellation was observed. */
 export async function cancelProviderCancelledNodeAddition(
   db: D1Database,

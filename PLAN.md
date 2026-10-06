@@ -14,6 +14,15 @@ protected. Do not reset, re-adopt, decommission or wipe this retained customer E
 requires the programmed Cloudflare installation profile, bootstrap and admission; provider
 Running is not Kubernetes/customer readiness. The 76% rolling-ten-minute purchase rule and
 continued placement under hard capacity/startup guards remain unchanged.
+The US installation profile is now sealed and its canonical hash was confirmed by a separate
+GET. One API adoption of the existing paid US1 returned202. The same Cloudflare Workflow was
+paused and resumed at a confirmed pre-installer checkpoint, without another order. It remains
+audited before any installation binding, bootstrap job, admitted Node or disk write. Its first
+firewall inventory read exposed a provider response mismatch: an empty filtered list returns
+`totalElements:0`, `totalPages:0` and an empty `last` link. The parser rejected that real HTTP200
+envelope and the allocation correctly stopped. The narrow parser/recovery correction and a
+guarded replacement of this pre-installation adoption are in progress; do not replay its firewall
+creation or overwrite its historical claim.
 The first EU node and five Flux platform releases are Ready, with 95 GiB measured storage.
 Its node identity, storage and protected cluster custody are preserved. The second existing EU
 VPS has passed signed network verification and admission, with 95 GiB measured capacity.

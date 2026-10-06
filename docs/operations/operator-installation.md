@@ -160,6 +160,14 @@ For an interrupted native apply with missing resources, repair only the exact op
 resources, then resume readback. Do not reset checkpoints, replace immutable job input, erase
 receipts, rotate the agent key or repeat a disk-write intent to make the job advance.
 
+If an audited adoption fails before any installation binding, bootstrap job, provider-host
+mutation, network/checkpoint/capacity or regional seed/join progress, the revision-guarded
+`/v1/nodes/additions/{id}/cancel` can close that reservation without cancelling the paid VPS.
+Retain its receipt, audit and firewall claim; an unknown firewall creation remains read-only.
+Confirm that the old Workflow is terminal before creating a fresh adoption with a new request
+key. Once any guarded installation progress exists, cancellation is refused; resume the original
+operation instead. Failed inventory reads preserve the firewall's original dispatch boundary.
+
 Preparation proofs have a short expiry. A multi-minute install can pause when its proof expires;
 collect fresh measurements and a signed artifact for the same operation and immutable network
 plan, then let normal verification renew the recorded proof. Resume with the same sealed input,

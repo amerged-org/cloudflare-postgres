@@ -2,20 +2,24 @@
 import { z } from "zod";
 import type { NodeAddition } from "@pgcf/contracts/nodes";
 import type { Env } from "../env.ts";
-import type { ContaboClient } from "../providers/contabo.ts";
+import {
+  hasAllocatedContaboHardware,
+  type ContaboClient,
+} from "../providers/contabo.ts";
 import { contaboClient } from "./bootstrap-relay.ts";
 import {
   NodeStateError,
   readNodeAddition,
   cancelUnattemptedNodeAddition,
   cancelProviderCancelledNodeAddition,
+  cancelAuditedNodeAdoption,
 } from "./node-state.ts";
 
 const refuse = (message: string): never => {
   throw new NodeStateError("conflict", message);
 };
 
-/** Record an owner's existing provider cancellation; never requests a provider mutation. */
+/** Close an untouched audited adoption or record an existing provider cancellation; never mutates the provider. */
 export async function cancelAlreadyCancelledProviderAddition(
   env: Env,
   operationId: string,
@@ -29,6 +33,54 @@ export async function cancelAlreadyCancelledProviderAddition(
     addition.provider_instance_id === null
   )
     return cancelUnattemptedNodeAddition(env.DB, operationId, expectedRevision);
+  if (addition.intent.request.mode === "adopt") {
+    if (
+      !Number.isSafeInteger(expectedRevision) ||
+      addition.revision !== expectedRevision ||
+      !addition.slot_held ||
+      addition.status !== "audited" ||
+      addition.dispatch_request_id !== null ||
+      !addition.provider_instance_id ||
+      !addition.receipt ||
+      !addition.audit ||
+      addition.intent.request.provider_instance_id !==
+        addition.provider_instance_id ||
+      addition.receipt.provider_instance_id !== addition.provider_instance_id ||
+      addition.receipt.request_id !== null ||
+      addition.audit.provider_instance_id !== addition.provider_instance_id ||
+      addition.checkpoint ||
+      addition.network ||
+      addition.capacity
+    )
+      return refuse(
+        "Only an untouched audited adoption can release its installation reservation",
+      );
+    const actual = await (options.provider ?? contaboClient(env)).getInstance(
+      addition.provider_instance_id,
+      { requestId: crypto.randomUUID() },
+    );
+    if (
+      !hasAllocatedContaboHardware(actual) ||
+      !["running", "stopped", "uninstalled"].includes(actual.status) ||
+      actual.id !== addition.provider_instance_id ||
+      actual.region !== addition.audit.provider_region ||
+      actual.productId !== addition.audit.product_id ||
+      actual.imageId !== addition.audit.image_id ||
+      !/^(?:[a-f0-9]{2}:){5}[a-f0-9]{2}$/.test(
+        actual.macAddress.toLowerCase(),
+      ) ||
+      !z.ipv4().safeParse(actual.ipConfig.v4.ip).success ||
+      !z.ipv4().safeParse(actual.ipConfig.v4.gateway).success ||
+      actual.ipConfig.v4.netmaskCidr < 1
+    )
+      return refuse(
+        "Fresh allocated provider inventory must match the audited adoption",
+      );
+    return cancelAuditedNodeAdoption(env.DB, addition, expectedRevision, {
+      tenant_id: actual.tenantId,
+      customer_id: actual.customerId,
+    });
+  }
   if (
     !Number.isSafeInteger(expectedRevision) ||
     addition.revision !== expectedRevision ||
