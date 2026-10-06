@@ -14,15 +14,25 @@ protected. Do not reset, re-adopt, decommission or wipe this retained customer E
 requires the programmed Cloudflare installation profile, bootstrap and admission; provider
 Running is not Kubernetes/customer readiness. The 76% rolling-ten-minute purchase rule and
 continued placement under hard capacity/startup guards remain unchanged.
-The US installation profile is now sealed and its canonical hash was confirmed by a separate
-GET. One API adoption of the existing paid US1 returned202. The same Cloudflare Workflow was
-paused and resumed at a confirmed pre-installer checkpoint, without another order. It remains
-audited before any installation binding, bootstrap job, admitted Node or disk write. Its first
-firewall inventory read exposed a provider response mismatch: an empty filtered list returns
-`totalElements:0`, `totalPages:0` and an empty `last` link. The parser rejected that real HTTP200
-envelope and the allocation correctly stopped. The narrow parser/recovery correction and a
-guarded replacement of this pre-installation adoption are in progress; do not replay its firewall
-creation or overwrite its historical claim.
+The US installation profile is sealed and its canonical hash was confirmed by a separate GET.
+The first adoption's same Workflow passed a real pre-installer pause/resume without another order.
+Its first firewall inventory read rejected a real empty HTTP200 page with `totalElements:0`,
+`totalPages:0` and an empty `last` link. Source `dd8f8648`, full CI `37531022272`, fixes that parser
+and preserves the original firewall dispatch boundary on failed reads. Its single API publication
+retained the native image/configuration/namespace, both EU Nodes, database/storage/role/Secret
+identities, EU custody and US profile. Container application version11 uses the same qualified
+native image. The old untouched audited adoption was cancelled through the guarded API and its
+same Workflow was confirmed terminated; its permanent claim, receipt and audit remain unchanged.
+A fresh adoption of the same paid US1 returned202, with no new order. Cloudflare created and
+confirmed its owned free firewall, sealed one installation binding, verified network readback and
+received one accepted rescue response. Hardware inspection has not yet reported, so there is
+still no bootstrap job, admitted US Node or installation disk write. A bounded administrator
+inspection status getter is implemented and tested; delivery and the actual failure diagnosis
+remain pending. The new Workflow is being paused at this pre-installer boundary for that API-only
+diagnostic update. The retained EU control node's UID-guarded new-database placement flag is now
+false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.
+Actual-RAM mode and automatic purchases remain disabled pending accepted US/recovery tests,
+reviewed test cleanup and explicit finite numeric standing limits.
 The first EU node and five Flux platform releases are Ready, with 95 GiB measured storage.
 Its node identity, storage and protected cluster custody are preserved. The second existing EU
 VPS has passed signed network verification and admission, with 95 GiB measured capacity.

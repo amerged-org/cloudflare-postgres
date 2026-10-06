@@ -60,6 +60,13 @@ The first node of a region additionally needs its reviewed platform source/image
 regional credentials; an EU worker uses the retained cluster join custody. Profiles and per-node
 rescue identities are encrypted in D1. Status never returns their private keys.
 
+During pre-installation, administrators can read
+`GET /v1/nodes/additions/{operation-id}/inspection`. This reads the existing native inspector
+with a bounded response and returns its verified identity, status and fixed error code. It never
+starts a Container, registers another inspection, requests rescue or writes a disk. A stored
+`reported` result means inspection completed; it does not mean the node is installed or admitted.
+An unavailable inspector remains unknown rather than being treated as healthy.
+
 For the current deployment, bind US1's existing original-request-correlated purchase receipt
 before preparing its bootstrap; do not issue another order. EU1 is already admitted and needs no
 bootstrap or adoption operation. The installation sequence below applies to US1 and future

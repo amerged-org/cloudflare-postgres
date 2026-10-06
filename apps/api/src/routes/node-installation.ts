@@ -6,6 +6,7 @@ import {
   NodeInstallationProfileStatus,
   NodeInstallationBindingRequest,
   NodeInstallationBindingStatus,
+  NodeInstallationInspectionStatus,
   NodeInstallationInspectionRequest,
   NodeInspectionTransportRequest,
 } from "@pgcf/contracts/node-installation";
@@ -172,6 +173,32 @@ export function registerNodeInstallation(app: ApiApp) {
       if (!row)
         throw new ApiError("not_found", "Installation binding unavailable");
       return c.json(installationBindingStatus(row));
+    },
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/nodes/additions/{id}/inspection",
+      security,
+      tags: ["Nodes"],
+      request: operation,
+      responses: responses(NodeInstallationInspectionStatus),
+    },
+    async (c) => {
+      await requireScope(c, "admin");
+      const id = OperationId.parse(c.req.param("id"));
+      const binding = await c.env.DB.prepare(
+        "SELECT 1 present FROM node_installation_bindings WHERE operation_id=?",
+      )
+        .bind(id)
+        .first<{ present: number }>();
+      if (!binding)
+        throw new ApiError("not_found", "Installation binding unavailable");
+      const status = await c.env.NODE_BOOTSTRAP.get(
+        c.env.NODE_BOOTSTRAP.idFromName(id),
+      ).inspectionStatus(id);
+      return c.json(NodeInstallationInspectionStatus.parse(status));
     },
   );
   register(

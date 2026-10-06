@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DurableObject } from "cloudflare:workers";
 import { OperationId } from "@pgcf/contracts";
+import { z } from "zod";
 import type { Env } from "./env.ts";
+import { ApiError } from "./app.ts";
 import {
   bootstrapJobInput,
   bootstrapJobStatus,
@@ -12,6 +14,10 @@ import { readNodeAddition } from "./domain/node-state.ts";
 import { hasVerifiedNodePreparation } from "./domain/node-network.ts";
 import { prepareNodeInspectionInput } from "./domain/node-inspection.ts";
 import { loadNodeInstallationBinding } from "./domain/node-installation.ts";
+import {
+  NodeInstallationInspection,
+  NodeInstallationInspectionStatus,
+} from "@pgcf/contracts/node-installation";
 import {
   NodeProofExecutionInput,
   type NodeProofMode,
@@ -87,6 +93,51 @@ async function nativeAdmissionCode(response: Response, signal: AbortSignal) {
     return command && Number(command[1]) <= 255 ? code : null;
   } catch {
     return null;
+  } finally {
+    if (abort) signal.removeEventListener("abort", abort);
+    void reader.cancel().catch(() => {});
+  }
+}
+
+const nativeInspectionStatus = NodeInstallationInspectionStatus.pick({
+  operation_id: true,
+  binding_sha256: true,
+  error_code: true,
+}).safeExtend({
+  expected_generation:
+    NodeInstallationInspectionStatus.shape.inspection_generation,
+  network_plan_sha256:
+    NodeInstallationInspectionStatus.shape.network_plan_sha256.unwrap(),
+  status: z.enum(["running", "reported", "failed"]),
+});
+async function inspectionStatusBody(response: Response, signal: AbortSignal) {
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("inspection_status_invalid");
+  let abort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    abort = () => reject(new Error("inspection_status_unavailable"));
+    signal.addEventListener("abort", abort, { once: true });
+  });
+  try {
+    const chunks: Uint8Array[] = [];
+    let length = 0;
+    for (;;) {
+      signal.throwIfAborted();
+      const part = await Promise.race([reader.read(), aborted]);
+      if (part.done) break;
+      length += part.value.byteLength;
+      if (length > 2048) throw new Error("inspection_status_invalid");
+      chunks.push(part.value);
+    }
+    const bytes = new Uint8Array(length);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return JSON.parse(
+      new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(bytes),
+    ) as unknown;
   } finally {
     if (abort) signal.removeEventListener("abort", abort);
     void reader.cancel().catch(() => {});
@@ -246,6 +297,154 @@ export class NodeBootstrap extends DurableObject<Env> {
       expected_generation: current.expected_generation,
       status: "running",
     };
+  }
+  /** Observe only the existing inspector; this never starts a Container or registers work. */
+  async inspectionStatus(operationId: string) {
+    OperationId.parse(operationId);
+    if (!this.ctx.id.equals(this.env.NODE_BOOTSTRAP.idFromName(operationId)))
+      throw new Error("bootstrap_container_identity_mismatch");
+    const binding = await loadNodeInstallationBinding(this.env, operationId);
+    if (!binding)
+      throw new ApiError("not_found", "Installation binding unavailable");
+    const { row } = binding,
+      addition = await readNodeAddition(this.env.DB, operationId),
+      plan = await this.env.DB.prepare(
+        "SELECT intent_hash,plan_sha256,status FROM node_network_preparations WHERE operation_id=?",
+      )
+        .bind(operationId)
+        .first<{ intent_hash: string; plan_sha256: string; status: string }>();
+    const base = {
+      operation_id: operationId,
+      inspection_generation: row.inspection_generation,
+      binding_sha256: row.binding_sha256,
+      network_plan_sha256: plan?.plan_sha256 ?? null,
+      observed_at: null as string | null,
+    };
+    const unavailable = (
+      error_code:
+        | "inspection_status_invalid"
+        | "inspection_status_unavailable"
+        | "inspection_server_identity_changed"
+        | "inspection_authority_closed"
+        | "inspection_input_required",
+    ) =>
+      NodeInstallationInspectionStatus.parse({
+        ...base,
+        status: "unavailable",
+        error_code,
+      });
+    if (
+      row.operation_id !== operationId ||
+      row.node_id !== addition.intent.node_id ||
+      row.region_id !== addition.intent.request.region_id ||
+      row.provider_instance_id !== addition.provider_instance_id ||
+      !plan ||
+      plan.intent_hash !== addition.intent_hash ||
+      plan.status === "blocked"
+    )
+      return unavailable("inspection_status_invalid");
+    if (row.inspection_json) {
+      const observed = NodeInstallationInspection.safeParse(
+        JSON.parse(row.inspection_json),
+      );
+      if (
+        !observed.success ||
+        observed.data.operation_id !== operationId ||
+        observed.data.node_id !== row.node_id ||
+        observed.data.region_id !== row.region_id ||
+        observed.data.provider_instance_id !== row.provider_instance_id ||
+        observed.data.profile_sha256 !== row.profile_sha256 ||
+        observed.data.binding_sha256 !== row.binding_sha256 ||
+        observed.data.network_plan_sha256 !== plan.plan_sha256
+      )
+        return unavailable("inspection_status_invalid");
+      return NodeInstallationInspectionStatus.parse({
+        ...base,
+        status: "reported",
+        error_code: null,
+        observed_at: observed.data.observed_at,
+      });
+    }
+    if (
+      !addition.slot_held ||
+      !["audited", "bootstrapping"].includes(addition.status)
+    )
+      return unavailable("inspection_authority_closed");
+    const container = this.ctx.container;
+    if (!container?.running)
+      return unavailable("inspection_status_unavailable");
+    if (
+      (await this.ctx.storage.get<string>(
+        "inspection_server_binding_sha256",
+      )) !== row.binding_sha256
+    )
+      return unavailable("inspection_server_identity_changed");
+    const signal = AbortSignal.timeout(5000);
+    let response: Response | undefined;
+    let abort: (() => void) | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+      abort = () => reject(new Error("inspection_status_unavailable"));
+      signal.addEventListener("abort", abort, { once: true });
+    });
+    try {
+      response = await Promise.race([
+        container.getTcpPort(8080).fetch(
+          new Request(`http://localhost:8080/v1/inspections/${operationId}`, {
+            headers: { Authorization: `Bearer ${binding.inspection_token}` },
+            signal,
+          }),
+        ),
+        aborted,
+      ]);
+      const raw = await inspectionStatusBody(response, signal);
+      if (
+        response.status === 404 &&
+        z
+          .strictObject({ error_code: z.literal("inspection_input_required") })
+          .safeParse(raw).success
+      )
+        return unavailable("inspection_input_required");
+      const native = nativeInspectionStatus.safeParse(raw);
+      if (
+        response.status !== 200 ||
+        !native.success ||
+        native.data.operation_id !== operationId ||
+        native.data.expected_generation !== row.inspection_generation ||
+        native.data.binding_sha256 !== row.binding_sha256 ||
+        native.data.network_plan_sha256 !== plan.plan_sha256 ||
+        (native.data.status === "failed"
+          ? native.data.error_code === null
+          : native.data.error_code !== null)
+      )
+        return unavailable("inspection_status_invalid");
+      const current = await loadNodeInstallationBinding(this.env, operationId),
+        currentPlan = await this.env.DB.prepare(
+          "SELECT plan_sha256 FROM node_network_preparations WHERE operation_id=?",
+        )
+          .bind(operationId)
+          .first<{ plan_sha256: string }>();
+      if (
+        !current ||
+        current.row.binding_sha256 !== row.binding_sha256 ||
+        current.row.inspection_generation !== row.inspection_generation ||
+        currentPlan?.plan_sha256 !== plan.plan_sha256
+      )
+        return unavailable("inspection_status_invalid");
+      return NodeInstallationInspectionStatus.parse({
+        ...base,
+        status: native.data.status,
+        error_code: native.data.error_code,
+      });
+    } catch (error) {
+      return unavailable(
+        error instanceof Error && error.message === "inspection_status_invalid"
+          ? "inspection_status_invalid"
+          : "inspection_status_unavailable",
+      );
+    } finally {
+      if (abort) signal.removeEventListener("abort", abort);
+      void response?.body?.cancel().catch(() => {});
+    }
   }
   async getProofInput(
     operationId: string,

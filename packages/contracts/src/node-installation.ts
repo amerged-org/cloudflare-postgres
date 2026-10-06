@@ -66,6 +66,90 @@ export const NodeInstallationBindingStatus = z.strictObject({
   inspection_generation: z.number().int().nonnegative(),
   inspected: z.boolean(),
 });
+/** Fixed inspection diagnostics; arbitrary native messages never become public error codes. */
+export const NodeInstallationInspectionErrorCode = z.union([
+  z.enum([
+    "inspection_cleanup_failed",
+    "inspection_client_key_invalid",
+    "inspection_command_failed",
+    "inspection_deadline_expired",
+    "inspection_deadline_invalid",
+    "inspection_disk_invalid",
+    "inspection_disk_mounted",
+    "inspection_failed",
+    "inspection_hardware_changed",
+    "inspection_host_key_mismatch",
+    "inspection_image_gpt_invalid",
+    "inspection_image_partition_bounds",
+    "inspection_image_size_invalid",
+    "inspection_installer_architecture_invalid",
+    "inspection_installer_digest_mismatch",
+    "inspection_installer_manifest_invalid",
+    "inspection_ipv6_unavailable",
+    "inspection_network_mismatch",
+    "inspection_official_source_refused",
+    "inspection_output_limit",
+    "inspection_proxy_configuration_limit",
+    "inspection_proxy_configuration_required",
+    "inspection_ram_backing_unproven",
+    "inspection_ram_insufficient",
+    "inspection_readback_invalid",
+    "inspection_registry_challenge_invalid",
+    "inspection_registry_redirect_invalid",
+    "inspection_registry_token_invalid",
+    "inspection_relay_binary_required",
+    "inspection_relay_closed",
+    "inspection_relay_failed",
+    "inspection_relay_stream_failed",
+    "inspection_report_limit",
+    "inspection_report_refused",
+    "inspection_report_unknown",
+    "inspection_response_limit",
+    "inspection_schematic_invalid",
+    "inspection_swap_active",
+    "inspection_transport_endpoint_mismatch",
+    "inspection_transport_refused",
+    "inspection_transport_target_mismatch",
+    "command_bound_invalid",
+    "command_unavailable",
+    "command_timeout",
+    "command_output_limit",
+    "job_cancelled",
+    "image_partition_count",
+    "image_partition_invalid",
+    "readback_invalid",
+    "inspection_status_unavailable",
+    "inspection_status_invalid",
+    "inspection_server_identity_changed",
+    "inspection_authority_closed",
+    "inspection_input_required",
+  ]),
+  z
+    .string()
+    .regex(
+      /^native_command_failed_(?:ssh|ssh_keygen|talosctl|kubectl|helm)_[1-9][0-9]{0,2}$/,
+    )
+    .refine((value) => Number(value.slice(value.lastIndexOf("_") + 1)) <= 255),
+]);
+export type NodeInstallationInspectionErrorCode = z.infer<
+  typeof NodeInstallationInspectionErrorCode
+>;
+export const NodeInstallationInspectionStatus = z.strictObject({
+  operation_id: OperationId,
+  inspection_generation: z
+    .number()
+    .int()
+    .nonnegative()
+    .max(Number.MAX_SAFE_INTEGER),
+  binding_sha256: Hash,
+  network_plan_sha256: Hash.nullable(),
+  status: z.enum(["unavailable", "running", "reported", "failed"]),
+  error_code: NodeInstallationInspectionErrorCode.nullable(),
+  observed_at: z.iso.datetime({ precision: 3 }).nullable(),
+});
+export type NodeInstallationInspectionStatus = z.infer<
+  typeof NodeInstallationInspectionStatus
+>;
 export const NodeInstallationInspection = z.strictObject({
   purpose: z.literal("pgcf-node-inspection/v1"),
   operation_id: OperationId,
