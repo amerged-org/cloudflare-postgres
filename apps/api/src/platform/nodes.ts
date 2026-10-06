@@ -42,6 +42,7 @@ import {
   readBootstrapJob,
 } from "../domain/bootstrap-jobs.ts";
 import { contaboClient } from "../domain/bootstrap-relay.ts";
+import { hasAllocatedContaboHardware } from "../providers/contabo.ts";
 import { ip } from "../domain/node-network.ts";
 import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
 import { runNodeCapacity } from "../domain/node-capacity.ts";
@@ -265,19 +266,14 @@ export async function configureNodeBootstrap(
     { requestId: crypto.randomUUID() },
   );
   if (
+    !hasAllocatedContaboHardware(actual) ||
     actual.id !== body.spec.provider_instance_id ||
     actual.region !== addition.audit.provider_region ||
     actual.productId !== addition.audit.product_id ||
     actual.macAddress.toLowerCase() !== body.spec.hardware.mac ||
     actual.ipConfig.v4.ip !== body.spec.hardware.ipv4 ||
     actual.ipConfig.v4.gateway !== body.spec.hardware.gateway ||
-    actual.ipConfig.v4.netmaskCidr !== body.spec.hardware.prefix_length ||
-    typeof actual.diskMb !== "number" ||
-    !Number.isFinite(actual.diskMb) ||
-    actual.diskMb <= 0 ||
-    typeof actual.ramMb !== "number" ||
-    !Number.isFinite(actual.ramMb) ||
-    actual.ramMb <= 0
+    actual.ipConfig.v4.netmaskCidr !== body.spec.hardware.prefix_length
   )
     throw new ApiError(
       "conflict",
@@ -477,6 +473,7 @@ export async function verifyNodeProof(
     proofIpv4 = ip(proof.addresses.ipv4),
     proofIpv6 = proof.addresses.ipv6 === null ? null : ip(proof.addresses.ipv6);
   if (
+    !hasAllocatedContaboHardware(actual) ||
     (actual.ipConfig.v4.ip ? ip(actual.ipConfig.v4.ip) : null) !== proofIpv4 ||
     (actual.ipConfig.v6?.ip ? ip(actual.ipConfig.v6.ip) : null) !== proofIpv6
   )

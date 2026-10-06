@@ -19,6 +19,7 @@ import { importBootstrapVerificationKeys } from "@pgcf/contracts/bootstrap-relay
 import { readNodeAddition, assertNodeRecoveryAuthority } from "./node-state.ts";
 import {
   ContaboClient,
+  hasAllocatedContaboHardware,
   type ContaboInstance,
   type ContaboFirewall,
   type ContaboFirewallRulesInput,
@@ -197,6 +198,7 @@ const family = (value: string): keyof Addresses =>
   z.ipv4().safeParse(value).success ? "ipv4" : "ipv6";
 const unique = (values: string[]) => [...new Set(values)].sort();
 function addresses(instance: ContaboInstance): Addresses {
+  if (!hasAllocatedContaboHardware(instance)) fail();
   const result = {
     ipv4: unique(
       [
@@ -212,10 +214,13 @@ function addresses(instance: ContaboInstance): Addresses {
     fail();
   return result;
 }
-const primary = (instance: ContaboInstance): Addresses => ({
-  ipv4: instance.ipConfig.v4.ip ? [ip(instance.ipConfig.v4.ip)] : [],
-  ipv6: instance.ipConfig.v6?.ip ? [ip(instance.ipConfig.v6.ip)] : [],
-});
+const primary = (instance: ContaboInstance): Addresses => {
+  if (!hasAllocatedContaboHardware(instance)) fail();
+  return {
+    ipv4: instance.ipConfig.v4.ip ? [ip(instance.ipConfig.v4.ip)] : [],
+    ipv6: instance.ipConfig.v6?.ip ? [ip(instance.ipConfig.v6.ip)] : [],
+  };
+};
 function cidr(value: string): string {
   const parts = value.split("/");
   if (

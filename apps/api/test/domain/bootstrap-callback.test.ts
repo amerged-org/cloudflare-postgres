@@ -1122,12 +1122,19 @@ describe("protected bootstrap authority", () => {
     ]);
     if (!("privateKey" in pair)) throw new Error("test_key_pair_invalid");
     const actual = {
+      status: "running",
+      macAddress: f.spec.hardware.mac,
+      cpuCores: 4,
+      ramMb: 8192,
+      diskMb: 153600,
       ipConfig: {
         v4: { ip: f.spec.hardware.ipv4 },
         v6: { ip: "2001:0DB8:0000:0000:0000:0000:0000:0042" },
       },
       additionalIps: [],
-    } as unknown as ContaboInstance;
+    } as unknown as ContaboInstance & {
+      ipConfig: NonNullable<ContaboInstance["ipConfig"]>;
+    };
     const provider = vi
         .spyOn(ContaboClient.prototype, "getInstance")
         .mockResolvedValue(actual),

@@ -58,16 +58,16 @@ const InstanceWire = z.object({
   tenantId: Short,
   customerId: Short,
   instanceId: Id,
-  name: Text,
+  name: Text.nullable(),
   displayName: z.string().max(255),
-  dataCenter: Short,
+  dataCenter: Short.nullable(),
   region: Regions,
-  regionName: Short,
+  regionName: Short.nullable(),
   productId: Short,
-  productName: Short,
+  productName: Text.max(128),
   imageId: Text.nullable().optional(),
   defaultUser: z.enum(["root", "admin", "administrator"]).optional(),
-  ipConfig: z.object({ v4: V4, v6: V6.optional() }),
+  ipConfig: z.object({ v4: V4, v6: V6.optional() }).nullable(),
   ramMb: z.number().finite().nonnegative().nullable(),
   cpuCores: Count,
   diskMb: z.number().finite().nonnegative().nullable(),
@@ -77,10 +77,10 @@ const InstanceWire = z.object({
   cancelDate: z.union([z.iso.date(), z.literal("")]).nullable(),
   status: Status,
   additionalIps: z.array(z.object({ v4: V4 })).max(100),
-  macAddress: Text,
-  vHostId: Id,
-  vHostNumber: Count,
-  vHostName: Text,
+  macAddress: Text.nullable(),
+  vHostId: Id.nullable(),
+  vHostNumber: Count.nullable(),
+  vHostName: Text.nullable(),
   addOns: z.array(AddOn).max(100),
   productType: z.enum(["hdd", "ssd", "vds", "nvme", "performance", "gpu"]),
   applicationId: Text.nullable(),
@@ -89,11 +89,11 @@ export interface ContaboInstance {
   id: string;
   tenantId: string;
   customerId: string;
-  name: string;
+  name: string | null;
   displayName: string;
-  dataCenter: string;
+  dataCenter: string | null;
   region: z.infer<typeof Regions>;
-  regionName: string;
+  regionName: string | null;
   productId: string;
   productName: string;
   imageId?: string | null;
@@ -103,7 +103,7 @@ export interface ContaboInstance {
   ramMb: number | null;
   cpuCores: number;
   diskMb: number | null;
-  macAddress: string;
+  macAddress: string | null;
   osType: string;
   applicationId: string | null;
   sshKeys?: string[];
@@ -113,6 +113,28 @@ export interface ContaboInstance {
   addOns: z.infer<typeof AddOn>[];
 }
 export type Instance = ContaboInstance;
+/** An order may exist before Contabo allocates its hardware and network. */
+export function hasAllocatedContaboHardware(
+  instance: ContaboInstance,
+): instance is ContaboInstance & {
+  ipConfig: NonNullable<ContaboInstance["ipConfig"]>;
+  macAddress: string;
+  ramMb: number;
+  diskMb: number;
+} {
+  return (
+    instance.status !== "pending_payment" &&
+    instance.ipConfig !== null &&
+    typeof instance.macAddress === "string" &&
+    typeof instance.ramMb === "number" &&
+    Number.isFinite(instance.ramMb) &&
+    instance.ramMb > 0 &&
+    typeof instance.diskMb === "number" &&
+    Number.isFinite(instance.diskMb) &&
+    instance.diskMb > 0 &&
+    instance.cpuCores > 0
+  );
+}
 const toInstance = (value: z.infer<typeof InstanceWire>): Instance => ({
   id: value.instanceId,
   tenantId: value.tenantId,

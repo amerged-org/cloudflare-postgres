@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, expect, it, vi } from "vitest";
-import { ContaboClient, ContaboError } from "../../src/providers/contabo.ts";
+import {
+  ContaboClient,
+  ContaboError,
+  hasAllocatedContaboHardware,
+} from "../../src/providers/contabo.ts";
 
 afterEach(() => vi.restoreAllMocks());
 const value = () => crypto.randomUUID();
@@ -475,6 +479,15 @@ it("preserves unallocated hardware on an actual pending-payment instance", async
         {
           ...f.instance,
           status: "pending_payment",
+          name: null,
+          dataCenter: null,
+          regionName: null,
+          productName: "",
+          ipConfig: null,
+          macAddress: null,
+          vHostId: null,
+          vHostNumber: null,
+          vHostName: null,
           cpuCores: 1,
           ramMb: null,
           diskMb: null,
@@ -483,15 +496,26 @@ it("preserves unallocated hardware on an actual pending-payment instance", async
       _links: { self: "/v1/compute/instances/" + f.instanceId },
     }),
   );
-  expect(
-    await f.client.getInstance(f.instanceId, { requestId: f.requestId }),
-  ).toMatchObject({
+  const instance = await f.client.getInstance(f.instanceId, {
+    requestId: f.requestId,
+  });
+  expect(instance).toMatchObject({
     id: f.instanceId,
     status: "pending_payment",
+    name: null,
+    dataCenter: null,
+    regionName: null,
+    productName: "",
+    ipConfig: null,
+    macAddress: null,
     cpuCores: 1,
     ramMb: null,
     diskMb: null,
   });
+  expect(hasAllocatedContaboHardware(instance)).toBe(false);
+  expect(hasAllocatedContaboHardware({ ...instance, status: "running" })).toBe(
+    false,
+  );
 });
 it("body and absolute deadline bounds fail closed without disclosing canaries", async () => {
   const f = setup();
@@ -873,7 +897,7 @@ it("instance detail exposes actual MAC and disk/network metadata without filling
   const instance = await f.client.getInstance(f.instanceId, {
     requestId: value(),
   });
-  expect(instance.ipConfig.v4).toEqual(f.instance.ipConfig.v4);
+  expect(instance.ipConfig?.v4).toEqual(f.instance.ipConfig.v4);
   expect(instance.ipConfig).not.toHaveProperty("v6");
 });
 it("instance detail preserves actual absent SSH keys and nullable cancellation/application fields", async () => {

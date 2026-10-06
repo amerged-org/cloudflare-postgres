@@ -647,8 +647,13 @@ and targeted health/overload checks. Record recovery time and last recoverable t
 - The first EU order was dispatched once. Its exact CREATED audit matches the original request
   and selected region/product/image/hostname. Contabo currently reports PENDING_PAYMENT with
   RAM and disk unallocated; this is an order receipt, not accepted 8-vCPU/24-GB/300-GB hardware.
-  Two reproducing provider tests first failed and now pass for nullable audit trace IDs and
-  unallocated RAM/disk. Installation still requires real positive hardware measurements.
+  Provider regression tests cover the complete pending-payment response: nullable audit trace
+  ID, RAM/disk, network, MAC, location/name and host metadata, plus an empty product display name.
+  The first delivered fix covered only trace/RAM/disk and did not resolve the receipt; one
+  controlled restart reached provider readback without executing a purchase step. The complete
+  correction retains unknown fields and requires allocated hardware before network/relay/install
+  actions. US remains unattempted while the original EU receipt is reconciled. The customer panel
+  currently requires owner sign-in; no invoice amount or payment has been verified there.
 - Reset-readiness audit (2026-10-06): native `cf6d5d55` is present locally with its exact source
   label and qualified private-registry readback; regional `ab678993` manifest/configuration and
   pinned Cilium/Flux assets are available over HTTPS. Both EU servers/nodes are Running/Ready;

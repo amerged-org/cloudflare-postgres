@@ -12,7 +12,10 @@ import { NodeBootstrapTransport } from "@pgcf/contracts/node-bootstrap";
 import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
-import { ContaboClient } from "../providers/contabo.ts";
+import {
+  ContaboClient,
+  hasAllocatedContaboHardware,
+} from "../providers/contabo.ts";
 import {
   bootstrapJobInput,
   admissionAuthority,
@@ -154,6 +157,7 @@ export async function issueBootstrapTransport(
     { requestId: crypto.randomUUID() },
   );
   if (
+    !hasAllocatedContaboHardware(instance) ||
     instance.id !== spec.provider_instance_id ||
     instance.region !== addition.audit.provider_region ||
     instance.productId !== addition.audit.product_id ||
