@@ -5,7 +5,12 @@ The first EU node and five Flux platform releases are Ready, with 95 GiB measure
 Its node identity, storage and protected cluster custody are preserved. The second existing EU
 VPS has passed signed network verification and admission, with 95 GiB measured capacity.
 Actual capacity demand placed databases on both EU nodes and SQL passed through Cloudflare.
-One new EU Cloud VPS 8 order exists and is pending payment; US has not yet been ordered.
+Exactly one new EU and one US-central Cloud VPS 8 order were paid and allocated with
+8 vCPU, 24,576 MiB RAM and 307,200 MiB SSD. The owner cancelled these incorrect storage
+orders; both still report rescue with a 2026-11-05 cancellation date. No installer job or
+target disk write exists. New EU1 and US1 must use 150 GB NVMe; the published API defaults
+V155 to 300 GB SSD and has no verified included-NVMe selector, so ordering awaits a verified
+path. The owner has been asked whether to use the official web shop for the replacements.
 No customer or platform production database has been migrated. The approved final topology is
 the retained EU control/relay server, one new EU customer worker and one new US regional/customer server.
 The old EU2 remains healthy until replacement readiness and verified data recovery permit removal.
@@ -19,7 +24,8 @@ zero unresolved findings. Anonymous manifest, configuration and every compressed
 layer verification passed, with 89,764,233 compressed bytes read back. Agent, both gateways and
 five platform releases remained Ready for 69.78 s. Both EU Node UIDs, all three test databases'
 namespace/Cluster/PVC/PV/Secret identities and three EU encrypted custody records are preserved.
-The management API and Edge use `ab678993`; the private bootstrap
+The Edge uses `ab678993`; the management API uses `6912e835` (CI `37465032904`)
+with the actual pending-allocation response correction. The private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
 inputs are now bound. The current native bootstrap image is
 `sha256:1b9a38a4e43ba87ef997eab71ed6799a3c4377cca00485f842e693ebac371923`
@@ -935,6 +941,17 @@ Public release polish and blank foreign-account installation acceptance follow o
 Later, extend backups and replication so that losing a server does not lose acknowledged transactions.
 Relocation of sleeping databases, branching, other VPS providers, an HTTP SQL endpoint, PostgREST,
 a Studio workbench.
+
+Latest replacement update (2026-10-06): only the 76% ten-minute actual-RAM purchase threshold
+remains approved; placements continue during rollout subject to physical RAM/CPU/storage
+guards. The isolated implementation has passed its focused D1 checks. The native image
+snapshot passed full qualification (18 layers, 714,047,406 bytes, zero unresolved findings).
+The patched PostgreSQL 18.6/pgvector 0.8.7 assembly removes the upstream unused snakeoil pair
+from a single published filesystem layer; real SQL and complete layer qualification passed.
+These local images are not yet delivered or a claim of complete headless Dev acceptance.
+An independently reviewed API correction records already-vendor-cancelled empty paid
+additions, retaining original claims/receipts and refusing jobs or installed nodes. Delivery
+and retirement of the two original additions are pending; provider deletion/refund is not claimed.
 
 ## 8. Known facts from the lab (2026-09-27 to 2026-10-01)
 

@@ -799,6 +799,60 @@ export async function markNodeAdditionFailed(
     );
   return changed(db, addition, "status='failed',failure_code=?", [code]);
 }
+/** Release only an empty paid addition after its authenticated provider cancellation was observed. */
+export async function cancelProviderCancelledNodeAddition(
+  db: D1Database,
+  addition: NodeAddition,
+  expectedRevision: number,
+): Promise<NodeAddition> {
+  revision(addition, expectedRevision);
+  if (
+    addition.intent.request.mode !== "order" ||
+    !addition.slot_held ||
+    !["audited", "provider_bound", "unknown"].includes(addition.status) ||
+    !addition.provider_instance_id ||
+    !addition.dispatch_request_id ||
+    !addition.receipt ||
+    addition.receipt.provider_instance_id !== addition.provider_instance_id ||
+    addition.receipt.request_id !== addition.dispatch_request_id ||
+    addition.checkpoint ||
+    addition.network ||
+    addition.capacity
+  )
+    throw new NodeStateError(
+      "conflict",
+      "Provider cancellation requires the unchanged original paid claim",
+    );
+  return changed(
+    db,
+    addition,
+    "status='cancelled',slot_held=0",
+    [],
+    `AND status=? AND slot_held=1 AND node_id=? AND region_id=? AND intent_hash=?
+      AND dispatch_request_id=? AND provider_instance_id=? AND receipt_json=?
+      AND audit_json IS ? AND approval_json IS ?
+      AND checkpoint_json IS NULL AND network_json IS NULL AND capacity_json IS NULL
+      AND EXISTS(SELECT 1 FROM regions r WHERE r.id=node_additions.region_id
+        AND r.provider='contabo' AND r.provider_region=?)
+      AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs j
+        WHERE j.operation_id=node_additions.operation_id OR j.node_id=node_additions.node_id)
+      AND NOT EXISTS(SELECT 1 FROM nodes n
+        WHERE n.id=node_additions.node_id OR n.provider_instance_id=node_additions.provider_instance_id)`,
+    [
+      addition.status,
+      addition.intent.node_id,
+      addition.intent.request.region_id,
+      addition.intent_hash,
+      addition.dispatch_request_id,
+      addition.provider_instance_id,
+      canonical(addition.receipt),
+      addition.audit === null ? null : canonical(addition.audit),
+      addition.approval === null ? null : canonical(addition.approval),
+      addition.intent.request.order.provider_region,
+    ],
+  );
+}
+
 export async function cancelUnattemptedNodeAddition(
   db: D1Database,
   operationId: string,

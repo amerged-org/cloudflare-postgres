@@ -19,6 +19,10 @@ import {
   NodeBootstrapCheckpoint,
 } from "@pgcf/contracts/node-bootstrap";
 import { z } from "zod";
+import {
+  cancelAlreadyCancelledProviderAddition,
+  stopCancelledNodeAdditionWorkflow,
+} from "../domain/cancel-provider-addition.ts";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
@@ -26,7 +30,6 @@ import { withIdempotency } from "../middleware/idempotency.ts";
 import { page } from "./pagination.ts";
 import {
   approveNodePurchase,
-  cancelUnattemptedNodeAddition,
   configureNodeRegionPolicy,
   readNodeAddition,
   reserveNodeAddition,
@@ -183,9 +186,13 @@ export async function cancelNodeAddition(
 ): Promise<Response> {
   await requireScope(c, "admin");
   const body = NodeRevision.parse(raw);
-  return c.json(
-    await cancelUnattemptedNodeAddition(c.env.DB, id, body.expected_revision),
+  const addition = await cancelAlreadyCancelledProviderAddition(
+    c.env,
+    id,
+    body.expected_revision,
   );
+  c.executionCtx.waitUntil(stopCancelledNodeAdditionWorkflow(c.env, id));
+  return c.json(addition);
 }
 export async function getCapacityPolicy(
   c: ApiContext,
