@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { mkdtemp, readFile, rm, stat } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
 import { BootstrapJob, canonical, digest } from "../src/bootstrap.ts";
 import { authority, fixture } from "./fixture.ts";
@@ -47,9 +50,12 @@ function coreDNSFixture() {
   return { input, current, clusterUID, material, deployment };
 }
 
-test("CoreDNS bootstrap appends only the exact quarantine toleration and reads back a lost patch response", async () => {
+test("CoreDNS bootstrap appends only the exact quarantine toleration using a private patch file and reads back a lost response", async (t) => {
   const state = coreDNSFixture();
   let patches = 0;
+  let patchFile = "";
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-coredns-test-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
   const previous = structuredClone(
     state.deployment.spec.template.spec.tolerations,
   );
@@ -63,7 +69,13 @@ test("CoreDNS bootstrap appends only the exact quarantine toleration and reads b
         };
       if (command.args.includes("patch")) {
         patches++;
-        const patch = JSON.parse(command.stdin!) as Array<{
+        patchFile = command.args
+          .find((arg) => arg.startsWith("--patch-file="))!
+          .slice("--patch-file=".length);
+        assert.equal(command.stdin, undefined);
+        assert.equal((await stat(patchFile)).mode & 0o777, 0o600);
+        assert.equal(patchFile.startsWith(`${directory}/`), true);
+        const patch = JSON.parse(await readFile(patchFile, "utf8")) as Array<{
           op: string;
           path: string;
           value?: unknown;
@@ -87,11 +99,13 @@ test("CoreDNS bootstrap appends only the exact quarantine toleration and reads b
       return { exit_code: 0, stdout: JSON.stringify(state.deployment) };
     },
   });
+  Reflect.set(job, "directory", directory);
   await Reflect.get(job, "ensureCoreDNSQuarantineToleration").call(
     job,
     state.clusterUID,
   );
   assert.equal(patches, 1);
+  await assert.rejects(readFile(patchFile), { code: "ENOENT" });
   assert.deepEqual(
     state.deployment.spec.template.spec.tolerations.slice(0, 1),
     previous,
@@ -109,8 +123,10 @@ test("CoreDNS bootstrap appends only the exact quarantine toleration and reads b
   assert.equal(patches, 1);
 });
 
-test("CoreDNS bootstrap rejects a replacement Deployment during readback", async () => {
+test("CoreDNS bootstrap rejects a replacement Deployment during readback", async (t) => {
   const state = coreDNSFixture();
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-coredns-test-"));
+  t.after(() => rm(directory, { recursive: true, force: true }));
   let patches = 0;
   const job = new BootstrapJob(state.input, {
     request: async () => Response.json(state.current),
@@ -128,6 +144,7 @@ test("CoreDNS bootstrap rejects a replacement Deployment during readback", async
       return { exit_code: 0, stdout: JSON.stringify(state.deployment) };
     },
   });
+  Reflect.set(job, "directory", directory);
   await assert.rejects(
     async () =>
       Reflect.get(job, "ensureCoreDNSQuarantineToleration").call(

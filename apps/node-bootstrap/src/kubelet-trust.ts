@@ -221,7 +221,7 @@ export async function publishKubeletTrust(
   try {
     // Atomic create cannot overwrite another map; a lost response is resolved by exact readback.
     await commands.kube(
-      ["create", "--filename=/dev/stdin", "--output=name"],
+      ["create", "--filename=-", "--output=name"],
       true,
       JSON.stringify(expected),
     );

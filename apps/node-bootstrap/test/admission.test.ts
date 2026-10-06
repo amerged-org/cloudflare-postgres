@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { randomBytes, randomUUID } from "node:crypto";
+import { readFile, stat } from "node:fs/promises";
+import { dirname } from "node:path";
 import { test } from "node:test";
 import { stringify } from "yaml";
 import {
@@ -108,6 +110,7 @@ test("authorized release reconciles a lost patch response, preserves other taint
   const state = admissionFixture();
   let current = state.current;
   let patches = 0;
+  let patchFile = "";
   const job = new BootstrapJob(state.input, {
     request: async (_url, init) => {
       const message = NodeBootstrapCallback.parse(
@@ -130,7 +133,18 @@ test("authorized release reconciles a lost patch response, preserves other taint
         };
       if (command.args.includes("patch")) {
         patches++;
-        const patch = JSON.parse(command.stdin!) as Array<{
+        patchFile = command.args
+          .find((arg) => arg.startsWith("--patch-file="))!
+          .slice("--patch-file=".length);
+        assert.equal(command.stdin, undefined);
+        assert.equal((await stat(patchFile)).mode & 0o777, 0o600);
+        assert.equal(
+          patchFile.startsWith(
+            `${dirname(command.args[command.args.indexOf("--kubeconfig") + 1]!)}/`,
+          ),
+          true,
+        );
+        const patch = JSON.parse(await readFile(patchFile, "utf8")) as Array<{
           op: string;
           path: string;
           value?: unknown;
@@ -151,6 +165,7 @@ test("authorized release reconciles a lost patch response, preserves other taint
   });
   const receipt = await job.admit();
   assert.equal(patches, 1);
+  await assert.rejects(readFile(patchFile), { code: "ENOENT" });
   assert.equal(receipt.node_uid, state.uid);
   assert.equal(receipt.previous_resource_version, "41");
   assert.equal(receipt.resource_version, "42");

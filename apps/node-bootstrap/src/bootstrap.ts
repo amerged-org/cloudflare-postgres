@@ -1482,7 +1482,12 @@ export class BootstrapJob {
         value: before.defined ? expected : [expected],
       },
     ];
+    const patchFile = join(this.directory, "coredns-quarantine-patch.json");
     try {
+      await writeFile(patchFile, JSON.stringify(patch), {
+        mode: 0o600,
+        flag: "wx",
+      });
       await this.kube(
         [
           "--namespace",
@@ -1491,14 +1496,15 @@ export class BootstrapJob {
           "deployment",
           "coredns",
           "--type=json",
-          "--patch-file=/dev/stdin",
+          `--patch-file=${patchFile}`,
           "--output=json",
         ],
         true,
-        JSON.stringify(patch),
       );
     } catch {
       /* A lost response is resolved by an authenticated read, without replay. */
+    } finally {
+      await rm(patchFile, { force: true });
     }
     const after = await read();
     if (after.uid !== before.uid)
@@ -1723,21 +1729,27 @@ export class BootstrapJob {
           },
           { op: "remove", path: `/spec/taints/${observed.quarantine.index}` },
         ];
+        const patchFile = join(this.directory, "quarantine-release-patch.json");
         try {
+          await writeFile(patchFile, JSON.stringify(patch), {
+            mode: 0o600,
+            flag: "wx",
+          });
           await this.kube(
             [
               "patch",
               "node",
               this.input.spec.hostname,
               "--type=json",
-              "--patch-file=/dev/stdin",
+              `--patch-file=${patchFile}`,
               "--output=json",
             ],
             true,
-            JSON.stringify(patch),
           );
         } catch {
           /* A lost patch response is reconciled below, without replay. */
+        } finally {
+          await rm(patchFile, { force: true });
         }
         observed = await this.admissionNode(
           binding.node_uid,

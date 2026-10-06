@@ -326,6 +326,11 @@ test("new-region installation records each intent and resolves lost native respo
     "regional_ready",
   ]);
   assert.equal(state.mutations.length, 4);
+  assert.ok(
+    state.mutations
+      .filter((args) => args.includes("apply"))
+      .every((args) => args.includes("--filename=-")),
+  );
   const before = state.mutations.length;
   await state.installer.install();
   assert.equal(state.mutations.length, before);

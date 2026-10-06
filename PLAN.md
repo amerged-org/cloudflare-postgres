@@ -11,13 +11,13 @@ The current regional image is
 `sha256:692a6c508e274d695151ce064b52fd66c5f00d5ec701c7d2adb2de89a092fdbb`
 from `e9569169`, CI `37360915487`. Image qualification and anonymous manifest,
 configuration and every layer verification passed. Agent and both gateways remained continuously
-Ready for 62.768 s. The management API uses `da004fd6` and Edge uses `b196fbaa`; the private bootstrap
+Ready for 62.768 s. The management API uses `198ac256` and Edge uses `b196fbaa`; the private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
 inputs are now bound. The current native bootstrap image is
-`sha256:53a460d205ea01df732502900333a419ad5eb1d5c346850f5bf7a3b3b51f5364`
-from `da004fd6`: qualification covered 711,911,304 bytes and 18 layers with zero unresolved
+`sha256:5437533555017b0063ab4d154fdb62d26d6957af8984cf50e9fb858b72465c11`
+from `198ac256`: qualification covered 711,912,328 bytes and 18 layers with zero unresolved
 findings, followed by exact private-registry manifest, configuration and layer readback.
-Latest complete CI `37401899511` is green. EU2 join, US installation and post-join network acceptance
+Latest complete CI `37403108103` is green. EU2 admission, US installation and post-join network acceptance
 remain outstanding. Release image signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
@@ -165,7 +165,16 @@ Container image readback. The relay reaches genuine Talos port 50000 in 4 ms, wh
 22/6443 time out despite the correct route and captured outbound resets. A narrow signed
 maintenance observation and authoritative image/checkpoint binding preserve these outcomes
 honestly; 17 API, 23 proof/hosted and five contract tests pass, with independent review.
-Its runtime delivery and real relay observation/full-proof acceptance remain pending.
+This runtime is qualified and delivered with complete private-registry readback and exact live
+instance image/completed rollout. Real relay observation and full dual-stack signed preparation
+passed; the same job applied its configuration, confirmed authenticated reboot and joined
+Kubernetes. EU2 is Ready under quarantine, with the unchanged first node and platform healthy.
+A real 1 GiB allocation/reclamation restored all free space and measured 95 GiB total, but its
+publication proof expired; no storage annotation was published. A fresh warm cycle is pending.
+Native kubelet trust-map creation is unconfirmed: exact Linux Node child stdin reproduces
+`/dev/stdin` reopening failure, while actual Dev server dry-run validates the manifest. Manifest
+`-` and private regular patch-file corrections pass four reproducing regressions and all 65
+native tests; qualification/delivery and trust-map readback remain pending.
 Expired preparation pauses progress and fresh full outside proofs resume it. The unchanged first
 node, agent, both gateways and five platform releases remain Ready. EU2 join, US installation
 and lost-worker recovery are not accepted. US remains unbought; the specific costed approval

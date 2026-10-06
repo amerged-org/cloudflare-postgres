@@ -84,6 +84,7 @@ async function stateFixture() {
   let loseResponse = false;
   let replaceNode = false;
   let creates = 0;
+  let createArgs: string[] = [];
   const reads: string[][] = [];
   const commands = {
     authorize: async () => clusterUid,
@@ -94,6 +95,7 @@ async function stateFixture() {
     },
     kube: async (args: string[], _permit_failure?: boolean, stdin?: string) => {
       if (args.includes("create")) {
+        createArgs = args;
         creates++;
         map = JSON.parse(stdin!) as Json;
         map.metadata = {
@@ -132,6 +134,7 @@ async function stateFixture() {
     reads,
     map: () => map,
     creates: () => creates,
+    createArgs: () => createArgs,
     loseResponse: () => {
       loseResponse = true;
     },
@@ -210,6 +213,7 @@ test("certificate-map creation uses only authenticated public Talos certificate 
   const state = await stateFixture();
   state.loseResponse();
   await publishKubeletTrust(state.input, state.commands);
+  assert.ok(state.createArgs().includes("--filename=-"));
   const map = state.map()!;
   assert.equal(object(map.metadata).name, `kubelet-${state.nodeUid}`);
   assert.equal(object(map.metadata).namespace, "pgcf-system");

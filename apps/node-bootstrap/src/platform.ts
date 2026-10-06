@@ -481,7 +481,7 @@ export class PlatformInstaller {
           "apply",
           "--server-side",
           "--field-manager=pgcf-node-bootstrap",
-          "--filename=/dev/stdin",
+          "--filename=-",
         ],
         false,
         objects.map((value) => stringify(value)).join("---\n"),
