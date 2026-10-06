@@ -82,6 +82,81 @@ describe("Container startup readiness", () => {
     return { f, instance, port, start };
   }
 
+  async function permitAdmission(
+    f: Awaited<ReturnType<typeof sealedRescueJob>>,
+  ) {
+    const now = new Date().toISOString(),
+      uid = crypto.randomUUID();
+    await env.DB.prepare(
+      "INSERT INTO nodes(id,region_id,k8s_node_name,provider_instance_id,node_uid,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,1,0,4096,2000,30,128,100,?,?,?)",
+    )
+      .bind(
+        f.job.node_id,
+        f.job.region_id,
+        f.body.spec.hostname,
+        f.providerId,
+        uid,
+        now,
+        now,
+        now,
+      )
+      .run();
+    let addition = await saveNodeBootstrapCheckpoint(
+      env.DB,
+      f.job.operation_id,
+      f.addition.revision,
+      {
+        stage: "joined",
+        reference: `${f.job.input_hash}:${f.job.revision}`,
+        saved_at: now,
+      },
+    );
+    const scope = {
+      operation_id: f.job.operation_id,
+      node_id: f.job.node_id,
+      intent_hash: addition.intent_hash,
+      checkpoint_reference: addition.checkpoint!.reference,
+      proof_reference: crypto.randomUUID(),
+    };
+    addition = await verifyNodeNetwork(
+      env.DB,
+      f.job.operation_id,
+      addition.revision,
+      {
+        ...scope,
+        verified_at: now,
+      },
+    );
+    await verifyNodeCapacity(env.DB, f.job.operation_id, addition.revision, {
+      ...scope,
+      observed_at: now,
+      allocatable_memory_mib: 4096,
+      allocatable_cpu_millicores: 2000,
+      storage_gib_total: 30,
+      platform_reserved_memory_mib: 128,
+      platform_reserved_cpu_millicores: 100,
+    });
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET admission_authorized=1,admission_binding_json=?,admission_expires_at=? WHERE operation_id=?",
+    )
+      .bind(
+        JSON.stringify({
+          checkpoint_revision: f.job.revision,
+          node_uid: uid,
+          resource_version: "12",
+          kube_system_uid: crypto.randomUUID(),
+          quarantine: {
+            key: "pgcf.io/quarantine",
+            value: "bootstrap",
+            effect: "NoSchedule",
+          },
+        }),
+        new Date(Date.now() + 60_000).toISOString(),
+        f.job.operation_id,
+      )
+      .run();
+  }
+
   it("waits for the actual port before sending one registration POST", async () => {
     let ready = false,
       probes = 0;
@@ -173,6 +248,68 @@ describe("Container startup readiness", () => {
     await expectJobPreserved(f);
   });
 
+  it("retains a known native refusal from one admission POST", async () => {
+    const calls: string[] = [];
+    const { f, instance } = await startup(async (request) => {
+      const target = new URL(request.url).pathname;
+      calls.push(request.method + " " + target);
+      if (request.method === "GET") return new Response(null, { status: 401 });
+      if (target === "/v1/jobs") return new Response(null, { status: 202 });
+      return Response.json({ error_code: "container_busy" }, { status: 409 });
+    });
+    await permitAdmission(f);
+    await expect(instance.admit(f.job.operation_id)).rejects.toThrow(
+      "bootstrap_admission_unconfirmed_409_container_busy",
+    );
+    expect(calls).toEqual([
+      "GET /",
+      "POST /v1/jobs",
+      "POST /v1/jobs/" + f.job.operation_id + "/admit",
+    ]);
+    await expectJobPreserved(f);
+  });
+
+  it("keeps unrecognized native response content out of admission errors", async () => {
+    const privateValue = crypto.randomUUID();
+    let admissions = 0;
+    const { f, instance } = await startup(async (request) => {
+      if (request.method === "GET") return new Response(null, { status: 401 });
+      if (new URL(request.url).pathname === "/v1/jobs")
+        return new Response(null, { status: 202 });
+      admissions++;
+      return Response.json(
+        { error_code: privateValue, message: privateValue },
+        { status: 400 },
+      );
+    });
+    await permitAdmission(f);
+    await expect(instance.admit(f.job.operation_id)).rejects.toThrow(
+      /^bootstrap_admission_unconfirmed$/,
+    );
+    expect(admissions).toBe(1);
+    await expectJobPreserved(f);
+  });
+
+  it("bounds native refusal bodies before decoding a known code", async () => {
+    let admissions = 0;
+    const { f, instance } = await startup(async (request) => {
+      if (request.method === "GET") return new Response(null, { status: 401 });
+      if (new URL(request.url).pathname === "/v1/jobs")
+        return new Response(null, { status: 202 });
+      admissions++;
+      return Response.json(
+        { error_code: "container_busy", message: "x".repeat(2048) },
+        { status: 409 },
+      );
+    });
+    await permitAdmission(f);
+    await expect(instance.admit(f.job.operation_id)).rejects.toThrow(
+      /^bootstrap_admission_unconfirmed$/,
+    );
+    expect(admissions).toBe(1);
+    await expectJobPreserved(f);
+  });
+
   it("refuses admission that expires while the port becomes ready", async () => {
     const methods: string[] = [];
     const { f, instance } = await startup(async (request) => {
@@ -184,76 +321,7 @@ describe("Container startup readiness", () => {
         .run();
       return new Response(null, { status: 401 });
     });
-    const now = new Date().toISOString(),
-      uid = crypto.randomUUID();
-    await env.DB.prepare(
-      "INSERT INTO nodes(id,region_id,k8s_node_name,provider_instance_id,node_uid,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,1,0,4096,2000,30,128,100,?,?,?)",
-    )
-      .bind(
-        f.job.node_id,
-        f.job.region_id,
-        f.body.spec.hostname,
-        f.providerId,
-        uid,
-        now,
-        now,
-        now,
-      )
-      .run();
-    let addition = await saveNodeBootstrapCheckpoint(
-      env.DB,
-      f.job.operation_id,
-      f.addition.revision,
-      {
-        stage: "joined",
-        reference: `${f.job.input_hash}:${f.job.revision}`,
-        saved_at: now,
-      },
-    );
-    const scope = {
-      operation_id: f.job.operation_id,
-      node_id: f.job.node_id,
-      intent_hash: addition.intent_hash,
-      checkpoint_reference: addition.checkpoint!.reference,
-      proof_reference: crypto.randomUUID(),
-    };
-    addition = await verifyNodeNetwork(
-      env.DB,
-      f.job.operation_id,
-      addition.revision,
-      {
-        ...scope,
-        verified_at: now,
-      },
-    );
-    await verifyNodeCapacity(env.DB, f.job.operation_id, addition.revision, {
-      ...scope,
-      observed_at: now,
-      allocatable_memory_mib: 4096,
-      allocatable_cpu_millicores: 2000,
-      storage_gib_total: 30,
-      platform_reserved_memory_mib: 128,
-      platform_reserved_cpu_millicores: 100,
-    });
-    await env.DB.prepare(
-      "UPDATE node_bootstrap_jobs SET admission_authorized=1,admission_binding_json=?,admission_expires_at=? WHERE operation_id=?",
-    )
-      .bind(
-        JSON.stringify({
-          checkpoint_revision: f.job.revision,
-          node_uid: uid,
-          resource_version: "12",
-          kube_system_uid: crypto.randomUUID(),
-          quarantine: {
-            key: "pgcf.io/quarantine",
-            value: "bootstrap",
-            effect: "NoSchedule",
-          },
-        }),
-        new Date(Date.now() + 60_000).toISOString(),
-        f.job.operation_id,
-      )
-      .run();
+    await permitAdmission(f);
     await expect(instance.admit(f.job.operation_id)).rejects.toThrow(
       "bootstrap_admission_not_authorized",
     );
