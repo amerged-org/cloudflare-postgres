@@ -81,7 +81,7 @@ function fixture(): { db: DesiredDatabase; ctx: BuildContext } {
         },
       },
       postgresImage:
-        "ghcr.io/amerged-org/pgcf-postgres@sha256:2c0b286e616191e5103f972181fee2fa7481102bf1a8c0d19154d37f961f3d2d",
+        "ghcr.io/amerged-org/pgcf-regional:postgres-sha-0cf76655e000@sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115",
       systemNamespace: "pgcf-system",
       cnpgNamespace: "cnpg-system",
       gatewaySelector: {

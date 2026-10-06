@@ -28,7 +28,7 @@ zero unresolved findings. Anonymous manifest, configuration and every compressed
 layer verification passed, with 89,764,233 compressed bytes read back. Agent, both gateways and
 five platform releases remained Ready for 69.78 s. Both EU Node UIDs, all three test databases'
 namespace/Cluster/PVC/PV/Secret identities and three EU encrypted custody records are preserved.
-The management API uses `6912e835` with complete CI `37465032904`; Edge and the regional
+The management API uses cancellation source `9a1ae0c4`, CI `37497225836`; Edge and the regional
 image remain at `ab678993`. Complete pending-payment inventory now parses without fabricating
 hardware, and configuration, network, relay and proof consumers reject unallocated resources.
 Both purchases have original-request-correlated D1 receipts; no order was replayed. The private bootstrap
@@ -69,6 +69,23 @@ The retained relay key's kid collides with the legacy verifier's different publi
 optional proof alias permits retaining both existing identities; deployment adds only its matching
 public key and identifier, with no private-key rotation. Provider NVMe selection and real US-first /
 EU automatic inspection, proof renewal, storage publication, installation and admission remain open.
+
+The private native transfer is complete from exact clean source `901b3228`: immutable manifest
+`sha256:06a1a6c938f78e64250883d6f3f063a76d029a3ee961b9a4a2456d0c4800e248`,
+config `sha256:1ac27808be59f3cacf2ee872a6199deb1424cb183829a8a9f8eac531d79b2aa4`,
+18 layers, 162,106,066 compressed and 502,782,976 raw tar bytes read back exactly. Full local
+qualification covered 714,834,399 bytes with zero unresolved findings; full source CI passed.
+One registry push occurred, with no Worker/application rollout or server action. The attachment
+permits private bootstrap storage; anonymous native access is not an acceptance gate.
+Full CI `37511566358` passed source `0cf76655`. The exact qualified PostgreSQL manifest was
+copied to the existing public runtime package under its distinct immutable `postgres-sha` tag,
+without touching regional tags or changing package permissions. Anonymous manifest/configuration
+and the complete single layer passed: 219,937,973 compressed bytes, 660,822,016 raw tar bytes,
+exact CI hashes, zero unresolved findings. Its public immutable digest is
+`sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115`.
+GitHub owner login is therefore no longer a dependency for these artifact access paths. Live
+runtime, profile activation and fresh VPS acceptance remain outstanding; NVMe API selection is
+still unverified and the owner's web-shop choice is pending.
 
 Release image signing remains Phase 5 work.
 
