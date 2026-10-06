@@ -13,6 +13,7 @@ import {
   NodeBootstrapCallback,
   NodeBootstrapAuthority,
   NodeBootstrapInput,
+  NodeBootstrapCheckpoint,
   NodeBootstrapSpec,
   NodeJoinBundle,
 } from "@pgcf/contracts/node-bootstrap";
@@ -33,6 +34,54 @@ import {
 } from "../src/bootstrap.ts";
 
 import { authority, fixture, platformFixture } from "./fixture.ts";
+
+test("native failures expose only a known executable and bounded exit code", async () => {
+  const input = fixture();
+  const sensitive = input.rescue.ssh_private_key;
+  let exit_code = 255;
+  const job = new BootstrapJob(input, {
+    run: async () => ({ exit_code, stdout: sensitive }),
+  });
+  Reflect.set(job, "env", { PRIVATE_KEY: sensitive });
+  const execute = (executable: string, permit_failure = false) =>
+    Reflect.get(job, "execute").call(
+      job,
+      executable,
+      [sensitive],
+      sensitive,
+      permit_failure,
+    );
+  await assert.rejects(execute("ssh"), (error: unknown) => {
+    assert.ok(error instanceof BootstrapError);
+    assert.equal(error.code, "native_command_failed_ssh_255");
+    assert.equal(error.message, error.code);
+    assert.ok(!JSON.stringify(error).includes(sensitive));
+    assert.equal(
+      NodeBootstrapCheckpoint.parse({
+        ...authority(input).checkpoint,
+        error_code: error.code,
+      }).error_code,
+      error.code,
+    );
+    return true;
+  });
+  exit_code = 1;
+  await assert.rejects(execute("ssh"), {
+    code: "native_command_failed_ssh_1",
+  });
+  await assert.rejects(execute("ssh-keygen"), {
+    code: "native_command_failed_ssh_keygen_1",
+  });
+  await assert.rejects(execute(sensitive), {
+    code: "native_command_failed",
+  });
+  exit_code = 256;
+  await assert.rejects(execute("ssh"), { code: "native_command_failed" });
+  assert.deepEqual(await execute("ssh", true), {
+    exit_code,
+    stdout: sensitive,
+  });
+});
 
 async function installationMustRemainReadOnly(
   stage: "quarantine_release_intent" | "quarantine_released",

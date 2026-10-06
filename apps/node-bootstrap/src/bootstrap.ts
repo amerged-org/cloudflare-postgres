@@ -677,8 +677,20 @@ export class BootstrapJob {
       env: this.env,
       ...(stdin === undefined ? {} : { stdin }),
     });
-    if (result.exit_code && !permit_failure)
-      throw new BootstrapError("native_command_failed");
+    if (result.exit_code && !permit_failure) {
+      const bounded =
+        ["ssh", "ssh-keygen", "talosctl", "kubectl", "helm"].includes(
+          executable,
+        ) &&
+        Number.isInteger(result.exit_code) &&
+        result.exit_code >= 1 &&
+        result.exit_code <= 255;
+      throw new BootstrapError(
+        bounded
+          ? `native_command_failed_${executable.replaceAll("-", "_")}_${result.exit_code}`
+          : "native_command_failed",
+      );
+    }
     return result;
   }
   private async ssh(script: string, permit_failure = false) {
