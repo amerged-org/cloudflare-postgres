@@ -39,7 +39,7 @@ export const DatabaseName = z
   .meta({ id: "DatabaseName" });
 const ExternalId = z.string().min(1).max(200);
 const HttpUrl = z.url({ protocol: /^https?$/ }).max(2048);
-const HttpsUrl = z.url({ protocol: /^https$/ }).max(2048);
+export const HttpsUrl = z.url({ protocol: /^https$/ }).max(2048);
 export const BucketName = z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/);
 const ProviderName = z.string().regex(/^[a-z][a-z0-9-]{1,31}$/);
 
@@ -334,11 +334,16 @@ export type DatabaseResize = z.infer<typeof DatabaseResize>;
 
 export const DatabaseRestore = z
   .discriminatedUnion("mode", [
-    z.strictObject({ mode: z.literal("full"), name: DatabaseName }),
+    z.strictObject({
+      mode: z.literal("full"),
+      name: DatabaseName,
+      region_id: RegionId.optional(),
+    }),
     z.strictObject({
       mode: z.literal("pitr"),
       name: DatabaseName,
       target_time: Timestamp,
+      region_id: RegionId.optional(),
     }),
   ])
   .meta({ id: "DatabaseRestore" });

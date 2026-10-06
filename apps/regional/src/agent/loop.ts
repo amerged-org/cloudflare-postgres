@@ -13,6 +13,7 @@ import {
   orphanObservations,
 } from "./observe.ts";
 import { backupCredentials, Reconciler } from "./reconcile.ts";
+import { recoveryBuildContext } from "./recovery.ts";
 import type { Kubernetes, Log } from "./types.ts";
 import type { RegionalMeasurements } from "./measurements.ts";
 import {
@@ -144,7 +145,9 @@ export class AgentLoop {
         try {
           const observation = await this.reconcile.reconcile(
             db,
-            db.desired_state === "running" ? await buildContext() : undefined,
+            db.desired_state === "running"
+              ? await recoveryBuildContext(db, await buildContext(), this.k8s)
+              : undefined,
           );
           this.retries.delete(db.id);
           if (observation) observations.push(observation);

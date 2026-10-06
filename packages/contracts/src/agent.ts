@@ -5,6 +5,7 @@ import { UsageSample } from "./usage.ts";
 import { ProviderInstanceId } from "./nodes.ts";
 import {
   BucketName,
+  HttpsUrl,
   OperationStatus,
   Timestamp,
   TEXT_MAX_LENGTH,
@@ -99,11 +100,35 @@ export const DesiredCreation = z.strictObject({
 });
 export type DesiredCreation = z.infer<typeof DesiredCreation>;
 
+export const RecoverySourceArchive = z.strictObject({
+  region_id: RegionId,
+  bucket: BucketName,
+  endpoint_url: HttpsUrl,
+  region: z.literal("auto"),
+});
+export type RecoverySourceArchive = z.infer<typeof RecoverySourceArchive>;
+const ArchiveCredential = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine((value) => !/[\r\n\0]/.test(value));
+/** Operator-installed regional read credentials; never included in agent desired state. */
+export const RecoverySourceCredentialsMap = z.record(
+  RegionId,
+  z.strictObject({
+    bucket: BucketName,
+    endpoint_url: HttpsUrl,
+    access_key_id: ArchiveCredential,
+    secret_access_key: ArchiveCredential,
+  }),
+);
+
 export const DesiredRecovery = z.strictObject({
   operation_id: OperationId,
   source_database_id: DatabaseId,
   source_archive_path: z.string().regex(ARCHIVE_DESTINATION_PATTERN),
   source_storage_generation: z.number().int().positive(),
+  source_archive: RecoverySourceArchive.optional(),
   backup_id: z.string().regex(/^[0-9]{8}T[0-9]{6}$/),
   target_time: Timestamp.optional(),
   status: OperationStatus,
@@ -188,8 +213,8 @@ export const DesiredDatabase = z
         !source ||
         source[3] !== db.recovery.source_database_id ||
         Number(source[4]) !== db.recovery.source_storage_generation ||
-        source[1] !== match?.[1] ||
-        source[2] !== match?.[2] ||
+        source[1] !== (db.recovery.source_archive?.bucket ?? match?.[1]) ||
+        source[2] !== (db.recovery.source_archive?.region_id ?? match?.[2]) ||
         db.recovery.source_database_id === db.id ||
         db.recovery.operation_id !== match?.[5] ||
         db.creation
@@ -198,7 +223,7 @@ export const DesiredDatabase = z
           code: "custom",
           path: ["recovery"],
           message:
-            "Recovery must use a separate target in the same archive region and bucket",
+            "Recovery must bind a separate target and its exact source archive identity",
         });
       }
     }

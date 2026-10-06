@@ -43,11 +43,61 @@ Secret, then check its real use before revoking the old value. R2 requires an ac
 WAL archive and restore read. A regional Tunnel requires Ready connectors and a real database
 connection. Contabo requires an authenticated inventory read; changing credentials must never
 issue a test order. Restore administration is tied to the current regional R2 credential, so do
-not change it during an unfinished restore.
+not change the target region's `pgcf-backup-s3` credential during an unfinished restore.
 
 Record changed key IDs, dates and successful checks in private custody. Refresh the encrypted
 operator backup and its independent offline copy. Do not record secret values in `PLAN.md`, Git,
 logs or incident messages.
+
+### Cross-region restore source credentials
+
+After the target region's ordinary bootstrap, before its first cross-region restore, install
+`pgcf-system/pgcf-restore-source-s3` in that regional Kubernetes cluster. Its `data.sources.json`
+value is base64-encoded JSON keyed by source region ID. Each value binds a bucket-scoped read-only
+credential to that source's exact archive bucket and HTTPS endpoint. The API Worker holds no
+copy of this S3 map.
+
+Prepare this JSON in owner-only private custody, replacing every placeholder:
+
+```json
+{
+  "<source-region-id>": {
+    "bucket": "<source-archive-bucket>",
+    "endpoint_url": "https://<source-r2-endpoint-host>",
+    "access_key_id": "<source-read-only-access-key-id>",
+    "secret_access_key": "<source-read-only-secret-access-key>"
+  }
+}
+```
+
+Encode the private JSON without printing it and apply this Secret through the authenticated
+target Kubernetes API:
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: pgcf-restore-source-s3
+  namespace: pgcf-system
+type: Opaque
+data:
+  sources.json: <base64-of-private-source-map>
+```
+
+Verify privately that the installed entry matches the source region's actual bucket and endpoint,
+then check a real restore read before retiring an old credential. The agent copies only the
+selected source entry into the target database's separate `recovery-source-credentials` Secret.
+Keep the target's ordinary `pgcf-backup-s3` write credentials unchanged; its own backups and
+temporary restore administration use those target credentials. The namespace permits HTTPS
+egress to the exact configured source and target R2 endpoint hosts. A same-region restore uses
+the ordinary regional credential and needs no source-map entry.
+
+Keep the source-read credential and map entry while any non-deleted restored target references
+that source region. This includes successful, promoted targets: their recovery metadata persists
+and the current reconciler still verifies the source ObjectStore on every running reconciliation.
+SQL completion alone does not authorize removing the entry. Remove it only after all referencing
+targets are deleted and it is no longer needed for planned archive recovery. Preserve private
+custody and the operator backup; never commit the JSON, encoded Secret or credential values.
 
 ## Talos and Kubernetes material
 

@@ -36,3 +36,42 @@ export function recoveryFixture() {
   };
   return f;
 }
+
+export function crossRegionRecoveryFixture() {
+  const f = recoveryFixture();
+  const source = {
+    region_id: "eu-test",
+    bucket: f.ctx.backup.bucket,
+    endpoint_url: f.ctx.backup.endpointUrl,
+    region: "auto" as const,
+  };
+  Object.assign(f.db.recovery!, { source_archive: source });
+  f.ctx.backup = {
+    ...f.ctx.backup,
+    bucket: "pgcf-backups-target",
+    endpointUrl: "https://target.r2.cloudflarestorage.com",
+    credentials: {
+      accessKeyId: "target-write-key",
+      secretAccessKey: "target-write-secret",
+    },
+  };
+  f.db.archive.destination_path = archiveDestinationPath(
+    f.ctx.backup.bucket,
+    "us-test",
+    f.db.id,
+    2,
+    f.db.recovery!.operation_id,
+  );
+  const ctx = Object.assign(f.ctx, {
+    recoverySource: {
+      bucket: source.bucket,
+      endpointUrl: source.endpoint_url,
+      region: "auto" as const,
+      credentials: {
+        accessKeyId: "source-read-key",
+        secretAccessKey: "source-read-secret",
+      },
+    },
+  });
+  return { ...f, ctx, source };
+}

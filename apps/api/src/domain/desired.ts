@@ -35,6 +35,9 @@ interface DesiredRow extends DatabaseRow, DesiredSize {
   backup_id: string | null;
   target_time: string | null;
   restore_status: DesiredRecovery["status"] | null;
+  source_region_id: string | null;
+  source_backup_bucket: string | null;
+  source_backup_endpoint_url: string | null;
 }
 export async function desired(
   c: ApiContext,
@@ -47,12 +50,15 @@ export async function desired(
     o.id creation_operation_id,o.generation creation_generation,o.status creation_status,
     EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready,
     m.password_ciphertext maintenance_ciphertext,m.password_iv maintenance_iv,m.password_kid maintenance_kid,m.password_revision maintenance_revision,
-    x.operation_id restore_operation_id,x.source_database_id,x.source_archive_path,x.source_storage_generation,x.backup_id,x.target_time,ro.status restore_status
+    x.operation_id restore_operation_id,x.source_database_id,x.source_archive_path,x.source_storage_generation,x.backup_id,x.target_time,ro.status restore_status,
+    src.region_id source_region_id,sr.backup_bucket source_backup_bucket,sr.backup_endpoint_url source_backup_endpoint_url
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
     LEFT JOIN operations o ON o.id=substr(d.archive_path,-23) AND o.kind='database.create' AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation
     LEFT JOIN maintenance_credentials m ON m.database_id=d.id
     LEFT JOIN database_restores x ON x.target_database_id=d.id
     LEFT JOIN operations ro ON ro.id=x.operation_id AND ro.database_id=d.id AND ro.kind='database.restore'
+    LEFT JOIN databases src ON src.id=x.source_database_id AND src.project_id=d.project_id
+    LEFT JOIN regions sr ON sr.id=src.region_id
     WHERE d.region_id=? AND d.node_id IS NOT NULL AND (d.desired_state='deleted' OR (n.schedulable=1 AND n.lost_at IS NULL)) AND d.desired_state IN('running','suspended','deleted') AND (d.desired_state<>'suspended' OR d.power_operation IS NOT NULL) AND NOT(d.desired_state='deleted' AND d.observed_state='deleted' AND d.observed_generation=d.generation)
     ${query.after ? "AND d.id>?" : ""} ORDER BY d.id LIMIT ?`,
   )
@@ -105,6 +111,16 @@ export async function desired(
                 source_database_id: row.source_database_id,
                 source_archive_path: row.source_archive_path,
                 source_storage_generation: row.source_storage_generation,
+                ...(row.source_region_id !== row.region_id
+                  ? {
+                      source_archive: {
+                        region_id: row.source_region_id,
+                        bucket: row.source_backup_bucket,
+                        endpoint_url: row.source_backup_endpoint_url,
+                        region: "auto",
+                      },
+                    }
+                  : {}),
                 backup_id: row.backup_id,
                 ...(row.target_time ? { target_time: row.target_time } : {}),
                 status: row.restore_status,

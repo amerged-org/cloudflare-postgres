@@ -17,6 +17,7 @@ import type { Env } from "../../src/env.ts";
 import { cleanupRetainedArchives } from "../../src/domain/retained-archives.ts";
 import { keyring } from "../../src/crypto/keyring.ts";
 import type { RoleRow } from "../../src/domain/rows.ts";
+import { archiveDestinationPath, newNodeId } from "@pgcf/contracts";
 const keys: string[] = [];
 afterEach(async () => {
   if (keys.length) await env.ARCHIVE.delete(keys.splice(0));
@@ -66,6 +67,134 @@ async function archived() {
     before,
   };
 }
+it("restores a source catalog into a separate target region without changing source placement or credentials", async () => {
+  const f = await archived(),
+    targetNode = newNodeId(),
+    now = new Date().toISOString(),
+    bucket = "pgcf-api-us-test";
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE regions SET backup_bucket=?,backup_endpoint_url=? WHERE id=?",
+    ).bind(bucket, "https://target.r2.cloudflarestorage.com", f.foreign),
+    env.DB.prepare(
+      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,1,1,4096,2000,30,128,100,?,?,?)",
+    ).bind(targetNode, f.foreign, "restore-target-node", now, now, now),
+  ]);
+  const mapping = {
+    ARCHIVE_BINDINGS: JSON.stringify({
+      [f.region]: { binding: "ARCHIVE", bucket: env.ARCHIVE_BUCKET_NAME },
+      [f.foreign]: { binding: "ARCHIVE_US", bucket },
+    }),
+  };
+  const source = await env.DB.prepare("SELECT * FROM databases WHERE id=?")
+    .bind(f.id)
+    .first();
+  const body = {
+      mode: "full",
+      name: "cross-region-restored",
+      region_id: f.foreign,
+    },
+    path = `/v1/databases/${f.id}/restore`;
+  const response = await overridden(
+    path,
+    f.integrator,
+    body,
+    mapping,
+    "cross-region-restore",
+  );
+  expect(response.status).toBe(202);
+  const result = await response.json<{
+    target_database: { id: string; region_id: string };
+    operation: { id: string };
+  }>();
+  expect(result.target_database.region_id).toBe(f.foreign);
+  const target = await env.DB.prepare(
+    "SELECT region_id,node_id,archive_path,storage_generation FROM databases WHERE id=?",
+  )
+    .bind(result.target_database.id)
+    .first();
+  expect(target).toEqual({
+    region_id: f.foreign,
+    node_id: targetNode,
+    archive_path: archiveDestinationPath(
+      bucket,
+      f.foreign,
+      result.target_database.id,
+      2,
+      result.operation.id,
+    ),
+    storage_generation: 2,
+  });
+  expect(
+    await env.DB.prepare("SELECT * FROM databases WHERE id=?")
+      .bind(f.id)
+      .first(),
+  ).toEqual(source);
+  const replay = await overridden(
+    path,
+    f.integrator,
+    body,
+    mapping,
+    "cross-region-restore",
+  );
+  expect(await replay.json()).toEqual(result);
+  expect(
+    (
+      await overridden(
+        path,
+        f.integrator,
+        { ...body, region_id: f.region },
+        mapping,
+        "cross-region-restore",
+      )
+    ).status,
+  ).toBe(409);
+  const desired = await overridden(
+    "/agent/v1/desired",
+    f.foreignAgent,
+    undefined,
+    mapping,
+    "unused",
+    "GET",
+  );
+  const page = await desired.json<{
+    databases: { id: string; recovery: { source_archive: unknown } }[];
+  }>();
+  expect(
+    page.databases.find((d) => d.id === result.target_database.id)?.recovery
+      .source_archive,
+  ).toEqual({
+    region_id: f.region,
+    bucket: env.ARCHIVE_BUCKET_NAME,
+    endpoint_url: "https://archive.invalid",
+    region: "auto",
+  });
+  const originalDesired = await overridden(
+    "/agent/v1/desired",
+    f.agent,
+    undefined,
+    mapping,
+    "unused",
+    "GET",
+  );
+  expect(
+    (
+      await originalDesired.json<{ databases: { id: string }[] }>()
+    ).databases.some((d) => d.id === result.target_database.id),
+  ).toBe(false);
+  expect(
+    (
+      await overridden(
+        path,
+        f.integrator,
+        { ...body, name: "missing-target", region_id: "missing-test" },
+        mapping,
+        "missing-target-region",
+      )
+    ).status,
+  ).toBe(409);
+});
+
 it("restores into one separate target on replay with credentials encrypted for its ID", async () => {
   const f = await archived();
   const body = { mode: "full", name: "restored" };
@@ -163,7 +292,7 @@ it("restores into one separate target on replay with credentials encrypted for i
       .first(),
   ).toEqual({ desired_state: "running" });
 });
-it("retains deleted-source restore authority and rejects another tenant, region and expired archive", async () => {
+it("retains deleted-source restore authority and rejects another tenant, missing region and expired archive", async () => {
   const f = await archived();
   expect(
     (await request(`/v1/databases/${f.id}`, f.integrator, "DELETE")).status,
@@ -181,10 +310,10 @@ it("retains deleted-source restore authority and rejects another tenant, region 
       await request(`/v1/databases/${f.id}/restore`, f.integrator, "POST", {
         mode: "full",
         name: "wrong-region",
-        region_id: f.foreign,
+        region_id: "missing-test",
       })
     ).status,
-  ).toBe(400);
+  ).toBe(409);
   expect(
     (
       await request(`/v1/databases/${f.id}/restore`, f.integrator, "POST", {
@@ -245,17 +374,18 @@ async function overridden(
   body: unknown,
   override: Partial<Env>,
   idempotency: string,
+  method = "POST",
 ) {
   const ctx = createExecutionContext();
   const result = await createApp().fetch(
     new Request(new URL(path, `https://${["api", "invalid"].join(".")}`), {
-      method: "POST",
+      method,
       headers: {
         Authorization: `Bearer ${key}`,
         "Content-Type": "application/json",
         "Idempotency-Key": idempotency,
       },
-      body: JSON.stringify(body),
+      ...(method === "GET" ? {} : { body: JSON.stringify(body) }),
     }),
     { ...env, ...override } as Env,
     ctx,

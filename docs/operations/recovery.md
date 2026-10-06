@@ -12,13 +12,20 @@ commit in `PLAN.md` after each real drill.
 2. Submit `POST /v1/databases/{source-id}/restore` with a persistent `Idempotency-Key` and either
    `{"mode":"full","name":"recovered"}` or
    `{"mode":"pitr","name":"recovered","target_time":"<UTC timestamp>"}`.
+   Optional `region_id` selects a target region; omission keeps the source region. For example,
+   `{"mode":"full","name":"recovered","region_id":"<target-region-id>"}` restores into healthy
+   capacity in that region after the source-read credentials below have been installed.
 3. Save the returned target ID and operation ID. Repeating the same request and key returns the
    same target; a transport failure does not justify issuing a new key or replaying SQL writes.
 4. Poll the operation. The source stays unchanged. The target uses new storage and its own
-   archive path; its configuration revision is independent of its storage generation.
+   region's bucket, endpoint and archive path; its configuration revision is independent of its
+   storage generation. Source backup/WAL selection still uses the source region's catalog and
+   bucket, including when the source has been deleted.
 5. Ready requires recovery promotion, SQL database-name mapping, actual role/settings and volume
    checks, and removal of the temporary restore administrator. Authenticate to the target over
    the normal endpoint and compare the required tables, roles, sequences and committed markers.
+   Confirm promotion by writing a new target marker, then obtain a completed base backup and
+   archived WAL in the target's own archive. Source credentials must not write those objects.
 6. Switch the adopter's connection only after these checks. Once writes reach the target, do not
    switch back to an older source without reconciling those writes.
 
@@ -30,6 +37,28 @@ to simulate expiration.
 The v1 catalog is limited to 16 pages, 16,000 objects, 64 backup metadata files and 64 KiB per
 metadata file. A newer WAL timeline needs a completed base backup on that timeline. Unsupported,
 missing or ambiguous coverage is refused rather than creating an empty database.
+
+### Cross-region source access
+
+Complete the target region's ordinary bootstrap and capacity admission first. Before requesting
+the restore, install the private source-read map described in
+[the credential runbook](credentials.md#cross-region-restore-source-credentials) in the target
+regional cluster. It binds the source region ID to the exact source bucket, HTTPS endpoint and
+bucket-scoped read-only S3 credential. The management API keeps no S3 credential map; its source
+catalog reads use the source region's R2 binding.
+
+The agent creates a separate `recovery-source-credentials` Secret in the target database namespace
+and a recovery-source ObjectStore for the original archive. The target's `pgcf-backup-s3` write
+credential, archive identity and temporary administration HMAC remain tied to the target region.
+Database egress allows HTTPS only to the exact configured source and target R2 endpoint hosts,
+alongside the existing DNS and Kubernetes API rules. Do not widen egress to arbitrary R2 hosts.
+The default same-region restore needs no cross-region source map.
+
+Cross-region acceptance requires a real Dev run: verify the source commit markers over the normal
+Cloudflare SQL endpoint, promotion, nonsuperuser application access, removal of temporary
+administration and a new target backup/WAL archive. Record duration and the last restored commit
+in `PLAN.md`; configuration or local checks alone do not establish acceptance. Preserve source
+data, archives and physical identities until an explicitly authorized loss drill or cleanup.
 
 ## Lost node
 
@@ -144,7 +173,10 @@ An etcd snapshot helps recover Kubernetes configuration, but it does not recreat
 PostgreSQL volumes. Validate SQL and routing before opening traffic.
 
 The D1 export/local restore rehearsal and API full restore/PITR/deleted-source acceptance are
-recorded in `PLAN.md`. Operator completion still requires one real existing-resource worker-loss
-recovery, including infrastructure rejoin, SQL verification, physical storage reclamation,
-recovery duration and the last recoverable transaction. A complete regional control-plane loss
-drill is outside the current customer-free completion gate.
+recorded in `PLAN.md`. The current completion drill installs and admits US1, then fences the exact
+EU2 worker and restores its disposable source from the EU R2 archive into a separate US1 target.
+Verify SQL, recovered markers, recovery duration and the last recoverable transaction before
+recovering infrastructure on the same existing EU2 provider with a new logical identity. Verify
+physical reclamation of the exact old LV identities and return to two EU nodes plus one US node.
+Keep the source healthy until US1 is ready and the scoped source-read credential map is installed.
+A complete regional control-plane loss drill remains outside this customer-free completion gate.

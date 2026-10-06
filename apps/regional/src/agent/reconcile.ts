@@ -631,6 +631,14 @@ export class Reconciler {
           db.recovery.source_storage_generation,
           db.recovery.backup_id,
           db.recovery.target_time ?? null,
+          ...(db.recovery.source_archive
+            ? [
+                db.recovery.source_archive.region_id,
+                db.recovery.source_archive.bucket,
+                db.recovery.source_archive.endpoint_url,
+                db.recovery.source_archive.region,
+              ]
+            : []),
         ])
       : undefined;
     if (
@@ -1790,7 +1798,8 @@ export class Reconciler {
       return false;
     if (
       manifest.kind === "Secret" &&
-      credentialSecretMatches(db, current) &&
+      (credentialSecretMatches(db, current) ||
+        manifest.metadata.name === "recovery-source-credentials") &&
       containsDesired(current.metadata.labels, metadata.labels) &&
       containsDesired(
         current.metadata.annotations,

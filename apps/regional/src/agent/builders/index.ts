@@ -26,6 +26,7 @@ export interface BuildContext {
     region: "auto";
     credentials: { accessKeyId: string; secretAccessKey: string };
   };
+  recoverySource?: BuildContext["backup"];
   postgresImage: string;
   systemNamespace: "pgcf-system";
   cnpgNamespace: "cnpg-system";
@@ -43,6 +44,7 @@ const BARMAN_PLUGIN = "barman-cloud.cloudnative-pg.io";
 const CLUSTER_NAME = "database";
 const ARCHIVE_NAME = "archive";
 const ARCHIVE_SECRET = "archive-credentials";
+const RECOVERY_SOURCE_SECRET = "recovery-source-credentials";
 const MAINTENANCE_SECRET = "maintenance-credentials";
 
 function barmanSidecarConfiguration(ctx: BuildContext) {
@@ -178,6 +180,27 @@ export function buildDatabaseManifests(
   }
   const db = parsed.data;
   const endpoint = validateContext(ctx);
+  let recoveryEndpoint = endpoint;
+  const sourceArchive = db.recovery?.source_archive;
+  if (sourceArchive) {
+    if (
+      !ctx.recoverySource ||
+      ctx.recoverySource.bucket !== sourceArchive.bucket ||
+      ctx.recoverySource.endpointUrl !== sourceArchive.endpoint_url ||
+      ctx.recoverySource.region !== sourceArchive.region
+    )
+      throw new TypeError(
+        "recovery source context does not match desired archive",
+      );
+    try {
+      recoveryEndpoint = validateContext({
+        ...ctx,
+        backup: ctx.recoverySource,
+      });
+    } catch {
+      throw new TypeError("invalid recovery source context");
+    }
+  }
   const archivePath = ARCHIVE_DESTINATION_PATTERN.exec(
     db.archive.destination_path,
   );
@@ -410,7 +433,9 @@ export function buildDatabaseManifests(
             ],
           },
           {
-            toFQDNs: [{ matchName: endpoint.hostname }],
+            toFQDNs: [
+              ...new Set([endpoint.hostname, recoveryEndpoint.hostname]),
+            ].map((matchName) => ({ matchName })),
             toPorts: [{ ports: [{ port: "443", protocol: "TCP" }] }],
           },
         ],
@@ -490,6 +515,26 @@ export function buildDatabaseManifests(
     },
     ...(db.recovery
       ? [
+          ...(sourceArchive
+            ? [
+                {
+                  apiVersion: "v1",
+                  kind: "Secret",
+                  metadata: metadata(RECOVERY_SOURCE_SECRET),
+                  type: "Opaque",
+                  data: {
+                    AWS_ACCESS_KEY_ID: Buffer.from(
+                      ctx.recoverySource!.credentials.accessKeyId,
+                      "utf8",
+                    ).toString("base64"),
+                    AWS_SECRET_ACCESS_KEY: Buffer.from(
+                      ctx.recoverySource!.credentials.secretAccessKey,
+                      "utf8",
+                    ).toString("base64"),
+                  },
+                },
+              ]
+            : []),
           {
             apiVersion: "barmancloud.cnpg.io/v1",
             kind: "ObjectStore",
@@ -497,14 +542,20 @@ export function buildDatabaseManifests(
             spec: {
               configuration: {
                 destinationPath: db.recovery.source_archive_path,
-                endpointURL: ctx.backup.endpointUrl,
+                endpointURL: sourceArchive
+                  ? ctx.recoverySource!.endpointUrl
+                  : ctx.backup.endpointUrl,
                 s3Credentials: {
                   accessKeyId: {
-                    name: ARCHIVE_SECRET,
+                    name: sourceArchive
+                      ? RECOVERY_SOURCE_SECRET
+                      : ARCHIVE_SECRET,
                     key: "AWS_ACCESS_KEY_ID",
                   },
                   secretAccessKey: {
-                    name: ARCHIVE_SECRET,
+                    name: sourceArchive
+                      ? RECOVERY_SOURCE_SECRET
+                      : ARCHIVE_SECRET,
                     key: "AWS_SECRET_ACCESS_KEY",
                   },
                 },

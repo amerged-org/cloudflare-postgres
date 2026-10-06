@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
-import type { DesiredResponse } from "@pgcf/contracts";
+import type { DesiredResponse, DesiredDatabase } from "@pgcf/contracts";
+import type { BuildContext } from "../../src/agent/builders/index.ts";
 import { AgentLoop } from "../../src/agent/loop.ts";
+import { Reconciler } from "../../src/agent/reconcile.ts";
+import { crossRegionRecoveryFixture } from "./recovery-fixture.ts";
 import type { PowerCoordinator } from "../../src/agent/power.ts";
 import {
   fixture,
@@ -10,6 +13,78 @@ import {
   metrics,
   authenticate,
 } from "./fixtures.ts";
+
+test("a cross-region restore selects only its exact configured source-read map before reconciliation", async (t) => {
+  const { db, ctx, source } = crossRegionRecoveryFixture(),
+    k8s = new MemoryKubernetes();
+  k8s.backupSecret(ctx);
+  const secret = (endpoint = source.endpoint_url) =>
+    k8s.put({
+      apiVersion: "v1",
+      kind: "Secret",
+      metadata: { name: "pgcf-restore-source-s3", namespace: "pgcf-system" },
+      data: {
+        "sources.json": Buffer.from(
+          JSON.stringify({
+            [source.region_id]: {
+              bucket: source.bucket,
+              endpoint_url: endpoint,
+              access_key_id: "source-read-key",
+              secret_access_key: "source-read-secret",
+            },
+          }),
+        ).toString("base64"),
+      },
+    });
+  secret();
+  const observed: unknown[] = [];
+  t.mock.method(
+    Reconciler.prototype,
+    "reconcile",
+    async (_db: DesiredDatabase, context?: BuildContext) => {
+      observed.push(context);
+      return null;
+    },
+  );
+  const desired = {
+    region: {
+      id: "us-test",
+      backup: {
+        bucket: ctx.backup.bucket,
+        endpoint_url: ctx.backup.endpointUrl,
+        region: "auto" as const,
+      },
+    },
+    databases: [db],
+    next: null,
+  };
+  const run = () =>
+    new AgentLoop(
+      { desired: async () => desired, observations: async () => {} },
+      k8s,
+      ctx.postgresImage,
+      new AbortController().signal,
+      () => {},
+    ).cycle();
+  await run();
+  assert.deepEqual(
+    (observed[0] as typeof ctx).recoverySource,
+    ctx.recoverySource,
+  );
+  assert.deepEqual(
+    (observed[0] as typeof ctx).backup.credentials,
+    ctx.backup.credentials,
+  );
+  secret("https://foreign.r2.cloudflarestorage.com");
+  await run();
+  assert.equal(observed.length, 1);
+  k8s.resources.delete(
+    k8s.key("Secret", "pgcf-system", "pgcf-restore-source-s3"),
+  );
+  await run();
+  assert.equal(observed.length, 1);
+  assert.equal(k8s.mutations, 0);
+});
 
 async function pendingCycle(
   t: TestContext,

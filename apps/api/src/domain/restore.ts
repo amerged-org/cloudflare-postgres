@@ -89,20 +89,33 @@ export async function restoreDatabase(
           "conflict",
           "The deleted source archive is outside recovery retention",
         );
-      const [region, size] = await Promise.all([
+      const targetRegionId = body.region_id ?? source.region_id;
+      const [sourceRegion, region, size] = await Promise.all([
         c.env.DB.prepare(
           "SELECT id,backup_bucket,backup_endpoint_url,agent_key_hash FROM regions WHERE id=?",
         )
           .bind(source.region_id)
           .first<RegionRow>(),
+        c.env.DB.prepare(
+          "SELECT id,backup_bucket,backup_endpoint_url,agent_key_hash FROM regions WHERE id=?",
+        )
+          .bind(targetRegionId)
+          .first<RegionRow>(),
         c.env.DB.prepare("SELECT * FROM size_classes WHERE id=? AND enabled=1")
           .bind(source.size_class_id)
           .first<SizeRow>(),
       ]);
-      if (!region || !size)
+      if (!sourceRegion || !size)
         throw new ApiError("conflict", "Source region or size is unavailable");
-      const selected = regionArchive(c.env, region),
-        prefix = validatedArchivePrefix(source, region, selected.bucketName);
+      if (!region)
+        throw new ApiError("conflict", "Restore target region is unavailable");
+      const selected = regionArchive(c.env, sourceRegion),
+        prefix = validatedArchivePrefix(
+          source,
+          sourceRegion,
+          selected.bucketName,
+        );
+      regionArchive(c.env, region);
       const backup = await restoreBackup(
         selected.bucket,
         prefix,
@@ -142,8 +155,8 @@ export async function restoreDatabase(
         targetId,
       );
       const node = choosePlacement(
-        await placementNodes(c.env.DB, source.region_id),
-        source.region_id,
+        await placementNodes(c.env.DB, targetRegionId),
+        targetRegionId,
         size,
       );
       const archive = archiveDestinationPath(
@@ -188,7 +201,7 @@ export async function restoreDatabase(
         databaseInsertStatement(c.env.DB, {
           body: {
             project_id: source.project_id,
-            region_id: source.region_id,
+            region_id: targetRegionId,
             size_class_id: source.size_class_id,
             name: body.name,
           },
@@ -265,7 +278,7 @@ export async function restoreDatabase(
           "conflict",
           "Source credentials, retention or placement changed; retry the request",
         );
-      if (node) hint(c, source.region_id, [targetId]);
+      if (node) hint(c, targetRegionId, [targetId]);
       return response(c, op);
     },
   });

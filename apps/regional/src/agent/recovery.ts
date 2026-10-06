@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Client, type ClientConfig } from "pg";
-import { DesiredDatabase } from "@pgcf/contracts";
+import { DesiredDatabase, RecoverySourceCredentialsMap } from "@pgcf/contracts";
+import { record } from "./types.ts";
+import type { Kubernetes } from "./types.ts";
 import {
   databaseNamespace,
   restoreAdministrationPassword,
@@ -15,6 +17,67 @@ export type RecoveryAdministrator = (
   action: RecoveryAction,
 ) => Promise<boolean>;
 export type RecoveryClientFactory = (config: ClientConfig) => Client;
+export async function recoveryBuildContext(
+  db: DesiredDatabase,
+  ctx: BuildContext,
+  k8s: Kubernetes,
+): Promise<BuildContext> {
+  const source = db.recovery?.source_archive;
+  if (!source) return ctx;
+  const secret = await k8s.read(
+    "Secret",
+    "pgcf-system",
+    "pgcf-restore-source-s3",
+  );
+  const unavailable = () =>
+    new Error("recovery_source_credentials_unavailable");
+  if (
+    !secret ||
+    secret.kind !== "Secret" ||
+    secret.metadata.name !== "pgcf-restore-source-s3" ||
+    secret.metadata.namespace !== "pgcf-system" ||
+    secret.metadata.deletionTimestamp
+  )
+    throw unavailable();
+  const encoded = record(secret.data)["sources.json"];
+  if (
+    typeof encoded !== "string" ||
+    !encoded ||
+    encoded.length > 128 * 1024 ||
+    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+      encoded,
+    )
+  )
+    throw unavailable();
+  let parsed: ReturnType<typeof RecoverySourceCredentialsMap.safeParse>;
+  try {
+    parsed = RecoverySourceCredentialsMap.safeParse(
+      JSON.parse(Buffer.from(encoded, "base64").toString("utf8")),
+    );
+  } catch {
+    throw unavailable();
+  }
+  if (!parsed.success) throw unavailable();
+  const selected = parsed.data[source.region_id];
+  if (
+    !selected ||
+    selected.bucket !== source.bucket ||
+    selected.endpoint_url !== source.endpoint_url
+  )
+    throw unavailable();
+  return {
+    ...ctx,
+    recoverySource: {
+      bucket: source.bucket,
+      endpointUrl: source.endpoint_url,
+      region: source.region,
+      credentials: {
+        accessKeyId: selected.access_key_id,
+        secretAccessKey: selected.secret_access_key,
+      },
+    },
+  };
+}
 export async function administerRecovery(
   db: DesiredDatabase,
   ctx: BuildContext,
