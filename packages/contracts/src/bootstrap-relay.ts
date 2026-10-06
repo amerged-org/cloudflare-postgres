@@ -5,6 +5,7 @@ import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 
 export const BOOTSTRAP_RELAY_PATH = "/_pgcf/bootstrap-relay";
 export const BOOTSTRAP_RELAY_IDENTITY_PATH = `${BOOTSTRAP_RELAY_PATH}/identity`;
+export const BOOTSTRAP_RELAY_PROBE_PATH = `${BOOTSTRAP_RELAY_PATH}/probe`;
 export const BOOTSTRAP_RELAY_HEADER = "X-PGCF-Bootstrap";
 export const BOOTSTRAP_RELAY_TOKEN_MAX_LENGTH = 2048;
 export const BOOTSTRAP_RELAY_MAX_TOKEN_SECONDS = 60;
@@ -68,6 +69,19 @@ export const bootstrapRelayClaimsSchema = z
       claims.exp - claims.iat <= BOOTSTRAP_RELAY_MAX_TOKEN_SECONDS,
   );
 export type BootstrapRelayClaims = z.infer<typeof bootstrapRelayClaimsSchema>;
+export const bootstrapRelayProbeSchema = z.strictObject({
+  version: z.literal(1),
+  relay_epoch: z.uuid(),
+  operation_id: OperationId,
+  node_id: NodeId,
+  region_id: RegionId,
+  revision: z.number().int().positive(),
+  address: bootstrapLiteralIpSchema,
+  source: bootstrapLiteralIpSchema,
+  port: z.union([z.literal(22), z.literal(50000), z.literal(6443)]),
+  outcome: z.enum(["connected", "refused", "timed_out"]),
+  observed_at: z.iso.datetime({ precision: 3 }),
+});
 export type BootstrapCryptoKey = Awaited<
   ReturnType<typeof crypto.subtle.importKey>
 >;

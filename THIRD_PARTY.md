@@ -1,6 +1,6 @@
 # Third-party components
 
-Reviewed: 2026-10-05. The repository's [Apache License 2.0](LICENSE) covers original
+Reviewed: 2026-10-06. The repository's [Apache License 2.0](LICENSE) covers original
 project work only. Upstream components keep their own licenses, notices and source obligations.
 No upstream source is vendored in the repository. The regional image bundles zod and ships its MIT
 notice at `/app/licenses/zod/LICENSE`, copied from the lockfile-resolved installed package.
@@ -24,16 +24,32 @@ Pinned platform versions are in [infra/platform/versions.lock.json](infra/platfo
 | [Cilium](https://github.com/cilium/cilium)                                          | [Apache-2.0](https://github.com/cilium/cilium/blob/main/LICENSE); BPF parts [dual GPL-2.0/BSD-2-Clause](https://github.com/cilium/cilium#license) | Pod networking and NetworkPolicy.                                                                                                       |
 | [OpenEBS LocalPV LVM](https://github.com/openebs/lvm-localpv)                       | [Apache-2.0](https://github.com/openebs/lvm-localpv/blob/develop/LICENSE)                                                                         | Hard-limited local volumes on the `pgcf` LVM volume group.                                                                              |
 | [cert-manager](https://github.com/cert-manager/cert-manager)                        | [Apache-2.0](https://github.com/cert-manager/cert-manager/blob/master/LICENSE)                                                                    | Certificates required by the Barman plugin.                                                                                             |
-| [cloudflared 2026.9.3](https://github.com/cloudflare/cloudflared)                   | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/master/LICENSE)                                                                       | Outbound tunnel from each region to Cloudflare.                                                                                         |
+| [cloudflared 2026.10.0](https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0) | [Apache-2.0](https://github.com/cloudflare/cloudflared/blob/2026.10.0/LICENSE) | Outbound regional and bootstrap-relay tunnels, pinned to multi-platform index `sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07`. |
 | [node:24.21.0-slim](https://github.com/nodejs/docker-node) | [Node.js MIT and bundled-component notices](https://github.com/nodejs/node/blob/v24.21.0/LICENSE); Debian packages retain their individual licenses | Redistributed runtime base image, pinned by its multi-platform digest in `apps/regional/Dockerfile`; see the base-image notice below. |
 | [Kubernetes JavaScript client](https://github.com/kubernetes-client/javascript)     | [Apache-2.0](https://github.com/kubernetes-client/javascript/blob/master/LICENSE)                                                                 | Kubernetes API access from the regional agent.                                                                                          |
 | [Neon serverless driver](https://github.com/neondatabase/serverless)                | [MIT](https://github.com/neondatabase/serverless/blob/main/LICENSE)                                                                               | Client library compatible with the edge endpoint (WebSocket `Pool`/`Client`). Used by clients and tests, not bundled into the platform. |
+
+**PostgreSQL security image:** `infra/postgres/Dockerfile` retains the unmodified upstream
+PostgreSQL 18.6 engine and the CloudNativePG runtime, pinned by the official multi-platform
+and AMD64 digests in `infra/postgres/sources.lock.json`. It replaces only the upstream
+`postgresql-18-pgvector` package with checksum-pinned pgvector 0.8.7, fixing
+[CVE-2026-103484](https://www.postgresql.org/about/news/pgvector-087-released-3392/).
+[pgvector](https://github.com/pgvector/pgvector/tree/f37c13f68b57d2c3472b2214fbcff699d6d34876)
+uses the PostgreSQL License. PostgreSQL and pgvector copyright files remain in the image.
+The final image snapshots the patched upstream filesystem into one layer after removing
+only `/etc/ssl/private/ssl-cert-snakeoil.key` and its unused paired certificate,
+`/etc/ssl/certs/ssl-cert-snakeoil.pem`. Earlier key-bearing build layers are not published.
+Verified upstream runtime settings, the engine bytes and other package versions are retained.
+Other upstream packages retain their licenses. First-party assembly code remains Apache-2.0.
+The single CI workflow checks the unchanged engine, package identity, actual extension creation
+and SQL, then qualifies every image layer before publication. Existing databases require their
+own extension upgrade after the image update; a new package alone does not change `extversion`.
 
 **Barman license note:** the upstream package metadata declares `GPL-3.0-only`, while the README
 and source headers say GPL version 3 or later. Record the declaration at the pinned release.
 
 **Regional base-image notice:** the image uses
-`node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6`.
+`node:24.21.0-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20`.
 Node.js includes components with their own notices; the Debian base is not covered by Node's MIT
 license alone. The [official image guidance](https://github.com/nodejs/docker-node#license) refers
 to these upstream licenses. Node's `/usr/local/LICENSE`, Debian package copyright files under
@@ -42,17 +58,17 @@ Redistributors must retain those notices and satisfy each component's applicable
 
 **Node bootstrap image:** `apps/node-bootstrap/Dockerfile` uses the same pinned Node base.
 It bundles yaml 2.9.1 (ISC) and zod 4.6.5 (MIT), with their installed license files under
-`/app/licenses`. The unmodified Talos CLI 1.14.1 (MPL-2.0) and Kubernetes CLI 1.36.3
+`/app/licenses`. The unmodified Talos CLI 1.14.1 (MPL-2.0) and Kubernetes CLI 1.36.5
 (Apache-2.0) are downloaded from their official releases and checked against the recorded
 SHA-256 for each supported architecture. Their license files are retained in the image.
 Helm `4.3.0` (Apache-2.0) is downloaded from the [official release](https://github.com/helm/helm/releases/tag/v4.3.0)
 with architecture-specific archive checksums in `infra/platform/versions.lock.json`; its license
 is retained at `/app/licenses/helm/LICENSE`. The qualified amd64 binary is extracted from the
 verified official archive and additionally bound by its whole-file SHA-256 and size. Pinned
-Cilium `1.20.2` chart and Flux `2.9.5` install assets retain their Apache-2.0 notices under
+Cilium `1.20.2` chart and Flux `2.9.6` install assets retain their Apache-2.0 notices under
 `/app/licenses/cilium` and `/app/licenses/flux`.
 The matching source releases are [Talos v1.14.1](https://github.com/siderolabs/talos/tree/v1.14.1)
-and [Kubernetes v1.36.3](https://github.com/kubernetes/kubernetes/tree/v1.36.3).
+and [Kubernetes v1.36.5](https://github.com/kubernetes/kubernetes/tree/v1.36.5).
 
 The actual base runs Debian Bookworm. Added direct Debian packages are pinned to
 ca-certificates `20250419~deb12u1`, curl `7.88.1-10+deb12u15` (build stage only) and
@@ -61,6 +77,13 @@ under `/usr/share/doc`; these packages and their dependencies keep their own lic
 See the primary package records for [ca-certificates](https://packages.debian.org/bookworm/ca-certificates),
 [curl](https://packages.debian.org/bookworm/curl) and [OpenSSH](https://packages.debian.org/bookworm/openssh-client).
 Full payload qualification and immutable release digests bind the actual shipped dependency set.
+
+**Barman plugin images:** the pinned [plugin v0.15.1](https://github.com/cloudnative-pg/plugin-barman-cloud/tree/v0.15.1)
+and [chart v0.8.1](https://github.com/cloudnative-pg/charts/tree/plugin-barman-cloud-v0.8.1)
+retain their Apache-2.0 licenses. The plugin release updates its Barman dependency to
+[3.20.1](https://github.com/EnterpriseDB/barman/tree/release%2F3.20.1), which retains
+GPL-3.0 source and redistribution obligations. These upstream images remain unmodified;
+the platform lock records verified chart bytes and metadata, not a complete image security audit.
 
 **Barman plugin issue:** the R2 restore failure reported in
 [plugin-barman-cloud issue #411](https://github.com/cloudnative-pg/plugin-barman-cloud/issues/411#issuecomment-3572945793)

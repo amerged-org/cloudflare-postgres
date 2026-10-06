@@ -18,9 +18,9 @@ export const PLATFORM_ARTIFACTS = {
     sha256: "0de1a09a3fd450916cdb316d41fa9dcfd769708f7a6cb5b49496a64ee9b26b39",
   },
   flux: {
-    version: "2.9.5",
-    url: "https://github.com/fluxcd/flux2/releases/download/v2.9.5/install.yaml",
-    sha256: "cc3dcd743af16215838b6937e1fce83745bf24c0dcc6c59737c59df15429caaf",
+    version: "2.9.6",
+    url: "https://github.com/fluxcd/flux2/releases/download/v2.9.6/install.yaml",
+    sha256: "9c1fda7e401429531ed1478f67ba06b3edff6513b75da7ee47bde9f1c4d4251c",
     max_bytes: 1024 * 1024,
   },
 };

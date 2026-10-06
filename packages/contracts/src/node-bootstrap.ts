@@ -2,6 +2,13 @@
 import { z } from "zod";
 import { NodeId, OperationId, RegionId } from "./ids.ts";
 import { parseRouteKeyring } from "./route-token.ts";
+import { NodeStorageTrial } from "./node-storage.ts";
+export {
+  NodeStorageTrial,
+  NodeStorageVgReadback,
+  nodeStorageTrialTransition,
+} from "./node-storage.ts";
+export type { NodeStorageTrialRun } from "./node-storage.ts";
 
 const Digest = z.string().regex(/^[a-f0-9]{64}$/);
 const PrivateText = z
@@ -9,6 +16,14 @@ const PrivateText = z
   .min(1)
   .max(256 * 1024);
 const PositiveBytes = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
+const NativeIpv6 = z
+  .ipv6()
+  .refine((value) => !value.includes("%") && !value.includes("."));
+export const NodeIpv6Network = z.strictObject({
+  address: NativeIpv6,
+  prefix_length: z.number().int().min(1).max(128),
+  gateway: NativeIpv6.optional(),
+});
 const Endpoint = z.url().refine((value) => {
   const url = new URL(value);
   return (
@@ -103,6 +118,7 @@ export const NodeBootstrapSpec = z
       ipv4: z.ipv4(),
       prefix_length: z.number().int().min(1).max(32),
       gateway: z.ipv4(),
+      ipv6: NodeIpv6Network.optional(),
       dns: z.array(z.ipv4()).min(1).max(3),
       install_disk: z
         .string()
@@ -192,7 +208,7 @@ const ClusterMaterial = {
   cluster_name: z.string().min(1).max(63),
   cluster_endpoint: Endpoint,
   talos_version: z.literal("1.14.1"),
-  kubernetes_version: z.literal("1.36.3"),
+  kubernetes_version: z.enum(["1.36.3", "1.36.5"]),
   talos_machine_secrets_yaml: PrivateText,
   talos_admin_config: PrivateText,
 };
@@ -332,6 +348,7 @@ export const NodeBootstrapCheckpoint = z.strictObject({
     .regex(/^[0-9]+$/)
     .nullable(),
   admission_receipt: NodeBootstrapAdmissionReceipt.nullable(),
+  storage_trial: NodeStorageTrial.nullable().optional(),
   error_code: z
     .string()
     .regex(/^[a-z][a-z0-9_]{0,63}$/)

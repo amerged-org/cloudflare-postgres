@@ -1,8 +1,8 @@
 # Talos bootstrap assets
 
-These first-party patches reproduce the configuration of the single-node Contabo lab. They target **Talos v1.14.1 with Kubernetes v1.36.3**; the Kubernetes version is explicit because the selected CNPG release supports 1.36, while this Talos release defaults to a newer one. Boot, storage, SQL and node-restart behavior worked in the lab.
+These first-party patches reproduce the configuration of the single-node Contabo lab. They target **Talos v1.14.1 with Kubernetes v1.36.5**; the Kubernetes version is explicit because the selected CNPG release supports 1.36, while this Talos release defaults to a newer one. The earlier 1.36.3 baseline passed boot, storage, SQL and node restart in Dev; the updated patch target requires the acceptance recorded in PLAN.md.
 
-This is the manual recipe. In Phase 3 of [PLAN.md](../../PLAN.md), the `node-bootstrap` Container automates the same rescue path: a worker joins an existing region, while a new region bootstraps its first control-plane/worker. The initial topology has one EU control-plane/worker plus one EU worker and one US control-plane/worker. Customer databases run on these control-plane/worker nodes with system and platform resources reserved. Node loss is recovered from R2.
+These examples are the manual recovery recipe. The programmed Phase 3 path in [PLAN.md](../../PLAN.md) uses the `node-bootstrap` Container, a protected regional installation profile and measured provider/network/storage proofs. A new EU customer worker joins the retained EU cluster; the existing EU control/relay server is excluded from new customer placement. The US server bootstraps its separate regional cluster and customer capacity. Node loss is recovered from R2. Installation and admission must finish before capacity becomes available; current Dev acceptance is recorded in PLAN.md.
 
 ## Private configuration
 
@@ -18,7 +18,7 @@ mkdir -p .env.local.talos/config
 awk '/^---$/ {exit} {print}' infra/talos/single-node-lab-scheduling.patch.yaml \
   > .env.local.talos/worker-reservations.patch.yaml
 talosctl gen config "$PGCF_CLUSTER_NAME" "$PGCF_KUBERNETES_API_ENDPOINT" \
-  --talos-version v1.14.1 --kubernetes-version 1.36.3 \
+  --talos-version v1.14.1 --kubernetes-version 1.36.5 \
   --install-disk "$PGCF_INSTALL_DISK" \
   --config-patch-control-plane @infra/talos/cilium.patch.yaml \
   --config-patch @infra/talos/single-disk-lab-storage.patch.yaml \

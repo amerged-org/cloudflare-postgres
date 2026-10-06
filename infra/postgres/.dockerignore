@@ -1,0 +1,4 @@
+# Only the immutable public assembly inputs may enter the PostgreSQL build context.
+**
+!Dockerfile
+!sources.lock.json

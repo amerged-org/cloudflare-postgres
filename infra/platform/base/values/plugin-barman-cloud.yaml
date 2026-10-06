@@ -1,8 +1,8 @@
 replicaCount: 1
 image:
-  tag: v0.15.0
+  tag: v0.15.1
 sidecarImage:
-  tag: v0.15.0
+  tag: v0.15.1
 crds:
   create: true
 certificate:

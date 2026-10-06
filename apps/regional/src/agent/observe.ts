@@ -245,6 +245,9 @@ export function nodeObservations(
     return {
       ...identity,
       name: node.metadata.name,
+      ...(node.metadata.labels?.["pgcf.io/database-placement"] === "disabled"
+        ? { database_placement_enabled: false as const }
+        : {}),
       ready:
         condition(node, "Ready")?.status === "True" &&
         record(node.spec).unschedulable !== true,

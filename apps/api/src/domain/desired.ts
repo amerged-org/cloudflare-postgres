@@ -44,6 +44,23 @@ export async function desired(
   query: DesiredQuery,
 ): Promise<Response> {
   const region = await agentRegion(c);
+  const policy = await c.env.DB.prepare(
+    "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib FROM node_region_policies WHERE region_id=?",
+  )
+    .bind(region.id)
+    .first<{
+      placement_mode: string;
+      maximum_database_memory_mib: number | null;
+      postgres_memory_request_mib: number | null;
+    }>();
+  const scheduling =
+    policy?.placement_mode === "actual_ram"
+      ? {
+          placement_mode: "actual_ram" as const,
+          maximum_database_memory_mib: policy.maximum_database_memory_mib,
+          postgres_memory_request_mib: policy.postgres_memory_request_mib,
+        }
+      : undefined;
   const result = await c.env.DB.prepare(
     `SELECT d.*,n.k8s_node_name,s.memory_mib,s.cpu_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json,
@@ -146,6 +163,9 @@ export async function desired(
         pg_major: row.pg_major,
         size: {
           memory_mib: row.memory_mib,
+          ...(scheduling && row.desired_state === "running"
+            ? { memory_request_mib: scheduling.postgres_memory_request_mib }
+            : {}),
           cpu_millicores: row.cpu_millicores,
           storage_gib: row.storage_gib,
           max_connections: row.max_connections,
@@ -174,6 +194,7 @@ export async function desired(
     DesiredResponse.parse({
       region: {
         id: region.id,
+        ...(scheduling ? { scheduling } : {}),
         backup: {
           bucket: region.backup_bucket,
           endpoint_url: region.backup_endpoint_url,

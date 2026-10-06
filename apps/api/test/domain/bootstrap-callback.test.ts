@@ -274,6 +274,110 @@ async function prepared(
   };
   return { ...f, addition, job, input, spec, bindings, identity };
 }
+
+it("records a quarantined storage trial once and refuses replacing its Node ownership on resume", async () => {
+  const f = await prepared();
+  const checkpoint = {
+    ...JSON.parse(f.job.checkpoint_json),
+    stage: "regional_ready",
+  };
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(checkpoint), f.job.operation_id)
+    .run();
+  const nodeUid = crypto.randomUUID(),
+    lvmUid = crypto.randomUUID(),
+    vgUid = crypto.randomUUID();
+  const before = {
+    observed_at: new Date().toISOString(),
+    node_uid: nodeUid,
+    lvmnode_uid: lvmUid,
+    resource_version: "31",
+    vg_uuid: vgUid,
+    size: 30 * 1024 ** 3,
+    free: 30 * 1024 ** 3,
+  };
+  const trial = {
+    version: 1,
+    input_hash: f.job.input_hash,
+    node_uid: nodeUid,
+    cluster_uid: crypto.randomUUID(),
+    storage_namespace_uid: crypto.randomUUID(),
+    lvmnode_uid: lvmUid,
+    vg_uuid: vgUid,
+    pv_uuid: crypto.randomUUID(),
+    device: "/dev/vda5",
+    partition_uuid: crypto.randomUUID(),
+    total_bytes: before.size,
+    extent_size_bytes: 4 * 1024 ** 2,
+    runs: [
+      {
+        namespace_name: `pgcf-storage-${f.job.input_hash.slice(0, 20)}-1`,
+        trial_sha256: hash(),
+        image: `fixture.invalid/image@sha256:${hash()}`,
+        data_sha256: hash(),
+        volume_bytes: 1024 ** 3,
+        stage: "intent",
+        namespace_uid: null,
+        pvc_uid: null,
+        pod_uid: null,
+        pv_name: null,
+        pv_uid: null,
+        volume_handle: null,
+        lvmvolume_uid: null,
+        lv_uuid: null,
+        before,
+        allocated: null,
+        after: null,
+        written_at: null,
+        published_at: null,
+      },
+    ],
+  };
+  expect(
+    (
+      await callback(f, {
+        ...f.identity,
+        kind: "checkpoint",
+        expected_revision: 0,
+        payload: { ...checkpoint, storage_trial: trial },
+      })
+    ).status,
+  ).toBe(200);
+  expect(
+    (
+      await callback(f, {
+        ...f.identity,
+        kind: "checkpoint",
+        expected_revision: 1,
+        payload: {
+          ...checkpoint,
+          stage: "awaiting_verification",
+          storage_trial: trial,
+        },
+      })
+    ).status,
+  ).toBe(409);
+  expect(
+    (
+      await callback(f, {
+        ...f.identity,
+        kind: "checkpoint",
+        expected_revision: 1,
+        payload: {
+          ...checkpoint,
+          storage_trial: { ...trial, node_uid: crypto.randomUUID() },
+        },
+      })
+    ).status,
+  ).toBe(409);
+  const saved = await readBootstrapJob(env.DB, f.job.operation_id);
+  expect(JSON.parse(saved.checkpoint_json).storage_trial.node_uid).toBe(
+    nodeUid,
+  );
+  expect(saved.revision).toBe(1);
+});
 type PeerConfiguration = Parameters<BeforeBootstrapConfiguration>[0];
 const approvedPeers = ["192.0.2.2", "198.51.100.3", "198.51.100.4"];
 function peerPlan(value: PeerConfiguration) {

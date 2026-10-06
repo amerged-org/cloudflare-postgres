@@ -23,10 +23,57 @@ import {
 } from "./image-qualification.ts";
 import {
   reviewedBase,
+  postgresBase,
   reviewedFiles,
   reviewedManifestPaths,
   verifyNativeArtifacts,
 } from "./reviewed-findings.ts";
+
+test("PostgreSQL qualification binds its own upstream and cannot inherit Node reviews", () => {
+  assert.deepEqual(
+    parseQualificationArguments(["--profile", "postgres", "runtime", "image"]),
+    {
+      profile: "postgres",
+      args: ["runtime", "image"],
+    },
+  );
+  assert.equal(
+    validateDockerfile(
+      `FROM ${postgresBase} AS postgres\nFROM scratch\n`,
+      "postgres",
+    ),
+    postgresBase,
+  );
+  assert.throws(() =>
+    validateDockerfile(
+      `FROM ${postgresBase} AS postgres\nFROM scratch\nFROM scratch\n`,
+      "postgres",
+    ),
+  );
+  assert.throws(() =>
+    validateDockerfile(`FROM ${reviewedBase.image}\n`, "postgres"),
+  );
+  assert.deepEqual(reviewedManifestPaths([], "postgres"), []);
+  assert.throws(() =>
+    reviewedManifestPaths(["app/node_modules/package.json"], "postgres"),
+  );
+  const check = runtimeChecks("postgres")[0]!;
+  assert.equal(check.entrypoint, "/usr/lib/postgresql/18/bin/postgres");
+  assert.doesNotThrow(() =>
+    validateRuntimeResult(check, {
+      exit: 0,
+      stdout: "postgres (PostgreSQL) 18.6 (Debian 18.6-1.pgdg13+2)",
+      stderr: "",
+    }),
+  );
+  assert.throws(() =>
+    validateRuntimeResult(check, {
+      exit: 0,
+      stdout: "postgres (PostgreSQL) 18.4",
+      stderr: "",
+    }),
+  );
+});
 
 test("qualification profiles default to regional and reject ambiguous or malformed options", () => {
   assert.deepEqual(
@@ -59,13 +106,16 @@ test("qualification profiles default to regional and reject ambiguous or malform
   );
 });
 
-test("the single CI workflow qualifies both image profiles before independent publication", async () => {
+test("the single CI workflow qualifies all three image profiles before independent publication", async () => {
   const workflow = await readFile(".github/workflows/ci.yml", "utf8"),
     regional = workflow
       .split("\n  image:\n")[1]!
       .split("\n  node_bootstrap_image:\n")[0]!,
     bootstrap = workflow
       .split("\n  node_bootstrap_image:\n")[1]!
+      .split("\n  postgres_image:\n")[0]!,
+    postgres = workflow
+      .split("\n  postgres_image:\n")[1]!
       .split("\n  external_probe:\n")[0]!;
   assert.match(regional, /IMAGE: ghcr\.io\/amerged-org\/pgcf-regional/);
   assert.match(bootstrap, /IMAGE: ghcr\.io\/amerged-org\/pgcf-node-bootstrap/);
@@ -97,6 +147,33 @@ test("the single CI workflow qualifies both image profiles before independent pu
       bootstrap.indexOf("--profile node-bootstrap promote"),
   );
   assert.match(regional, /--profile regional runtime/);
+  assert.match(postgres, /IMAGE: ghcr\.io\/amerged-org\/pgcf-postgres/);
+  assert.match(postgres, /--file infra\/postgres\/Dockerfile/);
+  assert.match(postgres, /node --test infra\/postgres\/image\.test\.mjs/);
+  assert.match(postgres, /needs: check/);
+  assert.doesNotMatch(postgres, /matrix:/);
+  const postgresActions = [
+    ...postgres.matchAll(/image-qualification\.ts --profile postgres (\w+)/g),
+  ].map((match) => match[1]!);
+  assert.deepEqual([...new Set(postgresActions)].sort(), [
+    "promote",
+    "qualify",
+    "registry",
+    "runtime",
+    "verify",
+  ]);
+  assert.ok(
+    postgres.indexOf("--profile postgres qualify") <
+      postgres.indexOf("docker push"),
+  );
+  assert.ok(
+    postgres.indexOf("--profile postgres verify") <
+      postgres.indexOf("docker push"),
+  );
+  assert.ok(
+    postgres.indexOf("--profile postgres registry") <
+      postgres.indexOf("--profile postgres promote"),
+  );
 });
 
 test("Dockerfile profiles bind every FROM and the exact pinned stage topology", () => {
@@ -174,7 +251,7 @@ test("runtime profiles invoke every shipped entry and exact native client versio
     validateRuntimeResult(kube, {
       exit: 0,
       stdout: JSON.stringify({
-        clientVersion: { gitVersion: "v1.36.3", platform: "linux/amd64" },
+        clientVersion: { gitVersion: "v1.36.5", platform: "linux/amd64" },
       }),
       stderr: "",
     }),
@@ -183,7 +260,7 @@ test("runtime profiles invoke every shipped entry and exact native client versio
     validateRuntimeResult(kube, {
       exit: 0,
       stdout: JSON.stringify({
-        clientVersion: { gitVersion: "v1.36.3", platform: "linux/arm64" },
+        clientVersion: { gitVersion: "v1.36.5", platform: "linux/arm64" },
       }),
       stderr: "",
     }),

@@ -1,13 +1,13 @@
 {
   "reviewProjectionSha256": "5238f159826432cf676e14523a9c3249f4c5a039f4dca604764906f7be4e2de2",
   "base": {
-    "image": "node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6",
+    "image": "node:24.21.0-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20",
     "diffIDs": [
-      "sha256:34467cc93912af891dfee8a3902adf9b4f355a9bca4eaa46f658d1181a21de0d",
-      "sha256:d4538219a5351d13fddbd63f69f91967df4615ce1920c8a0f981a6a1382e9c2b",
-      "sha256:be63ab2861093aeb3c3b7a85e837d5d562510736ba39c00c5ad6b9d5714c9035",
-      "sha256:429894d93c7696cccc056cc2caa20da017bbb4f604ad1226327aa060d78b3bd9",
-      "sha256:362feb000ea275c02b50abdf827ccf034ae1f7d50989852ea8fc3cd9b80fd7b3"
+      "sha256:e58989146fcec76699871403b9897b5c014af1ccd85f5a9300a215e7975525d7",
+      "sha256:a52fce3e2e53c15bee62149c2a83480bfc3000e19b253dba304220e3d487582f",
+      "sha256:65d71716d250882cedd073ea8e6ab52eb8ce7372fb9eed886775d91dbf9b0f74",
+      "sha256:bdfbfbb03dafc1b269c0668c632ae06c04bff6bc9ae624c8a9cbb3ecb4ad1d3c",
+      "sha256:b6a146dc1aed9a3193cadd3aa94373029d72d93c212e59a42c5d0194b2157ab5"
     ]
   },
   "files": [
@@ -17,7 +17,7 @@
       "size": 70804,
       "layer": 2,
       "tarEntry": 473,
-      "boundDigest": "sha256:be63ab2861093aeb3c3b7a85e837d5d562510736ba39c00c5ad6b9d5714c9035",
+      "boundDigest": "sha256:65d71716d250882cedd073ea8e6ab52eb8ce7372fb9eed886775d91dbf9b0f74",
       "officialBaseMembership": true,
       "findings": [
         {
@@ -42,7 +42,7 @@
       "size": 16361,
       "layer": 2,
       "tarEntry": 1061,
-      "boundDigest": "sha256:be63ab2861093aeb3c3b7a85e837d5d562510736ba39c00c5ad6b9d5714c9035",
+      "boundDigest": "sha256:65d71716d250882cedd073ea8e6ab52eb8ce7372fb9eed886775d91dbf9b0f74",
       "officialBaseMembership": true,
       "findings": [
         {
@@ -95,7 +95,7 @@
       "size": 530014,
       "layer": 2,
       "tarEntry": 519,
-      "boundDigest": "sha256:be63ab2861093aeb3c3b7a85e837d5d562510736ba39c00c5ad6b9d5714c9035",
+      "boundDigest": "sha256:65d71716d250882cedd073ea8e6ab52eb8ce7372fb9eed886775d91dbf9b0f74",
       "officialBaseMembership": true,
       "findings": [
         {
@@ -134,7 +134,7 @@
       "size": 5979,
       "layer": 2,
       "tarEntry": 1860,
-      "boundDigest": "sha256:be63ab2861093aeb3c3b7a85e837d5d562510736ba39c00c5ad6b9d5714c9035",
+      "boundDigest": "sha256:65d71716d250882cedd073ea8e6ab52eb8ce7372fb9eed886775d91dbf9b0f74",
       "officialBaseMembership": true,
       "findings": [
         {
@@ -173,7 +173,7 @@
       "size": 5932,
       "layer": 2,
       "tarEntry": 1861,
-      "boundDigest": "sha256:be63ab2861093aeb3c3b7a85e837d5d562510736ba39c00c5ad6b9d5714c9035",
+      "boundDigest": "sha256:65d71716d250882cedd073ea8e6ab52eb8ce7372fb9eed886775d91dbf9b0f74",
       "officialBaseMembership": true,
       "findings": [
         {
@@ -328,7 +328,7 @@
       "size": 2209528,
       "layer": 0,
       "tarEntry": 925,
-      "boundDigest": "sha256:34467cc93912af891dfee8a3902adf9b4f355a9bca4eaa46f658d1181a21de0d",
+      "boundDigest": "sha256:e58989146fcec76699871403b9897b5c014af1ccd85f5a9300a215e7975525d7",
       "officialBaseMembership": true,
       "findings": [
         {
@@ -856,37 +856,37 @@
     },
     {
       "path": "usr/local/bin/kubectl",
-      "sha256": "ebbd080e7c2e275093b55915722043257eb24004363e20acb3c4d71919f88336",
-      "size": 59556002,
+      "sha256": "33bc88a24c3b09cf55bfd59e6ca977881b61fc3f25ab65bc80c65b430248648e",
+      "size": 59584674,
       "layer": 7,
       "tarEntry": 3,
       "boundDigest": "sha256:904d7ff1de8ee66c8a6970fc6b7e6b1933ec0032e000a182d57fa0ecb0c56975",
       "officialBaseMembership": false,
       "nativeArtifact": {
         "name": "kubectl",
-        "version": "1.36.3",
+        "version": "1.36.5",
         "architecture": "linux/amd64",
-        "releaseUrl": "https://dl.k8s.io/release/v1.36.3/bin/linux/amd64/kubectl",
-        "checksumUrl": "https://dl.k8s.io/release/v1.36.3/bin/linux/amd64/kubectl.sha256",
-        "sha256": "ebbd080e7c2e275093b55915722043257eb24004363e20acb3c4d71919f88336",
-        "size": 59556002
+        "releaseUrl": "https://dl.k8s.io/release/v1.36.5/bin/linux/amd64/kubectl",
+        "checksumUrl": "https://dl.k8s.io/release/v1.36.5/bin/linux/amd64/kubectl.sha256",
+        "sha256": "33bc88a24c3b09cf55bfd59e6ca977881b61fc3f25ab65bc80c65b430248648e",
+        "size": 59584674
       },
       "findings": [
         {
           "rule": "generic-api-key",
-          "startLine": 45323,
-          "endLine": 45323,
+          "startLine": 46139,
+          "endLine": 46139,
           "startColumn": 149,
           "endColumn": 201,
           "span": {
-            "byteStart": 33134034,
-            "byteEndExclusive": 33134087,
+            "byteStart": 33143578,
+            "byteEndExclusive": 33143631,
             "size": 53,
             "sha256": "a9b8522ba6ceb94014c32956488232f149a7955657b9810bf55f0681e8a59cc0"
           },
           "classification": "compiler_packed_independent_protocol_and_display_literals",
           "sourceProof": {
-            "sourceCommit": "0f29094e5b73085e3802ecc1298ecae13866bfe6",
+            "sourceCommit": "ad950d1cc78b0183c476bd4d3f1934c104229727",
             "constantSize": 7,
             "sourceParts": [
               {
@@ -896,7 +896,7 @@
                 "sourceLine": 133,
                 "sourceSha256": "c358cce7bca1a3418ead35006502180aaf01c2f46837390674385cd5b125f80c",
                 "literalSha256": "20e8cdb5b4093e18eb565f0a0c148e44da1f0b8c5447f27c47881675bfa86c10",
-                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/cmd/kubeadm/app/phases/copycerts/copycerts.go"
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/ad950d1cc78b0183c476bd4d3f1934c104229727/cmd/kubeadm/app/phases/copycerts/copycerts.go"
               },
               {
                 "partStart": 0,
@@ -905,7 +905,7 @@
                 "sourceLine": 6273,
                 "sourceSha256": "598aae11c7c8bea62e52d4d7d9270a6252d3d436d1176e898ac43b0215daa69b",
                 "literalSha256": "e981ddae45d8f4ca53f1ccbe613ad254a041dacf65a06026099a6302d332113b",
-                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/pkg/apis/core/types.go"
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/ad950d1cc78b0183c476bd4d3f1934c104229727/pkg/apis/core/types.go"
               },
               {
                 "partStart": 7,
@@ -914,7 +914,7 @@
                 "sourceLine": 184,
                 "sourceSha256": "73797b23f60f0f13fd412813116ebb76d8e187ffe76f3c55884c946a852d4ae6",
                 "literalSha256": "c7ce66d0fb14e3c2d4d920918cc6cc7e488668b08dddeb7b85e44de3b9f3eb01",
-                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/pkg/kubelet/cm/pod_container_manager_linux.go"
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/ad950d1cc78b0183c476bd4d3f1934c104229727/pkg/kubelet/cm/pod_container_manager_linux.go"
               },
               {
                 "partStart": 28,
@@ -923,7 +923,7 @@
                 "sourceLine": 298,
                 "sourceSha256": "09b8744deac0d9c00a2a7286f740fffc2c495f1cc471f439124fa9d539242977",
                 "literalSha256": "406effb1e9c59672c66a598c2b21e331b23b16c54024e96d6df3e7c173549791",
-                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/pkg/kubelet/container/runtime.go"
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/ad950d1cc78b0183c476bd4d3f1934c104229727/pkg/kubelet/container/runtime.go"
               },
               {
                 "partStart": 42,
@@ -932,7 +932,7 @@
                 "sourceLine": 91,
                 "sourceSha256": "acde2f0489c47914dae1bef012f95a89b60665f6a5e145c7f9a1c4d714c4b193",
                 "literalSha256": "74e21680eac7385ca408cb01878465fd693b37e58eb0c0c32663a2d8f15d8136",
-                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/plugin/pkg/admission/certificates/approval/admission.go"
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/ad950d1cc78b0183c476bd4d3f1934c104229727/plugin/pkg/admission/certificates/approval/admission.go"
               },
               {
                 "partStart": 35,
@@ -941,7 +941,7 @@
                 "sourceLine": 93,
                 "sourceSha256": "ba37179999eb022b3a66e8b421a7803c8c609596e3d8d7fe52970867150d91d3",
                 "literalSha256": "c431bcf2d8f643b0d4cf0d14827191f2b4a8dfec53189ab33552e4e93c0ad5a6",
-                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/group_version.go"
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/ad950d1cc78b0183c476bd4d3f1934c104229727/staging/src/k8s.io/apimachinery/pkg/apis/meta/v1/group_version.go"
               },
               {
                 "partStart": 14,
@@ -950,7 +950,7 @@
                 "sourceLine": 112,
                 "sourceSha256": "d99728bc0ccc11f0e6674c2933a46ac699d580218fff6a63f34dcfd127597ad7",
                 "literalSha256": "dddc693e07b79c14eafe145ef79c72fc5f8548ac9454a98b0a9564280ca84946",
-                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/staging/src/k8s.io/kubectl/pkg/cmd/apiresources/apiresources.go"
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/ad950d1cc78b0183c476bd4d3f1934c104229727/staging/src/k8s.io/kubectl/pkg/cmd/apiresources/apiresources.go"
               },
               {
                 "partStart": 49,
@@ -959,7 +959,7 @@
                 "sourceLine": 238,
                 "sourceSha256": "361bc5cd473c82ebd7b6e42c505c707216817311bcc60bc09eb5d73969348407",
                 "literalSha256": "e5f911f0dc022751c45601728d45679a313c2a39df43ee82163ce51e6aa11953",
-                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/staging/src/k8s.io/kubectl/pkg/cmd/auth/whoami.go"
+                "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/ad950d1cc78b0183c476bd4d3f1934c104229727/staging/src/k8s.io/kubectl/pkg/cmd/auth/whoami.go"
               }
             ],
             "compiledPointerAndLengthReferencesVerified": true
@@ -967,19 +967,19 @@
         },
         {
           "rule": "generic-api-key",
-          "startLine": 49969,
-          "endLine": 49969,
+          "startLine": 50785,
+          "endLine": 50785,
           "startColumn": 66,
           "endColumn": 91,
           "span": {
-            "byteStart": 34489501,
-            "byteEndExclusive": 34489527,
+            "byteStart": 34499389,
+            "byteEndExclusive": 34499415,
             "size": 26,
             "sha256": "6d3fadad371230610bc0c88ba99d4d64da90c3b4057cb4e49eab943896443733"
           },
           "classification": "non_actual_cli_usage_example",
           "sourceProof": {
-            "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/0f29094e5b73085e3802ecc1298ecae13866bfe6/staging/src/k8s.io/kubectl/pkg/cmd/config/set_credentials.go",
+            "sourceUrl": "https://raw.githubusercontent.com/kubernetes/kubernetes/ad950d1cc78b0183c476bd4d3f1934c104229727/staging/src/k8s.io/kubectl/pkg/cmd/config/set_credentials.go",
             "sourceSha256": "6cfb579f337de3972810ba5e654510c30183483d39be3534f721ea454dcc2535",
             "sourceLine": 89,
             "literalSha256": "700792cb97cd08eef920cabfcdabbdc24b46201c6f40d17ab98d0f399cc752f2",

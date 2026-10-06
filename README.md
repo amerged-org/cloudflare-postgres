@@ -3,7 +3,7 @@
 Open-source, Neon-style serverless PostgreSQL that runs on **your Cloudflare account** and **your
 Contabo VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
 The VPS run real, unmodified PostgreSQL under CloudNativePG. The approved initial deployment retains one EU control/relay VPS, adds one EU customer worker
-and one US control-plane/customer VPS. Both customer servers are Cloud VPS 8; the old EU worker
+and one US control-plane/customer VPS. Both customer servers must be Cloud VPS 8 with 8 vCPU, 24 GB RAM and 150 GB NVMe; the old EU worker
 is removed after verified recovery. System and platform resources remain protected; server loss
 is recovered from R2.
 
@@ -70,9 +70,18 @@ Missing samples stay unknown. Cost attribution is deferred.
 The second EU node is admitted and serves a real capacity-test database. Automatic US purchase
 is approved within the specific cost cap recorded in PLAN.md. Its Cloudflare archive, scoped
 credentials, private Tunnel, gateway service and regional identity are configured. Cross-region
-restore is implemented and delivered, with live acceptance pending. The US node has not been bought
-and no customer or platform database has been migrated. EU/US operator acceptance comes first; Neon migration and public-release
-polish follow separately.
+restore is implemented and delivered, with live acceptance pending. The original EU/US 300 GB SSD
+orders were paid, then cancelled by the owner. Their 150 GB NVMe replacements await a verified
+ordering path: the documented API defaults V155 to SSD, while the shop exposes the NVMe choice.
+No customer or platform database has been migrated. EU/US operator acceptance comes first; Neon
+migration and public-release polish follow separately.
+
+The approved actual-RAM policy buys regional capacity at 76% average physical RAM usage over
+ten rolling minutes. Existing capacity remains eligible during rollout under hard RAM, CPU and
+storage guards. Missing observations remain unknown. Admin assignments use 256 MiB steps, with
+a 4096 MiB PostgreSQL cap in this installation; transient PostgreSQL/Barman startup peaks are
+admitted separately. This policy and the complete headless producer are implemented locally
+and still require delivery and live acceptance.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture

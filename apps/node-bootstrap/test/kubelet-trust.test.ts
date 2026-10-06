@@ -289,7 +289,7 @@ test("a joining worker publishes its map from the sealed private join identity w
     cluster_name: state.input.spec.cluster_name,
     cluster_endpoint: state.input.spec.cluster_endpoint,
     talos_version: "1.14.1" as const,
-    kubernetes_version: "1.36.3" as const,
+    kubernetes_version: "1.36.5" as const,
     talos_machine_secrets_yaml: randomUUID(),
     talos_admin_config: randomUUID(),
     kubeconfig: randomUUID(),

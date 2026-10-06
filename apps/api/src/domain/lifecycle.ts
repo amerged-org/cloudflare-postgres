@@ -11,6 +11,10 @@ import type { ApiContext } from "../env.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { databaseOperationResponse, hint } from "./databases.ts";
 import { databaseForRequest, type DatabaseRow } from "./rows.ts";
+import {
+  databaseStartupHeadroomSql,
+  startupReservationStatement,
+} from "./startup-admission.ts";
 
 export type PowerAction = "suspend" | "resume" | "hibernate" | "wake";
 export function powerTransitionStatements(
@@ -23,14 +27,15 @@ export function powerTransitionStatements(
 ): D1PreparedStatement[] {
   const sleeping = action === "suspend" || action === "hibernate";
   const authorizedRole = action === "wake" ? RoleName.parse(wakeRole) : null;
-  return [
+  const statements = [
     db
       .prepare(
         `UPDATE databases SET desired_state=?,suspension_reason=?,power_operation=?,generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
       WHERE id=? AND project_id=? AND generation=? AND desired_state=? AND observed_state=? AND updated_at=? AND power_operation IS ? AND suspension_reason IS ? AND observed_power=? AND observed_generation=? AND deleted_at IS NULL
       AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
       AND (?=0 OR (observed_state='ready' AND observed_generation=generation AND observed_power='awake') OR (?='suspend' AND desired_state='suspended' AND suspension_reason='idle' AND observed_state='provisioning' AND observed_power='hibernated' AND observed_generation=generation))
-      AND (?=0 OR EXISTS(SELECT 1 FROM roles r WHERE r.database_id=databases.id AND r.name=? AND r.deleted_at IS NULL))`,
+      AND (?=0 OR EXISTS(SELECT 1 FROM roles r WHERE r.database_id=databases.id AND r.name=? AND r.deleted_at IS NULL))
+      AND ${sleeping ? "1=1" : databaseStartupHeadroomSql()}`,
       )
       .bind(
         sleeping ? "suspended" : "running",
@@ -83,6 +88,19 @@ export function powerTransitionStatements(
         row.generation + 1,
       ),
   ];
+  if (!sleeping && row.node_id !== null)
+    statements.splice(
+      2,
+      0,
+      startupReservationStatement(db, {
+        databaseId: row.id,
+        operationId: operation,
+        generation: row.generation + 1,
+        nodeId: row.node_id,
+        now,
+      }),
+    );
+  return statements;
 }
 
 export async function changePower(
@@ -202,10 +220,16 @@ export async function recoverQuiescence(
     .first<DatabaseRow>();
   if (!row) return null;
   const operation = newOperationId();
-  const result = await db.batch([
+  const mayRestart = reason === "unknown" || reason === "timeout";
+  const statements = [
     db
       .prepare(
-        `UPDATE databases SET desired_state='running',suspension_reason=NULL,power_operation=?,generation=generation+1,observed_state='provisioning',status_message='Power transition refused',updated_at=? WHERE id=? AND generation=? AND updated_at=? AND desired_state='suspended' AND power_operation=? AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)`,
+        `UPDATE databases SET desired_state='running',suspension_reason=NULL,power_operation=?,generation=generation+1,observed_state='provisioning',status_message='Power transition refused',updated_at=? WHERE id=? AND generation=? AND updated_at=? AND desired_state='suspended' AND power_operation=?
+          AND observed_state=? AND observed_generation=? AND observed_power=? AND suspension_reason IS ? AND node_id IS ?
+          AND deleted_at IS NULL AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
+          AND EXISTS(SELECT 1 FROM operations o WHERE o.id=databases.power_operation AND o.database_id=databases.id AND o.project_id=databases.project_id
+            AND o.generation<=databases.generation AND o.kind IN('database.suspend','database.hibernate') AND o.status IN('pending','running'))
+          AND ${mayRestart ? databaseStartupHeadroomSql() : "1=1"}`,
       )
       .bind(
         operation,
@@ -214,6 +238,11 @@ export async function recoverQuiescence(
         row.generation,
         row.updated_at,
         row.power_operation,
+        row.observed_state,
+        row.observed_generation,
+        row.observed_power,
+        row.suspension_reason ?? null,
+        row.node_id,
       ),
     db
       .prepare(
@@ -242,7 +271,20 @@ export async function recoverQuiescence(
         operation,
         row.generation + 1,
       ),
-  ]);
+  ];
+  if (mayRestart && row.node_id !== null)
+    statements.splice(
+      2,
+      0,
+      startupReservationStatement(db, {
+        databaseId: row.id,
+        operationId: operation,
+        generation: row.generation + 1,
+        nodeId: row.node_id,
+        now,
+      }),
+    );
+  const result = await db.batch(statements);
   return result[0]!.meta.changes === 1
     ? { operation, revision: row.generation + 1, regionId: row.region_id }
     : null;

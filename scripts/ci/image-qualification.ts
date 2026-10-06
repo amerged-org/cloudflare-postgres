@@ -33,6 +33,7 @@ import {
   classifyReviewed,
   readPackageProvenance,
   reviewedBase,
+  postgresBase,
   reviewedFiles,
   reviewedManifestPaths,
   imageProfile,
@@ -97,18 +98,21 @@ export function validateDockerfile(
       .split(/\r?\n/)
       .filter((line) => /^\s*FROM\b/i.test(line))
       .map((line) => line.trim()),
-    expected = [
-      `FROM ${reviewedBase.image} AS build`,
-      ...(profile === "node-bootstrap"
-        ? [`FROM ${reviewedBase.image} AS clients`]
-        : []),
-      `FROM ${reviewedBase.image}`,
-    ];
+    expected =
+      profile === "postgres"
+        ? [`FROM ${postgresBase} AS postgres`, "FROM scratch"]
+        : [
+            `FROM ${reviewedBase.image} AS build`,
+            ...(profile === "node-bootstrap"
+              ? [`FROM ${reviewedBase.image} AS clients`]
+              : []),
+            `FROM ${reviewedBase.image}`,
+          ];
   requireCheck(
     JSON.stringify(from) === JSON.stringify(expected),
     "Dockerfile base or stage topology differs from the pinned profile",
   );
-  return reviewedBase.image;
+  return profile === "postgres" ? postgresBase : reviewedBase.image;
 }
 
 export function safeArchivePath(name: string): string {
@@ -375,6 +379,7 @@ export function assertScanResult(
 }
 
 type ToolStage =
+  | "runtime_postgres"
   | "runtime_help"
   | "runtime_agent"
   | "runtime_gateway"
@@ -382,6 +387,9 @@ type ToolStage =
   | "runtime_bootstrap_modules"
   | "runtime_bootstrap_server"
   | "runtime_bootstrap_proxy"
+  | "runtime_inspection_proxy"
+  | "runtime_outside_scan"
+  | "runtime_proof_proxy"
   | "runtime_talos"
   | "runtime_kubectl"
   | "runtime_helm"
@@ -451,6 +459,17 @@ export function runtimeChecks(
   profileInput: ImageProfile = "regional",
 ): RuntimeCheck[] {
   const profile = imageProfile(profileInput);
+  if (profile === "postgres")
+    return [
+      {
+        stage: "runtime_postgres",
+        entrypoint: "/usr/lib/postgresql/18/bin/postgres",
+        args: ["--version"],
+        exit: 0,
+        stdout: "postgres (PostgreSQL) 18.6 (Debian 18.6-1.pgdg13+2)",
+        stderr: "",
+      },
+    ];
   if (profile === "regional")
     return [
       {
@@ -494,7 +513,7 @@ export function runtimeChecks(
       args: [
         "--input-type=module",
         "-e",
-        "await import('/app/server.mjs'); await import('/app/proxy-command.mjs');",
+        "await import('/app/server.mjs'); await import('/app/proxy-command.mjs'); await import('/app/inspection-proxy-command.mjs'); await import('/app/outside-scan-command.mjs'); await import('/app/proof-proxy-command.mjs');",
       ],
       exit: 0,
       stdout: "",
@@ -515,6 +534,32 @@ export function runtimeChecks(
       exit: 1,
       stdout: "",
       stderr: "bootstrap_proxy_failed",
+    },
+    {
+      stage: "runtime_inspection_proxy",
+      entrypoint: "node",
+      args: ["/app/inspection-proxy-command.mjs"],
+      exit: 1,
+      stdout: "",
+      stderr: "inspection_proxy_failed",
+    },
+    {
+      stage: "runtime_outside_scan",
+      entrypoint: "node",
+      args: ["/app/outside-scan-command.mjs"],
+      exit: 1,
+      stdout: "",
+      stderr: JSON.stringify({
+        error_code: "outside_scan_command_input_required",
+      }),
+    },
+    {
+      stage: "runtime_proof_proxy",
+      entrypoint: "node",
+      args: ["/app/proof-proxy-command.mjs"],
+      exit: 1,
+      stdout: "",
+      stderr: "node_proof_proxy_failed",
     },
     {
       stage: "runtime_talos",
@@ -575,7 +620,7 @@ export function validateRuntimeResult(
       throw new QualificationFailure("runtime_version_invalid:runtime_kubectl");
     }
     requireCheck(
-      version?.clientVersion?.gitVersion === "v1.36.3" &&
+      version?.clientVersion?.gitVersion === "v1.36.5" &&
         version.clientVersion.platform === "linux/amd64",
       "runtime_version_invalid:runtime_kubectl",
     );
@@ -907,7 +952,9 @@ export async function qualify(
       "Tag does not refer to the built image",
     );
     const dockerfile = await readFile(
-      `apps/${profile === "regional" ? "regional" : "node-bootstrap"}/Dockerfile`,
+      profile === "postgres"
+        ? "infra/postgres/Dockerfile"
+        : `apps/${profile === "regional" ? "regional" : "node-bootstrap"}/Dockerfile`,
       "utf8",
     );
     const baseImage = validateDockerfile(dockerfile, profile);
@@ -987,7 +1034,14 @@ export async function qualify(
         );
       }
     }
-    validateBasePrefix(config.rootfs.diff_ids, base.RootFS.Layers);
+    if (profile === "postgres") {
+      // The key-free rootfs snapshot deliberately inherits no key-bearing upstream layer.
+      // The exact official source image, engine hash and effective configuration are tested separately.
+      requireCheck(
+        config.rootfs.diff_ids.length === 1,
+        "PostgreSQL assembly must contain exactly one flattened filesystem layer",
+      );
+    } else validateBasePrefix(config.rootfs.diff_ids, base.RootFS.Layers);
     requireCheck(
       config.rootfs.diff_ids.length === descriptor.Layers.length,
       "Saved layer count differs from config",

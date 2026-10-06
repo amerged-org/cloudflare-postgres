@@ -5,12 +5,16 @@ The first EU node and five Flux platform releases are Ready, with 95 GiB measure
 Its node identity, storage and protected cluster custody are preserved. The second existing EU
 VPS has passed signed network verification and admission, with 95 GiB measured capacity.
 Actual capacity demand placed databases on both EU nodes and SQL passed through Cloudflare.
-Exactly one new EU and one US-central Cloud VPS 8 order were paid and allocated with
-8 vCPU, 24,576 MiB RAM and 307,200 MiB SSD. The owner cancelled these incorrect storage
-orders; both still report rescue with a 2026-11-05 cancellation date. No installer job or
-target disk write exists. New EU1 and US1 must use 150 GB NVMe; the published API defaults
-V155 to 300 GB SSD and has no verified included-NVMe selector, so ordering awaits a verified
-path. The owner has been asked whether to use the official web shop for the replacements.
+Exactly one new EU and one new US-central Cloud VPS 8 were ordered through the Contabo API.
+After payment, both original instances were allocated with 8 vCPU, 24,576 MiB RAM and
+307,200 MiB SSD. The owner cancelled these incorrect storage orders; provider readback records
+a 2026-11-05 cancellation date while both remain in rescue. Neither has an installer job or disk
+write. Replacement EU1 and US1 must use Cloud VPS 8 with 150 GB NVMe; exact API storage selection
+is unverified in the published API; the owner’s choice of web-shop ordering is pending. Neither replacement has passed installation/admission yet.
+The original SSD additions are now logically cancelled through the reviewed API: their claims,
+receipts, audits and protected EU source/custody remain unchanged, and both reserved slots are
+released. The exact original EU Workflow is errored and US is terminated; neither target has
+a job, node or disk write. Provider cancellation remains scheduled for 2026-11-05.
 No customer or platform production database has been migrated. The approved final topology is
 the retained EU control/relay server, one new EU customer worker and one new US regional/customer server.
 The old EU2 remains healthy until replacement readiness and verified data recovery permit removal.
@@ -24,8 +28,10 @@ zero unresolved findings. Anonymous manifest, configuration and every compressed
 layer verification passed, with 89,764,233 compressed bytes read back. Agent, both gateways and
 five platform releases remained Ready for 69.78 s. Both EU Node UIDs, all three test databases'
 namespace/Cluster/PVC/PV/Secret identities and three EU encrypted custody records are preserved.
-The Edge uses `ab678993`; the management API uses `6912e835` (CI `37465032904`)
-with the actual pending-allocation response correction. The private bootstrap
+The management API uses `6912e835` with complete CI `37465032904`; Edge and the regional
+image remain at `ab678993`. Complete pending-payment inventory now parses without fabricating
+hardware, and configuration, network, relay and proof consumers reject unallocated resources.
+Both purchases have original-request-correlated D1 receipts; no order was replayed. The private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
 inputs are now bound. The current native bootstrap image is
 `sha256:1b9a38a4e43ba87ef997eab71ed6799a3c4377cca00485f842e693ebac371923`
@@ -329,9 +335,10 @@ defines the warm route cache, direct Pod-IP/TLS path, configuration fingerprints
 - CNPG `Cluster`:
   - 1 instance, pinned PostgreSQL 18 image.
   - StorageClass `pgcf-lvm` with the size class storage.
-  - Current memory requests = limits from the size class. The approved warm-reclaim design
-    introduces an explicit class policy with a PostgreSQL memory request below its limit,
-    configured before idle transitions; full placement reservations remain in force initially.
+  - Reserved mode requests the full class memory. The approved actual-RAM mode supplies an
+    explicit PostgreSQL request (128 MiB in this installation) while retaining the assigned
+    container limit. Barman has separate requests/limits. Actual mode requires fresh physical
+    RAM and atomic transient startup admission; it is not enabled merely by lowering a request.
   - `nodeSelector` on the placed node; `enableSuperuserAccess: false`.
   - `initdb` database named after the database ID (the PostgreSQL database name equals the ID),
     owned by role `app`; additional roles via `managed.roles`.
@@ -415,15 +422,36 @@ defines the warm route cache, direct Pod-IP/TLS path, configuration fingerprints
 ### Capacity and placement
 
 A node's allocatable resources are the Kubernetes allocatable values minus a measured platform
-reservation. Each database reserves:
+reservation. Storage and CPU keep their hard fit checks, including sleeping assignments.
 
-- **Storage:** its size class storage.
-- **Memory and CPU:** full size-class and sidecar reservations, including sleeping databases.
-  A sleeping reservation factor is not implemented. Reducing reservations requires measured
-  density and an explicit capacity check before wake; it must not silently overcommit a node.
+Reserved mode is the compatibility default and reserves full PostgreSQL and Barman memory.
+The owner-approved actual-RAM mode uses the node's measured working set divided by physical
+memory capacity, sampled once per minute. Ten consecutive fresh buckets produce the rolling
+average; unknown/null/gapped or changed-UID observations never become zero utilization.
+At **at least 76%**, the capacity path requests one additional server in the same region,
+within configured node and standing cost-profile caps. During installation, existing nodes
+continue accepting databases under fresh physical RAM, CPU and storage guards; there is no
+additional utilization cutoff. Newly Ready capacity can serve customers immediately from a valid latest
+physical sample without waiting ten minutes for its first averaging window. The average remains
+unknown until complete, and 76% purchase decisions require all ten measured buckets.
+The EU control/relay node uses a separate placement flag, preserving its platform scheduling and
+management of existing databases.
 
-Placement picks the node with the most free memory in the region that fits. Contabo contracts are
-monthly, so scale-in only cancels at the end of a term, and autoscaling uses hysteresis.
+Admin class assignments use 256 MiB increments; this installation's actual mode permits up to
+4096 MiB per PostgreSQL container. A smaller explicit Kubernetes request permits intentional
+steady-state overbooking. Create, restore, wake, resume and running resize atomically hold the
+full target PostgreSQL limit plus Barman's limit during startup. Accepted ready/hibernated/deleted
+observations and a later physical sample settle holds; uncertain starts have no timeout release.
+Pending demand caused only by startup RAM or held starts waits below the 76% rolling purchase threshold.
+CPU/storage exhaustion and an empty customer pool retain their independent capacity path.
+
+Changing placement mode or the PostgreSQL request requires no assigned live databases and no
+unsettled starts; unplaced demand may remain. Apply this configuration after harness cleanup and
+before customer migration. Updating cost or node caps with the same request geometry is allowed.
+D1 keeps projects/external IDs, database/class/node assignments, physical memory history and
+startup holds. Use the guarded admin API; direct table edits bypass lifecycle guards.
+
+Contabo contracts are monthly. Any scale-in follows the provider's term/cancellation rules.
 
 ### Scaling and adopter connection capacity
 
@@ -632,15 +660,25 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   8 vCPU, 24 GB RAM, 300 GB SSD, 600 Mbit/s and three included snapshots. The verified quotes
   are €16.94 gross/month EU and €20.87 gross/month US, €37.81 combined, with €0 setup.
   This selection supersedes the previous V159/€20.09 US quote and approval hold.
+- Replacement authorization (2026-10-06): the owner cancelled the two 300 GB SSD orders and
+  explicitly requested one new EU1 and one US1 with 150 GB NVMe, 8 vCPU and 24 GB RAM.
+  Fresh official shop quotes show €14.00/€17.25 net monthly and €16.66/€20.53 with displayed
+  19% VAT, €37.19 combined and no setup fee; actual account tax remains to be verified.
+  The public API hardware table still defaults V155 to 300 GB SSD, and the included NVMe
+  selector has no numeric add-on ID. Do not guess an expansion add-on or substitute the
+  4-vCPU/8-GB V159 model. Retire only the vendor-cancelled empty additions through guarded
+  API cancellation; preserve old EU2 until replacement and recovery acceptance.
 - Capacity additions have standing owner authorization within the configured regional offer,
   exact cost profile and node/spend caps. No new per-server approval prompt is required.
   Uncertain responses must be reconciled using the original request UUID; never repeat an
   irreversible provider order to discover its outcome.
 - Approved actual-RAM policy: sample each customer node's working-set bytes divided by its
   physical memory capacity each minute. Require ten consecutive fresh minute buckets and use
-  their rolling average. At **at least 81%**, permanently close that node to every new database
-  placement and initiate one addition in the same region. Missing samples, changed Node UID
-  and MemoryPressure remain explicit unknown/unsafe states, never zero utilization.
+  their rolling average. The latest owner instruction sets **76%** as the proactive purchase
+  trigger. This is the only utilization threshold. Continue placing databases on existing nodes while deployment runs,
+  subject to the hard physical RAM/CPU/storage guards until replacement capacity is Ready. Missing samples, changed Node UID and MemoryPressure remain unknown/unsafe,
+  never zero utilization. Fresh newly Ready capacity need not wait for ten minutes of average
+  history before safe placement. Each triggering Node UID creates at most one regional addition.
 - Admin RAM assignment uses 256 MiB increments. This installation permits PostgreSQL limits
   from 256 MiB through 4096 MiB; free/paid labels and customer entitlements belong to the adopter.
   D1 records the project external ID, database, size class, assigned RAM and placed node.
@@ -651,15 +689,60 @@ and targeted health/overload checks. Record recovery time and last recoverable t
 - Actual-RAM placement, standing approvals and the complete headless bootstrap producer are
   implementation/live-acceptance work. The deployed path still uses full reservations.
 - The first EU order was dispatched once. Its exact CREATED audit matches the original request
-  and selected region/product/image/hostname. Contabo currently reports PENDING_PAYMENT with
-  RAM and disk unallocated; this is an order receipt, not accepted 8-vCPU/24-GB/300-GB hardware.
+  and selected region/product/image/hostname. Both initial instances first reported PENDING_PAYMENT
+  with unallocated hardware. On the owner’s paid-continue instruction, actual reads confirmed both
+  original instances Running with the exact purchased hardware; installation remains separate.
   Provider regression tests cover the complete pending-payment response: nullable audit trace
   ID, RAM/disk, network, MAC, location/name and host metadata, plus an empty product display name.
   The first delivered fix covered only trace/RAM/disk and did not resolve the receipt; one
   controlled restart reached provider readback without executing a purchase step. The complete
   correction retains unknown fields and requires allocated hardware before network/relay/install
-  actions. US remains unattempted while the original EU receipt is reconciled. The customer panel
-  currently requires owner sign-in; no invoice amount or payment has been verified there.
+  actions. The complete correction was delivered from `6912e835`, CI `37465032904`, and both
+  original order receipts/audits are reconciled. The owner confirmed payment; provider allocation
+  is verified. The exact invoice amount has not been read from the customer panel.
+- Empty vendor-cancelled addition retirement is delivered from `9a1ae0c4`, CI `37497225836`.
+  All 398 API tests passed; full CI and independent cancellation review passed. The current
+  four firewall mappings, three rescue entries, US archive/transport bindings, ten required
+  secrets and exact native `cf6d5d55` image/namespace are preserved. Fresh original provider
+  receipts/audits/cancellation dates and zero target jobs/nodes were verified before one cancel
+  call per region. All original ledger fields except status/slot/revision/update time remain
+  byte-identical; both old EU Node UIDs, source readiness and encrypted regional custody remain
+  unchanged. The EU original Workflow is errored; US is terminated. No provider infrastructure
+  mutation, deletion or refund is claimed. Automatic expansion remains disabled in both live
+  regional policies while the NVMe ordering path is unresolved.
+- A fresh 74,178,541-byte Dev D1 export restored 31 tables and 98,738 rows. Migrations 0018–0021
+  rehearsed locally with every pre-existing column/value fingerprint preserved, clean integrity
+  and foreign keys, and compatibility-default reserved placement. No live migration was applied.
+- Latest rollout requirement (2026-10-06): use new 150 GB NVMe EU/US targets to accept the
+  complete programmed Cloudflare purchase/install/join process with a qualified pinned image.
+  Manual per-node bootstrap configuration and disk writes are on hold; no new installer job or
+  target disk write has occurred. Both RAM-rescue systems and exact new target image/GPT hashes
+  are measured. Software release preparation, security-patch review, source/image
+  qualification and the actual network/port/isolation checks are part of the programmed path.
+  Installed Talos has no SSH daemon; rescue permits only the controlled registered-key path.
+  The current host identities and uploaded user data are automatically imported into sealed
+  bindings, rather than regenerated while the hosts are already in rescue.
+- Current firewall pricing is free for every VPS/VDS, confirmed by the official
+  [April 2026 launch](https://contabo.com/blog/contabo-firewall-is-here-free-with-every-vps-and-vds/),
+  [current product documentation](https://docs.contabo.com/docs/products/cloud-vps/) and
+  [firewall service page](https://contabo.com/en-us/firewall/). The older API introduction’s
+  paid-add-on sentence is stale. Two owned empty, unattached definitions were created once each
+  and read back; no optional add-on order was submitted. Automatic instance metadata later shows
+  included firewall ID 1501 on EU and firewall/location IDs 1501/2247 on US. ID 2247 is
+  United States (Central); neither ID selects SSD or NVMe. Those observations are retained unchanged.
+- Isolated implementation now enforces fresh physical startup headroom with full transient
+  PostgreSQL/sidecar peak holds for create, restore, wake, resume and running resize. An accepted
+  ready/hibernated/deleted observation plus a later current-UID memory sample settles a hold;
+  failed-operation metadata and timeouts do not. Below-76 RAM/start queues do not purchase nodes.
+  Hard CPU/storage exhaustion and absent customer capacity retain their capacity path.
+  Switching placement mode or PostgreSQL request geometry requires an empty assigned live cohort
+  and no unsettled starts; unplaced pending demand may remain. Configure actual mode after
+  harness cleanup and before customer migration. Existing class assignments must fit the configured
+  quantum/maximum. Cost/node-cap changes with unchanged request geometry remain available.
+- Protected installation profiles, per-node host identities, dynamic free-firewall definition
+  allocation, inspection authentication and input composition are implemented in the isolated
+  worktree. The native physical inspection, measured storage publication and complete proof
+  orchestration are still being connected; they have not passed Dev acceptance.
 - Reset-readiness audit (2026-10-06): native `cf6d5d55` is present locally with its exact source
   label and qualified private-registry readback; regional `ab678993` manifest/configuration and
   pinned Cilium/Flux assets are available over HTTPS. Both EU servers/nodes are Running/Ready;
@@ -814,7 +897,9 @@ Build:
 - Before join, apply the peer-address firewall allowlist for API, Talos, kubelet, control-plane
   etcd and CNI traffic, and configure Cilium WireGuard Pod encryption. Keep the new node out of
   database placement until the encrypted inter-node path and network isolation are verified.
-- Capacity cron with an autoscale policy and hard caps. Initial node caps are EU = 2 and US = 1.
+- Capacity cron with an autoscale policy and hard caps. The initial transition temporarily permits
+  three EU nodes while old EU2 is replaced; US initially permits one. Configure additional headroom
+  and the standing cost profile before enabling customer expansion.
 - Owner clarification (2026-10-06): capacity expansion must run headless through
   `https://api.contabo.com/` after one-time account, offer and cost/node-cap configuration.
   The Cloudflare workflow must compose provider-bound bootstrap inputs and produce the required
@@ -829,8 +914,9 @@ Build:
   reservations. Stale node observations stop purchasing; active additions and node caps prevent
   another reservation. There is no sampled CPU-utilization percentage threshold in v1.
 - Reconcile uncertain provider responses before retrying; a replay must never buy another node.
-- Node caps count live nodes. Marking a node lost frees its slot for a replacement; the replacement
-  order still needs the owner's costed approval. Reinstalling the same VPS in place needs no purchase.
+- Node caps count live nodes. Marking a node lost frees its slot for a replacement. A matching
+  unexpired standing regional cost profile can authorize the replacement automatically; otherwise
+  an exact costed approval is required. Reinstalling the same VPS requires no new purchase.
 
 Live acceptance:
 
@@ -941,17 +1027,6 @@ Public release polish and blank foreign-account installation acceptance follow o
 Later, extend backups and replication so that losing a server does not lose acknowledged transactions.
 Relocation of sleeping databases, branching, other VPS providers, an HTTP SQL endpoint, PostgREST,
 a Studio workbench.
-
-Latest replacement update (2026-10-06): only the 76% ten-minute actual-RAM purchase threshold
-remains approved; placements continue during rollout subject to physical RAM/CPU/storage
-guards. The isolated implementation has passed its focused D1 checks. The native image
-snapshot passed full qualification (18 layers, 714,047,406 bytes, zero unresolved findings).
-The patched PostgreSQL 18.6/pgvector 0.8.7 assembly removes the upstream unused snakeoil pair
-from a single published filesystem layer; real SQL and complete layer qualification passed.
-These local images are not yet delivered or a claim of complete headless Dev acceptance.
-An independently reviewed API correction records already-vendor-cancelled empty paid
-additions, retaining original claims/receipts and refusing jobs or installed nodes. Delivery
-and retirement of the two original additions are pending; provider deletion/refund is not claimed.
 
 ## 8. Known facts from the lab (2026-09-27 to 2026-10-01)
 

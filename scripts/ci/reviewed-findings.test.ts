@@ -10,8 +10,107 @@ import {
   reviewedManifestPaths,
   imageProfile,
   verifyNativeArtifacts,
+  postgresBase,
 } from "./reviewed-findings.ts";
+import postgresReview from "./postgres-reviewed-findings.json" with { type: "json" };
 import type { CanonicalFinding } from "./scanner.ts";
+
+test("PostgreSQL resolves only independently reviewed public code and self-test spans in the pinned flattened assembly", () => {
+  const digest = "sha256:" + "f".repeat(64);
+  const proof = {
+    profile: "postgres" as const,
+    baseImage: postgresBase,
+    baseDiffIDs: [],
+    imageDiffIDs: [digest],
+    packages: [],
+  };
+  const values: CanonicalFinding[] = postgresReview.files.flatMap((file) =>
+    file.findings.map((span) => ({
+      File: file.path,
+      RuleID: span.rule,
+      StartLine: span.startLine,
+      EndLine: span.endLine,
+      StartColumn: span.startColumn,
+      EndColumn: span.endColumn,
+      Match: "REDACTED",
+      Secret: "REDACTED",
+      Tags: [],
+      input: {
+        kind: "layer-file",
+        layer: 0,
+        tarEntry: 1,
+        path: file.path,
+        sha256: file.sha256,
+        size: file.size,
+        boundDigest: digest,
+        sourcePath: "unused",
+      },
+      span: span.span,
+    })),
+  );
+  assert.equal(values.length, 13);
+  assert.deepEqual(classifyReviewed(values, proof), {
+    resolved: 13,
+    unresolved: 0,
+  });
+  assert.equal(
+    classifyReviewed(values, { ...proof, baseImage: reviewedBase.image })
+      .unresolved,
+    13,
+  );
+  const original = values[0]!;
+  assert.equal(
+    classifyReviewed(
+      [{ ...original, input: { ...original.input, sha256: "0".repeat(64) } }],
+      proof,
+    ).unresolved,
+    1,
+  );
+  assert.equal(
+    classifyReviewed(
+      [
+        {
+          ...original,
+          input: { ...original.input, boundDigest: "sha256:" + "a".repeat(64) },
+        },
+      ],
+      proof,
+    ).unresolved,
+    1,
+  );
+  assert.equal(
+    classifyReviewed(
+      [
+        {
+          ...original,
+          span: { ...original.span!, byteStart: original.span!.byteStart + 1 },
+        },
+      ],
+      proof,
+    ).unresolved,
+    1,
+  );
+  assert.equal(
+    classifyReviewed(
+      [
+        {
+          ...original,
+          File: "etc/ssl/private/ssl-cert-snakeoil.key",
+          input: {
+            ...original.input,
+            path: "etc/ssl/private/ssl-cert-snakeoil.key",
+          },
+        },
+      ],
+      proof,
+    ).unresolved,
+    1,
+  );
+  assert.equal(
+    classifyReviewed([{ ...original, Tags: ["base64"] }], proof).unresolved,
+    1,
+  );
+});
 
 function finding(file = reviewedFiles[0]!, index = 0): CanonicalFinding {
   const span = file.findings[index]!;

@@ -19,10 +19,6 @@ import {
   NodeBootstrapCheckpoint,
 } from "@pgcf/contracts/node-bootstrap";
 import { z } from "zod";
-import {
-  cancelAlreadyCancelledProviderAddition,
-  stopCancelledNodeAdditionWorkflow,
-} from "../domain/cancel-provider-addition.ts";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
@@ -36,6 +32,7 @@ import {
   verifyNodeCapacity,
   verifyNodeNetwork,
   markNodeLost,
+  approveStandingNodePurchase,
 } from "../domain/node-state.ts";
 import {
   bootstrapJobInput,
@@ -45,6 +42,10 @@ import {
   readBootstrapJob,
 } from "../domain/bootstrap-jobs.ts";
 import { contaboClient } from "../domain/bootstrap-relay.ts";
+import {
+  cancelAlreadyCancelledProviderAddition,
+  stopCancelledNodeAdditionWorkflow,
+} from "../domain/cancel-provider-addition.ts";
 import { hasAllocatedContaboHardware } from "../providers/contabo.ts";
 import { ip } from "../domain/node-network.ts";
 import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
@@ -65,6 +66,35 @@ export const NodePurchaseApproval = z.strictObject({
 export const NodeRevision = z.strictObject({
   expected_revision: z.number().int().positive(),
 });
+export const NodeDatabasePlacement = z.strictObject({
+  expected_node_uid: z.uuid(),
+  database_placement_enabled: z.boolean(),
+});
+export async function setNodeDatabasePlacement(
+  c: ApiContext,
+  id: string,
+  raw: z.infer<typeof NodeDatabasePlacement>,
+): Promise<Response> {
+  await requireScope(c, "admin");
+  const body = NodeDatabasePlacement.parse(raw);
+  const result = await c.env.DB.prepare(
+    "UPDATE nodes SET database_placement_enabled=?,database_placement_closed_at=?,updated_at=? WHERE id=? AND node_uid=? AND lost_at IS NULL",
+  )
+    .bind(
+      Number(body.database_placement_enabled),
+      body.database_placement_enabled ? null : new Date().toISOString(),
+      new Date().toISOString(),
+      id,
+      body.expected_node_uid,
+    )
+    .run();
+  if (result.meta.changes !== 1)
+    throw new ApiError(
+      "conflict",
+      "Placement control requires the current physical node identity",
+    );
+  return c.json({ node_id: id, ...body });
+}
 export const NodeVerificationRequest = z.strictObject({
   expected_revision: z.number().int().positive(),
   sha256: z.string().regex(/^[a-f0-9]{64}$/),
@@ -105,10 +135,14 @@ export async function requestNodeAddition(
   return withIdempotency(c, {
     replay: async (id) => nodeAdditionResponse(c, id),
     execute: async (lease) => {
-      const addition = await reserveNodeAddition(c.env.DB, {
+      let addition = await reserveNodeAddition(c.env.DB, {
         request_key: key,
         request: body,
       });
+      addition = await approveStandingNodePurchase(
+        c.env.DB,
+        addition.intent.operation_id,
+      );
       await lease
         .completeStatement(addition.intent.operation_id, 202, {
           sql: "EXISTS(SELECT 1 FROM node_additions WHERE operation_id=?)",
@@ -211,6 +245,10 @@ export async function getCapacityPolicy(
       order_config: string | null;
       autoscale_enabled: number;
       adopt_instance_ids: string;
+      placement_mode: "reserved" | "actual_ram";
+      maximum_database_memory_mib: number | null;
+      postgres_memory_request_mib: number | null;
+      standing_cost_profile: string | null;
     }>();
   if (!row)
     throw new ApiError("not_found", "Region capacity policy is not configured");
@@ -222,6 +260,13 @@ export async function getCapacityPolicy(
       autoscale_enabled: Boolean(row.autoscale_enabled),
       order: row.order_config === null ? null : JSON.parse(row.order_config),
       adopt_instance_ids: JSON.parse(row.adopt_instance_ids),
+      placement_mode: row.placement_mode,
+      maximum_database_memory_mib: row.maximum_database_memory_mib,
+      postgres_memory_request_mib: row.postgres_memory_request_mib,
+      standing_cost_profile:
+        row.standing_cost_profile === null
+          ? null
+          : JSON.parse(row.standing_cost_profile),
     }),
   );
 }
@@ -242,6 +287,10 @@ export async function setCapacityPolicy(
     max_nodes: policy.max_nodes,
     purchases_enabled: policy.purchases_enabled,
     order: policy.order,
+    placement_mode: policy.placement_mode,
+    maximum_database_memory_mib: policy.maximum_database_memory_mib,
+    postgres_memory_request_mib: policy.postgres_memory_request_mib,
+    standing_cost_profile: policy.standing_cost_profile,
   });
   await c.env.DB.prepare(
     "UPDATE node_region_policies SET autoscale_enabled=?,adopt_instance_ids=? WHERE region_id=?",
@@ -367,6 +416,7 @@ const ProofEnvelope = z.strictObject({
   payload: Proof,
   signature: z.string().regex(/^[A-Za-z0-9_-]{86}$/),
 });
+export const nodeVerificationProofSchema = Proof;
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -376,14 +426,25 @@ function canonical(value: unknown): string {
     .map((name) => `${JSON.stringify(name)}:${canonical(object[name])}`)
     .join(",")}}`;
 }
+export const canonicalNodeVerificationProof = canonical;
 export async function verifyNodeProof(
   c: ApiContext,
   id: string,
   raw: z.infer<typeof NodeVerificationRequest>,
 ): Promise<Response> {
   await requireScope(c, "admin");
+  const next = await verifyNodeProofArtifact(c.env, id, raw);
+  c.executionCtx.waitUntil(startAddNode(c.env, id));
+  return c.json(next, 202);
+}
+
+export async function verifyNodeProofArtifact(
+  env: Env,
+  id: string,
+  raw: z.infer<typeof NodeVerificationRequest>,
+) {
   const body = NodeVerificationRequest.parse(raw),
-    addition = await readNodeAddition(c.env.DB, id);
+    addition = await readNodeAddition(env.DB, id);
   if (
     addition.revision !== body.expected_revision ||
     addition.checkpoint?.stage !== "joined" ||
@@ -393,10 +454,10 @@ export async function verifyNodeProof(
       "conflict",
       "Verification requires the current joined node checkpoint",
     );
-  const row = await readBootstrapJob(c.env.DB, id),
-    input = await bootstrapJobInput(c.env, row);
+  const row = await readBootstrapJob(env.DB, id),
+    input = await bootstrapJobInput(env, row);
   const proofKey = `node-verification/${id}/${addition.checkpoint.reference}/proof.json`;
-  const object = await c.env.ARCHIVE.get(proofKey);
+  const object = await env.ARCHIVE.get(proofKey);
   if (!object || object.size > 256 * 1024)
     throw new ApiError(
       "conflict",
@@ -415,7 +476,7 @@ export async function verifyNodeProof(
     ),
   );
   const keys = await importBootstrapVerificationKeys(
-      JSON.parse(c.env.BOOTSTRAP_VERIFIER_KEYS),
+      JSON.parse(env.BOOTSTRAP_VERIFIER_KEYS),
     ),
     key = keys.get(envelope.kid),
     signature = base64urlToBytes(envelope.signature);
@@ -461,8 +522,8 @@ export async function verifyNodeProof(
       "Node proof identity, checkpoint or freshness differs from the operation",
     );
   const protectedCluster = await loadRegionJoinBundle(
-    c.env.DB,
-    c.env.CREDENTIAL_KEYS,
+    env.DB,
+    env.CREDENTIAL_KEYS,
     joinBundleReference(row.region_id, 1),
   );
   if (
@@ -473,7 +534,7 @@ export async function verifyNodeProof(
       "conflict",
       "Proof cluster identity differs from actual sealed Kubernetes readback",
     );
-  const actual = await contaboClient(c.env).getInstance(
+  const actual = await contaboClient(env).getInstance(
       proof.provider_instance_id,
       { requestId: crypto.randomUUID() },
     ),
@@ -497,7 +558,7 @@ export async function verifyNodeProof(
       "conflict",
       "Additional provider addresses require complete verified outside-allowlist scan coverage",
     );
-  const peers = await c.env.DB.prepare(
+  const peers = await env.DB.prepare(
     "SELECT id,provider_instance_id FROM nodes WHERE region_id=? AND id<>? AND lost_at IS NULL",
   )
     .bind(row.region_id, row.node_id)
@@ -568,7 +629,7 @@ export async function verifyNodeProof(
         "Complete controlled outside-allowlist scan proof is required",
       );
   }
-  const node = await c.env.DB.prepare(
+  const node = await env.DB.prepare(
     "SELECT * FROM nodes WHERE id=? AND region_id=? AND provider_instance_id=? AND k8s_node_name=? AND ready=1 AND node_uid=?",
   )
     .bind(
@@ -640,11 +701,11 @@ export async function verifyNodeProof(
     checkpoint_reference: addition.checkpoint.reference,
     proof_reference: `${proofKey}#${body.sha256}`,
   };
-  let next = await verifyNodeNetwork(c.env.DB, id, addition.revision, {
+  let next = await verifyNodeNetwork(env.DB, id, addition.revision, {
     ...scope,
     verified_at: proof.observed_at,
   });
-  next = await verifyNodeCapacity(c.env.DB, id, next.revision, {
+  next = await verifyNodeCapacity(env.DB, id, next.revision, {
     ...scope,
     observed_at: node.last_observed_at,
     allocatable_memory_mib: node.allocatable_memory_mib,
@@ -656,7 +717,7 @@ export async function verifyNodeProof(
   if (Date.parse(proof.expires_at) <= Date.now())
     throw new ApiError("conflict", "Node proof expired before admission");
   const serializedBinding = JSON.stringify(admissionBinding);
-  const updated = await c.env.DB.prepare(
+  const updated = await env.DB.prepare(
     `UPDATE node_bootstrap_jobs SET admission_authorized=1,admission_binding_json=?,admission_expires_at=?,updated_at=?
      WHERE operation_id=? AND input_hash=? AND revision=? AND checkpoint_json=? AND admission_binding_json IS ?
      AND authorized=1 AND admitted=0 AND cancelled=0`,
@@ -677,7 +738,7 @@ export async function verifyNodeProof(
       "conflict",
       "Bootstrap admission changed while verification was in progress",
     );
-  const admitted = await readBootstrapJob(c.env.DB, id);
+  const admitted = await readBootstrapJob(env.DB, id);
   if (
     admitted.admission_binding_json !== serializedBinding ||
     admitted.admission_expires_at !== proof.expires_at ||
@@ -690,8 +751,7 @@ export async function verifyNodeProof(
       "conflict",
       "Bootstrap admission changed before authorization readback",
     );
-  c.executionCtx.waitUntil(startAddNode(c.env, id));
-  return c.json(next, 202);
+  return next;
 }
 
 export async function capacityDecision(

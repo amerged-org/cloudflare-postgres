@@ -1,7 +1,9 @@
 # Existing-account installation
 
 This guide completes the operator's existing Cloudflare/Contabo installation. Preserve the first
-EU node and its imported credentials. Initial limits are two EU nodes and one US node; public
+EU control/relay node and its imported credentials. The final topology has one EU customer worker
+and one US control-plane/customer node. Retain the old EU2 until replacement and recovery
+acceptance; temporary node caps must include that retained source. Public
 distribution and installation in a foreign Cloudflare account are separate release work.
 
 ## Reviewed deployment inputs
@@ -45,7 +47,61 @@ Verify the real VPC-to-Tunnel identity and the relay's current process epoch bef
 bootstrap jobs. Native SSH, Talos and Kubernetes sessions still verify their host keys or
 certificates end to end. Broken transport never replays a native command.
 
-## Existing EU worker and new US region
+## Programmed installation path
+
+The current headless producer is under implementation and requires the Dev acceptance in PLAN.md.
+Configure an authenticated regional `/v1/regions/{id}/installation-profile` once, with the reviewed
+Talos image source, measured storage geometry, DNS, retained rescue client key and issuer region.
+The first node of a region additionally needs its reviewed platform source/image and protected
+regional credentials; an EU worker uses the retained cluster join custody. Profiles and per-node
+rescue identities are encrypted in D1. Status never returns their private keys.
+
+For actual-RAM placement, configure the policy explicitly: 256 MiB assignment steps, maximum
+4096 MiB, and the reviewed PostgreSQL request (128 MiB in this installation). Keep CPU and storage
+checks enabled. Changing reservation geometry requires an empty assigned live cohort and no
+unsettled startups; a normal cost/node-cap change does not reset existing database state. Mark the
+retained control server ineligible through its UID-guarded database-placement endpoint, while
+preserving Kubernetes/platform operation and existing data until cleanup.
+
+The automatic sequence is:
+
+1. Ten fresh consecutive minute samples from the same physical Node UID reach 76% average
+   working-set/physical RAM. Cloudflare reserves one regional addition, checks the exact standing
+   offer and spend/node caps, then dispatches one original provider request UUID.
+2. Read-only receipt/audit reconciliation establishes the actual instance. Unknown order outcomes
+   never cause a second purchase. A cancellation is recorded only after fresh matching provider
+   inventory confirms it and no installer job, node or destructive progress exists.
+3. Allocate/read back the owned free firewall definition, create a unique retained rescue host
+   identity, and request registered-key RAM rescue. Native inspection measures the actual disk,
+   RAM, MAC, network and official pinned Talos image/GPT; incomplete hardware remains unknown.
+4. Compose and seal the exact installation input. Actual outside-allowlist dual-stack port scans
+   and allowed-source controls establish a signed preparation proof. The Workflow refreshes
+   measurements when the proof has less than 60 seconds remaining; it retains all write offsets
+   and immutable checkpoints.
+5. Install the qualified image, apply the exact network configuration and join/bootstrap the
+   intended region. The release pins reviewed security patch versions. Installed Talos has no
+   SSH daemon; management ports remain restricted to their reviewed sources and PostgreSQL is
+   never exposed. Rescue password authentication is disabled by the generated configuration.
+6. While quarantined, measure LVM/CSI capacity, write/read/reclaim an operation-owned trial volume,
+   verify node identity, encrypted peer traffic and complete external port isolation. Publish the
+   actual capacity and signed post-join proof; admission is the only path that releases quarantine.
+7. New Ready capacity accepts placement from fresh physical headroom without waiting ten minutes
+   for its utilization average. Existing regional servers remain eligible throughout rollout
+   under hard RAM/CPU/storage and full PostgreSQL/Barman startup-peak admission. There is no 81%
+   placement cutoff. Failed starts/timeouts do not silently release unknown peak reservations.
+
+Contabo's documented public API currently lists V155 as 300 GB SSD and does not expose the free
+150 GB NVMe selector used by its web shop. Do not activate a standing NVMe purchase profile with
+an unverified payload, an additional-storage expansion or a different hardware product. The
+owner's current replacement request is specifically 8 vCPU, 24 GB RAM and 150 GB NVMe. Until the
+provider's API selection is confirmed, ordering remains an explicit limitation; complete image
+installation is a separate acceptance gate.
+
+## Legacy manual evidence and recovery path
+
+The following procedure documents the earlier accepted EU2 path and explicit recovery inputs.
+It is not the normal per-server setup once the programmed producer has passed acceptance.
+
 
 1. Configure `/v1/regions/{id}/capacity-policy` with the explicit node maximum. EU lists the second
    existing provider instance in `adopt_instance_ids`; US may order only its configured approved

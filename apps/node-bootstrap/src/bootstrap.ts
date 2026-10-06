@@ -23,9 +23,13 @@ import { startNativeProxy, type ProxyConfig } from "./proxy-command.ts";
 import { PlatformInstaller, readPlatformAssets } from "./platform.ts";
 import { publishKubeletTrust } from "./kubelet-trust.ts";
 import { prepareScratch } from "./rescue-scratch.ts";
+import { publishNodeStorageCapacity } from "./storage-capacity.ts";
+import { NodeStorageTrial } from "@pgcf/contracts/node-bootstrap";
+import { BootstrapError } from "./bootstrap-error.ts";
+export { BootstrapError } from "./bootstrap-error.ts";
 
 export const TALOS_VERSION = "1.14.1";
-export const KUBERNETES_VERSION = "1.36.3";
+export const KUBERNETES_VERSION = "1.36.5";
 export const CHUNK_BYTES = 16 * 1024 ** 2;
 const MAX_COMMAND_MS = 540_000;
 const OUTPUT_LIMIT = 512 * 1024;
@@ -60,14 +64,6 @@ const STAGES: NodeBootstrapStage[] = [
   "quarantine_release_intent",
   "quarantine_released",
 ];
-
-export class BootstrapError extends Error {
-  readonly code: string;
-  constructor(code: string) {
-    super(code);
-    this.code = code;
-  }
-}
 
 export function canonical(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
@@ -668,12 +664,14 @@ export class BootstrapJob {
     args: string[],
     stdin?: string,
     permit_failure = false,
+    signal = this.abort.signal,
+    timeout_ms = MAX_COMMAND_MS,
   ) {
     const result = await this.run({
       executable,
       args,
-      signal: this.abort.signal,
-      timeout_ms: MAX_COMMAND_MS,
+      signal,
+      timeout_ms,
       env: this.env,
       ...(stdin === undefined ? {} : { stdin }),
     });
@@ -1100,9 +1098,19 @@ export class BootstrapJob {
             interfaces: [
               {
                 deviceSelector: { hardwareAddr: hardware.mac },
-                addresses: [`${hardware.ipv4}/${hardware.prefix_length}`],
+                addresses: [
+                  `${hardware.ipv4}/${hardware.prefix_length}`,
+                  ...(hardware.ipv6
+                    ? [
+                        `${hardware.ipv6.address}/${hardware.ipv6.prefix_length}`,
+                      ]
+                    : []),
+                ],
                 routes: [
                   { network: `${zero}/0`, gateway: hardware.gateway },
+                  ...(hardware.ipv6?.gateway
+                    ? [{ network: "::/0", gateway: hardware.ipv6.gateway }]
+                    : []),
                   ...peerRoutes(spec).map(({ destination, gateway }) => ({
                     network: destination,
                     gateway,
@@ -1112,7 +1120,10 @@ export class BootstrapJob {
               },
             ],
           },
-          certSANs: [hardware.ipv4],
+          certSANs: [
+            hardware.ipv4,
+            ...(hardware.ipv6 ? [hardware.ipv6.address] : []),
+          ],
         },
       },
       {
@@ -1596,6 +1607,77 @@ export class BootstrapJob {
       },
     });
   }
+  private async publishStorageCapacity() {
+    const signal = AbortSignal.any([
+      this.abort.signal,
+      AbortSignal.timeout(285_000),
+    ]);
+    const authorize = async () => {
+      const authority = await this.authority.read(signal);
+      const bundle =
+        authority.protected_material?.purpose === "join_bundle"
+          ? authority.protected_material.material
+          : this.input.join_bundle;
+      if (
+        !bundle ||
+        (this.input.spec.role === "controlplane" &&
+          !authority.checkpoint.sealed_ref)
+      )
+        throw new BootstrapError("storage_cluster_bundle_unsealed");
+      assertBundleIdentity(this.input.spec, bundle);
+      return bundle.kube_system_uid;
+    };
+    await publishNodeStorageCapacity(this.input, {
+      signal,
+      authorize,
+      kube: (args, permit_failure, stdin) =>
+        this.execute(
+          "kubectl",
+          [
+            "--kubeconfig",
+            join(this.directory, "kubeconfig"),
+            "--request-timeout=15s",
+            ...args,
+          ],
+          stdin,
+          permit_failure,
+          signal,
+          20_000,
+        ),
+      talos: (args) =>
+        this.execute(
+          "talosctl",
+          [
+            "--nodes",
+            this.input.spec.hardware.ipv4,
+            "--endpoints",
+            this.input.spec.hardware.ipv4,
+            "--talosconfig",
+            join(this.directory, "talosconfig"),
+            ...args,
+          ],
+          undefined,
+          false,
+          signal,
+          20_000,
+        ),
+      readTrial: async () =>
+        (await this.authority.read(signal)).checkpoint.storage_trial ?? null,
+      saveTrial: async (trial) => {
+        const previous = await this.authority.read(signal);
+        await this.authority.checkpoint(
+          previous,
+          {
+            ...previous.checkpoint,
+            storage_trial: NodeStorageTrial.parse(trial),
+            status: "running",
+            error_code: null,
+          },
+          signal,
+        );
+      },
+    });
+  }
   private async admissionNode(node_uid: string, kube_system_uid: string) {
     const namespace = record(
       JSON.parse(
@@ -1975,6 +2057,7 @@ export class BootstrapJob {
         authority = await this.checkpoint("kubernetes_joined");
       await this.installPlatform();
       await this.publishKubeletTrust();
+      await this.publishStorageCapacity();
       await this.checkpoint("awaiting_verification", {
         status: "awaiting_verification",
       });

@@ -41,4 +41,6 @@ export const nodeRow = (row: Row): Node =>
       row.platform_reserved_cpu_millicores ?? null,
     ready: row.ready === 1,
     schedulable: row.schedulable === 1,
+    database_placement_enabled: row.database_placement_enabled === 1,
+    memory_window_valid: row.memory_window_valid === 1,
   });

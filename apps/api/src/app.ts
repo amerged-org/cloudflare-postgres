@@ -12,6 +12,10 @@ import { registerAgentMetrics } from "./routes/agent-metrics.ts";
 import { registerCosts } from "./routes/costs.ts";
 import { registerOperationalHealth } from "./routes/health.ts";
 import { registerNodes } from "./routes/nodes.ts";
+import { registerNodeInstallation } from "./routes/node-installation.ts";
+import { registerNodeProof } from "./routes/node-proof.ts";
+import { authenticateNodeProofRequest } from "./domain/node-proof-session.ts";
+import { authenticateNodeInstallationInspection } from "./domain/node-installation.ts";
 import { authenticateBootstrapCallback } from "./domain/bootstrap-jobs.ts";
 import { NodeStateError } from "./domain/node-state.ts";
 import { requireScope } from "./middleware/auth.ts";
@@ -51,6 +55,17 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/nodes/additions/:id/cancel",
   "/v1/nodes/additions/:id/bootstrap",
   "/v1/nodes/additions/:id/verify",
+  "/v1/nodes/additions/:id/installation-binding",
+  "/v1/regions/:id/installation-profile",
+  "/internal/v1/node-installation/:id/inspection",
+  "/internal/v1/node-installation/:id/transport",
+  "/internal/v1/node-installation/:id/relay",
+  "/source-control",
+  "/internal/v1/node-proof/:id/transport",
+  "/internal/v1/node-proof/:id/relay",
+  "/internal/v1/node-proof/:id/access",
+  "/internal/v1/node-proof/:id/report",
+  "/internal/v1/node-proof/:id/ownership",
   "/v1/regions/:id/capacity-policy",
   "/v1/regions/:id/capacity-decision",
   "/internal/v1/node-bootstrap/:operation_id",
@@ -245,11 +260,30 @@ export function createApp(): ApiApp {
     const privateBootstrap =
       /^\/v1\/nodes\/additions\/op_[a-z0-9]{20}\/bootstrap$/.test(path) &&
       c.req.method === "POST";
+    const inspection =
+      /^\/internal\/v1\/node-installation\/(op_[a-z0-9]{20})\/(?:inspection|transport)$/.exec(
+        path,
+      );
+    const privateProfile =
+      /^\/v1\/regions\/[^/]+\/installation-profile$/.test(path) &&
+      c.req.method === "PUT";
     let maximum = JSON_BODY_MAX_BYTES;
-    if (callback && c.req.method === "POST") {
+    const proof =
+      /^\/internal\/v1\/node-proof\/(op_[a-z0-9]{20})\/(?:transport|access|report|ownership)$/.exec(
+        path,
+      );
+    if (proof && c.req.method === "POST") {
+      await authenticateNodeProofRequest(c, proof[1]!);
+      maximum = 512 * 1024;
+    } else if (path === "/source-control" && c.req.method === "POST") {
+      await authenticateNodeProofRequest(c);
+      maximum = 1024;
+    } else if (callback && c.req.method === "POST") {
       await authenticateBootstrapCallback(c, callback[1]!);
       maximum = 512 * 1024;
-    } else if (privateBootstrap) {
+    } else if (inspection && c.req.method === "POST") {
+      await authenticateNodeInstallationInspection(c, inspection[1]!);
+    } else if (privateBootstrap || privateProfile) {
       await requireScope(c, "admin");
       maximum = 512 * 1024;
     }
@@ -302,6 +336,8 @@ export function createApp(): ApiApp {
   registerAgentMetrics(app);
   registerCosts(app);
   registerNodes(app);
+  registerNodeInstallation(app);
+  registerNodeProof(app);
   registerOperationalHealth(app);
   app.doc31("/v1/openapi.json", {
     openapi: "3.1.0",

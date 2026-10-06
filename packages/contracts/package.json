@@ -14,6 +14,8 @@
     "./gateway-activity": "./src/gateway-activity.ts",
     "./costs": "./src/costs.ts",
     "./node-bootstrap": "./src/node-bootstrap.ts",
+    "./node-installation": "./src/node-installation.ts",
+    "./node-proof": "./src/node-proof.ts",
     "./bootstrap-relay": "./src/bootstrap-relay.ts",
     "./nodes": "./src/nodes.ts",
     "./client": "./src/client.ts"

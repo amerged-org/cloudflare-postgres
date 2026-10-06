@@ -371,6 +371,21 @@ test("invalid names and reserved PostgreSQL roles are rejected before manifests 
   assert.throws(() => databaseNamespace("../../namespace"), TypeError);
 });
 
+test("explicit startup memory permits overbooking while preserving the PostgreSQL cap", () => {
+  const { db, ctx } = fixture();
+  db.size.memory_mib = 4096;
+  db.size.memory_request_mib = 128;
+  const manifests = buildDatabaseManifests(db, ctx);
+  const resources = record(record(object(manifests, "Cluster").spec).resources);
+  assert.deepEqual(resources.requests, { cpu: "500m", memory: "128Mi" });
+  assert.deepEqual(resources.limits, { cpu: "500m", memory: "4096Mi" });
+  const hard = record(record(object(manifests, "ResourceQuota").spec).hard);
+  assert.equal(
+    hard["limits.memory"],
+    `${2 * (4096 + SIDECAR.limitMemoryMib)}Mi`,
+  );
+});
+
 test("quota covers two PostgreSQL and Barman pod slots for the supported size examples", () => {
   const { db, ctx } = fixture();
   for (const size of [

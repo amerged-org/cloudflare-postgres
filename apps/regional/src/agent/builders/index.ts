@@ -645,7 +645,13 @@ export function buildDatabaseManifests(
               },
             },
         affinity: { nodeSelector: { "kubernetes.io/hostname": db.node } },
-        resources: { requests: { ...compute }, limits: { ...compute } },
+        resources: {
+          requests: {
+            ...compute,
+            memory: mib(db.size.memory_request_mib ?? db.size.memory_mib),
+          },
+          limits: { ...compute },
+        },
         seccompProfile: { type: "RuntimeDefault" },
         storage: {
           storageClass: ctx.storageClass,

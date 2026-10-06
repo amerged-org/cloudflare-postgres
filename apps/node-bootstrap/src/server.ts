@@ -7,6 +7,10 @@ import {
 } from "node:http";
 import { pathToFileURL } from "node:url";
 import { OperationId } from "@pgcf/contracts";
+import { NodeInspectionInput } from "@pgcf/contracts/node-installation";
+import { runInspection } from "./inspector.ts";
+import { NodeProofExecutionInput } from "@pgcf/contracts/node-proof";
+import { runNodeProof } from "./node-proof-runner.ts";
 import {
   BootstrapError,
   BootstrapJob,
@@ -40,10 +44,38 @@ function reply(response: ServerResponse, status: number, value: unknown) {
 }
 export function createBootstrapServer(
   bearer: string,
-  options: BootstrapOptions = {},
+  options: BootstrapOptions & {
+    inspection?: typeof runInspection;
+    proof?: typeof runNodeProof;
+  } = {},
 ) {
   if (bearer.length < 32) throw new BootstrapError("server_bearer_required");
   const jobs = new Map<string, { job: BootstrapJob; running: boolean }>();
+  const inspections = new Map<
+    string,
+    {
+      expected_generation: number;
+      binding_sha256: string;
+      network_plan_sha256: string;
+      running: boolean;
+      status: "running" | "reported" | "failed";
+      error_code: string | null;
+      abort: AbortController;
+    }
+  >();
+  const proofs = new Map<
+    string,
+    {
+      session_id: string;
+      binding_sha256: string;
+      plan_sha256: string;
+      input_hash: string | null;
+      running: boolean;
+      status: "running" | "reported" | "failed";
+      error_code: string | null;
+      abort: AbortController;
+    }
+  >();
   const server = createServer((request, response) => {
     const handle = async () => {
       // Authentication precedes body collection and parsing of private material.
@@ -53,6 +85,163 @@ export function createBootstrapServer(
         return;
       }
       const path = request.url ?? "";
+      if (request.method === "POST" && path === "/v1/proofs") {
+        const input = NodeProofExecutionInput.parse(await body(request)),
+          key = `${input.claims.operation_id}:${input.claims.mode}`,
+          previous = proofs.get(key);
+        if (previous?.running) {
+          if (
+            previous.session_id !== input.claims.session_id ||
+            previous.binding_sha256 !== input.claims.binding_sha256 ||
+            previous.plan_sha256 !== input.claims.plan_sha256 ||
+            previous.input_hash !== input.claims.input_hash
+          )
+            throw new BootstrapError("proof_identity_conflict");
+          reply(response, 202, {
+            operation_id: input.claims.operation_id,
+            mode: input.claims.mode,
+            status: previous.status,
+            session_id: previous.session_id,
+          });
+          return;
+        }
+        if (
+          [...inspections.values()].some((entry) => entry.running) ||
+          [...proofs.values()].some((entry) => entry.running)
+        )
+          throw new BootstrapError("container_busy");
+        const entry = {
+          session_id: input.claims.session_id,
+          binding_sha256: input.claims.binding_sha256,
+          plan_sha256: input.claims.plan_sha256,
+          input_hash: input.claims.input_hash,
+          running: true,
+          status: "running" as "running" | "reported" | "failed",
+          error_code: null as string | null,
+          abort: new AbortController(),
+        };
+        proofs.set(key, entry);
+        void (options.proof ?? runNodeProof)(input, {
+          run: options.run,
+          request: options.request,
+          signal: entry.abort.signal,
+        })
+          .then(() => {
+            entry.status = "reported";
+          })
+          .catch((error: unknown) => {
+            entry.status = "failed";
+            entry.error_code =
+              error instanceof BootstrapError &&
+              /^[a-z0-9_]{1,100}$/.test(error.code)
+                ? error.code
+                : "node_proof_failed";
+          })
+          .finally(() => {
+            entry.running = false;
+          });
+        reply(response, 202, {
+          operation_id: input.claims.operation_id,
+          mode: input.claims.mode,
+          status: entry.status,
+          session_id: entry.session_id,
+        });
+        return;
+      }
+      const proof =
+        /^\/v1\/proofs\/(op_[a-z0-9]{20})\/(preparation|postjoin)$/.exec(path);
+      if (proof && request.method === "GET") {
+        const entry = proofs.get(`${proof[1]}:${proof[2]}`);
+        if (!entry) {
+          reply(response, 404, { error_code: "proof_input_required" });
+          return;
+        }
+        reply(response, 200, {
+          operation_id: proof[1],
+          mode: proof[2],
+          session_id: entry.session_id,
+          status: entry.status,
+          error_code: entry.error_code,
+        });
+        return;
+      }
+      if (request.method === "POST" && path === "/v1/inspections") {
+        const input = NodeInspectionInput.parse(await body(request));
+        const previous = inspections.get(input.operation_id);
+        if (previous?.running) {
+          if (
+            previous.expected_generation !== input.expected_generation ||
+            previous.binding_sha256 !== input.binding_sha256 ||
+            previous.network_plan_sha256 !== input.network_plan_sha256
+          )
+            throw new BootstrapError("inspection_identity_conflict");
+          reply(response, 202, {
+            operation_id: input.operation_id,
+            expected_generation: previous.expected_generation,
+            binding_sha256: previous.binding_sha256,
+            status: previous.status,
+          });
+          return;
+        }
+        if (
+          Array.from(jobs.values()).some((entry) => entry.running) ||
+          Array.from(inspections.values()).some((entry) => entry.running)
+        )
+          throw new BootstrapError("container_busy");
+        const entry = {
+          expected_generation: input.expected_generation,
+          binding_sha256: input.binding_sha256,
+          network_plan_sha256: input.network_plan_sha256,
+          running: true,
+          status: "running" as "running" | "reported" | "failed",
+          error_code: null as string | null,
+          abort: new AbortController(),
+        };
+        inspections.set(input.operation_id, entry);
+        void (options.inspection ?? runInspection)(input, {
+          run: options.run,
+          request: options.request,
+          signal: entry.abort.signal,
+        })
+          .then(() => {
+            entry.status = "reported";
+          })
+          .catch((error: unknown) => {
+            entry.status = "failed";
+            entry.error_code =
+              error instanceof BootstrapError &&
+              /^[a-z0-9_]{1,100}$/.test(error.code)
+                ? error.code
+                : "inspection_failed";
+          })
+          .finally(() => {
+            entry.running = false;
+          });
+        reply(response, 202, {
+          operation_id: input.operation_id,
+          expected_generation: entry.expected_generation,
+          binding_sha256: entry.binding_sha256,
+          status: entry.status,
+        });
+        return;
+      }
+      const inspection = /^\/v1\/inspections\/(op_[a-z0-9]{20})$/.exec(path);
+      if (inspection && request.method === "GET") {
+        const entry = inspections.get(inspection[1]!);
+        if (!entry) {
+          reply(response, 404, { error_code: "inspection_input_required" });
+          return;
+        }
+        reply(response, 200, {
+          operation_id: inspection[1],
+          expected_generation: entry.expected_generation,
+          binding_sha256: entry.binding_sha256,
+          network_plan_sha256: entry.network_plan_sha256,
+          status: entry.status,
+          error_code: entry.error_code,
+        });
+        return;
+      }
       if (request.method === "POST" && path === "/v1/jobs") {
         const input = validateInput(await body(request));
         const previous = jobs.get(input.spec.operation_id);
@@ -62,7 +251,10 @@ export function createBootstrapServer(
           reply(response, 202, await previous.job.status());
           return;
         }
-        if (Array.from(jobs.values()).some((entry) => entry.running))
+        if (
+          Array.from(jobs.values()).some((entry) => entry.running) ||
+          Array.from(inspections.values()).some((entry) => entry.running)
+        )
           throw new BootstrapError("container_busy");
         const job = new BootstrapJob(input, options);
         const status = await job.status();
@@ -130,7 +322,10 @@ export function createBootstrapServer(
         response,
         code === "request_body_limit"
           ? 413
-          : code === "container_busy" || code === "job_identity_conflict"
+          : code === "container_busy" ||
+              code === "job_identity_conflict" ||
+              code === "inspection_identity_conflict" ||
+              code === "proof_identity_conflict"
             ? 409
             : 400,
         { error_code: code },
@@ -142,6 +337,8 @@ export function createBootstrapServer(
   server.maxHeadersCount = 32;
   const stop = () => {
     for (const entry of jobs.values()) entry.job.abort.abort();
+    for (const entry of inspections.values()) entry.abort.abort();
+    for (const entry of proofs.values()) entry.abort.abort();
     server.close();
   };
   return { server, stop };

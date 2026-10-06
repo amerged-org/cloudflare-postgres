@@ -22,9 +22,16 @@ import {
   placementNodes,
   nodePlacementGuard,
   nodePlacementBindings,
+  nodeDatabasePlacementGuard,
+  nodeMemoryReservationGuard,
+  databaseMemoryPolicyAllows,
 } from "./placement.ts";
 import { syncDatabaseActor } from "./database-actor-sync.ts";
-import { runNodeCapacity } from "./node-capacity.ts";
+import { runNodeCapacity, startupPlacementNodes } from "./node-capacity.ts";
+import {
+  startupHeadroomSql,
+  startupReservationStatement,
+} from "./startup-admission.ts";
 import {
   generateMaintenanceCredential,
   maintenanceCreationStatement,
@@ -80,7 +87,9 @@ export function databaseInsertStatement(
       SELECT ?,p.id,r.id,NULL,?,s.id,'running',1,?,'Waiting for verified regional capacity',?,?
       FROM projects p JOIN regions r ON r.id=? AND r.backup_bucket=? JOIN size_classes s ON s.id=? AND s.enabled=1
       WHERE p.id=? AND p.deleted_at IS NULL AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=?
-      AND s.max_connections=? AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=? AND (${snapshot.authority?.sql ?? "1=1"})`,
+      AND s.max_connections=? AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?
+      AND (COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id),'reserved')='reserved' OR (s.memory_mib%256=0 AND (SELECT maximum_database_memory_mib FROM node_region_policies WHERE region_id=r.id)>=s.memory_mib AND (SELECT postgres_memory_request_mib FROM node_region_policies WHERE region_id=r.id)<=s.memory_mib))
+      AND (${snapshot.authority?.sql ?? "1=1"})`,
       )
       .bind(
         snapshot.id,
@@ -107,8 +116,9 @@ export function databaseInsertStatement(
       `INSERT INTO databases (id,project_id,region_id,node_id,name,size_class_id,desired_state,generation,archive_path,created_at,updated_at)
             SELECT ?,p.id,n.region_id,n.id,?,s.id,'running',1,?,?,? FROM nodes n JOIN projects p ON p.id=? AND p.deleted_at IS NULL
             JOIN size_classes s ON s.id=? AND s.enabled=1 JOIN regions r ON r.id=n.region_id AND r.backup_bucket=?
-            WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")} AND n.storage_gib_total IS NOT NULL
-            AND n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?
+            WHERE n.id=? AND n.region_id=? AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")} AND ${nodeDatabasePlacementGuard("n")} AND n.storage_gib_total IS NOT NULL
+            AND ${startupHeadroomSql()}
+            AND ${nodeMemoryReservationGuard("n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?")}
             AND n.platform_reserved_cpu_millicores IS NOT NULL
             AND n.allocatable_cpu_millicores-n.platform_reserved_cpu_millicores-COALESCE((SELECT SUM(sc.cpu_millicores+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.cpu_millicores+?
             AND n.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.storage_gib
@@ -170,6 +180,17 @@ export async function createDatabase(
           "invalid_request",
           "Size class or region unavailable",
         );
+      if (
+        !(await databaseMemoryPolicyAllows(
+          c.env.DB,
+          region.id,
+          size.memory_mib,
+        ))
+      )
+        throw new ApiError(
+          "invalid_request",
+          "Size class exceeds the configured per-database memory maximum",
+        );
       const id = newDatabaseId(),
         op = newOperationId(),
         now = new Date().toISOString();
@@ -187,7 +208,7 @@ export async function createDatabase(
           attempt === 2
             ? null
             : choosePlacement(
-                await placementNodes(c.env.DB, body.region_id),
+                await startupPlacementNodes(c.env.DB, body.region_id, size.id),
                 body.region_id,
                 size,
               );
@@ -241,6 +262,17 @@ export async function createDatabase(
               `INSERT INTO operations (id,kind,status,project_id,database_id,generation,created_at,updated_at)
             SELECT ?,'database.create','pending',project_id,id,generation,?,? FROM databases WHERE id=? AND project_id=?`,
             ).bind(op, now, now, id, body.project_id),
+            ...(node
+              ? [
+                  startupReservationStatement(c.env.DB, {
+                    databaseId: id,
+                    operationId: op,
+                    generation: 1,
+                    nodeId: node.id,
+                    now,
+                  }),
+                ]
+              : []),
             c.env.DB.prepare(
               `INSERT INTO lifecycle_events (database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
             SELECT id,'created',node_id,size_class_id,generation,?,? FROM databases WHERE id=? AND project_id=? AND node_id IS NOT NULL`,
@@ -318,10 +350,11 @@ export function databaseResizeStatement(
       AND desired_state='running' AND observed_state='ready' AND observed_generation=generation AND deleted_at IS NULL
       AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
       AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=? AND s.enabled=1
-        WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")}
+        WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1 AND ${nodePlacementGuard("n")} AND ${nodeDatabasePlacementGuard("n")}
+          AND ${startupHeadroomSql()}
           AND n.storage_gib_total IS NOT NULL AND n.platform_reserved_cpu_millicores IS NOT NULL
           AND s.storage_gib=(SELECT old.storage_gib FROM size_classes old WHERE old.id=databases.size_class_id)
-          AND n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?
+          AND ${nodeMemoryReservationGuard("n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?")}
           AND n.allocatable_cpu_millicores-n.platform_reserved_cpu_millicores-COALESCE((SELECT SUM(sc.cpu_millicores+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.cpu_millicores+?
           AND n.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.storage_gib
           AND s.memory_mib=? AND s.cpu_millicores=? AND s.storage_gib=? AND s.max_connections=?
@@ -378,6 +411,17 @@ export async function resizeDatabase(
         (target.id !== previous.id && target.enabled !== 1)
       )
         throw new ApiError("invalid_request", "Size class unavailable");
+      if (
+        !(await databaseMemoryPolicyAllows(
+          c.env.DB,
+          row.region_id,
+          target.memory_mib,
+        ))
+      )
+        throw new ApiError(
+          "invalid_request",
+          "Size class exceeds the configured per-database memory maximum",
+        );
       if (target.storage_gib < previous.storage_gib)
         throw new ApiError(
           "invalid_request",
@@ -476,6 +520,13 @@ export async function resizeDatabase(
           SELECT ?,'database.resize','pending',project_id,id,generation,?,? FROM databases
           WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND size_class_id=?`,
         ).bind(op, now, now, id, row.project_id, generation, target.id),
+        startupReservationStatement(c.env.DB, {
+          databaseId: id,
+          operationId: op,
+          generation,
+          nodeId: row.node_id,
+          now,
+        }),
         lease.completeStatement(op, 202, {
           sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
           bindings: [op, row.project_id],

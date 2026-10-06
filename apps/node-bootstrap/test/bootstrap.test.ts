@@ -7,7 +7,7 @@ import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
-import { parse } from "yaml";
+import { parse, parseAllDocuments } from "yaml";
 import { zstdDecompressSync } from "node:zlib";
 import {
   NodeBootstrapCallback,
@@ -34,6 +34,7 @@ import {
 } from "../src/bootstrap.ts";
 
 import { authority, fixture, platformFixture } from "./fixture.ts";
+import { storageCapacityFixture } from "./storage-capacity.fixture.ts";
 
 test("Talos maintenance flags follow command arguments and authenticated calls preserve talosconfig", async () => {
   const input = fixture();
@@ -328,6 +329,60 @@ test("legacy schematic verification preserves the exact ip-only request", async 
   assert.deepEqual(sent, {
     customization: { extraKernelArgs: [networkKernelArg(input.spec)] },
   });
+});
+
+test("machine configuration adds measured IPv6 on the same MAC and only a known default gateway", async () => {
+  for (const gateway of ["fe80::1", undefined]) {
+    const input = fixture();
+    input.spec.hardware.ipv6 = {
+      address: "2001:db8:7::17",
+      prefix_length: 64,
+      ...(gateway ? { gateway } : {}),
+    };
+    input.input_hash = inputHash(input.spec);
+    const directory = await mkdtemp(join(tmpdir(), "pgcf-ipv6-config-test-"));
+    let network: Record<string, unknown>[] | undefined;
+    const job = new BootstrapJob(input, {
+      run: async (command) => {
+        assert.equal(command.executable, "talosctl");
+        if (command.args.includes("secrets")) {
+          await writeFile(
+            join(directory, "machine-secrets"),
+            "test-only-runtime-seed\n",
+          );
+          return { exit_code: 0, stdout: "" };
+        }
+        network = parseAllDocuments(
+          await readFile(join(directory, "network"), "utf8"),
+        ).map((doc) => doc.toJSON());
+        throw new BootstrapError("capture_network_config");
+      },
+    });
+    Reflect.set(job, "directory", directory);
+    try {
+      await assert.rejects(
+        Reflect.get(job, "prepareConfig").call(job, authority(input)),
+        /capture_network_config/,
+      );
+      const machine = network![0]!.machine as Record<string, unknown>;
+      const interfaces = (machine.network as Record<string, unknown>)
+        .interfaces as Record<string, unknown>[];
+      assert.deepEqual(interfaces[0]!.deviceSelector, {
+        hardwareAddr: input.spec.hardware.mac,
+      });
+      assert.deepEqual(interfaces[0]!.addresses, [
+        `${input.spec.hardware.ipv4}/${input.spec.hardware.prefix_length}`,
+        "2001:db8:7::17/64",
+      ]);
+      const routes = interfaces[0]!.routes as Record<string, unknown>[];
+      assert.deepEqual(
+        routes.filter((route) => route.network === "::/0"),
+        gateway ? [{ network: "::/0", gateway }] : [],
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  }
 });
 
 test("rescue inspection uses portable plaintext swap output and stops on a failed query", async () => {
@@ -818,7 +873,7 @@ test("operator direct transport is explicit and worker join needs actual protect
       cluster_name: spec.cluster_name,
       cluster_endpoint: spec.cluster_endpoint,
       talos_version: "1.14.1",
-      kubernetes_version: "1.36.3",
+      kubernetes_version: "1.36.5",
       talos_machine_secrets_yaml: randomUUID(),
       talos_admin_config: randomUUID(),
       kubeconfig: null,
@@ -1087,6 +1142,11 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
   const input = platformFixture();
   let current = authority(input);
   const uid = randomUUID();
+  const storage = storageCapacityFixture({ input, clusterUid: uid });
+  Object.assign(storage.node.status, {
+    nodeInfo: { kubeletVersion: "v1.36.5" },
+  });
+  const immutableInput = canonical(input);
   const oldBoot = randomUUID();
   const newBoot = randomUUID();
   const admin = stringify({
@@ -1106,7 +1166,7 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
       cluster_name: input.spec.cluster_name,
       cluster_endpoint: input.spec.cluster_endpoint,
       talos_version: "1.14.1",
-      kubernetes_version: "1.36.3",
+      kubernetes_version: "1.36.5",
       talos_machine_secrets_yaml: randomUUID(),
       talos_admin_config: admin,
     },
@@ -1155,12 +1215,15 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
       const message = NodeBootstrapCallback.parse(
         JSON.parse(String(init?.body)),
       );
-      if (message.kind === "checkpoint")
+      if (message.kind === "checkpoint") {
         current = {
           ...current,
           revision: current.revision + 1,
           checkpoint: message.payload,
         };
+        if (message.payload.storage_trial)
+          await storage.commands.saveTrial(message.payload.storage_trial);
+      }
       if (message.kind === "seal")
         current = {
           ...current,
@@ -1187,6 +1250,14 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
       )
         throw new Error("uncertain mutation repeated");
       if (args.includes("read")) return { exit_code: 0, stdout: newBoot };
+      if (
+        command.executable === "talosctl" &&
+        args.includes("get") &&
+        args.includes("--namespace")
+      ) {
+        await storage.commands.authorize();
+        return storage.commands.talos(args.slice(args.indexOf("get")));
+      }
       if (args.includes("version"))
         return {
           exit_code: 0,
@@ -1246,8 +1317,14 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
         });
         return { exit_code: 0, stdout: "" };
       }
-      if (command.executable === "kubectl" && args.includes("namespace"))
-        return { exit_code: 0, stdout: JSON.stringify({ metadata: { uid } }) };
+      if (command.executable === "kubectl" && !args.includes("deployment")) {
+        const action = args.findIndex((arg) =>
+          ["get", "create", "patch", "delete", "logs"].includes(arg),
+        );
+        assert.ok(action >= 0);
+        await storage.commands.authorize();
+        return storage.commands.kube(args.slice(action), true, command.stdin);
+      }
       if (command.executable === "kubectl" && args.includes("deployment"))
         return {
           exit_code: 0,
@@ -1276,38 +1353,11 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
             },
           }),
         };
-      if (command.executable === "kubectl" && args.includes("node"))
-        return {
-          exit_code: 0,
-          stdout: JSON.stringify({
-            metadata: {
-              labels: {
-                "pgcf.io/node-id": input.spec.node_id,
-                "pgcf.io/region": input.spec.region_id,
-                "pgcf.io/provider-instance-id": input.spec.provider_instance_id,
-              },
-            },
-            spec: {
-              taints: [
-                {
-                  key: "pgcf.io/quarantine",
-                  value: "bootstrap",
-                  effect: "NoSchedule",
-                },
-              ],
-            },
-            status: {
-              nodeInfo: { kubeletVersion: "v1.36.3" },
-              addresses: [
-                { type: "InternalIP", address: input.spec.hardware.ipv4 },
-              ],
-            },
-          }),
-        };
       throw new Error("unexpected command");
     },
   });
   let installation_calls = 0;
+  let retainedBundle: string | undefined;
   Reflect.set(job, "installPlatform", async () => {
     installation_calls++;
     assert.equal(current.checkpoint.stage, "kubernetes_joined");
@@ -1316,6 +1366,7 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
       current.protected_material?.purpose === "join_bundle" &&
         current.protected_material.material.kube_system_uid === uid,
     );
+    retainedBundle = canonical(current.protected_material);
   });
   let trust_calls = 0;
   Reflect.set(job, "publishKubeletTrust", async () => {
@@ -1345,4 +1396,21 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
     observed.protected_material?.purpose === "join_bundle" &&
       observed.protected_material.material.kube_system_uid === uid,
   );
+  assert.equal(canonical(current.protected_material), retainedBundle);
+  assert.equal(canonical(input), immutableInput);
+  const storageTrial = observed.checkpoint.storage_trial!;
+  assert.equal(storageTrial.input_hash, input.input_hash);
+  assert.equal(storageTrial.cluster_uid, uid);
+  assert.equal(storageTrial.runs.at(-1)!.stage, "published");
+  assert.equal(
+    storageTrial.runs.at(-1)!.before.free -
+      storageTrial.runs.at(-1)!.allocated!.free,
+    1024 ** 3,
+  );
+  assert.equal(
+    storageTrial.runs.at(-1)!.after!.free,
+    storageTrial.runs.at(-1)!.before.free,
+  );
+  assert.equal(storage.logical_volumes.length, 0);
+  assert.equal(storage.objects.size, 0);
 });

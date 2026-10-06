@@ -164,7 +164,10 @@ export type SizeClass = z.infer<typeof SizeClass>;
 
 /** Body of PUT /v1/size-classes/{id}. */
 export const SizeClassUpsert = z
-  .strictObject(SizeClassFields)
+  .strictObject({
+    ...SizeClassFields,
+    memory_mib: SizeClassFields.memory_mib.multipleOf(256),
+  })
   .meta({ id: "SizeClassUpsert" });
 export type SizeClassUpsert = z.infer<typeof SizeClassUpsert>;
 
@@ -235,6 +238,18 @@ export const Node = z
       .nullable(),
     ready: z.boolean(),
     schedulable: z.boolean(),
+    database_placement_enabled: z.boolean().optional(),
+    database_placement_closed_at: Timestamp.nullable().optional(),
+    memory_expansion_triggered_at: Timestamp.nullable().optional(),
+    memory_window_observed_at: Timestamp.nullable().optional(),
+    memory_window_valid: z.boolean().optional(),
+    memory_utilization_ppm: z
+      .number()
+      .int()
+      .min(0)
+      .max(1000000)
+      .nullable()
+      .optional(),
     allocatable_memory_mib: z.number().int().nonnegative(),
     allocatable_cpu_millicores: z.number().int().nonnegative(),
     storage_gib_total: z.number().int().nonnegative().nullable(),

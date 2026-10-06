@@ -1,16 +1,16 @@
 {
   "schemaVersion": 1,
-  "verifiedOn": "2026-10-02",
+  "verifiedOn": "2026-10-06",
   "target": {
     "talosVersion": "1.14.1",
-    "kubernetesVersion": "1.36.3",
+    "kubernetesVersion": "1.36.5",
     "topology": "Single-node feasibility baseline; no availability guarantee."
   },
   "flux": {
-    "version": "v2.9.5",
-    "releaseURL": "https://github.com/fluxcd/flux2/releases/tag/v2.9.5",
-    "installManifestURL": "https://github.com/fluxcd/flux2/releases/download/v2.9.5/install.yaml",
-    "installManifestSha256": "cc3dcd743af16215838b6937e1fce83745bf24c0dcc6c59737c59df15429caaf"
+    "version": "v2.9.6",
+    "releaseURL": "https://github.com/fluxcd/flux2/releases/tag/v2.9.6",
+    "installManifestURL": "https://github.com/fluxcd/flux2/releases/download/v2.9.6/install.yaml",
+    "installManifestSha256": "9c1fda7e401429531ed1478f67ba06b3edff6513b75da7ee47bde9f1c4d4251c"
   },
   "charts": [
     {
@@ -80,19 +80,23 @@
       "archiveSha256": "b53d3991fe84bcf38767e7702cae78666265427a127a26fff168ab4207d2b1df",
       "documentationURL": "https://github.com/cloudnative-pg/charts/blob/cloudnative-pg-v0.29.1/.github/workflows/release-publish.yml",
       "releaseURL": "https://github.com/cloudnative-pg/charts/releases/tag/cloudnative-pg-v0.29.1",
-      "renderedImages": ["ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1"]
+      "renderedImages": [
+        "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1"
+      ]
     },
     {
       "name": "plugin-barman-cloud",
-      "chartVersion": "0.8.0",
-      "appVersion": "v0.15.0",
+      "chartVersion": "0.8.1",
+      "appVersion": "v0.15.1",
       "source": "oci://ghcr.io/cloudnative-pg/charts/plugin-barman-cloud",
-      "ociManifestDigest": "sha256:7c6b954f627ff91e511cb2e91854cfb1b7e96df5d30208494eb5d964da47303e",
-      "archiveSha256": "e9d8e8578d2757761fe5e1a761c762b54ccd02bc27df8ad251812aa2571c4d42",
-      "documentationURL": "https://github.com/cloudnative-pg/charts/blob/plugin-barman-cloud-v0.8.0/.github/workflows/release-publish.yml",
-      "releaseURL": "https://github.com/cloudnative-pg/charts/releases/tag/plugin-barman-cloud-v0.8.0",
-      "renderedImages": ["ghcr.io/cloudnative-pg/plugin-barman-cloud:v0.15.0"],
-      "runtimeSidecarImage": "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.15.0"
+      "ociManifestDigest": "sha256:b48511269e2c75603ee2f06f6c5444e8154542103a3c3b9d692344725bac37b7",
+      "archiveSha256": "9ad0b9e56da2777a1a0269feaf7215e18297e9c8b5730e04acb27b5d462e9456",
+      "documentationURL": "https://github.com/cloudnative-pg/charts/blob/plugin-barman-cloud-v0.8.1/.github/workflows/release-publish.yml",
+      "releaseURL": "https://github.com/cloudnative-pg/charts/releases/tag/plugin-barman-cloud-v0.8.1",
+      "renderedImages": [
+        "ghcr.io/cloudnative-pg/plugin-barman-cloud:v0.15.1"
+      ],
+      "runtimeSidecarImage": "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.15.1"
     }
   ],
   "regional": {
@@ -101,9 +105,9 @@
       {
         "name": "cloudflared",
         "reference": "docker.io/cloudflare/cloudflared",
-        "version": "2026.9.3",
-        "indexDigest": "sha256:072c067d25ccbe61d46e18f0d0723255f2bb5304f7317caa95b27031520ff92c",
-        "releaseURL": "https://github.com/cloudflare/cloudflared/releases/tag/2026.9.3"
+        "version": "2026.10.0",
+        "indexDigest": "sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07",
+        "releaseURL": "https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0"
       },
       {
         "name": "pgcf-regional",

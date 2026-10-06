@@ -74,14 +74,26 @@ export const DesiredQuery = z.strictObject({
 });
 export type DesiredQuery = z.infer<typeof DesiredQuery>;
 
-export const DesiredSize = z.strictObject({
-  memory_mib: z.number().int().min(256),
-  cpu_millicores: z.number().int().min(100),
-  storage_gib: z.number().int().min(1),
-  max_connections: z.number().int().min(10),
-  archive_timeout_seconds: z.number().int().min(30),
-  backup_retention_days: z.number().int().min(1),
-});
+export const DesiredSize = z
+  .strictObject({
+    memory_mib: z.number().int().min(256),
+    /** Explicit startup request for an actual-RAM region; the class remains the hard memory limit. */
+    memory_request_mib: z.number().int().positive().max(1048576).optional(),
+    cpu_millicores: z.number().int().min(100),
+    storage_gib: z.number().int().min(1),
+    max_connections: z.number().int().min(10),
+    archive_timeout_seconds: z.number().int().min(30),
+    backup_retention_days: z.number().int().min(1),
+  })
+  .refine(
+    (size) =>
+      size.memory_request_mib === undefined ||
+      size.memory_request_mib <= size.memory_mib,
+    {
+      message:
+        "PostgreSQL startup memory request cannot exceed its class limit",
+    },
+  );
 export type DesiredSize = z.infer<typeof DesiredSize>;
 
 export const DesiredRole = z.strictObject({
@@ -268,21 +280,62 @@ export const DesiredDatabase = z
   });
 export type DesiredDatabase = z.infer<typeof DesiredDatabase>;
 
+export const DesiredRegion = z.strictObject({
+  id: RegionId,
+  backup: z.strictObject({
+    bucket: BucketName,
+    endpoint_url: z.url({ protocol: /^https$/ }),
+    region: z.literal("auto"),
+  }),
+  scheduling: z
+    .strictObject({
+      placement_mode: z.literal("actual_ram"),
+      maximum_database_memory_mib: z
+        .number()
+        .int()
+        .positive()
+        .max(1048576)
+        .multipleOf(256),
+      postgres_memory_request_mib: z.number().int().positive().max(1048576),
+    })
+    .refine(
+      (scheduling) =>
+        scheduling.postgres_memory_request_mib <=
+        scheduling.maximum_database_memory_mib,
+      {
+        message:
+          "PostgreSQL startup request cannot exceed the regional database limit",
+      },
+    )
+    .optional(),
+});
+export type DesiredRegion = z.infer<typeof DesiredRegion>;
+
 export const DesiredResponse = z
   .strictObject({
-    region: z.strictObject({
-      id: RegionId,
-      backup: z.strictObject({
-        bucket: BucketName,
-        endpoint_url: z.url({ protocol: /^https$/ }),
-        region: z.literal("auto"),
-      }),
-    }),
+    region: DesiredRegion,
     databases: z.array(DesiredDatabase).max(DESIRED_PAGE_LIMIT_MAX),
     next: DatabaseId.nullable(),
   })
   .superRefine((response, ctx) => {
     response.databases.forEach((database, index) => {
+      const scheduling = response.region.scheduling;
+      if (
+        database.desired_state === "running" &&
+        (database.size.memory_request_mib !==
+          scheduling?.postgres_memory_request_mib ||
+          (scheduling !== undefined &&
+            (database.size.memory_mib >
+              scheduling.maximum_database_memory_mib ||
+              database.size.memory_mib % 256 !== 0)))
+      ) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["databases", index, "size"],
+          message:
+            "Desired memory must bind the explicit regional scheduling policy",
+        });
+      }
       const match = ARCHIVE_DESTINATION_PATTERN.exec(
         database.archive.destination_path,
       );
@@ -318,6 +371,8 @@ export const NodeObservation = z.strictObject({
   node_uid: z.uuid().optional(),
   name: K8sNodeName,
   ready: z.boolean(),
+  /** An operator's disabled label can close placement; observations never reopen it. */
+  database_placement_enabled: z.literal(false).optional(),
   allocatable_memory_mib: Count,
   allocatable_cpu_millicores: Count,
   storage_gib_total: Count.nullable(),
@@ -325,6 +380,41 @@ export const NodeObservation = z.strictObject({
   platform_reserved_cpu_millicores: Count.nullable().optional(),
 });
 export type NodeObservation = z.infer<typeof NodeObservation>;
+
+const MemoryBytes = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
+export const NodeMemorySample = z
+  .strictObject({
+    node_uid: z.uuid(),
+    observed_at: Timestamp,
+    working_set_bytes: MemoryBytes,
+    capacity_memory_bytes: MemoryBytes.positive(),
+    available_bytes: MemoryBytes.nullable(),
+    memory_pressure: z.boolean().nullable(),
+  })
+  .refine(
+    (value) =>
+      value.working_set_bytes <= value.capacity_memory_bytes &&
+      (value.available_bytes === null ||
+        value.available_bytes <= value.capacity_memory_bytes),
+    { message: "Node memory gauges cannot exceed physical capacity" },
+  );
+export type NodeMemorySample = z.infer<typeof NodeMemorySample>;
+
+export const NodeMemoryObservation = z
+  .strictObject({
+    node_id: NodeId,
+    provider_instance_id: ProviderInstanceId,
+    node_uid: z.uuid(),
+    memory: NodeMemorySample.nullable(),
+  })
+  .refine(
+    (value) =>
+      value.memory === null || value.memory.node_uid === value.node_uid,
+    {
+      message: "Memory belongs to the authenticated Kubernetes node UID",
+    },
+  );
+export type NodeMemoryObservation = z.infer<typeof NodeMemoryObservation>;
 
 export const BackupObservation = z.strictObject({
   health: z.enum(["ok", "failing", "unknown"]),
@@ -405,12 +495,32 @@ export const Orphan = z.strictObject({
 });
 export type Orphan = z.infer<typeof Orphan>;
 
-export const ObservationRequest = z.strictObject({
-  observed_at: Timestamp,
-  nodes: z.array(NodeObservation).max(1000),
-  databases: z.array(DatabaseObservation).max(10_000),
-  orphans: z.array(Orphan).max(1000),
-});
+export const ObservationRequest = z
+  .strictObject({
+    observed_at: Timestamp,
+    nodes: z.array(NodeObservation).max(1000),
+    databases: z.array(DatabaseObservation).max(10_000),
+    orphans: z.array(Orphan).max(1000),
+    /** Partial background samples; an empty inventory here does not replace the region inventory. */
+    node_memory_samples: z.array(NodeMemoryObservation).max(1000).optional(),
+  })
+  .superRefine((value, ctx) => {
+    const identities = new Set<string>();
+    for (const [index, sample] of (value.node_memory_samples ?? []).entries()) {
+      if (
+        identities.has(sample.node_id) ||
+        (sample.memory !== null &&
+          Date.parse(sample.memory.observed_at) > Date.parse(value.observed_at))
+      )
+        ctx.addIssue({
+          code: "custom",
+          path: ["node_memory_samples", index],
+          message:
+            "Memory samples must be unique and no newer than their envelope",
+        });
+      identities.add(sample.node_id);
+    }
+  });
 export type ObservationRequest = z.infer<typeof ObservationRequest>;
 
 // ---------- Link messages (GET /agent/v1/link WebSocket) ----------

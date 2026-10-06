@@ -80,6 +80,151 @@ function observation(): Record<string, unknown> {
   };
 }
 
+it("explicit actual-RAM scheduling binds startup requests and rejects oversized running classes without changing legacy pages", () => {
+  const database = desired();
+  const region = {
+    id: "eu-1",
+    backup: {
+      bucket: "pgcf-backups",
+      endpoint_url: backupEndpoint,
+      region: "auto",
+    },
+  };
+  const body = { region, databases: [database], next: null };
+  expect(DesiredResponse.safeParse(body).success).toBe(true);
+  expect(
+    DesiredResponse.safeParse({
+      ...body,
+      databases: [
+        {
+          ...database,
+          size: { ...(database.size as object), memory_mib: 300 },
+        },
+      ],
+    }).success,
+  ).toBe(true);
+  const scheduled = {
+    ...body,
+    region: {
+      ...region,
+      scheduling: {
+        placement_mode: "actual_ram",
+        maximum_database_memory_mib: 4096,
+        postgres_memory_request_mib: 256,
+      },
+    },
+    databases: [
+      {
+        ...database,
+        size: { ...(database.size as object), memory_request_mib: 256 },
+      },
+    ],
+  };
+  expect(DesiredResponse.safeParse(scheduled).success).toBe(true);
+  expect(
+    DesiredResponse.safeParse({
+      ...scheduled,
+      databases: [
+        {
+          ...database,
+          size: {
+            ...(database.size as object),
+            memory_mib: 300,
+            memory_request_mib: 256,
+          },
+        },
+      ],
+    }).success,
+  ).toBe(false);
+  expect(
+    DesiredResponse.safeParse({
+      ...scheduled,
+      region: {
+        ...region,
+        scheduling: {
+          placement_mode: "actual_ram",
+          maximum_database_memory_mib: 4096,
+        },
+      },
+    }).success,
+  ).toBe(false);
+  expect(
+    DesiredResponse.safeParse({ ...body, databases: scheduled.databases })
+      .success,
+  ).toBe(false);
+  expect(
+    DesiredResponse.safeParse({
+      ...scheduled,
+      databases: [
+        {
+          ...database,
+          size: { ...(database.size as object), memory_request_mib: 128 },
+        },
+      ],
+    }).success,
+  ).toBe(false);
+  const oversized = {
+    ...database,
+    size: {
+      ...(database.size as object),
+      memory_mib: 4352,
+      memory_request_mib: 256,
+    },
+  };
+  expect(
+    DesiredResponse.safeParse({ ...scheduled, databases: [oversized] }).success,
+  ).toBe(false);
+  expect(
+    DesiredResponse.safeParse({
+      ...scheduled,
+      databases: [{ ...oversized, desired_state: "deleted", roles: [] }],
+    }).success,
+  ).toBe(true);
+  expect(
+    DesiredResponse.safeParse({
+      ...scheduled,
+      region: {
+        ...region,
+        scheduling: {
+          placement_mode: "actual_ram",
+          maximum_database_memory_mib: 4096,
+          postgres_memory_request_mib: 128,
+        },
+      },
+      databases: [{ ...oversized, desired_state: "deleted", roles: [] }],
+    }).success,
+  ).toBe(true);
+  expect(
+    DesiredResponse.safeParse({
+      ...scheduled,
+      databases: [
+        {
+          ...oversized,
+          desired_state: "suspended",
+          power: {
+            operation: opId,
+            revision: 1,
+            mode: "quiesce",
+            reason: "manual",
+          },
+          size: { ...(database.size as object), memory_mib: 4352 },
+        },
+      ],
+    }).success,
+  ).toBe(true);
+  expect(
+    DesiredResponse.safeParse({
+      ...scheduled,
+      databases: [
+        {
+          ...database,
+          size: { ...(database.size as object), memory_request_mib: 768 },
+        },
+      ],
+    }).success,
+  ).toBe(false);
+});
+
 it("keeps maintenance separate and optional on desired pages", () => {
   const old = desired();
   expect(DesiredDatabase.parse(old).maintenance).toBeUndefined();

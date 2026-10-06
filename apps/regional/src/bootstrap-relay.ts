@@ -1,12 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createServer, type IncomingMessage } from "node:http";
 import net, { type Socket } from "node:net";
+import { createSocket } from "node:dgram";
 import { randomUUID } from "node:crypto";
 import { WebSocketServer } from "ws";
 import {
   BOOTSTRAP_RELAY_HEADER,
   BOOTSTRAP_RELAY_PATH,
   BOOTSTRAP_RELAY_IDENTITY_PATH,
+  BOOTSTRAP_RELAY_PROBE_PATH,
+  bootstrapRelayProbeSchema,
   bootstrapRelayIdentitySchema,
   bootstrapCapabilitySchema,
   bootstrapLiteralIpSchema,
@@ -120,6 +123,33 @@ function singleToken(request: IncomingMessage): string | undefined {
   const value = request.headers[header];
   return count === 1 && typeof value === "string" ? value : undefined;
 }
+async function probeSource(address: string, port: number): Promise<string> {
+  const socket = createSocket(net.isIP(address) === 4 ? "udp4" : "udp6");
+  try {
+    return await new Promise<string>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new Error("probe_route_unavailable")),
+        1000,
+      );
+      socket.once("error", () => {
+        clearTimeout(timer);
+        reject(new Error("probe_route_unavailable"));
+      });
+      socket.connect(port, address, () => {
+        clearTimeout(timer);
+        const source = socket.address().address;
+        if (!net.isIP(source)) reject(new Error("probe_route_unavailable"));
+        else resolve(source);
+      });
+    });
+  } finally {
+    try {
+      socket.close();
+    } catch {
+      /* No route was established. */
+    }
+  }
+}
 export function createBootstrapRelay(
   configuration: BootstrapRelayConfiguration,
 ) {
@@ -194,6 +224,15 @@ export function createBootstrapRelay(
     active = new Set<() => void>();
   let pending = 0,
     closing = false;
+  const probeStops = new Set<() => void>();
+  const takeNonce = (nonce: string, expires: number): boolean => {
+    for (const [value, expiry] of nonces)
+      if (expiry <= Date.now() / 1000) nonces.delete(value);
+    if (nonces.has(nonce) || nonces.size >= BOOTSTRAP_RELAY_LIMITS.nonceEntries)
+      return false;
+    nonces.set(nonce, expires);
+    return true;
+  };
   const server = createServer({ maxHeaderSize: 4096 }, (request, response) => {
     if (
       !closing &&
@@ -206,6 +245,121 @@ export function createBootstrapRelay(
         Connection: "close",
       });
       response.end(JSON.stringify(identity));
+    } else if (
+      !closing &&
+      request.method === "GET" &&
+      request.url === BOOTSTRAP_RELAY_PROBE_PATH
+    ) {
+      if (pending + active.size >= connections) {
+        response.writeHead(503, { Connection: "close", "Content-Length": "0" });
+        response.end();
+        return;
+      }
+      pending++;
+      void (async () => {
+        const checked = await verifyBootstrapRelay(singleToken(request), {
+          keys,
+          region: identity.region,
+          issuer_region: identity.issuer_region,
+          relay_epoch: identity.relay_epoch,
+          allowedTargetRegions: identity.allowed_target_regions,
+        });
+        if (
+          !checked.ok ||
+          request.headers["transfer-encoding"] ||
+          (request.headers["content-length"] !== undefined &&
+            request.headers["content-length"] !== "0") ||
+          !takeNonce(checked.claims.nonce, checked.claims.exp)
+        ) {
+          response.writeHead(401, {
+            Connection: "close",
+            "Content-Length": "0",
+          });
+          response.end();
+          return;
+        }
+        const claims = checked.claims,
+          source = await probeSource(claims.target.address, claims.target.port);
+        if (closing || response.destroyed || Date.now() / 1000 >= claims.exp)
+          throw new Error("probe_closed");
+        const owner = memory.owner(claims.nonce),
+          baseline = owner.lease();
+        if (!baseline.grow(16 * 1024)) {
+          owner.close();
+          throw new Error("probe_capacity");
+        }
+        let stop: (() => void) | undefined;
+        try {
+          const outcome = await new Promise<
+            "connected" | "refused" | "timed_out"
+          >((resolve, reject) => {
+            const socket = net.connect({
+              host: claims.target.address,
+              port: claims.target.port,
+              localAddress: source,
+              family: net.isIP(source),
+              autoSelectFamily: false,
+            });
+            let settled = false;
+            const finish = (value?: "connected" | "refused" | "timed_out") => {
+              if (settled) return;
+              settled = true;
+              clearTimeout(timer);
+              socket.destroy();
+              if (value) resolve(value);
+              else reject(new Error("probe_inconclusive"));
+            };
+            const timer = setTimeout(() => finish("timed_out"), 3000);
+            stop = () => finish();
+            probeStops.add(stop);
+            response.once("close", stop);
+            socket.once("connect", () => {
+              if (socket.localAddress !== source) finish();
+              else finish("connected");
+            });
+            socket.once("error", (error: NodeJS.ErrnoException) =>
+              finish(error.code === "ECONNREFUSED" ? "refused" : undefined),
+            );
+          });
+          const value = bootstrapRelayProbeSchema.parse({
+            version: 1,
+            relay_epoch: identity.relay_epoch,
+            operation_id: claims.operation,
+            node_id: claims.node,
+            region_id: claims.region,
+            revision: claims.revision,
+            address: claims.target.address,
+            source,
+            port: claims.target.port,
+            outcome,
+            observed_at: new Date().toISOString(),
+          });
+          response.writeHead(200, {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+            Connection: "close",
+          });
+          response.end(JSON.stringify(value));
+        } finally {
+          if (stop) {
+            probeStops.delete(stop);
+            response.off("close", stop);
+          }
+          owner.close();
+        }
+      })()
+        .catch(() => {
+          if (!response.destroyed && !response.headersSent) {
+            response.writeHead(503, {
+              Connection: "close",
+              "Content-Length": "0",
+            });
+            response.end();
+          }
+        })
+        .finally(() => {
+          pending--;
+        });
     } else {
       response.writeHead(closing ? 503 : 404, {
         "Content-Length": "0",
@@ -264,18 +418,11 @@ export function createBootstrapRelay(
         reject(socket, 401);
         return;
       }
-      const now = Date.now() / 1000;
-      for (const [nonce, expiry] of nonces)
-        if (expiry <= now) nonces.delete(nonce);
       const nonce = checked.claims.nonce;
-      if (
-        nonces.has(nonce) ||
-        nonces.size >= BOOTSTRAP_RELAY_LIMITS.nonceEntries
-      ) {
+      if (!takeNonce(nonce, checked.claims.exp)) {
         reject(socket, 401);
         return;
       }
-      nonces.set(nonce, checked.claims.exp);
       if (closing || socket.destroyed) return;
       clearTimeout(handshakeTimers.get(socket));
       handshakeTimers.delete(socket);
@@ -465,6 +612,7 @@ export function createBootstrapRelay(
     close: async () => {
       closing = true;
       for (const stop of [...active]) stop();
+      for (const stop of [...probeStops]) stop();
       for (const socket of rawSockets) socket.destroy();
       await Promise.all([
         new Promise<void>((resolve) => server.close(() => resolve())),

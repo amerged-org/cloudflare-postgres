@@ -14,6 +14,10 @@ it("returns the exact public capacity policy from PUT and GET after persisting i
     max_nodes: 2,
     purchases_enabled: false,
     order: null,
+    placement_mode: "reserved",
+    maximum_database_memory_mib: null,
+    postgres_memory_request_mib: null,
+    standing_cost_profile: null,
     autoscale_enabled: false,
     adopt_instance_ids: [
       String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!),
@@ -71,5 +75,9 @@ it("maps stored order JSON and enabled booleans without exposing persistence col
     order,
     autoscale_enabled: true,
     adopt_instance_ids: [],
+    placement_mode: "reserved",
+    maximum_database_memory_mib: null,
+    postgres_memory_request_mib: null,
+    standing_cost_profile: null,
   });
 });

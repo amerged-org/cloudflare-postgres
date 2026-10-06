@@ -17,7 +17,7 @@ function coreDNSFixture() {
     cluster_name: input.spec.cluster_name,
     cluster_endpoint: input.spec.cluster_endpoint,
     talos_version: "1.14.1" as const,
-    kubernetes_version: "1.36.3" as const,
+    kubernetes_version: "1.36.5" as const,
     talos_machine_secrets_yaml: randomUUID(),
     talos_admin_config: randomUUID(),
     kube_system_uid: clusterUID,

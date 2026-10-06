@@ -40,7 +40,7 @@ const SigningConfig = z.strictObject({
   active: SigningKey,
   keys: z.record(SigningKey, z.string().max(256)),
 });
-async function signingKey(secret: string) {
+export async function bootstrapTransportSigningKey(secret: string) {
   const config = SigningConfig.parse(JSON.parse(secret)),
     bytes = base64urlToBytes(config.keys[config.active] ?? "");
   if (!bytes || bytes.length < 32 || bytes.length > 192)
@@ -248,7 +248,9 @@ export async function issueBootstrapTransport(
         "Protected cluster endpoint differs from the job",
       );
   }
-  const key = await signingKey(env.BOOTSTRAP_RELAY_SIGNING_KEYS);
+  const key = await bootstrapTransportSigningKey(
+    env.BOOTSTRAP_RELAY_SIGNING_KEYS,
+  );
   const token = await signBootstrapRelay({
     ...key,
     operation: row.operation_id,

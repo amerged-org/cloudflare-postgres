@@ -47,6 +47,8 @@ import {
   setCapacityPolicy,
   verifyNodeProof,
   markLostNode,
+  NodeDatabasePlacement,
+  setNodeDatabasePlacement,
 } from "../platform/nodes.ts";
 
 const json = (schema: z.ZodType) => ({ "application/json": { schema } });
@@ -80,6 +82,28 @@ function register(
   app.openapi(createRoute(route), handler);
 }
 export function registerNodes(app: ApiApp): void {
+  register(
+    app,
+    {
+      method: "put",
+      path: "/v1/nodes/{id}/database-placement",
+      security,
+      tags: ["Nodes"],
+      request: {
+        params: z.object({ id: NodeId }),
+        body: body(NodeDatabasePlacement),
+      },
+      responses: responses(
+        NodeDatabasePlacement.safeExtend({ node_id: NodeId }),
+      ),
+    },
+    async (c) =>
+      setNodeDatabasePlacement(
+        c,
+        NodeId.parse(c.req.param("id")),
+        NodeDatabasePlacement.parse(await c.req.json()),
+      ),
+  );
   register(
     app,
     {

@@ -5,6 +5,7 @@ import { kubernetesFromConfig } from "./kubernetes.ts";
 import { AgentLink } from "./link.ts";
 import { AgentLoop } from "./loop.ts";
 import { RegionalMeasurements } from "./measurements.ts";
+import { RegionalNodeMemory } from "./node-memory.ts";
 import { PowerCoordinator } from "./power.ts";
 import type { Log } from "./types.ts";
 
@@ -39,6 +40,11 @@ async function main(): Promise<void> {
       log,
     });
     const api = new AgentApi(config);
+    const nodeMemory = new RegionalNodeMemory({
+      k8s: (signal) => kubernetesFromConfig(signal, config.kubeconfigFile),
+      signal: controller.signal,
+      api,
+    });
     const measurements = new RegionalMeasurements({
       k8s: (signal) => kubernetesFromConfig(signal, config.kubeconfigFile),
       signal: controller.signal,
@@ -63,6 +69,7 @@ async function main(): Promise<void> {
       loop.run(),
       link.run(controller.signal),
       measurements.run(),
+      nodeMemory.run(),
     ]);
   } finally {
     controller.abort();

@@ -24,6 +24,7 @@ import {
   type ContaboFirewall,
   type ContaboFirewallRulesInput,
 } from "../providers/contabo.ts";
+import { installationFirewallBinding } from "./node-installation.ts";
 
 const Hash = z.string().regex(/^[a-f0-9]{64}$/),
   IP = z.union([z.ipv4(), z.ipv6()]);
@@ -411,7 +412,9 @@ async function makePlan(
   ]) {
     const id = ProviderInstanceId.parse(node.provider_instance_id),
       instance = await client.getInstance(id, request()),
-      firewallId = bindings[id];
+      firewallId =
+        bindings[id] ??
+        (await installationFirewallBinding(env.DB, operationId, id));
     if (
       !firewallId ||
       instance.region !== region.provider_region ||

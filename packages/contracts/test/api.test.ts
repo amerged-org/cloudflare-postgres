@@ -24,11 +24,32 @@ import {
   newProjectId,
   newNodeId,
   RoleCreate,
+  SizeClassUpsert,
   MAINTENANCE_ROLE,
 } from "../src/index.ts";
 
 const encode = (text: string) =>
   bytesToBase64url(new TextEncoder().encode(text));
+
+it("assigns database RAM in 256 MiB increments", () => {
+  const body = {
+    memory_mib: 256,
+    cpu_millicores: 100,
+    storage_gib: 5,
+    max_connections: 50,
+    sleep_after_seconds: 60,
+    archive_timeout_seconds: 60,
+    backup_retention_days: 7,
+    enabled: true,
+  };
+  expect(SizeClassUpsert.parse(body).memory_mib).toBe(256);
+  expect(SizeClassUpsert.parse({ ...body, memory_mib: 4096 }).memory_mib).toBe(
+    4096,
+  );
+  expect(SizeClassUpsert.safeParse({ ...body, memory_mib: 300 }).success).toBe(
+    false,
+  );
+});
 
 it("reserves only the exact internal maintenance role in customer creation", () => {
   expect(RoleCreate.safeParse({ name: MAINTENANCE_ROLE }).success).toBe(false);

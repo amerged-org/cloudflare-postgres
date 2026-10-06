@@ -505,10 +505,7 @@ export async function run(
   };
 }
 
-if (
-  process.argv[1] &&
-  resolve(process.argv[1]) === fileURLToPath(import.meta.url)
-) {
+async function publisherMain() {
   try {
     const result = await run(process.argv.slice(2), process.env);
     if (result.status === "usage")
@@ -525,3 +522,5 @@ if (
     process.exitCode = 1;
   }
 }
+if (process.argv[1] && /\/publish-storage-capacity\.(?:ts|mjs)$/.test(process.argv[1]) &&
+    resolve(process.argv[1]) === fileURLToPath(import.meta.url)) void publisherMain();

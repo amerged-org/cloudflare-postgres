@@ -37,6 +37,19 @@ export const NodeOrderConfiguration = z.strictObject({
   image_id: Selector,
   term_months: z.union([z.literal(1), z.literal(12), z.literal(24)]),
   location: z.string().trim().min(1).max(128),
+  add_ons: z
+    .array(
+      z.strictObject({
+        id: z
+          .string()
+          .regex(/^[1-9][0-9]{0,18}$/)
+          .refine((value) => BigInt(value) <= 9223372036854775807n),
+        quantity: z.number().int().safe().positive(),
+      }),
+    )
+    .min(1)
+    .max(100)
+    .optional(),
 });
 export type NodeOrderConfiguration = z.infer<typeof NodeOrderConfiguration>;
 export const NodeAdditionRequest = z.discriminatedUnion("mode", [
@@ -77,18 +90,84 @@ export const NodeAdditionIntent = z
       });
   });
 export type NodeAdditionIntent = z.infer<typeof NodeAdditionIntent>;
+/** Owner configuration authorizes bounded infrastructure orders, never customer prices. */
+export const StandingNodeCostProfile = z
+  .strictObject({
+    id: Selector,
+    order: NodeOrderConfiguration,
+    owner_reference: Reference,
+    approved_at: Timestamp,
+    expires_at: Timestamp,
+    currency: InfrastructureCurrency,
+    monthly_amount: MonthlyInfrastructureAmount,
+    setup_amount: MonthlyInfrastructureAmount,
+    max_orders: z.number().int().min(1).max(10000),
+    max_total_monthly_amount: MonthlyInfrastructureAmount,
+    max_total_setup_amount: MonthlyInfrastructureAmount,
+  })
+  .superRefine((profile, context) => {
+    const units = (amount: string) => BigInt(amount.replace(".", ""));
+    if (
+      Date.parse(profile.expires_at) <= Date.parse(profile.approved_at) ||
+      units(profile.monthly_amount) > units(profile.max_total_monthly_amount) ||
+      units(profile.setup_amount) > units(profile.max_total_setup_amount)
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "Standing approval needs a finite expiry and caps covering one configured order",
+      });
+  });
+export type StandingNodeCostProfile = z.infer<typeof StandingNodeCostProfile>;
 export const NodeRegionPolicy = z
   .strictObject({
     region_id: RegionId,
     max_nodes: z.number().int().min(1).max(10000),
     purchases_enabled: z.boolean().default(false),
     order: NodeOrderConfiguration.nullable().default(null),
+    placement_mode: z.enum(["reserved", "actual_ram"]).default("reserved"),
+    maximum_database_memory_mib: z
+      .number()
+      .int()
+      .positive()
+      .max(1048576)
+      .multipleOf(256)
+      .nullable()
+      .default(null),
+    postgres_memory_request_mib: z
+      .number()
+      .int()
+      .positive()
+      .max(1048576)
+      .nullable()
+      .default(null),
+    standing_cost_profile: StandingNodeCostProfile.nullable().default(null),
   })
   .superRefine((policy, context) => {
     if (policy.purchases_enabled && policy.order === null)
       context.addIssue({
         code: "custom",
         message: "Enabled purchases require an explicit configured order",
+      });
+    if (
+      policy.placement_mode === "actual_ram" &&
+      (policy.maximum_database_memory_mib === null ||
+        policy.postgres_memory_request_mib === null ||
+        policy.postgres_memory_request_mib > policy.maximum_database_memory_mib)
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "Actual RAM placement requires an explicit per-database maximum and PostgreSQL request within it",
+      });
+    if (
+      policy.standing_cost_profile !== null &&
+      JSON.stringify(policy.standing_cost_profile.order) !==
+        JSON.stringify(policy.order)
+    )
+      context.addIssue({
+        code: "custom",
+        message: "Standing cost profile must bind the exact configured order",
       });
   });
 export type NodeRegionPolicy = z.infer<typeof NodeRegionPolicy>;
@@ -103,6 +182,7 @@ export const CostedNodeApproval = z
     currency: InfrastructureCurrency,
     term_months: z.union([z.literal(1), z.literal(12), z.literal(24)]),
     location: z.string().trim().min(1).max(128),
+    standing_profile_id: Selector.optional(),
   })
   .superRefine((approval, context) => {
     if (Date.parse(approval.expires_at) <= Date.parse(approval.approved_at))

@@ -250,6 +250,31 @@ it("provider pagination links cannot send authentication to another origin or pa
     ),
   ).toBe(true);
 });
+it("sends an explicitly approved storage selector as exact numeric API addon IDs", async () => {
+  const f = setup(),
+    addonId = id();
+  f.set(() =>
+    Response.json(
+      {
+        data: [f.receipt],
+        _links: { self: "/v1/compute/instances/" + f.instanceId },
+      },
+      { status: 201 },
+    ),
+  );
+  const result = await f.client.order(
+    {
+      ...f.order,
+      addOns: { addonsIds: [{ id: addonId, quantity: 1 }] },
+    } as never,
+    { requestId: f.requestId },
+  );
+  expect(result.kind).toBe("accepted");
+  expect(f.posts()).toHaveLength(1);
+  expect(JSON.parse(String(f.posts()[0]!.init.body)).addOns).toEqual({
+    addonsIds: [{ id: Number(addonId), quantity: 1 }],
+  });
+});
 it("one validated order sends explicit fields and preserves the saved tracing ID exactly", async () => {
   const f = setup();
   f.set(() =>
@@ -578,6 +603,101 @@ function firewall(
     updatedDate: new Date().toISOString(),
   };
 }
+it("creates an empty unattached firewall definition without purchase fields and reads its exact owned identity", async () => {
+  const f = setup(),
+    firewallId = value(),
+    input = {
+      name: value(),
+      description: value(),
+      status: "active" as const,
+      rules: { inbound: [] },
+    },
+    created = {
+      ...firewall(f, firewallId, []),
+      ...input,
+      instances: [],
+      instanceStatus: [],
+    };
+  f.set((url, init) => {
+    if (init.method === "POST") {
+      expect(url.pathname).toBe("/v1/firewalls");
+      expect(JSON.parse(String(init.body))).toEqual(input);
+      expect(new Headers(init.headers).get("x-request-id")).toBe(f.requestId);
+      return Response.json(
+        { data: [created], _links: { self: `/v1/firewalls/${firewallId}` } },
+        { status: 201 },
+      );
+    }
+    expect(url.searchParams.get("name")).toBe(input.name);
+    return Response.json({
+      data: [created],
+      _pagination: { page: 1, size: 100, totalElements: 1, totalPages: 1 },
+      _links: { self: url.pathname, first: url.pathname, last: url.pathname },
+    });
+  });
+  expect(
+    await f.client.createFirewall(input, { requestId: f.requestId }),
+  ).toMatchObject({ kind: "accepted", value: { firewallId, instances: [] } });
+  expect(
+    await f.client.listFirewalls({ name: input.name }, { requestId: value() }),
+  ).toMatchObject([{ firewallId }]);
+  await expect(
+    f.client.createFirewall({ ...input, addOns: {} } as typeof input, {
+      requestId: value(),
+    }),
+  ).rejects.toMatchObject({ code: "invalid_input" });
+  expect(f.posts()).toHaveLength(1);
+});
+it("treats firewall entitlement rejection as definite and a lost creation response as unknown without replay", async () => {
+  const f = setup(),
+    input = {
+      name: value(),
+      status: "active" as const,
+      rules: { inbound: [] },
+    };
+  f.set(() => new Response(null, { status: 402 }));
+  expect(
+    await f.client.createFirewall(input, { requestId: f.requestId }),
+  ).toMatchObject({ kind: "rejected", dispatched: true, status: 402 });
+  f.set(() => {
+    throw new Error(f.credentials.password);
+  });
+  expect(
+    await f.client.createFirewall(input, { requestId: value() }),
+  ).toMatchObject({ kind: "unknown", dispatched: true, code: "network_error" });
+  expect(f.posts()).toHaveLength(2);
+});
+it("refuses mismatched firewall creation receipts and incomplete filtered inventory", async () => {
+  const f = setup(1),
+    firewallId = value(),
+    input = {
+      name: value(),
+      status: "active" as const,
+      rules: { inbound: [] },
+    };
+  f.set(() =>
+    Response.json(
+      {
+        data: [firewall(f, firewallId, [])],
+        _links: { self: `/v1/firewalls/${firewallId}` },
+      },
+      { status: 201 },
+    ),
+  );
+  expect(
+    await f.client.createFirewall(input, { requestId: f.requestId }),
+  ).toMatchObject({ kind: "unknown", code: "invalid_response" });
+  f.set((url) =>
+    Response.json({
+      data: [],
+      _pagination: { page: 1, size: 1, totalElements: 1, totalPages: 1 },
+      _links: { self: url.pathname, first: url.pathname, last: url.pathname },
+    }),
+  );
+  await expect(
+    f.client.listFirewalls({ name: input.name }, { requestId: value() }),
+  ).rejects.toMatchObject({ code: "pagination_incomplete" });
+});
 it("firewall reads, explicit rules and assignment receipts preserve identity without claiming deployment ready", async () => {
   const f = setup(),
     firewallId = value(),

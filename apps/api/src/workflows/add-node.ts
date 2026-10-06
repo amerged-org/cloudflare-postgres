@@ -32,6 +32,14 @@ import {
   ensureNodeNetwork,
 } from "../domain/node-network.ts";
 import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
+import { prepareNodeInstallationInputs } from "../domain/prepare-node-installation.ts";
+import { ensureNodeInstallationInspection } from "../domain/node-inspection.ts";
+import { composeConfiguredNodeBootstrap } from "../domain/bootstrap-composition.ts";
+import {
+  ensureNodePreparationProof,
+  ensureNodeVerificationProof,
+} from "../domain/node-proof.ts";
+import { NodeBootstrapCheckpoint } from "@pgcf/contracts/node-bootstrap";
 
 function orderInput(
   env: Env,
@@ -58,6 +66,11 @@ function orderInput(
     imageId: order.image_id,
     period: order.term_months,
     displayName: addition.intent.requested_hostname,
+    ...(order.add_ons === undefined
+      ? {}
+      : {
+          addOns: { addonsIds: order.add_ons.map((addon) => ({ ...addon })) },
+        }),
     defaultUser: z
       .enum(["root", "admin", "administrator"])
       .parse(env.CONTABO_ORDER_DEFAULT_USER),
@@ -336,8 +349,7 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
       }
       if (
         addition.status === "reserved" &&
-        addition.intent.request.mode === "order" &&
-        addition.approval !== null
+        addition.intent.request.mode === "order"
       ) {
         await step.do(
           `purchase-${cycle}`,
@@ -379,6 +391,17 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
       }
       addition = await readNodeAddition(this.env.DB, id);
       if (["audited", "bootstrapping"].includes(addition.status)) {
+        const prepared = await step.do(
+          `installation-inputs-${cycle}`,
+          { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" },
+          async () => {
+            return prepareNodeInstallationInputs(this.env, id);
+          },
+        );
+        if (prepared.profile_configured && !prepared.binding_ready) {
+          await step.sleep(`installation-inputs-wait-${cycle}`, "1 minute");
+          continue;
+        }
         await step.do(
           `network-rescue-${cycle}`,
           { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" },
@@ -387,6 +410,22 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
             return { operation_id: id };
           },
         );
+        if (prepared.profile_configured && !prepared.job_configured) {
+          const inspected = await step.do(
+            `inspection-${cycle}`,
+            { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" },
+            () => ensureNodeInstallationInspection(this.env, id),
+          );
+          if (!inspected) {
+            await step.sleep(`inspection-wait-${cycle}`, "1 minute");
+            continue;
+          }
+          await step.do(
+            `compose-inspected-${cycle}`,
+            { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" },
+            () => composeConfiguredNodeBootstrap(this.env, id),
+          );
+        }
         const job = await this.env.DB.prepare(
           "SELECT input_hash FROM node_bootstrap_jobs WHERE operation_id=?",
         )
@@ -411,6 +450,15 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
                 !job.admitted &&
                 !job.cancelled
               ) {
+                const checkpoint = NodeBootstrapCheckpoint.parse(
+                  JSON.parse(job.checkpoint_json),
+                );
+                if (checkpoint.stage === "awaiting_verification") {
+                  await ensureNodeVerificationProof(this.env, id);
+                  return { operation_id: id };
+                }
+                if (!(await ensureNodePreparationProof(this.env, id)))
+                  return { operation_id: id };
                 if (!(await ensureNodeNetwork(this.env, id)))
                   return { operation_id: id };
                 const current = await readNodeAddition(this.env.DB, id);

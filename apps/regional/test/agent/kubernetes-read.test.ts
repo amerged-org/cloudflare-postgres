@@ -27,6 +27,7 @@ import {
 } from "../../src/agent/kubernetes.ts";
 import type { Resource } from "../../src/agent/types.ts";
 import { validateKubeletTrust } from "../../src/agent/kubelet-trust.ts";
+import { nodeMemorySample } from "../../src/agent/node-memory.ts";
 
 test("PVC reads use the core API and retain resource identity", async (t) => {
   const namespace = "pgcf-test";
@@ -364,9 +365,28 @@ test("an authenticated kubelet certificate pin enables real TLS for the bound no
   } finally {
     rmSync(directory, { recursive: true, force: true });
   }
+  const token = randomUUID();
+  const observedAt = Date.now();
+  const summary = {
+    node: {
+      nodeName: "kubernetes",
+      memory: {
+        time: new Date(observedAt).toISOString(),
+        workingSetBytes: 512 * 2 ** 20,
+        availableBytes: 512 * 2 ** 20,
+      },
+    },
+    pods: [],
+  };
+  let status = 200;
   const server = https.createServer(
     { cert: certificatePem, key },
-    (_request, response) => response.end(JSON.stringify({ pods: [] })),
+    (request, response) => {
+      assert.equal(request.headers.authorization, `Bearer ${token}`);
+      assert.equal(request.url, "/stats/summary");
+      response.statusCode = status;
+      response.end(JSON.stringify(summary));
+    },
   );
   server.listen(0, address);
   await once(server, "listening");
@@ -395,13 +415,21 @@ test("an authenticated kubelet certificate pin enables real TLS for the bound no
     "applyToHTTPSOptions",
     async (options: https.RequestOptions) => {
       options.ca = Buffer.from(randomUUID());
+      options.headers = { Authorization: `Bearer ${token}` };
     },
   );
   const node: Resource = {
     apiVersion: "v1",
     kind: "Node",
     metadata: { name: "kubernetes", uid: randomUUID() },
-    status: { addresses: [{ type: "InternalIP", address }] },
+    status: {
+      addresses: [{ type: "InternalIP", address }],
+      capacity: { memory: "1Gi" },
+      conditions: [
+        { type: "Ready", status: "True" },
+        { type: "MemoryPressure", status: "False" },
+      ],
+    },
   };
   const pin = {
     certificatePem,
@@ -412,8 +440,22 @@ test("an authenticated kubelet certificate pin enables real TLS for the bound no
   };
   assert.deepEqual(
     await kubeletSummary(config, node, new AbortController().signal, pin),
-    { pods: [] },
+    summary,
   );
+  assert.equal(
+    nodeMemorySample(
+      node,
+      await kubeletSummary(config, node, new AbortController().signal, pin),
+      observedAt,
+    )?.capacity_memory_bytes,
+    2 ** 30,
+  );
+  status = 503;
+  await assert.rejects(
+    kubeletSummary(config, node, new AbortController().signal, pin),
+    /kubelet_stats_unavailable/,
+  );
+  status = 200;
   await assert.rejects(
     kubeletSummary(config, node, new AbortController().signal, {
       ...pin,
@@ -479,6 +521,7 @@ test("an authenticated kubelet certificate pin enables real TLS for the bound no
     "applyToHTTPSOptions",
     async (options: https.RequestOptions) => {
       options.ca = Buffer.from(randomUUID());
+      options.headers = { Authorization: `Bearer ${token}` };
     },
   );
   t.mock.method(KubeConfig.prototype, "makeApiClient", (type: unknown) =>
@@ -512,7 +555,7 @@ test("an authenticated kubelet certificate pin enables real TLS for the bound no
     new AbortController().signal,
     "test-config",
   );
-  assert.deepEqual(await adapter.statsSummary!(node), { pods: [] });
+  assert.deepEqual(await adapter.statsSummary!(node), summary);
   assert.equal(artifactReads, 1);
   data.cluster_uid = randomUUID();
   const foreign = kubernetesFromConfig(

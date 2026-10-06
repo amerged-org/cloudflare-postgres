@@ -37,6 +37,61 @@ function desired(
   };
 }
 
+test("regional desired source accepts explicit actual-RAM requests and refuses tampered or oversized running classes", async () => {
+  const { db } = fixture();
+  const legacy = desired(db);
+  const scheduling = {
+    placement_mode: "actual_ram",
+    maximum_database_memory_mib: 4096,
+    postgres_memory_request_mib: 256,
+  };
+  let body: unknown = {
+    ...legacy,
+    region: { ...legacy.region, scheduling },
+    databases: [{ ...db, size: { ...db.size, memory_request_mib: 256 } }],
+  };
+  const key = `pgcf_ak_eu-test_${randomBytes(32).toString("base64url")}`;
+  const server = createServer((request, response) => {
+    assert.equal(request.headers.authorization, `Bearer ${key}`);
+    response.end(JSON.stringify(body));
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const client = new AgentApi({
+    apiUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}`,
+    agentKey: key,
+    regionId: "eu-test",
+  });
+  const pull = () => client.desired(new AbortController().signal);
+  try {
+    assert.equal((await pull()).databases[0]?.size.memory_request_mib, 256);
+    body = {
+      ...legacy,
+      region: { ...legacy.region, scheduling },
+      databases: [
+        {
+          ...db,
+          size: { ...db.size, memory_mib: 4352, memory_request_mib: 256 },
+        },
+      ],
+    };
+    await assert.rejects(pull(), /desired_response_invalid/);
+    body = {
+      ...legacy,
+      databases: [{ ...db, size: { ...db.size, memory_request_mib: 256 } }],
+    };
+    await assert.rejects(pull(), /desired_response_invalid/);
+    body = legacy;
+    assert.equal(
+      (await pull()).databases[0]?.size.memory_request_mib,
+      undefined,
+    );
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
 test("backup credential outage cannot block another database's deletion", async () => {
   const { db, ctx } = fixture();
   const removed = {

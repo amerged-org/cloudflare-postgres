@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Build context is the repository root: docker build -f apps/regional/Dockerfile .
 # node:24.21.0-slim multi-platform index, resolved with `docker buildx imagetools inspect`.
-FROM node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6 AS build
+FROM node:24.21.0-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20 AS build
 WORKDIR /workspace
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json LICENSE ./
 COPY apps/api/package.json apps/api/package.json
@@ -28,7 +28,7 @@ RUN node -e "const f='apps/regional/package.json',p=JSON.parse(require('fs').rea
  && cp apps/regional/dist/gateway/main.mjs /out/gateway.mjs \
  && cp apps/regional/dist/bootstrap-relay-main.mjs /out/bootstrap-relay.mjs
 
-FROM node:24.21.0-slim@sha256:0e0ff40c39bc087845bfb27465a0df4ea419520094bc35842ff83dd8cbe6f9b6
+FROM node:24.21.0-slim@sha256:d6aa754f16b3197301076f047b5def2f02ea1dbbc2ca920407d46d7ec7f87b20
 WORKDIR /app
 ENV NODE_ENV=production
 COPY --from=build --chown=root:root /out/node_modules ./node_modules

@@ -16,6 +16,7 @@ import {
   NodeBootstrapInput,
   NodeBootstrapSpec,
   NodeBootstrapStatus,
+  nodeStorageTrialTransition,
 } from "@pgcf/contracts/node-bootstrap";
 import { ProviderInstanceId } from "@pgcf/contracts/nodes";
 import { z } from "zod";
@@ -605,6 +606,30 @@ export async function bootstrapCallback(
     };
   } else {
     const next = envelope.payload;
+    const storageChanged =
+      JSON.stringify(checkpoint.storage_trial ?? null) !==
+      JSON.stringify(next.storage_trial ?? null);
+    if (
+      !nodeStorageTrialTransition(
+        checkpoint.storage_trial,
+        next.storage_trial,
+        row.input_hash,
+      ) ||
+      (next.storage_trial &&
+        !checkpoint.storage_trial &&
+        stages.indexOf(checkpoint.stage) <
+          stages.indexOf("kubernetes_joined")) ||
+      (storageChanged &&
+        stages.indexOf(checkpoint.stage) >=
+          stages.indexOf("awaiting_verification")) ||
+      (next.stage === "awaiting_verification" &&
+        next.storage_trial &&
+        next.storage_trial.runs.at(-1)!.stage !== "published")
+    )
+      throw new ApiError(
+        "conflict",
+        "Storage trial cannot replace ownership or erase recorded progress",
+      );
     if (
       stages.indexOf(next.stage) < stages.indexOf(checkpoint.stage) ||
       (stages.indexOf(next.stage) > stages.indexOf(checkpoint.stage) + 1 &&

@@ -17,6 +17,7 @@ import {
   BOOTSTRAP_RELAY_HEADER,
   importBootstrapVerificationKeys,
   signBootstrapRelay,
+  bootstrapRelayProbeSchema,
   type BootstrapCryptoKey,
 } from "../../../packages/contracts/src/bootstrap-relay.ts";
 import {
@@ -29,6 +30,7 @@ import {
 } from "../../../packages/contracts/src/ids.ts";
 
 const address = [127, 0, 0, 1].join(".");
+const probePath = `${BOOTSTRAP_RELAY_PATH}/probe`;
 async function fixture(
   t: TestContext,
   options: {
@@ -210,6 +212,34 @@ async function drained(relay: ReturnType<typeof createBootstrapRelay>) {
   assert.equal(relay.snapshot().connections, 0);
   assert.equal(relay.snapshot().memoryUsed, 0);
 }
+
+test("private relay probes authenticate first, measure the actual socket source and consume their exact token once", async (t) => {
+  const f = await fixture(t);
+  assert.equal((await fetch(f.base + probePath)).status, 401);
+  assert.equal(f.dials(), 0);
+  const token = await f.token();
+  const response = await fetch(f.base + probePath, {
+    headers: { [BOOTSTRAP_RELAY_HEADER]: token },
+  });
+  assert.equal(response.status, 200);
+  const value = bootstrapRelayProbeSchema.parse(await response.json());
+  assert.equal(value.outcome, "connected");
+  assert.equal(value.source, address);
+  assert.equal(value.address, address);
+  assert.equal(value.port, 50000);
+  assert.equal(value.operation_id, f.input.operation);
+  assert.equal(value.node_id, f.input.node);
+  assert.equal(value.relay_epoch, f.relay.identity.relay_epoch);
+  assert.equal(
+    (
+      await fetch(f.base + probePath, {
+        headers: { [BOOTSTRAP_RELAY_HEADER]: token },
+      })
+    ).status,
+    401,
+  );
+  assert.equal(f.dials(), 1);
+});
 
 test("real binary WebSocket/TCP transport forwards exact bytes once and exposes only process identity", async (t) => {
   const f = await fixture(t),

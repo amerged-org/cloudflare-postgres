@@ -11,6 +11,8 @@ import { agentRegion } from "./agent-auth.ts";
 import { recoverQuiescence } from "./lifecycle.ts";
 import { hint } from "./databases.ts";
 import type { DatabaseRow } from "./rows.ts";
+import { recordNodeMemoryObservation } from "./memory-capacity.ts";
+import { recordStartupObservationStatement } from "./startup-admission.ts";
 
 export function truncateAgentText(value: string): string {
   const bytes = new TextEncoder().encode(value);
@@ -140,8 +142,9 @@ export async function observations(
     )
       continue;
     await c.env.DB.prepare(
-      `INSERT INTO nodes (id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,schedulable,provider_instance_id,node_uid)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?) ON CONFLICT(region_id,k8s_node_name) DO UPDATE SET ready=CASE WHEN nodes.node_uid IS NOT NULL AND excluded.node_uid IS NOT NULL AND nodes.node_uid<>excluded.node_uid THEN 0 ELSE excluded.ready END,
+      `INSERT INTO nodes (id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,schedulable,provider_instance_id,node_uid,database_placement_enabled)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?) ON CONFLICT(region_id,k8s_node_name) DO UPDATE SET ready=CASE WHEN nodes.node_uid IS NOT NULL AND excluded.node_uid IS NOT NULL AND nodes.node_uid<>excluded.node_uid THEN 0 ELSE excluded.ready END,
+      database_placement_enabled=CASE WHEN excluded.database_placement_enabled=0 THEN 0 ELSE nodes.database_placement_enabled END,
       schedulable=CASE WHEN nodes.node_uid IS NOT NULL AND excluded.node_uid IS NOT NULL AND nodes.node_uid<>excluded.node_uid THEN 0 ELSE nodes.schedulable END,
       allocatable_memory_mib=excluded.allocatable_memory_mib,
       allocatable_cpu_millicores=excluded.allocatable_cpu_millicores,storage_gib_total=excluded.storage_gib_total,platform_reserved_memory_mib=excluded.platform_reserved_memory_mib,
@@ -166,8 +169,25 @@ export async function observations(
         now,
         verifiedIdentity ? node.provider_instance_id! : null,
         verifiedIdentity ? node.node_uid! : null,
+        Number(node.database_placement_enabled !== false),
       )
       .run();
+  }
+  for (const sample of body.node_memory_samples ?? []) {
+    try {
+      await recordNodeMemoryObservation(
+        c.env.DB,
+        region.id,
+        sample,
+        body.observed_at,
+        receivedAt,
+      );
+    } catch {
+      throw new ApiError(
+        "invalid_request",
+        "Node memory identity, measurements or time are inconsistent",
+      );
+    }
   }
   let accepted = 0;
   for (const observation of body.databases) {
@@ -458,12 +478,31 @@ export async function observations(
           now,
         ),
       );
+    if (
+      observation.state === "ready" ||
+      observation.state === "hibernated" ||
+      observation.state === "deleted"
+    )
+      statements.push(
+        recordStartupObservationStatement(c.env.DB, {
+          databaseId: row.id,
+          generation: observation.generation,
+          observedAt: now,
+          state: observation.state,
+        }),
+      );
     const result = await c.env.DB.batch(statements);
     accepted += result[0]!.meta.changes;
   }
-  await c.env.REGION_LINK.get(
-    c.env.REGION_LINK.idFromName(region.id),
-  ).reportOrphans(body.observed_at, body.orphans);
+  if (
+    body.node_memory_samples === undefined ||
+    body.nodes.length ||
+    body.databases.length ||
+    body.orphans.length
+  )
+    await c.env.REGION_LINK.get(
+      c.env.REGION_LINK.idFromName(region.id),
+    ).reportOrphans(body.observed_at, body.orphans);
   await c.env.DB.prepare("UPDATE regions SET agent_last_seen_at=? WHERE id=?")
     .bind(now, region.id)
     .run();

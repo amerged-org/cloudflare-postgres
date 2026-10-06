@@ -283,6 +283,98 @@ jobs:
         if: always()
         run: rm -rf "$RUNNER_TEMP/pgcf-bootstrap-image-gate"
 
+  postgres_image:
+    needs: check
+    if: github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/amerged-org/pgcf-postgres
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up pnpm at the version in package.json
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install qualification dependencies
+        run: CI=true pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build the linux/amd64 image
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/pgcf-postgres-image-gate"
+          docker buildx build --platform linux/amd64 --load \
+            --provenance=false --sbom=false \
+            --iidfile "$RUNNER_TEMP/pgcf-postgres-image-gate/image.id" \
+            --file infra/postgres/Dockerfile \
+            --tag "$IMAGE:sha-${GITHUB_SHA::12}" \
+            --tag "$IMAGE:latest" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.licenses=Apache-2.0 AND PostgreSQL" \
+            infra/postgres
+      - name: Fail if the image contains .env or .pem files
+        run: |
+          found=$(docker run --rm --platform linux/amd64 --cpus 2 --memory 2g --network none --user 0 --entrypoint find "$IMAGE:latest" \
+            / -xdev -type f \( -name '.env*' -o -name '.dev.vars*' -o -name '*.pem' -o -name '*.key' -o -name kubeconfig -o -name talosconfig \) -print)
+          if [ -n "$found" ]; then
+            echo "Forbidden files in the image:"
+            echo "$found"
+            exit 1
+          fi
+      - name: Verify PostgreSQL and patched pgvector with actual SQL
+        run: |
+          PGCF_TEST_POSTGRES_IMAGE="$IMAGE:sha-${GITHUB_SHA::12}" node --test infra/postgres/image.test.mjs
+          node scripts/ci/image-qualification.ts --profile postgres runtime "$(cat "$RUNNER_TEMP/pgcf-postgres-image-gate/image.id")"
+      - name: Qualify every shipped image layer before publishing
+        run: |
+          node scripts/ci/image-qualification.ts --profile postgres qualify "$IMAGE:latest" \
+            "$(cat "$RUNNER_TEMP/pgcf-postgres-image-gate/image.id")" "$GITHUB_SHA" \
+            "https://github.com/$GITHUB_REPOSITORY" "$RUNNER_TEMP/pgcf-postgres-image-gate/qualification.json"
+          {
+            echo 'Image qualification (all payload bytes and metadata, unchanged gitleaks 8.30.1 rules):'
+            echo '```json'
+            cat "$RUNNER_TEMP/pgcf-postgres-image-gate/qualification.json"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Log in to GHCR
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+      - name: Push the image and record its digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image_id=$(cat "$RUNNER_TEMP/pgcf-postgres-image-gate/image.id")
+          node scripts/ci/image-qualification.ts --profile postgres verify "$IMAGE:sha-${GITHUB_SHA::12}" \
+            "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/pgcf-postgres-image-gate/qualification.json"
+          docker push "$IMAGE:sha-${GITHUB_SHA::12}"
+          node scripts/ci/image-qualification.ts --profile postgres registry "$IMAGE:sha-${GITHUB_SHA::12}" \
+            "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/pgcf-postgres-image-gate/qualification.json" "$RUNNER_TEMP/pgcf-postgres-image-gate/registry-sha.json"
+          digest=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; console.log(JSON.parse(readFileSync(process.argv[1], "utf8")).digest)' "$RUNNER_TEMP/pgcf-postgres-image-gate/registry-sha.json")
+          node scripts/ci/image-qualification.ts --profile postgres promote "$IMAGE" \
+            "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/pgcf-postgres-image-gate/qualification.json" "$RUNNER_TEMP/pgcf-postgres-image-gate/registry-sha.json"
+          node scripts/ci/image-qualification.ts --profile postgres registry "$IMAGE:latest" \
+            "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/pgcf-postgres-image-gate/qualification.json" "$RUNNER_TEMP/pgcf-postgres-image-gate/registry-latest.json"
+          {
+            echo "Image digest: \`$IMAGE@$digest\`"
+            echo "Tags: \`sha-${GITHUB_SHA::12}\`, \`latest\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove image qualification files
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/pgcf-postgres-image-gate"
+
   external_probe:
     if: github.event_name == 'workflow_dispatch' && (inputs.external_probe || inputs.node_network_probe) && github.ref == 'refs/heads/main' && github.event.repository.private == false
     runs-on: macos-15

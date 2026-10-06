@@ -1,12 +1,19 @@
 // SPDX-License-Identifier: Apache-2.0
 import review from "./reviewed-findings.json" with { type: "json" };
+import postgresSources from "../../infra/postgres/sources.lock.json" with { type: "json" };
+import postgresReview from "./postgres-reviewed-findings.json" with { type: "json" };
 import type { CanonicalFinding } from "./scanner.ts";
 
 export const reviewedFiles = review.files;
 export const reviewedBase = review.base;
-export type ImageProfile = "regional" | "node-bootstrap";
+export const postgresBase = `${postgresSources.postgresql.upstream_image}@${postgresSources.postgresql.image_index_digest}`;
+export type ImageProfile = "regional" | "node-bootstrap" | "postgres";
 export function imageProfile(value: unknown = "regional"): ImageProfile {
-  if (value !== "regional" && value !== "node-bootstrap")
+  if (
+    value !== "regional" &&
+    value !== "node-bootstrap" &&
+    value !== "postgres"
+  )
     throw new Error("Invalid image qualification profile");
   return value;
 }
@@ -17,6 +24,11 @@ export function reviewedManifestPaths(
 ): string[] {
   const profile = imageProfile(profileInput),
     manifests: string[] = [];
+  if (profile === "postgres") {
+    if (paths.some((path) => /^app\/node_modules(?:\/|$)/.test(path)))
+      throw new Error("Unexpected Node runtime package in PostgreSQL profile");
+    return [];
+  }
   if (
     profile === "node-bootstrap" &&
     paths.some((path) =>
@@ -123,6 +135,11 @@ export function readPackageProvenance(
   profileInput: ImageProfile = "regional",
 ): PackageProvenance[] {
   const profile = imageProfile(profileInput);
+  if (profile === "postgres") {
+    if (manifests.length)
+      throw new Error("Unexpected PostgreSQL package review");
+    return [];
+  }
   if (
     manifests.some(
       (manifest) =>
@@ -172,6 +189,61 @@ export function classifyReviewed(
   provenance: Provenance,
 ): { resolved: number; unresolved: number } {
   let resolved = 0;
+  // The flattened PostgreSQL assembly has its own independent source-bound review.
+  // Node and native-client exceptions never authorize PostgreSQL bytes.
+  if (provenance.profile === "postgres") {
+    if (
+      provenance.baseImage !== postgresBase ||
+      postgresReview.base.image !== postgresBase
+    )
+      return { resolved, unresolved: findings.length };
+    for (const finding of findings) {
+      const input = finding.input;
+      if (
+        !Number.isSafeInteger(input.layer) ||
+        input.layer === null ||
+        input.layer < 0 ||
+        input.layer >= provenance.imageDiffIDs.length ||
+        !Number.isSafeInteger(input.tarEntry) ||
+        input.tarEntry === null ||
+        input.tarEntry < 0 ||
+        typeof input.boundDigest !== "string" ||
+        !/^sha256:[a-f0-9]{64}$/.test(input.boundDigest) ||
+        provenance.imageDiffIDs[input.layer] !== input.boundDigest
+      )
+        continue;
+      const file = postgresReview.files.find(
+        (file) =>
+          input.kind === "layer-file" &&
+          input.path === file.path &&
+          input.sha256 === file.sha256 &&
+          input.size === file.size,
+      );
+      if (
+        !file ||
+        finding.File !== file.path ||
+        finding.Tags.length ||
+        finding.Secret !== "REDACTED"
+      )
+        continue;
+      if (
+        file.findings.some(
+          (entry) =>
+            entry.rule === finding.RuleID &&
+            entry.startLine === finding.StartLine &&
+            entry.endLine === finding.EndLine &&
+            entry.startColumn === finding.StartColumn &&
+            entry.endColumn === finding.EndColumn &&
+            entry.span.byteStart === finding.span?.byteStart &&
+            entry.span.byteEndExclusive === finding.span.byteEndExclusive &&
+            entry.span.size === finding.span.size &&
+            entry.span.sha256 === finding.span.sha256,
+        )
+      )
+        resolved++;
+    }
+    return { resolved, unresolved: findings.length - resolved };
+  }
   const exactBase =
     provenance.baseImage === reviewedBase.image &&
     JSON.stringify(provenance.baseDiffIDs) ===

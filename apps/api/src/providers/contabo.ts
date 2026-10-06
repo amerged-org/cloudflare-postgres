@@ -209,6 +209,14 @@ const Order = z
     sshKeys: z.array(Id).min(1).max(100).optional(),
     rootPassword: Id.optional(),
     userData: z.string().max(32768).optional(),
+    addOns: z
+      .strictObject({
+        addonsIds: z
+          .array(AddOn.safeExtend({ quantity: Count.positive() }))
+          .min(1)
+          .max(100),
+      })
+      .optional(),
   })
   .refine(
     (input) => input.rootPassword !== undefined || input.sshKeys !== undefined,
@@ -223,6 +231,7 @@ export interface ContaboOrderInput {
   sshKeys?: readonly string[];
   rootPassword?: string;
   userData?: string;
+  addOns?: { addonsIds: readonly { id: string; quantity: number }[] };
 }
 const Rescue = z
   .strictObject({
@@ -318,6 +327,13 @@ const Rule = z
 export interface ContaboFirewallRulesInput {
   rules: { inbound: z.infer<typeof Rule>[] };
 }
+const CreateFirewall = z.strictObject({
+  name: z.string().min(1).max(255),
+  description: z.string().max(255).optional(),
+  status: z.enum(["active", "inactive"]),
+  rules: z.strictObject({ inbound: z.array(Rule).max(100) }).optional(),
+});
+export type ContaboFirewallCreateInput = z.infer<typeof CreateFirewall>;
 const Rules = z.strictObject({
   rules: z.strictObject({ inbound: z.array(Rule).min(1).max(100) }),
 });
@@ -468,7 +484,7 @@ export interface ContaboClientOptions {
   pageSize?: number;
   now?: () => number;
 }
-const explicitRejection = new Set([400, 401, 403, 404, 405, 415, 422]);
+const explicitRejection = new Set([400, 401, 402, 403, 404, 405, 415, 422]);
 const invalid = (): never => {
   throw new ContaboError("invalid_input");
 };
@@ -517,7 +533,22 @@ function numericRefs(value: Record<string, unknown>): string {
             ? String(input)
             : name === "sshKeys"
               ? "[" + (input as string[]).join(",") + "]"
-              : JSON.stringify(input)),
+              : name === "addOns"
+                ? '{"addonsIds":[' +
+                  (
+                    input as { addonsIds: { id: string; quantity: number }[] }
+                  ).addonsIds
+                    .map(
+                      (addon) =>
+                        '{"id":' +
+                        addon.id +
+                        ',"quantity":' +
+                        addon.quantity +
+                        "}",
+                    )
+                    .join(",") +
+                  "]}"
+                : JSON.stringify(input)),
       )
       .join(",") +
     "}"
@@ -1173,6 +1204,52 @@ export class ContaboClient {
     if (rows.length !== 1 || !value.success || value.data.firewallId !== id)
       throw new ContaboError("invalid_response");
     return value.data;
+  }
+  async listFirewalls(
+    filters: { name?: string },
+    input: ContaboRequest,
+  ): Promise<ContaboFirewall[]> {
+    const value = parsed(
+      z.strictObject({ name: z.string().min(1).max(255).optional() }),
+      filters,
+    );
+    return this.page(
+      "/v1/firewalls",
+      new URLSearchParams(value),
+      input,
+      Firewall,
+      (row) => row.firewallId,
+    );
+  }
+  /** Creates a definition only; this request cannot purchase instance add-ons. */
+  async createFirewall(
+    input: ContaboFirewallCreateInput,
+    request: ContaboRequest,
+  ): Promise<MutationResult<ContaboFirewall>> {
+    const body = parsed(CreateFirewall, input);
+    return this.mutation(
+      "/v1/firewalls",
+      "POST",
+      JSON.stringify(body),
+      request,
+      201,
+      (raw) => {
+        const response = z
+            .object({ data: z.array(Firewall).length(1), _links: Links })
+            .parse(raw),
+          value = response.data[0]!;
+        z.uuid().parse(value.firewallId);
+        this.envelope(raw, `/v1/firewalls/${value.firewallId}`);
+        if (
+          value.name !== body.name ||
+          value.status !== body.status ||
+          (body.description !== undefined &&
+            value.description !== body.description)
+        )
+          throw new ContaboError("invalid_response");
+        return value;
+      },
+    );
   }
   async putFirewallRules(
     idInput: string,

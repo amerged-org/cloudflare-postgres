@@ -1,9 +1,9 @@
 # Regional platform releases
 
 This directory contains the platform release baseline for a fresh Talos **1.14.1** / Kubernetes
-**1.36.3** cluster. It supplies Cilium **1.20.2**, OpenEBS **4.6.1** with only LocalPV LVM
+**1.36.5** cluster. It supplies Cilium **1.20.2**, OpenEBS **4.6.1** with only LocalPV LVM
 **1.10.1**, cert-manager **v1.21.2**, CloudNativePG chart **0.29.1** / operator **1.30.1**, and the
-Barman Cloud plugin chart **0.8.0** / plugin **v0.15.0**. Flux **v2.9.5** reconciles these
+Barman Cloud plugin chart **0.8.1** / plugin **v0.15.1**. Flux **v2.9.6** reconciles these
 components; it does not upgrade Talos or Kubernetes. The regional components (`cloudflared`, gateway
 and agent) are a separate Flux Kustomization in [regional](regional); see
 [Regional components](#regional-components).
@@ -46,7 +46,7 @@ Prepare the cluster before installation:
   addresses, including UDP 51871 for WireGuard. Verify encryption and outside-allowlist denial
   before database placement on that node. This setting is not evidence of a live encrypted path.
 - Install the pinned Flux CLI from its
-  [official release](https://github.com/fluxcd/flux2/releases/tag/v2.9.5), verify its checksum and
+  [official release](https://github.com/fluxcd/flux2/releases/tag/v2.9.6), verify its checksum and
   run `flux check --pre`.
 
 All HelmRelease objects and value ConfigMaps live in `flux-system`:
@@ -82,14 +82,14 @@ helm install cilium \
   --values infra/platform/base/values/cilium.yaml \
   --wait --timeout 10m
 
-flux install --version=v2.9.5 \
+flux install --version=v2.9.6 \
   --namespace=flux-system \
   --components=source-controller,kustomize-controller,helm-controller,notification-controller
 ```
 
 Flux then installs the remaining components in dependency order. Barman requires a working
 cert-manager, as its
-[official chart](https://github.com/cloudnative-pg/charts/blob/plugin-barman-cloud-v0.8.0/charts/plugin-barman-cloud/README.md)
+[official chart](https://github.com/cloudnative-pg/charts/blob/plugin-barman-cloud-v0.8.1/charts/plugin-barman-cloud/README.md)
 documents.
 
 Copy [bootstrap/flux-sync.example.yaml](bootstrap/flux-sync.example.yaml) into private installation
