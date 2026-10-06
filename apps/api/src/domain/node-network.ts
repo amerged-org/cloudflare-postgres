@@ -187,7 +187,7 @@ const digest = async (value: unknown) =>
 function fail(): never {
   throw new Error("node_network_blocked");
 }
-function ip(value: string): string {
+export function ip(value: string): string {
   if (!IP.safeParse(value).success) return fail();
   return z.ipv4().safeParse(value).success
     ? value

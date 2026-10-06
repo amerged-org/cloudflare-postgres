@@ -43,7 +43,14 @@ import {
   importBootstrapVerificationKeys,
   verifyBootstrapRelay,
 } from "../../../../packages/contracts/src/bootstrap-relay.ts";
-import type { ContaboInstance } from "../../src/providers/contabo.ts";
+import {
+  ContaboClient,
+  type ContaboInstance,
+} from "../../src/providers/contabo.ts";
+import {
+  joinBundleReference,
+  storeRegionJoinBundle,
+} from "../../src/crypto/bootstrap-credentials.ts";
 import { finalizeNodeAdmission } from "../../src/domain/bootstrap-jobs.ts";
 import {
   verifyNodeCapacity,
@@ -1060,6 +1067,217 @@ describe("protected bootstrap authority", () => {
           .admission_authorized,
       ).toBe(0);
     } finally {
+      await env.ARCHIVE.delete(proofKey);
+    }
+  });
+  it("compares signed verification addresses by IP identity while rejecting changed or missing inventory", async () => {
+    const f = await prepared(),
+      uid = crypto.randomUUID(),
+      clusterUid = crypto.randomUUID(),
+      now = new Date().toISOString();
+    const addition = await saveNodeBootstrapCheckpoint(
+      env.DB,
+      f.job.operation_id,
+      f.addition.revision,
+      {
+        stage: "joined",
+        reference: `${f.job.input_hash}:0`,
+        saved_at: new Date(Date.now() - 1000).toISOString(),
+      },
+    );
+    await storeRegionJoinBundle(
+      env.DB,
+      env.CREDENTIAL_KEYS,
+      joinBundleReference(f.region, 1),
+      {
+        version: 1,
+        cluster_name: f.spec.cluster_name,
+        cluster_endpoint: f.spec.cluster_endpoint,
+        kube_system_uid: clusterUid,
+        talos_version: "1.14.1",
+        kubernetes_version: "1.36.3",
+        talos_machine_secrets_yaml: crypto.randomUUID(),
+        talos_admin_config: crypto.randomUUID(),
+        kubeconfig: crypto.randomUUID(),
+      },
+    );
+    await env.DB.prepare(
+      "INSERT INTO nodes(id,region_id,k8s_node_name,provider_instance_id,node_uid,ready,schedulable,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,1,0,4096,2000,30,128,100,?,?,?)",
+    )
+      .bind(
+        f.job.node_id,
+        f.region,
+        f.spec.hostname,
+        f.spec.provider_instance_id,
+        uid,
+        now,
+        now,
+        now,
+      )
+      .run();
+    const pair = await crypto.subtle.generateKey("Ed25519", true, [
+      "sign",
+      "verify",
+    ]);
+    if (!("privateKey" in pair)) throw new Error("test_key_pair_invalid");
+    const actual = {
+      ipConfig: {
+        v4: { ip: f.spec.hardware.ipv4 },
+        v6: { ip: "2001:0DB8:0000:0000:0000:0000:0000:0042" },
+      },
+      additionalIps: [],
+    } as unknown as ContaboInstance;
+    const provider = vi
+        .spyOn(ContaboClient.prototype, "getInstance")
+        .mockResolvedValue(actual),
+      workflow = { create: vi.fn(async () => ({})) },
+      proofKey = `node-verification/${f.job.operation_id}/${addition.checkpoint!.reference}/proof.json`;
+    const submit = async (ipv6: string | null = "2001:db8::42") => {
+      const payload = {
+        purpose: "pgcf-node-verification/v1",
+        operation_id: f.job.operation_id,
+        node_id: f.job.node_id,
+        region_id: f.region,
+        provider_instance_id: f.spec.provider_instance_id,
+        intent_hash: addition.intent_hash,
+        input_hash: f.job.input_hash,
+        checkpoint_reference: addition.checkpoint!.reference,
+        cluster_uid: clusterUid,
+        node_uid: uid,
+        node_resource_version: "12",
+        observed_at: now,
+        expires_at: new Date(Date.now() + 60_000).toISOString(),
+        addresses: { ipv4: f.spec.hardware.ipv4, ipv6 },
+        wireguard: { mode: "wireguard", peers: [], packet_observations: [] },
+        scans: [
+          { family: "ipv4", address: f.spec.hardware.ipv4 },
+          ...(ipv6 === null ? [] : [{ family: "ipv6", address: ipv6 }]),
+        ].map((scan) => ({
+          ...scan,
+          source: scan.family === "ipv4" ? "198.51.100.1" : "2001:db8:1::1",
+          observed_at: now,
+          scanned_ports: 65535,
+          open_ports: [],
+          control: { address: "198.51.100.2", port: 443, connected: true },
+        })),
+      };
+      const signature = bytesToBase64url(
+          exportBytes(
+            await crypto.subtle.sign(
+              "Ed25519",
+              pair.privateKey,
+              new TextEncoder().encode(
+                `pgcf-node-verification/v1\n${canonicalConfiguration(payload)}`,
+              ),
+            ),
+          ),
+        ),
+        bytes = new TextEncoder().encode(
+          JSON.stringify({ kid: "test", payload, signature }),
+        );
+      await env.ARCHIVE.put(proofKey, bytes);
+      const context = createExecutionContext(),
+        response = await createApp().fetch(
+          new Request(
+            new URL(
+              `/v1/nodes/additions/${f.job.operation_id}/verify`,
+              f.input.callback.url,
+            ),
+            {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${f.admin}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({
+                expected_revision: addition.revision,
+                sha256: bytesToHex(
+                  new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
+                ),
+              }),
+            },
+          ),
+          {
+            ...f.bindings,
+            ADD_NODE: workflow as unknown as Env["ADD_NODE"],
+            CONTABO_CLIENT_ID: crypto.randomUUID(),
+            CONTABO_CLIENT_SECRET: crypto.randomUUID(),
+            CONTABO_USERNAME: crypto.randomUUID(),
+            CONTABO_PASSWORD: crypto.randomUUID(),
+            BOOTSTRAP_VERIFIER_KEYS: JSON.stringify({
+              test: bytesToBase64url(
+                exportBytes(
+                  await crypto.subtle.exportKey("raw", pair.publicKey),
+                ),
+              ),
+            }),
+          },
+          context,
+        );
+      await waitOnExecutionContext(context);
+      return response;
+    };
+    const reject = async (
+      ipv6?: string | null,
+      message = "Proof addresses differ from current provider inventory",
+    ) => {
+      const response = await submit(ipv6);
+      expect(response.status).toBe(409);
+      expect(
+        ((await response.json()) as { error: { message: string } }).error
+          .message,
+      ).toBe(message);
+      expect(
+        (await readBootstrapJob(env.DB, f.job.operation_id))
+          .admission_authorized,
+      ).toBe(0);
+      expect(workflow.create).not.toHaveBeenCalled();
+    };
+    try {
+      actual.ipConfig.v4.ip = "192.0.2.250";
+      if (actual.ipConfig.v4.ip === f.spec.hardware.ipv4)
+        actual.ipConfig.v4.ip = "192.0.2.251";
+      await reject();
+      actual.ipConfig.v4.ip = f.spec.hardware.ipv4;
+      actual.ipConfig.v6!.ip = "2001:db8::43";
+      await reject();
+      actual.ipConfig.v6!.ip = "";
+      await reject();
+      delete actual.ipConfig.v6;
+      await reject();
+      actual.ipConfig.v6 = {
+        ip: "2001:0DB8:0000:0000:0000:0000:0000:0042",
+        gateway: "",
+        netmaskCidr: 64,
+      };
+      await reject(null);
+      actual.ipConfig.v6.ip = "2001:db8::42";
+      actual.additionalIps = [
+        { v4: { ...actual.ipConfig.v4, ip: "198.51.100.250" } },
+      ];
+      await reject(
+        undefined,
+        "Additional provider addresses require complete verified outside-allowlist scan coverage",
+      );
+      actual.additionalIps = [
+        { v4: { ...actual.ipConfig.v4, ip: f.spec.hardware.ipv4 } },
+        { v4: { ...actual.ipConfig.v4, ip: "" } },
+      ];
+      actual.ipConfig.v6.ip = "2001:0DB8:0000:0000:0000:0000:0000:0042";
+      const accepted = await submit();
+      expect(accepted.status).toBe(202);
+      expect(
+        (await readBootstrapJob(env.DB, f.job.operation_id))
+          .admission_authorized,
+      ).toBe(1);
+      expect(workflow.create).toHaveBeenCalledOnce();
+      expect(
+        (await env.DB.prepare("SELECT schedulable FROM nodes WHERE id=?")
+          .bind(f.job.node_id)
+          .first<{ schedulable: number }>())!.schedulable,
+      ).toBe(0);
+    } finally {
+      provider.mockRestore();
       await env.ARCHIVE.delete(proofKey);
     }
   });

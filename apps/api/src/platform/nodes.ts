@@ -38,6 +38,7 @@ import {
   readBootstrapJob,
 } from "../domain/bootstrap-jobs.ts";
 import { contaboClient } from "../domain/bootstrap-relay.ts";
+import { ip } from "../domain/node-network.ts";
 import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
 import { runNodeCapacity } from "../domain/node-capacity.ts";
 import {
@@ -464,12 +465,14 @@ export async function verifyNodeProof(
       "Proof cluster identity differs from actual sealed Kubernetes readback",
     );
   const actual = await contaboClient(c.env).getInstance(
-    proof.provider_instance_id,
-    { requestId: crypto.randomUUID() },
-  );
+      proof.provider_instance_id,
+      { requestId: crypto.randomUUID() },
+    ),
+    proofIpv4 = ip(proof.addresses.ipv4),
+    proofIpv6 = proof.addresses.ipv6 === null ? null : ip(proof.addresses.ipv6);
   if (
-    actual.ipConfig.v4.ip !== proof.addresses.ipv4 ||
-    (actual.ipConfig.v6?.ip || null) !== proof.addresses.ipv6
+    (actual.ipConfig.v4.ip ? ip(actual.ipConfig.v4.ip) : null) !== proofIpv4 ||
+    (actual.ipConfig.v6?.ip ? ip(actual.ipConfig.v6.ip) : null) !== proofIpv6
   )
     throw new ApiError(
       "conflict",
@@ -477,8 +480,7 @@ export async function verifyNodeProof(
     );
   if (
     actual.additionalIps.some(
-      (address) =>
-        address.v4.ip !== "" && address.v4.ip !== proof.addresses.ipv4,
+      (address) => address.v4.ip !== "" && ip(address.v4.ip) !== proofIpv4,
     )
   )
     throw new ApiError(
