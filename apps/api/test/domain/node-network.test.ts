@@ -3,6 +3,15 @@ import { env } from "cloudflare:workers";
 import { afterEach, expect, it } from "vitest";
 import { bytesToBase64url, newNodeId } from "@pgcf/contracts";
 import {
+  NodeBootstrapCheckpoint,
+  NodeBootstrapSpec,
+  type NodeBootstrapMaintenanceObservation,
+} from "@pgcf/contracts/node-bootstrap";
+import {
+  bootstrapSpecHash,
+  sealBootstrapInput,
+} from "../../src/crypto/bootstrap-tickets.ts";
+import {
   configureNodeRegionPolicy,
   reserveNodeAddition,
   recordNodeReceipt,
@@ -24,6 +33,9 @@ afterEach(async () => {
     await env.ARCHIVE.delete(`node-preparation/${op}/proof.json`);
     await env.DB.batch([
       env.DB.prepare(
+        "DELETE FROM node_bootstrap_jobs WHERE operation_id=?",
+      ).bind(op),
+      env.DB.prepare(
         "DELETE FROM node_network_mutations WHERE operation_id=?",
       ).bind(op),
       env.DB.prepare(
@@ -42,6 +54,176 @@ afterEach(async () => {
       .bind(region)
       .run();
   await cleanupFixtures();
+});
+it("accepts maintenance timeouts only for the fully written authoritative job and keeps safe checkpoint advances valid", async () => {
+  const f = await setup();
+  await f.settle();
+  const operation = f.addition.intent.operation_id;
+  const spec = NodeBootstrapSpec.parse({
+    version: 1,
+    operation_id: operation,
+    node_id: f.addition.intent.node_id,
+    region_id: f.state.region,
+    provider_instance_id: f.addition.provider_instance_id,
+    inventory_revision: f.addition.revision,
+    role: "controlplane",
+    hostname: f.addition.intent.requested_hostname,
+    rescue_host_fingerprint: "SHA256:" + "A".repeat(43),
+    hardware: {
+      mac: "02:00:00:00:00:01",
+      ipv4: address(2),
+      prefix_length: 24,
+      gateway: address(254),
+      dns: [address(254)],
+      install_disk: "/dev/sda",
+      disk_bytes: 161_061_273_600,
+      rescue_ram_min_bytes: 8_326_418_432,
+    },
+    image: {
+      schematic_id: "a".repeat(64),
+      compressed_sha256: "b".repeat(64),
+      compressed_bytes: 232_142_156,
+      raw_sha256: "c".repeat(64),
+      raw_bytes: 4_453_302_272,
+      installer_digest: "sha256:" + "d".repeat(64),
+    },
+    storage: { ephemeral_gib: 4, lvm_gib: 8 },
+    cluster_name: "maintenance-test",
+    cluster_endpoint: `https://${address(2)}:6443`,
+    cluster_uid: null,
+    join_bundle_sha256: null,
+    transport: { mode: "relay", issuer_region_id: f.state.region },
+  });
+  const input_hash = await bootstrapSpecHash(spec);
+  const sealed = await sealBootstrapInput(
+    env.CREDENTIAL_KEYS,
+    {
+      spec,
+      input_hash,
+      callback: {
+        url: `https://api.invalid/internal/v1/node-bootstrap/${operation}`,
+        bearer: "x".repeat(32),
+      },
+      rescue: {
+        ssh_private_key: "test-private-material",
+        ssh_host_key: "ssh-ed25519 AAAA",
+        ssh_host_fingerprint: spec.rescue_host_fingerprint,
+      },
+      join_bundle: null,
+    },
+    f.addition.revision,
+  );
+  const checkpoint = NodeBootstrapCheckpoint.parse({
+    stage: "rescue_reboot_intent",
+    status: "waiting",
+    downloaded_bytes: spec.image.compressed_bytes,
+    written_bytes: spec.image.raw_bytes,
+    write_intent_offset: null,
+    destructive_intent: true,
+    sealed_ref: null,
+    pre_reboot_boot_id: null,
+    release_node_uid: null,
+    release_resource_version: null,
+    admission_receipt: null,
+    error_code: null,
+  });
+  const at = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO node_bootstrap_jobs(operation_id,node_id,region_id,input_hash,inventory_revision,sealed_revision,input_ciphertext,input_iv,input_kid,callback_hash,revision,checkpoint_json,created_at,updated_at)
+    VALUES(?,?,?,?,?,?,?,?,?,?,493,?,?,?)`,
+  )
+    .bind(
+      operation,
+      spec.node_id,
+      spec.region_id,
+      input_hash,
+      spec.inventory_revision,
+      f.addition.revision,
+      sealed.ciphertext,
+      sealed.iv,
+      sealed.kid,
+      "e".repeat(64),
+      JSON.stringify(checkpoint),
+      at,
+      at,
+    )
+    .run();
+  const data = await f.payload();
+  const target = data.access.find(
+    (access) => access.provider_instance_id === spec.provider_instance_id,
+  )!;
+  target.checks = [
+    { port: 22, outcome: "timed_out" },
+    { port: 50000, outcome: "connected" },
+    { port: 6443, outcome: "timed_out" },
+  ];
+  const observation: NodeBootstrapMaintenanceObservation = {
+    input_hash,
+    checkpoint_revision: 493,
+    checkpoint_stage: "rescue_reboot_intent",
+    raw_bytes: spec.image.raw_bytes,
+    talos_version: "1.14.1",
+    install_disk: spec.hardware.install_disk,
+    disk_bytes: spec.hardware.disk_bytes,
+    observed_at: data.observed_at,
+  };
+  target.talos_maintenance = observation;
+  await f.sign(data);
+  expect(await f.run()).toBe(true);
+  for (const stage of [
+    "config_prepared",
+    "config_applied",
+    "talos_reboot_intent",
+  ] as const) {
+    checkpoint.stage = stage;
+    if (stage === "talos_reboot_intent")
+      checkpoint.pre_reboot_boot_id = value();
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET revision=revision+1,checkpoint_json=? WHERE operation_id=?",
+    )
+      .bind(JSON.stringify(checkpoint), operation)
+      .run();
+    expect(await f.run()).toBe(true);
+  }
+  checkpoint.written_bytes--;
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(checkpoint), operation)
+    .run();
+  expect(await f.run()).toBe(false);
+  checkpoint.written_bytes++;
+  checkpoint.stage = "gpt_relocated";
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(checkpoint), operation)
+    .run();
+  expect(await f.run()).toBe(false);
+  checkpoint.stage = "rescue_reboot_intent";
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET checkpoint_json=?,cancelled=1 WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(checkpoint), operation)
+    .run();
+  expect(await f.run()).toBe(false);
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET cancelled=0 WHERE operation_id=?",
+  )
+    .bind(operation)
+    .run();
+  observation.input_hash = "0".repeat(64);
+  await f.sign(data);
+  expect(await f.run()).toBe(false);
+  observation.input_hash = input_hash;
+  target.checks[1]!.outcome = "timed_out";
+  await f.sign(data);
+  expect(await f.run()).toBe(false);
+  target.checks[1]!.outcome = "connected";
+  const peer = data.access.find((access) => access !== target)!;
+  peer.checks[0]!.outcome = "timed_out";
+  await f.sign(data);
+  expect(await f.run()).toBe(false);
 });
 const value = () => crypto.randomUUID();
 const address = (ordinal: number) => [192, 0, 2, ordinal].join(".");
@@ -282,6 +464,7 @@ async function setup(ipv6 = true) {
       ipv6: v6(11),
       port: 12345,
     }),
+    CREDENTIAL_KEYS: env.CREDENTIAL_KEYS,
     BOOTSTRAP_VERIFIER_KEYS: JSON.stringify({
       fixture: bytesToBase64url(
         new Uint8Array(

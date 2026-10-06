@@ -16,6 +16,7 @@ import { join } from "node:path";
 import test from "node:test";
 import { newNodeId, newOperationId } from "@pgcf/contracts";
 import { nodeAdditionHostname } from "@pgcf/contracts/nodes";
+import type { NodeBootstrapMaintenanceBinding } from "@pgcf/contracts/node-bootstrap";
 import type { Resource } from "../../../apps/regional/src/agent/types.ts";
 import {
   authenticated,
@@ -45,6 +46,7 @@ import {
   verifyMeasurements,
   assertScanSource,
   measureScans,
+  measureAccess,
   PREPARATION_DOMAIN,
   VERIFICATION_DOMAIN,
 } from "../src/node-network-proof.ts";
@@ -256,6 +258,94 @@ test("signed measurements reject stale, changed-plan, source-family and partial 
   assert.throws(
     () => verifyMeasurements(f.config, [receipt()], f.at),
     /scan_coverage/,
+  );
+});
+
+test("maintenance access preserves inactive-port timeouts only with bound actual Talos reads", async () => {
+  const f = fixture();
+  const maintenance: NodeBootstrapMaintenanceBinding = {
+    input_hash: hash(randomBytes(32).toString("hex")),
+    checkpoint_revision: 493,
+    checkpoint_stage: "rescue_reboot_intent",
+    raw_bytes: 4_453_302_272,
+    install_disk: "/dev/sda",
+    disk_bytes: 161_061_273_600,
+    talos_version: "1.14.1",
+  };
+  f.config.binding.maintenance = maintenance;
+  const payload: Measurement = {
+    purpose: "pgcf-node-measurement/v1",
+    kind: "access",
+    binding_sha256: hash(f.config.binding),
+    observed_at: new Date(f.at).toISOString(),
+    access: [
+      {
+        provider_instance_id: f.plan.provider_instance_id,
+        address: address(2),
+        relay_source: address(3),
+        observed_at: new Date(f.at).toISOString(),
+        checks: [
+          { port: 22, outcome: "timed_out" },
+          { port: 50000, outcome: "connected" },
+          { port: 6443, outcome: "timed_out" },
+        ],
+        talos_maintenance: {
+          ...maintenance,
+          observed_at: new Date(f.at).toISOString(),
+        },
+      },
+    ],
+  };
+  const receipt = () =>
+    signed(
+      "pgcf-node-measurement/v1\n",
+      payload,
+      f.keys.kid,
+      f.keys.privateKey,
+    );
+  assert.equal(verifyMeasurements(f.config, [receipt()], f.at).length, 1);
+  payload.access[0]!.checks[1]!.outcome = "timed_out";
+  assert.throws(
+    () => verifyMeasurements(f.config, [receipt()], f.at),
+    /access_binding/,
+  );
+  payload.access[0]!.checks[1]!.outcome = "connected";
+  payload.access[0]!.talos_maintenance!.disk_bytes--;
+  assert.throws(
+    () => verifyMeasurements(f.config, [receipt()], f.at),
+    /maintenance_binding/,
+  );
+  payload.access[0]!.talos_maintenance!.disk_bytes++;
+  const actual = payload.access[0]!.talos_maintenance!;
+  f.config.maintenance_observation = {
+    ...actual,
+    observed_at: new Date(f.at - 130000).toISOString(),
+  };
+  await assert.rejects(
+    measureAccess(f.config, address(3), f.keys.privateKey, Date.now() + 1000),
+    /stale_measurement/,
+  );
+  f.config.maintenance_observation = {
+    ...actual,
+    disk_bytes: actual.disk_bytes - 1,
+  };
+  await assert.rejects(
+    measureAccess(f.config, address(3), f.keys.privateKey, Date.now() + 1000),
+    /maintenance_binding/,
+  );
+  f.config.maintenance_observation = Object.assign(
+    { ...actual },
+    { unreviewed: true },
+  );
+  await assert.rejects(
+    measureAccess(f.config, address(3), f.keys.privateKey, Date.now() + 1000),
+    /maintenance_binding/,
+  );
+  maintenance.checkpoint_stage = "gpt_relocated";
+  payload.binding_sha256 = hash(f.config.binding);
+  assert.throws(
+    () => verifyMeasurements(f.config, [receipt()], f.at),
+    /maintenance_binding/,
   );
 });
 

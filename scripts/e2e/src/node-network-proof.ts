@@ -5,6 +5,10 @@ import { isIP } from "node:net";
 import { pathToFileURL } from "node:url";
 import { NodeId, OperationId, RegionId } from "@pgcf/contracts";
 import { ProviderInstanceId } from "@pgcf/contracts/nodes";
+import {
+  NodeBootstrapMaintenanceBinding,
+  NodeBootstrapMaintenanceObservation,
+} from "@pgcf/contracts/node-bootstrap";
 import { ContaboClient } from "../../../apps/api/src/providers/contabo.ts";
 import type {
   ContaboFirewall,
@@ -81,13 +85,18 @@ export interface MeasurementBinding {
   plan_sha256: string;
   readback_at: string;
   verification: VerificationBinding | null;
+  maintenance?: NodeBootstrapMaintenanceBinding;
 }
 export interface AccessObservation {
   provider_instance_id: string;
   address: string;
   relay_source: string;
   observed_at: string;
-  checks: { port: 22 | 50000 | 6443; outcome: "connected" | "refused" }[];
+  checks: {
+    port: 22 | 50000 | 6443;
+    outcome: "connected" | "refused" | "timed_out";
+  }[];
+  talos_maintenance?: NodeBootstrapMaintenanceObservation;
 }
 export interface ScanObservation {
   provider_instance_id: string;
@@ -121,6 +130,7 @@ export interface CommonConfig {
   measurement_keys: Record<string, string>;
   control_keys: Record<string, string>;
   kid: string;
+  maintenance_observation?: NodeBootstrapMaintenanceObservation;
   scan?: {
     https_control?: HttpsControl;
     source_pool?: string[];
@@ -326,12 +336,23 @@ export function validateBinding(
   plan: NetworkPlan,
   now = Date.now(),
 ): void {
-  exact(binding, ["plan_sha256", "readback_at", "verification"]);
+  exact(binding, [
+    "plan_sha256",
+    "readback_at",
+    "verification",
+    ...(binding.maintenance === undefined ? [] : ["maintenance"]),
+  ]);
   if (
     hash(plan) !== hashValue(binding.plan_sha256) ||
     Date.parse(timestamp(binding.readback_at)) > now
   )
     blocked("plan_binding");
+  if (
+    binding.maintenance !== undefined &&
+    (binding.verification !== null ||
+      !NodeBootstrapMaintenanceBinding.safeParse(binding.maintenance).success)
+  )
+    blocked("maintenance_binding");
   if (binding.verification !== null) {
     const value = exact(binding.verification, [
       "input_hash",
@@ -348,6 +369,49 @@ export function validateBinding(
     text(value.checkpoint_reference, /^.{1,128}$/);
     text(value.hostname, /^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/);
   }
+}
+function maintenanceObservation(
+  config: CommonConfig,
+  value: unknown,
+  now: number,
+): NodeBootstrapMaintenanceObservation {
+  const parsed = NodeBootstrapMaintenanceObservation.safeParse(value);
+  if (!parsed.success) blocked("maintenance_binding");
+  const { observed_at, ...actual } = parsed.data;
+  if (canonical(actual) !== canonical(config.binding.maintenance))
+    blocked("maintenance_binding");
+  fresh(timestamp(observed_at), config.binding.readback_at, now);
+  return parsed.data;
+}
+function assertMaintenanceAccess(
+  config: CommonConfig,
+  access: AccessObservation,
+  now: number,
+): void {
+  const binding = config.binding.maintenance;
+  const target =
+    access.provider_instance_id === config.plan.provider_instance_id;
+  if (!binding || !target) {
+    if (
+      access.talos_maintenance !== undefined ||
+      access.checks.some((check) => check.outcome === "timed_out")
+    )
+      blocked("access_binding");
+    return;
+  }
+  const actual = maintenanceObservation(config, access.talos_maintenance, now);
+  if (actual.observed_at > access.observed_at) blocked("maintenance_binding");
+  if (
+    access.checks.find((check) => check.port === 50000)?.outcome !==
+      "connected" ||
+    access.checks.some(
+      (check) =>
+        check.outcome === "timed_out" &&
+        check.port !== 22 &&
+        check.port !== 6443,
+    )
+  )
+    blocked("access_binding");
 }
 function scope(binding: MeasurementBinding) {
   return hash(binding);
@@ -399,6 +463,11 @@ export async function measureAccess(
 ): Promise<Envelope<Measurement>> {
   validateBinding(config.binding, config.plan);
   if (config.binding.verification !== null) blocked("access_purpose");
+  const maintenance = config.binding.maintenance
+    ? maintenanceObservation(config, config.maintenance_observation, Date.now())
+    : undefined;
+  if (!maintenance && config.maintenance_observation !== undefined)
+    blocked("maintenance_binding");
   const family = isIP(source) === 4 ? "ipv4" : "ipv6";
   if (!config.plan.relay.addresses[family].map(ip).includes(ip(source)))
     blocked("relay_source_binding");
@@ -409,19 +478,38 @@ export async function measureAccess(
     const checks: AccessObservation["checks"] = [];
     for (const port of [22, 50000, 6443] as const) {
       const outcome = await tcp(address, port, source, 3000, deadline);
-      if (outcome !== "connected" && outcome !== "refused")
+      if (
+        outcome !== "connected" &&
+        outcome !== "refused" &&
+        outcome !== "timed_out"
+      )
         blocked("relay_access_inconclusive");
       checks.push({ port, outcome });
     }
     if (!checks.some((check) => check.outcome === "connected"))
       blocked("relay_access_unproven");
-    access.push({
+    let talos_maintenance: NodeBootstrapMaintenanceObservation | undefined;
+    if (
+      member.provider_instance_id === config.plan.provider_instance_id &&
+      config.binding.maintenance
+    ) {
+      if (
+        !config.maintenance_observation ||
+        checks.find((check) => check.port === 50000)?.outcome !== "connected"
+      )
+        blocked("maintenance_binding");
+      talos_maintenance = maintenance;
+    }
+    const observation: AccessObservation = {
       provider_instance_id: member.provider_instance_id,
       address,
       relay_source: ip(source),
       observed_at: new Date().toISOString(),
       checks,
-    });
+      ...(talos_maintenance ? { talos_maintenance } : {}),
+    };
+    assertMaintenanceAccess(config, observation, Date.now());
+    access.push(observation);
   }
   const payload: Measurement = {
     purpose: "pgcf-node-measurement/v1",
@@ -574,6 +662,9 @@ export function verifyMeasurements(
           "relay_source",
           "observed_at",
           "checks",
+          ...(access.talos_maintenance === undefined
+            ? []
+            : ["talos_maintenance"]),
         ]);
         const member = config.plan.members.find(
             (member) =>
@@ -593,13 +684,14 @@ export function verifyMeasurements(
           access.checks.some(
             (check) =>
               ![22, 50000, 6443].includes(check.port) ||
-              !["connected", "refused"].includes(check.outcome),
+              !["connected", "refused", "timed_out"].includes(check.outcome),
           ) ||
           !access.checks.some((check) => check.outcome === "connected")
         )
           blocked("access_binding");
         seen.add(access.provider_instance_id);
         fresh(timestamp(access.observed_at), config.binding.readback_at, now);
+        assertMaintenanceAccess(config, access, now);
       }
     } else if (payload.kind === "scan") {
       exact(payload, [
@@ -1123,6 +1215,12 @@ export async function main(mode = process.argv[2]): Promise<void> {
     kid,
     measurement_keys: object(config.measurement_keys) as Record<string, string>,
     control_keys: object(config.control_keys) as Record<string, string>,
+    ...(config.maintenance_observation
+      ? {
+          maintenance_observation:
+            config.maintenance_observation as NodeBootstrapMaintenanceObservation,
+        }
+      : {}),
     ...(config.scan ? { scan: config.scan as CommonConfig["scan"] } : {}),
   };
   let artifact: unknown;

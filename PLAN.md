@@ -11,13 +11,13 @@ The current regional image is
 `sha256:692a6c508e274d695151ce064b52fd66c5f00d5ec701c7d2adb2de89a092fdbb`
 from `e9569169`, CI `37360915487`. Image qualification and anonymous manifest,
 configuration and every layer verification passed. Agent and both gateways remained continuously
-Ready for 62.768 s. The management API uses `bc04153d` and Edge uses `b196fbaa`; the private bootstrap
+Ready for 62.768 s. The management API uses `da004fd6` and Edge uses `b196fbaa`; the private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
 inputs are now bound. The current native bootstrap image is
-`sha256:70372eacfcc2d71dfa0f6103faa617715155ddd046a235eaaa4a3c893dd73954`
-from `bc04153d`: qualification covered 711,911,304 bytes and 18 layers with zero unresolved
+`sha256:53a460d205ea01df732502900333a419ad5eb1d5c346850f5bf7a3b3b51f5364`
+from `da004fd6`: qualification covered 711,911,304 bytes and 18 layers with zero unresolved
 findings, followed by exact private-registry manifest, configuration and layer readback.
-Latest complete CI `37395016762` is green. EU2 join, US installation and post-join network acceptance
+Latest complete CI `37401899511` is green. EU2 join, US installation and post-join network acceptance
 remain outstanding. Release image signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
@@ -158,11 +158,14 @@ native tests plus actual 536,870,912-byte readback in 0.917 s with zero extra di
 Its `bc04153d` runtime is qualified and delivered, with completed Cloudflare rollout and exact
 instance image readback. The same job has acknowledged all 4,453,302,272 disk bytes, verified
 every partition and GPT, and recorded the rescue reboot. Actual operator maintenance reads
-confirm Talos 1.14.1, the exact disk and the intended peer route. The native CLI currently places
-the command-local `--insecure` flag before the subcommand, which the pinned client rejects;
-the exact commands succeed with the flag after the subcommand. A reproducing regression and
-corrected ordering pass all 65 native tests; runtime qualification and delivery are pending.
-Relay access remains inconclusive and requires actual diagnosis before fresh proof publication.
+confirm Talos 1.14.1, the exact disk and the intended peer route. The pinned client rejected
+the original command-local `--insecure` flag before the subcommand; corrected ordering passes
+all 65 native tests and is qualified and delivered from `da004fd6`, with exact registry and
+Container image readback. The relay reaches genuine Talos port 50000 in 4 ms, while inactive
+22/6443 time out despite the correct route and captured outbound resets. A narrow signed
+maintenance observation and authoritative image/checkpoint binding preserve these outcomes
+honestly; 17 API, 23 proof/hosted and five contract tests pass, with independent review.
+Its runtime delivery and real relay observation/full-proof acceptance remain pending.
 Expired preparation pauses progress and fresh full outside proofs resume it. The unchanged first
 node, agent, both gateways and five platform releases remain Ready. EU2 join, US installation
 and lost-worker recovery are not accepted. US remains unbought; the specific costed approval

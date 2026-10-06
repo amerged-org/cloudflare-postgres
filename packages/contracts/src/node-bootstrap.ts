@@ -339,6 +339,36 @@ export const NodeBootstrapCheckpoint = z.strictObject({
 });
 export type NodeBootstrapCheckpoint = z.infer<typeof NodeBootstrapCheckpoint>;
 
+// This anchor stays valid across safe checkpoint advances; mutable reboot IDs
+// remain the native executor's authenticated reboot-confirmation responsibility.
+export const NodeBootstrapMaintenanceBinding = z
+  .strictObject({
+    input_hash: Digest,
+    checkpoint_revision: z.number().int().positive(),
+    checkpoint_stage: NodeBootstrapStage,
+    raw_bytes: NodeBootstrapSpec.shape.image.shape.raw_bytes,
+    install_disk: NodeBootstrapSpec.shape.hardware.shape.install_disk,
+    disk_bytes: PositiveBytes,
+    talos_version: ClusterMaterial.talos_version,
+  })
+  .refine(
+    (value) =>
+      NodeBootstrapStage.options.indexOf(value.checkpoint_stage) >=
+        NodeBootstrapStage.options.indexOf("rescue_reboot_intent") &&
+      value.raw_bytes < value.disk_bytes,
+    "maintenance requires an installed-image reboot anchor",
+  );
+export type NodeBootstrapMaintenanceBinding = z.infer<
+  typeof NodeBootstrapMaintenanceBinding
+>;
+export const NodeBootstrapMaintenanceObservation =
+  NodeBootstrapMaintenanceBinding.safeExtend({
+    observed_at: z.iso.datetime({ precision: 3 }),
+  });
+export type NodeBootstrapMaintenanceObservation = z.infer<
+  typeof NodeBootstrapMaintenanceObservation
+>;
+
 const Identity = {
   version: z.literal(1),
   operation_id: OperationId,

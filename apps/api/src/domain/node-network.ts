@@ -9,6 +9,12 @@ import {
   base64urlToBytes,
 } from "@pgcf/contracts";
 import { ProviderInstanceId } from "@pgcf/contracts/nodes";
+import {
+  NodeBootstrapCheckpoint,
+  NodeBootstrapStage,
+  NodeBootstrapMaintenanceObservation,
+} from "@pgcf/contracts/node-bootstrap";
+import { openBootstrapInput } from "../crypto/bootstrap-tickets.ts";
 import { importBootstrapVerificationKeys } from "@pgcf/contracts/bootstrap-relay";
 import { readNodeAddition, assertNodeRecoveryAuthority } from "./node-state.ts";
 import {
@@ -32,10 +38,11 @@ const Access = z.strictObject({
     .array(
       z.strictObject({
         port: z.union([z.literal(22), z.literal(50000), z.literal(6443)]),
-        outcome: z.enum(["connected", "refused"]),
+        outcome: z.enum(["connected", "refused", "timed_out"]),
       }),
     )
     .length(3),
+  talos_maintenance: NodeBootstrapMaintenanceObservation.optional(),
 });
 const Scan = z.strictObject({
   provider_instance_id: ProviderInstanceId,
@@ -103,6 +110,7 @@ export interface NodeNetworkEnv {
   BOOTSTRAP_OPERATOR_SOURCES: string;
   BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID: string;
   BOOTSTRAP_SCAN_CONTROL: string;
+  CREDENTIAL_KEYS: string;
 }
 export interface NodeNetworkOptions {
   fetcher?: typeof fetch;
@@ -663,6 +671,7 @@ async function proof(
   expires: string;
   oldest: number;
   observed: number;
+  maintenance: NodeBootstrapMaintenanceObservation | null;
 } | null> {
   const object = await env.ARCHIVE.get(
     `node-preparation/${plan.operation_id}/proof.json`,
@@ -735,6 +744,7 @@ async function proof(
       value.access.length
   )
     return null;
+  let maintenance: NodeBootstrapMaintenanceObservation | null = null;
   for (const access of value.access) {
     const member = plan.members.find(
       (member) => member.provider_instance_id === access.provider_instance_id,
@@ -753,6 +763,30 @@ async function proof(
       access.observed_at > value.observed_at
     )
       return null;
+    if (
+      access.talos_maintenance ||
+      access.checks.some((check) => check.outcome === "timed_out")
+    ) {
+      const observation = access.talos_maintenance;
+      if (
+        member.provider_instance_id !== plan.provider_instance_id ||
+        !observation ||
+        access.checks.find((check) => check.port === 50000)?.outcome !==
+          "connected" ||
+        access.checks.some(
+          (check) =>
+            check.outcome === "timed_out" &&
+            check.port !== 22 &&
+            check.port !== 6443,
+        ) ||
+        observation.observed_at < preparation.readback_at ||
+        observation.observed_at > access.observed_at ||
+        Date.parse(observation.observed_at) < now - 120000 ||
+        !(await maintenanceAuthority(env, plan, observation, access.address))
+      )
+        return null;
+      maintenance = observation;
+    }
   }
   for (const kind of ["ipv4", "ipv6"] as const) {
     const expected = plan.members.flatMap((member) =>
@@ -810,6 +844,7 @@ async function proof(
   const observations = [
     observed,
     ...value.access.map((access) => Date.parse(access.observed_at)),
+    ...(maintenance ? [Date.parse(maintenance.observed_at)] : []),
     ...Object.values(value.external).flatMap((external) =>
       external
         ? [
@@ -824,7 +859,75 @@ async function proof(
     expires: value.expires_at,
     oldest: Math.min(...observations),
     observed,
+    maintenance,
   };
+}
+
+async function maintenanceAuthority(
+  env: NodeNetworkEnv,
+  plan: Plan,
+  observation: NodeBootstrapMaintenanceObservation,
+  address: string,
+): Promise<boolean> {
+  const row = await env.DB.prepare(
+    "SELECT * FROM node_bootstrap_jobs WHERE operation_id=?",
+  )
+    .bind(plan.operation_id)
+    .first<{
+      operation_id: string;
+      node_id: string;
+      region_id: string;
+      input_hash: string;
+      sealed_revision: number;
+      input_ciphertext: string;
+      input_iv: string;
+      input_kid: string;
+      authorized: number;
+      admitted: number;
+      cancelled: number;
+      revision: number;
+      checkpoint_json: string;
+    }>();
+  if (
+    !row ||
+    row.authorized !== 1 ||
+    row.admitted !== 0 ||
+    row.cancelled !== 0 ||
+    row.node_id !== plan.node_id ||
+    row.region_id !== plan.region_id ||
+    row.input_hash !== observation.input_hash ||
+    row.revision < observation.checkpoint_revision
+  )
+    return false;
+  const checkpoint = NodeBootstrapCheckpoint.parse(
+    JSON.parse(row.checkpoint_json),
+  );
+  if (
+    NodeBootstrapStage.options.indexOf(checkpoint.stage) <
+      NodeBootstrapStage.options.indexOf(observation.checkpoint_stage) ||
+    ["failed", "cancelled", "released"].includes(checkpoint.status)
+  )
+    return false;
+  const input = await openBootstrapInput(env.CREDENTIAL_KEYS, {
+    operation_id: row.operation_id,
+    input_hash: row.input_hash,
+    revision: row.sealed_revision,
+    ciphertext: row.input_ciphertext,
+    iv: row.input_iv,
+    kid: row.input_kid,
+  });
+  const spec = input.spec;
+  return (
+    spec.node_id === plan.node_id &&
+    spec.region_id === plan.region_id &&
+    spec.provider_instance_id === plan.provider_instance_id &&
+    spec.transport.mode === "relay" &&
+    ip(address) === spec.hardware.ipv4 &&
+    observation.raw_bytes === spec.image.raw_bytes &&
+    checkpoint.written_bytes === spec.image.raw_bytes &&
+    observation.install_disk === spec.hardware.install_disk &&
+    observation.disk_bytes === spec.hardware.disk_bytes
+  );
 }
 export async function ensureNodeNetwork(
   env: NodeNetworkEnv,
@@ -1029,7 +1132,10 @@ async function ensureNodePreparation(
     if (!validAt(finished)) return false;
 
     const result = await env.DB.prepare(
-      "UPDATE node_network_preparations SET status='verified',proof_sha256=?,proof_expires_at=?,revision=revision+1,updated_at=? WHERE operation_id=? AND revision=? AND plan_sha256=? AND EXISTS(SELECT 1 FROM node_additions WHERE operation_id=? AND intent_hash=? AND slot_held=1 AND status IN('audited','bootstrapping','ready'))",
+      `UPDATE node_network_preparations SET status='verified',proof_sha256=?,proof_expires_at=?,revision=revision+1,updated_at=? WHERE operation_id=? AND revision=? AND plan_sha256=? AND EXISTS(SELECT 1 FROM node_additions WHERE operation_id=? AND intent_hash=? AND slot_held=1 AND status IN('audited','bootstrapping','ready'))
+       AND (? IS NULL OR EXISTS(SELECT 1 FROM node_bootstrap_jobs j WHERE j.operation_id=? AND j.input_hash=? AND j.revision>=? AND j.authorized=1 AND j.admitted=0 AND j.cancelled=0
+         AND json_extract(j.checkpoint_json,'$.written_bytes')=? AND json_extract(j.checkpoint_json,'$.stage') IN (SELECT value FROM json_each(?))
+         AND json_extract(j.checkpoint_json,'$.status') NOT IN ('failed','cancelled','released')))`,
     )
       .bind(
         verified.hash,
@@ -1040,6 +1146,20 @@ async function ensureNodePreparation(
         preparation.plan_sha256,
         operationId,
         preparation.intent_hash,
+        verified.maintenance?.input_hash ?? null,
+        operationId,
+        verified.maintenance?.input_hash ?? null,
+        verified.maintenance?.checkpoint_revision ?? null,
+        verified.maintenance?.raw_bytes ?? null,
+        JSON.stringify(
+          verified.maintenance
+            ? NodeBootstrapStage.options.slice(
+                NodeBootstrapStage.options.indexOf(
+                  verified.maintenance.checkpoint_stage,
+                ),
+              )
+            : [],
+        ),
       )
       .run();
     return result.meta.changes === 1 && validAt(now());
