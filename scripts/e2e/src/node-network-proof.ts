@@ -1029,6 +1029,19 @@ export async function produceVerification(
     ["get", "node", binding.hostname, "-o", "json"],
     deadline,
   );
+  // Scan receipts retain their original binding. Capacity and admission use the
+  // current Node revision, which must then stay unchanged through observation.
+  const capacityBinding = {
+    ...binding,
+    node_resource_version: text(
+      node.metadata.resourceVersion,
+      /^[0-9]{1,128}$/,
+    ),
+  };
+  const capacityConfig: CommonConfig = {
+    ...config,
+    binding: { ...config.binding, verification: capacityBinding },
+  };
   const podList = object(
     await kube(
       config,
@@ -1041,7 +1054,13 @@ export async function produceVerification(
   );
   const pods = list(podList.items, 10000) as Resource[],
     namespaces = list(namespaceList.items, 10000) as Resource[];
-  const capacity = boundCapacity(config, namespace, node, pods, namespaces);
+  const capacity = boundCapacity(
+    capacityConfig,
+    namespace,
+    node,
+    pods,
+    namespaces,
+  );
   const member = config.plan.members.find(
     (value) => value.node_id === config.plan.node_id,
   )!;
@@ -1123,7 +1142,7 @@ export async function produceVerification(
       deadline,
     );
   const finalCapacity = boundCapacity(
-    config,
+    capacityConfig,
     finalNamespace,
     finalNode,
     pods,
@@ -1144,7 +1163,7 @@ export async function produceVerification(
     checkpoint_reference: binding.checkpoint_reference,
     cluster_uid: binding.cluster_uid,
     node_uid: binding.node_uid,
-    node_resource_version: binding.node_resource_version,
+    node_resource_version: capacityBinding.node_resource_version,
     observed_at,
     expires_at: new Date(Date.now() + 120000).toISOString(),
     addresses: {

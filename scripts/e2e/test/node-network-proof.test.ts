@@ -10,7 +10,7 @@ import { createServer } from "node:net";
 import { EventEmitter, once } from "node:events";
 import https from "node:https";
 import { syncBuiltinESMExports } from "node:module";
-import { mkdtemp, readFile, stat, rm } from "node:fs/promises";
+import { mkdtemp, readFile, stat, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -41,6 +41,7 @@ import type {
 } from "../src/node-network-native.ts";
 import {
   boundCapacity,
+  produceVerification,
   firewallEvidence,
   parsePlan,
   verifyMeasurements,
@@ -54,6 +55,7 @@ import type {
   CommonConfig,
   Measurement,
   NetworkPlan,
+  PostjoinConfig,
 } from "../src/node-network-proof.ts";
 import { packetEvidence, wireguardPeers } from "../src/node-network-packets.ts";
 
@@ -1135,7 +1137,7 @@ test("unencrypted VXLAN Pod packets cannot hide inside a public-address capture"
   );
 });
 
-test("postjoin capacity requires bound cluster/node/revision, quarantine and real headroom", () => {
+function postjoinFixture() {
   const f = fixture(),
     binding = {
       input_hash: hash(randomUUID()),
@@ -1174,6 +1176,12 @@ test("postjoin capacity requires bound cluster/node/revision, quarantine and rea
       allocatable: { cpu: "3", memory: "6Gi" },
     },
   };
+  return { ...f, binding, namespace, node };
+}
+
+test("postjoin capacity requires bound cluster/node/revision, quarantine and real headroom", () => {
+  const f = postjoinFixture(),
+    { namespace, node } = f;
   assert.equal(
     boundCapacity(f.config, namespace, node, [], []).allocatable_cpu_millicores,
     3000,
@@ -1189,4 +1197,110 @@ test("postjoin capacity requires bound cluster/node/revision, quarantine and rea
     () => boundCapacity(f.config, namespace, node, [], []),
     /capacity_unavailable/,
   );
+});
+
+test("verification rebases only the local capacity revision while preserving signed scan bindings and identity guards", async () => {
+  const f = postjoinFixture();
+  if (f.payload.kind !== "scan") assert.fail();
+  f.payload.binding_sha256 = hash(f.config.binding);
+  const receipt = signed(
+    "pgcf-node-measurement/v1\n",
+    f.payload,
+    f.keys.kid,
+    f.keys.privateKey,
+  );
+  const originalBinding = canonical(f.config.binding);
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-verification-test-"));
+  const program = join(directory, "observations"),
+    counter = join(directory, "node-read");
+  const quote = (value: string) => "'" + value.replaceAll("'", "'\\''") + "'";
+  const run = async (
+    node: Resource,
+    namespace = f.namespace,
+    finalNode = node,
+  ) => {
+    await rm(counter, { force: true });
+    const script = `#!/bin/sh
+case "$*" in
+  'get namespace kube-system -o json') printf '%s' ${quote(JSON.stringify(namespace))} ;;
+  'get node ${f.binding.hostname} -o json')
+    if test -f ${quote(counter)}; then printf '%s' ${quote(JSON.stringify(finalNode))};
+    else : >${quote(counter)}; printf '%s' ${quote(JSON.stringify(node))}; fi ;;
+  'get pods --all-namespaces -o json'|'get namespaces -o json') printf '%s' '{"items":[]}' ;;
+  interfaces) printf 'cilium_wg0\\n' ;;
+  endpoints|handshakes) ;;
+  *) exit 1 ;;
+esac
+`;
+    await writeFile(program, script, { mode: 0o700 });
+    const command = {
+      program,
+      sha256: createHash("sha256").update(script).digest("hex"),
+      args: [] as string[],
+    };
+    const config: PostjoinConfig = {
+      ...f.config,
+      kubectl: command,
+      wireguard: {
+        device: "cilium_wg0",
+        interfaces: { ...command, args: ["interfaces"] },
+        endpoints: { ...command, args: ["endpoints"] },
+        handshakes: { ...command, args: ["handshakes"] },
+      },
+      capture: null,
+    };
+    return produceVerification(
+      config,
+      [receipt],
+      f.keys.privateKey,
+      Date.now() + 10000,
+    );
+  };
+  const current = structuredClone(f.node);
+  current.metadata.resourceVersion = "13";
+  try {
+    const envelope = await run(current);
+    const proof = authenticated(VERIFICATION_DOMAIN, envelope, f.keys.trusted);
+    assert.equal(proof.node_resource_version, "13");
+    assert.equal(proof.node_uid, f.binding.node_uid);
+    assert.equal(proof.cluster_uid, f.binding.cluster_uid);
+    assert.equal(proof.input_hash, f.binding.input_hash);
+    assert.equal(proof.checkpoint_reference, f.binding.checkpoint_reference);
+    assert.equal(canonical(f.config.binding), originalBinding);
+    assert.equal(receipt.payload.binding_sha256, hash(f.config.binding));
+
+    const replaced = structuredClone(current);
+    replaced.metadata.uid = randomUUID();
+    await assert.rejects(run(replaced), /kubernetes_binding/);
+    const relabelled = structuredClone(current);
+    relabelled.metadata.labels!["pgcf.io/provider-instance-id"] = providerId();
+    await assert.rejects(run(relabelled), /kubernetes_binding/);
+    const foreignCluster = structuredClone(f.namespace);
+    foreignCluster.metadata.uid = randomUUID();
+    await assert.rejects(run(current, foreignCluster), /kubernetes_binding/);
+    const released = structuredClone(current);
+    released.spec = { taints: [] };
+    await assert.rejects(run(released), /quarantine_missing/);
+    const unknownCapacity = structuredClone(current);
+    unknownCapacity.metadata.annotations = {};
+    await assert.rejects(run(unknownCapacity), /capacity_unavailable/);
+    const advancedDuringObservation = structuredClone(current);
+    advancedDuringObservation.metadata.resourceVersion = "14";
+    await assert.rejects(
+      run(current, f.namespace, advancedDuringObservation),
+      /kubernetes_binding/,
+    );
+    const changedCapacity = structuredClone(current);
+    changedCapacity.status = {
+      conditions: [{ type: "Ready", status: "True" }],
+      allocatable: { cpu: "4", memory: "6Gi" },
+    };
+    await assert.rejects(
+      run(current, f.namespace, changedCapacity),
+      /capacity_changed/,
+    );
+    assert.equal(canonical(f.config.binding), originalBinding);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

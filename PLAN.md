@@ -3,21 +3,21 @@
 Status (2026-10-06): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
 The first EU node and five Flux platform releases are Ready, with 95 GiB measured storage.
 Its node identity, storage and protected cluster custody are preserved. The second existing EU
-VPS has passed image/GPT verification and booted Talos maintenance; native configuration and
-network acceptance remain in progress. No US VPS has been bought and no customer or platform
+VPS has finished installation and is Ready under quarantine with 95 GiB measured capacity;
+final signed network verification and admission remain in progress. No US VPS has been bought and no customer or platform
 production database has been migrated. The initial topology remains two EU VPS and one US VPS.
 
 The current regional image is
 `sha256:692a6c508e274d695151ce064b52fd66c5f00d5ec701c7d2adb2de89a092fdbb`
 from `e9569169`, CI `37360915487`. Image qualification and anonymous manifest,
 configuration and every layer verification passed. Agent and both gateways remained continuously
-Ready for 62.768 s. The management API uses `198ac256` and Edge uses `b196fbaa`; the private bootstrap
+Ready for 62.768 s. The management API uses `4d24cbfe` and Edge uses `b196fbaa`; the private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
 inputs are now bound. The current native bootstrap image is
-`sha256:5437533555017b0063ab4d154fdb62d26d6957af8984cf50e9fb858b72465c11`
-from `198ac256`: qualification covered 711,912,328 bytes and 18 layers with zero unresolved
+`sha256:02f0eab96bae751c167871308e70a20cc808009c6ec4eb968a17c5c9fb473a9e`
+from `4d24cbfe`: qualification covered 711,912,830 bytes and 18 layers with zero unresolved
 findings, followed by exact private-registry manifest, configuration and layer readback.
-Latest complete CI `37403108103` is green. EU2 admission, US installation and post-join network acceptance
+Latest complete CI `37405284021` is green. EU2 admission, US installation and post-join network acceptance
 remain outstanding. Release image signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
@@ -174,7 +174,18 @@ publication proof expired; no storage annotation was published. A fresh warm cyc
 Native kubelet trust-map creation is unconfirmed: exact Linux Node child stdin reproduces
 `/dev/stdin` reopening failure, while actual Dev server dry-run validates the manifest. Manifest
 `-` and private regular patch-file corrections pass four reproducing regressions and all 65
-native tests; qualification/delivery and trust-map readback remain pending.
+native tests; the qualified correction is delivered and the exact trust map is read back.
+Bootstrap is at `awaiting_verification`, revision 504. A warm 1 GiB allocation/reclamation cycle
+completed and published actual 95 GiB in 124.433 s, with 178.9 s freshness headroom and all
+trial resources removed. Unfiltered eight-second capture initially streamed 159,726,343 bytes,
+99.67211% TCP 10250, exceeding the existing 32 MiB cap. Spooling before transfer preserves the
+capture and cap: actual preflight measured 572,252 bytes, 498 encrypted peer packets, zero
+plaintext Pod packets and zero kernel drops; all three kernel WireGuard projections passed.
+The final collector's before-scan Node resource version rejects a harmless heartbeat update
+with unchanged UID, labels, spec and capacity. A reproducing test and local observation-time
+version binding pass 24 proof/hosted tests and independent review, retaining original scan
+identity scopes and strict before/after capture plus native admission UID/version preconditions.
+Fresh full verification, quarantine release and SQL/backup placement remain pending.
 Expired preparation pauses progress and fresh full outside proofs resume it. The unchanged first
 node, agent, both gateways and five platform releases remain Ready. EU2 join, US installation
 and lost-worker recovery are not accepted. US remains unbought; the specific costed approval
