@@ -119,6 +119,27 @@ function hardware(
     )
     .join(separator);
 }
+function assertReadOnlyScript(script: string) {
+  assert.ok(
+    !/sgdisk\s+--(?:zap|move)|\bdd\s|mkfs|reboot|of=\/dev\//.test(script),
+  );
+}
+test("the read-only command guard accepts an owned scratch hash ending in dd but refuses actual disk commands", () => {
+  const ownedSource = `pgcf-inspection-op_fixture-${"a".repeat(62)}dd`;
+  assertReadOnlyScript(
+    `test "$(findmnt --noheadings --raw --target /run/pgcf-inspection/owned --output TARGET,SOURCE,FSTYPE)" = '/run/pgcf-inspection/owned ${ownedSource} tmpfs'`,
+  );
+  assert.throws(() => assertReadOnlyScript("dd if=/tmp/image.raw of=/dev/vda"));
+  assert.throws(() =>
+    assertReadOnlyScript("true; dd if=/tmp/image.raw > /dev/vda"),
+  );
+  assert.throws(() => assertReadOnlyScript("sgdisk --zap-all /dev/vda"));
+  assert.throws(() =>
+    assertReadOnlyScript("sgdisk --move-second-header /dev/vda"),
+  );
+  assert.throws(() => assertReadOnlyScript("mkfs.ext4 /dev/vda"));
+  assert.throws(() => assertReadOnlyScript("reboot"));
+});
 function scenario(value: NodeInspectionInput) {
   const manifest = JSON.stringify({
     schemaVersion: 2,
@@ -152,9 +173,7 @@ function scenario(value: NodeInspectionInput) {
       `${value.operation_id} ${value.rescue.ssh_host_key}`,
     );
     const script = command.stdin!;
-    assert.ok(
-      !/sgdisk\s+--(?:zap|move)|dd\s|mkfs|reboot|of=\/dev\//.test(script),
-    );
+    assertReadOnlyScript(script);
     if (script.includes("__PGCF_INSPECTION_HARDWARE__")) {
       hardwareReads++;
       return { exit_code: 0, stdout: hardware(value) };
