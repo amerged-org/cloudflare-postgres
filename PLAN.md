@@ -761,6 +761,19 @@ Build:
   etcd and CNI traffic, and configure Cilium WireGuard Pod encryption. Keep the new node out of
   database placement until the encrypted inter-node path and network isolation are verified.
 - Capacity cron with an autoscale policy and hard caps. Initial node caps are EU = 2 and US = 1.
+- Owner clarification (2026-10-06): capacity expansion must run headless through
+  `https://api.contabo.com/` after one-time account, offer and cost/node-cap configuration.
+  The Cloudflare workflow must compose provider-bound bootstrap inputs and produce the required
+  real network evidence, then install, admit capacity and place pending databases without a
+  per-server operator handoff. Current per-intent approval and externally supplied bootstrap/
+  verification inputs are remaining orchestration gaps; scriptable APIs alone are not proof
+  of the complete headless path. This does not authorize purchases beyond existing cost/node caps.
+- The current trigger checks resource reservations each minute: after trying pending placements,
+  add capacity if a running database remains unplaced or no healthy node can admit the smallest
+  enabled size class. CPU/RAM include Barman requests and exclude system/platform reserves;
+  storage uses measured LVM capacity minus existing allocations. Hibernated databases retain
+  reservations. Stale node observations stop purchasing; active additions and node caps prevent
+  another reservation. There is no sampled CPU-utilization percentage threshold in v1.
 - Reconcile uncertain provider responses before retrying; a replay must never buy another node.
 - Node caps count live nodes. Marking a node lost frees its slot for a replacement; the replacement
   order still needs the owner's costed approval. Reinstalling the same VPS in place needs no purchase.
