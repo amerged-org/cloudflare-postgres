@@ -175,8 +175,10 @@ PostgreSQL volumes. Validate SQL and routing before opening traffic.
 The D1 export/local restore rehearsal and API full restore/PITR/deleted-source acceptance are
 recorded in `PLAN.md`. The current completion drill installs and admits US1, then fences the exact
 EU2 worker and restores its disposable source from the EU R2 archive into a separate US1 target.
-Verify SQL, recovered markers, recovery duration and the last recoverable transaction before
-recovering infrastructure on the same existing EU2 provider with a new logical identity. Verify
-physical reclamation of the exact old LV identities and return to two EU nodes plus one US node.
-Keep the source healthy until US1 is ready and the scoped source-read credential map is installed.
+Verify SQL, recovered markers, recovery duration and the last recoverable transaction. Admit the
+new EU customer worker into the retained EU cluster before retiring the old EU2; the final
+topology retains the EU control/relay server, new EU customer worker and US1. Old EU2 cleanup
+requires authenticated physical absence of the exact old LV identities, as described above;
+provider cancellation or Kubernetes metadata removal alone is insufficient. Keep the source
+healthy until US1 is Ready and the scoped source-read credential map is installed.
 A complete regional control-plane loss drill remains outside this customer-free completion gate.

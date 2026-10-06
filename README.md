@@ -95,7 +95,7 @@ flowchart LR
   end
 
   subgraph CF["Your Cloudflare account: control plane"]
-    Edge["Edge Worker<br/>D1 admission, signed route"]
+    Edge["Edge Worker<br/>routing hints, signed route"]
     API["API Worker<br/>/v1"]
     DBA["DatabaseActor DO<br/>per database: wake, idle, usage"]
     RL["RegionLink DO<br/>per region"]

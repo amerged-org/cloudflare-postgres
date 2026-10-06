@@ -15,6 +15,13 @@ acceptance result.
 
 ## Complete node installation proof
 
+This section records the earlier manual proof path used for EU2 acceptance. The programmed
+installation instead selects an owned outside-allowlist source, runs the native scans and access
+controls, publishes signed operation-bound artifacts and refreshes expiring preparation proofs
+through the Workflow. It does not dispatch GitHub Actions or require an operator to assemble a
+proof for every server. See [the programmed installation path](operator-installation.md#programmed-installation-path)
+for that sequence and PLAN.md for its fresh-node live acceptance.
+
 The same workflow's opt-in `node_network_probe` dispatch uses that free native runner to scan
 all 65,535 TCP ports on each approved IPv4 node address. It does not run the ordinary build or
 publish jobs. This is the full IPv4 measurement for node preparation/post-join, separate from

@@ -16,10 +16,12 @@ version is fixed and its archive matched the recorded repository-index checksum,
 follows the current HTTP index. Images keep the exact references shipped by the pinned charts. The
 `regional` section lists the cloudflared digest and the regional image reference.
 
-These versions ran together in the single-node Contabo lab. A fresh installation from this
-directory is part of Phase 0. The initial EU and US control-plane/worker nodes also host customer
-databases with system and platform resources reserved; the second EU node joins as a worker in
-Phase 3. Node loss is recovered from R2.
+The earlier platform baseline ran in the Contabo lab; live acceptance of this updated baseline
+is recorded in [PLAN.md](../../PLAN.md). The approved deployment retains the EU control/relay
+node without new customer database placement. A new EU customer worker joins that cluster;
+a new US control-plane/customer node bootstraps its own regional platform. System and platform
+resources remain reserved. Keep the old EU2 until replacement readiness and verified R2 recovery
+permit its removal. Node loss is recovered from R2.
 
 ## Ownership and prerequisites
 
@@ -158,16 +160,24 @@ patches:
 The pinned `PGCF_POSTGRES_IMAGE` is supplied by ConfigMap `pgcf-regional` and recorded in the
 version lock. The agent validates the image digest before reconciling a database. Node capacity
 uses `pgcf.io/storage-gib-total`, published from the measured dedicated LVM volume group by the
-bootstrap/operator path; Kubernetes ephemeral storage is not database capacity. Missing capacity
+native bootstrap job; Kubernetes ephemeral storage is not database capacity. Missing capacity
 is reported as unavailable and cannot admit a placement.
 
 ### Publish measured LVM capacity
 
-After the L2 bootstrap's authenticated disk/VG and post-reboot smoke proof, publish storage with
-[the capacity publisher](../talos/publish-storage-capacity.ts). This is an operator action, not an
-agent permission: the regional agent can read Nodes but cannot annotate them. The supervisor must
-review the changed scheduling inputs and this step before using the vetted L2 live kit. The
-publisher does not replace or modify that kit.
+The programmed installation runs [the native storage-capacity flow](../../apps/node-bootstrap/src/storage-capacity.ts)
+after platform readiness and before post-join verification. It binds the actual cluster, Node,
+OpenEBS and physical VG identities; allocates an operation-owned 1 GiB trial volume; verifies its
+written data; and waits for both metadata removal and physical LV reclamation. Only then does it
+publish capacity with UID/resource-version guards and a bound proof marker. Its journal permits
+readback and cleanup after interruption without substituting configured partition sizes for
+measurements. The node remains quarantined until separate admission succeeds. This merged path
+still needs the fresh-node live acceptance in PLAN.md.
+
+The following standalone [capacity publisher](../talos/publish-storage-capacity.ts) documents
+the earlier operator proof path and explicit recovery inputs. It is not a manual step in each
+programmed rollout. The regional agent can read Nodes but cannot annotate them; publication
+belongs to the authenticated bootstrap flow or an explicit reviewed operator invocation.
 
 Prepare these runtime inputs from the approved cluster inventory and actual measured proof, not
 from whatever cluster happens to be selected in a terminal. Keep their values in private operator
@@ -239,12 +249,11 @@ change and will fail closed. The publisher polls at most 30 seconds for the exac
 revision, and does not allocate storage, synthesize readbacks or change metadata to manufacture
 freshness. Do not run it concurrently with the vetted Flux or bootstrap commands.
 
-These three bound readbacks are **new required live inputs**. The existing L2 kit has not been
-verified to record them. The supervisor must review their collection/provenance and approve the
-public input changes before this step can run; missing observations block publication rather than
-being filled in manually or inferred from manager timestamps. An expired proof requires a new
-approved smoke observation. Completing this local implementation does not prove that capacity has
-been published or that the live reserve/placement checks passed.
+The standalone publisher requires all three actual bound readbacks; missing observations block
+publication rather than being filled in manually or inferred from manager timestamps. An expired
+proof requires a new approved smoke observation. The programmed flow collects its own observations
+and verifies physical reclamation before publication. Passing software checks does not prove a
+particular node's capacity publication or reserve/placement acceptance.
 
 Flux substitutes two variables from a private ConfigMap (`PGCF_REGION_ID` and `PGCF_API_HOST`, the
 host name of the API Worker) into ConfigMap `pgcf-regional` and the agent's egress policy.

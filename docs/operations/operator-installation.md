@@ -49,7 +49,8 @@ certificates end to end. Broken transport never replays a native command.
 
 ## Programmed installation path
 
-The current headless producer is under implementation and requires the Dev acceptance in PLAN.md.
+The headless producer is implemented and has passed the common software and image checks; delivery
+and fresh-node Dev acceptance are tracked in PLAN.md.
 Configure an authenticated regional `/v1/regions/{id}/installation-profile` once, with the reviewed
 Talos image source, measured storage geometry, DNS, retained rescue client key and issuer region.
 The first node of a region additionally needs its reviewed platform source/image and protected
@@ -101,7 +102,6 @@ installation is a separate acceptance gate.
 
 The following procedure documents the earlier accepted EU2 path and explicit recovery inputs.
 It is not the normal per-server setup once the programmed producer has passed acceptance.
-
 
 1. Configure `/v1/regions/{id}/capacity-policy` with the explicit node maximum. EU lists the second
    existing provider instance in `adopt_instance_ids`; US may order only its configured approved
