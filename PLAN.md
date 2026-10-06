@@ -645,6 +645,16 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   independent bootstrap route before resetting EU1, which currently hosts the sole control plane
   and relay. Existing-instance recovery currently requires a surviving regional cluster; full
   regional control-plane loss/rebuild is not live-accepted. No reset is executed by this decision.
+- Reset-readiness audit (2026-10-06): native `cf6d5d55` is present locally with its exact source
+  label and qualified private-registry readback; regional `ab678993` manifest/configuration and
+  pinned Cilium/Flux assets are available over HTTPS. Both EU servers/nodes are Running/Ready;
+  all three databases and both recovery markers are readable, with R2 base backups/WAL present
+  for all three and original regional custody unchanged. EU1 hosts the sole control plane and
+  sole bootstrap relay. This confirms reusable software and readable backups, not an accepted
+  full-region restore or permission to destroy that bootstrap dependency immediately. Preserve
+  independently retained etcd/cluster and database custody and verify an alternate bootstrap
+  route before the owner resets EU1. New model compatibility and rebuild time require actual
+  hardware checks and a live run; the current RAM-staged installer cannot fit a nominal 4 GiB VPS.
 
 Use regression tests for changes, scoped package checks and one composed CI; repeat old live
 checks only when their behavior changed. No additional cold-start optimization or twenty-start
