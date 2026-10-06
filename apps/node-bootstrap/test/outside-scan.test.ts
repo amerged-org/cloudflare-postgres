@@ -20,6 +20,8 @@ import {
   type OutsideScanInput,
 } from "../src/outside-scan.ts";
 import { runOutsideScanCommand } from "../src/outside-scan-command.ts";
+import { proofExecutionFixture } from "./node-proof.fixture.ts";
+import { validateProofExecution } from "../src/proof-proxy-command.ts";
 
 function fixture(family: "ipv4" | "ipv6" = "ipv4") {
   const keys = generateKeyPairSync("ed25519"),
@@ -126,7 +128,10 @@ function nativeFixture(
       const headers = (
         args[0] as unknown as { headers: Record<string, string> }
       ).headers;
-      assert.equal(Boolean(headers.Authorization), true);
+      assert.equal(
+        headers.Authorization,
+        `Bearer ${f.input.https_control!.bearer}`,
+      );
       return Object.assign(request, {
         destroy: () => request,
         end: (body: string) => {
@@ -220,6 +225,45 @@ function nativeFixture(
     active: () => active,
   };
 }
+
+test("a real signed proof session can authorize the HTTPS source control before a complete scan", async (t) => {
+  const f = fixture(),
+    session = proofExecutionFixture();
+  session.input.claims.origin = f.input.https_control!.origin;
+  session.input.api_base_url = session.input.claims.origin;
+  session.resign();
+  const issued = validateProofExecution(session.input);
+  assert.ok(issued.session_bearer.length > 256);
+  assert.ok(issued.session_bearer.length <= 4096);
+  f.input.https_control!.bearer = issued.session_bearer;
+  f.input.https_control!.expires_at = issued.claims.expires_at;
+  const state = nativeFixture(t, f);
+  const result = await scanOutsideFamily(f.input, { concurrency: 32 });
+  assert.equal(state.probes(), 65535);
+  assert.equal(result.scans[0]!.scanned_ports, 65535);
+  assert.equal(JSON.stringify(result).includes(issued.session_bearer), false);
+});
+test("oversized legacy bearers and malformed or oversized proof tokens still fail before any control request or target probe", async (t) => {
+  const f = fixture(),
+    state = nativeFixture(t, f);
+  f.input.https_control!.bearer = "a".repeat(257);
+  await assert.rejects(
+    scanOutsideFamily(f.input),
+    /outside_scan_control_invalid/,
+  );
+  f.input.https_control!.bearer = `np1.${"a".repeat(257)}!.signature`;
+  await assert.rejects(
+    scanOutsideFamily(f.input),
+    /outside_scan_control_invalid/,
+  );
+  f.input.https_control!.bearer = `np1.${"a".repeat(4096)}.signature`;
+  await assert.rejects(
+    scanOutsideFamily(f.input),
+    /outside_scan_control_invalid/,
+  );
+  assert.equal(state.controls(), 0);
+  assert.equal(state.probes(), 0);
+});
 
 test("scans every TCP port exactly once from the bound source with verified fresh controls and bounded sockets", async (t) => {
   const f = fixture(),

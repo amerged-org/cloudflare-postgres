@@ -58,6 +58,8 @@ import type {
   PostjoinConfig,
 } from "../src/node-network-proof.ts";
 import { packetEvidence, wireguardPeers } from "../src/node-network-packets.ts";
+import { proofExecutionFixture } from "../../../apps/node-bootstrap/test/node-proof.fixture.ts";
+import { validateProofExecution } from "../../../apps/node-bootstrap/src/proof-proxy-command.ts";
 
 const loopback = [127, 0, 0, 1].join(".");
 const address = (last: number) => [198, 51, 100, last].join(".");
@@ -853,13 +855,19 @@ test("one pinned HTTPS session stays alive with fresh controls and closes after 
   );
   syncBuiltinESMExports();
   context.mock.timers.enable({ apis: ["setInterval"] });
+  const proof = proofExecutionFixture();
+  proof.input.claims.origin = origin;
+  proof.input.api_base_url = origin;
+  proof.resign();
+  const issued = validateProofExecution(proof.input);
+  assert.ok(issued.session_bearer.length > 256);
   const session = createHttpsControlSession(
     f.plan.scan_control.ipv4,
     source,
     f.keys.trusted,
     {
       origin,
-      bearer: "private-test-bearer",
+      bearer: issued.session_bearer,
       expires_at: new Date(Date.now() + 60000).toISOString(),
     },
     Date.now() + 60000,

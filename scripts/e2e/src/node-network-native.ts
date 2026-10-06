@@ -15,6 +15,7 @@ import { isAbsolute } from "node:path";
 import { Agent as HttpsAgent, request as httpsRequest } from "node:https";
 import { checkServerIdentity } from "node:tls";
 import type { TLSSocket } from "node:tls";
+import { NodeProofSessionBearer } from "@pgcf/contracts/node-proof";
 
 export const MAX_COMMAND_BYTES = 32 * 1024 * 1024;
 export const MAX_JSON_BYTES = 256 * 1024;
@@ -464,7 +465,8 @@ async function requestHttpsSourceControl(
     origin.port ||
     isIP(origin.hostname) ||
     !control.bearer ||
-    control.bearer.length > 256 ||
+    (control.bearer.length > 256 &&
+      !NodeProofSessionBearer.safeParse(control.bearer).success) ||
     Date.parse(control.expires_at) <= Date.now() ||
     Date.parse(control.expires_at) > Date.now() + 600_000 ||
     !Number.isFinite(Date.parse(control.expires_at)) ||

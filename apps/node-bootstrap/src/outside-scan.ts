@@ -8,6 +8,7 @@ import { checkServerIdentity } from "node:tls";
 import { NodeId, OperationId, RegionId, Timestamp } from "@pgcf/contracts";
 import { ProviderInstanceId } from "@pgcf/contracts/nodes";
 import { NodeBootstrapMaintenanceBinding } from "@pgcf/contracts/node-bootstrap";
+import { NodeProofSessionBearer } from "@pgcf/contracts/node-proof";
 import {
   authenticated,
   completedScan,
@@ -616,7 +617,8 @@ class ControlSession {
       origin.password ||
       isIP(origin.hostname) ||
       !control.bearer ||
-      control.bearer.length > 256 ||
+      (control.bearer.length > 256 &&
+        !NodeProofSessionBearer.safeParse(control.bearer).success) ||
       /[\r\n\0]/.test(control.bearer) ||
       !Number.isFinite(Date.parse(control.expires_at)) ||
       Date.parse(control.expires_at) <= Date.now() ||

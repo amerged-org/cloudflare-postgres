@@ -9,6 +9,10 @@ import {
 export const NODE_PROOF_SESSION_DOMAIN = "pgcf-node-proof-session/v1\n";
 export const NODE_PROOF_MEASUREMENT_DOMAIN = "pgcf-node-measurement/v1\n";
 export const NODE_PROOF_CONTROL_DOMAIN = "pgcf-node-https-source-control/v1\n";
+export const NodeProofSessionBearer = z
+  .string()
+  .regex(/^np1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/)
+  .max(4096);
 const Hash = z.string().regex(/^[a-f0-9]{64}$/);
 const At = z.iso.datetime({ precision: 3 });
 export const NodeProofMode = z.enum(["preparation", "postjoin"]);
@@ -448,10 +452,7 @@ export type NodeProofSource = z.infer<typeof NodeProofSource>;
 export const NodeProofExecutionInput = z
   .strictObject({
     claims: NodeProofClaims,
-    session_bearer: z
-      .string()
-      .regex(/^np1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/)
-      .max(4096),
+    session_bearer: NodeProofSessionBearer,
     bootstrap: ExecutionBootstrapInput,
     cluster_bundle: ExecutionJoinBundle.nullable(),
     talos_admin_config: ExecutionJoinBundle.shape.talos_admin_config.optional(),

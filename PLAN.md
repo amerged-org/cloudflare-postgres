@@ -53,9 +53,21 @@ authorized created job. A single controlled resume of the same Workflow exposed
 `node_proof_kubeconfig_identity_changed`. Authenticated offline decryption of the retained EU
 join-bundle revision1 confirms that its entire clear object, kubeconfig, endpoint and cluster UID
 match the protected source. Every identity/TLS predicate passes; only its ordinary
-`context.namespace: default` is rejected by the native guard. The same Workflow is paused again
-at the unchanged created-job checkpoint, before any installation disk write, for a narrow
-default-namespace correction. Never reset or replace its job, sealed input or source custody.
+`context.namespace: default` was rejected by the native guard. Source `760b9d52`, full CI
+`37546264388`, permits only absent or exact default and removes the field only in the derived
+scratch copy. All154 native tests, types, lint, formatting and independent reviews passed.
+Local qualification covered714,922,071 bytes and18 layers with zero unresolved findings;
+private-registry readback verified162,109,966 compressed and502,804,992 raw bytes. The immutable
+native manifest is `sha256:99a98cba6a6c75cfa933bb341b924a017b680f96fba126c418306e5ee679c101`.
+One publication/completed rollout preserved all existing configuration except the image URI,
+EU data/custody, US profile and whole created-job ciphertext; actual running image and positive
+placement/version were independently verified. One controlled resume reached real source Pods,
+both Ready with the qualified regional image and zero restarts. A scanner then reported
+`outside_scan_control_invalid`; its control rejects bearers longer than256 characters, while
+the authoritative signed `np1` session contract and issuer permit4096. This producer/consumer
+mismatch remains under correction. The native proof ended at its deadline, and the same
+Workflow is paused again at the unchanged created-job checkpoint before any installation disk
+write. Never reset or replace its job, sealed input, source journals or custody.
 The retained EU control node's UID-guarded new-database placement flag is now
 false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.
 Actual-RAM mode and automatic purchases remain disabled pending accepted US/recovery tests,
