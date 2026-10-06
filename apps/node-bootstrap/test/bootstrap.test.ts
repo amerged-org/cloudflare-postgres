@@ -883,6 +883,91 @@ test("clean reboot verification refuses the old boot ID and accepts an observed 
   await Reflect.get(job, "confirmReboot").call(job, boot);
 });
 
+function resumedDiskWrite(prefixExitCode = 0) {
+  const chunkBytes = 16 * 1024 ** 2;
+  const writtenBytes = 32 * chunkBytes;
+  const original = fixture();
+  const spec = {
+    ...original.spec,
+    image: { ...original.spec.image, raw_bytes: writtenBytes + chunkBytes },
+  };
+  const input = { ...original, spec, input_hash: inputHash(spec) };
+  let current = authority(input);
+  current.checkpoint = {
+    ...current.checkpoint,
+    stage: "disk_write_intent",
+    destructive_intent: true,
+    written_bytes: writtenBytes,
+    downloaded_bytes: spec.image.compressed_bytes,
+  };
+  const scripts: string[] = [];
+  const checkpoints: NodeBootstrapCheckpoint[] = [];
+  const job = new BootstrapJob(input, {
+    request: async (_url, init) => {
+      const message = NodeBootstrapCallback.parse(
+        JSON.parse(String(init?.body)),
+      );
+      if (message.kind === "checkpoint") {
+        checkpoints.push(message.payload);
+        current = {
+          ...current,
+          revision: current.revision + 1,
+          checkpoint: message.payload,
+        };
+      }
+      return Response.json(current);
+    },
+    run: async (command) => {
+      scripts.push(command.stdin ?? "");
+      return {
+        exit_code:
+          scripts.length === 1 ? prefixExitCode : scripts.length === 2 ? 1 : 0,
+        stdout: "",
+      };
+    },
+  });
+  const raw = shellQuote(`/run/pgcf-bootstrap/${spec.operation_id}/image.raw`);
+  const disk = shellQuote(spec.hardware.install_disk);
+  return { job, scripts, checkpoints, chunkBytes, writtenBytes, raw, disk };
+}
+
+test("disk resume verifies the entire acknowledged prefix in one read before writing the next chunk", async () => {
+  const { job, scripts, checkpoints, chunkBytes, writtenBytes, raw, disk } =
+    resumedDiskWrite();
+  await Reflect.get(job, "writeDisk").call(job);
+  assert.equal(scripts.length, 3);
+  assert.equal(
+    scripts[0],
+    `set -euo pipefail\ncmp --bytes=${writtenBytes} ${raw} ${disk}\n`,
+  );
+  assert.equal(
+    scripts[1],
+    `set -euo pipefail\ncmp --bytes=${chunkBytes} --ignore-initial=${writtenBytes}:${writtenBytes} ${raw} ${disk}\n`,
+  );
+  assert.ok(
+    scripts[2]!.includes(
+      `dd if=${raw} of=${disk} bs=512 skip=${writtenBytes / 512} seek=${writtenBytes / 512} count=${chunkBytes / 512} conv=notrunc,fsync status=none\ncmp --bytes=${chunkBytes} --ignore-initial=${writtenBytes}:${writtenBytes} ${raw} ${disk}`,
+    ),
+  );
+  assert.equal(checkpoints[0]?.written_bytes, writtenBytes);
+  assert.equal(checkpoints[0]?.write_intent_offset, writtenBytes);
+  assert.equal(checkpoints[1]?.written_bytes, writtenBytes + chunkBytes);
+  assert.equal(checkpoints[1]?.write_intent_offset, null);
+  assert.equal(checkpoints[2]?.stage, "disk_written");
+});
+
+test("an acknowledged prefix mismatch blocks disk writes and checkpoint progress", async () => {
+  const { job, scripts, checkpoints, writtenBytes, raw, disk } =
+    resumedDiskWrite(1);
+  await assert.rejects(async () => Reflect.get(job, "writeDisk").call(job), {
+    code: "native_command_failed_ssh_1",
+  });
+  assert.deepEqual(scripts, [
+    `set -euo pipefail\ncmp --bytes=${writtenBytes} ${raw} ${disk}\n`,
+  ]);
+  assert.deepEqual(checkpoints, []);
+});
+
 test("an uncertain GPT relocation resumes with partition readback and never repeats the destructive command", async () => {
   const input = platformFixture();
   let current = authority(input);

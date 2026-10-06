@@ -973,13 +973,8 @@ export class BootstrapJob {
       (offset !== spec.image.raw_bytes && offset % CHUNK_BYTES !== 0)
     )
       throw new BootstrapError("write_offset_invalid");
-    // Every acknowledged chunk is read back after restart; a stored offset alone is not disk evidence.
-    for (let verified = 0; verified < offset; verified += CHUNK_BYTES) {
-      const count = Math.min(CHUNK_BYTES, offset - verified);
-      await this.ssh(
-        `cmp --bytes=${count} --ignore-initial=${verified}:${verified} ${raw} ${disk}`,
-      );
-    }
+    // Read back every acknowledged byte in one command; a stored offset alone is not disk evidence.
+    if (offset > 0) await this.ssh(`cmp --bytes=${offset} ${raw} ${disk}`);
     while (offset < spec.image.raw_bytes) {
       const count = Math.min(CHUNK_BYTES, spec.image.raw_bytes - offset);
       authority = await this.authority.read(this.abort.signal);
