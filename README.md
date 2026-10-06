@@ -18,8 +18,8 @@ loss is recovered from R2.
 
 ## Status
 
-**Phases 0 and 1 accepted in Dev; operator completion in progress (2026-10-05).** The first EU node and
-all five Flux releases are Ready, with 95 GiB storage. The complete Dev path through
+**Phases 0 and 1 accepted in Dev; operator completion in progress (2026-10-06).** Both EU nodes and
+all five Flux releases are Ready, with 95 GiB measured storage per node. The complete Dev path through
 `db.ohmyho.st` reaches real PostgreSQL with verified TLS, continuous WAL archiving and R2 backups.
 
 Real E0–E6 passed, including complete TCP port scans of the observed node IPv4 from both sources.
@@ -29,7 +29,8 @@ Loss of a ready database namespace reported recovery required rather than creati
 The R2 outage test proved two failing archive observations under the active block and a successful
 new connection during the alarm. A separate restore drill preserved committed markers, omitted
 a rolled-back marker and reclaimed its target storage. API full restore, PITR and restore after
-source deletion have passed. Lost-worker recovery and EU/US installation acceptance remain pending.
+source deletion have passed. EU capacity expansion, signed network verification and placement on
+both nodes have passed. US installation and cross-region lost-worker recovery remain pending.
 
 Raw 100 MiB and 1 GiB stream checks, slow reception and 600 seconds idle passed. A 10-second
 read load measured 735.604 SQL/s over 50 warmed connections, p95 75.368 ms and zero errors.
@@ -64,9 +65,10 @@ Actual R2 listing, archive summary and hourly backup usage agreed on 7,515,287 b
 The filesystem collector measured actual volume use in Dev. API full restore, PITR and restore
 after source deletion passed with separate volumes, verified SQL and removed temporary admin access.
 An isolated real Cloudflare admission probe refused excess registered attempts before D1 or wake.
-Lost-worker rebuild and the complete EU/US installation still need live acceptance.
+US installation and lost-worker recovery still need live acceptance.
 Missing samples stay unknown. Cost attribution is deferred.
-The second EU node's checkpointed installation is in progress. The US node has not been bought
+The second EU node is admitted and serves a real capacity-test database. Automatic US purchase
+is approved within the specific cost cap recorded in PLAN.md; the US node has not been bought
 and no customer or platform database has been migrated. EU/US operator acceptance comes first; Neon migration and public-release
 polish follow separately.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.

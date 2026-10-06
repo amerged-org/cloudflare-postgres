@@ -3,22 +3,24 @@
 Status (2026-10-06): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
 The first EU node and five Flux platform releases are Ready, with 95 GiB measured storage.
 Its node identity, storage and protected cluster custody are preserved. The second existing EU
-VPS has finished installation and is Ready under quarantine with 95 GiB measured capacity;
-final signed network verification and admission remain in progress. No US VPS has been bought and no customer or platform
+VPS has passed signed network verification and admission, with 95 GiB measured capacity.
+Actual capacity demand placed databases on both EU nodes and SQL passed through Cloudflare.
+No US VPS has been bought and no customer or platform
 production database has been migrated. The initial topology remains two EU VPS and one US VPS.
 
 The current regional image is
 `sha256:692a6c508e274d695151ce064b52fd66c5f00d5ec701c7d2adb2de89a092fdbb`
 from `e9569169`, CI `37360915487`. Image qualification and anonymous manifest,
 configuration and every layer verification passed. Agent and both gateways remained continuously
-Ready for 62.768 s. The management API uses `4d24cbfe` and Edge uses `b196fbaa`; the private bootstrap
+Ready for 62.768 s. The management API uses `cf6d5d55` and Edge uses `b196fbaa`; the private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
 inputs are now bound. The current native bootstrap image is
-`sha256:02f0eab96bae751c167871308e70a20cc808009c6ec4eb968a17c5c9fb473a9e`
-from `4d24cbfe`: qualification covered 711,912,830 bytes and 18 layers with zero unresolved
+`sha256:1b9a38a4e43ba87ef997eab71ed6799a3c4377cca00485f842e693ebac371923`
+from `cf6d5d55`: qualification covered 711,913,354 bytes and 18 layers with zero unresolved
 findings, followed by exact private-registry manifest, configuration and layer readback.
-Latest complete CI `37405284021` is green. EU2 admission, US installation and post-join network acceptance
-remain outstanding. Release image signing remains Phase 5 work.
+The completed rollout and actual Container instance use that exact image. Latest complete CI
+`37415049259` is green. US installation and cross-region node-loss recovery remain outstanding.
+Release image signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
 API/D1/RegionLink/agent/Tunnel/VPC HTTP/gateway path through `db.ohmyho.st`, with verified
@@ -185,11 +187,22 @@ The final collector's before-scan Node resource version rejects a harmless heart
 with unchanged UID, labels, spec and capacity. A reproducing test and local observation-time
 version binding pass 24 proof/hosted tests and independent review, retaining original scan
 identity scopes and strict before/after capture plus native admission UID/version preconditions.
-Fresh full verification, quarantine release and SQL/backup placement remain pending.
-Expired preparation pauses progress and fresh full outside proofs resume it. The unchanged first
-node, agent, both gateways and five platform releases remain Ready. EU2 join, US installation
-and lost-worker recovery are not accepted. US remains unbought; the specific costed approval
-request is pending.
+Fresh full verification passed in hosted run `37415715455`. Native admission released quarantine
+at bootstrap revision 506; the addition reached Ready at revision 15 with the original EU2 Node
+UID. All three actual capacity databases are Ready: two on EU1 and one on EU2. SQL over the normal
+Cloudflare path verified their database identities and nonsuperuser application roles. The last
+temporary capture Pod was removed and its absence verified. Expired preparation pauses progress
+and fresh full outside proofs resume it. The unchanged first node, agent, both gateways and five
+platform releases remain Ready. EU expansion is accepted; US installation and lost-worker recovery
+are not yet accepted. The owner approved one automatic US1 purchase at a maximum of €20.09 gross
+per month and €0 setup on 2026-10-06; the actual order and first-region installation remain pending.
+
+The disposable EU2 recovery source has two confirmed commits, a completed real Barman base backup
+and the post-commit WAL segment in the EU R2 archive. Both markers passed SQL readback. Its source
+Cluster, PVC/PV and physical LV/volume-group identities were captured before the planned loss.
+EU2 remains healthy; no failure intent, provider stop, loss record or source deletion has been
+performed. The approved drill restores this source onto US1 after US admission. Cross-region
+target selection and source archive access still require implementation and live acceptance.
 
 Operational Cloudflare, Barman R2 and PGCF admin/agent credentials have no configured expiry.
 Routing/control tokens retain their short security deadlines. Read-only adopter inventory remains
@@ -575,6 +588,13 @@ Three implementation tracks run in parallel, with one serial Git lane and one se
 Completion requires the real EU capacity/adoption path and US first installation, database
 lifecycle per region, PITR and deleted-source restore, one existing-resource node-loss recovery,
 and targeted health/overload checks. Record recovery time and last recoverable transaction.
+
+- Owner decision (2026-10-06): paid automatic Contabo API purchase of US1 is approved.
+- Cost cap: €20.09 gross/month, €0 setup; Cloudflare orchestrates purchase and installation.
+- Test automatic purchase and full US1 installation, including safe interruption/resume.
+- Test EU2 loss: restore its disposable database from real R2 backups onto US1; verify SQL/data.
+- Supersedes pending approval/same-instance drill; preserve EU1 and record RTO/recovered state.
+
 Use regression tests for changes, scoped package checks and one composed CI; repeat old live
 checks only when their behavior changed. No additional cold-start optimization or twenty-start
 series is required. Current approximately nine-second starts are accepted for v1.
