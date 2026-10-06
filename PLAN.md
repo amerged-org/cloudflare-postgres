@@ -7,19 +7,26 @@ VPS has passed signed network verification and admission, with 95 GiB measured c
 Actual capacity demand placed databases on both EU nodes and SQL passed through Cloudflare.
 No US VPS has been bought and no customer or platform
 production database has been migrated. The initial topology remains two EU VPS and one US VPS.
+The US Cloudflare region, separate archive bucket, scoped S3 credentials, private data Tunnel
+and gateway VPC service are configured. The private bootstrap relay now allows both EU and US.
 
 The current regional image is
-`sha256:692a6c508e274d695151ce064b52fd66c5f00d5ec701c7d2adb2de89a092fdbb`
-from `e9569169`, CI `37360915487`. Image qualification and anonymous manifest,
-configuration and every layer verification passed. Agent and both gateways remained continuously
-Ready for 62.768 s. The management API uses `cf6d5d55` and Edge uses `b196fbaa`; the private bootstrap
+`sha256:53f9aaafdbda2f776a3ba20691f01a6ed6376638f02dcf436332b5056f54f735`
+from `ab678993`, CI `37419289338`. Qualification covered 658,584,124 bytes and ten layers with
+zero unresolved findings. Anonymous manifest, configuration and every compressed/uncompressed
+layer verification passed, with 89,764,233 compressed bytes read back. Agent, both gateways and
+five platform releases remained Ready for 69.78 s. Both EU Node UIDs, all three test databases'
+namespace/Cluster/PVC/PV/Secret identities and three EU encrypted custody records are preserved.
+The management API and Edge use `ab678993`; the private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
 inputs are now bound. The current native bootstrap image is
 `sha256:1b9a38a4e43ba87ef997eab71ed6799a3c4377cca00485f842e693ebac371923`
 from `cf6d5d55`: qualification covered 711,913,354 bytes and 18 layers with zero unresolved
 findings, followed by exact private-registry manifest, configuration and layer readback.
-The completed rollout and actual Container instance use that exact image. Latest complete CI
-`37415049259` is green. US installation and cross-region node-loss recovery remain outstanding.
+The exact application/namespace binding and completed rollout retain that image. Its running
+instance was verified during EU2 admission; the application is currently inactive with zero
+instances. Latest complete CI `37419289338` is green. US installation and cross-region node-loss
+recovery remain outstanding.
 Release image signing remains Phase 5 work.
 
 Phase 1's earlier real E0–E6, five create/delete cycles and ten agent restarts passed the complete
@@ -205,7 +212,19 @@ performed. The approved drill restores this source onto US1 after US admission. 
 target selection and separate source archive access are implemented and locally checked:
 contracts 148, API 379 and regional 417 tests pass, with package type checks. The source-read
 credential map binds the exact original region, bucket and endpoint; target backups and temporary
-administration retain the target's own credentials. Deployment and live acceptance remain pending.
+administration retain the target's own credentials. API, Edge and the qualified regional image
+are delivered; all existing bindings and secrets are preserved with only US archive/gateway
+bindings added. Normal Cloudflare SQL still verifies all three capacity databases and both source
+markers. Cross-region live acceptance remains pending.
+
+US setup now has a default-jurisdiction archive with a North America location hint, separate
+non-expiring bucket-scoped US write and EU read-only S3 credentials, a private Tunnel and a
+hostname-based VPC HTTP gateway. The region's once-issued agent/route material is retained
+privately. The original relay ConfigMap/deployment and first-node identity are preserved; its
+new Pod/process epoch reports the same issuer and capabilities with EU and US targets allowed.
+No provider order, US installation or EU2 failure action has been performed. A fresh public
+one-month US quote shows €19.76 gross/month with 19% VAT and €0 setup; account billing country/VAT
+remains unverified, so the purchase stays pending within the already-approved €20.09 gross cap.
 
 Operational Cloudflare, Barman R2 and PGCF admin/agent credentials have no configured expiry.
 Routing/control tokens retain their short security deadlines. Read-only adopter inventory remains
@@ -1001,3 +1020,4 @@ Earlier failed attempts and corrections remain in Git history.
 | 2026-10-06 | EU2 rescue / installation preparation | Management API `00619393`, Edge `b196fbaa` and regional `e9569169` are deployed; CI `37378985882` is green and hosted runner assignment has recovered. Native bootstrap `sha256:a46d6824c342f9068af103558981ca1b0a033fedd2ccf0822f80a3f70df5d8d4` is qualified from `00619393`: 711,899,012 bytes, 18 layers, zero unresolved findings and complete registry readback. Cosmetic firewall labels were applied with exact assignment/rule readback. EU2 RAM rescue passed strict known-host/client-key verification and measured one unmounted 161,061,273,600-byte disk, 8,326,418,432 bytes RAM and no swap; the disk is untouched. EU1 peer /32 routing was applied without reboot, preserving node identity, custody and readiness; a corresponding early Talos image route is measured and pinned. The RAM-backed rescue overlay has only 832,643,072 bytes in `/run` for 4,685,444,428 installer bytes; portable-swap, overlay and operation-specific RAM scratch fixes passed actual strict-SSH inspection, fresh setup, matching resume and pre-write guards. The isolated tmpfs measured 5,222,318,080 total / 5,222,313,984 free bytes and was removed with source/identity guards; disk writes remained zero. Corrected runtime qualification/delivery, fresh full outside scans/signed preparation, EU2 join, US installation, lost-worker recovery and coordinated cluster credential rotation before Neon migration remain outstanding. US purchase requires the pending costed approval. |
 | 2026-10-06 | Native rescue runtime / network proof | Bootstrap source `269ca6c6` passes all 59 native tests and actual strict-SSH RAM staging/guard preflight. Qualified image `sha256:c4a0fc39989dcdee33854ce1dbfc2d60ae4e92a7bc1334f558f64bd05b1ed1f7` covers 711,909,770 bytes / 18 layers with zero unresolved findings; private-registry readback verified 161,610,900 compressed bytes. API and exact Container image/namespace binding are deployed, original secret names retained, CI `37384157373` green. EU2 immutable input is configured at checkpoint zero with zero downloaded/written bytes. Full 65,535-port IPv6 scans passed for both members; actual relay access passed all three management ports per member using bounded RAM-only rescue listeners, which were removed. Hosted IPv4 run `37384991932` failed with a masked scanner reason; reproducing tests pass for bounded diagnostic propagation. Combined signed preparation and installation remain pending. |
 | 2026-10-06 | EU expansion accepted | API/native `cf6d5d55` delivered; full CI `37415049259` green. Qualified native image `sha256:1b9a38a4e43ba87ef997eab71ed6799a3c4377cca00485f842e693ebac371923`: 711,913,354 bytes / 18 layers, zero unresolved findings and 161,611,765 compressed bytes verified from the private registry; completed rollout and exact running instance readback. Real 1 GiB allocation/reclamation published 95 GiB on EU2 in 124.433 s and removed all trial storage. Full signed dual-stack proof passed in hosted run `37415715455`; native admission reached released revision 506 and addition Ready revision 15 with unchanged EU2 Node UID. Two real 600-millicore capacity databases run on EU1 and a third on EU2; all passed normal Cloudflare SQL identity and nonsuperuser role checks. Real unfiltered capture confirmed encrypted peer traffic, zero plaintext Pod traffic and zero kernel drops; the final capture Pod is absent. EU1 identity, three custody records, agent, two gateways and five platform releases remain healthy. The disposable EU2 recovery source has two confirmed commits, a completed R2 base backup and the post-commit WAL segment; source physical volume identities are retained. US purchase at at most €20.09 gross/month and €0 setup is owner-approved, but US installation and EU2-to-US1 loss recovery remain pending. |
+| 2026-10-06 | Cross-region delivery / US control plane | Cross-region target selection and distinct source archive credentials are delivered from `ab678993`; full CI `37419289338` is green. Regional image `sha256:53f9aaafdbda2f776a3ba20691f01a6ed6376638f02dcf436332b5056f54f735` qualified 658,584,124 bytes / ten layers with zero unresolved findings; anonymous registry readback verified all layer/configuration identities and 89,764,233 compressed bytes. One Recreate agent and two gateways plus five platform releases stayed Ready for 69.78 s. Both EU Node UIDs, three database namespace/Cluster/PVC/PV/Secret identities and three EU encrypted custody records remained exact. Normal Cloudflare SQL verified all three placements and both disposable EU2 source markers. API/Edge publish preserved every existing binding/secret and added only US archive/gateway bindings. US has a real default-jurisdiction R2 archive with North America hint, separate bucket-scoped non-expiring US write/EU read credentials, private Tunnel/VPC and once-issued region custody. The retained first-node relay restarted under UID/version guards; its actual new epoch confirms the same issuer/capabilities and EU/US scope. Native bootstrap remains qualified `cf6d5d55`, exact application/namespace and completed rollout; currently inactive with zero instances, with running-image proof retained from EU2 admission. No US order or EU2 failure action occurred. Public one-month quote is €19.76 gross with 19% VAT / €0 setup; owner account VAT/country verification is pending within the approved €20.09 cap. US installation and EU2-to-US1 recovery remain unaccepted. |

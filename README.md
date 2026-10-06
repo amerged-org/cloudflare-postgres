@@ -68,7 +68,9 @@ An isolated real Cloudflare admission probe refused excess registered attempts b
 US installation and lost-worker recovery still need live acceptance.
 Missing samples stay unknown. Cost attribution is deferred.
 The second EU node is admitted and serves a real capacity-test database. Automatic US purchase
-is approved within the specific cost cap recorded in PLAN.md; the US node has not been bought
+is approved within the specific cost cap recorded in PLAN.md. Its Cloudflare archive, scoped
+credentials, private Tunnel, gateway service and regional identity are configured. Cross-region
+restore is implemented and delivered, with live acceptance pending. The US node has not been bought
 and no customer or platform database has been migrated. EU/US operator acceptance comes first; Neon migration and public-release
 polish follow separately.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
