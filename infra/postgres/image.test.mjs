@@ -31,11 +31,15 @@ test("the flattened image preserves the verified upstream effective runtime conf
   );
   const inspected = spawnSync(
     "docker",
-    ["image", "inspect", "--platform", "linux/amd64", image],
+    ["image", "inspect", image],
     { encoding: "utf8", timeout: 30_000, maxBuffer: 1024 * 1024 },
   );
   assert.equal(inspected.status, 0, "image runtime metadata inspection failed");
-  const config = JSON.parse(inspected.stdout)[0].Config;
+  const images = JSON.parse(inspected.stdout);
+  assert.equal(images.length, 1, "one built image must be inspected");
+  assert.equal(images[0].Os, "linux");
+  assert.equal(images[0].Architecture, "amd64");
+  const config = images[0].Config;
   const actual = Object.fromEntries(
     Object.keys(sources.postgresql.runtime_config).map((key) => [
       key,

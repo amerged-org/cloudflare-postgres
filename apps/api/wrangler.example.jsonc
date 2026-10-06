@@ -39,6 +39,9 @@
     "BOOTSTRAP_RELAY_URL": "<BOOTSTRAP_RELAY_URL>",
     "BOOTSTRAP_RELAY_ISSUER_REGION": "<BOOTSTRAP_RELAY_ISSUER_REGION>",
     "BOOTSTRAP_VERIFIER_KEYS": "<DEDICATED_VERIFIER_PUBLIC_KEYS_JSON>",
+    // Optional proof alias: add its matching relay public key to BOOTSTRAP_VERIFIER_KEYS.
+    // Preserve existing verifier entries and the relay's own active key identifier.
+    // "NODE_PROOF_SIGNING_KEY_ID": "node-automation-v1",
     "CONTABO_ORDER_DEFAULT_USER": "<CONTABO_ORDER_DEFAULT_USER>",
     "CONTABO_ORDER_SSH_KEY_IDS": "<CONTABO_ORDER_SSH_KEY_IDS_JSON>",
     "CONTABO_RESCUE_SSH_KEY_IDS": "<CONTABO_RESCUE_SSH_KEY_IDS_JSON>",

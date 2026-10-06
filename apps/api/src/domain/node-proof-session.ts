@@ -30,12 +30,21 @@ async function signer(env: Env) {
   const key = await bootstrapTransportSigningKey(
     env.BOOTSTRAP_RELAY_SIGNING_KEYS,
   );
+  const selected = NodeProofClaims.shape.kid.safeParse(
+    env.NODE_PROOF_SIGNING_KEY_ID ?? key.kid,
+  );
+  if (!selected.success)
+    throw new ApiError(
+      "conflict",
+      "Automation signing key identifier is invalid",
+    );
+  const kid = selected.data;
   const publicKeys = JSON.parse(env.BOOTSTRAP_VERIFIER_KEYS) as Record<
     string,
     string
   >;
   const publicKey = (await importBootstrapVerificationKeys(publicKeys)).get(
-    key.kid,
+    kid,
   );
   if (!publicKey)
     throw new ApiError(
@@ -55,13 +64,13 @@ async function signer(env: Env) {
       "conflict",
       "Automation signing key does not match its trusted verifier",
     );
-  const raw = base64urlToBytes(publicKeys[key.kid]!)!;
+  const raw = base64urlToBytes(publicKeys[kid]!)!;
   const spki = new Uint8Array(44);
   spki.set([
     0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
   ]);
   spki.set(raw, 12);
-  return { ...key, publicKeys: { [key.kid]: bytesToBase64url(spki) } };
+  return { ...key, kid, publicKeys: { [kid]: bytesToBase64url(spki) } };
 }
 async function current(env: Env, operationId: string) {
   const addition = await readNodeAddition(env.DB, operationId);
