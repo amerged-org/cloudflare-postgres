@@ -635,7 +635,8 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   the configured regional offer and cost profile. Purchases within that profile have standing
   owner authorization; do not request approval for each capacity addition. PostgreSQL for the
   adopter's free plan has a 256 MiB RAM limit; platform and Barman overhead remain separately
-  measured. The averaging window and actual-RAM denominator are still to be specified.
+  measured. The owner confirmed a rolling ten-minute averaging window; the exact actual-RAM
+  metric/denominator still needs an explicit implementation definition.
   Actual-load placement, safe wake admission under overbooking and the full headless producer
   remain implementation/live-acceptance work; the deployed reservation-based path is unchanged.
 - The owner intends to test different EU/US VPS models and asks about resetting the existing
@@ -655,6 +656,16 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   independently retained etcd/cluster and database custody and verify an alternate bootstrap
   route before the owner resets EU1. New model compatibility and rebuild time require actual
   hardware checks and a live run; the current RAM-staged installer cannot fit a nominal 4 GiB VPS.
+- Owner topology clarification (2026-10-06): retain the existing EU1 as the EU Kubernetes/platform
+  and bootstrap-relay host, with no new customer databases placed on it. The owner will initially
+  purchase two replacement-model servers: one new EU database worker joining that retained EU
+  cluster, and one US regional control-plane/database host. Do not reset the retained EU1 or place
+  a duplicate initial order while the owner purchases these instances. Exclude EU1 from new
+  database placement without disabling scheduling of its platform/relay services. Existing EU1
+  test databases must be deliberately moved/restored or deleted only after preserving their data;
+  the old EU2 is not reset/decommissioned by this clarification. Final handling of old EU2 and
+  the selected actual EU/US product IDs remain pending. Standing headless purchases apply to
+  subsequent capacity additions under the configured offer/cost profile.
 
 Use regression tests for changes, scoped package checks and one composed CI; repeat old live
 checks only when their behavior changed. No additional cold-start optimization or twenty-start
