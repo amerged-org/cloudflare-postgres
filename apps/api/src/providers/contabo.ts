@@ -68,9 +68,9 @@ const InstanceWire = z.object({
   imageId: Text.nullable().optional(),
   defaultUser: z.enum(["root", "admin", "administrator"]).optional(),
   ipConfig: z.object({ v4: V4, v6: V6.optional() }),
-  ramMb: z.number().finite().nonnegative(),
+  ramMb: z.number().finite().nonnegative().nullable(),
   cpuCores: Count,
-  diskMb: z.number().finite().nonnegative(),
+  diskMb: z.number().finite().nonnegative().nullable(),
   osType: Text,
   sshKeys: z.array(Id).max(100).optional(),
   createdDate: DateTime,
@@ -100,9 +100,9 @@ export interface ContaboInstance {
   defaultUser?: "root" | "admin" | "administrator";
   ipConfig: z.infer<typeof InstanceWire>["ipConfig"];
   additionalIps: z.infer<typeof InstanceWire>["additionalIps"];
-  ramMb: number;
+  ramMb: number | null;
   cpuCores: number;
-  diskMb: number;
+  diskMb: number | null;
   macAddress: string;
   osType: string;
   applicationId: string | null;
@@ -151,7 +151,7 @@ const AuditWire = z.object({
   changedBy: Short,
   username: Text,
   requestId: z.uuid(),
-  traceId: Text,
+  traceId: Text.nullable(),
   instanceId: z.union([Id, z.literal(0).transform(() => "0")]),
   changes: z.unknown().optional(),
 });
@@ -162,7 +162,7 @@ export interface ContaboAudit {
   tenantId: string;
   customerId: string;
   requestId: string;
-  traceId: string;
+  traceId: string | null;
   instanceId: string;
 }
 export type Audit = ContaboAudit;

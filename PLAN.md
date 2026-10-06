@@ -5,8 +5,10 @@ The first EU node and five Flux platform releases are Ready, with 95 GiB measure
 Its node identity, storage and protected cluster custody are preserved. The second existing EU
 VPS has passed signed network verification and admission, with 95 GiB measured capacity.
 Actual capacity demand placed databases on both EU nodes and SQL passed through Cloudflare.
-No US VPS has been bought and no customer or platform
-production database has been migrated. The initial topology remains two EU VPS and one US VPS.
+One new EU Cloud VPS 8 order exists and is pending payment; US has not yet been ordered.
+No customer or platform production database has been migrated. The approved final topology is
+the retained EU control/relay server, one new EU customer worker and one new US regional/customer server.
+The old EU2 remains healthy until replacement readiness and verified data recovery permit removal.
 The US Cloudflare region, separate archive bucket, scoped S3 credentials, private data Tunnel
 and gateway VPC service are configured. The private bootstrap relay now allows both EU and US.
 
@@ -282,10 +284,11 @@ scope, first in Dev and then in production. US remains the default and EU remain
    integrators call `suspend`/`resume`.
 5. **Generic.** No adopter names, plans or defaults in code. Size classes and policies are
    installation configuration.
-6. **Initial topology and recovery.** Two existing EU VPS and one new US VPS. EU has one
-   control-plane/worker node and a second worker; US has one control-plane/worker node. Both
-   control-plane/worker nodes host customer databases after reserving system and platform
-   resources. Recover a lost node and its databases from R2.
+6. **Initial topology and recovery.** Retain the existing EU control-plane/relay VPS and exclude
+   it from new customer database placement. A new EU customer worker joins that cluster; a new
+   US control-plane/customer VPS starts the US region. Both customer servers use Cloud VPS 8.
+   Recover the old EU2 test data from R2 before decommissioning it. System and platform resources
+   remain separately protected and measured.
 7. **Smallest thing that works end to end.** Add machinery only for an observed problem.
 8. **Delete, don't park.** Unused code, files and branches are deleted. Git history is the archive.
 9. **Real systems.** No mocks or hardcoded data in product code. A phase passes only through its
@@ -618,34 +621,34 @@ Completion requires the real EU capacity/adoption path and US first installation
 lifecycle per region, PITR and deleted-source restore, one existing-resource node-loss recovery,
 and targeted health/overload checks. Record recovery time and last recoverable transaction.
 
-- Owner decision (2026-10-06): paid automatic Contabo API purchase of US1 is approved.
-- Cost cap: €20.09 gross/month, €0 setup; Cloudflare orchestrates purchase and installation.
-- Test automatic purchase and full US1 installation, including safe interruption/resume.
-- Test EU2 loss: restore its disposable database from real R2 backups onto US1; verify SQL/data.
-- Supersedes pending approval/same-instance drill; preserve EU1 and record RTO/recovered state.
-- Owner follow-up (2026-10-06): discuss and obtain approval of the capacity-expansion rule
-  before purchasing US1 or implementing that rule and the complete headless flow. The earlier
-  €20.09 gross/month and €0 setup ceiling remains; it is not permission to bypass this later
-  approval condition. The proposed 80% reservation threshold plus actual-load protection is
-  not approved or implemented. Keep purchases disabled until the owner approves the proposal.
-- Latest owner decision (2026-10-06): use actual average RAM utilization with intentional
-  overbooking, superseding the proposed 80% reservation-based rule and the per-purchase approval
-  wait above. At 80% average actual RAM on a node, stop placing every new database on that node,
-  regardless of adopter free/paid plan, and automatically purchase/install the next server under
-  the configured regional offer and cost profile. Purchases within that profile have standing
-  owner authorization; do not request approval for each capacity addition. PostgreSQL for the
-  adopter's free plan has a 256 MiB RAM limit; platform and Barman overhead remain separately
-  measured. The owner confirmed a rolling ten-minute averaging window; the exact actual-RAM
-  metric/denominator still needs an explicit implementation definition.
-  Actual-load placement, safe wake admission under overbooking and the full headless producer
-  remain implementation/live-acceptance work; the deployed reservation-based path is unchanged.
-- The owner intends to test different EU/US VPS models and asks about resetting the existing
-  servers. Exact replacement product IDs/hardware and reset targets are pending. Qualified
-  installer/runtime artifacts are reusable, but they are not VM/data snapshots. Preserve/export
-  Cloudflare custody, real R2 database backups and cluster configuration, and establish an
-  independent bootstrap route before resetting EU1, which currently hosts the sole control plane
-  and relay. Existing-instance recovery currently requires a surviving regional cluster; full
-  regional control-plane loss/rebuild is not live-accepted. No reset is executed by this decision.
+- Owner authorization (2026-10-06, “korrekt go”): purchase exactly one EU and one US-central
+  Cloud VPS 8 through the Contabo API, product V155, one-month term, no optional add-ons:
+  8 vCPU, 24 GB RAM, 300 GB SSD, 600 Mbit/s and three included snapshots. The verified quotes
+  are €16.94 gross/month EU and €20.87 gross/month US, €37.81 combined, with €0 setup.
+  This selection supersedes the previous V159/€20.09 US quote and approval hold.
+- Capacity additions have standing owner authorization within the configured regional offer,
+  exact cost profile and node/spend caps. No new per-server approval prompt is required.
+  Uncertain responses must be reconciled using the original request UUID; never repeat an
+  irreversible provider order to discover its outcome.
+- Approved actual-RAM policy: sample each customer node's working-set bytes divided by its
+  physical memory capacity each minute. Require ten consecutive fresh minute buckets and use
+  their rolling average. At **at least 81%**, permanently close that node to every new database
+  placement and initiate one addition in the same region. Missing samples, changed Node UID
+  and MemoryPressure remain explicit unknown/unsafe states, never zero utilization.
+- Admin RAM assignment uses 256 MiB increments. This installation permits PostgreSQL limits
+  from 256 MiB through 4096 MiB; free/paid labels and customer entitlements belong to the adopter.
+  D1 records the project external ID, database, size class, assigned RAM and placed node.
+  Five 4 GiB database limits total 20 GiB, or 83.3% of 24 GiB; limits are not actual usage.
+  PostgreSQL container limits prevent one database consuming the whole host. Barman and system
+  consumption are separate. Safe concurrent-start admission and explicit smaller Kubernetes
+  memory requests are required for intentional overbooking.
+- Actual-RAM placement, standing approvals and the complete headless bootstrap producer are
+  implementation/live-acceptance work. The deployed path still uses full reservations.
+- The first EU order was dispatched once. Its exact CREATED audit matches the original request
+  and selected region/product/image/hostname. Contabo currently reports PENDING_PAYMENT with
+  RAM and disk unallocated; this is an order receipt, not accepted 8-vCPU/24-GB/300-GB hardware.
+  Two reproducing provider tests first failed and now pass for nullable audit trace IDs and
+  unallocated RAM/disk. Installation still requires real positive hardware measurements.
 - Reset-readiness audit (2026-10-06): native `cf6d5d55` is present locally with its exact source
   label and qualified private-registry readback; regional `ab678993` manifest/configuration and
   pinned Cilium/Flux assets are available over HTTPS. Both EU servers/nodes are Running/Ready;
@@ -656,16 +659,12 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   independently retained etcd/cluster and database custody and verify an alternate bootstrap
   route before the owner resets EU1. New model compatibility and rebuild time require actual
   hardware checks and a live run; the current RAM-staged installer cannot fit a nominal 4 GiB VPS.
-- Owner topology clarification (2026-10-06): retain the existing EU1 as the EU Kubernetes/platform
-  and bootstrap-relay host, with no new customer databases placed on it. The owner will initially
-  purchase two replacement-model servers: one new EU database worker joining that retained EU
-  cluster, and one US regional control-plane/database host. Do not reset the retained EU1 or place
-  a duplicate initial order while the owner purchases these instances. Exclude EU1 from new
-  database placement without disabling scheduling of its platform/relay services. Existing EU1
-  test databases must be deliberately moved/restored or deleted only after preserving their data;
-  the old EU2 is not reset/decommissioned by this clarification. Final handling of old EU2 and
-  the selected actual EU/US product IDs remain pending. Standing headless purchases apply to
-  subsequent capacity additions under the configured offer/cost profile.
+- Confirmed topology (2026-10-06): the current EU1 remains the Kubernetes/platform and
+  bootstrap-relay host, with no new customer databases. The newly ordered EU worker becomes
+  customer EU1; the newly purchased US regional host becomes customer US1. Do not reset the
+  retained EU control server. Decommission old EU2 only after both replacements are Ready and
+  its disposable source data has been restored and verified. Preserve or deliberately remove
+  existing EU control-host test databases after their archives and data have been verified.
 
 Use regression tests for changes, scoped package checks and one composed CI; repeat old live
 checks only when their behavior changed. No additional cold-start optimization or twenty-start
@@ -799,7 +798,8 @@ Build:
 - The `node-bootstrap` Container. It runs the verified rescue path: per-node Image Factory
   schematic with static network arguments, checksum-verified NoCloud raw image, GPT relocation,
   `apply-config` worker for an existing region, or bootstrap a control-plane/worker for a new region.
-  Control-plane/worker nodes host customer databases with measured system/platform reservations.
+  The retained EU control/relay node is excluded from new customer placement; the US regional
+  control-plane/customer node retains measured system/platform reservations.
 - Before join, apply the peer-address firewall allowlist for API, Talos, kubelet, control-plane
   etcd and CNI traffic, and configure Cilium WireGuard Pod encryption. Keep the new node out of
   database placement until the encrypted inter-node path and network isolation are verified.
@@ -845,8 +845,9 @@ Live acceptance:
   generation are distinct. Verify the target before the adopter changes its active connection.
 - Isolation tests: cross-tenant network and SQL, disk-full containment, CPU noisy neighbor.
 - Credential and API key rotation.
-- Keep full, measured placement reservations for v1. Density optimization, sleeping reservation
-  factors and relocation are later work.
+- Reserved placement remains the compatibility default. The owner-approved actual-RAM mode
+  uses explicit startup memory requests, per-database limits and concurrent-start admission;
+  CPU and storage guards remain enforced. Automatic relocation is later work.
 - Bound registered-hint admission before D1/wake. Edge-side SCRAM before wake is later work.
 - Qualify deployment images and the changed security boundaries; public signing is Phase 5.
 

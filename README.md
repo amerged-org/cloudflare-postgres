@@ -2,10 +2,10 @@
 
 Open-source, Neon-style serverless PostgreSQL that runs on **your Cloudflare account** and **your
 Contabo VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
-The VPS run real, unmodified PostgreSQL under CloudNativePG. The planned initial deployment uses two EU
-VPS (one control-plane/worker and one worker) and one US control-plane/worker VPS. Customer
-databases run on all three nodes with resources reserved for the system and platform; server
-loss is recovered from R2.
+The VPS run real, unmodified PostgreSQL under CloudNativePG. The approved initial deployment retains one EU control/relay VPS, adds one EU customer worker
+and one US control-plane/customer VPS. Both customer servers are Cloud VPS 8; the old EU worker
+is removed after verified recovery. System and platform resources remain protected; server loss
+is recovered from R2.
 
 - Create, resize, suspend, restore and delete databases through a versioned API.
 - Connect through Cloudflare: PostgreSQL over WebSocket. The VPS expose no database port.

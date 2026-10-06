@@ -272,8 +272,10 @@ export async function configureNodeBootstrap(
     actual.ipConfig.v4.ip !== body.spec.hardware.ipv4 ||
     actual.ipConfig.v4.gateway !== body.spec.hardware.gateway ||
     actual.ipConfig.v4.netmaskCidr !== body.spec.hardware.prefix_length ||
+    typeof actual.diskMb !== "number" ||
     !Number.isFinite(actual.diskMb) ||
     actual.diskMb <= 0 ||
+    typeof actual.ramMb !== "number" ||
     !Number.isFinite(actual.ramMb) ||
     actual.ramMb <= 0
   )

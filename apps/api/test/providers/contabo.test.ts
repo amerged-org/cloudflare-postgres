@@ -428,6 +428,71 @@ it("request-correlated audits preserve exact identity without exposing arbitrary
   });
   expect(JSON.stringify(result).includes(f.credentials.password)).toBe(false);
 });
+it("reconciles an original creation audit whose optional trace header was not supplied", async () => {
+  const f = setup();
+  f.set(() =>
+    Response.json({
+      _pagination: { size: 100, totalElements: 1, totalPages: 1, page: 1 },
+      data: [
+        {
+          id: Number(id()),
+          action: "CREATED",
+          timestamp: new Date().toISOString(),
+          tenantId: "INT",
+          customerId: id(),
+          changedBy: value(),
+          username: f.credentials.username,
+          requestId: f.requestId,
+          traceId: null,
+          instanceId: Number(f.instanceId),
+          changes: {},
+        },
+      ],
+      _links: {
+        self: "/v1/compute/instances/audits",
+        first: "/v1/compute/instances/audits",
+        last: "/v1/compute/instances/audits",
+      },
+    }),
+  );
+  const result = await f.client.instanceAudits(
+    { requestId: f.requestId },
+    { requestId: value() },
+  );
+  expect(result).toHaveLength(1);
+  expect(result[0]).toMatchObject({
+    requestId: f.requestId,
+    instanceId: f.instanceId,
+    action: "CREATED",
+    traceId: null,
+  });
+});
+it("preserves unallocated hardware on an actual pending-payment instance", async () => {
+  const f = setup();
+  f.set(() =>
+    Response.json({
+      data: [
+        {
+          ...f.instance,
+          status: "pending_payment",
+          cpuCores: 1,
+          ramMb: null,
+          diskMb: null,
+        },
+      ],
+      _links: { self: "/v1/compute/instances/" + f.instanceId },
+    }),
+  );
+  expect(
+    await f.client.getInstance(f.instanceId, { requestId: f.requestId }),
+  ).toMatchObject({
+    id: f.instanceId,
+    status: "pending_payment",
+    cpuCores: 1,
+    ramMb: null,
+    diskMb: null,
+  });
+});
 it("body and absolute deadline bounds fail closed without disclosing canaries", async () => {
   const f = setup();
   f.set(() => new Response(f.credentials.password.repeat(100000)));
