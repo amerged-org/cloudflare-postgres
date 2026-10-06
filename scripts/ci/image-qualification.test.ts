@@ -174,6 +174,21 @@ test("the single CI workflow qualifies all three image profiles before independe
     postgres.indexOf("--profile postgres registry") <
       postgres.indexOf("--profile postgres promote"),
   );
+  const mirror = postgres.split(
+    "- name: Copy the qualified PostgreSQL manifest to public runtime storage",
+  )[1];
+  assert.ok(
+    mirror,
+    "PostgreSQL runtime bytes need the existing public pull path",
+  );
+  assert.match(mirror, /pgcf-regional:postgres-sha-/);
+  assert.match(mirror, /imagetools create --prefer-index=false/);
+  assert.match(mirror, /--profile postgres registry/);
+  assert.match(mirror, /public-postgres-sha\.json/);
+  assert.doesNotMatch(
+    mirror,
+    /pgcf-regional:latest|--profile postgres promote/,
+  );
 });
 
 test("Dockerfile profiles bind every FROM and the exact pinned stage topology", () => {

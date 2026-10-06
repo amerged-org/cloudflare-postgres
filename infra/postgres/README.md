@@ -63,3 +63,9 @@ image digest, the unmodified upstream PostgreSQL image index, the pgvector packa
 version/SHA-256 and its pinned upstream source/notice references from
 `sources.lock.json`. This directory does not replace the upstream notices or the
 repository's image qualification policy.
+
+Qualified manifests are also copied to the existing public `pgcf-regional` package under
+a separate immutable `postgres-sha-<commit>` tag. The copy must retain the exact manifest,
+configuration and ordered filesystem digests; it never changes the regional `latest` tag.
+Verify anonymous access and every compressed/uncompressed layer before selecting that
+reference for Talos/CloudNativePG. The native bootstrap image may remain private.

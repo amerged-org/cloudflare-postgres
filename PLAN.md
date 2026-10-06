@@ -50,9 +50,18 @@ software checks and three image jobs. Source `901b3228` produces regional
 (18 layers, 715,162,096 bytes), and PostgreSQL
 `sha256:2c0b286e616191e5103f972181fee2fa7481102bf1a8c0d19154d37f961f3d2d`
 (one layer, 1,002,669,632 bytes), all with zero unresolved scanner findings. CI verified actual
-SQL/pgvector, the unchanged engine and full registry bytes. Local checks passed contracts 151,
+SQL/pgvector, the unchanged engine and manifest/configuration bindings. Separate deployment
+readback verifies every compressed and uncompressed registry layer. Local checks passed contracts 151,
 API 502, Edge 80, regional 425, native 148, CLI 30, harness 237, infrastructure 21 and CI logic 71.
 The new images, migrations, profiles and actual-RAM policy are not yet delivered/live-accepted.
+The regional image’s anonymous readback verified 89,781,987 compressed bytes and all ten raw
+layer hashes. Native and PostgreSQL private GHCR namespaces return HTTP 401 to anonymous token
+requests. Native does not require public access: an independent local build from exact clean
+`901b3228` passed all runtime checks and 18-layer qualification (714,834,399 bytes, zero unresolved
+findings) for transfer into the private Cloudflare registry. The CI transfer will copy the same qualified PostgreSQL
+manifest into the existing public package under a distinct `postgres-sha-<commit>` tag;
+regional tags remain untouched. Actual credential-free pull/readback is still required before
+Talos/CNPG delivery. No package visibility or account permission was changed.
 The first common CI failed because source tests needed their compiled portable scanner; the test
 command now builds it. The next PostgreSQL job failed on Docker 28's unsupported inspect platform
 flag; explicit inspected architecture and configuration validation now use its supported command.
