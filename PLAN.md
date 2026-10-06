@@ -623,6 +623,11 @@ and targeted health/overload checks. Record recovery time and last recoverable t
 - Test automatic purchase and full US1 installation, including safe interruption/resume.
 - Test EU2 loss: restore its disposable database from real R2 backups onto US1; verify SQL/data.
 - Supersedes pending approval/same-instance drill; preserve EU1 and record RTO/recovered state.
+- Owner follow-up (2026-10-06): discuss and obtain approval of the capacity-expansion rule
+  before purchasing US1 or implementing that rule and the complete headless flow. The earlier
+  €20.09 gross/month and €0 setup ceiling remains; it is not permission to bypass this later
+  approval condition. The proposed 80% reservation threshold plus actual-load protection is
+  not approved or implemented. Keep purchases disabled until the owner approves the proposal.
 
 Use regression tests for changes, scoped package checks and one composed CI; repeat old live
 checks only when their behavior changed. No additional cold-start optimization or twenty-start
