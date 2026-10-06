@@ -377,7 +377,8 @@ jobs:
         run: |
           image_id=$(cat "$RUNNER_TEMP/pgcf-postgres-image-gate/image.id")
           digest=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; console.log(JSON.parse(readFileSync(process.argv[1], "utf8")).digest)' "$RUNNER_TEMP/pgcf-postgres-image-gate/registry-sha.json")
-          public_image="ghcr.io/amerged-org/pgcf-regional:postgres-sha-${GITHUB_SHA::12}"
+          postgres_version=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; process.stdout.write(JSON.parse(readFileSync("infra/postgres/sources.lock.json", "utf8")).postgresql.version)')
+          public_image="ghcr.io/amerged-org/pgcf-regional:${postgres_version}-pgcf-sha-${GITHUB_SHA::12}"
           docker buildx imagetools create --prefer-index=false --tag "$public_image" "$IMAGE@$digest"
           node scripts/ci/image-qualification.ts --profile postgres registry "$public_image" \
             "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \

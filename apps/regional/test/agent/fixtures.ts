@@ -62,7 +62,7 @@ export function fixture(): { db: DesiredDatabase; ctx: BuildContext } {
           secretAccessKey: randomBytes(32).toString("hex"),
         },
       },
-      postgresImage: `ghcr.io/cloudnative-pg/postgresql@sha256:${"a".repeat(64)}`,
+      postgresImage: `ghcr.io/cloudnative-pg/postgresql:18.6@sha256:${"a".repeat(64)}`,
       systemNamespace: "pgcf-system",
       cnpgNamespace: "cnpg-system",
       storageClass: "pgcf-lvm",

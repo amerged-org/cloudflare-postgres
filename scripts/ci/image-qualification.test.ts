@@ -29,6 +29,44 @@ import {
   verifyNativeArtifacts,
 } from "./reviewed-findings.ts";
 
+test("published PostgreSQL consumer pins retain the version tag required by CNPG admission", async () => {
+  const sources = JSON.parse(
+    await readFile("infra/postgres/sources.lock.json", "utf8"),
+  ) as { postgresql: { version: string } };
+  const platform = JSON.parse(
+    await readFile("infra/platform/versions.lock.json", "utf8"),
+  ) as { regional: { postgresImage: { reference: string } } };
+  const config = await readFile("infra/platform/regional/config.yaml", "utf8");
+  const reference = /PGCF_POSTGRES_IMAGE:\s*(\S+)/.exec(config)?.[1];
+  assert.equal(reference, platform.regional.postgresImage.reference);
+  assert.ok(reference);
+  const tag = /:([^:@/]+)@sha256:[a-f0-9]{64}$/.exec(reference)?.[1];
+  assert.ok(tag, "CNPG needs a version-bearing tag even for a digest pin");
+  // CNPG 1.30.1 uses machinery v0.6.0 FromTag after stripping the digest.
+  // Its actual prefix grammar is pinned at:
+  // https://github.com/cloudnative-pg/machinery/blob/50976ec08e4f280c3bd89d42caf7a1cca887729c/pkg/postgres/version/version.go#L30
+  const version = /^(\d\.?)+/.exec(tag)?.[0];
+  assert.equal(version, sources.postgresql.version);
+  assert.deepEqual(version?.split(".").map(Number), [18, 6]);
+  const rejectedReference = reference.replace(
+    /:[^:@/]+@/,
+    ":postgres-sha-0cf76655e000@",
+  );
+  const rejectedTag = /:([^:@/]+)@sha256:[a-f0-9]{64}$/.exec(
+    rejectedReference,
+  )?.[1];
+  assert.ok(rejectedTag);
+  assert.equal(/^(\d\.?)+/.exec(rejectedTag), null);
+  assert.equal(
+    rejectedReference.split("@")[1],
+    reference.split("@")[1],
+    "the admission fix changes the tag, not the qualified content",
+  );
+  assert.ok(tag.startsWith(`${sources.postgresql.version}-pgcf-sha-`));
+  assert.match(tag, /-pgcf-sha-[a-f0-9]{12}$/);
+  assert.match(reference, /@sha256:[a-f0-9]{64}$/);
+});
+
 test("PostgreSQL qualification binds its own upstream and cannot inherit Node reviews", () => {
   assert.deepEqual(
     parseQualificationArguments(["--profile", "postgres", "runtime", "image"]),
@@ -181,7 +219,8 @@ test("the single CI workflow qualifies all three image profiles before independe
     mirror,
     "PostgreSQL runtime bytes need the existing public pull path",
   );
-  assert.match(mirror, /pgcf-regional:postgres-sha-/);
+  assert.match(mirror, /postgresql\.version/);
+  assert.match(mirror, /pgcf-regional:\$\{postgres_version\}-pgcf-sha-/);
   assert.match(mirror, /imagetools create --prefer-index=false/);
   assert.match(mirror, /--profile postgres registry/);
   assert.match(mirror, /public-postgres-sha\.json/);

@@ -65,7 +65,9 @@ version/SHA-256 and its pinned upstream source/notice references from
 repository's image qualification policy.
 
 Qualified manifests are also copied to the existing public `pgcf-regional` package under
-a separate immutable `postgres-sha-<commit>` tag. The copy must retain the exact manifest,
+a separate immutable `<postgres-version>-pgcf-sha-<commit>` tag. CloudNativePG detects
+the PostgreSQL version from the tag even when the reference includes a digest, so the
+version prefix is required. The copy must retain the exact manifest,
 configuration and ordered filesystem digests; it never changes the regional `latest` tag.
 Verify anonymous access and every compressed/uncompressed layer before selecting that
 reference for Talos/CloudNativePG. The native bootstrap image may remain private.

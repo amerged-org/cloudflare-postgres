@@ -22,14 +22,16 @@ The US Cloudflare region, separate archive bucket, scoped S3 credentials, privat
 and gateway VPC service are configured. The private bootstrap relay now allows both EU and US.
 
 The current regional image is
-`sha256:53f9aaafdbda2f776a3ba20691f01a6ed6376638f02dcf436332b5056f54f735`
-from `ab678993`, CI `37419289338`. Qualification covered 658,584,124 bytes and ten layers with
-zero unresolved findings. Anonymous manifest, configuration and every compressed/uncompressed
-layer verification passed, with 89,764,233 compressed bytes read back. Agent, both gateways and
-five platform releases remained Ready for 69.78 s. Both EU Node UIDs, all three test databases'
+`sha256:eeaa6ab0c1fc182e9e050d6f104565ec0a3dc4e7482b1950287c31b62ebe607a`
+from `901b3228`, CI `37506713888`, with consumer `b8238bf2` / CI `37514069179`.
+Qualification covered 658,637,376 bytes and ten layers with zero unresolved findings.
+Anonymous manifest, configuration and every compressed/uncompressed layer verification passed,
+with 89,781,987 compressed bytes read back. Agent, both gateways, relay and regional tunnels
+passed exact running-image checks and at least 60 seconds of continuous health; five platform
+releases are Ready, including Barman plugin v0.15.1 / chart0.8.1. Both EU Node UIDs, all three test databases'
 namespace/Cluster/PVC/PV/Secret identities and three EU encrypted custody records are preserved.
 The management API now uses headless source `26ab9ee1`, CI `37510045964`; Edge and the regional
-image remain at `ab678993`. Complete pending-payment inventory now parses without fabricating
+image uses `901b3228`; Edge remains at `ab678993`. Complete pending-payment inventory now parses without fabricating
 hardware, and configuration, network, relay and proof consumers reject unallocated resources.
 Both purchases have original-request-correlated D1 receipts; no order was replayed. The private bootstrap
 Workflow, Container and VPC bindings are activated. EU firewall/rescue/operator-source
@@ -54,8 +56,8 @@ software checks and three image jobs. Source `901b3228` produces regional
 SQL/pgvector, the unchanged engine and manifest/configuration bindings. Separate deployment
 readback verifies every compressed and uncompressed registry layer. Local checks passed contracts 151,
 API 502, Edge 80, regional 425, native 148, CLI 30, harness 237, infrastructure 21 and CI logic 71.
-The headless API/native images and four additive migrations are delivered. Regional/PG delivery,
-profile activation, actual-RAM policy and fresh-node live acceptance remain outstanding.
+The headless API/native and regional/relay images and four additive migrations are delivered.
+PostgreSQL delivery, profile activation, actual-RAM policy and fresh-node live acceptance remain outstanding.
 The regional image’s anonymous readback verified 89,781,987 compressed bytes and all ten raw
 layer hashes. Native and PostgreSQL private GHCR namespaces return HTTP 401 to anonymous token
 requests. Native uses an independently qualified clean `901b3228` build in the private Cloudflare
@@ -84,7 +86,7 @@ and the complete single layer passed: 219,937,973 compressed bytes, 660,822,016 
 exact CI hashes, zero unresolved findings. Its public immutable digest is
 `sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115`.
 GitHub owner login is therefore no longer a dependency for these artifact access paths.
-Regional/PG runtime delivery, profile activation and fresh VPS acceptance remain outstanding.
+PostgreSQL delivery, profile activation and fresh VPS acceptance remain outstanding.
 NVMe API selection is
 still unverified and the owner's web-shop choice is pending.
 
@@ -98,6 +100,20 @@ UIDs, all three database namespace/Cluster/PVC/PV/Secret identities, role rows, 
 three encrypted EU custody records remain exact, with physical database health confirmed. All
 existing policies remain reserved; no profile, provider order, rescue dispatch or disk write ran.
 Full consumer CI `37514069179` passed `b8238bf2`, including all three image jobs.
+
+Regional/relay delivery is complete using the already fully qualified image above. Exact running
+image IDs and the same old Node, database/storage/role/Secret and encrypted-custody identities
+passed. No OS reset/reboot or Flux-controller upgrade occurred. A read-only PostgreSQL baseline
+confirms all three databases on18.4, no installed vector extension, zero/zero/one application
+relations and both original recovery markers. The first image-only Cluster patch was explicitly
+rejected by CloudNativePG with `invalid version tag`: the public `postgres-sha` tag needs a
+PostgreSQL version prefix. Readback confirms zero image patches applied, all three physical
+databases healthy and protected identities unchanged; correction is in progress.
+
+The owner reiterated API-only ordering. Three deliberately unorderable schema-validation probes
+used the NVMe shop slug as product ID and snake/camel storage keys. All returned the same HTTP400
+base-field validation; the complete provider inventory remained unchanged. These responses do
+not prove that any storage selector is supported, and no replacement order was accepted.
 
 Release image signing remains Phase 5 work.
 

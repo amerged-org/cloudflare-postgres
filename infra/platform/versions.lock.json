@@ -116,7 +116,7 @@
       }
     ],
     "postgresImage": {
-      "reference": "ghcr.io/amerged-org/pgcf-regional:postgres-sha-0cf76655e000@sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115",
+      "reference": "ghcr.io/amerged-org/pgcf-regional:18.6-pgcf-sha-0cf76655e000@sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115",
       "version": "18.6",
       "source": "https://github.com/amerged-org/cloudflare-postgres/tree/0cf76655e00038dc0360a7715634fe6e5d7769dd/infra/postgres",
       "note": "Unmodified PostgreSQL 18.6 engine and pgvector 0.8.7, qualified in CI 37511566358. Exact private/public manifest equality and anonymous manifest/configuration plus complete compressed/uncompressed layer readback passed."
