@@ -2,6 +2,8 @@
 import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
 import { bytesToBase64url, newNodeId } from "@pgcf/contracts";
+import { canonicalNodeProof } from "@pgcf/contracts/node-proof";
+import type { ContaboFirewall } from "../../src/providers/contabo.ts";
 import {
   NodeBootstrapCheckpoint,
   NodeBootstrapSpec,
@@ -617,6 +619,153 @@ async function setup(ipv6 = true) {
     },
   };
 }
+it("includes each provider IPv6 gateway in initial ICMP policy and preserves the sealed plan", async () => {
+  const f = await setup();
+  const gateways = new Map<string, string>();
+  for (const [index, [id, instance]] of [...f.instances].entries()) {
+    const gateway = `fe80::${index + 7}`;
+    instance.ipConfig.v6.gateway = gateway;
+    gateways.set(id, gateway);
+  }
+  await f.settle();
+  for (const [id, firewallId] of Object.entries(f.bindings)) {
+    const rules = f.firewalls.get(firewallId)!.rules
+      .inbound as ContaboFirewall["rules"]["inbound"];
+    const icmp = rules.filter((rule) => rule.protocol === "icmp");
+    expect(icmp).toHaveLength(1);
+    expect(icmp[0]).toMatchObject({
+      protocol: "icmp",
+      destPorts: [],
+      srcCidr: { ipv6: [`${gateways.get(id)}/128`] },
+      action: "accept",
+      status: "active",
+    });
+    expect(icmp[0]!.srcCidr.ipv4).toBeUndefined();
+  }
+  const readPlan = () =>
+    env.DB.prepare(
+      "SELECT plan_json,plan_sha256 FROM node_network_preparations WHERE operation_id=?",
+    )
+      .bind(f.addition.intent.operation_id)
+      .first();
+  const sealed = await readPlan();
+  await f.sign();
+  expect(await f.run()).toBe(true);
+  for (const instance of f.instances.values())
+    instance.ipConfig.v6.gateway = "fe80::99";
+  expect(await f.run()).toBe(false);
+  expect(await readPlan()).toEqual(sealed);
+  expect(f.calls.filter((call) => call.method === "PUT")).toHaveLength(2);
+});
+it("rejects ICMP readback with ports, IPv4 sources or a broadened gateway source", async () => {
+  const f = await setup();
+  await f.settle();
+  await f.sign();
+  expect(await f.run()).toBe(true);
+  const firewall = f.firewalls.values().next().value!;
+  const icmp = (
+    firewall.rules.inbound as ContaboFirewall["rules"]["inbound"]
+  ).find((rule) => rule.protocol === "icmp")!;
+  const exact = structuredClone(icmp);
+  icmp.destPorts = ["22"];
+  expect(await f.run()).toBe(false);
+  Object.assign(icmp, structuredClone(exact));
+  icmp.srcCidr.ipv4 = [address(9) + "/32"];
+  expect(await f.run()).toBe(false);
+  Object.assign(icmp, structuredClone(exact));
+  icmp.srcCidr.ipv6 = [v6(9) + "/128"];
+  expect(await f.run()).toBe(false);
+  Object.assign(icmp, structuredClone(exact));
+  icmp.srcCidr.ipv6 = [v6(254) + "/64"];
+  expect(await f.run()).toBe(false);
+  Object.assign(icmp, structuredClone(exact));
+  expect(await f.run()).toBe(true);
+  expect(f.calls.filter((call) => call.method === "PUT")).toHaveLength(2);
+});
+it("keeps a pre-existing legacy plan without ICMP byte-exact and eligible", async () => {
+  const f = await setup();
+  await f.settle();
+  const operation = f.addition.intent.operation_id;
+  const row = await env.DB.prepare(
+    "SELECT plan_json FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(operation)
+    .first<{ plan_json: string }>();
+  const plan = JSON.parse(row!.plan_json);
+  const digest = async (value: unknown) =>
+    [
+      ...new Uint8Array(
+        await crypto.subtle.digest(
+          "SHA-256",
+          new TextEncoder().encode(canonicalNodeProof(value)),
+        ),
+      ),
+    ]
+      .map((byte) => byte.toString(16).padStart(2, "0"))
+      .join("");
+  for (const member of plan.members) {
+    member.rules.rules.inbound = member.rules.rules.inbound.filter(
+      (rule: { protocol: string }) => rule.protocol !== "icmp",
+    );
+    member.rules_sha256 = await digest(
+      member.rules.rules.inbound
+        .map(
+          (rule: {
+            protocol: string;
+            destPorts: string[];
+            srcCidr: { ipv4?: string[]; ipv6?: string[] };
+          }) => ({
+            protocol: rule.protocol,
+            destPorts: [...new Set(rule.destPorts)].sort(),
+            srcCidr: {
+              ipv4: [...new Set(rule.srcCidr.ipv4 ?? [])].sort(),
+              ipv6: [...new Set(rule.srcCidr.ipv6 ?? [])].sort(),
+            },
+            action: "accept",
+            status: "active",
+          }),
+        )
+        .sort((left: unknown, right: unknown) =>
+          canonicalNodeProof(left).localeCompare(canonicalNodeProof(right)),
+        ),
+    );
+    const firewall = f.firewalls.get(member.firewall_id)!;
+    firewall.rules.inbound = firewall.rules.inbound.filter(
+      (rule) => (rule as { protocol: string }).protocol !== "icmp",
+    );
+  }
+  const json = canonicalNodeProof(plan),
+    sha = await digest(plan);
+  await env.DB.batch([
+    env.DB.prepare(
+      "DELETE FROM node_network_mutations WHERE operation_id=?",
+    ).bind(operation),
+    env.DB.prepare(
+      "DELETE FROM node_network_firewalls WHERE operation_id=?",
+    ).bind(operation),
+    env.DB.prepare(
+      "DELETE FROM node_network_preparations WHERE operation_id=?",
+    ).bind(operation),
+  ]);
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO node_network_preparations(operation_id,intent_hash,plan_json,plan_sha256,created_at,updated_at) VALUES(?,?,?,?,?,?)",
+  )
+    .bind(operation, f.addition.intent_hash, json, sha, now, now)
+    .run();
+  expect(await f.run()).toBe(false);
+  await f.sign();
+  expect(await f.run()).toBe(true);
+  expect(
+    await env.DB.prepare(
+      "SELECT plan_json,plan_sha256 FROM node_network_preparations WHERE operation_id=?",
+    )
+      .bind(operation)
+      .first(),
+  ).toEqual({ plan_json: json, plan_sha256: sha });
+  expect(f.calls.filter((call) => call.method === "PUT")).toHaveLength(2);
+  expect(f.sentRules).toHaveLength(2);
+});
 it("uses distinct provider rule labels while retaining the immutable security plan", async () => {
   const f = await setup();
   expect(await f.run()).toBe(false);
@@ -626,6 +775,7 @@ it("uses distinct provider rule labels while retaining the immutable security pl
       "PGCF approved management (tcp)",
       "PGCF exact regional peers (tcp)",
       "PGCF exact regional peers (udp)",
+      "PGCF exact IPv6 gateway (icmp)",
     ]);
   const row = await env.DB.prepare(
     "SELECT plan_json,plan_sha256 FROM node_network_preparations WHERE operation_id=?",
@@ -642,6 +792,7 @@ it("uses distinct provider rule labels while retaining the immutable security pl
       "PGCF approved management",
       "PGCF exact regional peers",
       "PGCF exact regional peers",
+      "PGCF exact IPv6 gateway",
     ]);
   expect(await f.run()).toBe(false);
   await f.sign();

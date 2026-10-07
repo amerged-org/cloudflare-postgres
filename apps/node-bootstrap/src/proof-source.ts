@@ -1390,12 +1390,13 @@ class SourceRunner {
       };
       await this.save({});
     }
+    let measured: OutsideScanMeasurement | undefined;
     try {
       if (this.state.stage === "cleanup") {
         await this.cleanup();
         return fail("previous_run_cleaned");
       }
-      const measured =
+      measured =
         this.source.kind === "rescue"
           ? await this.rescue(assets)
           : await this.pod(assets);
@@ -1407,6 +1408,16 @@ class SourceRunner {
         await this.cleanup();
       } catch {
         /* Keep exact dirty ownership for authorized later cleanup. */
+      }
+      if (
+        measured &&
+        this.state.stage === "cleaned" &&
+        this.state.receipt_sha256 === hash(measured)
+      ) {
+        this.check();
+        await this.commands.authorizeSource();
+        this.check();
+        return measured;
       }
       throw error;
     }

@@ -145,6 +145,7 @@ function fixture() {
     mutations: string[][] = [],
     logReads: string[][] = [],
     actions: string[] = [];
+  let authorizationCount = 0;
   let state: ProofSourceOwnership | null = null,
     loseCreate = false,
     replaceBeforeCleanup = false,
@@ -156,7 +157,8 @@ function fixture() {
     wrongImage = false,
     failedLogs: string | null = null,
     failBeforeInput = false,
-    afterLogs: (() => void) | undefined;
+    afterLogs: (() => void) | undefined,
+    firstNamespaceInventoryFailure: (() => void) | undefined;
   const abort = new AbortController();
   const key = (kind: string, name: string) => `${kind}/${name}`;
   const cluster = {
@@ -190,6 +192,7 @@ function fixture() {
     signal: abort.signal,
     authorizeSource: async () => {
       if (unavailable) throw new Error("source_authority_unavailable");
+      authorizationCount++;
     },
     readOwnership: async () => (state ? structuredClone(state) : null),
     saveOwnership: async (next) => {
@@ -244,7 +247,13 @@ function fixture() {
             }),
           };
         }
-        if (args[1]!.includes(","))
+        if (args[1]!.includes(",")) {
+          if (firstNamespaceInventoryFailure) {
+            const onFailure = firstNamespaceInventoryFailure;
+            firstNamespaceInventoryFailure = undefined;
+            onFailure();
+            return { exit_code: 1, stdout: "" };
+          }
           return {
             exit_code: 0,
             stdout: JSON.stringify({
@@ -255,6 +264,7 @@ function fixture() {
               ),
             }),
           };
+        }
         if (args[1] === "node")
           return { exit_code: 0, stdout: JSON.stringify(node) };
         if (args[1] === "namespace" && args[2] === "kube-system")
@@ -367,6 +377,7 @@ function fixture() {
     abort,
     node,
     state: () => state,
+    authorizationCount: () => authorizationCount,
     loseCreate: () => {
       loseCreate = true;
     },
@@ -385,6 +396,9 @@ function fixture() {
     },
     revokeAuthority: () => {
       unavailable = true;
+    },
+    failFirstNamespaceInventory: (onFailure: () => void = () => {}) => {
+      firstNamespaceInventoryFailure = onFailure;
     },
     loseInputReply: () => {
       loseInputReply = true;
@@ -597,6 +611,93 @@ test("installed source executes the real CLI path with exact identity, bounded m
   assert.equal(f.objects.size, 0);
   assert.equal(f.mutations.filter((args) => args[0] === "create").length, 2);
   assert.ok(f.saved.some((state) => state.namespace_uid && state.pod_uid));
+});
+
+test("a validated measurement survives a transient inventory failure only after exact cleanup completes", async () => {
+  const f = fixture();
+  let authorityAtFailure = 0;
+  f.failFirstNamespaceInventory(() => {
+    authorityAtFailure = f.authorizationCount();
+  });
+  const result = await runOwnedOutsideScan(f.source, f.input, f.commands);
+  assert.deepEqual(result, f.measured);
+  assert.ok(f.authorizationCount() > authorityAtFailure);
+  assert.equal(f.mutations.filter((args) => args[0] === "exec").length, 1);
+  assert.equal(f.logReads.length, 1);
+  assert.equal(f.state()!.receipt_sha256, hash(f.measured));
+  assert.equal(f.state()!.stage, "cleaned");
+  assert.equal(f.objects.size, 0);
+  assert.equal(f.mutations.filter((args) => args[0] === "create").length, 2);
+  assert.equal(f.mutations.filter((args) => args[0] === "delete").length, 2);
+});
+
+test("an original scanner failure stays rejected after confirmed owned cleanup", async () => {
+  const f = fixture();
+  f.failPod('{"error_code":"outside_scan_source_unproven"}\n');
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    (error: unknown) =>
+      error instanceof BootstrapError &&
+      error.code === "outside_scan_source_unproven",
+  );
+  assert.equal(f.mutations.filter((args) => args[0] === "exec").length, 1);
+  assert.equal(f.logReads.length, 1);
+  assert.equal(f.state()!.stage, "cleaned");
+  assert.equal(f.state()!.receipt_sha256, null);
+  assert.equal(f.objects.size, 0);
+});
+
+test("a validated measurement is not returned while repeated cleanup sees a foreign child", async () => {
+  const f = fixture();
+  f.addForeignChild();
+  f.failFirstNamespaceInventory();
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /proof_source_namespace_children_unknown/,
+  );
+  assert.equal(f.state()!.receipt_sha256, hash(f.measured));
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.equal(f.objects.has("persistentvolumeclaim/customer-data"), true);
+  assert.equal(f.objects.has(`namespace/${f.state()!.namespace_name}`), true);
+  assert.equal(f.mutations.filter((args) => args[0] === "exec").length, 1);
+  assert.equal(f.logReads.length, 1);
+});
+
+test("a validated measurement is not returned after cleanup authority is revoked", async () => {
+  const f = fixture();
+  f.failFirstNamespaceInventory();
+  const saveOwnership = f.commands.saveOwnership!;
+  f.commands.saveOwnership = async (state) => {
+    await saveOwnership(state);
+    if (state.stage === "cleaned") f.revokeAuthority();
+  };
+  await assert.rejects(runOwnedOutsideScan(f.source, f.input, f.commands));
+  assert.equal(f.state()!.stage, "cleaned");
+  assert.equal(f.state()!.receipt_sha256, hash(f.measured));
+  assert.equal(f.objects.size, 0);
+  assert.equal(f.mutations.filter((args) => args[0] === "exec").length, 1);
+  assert.equal(f.logReads.length, 1);
+});
+
+test("changed source identity keeps a validated measurement pending during cleanup recovery", async () => {
+  const f = fixture();
+  f.failFirstNamespaceInventory(() => {
+    f.node.metadata.uid = randomUUID();
+  });
+  await assert.rejects(runOwnedOutsideScan(f.source, f.input, f.commands));
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.equal(f.state()!.receipt_sha256, hash(f.measured));
+  assert.equal(f.objects.has(`namespace/${f.state()!.namespace_name}`), true);
+  assert.equal(f.mutations.filter((args) => args[0] === "exec").length, 1);
+  assert.equal(f.logReads.length, 1);
+  assert.equal(
+    f.mutations.some((args) =>
+      args.some(
+        (value) => value.includes("/namespaces/") && !value.includes("/pods/"),
+      ),
+    ),
+    false,
+  );
 });
 
 test("actual pulled image identity is checked before uploading or running the scanner", async () => {

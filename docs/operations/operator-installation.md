@@ -121,6 +121,14 @@ The HTTPS control path may reconnect after a normal server close. Every connecti
 authorization, port443, exact local/control address, a fresh signed nonce/origin and the same
 observed public source. Physical socket-object continuity is not an installation identity.
 
+Include ICMP from the actual assigned IPv6 gateway/128 with no destination ports or IPv4 scope
+in an initial provider-firewall plan, alongside its restricted TCP/UDP rules and permanent DROP.
+This permits gateway neighbor discovery; it does not claim arbitrary-path PMTU acceptance.
+An existing sealed plan is never silently rewritten. A necessary legacy source-firewall repair
+requires exact before/after rule and attachment identity checks, one recorded mutation and
+GET-only resolution of an uncertain result. Keep these lifecycle calls separate from the zero
+provider-call requirement for routine transport.
+
 US1's purchase, profile, installation binding and reported inspection are already retained; its
 original authorized job is still `created`, before disk writes. Continue that same addition and
 AddNode Workflow through its existing pause/resume control, preserving sealed inputs, credentials,

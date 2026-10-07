@@ -93,6 +93,48 @@ unauthorized TLS and changed public sources still fail. No new
 provider order, EU reset or source OS write occurred. US installation/admission and final live
 acceptance remain pending, without a replacement order or weakened dual-stack proof.
 
+Source `b9bbc99`, full CI `37604039662`, delivered the TLS reconnect repair once with qualified
+Native manifest `sha256:0ba5a80744551fd856defd80dbfb59b193a60c45f609aee5f87ea5ca9fa4de51`.
+All18 layers/714,976,857 qualification bytes passed; complete private readback verified162,118,420
+compressed and502,859,776 raw bytes. Actual version20/placement20 Running matched the image,
+with protected EU data/custody and the original created US job unchanged. Controlled resumes
+then retained `outside_scan_capability_gap_ipv6_control_timeout` before expiry. A first passive
+capture missed the scanner window and supplied no network conclusion. A second capture began
+on fresh owned resource creation: five retransmitted SYNs reached the physical interface for
+the exact sealed IPv6 control endpoint, with three unicast solicitations for the exact provider
+gateway and no SYN-ACK, TLS, neighbor advertisement or ICMP error. Fresh before/after
+Node/Cluster/boot/system/config/address/route/MAC identities matched.
+
+The necessary source-firewall lifecycle observation found one attached active firewall, three
+TCP/UDP accepts, permanent DROP and no ICMP accept; the source has no local NetworkRuleConfig
+or NetworkDefaultActionConfig. Exactly one API PUT added only ICMP from the assigned IPv6
+gateway/128, with empty ports and no IPv4 scope. GET-only reconciliation confirmed four accepts,
+unchanged original TCP/UDP rules, permanent DROP, attachment identities and source custody at
+11:26:12Z. The apply measured1 OAuth plus4 resource calls; reconciliation measured1 OAuth plus3
+resource calls. The earlier read collector discarded four fixed wire emissions because the SDK
+logged JSON strings; its zero capture is not a zero-call claim, and no read was repeated merely
+to reconstruct the missing OAuth/resource split. These lifecycle measurements are separate from
+routine transport. Completed additional transport windows recorded469 and496 owned frames over
+30 minutes, then555 and420 over15 minutes, each with zero provider wire events. Overlapping
+windows must not be summed into a lifetime count.
+
+After the gateway rule, six source-matched IPv6 control requests returned HTTP200 in215–338ms;
+the trace supports source attribution, not an exact operation attribution from redacted bearers.
+The retained failure changed to `proof_source_namespace_children_unknown`; a later metadata-only
+13-kind snapshot contained only the allowed default ServiceAccount/root CA ConfigMap. That
+snapshot does not identify the earlier failing predicate. A SourceRunner regression reproduces
+a valid measurement followed by a transient first inventory failure, confirmed second cleanup,
+and an incorrectly retained first error. The repair retains the validated measurement only after
+complete cleanup, matching receipt hash and fresh authority; scan errors and dirty/revoked state
+still fail. A real-D1 regression also reproduces zero ICMP rules in initial plans with actual
+inventory gateways. Initial-plan generation and exact readback gain IPv6 gateway/128 ICMP;
+existing sealed plans remain unchanged. This narrow rule does not promise arbitrary-path PMTU
+ICMP acceptance. The same US Workflow is paused at step696, still before disk writes. Full US
+Ready/SQL/backup/WAL/restore/physical-reclamation acceptance remains outstanding.
+The integrated repair passes41 Native source-runner cases and21 real-D1 network cases, types,
+scoped lint and formatting. Existing legacy plans remain byte-exact and eligible; newly generated
+gateway policies still reject a later provider-gateway change through the existing plan-hash gate.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

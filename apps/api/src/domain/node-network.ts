@@ -254,7 +254,7 @@ function normalizedRules(
       if (
         rule.action !== "accept" ||
         rule.status !== "active" ||
-        !["tcp", "udp"].includes(rule.protocol)
+        !["tcp", "udp", "icmp"].includes(rule.protocol)
       )
         fail();
       const ports: number[] = [];
@@ -264,10 +264,16 @@ function normalizedRules(
         if (first! > last! || last! > 65535 || last! - first! > 15) fail();
         for (let port = first!; port <= last!; port++) ports.push(port);
       }
-      if (!ports.length || ports.length > 15) fail();
       const v4 = unique((rule.srcCidr.ipv4 ?? []).map(cidr)),
         v6 = unique((rule.srcCidr.ipv6 ?? []).map(cidr));
-      if (!v4.length && !v6.length) fail();
+      if (rule.protocol === "icmp") {
+        if (ports.length || v4.length || v6.length !== 1) fail();
+      } else if (
+        !ports.length ||
+        ports.length > 15 ||
+        (!v4.length && !v6.length)
+      )
+        fail();
       return {
         protocol: rule.protocol,
         destPorts: unique(ports.map(String)),
@@ -370,6 +376,24 @@ async function makePlan(
     .bind(addition.intent.request.region_id)
     .first<{ provider: string; provider_region: string }>();
   if (!region || region.provider !== "contabo") fail();
+  const existing = await env.DB.prepare(
+    "SELECT plan_json FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(operationId)
+    .first<{ plan_json: string }>();
+  const previous = existing ? (JSON.parse(existing.plan_json) as Plan) : null;
+  if (
+    previous &&
+    (previous.version !== 1 ||
+      previous.operation_id !== operationId ||
+      previous.intent_hash !== addition.intent_hash)
+  )
+    fail();
+  const gatewayPolicy =
+    previous === null ||
+    previous.members.some((member) =>
+      member.rules.rules.inbound.some((rule) => rule.protocol === "icmp"),
+    );
   const nodes = (
     await env.DB.prepare(
       "SELECT id,provider_instance_id FROM nodes WHERE region_id=? AND id<>? AND lost_at IS NULL ORDER BY id LIMIT 17",
@@ -403,7 +427,8 @@ async function makePlan(
     ),
     relay = await client.getInstance(relayId, request());
   if (relayId === addition.provider_instance_id) fail();
-  const members: Member[] = [];
+  const members: Member[] = [],
+    ipv6Gateways = new Map<string, string>();
   for (const node of [
     {
       id: addition.intent.node_id,
@@ -423,6 +448,11 @@ async function makePlan(
       instance.customerId !== relay.customerId
     )
       fail();
+    if (gatewayPolicy && instance.ipConfig?.v6?.ip) {
+      const gateway = instance.ipConfig.v6.gateway;
+      if (!z.ipv6().safeParse(gateway).success) fail();
+      ipv6Gateways.set(id, `${ip(gateway)}/128`);
+    }
     members.push({
       node_id: node.id,
       provider_instance_id: id,
@@ -483,6 +513,16 @@ async function makePlan(
           status: "active",
           displayName: "PGCF exact regional peers",
         });
+    const gateway = ipv6Gateways.get(member.provider_instance_id);
+    if (gateway)
+      inbound.push({
+        protocol: "icmp",
+        destPorts: [],
+        srcCidr: { ipv6: [gateway] },
+        action: "accept",
+        status: "active",
+        displayName: "PGCF exact IPv6 gateway",
+      });
     member.rules = { rules: { inbound } };
     member.rules_sha256 = await digest(normalizedRules(inbound));
   }
