@@ -958,7 +958,11 @@ class SourceRunner {
       )
         return fail("namespace_children_unknown");
       for (const raw of list.items) {
-        const item = object(raw);
+        const value = object(raw),
+          item =
+            value.apiVersion === undefined && value.kind === undefined
+              ? { ...value, apiVersion, kind: kind.slice(0, -4) }
+              : value;
         if (item.apiVersion !== apiVersion || item.kind !== kind.slice(0, -4))
           return fail("namespace_children_unknown");
         items.push(item);

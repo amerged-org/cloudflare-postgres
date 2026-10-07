@@ -200,6 +200,22 @@ source/execution cases pass. This is an API-only recovery correction; the qualif
 source OS/firewall and original operation remain unchanged. Live installation/admission and final
 acceptance are still pending.
 
+Source `cc5dbeb5` passes full CI `37636098688`. Its API-only publication stayed before the
+intent/CLI because scheduled capacity reconciliation had already restarted the same errored
+Workflow. The original job remained created/revision0 with zero downloaded/written bytes;
+no second order or adoption occurred. The completed 30-minute capture recorded696 owned
+request frames and zero actual provider wire events across all seven lifecycle stages.
+Subsequent programmed cleanup reported `proof_source_namespace_children_unknown`.
+A bounded direct read of the two exact dirty namespaces verified all13 typed collection wrappers,
+no continuation/remaining-item indication, preserved Node/Cluster identity and2866/10279 bytes.
+The raw Kubernetes typed Lists omit item `apiVersion` and `kind`, unlike kubectl's merged List.
+The new strict item check incorrectly rejected the permitted default ServiceAccount and root CA
+ConfigMap. A reproducing test first fails with that exact error. The correction infers TypeMeta
+only when both fields are absent from an exact validated collection; explicit mismatches or
+partially present fields still reject. All namespace/system-child, complete-list, output,
+identity and deletion guards remain. This changed Native path needs one qualified image delivery;
+the queued API recovery correction is included in that stand. US live acceptance remains pending.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

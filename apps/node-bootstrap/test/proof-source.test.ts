@@ -296,11 +296,18 @@ function fixture() {
           const collection = inventoryCollection(args);
           return inventoryOutput(
             args,
-            [...objects.values()].filter(
-              (value) =>
-                obj(value.metadata).namespace === collection.namespace &&
-                value.kind === collection.kind.slice(0, -4),
-            ),
+            [...objects.values()]
+              .filter(
+                (value) =>
+                  obj(value.metadata).namespace === collection.namespace &&
+                  value.kind === collection.kind.slice(0, -4),
+              )
+              .map((value) => {
+                const item = { ...value };
+                delete item.apiVersion;
+                delete item.kind;
+                return item;
+              }),
           );
         }
         if (args[1] === "node")
@@ -1440,6 +1447,50 @@ test("cleanup inventories every standard collection without Kubernetes discovery
   assert.equal(f.objects.size, 0);
 });
 
+test("typed Kubernetes collections accept omitted item TypeMeta from the verified collection", async () => {
+  const { f, original, ownership } = await expiredCleanupFixture();
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && args[1]!.endsWith("/serviceaccounts"))
+        return inventoryOutput(args, [
+          {
+            metadata: {
+              name: "default",
+              namespace: ownership.namespace_name,
+              uid: randomUUID(),
+              resourceVersion: "1",
+            },
+          },
+        ]);
+      if (args[0] === "get" && args[1]!.endsWith("/configmaps"))
+        return inventoryOutput(args, [
+          {
+            metadata: {
+              name: "kube-root-ca.crt",
+              namespace: ownership.namespace_name,
+              uid: randomUUID(),
+              resourceVersion: "1",
+            },
+            data: {
+              "ca.crt":
+                "-----BEGIN CERTIFICATE-----\nYWJj\n-----END CERTIFICATE-----\n",
+            },
+          },
+        ]);
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await cleanupOwnedProofSource(
+    f.source,
+    original,
+    commands,
+    new Date(Date.now() + 120_000).toISOString(),
+  );
+  assert.equal(f.state()!.stage, "cleaned");
+  assert.equal(f.objects.size, 0);
+});
+
 test("a typed collection cannot disguise an allowed system child of another kind", async () => {
   const { f, original, ownership } = await expiredCleanupFixture();
   const commands: ProofSourceCommands = {
@@ -1449,6 +1500,39 @@ test("a typed collection cannot disguise an allowed system child of another kind
         return inventoryOutput(args, [
           {
             apiVersion: "v1",
+            kind: "ServiceAccount",
+            metadata: {
+              name: "default",
+              namespace: ownership.namespace_name,
+              uid: randomUUID(),
+              resourceVersion: "1",
+            },
+          },
+        ]);
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 120_000).toISOString(),
+    ),
+    /proof_source_namespace_children_unknown/,
+  );
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.ok(f.objects.has(`namespace/${ownership.namespace_name}`));
+});
+
+test("a collection refuses partially present item TypeMeta rather than inferring a conflicting identity", async () => {
+  const { f, original, ownership } = await expiredCleanupFixture();
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && args[1]!.endsWith("/serviceaccounts"))
+        return inventoryOutput(args, [
+          {
             kind: "ServiceAccount",
             metadata: {
               name: "default",
