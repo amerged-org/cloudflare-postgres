@@ -102,11 +102,20 @@ vendor status/route is absent from serialized Workflow error metadata. No mutati
 The existing same-ID recovery path restarted the Workflow automatically; that does not establish
 proof acceptance. Preparation remains awaiting_proof with no signed artifact, and the original
 bootstrap stayscreated/revision0/downloaded0/written0. Native proof attempts still fail or retry
-before new scanners. A separate bounded administrator preparation-journal getter is implemented
-and under review: current session timestamps plus existing source stages/UID hashes only, with
-local DO reads and no Container contact, session creation, authority or storage mutation. It is
-needed to identify the observed pre-scan wait from actual state. Never reset or replace the job,
-sealed input, source journals or custody.
+before new scanners. The bounded administrator preparation-journal getter is delivered from
+`770e00a6`, full CI `37557199208`; 48 scoped tests, types, lint, formatting and independent review
+passed. Its one API publication reused the qualified native image/configuration and preserved
+the whole paused created job, both EU Nodes, database/storage/role identities and EU/US custody.
+It reads current session timestamps and existing source stages/UID hashes locally, without
+Container contact, session creation, authority or storage mutation. A controlled same-ID resume
+then exposed a real native `job_cancelled` at 01:49:52.584 UTC for the session issued 01:48:19.009 UTC:
+93.6 seconds elapsed, with 446.4 seconds remaining before its full 540-second expiry. Full-session
+expiry is excluded; the exact cleanup command and abort origin remain unconfirmed. Both older
+journals stayed at cleanup, with no new scanner or US installation write in that measured attempt.
+A diagnostic-only patch identifies finite cleanup operations and bounded/external abort origins;
+all 30/120/540-second bounds, ownership guards and unknown-delete readback remain unchanged.
+It is not yet delivered or accepted. Never reset or replace the job, sealed input, source journals
+or custody.
 The retained EU control node's UID-guarded new-database placement flag is now
 false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.
 Actual-RAM mode and automatic purchases remain disabled pending accepted US/recovery tests,

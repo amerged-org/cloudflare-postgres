@@ -7,7 +7,11 @@ import { isIP } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import { OperationId, NodeId, RegionId, Timestamp } from "@pgcf/contracts";
 import { ProviderInstanceId } from "@pgcf/contracts/nodes";
-import { NodeProofMeasurement } from "@pgcf/contracts/node-proof";
+import {
+  NodeProofMeasurement,
+  nodeProofCleanupErrorCode,
+  type NodeProofCleanupOperation,
+} from "@pgcf/contracts/node-proof";
 import { hash, ip } from "../../../scripts/e2e/src/node-network-native.ts";
 import {
   BootstrapError,
@@ -594,11 +598,42 @@ class SourceRunner {
       await this.commands.ssh(script, await this.options(cleanup)),
     );
   }
-  private async kube(args: string[], stdin?: string, cleanup = false) {
+  private async kube(
+    args: string[],
+    stdin?: string,
+    cleanup = false,
+    operation?: NodeProofCleanupOperation,
+  ) {
     if (!this.commands.kube) return fail("kube_adapter_required");
-    return bounded(
-      await this.commands.kube(args, true, stdin, await this.options(cleanup)),
-    );
+    const externalWasAborted = this.commands.signal?.aborted === true,
+      options = await this.options(cleanup);
+    try {
+      return bounded(await this.commands.kube(args, true, stdin, options));
+    } catch (error) {
+      if (
+        !cleanup ||
+        !operation ||
+        !(error instanceof BootstrapError) ||
+        !["job_cancelled", "command_timeout"].includes(error.code)
+      )
+        throw error;
+      // Cleanup intentionally permits an already-cancelled caller. A new
+      // external abort still takes precedence over a concurrent bounded timer.
+      const externalAbort =
+          !externalWasAborted && this.commands.signal?.aborted === true,
+        boundedDeadline =
+          options.signal.aborted &&
+          options.signal.reason instanceof DOMException &&
+          options.signal.reason.name === "TimeoutError",
+        origin = externalAbort
+          ? "external_abort"
+          : boundedDeadline || error.code === "command_timeout"
+            ? options.timeout_ms < 30_000
+              ? "aggregate_deadline"
+              : "command_deadline"
+            : "external_abort";
+      throw new BootstrapError(nodeProofCleanupErrorCode(operation, origin));
+    }
   }
   private async save(fields: Partial<ProofSourceOwnership>, cleanup = false) {
     this.check(cleanup);
@@ -633,6 +668,7 @@ class SourceRunner {
     name: string,
     namespace?: string,
     cleanup = false,
+    operation?: NodeProofCleanupOperation,
   ): Promise<Json | null> {
     const result = await this.kube(
       [
@@ -645,6 +681,7 @@ class SourceRunner {
       ],
       undefined,
       cleanup,
+      operation,
     );
     if (result.exit_code !== 0) return fail("readback_failed");
     return result.stdout.trim() ? object(JSON.parse(result.stdout)) : null;
@@ -733,8 +770,15 @@ class SourceRunner {
         "kube-system",
         undefined,
         cleanup,
+        "cluster_identity",
       ),
-      node = await this.get("node", this.source.node_name, undefined, cleanup);
+      node = await this.get(
+        "node",
+        this.source.node_name,
+        undefined,
+        cleanup,
+        "node_identity",
+      );
     if (
       !cluster ||
       object(cluster.metadata).uid !== this.source.cluster_uid ||
@@ -780,6 +824,7 @@ class SourceRunner {
       ],
       undefined,
       true,
+      "namespace_inventory",
     );
     if (result.exit_code !== 0) return fail("namespace_children_unknown");
     const list = object(JSON.parse(result.stdout));
@@ -1064,6 +1109,7 @@ class SourceRunner {
           kind === "Pod" ? "outside-scan" : this.state.namespace_name!,
           kind === "Pod" ? this.state.namespace_name! : undefined,
           true,
+          kind === "Pod" ? "owned_pod_read" : "owned_namespace_read",
         );
         if (!actual) continue;
         const m = this.owned(actual, kind, uid, true);
@@ -1084,7 +1130,12 @@ class SourceRunner {
           });
           await this.sourceNode(true);
           try {
-            await this.kube(request.args, request.stdin, true);
+            await this.kube(
+              request.args,
+              request.stdin,
+              true,
+              kind === "Pod" ? "owned_pod_delete" : "owned_namespace_delete",
+            );
           } catch {
             /* Confirm deletion below; never force foreign cleanup. */
           }
@@ -1095,6 +1146,7 @@ class SourceRunner {
             kind === "Pod" ? "outside-scan" : this.state.namespace_name!,
             kind === "Pod" ? this.state.namespace_name! : undefined,
             true,
+            kind === "Pod" ? "owned_pod_readback" : "owned_namespace_readback",
           )
         )
           await this.wait(true);

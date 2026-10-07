@@ -17,6 +17,7 @@ import { test } from "node:test";
 import { newNodeId, newOperationId } from "@pgcf/contracts";
 import { hash } from "../../../scripts/e2e/src/node-network-native.ts";
 import { runCommand } from "../src/bootstrap.ts";
+import { BootstrapError } from "../src/bootstrap-error.ts";
 import {
   readProofSourceAssets,
   proofSourceScratchScript,
@@ -574,6 +575,168 @@ test("an expired interrupted journal permits only fresh exact cleanup and cannot
     ),
     /proof_source_direct_source_mismatch/,
   );
+});
+
+async function expiredCleanupFixture() {
+  const f = fixture(),
+    assets = await readProofSourceAssets(false),
+    original = structuredClone(f.input),
+    invocation = randomUUID();
+  original.deadline_at = new Date(Date.now() - 60_000).toISOString();
+  const ownership: ProofSourceOwnership = {
+    version: 1,
+    source_sha256: hash(f.source),
+    input_sha256: hash(original),
+    invocation_id: invocation,
+    kind: "pod",
+    stage: "cleanup",
+    scratch_directory: null,
+    mount_source: null,
+    namespace_name: `pgcf-proof-${hash({ input: hash(original), source: hash(f.source), invocation }).slice(0, 32)}`,
+    namespace_uid: randomUUID(),
+    pod_uid: randomUUID(),
+    node_sha256: null,
+    node_bytes: null,
+    node_received_bytes: 0,
+    cli_sha256: assets.cli_sha256,
+    cli_bytes: assets.cli_bytes,
+    receipt_sha256: null,
+  };
+  await f.commands.saveOwnership!(ownership);
+  for (const value of proofSourcePodObjects(f.source, ownership, assets, 120)) {
+    const m = obj(value.metadata);
+    m.uid = value.kind === "Pod" ? ownership.pod_uid : ownership.namespace_uid;
+    m.resourceVersion = "1";
+    f.objects.set(`${String(value.kind).toLowerCase()}/${m.name}`, value);
+  }
+  return { f, original, ownership };
+}
+test("expired cleanup identifies its namespace inventory command deadline without deleting the owned namespace", async (t) => {
+  const { f, original, ownership } = await expiredCleanupFixture();
+  const boundedTimers: AbortController[] = [];
+  t.mock.method(AbortSignal, "timeout", () => {
+    const timer = new AbortController();
+    boundedTimers.push(timer);
+    return timer.signal;
+  });
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && args[1]!.includes(",")) {
+        assert.equal(options!.timeout_ms, 30_000);
+        boundedTimers
+          .at(-1)!
+          .abort(new DOMException("bounded cleanup deadline", "TimeoutError"));
+        assert.equal(options!.signal.aborted, true);
+        throw new BootstrapError("job_cancelled");
+      }
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 120_000).toISOString(),
+    ),
+    (error: unknown) =>
+      error instanceof BootstrapError &&
+      error.code ===
+        "proof_source_cleanup_namespace_inventory_command_deadline",
+  );
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.equal(f.state()!.namespace_uid, ownership.namespace_uid);
+  assert.equal(f.state()!.input_sha256, hash(original));
+  assert.equal(f.objects.size, 1);
+  assert.equal(
+    obj(f.objects.get(`namespace/${ownership.namespace_name}`)!.metadata).uid,
+    ownership.namespace_uid,
+  );
+  assert.equal(
+    f.mutations.some((args) =>
+      args.includes(`--raw=/api/v1/namespaces/${ownership.namespace_name}`),
+    ),
+    false,
+  );
+});
+
+test("expired cleanup identifies a reduced aggregate deadline in its namespace inventory", async (t) => {
+  const { f, original, ownership } = await expiredCleanupFixture(),
+    boundedTimers: AbortController[] = [];
+  t.mock.method(AbortSignal, "timeout", () => {
+    const timer = new AbortController();
+    boundedTimers.push(timer);
+    return timer.signal;
+  });
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && args[1]!.includes(",")) {
+        assert.ok(options!.timeout_ms > 0 && options!.timeout_ms < 30_000);
+        boundedTimers
+          .at(-1)!
+          .abort(
+            new DOMException("remaining aggregate deadline", "TimeoutError"),
+          );
+        throw new BootstrapError("job_cancelled");
+      }
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 20_000).toISOString(),
+    ),
+    (error: unknown) =>
+      error instanceof BootstrapError &&
+      error.code ===
+        "proof_source_cleanup_namespace_inventory_aggregate_deadline",
+  );
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.equal(f.state()!.namespace_uid, ownership.namespace_uid);
+  assert.equal(f.objects.size, 1);
+});
+
+test("a new external abort takes precedence over a concurrent cleanup command deadline", async (t) => {
+  const { f, original, ownership } = await expiredCleanupFixture(),
+    boundedTimers: AbortController[] = [];
+  t.mock.method(AbortSignal, "timeout", () => {
+    const timer = new AbortController();
+    boundedTimers.push(timer);
+    return timer.signal;
+  });
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && args[1]!.includes(",")) {
+        assert.equal(options!.timeout_ms, 30_000);
+        f.abort.abort(new DOMException("new external abort", "AbortError"));
+        boundedTimers
+          .at(-1)!
+          .abort(new DOMException("bounded cleanup deadline", "TimeoutError"));
+        throw new BootstrapError("job_cancelled");
+      }
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 120_000).toISOString(),
+    ),
+    (error: unknown) =>
+      error instanceof BootstrapError &&
+      error.code === "proof_source_cleanup_namespace_inventory_external_abort",
+  );
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.equal(f.state()!.namespace_uid, ownership.namespace_uid);
+  assert.equal(f.objects.size, 1);
 });
 
 test("expired cleanup has an aggregate budget for measured grant latency while every command remains bounded to thirty seconds", async (t) => {

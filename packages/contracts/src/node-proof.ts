@@ -17,8 +17,73 @@ const Hash = z.string().regex(/^[a-f0-9]{64}$/);
 const At = z.iso.datetime({ precision: 3 });
 export const NodeProofMode = z.enum(["preparation", "postjoin"]);
 export type NodeProofMode = z.infer<typeof NodeProofMode>;
+export const NodeProofCleanupOperation = z.enum([
+  "cluster_identity",
+  "node_identity",
+  "owned_pod_read",
+  "owned_namespace_read",
+  "namespace_inventory",
+  "owned_pod_delete",
+  "owned_namespace_delete",
+  "owned_pod_readback",
+  "owned_namespace_readback",
+]);
+export type NodeProofCleanupOperation = z.infer<
+  typeof NodeProofCleanupOperation
+>;
+export const NodeProofCleanupAbortOrigin = z.enum([
+  "command_deadline",
+  "aggregate_deadline",
+  "external_abort",
+]);
+export type NodeProofCleanupAbortOrigin = z.infer<
+  typeof NodeProofCleanupAbortOrigin
+>;
+export const NODE_PROOF_CLEANUP_ERROR_CODES = [
+  "proof_source_cleanup_cluster_identity_command_deadline",
+  "proof_source_cleanup_cluster_identity_aggregate_deadline",
+  "proof_source_cleanup_cluster_identity_external_abort",
+  "proof_source_cleanup_node_identity_command_deadline",
+  "proof_source_cleanup_node_identity_aggregate_deadline",
+  "proof_source_cleanup_node_identity_external_abort",
+  "proof_source_cleanup_owned_pod_read_command_deadline",
+  "proof_source_cleanup_owned_pod_read_aggregate_deadline",
+  "proof_source_cleanup_owned_pod_read_external_abort",
+  "proof_source_cleanup_owned_namespace_read_command_deadline",
+  "proof_source_cleanup_owned_namespace_read_aggregate_deadline",
+  "proof_source_cleanup_owned_namespace_read_external_abort",
+  "proof_source_cleanup_namespace_inventory_command_deadline",
+  "proof_source_cleanup_namespace_inventory_aggregate_deadline",
+  "proof_source_cleanup_namespace_inventory_external_abort",
+  "proof_source_cleanup_owned_pod_delete_command_deadline",
+  "proof_source_cleanup_owned_pod_delete_aggregate_deadline",
+  "proof_source_cleanup_owned_pod_delete_external_abort",
+  "proof_source_cleanup_owned_namespace_delete_command_deadline",
+  "proof_source_cleanup_owned_namespace_delete_aggregate_deadline",
+  "proof_source_cleanup_owned_namespace_delete_external_abort",
+  "proof_source_cleanup_owned_pod_readback_command_deadline",
+  "proof_source_cleanup_owned_pod_readback_aggregate_deadline",
+  "proof_source_cleanup_owned_pod_readback_external_abort",
+  "proof_source_cleanup_owned_namespace_readback_command_deadline",
+  "proof_source_cleanup_owned_namespace_readback_aggregate_deadline",
+  "proof_source_cleanup_owned_namespace_readback_external_abort",
+] as const;
+export const NodeProofCleanupErrorCode = z.enum(NODE_PROOF_CLEANUP_ERROR_CODES);
+export type NodeProofCleanupErrorCode = z.infer<
+  typeof NodeProofCleanupErrorCode
+>;
+/** Cleanup diagnostics identify a finite operation and abort source, never a command or resource name. */
+export function nodeProofCleanupErrorCode(
+  operation: NodeProofCleanupOperation,
+  origin: NodeProofCleanupAbortOrigin,
+): NodeProofCleanupErrorCode {
+  return NodeProofCleanupErrorCode.parse(
+    `proof_source_cleanup_${NodeProofCleanupOperation.parse(operation)}_${NodeProofCleanupAbortOrigin.parse(origin)}`,
+  );
+}
 /** Known proof diagnostics only; native messages and private proof inputs stay outside status. */
 export const NodeProofErrorCode = z.union([
+  NodeProofCleanupErrorCode,
   z.enum([
     "node_proof_access_binding_changed",
     "node_proof_authority_refused",
