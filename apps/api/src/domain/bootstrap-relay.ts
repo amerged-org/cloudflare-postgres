@@ -15,6 +15,7 @@ import type { Env } from "../env.ts";
 import {
   ContaboClient,
   hasAllocatedContaboHardware,
+  type ContaboClientOptions,
 } from "../providers/contabo.ts";
 import {
   bootstrapJobInput,
@@ -24,16 +25,36 @@ import {
 import { readNodeAddition } from "./node-state.ts";
 import { hasVerifiedNodePreparation } from "./node-network.ts";
 
+type ProviderCredentials = Pick<
+  ContaboClientOptions,
+  "clientId" | "clientSecret" | "username" | "password"
+>;
+let providerClient:
+  { credentials: ProviderCredentials; client: ContaboClient } | undefined;
+
 export function contaboClient(env: Env) {
-  return new ContaboClient({
+  const credentials: ProviderCredentials = {
     clientId: env.CONTABO_CLIENT_ID,
     clientSecret: env.CONTABO_CLIENT_SECRET,
     username: env.CONTABO_USERNAME,
     password: env.CONTABO_PASSWORD,
+  };
+  if (
+    providerClient &&
+    providerClient.credentials.clientId === credentials.clientId &&
+    providerClient.credentials.clientSecret === credentials.clientSecret &&
+    providerClient.credentials.username === credentials.username &&
+    providerClient.credentials.password === credentials.password
+  )
+    return providerClient.client;
+  const client = new ContaboClient({
+    ...credentials,
     maxPages: 4,
     pageSize: 100,
     timeoutMs: 20_000,
   });
+  providerClient = { credentials, client };
+  return client;
 }
 const SigningKey = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/);
 const SigningConfig = z.strictObject({

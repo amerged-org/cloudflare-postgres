@@ -176,6 +176,19 @@ change emits only nine fixed stages, fixed exception categories, a runtime-valid
 eleven known provider codes with bounded HTTP status and the existing server-generated
 diagnostic UUID; it rethrows the original error with the same
 operation order, requests, authority and time limits. Native `51dcfff4` remains unchanged.
+The diagnostic API is delivered from `c528e280`, full CI `37572506643`, preserving Native
+configuration, namespace, seals and custody through one publication and same-Workflow resume.
+That monitored attempt ended with `proof_source_cleanup_namespace_inventory_command_deadline`
+after 88.928 seconds, with 451.072 seconds remaining; it is not claimed to be the transport
+refusal captured separately. The correlated owned transport trace recorded HTTP 500/848 ms
+at `source_authority`, category `provider_error`, code `authorization_unavailable`, provider
+HTTP 400, beside HTTP 200 requests. The provider client emits that code for its OAuth password
+grant response. The factory created a new client on every source authorization, discarding its
+existing token expiry and concurrent-authentication state. A real-client regression reproduced
+two OAuth calls for two concurrent fresh GETs; the bounded one-slot credential-scoped reuse
+reduces this to one OAuth call while retaining both GETs. Exact credential change, early expiry,
+401 invalidation and caller-abort isolation remain tested; no inventory, authority, token
+persistence, retry or Native behavior is added. This authentication fix still requires live acceptance.
 US installation/admission is not accepted.
 Never reset or replace the job, sealed input, source journals or custody.
 The retained EU control node's UID-guarded new-database placement flag is now
