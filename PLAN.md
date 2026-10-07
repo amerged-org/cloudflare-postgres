@@ -129,8 +129,21 @@ attempt. The bounded inventory fix uses fixed 4/3/3/3 batches, at most two concu
 two fully settled waves. A measured-grant-cost virtual path completes in 115,840 ms; a serial
 model exceeds the aggregate bound. All responses and foreign-child checks precede namespace
 deletion, with the original total 256 KiB output bound and unchanged 30/120/540-second limits,
-UID/resource-version checks and unknown-delete readback. This fix is not yet delivered or
-accepted. Never reset or replace the job, sealed input, source journals or custody.
+UID/resource-version checks and unknown-delete readback. The fix is delivered from `17b299a7`,
+full CI `37563569399`; 165 native tests, types, lint, formatting and independent review passed.
+Local qualification covered 714,959,961 bytes/18 layers with zero unresolved findings; private
+readback verified 162,116,097 compressed and 502,842,880 raw bytes. Native manifest
+`sha256:8bbf705897fa1e0ff9030ebffdeb7ccf846d8af281966781155374c52a49c771` is verified in direct
+RUNNING deployment/current placement version 17, with aggregate active counter 0 retained as a
+discrepancy. One publication and same-Workflow resume retained the original created job and
+all protected EU/US identities, seals and custody. Public monitoring then saw running,
+unavailable/invalid status and programmed session turnover, without a captured valid terminal;
+no exit/OOM cause is established. The shared getter contract omitted thirty reachable fixed
+proxy/packet errors, so a matching failed native body could be hidden as invalid status. The
+real D1 getter regression reproduced this rejection; the API-only contract repair adds exactly
+those fixed codes without widening strings, changing response shapes or starting/minting work.
+The actual failure remains unconfirmed until exposed; US installation/admission is not accepted.
+Never reset or replace the job, sealed input, source journals or custody.
 The retained EU control node's UID-guarded new-database placement flag is now
 false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.
 Actual-RAM mode and automatic purchases remain disabled pending accepted US/recovery tests,

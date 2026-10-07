@@ -265,6 +265,51 @@ it("reads the existing preparation failure without starting work, altering the s
   });
 });
 
+it("exposes a fixed native transport refusal without changing the original D1 job or stored session", async () => {
+  const f = await fixture();
+  f.response.error_code = "node_proof_transport_refused";
+  const before = await env.DB.prepare(
+    "SELECT * FROM node_bootstrap_jobs WHERE operation_id=?",
+  )
+    .bind(f.id)
+    .first();
+  expect(await f.status()).toEqual({
+    operation_id: f.id,
+    mode: "preparation",
+    session_id: f.session.claims.session_id,
+    binding_sha256: f.binding.row.binding_sha256,
+    plan_sha256: f.input.claims.plan_sha256,
+    input_hash: f.input.claims.input_hash,
+    status: "failed",
+    error_code: "node_proof_transport_refused",
+  });
+  expect(f.fetch).toHaveBeenCalledTimes(1);
+  const request = f.fetch.mock.calls[0]![0];
+  expect(new URL(request.url).pathname).toBe(`/v1/proofs/${f.id}/preparation`);
+  expect(request.headers.get("Authorization")).toBe(
+    `Bearer ${f.binding.inspection_token}`,
+  );
+  expect(request.body).toBeNull();
+  expect(f.container.start).not.toHaveBeenCalled();
+  expect(f.container.setInactivityTimeout).not.toHaveBeenCalled();
+  expect(
+    await env.DB.prepare(
+      "SELECT * FROM node_bootstrap_jobs WHERE operation_id=?",
+    )
+      .bind(f.id)
+      .first(),
+  ).toEqual(before);
+  await f.withStore(async (_instance, state) => {
+    expect(await state.storage.get("proof_current:preparation")).toBe(
+      f.session.claims.session_id,
+    );
+    expect(
+      await state.storage.get(`proof_input:${f.session.claims.session_id}`),
+    ).toEqual(f.input);
+    expect(await state.storage.getAlarm()).toBeNull();
+  });
+});
+
 it("does not query a stopped container or mint a missing stored session", async () => {
   const f = await fixture();
   f.container.running = false;
