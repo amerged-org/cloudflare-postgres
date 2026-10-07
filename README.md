@@ -113,8 +113,10 @@ credential changes replace the client. Uncertain mutations are never replayed. T
 deployed and the programmed cleanup has removed the old owned probe namespaces. Fresh US proof
 now has a verified global IPv6/default-route prerequisite on the retained source host. Bounded
 failed-Pod diagnostics preserve recognized scanner codes before cleanup. Freshly authenticated
-TLS control connections retain signed source identity. Gateway ICMPv6 permits neighbor discovery;
-the next correction handles confirmed cleanup recovery and initial firewall generation.
+TLS control connections retain signed source identity. Gateway ICMPv6 permits neighbor discovery.
+Completed scan observations remain fresh at report admission; historical start/control times are
+bounded against scan completion. Owned cleanup inventories the same 13 resource collections through
+bounded direct Kubernetes reads, without discovery, and refuses incomplete or foreign resources.
 US admission and complete measured live acceptance remain outstanding in PLAN.md.
 
 ```mermaid

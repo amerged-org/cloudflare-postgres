@@ -38,6 +38,45 @@ import type {
 
 type Json = Record<string, unknown>;
 const obj = (value: unknown) => value as Json;
+function inventoryCollection(args: string[]) {
+  const match = args[1]!.match(
+    /^--raw=\/(api\/v1|apis\/(?:apps|batch)\/v1)\/namespaces\/([^/]+)\/([^/]+)$/,
+  );
+  assert.ok(match, "exact_inventory_collection_required");
+  const kinds: Record<string, string> = {
+    pods: "Pod",
+    persistentvolumeclaims: "PersistentVolumeClaim",
+    secrets: "Secret",
+    configmaps: "ConfigMap",
+    services: "Service",
+    serviceaccounts: "ServiceAccount",
+    replicationcontrollers: "ReplicationController",
+    deployments: "Deployment",
+    statefulsets: "StatefulSet",
+    daemonsets: "DaemonSet",
+    replicasets: "ReplicaSet",
+    jobs: "Job",
+    cronjobs: "CronJob",
+  };
+  assert.ok(kinds[match[3]!]);
+  return {
+    apiVersion: match[1] === "api/v1" ? "v1" : match[1]!.slice(5),
+    kind: kinds[match[3]!]! + "List",
+    namespace: match[2]!,
+  };
+}
+function inventoryOutput(args: string[], items: unknown[], padding?: string) {
+  const { apiVersion, kind } = inventoryCollection(args);
+  return {
+    exit_code: 0,
+    stdout: JSON.stringify({
+      apiVersion,
+      kind,
+      items,
+      ...(padding === undefined ? {} : { padding }),
+    }),
+  };
+}
 function assertSafeRescueScripts(script: string) {
   assert.ok(
     !/(?:^|[\s;&|()])(?:apt(?:-get)?|mkfs(?:\.[A-Za-z0-9_-]+)?|reboot)(?=$|[\s;&|()])|of=\/dev\//m.test(
@@ -247,23 +286,22 @@ function fixture() {
             }),
           };
         }
-        if (args[1]!.includes(",")) {
+        if (args[1]!.startsWith("--raw=")) {
           if (firstNamespaceInventoryFailure) {
             const onFailure = firstNamespaceInventoryFailure;
             firstNamespaceInventoryFailure = undefined;
             onFailure();
             return { exit_code: 1, stdout: "" };
           }
-          return {
-            exit_code: 0,
-            stdout: JSON.stringify({
-              apiVersion: "v1",
-              kind: "List",
-              items: [...objects.values()].filter(
-                (value) => obj(value.metadata).namespace === args[3],
-              ),
-            }),
-          };
+          const collection = inventoryCollection(args);
+          return inventoryOutput(
+            args,
+            [...objects.values()].filter(
+              (value) =>
+                obj(value.metadata).namespace === collection.namespace &&
+                value.kind === collection.kind.slice(0, -4),
+            ),
+          );
         }
         if (args[1] === "node")
           return { exit_code: 0, stdout: JSON.stringify(node) };
@@ -961,7 +999,7 @@ test("expired cleanup identifies its namespace inventory command deadline withou
   const commands: ProofSourceCommands = {
     ...f.commands,
     kube: async (args, permit, stdin, options) => {
-      if (args[0] === "get" && args[1]!.includes(",")) {
+      if (args[0] === "get" && args[1]!.startsWith("--raw=")) {
         assert.equal(options!.timeout_ms, 30_000);
         boundedTimers
           .find((timer) => timer.signal === options!.signal)!
@@ -1016,7 +1054,7 @@ test("expired cleanup identifies a reduced aggregate deadline in its namespace i
   const commands: ProofSourceCommands = {
     ...f.commands,
     kube: async (args, permit, stdin, options) => {
-      if (args[0] === "get" && args[1]!.includes(",")) {
+      if (args[0] === "get" && args[1]!.startsWith("--raw=")) {
         assert.ok(options!.timeout_ms > 0 && options!.timeout_ms < 30_000);
         boundedTimers
           .find((timer) => timer.signal === options!.signal)!
@@ -1061,7 +1099,7 @@ test("a new external abort takes precedence over a concurrent cleanup command de
   const commands: ProofSourceCommands = {
     ...f.commands,
     kube: async (args, permit, stdin, options) => {
-      if (args[0] === "get" && args[1]!.includes(",")) {
+      if (args[0] === "get" && args[1]!.startsWith("--raw=")) {
         assert.equal(options!.timeout_ms, 30_000);
         f.abort.abort(new DOMException("new external abort", "AbortError"));
         boundedTimers
@@ -1177,16 +1215,24 @@ test("expired cleanup retains aggregate and individual bounds with coalesced ide
   );
   assert.equal(grants, 0);
   assert.equal(f.objects.size, 2);
-  await cleanupOwnedProofSource(
-    f.source,
-    original,
-    commands,
-    new Date(base + 120_000).toISOString(),
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(base + 120_000).toISOString(),
+    ),
+    /proof_source_deadline/,
   );
-  assert.equal(f.state()!.stage, "cleaned");
+  assert.equal(f.state()!.stage, "cleanup");
   assert.equal(f.state()!.namespace_uid, ownership.namespace_uid);
-  assert.equal(f.objects.size, 0);
-  assert.ok(elapsed < 120_000);
+  assert.ok(f.objects.has(`namespace/${ownership.namespace_name}`));
+  assert.equal(
+    f.mutations.some((args) =>
+      args.includes(`--raw=/api/v1/namespaces/${ownership.namespace_name}`),
+    ),
+    false,
+  );
   t.diagnostic(
     JSON.stringify({
       cleanup_model_elapsed_ms: elapsed,
@@ -1195,10 +1241,9 @@ test("expired cleanup retains aggregate and individual bounds with coalesced ide
   );
 });
 
-test("coalesced source identities settle paired inventory within the measured slow-grant cleanup budget", async (t) => {
+test("coalesced source identities settle raw collection inventory within the measured current-grant cleanup budget", async (t) => {
   const { f, original } = await expiredCleanupFixture(),
     base = Date.now(),
-    boundedTimers: AbortController[] = [],
     pending: { at: number; resolve: () => void }[] = [],
     inventory: string[] = [],
     identities: string[][] = [];
@@ -1227,11 +1272,7 @@ test("coalesced source identities settle paired inventory within the measured sl
     });
   t.mock.method(Date, "now", () => base + elapsed);
   t.mock.method(performance, "now", () => elapsed);
-  t.mock.method(AbortSignal, "timeout", () => {
-    const timer = new AbortController();
-    boundedTimers.push(timer);
-    return timer.signal;
-  });
+  t.mock.method(AbortSignal, "timeout", () => new AbortController().signal);
   t.mock.method(
     AbortSignal,
     "any",
@@ -1240,7 +1281,7 @@ test("coalesced source identities settle paired inventory within the measured sl
   const commands: ProofSourceCommands = {
     ...f.commands,
     authorizeSource: async () => {
-      await latency(4143);
+      await latency(1833);
       await f.commands.authorizeSource();
     },
     readOwnership: async () => {
@@ -1253,7 +1294,7 @@ test("coalesced source identities settle paired inventory within the measured sl
     },
     kube: async (args, permit, stdin, options) => {
       assert.ok(options!.timeout_ms > 0 && options!.timeout_ms <= 30_000);
-      const isInventory = args[0] === "get" && args[1]!.includes(",");
+      const isInventory = args[0] === "get" && args[1]!.startsWith("--raw=");
       if (
         args[0] === "get" &&
         (args[1] === "namespace/kube-system" ||
@@ -1263,22 +1304,11 @@ test("coalesced source identities settle paired inventory within the measured sl
         identities.push(args);
       if (isInventory) {
         inventory.push(args[1]!);
-        if (args[1]!.split(",").length > 4) {
-          // Reproduce the observed combined command reaching its own bound.
-          // The measured grant costs below do not claim a connection per kind.
-          await latency(options!.timeout_ms);
-          boundedTimers
-            .find((timer) => timer.signal === options!.signal)!
-            .abort(
-              new DOMException("combined inventory deadline", "TimeoutError"),
-            );
-          throw new BootstrapError("job_cancelled");
-        }
         active++;
         maximumActive = Math.max(maximumActive, active);
       }
       try {
-        await latency(4143);
+        await latency(1833);
         return await f.commands.kube!(args, permit, stdin, options);
       } finally {
         if (isInventory) active--;
@@ -1293,16 +1323,10 @@ test("coalesced source identities settle paired inventory within the measured sl
   );
   assert.equal(f.state()!.stage, "cleaned");
   assert.equal(f.objects.size, 0);
-  assert.equal(maximumActive, 2);
+  assert.equal(maximumActive, 4);
   assert.equal(active, 0);
-  assert.deepEqual(
-    inventory.map((value) => value.split(",").length).sort(),
-    [3, 3, 3, 4],
-  );
-  assert.equal(
-    new Set(inventory.flatMap((value) => value.split(","))).size,
-    13,
-  );
+  assert.equal(inventory.length, 13);
+  assert.equal(new Set(inventory).size, 13);
   assert.equal(identities.length, 3);
   for (const args of identities)
     assert.deepEqual(args, [
@@ -1385,34 +1409,81 @@ test("cleanup refreshes the exact source Node UID before deleting its namespace"
   assert.equal(f.mutations.length, 1);
 });
 
-test("a foreign child in the final inventory batch preserves the namespace", async () => {
+test("cleanup inventories every standard collection without Kubernetes discovery", async () => {
   const { f, original, ownership } = await expiredCleanupFixture(),
-    inventory: string[] = [];
+    paths: string[] = [];
   const commands: ProofSourceCommands = {
     ...f.commands,
     kube: async (args, permit, stdin, options) => {
-      if (args[0] === "get" && args[1]!.includes(",")) {
-        inventory.push(args[1]!);
-        if (args[1] === "replicasets.apps,jobs.batch,cronjobs.batch")
-          return {
-            exit_code: 0,
-            stdout: JSON.stringify({
-              apiVersion: "v1",
-              kind: "List",
-              items: [
-                {
-                  apiVersion: "batch/v1",
-                  kind: "Job",
-                  metadata: {
-                    name: "foreign",
-                    namespace: ownership.namespace_name,
-                    uid: randomUUID(),
-                    resourceVersion: "1",
-                  },
-                },
-              ],
-            }),
-          };
+      if (args[0] === "get" && args[1]!.includes(","))
+        throw new Error("discovery_read_forbidden");
+      if (args[0] === "get" && args[1]!.startsWith("--raw=")) {
+        paths.push(args[1]!.slice(6));
+      }
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await cleanupOwnedProofSource(
+    f.source,
+    original,
+    commands,
+    new Date(Date.now() + 120_000).toISOString(),
+  );
+  assert.equal(paths.length, 13);
+  assert.equal(new Set(paths).size, 13);
+  assert.ok(
+    paths.every((value) =>
+      value.includes(`/namespaces/${ownership.namespace_name}/`),
+    ),
+  );
+  assert.equal(f.state()!.stage, "cleaned");
+  assert.equal(f.objects.size, 0);
+});
+
+test("a typed collection cannot disguise an allowed system child of another kind", async () => {
+  const { f, original, ownership } = await expiredCleanupFixture();
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && args[1]!.endsWith("/secrets"))
+        return inventoryOutput(args, [
+          {
+            apiVersion: "v1",
+            kind: "ServiceAccount",
+            metadata: {
+              name: "default",
+              namespace: ownership.namespace_name,
+              uid: randomUUID(),
+              resourceVersion: "1",
+            },
+          },
+        ]);
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 120_000).toISOString(),
+    ),
+    /proof_source_namespace_children_unknown/,
+  );
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.ok(f.objects.has(`namespace/${ownership.namespace_name}`));
+});
+
+test("a continued collection cannot authorize namespace deletion from a partial inventory", async () => {
+  const { f, original, ownership } = await expiredCleanupFixture();
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && args[1]!.endsWith("/secrets")) {
+        const result = inventoryOutput(args, []),
+          value = obj(JSON.parse(result.stdout));
+        value.metadata = { continue: "next-page" };
+        return { ...result, stdout: JSON.stringify(value) };
       }
       return f.commands.kube!(args, permit, stdin, options);
     },
@@ -1426,7 +1497,45 @@ test("a foreign child in the final inventory batch preserves the namespace", asy
     ),
     /proof_source_namespace_children_unknown/,
   );
-  assert.equal(inventory.length, 4);
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.ok(f.objects.has(`namespace/${ownership.namespace_name}`));
+});
+
+test("a foreign child in the final inventory batch preserves the namespace", async () => {
+  const { f, original, ownership } = await expiredCleanupFixture(),
+    inventory: string[] = [];
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && args[1]!.startsWith("--raw=")) {
+        inventory.push(args[1]!);
+        if (args[1]!.endsWith("/cronjobs"))
+          return inventoryOutput(args, [
+            {
+              apiVersion: "batch/v1",
+              kind: "CronJob",
+              metadata: {
+                name: "foreign",
+                namespace: ownership.namespace_name,
+                uid: randomUUID(),
+                resourceVersion: "1",
+              },
+            },
+          ]);
+      }
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 120_000).toISOString(),
+    ),
+    /proof_source_namespace_children_unknown/,
+  );
+  assert.equal(inventory.length, 13);
   assert.equal(f.state()!.stage, "cleanup");
   assert.equal(f.objects.size, 1);
 });
@@ -1437,9 +1546,9 @@ test("a failed inventory batch waits for its started sibling before refusing nam
   const commands: ProofSourceCommands = {
     ...f.commands,
     kube: async (args, permit, stdin, options) => {
-      if (args[1] === "deployments.apps,statefulsets.apps,daemonsets.apps")
+      if (args[1]!.endsWith("/deployments"))
         throw new Error("inventory_read_unavailable");
-      if (args[1] === "replicasets.apps,jobs.batch,cronjobs.batch") {
+      if (args[1]!.endsWith("/serviceaccounts")) {
         await new Promise<void>((resolve) => setImmediate(resolve));
         siblingSettled = true;
       }
@@ -1465,16 +1574,8 @@ test("inventory batches share the original total output budget", async () => {
   const commands: ProofSourceCommands = {
     ...f.commands,
     kube: async (args, permit, stdin, options) => {
-      if (args[0] === "get" && args[1]!.includes(","))
-        return {
-          exit_code: 0,
-          stdout: JSON.stringify({
-            apiVersion: "v1",
-            kind: "List",
-            items: [],
-            padding: "x".repeat(70_000),
-          }),
-        };
+      if (args[0] === "get" && args[1]!.startsWith("--raw="))
+        return inventoryOutput(args, [], "x".repeat(70_000));
       return f.commands.kube!(args, permit, stdin, options);
     },
   };

@@ -270,17 +270,41 @@ function commands(mode: "preparation" | "postjoin" = "preparation") {
               direction === "source" ? sourceNode : targetNode,
             ),
           };
-        if (args[1]!.includes(","))
+        if (args[1]!.startsWith("--raw=")) {
+          const match = args[1]!.match(
+            /^--raw=\/(api\/v1|apis\/(?:apps|batch)\/v1)\/namespaces\/([^/]+)\/([^/]+)$/,
+          );
+          assert.ok(match, "exact_inventory_collection_required");
+          const kinds: Record<string, string> = {
+              pods: "Pod",
+              persistentvolumeclaims: "PersistentVolumeClaim",
+              secrets: "Secret",
+              configmaps: "ConfigMap",
+              services: "Service",
+              serviceaccounts: "ServiceAccount",
+              replicationcontrollers: "ReplicationController",
+              deployments: "Deployment",
+              statefulsets: "StatefulSet",
+              daemonsets: "DaemonSet",
+              replicasets: "ReplicaSet",
+              jobs: "Job",
+              cronjobs: "CronJob",
+            },
+            kind = kinds[match[3]!]!;
+          assert.ok(kind);
           return {
             exit_code: 0,
             stdout: JSON.stringify({
-              apiVersion: "v1",
-              kind: "List",
+              apiVersion: match[1] === "api/v1" ? "v1" : match[1]!.slice(5),
+              kind: kind + "List",
               items: [...objects.values()].filter(
-                (value) => obj(value.metadata).namespace === ns,
+                (value) =>
+                  obj(value.metadata).namespace === match[2] &&
+                  value.kind === kind,
               ),
             }),
           };
+        }
         const value = objects.get(key(args[1]!, args[2]!));
         return { exit_code: 0, stdout: value ? JSON.stringify(value) : "" };
       }

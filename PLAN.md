@@ -135,6 +135,45 @@ The integrated repair passes41 Native source-runner cases and21 real-D1 network 
 scoped lint and formatting. Existing legacy plans remain byte-exact and eligible; newly generated
 gateway policies still reject a later provider-gateway change through the existing plan-hash gate.
 
+Source `2c94ff59`, full CI `37618015121`, is delivered once with qualified Native manifest
+`sha256:6983849487f21c9a56c7f7664f6077468c17d85a447682d3310a650affbee1e6`.
+All 18 layers/714,977,367 qualification bytes passed; complete private readback verified
+162,118,476 compressed and 502,860,288 raw bytes. The completed rollout and actual application,
+deployment and placement version 21 match this image, with placement health Running. The
+container was initially stopped and aggregate active count remained zero; normal Workflow
+execution starts the process. Protected EU data/custody, the source IPv6 repair, gateway firewall
+rule and the whole original created US job were unchanged. The same Workflow resumed once at
+12:26:07Z. Its completed 30-minute capture contains 996 owned ownership/transport frames and
+zero provider wire events. Additional retained owned routes show two access HTTP200 responses
+and two report HTTP409 responses at 12:33:04.871Z and 12:38:22.151Z, taking 644 and 689 ms.
+All 59 ownership and 937 transport responses were HTTP200 in that capture. Native's generic
+`node_proof_authority_refused` is emitted by a failed internal POST; these captured conflicts
+occurred at report submission, rather than a failed fresh transport authorization. The later
+terminal at 13:04:16.610Z used that same generic code, 315.419 seconds after issuance with
+224.581 seconds remaining and all 46 source journals cleaned; it falls outside the retained
+Tail window, so its exact POST route is not established. The Workflow is now paused at step
+1052, with the original installer still created/revision 0 and zero downloaded/written bytes.
+Report validation diagnosis and full US live acceptance remain pending.
+
+A real-D1 regression reproduces rejection of a Native-valid 80-second scan followed by 60 seconds
+of cleanup: its completion is fresh but its historical start has aged beyond the report's
+120-second check. Historical start/initial-control checks now use scan completion, retaining
+120-second completed-observation/access/final-control freshness, exact timestamps and all
+current authority/binding/nonce/source gates. Stale completion and excessive scan intervals still
+reject before firewall or R2 writes; 14 artifact cases pass. Source-only control-to-report gaps
+of 175.371 and 169.255 seconds also demonstrate a separate cleanup timing problem, without
+establishing exact receipt timestamps. The affected intervals contain 95/94 successful transport
+requests; transport wall time has a measured median of 1,833ms across the retained capture.
+A no-discovery cleanup regression first failed against the former grouped kubectl reads. The
+repair reads the same 13 explicit standard REST collections with four concurrent reads per
+family, strict typed Lists/items and complete-list metadata, preserving the 256KiB total,
+30-second command and expired-cleanup aggregate bounds. Foreign children, changed identities,
+partial inventories and unknown outcomes still block namespace deletion. Source/runner checks
+and the two new typed/partial inventory guards pass; slower grant models still refuse at the
+existing deadline with namespace ownership retained. These software checks do not establish a
+live cleanup duration or US readiness. One combined CI and qualified changed-image delivery
+precede the next controlled continuation of the original US operation.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider
@@ -1413,6 +1452,36 @@ Build:
 
 Acceptance: a fresh Cloudflare account and a fresh VPS reach Phase 1 acceptance by following only
 the docs.
+
+### Future node releases and patch management — owner requirement (2026-10-07)
+
+Planned after the current operator live acceptance: provisioning and ongoing upgrades must be
+one deterministic, programmed lifecycle controlled by Cloudflare, with no AI agent required.
+Bootstrap-image publication alone does not establish acceptance of VPS upgrades.
+
+- Maintain one approved, immutable release manifest with pinned versions/digests for Talos,
+  Kubernetes, platform services, PostgreSQL, backup components and configuration templates.
+  Distinguish the Cloudflare bootstrap executable image from the Talos VPS operating-system image.
+- Store desired release, observed versions/configuration hashes and rollout progress per node in
+  Cloudflare. EU1 and US1 converge to the same approved customer-node release; the control/relay
+  role follows the same release manifest with its role-specific components. Region, role, network
+  and secrets remain explicit parameters, rather than undocumented server-specific changes.
+- New VPS receive the current approved image and complete declarative desired state directly.
+  Later configuration changes are incorporated into that desired state; do not replay an informal
+  history of manual edits. Required schema/data migrations remain explicit, versioned steps.
+- Upgrade existing nodes through supported Talos, Kubernetes and service upgrade mechanisms,
+  preserving data volumes and database identities. Updating the bootstrap image does not reimage
+  existing EU1/US1. Security patches require a qualified release and controlled rollout.
+- Reconcile drift and apply updates through programmed controllers/workflows with persisted
+  checkpoints, identity checks and safe interruption/resumption. Update nodes in a controlled
+  order with capacity, backup and health checks; uncertain writes are resolved through readback.
+  Temporary version skew is visible and bounded by the rollout, never an undocumented final state.
+
+Acceptance: add a fresh node directly on the approved release, then upgrade existing EU1 and US1
+to a subsequent release without data loss. Verify actual versions/configuration hashes, roles/TLS,
+SQL, R2 backup/WAL and recovery; interrupt and resume an upgrade without unsafe replay. Record
+convergence time, patch levels, any temporary skew and the verified recovery path in Status.
+This lifecycle remains planned until these real Dev checks pass.
 
 ### Rust runtime and fast compute lifecycle — approved architecture (2026-10-05)
 

@@ -121,6 +121,15 @@ The HTTPS control path may reconnect after a normal server close. Every connecti
 authorization, port443, exact local/control address, a fresh signed nonce/origin and the same
 observed public source. Physical socket-object continuity is not an installation identity.
 
+At report admission, completed scan/access observations and the final control remain bounded to
+120 seconds. Historical scan starts and initial controls are bounded against scan completion,
+matching Native validation; owned cleanup never rewrites their timestamps. Inventory reads use
+the 13 explicit standard namespaced Kubernetes REST collections, with at most four concurrent
+reads per family, the existing 30-second command bounds and a shared 256KiB output limit. Verify
+each typed List and item, and refuse nonempty continuation or remaining-item metadata. Unknown,
+partial or foreign children preserve the namespace; Node/Cluster checks and UID/resourceVersion
+deletion preconditions remain. Observe actual cleanup/report timing before claiming readiness.
+
 Include ICMP from the actual assigned IPv6 gateway/128 with no destination ports or IPv4 scope
 in an initial provider-firewall plan, alongside its restricted TCP/UDP rules and permanent DROP.
 This permits gateway neighbor discovery; it does not claim arbitrary-path PMTU acceptance.

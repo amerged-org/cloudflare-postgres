@@ -892,54 +892,77 @@ class SourceRunner {
     return fail("pod_failed");
   }
   private async namespaceChildren() {
-    const batches = [
-        "pods,persistentvolumeclaims,secrets,configmaps",
-        "services,serviceaccounts,replicationcontrollers",
-        "deployments.apps,statefulsets.apps,daemonsets.apps",
-        "replicasets.apps,jobs.batch,cronjobs.batch",
-      ],
-      results: CommandResult[] = [];
+    const collections = [
+        ["v1", "pods", "PodList"],
+        ["v1", "persistentvolumeclaims", "PersistentVolumeClaimList"],
+        ["v1", "secrets", "SecretList"],
+        ["v1", "configmaps", "ConfigMapList"],
+        ["v1", "services", "ServiceList"],
+        ["v1", "serviceaccounts", "ServiceAccountList"],
+        ["v1", "replicationcontrollers", "ReplicationControllerList"],
+        ["apps/v1", "deployments", "DeploymentList"],
+        ["apps/v1", "statefulsets", "StatefulSetList"],
+        ["apps/v1", "daemonsets", "DaemonSetList"],
+        ["apps/v1", "replicasets", "ReplicaSetList"],
+        ["batch/v1", "jobs", "JobList"],
+        ["batch/v1", "cronjobs", "CronJobList"],
+      ] as const,
+      results: { result: CommandResult; apiVersion: string; kind: string }[] =
+        [];
     let bytes = 0;
-    for (let index = 0; index < batches.length; index += 2) {
+    // Explicit REST collections avoid kubectl's unrelated discovery requests.
+    // Bound concurrency across both families and settle every started read.
+    for (let index = 0; index < collections.length; index += 4) {
       const settled = await Promise.allSettled(
-        batches
-          .slice(index, index + 2)
-          .map((resources) =>
-            this.kube(
+        collections
+          .slice(index, index + 4)
+          .map(async ([apiVersion, resource, kind]) => {
+            const prefix =
+              apiVersion === "v1" ? "/api/v1" : `/apis/${apiVersion}`;
+            const result = await this.kube(
               [
                 "get",
-                resources,
-                "--namespace",
-                this.state.namespace_name!,
-                "--output=json",
+                `--raw=${prefix}/namespaces/${this.state.namespace_name!}/${resource}`,
               ],
               undefined,
               true,
               "namespace_inventory",
-            ),
-          ),
+            );
+            return { result, apiVersion, kind };
+          }),
       );
       const failed = settled.find((result) => result.status === "rejected");
       if (failed?.status === "rejected") throw failed.reason;
       for (const result of settled) {
         if (result.status !== "fulfilled")
           return fail("namespace_children_unknown");
-        bytes += Buffer.byteLength(result.value.stdout);
+        bytes += Buffer.byteLength(result.value.result.stdout);
         if (bytes > 256 * 1024) return fail("output_limit");
         results.push(result.value);
       }
     }
     const items: unknown[] = [];
-    for (const result of results) {
+    for (const { result, apiVersion, kind } of results) {
       if (result.exit_code !== 0) return fail("namespace_children_unknown");
       const list = object(JSON.parse(result.stdout));
       if (
-        list.apiVersion !== "v1" ||
-        list.kind !== "List" ||
+        list.apiVersion !== apiVersion ||
+        list.kind !== kind ||
         !Array.isArray(list.items)
       )
         return fail("namespace_children_unknown");
-      items.push(...list.items);
+      const meta = list.metadata === undefined ? {} : object(list.metadata);
+      if (
+        (meta.continue !== undefined && meta.continue !== "") ||
+        (meta.remainingItemCount !== undefined && meta.remainingItemCount !== 0)
+      )
+        return fail("namespace_children_unknown");
+      for (const raw of list.items) {
+        const item = object(raw);
+        if (item.apiVersion !== apiVersion || item.kind !== kind.slice(0, -4))
+          return fail("namespace_children_unknown");
+        items.push(item);
+      }
     }
     for (const raw of items) {
       const value = object(raw),

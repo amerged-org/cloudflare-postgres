@@ -258,7 +258,13 @@ async function validateMeasurements(
         scan.before.nonce === scan.after.nonce
       )
         return deny();
-      fresh(scan.started_at, report.binding.readback_at, now);
+      // Historical scan boundaries age with the completed scan, not with the
+      // later report after owned cleanup. Completion remains fresh at admission.
+      fresh(
+        scan.started_at,
+        report.binding.readback_at,
+        Date.parse(scan.observed_at),
+      );
       fresh(scan.observed_at, scan.started_at, now);
       for (const control of [scan.before, scan.after]) {
         if (
@@ -270,7 +276,11 @@ async function validateMeasurements(
         )
           return deny();
         nonces.add(control.nonce);
-        fresh(control.observed_at, report.binding.readback_at, now);
+        fresh(
+          control.observed_at,
+          report.binding.readback_at,
+          control === scan.before ? Date.parse(scan.observed_at) : now,
+        );
       }
     }
   }

@@ -240,6 +240,71 @@ it("rejects an unauthorized report before any R2 write or firewall gate", async 
   expect(f.verify.mock.calls.length).toBe(0);
 });
 
+it("accepts a completed fresh scan after cleanup when its historical start remains inside the same session", async () => {
+  const f = await fixture(),
+    now = Date.now();
+  const session = await issueNodeProofSession(
+    f.bindings,
+    f.addition.intent.operation_id,
+    "preparation",
+    now - 200_000,
+  );
+  const report = structuredClone(f.report);
+  const measurement = report.measurements.find(
+    (value) => value.kind === "scan",
+  )!;
+  if (measurement.kind !== "scan") throw new Error("fixture_scan_missing");
+  const scan = measurement.scans[0]!;
+  scan.before.observed_at = new Date(now - 142_000).toISOString();
+  scan.started_at = new Date(now - 140_000).toISOString();
+  scan.observed_at = scan.after.observed_at = new Date(
+    now - 60_000,
+  ).toISOString();
+  measurement.observed_at = scan.observed_at;
+  const result = await acceptNodeProofReport(
+    f.bindings,
+    session.bearer,
+    report,
+  );
+  expect(result.verified).toBe(true);
+  expect(f.firewall).toHaveBeenCalledTimes(1);
+  const stored = await env.ARCHIVE.get(f.alias);
+  const document = JSON.parse(await stored!.text());
+  expect(await trusted(f, document)).toBe(true);
+  expect(document.payload.external.ipv4.scans[0].started_at).toBe(
+    scan.started_at,
+  );
+  expect(document.payload.external.ipv4.scans[0].observed_at).toBe(
+    scan.observed_at,
+  );
+});
+
+it("still rejects stale completion and an excessive scan interval before any firewall or archive write", async () => {
+  const f = await fixture(),
+    now = Date.now(),
+    report = structuredClone(f.report),
+    measurement = report.measurements.find((value) => value.kind === "scan")!;
+  if (measurement.kind !== "scan") throw new Error("fixture_scan_missing");
+  const scan = measurement.scans[0]!;
+  measurement.observed_at = new Date(now - 130_000).toISOString();
+  scan.observed_at = scan.after.observed_at = measurement.observed_at;
+  await expect(
+    acceptNodeProofReport(f.bindings, f.session.bearer, report),
+  ).rejects.toMatchObject({ code: "conflict" });
+  measurement.observed_at = f.report.measurements[1]!.observed_at;
+  scan.observed_at = scan.after.observed_at = new Date(
+    now - 1_000,
+  ).toISOString();
+  scan.started_at = new Date(now - 122_000).toISOString();
+  scan.before.observed_at = new Date(now - 124_000).toISOString();
+  await expect(
+    acceptNodeProofReport(f.bindings, f.session.bearer, report),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(f.firewall).not.toHaveBeenCalled();
+  expect(f.verify).not.toHaveBeenCalled();
+  expect(await env.ARCHIVE.get(f.alias)).toBeNull();
+});
+
 it("renews preparation authority from confirmed Cloudflare readback without polling provider firewalls", async () => {
   const f = await fixture(),
     prove = vi.fn(async () => ({ status: "running" }));
