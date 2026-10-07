@@ -64,10 +64,26 @@ EU data/custody, US profile and whole created-job ciphertext; actual running ima
 placement/version were independently verified. One controlled resume reached real source Pods,
 both Ready with the qualified regional image and zero restarts. A scanner then reported
 `outside_scan_control_invalid`; its control rejects bearers longer than256 characters, while
-the authoritative signed `np1` session contract and issuer permit4096. This producer/consumer
-mismatch remains under correction. The native proof ended at its deadline, and the same
-Workflow is paused again at the unchanged created-job checkpoint before any installation disk
-write. Never reset or replace its job, sealed input, source journals or custody.
+the authoritative signed `np1` session contract and issuer permit4096. Source `cc072011` fixes that producer/consumer
+mismatch by sharing the existing exact `np1`/4096 schema; legacy bearers retain256 and every
+other control guard remains. Both real-signed946-character regressions reproduced the rejection;
+156 native,237 harness and151 contract tests, types, lint, formatting and independent review
+passed. Full CI `37548806187` passed. Local qualification covered714,947,157 bytes and18 layers
+with zero unresolved findings; complete private-registry readback verified162,113,966 compressed
+and502,830,080 raw bytes. The new native manifest is
+`sha256:4651403b9d4aac87bf272a2cd3040b91d7b41904691c777426a8effef62e8aaa`.
+One publication/completed rollout preserved configuration except its URI, all EU/US custody and
+the whole created job; actual running placement/version/image were independently verified.
+Fresh attempts still reached no new source scanner. A bounded private Worker Tail confirmed
+successful ownership/transport callbacks: ownership wall-time median383ms, transport median
+3,681.5ms across9/18 requests, all HTTP200 in that sample. Both old exact source namespaces
+remained Active without deletion timestamps. A real cleanup-path virtual-clock regression using
+those measured3.7-second authorization/CONNECT and380ms ownership costs reproduced the30-second
+aggregate cleanup exhaustion before any deletion; a120-second deadline is currently rejected
+by its constructor. A narrow aggregate expired-cleanup budget correction is in progress, retaining
+30-second individual commands,540-second session expiry and all ownership/UID/resource-version/
+foreign-child checks. The same Workflow is paused at the unchanged created-job checkpoint before
+any installation disk write. Never reset or replace its job, sealed input, source journals or custody.
 The retained EU control node's UID-guarded new-database placement flag is now
 false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.
 Actual-RAM mode and automatic purchases remain disabled pending accepted US/recovery tests,

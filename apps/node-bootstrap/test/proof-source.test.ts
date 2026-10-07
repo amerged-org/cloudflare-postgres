@@ -560,6 +560,116 @@ test("an expired interrupted journal permits only fresh exact cleanup and cannot
   );
 });
 
+test("expired cleanup has an aggregate budget for measured grant latency while every command remains bounded to thirty seconds", async (t) => {
+  const f = fixture(),
+    assets = await readProofSourceAssets(false),
+    original = structuredClone(f.input),
+    invocation = randomUUID(),
+    base = Date.now();
+  original.deadline_at = new Date(base - 60_000).toISOString();
+  const ownership: ProofSourceOwnership = {
+    version: 1,
+    source_sha256: hash(f.source),
+    input_sha256: hash(original),
+    invocation_id: invocation,
+    kind: "pod",
+    stage: "running",
+    scratch_directory: null,
+    mount_source: null,
+    namespace_name: `pgcf-proof-${hash({ input: hash(original), source: hash(f.source), invocation }).slice(0, 32)}`,
+    namespace_uid: randomUUID(),
+    pod_uid: randomUUID(),
+    node_sha256: null,
+    node_bytes: null,
+    node_received_bytes: 0,
+    cli_sha256: assets.cli_sha256,
+    cli_bytes: assets.cli_bytes,
+    receipt_sha256: null,
+  };
+  await f.commands.saveOwnership!(ownership);
+  for (const value of proofSourcePodObjects(f.source, ownership, assets, 120)) {
+    const m = obj(value.metadata);
+    m.uid = value.kind === "Pod" ? ownership.pod_uid : ownership.namespace_uid;
+    m.resourceVersion = "1";
+    f.objects.set(`${String(value.kind).toLowerCase()}/${m.name}`, value);
+  }
+  let elapsed = 0,
+    grants = 0;
+  t.mock.method(Date, "now", () => base + elapsed);
+  t.mock.method(performance, "now", () => elapsed);
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    authorizeSource: async () => {
+      elapsed += 3700;
+      grants++;
+      await f.commands.authorizeSource();
+    },
+    readOwnership: async () => {
+      elapsed += 380;
+      return f.commands.readOwnership!();
+    },
+    saveOwnership: async (state) => {
+      elapsed += 380;
+      await f.commands.saveOwnership!(state);
+    },
+    kube: async (args, permit, stdin, options) => {
+      assert.ok(
+        options && options.timeout_ms > 0 && options.timeout_ms <= 30_000,
+      );
+      assert.equal(["create", "exec", "logs"].includes(args[0]!), false);
+      // Each real kubectl process opens its own proxy CONNECT, requiring the
+      // second grant measured in the successful live callback trace.
+      elapsed += 3700;
+      grants++;
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(base + 30_000).toISOString(),
+    ),
+    /proof_source_deadline/,
+  );
+  assert.equal(f.mutations.length, 0);
+  assert.equal(f.objects.size, 2);
+  assert.equal(f.state()!.stage, "cleanup");
+  elapsed = 0;
+  grants = 0;
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(base + 120_001).toISOString(),
+    ),
+    /proof_source_deadline_invalid/,
+  );
+  assert.equal(grants, 0);
+  assert.equal(f.objects.size, 2);
+  await cleanupOwnedProofSource(
+    f.source,
+    original,
+    commands,
+    new Date(base + 120_000).toISOString(),
+  );
+  assert.equal(f.state()!.stage, "cleaned");
+  assert.equal(f.objects.size, 0);
+  assert.deepEqual(
+    f.mutations.map((args) => args[0]),
+    ["delete", "delete"],
+  );
+  assert.ok(grants >= 20 && elapsed > 30_000 && elapsed < 120_000);
+  t.diagnostic(
+    JSON.stringify({
+      cleanup_model_elapsed_ms: elapsed,
+      successful_grants: grants,
+    }),
+  );
+});
+
 test("Pod source never receives host paths, API tokens or a global signing key", async () => {
   const f = fixture(),
     assets = await readProofSourceAssets(false),

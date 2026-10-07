@@ -99,6 +99,7 @@ const CHUNK = 4 * 1024 ** 2,
 const UID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i,
   HASH = /^[a-f0-9]{64}$/;
 const stages = ["intent", "ready", "running", "measured", "cleanup", "cleaned"];
+export const EXPIRED_SOURCE_CLEANUP_MAX_MS = 120_000;
 const fail = (code: string): never => {
   throw new BootstrapError(`proof_source_${code}`);
 };
@@ -561,7 +562,10 @@ class SourceRunner {
     const remaining =
       Date.parse(Timestamp.parse(cleanupDeadline ?? input.deadline_at)) -
       Date.now();
-    if (remaining <= 0 || remaining > (cleanupDeadline ? 30_000 : 600_000))
+    if (
+      remaining <= 0 ||
+      remaining > (cleanupDeadline ? EXPIRED_SOURCE_CLEANUP_MAX_MS : 600_000)
+    )
       throw new BootstrapError("proof_source_deadline_invalid");
     this.end = performance.now() + remaining;
   }

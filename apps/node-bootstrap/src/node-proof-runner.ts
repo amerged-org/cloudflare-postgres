@@ -38,6 +38,7 @@ import {
 import { inspectionResponseBody } from "./inspection-proxy-command.ts";
 import {
   cleanupOwnedProofSource,
+  EXPIRED_SOURCE_CLEANUP_MAX_MS,
   runOwnedOutsideScan,
   type ProofSourceDescriptor,
   type ProofSourceOwnership,
@@ -596,7 +597,8 @@ class ProofRunner {
           source,
         ),
         cleanupAt = new Date(
-          Date.now() + Math.min(30_000, this.remaining() - 1),
+          Date.now() +
+            Math.min(EXPIRED_SOURCE_CLEANUP_MAX_MS, this.remaining() - 1),
         ).toISOString();
       await cleanupOwnedProofSource(
         source,
