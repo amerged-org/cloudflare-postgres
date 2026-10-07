@@ -8,6 +8,7 @@ import {
   NodeProofMode,
   NodeProofStatus,
   NodeProofJournalStatus,
+  NodeProofSourceStatus,
 } from "@pgcf/contracts/node-proof";
 import { ErrorBody, OperationId } from "@pgcf/contracts";
 import {
@@ -34,6 +35,65 @@ function proofBody<T>(schema: z.ZodType<T>, value: unknown): T {
   return parsed.data;
 }
 export function registerNodeProof(app: ApiApp) {
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/v1/nodes/additions/{id}/proof/source",
+      security: [{ bearerAuth: [] }],
+      tags: ["Nodes"],
+      middleware: async (c: ApiContext, next: Next) => {
+        await requireScope(c, "admin");
+        await next();
+      },
+      request: { params: z.object({ id: OperationId }) },
+      responses: {
+        200: {
+          description: "Read-only retained public proof source identity",
+          content: { "application/json": { schema: NodeProofSourceStatus } },
+        },
+        400: {
+          description: "Invalid request",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        401: {
+          description: "Invalid credentials",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        403: {
+          description:
+            "Administrator scope or current proof authority required",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        404: {
+          description: "Installation binding or retained source unavailable",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        409: {
+          description: "Retained source identity is no longer current",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        500: {
+          description: "Invalid retained source response",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+      },
+    }),
+    async (c) => {
+      await requireScope(c, "admin");
+      const id = OperationId.parse(c.req.param("id"));
+      const binding = await c.env.DB.prepare(
+        "SELECT 1 present FROM node_installation_bindings WHERE operation_id=?",
+      )
+        .bind(id)
+        .first<{ present: number }>();
+      if (!binding)
+        throw new ApiError("not_found", "Installation binding unavailable");
+      const source = await c.env.NODE_BOOTSTRAP.get(
+        c.env.NODE_BOOTSTRAP.idFromName(id),
+      ).proofSourceStatus(id);
+      return c.json(NodeProofSourceStatus.parse(source), 200);
+    },
+  );
   app.openapi(
     createRoute({
       method: "get",

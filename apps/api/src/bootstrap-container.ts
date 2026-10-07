@@ -28,6 +28,8 @@ import {
   NodeProofStatus,
   NodeProofJournalStatus,
   NodeProofJournalEntry,
+  NodeProofSourceStatus,
+  NodeProofNetworkPlan,
 } from "@pgcf/contracts/node-proof";
 import {
   prepareNodeProofInput,
@@ -36,6 +38,7 @@ import {
 } from "./domain/node-proof-execution.ts";
 import { canonicalNodeProof } from "@pgcf/contracts/node-proof";
 import { installationHash } from "./domain/node-installation.ts";
+import { assertNodeProofSourceAuthority } from "./domain/node-proof-source.ts";
 
 const nativeAdmissionCodes = new Set([
   "container_busy",
@@ -471,6 +474,115 @@ export class NodeBootstrap extends DurableObject<Env> {
       if (abort) signal.removeEventListener("abort", abort);
       void response?.body?.cancel().catch(() => {});
     }
+  }
+  /** Read the retained source through current CF authority, without issuing execution authority. */
+  async proofSourceStatus(operationId: string) {
+    OperationId.parse(operationId);
+    if (!this.ctx.id.equals(this.env.NODE_BOOTSTRAP.idFromName(operationId)))
+      throw new ApiError("forbidden", "Proof source identity differs");
+    const deny = (): never => {
+      throw new ApiError("forbidden", "Proof source authority changed");
+    };
+    const association = async () => {
+      const stored = await this.ctx.storage.get("proof_source_binding");
+      if (stored !== undefined) {
+        const parsed = NodeProofSourceBinding.safeParse(stored);
+        if (!parsed.success) return deny();
+        return parsed.data;
+      }
+      let legacy: NodeProofSourceBinding | undefined;
+      for (const mode of ["preparation", "postjoin"] as const) {
+        const session = await this.ctx.storage.get<string>(
+          `proof_current:${mode}`,
+        );
+        if (!session) continue;
+        if (!NodeProofStatus.shape.session_id.safeParse(session).success)
+          return deny();
+        const parsed = NodeProofExecutionInput.safeParse(
+          await this.ctx.storage.get(`proof_input:${session}`),
+        );
+        if (!parsed.success) return deny();
+        const input = parsed.data;
+        if (input.claims.session_id !== session || input.claims.mode !== mode)
+          return deny();
+        const candidate = proofSourceBinding(input);
+        if (
+          legacy &&
+          canonicalNodeProof(legacy) !== canonicalNodeProof(candidate)
+        )
+          return deny();
+        legacy = candidate;
+      }
+      return legacy;
+    };
+    const source = await association();
+    if (!source) throw new ApiError("not_found", "Proof source is unavailable");
+    const authority = async () => {
+      const binding = await loadNodeInstallationBinding(this.env, operationId),
+        addition = await readNodeAddition(this.env.DB, operationId),
+        job = await readBootstrapJob(this.env.DB, operationId),
+        saved = await this.env.DB.prepare(
+          "SELECT intent_hash,plan_json,plan_sha256,status,readback_at FROM node_network_preparations WHERE operation_id=?",
+        )
+          .bind(operationId)
+          .first<{
+            intent_hash: string;
+            plan_json: string;
+            plan_sha256: string;
+            status: string;
+            readback_at: string | null;
+          }>();
+      const currentAssociation = await association();
+      if (
+        !binding ||
+        !addition.slot_held ||
+        !["audited", "bootstrapping"].includes(addition.status) ||
+        !job.authorized ||
+        job.admitted ||
+        job.cancelled ||
+        !saved?.readback_at ||
+        saved.status === "blocked" ||
+        saved.intent_hash !== addition.intent_hash ||
+        source.operation_id !== operationId ||
+        source.binding_sha256 !== binding.row.binding_sha256 ||
+        source.inspection_generation !== binding.row.inspection_generation ||
+        source.plan_sha256 !== saved.plan_sha256 ||
+        source.input_hash !== job.input_hash ||
+        job.node_id !== binding.row.node_id ||
+        job.region_id !== binding.row.region_id ||
+        binding.row.node_id !== addition.intent.node_id ||
+        binding.row.region_id !== addition.intent.request.region_id ||
+        binding.row.provider_instance_id !== addition.provider_instance_id ||
+        !currentAssociation ||
+        canonicalNodeProof(currentAssociation) !== canonicalNodeProof(source)
+      )
+        return deny();
+      const plan = NodeProofNetworkPlan.parse(JSON.parse(saved.plan_json));
+      if ((await installationHash(plan)) !== saved.plan_sha256) return deny();
+      const input = await bootstrapJobInput(this.env, job);
+      if (
+        input.spec.operation_id !== operationId ||
+        input.spec.node_id !== binding.row.node_id ||
+        input.spec.region_id !== binding.row.region_id ||
+        input.spec.provider_instance_id !== binding.row.provider_instance_id
+      )
+        return deny();
+      await assertNodeProofSourceAuthority(
+        this.env,
+        operationId,
+        plan,
+        source.source,
+      );
+    };
+    await authority();
+    const result = NodeProofSourceStatus.parse({
+      ...source,
+      source: Object.fromEntries(
+        Object.entries(source.source).filter(([key]) => key !== "access"),
+      ),
+    });
+    await authority();
+    return result;
   }
   async #proofObservation(operationId: string, mode: NodeProofMode) {
     OperationId.parse(operationId);

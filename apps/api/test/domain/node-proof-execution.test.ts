@@ -6,8 +6,11 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { afterEach, expect, it, vi } from "vitest";
-import { bytesToBase64url, newNodeId } from "@pgcf/contracts";
-import { NodeProofExecutionInput } from "@pgcf/contracts/node-proof";
+import { bytesToBase64url, newNodeId, newOperationId } from "@pgcf/contracts";
+import {
+  NodeProofExecutionInput,
+  NodeProofSourceStatus,
+} from "@pgcf/contracts/node-proof";
 import { NodeJoinBundle } from "@pgcf/contracts/node-bootstrap";
 import {
   bootstrapRelayClaimsSchema,
@@ -41,6 +44,250 @@ import {
   storeRegionJoinBundle,
 } from "../../src/crypto/bootstrap-credentials.ts";
 import { storeNodeInstallationProfile } from "../../src/domain/node-installation.ts";
+import {
+  readBootstrapJob,
+  bootstrapJobInput,
+} from "../../src/domain/bootstrap-jobs.ts";
+
+async function sourceGetterFixture() {
+  const f = await fixture(),
+    selected = await sealedPodSource(f);
+  await recordNodeInstallationInspection(f.bindings, f.id, 0, {
+    ...f.inspection,
+    network_plan_sha256: f.input.binding.plan_sha256,
+  });
+  await composeConfiguredNodeBootstrap(f.bindings, f.id, {
+    provider: f.provider,
+  });
+  const job = await readBootstrapJob(env.DB, f.id);
+  const association = execution.NodeProofSourceBinding.parse({
+    operation_id: f.id,
+    binding_sha256: f.binding.row.binding_sha256,
+    inspection_generation: 1,
+    plan_sha256: f.input.binding.plan_sha256,
+    input_hash: job.input_hash,
+    source: { ...selected.input.source, ipv6: "2001:4860:4860::8844" },
+  });
+  await f.withStore(async (_instance, state) => {
+    await state.storage.put("proof_source_binding", association);
+  });
+  const sourceRPC = vi.fn(async (id: string) =>
+    f.withStore(async (instance, state) => {
+      const before = await state.storage.list(),
+        alarm = await state.storage.getAlarm();
+      Object.defineProperty(state, "container", {
+        configurable: true,
+        get: () => {
+          throw new Error("source_getter_native_forbidden");
+        },
+      });
+      try {
+        return await (
+          instance as unknown as {
+            proofSourceStatus(id: string): Promise<unknown>;
+          }
+        ).proofSourceStatus(id);
+      } finally {
+        delete (state as { container?: unknown }).container;
+        expect(await state.storage.list()).toEqual(before);
+        expect(await state.storage.getAlarm()).toEqual(alarm);
+      }
+    }),
+  );
+  const get = vi.fn(() => ({ proofSourceStatus: sourceRPC }));
+  const bindings = {
+    ...f.bindings,
+    NODE_BOOTSTRAP: {
+      idFromName: (id: string) => env.NODE_BOOTSTRAP.idFromName(id),
+      get,
+    } as unknown as typeof env.NODE_BOOTSTRAP,
+  };
+  const request = async (key = f.fixture.admin, id = f.id) => {
+    const context = createExecutionContext();
+    const response = await createApp().fetch(
+      new Request(`https://api.invalid/v1/nodes/additions/${id}/proof/source`, {
+        headers: { Authorization: `Bearer ${key}` },
+      }),
+      bindings,
+      context,
+    );
+    await waitOnExecutionContext(context);
+    return response;
+  };
+  return { ...f, selected, association, sourceRPC, get, request };
+}
+
+it("returns the sealed public proof source through real current CF authority without provider calls, private access or storage changes", async () => {
+  const f = await sourceGetterFixture();
+  const provider = vi
+    .spyOn(ContaboClient.prototype, "getInstance")
+    .mockRejectedValue(new Error("source_getter_provider_forbidden"));
+  const response = await f.request();
+  expect(response.status).toBe(200);
+  const body = (await response.json()) as Record<string, unknown>;
+  expect(body).toEqual({
+    ...f.association,
+    source: Object.fromEntries(
+      Object.entries(f.association.source).filter(([key]) => key !== "access"),
+    ),
+  });
+  const text = JSON.stringify(body);
+  expect(text).not.toContain("access");
+  expect(text).not.toContain(f.session.bearer);
+  expect(text).not.toContain(f.bundle.talos_admin_config);
+  expect(text).not.toContain(f.bundle.kubeconfig);
+  expect(provider).not.toHaveBeenCalled();
+});
+
+it("checks actual administrator scope and local presence before any source RPC", async () => {
+  const f = await sourceGetterFixture();
+  expect((await f.request(f.fixture.integrator)).status).toBe(403);
+  expect(
+    (await f.request(f.fixture.integrator, "malformed-operation")).status,
+  ).toBe(403);
+  expect((await f.request("invalid-credentials")).status).toBe(401);
+  expect((await f.request(f.fixture.admin, newOperationId())).status).toBe(404);
+  expect(f.get).not.toHaveBeenCalled();
+  expect(f.sourceRPC).not.toHaveBeenCalled();
+});
+
+it("refuses the retained source when its actual CF Node UID changes", async () => {
+  const f = await sourceGetterFixture();
+  await env.DB.prepare("UPDATE nodes SET node_uid=? WHERE id=?")
+    .bind(crypto.randomUUID(), f.selected.source.fixture.node)
+    .run();
+  expect((await f.request()).status).toBe(409);
+});
+
+it("returns fixed forbidden when the retained association disappears during its awaits", async () => {
+  const f = await sourceGetterFixture();
+  await f.withStore(async (instance, state) => {
+    const original = state.storage.get,
+      read = original.bind(state.storage);
+    let seen = 0;
+    Object.defineProperty(state.storage, "get", {
+      configurable: true,
+      value: async (...args: unknown[]) => {
+        const value = await Reflect.apply(read, state.storage, args);
+        if (args[0] === "proof_source_binding" && ++seen === 1)
+          await state.storage.delete("proof_source_binding");
+        return value;
+      },
+    });
+    try {
+      await expect(instance.proofSourceStatus(f.id)).rejects.toMatchObject({
+        code: "forbidden",
+      });
+      expect(await state.storage.get("proof_source_binding")).toBeUndefined();
+    } finally {
+      Object.defineProperty(state.storage, "get", {
+        configurable: true,
+        value: original,
+      });
+    }
+  });
+});
+
+it("refuses a cancelled current job without exposing the source or private access", async () => {
+  const f = await sourceGetterFixture();
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET cancelled=1 WHERE operation_id=?",
+  )
+    .bind(f.id)
+    .run();
+  const response = await f.request();
+  expect(response.status).toBe(403);
+  expect(await response.text()).not.toContain(f.association.source.ipv4);
+});
+
+it("refuses stale association fingerprints and rejects private response fields", async () => {
+  const f = await sourceGetterFixture();
+  expect(NodeProofSourceStatus.safeParse(f.association).success).toBe(false);
+  await f.withStore(async (_instance, state) => {
+    await state.storage.put("proof_source_binding", {
+      ...f.association,
+      inspection_generation: 2,
+    });
+  });
+  expect((await f.request()).status).toBe(403);
+});
+
+it("reads matching legacy input without persisting an association or renewing its token", async () => {
+  const f = await sourceGetterFixture();
+  const fresh = await issueNodeProofSession(f.bindings, f.id, "preparation");
+  const input = NodeProofExecutionInput.parse({
+    ...f.selected.input,
+    claims: fresh.claims,
+    session_bearer: fresh.bearer,
+    control_keys: fresh.control_keys,
+    bootstrap: await bootstrapJobInput(
+      f.bindings,
+      await readBootstrapJob(env.DB, f.id),
+    ),
+    source: f.association.source,
+  });
+  await f.withStore(async (_instance, state) => {
+    await state.storage.delete("proof_source_binding");
+    await state.storage.put(
+      "proof_current:preparation",
+      fresh.claims.session_id,
+    );
+    await state.storage.put(`proof_input:${fresh.claims.session_id}`, input);
+  });
+  expect((await f.request()).status).toBe(200);
+  await f.withStore(async (_instance, state) => {
+    expect(await state.storage.get("proof_source_binding")).toBeUndefined();
+    expect(await state.storage.get("proof_current:preparation")).toBe(
+      fresh.claims.session_id,
+    );
+  });
+});
+
+it("publishes the administrator source identity endpoint and excludes private access in OpenAPI", async () => {
+  const response = await createApp().fetch(
+    new Request("https://api.invalid/v1/openapi.json"),
+    env,
+  );
+  const document = (await response.json()) as {
+    paths: Record<
+      string,
+      {
+        get: {
+          security: unknown;
+          responses: Record<
+            string,
+            {
+              content: Record<
+                string,
+                { schema: { properties: Record<string, unknown> } }
+              >;
+            }
+          >;
+        };
+      }
+    >;
+  };
+  const route = document.paths["/v1/nodes/additions/{id}/proof/source"]?.get;
+  expect(route?.security).toEqual([{ bearerAuth: [] }]);
+  expect(
+    Object.keys(
+      route?.responses["200"]?.content["application/json"]?.schema.properties ??
+        {},
+    ).sort(),
+  ).toEqual(
+    [
+      "operation_id",
+      "binding_sha256",
+      "inspection_generation",
+      "plan_sha256",
+      "input_hash",
+      "source",
+    ].sort(),
+  );
+  expect(JSON.stringify(route?.responses["200"])).not.toContain('"access"');
+  expect(route?.responses["403"]).toBeDefined();
+  expect(route?.responses["404"]).toBeDefined();
+});
 
 const regions: string[] = [];
 afterEach(async () => {

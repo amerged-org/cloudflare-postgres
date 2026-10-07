@@ -93,6 +93,24 @@ This observes the retained native proof session and its fixed error code; it nev
 creates a session, registers work or refreshes its expiry. A reported proof still requires the
 separate signed-artifact and admission checks.
 
+`GET /v1/nodes/additions/{operation-id}/proof/source` is an administrator-only, read-only view of
+the once-sealed source's public identity and binding/generation/plan/input hashes. It excludes
+join bundles, keys, certificates and bearers. It checks current CF authority and retained source
+custody before and after projection without contacting Native or Contabo, minting a session,
+starting work, setting an alarm or modifying storage. Identity or authority changes refuse the
+read. Use this mapping when comparing necessary provider lifecycle facts before a source-network
+repair; do not infer an assigned host address from advertised provider inventory alone.
+
+An existing source needs a stable assigned global IPv6 address and an IPv6 default route for the
+full dual-stack proof. A host-network probe reporting `outside_scan_capability_gap_ipv6_eaddrnotavail`
+has not completed that proof. Pause repeated attempts, read actual Talos addresses/routes under
+the retained mTLS custody and the exact source Node/Cluster/boot identity, then compare the sealed
+source mapping with fresh matching provider facts before a targeted configuration correction.
+Preserve IPv4, credentials, identities and database data; do not reset EU or weaken the IPv6 scan.
+Preview the exact format-preserving network change using the pinned client's dry run and supported
+nonreboot mode. An uncertain apply requires readback of both persistent and active configurations,
+plus actual address/route, identity and database health; never blindly repeat the write.
+
 US1's purchase, profile, installation binding and reported inspection are already retained; its
 original authorized job is still `created`, before disk writes. Continue that same addition and
 AddNode Workflow through its existing pause/resume control, preserving sealed inputs, credentials,

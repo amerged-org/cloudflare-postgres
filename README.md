@@ -109,8 +109,10 @@ Kubernetes/Talos commands, transport grants and proof cleanup must make zero Con
 Contabo remains at purchase, initial inventory/firewall/rescue, hypervisor and uncertain-provider
 resolution boundaries, including fresh verification before the first destructive write. Its
 credential-scoped client reuses and coalesces OAuth until early expiry or 401 invalidation;
-credential changes replace the client. Uncertain mutations are never replayed. Deployment and
-measured live acceptance of this provider-free path remain outstanding in PLAN.md.
+credential changes replace the client. Uncertain mutations are never replayed. The API repair is
+deployed and the programmed cleanup has removed the old owned probe namespaces. Fresh US proof
+currently stops at a verified missing global IPv6/default-route prerequisite on the retained
+source host. US admission and complete measured live acceptance remain outstanding in PLAN.md.
 
 ```mermaid
 flowchart LR

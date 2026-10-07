@@ -582,6 +582,20 @@ export const NodeProofSource = z.discriminatedUnion("kind", [
   }),
 ]);
 export type NodeProofSource = z.infer<typeof NodeProofSource>;
+/** Administrator observation of the retained identity; private source access is excluded. */
+export const NodeProofSourceIdentity = z.discriminatedUnion("kind", [
+  NodeProofSource.options[0].omit({ access: true }),
+  NodeProofSource.options[1].omit({ access: true }),
+]);
+export const NodeProofSourceStatus = z.strictObject({
+  operation_id: OperationId,
+  binding_sha256: Hash,
+  inspection_generation: NodeProofClaims.shape.inspection_generation,
+  plan_sha256: Hash,
+  input_hash: Hash,
+  source: NodeProofSourceIdentity,
+});
+export type NodeProofSourceStatus = z.infer<typeof NodeProofSourceStatus>;
 export const NodeProofExecutionInput = z
   .strictObject({
     claims: NodeProofClaims,

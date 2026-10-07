@@ -38,9 +38,18 @@ migration is required. Its buffered wire events recorded 3 OAuth and 66 resource
 all in the firewall stage. Repeated input preparation still rechecked a confirmed allocation
 each cycle; a real-D1 regression reproduces that remaining provider poll, and the follow-up
 uses the sealed binding plus fresh CF authority instead. The IPv6 scanner reported
-`outside_scan_capability_gap_ipv6_eaddrnotavail`; its owned Pod uses host networking. Kubernetes
-reports no source IPv6 address, but actual Talos interface assignment has not yet been observed,
-so the OS configuration cause remains unproved. Native later reported `proof_source_pod_failed`.
+`outside_scan_capability_gap_ipv6_eaddrnotavail`; its owned Pod uses host networking. A bounded
+direct Talos mTLS read subsequently verified the same source Node/Cluster UID, boot ID and system
+UUID before and after, with zero global IPv6 addresses and zero IPv6 default routes. The host
+prerequisite gap is now established; the captured Pod manifest does not contain the separately
+staged scan input, so it does not establish the exact selected-address equality. A read-only
+administrator source-identity endpoint exposes the once-sealed public mapping and binding hashes
+through fresh CF checks, without private access material, provider/Native calls, session issuance,
+alarms or storage mutation. Its missing literal route first reproduced HTTP400 through the generic
+mode route; 44 scoped cases, types, lint and formatting pass. The targeted IPv6 repair remains
+held for that exact CF mapping, matching provider lifecycle facts and an unchanged identity/data
+snapshot; the local six-case candidate builder preserves IPv4, credentials and nonnetwork fields.
+Native later reported `proof_source_pod_failed`.
 One pause stops repeated attempts; US installation/admission and final live acceptance remain
 pending, without a replacement order, EU reset or weakened dual-stack proof.
 
