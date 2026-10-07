@@ -142,6 +142,14 @@ no exit/OOM cause is established. The shared getter contract omitted thirty reac
 proxy/packet errors, so a matching failed native body could be hidden as invalid status. The
 real D1 getter regression reproduced this rejection; the API-only contract repair adds exactly
 those fixed codes without widening strings, changing response shapes or starting/minting work.
+Source `e12a5602` CI `37567110056` failed only the existing actual-RAM placement fixture;
+the diagnostic regressions passed and no API publication was attempted. The unchanged domain
+and real fixture reproduce a strict-newer timestamp boundary: ten 75% observations are accepted,
+ten 76% observations at the same timestamps are ignored, and ten at +1 ms trigger expansion.
+The CI observation timestamps were not captured, so that collision is not claimed as recorded
+in CI. The test now uses one fresh minute-contained anchor with explicit +1/+2/+3 ms chronology
+and asserts each observation's acceptance; production threshold, freshness and monotonicity
+guards are unchanged.
 The actual failure remains unconfirmed until exposed; US installation/admission is not accepted.
 Never reset or replace the job, sealed input, source journals or custody.
 The retained EU control node's UID-guarded new-database placement flag is now

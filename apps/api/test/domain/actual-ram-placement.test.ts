@@ -42,11 +42,12 @@ async function seed(
   f: Fixture & { uid: string; provider: string },
   percent: number,
   at = Date.now(),
+  accepted = true,
 ) {
   for (let i = 9; i >= 0; i--) {
     const time = at - i * 60_000,
       observed_at = new Date(time).toISOString();
-    await recordNodeMemoryObservation(
+    const recorded = await recordNodeMemoryObservation(
       env.DB,
       f.region,
       {
@@ -66,6 +67,7 @@ async function seed(
       observed_at,
       time,
     );
+    expect(recorded).toBe(accepted);
   }
 }
 
@@ -75,7 +77,9 @@ it("expands proactively at 76 percent while keeping old placement available unde
     DatabaseWithOperation.parse(await (await f.create("missing-sample")).json())
       .database.observed_state,
   ).toBe("pending");
-  await seed(f, 75);
+  // Keep newer synthetic observations within the same ten minute buckets.
+  const sampleAt = Math.floor(Date.now() / 60_000) * 60_000;
+  await seed(f, 75, sampleAt);
   const first = DatabaseWithOperation.parse(
     await (await f.create("overbooked")).json(),
   );
@@ -91,7 +95,8 @@ it("expands proactively at 76 percent while keeping old placement available unde
       .bind(f.node)
       .first("memory_expansion_triggered_at"),
   ).toBeNull();
-  await seed(f, 76);
+  await seed(f, 76, sampleAt, false);
+  await seed(f, 76, sampleAt + 1);
   const expanding = await env.DB.prepare(
     "SELECT ready,schedulable,database_placement_closed_at,memory_expansion_triggered_at FROM nodes WHERE id=?",
   )
@@ -108,7 +113,7 @@ it("expands proactively at 76 percent while keeping old placement available unde
     database_placement_closed_at: null,
   });
   expect(expanding?.memory_expansion_triggered_at).toBeTruthy();
-  await seed(f, 81);
+  await seed(f, 81, sampleAt + 2);
   const later = DatabaseWithOperation.parse(
     await (await f.create("onboard-during-rollout")).json(),
   );
@@ -117,7 +122,7 @@ it("expands proactively at 76 percent while keeping old placement available unde
       .bind(later.database.id)
       .first("node_id"),
   ).toBe(f.node);
-  await seed(f, 20);
+  await seed(f, 20, sampleAt + 3);
   expect(
     await env.DB.prepare(
       "SELECT memory_expansion_triggered_at FROM nodes WHERE id=?",
