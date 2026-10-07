@@ -150,7 +150,20 @@ The CI observation timestamps were not captured, so that collision is not claime
 in CI. The test now uses one fresh minute-contained anchor with explicit +1/+2/+3 ms chronology
 and asserts each observation's acceptance; production threshold, freshness and monotonicity
 guards are unchanged.
-The actual failure remains unconfirmed until exposed; US installation/admission is not accepted.
+The API-only repair is delivered from `07c73d1f`, full CI `37567807420`; one publication retained
+Native `8bbf7058`, its configuration/namespace and the original paused created job, followed by
+one same-Workflow resume. The finite-code monitor caught `proof_source_deadline` at
+03:54:27.235 UTC, 123.838 seconds after the 03:52:23.397 issuance, with 416.162 seconds remaining.
+This proves the expired-source aggregate bound was reached; it is not a completed cleanup
+duration or full-session expiry. Both old source namespaces remain Active and nondeleting,
+one without a Pod and one with the same failed scanner Pod. The minimal round-trip reduction
+coalesces fresh kube-system/known-Node identity reads into one strict two-object List at every
+existing check, including before each delete. The observed 4,143 ms slow-grant scenario failed
+before the change and completes in a 104,715 ms virtual model after it. This is not live acceptance;
+all prior UID/provider/region/Ready/IP/deletion predicates, 13-kind foreign checks, 256 KiB bound,
+uncertain-delete readback and 30/120/540-second limits remain unchanged.
+The observed aggregate failure is diagnosed; the round-trip fix still requires live acceptance.
+US installation/admission is not accepted.
 Never reset or replace the job, sealed input, source journals or custody.
 The retained EU control node's UID-guarded new-database placement flag is now
 false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.

@@ -154,6 +154,15 @@ function fixture() {
     wrongImage = false;
   const abort = new AbortController();
   const key = (kind: string, name: string) => `${kind}/${name}`;
+  const cluster = {
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: {
+      name: "kube-system",
+      uid: source.cluster_uid,
+      resourceVersion: "1",
+    },
+  };
   const node = {
     apiVersion: "v1",
     kind: "Node",
@@ -212,6 +221,23 @@ function fixture() {
     kube: async (args, _permit, stdin, options) => {
       assert.ok(options && !options.signal.aborted);
       if (args[0] === "get") {
+        if (args[1] === "namespace/kube-system") {
+          assert.deepEqual(args, [
+            "get",
+            "namespace/kube-system",
+            `node/${source.node_name}`,
+            "--ignore-not-found",
+            "--output=json",
+          ]);
+          return {
+            exit_code: 0,
+            stdout: JSON.stringify({
+              apiVersion: "v1",
+              kind: "List",
+              items: [cluster, node],
+            }),
+          };
+        }
         if (args[1]!.includes(","))
           return {
             exit_code: 0,
@@ -228,7 +254,7 @@ function fixture() {
         if (args[1] === "namespace" && args[2] === "kube-system")
           return {
             exit_code: 0,
-            stdout: JSON.stringify({ metadata: { uid: source.cluster_uid } }),
+            stdout: JSON.stringify(cluster),
           };
         const value = objects.get(key(args[1]!, args[2]!));
         return { exit_code: 0, stdout: value ? JSON.stringify(value) : "" };
@@ -754,7 +780,7 @@ test("a new external abort takes precedence over a concurrent cleanup command de
   assert.equal(f.objects.size, 1);
 });
 
-test("serial cleanup grant costs cannot extend aggregate or individual command bounds", async (t) => {
+test("expired cleanup retains aggregate and individual bounds with coalesced identity reads", async (t) => {
   const f = fixture(),
     assets = await readProofSourceAssets(false),
     original = structuredClone(f.input),
@@ -843,18 +869,16 @@ test("serial cleanup grant costs cannot extend aggregate or individual command b
   );
   assert.equal(grants, 0);
   assert.equal(f.objects.size, 2);
-  await assert.rejects(
-    cleanupOwnedProofSource(
-      f.source,
-      original,
-      commands,
-      new Date(base + 120_000).toISOString(),
-    ),
-    /proof_source_deadline/,
+  await cleanupOwnedProofSource(
+    f.source,
+    original,
+    commands,
+    new Date(base + 120_000).toISOString(),
   );
-  assert.equal(f.state()!.stage, "cleanup");
+  assert.equal(f.state()!.stage, "cleaned");
   assert.equal(f.state()!.namespace_uid, ownership.namespace_uid);
-  assert.ok(elapsed >= 120_000);
+  assert.equal(f.objects.size, 0);
+  assert.ok(elapsed < 120_000);
   t.diagnostic(
     JSON.stringify({
       cleanup_model_elapsed_ms: elapsed,
@@ -863,12 +887,13 @@ test("serial cleanup grant costs cannot extend aggregate or individual command b
   );
 });
 
-test("namespace inventory settles bounded paired batches within the measured cleanup budget", async (t) => {
+test("coalesced source identities settle paired inventory within the measured slow-grant cleanup budget", async (t) => {
   const { f, original } = await expiredCleanupFixture(),
     base = Date.now(),
     boundedTimers: AbortController[] = [],
     pending: { at: number; resolve: () => void }[] = [],
-    inventory: string[] = [];
+    inventory: string[] = [],
+    identities: string[][] = [];
   let elapsed = 0,
     scheduled = false,
     active = 0,
@@ -907,7 +932,7 @@ test("namespace inventory settles bounded paired batches within the measured cle
   const commands: ProofSourceCommands = {
     ...f.commands,
     authorizeSource: async () => {
-      await latency(3700);
+      await latency(4143);
       await f.commands.authorizeSource();
     },
     readOwnership: async () => {
@@ -921,6 +946,13 @@ test("namespace inventory settles bounded paired batches within the measured cle
     kube: async (args, permit, stdin, options) => {
       assert.ok(options!.timeout_ms > 0 && options!.timeout_ms <= 30_000);
       const isInventory = args[0] === "get" && args[1]!.includes(",");
+      if (
+        args[0] === "get" &&
+        (args[1] === "namespace/kube-system" ||
+          args[1] === "node" ||
+          (args[1] === "namespace" && args[2] === "kube-system"))
+      )
+        identities.push(args);
       if (isInventory) {
         inventory.push(args[1]!);
         if (args[1]!.split(",").length > 4) {
@@ -938,7 +970,7 @@ test("namespace inventory settles bounded paired batches within the measured cle
         maximumActive = Math.max(maximumActive, active);
       }
       try {
-        await latency(3700);
+        await latency(4143);
         return await f.commands.kube!(args, permit, stdin, options);
       } finally {
         if (isInventory) active--;
@@ -963,8 +995,86 @@ test("namespace inventory settles bounded paired batches within the measured cle
     new Set(inventory.flatMap((value) => value.split(","))).size,
     13,
   );
-  assert.ok(elapsed > 108_440 && elapsed < 120_000);
+  assert.equal(identities.length, 3);
+  for (const args of identities)
+    assert.deepEqual(args, [
+      "get",
+      "namespace/kube-system",
+      `node/${f.source.node_name}`,
+      "--ignore-not-found",
+      "--output=json",
+    ]);
+  assert.ok(elapsed > 0 && elapsed < 120_000);
   t.diagnostic(JSON.stringify({ measured_grant_model_elapsed_ms: elapsed }));
+});
+
+async function refusesSourceIdentity(
+  change: (value: Json) => void,
+  atRead = 1,
+) {
+  const { f, original, ownership } = await expiredCleanupFixture();
+  let identityReads = 0;
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      const result = await f.commands.kube!(args, permit, stdin, options);
+      if (args[0] === "get" && args[1] === "namespace/kube-system") {
+        identityReads++;
+        if (identityReads === atRead) {
+          const value = obj(JSON.parse(result.stdout));
+          change(value);
+          return { ...result, stdout: JSON.stringify(value) };
+        }
+      }
+      return result;
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 120_000).toISOString(),
+    ),
+    /proof_source_source_identity_changed/,
+  );
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.equal(f.state()!.namespace_uid, ownership.namespace_uid);
+  assert.ok(f.objects.has(`namespace/${ownership.namespace_name}`));
+  return { f, identityReads };
+}
+
+test("source identity requires exactly the two named core objects with their original UIDs", async () => {
+  await refusesSourceIdentity((value) => {
+    (value.items as Json[]).pop();
+  });
+  await refusesSourceIdentity((value) => {
+    const items = value.items as Json[];
+    items.push(structuredClone(items[1]!));
+  });
+  await refusesSourceIdentity((value) => {
+    const items = value.items as Json[];
+    items[1] = structuredClone(items[0]!);
+  });
+  await refusesSourceIdentity((value) => {
+    (value.items as Json[])[1]!.kind = "Pod";
+  });
+  await refusesSourceIdentity((value) => {
+    const items = value.items as Json[];
+    obj(items[1]!.metadata).name = "foreign-source";
+  });
+  await refusesSourceIdentity((value) => {
+    obj((value.items as Json[])[0]!.metadata).uid = randomUUID();
+  });
+});
+
+test("cleanup refreshes the exact source Node UID before deleting its namespace", async () => {
+  const { f, identityReads } = await refusesSourceIdentity((value) => {
+    obj((value.items as Json[])[1]!.metadata).uid = randomUUID();
+  }, 3);
+  assert.equal(identityReads, 3);
+  assert.equal(f.objects.size, 1);
+  assert.equal(f.mutations.length, 1);
 });
 
 test("a foreign child in the final inventory batch preserves the namespace", async () => {

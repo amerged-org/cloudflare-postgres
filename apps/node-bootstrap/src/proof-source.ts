@@ -765,19 +765,41 @@ class SourceRunner {
   }
   private async sourceNode(cleanup = false) {
     if (this.source.kind !== "pod") return;
-    const cluster = await this.get(
-        "namespace",
-        "kube-system",
-        undefined,
-        cleanup,
-        "cluster_identity",
+    const nodeName = this.source.node_name;
+    const result = await this.kube(
+      [
+        "get",
+        "namespace/kube-system",
+        `node/${nodeName}`,
+        "--ignore-not-found",
+        "--output=json",
+      ],
+      undefined,
+      cleanup,
+      "node_identity",
+    );
+    if (result.exit_code !== 0 || !result.stdout.trim())
+      return fail("source_identity_changed");
+    const identities = object(JSON.parse(result.stdout));
+    if (
+      identities.apiVersion !== "v1" ||
+      identities.kind !== "List" ||
+      !Array.isArray(identities.items) ||
+      identities.items.length !== 2
+    )
+      return fail("source_identity_changed");
+    const items = identities.items.map(object),
+      cluster = items.find(
+        (value) =>
+          value.apiVersion === "v1" &&
+          value.kind === "Namespace" &&
+          object(value.metadata).name === "kube-system",
       ),
-      node = await this.get(
-        "node",
-        this.source.node_name,
-        undefined,
-        cleanup,
-        "node_identity",
+      node = items.find(
+        (value) =>
+          value.apiVersion === "v1" &&
+          value.kind === "Node" &&
+          object(value.metadata).name === nodeName,
       );
     if (
       !cluster ||
