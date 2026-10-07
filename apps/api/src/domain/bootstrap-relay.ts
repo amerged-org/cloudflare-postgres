@@ -20,10 +20,10 @@ import {
   bootstrapJobInput,
   admissionAuthority,
   readBootstrapJob,
+  hasBootstrapNetworkAuthority,
   type BootstrapJobRow,
 } from "./bootstrap-jobs.ts";
 import { readNodeAddition } from "./node-state.ts";
-import { hasVerifiedNodePreparation } from "./node-network.ts";
 
 type ProviderCredentials = Pick<
   ContaboClientOptions,
@@ -93,11 +93,7 @@ export async function issueBootstrapTransport(
   const addition = await readNodeAddition(env.DB, row.operation_id);
   if (
     !(await admissionAuthority(env, row)).admission_authorized &&
-    !(await hasVerifiedNodePreparation(
-      env.DB,
-      row.operation_id,
-      addition.intent_hash,
-    ))
+    !(await hasBootstrapNetworkAuthority(env, row))
   )
     throw new ApiError(
       "forbidden",
@@ -300,11 +296,7 @@ export async function issueBootstrapTransport(
     throw new ApiError("forbidden", "Bootstrap transport authority changed");
   if (
     !(await admissionAuthority(env, current)).admission_authorized &&
-    !(await hasVerifiedNodePreparation(
-      env.DB,
-      row.operation_id,
-      currentAddition.intent_hash,
-    ))
+    !(await hasBootstrapNetworkAuthority(env, current))
   )
     throw new ApiError("forbidden", "Bootstrap preparation authority changed");
   return NodeBootstrapTransport.parse({

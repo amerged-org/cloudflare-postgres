@@ -16,6 +16,7 @@ import {
   NodeBootstrapInput,
   NodeBootstrapSpec,
   NodeBootstrapStatus,
+  NodeBootstrapStage,
   nodeStorageTrialTransition,
 } from "@pgcf/contracts/node-bootstrap";
 import {
@@ -89,6 +90,7 @@ export interface BootstrapJobRow {
   admission_authorized: number;
   admission_binding_json: string | null;
   admission_expires_at: string | null;
+  network_authorization_json: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -479,11 +481,7 @@ async function authority(
   const admission = await admissionAuthority(env, row);
   if (
     !admission.admission_authorized &&
-    !(await hasVerifiedNodePreparation(
-      env.DB,
-      row.operation_id,
-      addition.intent_hash,
-    ))
+    !(await hasBootstrapNetworkAuthority(env, row))
   )
     throw new ApiError(
       "forbidden",
@@ -534,6 +532,251 @@ interface DestructiveProviderAuthority {
   audit_json: string;
   receipt_json: string;
   network: NodeNetworkSnapshot;
+  provider_inventory_sha256: string;
+}
+const BootstrapNetworkAuthorization = z.strictObject({
+  version: z.literal(1),
+  operation_id: OperationId,
+  node_id: NodeId,
+  region_id: RegionId,
+  provider_instance_id: ProviderInstanceId,
+  input_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  sealed_revision: z.number().int().positive(),
+  intent_hash: z.string().regex(/^[a-f0-9]{64}$/),
+  binding_sha256: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .nullable(),
+  plan_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  readback_at: z.iso.datetime(),
+  initial_proof_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  provider_audit_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  provider_receipt_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  provider_inventory_sha256: z.string().regex(/^[a-f0-9]{64}$/),
+  authorized_revision: z.number().int().nonnegative(),
+  issued_at: z.iso.datetime(),
+});
+async function installationBindingHash(env: Env, operationId: string) {
+  const row = await env.DB.prepare(
+    "SELECT binding_sha256 FROM node_installation_bindings WHERE operation_id=?",
+  )
+    .bind(operationId)
+    .first<{ binding_sha256: string }>();
+  return row?.binding_sha256 ?? null;
+}
+async function networkAuthorization(
+  env: Env,
+  row: BootstrapJobRow,
+  verified: DestructiveProviderAuthority,
+  revision: number,
+) {
+  return BootstrapNetworkAuthorization.parse({
+    version: 1,
+    operation_id: row.operation_id,
+    node_id: row.node_id,
+    region_id: row.region_id,
+    provider_instance_id: verified.provider_instance_id,
+    input_hash: row.input_hash,
+    sealed_revision: row.sealed_revision,
+    intent_hash: verified.intent_hash,
+    binding_sha256: await installationBindingHash(env, row.operation_id),
+    plan_sha256: verified.network.plan_sha256,
+    readback_at: verified.network.readback_at,
+    initial_proof_sha256: verified.network.proof_sha256,
+    provider_audit_sha256: await materialHash(JSON.parse(verified.audit_json)),
+    provider_receipt_sha256: await materialHash(
+      JSON.parse(verified.receipt_json),
+    ),
+    provider_inventory_sha256: verified.provider_inventory_sha256,
+    authorized_revision: revision,
+    issued_at: new Date().toISOString(),
+  });
+}
+/** Initial proof admits installation once; every continuation still checks current custody. */
+export async function hasBootstrapNetworkAuthority(
+  env: Env,
+  row: BootstrapJobRow,
+): Promise<boolean> {
+  try {
+    const addition = await readNodeAddition(env.DB, row.operation_id),
+      checkpoint = NodeBootstrapCheckpoint.parse(
+        JSON.parse(row.checkpoint_json),
+      );
+    if (
+      !row.authorized ||
+      row.admitted ||
+      row.cancelled ||
+      !addition.slot_held ||
+      !["audited", "bootstrapping"].includes(addition.status)
+    )
+      return false;
+    if (!checkpoint.destructive_intent)
+      return hasVerifiedNodePreparation(
+        env.DB,
+        row.operation_id,
+        addition.intent_hash,
+      );
+    const stage = NodeBootstrapStage.options.indexOf(checkpoint.stage);
+    if (
+      stage < NodeBootstrapStage.options.indexOf("disk_write_intent") ||
+      stage > NodeBootstrapStage.options.indexOf("awaiting_verification") ||
+      (!["running", "waiting"].includes(checkpoint.status) &&
+        !(
+          checkpoint.stage === "awaiting_verification" &&
+          checkpoint.status === "awaiting_verification"
+        ))
+    )
+      return false;
+    if (row.network_authorization_json === null) return false;
+    if (
+      !row.network_authorization_json ||
+      row.network_authorization_json.length > 8192
+    )
+      return false;
+    const record = BootstrapNetworkAuthorization.parse(
+        JSON.parse(row.network_authorization_json),
+      ),
+      snapshot = await readNodeNetworkSnapshot(env, row.operation_id);
+    if (
+      !snapshot ||
+      record.operation_id !== row.operation_id ||
+      record.node_id !== row.node_id ||
+      record.region_id !== row.region_id ||
+      record.input_hash !== row.input_hash ||
+      record.sealed_revision !== row.sealed_revision ||
+      record.authorized_revision > row.revision ||
+      record.provider_instance_id !== addition.provider_instance_id ||
+      record.intent_hash !== addition.intent_hash ||
+      record.plan_sha256 !== snapshot.plan_sha256 ||
+      record.readback_at !== snapshot.readback_at ||
+      record.binding_sha256 !==
+        (await installationBindingHash(env, row.operation_id)) ||
+      record.provider_audit_sha256 !== (await materialHash(addition.audit)) ||
+      record.provider_receipt_sha256 !== (await materialHash(addition.receipt))
+    )
+      return false;
+    const fresh = await readBootstrapJob(env.DB, row.operation_id),
+      current = await readNodeAddition(env.DB, row.operation_id),
+      after = await readNodeNetworkSnapshot(env, row.operation_id);
+    return (
+      fresh.authorized === 1 &&
+      fresh.admitted === 0 &&
+      fresh.cancelled === 0 &&
+      fresh.input_hash === row.input_hash &&
+      fresh.sealed_revision === row.sealed_revision &&
+      fresh.revision === row.revision &&
+      fresh.checkpoint_json === row.checkpoint_json &&
+      fresh.network_authorization_json === row.network_authorization_json &&
+      current.revision === addition.revision &&
+      current.intent_hash === addition.intent_hash &&
+      current.provider_instance_id === addition.provider_instance_id &&
+      current.slot_held &&
+      ["audited", "bootstrapping"].includes(current.status) &&
+      JSON.stringify(after) === JSON.stringify(snapshot)
+    );
+  } catch {
+    return false;
+  }
+}
+/** One explicit migration lifecycle boundary; routine predicates never call providers. */
+export async function establishBootstrapNetworkAuthority(
+  env: Env,
+  row: BootstrapJobRow,
+): Promise<boolean> {
+  if (row.network_authorization_json !== null)
+    return hasBootstrapNetworkAuthority(env, row);
+  try {
+    const addition = await readNodeAddition(env.DB, row.operation_id),
+      checkpoint = NodeBootstrapCheckpoint.parse(
+        JSON.parse(row.checkpoint_json),
+      ),
+      stage = NodeBootstrapStage.options.indexOf(checkpoint.stage);
+    if (
+      !row.authorized ||
+      row.admitted ||
+      row.cancelled ||
+      !addition.slot_held ||
+      !["audited", "bootstrapping"].includes(addition.status) ||
+      !checkpoint.destructive_intent ||
+      stage < NodeBootstrapStage.options.indexOf("disk_write_intent") ||
+      stage > NodeBootstrapStage.options.indexOf("awaiting_verification") ||
+      (!["running", "waiting"].includes(checkpoint.status) &&
+        !(
+          checkpoint.stage === "awaiting_verification" &&
+          checkpoint.status === "awaiting_verification"
+        ))
+    )
+      return false;
+    if (
+      !(await hasVerifiedNodePreparation(
+        env.DB,
+        row.operation_id,
+        addition.intent_hash,
+      ))
+    )
+      return false;
+    const input = await bootstrapJobInput(env, row),
+      verified = await destructiveProviderAuthority(env, row, input),
+      record = await networkAuthorization(env, row, verified, row.revision);
+    const result = await env.DB.prepare(
+      `UPDATE node_bootstrap_jobs SET network_authorization_json=? WHERE operation_id=? AND input_hash=? AND sealed_revision=? AND revision=? AND checkpoint_json=? AND authorized=1 AND admitted=0 AND cancelled=0 AND network_authorization_json IS NULL
+        AND EXISTS(SELECT 1 FROM node_additions a WHERE a.operation_id=node_bootstrap_jobs.operation_id AND a.revision=? AND a.provider_instance_id=? AND a.intent_hash=? AND a.audit_json=? AND a.receipt_json=? AND a.slot_held=1 AND a.status IN('audited','bootstrapping'))
+        AND EXISTS(SELECT 1 FROM node_network_preparations p WHERE p.operation_id=node_bootstrap_jobs.operation_id AND p.revision=? AND p.plan_sha256=? AND p.plan_json=? AND p.readback_at=? AND p.status='verified' AND p.proof_sha256=? AND p.proof_expires_at=? AND julianday(p.proof_expires_at)>julianday('now'))
+        AND EXISTS(SELECT 1 FROM regions r WHERE r.id=? AND r.provider='contabo' AND r.provider_region=?)
+        AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=? AND n.id<>? AND n.lost_at IS NULL AND NOT EXISTS(SELECT 1 FROM json_each(?,'$.members') m WHERE n.id=json_extract(m.value,'$.node_id') AND n.provider_instance_id=json_extract(m.value,'$.provider_instance_id')))
+        AND NOT EXISTS(SELECT 1 FROM json_each(?,'$.members') m WHERE json_extract(m.value,'$.node_id')<>? AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=? AND n.id=json_extract(m.value,'$.node_id') AND n.provider_instance_id=json_extract(m.value,'$.provider_instance_id') AND n.lost_at IS NULL))
+        AND ((? IS NULL AND NOT EXISTS(SELECT 1 FROM node_installation_bindings b WHERE b.operation_id=node_bootstrap_jobs.operation_id)) OR EXISTS(SELECT 1 FROM node_installation_bindings b WHERE b.operation_id=node_bootstrap_jobs.operation_id AND b.binding_sha256=?))
+        AND NOT EXISTS(SELECT 1 FROM json_each(?) s WHERE NOT EXISTS(SELECT 1 FROM node_network_firewalls l WHERE l.firewall_id=json_extract(s.value,'$.firewall_id') AND l.operation_id=json_extract(s.value,'$.operation_id') AND l.plan_sha256=json_extract(s.value,'$.plan_sha256') AND l.revision=json_extract(s.value,'$.revision')))
+        AND ((? IS NULL AND NOT EXISTS(SELECT 1 FROM node_firewall_allocations f WHERE f.operation_id=node_bootstrap_jobs.operation_id)) OR EXISTS(SELECT 1 FROM node_firewall_allocations f WHERE f.operation_id=node_bootstrap_jobs.operation_id AND f.firewall_id IS ? AND f.state=? AND f.result_json IS ? AND f.updated_at=?))`,
+    )
+      .bind(
+        JSON.stringify(record),
+        row.operation_id,
+        row.input_hash,
+        row.sealed_revision,
+        row.revision,
+        row.checkpoint_json,
+        verified.revision,
+        verified.provider_instance_id,
+        verified.intent_hash,
+        verified.audit_json,
+        verified.receipt_json,
+        verified.network.revision,
+        verified.network.plan_sha256,
+        verified.network.plan_json,
+        verified.network.readback_at,
+        verified.network.proof_sha256,
+        verified.network.proof_expires_at,
+        row.region_id,
+        verified.network.provider_region,
+        row.region_id,
+        row.node_id,
+        verified.network.plan_json,
+        verified.network.plan_json,
+        row.node_id,
+        row.region_id,
+        record.binding_sha256,
+        record.binding_sha256,
+        JSON.stringify(verified.network.firewall_leases),
+        verified.network.allocation === null ? null : 1,
+        verified.network.allocation?.firewall_id ?? null,
+        verified.network.allocation?.state ?? null,
+        verified.network.allocation?.result_json ?? null,
+        verified.network.allocation?.updated_at ?? null,
+      )
+      .run();
+    const fresh = await readBootstrapJob(env.DB, row.operation_id);
+    if (
+      result.meta.changes !== 1 ||
+      fresh.revision !== row.revision ||
+      fresh.checkpoint_json !== row.checkpoint_json
+    )
+      return false;
+    row = fresh;
+    return hasBootstrapNetworkAuthority(env, row);
+  } catch {
+    return false;
+  }
 }
 async function destructiveProviderAuthority(
   env: Env,
@@ -561,7 +804,12 @@ async function destructiveProviderAuthority(
     "SELECT revision,provider_instance_id,intent_hash,audit_json,receipt_json FROM node_additions WHERE operation_id=?",
   )
     .bind(row.operation_id)
-    .first<Omit<DestructiveProviderAuthority, "network">>();
+    .first<
+      Omit<
+        DestructiveProviderAuthority,
+        "network" | "provider_inventory_sha256"
+      >
+    >();
   if (
     !snapshot ||
     snapshot.revision !== addition.revision ||
@@ -633,8 +881,22 @@ async function destructiveProviderAuthority(
       "conflict",
       "Destructive checkpoint changed concurrently",
     );
-  await authority(env, fresh);
-  return { ...snapshot, network };
+  if (
+    !(await hasVerifiedNodePreparation(
+      env.DB,
+      row.operation_id,
+      current.intent_hash,
+    ))
+  )
+    throw new ApiError(
+      "conflict",
+      "Initial network proof expired before disk authorization",
+    );
+  return {
+    ...snapshot,
+    network,
+    provider_inventory_sha256: await materialHash(actual),
+  };
 }
 export async function bootstrapCallback(
   c: ApiContext,
@@ -822,9 +1084,18 @@ export async function bootstrapCallback(
     }
     checkpoint = next;
   }
+  const continuation =
+    providerAuthority === null
+      ? null
+      : await networkAuthorization(
+          c.env,
+          row,
+          providerAuthority,
+          row.revision + 1,
+        );
   const result = await c.env.DB.prepare(
-    `UPDATE node_bootstrap_jobs SET checkpoint_json=?,material_ref_json=COALESCE(?,material_ref_json),revision=revision+1,updated_at=?
-    WHERE operation_id=? AND input_hash=? AND revision=? AND authorized=1 AND admitted=0 AND cancelled=0
+    `UPDATE node_bootstrap_jobs SET checkpoint_json=?,material_ref_json=COALESCE(?,material_ref_json),network_authorization_json=COALESCE(network_authorization_json,?),revision=revision+1,updated_at=?
+    WHERE operation_id=? AND input_hash=? AND revision=? AND sealed_revision=? AND authorized=1 AND admitted=0 AND cancelled=0
       AND (? IS NULL OR EXISTS(SELECT 1 FROM node_additions a WHERE a.operation_id=node_bootstrap_jobs.operation_id
         AND a.revision=? AND a.provider_instance_id=? AND a.intent_hash=? AND a.audit_json=? AND a.receipt_json=?
         AND a.slot_held=1 AND a.status IN ('audited','bootstrapping')))
@@ -833,6 +1104,7 @@ export async function bootstrapCallback(
           AND p.intent_hash=? AND p.plan_sha256=? AND p.plan_json=? AND p.revision=? AND p.status='verified'
           AND p.readback_at=? AND p.proof_sha256=? AND p.proof_expires_at=?
           AND julianday(p.proof_expires_at)>julianday('now'))
+        AND ((? IS NULL AND NOT EXISTS(SELECT 1 FROM node_installation_bindings b WHERE b.operation_id=node_bootstrap_jobs.operation_id)) OR EXISTS(SELECT 1 FROM node_installation_bindings b WHERE b.operation_id=node_bootstrap_jobs.operation_id AND b.binding_sha256=?))
         AND EXISTS(SELECT 1 FROM regions r WHERE r.id=node_bootstrap_jobs.region_id
           AND r.provider='contabo' AND r.provider_region=?)
         AND NOT EXISTS(SELECT 1 FROM json_each(?) s WHERE NOT EXISTS(
@@ -853,10 +1125,12 @@ export async function bootstrapCallback(
     .bind(
       JSON.stringify(checkpoint),
       ref === null ? null : JSON.stringify(ref),
+      continuation === null ? null : JSON.stringify(continuation),
       new Date().toISOString(),
       operationId,
       row.input_hash,
       row.revision,
+      row.sealed_revision,
       providerAuthority?.revision ?? null,
       providerAuthority?.revision ?? null,
       providerAuthority?.provider_instance_id ?? null,
@@ -871,6 +1145,8 @@ export async function bootstrapCallback(
       providerAuthority?.network.readback_at ?? null,
       providerAuthority?.network.proof_sha256 ?? null,
       providerAuthority?.network.proof_expires_at ?? null,
+      continuation?.binding_sha256 ?? null,
+      continuation?.binding_sha256 ?? null,
       providerAuthority?.network.provider_region ?? null,
       JSON.stringify(providerAuthority?.network.firewall_leases ?? []),
       providerAuthority?.network.plan_json ?? "{}",

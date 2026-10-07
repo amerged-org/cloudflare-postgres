@@ -329,6 +329,37 @@ is being prepared, with no EU upgrade or reinstall dispatched. SQL server-versio
 US inventory/readiness remain pending.
 No replacement order, EU reset, source OS write or additional image delivery occurred.
 
+Source `f5e7e048`, full CI `37693780073`, is delivered once API-only with the same
+qualified Native64 manifest and exact configuration. Protected EU state and the original US
+job were preserved. One original-Workflow resume initially returned a Cloudflare Container
+availability error atstep607. Scheduled reconciliation automatically restarted the same
+Workflow; the unchanged Native application24 became active with zero health errors. No manual
+retry, new order or image delivery was used. Its fresh session issued at22:20:55.552Z and
+reported after246.840 seconds, with both journals cleaned. CF preparation was verified at
+revision6; the addition reachedbootstrapping/revision4/prepared and native rescue_verified/
+revision1. Image download completed at232,141,432 compressed bytes; the first disk-write
+checkpoint followed fresh provider verification, measured1 OAuth plus2 GET calls inprewrite
+and zero calls in routine proof/transport frames. At22:27:31Z the job had48 MiB acknowledged,
+then initial-proof expiry forced another full scan while retaining the pending chunk.
+This observed coupling gates every installer authority/checkpoint and transport grant with
+the120-second initial network-proof lifetime, although current job/native identity authority
+is checked independently. The resulting repeated full scans are a programmed rollout delay.
+A real-D1 regression reproduces403 after only that proof expires following a successful first
+destructive checkpoint. The scoped correction prepares a once-set, bounded Cloudflare record
+binding the original input/operation/plan/provider checks to that first authorization; short
+transport grants, current CF revocation/scope, fresh native identities and postjoin proof remain.
+Existing partial jobs must acquire the record once through fresh proof/provider verification
+and an exact progress CAS, without resetting or replaying a disk write. One controlled pause
+atstep88 retained jobrevision13,48 MiB acknowledged and the pending48 MiB offset, with sealed
+input and permissions unchanged. 45 callback and39 transport/registration/Workflow cases, API types, scoped lint/formatting
+and independent callsite review pass. The routine predicate is CF-only; legacy initialization
+exists solely at the explicit Workflow boundary. Fresh initial and mandatory postjoin proof,
+short signed grants, binding/region/member/lease/allocation fences and current job revocation
+remain. Migration0022 adds only nullable bounded JSON plus a once-set immutable trigger;
+the actual Dev migration ledger contains all21 previous migrations, with only0022 pending.
+The additive migration remains unexecuted. US Ready/SQL/backup/WAL/restore/reclamation and
+software alignment remain unaccepted.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

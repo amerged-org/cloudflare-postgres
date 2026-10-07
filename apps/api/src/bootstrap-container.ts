@@ -9,9 +9,9 @@ import {
   bootstrapJobStatus,
   readBootstrapJob,
   admissionAuthority,
+  hasBootstrapNetworkAuthority,
 } from "./domain/bootstrap-jobs.ts";
 import { readNodeAddition } from "./domain/node-state.ts";
-import { hasVerifiedNodePreparation } from "./domain/node-network.ts";
 import {
   prepareNodeInspectionInput,
   assertNodeInspectionInputCurrent,
@@ -195,13 +195,7 @@ export class NodeBootstrap extends DurableObject<Env> {
     if (admission) {
       if (!(await admissionAuthority(this.env, row)).admission_authorized)
         throw new Error("bootstrap_admission_not_authorized");
-    } else if (
-      !(await hasVerifiedNodePreparation(
-        this.env.DB,
-        operationId,
-        addition.intent_hash,
-      ))
-    )
+    } else if (!(await hasBootstrapNetworkAuthority(this.env, row)))
       throw new Error("bootstrap_network_preparation_required");
     return row;
   }

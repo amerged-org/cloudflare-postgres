@@ -14,6 +14,8 @@ import {
   finalizeNodeAdmission,
   type BootstrapJobRow,
   bootstrapJobInput,
+  hasBootstrapNetworkAuthority,
+  establishBootstrapNetworkAuthority,
 } from "../domain/bootstrap-jobs.ts";
 import {
   claimNodeDispatch,
@@ -30,7 +32,6 @@ import { placePendingDatabases } from "../domain/node-capacity.ts";
 import {
   ensureNodeFirewall,
   ensureNodeNetwork,
-  hasVerifiedNodePreparation,
 } from "../domain/node-network.ts";
 import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
 import { prepareNodeInstallationInputs } from "../domain/prepare-node-installation.ts";
@@ -383,12 +384,14 @@ export async function ensureBootstrapNetworkBoundary(
     (addition.checkpoint?.stage === "prepared" &&
       addition.checkpoint.reference === addition.intent_hash) ||
     checkpoint.stage !== "created"
-  )
-    return hasVerifiedNodePreparation(
-      env.DB,
-      operationId,
-      addition.intent_hash,
-    );
+  ) {
+    if (
+      checkpoint.destructive_intent &&
+      job.network_authorization_json === null
+    )
+      return establishBootstrapNetworkAuthority(env, job);
+    return hasBootstrapNetworkAuthority(env, job);
+  }
   if (!(await ensureNodeNetwork(env, operationId))) return false;
   const current = await readNodeAddition(env.DB, operationId);
   if (current.checkpoint === null)

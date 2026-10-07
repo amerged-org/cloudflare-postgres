@@ -27,10 +27,16 @@ import {
   canonicalNodePreparationProof,
   NODE_PREPARATION_SIGNATURE_DOMAIN,
   nodePreparationProofSchema,
+  readNodeNetworkSnapshot,
 } from "../../src/domain/node-network.ts";
 import type { Env } from "../../src/env.ts";
 import { cleanupFixtures } from "./fixtures.ts";
 import { auditedRescueConfiguration } from "./rescue-fixtures.ts";
+import { issueBootstrapTransport } from "../../src/domain/bootstrap-relay.ts";
+import {
+  importBootstrapVerificationKeys,
+  verifyBootstrapRelay,
+} from "@pgcf/contracts/bootstrap-relay";
 
 const artifacts: string[] = [];
 afterEach(async () => {
@@ -245,6 +251,130 @@ describe("Container startup readiness", () => {
       "bootstrap_network_preparation_required",
     );
     expect(methods).toEqual(["GET"]);
+    await expectJobPreserved(f);
+  });
+
+  it("resumes a scoped durable installation after its original preparation expires", async () => {
+    const methods: string[] = [];
+    const { f, instance } = await startup(async (request) => {
+      methods.push(request.method);
+      return new Response(null, {
+        status: request.method === "POST" ? 202 : 401,
+      });
+    });
+    await installationContinuation(f);
+    await env.DB.prepare(
+      "UPDATE node_network_preparations SET proof_expires_at=? WHERE operation_id=?",
+    )
+      .bind(new Date(Date.now() - 1).toISOString(), f.job.operation_id)
+      .run();
+    const provider = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("routine_provider_forbidden"));
+    expect(
+      await readNodeNetworkSnapshot(f.bindings, f.job.operation_id),
+    ).not.toBeNull();
+    await expect(instance.start(f.job.operation_id)).resolves.toMatchObject({
+      operation_id: f.job.operation_id,
+    });
+    expect(methods).toEqual(["GET", "POST"]);
+    expect(provider).not.toHaveBeenCalled();
+    await expectJobPreserved(f);
+  });
+
+  it("keeps a legacy partial installation closed when its authorization is absent and proof expired", async () => {
+    const { f, instance, port } = await startup(
+      async () => new Response(null, { status: 401 }),
+    );
+    await installationContinuation(f, false);
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE node_network_preparations SET proof_expires_at=? WHERE operation_id=?",
+      ).bind(new Date(Date.now() - 1).toISOString(), f.job.operation_id),
+    ]);
+    const provider = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("routine_provider_forbidden"));
+    await expect(instance.start(f.job.operation_id)).rejects.toThrow(
+      "bootstrap_network_preparation_required",
+    );
+    expect(port.fetch).not.toHaveBeenCalled();
+    expect(provider).not.toHaveBeenCalled();
+    await expectJobPreserved(f);
+  });
+
+  it("never substitutes durable installation authority for fresh final admission", async () => {
+    const { f, instance, port } = await startup(
+      async () => new Response(null, { status: 401 }),
+    );
+    await installationContinuation(f);
+    await expect(instance.admit(f.job.operation_id)).rejects.toThrow(
+      "bootstrap_admission_not_authorized",
+    );
+    expect(port.fetch).not.toHaveBeenCalled();
+    await expectJobPreserved(f);
+  });
+
+  it("issues only short scoped transport grants while durable installation continues past initial proof expiry", async () => {
+    const { f } = await startup(
+      async () => new Response(null, { status: 401 }),
+    );
+    await installationContinuation(f);
+    await env.DB.prepare(
+      "UPDATE node_network_preparations SET proof_expires_at=? WHERE operation_id=?",
+    )
+      .bind(new Date(Date.now() - 1).toISOString(), f.job.operation_id)
+      .run();
+    const relay = relayIdentity(f),
+      provider = vi
+        .spyOn(globalThis, "fetch")
+        .mockRejectedValue(new Error("routine_provider_forbidden"));
+    const grant = await issueBootstrapTransport(f.bindings, f.job, {
+        capability: "rescue_ssh",
+      }),
+      verified = await verifyBootstrapRelay(grant.token, {
+        keys: await importBootstrapVerificationKeys(
+          JSON.parse(f.bindings.BOOTSTRAP_VERIFIER_KEYS),
+        ),
+        region: f.job.region_id,
+        issuer_region: f.job.region_id,
+        relay_epoch: relay.epoch,
+        allowedTargetRegions: [f.job.region_id],
+      });
+    expect(verified.ok).toBe(true);
+    if (!verified.ok) throw new Error("scoped_grant_signature_invalid");
+    const claims = verified.claims;
+    expect(claims.operation).toBe(f.job.operation_id);
+    expect(claims.target).toEqual({
+      address: f.body.spec.hardware.ipv4,
+      port: 22,
+    });
+    expect(claims.exp - claims.iat).toBeGreaterThan(0);
+    expect(claims.exp - claims.iat).toBeLessThanOrEqual(60);
+    expect(relay.fetch).toHaveBeenCalledOnce();
+    expect(provider).not.toHaveBeenCalled();
+    await expectJobPreserved(f);
+  });
+
+  it("refuses changed network custody during relay identity readback instead of issuing a durable grant", async () => {
+    const { f } = await startup(
+      async () => new Response(null, { status: 401 }),
+    );
+    await installationContinuation(f);
+    relayIdentity(f, async () => {
+      await env.DB.prepare(
+        "UPDATE node_network_preparations SET status='blocked' WHERE operation_id=?",
+      )
+        .bind(f.job.operation_id)
+        .run();
+    });
+    const provider = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("routine_provider_forbidden"));
+    await expect(
+      issueBootstrapTransport(f.bindings, f.job, { capability: "rescue_ssh" }),
+    ).rejects.toThrow("Bootstrap preparation authority changed");
+    expect(provider).not.toHaveBeenCalled();
     await expectJobPreserved(f);
   });
 
@@ -538,6 +668,13 @@ async function networkPreparation(
   f.bindings.BOOTSTRAP_VERIFIER_KEYS = JSON.stringify({
     fixture: bytesToBase64url(new Uint8Array(publicKey)),
   });
+  const privateKey = await crypto.subtle.exportKey("pkcs8", pair.privateKey);
+  if (!(privateKey instanceof ArrayBuffer))
+    throw new Error("test_key_export_invalid");
+  f.bindings.BOOTSTRAP_RELAY_SIGNING_KEYS = JSON.stringify({
+    active: "fixture",
+    keys: { fixture: bytesToBase64url(new Uint8Array(privateKey)) },
+  });
   const envelope = {
       kid: "fixture",
       payload,
@@ -573,6 +710,87 @@ async function networkPreparation(
       new Date(now).toISOString(),
     )
     .run();
+  f.bindings.BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID = relayId;
+  f.bindings.BOOTSTRAP_RELAY_ISSUER_REGION = f.job.region_id;
+  f.bindings.BOOTSTRAP_FIREWALL_BINDINGS = JSON.stringify({
+    [f.providerId]: firewallId,
+  });
+  f.bindings.BOOTSTRAP_OPERATOR_SOURCES = JSON.stringify(plan.operators.ipv4);
+  f.bindings.BOOTSTRAP_SCAN_CONTROL = JSON.stringify(plan.scan_control);
+  await env.DB.prepare(
+    "INSERT INTO node_network_firewalls(firewall_id,operation_id,plan_sha256) VALUES(?,?,?)",
+  )
+    .bind(firewallId, f.job.operation_id, planSha256)
+    .run();
+}
+async function installationContinuation(f: Job, persist = true) {
+  const checkpoint = NodeBootstrapCheckpoint.parse({
+    ...f.checkpoint,
+    stage: "disk_write_intent",
+    status: "running",
+    destructive_intent: true,
+    write_intent_offset: 0,
+  });
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET checkpoint_json=?,revision=revision+1 WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(checkpoint), f.job.operation_id)
+    .run();
+  const job = await readBootstrapJob(env.DB, f.job.operation_id),
+    network = await env.DB.prepare(
+      "SELECT plan_sha256,readback_at,proof_sha256 FROM node_network_preparations WHERE operation_id=?",
+    )
+      .bind(job.operation_id)
+      .first<{
+        plan_sha256: string;
+        readback_at: string;
+        proof_sha256: string;
+      }>();
+  const authorization = {
+    version: 1,
+    operation_id: job.operation_id,
+    node_id: job.node_id,
+    region_id: job.region_id,
+    provider_instance_id: f.providerId,
+    input_hash: job.input_hash,
+    sealed_revision: job.sealed_revision,
+    intent_hash: f.addition.intent_hash,
+    binding_sha256: null,
+    plan_sha256: network!.plan_sha256,
+    readback_at: network!.readback_at,
+    initial_proof_sha256: network!.proof_sha256,
+    provider_audit_sha256: await digest(f.addition.audit),
+    provider_receipt_sha256: await digest(f.addition.receipt),
+    provider_inventory_sha256: await digest({ instance: f.providerId }),
+    authorized_revision: job.revision,
+    issued_at: new Date().toISOString(),
+  };
+  if (persist)
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET network_authorization_json=? WHERE operation_id=?",
+    )
+      .bind(canonical(authorization), job.operation_id)
+      .run();
+  f.job = await readBootstrapJob(env.DB, job.operation_id);
+  f.checkpoint = checkpoint;
+}
+function relayIdentity(f: Job, before: () => Promise<void> = async () => {}) {
+  const epoch = crypto.randomUUID(),
+    fetch = vi.fn(async () => {
+      await before();
+      return Response.json({
+        v: 1,
+        region: f.job.region_id,
+        issuer_region: f.job.region_id,
+        relay_epoch: epoch,
+        allowed_target_regions: [f.job.region_id],
+        capabilities: ["rescue_ssh", "talos_api", "kubernetes_api"],
+      });
+    });
+  f.bindings.BOOTSTRAP_RELAY_SERVICE = { fetch } as unknown as Fetcher;
+  f.bindings.BOOTSTRAP_RELAY_URL =
+    "https://relay.invalid/_pgcf/bootstrap-relay";
+  return { fetch, epoch };
 }
 describe("verified network gate for native installation", () => {
   it("refuses direct Container start before Container availability when rescue is active without preparation", async () => {

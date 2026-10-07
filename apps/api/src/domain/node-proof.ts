@@ -5,6 +5,10 @@ import type { Env } from "../env.ts";
 import { readNodeInstallationBinding } from "./node-installation.ts";
 import { readNodeAddition, assertNodeRecoveryAuthority } from "./node-state.ts";
 import { ensureNodeFirewall } from "./node-network.ts";
+import {
+  hasBootstrapNetworkAuthority,
+  type BootstrapJobRow,
+} from "./bootstrap-jobs.ts";
 
 interface ProofDispatcher {
   prove(operationId: string, mode: NodeProofMode): Promise<{ status: string }>;
@@ -30,6 +34,18 @@ export async function ensureNodePreparationProof(
     !["audited", "bootstrapping"].includes(addition.status)
   )
     return false;
+  const job = await env.DB.prepare(
+    "SELECT * FROM node_bootstrap_jobs WHERE operation_id=?",
+  )
+    .bind(operationId)
+    .first<BootstrapJobRow>();
+  if (
+    job &&
+    NodeBootstrapCheckpoint.parse(JSON.parse(job.checkpoint_json))
+      .destructive_intent &&
+    job.network_authorization_json !== null
+  )
+    return hasBootstrapNetworkAuthority(env, job);
   const preparation = await env.DB.prepare(
     "SELECT status,proof_expires_at,intent_hash,readback_at FROM node_network_preparations WHERE operation_id=?",
   )

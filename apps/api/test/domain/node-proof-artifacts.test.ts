@@ -23,7 +23,11 @@ import { ensureNodePreparationProof } from "../../src/domain/node-proof.ts";
 import { installationHash } from "../../src/domain/node-installation.ts";
 import { boundInstallationFixture } from "./installation-fixtures.ts";
 import { cleanupFixtures } from "./fixtures.ts";
-import { configureBootstrapJob } from "../../src/domain/bootstrap-jobs.ts";
+import {
+  configureBootstrapJob,
+  readBootstrapJob,
+} from "../../src/domain/bootstrap-jobs.ts";
+import { NodeBootstrapCheckpoint } from "@pgcf/contracts/node-bootstrap";
 import { ensureBootstrapNetworkBoundary } from "../../src/workflows/add-node.ts";
 
 const regions: string[] = [],
@@ -340,6 +344,110 @@ it("uses the accepted proof authority at the next Workflow boundary without agin
     ),
   ).toBe(true);
   expect(provider).not.toHaveBeenCalled();
+});
+
+it("keeps preparation and Workflow continuation scoped after the initial proof expires", async () => {
+  const f = await fixture();
+  await configureBootstrapJob(
+    f.bindings,
+    f.addition.intent.operation_id,
+    f.body,
+  );
+  const session = await issueNodeProofSession(
+    f.bindings,
+    f.addition.intent.operation_id,
+    "preparation",
+  );
+  f.verify.mockRestore();
+  expect(
+    (await acceptNodeProofReport(f.bindings, session.bearer, f.report))
+      .verified,
+  ).toBe(true);
+  const job = await readBootstrapJob(env.DB, f.addition.intent.operation_id),
+    checkpoint = NodeBootstrapCheckpoint.parse({
+      ...JSON.parse(job.checkpoint_json),
+      stage: "disk_write_intent",
+      status: "running",
+      destructive_intent: true,
+      write_intent_offset: 0,
+      downloaded_bytes: f.body.spec.image.compressed_bytes,
+    }),
+    preparation = await env.DB.prepare(
+      "SELECT plan_sha256,readback_at,proof_sha256 FROM node_network_preparations WHERE operation_id=?",
+    )
+      .bind(job.operation_id)
+      .first<{
+        plan_sha256: string;
+        readback_at: string;
+        proof_sha256: string;
+      }>();
+  const record = {
+    version: 1,
+    operation_id: job.operation_id,
+    node_id: job.node_id,
+    region_id: job.region_id,
+    provider_instance_id: f.providerId,
+    input_hash: job.input_hash,
+    sealed_revision: job.sealed_revision,
+    intent_hash: f.addition.intent_hash,
+    binding_sha256: f.binding.row.binding_sha256,
+    plan_sha256: preparation!.plan_sha256,
+    readback_at: preparation!.readback_at,
+    initial_proof_sha256: preparation!.proof_sha256,
+    provider_audit_sha256: await installationHash(f.addition.audit),
+    provider_receipt_sha256: await installationHash(f.addition.receipt),
+    provider_inventory_sha256: await installationHash(f.actual),
+    authorized_revision: job.revision + 1,
+    issued_at: new Date().toISOString(),
+  };
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET revision=revision+1,checkpoint_json=?,network_authorization_json=? WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(checkpoint), JSON.stringify(record), job.operation_id)
+    .run();
+  await env.DB.prepare(
+    "UPDATE node_network_preparations SET proof_expires_at=? WHERE operation_id=?",
+  )
+    .bind(new Date(Date.now() - 1).toISOString(), job.operation_id)
+    .run();
+  const prove = vi.fn(async () => ({ status: "running" })),
+    bindings = {
+      ...f.bindings,
+      NODE_BOOTSTRAP: {
+        idFromName: () => job.operation_id,
+        get: () => ({ prove }),
+      } as unknown as typeof f.bindings.NODE_BOOTSTRAP,
+    },
+    provider = vi
+      .spyOn(globalThis, "fetch")
+      .mockRejectedValue(new Error("routine_provider_forbidden"));
+  expect(await ensureNodePreparationProof(bindings, job.operation_id)).toBe(
+    true,
+  );
+  expect(await ensureBootstrapNetworkBoundary(bindings, job.operation_id)).toBe(
+    true,
+  );
+  expect(prove).not.toHaveBeenCalled();
+  expect(provider).not.toHaveBeenCalled();
+  expect(
+    (await env.DB.prepare(
+      "SELECT proof_sha256 FROM node_network_preparations WHERE operation_id=?",
+    )
+      .bind(job.operation_id)
+      .first<{ proof_sha256: string }>())!.proof_sha256,
+  ).toBe(preparation!.proof_sha256);
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET authorized=0 WHERE operation_id=?",
+  )
+    .bind(job.operation_id)
+    .run();
+  expect(await ensureNodePreparationProof(bindings, job.operation_id)).toBe(
+    false,
+  );
+  expect(await ensureBootstrapNetworkBoundary(bindings, job.operation_id)).toBe(
+    false,
+  );
+  expect(prove).not.toHaveBeenCalled();
 });
 
 it("requires a fresh signed report to replace expired accepted proof authority", async () => {

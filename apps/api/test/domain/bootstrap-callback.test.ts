@@ -29,6 +29,8 @@ import {
   bootstrapJobInput,
   configureBootstrapJob,
   readBootstrapJob,
+  hasBootstrapNetworkAuthority,
+  establishBootstrapNetworkAuthority,
   type NodeBootstrapConfiguration,
 } from "../../src/domain/bootstrap-jobs.ts";
 import {
@@ -803,6 +805,139 @@ async function confirmedFirewallAllocation(
     .run();
 }
 describe("protected bootstrap authority", () => {
+  it("refuses legacy continuation without fresh proof and never initializes from a routine read", async () => {
+    const { f, envelope } = await beforeDestructiveWrite();
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET checkpoint_json=?,revision=revision+1 WHERE operation_id=?",
+    )
+      .bind(
+        JSON.stringify({
+          ...envelope.payload,
+          written_bytes: 512,
+          write_intent_offset: 512,
+        }),
+        f.job.operation_id,
+      )
+      .run();
+    const row = await readBootstrapJob(env.DB, f.job.operation_id),
+      provider = vi
+        .spyOn(ContaboClient.prototype, "getInstance")
+        .mockRejectedValue(new Error("unexpected_provider_read"));
+    expect(await hasBootstrapNetworkAuthority(f.bindings, row)).toBe(false);
+    expect(provider).not.toHaveBeenCalled();
+    await env.DB.prepare(
+      "UPDATE node_network_preparations SET proof_expires_at=? WHERE operation_id=?",
+    )
+      .bind(new Date(Date.now() - 1).toISOString(), row.operation_id)
+      .run();
+    expect(await establishBootstrapNetworkAuthority(f.bindings, row)).toBe(
+      false,
+    );
+    expect(provider).not.toHaveBeenCalled();
+    const after = await readBootstrapJob(env.DB, row.operation_id);
+    expect(after.network_authorization_json).toBeNull();
+    expect(after.checkpoint_json).toBe(row.checkpoint_json);
+    expect(after.revision).toBe(row.revision);
+  });
+  it("establishes legacy authority once without changing acknowledged or pending disk progress", async () => {
+    const { f, envelope } = await beforeDestructiveWrite();
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET checkpoint_json=?,revision=revision+1 WHERE operation_id=?",
+    )
+      .bind(
+        JSON.stringify({
+          ...envelope.payload,
+          written_bytes: 512,
+          write_intent_offset: 512,
+        }),
+        f.job.operation_id,
+      )
+      .run();
+    const row = await readBootstrapJob(env.DB, f.job.operation_id),
+      provider = vi
+        .spyOn(ContaboClient.prototype, "getInstance")
+        .mockResolvedValue(providerTarget(f));
+    expect(await establishBootstrapNetworkAuthority(f.bindings, row)).toBe(
+      true,
+    );
+    const current = await readBootstrapJob(env.DB, row.operation_id);
+    expect(current.checkpoint_json).toBe(row.checkpoint_json);
+    expect(current.revision).toBe(row.revision);
+    expect(typeof current.network_authorization_json).toBe("string");
+    await env.DB.prepare(
+      "UPDATE node_network_preparations SET proof_expires_at=? WHERE operation_id=?",
+    )
+      .bind(new Date(Date.now() - 1).toISOString(), row.operation_id)
+      .run();
+    expect(await establishBootstrapNetworkAuthority(f.bindings, current)).toBe(
+      true,
+    );
+    expect(provider).toHaveBeenCalledTimes(1);
+    f.bindings.BOOTSTRAP_OPERATOR_SOURCES = JSON.stringify([
+      "203.0.113.201/32",
+    ]);
+    expect(await hasBootstrapNetworkAuthority(f.bindings, current)).toBe(false);
+    expect(provider).toHaveBeenCalledTimes(1);
+  });
+  it("continues a durably authorized disk installation after initial proof expiry and stops on revocation", async () => {
+    const { f, envelope } = await beforeDestructiveWrite();
+    const provider = vi
+      .spyOn(ContaboClient.prototype, "getInstance")
+      .mockResolvedValue(providerTarget(f));
+    expect((await callback(f, envelope)).status).toBe(200);
+    const before = await readBootstrapJob(env.DB, f.job.operation_id);
+    await env.DB.prepare(
+      "UPDATE node_network_preparations SET proof_expires_at=? WHERE operation_id=?",
+    )
+      .bind(new Date(Date.now() - 1).toISOString(), f.job.operation_id)
+      .run();
+    expect((await callback(f, { ...f.identity, kind: "read" })).status).toBe(
+      200,
+    );
+    expect(provider).toHaveBeenCalledTimes(1);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+    const waiting = {
+      ...JSON.parse(before.checkpoint_json),
+      stage: "awaiting_verification",
+      status: "awaiting_verification",
+    };
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET checkpoint_json=?,revision=revision+1 WHERE operation_id=?",
+    )
+      .bind(JSON.stringify(waiting), before.operation_id)
+      .run();
+    expect((await callback(f, { ...f.identity, kind: "read" })).status).toBe(
+      200,
+    );
+    const awaiting = await readBootstrapJob(env.DB, before.operation_id);
+    expect(
+      (
+        await callback(f, {
+          ...f.identity,
+          kind: "checkpoint",
+          expected_revision: awaiting.revision,
+          payload: {
+            ...waiting,
+            stage: "quarantine_release_intent",
+            status: "running",
+            release_node_uid: crypto.randomUUID(),
+            release_resource_version: "2",
+          },
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (await readBootstrapJob(env.DB, before.operation_id)).checkpoint_json,
+    ).toBe(awaiting.checkpoint_json);
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET authorized=0 WHERE operation_id=?",
+    )
+      .bind(f.job.operation_id)
+      .run();
+    expect((await callback(f, { ...f.identity, kind: "read" })).status).toBe(
+      403,
+    );
+  });
   it("rejects changed firewall rules before first disk intent without repairing provider state", async () => {
     const { f, envelope, firewall, firewallRead } =
         await beforeDestructiveWrite(),

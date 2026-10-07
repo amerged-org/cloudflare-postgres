@@ -69,6 +69,20 @@ lease/allocation and job authority checks before and after. It does not age the 
 again at each transition. A changed or expired artifact requires normal signature, scope and
 observation-freshness validation; revoked authority blocks without a fallback. Later write chunks
 retain their scoped authority and readback checks without repeating provider queries.
+The first destructive checkpoint stores an immutable Cloudflare installation authorization
+bound to the exact job/input, sealed network plan and verified provider facts. Continued
+installation uses fresh job/scope checks and short transport grants rather than repeating a
+full port scan whenever the initial preparation proof expires. Native host/certificate,
+physical/cluster/node identity and acknowledged/pending-byte comparisons remain mandatory.
+This authorization ends with cancellation, revocation or admission and grants no permission
+to another job or to release quarantine without fresh postjoin proof.
+For a partially written job created before migration0022, the programmed Workflow establishes
+this record once at an explicit lifecycle boundary using a fresh preparation proof and fresh
+read-only provider facts. Its CAS preserves the complete input and current acknowledged/pending
+checkpoint. Routine reads/grants cannot establish the record or query Contabo. Apply0022 through
+the tracked D1 migration path only after checking the exact pending migration and the paused
+job; do not reset the disk or replay an uncertain write.
+
 The provider client retains credential-scoped OAuth reuse/coalescing, early-expiry refresh and
 401 invalidation. A credential change closes reuse of the old client; an uncertain mutation is
 resolved through its existing claim and readback rather than replayed.
