@@ -50,15 +50,31 @@ Verify the real VPC-to-Tunnel identity and the relay's current process epoch bef
 bootstrap jobs. Native SSH, Talos and Kubernetes sessions still verify their host keys or
 certificates end to end. Broken transport never replays a native command.
 
+Select and seal the provider-verified proof source association once per installation in
+Cloudflare. Reuse that association across proof renewals with fresh expiring claims. Each grant
+still checks the current operation, job, binding, plan, Node UID/Ready/freshness and retained
+cluster custody. Native reads must confirm the actual Cluster/Node identities, addresses and
+host keys or certificates before work and owned cleanup; changed or unknown identity blocks it.
+Do not query Contabo for each Kubernetes/Talos command, grant, relay connection or cleanup step.
+Provider reads belong to order/initial mapping, firewall/rescue, hypervisor and uncertain-outcome
+reconciliation, with a fresh matching provider check before the first destructive checkpoint.
+The provider client retains credential-scoped OAuth reuse/coalescing, early-expiry refresh and
+401 invalidation. A credential change closes reuse of the old client; an uncertain mutation is
+resolved through its existing claim and readback rather than replayed.
+
 ## Programmed installation path
 
 The headless producer is implemented and has passed the common software and image checks; delivery
 and fresh-node Dev acceptance are tracked in PLAN.md.
-Configure an authenticated regional `/v1/regions/{id}/installation-profile` once, with the reviewed
-Talos image source, measured storage geometry, DNS, retained rescue client key and issuer region.
-The first node of a region additionally needs its reviewed platform source/image and protected
-regional credentials; an EU worker uses the retained cluster join custody. Profiles and per-node
-rescue identities are encrypted in D1. Status never returns their private keys.
+Configure `PUT /v1/regions/{id}/installation-profile` once with administrator scope. The exact
+profile fields are `version:1`, `region_id`, `provider_product_id`, `relay_issuer_region_id`, `dns`,
+`storage:{ephemeral_gib,lvm_gib}` and `rescue_client_private_key`. Storage is the reviewed layout;
+the inspector supplies measured physical geometry and the verified official Talos image/GPT.
+A first regional node additionally needs `first_region:{cluster_name,reviewed_commit,regional_image,platform}`.
+Its `platform` contains `version:1`, `region_id`, `api_host`, the retained `agent_key`,
+`route_keyring`, `tunnel_token` and `backup_s3:{access_key_id,secret_access_key}`. A worker uses the
+existing regional join custody. Preserve the issued regional credentials; profiles and rescue
+identities are encrypted in D1, and status never returns their private keys.
 
 During pre-installation, administrators can read
 `GET /v1/nodes/additions/{operation-id}/inspection`. This reads the existing native inspector
@@ -77,20 +93,36 @@ This observes the retained native proof session and its fixed error code; it nev
 creates a session, registers work or refreshes its expiry. A reported proof still requires the
 separate signed-artifact and admission checks.
 
-For the current deployment, bind US1's existing original-request-correlated purchase receipt
-before preparing its bootstrap; do not issue another order. EU1 is already admitted and needs no
-bootstrap or adoption operation. The installation sequence below applies to US1 and future
-authorized additions, not to the retained EU nodes.
+US1's purchase, profile, installation binding and reported inspection are already retained; its
+original authorized job is still `created`, before disk writes. Continue that same addition and
+AddNode Workflow through its existing pause/resume control, preserving sealed inputs, credentials,
+proof-source association and journals. Resolve an uncertain control response through observation.
+Do not repeat the purchase, profile import, adoption, registration or disk-write intent. EU1 is
+already admitted and needs no bootstrap or adoption operation. The sequence below describes US1's
+remaining programmed work and future authorized additions; it does not authorize reinstalling EU.
 
-For actual-RAM placement, configure the policy explicitly: 256 MiB assignment steps, maximum
-4096 MiB, and the reviewed PostgreSQL request (128 MiB in this installation). Keep CPU and storage
-checks enabled. Changing reservation geometry requires an empty assigned live cohort and no
-unsettled startups; a normal cost/node-cap change does not reset existing database state. Mark the
-retained control server ineligible through its UID-guarded database-placement endpoint, while
-preserving Kubernetes/platform operation and existing data. The flag excludes new placement;
-existing assigned databases must continue to serve, wake, resize and delete normally.
+Keep actual-RAM mode, automatic purchases and autoscaling disabled until US/recovery acceptance,
+reviewed test cleanup and explicit finite owner limits. Then use the guarded
+`PUT /v1/regions/{id}/capacity-policy` with `region_id`, `max_nodes`, `purchases_enabled`, `order`,
+`placement_mode`, `maximum_database_memory_mib`, `postgres_memory_request_mib`,
+`standing_cost_profile`, `autoscale_enabled` and `adopt_instance_ids`. Preserve current finite node
+caps. Use `placement_mode:"actual_ram"`, 256 MiB assignment steps, maximum 4096 MiB and the reviewed
+128 MiB PostgreSQL request for this installation. Changing mode or the PostgreSQL request requires
+an empty assigned live cohort and no unsettled startups; configured limits must cover existing
+databases. Cost/node-cap updates do not reset database state.
 
-The automatic sequence is:
+The exact regional `order` contains `product_id`, `provider_region`, `image_id`, `term_months` and
+`location`. Use the confirmed V159 offer with `term_months:1` and omit `add_ons`. Its standing
+profile must bind that exact order and explicit `id`, `owner_reference`, `approved_at`, `expires_at`,
+`currency`, `monthly_amount`, `setup_amount`, `max_orders`, `max_total_monthly_amount` and
+`max_total_setup_amount`. Do not infer unlimited orders or spend from a model approval. Enable
+standing purchases only while these finite limits and expiry authorize the order.
+
+The retained control server's UID-guarded new-database placement flag is already disabled;
+preserve Kubernetes/platform operation and existing data. The flag excludes new placement;
+existing databases must continue to serve, wake, resize and delete normally.
+
+Cloudflare executes the automatic capacity-to-Ready sequence from persisted state:
 
 1. Ten fresh consecutive minute samples from the same physical Node UID reach 76% average
    working-set/physical RAM. Cloudflare reserves one regional addition, checks the exact standing
@@ -101,11 +133,12 @@ The automatic sequence is:
 3. Allocate/read back the owned free firewall definition, create a unique retained rescue host
    identity, and request registered-key RAM rescue. Native inspection measures the actual disk,
    RAM, MAC, network and official pinned Talos image/GPT; incomplete hardware remains unknown.
-4. Compose and seal the exact installation input. Actual outside-allowlist dual-stack port scans
+4. Compose and seal the exact installation input and provider-verified source association. Actual outside-allowlist dual-stack port scans
    and allowed-source controls establish a signed preparation proof. The Workflow refreshes
    measurements when the proof has less than 60 seconds remaining; it retains all write offsets
    and immutable checkpoints.
-5. Install the qualified image, apply the exact network configuration and join/bootstrap the
+5. Verify the target provider identity at the first destructive checkpoint, then install the
+   qualified image, apply the exact network configuration and join/bootstrap the
    intended region. The release pins reviewed security patch versions. Installed Talos has no
    SSH daemon; management ports remain restricted to their reviewed sources and PostgreSQL is
    never exposed. Rescue password authentication is disabled by the generated configuration.
@@ -201,3 +234,15 @@ Earlier loss, deletion and decommissioning kits are withheld; any later loss dri
 separately reviewed scope that preserves or recovers the same customer EU1. Keep unchanged prior
 proofs and record new measured results in `PLAN.md`. Approximately nine-second cold starts are accepted for v1.
 Do not migrate Neon or call the product finished until EU and US plus recovery have passed.
+Record measured installation/rollout time and actual Contabo calls by lifecycle phase, including
+zero calls throughout repeated transport grants, Kubernetes/Talos reads and proof cleanup after
+source selection. Local tests, a configured image or provider Running do not establish this live
+acceptance. Use the normal Cloudflare SQL endpoint to verify actual placement, roles/TLS, committed
+markers, R2 base backup/WAL and deletion through confirmed physical storage reclamation.
+
+After operator acceptance, inventory the adopter's databases, roles/extensions, client pooling,
+timeouts and required capacity in its own repository. Keep its Neon databases separate until
+each reviewed migration freezes writes, restores and compares data/roles/sequences, verifies the
+Cloudflare target's TLS and backup/WAL, and accepts the connection cutover. Do not switch back to
+a stale Neon source after target writes without reconciling them. Credential changes follow the
+separate custody runbook; this completion does not authorize an uncoordinated rotation.

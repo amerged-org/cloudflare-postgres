@@ -16,11 +16,12 @@ resources remain protected; server loss is recovered from R2.
 - Usage and infrastructure-cost metrics per database. You put your own pricing on top.
 - Horizontal scaling: Cloudflare adds Contabo VPS through the Contabo API within your caps.
 
-[ohmyho.st](https://ohmyho.st) is the first adopter. It will replace Neon with this service.
+[ohmyho.st](https://ohmyho.st) is the first adopter. Its Neon migration follows operator acceptance;
+existing customer databases remain on Neon until their separate migration is accepted.
 
 ## Status
 
-**Phases 0 and 1 accepted in Dev; operator completion in progress (2026-10-06).** Both EU nodes and
+**Phases 0 and 1 accepted in Dev; operator completion in progress (2026-10-07).** Both EU nodes and
 all five Flux releases are Ready, with 95 GiB measured storage per node. The complete Dev path through
 `db.ohmyho.st` reaches real PostgreSQL with verified TLS, continuous WAL archiving and R2 backups.
 
@@ -81,19 +82,35 @@ allocated SSD and did not run an installer. Those failed selections are historic
 V159 offer supplies the required 150 GiB NVMe without a storage add-on. No new EU worker is needed,
 and EU1 is not reset, re-adopted or decommissioned. First verify an R2 restore into US1 while
 preserving the healthy EU source; the earlier destructive loss and deletion kits are withheld.
-No customer or platform database has been migrated. EU/US operator acceptance comes first; Neon
-migration and public-release polish follow separately.
+US1's installation profile and binding are sealed, hardware inspection has reported, and its
+original authorized bootstrap job remains at `created`, before installation disk writes.
+Preparation proof, installation/admission and cross-region recovery remain unaccepted. Resume
+the same addition and Workflow with their retained seals and journals; do not purchase, re-adopt
+or reset US1. No customer or platform database has been migrated. EU/US operator acceptance comes
+first; Neon migration and public-release polish follow separately.
 
-The approved actual-RAM policy buys regional capacity at 76% average physical RAM usage over
-ten rolling minutes. Existing capacity remains eligible during rollout under hard RAM, CPU and
-storage guards. Missing observations remain unknown. Admin assignments use 256 MiB steps, with
-a 4096 MiB PostgreSQL cap in this installation; transient PostgreSQL/Barman startup peaks are
-admitted separately. The headless API, bootstrap image and regional producer are delivered;
-installation-profile activation, this policy's activation and fresh-node live acceptance remain
-outstanding.
+The approved actual-RAM policy requests regional V159 capacity at at least 76% average physical
+RAM usage over ten fresh consecutive minute samples from the same Node UID, within explicit node
+and standing cost caps. Orders use one month and no storage add-on. Existing capacity remains
+eligible during rollout under hard RAM, CPU, storage and full PostgreSQL/Barman startup-peak
+guards; there is no 81% placement cutoff. Missing observations remain unknown. Admin assignments
+use 256 MiB steps, with a 4096 MiB PostgreSQL cap in this installation. Actual-RAM mode and automatic
+purchases remain disabled until US/recovery acceptance, reviewed test cleanup and finite owner
+limits are supplied. Profile configuration is complete; policy activation and fresh-node live
+acceptance remain outstanding.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture
+
+The programmed installer selects a provider-verified source once and retains its association in
+Cloudflare across proof renewals. Renewed claims are short-lived; current job/binding authority,
+host keys, TLS, Cluster UID, Node UID and fresh native identity readbacks still fence execution.
+Kubernetes/Talos commands, transport grants and proof cleanup must make zero Contabo calls.
+Contabo remains at purchase, initial inventory/firewall/rescue, hypervisor and uncertain-provider
+resolution boundaries, including fresh verification before the first destructive write. Its
+credential-scoped client reuses and coalesces OAuth until early expiry or 401 invalidation;
+credential changes replace the client. Uncertain mutations are never replayed. Deployment and
+measured live acceptance of this provider-free path remain outstanding in PLAN.md.
 
 ```mermaid
 flowchart LR
@@ -143,7 +160,7 @@ flowchart LR
   Boot -->|"install Talos, join"| Region
 ```
 
-Connecting to a sleeping database (sleep and wake arrive in Phase 2; in Phase 1 databases always run):
+Connecting to a sleeping database:
 
 ```mermaid
 sequenceDiagram
@@ -170,7 +187,7 @@ sequenceDiagram
 | Part                  | Where                | Job                                                                                    |
 | --------------------- | -------------------- | -------------------------------------------------------------------------------------- |
 | API Worker            | Cloudflare           | `/v1` API, D1 state, Durable Objects, Workflows, usage rollups                         |
-| Edge Worker           | Cloudflare           | Database endpoint: D1 admission, wake, signed route, native forwarding                 |
+| Edge Worker           | Cloudflare           | Database endpoint: Actor admission, wake, signed route, native forwarding              |
 | Regional agent        | Kubernetes           | Reconciles databases into CNPG resources; hibernate/wake; reports status and samples   |
 | Gateway + cloudflared | Kubernetes           | Entry from Cloudflare; startup validation before PostgreSQL dial, TLS, stream counters |
 | Node bootstrap        | Cloudflare Container | Turns a Contabo VPS into a Talos node                                                  |
@@ -179,7 +196,7 @@ sequenceDiagram
 The approved client endpoint is `GET /v2?database=<id>&user=<role>` on the single database hostname.
 Configure the Neon serverless driver's `Pool`/`Client` WebSocket mode with `pipelineConnect=false`
 and a `wsProxy` URL containing both URL-encoded hints. Requests to the bare `/v2` endpoint or with
-missing or invalid hints are unsupported. Edge checks the database and role against D1, signs a
+missing or invalid hints are unsupported. Actor admission checks the database and role against D1; Edge signs a
 v2 routing token with mandatory user, and returns the unopened upstream WebSocket for native
 forwarding. Admission failures return a small failure-only `101` WebSocket carrying a PostgreSQL
 SQLSTATE error before any gateway upgrade or PostgreSQL dial. Dev uses a VPC HTTP service with

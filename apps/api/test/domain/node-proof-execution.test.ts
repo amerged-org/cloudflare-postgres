@@ -8,9 +8,11 @@ import {
 import { afterEach, expect, it, vi } from "vitest";
 import { bytesToBase64url, newNodeId } from "@pgcf/contracts";
 import { NodeProofExecutionInput } from "@pgcf/contracts/node-proof";
+import { NodeJoinBundle } from "@pgcf/contracts/node-bootstrap";
 import {
   bootstrapRelayClaimsSchema,
   BOOTSTRAP_RELAY_IDENTITY_PATH,
+  BOOTSTRAP_RELAY_PATH,
   BOOTSTRAP_RELAY_PROBE_PATH,
   BOOTSTRAP_RELAY_HEADER,
 } from "@pgcf/contracts/bootstrap-relay";
@@ -19,7 +21,11 @@ import { NodeBootstrap } from "../../src/bootstrap-container.ts";
 import { issueNodeProofSession } from "../../src/domain/node-proof-session.ts";
 import { installationHash } from "../../src/domain/node-installation.ts";
 import { ContaboError } from "../../src/providers/contabo.ts";
-import { boundInstallationFixture } from "./installation-fixtures.ts";
+import {
+  boundInstallationFixture,
+  installationFixture,
+} from "./installation-fixtures.ts";
+import { ContaboClient } from "../../src/providers/contabo.ts";
 import { cleanupFixtures } from "./fixtures.ts";
 import * as network from "../../src/domain/node-network.ts";
 import * as sources from "../../src/domain/node-proof-source.ts";
@@ -31,7 +37,10 @@ import { composeConfiguredNodeBootstrap } from "../../src/domain/bootstrap-compo
 import {
   regionSeedReference,
   storeRegionSeed,
+  joinBundleReference,
+  storeRegionJoinBundle,
 } from "../../src/crypto/bootstrap-credentials.ts";
+import { storeNodeInstallationProfile } from "../../src/domain/node-installation.ts";
 
 const regions: string[] = [];
 afterEach(async () => {
@@ -192,6 +201,138 @@ async function fixture() {
   }
   return { ...f, id, input, session, withStore, request };
 }
+async function sealedPodSource(f: Awaited<ReturnType<typeof fixture>>) {
+  const source = await installationFixture();
+  regions.push(source.fixture.region);
+  source.actual.region = "US-central";
+  source.actual.status = "running";
+  source.actual.ipConfig.v4.ip = "8.8.4.4";
+  const uid = crypto.randomUUID(),
+    at = new Date().toISOString();
+  await env.DB.prepare("UPDATE regions SET provider_region=? WHERE id=?")
+    .bind(source.actual.region, source.fixture.region)
+    .run();
+  await storeNodeInstallationProfile(
+    source.bindings,
+    source.fixture.region,
+    source.profile,
+  );
+  await env.DB.prepare(
+    "INSERT INTO nodes(id,region_id,k8s_node_name,provider_instance_id,node_uid,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,1,8192,8000,32,128,?,?,?)",
+  )
+    .bind(
+      source.fixture.node,
+      source.fixture.region,
+      source.fixture.nodeName,
+      source.actual.id,
+      uid,
+      at,
+      at,
+      at,
+    )
+    .run();
+  const bundle = NodeJoinBundle.parse({
+    ...f.bundle,
+    cluster_name: source.profile.first_region!.cluster_name,
+    cluster_endpoint: `https://${source.actual.ipConfig.v4.ip}:6443`,
+    kube_system_uid: crypto.randomUUID(),
+  });
+  await storeRegionJoinBundle(
+    env.DB,
+    f.bindings.CREDENTIAL_KEYS,
+    joinBundleReference(source.fixture.region, 1),
+    bundle,
+  );
+  const input = NodeProofExecutionInput.parse({
+    ...f.input,
+    source: {
+      kind: "pod",
+      cluster_uid: bundle.kube_system_uid,
+      node_uid: uid,
+      node_name: source.fixture.nodeName,
+      node_id: source.fixture.node,
+      region_id: source.fixture.region,
+      provider_instance_id: source.actual.id,
+      ipv4: source.actual.ipConfig.v4.ip,
+      image: source.profile.first_region!.regional_image,
+      access: { join_bundle: bundle },
+    },
+  });
+  await f.withStore(async (_instance, state) => {
+    await state.storage.put(
+      `proof_input:${f.session.claims.session_id}`,
+      input,
+    );
+  });
+  return { source, input, uid };
+}
+it("authorizes repeated sealed source and target transports without any provider request", async () => {
+  const f = await fixture(),
+    selected = await sealedPodSource(f);
+  Object.assign(f.bindings, {
+    CONTABO_CLIENT_ID: crypto.randomUUID(),
+    CONTABO_CLIENT_SECRET: "fixture-secret",
+    CONTABO_USERNAME: "fixture-user",
+    CONTABO_PASSWORD: "fixture-password",
+  });
+  const provider = vi
+    .spyOn(ContaboClient.prototype, "getInstance")
+    .mockRejectedValue(new Error("routine_provider_request_forbidden"));
+  const fetch = vi.fn(async (request: Request | URL) =>
+    new URL((request as Request).url ?? String(request)).pathname ===
+    BOOTSTRAP_RELAY_PATH
+      ? new Response(null, { status: 426 })
+      : Response.json({
+          v: 1,
+          region: f.fixture.region,
+          issuer_region: f.fixture.region,
+          relay_epoch: crypto.randomUUID(),
+          allowed_target_regions: [
+            f.fixture.region,
+            selected.source.fixture.region,
+          ],
+          capabilities: ["rescue_ssh", "talos_api", "kubernetes_api"],
+        }),
+  );
+  f.bindings.BOOTSTRAP_RELAY_SERVICE = { fetch } as unknown as Fetcher;
+  let sourceToken: string | undefined;
+  for (const body of [
+    { capability: "kubernetes_api", direction: "source" },
+    { capability: "kubernetes_api", direction: "source" },
+    { capability: "talos_api", direction: "target" },
+  ]) {
+    const response = await f.request("transport", JSON.stringify(body));
+    expect(response.status).toBe(200);
+    if (body.direction === "source")
+      sourceToken = ((await response.json()) as { token: string }).token;
+  }
+  const relay = await createApp().fetch(
+    new Request(`https://api.invalid/internal/v1/node-proof/${f.id}/relay`, {
+      headers: {
+        Authorization: `Bearer ${f.session.bearer}`,
+        Upgrade: "websocket",
+        [BOOTSTRAP_RELAY_HEADER]: sourceToken!,
+      },
+    }),
+    f.bindings,
+    createExecutionContext(),
+  );
+  expect(relay.status).toBe(426);
+  expect(
+    (
+      await f.request(
+        "ownership",
+        JSON.stringify({ action: "read", kind: "source", key: "a".repeat(64) }),
+      )
+    ).status,
+  ).toBe(200);
+  expect(provider).not.toHaveBeenCalled();
+  await f.withStore(async (_instance, state) => {
+    expect(
+      await state.storage.get(`proof_input:${f.session.claims.session_id}`),
+    ).toEqual(selected.input);
+  });
+});
 it("authenticates every private proof POST before malformed body parsing", async () => {
   const f = await fixture();
   for (const path of ["transport", "access", "report", "ownership"])
@@ -542,6 +683,7 @@ it("settles the exact interrupted postjoin journal before starting a new session
 });
 it("passes the decrypted exact region seed to read-only TLS preparation without inventing a cluster UID", async () => {
   const f = await fixture();
+  const selected = await sealedPodSource(f);
   await recordNodeInstallationInspection(f.bindings, f.id, 0, {
     ...f.inspection,
     network_plan_sha256: f.input.binding.plan_sha256,
@@ -570,7 +712,9 @@ it("passes the decrypted exact region seed to read-only TLS preparation without 
     .bind(JSON.stringify(ref), f.id)
     .run();
   vi.spyOn(network, "ensureNodeFirewall").mockResolvedValue(true);
-  vi.spyOn(sources, "selectNodeProofSource").mockResolvedValue(f.input.source);
+  vi.spyOn(sources, "selectNodeProofSource").mockResolvedValue(
+    selected.input.source,
+  );
   const input = await execution.prepareNodeProofInput(
     f.bindings,
     f.id,
@@ -586,6 +730,104 @@ it("passes the decrypted exact region seed to read-only TLS preparation without 
   await expect(
     execution.prepareNodeProofInput(f.bindings, f.id, "preparation"),
   ).rejects.toMatchObject({ code: "forbidden" });
+});
+it("selects a proof source once then renews claims from its sealed association without provider calls", async () => {
+  const f = await fixture(),
+    selected = await sealedPodSource(f);
+  await recordNodeInstallationInspection(f.bindings, f.id, 0, {
+    ...f.inspection,
+    network_plan_sha256: f.input.binding.plan_sha256,
+  });
+  await composeConfiguredNodeBootstrap(f.bindings, f.id, {
+    provider: f.provider,
+  });
+  const provider = {
+    getInstance: vi.fn(async (id: string) => {
+      if (id === f.actual.id) return f.actual;
+      if (id === selected.source.actual.id) return selected.source.actual;
+      throw new Error("unexpected_lifecycle_provider_identity");
+    }),
+  };
+  const first = await execution.prepareNodeProofInput(
+    f.bindings,
+    f.id,
+    "preparation",
+    {
+      sourceSelection: { provider },
+    },
+  );
+  expect(first?.source).toEqual({
+    ...selected.input.source,
+    image: f.profile.first_region!.regional_image,
+  });
+  expect(provider.getInstance).toHaveBeenCalledTimes(2);
+  const boundaryCalls = provider.getInstance.mock.calls.length;
+  provider.getInstance.mockRejectedValue(
+    new Error("renewal_provider_forbidden"),
+  );
+  const association = execution.proofSourceBinding(first!);
+  const renewed = await execution.prepareNodeProofInput(
+    f.bindings,
+    f.id,
+    "preparation",
+    {
+      sourceBinding: association,
+      sourceSelection: { provider },
+    },
+  );
+  expect(renewed?.source).toEqual(first!.source);
+  expect(renewed?.claims.session_id).not.toBe(first!.claims.session_id);
+  expect(provider.getInstance).toHaveBeenCalledTimes(boundaryCalls);
+  await storeRegionJoinBundle(
+    env.DB,
+    f.bindings.CREDENTIAL_KEYS,
+    joinBundleReference(f.fixture.region, 1),
+    {
+      ...f.bundle,
+      cluster_name: first!.bootstrap.spec.cluster_name,
+      cluster_endpoint: first!.bootstrap.spec.cluster_endpoint,
+    },
+  );
+  await env.DB.prepare(
+    "UPDATE node_additions SET checkpoint_json=? WHERE operation_id=?",
+  )
+    .bind(
+      JSON.stringify({
+        stage: "joined",
+        reference: "fixture:joined",
+        saved_at: new Date().toISOString(),
+        revision: 1,
+      }),
+      f.id,
+    )
+    .run();
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET checkpoint_json=json_set(checkpoint_json,'$.stage','awaiting_verification') WHERE operation_id=?",
+  )
+    .bind(f.id)
+    .run();
+  const postjoin = await execution.prepareNodeProofInput(
+    f.bindings,
+    f.id,
+    "postjoin",
+    {
+      sourceBinding: association,
+      sourceSelection: { provider },
+    },
+  );
+  expect(postjoin?.claims.mode).toBe("postjoin");
+  expect(postjoin?.source).toEqual(first!.source);
+  expect(postjoin?.cluster_bundle?.kube_system_uid).toBe(
+    f.bundle.kube_system_uid,
+  );
+  expect(provider.getInstance).toHaveBeenCalledTimes(boundaryCalls);
+  await expect(
+    execution.prepareNodeProofInput(f.bindings, f.id, "preparation", {
+      sourceBinding: { ...association, binding_sha256: "0".repeat(64) },
+      sourceSelection: { provider },
+    }),
+  ).rejects.toMatchObject({ code: "forbidden" });
+  expect(provider.getInstance).toHaveBeenCalledTimes(boundaryCalls);
 });
 it("dispatches proof continuation only after authenticated shared artifact verification", async () => {
   const f = await fixture();
@@ -639,9 +881,13 @@ it("coalesces running proof sessions without registering a replacement Container
     .mockResolvedValue(f.input);
   const start = vi.fn(),
     methods: string[] = [];
+  let nativeStatus = "running";
   const container = {
     running: false,
-    start,
+    start: () => {
+      container.running = true;
+      start();
+    },
     setInactivityTimeout: async () => {},
     getTcpPort: () => ({
       fetch: async (request: Request) => {
@@ -650,31 +896,122 @@ it("coalesces running proof sessions without registering a replacement Container
           return new Response(null, { status: 202 });
         return new URL(request.url).pathname === "/"
           ? new Response(null, { status: 401 })
-          : Response.json({ status: "running" });
+          : Response.json({ status: nativeStatus });
       },
     }),
   };
-  async function invoke() {
+  async function invoke(mode: "preparation" | "postjoin" = "preparation") {
     return f.withStore(async (instance, state) => {
       Object.defineProperty(state, "container", {
         configurable: true,
         value: container,
       });
       try {
-        return await instance.prove(f.id, "preparation");
+        return await instance.prove(f.id, mode);
       } finally {
         delete (state as { container?: unknown }).container;
       }
     });
   }
-  expect(await invoke()).toMatchObject({ status: "running" });
-  container.running = true;
+  await f.withStore(async (instance, state) => {
+    Object.defineProperty(state, "container", {
+      configurable: true,
+      value: container,
+    });
+    try {
+      const results = await Promise.all([
+        instance.prove(f.id, "preparation"),
+        instance.prove(f.id, "preparation"),
+      ]);
+      expect(results).toEqual([
+        expect.objectContaining({ status: "running" }),
+        expect.objectContaining({ status: "running" }),
+      ]);
+    } finally {
+      delete (state as { container?: unknown }).container;
+    }
+  });
   expect(await invoke()).toMatchObject({ status: "running" });
   expect(start).toHaveBeenCalledOnce();
   expect(prepare).toHaveBeenCalledOnce();
   expect(methods.filter((value) => value.startsWith("POST"))).toEqual([
     "POST /v1/proofs",
   ]);
+  await f.withStore(async (_instance, state) => {
+    expect(await state.storage.get("proof_source_binding")).toEqual(
+      execution.proofSourceBinding(f.input),
+    );
+  });
+  nativeStatus = "failed";
+  const fresh = await issueNodeProofSession(f.bindings, f.id, "preparation");
+  const renewed = NodeProofExecutionInput.parse({
+    ...f.input,
+    claims: fresh.claims,
+    session_bearer: fresh.bearer,
+    control_keys: fresh.control_keys,
+  });
+  prepare.mockResolvedValue(renewed);
+  expect(await invoke()).toMatchObject({ status: "running" });
+  expect(prepare).toHaveBeenLastCalledWith(f.bindings, f.id, "preparation", {
+    sourceBinding: execution.proofSourceBinding(f.input),
+  });
+  await f.withStore(async (_instance, state) => {
+    expect(await state.storage.get("proof_source_binding")).toEqual(
+      execution.proofSourceBinding(f.input),
+    );
+    expect(await state.storage.get("proof_current:preparation")).toBe(
+      fresh.claims.session_id,
+    );
+  });
+});
+it("rejects conflicting legacy proof source associations before selection or dispatch", async () => {
+  const f = await fixture();
+  const prepare = vi.spyOn(execution, "prepareNodeProofInput");
+  const fresh = await issueNodeProofSession(f.bindings, f.id, "preparation");
+  const conflicting = NodeProofExecutionInput.parse({
+    ...f.input,
+    claims: fresh.claims,
+    session_bearer: fresh.bearer,
+    control_keys: fresh.control_keys,
+    source: { ...f.input.source, provider_instance_id: "98" },
+  });
+  const dispatch = vi.fn(async (request: Request) =>
+    new URL(request.url).pathname === "/"
+      ? new Response(null, { status: 401 })
+      : Response.json({ status: "failed" }),
+  );
+  await f.withStore(async (instance, state) => {
+    await state.storage.put(
+      "proof_current:preparation",
+      f.session.claims.session_id,
+    );
+    await state.storage.put("proof_current:postjoin", fresh.claims.session_id);
+    await state.storage.put(
+      `proof_input:${fresh.claims.session_id}`,
+      conflicting,
+    );
+    Object.defineProperty(state, "container", {
+      configurable: true,
+      value: {
+        running: false,
+        start: () => {},
+        setInactivityTimeout: async () => {},
+        getTcpPort: () => ({ fetch: dispatch }),
+      },
+    });
+    try {
+      await expect(instance.prove(f.id, "preparation")).rejects.toThrow(
+        "proof_source_binding_changed",
+      );
+      expect(await state.storage.get("proof_source_binding")).toBeUndefined();
+    } finally {
+      delete (state as { container?: unknown }).container;
+    }
+  });
+  expect(prepare).not.toHaveBeenCalled();
+  expect(
+    dispatch.mock.calls.every(([request]) => request.method === "GET"),
+  ).toBe(true);
 });
 it("refuses an authenticated arbitrary transport destination as an invalid request", async () => {
   const f = await fixture();

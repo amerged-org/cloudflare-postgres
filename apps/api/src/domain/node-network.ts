@@ -25,6 +25,7 @@ import {
   type ContaboFirewallRulesInput,
 } from "../providers/contabo.ts";
 import { installationFirewallBinding } from "./node-installation.ts";
+import { contaboClient } from "./bootstrap-relay.ts";
 
 const Hash = z.string().regex(/^[a-f0-9]{64}$/),
   IP = z.union([z.ipv4(), z.ipv6()]);
@@ -1022,15 +1023,21 @@ async function ensureNodePreparation(
       started = now();
     if (!Number.isSafeInteger(started) || started < 0) return false;
     const deadline = Date.now() + 20000,
-      request = () => ({ requestId: crypto.randomUUID(), deadline });
-    const client = new ContaboClient({
-      clientId: env.CONTABO_CLIENT_ID,
-      clientSecret: env.CONTABO_CLIENT_SECRET,
-      username: env.CONTABO_USERNAME,
-      password: env.CONTABO_PASSWORD,
-      fetcher: options.fetcher,
-      timeoutMs: 5000,
-    });
+      request = (requestId = crypto.randomUUID()) => ({
+        requestId,
+        deadline: Math.min(deadline, Date.now() + 5000),
+        accounting: { operation_id: operationId, stage: "firewall" as const },
+      });
+    const client = options.fetcher
+      ? new ContaboClient({
+          clientId: env.CONTABO_CLIENT_ID,
+          clientSecret: env.CONTABO_CLIENT_SECRET,
+          username: env.CONTABO_USERNAME,
+          password: env.CONTABO_PASSWORD,
+          fetcher: options.fetcher,
+          timeoutMs: 5000,
+        })
+      : contaboClient(env);
     const plan = await makePlan(env, client, operationId, request),
       preparation = await prepare(env.DB, plan, started);
     for (const member of plan.members)
@@ -1057,7 +1064,7 @@ async function ensureNodePreparation(
                 })),
               },
             },
-            { requestId, deadline },
+            request(requestId),
           ),
       );
       if (!rulesReady) {
@@ -1081,7 +1088,7 @@ async function ensureNodePreparation(
           client.assignFirewall(
             member.firewall_id,
             member.provider_instance_id,
-            { requestId, deadline },
+            request(requestId),
           ),
       );
       if (!assignmentReady) ready = false;

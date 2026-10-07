@@ -12,6 +12,9 @@ and admission. Current completion first restores from the healthy EU1 source int
 US1 target. Do not reset, re-adopt, fence, delete or decommission EU1 for this drill; the earlier
 loss and deletion kits are withheld. The incident procedures below apply to an actual loss or
 a separately reviewed drill that preserves or recovers the same customer EU1.
+US1's profile, binding and reported inspection are already retained; its original authorized job
+is still `created`, with installation and Ready acceptance outstanding. Continue the same
+Cloudflare addition/Workflow and seals rather than ordering, re-adopting or resetting that VPS.
 
 ## Restore or PITR
 
@@ -67,6 +70,9 @@ Cloudflare SQL endpoint, promotion, nonsuperuser application access, removal of 
 administration and a new target backup/WAL archive. Record duration and the last restored commit
 in `PLAN.md`; configuration or local checks alone do not establish acceptance. Preserve source
 data, archives and physical identities until an explicitly authorized loss drill or cleanup.
+A healthy cross-region restore proves archive portability and target recovery; it does not prove
+an actual server-loss or outage recovery duration. That separate gate needs an authorized real
+failure, the actual restored transaction boundary and measured recovery time.
 
 ## Lost node
 
@@ -103,6 +109,11 @@ Node-loss and node-addition endpoints require an admin API key.
    returns the same addition. An uncertain response does not authorize another operation or an
    automatic reinstall. Current recovery supports a worker joining a surviving regional cluster;
    it does not rebuild a lost regional control plane.
+   Keep provider verification at the recovery lifecycle and before the first destructive write.
+   The Cloudflare-stored source association survives proof renewals with fresh scoped claims;
+   Kubernetes/Talos reads, grants and exact owned cleanup make no per-command provider calls.
+   Current CF authority and actual host-key/TLS, Cluster UID and Node UID checks remain required.
+   Resolve unknown provider/native mutation outcomes by readback, preserving their original intent.
 6. Keep the lost server isolated until bootstrap verification, database restoration and SQL data
    comparison finish. Open traffic only after the new worker passes network/capacity verification
    and restored database targets pass the checks above.
@@ -191,3 +202,13 @@ kits are withheld. Install the scoped source-read credential map only after US1 
 credentials must not alter the EU source archive. A later separately authorized incident or
 loss drill must preserve or recover this same customer EU1.
 A complete regional control-plane loss drill remains outside this customer-free completion gate.
+
+## Later adopter migration
+
+Operator acceptance and customer migration are separate. Keep existing Neon databases in service
+until a reviewed per-database cutover is accepted. Inventory roles, extensions, data/sequences,
+clients/pooling and capacity in the adopter repository, then stop source writes for the actual
+transfer. Verify target contents, nonsuperuser roles and TLS through Cloudflare, plus a completed
+target base backup and archived WAL, before changing application connections. Retain the Neon
+source through acceptance; after target writes, a rollback must reconcile them rather than point
+clients at stale data. Keep adapter changes and customer prices outside this generic service.

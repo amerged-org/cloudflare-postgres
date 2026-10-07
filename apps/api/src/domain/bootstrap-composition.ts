@@ -117,7 +117,10 @@ export async function composeConfiguredNodeBootstrap(
     return refuse("Installation inspection identity changed");
   const actual = await (options.provider ?? contaboClient(env)).getInstance(
     addition.provider_instance_id,
-    { requestId: crypto.randomUUID() },
+    {
+      requestId: crypto.randomUUID(),
+      accounting: { operation_id: operationId, stage: "inspection" },
+    },
   );
   if (
     !hasAllocatedContaboHardware(actual) ||

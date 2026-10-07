@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import { afterEach, expect, it, vi } from "vitest";
 import type { Env } from "../../src/env.ts";
 import { NodeJoinBundle } from "@pgcf/contracts/node-bootstrap";
+import { ContaboClient } from "../../src/providers/contabo.ts";
 import {
   joinBundleReference,
   storeRegionJoinBundle,
@@ -12,7 +13,10 @@ import {
   installationHash,
   storeNodeInstallationProfile,
 } from "../../src/domain/node-installation.ts";
-import { selectNodeProofSource } from "../../src/domain/node-proof-source.ts";
+import {
+  assertNodeProofSourceAuthority,
+  selectNodeProofSource,
+} from "../../src/domain/node-proof-source.ts";
 import {
   boundInstallationFixture,
   installationFixture,
@@ -339,4 +343,133 @@ it("uses only an active encrypted rescue binding and always refuses provider or 
   ).toEqual(before);
   f.source.actual.cancelDate = null;
   expect(await f.select()).toBeNull();
+});
+
+it("reuses a sealed pod association without provider reads and refuses changed or stale physical identity", async () => {
+  const f = await fixture(),
+    selected = await f.select();
+  if (!selected || selected.kind !== "pod") throw new Error("source_missing");
+  f.provider.getInstance.mockClear();
+  const provider = vi
+    .spyOn(ContaboClient.prototype, "getInstance")
+    .mockRejectedValue(new Error("unexpected_provider_read"));
+  const validate = () =>
+    assertNodeProofSourceAuthority(
+      f.target.bindings as Env,
+      f.target.addition.intent.operation_id,
+      f.plan,
+      selected,
+    );
+  await validate();
+  await validate();
+  await env.DB.prepare("UPDATE nodes SET node_uid=? WHERE id=?")
+    .bind(crypto.randomUUID(), f.source.fixture.node)
+    .run();
+  await expect(validate()).rejects.toThrow("source authority");
+  await env.DB.prepare(
+    "UPDATE nodes SET node_uid=?,last_observed_at=? WHERE id=?",
+  )
+    .bind(
+      f.nodeUid,
+      new Date(Date.now() - 180001).toISOString(),
+      f.source.fixture.node,
+    )
+    .run();
+  await expect(validate()).rejects.toThrow("source authority");
+  expect(provider).not.toHaveBeenCalled();
+  expect(f.provider.getInstance).not.toHaveBeenCalled();
+});
+
+it("refuses changed cluster or credential custody and a closed target while preserving sealed source state", async () => {
+  const f = await fixture(),
+    selected = await f.select();
+  if (!selected || selected.kind !== "pod") throw new Error("source_missing");
+  const before = structuredClone(selected);
+  const provider = vi
+    .spyOn(ContaboClient.prototype, "getInstance")
+    .mockRejectedValue(new Error("unexpected_provider_read"));
+  const validate = () =>
+    assertNodeProofSourceAuthority(
+      f.target.bindings as Env,
+      f.target.addition.intent.operation_id,
+      f.plan,
+      selected,
+    );
+  const replaceCustody = async (bundle: NodeJoinBundle) => {
+    await env.DB.prepare(
+      "DELETE FROM region_bootstrap_credentials WHERE region_id=? AND purpose='join_bundle' AND revision=1",
+    )
+      .bind(f.source.fixture.region)
+      .run();
+    await storeRegionJoinBundle(
+      f.source.bindings.DB,
+      f.source.bindings.CREDENTIAL_KEYS,
+      joinBundleReference(f.source.fixture.region, 1),
+      bundle,
+    );
+  };
+  await replaceCustody({ ...f.bundle, kube_system_uid: crypto.randomUUID() });
+  await expect(validate()).rejects.toThrow("source authority");
+  await replaceCustody({
+    ...f.bundle,
+    kubeconfig: f.bundle.kubeconfig + "\nchanged",
+  });
+  await expect(validate()).rejects.toThrow("source authority");
+  await replaceCustody(f.bundle);
+  await validate();
+  await env.DB.prepare(
+    "UPDATE node_additions SET status='cancelled',slot_held=0 WHERE operation_id=?",
+  )
+    .bind(f.target.addition.intent.operation_id)
+    .run();
+  await expect(validate()).rejects.toThrow("source authority");
+  expect(selected).toEqual(before);
+  expect(provider).not.toHaveBeenCalled();
+});
+
+it("validates an exact bound rescue association locally and refuses changed binding authority", async () => {
+  const f = await fixture();
+  await env.DB.prepare("DELETE FROM nodes WHERE id=?")
+    .bind(f.source.fixture.node)
+    .run();
+  f.source.actual.status = "rescue";
+  await env.DB.prepare(
+    "UPDATE node_additions SET audit_json=? WHERE operation_id=?",
+  )
+    .bind(
+      JSON.stringify({
+        ...f.source.addition.audit,
+        provider_region: f.source.actual.region,
+      }),
+      f.source.addition.intent.operation_id,
+    )
+    .run();
+  await bindNodeInstallation(
+    f.source.bindings,
+    f.source.addition.intent.operation_id,
+    f.source.addition.revision,
+    crypto.randomUUID(),
+    f.source.provider,
+  );
+  const selected = await f.select();
+  if (!selected || selected.kind !== "rescue")
+    throw new Error("source_missing");
+  const provider = vi
+    .spyOn(ContaboClient.prototype, "getInstance")
+    .mockRejectedValue(new Error("unexpected_provider_read"));
+  const validate = () =>
+    assertNodeProofSourceAuthority(
+      f.target.bindings as Env,
+      f.target.addition.intent.operation_id,
+      f.plan,
+      selected,
+    );
+  await validate();
+  await env.DB.prepare(
+    "UPDATE node_installation_bindings SET inspection_generation=inspection_generation+1 WHERE operation_id=?",
+  )
+    .bind(f.source.addition.intent.operation_id)
+    .run();
+  await expect(validate()).rejects.toThrow("source authority");
+  expect(provider).not.toHaveBeenCalled();
 });

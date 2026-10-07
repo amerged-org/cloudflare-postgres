@@ -189,7 +189,11 @@ export async function ensureNodeInstallationFirewall(
     return null;
   const provider = options.provider ?? contaboClient(env),
     deadline = Date.now() + 20_000,
-    request = () => ({ requestId: crypto.randomUUID(), deadline });
+    request = (requestId = crypto.randomUUID()) => ({
+      requestId,
+      deadline,
+      accounting: { operation_id: operationId, stage: "firewall" as const },
+    });
   const actual = await provider.getInstance(
     addition.provider_instance_id,
     request(),
@@ -344,7 +348,7 @@ export async function ensureNodeInstallationFirewall(
           status: "active",
           rules: { inbound: [] },
         },
-        { requestId: claim.request_id, deadline },
+        request(claim.request_id),
       );
     } catch (error) {
       result = {

@@ -30,6 +30,7 @@ import { placePendingDatabases } from "../domain/node-capacity.ts";
 import {
   ensureNodeFirewall,
   ensureNodeNetwork,
+  hasVerifiedNodePreparation,
 } from "../domain/node-network.ts";
 import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
 import { prepareNodeInstallationInputs } from "../domain/prepare-node-installation.ts";
@@ -99,7 +100,10 @@ export async function dispatchNodeOrder(
   addition = claim.addition;
   let result;
   try {
-    result = await provider.order(input, { requestId: claim.request_id });
+    result = await provider.order(input, {
+      requestId: claim.request_id,
+      accounting: { operation_id: operationId, stage: "order" },
+    });
   } catch {
     await markNodeDispatchUnknown(env.DB, operationId, addition.revision);
     return;
@@ -143,7 +147,10 @@ export async function reconcileNodeProvider(
     await assertNodeRecoveryAuthority(env.DB, addition);
     const actual = await provider.getInstance(
       addition.intent.request.provider_instance_id,
-      { requestId: crypto.randomUUID() },
+      {
+        requestId: crypto.randomUUID(),
+        accounting: { operation_id: operationId, stage: "resolution" },
+      },
     );
     addition = await recordNodeReceipt(env.DB, operationId, addition.revision, {
       provider_instance_id: actual.id,
@@ -163,7 +170,10 @@ export async function reconcileNodeProvider(
         startDate: addition.created_at.slice(0, 10),
         endDate: new Date().toISOString().slice(0, 10),
       },
-      { requestId: crypto.randomUUID() },
+      {
+        requestId: crypto.randomUUID(),
+        accounting: { operation_id: operationId, stage: "resolution" },
+      },
     );
     const matches = [
       ...new Set(
@@ -180,6 +190,7 @@ export async function reconcileNodeProvider(
     if (matches.length !== 1) return;
     const actual = await provider.getInstance(matches[0]!, {
       requestId: crypto.randomUUID(),
+      accounting: { operation_id: operationId, stage: "resolution" },
     });
     if (
       actual.displayName !== addition.intent.requested_hostname ||
@@ -202,6 +213,7 @@ export async function reconcileNodeProvider(
   ) {
     const actual = await provider.getInstance(addition.provider_instance_id, {
       requestId: crypto.randomUUID(),
+      accounting: { operation_id: operationId, stage: "resolution" },
     });
     if (!actual.imageId) return;
     await recordNodeAudit(env.DB, operationId, addition.revision, {
@@ -232,6 +244,28 @@ export async function ensureNodeRescue(
     (job !== null && (!job.authorized || job.admitted || job.cancelled))
   )
     return false;
+  if (job !== null && job.rescue_active) {
+    await assertNodeRecoveryAuthority(env.DB, addition);
+    const { spec } = await bootstrapJobInput(env, job);
+    const current = await readBootstrapJob(env.DB, operationId),
+      currentAddition = await readNodeAddition(env.DB, operationId);
+    return (
+      spec.provider_instance_id === addition.provider_instance_id &&
+      spec.node_id === addition.intent.node_id &&
+      spec.region_id === addition.intent.request.region_id &&
+      Boolean(current.authorized) &&
+      !current.admitted &&
+      !current.cancelled &&
+      Boolean(current.rescue_active) &&
+      current.input_hash === job.input_hash &&
+      current.revision === job.revision &&
+      currentAddition.revision === addition.revision &&
+      currentAddition.intent_hash === addition.intent_hash &&
+      currentAddition.provider_instance_id === addition.provider_instance_id &&
+      currentAddition.slot_held &&
+      ["audited", "bootstrapping"].includes(currentAddition.status)
+    );
+  }
   const rescueConfiguration = await validateRescueConfiguration(
     env,
     addition.provider_instance_id,
@@ -246,6 +280,7 @@ export async function ensureNodeRescue(
   const client = provider ?? contaboClient(env);
   const actual = await client.getInstance(addition.provider_instance_id, {
     requestId: crypto.randomUUID(),
+    accounting: { operation_id: operationId, stage: "rescue" },
   });
   if (actual.status === "rescue") {
     if (job !== null)
@@ -291,7 +326,10 @@ export async function ensureNodeRescue(
             ? { userData: rescueConfiguration.user_data }
             : {}),
         },
-        { requestId },
+        {
+          requestId,
+          accounting: { operation_id: operationId, stage: "rescue" },
+        },
       );
       state = result.kind;
       code = result.code;
@@ -315,10 +353,51 @@ export async function ensureNodeRescue(
           requestId: mutation.request_id,
           instanceId: addition.provider_instance_id,
         },
-        { requestId: crypto.randomUUID() },
+        {
+          requestId: crypto.randomUUID(),
+          accounting: { operation_id: operationId, stage: "resolution" },
+        },
       );
   }
   return false;
+}
+export async function ensureBootstrapNetworkBoundary(
+  env: Env,
+  operationId: string,
+): Promise<boolean> {
+  const addition = await readNodeAddition(env.DB, operationId),
+    job = await readBootstrapJob(env.DB, operationId);
+  if (
+    !addition.slot_held ||
+    !["audited", "bootstrapping"].includes(addition.status) ||
+    !job.authorized ||
+    job.admitted ||
+    job.cancelled
+  )
+    return false;
+  await assertNodeRecoveryAuthority(env.DB, addition);
+  const checkpoint = NodeBootstrapCheckpoint.parse(
+    JSON.parse(job.checkpoint_json),
+  );
+  if (
+    (addition.checkpoint?.stage === "prepared" &&
+      addition.checkpoint.reference === addition.intent_hash) ||
+    checkpoint.stage !== "created"
+  )
+    return hasVerifiedNodePreparation(
+      env.DB,
+      operationId,
+      addition.intent_hash,
+    );
+  if (!(await ensureNodeNetwork(env, operationId))) return false;
+  const current = await readNodeAddition(env.DB, operationId);
+  if (current.checkpoint === null)
+    await saveNodeBootstrapCheckpoint(env.DB, operationId, current.revision, {
+      stage: "prepared",
+      reference: current.intent_hash,
+      saved_at: new Date().toISOString(),
+    });
+  return true;
 }
 export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
   override async run(
@@ -459,20 +538,8 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
                 }
                 if (!(await ensureNodePreparationProof(this.env, id)))
                   return { operation_id: id };
-                if (!(await ensureNodeNetwork(this.env, id)))
+                if (!(await ensureBootstrapNetworkBoundary(this.env, id)))
                   return { operation_id: id };
-                const current = await readNodeAddition(this.env.DB, id);
-                if (current.checkpoint === null)
-                  await saveNodeBootstrapCheckpoint(
-                    this.env.DB,
-                    id,
-                    current.revision,
-                    {
-                      stage: "prepared",
-                      reference: current.intent_hash,
-                      saved_at: new Date().toISOString(),
-                    },
-                  );
                 await this.env.NODE_BOOTSTRAP.get(
                   this.env.NODE_BOOTSTRAP.idFromName(id),
                 ).start(id);

@@ -149,7 +149,10 @@ export async function prepareNodeInspectionInput(
     return deny();
   const actual = await (options.provider ?? contaboClient(env)).getInstance(
     addition.provider_instance_id,
-    { requestId: crypto.randomUUID() },
+    {
+      requestId: crypto.randomUUID(),
+      accounting: { operation_id: operationId, stage: "inspection" },
+    },
   );
   if (!hasAllocatedContaboHardware(actual) || actual.status !== "rescue")
     return null;
@@ -247,6 +250,158 @@ export async function prepareNodeInspectionInput(
   });
 }
 
+/** Routine inspection capabilities use the stored lifecycle mapping and current CF authority. */
+export async function assertNodeInspectionInputCurrent(
+  env: Env,
+  operationId: string,
+  input: NodeInspectionInput,
+): Promise<void> {
+  OperationId.parse(operationId);
+  const parsed = NodeInspectionInput.safeParse(input);
+  if (!parsed.success) return deny();
+  const value = parsed.data,
+    now = Date.now();
+  if (
+    value.operation_id !== operationId ||
+    Date.parse(value.deadline_at) <= now ||
+    Date.parse(value.deadline_at) > now + 540000
+  )
+    return deny();
+  const addition = await readNodeAddition(env.DB, operationId);
+  await assertNodeRecoveryAuthority(env.DB, addition);
+  if (
+    !addition.slot_held ||
+    !addition.audit ||
+    !addition.provider_instance_id ||
+    !["audited", "bootstrapping"].includes(addition.status) ||
+    value.node_id !== addition.intent.node_id ||
+    value.region_id !== addition.intent.request.region_id ||
+    value.provider_instance_id !== addition.provider_instance_id ||
+    addition.audit.provider_instance_id !== value.provider_instance_id ||
+    (await env.DB.prepare(
+      "SELECT 1 present FROM node_bootstrap_jobs WHERE operation_id=?",
+    )
+      .bind(operationId)
+      .first())
+  )
+    return deny();
+  const binding = await loadNodeInstallationBinding(env, operationId),
+    installed = await readNodeInstallationProfile(env, value.region_id);
+  if (
+    !binding ||
+    !installed ||
+    binding.row.node_id !== value.node_id ||
+    binding.row.region_id !== value.region_id ||
+    binding.row.provider_instance_id !== value.provider_instance_id ||
+    binding.row.binding_sha256 !== value.binding_sha256 ||
+    binding.row.profile_sha256 !== value.profile_sha256 ||
+    installed.profile_sha256 !== value.profile_sha256 ||
+    binding.row.inspection_generation !== value.expected_generation ||
+    installed.profile.provider_product_id !== addition.audit.product_id ||
+    installed.profile.relay_issuer_region_id !==
+      env.BOOTSTRAP_RELAY_ISSUER_REGION ||
+    installed.profile.rescue_client_private_key !==
+      value.rescue.ssh_private_key ||
+    binding.rescue.ssh_private_key !== value.rescue.ssh_private_key ||
+    binding.rescue.ssh_host_key !== value.rescue.ssh_host_key ||
+    binding.rescue.ssh_host_fingerprint !== value.rescue.ssh_host_fingerprint ||
+    binding.inspection_token !== value.callback.bearer ||
+    (await installationHash(installed.profile.dns)) !==
+      (await installationHash(value.dns))
+  )
+    return deny();
+  const saved = await env.DB.prepare(
+    "SELECT plan_json,plan_sha256,status,readback_at FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(operationId)
+    .first<{
+      plan_json: string;
+      plan_sha256: string;
+      status: string;
+      readback_at: string | null;
+    }>();
+  if (
+    !saved ||
+    saved.status === "blocked" ||
+    !saved.readback_at ||
+    saved.plan_sha256 !== value.network_plan_sha256
+  )
+    return deny();
+  const raw: unknown = JSON.parse(saved.plan_json),
+    plan = Plan.safeParse(raw);
+  if (
+    !plan.success ||
+    (await installationHash(raw)) !== value.network_plan_sha256 ||
+    plan.data.operation_id !== operationId ||
+    plan.data.node_id !== value.node_id ||
+    plan.data.region_id !== value.region_id ||
+    plan.data.provider_instance_id !== value.provider_instance_id ||
+    plan.data.intent_hash !== addition.intent_hash ||
+    plan.data.relay.provider_instance_id !==
+      env.BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID
+  )
+    return deny();
+  const member = plan.data.members.find(
+    (candidate) => candidate.node_id === value.node_id,
+  );
+  if (
+    !member ||
+    member.provider_instance_id !== value.provider_instance_id ||
+    member.firewall_id !== binding.row.firewall_id ||
+    !member.addresses.ipv4.includes(value.expected_network.ipv4) ||
+    (value.expected_network.ipv6 &&
+      !member.addresses.ipv6?.includes(value.expected_network.ipv6.address))
+  )
+    return deny();
+  const peers = [
+    ...new Set([
+      ...plan.data.relay.addresses.ipv4,
+      ...plan.data.members
+        .filter((peer) => peer.node_id !== value.node_id)
+        .flatMap((peer) => peer.addresses.ipv4),
+    ]),
+  ]
+    .filter((ip) => ip !== value.expected_network.ipv4)
+    .sort();
+  const base = new URL(env.NODE_BOOTSTRAP_CALLBACK_URL);
+  if (
+    base.protocol !== "https:" ||
+    base.pathname !== "/" ||
+    base.username ||
+    base.password ||
+    base.search ||
+    base.hash ||
+    value.callback.url !==
+      new URL(`/internal/v1/node-installation/${operationId}/inspection`, base)
+        .href ||
+    value.transport_url !==
+      new URL(`/internal/v1/node-installation/${operationId}/transport`, base)
+        .href ||
+    value.relay_url !==
+      new URL(
+        `/internal/v1/node-installation/${operationId}/relay`,
+        base.href.replace(/^https:/, "wss:"),
+      ).href ||
+    (await installationHash(peers)) !==
+      (await installationHash(value.peer_ipv4))
+  )
+    return deny();
+}
+interface InspectionInputStore {
+  getInspectionInput(operationId: string): Promise<NodeInspectionInput | null>;
+}
+async function storedInspectionInput(env: Env, operationId: string) {
+  const stored = await (
+    env.NODE_BOOTSTRAP.get(
+      env.NODE_BOOTSTRAP.idFromName(operationId),
+    ) as unknown as InspectionInputStore
+  ).getInspectionInput(operationId);
+  if (!stored) return deny();
+  const input = NodeInspectionInput.parse(stored);
+  await assertNodeInspectionInputCurrent(env, operationId, input);
+  return input;
+}
+
 async function boundedIdentity(response: Response, signal: AbortSignal) {
   if (!response.ok || !response.body) return deny();
   const reader = response.body.getReader(),
@@ -288,30 +443,18 @@ async function boundedIdentity(response: Response, signal: AbortSignal) {
 }
 
 async function assertCurrentInspection(env: Env, input: NodeInspectionInput) {
-  const current = await env.DB.prepare(
-    `SELECT b.inspection_generation FROM node_installation_bindings b
-     JOIN node_additions a ON a.operation_id=b.operation_id
-     WHERE b.operation_id=? AND b.binding_sha256=? AND a.slot_held=1
-       AND a.status IN ('audited','bootstrapping')
-       AND a.provider_instance_id=b.provider_instance_id
-       AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs j WHERE j.operation_id=b.operation_id)`,
-  )
-    .bind(input.operation_id, input.binding_sha256)
-    .first<{ inspection_generation: number }>();
-  if (!current || current.inspection_generation !== input.expected_generation)
-    return deny();
+  await assertNodeInspectionInputCurrent(env, input.operation_id, input);
 }
 
 export async function issueNodeInspectionTransport(
   env: Env,
   operationId: string,
   expectedGeneration: number,
-  options: InspectionOptions = {},
 ): Promise<NodeBootstrapTransport> {
   const binding = await loadNodeInstallationBinding(env, operationId);
   if (!binding || binding.row.inspection_generation !== expectedGeneration)
     return deny();
-  const input = await prepareNodeInspectionInput(env, operationId, options);
+  const input = await storedInspectionInput(env, operationId);
   if (
     !input ||
     input.expected_generation !== expectedGeneration ||
@@ -392,7 +535,7 @@ export async function relayNodeInspection(
   } catch {
     return deny();
   }
-  const input = await prepareNodeInspectionInput(c.env, operationId);
+  const input = await storedInspectionInput(c.env, operationId);
   if (
     !input ||
     input.expected_generation !== binding.inspection_generation ||

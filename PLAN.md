@@ -2,6 +2,42 @@
 
 Status (2026-10-07): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
 
+The latest owner direction removes Contabo from routine transport and proof-resource cleanup.
+Provider access belongs to purchase, initial association, firewall/rescue/hypervisor actions,
+uncertain-action resolution and necessary lifecycle verification, including before the first
+destructive installation checkpoint. Cloudflare persists one verified source association per
+installation operation and renews only its bounded proof authority. Routine grants and relays
+use the current operation, sealed addresses and credentials, while Native continues fresh
+Talos/Kubernetes cluster and node identity checks. Identity changes fail closed. OAuth expiry,
+credential changes, concurrent login coalescing and 401 invalidation remain; inventory and
+authority are not cached. Implementation and focused regressions are in progress, not yet
+live acceptance. The earlier prepared f6 API publication was held before its intent; the
+existing US1 operation and paid instance are retained without a replacement or EU reset.
+
+The integrated repair stores the proof-source association transactionally in the existing
+operation Durable Object, serializes concurrent proof registration and carries the same
+association through fresh preparation/postjoin sessions. Existing trusted inputs can seed
+the association without reusing their expired authority; conflicting associations block.
+Inspection grants similarly use the sealed initial assignment. Provider-free authority checks
+retain current CF operation/binding/plan, fresh source Node UID/Ready observations and exact
+encrypted cluster custody, while Native's fresh Talos/Kubernetes identities remain unchanged.
+Confirmed rescue and later network/proof cycles no longer poll Contabo. Before the first
+destructive checkpoint, a fresh provider inventory check and snapshot-bound CAS fence identity
+changes and concurrent revocation. The firewall authentication regression reproduced three
+OAuth calls across three checks; the shared credential-scoped client now makes one, while
+retaining per-request and aggregate deadlines. Fixed-field wire events count actual OAuth and
+resource HTTP attempts without logging provider payloads or credentials. Focused regressions,
+types, lint and formatting pass; final integrated CI and live acceptance remain pending.
+
+Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
+roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
+LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider
+HTTP attempts separately from historical order timing; do not infer an undocumented lifetime
+call count. Routine transport must show zero provider calls. The 76%/ten fresh consecutive
+minute/physical Node UID rule, V159 one-month/no-storage-addon model and continued placement
+under full PostgreSQL/Barman startup guards remain; finite recorded spend/node limits gate
+purchases. No unlimited authorization or additional 81% placement cutoff is introduced.
+
 Latest owner topology overrides the earlier V155 replacement/removal plan: retain the existing
 EU control/relay VPS and the already-admitted EU worker, now customer **EU1**. Both customer
 servers use **V159 / Cloud VPS Plus 4: 4 vCPU, 8 GiB RAM, 150 GiB NVMe**, not the prior 8-vCPU /

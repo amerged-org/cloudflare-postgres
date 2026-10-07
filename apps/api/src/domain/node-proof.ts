@@ -31,17 +31,27 @@ export async function ensureNodePreparationProof(
   )
     return false;
   const preparation = await env.DB.prepare(
-    "SELECT status,proof_expires_at FROM node_network_preparations WHERE operation_id=?",
+    "SELECT status,proof_expires_at,intent_hash,readback_at FROM node_network_preparations WHERE operation_id=?",
   )
     .bind(operationId)
-    .first<{ status: string; proof_expires_at: string | null }>();
+    .first<{
+      status: string;
+      proof_expires_at: string | null;
+      intent_hash: string;
+      readback_at: string | null;
+    }>();
+  const confirmed =
+    preparation?.intent_hash === addition.intent_hash &&
+    preparation.readback_at !== null &&
+    preparation.status !== "blocked";
   if (
+    confirmed &&
     preparation?.status === "verified" &&
     preparation.proof_expires_at &&
     Date.parse(preparation.proof_expires_at) > Date.now() + 60000
   )
     return true;
-  if (!(await ensureNodeFirewall(env, operationId))) return false;
+  if (!confirmed && !(await ensureNodeFirewall(env, operationId))) return false;
   await dispatch(env, operationId, "preparation");
   return false;
 }

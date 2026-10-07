@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { bytesToBase64url, newNodeId } from "@pgcf/contracts";
 import {
   NodeBootstrapCheckpoint,
@@ -29,6 +29,7 @@ import { fixture, cleanupFixtures } from "./fixtures.ts";
 const operations: string[] = [];
 const policies: string[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   for (const op of operations.splice(0)) {
     await env.ARCHIVE.delete(`node-preparation/${op}/proof.json`);
     await env.DB.batch([
@@ -390,15 +391,18 @@ async function setup(ipv6 = true) {
   let lost = false,
     apply = true,
     reject = false;
+  let oauthRequests = 0;
   const fetcher: typeof fetch = async (input, options) => {
     const url = new URL(String(input)),
       method = options?.method ?? "GET";
-    if (url.pathname.endsWith("/token"))
+    if (url.pathname.endsWith("/token")) {
+      oauthRequests++;
       return Response.json({
         access_token: value(),
         token_type: "Bearer",
         expires_in: 3600,
       });
+    }
     calls.push({
       method,
       path: url.pathname,
@@ -590,6 +594,8 @@ async function setup(ipv6 = true) {
   };
   return {
     state,
+    fetcher,
+    oauthRequests: () => oauthRequests,
     addition,
     run,
     firewall,
@@ -648,6 +654,20 @@ it("uses distinct provider rule labels while retaining the immutable security pl
       .first(),
   ).toEqual(row);
   expect(f.calls.filter((call) => call.method === "PUT")).toHaveLength(2);
+});
+it("reuses provider authentication across production firewall lifecycle checks", async () => {
+  const f = await setup();
+  vi.spyOn(globalThis, "fetch").mockImplementation(f.fetcher);
+  expect(
+    await ensureNodeFirewall(f.settings, f.addition.intent.operation_id),
+  ).toBe(false);
+  expect(
+    await ensureNodeFirewall(f.settings, f.addition.intent.operation_id),
+  ).toBe(true);
+  expect(
+    await ensureNodeFirewall(f.settings, f.addition.intent.operation_id),
+  ).toBe(true);
+  expect(f.oauthRequests()).toBe(1);
 });
 
 it("acknowledges exact owned policy readback after explicit rejection without redispatching", async () => {

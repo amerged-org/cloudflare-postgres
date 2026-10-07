@@ -41,6 +41,11 @@ import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 import type { Env } from "../../src/env.ts";
 import { issueBootstrapTransport } from "../../src/domain/bootstrap-relay.ts";
 import {
+  ensureNodeRescue,
+  ensureBootstrapNetworkBoundary,
+} from "../../src/workflows/add-node.ts";
+import * as network from "../../src/domain/node-network.ts";
+import {
   importBootstrapVerificationKeys,
   verifyBootstrapRelay,
 } from "../../../../packages/contracts/src/bootstrap-relay.ts";
@@ -59,6 +64,7 @@ import {
 } from "../../src/domain/node-state.ts";
 
 afterEach(cleanupFixtures);
+afterEach(() => vi.restoreAllMocks());
 const hash = () => bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
 const exportBytes = (bytes: ArrayBuffer | JsonWebKey) => {
   if (!(bytes instanceof ArrayBuffer))
@@ -579,7 +585,308 @@ async function callback(
   await waitOnExecutionContext(context);
   return response;
 }
+function providerTarget(
+  f: Awaited<ReturnType<typeof prepared>>,
+): ContaboInstance {
+  return {
+    id: f.spec.provider_instance_id,
+    tenantId: crypto.randomUUID(),
+    customerId: crypto.randomUUID(),
+    name: f.spec.hostname,
+    displayName: f.spec.hostname,
+    dataCenter: "fixture",
+    region: "EU",
+    regionName: "fixture",
+    productId: f.addition.audit!.product_id,
+    productName: "fixture",
+    imageId: f.addition.audit!.image_id,
+    ipConfig: {
+      v4: {
+        ip: f.spec.hardware.ipv4,
+        gateway: f.spec.hardware.gateway,
+        netmaskCidr: f.spec.hardware.prefix_length,
+      },
+      v6: { ip: "", gateway: "", netmaskCidr: 0 },
+    },
+    ramMb: 8192,
+    cpuCores: 4,
+    diskMb: 65536,
+    macAddress: f.spec.hardware.mac,
+    osType: "Linux",
+    sshKeys: [],
+    createdDate: new Date().toISOString(),
+    cancelDate: null,
+    status: "rescue",
+    addOns: [],
+    applicationId: null,
+    additionalIps: [],
+  };
+}
+async function beforeDestructiveWrite() {
+  const f = await prepared(),
+    current = {
+      ...JSON.parse(f.job.checkpoint_json),
+      stage: "image_verified",
+      status: "running",
+      downloaded_bytes: f.spec.image.compressed_bytes,
+    };
+  f.bindings.CONTABO_CLIENT_ID = crypto.randomUUID();
+  f.bindings.CONTABO_CLIENT_SECRET = crypto.randomUUID();
+  f.bindings.CONTABO_USERNAME = crypto.randomUUID();
+  f.bindings.CONTABO_PASSWORD = crypto.randomUUID();
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(current), f.job.operation_id)
+    .run();
+  const next = {
+    ...current,
+    stage: "disk_write_intent",
+    destructive_intent: true,
+    write_intent_offset: 0,
+  };
+  return {
+    f,
+    next,
+    envelope: {
+      ...f.identity,
+      kind: "checkpoint",
+      expected_revision: 0,
+      payload: next,
+    },
+  };
+}
 describe("protected bootstrap authority", () => {
+  it("verifies the initial network boundary once while keeping fresh Cloudflare proof authority", async () => {
+    const f = await prepared(),
+      verify = vi.spyOn(network, "ensureNodeNetwork").mockResolvedValue(true);
+    expect(
+      await ensureBootstrapNetworkBoundary(f.bindings, f.job.operation_id),
+    ).toBe(true);
+    expect(verify).toHaveBeenCalledTimes(1);
+    expect(
+      (await readNodeAddition(env.DB, f.job.operation_id)).checkpoint?.stage,
+    ).toBe("prepared");
+    expect(
+      await ensureBootstrapNetworkBoundary(f.bindings, f.job.operation_id),
+    ).toBe(true);
+    expect(verify).toHaveBeenCalledTimes(1);
+    await env.DB.prepare(
+      "UPDATE node_network_preparations SET proof_expires_at=? WHERE operation_id=?",
+    )
+      .bind(new Date(Date.now() - 1).toISOString(), f.job.operation_id)
+      .run();
+    expect(
+      await ensureBootstrapNetworkBoundary(f.bindings, f.job.operation_id),
+    ).toBe(false);
+    expect(verify).toHaveBeenCalledTimes(1);
+  });
+  it("does not poll provider or firewall after sealed rescue is already active", async () => {
+    const f = await prepared();
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET rescue_active=1 WHERE operation_id=?",
+    )
+      .bind(f.job.operation_id)
+      .run();
+    const get = vi.fn(async () => {
+        throw new Error("unexpected_provider_read");
+      }),
+      rescue = vi.fn(async () => {
+        throw new Error("unexpected_rescue_write");
+      }),
+      firewall = vi
+        .spyOn(network, "ensureNodeFirewall")
+        .mockResolvedValue(true);
+    expect(
+      await ensureNodeRescue(f.bindings, f.job.operation_id, {
+        getInstance: get,
+        rescue,
+        actionAudits: vi.fn(async () => []),
+      }),
+    ).toBe(true);
+    expect(get).not.toHaveBeenCalled();
+    expect(rescue).not.toHaveBeenCalled();
+    expect(firewall).not.toHaveBeenCalled();
+  });
+  it("rejects changed provider inventory before the first destructive checkpoint without mutation", async () => {
+    const { f, envelope } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id),
+      actual = providerTarget(f),
+      provider = vi
+        .spyOn(ContaboClient.prototype, "getInstance")
+        .mockResolvedValue({ ...actual, productId: "different-product" });
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(provider).toHaveBeenCalledTimes(1);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("verifies only the first destructive boundary and rejects replayed revisions before provider access", async () => {
+    const { f, envelope, next } = await beforeDestructiveWrite(),
+      provider = vi
+        .spyOn(ContaboClient.prototype, "getInstance")
+        .mockResolvedValue(providerTarget(f));
+    expect((await callback(f, envelope)).status).toBe(200);
+    expect(provider).toHaveBeenCalledTimes(1);
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(provider).toHaveBeenCalledTimes(1);
+    expect(
+      (
+        await callback(f, {
+          ...envelope,
+          expected_revision: 1,
+          payload: { ...next, written_bytes: 256, write_intent_offset: 256 },
+        })
+      ).status,
+    ).toBe(200);
+    expect(provider).toHaveBeenCalledTimes(1);
+  });
+  it("leaves the checkpoint untouched when first-write provider verification fails", async () => {
+    const { f, envelope } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id),
+      provider = vi
+        .spyOn(ContaboClient.prototype, "getInstance")
+        .mockRejectedValue(new Error("provider_read_unavailable"));
+    expect((await callback(f, envelope)).status).toBe(500);
+    expect(provider).toHaveBeenCalledTimes(1);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("rejects a cancelled target and actual unallocated hardware before disk intent", async () => {
+    const { f, envelope } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id),
+      actual = providerTarget(f),
+      provider = vi
+        .spyOn(ContaboClient.prototype, "getInstance")
+        .mockResolvedValue({ ...actual, cancelDate: new Date().toISOString() });
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+    provider.mockResolvedValue({
+      ...actual,
+      ramMb: null,
+      status: "pending_payment",
+    });
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("refuses an old revision before provider I/O and a revision changed during that I/O", async () => {
+    const { f, envelope } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id),
+      actual = providerTarget(f),
+      provider = vi
+        .spyOn(ContaboClient.prototype, "getInstance")
+        .mockImplementation(async () => {
+          await env.DB.prepare(
+            "UPDATE node_bootstrap_jobs SET revision=revision+1 WHERE operation_id=?",
+          )
+            .bind(f.job.operation_id)
+            .run();
+          return actual;
+        });
+    expect(
+      (await callback(f, { ...envelope, expected_revision: 1 })).status,
+    ).toBe(409);
+    expect(provider).not.toHaveBeenCalled();
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(provider).toHaveBeenCalledTimes(1);
+    const after = await readBootstrapJob(env.DB, f.job.operation_id);
+    expect(after.checkpoint_json).toBe(before.checkpoint_json);
+    expect(after.revision).toBe(1);
+  });
+  it("refuses provider authority changed during first-write readback", async () => {
+    const { f, envelope } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id),
+      actual = providerTarget(f);
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockImplementation(
+      async () => {
+        await env.DB.prepare(
+          "UPDATE node_additions SET revision=revision+1,status='failed' WHERE operation_id=?",
+        )
+          .bind(f.job.operation_id)
+          .run();
+        return actual;
+      },
+    );
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("atomically binds disk intent to the provider authority even without a revision change", async () => {
+    const { f, envelope } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id),
+      prepare = env.DB.prepare.bind(env.DB);
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(
+      providerTarget(f),
+    );
+    vi.spyOn(env.DB, "prepare").mockImplementation((sql) => {
+      const statement = prepare(sql);
+      if (sql.startsWith("UPDATE node_bootstrap_jobs SET checkpoint_json")) {
+        const bind = statement.bind.bind(statement);
+        Object.defineProperty(statement, "bind", {
+          value: (...values: unknown[]) => {
+            const bound = bind(...values),
+              run = bound.run.bind(bound);
+            Object.defineProperty(bound, "run", {
+              value: async () => {
+                await prepare(
+                  "UPDATE node_additions SET provider_instance_id=? WHERE operation_id=?",
+                )
+                  .bind(
+                    String(Number(f.spec.provider_instance_id) + 1),
+                    f.job.operation_id,
+                  )
+                  .run();
+                return run();
+              },
+            });
+            return bound;
+          },
+        });
+      }
+      return statement;
+    });
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("rejects an audit changed between its parsed read and exact CAS snapshot", async () => {
+    const { f, envelope } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id),
+      prepare = env.DB.prepare.bind(env.DB),
+      provider = vi
+        .spyOn(ContaboClient.prototype, "getInstance")
+        .mockResolvedValue(providerTarget(f));
+    vi.spyOn(env.DB, "prepare").mockImplementation((sql) => {
+      const statement = prepare(sql);
+      if (
+        sql.startsWith(
+          "SELECT revision,provider_instance_id,intent_hash,audit_json,receipt_json",
+        )
+      ) {
+        const bind = statement.bind.bind(statement);
+        Object.defineProperty(statement, "bind", {
+          value: (...values: unknown[]) => {
+            const bound = bind(...values),
+              first = bound.first.bind(bound);
+            Object.defineProperty(bound, "first", {
+              value: async () => {
+                const audit = {
+                  ...f.addition.audit!,
+                  product_id: "different-product",
+                };
+                await prepare(
+                  "UPDATE node_additions SET audit_json=? WHERE operation_id=?",
+                )
+                  .bind(JSON.stringify(audit), f.job.operation_id)
+                  .run();
+                return first();
+              },
+            });
+            return bound;
+          },
+        });
+      }
+      return statement;
+    });
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(provider).not.toHaveBeenCalled();
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
   it("lets a joined worker skip platform installation while a control plane cannot", async () => {
     const f = await prepared();
     const previous = {
@@ -991,20 +1298,17 @@ describe("protected bootstrap authority", () => {
       applicationId: null,
       additionalIps: [],
     };
-    const provider = { getInstance: vi.fn(async () => actual) };
-    const first = await issueBootstrapTransport(
-      settings,
-      row,
-      { capability: "rescue_ssh" },
-      provider,
-    );
+    const provider = vi
+      .spyOn(ContaboClient.prototype, "getInstance")
+      .mockResolvedValue(actual);
+    const first = await issueBootstrapTransport(settings, row, {
+      capability: "rescue_ssh",
+    });
     epoch = secondEpoch;
-    const second = await issueBootstrapTransport(
-      settings,
-      row,
-      { capability: "rescue_ssh" },
-      provider,
-    );
+    const second = await issueBootstrapTransport(settings, row, {
+      capability: "rescue_ssh",
+    });
+    expect(provider).not.toHaveBeenCalled();
     const keys = await importBootstrapVerificationKeys({ test: publicKey }),
       expected = {
         keys,
@@ -1037,17 +1341,22 @@ describe("protected bootstrap authority", () => {
       ).ok,
     ).toBe(true);
     expect(first.token).not.toBe(second.token);
+    const platformRow = {
+      ...row,
+      checkpoint_json: JSON.stringify({
+        ...JSON.parse(row.checkpoint_json),
+        stage: "cilium_install_intent",
+      }),
+    };
+    await env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+    )
+      .bind(platformRow.checkpoint_json, row.operation_id)
+      .run();
     const platformTransport = await issueBootstrapTransport(
       settings,
-      {
-        ...row,
-        checkpoint_json: JSON.stringify({
-          ...JSON.parse(row.checkpoint_json),
-          stage: "cilium_install_intent",
-        }),
-      },
+      platformRow,
       { capability: "kubernetes_api" },
-      provider,
     );
     expect(
       (
@@ -1068,6 +1377,27 @@ describe("protected bootstrap authority", () => {
       `/internal/v1/node-bootstrap/${f.job.operation_id}/relay`,
     );
     expect(url.search).toBe("");
+    service.fetch.mockImplementationOnce(async () => {
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET cancelled=1,authorized=0 WHERE operation_id=?",
+      )
+        .bind(row.operation_id)
+        .run();
+      return Response.json({
+        v: 1,
+        region: f.region,
+        issuer_region: f.region,
+        relay_epoch: epoch,
+        allowed_target_regions: [f.region],
+        capabilities: ["rescue_ssh", "talos_api", "kubernetes_api"],
+      });
+    });
+    await expect(
+      issueBootstrapTransport(settings, platformRow, {
+        capability: "kubernetes_api",
+      }),
+    ).rejects.toMatchObject({ code: "forbidden" });
+    expect(provider).not.toHaveBeenCalled();
   });
   it("refuses unsigned verification artifacts before any provider request or quarantine release", async () => {
     const f = await prepared();

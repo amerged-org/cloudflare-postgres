@@ -5,7 +5,6 @@ import {
   NodeProofExecutionInput,
   NodeProofBinding,
   NodeProofMeasurement,
-  canonicalNodeProof,
   type NodeProofMode,
 } from "@pgcf/contracts/node-proof";
 import {
@@ -36,9 +35,12 @@ import {
   readNodeInstallationProfile,
   installationHash,
 } from "./node-installation.ts";
-import { ensureNodeFirewall } from "./node-network.ts";
 import { bootstrapTransportSigningKey } from "./bootstrap-relay.ts";
-import { selectNodeProofSource } from "./node-proof-source.ts";
+import {
+  assertNodeProofSourceAuthority,
+  selectNodeProofSource,
+  type NodeProofSourceOptions,
+} from "./node-proof-source.ts";
 import {
   issueNodeProofSession,
   authenticateNodeProofRequest,
@@ -67,10 +69,37 @@ const providerDiagnosticCode = z.enum([
   "unexpected_status",
   "authorization_unavailable",
 ]);
+export const NodeProofSourceBinding = NodeProofExecutionInput.shape.claims
+  .pick({
+    operation_id: true,
+    binding_sha256: true,
+    inspection_generation: true,
+    plan_sha256: true,
+    input_hash: true,
+  })
+  .safeExtend({ source: NodeProofExecutionInput.shape.source });
+export type NodeProofSourceBinding = z.infer<typeof NodeProofSourceBinding>;
+export function proofSourceBinding(
+  input: NodeProofExecutionInput,
+): NodeProofSourceBinding {
+  const claims = input.claims;
+  return NodeProofSourceBinding.parse({
+    operation_id: claims.operation_id,
+    binding_sha256: claims.binding_sha256,
+    inspection_generation: claims.inspection_generation,
+    plan_sha256: claims.plan_sha256,
+    input_hash: claims.input_hash,
+    source: input.source,
+  });
+}
 export async function prepareNodeProofInput(
   env: Env,
   operationId: string,
   mode: NodeProofMode,
+  options: {
+    sourceBinding?: NodeProofSourceBinding;
+    sourceSelection?: NodeProofSourceOptions;
+  } = {},
 ): Promise<NodeProofExecutionInput | null> {
   OperationId.parse(operationId);
   const binding = await loadNodeInstallationBinding(env, operationId);
@@ -94,7 +123,6 @@ export async function prepareNodeProofInput(
       addition.checkpoint?.stage !== "joined")
   )
     return null;
-  if (!(await ensureNodeFirewall(env, operationId))) return null;
   const saved = await env.DB.prepare(
     "SELECT plan_json,plan_sha256,readback_at,status FROM node_network_preparations WHERE operation_id=?",
   )
@@ -132,10 +160,26 @@ export async function prepareNodeProofInput(
       }
     }
   }
-  const source = await selectNodeProofSource(env, operationId, plan, {
-    sourceImage,
-  });
+  const association = options.sourceBinding
+    ? NodeProofSourceBinding.parse(options.sourceBinding)
+    : null;
+  if (
+    association &&
+    (association.operation_id !== operationId ||
+      association.binding_sha256 !== binding.row.binding_sha256 ||
+      association.inspection_generation !== binding.row.inspection_generation ||
+      association.plan_sha256 !== saved.plan_sha256 ||
+      association.input_hash !== row.input_hash)
+  )
+    return deny();
+  const source =
+    association?.source ??
+    (await selectNodeProofSource(env, operationId, plan, {
+      ...options.sourceSelection,
+      sourceImage,
+    }));
   if (!source) return null;
+  await assertNodeProofSourceAuthority(env, operationId, plan, source);
   const session = await issueNodeProofSession(env, operationId, mode);
   let cluster_bundle: NodeJoinBundle | null = null;
   if (mode === "postjoin" || bootstrap.spec.role === "worker")
@@ -231,21 +275,12 @@ export async function authorizeNodeProofSource(
     input.session_bearer,
     input.claims.operation_id,
   );
-  const selected = await selectNodeProofSource(
+  await assertNodeProofSourceAuthority(
     env,
     input.claims.operation_id,
     input.plan,
-    {
-      ...(input.source.kind === "pod"
-        ? { sourceImage: input.source.image }
-        : {}),
-    },
+    input.source,
   );
-  if (
-    !selected ||
-    canonicalNodeProof(selected) !== canonicalNodeProof(input.source)
-  )
-    return deny();
   await authenticateNodeProofSession(
     env,
     input.session_bearer,

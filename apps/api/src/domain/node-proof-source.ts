@@ -6,6 +6,10 @@ import {
   NodePlatformSpec,
 } from "@pgcf/contracts/node-bootstrap";
 import { NodeInspectionInput } from "@pgcf/contracts/node-installation";
+import {
+  canonicalNodeProof,
+  NodeProofSource,
+} from "@pgcf/contracts/node-proof";
 import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
@@ -22,6 +26,7 @@ import { contaboClient } from "./bootstrap-relay.ts";
 import {
   installationHash,
   loadNodeInstallationBinding,
+  readNodeInstallationBinding,
   readNodeInstallationProfile,
 } from "./node-installation.ts";
 import { assertNodeRecoveryAuthority, readNodeAddition } from "./node-state.ts";
@@ -260,6 +265,220 @@ interface NodeRow {
   provider_region: string;
 }
 
+/** Validate the stored association locally; only initial selection verifies provider inventory. */
+export async function assertNodeProofSourceAuthority(
+  env: Env,
+  targetOperationId: string,
+  value: unknown,
+  stored: Source,
+): Promise<void> {
+  const parsed = Plan.safeParse(value),
+    selected = NodeProofSource.safeParse(stored);
+  if (!parsed.success || !selected.success) return unavailable();
+  const plan = parsed.data,
+    source = selected.data,
+    target = await readNodeAddition(env.DB, targetOperationId);
+  await assertNodeRecoveryAuthority(env.DB, target);
+  const binding = await readNodeInstallationBinding(env.DB, targetOperationId),
+    saved = await env.DB.prepare(
+      "SELECT plan_sha256,status,readback_at FROM node_network_preparations WHERE operation_id=?",
+    )
+      .bind(targetOperationId)
+      .first<{
+        plan_sha256: string;
+        status: string;
+        readback_at: string | null;
+      }>(),
+    region = await env.DB.prepare(
+      "SELECT provider,provider_region FROM regions WHERE id=?",
+    )
+      .bind(source.region_id)
+      .first<{ provider: string; provider_region: string }>();
+  if (
+    !target.slot_held ||
+    !target.audit ||
+    !target.receipt ||
+    !target.provider_instance_id ||
+    target.audit.provider_instance_id !== target.provider_instance_id ||
+    target.receipt.provider_instance_id !== target.provider_instance_id ||
+    !["audited", "bootstrapping"].includes(target.status) ||
+    plan.operation_id !== targetOperationId ||
+    plan.node_id !== target.intent.node_id ||
+    plan.region_id !== target.intent.request.region_id ||
+    plan.provider_instance_id !== target.provider_instance_id ||
+    plan.intent_hash !== target.intent_hash ||
+    !binding ||
+    binding.node_id !== plan.node_id ||
+    binding.region_id !== plan.region_id ||
+    binding.provider_instance_id !== plan.provider_instance_id ||
+    !saved?.readback_at ||
+    saved.status === "blocked" ||
+    saved.plan_sha256 !== (await installationHash(value)) ||
+    region?.provider !== "contabo" ||
+    region.provider_region === target.audit.provider_region ||
+    [
+      plan.provider_instance_id,
+      plan.relay.provider_instance_id,
+      ...plan.members.map((member) => member.provider_instance_id),
+    ].includes(source.provider_instance_id) ||
+    !nodeProofSourceOutsidePlan(value, source.ipv4) ||
+    (source.ipv6 && !nodeProofSourceOutsidePlan(value, source.ipv6)) ||
+    (plan.members.some((member) => member.addresses.ipv6.length > 0) &&
+      !source.ipv6)
+  )
+    return unavailable();
+  const targetAudit = target.audit;
+  const currentTarget = async () =>
+    !!(await env.DB.prepare(
+      `SELECT 1 present FROM node_additions a
+       JOIN node_installation_bindings b ON b.operation_id=a.operation_id
+       JOIN node_network_preparations p ON p.operation_id=a.operation_id
+       JOIN regions r ON r.id=a.region_id
+       WHERE a.operation_id=? AND a.revision=? AND a.slot_held=1 AND a.status IN('audited','bootstrapping')
+         AND a.provider_instance_id=? AND b.node_id=? AND b.region_id=? AND b.provider_instance_id=?
+         AND b.binding_sha256=? AND b.profile_sha256=? AND b.inspection_generation=?
+         AND p.plan_sha256=? AND p.readback_at IS NOT NULL AND p.status<>'blocked'
+         AND r.provider='contabo' AND r.provider_region=?`,
+    )
+      .bind(
+        targetOperationId,
+        target.revision,
+        target.provider_instance_id,
+        binding.node_id,
+        binding.region_id,
+        binding.provider_instance_id,
+        binding.binding_sha256,
+        binding.profile_sha256,
+        binding.inspection_generation,
+        saved.plan_sha256,
+        targetAudit.provider_region,
+      )
+      .first());
+  if (source.kind === "pod") {
+    const currentNode = async () => {
+      const now = Date.now();
+      return !!(await env.DB.prepare(
+        `SELECT 1 present FROM nodes n JOIN regions r ON r.id=n.region_id
+         WHERE n.id=? AND n.region_id=? AND n.provider_instance_id=? AND n.node_uid=?
+           AND n.k8s_node_name=? AND n.ready=1 AND n.lost_at IS NULL
+           AND r.provider='contabo' AND r.provider_region=?
+           AND n.last_observed_at>=? AND n.last_observed_at<=?`,
+      )
+        .bind(
+          source.node_id,
+          source.region_id,
+          source.provider_instance_id,
+          source.node_uid,
+          source.node_name,
+          region.provider_region,
+          new Date(now - NODE_OBSERVATION_MAX_AGE_MS).toISOString(),
+          new Date(now + 5000).toISOString(),
+        )
+        .first());
+    };
+    if (!(await currentNode())) return unavailable();
+    const targetProfile = await readNodeInstallationProfile(
+        env,
+        plan.region_id,
+      ),
+      sourceProfile = await readNodeInstallationProfile(env, source.region_id);
+    let bundle: NodeJoinBundle;
+    try {
+      bundle = NodeJoinBundle.parse(
+        await loadRegionJoinBundle(
+          env.DB,
+          env.CREDENTIAL_KEYS,
+          joinBundleReference(source.region_id, 1),
+        ),
+      );
+    } catch {
+      return unavailable();
+    }
+    if (
+      ![
+        targetProfile?.profile.first_region?.regional_image,
+        sourceProfile?.profile.first_region?.regional_image,
+      ].includes(source.image) ||
+      bundle.kube_system_uid !== source.cluster_uid ||
+      canonicalNodeProof(bundle) !==
+        canonicalNodeProof(source.access.join_bundle) ||
+      !(await currentNode()) ||
+      !(await currentTarget())
+    )
+      return unavailable();
+    return;
+  }
+  const addition = await readNodeAddition(env.DB, source.operation_id);
+  await assertNodeRecoveryAuthority(env.DB, addition);
+  const bound = await loadNodeInstallationBinding(env, source.operation_id);
+  if (
+    !bound ||
+    !addition.audit ||
+    !addition.receipt ||
+    !addition.slot_held ||
+    !["audited", "bootstrapping"].includes(addition.status) ||
+    addition.intent.node_id !== source.node_id ||
+    addition.intent.request.region_id !== source.region_id ||
+    addition.provider_instance_id !== source.provider_instance_id ||
+    addition.audit.provider_instance_id !== source.provider_instance_id ||
+    addition.audit.provider_region !== region.provider_region ||
+    addition.receipt.provider_instance_id !== source.provider_instance_id ||
+    bound.row.node_id !== source.node_id ||
+    bound.row.region_id !== source.region_id ||
+    bound.row.provider_instance_id !== source.provider_instance_id ||
+    bound.row.binding_sha256 !== source.access.binding_sha256 ||
+    bound.row.profile_sha256 !== source.access.profile_sha256 ||
+    bound.row.inspection_generation !== source.access.inspection_generation ||
+    source.access.expected_network.ipv4 !== source.ipv4 ||
+    (source.ipv6 ?? null) !==
+      (source.access.expected_network.ipv6
+        ? address(source.access.expected_network.ipv6.address).normalized
+        : null)
+  )
+    return unavailable();
+  const rescue = NodeBootstrapInput.shape.rescue.parse({
+      ssh_private_key: bound.rescue.ssh_private_key,
+      ssh_host_key: bound.rescue.ssh_host_key,
+      ssh_host_fingerprint: bound.rescue.ssh_host_fingerprint,
+    }),
+    profile = await readNodeInstallationProfile(env, source.region_id);
+  if (
+    !profile ||
+    profile.profile_sha256 !== source.access.profile_sha256 ||
+    profile.profile.provider_product_id !== addition.audit.product_id ||
+    profile.profile.rescue_client_private_key !== rescue.ssh_private_key ||
+    canonicalNodeProof(rescue) !== canonicalNodeProof(source.access.rescue) ||
+    !(await validateRescueConfiguration(env, source.provider_instance_id, {
+      spec: { rescue_host_fingerprint: rescue.ssh_host_fingerprint },
+      rescue,
+    }))
+  )
+    return unavailable();
+  const currentSource = await env.DB.prepare(
+    `SELECT 1 present FROM node_additions a JOIN node_installation_bindings b ON b.operation_id=a.operation_id
+     JOIN regions r ON r.id=a.region_id
+     WHERE a.operation_id=? AND a.revision=? AND a.status IN('audited','bootstrapping') AND a.slot_held=1
+       AND a.provider_instance_id=? AND b.node_id=? AND b.region_id=? AND b.provider_instance_id=?
+       AND b.binding_sha256=? AND b.profile_sha256=? AND b.inspection_generation=?
+       AND r.provider='contabo' AND r.provider_region=?
+       AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs j WHERE j.operation_id=a.operation_id AND j.cancelled=0)`,
+  )
+    .bind(
+      source.operation_id,
+      addition.revision,
+      source.provider_instance_id,
+      source.node_id,
+      source.region_id,
+      source.provider_instance_id,
+      source.access.binding_sha256,
+      source.access.profile_sha256,
+      source.access.inspection_generation,
+      region.provider_region,
+    )
+    .first();
+  if (!currentSource || !(await currentTarget())) return unavailable();
+}
+
 /** Read-only source selection. Native execution rechecks actual Node UID/Ready and both address families. */
 export async function selectNodeProofSource(
   env: Env,
@@ -312,7 +531,13 @@ export async function selectNodeProofSource(
   const freshInstance = (id: string) => {
     let pending = inventory.get(id);
     if (!pending) {
-      pending = provider.getInstance(id, { requestId: crypto.randomUUID() });
+      pending = provider.getInstance(id, {
+        requestId: crypto.randomUUID(),
+        accounting: {
+          operation_id: targetOperationId,
+          stage: "source_selection",
+        },
+      });
       inventory.set(id, pending);
     }
     return pending;

@@ -4,6 +4,7 @@ import {
   ContaboClient,
   ContaboError,
   hasAllocatedContaboHardware,
+  type ContaboRequest,
 } from "../../src/providers/contabo.ts";
 
 afterEach(() => vi.restoreAllMocks());
@@ -166,6 +167,176 @@ it("caches OAuth only in memory and validates instance identity without exposing
   await expect(
     f.client.getInstance(f.instanceId, { requestId: value() }),
   ).rejects.toMatchObject({ code: "invalid_response" });
+});
+it("accounts one initiating OAuth and two concurrent resource wires with local caller identities", async () => {
+  const f = setup(),
+    first = {
+      operation_id: "op_" + "a".repeat(20),
+      stage: "inspection" as const,
+    },
+    second = {
+      operation_id: "op_" + "b".repeat(20),
+      stage: "prewrite" as const,
+    },
+    secondRequest = value(),
+    sequence: (Record<string, unknown> | "fetch")[] = [],
+    log = vi.spyOn(console, "log").mockImplementation((line: string) => {
+      sequence.push(JSON.parse(line) as Record<string, unknown>);
+    }),
+    client = new ContaboClient({
+      ...f.credentials,
+      fetcher: async (input, init) => {
+        sequence.push("fetch");
+        return f.fetcher(input, init);
+      },
+    });
+  await Promise.all([
+    client.getInstance(f.instanceId, {
+      requestId: f.requestId,
+      accounting: first,
+    }),
+    client.getInstance(f.instanceId, {
+      requestId: secondRequest,
+      accounting: second,
+    }),
+  ]);
+  const events = log.mock.calls.map(
+    ([line]) => JSON.parse(String(line)) as Record<string, unknown>,
+  );
+  expect(events).toHaveLength(3);
+  expect(events[0]).toMatchObject({
+    event: "contabo_wire_request",
+    ...first,
+    kind: "oauth",
+    method: "POST",
+    request_id: f.requestId,
+  });
+  expect(events.filter((event) => event.kind === "resource")).toEqual([
+    expect.objectContaining({
+      ...first,
+      method: "GET",
+      request_id: f.requestId,
+    }),
+    expect.objectContaining({
+      ...second,
+      method: "GET",
+      request_id: secondRequest,
+    }),
+  ]);
+  expect(sequence.filter((_, index) => index % 2 === 1)).toEqual([
+    "fetch",
+    "fetch",
+    "fetch",
+  ]);
+  expect(new Set(events.map((event) => event.wire_id)).size).toBe(3);
+  for (const event of events) {
+    expect(Object.keys(event).sort()).toEqual(
+      [
+        "event",
+        "operation_id",
+        "stage",
+        "kind",
+        "method",
+        "request_id",
+        "wire_id",
+      ].sort(),
+    );
+    expect(event.wire_id).toMatch(
+      /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/,
+    );
+  }
+  const text = JSON.stringify(events);
+  expect(
+    Object.values(f.credentials).some((secret) => text.includes(secret)),
+  ).toBe(false);
+  expect(text.includes(f.token)).toBe(false);
+  expect(text.includes(f.instance.ipConfig.v4.ip)).toBe(false);
+  for (const call of f.calls) {
+    expect(new Headers(call.init.headers).has("accounting")).toBe(false);
+    expect(call.url.includes(first.operation_id)).toBe(false);
+    expect(String(call.init.body).includes(first.operation_id)).toBe(false);
+    expect(String(call.init.body).includes(second.operation_id)).toBe(false);
+  }
+});
+it("keeps the parsed accounting context on every inventory page", async () => {
+  const f = setup(1),
+    accounting = {
+      operation_id: "op_" + "c".repeat(20),
+      stage: "resolution" as const,
+    },
+    input = { requestId: f.requestId, accounting },
+    log = vi.spyOn(console, "log").mockImplementation(() => {});
+  f.set((url) => {
+    const page = Number(url.searchParams.get("page") ?? 1);
+    if (page === 1) accounting.operation_id = "op_" + "d".repeat(20);
+    return Response.json({
+      _pagination: { size: 1, totalElements: 2, totalPages: 2, page },
+      data: [{ ...f.instance, instanceId: Number(f.instanceId) + page - 1 }],
+      _links: {
+        self: "/v1/compute/instances",
+        first: "/v1/compute/instances?page=1",
+        last: "/v1/compute/instances?page=2",
+      },
+    });
+  });
+  expect(await f.client.listInstances({}, input)).toHaveLength(2);
+  const events = log.mock.calls.map(
+    ([line]) => JSON.parse(String(line)) as Record<string, unknown>,
+  );
+  expect(events).toHaveLength(3);
+  expect(events.map((event) => event.operation_id)).toEqual(
+    Array(3).fill("op_" + "c".repeat(20)),
+  );
+  expect(events.filter((event) => event.kind === "resource")).toHaveLength(2);
+});
+it("refuses private accounting extras and unknown stages before dispatch and leaves accounting optional", async () => {
+  const f = setup(),
+    canary = "private-accounting-" + value(),
+    log = vi.spyOn(console, "log").mockImplementation(() => {});
+  await expect(
+    f.client.getInstance(f.instanceId, {
+      requestId: f.requestId,
+      accounting: {
+        operation_id: "op_" + "e".repeat(20),
+        stage: "inspection",
+        private_body: canary,
+      },
+    } as unknown as ContaboRequest),
+  ).rejects.toMatchObject({ code: "invalid_input" });
+  await expect(
+    f.client.getInstance(f.instanceId, {
+      requestId: f.requestId,
+      accounting: { operation_id: "op_" + "e".repeat(20), stage: canary },
+    } as unknown as ContaboRequest),
+  ).rejects.toMatchObject({ code: "invalid_input" });
+  expect(f.calls).toHaveLength(0);
+  expect(log).not.toHaveBeenCalled();
+  expect(
+    await f.client.getInstance(f.instanceId, { requestId: f.requestId }),
+  ).toMatchObject({ id: f.instanceId });
+  expect(log).not.toHaveBeenCalled();
+});
+it("isolates accounting console failure without replaying an uncertain provider mutation", async () => {
+  const f = setup(),
+    canary = "private-wire-" + value();
+  vi.spyOn(console, "log").mockImplementation(() => {
+    throw new Error(canary);
+  });
+  f.set(() => {
+    throw new Error(canary);
+  });
+  const result = await f.client.order(f.order, {
+    requestId: f.requestId,
+    accounting: { operation_id: "op_" + "f".repeat(20), stage: "order" },
+  });
+  expect(result).toMatchObject({
+    kind: "unknown",
+    dispatched: true,
+    requestId: f.requestId,
+  });
+  expect(f.posts()).toHaveLength(1);
+  expect(f.calls).toHaveLength(2);
+  expect(JSON.stringify(result)).not.toContain(canary);
 });
 it("rejects unsafe numeric int64 responses and malformed IP configuration instead of rounding or guessing", async () => {
   const f = setup();

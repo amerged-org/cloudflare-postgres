@@ -19,6 +19,7 @@ import {
   signNodeProofDocument,
 } from "../../src/domain/node-proof-session.ts";
 import { acceptNodeProofReport } from "../../src/domain/node-proof-artifacts.ts";
+import { ensureNodePreparationProof } from "../../src/domain/node-proof.ts";
 import { installationHash } from "../../src/domain/node-installation.ts";
 import { boundInstallationFixture } from "./installation-fixtures.ts";
 import { cleanupFixtures } from "./fixtures.ts";
@@ -237,6 +238,38 @@ it("rejects an unauthorized report before any R2 write or firewall gate", async 
   expect(put).not.toHaveBeenCalled();
   expect(f.firewall.mock.calls.length).toBe(0);
   expect(f.verify.mock.calls.length).toBe(0);
+});
+
+it("renews preparation authority from confirmed Cloudflare readback without polling provider firewalls", async () => {
+  const f = await fixture(),
+    prove = vi.fn(async () => ({ status: "running" }));
+  const bindings = {
+    ...f.bindings,
+    NODE_BOOTSTRAP: {
+      idFromName: () => f.addition.intent.operation_id,
+      get: () => ({ prove }),
+    } as unknown as typeof f.bindings.NODE_BOOTSTRAP,
+  };
+  f.firewall.mockRejectedValue(new Error("renewal_provider_forbidden"));
+  expect(
+    await ensureNodePreparationProof(bindings, f.addition.intent.operation_id),
+  ).toBe(false);
+  expect(prove).toHaveBeenCalledWith(
+    f.addition.intent.operation_id,
+    "preparation",
+  );
+  expect(f.firewall).not.toHaveBeenCalled();
+  await env.DB.prepare(
+    "UPDATE node_network_preparations SET readback_at=NULL WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .run();
+  f.firewall.mockResolvedValue(false);
+  expect(
+    await ensureNodePreparationProof(bindings, f.addition.intent.operation_id),
+  ).toBe(false);
+  expect(f.firewall).toHaveBeenCalledTimes(1);
+  expect(prove).toHaveBeenCalledTimes(1);
 });
 
 async function preparationDocument(

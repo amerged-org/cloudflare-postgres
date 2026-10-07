@@ -12,11 +12,15 @@ import {
 } from "./domain/bootstrap-jobs.ts";
 import { readNodeAddition } from "./domain/node-state.ts";
 import { hasVerifiedNodePreparation } from "./domain/node-network.ts";
-import { prepareNodeInspectionInput } from "./domain/node-inspection.ts";
+import {
+  prepareNodeInspectionInput,
+  assertNodeInspectionInputCurrent,
+} from "./domain/node-inspection.ts";
 import { loadNodeInstallationBinding } from "./domain/node-installation.ts";
 import {
   NodeInstallationInspection,
   NodeInstallationInspectionStatus,
+  NodeInspectionInput,
 } from "@pgcf/contracts/node-installation";
 import {
   NodeProofExecutionInput,
@@ -25,7 +29,12 @@ import {
   NodeProofJournalStatus,
   NodeProofJournalEntry,
 } from "@pgcf/contracts/node-proof";
-import { prepareNodeProofInput } from "./domain/node-proof-execution.ts";
+import {
+  prepareNodeProofInput,
+  NodeProofSourceBinding,
+  proofSourceBinding,
+} from "./domain/node-proof-execution.ts";
+import { canonicalNodeProof } from "@pgcf/contracts/node-proof";
 import { installationHash } from "./domain/node-installation.ts";
 
 const nativeAdmissionCodes = new Set([
@@ -166,6 +175,7 @@ async function statusIdentifierHash(value: string) {
 }
 
 export class NodeBootstrap extends DurableObject<Env> {
+  private proofTurn: Promise<void> = Promise.resolve();
   async #registrationAuthority(operationId: string, admission: boolean) {
     const row = await readBootstrapJob(this.env.DB, operationId),
       addition = await readNodeAddition(this.env.DB, operationId);
@@ -281,6 +291,7 @@ export class NodeBootstrap extends DurableObject<Env> {
       "inspection_server_binding_sha256",
       input.binding_sha256,
     );
+    await this.ctx.storage.put("inspection_input", input);
     if (!container.running)
       container.start({
         enableInternet: true,
@@ -292,14 +303,8 @@ export class NodeBootstrap extends DurableObject<Env> {
     await container.setInactivityTimeout(600000);
     await this.ctx.storage.setAlarm(Date.now() + 600000);
     await this.#waitForPort(container);
-    const current = await prepareNodeInspectionInput(this.env, operationId);
-    if (
-      !current ||
-      current.binding_sha256 !== input.binding_sha256 ||
-      current.network_plan_sha256 !== input.network_plan_sha256 ||
-      current.expected_generation !== input.expected_generation
-    )
-      throw new Error("inspection_authority_changed");
+    await assertNodeInspectionInputCurrent(this.env, operationId, input);
+    const current = input;
     const response = await container.getTcpPort(8080).fetch(
       new Request("http://localhost:8080/v1/inspections", {
         method: "POST",
@@ -750,6 +755,19 @@ export class NodeBootstrap extends DurableObject<Env> {
       )) ?? null
     );
   }
+  /** Read the sealed initial inspection assignment; never prepare or start work. */
+  async getInspectionInput(
+    operationId: string,
+  ): Promise<NodeInspectionInput | null> {
+    OperationId.parse(operationId);
+    if (!this.ctx.id.equals(this.env.NODE_BOOTSTRAP.idFromName(operationId)))
+      throw new Error("bootstrap_container_identity_mismatch");
+    const raw = await this.ctx.storage.get("inspection_input");
+    if (raw === undefined) return null;
+    const input = NodeInspectionInput.parse(raw);
+    await assertNodeInspectionInputCurrent(this.env, operationId, input);
+    return input;
+  }
   async proofOwnership(
     operationId: string,
     sessionId: string,
@@ -940,6 +958,19 @@ export class NodeBootstrap extends DurableObject<Env> {
     return { saved: true };
   }
   async prove(operationId: string, mode: NodeProofMode) {
+    const previous = this.proofTurn;
+    let release!: () => void;
+    this.proofTurn = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await previous;
+    try {
+      return await this.proveSerial(operationId, mode);
+    } finally {
+      release();
+    }
+  }
+  private async proveSerial(operationId: string, mode: NodeProofMode) {
     OperationId.parse(operationId);
     if (!this.ctx.id.equals(this.env.NODE_BOOTSTRAP.idFromName(operationId)))
       throw new Error("proof_container_identity_mismatch");
@@ -988,13 +1019,51 @@ export class NodeBootstrap extends DurableObject<Env> {
           return { operation_id: operationId, status: "running" };
       } else await response.body?.cancel();
     }
-    const input = await prepareNodeProofInput(this.env, operationId, mode);
-    if (!input) return { operation_id: operationId, status: "waiting" };
-    await this.ctx.storage.put(`proof_input:${input.claims.session_id}`, input);
-    await this.ctx.storage.put(
-      `proof_current:${mode}`,
-      input.claims.session_id,
+    let sourceBinding = await this.ctx.storage.get<NodeProofSourceBinding>(
+      "proof_source_binding",
     );
+    if (sourceBinding === undefined) {
+      // Earlier versions already persisted provider-verified input. Adopt its
+      // association only; fresh claims and current CF authority are checked below.
+      for (const previousMode of ["preparation", "postjoin"] as const) {
+        const previousSession = await this.ctx.storage.get<string>(
+          `proof_current:${previousMode}`,
+        );
+        if (!previousSession) continue;
+        const previous = await this.ctx.storage.get(
+          `proof_input:${previousSession}`,
+        );
+        if (previous === undefined)
+          throw new Error("proof_source_binding_missing");
+        const candidate = proofSourceBinding(
+          NodeProofExecutionInput.parse(previous),
+        );
+        if (
+          sourceBinding &&
+          canonicalNodeProof(sourceBinding) !== canonicalNodeProof(candidate)
+        )
+          throw new Error("proof_source_binding_changed");
+        sourceBinding = candidate;
+      }
+    }
+    const input = await prepareNodeProofInput(this.env, operationId, mode, {
+      sourceBinding,
+    });
+    if (!input) return { operation_id: operationId, status: "waiting" };
+    const association = proofSourceBinding(input);
+    await this.ctx.storage.transaction(async (txn) => {
+      const stored = await txn.get("proof_source_binding");
+      if (
+        stored !== undefined &&
+        canonicalNodeProof(NodeProofSourceBinding.parse(stored)) !==
+          canonicalNodeProof(association)
+      )
+        throw new Error("proof_source_binding_changed");
+      if (stored === undefined)
+        await txn.put("proof_source_binding", association);
+      await txn.put(`proof_input:${input.claims.session_id}`, input);
+      await txn.put(`proof_current:${mode}`, input.claims.session_id);
+    });
     const response = await container.getTcpPort(8080).fetch(
       new Request("http://localhost:8080/v1/proofs", {
         method: "POST",

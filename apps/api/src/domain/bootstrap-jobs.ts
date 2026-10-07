@@ -18,7 +18,11 @@ import {
   NodeBootstrapStatus,
   nodeStorageTrialTransition,
 } from "@pgcf/contracts/node-bootstrap";
-import { ProviderInstanceId } from "@pgcf/contracts/nodes";
+import {
+  ProviderInstanceId,
+  NodeProviderAudit,
+  NodeProviderReceipt,
+} from "@pgcf/contracts/nodes";
 import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
@@ -45,7 +49,8 @@ import {
   completeNodeAddition,
   assertNodeRecoveryAuthority,
 } from "./node-state.ts";
-import { issueBootstrapTransport } from "./bootstrap-relay.ts";
+import { contaboClient, issueBootstrapTransport } from "./bootstrap-relay.ts";
+import { hasAllocatedContaboHardware } from "../providers/contabo.ts";
 import { hasVerifiedNodePreparation } from "./node-network.ts";
 
 export const NodeBootstrapConfiguration = z.strictObject({
@@ -516,6 +521,93 @@ async function authority(
   });
 }
 const stages = NodeBootstrapCheckpoint.shape.stage.options;
+interface DestructiveProviderAuthority {
+  revision: number;
+  provider_instance_id: string;
+  intent_hash: string;
+  audit_json: string;
+  receipt_json: string;
+}
+async function destructiveProviderAuthority(
+  env: Env,
+  row: BootstrapJobRow,
+  input: NodeBootstrapInput,
+): Promise<DestructiveProviderAuthority> {
+  const addition = await readNodeAddition(env.DB, row.operation_id),
+    spec = input.spec;
+  if (
+    !addition.slot_held ||
+    !["audited", "bootstrapping"].includes(addition.status) ||
+    !addition.audit ||
+    !addition.receipt ||
+    addition.provider_instance_id !== spec.provider_instance_id ||
+    addition.audit.provider_instance_id !== spec.provider_instance_id ||
+    addition.receipt.provider_instance_id !== spec.provider_instance_id ||
+    addition.intent.node_id !== row.node_id ||
+    addition.intent.request.region_id !== row.region_id
+  )
+    throw new ApiError(
+      "conflict",
+      "Destructive installation authority changed",
+    );
+  const snapshot = await env.DB.prepare(
+    "SELECT revision,provider_instance_id,intent_hash,audit_json,receipt_json FROM node_additions WHERE operation_id=?",
+  )
+    .bind(row.operation_id)
+    .first<DestructiveProviderAuthority>();
+  if (
+    !snapshot ||
+    snapshot.revision !== addition.revision ||
+    snapshot.provider_instance_id !== spec.provider_instance_id ||
+    snapshot.intent_hash !== addition.intent_hash ||
+    snapshot.audit_json === null ||
+    snapshot.receipt_json === null ||
+    JSON.stringify(NodeProviderAudit.parse(JSON.parse(snapshot.audit_json))) !==
+      JSON.stringify(addition.audit) ||
+    JSON.stringify(
+      NodeProviderReceipt.parse(JSON.parse(snapshot.receipt_json)),
+    ) !== JSON.stringify(addition.receipt)
+  )
+    throw new ApiError("conflict", "Provider audit snapshot changed");
+  const actual = await contaboClient(env).getInstance(
+    spec.provider_instance_id,
+    {
+      requestId: crypto.randomUUID(),
+      accounting: { operation_id: row.operation_id, stage: "prewrite" },
+    },
+  );
+  if (
+    !hasAllocatedContaboHardware(actual) ||
+    actual.id !== spec.provider_instance_id ||
+    actual.region !== addition.audit.provider_region ||
+    actual.productId !== addition.audit.product_id ||
+    actual.imageId !== addition.audit.image_id ||
+    (actual.cancelDate !== null && actual.cancelDate !== "") ||
+    actual.ipConfig.v4.ip !== spec.hardware.ipv4 ||
+    actual.macAddress.toLowerCase() !== spec.hardware.mac.toLowerCase()
+  )
+    throw new ApiError(
+      "conflict",
+      "Provider inventory changed before disk write",
+    );
+  const fresh = await readBootstrapJob(env.DB, row.operation_id),
+    current = await readNodeAddition(env.DB, row.operation_id);
+  if (
+    fresh.revision !== row.revision ||
+    fresh.input_hash !== row.input_hash ||
+    !fresh.authorized ||
+    fresh.admitted ||
+    fresh.cancelled ||
+    current.revision !== addition.revision ||
+    current.provider_instance_id !== addition.provider_instance_id
+  )
+    throw new ApiError(
+      "conflict",
+      "Destructive checkpoint changed concurrently",
+    );
+  await authority(env, fresh);
+  return snapshot;
+}
 export async function bootstrapCallback(
   c: ApiContext,
   operationId: string,
@@ -552,7 +644,8 @@ export async function bootstrapCallback(
   let checkpoint = NodeBootstrapCheckpoint.parse(
       JSON.parse(row.checkpoint_json),
     ),
-    ref: BootstrapCredentialRef | null = null;
+    ref: BootstrapCredentialRef | null = null,
+    providerAuthority: DestructiveProviderAuthority | null = null;
   if (envelope.kind === "seal") {
     const supplied = envelope.payload,
       material = supplied.material;
@@ -688,11 +781,25 @@ export async function bootstrapCallback(
         "conflict",
         "Admission fields belong only to the authorized quarantine release",
       );
+    if (!checkpoint.destructive_intent && next.destructive_intent) {
+      if (
+        checkpoint.stage !== "image_verified" ||
+        next.stage !== "disk_write_intent"
+      )
+        throw new ApiError(
+          "conflict",
+          "Disk write intent belongs to the verified image boundary",
+        );
+      providerAuthority = await destructiveProviderAuthority(c.env, row, input);
+    }
     checkpoint = next;
   }
   const result = await c.env.DB.prepare(
     `UPDATE node_bootstrap_jobs SET checkpoint_json=?,material_ref_json=COALESCE(?,material_ref_json),revision=revision+1,updated_at=?
-    WHERE operation_id=? AND input_hash=? AND revision=? AND authorized=1 AND admitted=0 AND cancelled=0`,
+    WHERE operation_id=? AND input_hash=? AND revision=? AND authorized=1 AND admitted=0 AND cancelled=0
+      AND (? IS NULL OR EXISTS(SELECT 1 FROM node_additions a WHERE a.operation_id=node_bootstrap_jobs.operation_id
+        AND a.revision=? AND a.provider_instance_id=? AND a.intent_hash=? AND a.audit_json=? AND a.receipt_json=?
+        AND a.slot_held=1 AND a.status IN ('audited','bootstrapping')))`,
   )
     .bind(
       JSON.stringify(checkpoint),
@@ -701,6 +808,12 @@ export async function bootstrapCallback(
       operationId,
       row.input_hash,
       row.revision,
+      providerAuthority?.revision ?? null,
+      providerAuthority?.revision ?? null,
+      providerAuthority?.provider_instance_id ?? null,
+      providerAuthority?.intent_hash ?? null,
+      providerAuthority?.audit_json ?? null,
+      providerAuthority?.receipt_json ?? null,
     )
     .run();
   if (result.meta.changes !== 1)

@@ -14,12 +14,12 @@ import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import {
   ContaboClient,
-  hasAllocatedContaboHardware,
   type ContaboClientOptions,
 } from "../providers/contabo.ts";
 import {
   bootstrapJobInput,
   admissionAuthority,
+  readBootstrapJob,
   type BootstrapJobRow,
 } from "./bootstrap-jobs.ts";
 import { readNodeAddition } from "./node-state.ts";
@@ -32,7 +32,15 @@ type ProviderCredentials = Pick<
 let providerClient:
   { credentials: ProviderCredentials; client: ContaboClient } | undefined;
 
-export function contaboClient(env: Env) {
+export function contaboClient(
+  env: Pick<
+    Env,
+    | "CONTABO_CLIENT_ID"
+    | "CONTABO_CLIENT_SECRET"
+    | "CONTABO_USERNAME"
+    | "CONTABO_PASSWORD"
+  >,
+) {
   const credentials: ProviderCredentials = {
     clientId: env.CONTABO_CLIENT_ID,
     clientSecret: env.CONTABO_CLIENT_SECRET,
@@ -81,7 +89,6 @@ export async function issueBootstrapTransport(
   env: Env,
   row: BootstrapJobRow,
   payload: { capability: BootstrapCapability },
-  provider?: Pick<ContaboClient, "getInstance">,
 ): Promise<NodeBootstrapTransport> {
   const addition = await readNodeAddition(env.DB, row.operation_id);
   if (
@@ -173,20 +180,10 @@ export async function issueBootstrapTransport(
       "conflict",
       "Trusted relay identity is outside the configured operation scope",
     );
-  const instance = await (provider ?? contaboClient(env)).getInstance(
-    addition.provider_instance_id,
-    { requestId: crypto.randomUUID() },
-  );
-  if (
-    !hasAllocatedContaboHardware(instance) ||
-    instance.id !== spec.provider_instance_id ||
-    instance.region !== addition.audit.provider_region ||
-    instance.productId !== addition.audit.product_id ||
-    instance.ipConfig.v4.ip !== spec.hardware.ipv4
-  )
+  if (spec.provider_instance_id !== addition.provider_instance_id)
     throw new ApiError(
       "conflict",
-      "Actual provider address or approved inventory changed",
+      "Sealed target differs from the current bootstrap job",
     );
   let address: string;
   if (payload.capability === "rescue_ssh") {
@@ -218,7 +215,7 @@ export async function issueBootstrapTransport(
         "forbidden",
         "Rescue transport is not authorized at this checkpoint",
       );
-    address = instance.ipConfig.v4.ip;
+    address = spec.hardware.ipv4;
   } else if (payload.capability === "talos_api") {
     if (
       [
@@ -235,7 +232,7 @@ export async function issueBootstrapTransport(
         "forbidden",
         "Talos transport is not authorized before the installed-image reboot",
       );
-    address = instance.ipConfig.v4.ip;
+    address = spec.hardware.ipv4;
   } else {
     if (
       !(spec.role === "worker" && checkpoint.stage === "talos_authenticated") &&
@@ -283,6 +280,33 @@ export async function issueBootstrapTransport(
     capability: payload.capability,
     address,
   });
+  const current = await readBootstrapJob(env.DB, row.operation_id),
+    currentAddition = await readNodeAddition(env.DB, row.operation_id);
+  if (
+    !current.authorized ||
+    current.admitted ||
+    current.cancelled ||
+    current.revision !== row.revision ||
+    current.input_hash !== row.input_hash ||
+    current.checkpoint_json !== row.checkpoint_json ||
+    current.rescue_active !== row.rescue_active ||
+    currentAddition.revision !== addition.revision ||
+    !currentAddition.slot_held ||
+    !["audited", "bootstrapping"].includes(currentAddition.status) ||
+    currentAddition.provider_instance_id !== spec.provider_instance_id ||
+    JSON.stringify(currentAddition.audit) !== JSON.stringify(addition.audit) ||
+    JSON.stringify(currentAddition.receipt) !== JSON.stringify(addition.receipt)
+  )
+    throw new ApiError("forbidden", "Bootstrap transport authority changed");
+  if (
+    !(await admissionAuthority(env, current)).admission_authorized &&
+    !(await hasVerifiedNodePreparation(
+      env.DB,
+      row.operation_id,
+      currentAddition.intent_hash,
+    ))
+  )
+    throw new ApiError("forbidden", "Bootstrap preparation authority changed");
   return NodeBootstrapTransport.parse({
     websocket_url: (() => {
       const url = new URL(

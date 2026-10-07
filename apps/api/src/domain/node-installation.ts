@@ -334,6 +334,7 @@ export async function bindNodeInstallation(
     return fail("Node inventory revision changed");
   const actual = await provider.getInstance(addition.provider_instance_id, {
     requestId: crypto.randomUUID(),
+    accounting: { operation_id: operationId, stage: "inspection" },
   });
   if (
     !hasAllocatedContaboHardware(actual) ||
@@ -350,7 +351,10 @@ export async function bindNodeInstallation(
     );
   const relay = await provider.getInstance(
     env.BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID,
-    { requestId: crypto.randomUUID() },
+    {
+      requestId: crypto.randomUUID(),
+      accounting: { operation_id: operationId, stage: "inspection" },
+    },
   );
   if (
     !hasAllocatedContaboHardware(relay) ||

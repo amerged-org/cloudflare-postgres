@@ -319,7 +319,10 @@ export async function configureNodeBootstrap(
   await validateRescueConfiguration(c.env, addition.provider_instance_id, body);
   const actual = await contaboClient(c.env).getInstance(
     addition.provider_instance_id,
-    { requestId: crypto.randomUUID() },
+    {
+      requestId: crypto.randomUUID(),
+      accounting: { operation_id: id, stage: "inspection" },
+    },
   );
   if (
     !hasAllocatedContaboHardware(actual) ||
@@ -536,7 +539,10 @@ export async function verifyNodeProofArtifact(
     );
   const actual = await contaboClient(env).getInstance(
       proof.provider_instance_id,
-      { requestId: crypto.randomUUID() },
+      {
+        requestId: crypto.randomUUID(),
+        accounting: { operation_id: row.operation_id, stage: "inspection" },
+      },
     ),
     proofIpv4 = ip(proof.addresses.ipv4),
     proofIpv6 = proof.addresses.ipv6 === null ? null : ip(proof.addresses.ipv6);

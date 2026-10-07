@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
+import { OperationId } from "@pgcf/contracts";
 
 const ORIGIN = "https://api.contabo.com";
 const OAUTH =
@@ -402,6 +403,31 @@ const Pagination = z.object({
   totalElements: Count,
   totalPages: Count,
 });
+export const CONTABO_ACCOUNTING_STAGES = [
+  "inspection",
+  "source_selection",
+  "prewrite",
+  "firewall",
+  "rescue",
+  "order",
+  "resolution",
+] as const;
+export const ContaboAccountingStage = z.enum(CONTABO_ACCOUNTING_STAGES);
+export type ContaboAccountingStage = z.infer<typeof ContaboAccountingStage>;
+export const ContaboRequestAccounting = z.strictObject({
+  operation_id: OperationId,
+  stage: ContaboAccountingStage,
+});
+export type ContaboRequestAccounting = z.infer<typeof ContaboRequestAccounting>;
+const ContaboWireEvent = z.strictObject({
+  event: z.literal("contabo_wire_request"),
+  operation_id: OperationId,
+  stage: ContaboAccountingStage,
+  kind: z.enum(["oauth", "resource"]),
+  method: z.enum(["GET", "POST", "PUT"]),
+  request_id: z.uuid(),
+  wire_id: z.uuid(),
+});
 const requestSchema = z.strictObject({
   requestId: z.uuid(),
   traceId: z
@@ -412,12 +438,14 @@ const requestSchema = z.strictObject({
     .optional(),
   signal: z.custom<AbortSignal>((v) => v instanceof AbortSignal).optional(),
   deadline: z.number().int().safe().optional(),
+  accounting: ContaboRequestAccounting.optional(),
 });
 export interface ContaboRequest {
   requestId: string;
   traceId?: string;
   signal?: AbortSignal;
   deadline?: number;
+  accounting?: ContaboRequestAccounting;
 }
 export type ContaboCode =
   | "invalid_input"
@@ -714,25 +742,57 @@ export class ContaboClient {
       throw new ContaboError("invalid_response", response.status);
     }
   }
-  private async token(signal: AbortSignal): Promise<string> {
+  private wireFetch(
+    url: string,
+    init: RequestInit,
+    request: ContaboRequest,
+    kind: "oauth" | "resource",
+  ): Promise<Response> {
+    // Accounting belongs to this invocation, never the shared token or authentication promise.
+    try {
+      if (request.accounting) {
+        const event = ContaboWireEvent.safeParse({
+          event: "contabo_wire_request",
+          ...request.accounting,
+          kind,
+          method: init.method,
+          request_id: request.requestId,
+          wire_id: crypto.randomUUID(),
+        });
+        if (event.success) console.log(JSON.stringify(event.data));
+      }
+    } catch {
+      // An unavailable console must not change provider dispatch or its original outcome.
+    }
+    return (this.#options.fetcher ?? fetch)(url, init);
+  }
+  private async token(
+    signal: AbortSignal,
+    request: ContaboRequest,
+  ): Promise<string> {
     if (this.#auth && this.#auth.expires > this.now()) return this.#auth.value;
     this.#authenticating ??= (async () => {
       const own = AbortSignal.timeout(this.timeout),
         o = this.#options;
       const response = await bounded(
-        (o.fetcher ?? fetch)(OAUTH, {
-          method: "POST",
-          redirect: "manual",
-          signal: own,
-          headers: { "Content-Type": "application/x-www-form-urlencoded" },
-          body: new URLSearchParams({
-            grant_type: "password",
-            client_id: o.clientId,
-            client_secret: o.clientSecret,
-            username: o.username,
-            password: o.password,
-          }),
-        }),
+        this.wireFetch(
+          OAUTH,
+          {
+            method: "POST",
+            redirect: "manual",
+            signal: own,
+            headers: { "Content-Type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({
+              grant_type: "password",
+              client_id: o.clientId,
+              client_secret: o.clientSecret,
+              username: o.username,
+              password: o.password,
+            }),
+          },
+          request,
+          "oauth",
+        ),
         own,
       );
       if (response.status !== 200) {
@@ -816,13 +876,18 @@ export class ContaboClient {
       headers.set("Content-Type", "application/json");
     }
     const result = await bounded(
-      (this.#options.fetcher ?? fetch)(url.href, {
-        method,
-        redirect: "manual",
-        headers,
-        signal,
-        ...(body === undefined ? {} : { body }),
-      }),
+      this.wireFetch(
+        url.href,
+        {
+          method,
+          redirect: "manual",
+          headers,
+          signal,
+          ...(body === undefined ? {} : { body }),
+        },
+        request,
+        "resource",
+      ),
       signal,
     );
     if (result.status === 401) this.#auth = undefined;
@@ -837,7 +902,7 @@ export class ContaboClient {
       ? { request: parsed(requestSchema, requestInput), signal }
       : this.context(requestInput);
     try {
-      const token = await this.token(context.signal),
+      const token = await this.token(context.signal, context.request),
         response = await this.response(
           path,
           "GET",
@@ -879,7 +944,7 @@ export class ContaboClient {
     }
     let token: string;
     try {
-      token = await this.token(signal);
+      token = await this.token(signal, request);
     } catch (error) {
       return {
         kind: "rejected",
@@ -967,7 +1032,7 @@ export class ContaboClient {
     schema: z.ZodType<T>,
     identity: (value: T) => string,
   ): Promise<T[]> {
-    const { signal } = this.context(input);
+    const { signal, request } = this.context(input);
     query.set("size", String(this.size));
     let first: number | undefined,
       expected: number | undefined,
@@ -978,7 +1043,7 @@ export class ContaboClient {
       identities = new Set<string>();
     for (let count = 0; count < this.pages; count++) {
       if (expected !== undefined) query.set("page", String(expected));
-      const raw = await this.read(`${path}?${query}`, input, signal),
+      const raw = await this.read(`${path}?${query}`, request, signal),
         page = z
           .object({
             data: z.array(schema).max(this.size),
