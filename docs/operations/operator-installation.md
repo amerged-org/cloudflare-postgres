@@ -63,8 +63,12 @@ plan/configuration, region membership, allocation/leases and signed R2 evidence,
 fence those records without extending observation freshness. Before the first disk-write intent,
 read current target addresses/hardware and exact firewall ownership, assignments, rules and
 attachment state. These checks never repair provider policy; changed facts or a concurrent CF
-network change block the checkpoint. Later write chunks retain their scoped authority and
-readback checks without repeating provider queries.
+network change block the checkpoint. Once a signed report is accepted, the Workflow consumes
+only its exact stored artifact hash within the existing proof expiry, with fresh CF plan,
+lease/allocation and job authority checks before and after. It does not age the original scan
+again at each transition. A changed or expired artifact requires normal signature, scope and
+observation-freshness validation; revoked authority blocks without a fallback. Later write chunks
+retain their scoped authority and readback checks without repeating provider queries.
 The provider client retains credential-scoped OAuth reuse/coalescing, early-expiry refresh and
 401 invalidation. A credential change closes reuse of the old client; an uncertain mutation is
 resolved through its existing claim and readback rather than replayed.

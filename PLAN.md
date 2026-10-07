@@ -294,6 +294,41 @@ The administrative projection includes only current or unfinished journals after
 historical records; malformed/overflow history fails closed without partial authority. Native
 runtime/image, observation freshness and owned-resource deletion guards remain unchanged.
 
+Source `858abd572`, full CI `37678023727`, is delivered once API-only. The unchanged
+qualified Native source `64f3b93f`/manifest `sha256:74b88ee2fc03c62731270a6589d89b132340c0da4223739f71bc55b633bba7e3`
+and exact configuration were retained. Fresh before/after checks preserved both EU Nodes, all
+three database/role/PVC/PV/Secret identities, encrypted EU/US custody and the entire original
+created US job. One resume intent at20:23:51.374Z restarted the same Workflow. Its new session
+issued at20:24:09.271Z and reported successfully after270.568 seconds; both current journals
+were cleaned. CF preparation was actually verified atrevision3 with a stored signed hash and
+109.911 seconds remaining at20:28:43.714Z. The captured access/report requests and routine
+transport frames contained no provider wire events. This is successful proof admission, not
+US node admission. Later cycles still left the addition audited/revision3 and installer created/
+revision0/zero bytes despite another verified preparation. One controlled pause atstep604
+preserved that entire job; the transition to installer authorization is under diagnosis.
+The completed1,800-second instrumented capture contains615 owned frames and zero actual
+provider wire events across all seven stages. This is a capture-window count, not lifetime
+purchase/installation accounting. The installer transition regression reproduced with a real
+accepted109-second-old scan: after advancing30 seconds, stored proof authority remained fresh
+but the Workflow boundary returnedfalse. The correction reuses only the exact accepted R2 artifact hash and stored expiry, while
+fresh CF plan/configuration/lease/allocation and current job checks fence the handoff. New
+artifacts retain normal signature and120-second observation validation; revoked jobs fail
+closed instead of falling back. 85 affected network/report/callback cases, API types, scoped lint/formatting and independent
+review pass. Maintenance disk/stage checks remain mandatory, and exact checkpoint custody
+is compared before/after accepted-proof reuse.
+A separate authenticated EU read at20:58:24.649Z preserved both Node/Cluster/boot/system/config
+identities, all three healthy PostgreSQL clusters and five Ready platform releases. Both Nodes
+run Talos1.14.1, kernel6.18.51, containerd2.3.5 and kubelet1.36.3; the API server is1.36.3.
+PostgreSQL Pods resolve the qualified18.6 image digest `sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115`.
+Agent/gateway/relay Pods retain regional digest `sha256:eeaa6ab0c1fc182e9e050d6f104565ec0a3dc4e7482b1950287c31b62ebe607a`.
+Actual platform versions are CNPG1.30.1, Barman0.15.1, Cilium1.20.2, cert-manager1.21.2 and
+OpenEBS4.6.1. The customer installer is pinned by digest; the control-node desired installer
+uses a1.14.1 tag, and per-node schematics differ with their network configuration. Kubernetes
+1.36.3 differs from the reviewed fresh-node1.36.5 baseline. Supported data-preserving alignment
+is being prepared, with no EU upgrade or reinstall dispatched. SQL server-version and actual
+US inventory/readiness remain pending.
+No replacement order, EU reset, source OS write or additional image delivery occurred.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

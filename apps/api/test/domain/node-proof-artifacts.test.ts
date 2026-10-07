@@ -23,6 +23,8 @@ import { ensureNodePreparationProof } from "../../src/domain/node-proof.ts";
 import { installationHash } from "../../src/domain/node-installation.ts";
 import { boundInstallationFixture } from "./installation-fixtures.ts";
 import { cleanupFixtures } from "./fixtures.ts";
+import { configureBootstrapJob } from "../../src/domain/bootstrap-jobs.ts";
+import { ensureBootstrapNetworkBoundary } from "../../src/workflows/add-node.ts";
 
 const regions: string[] = [],
   operations: string[] = [];
@@ -40,6 +42,7 @@ const nonce = () =>
     .map((n) => n.toString(16).padStart(2, "0"))
     .join("");
 afterEach(async () => {
+  vi.useRealTimers();
   vi.restoreAllMocks();
   for (const op of operations.splice(0)) {
     await env.ARCHIVE.delete(`node-preparation/${op}/proof.json`);
@@ -259,6 +262,137 @@ it("accepts a routine report without any provider fetch", async () => {
     acceptNodeProofReport(f.bindings, f.session.bearer, f.report),
   ).resolves.toMatchObject({ verified: true });
   expect(provider).not.toHaveBeenCalled();
+});
+
+it("does not revalidate an accepted artifact after its bootstrap job is revoked", async () => {
+  const f = await fixture();
+  await configureBootstrapJob(
+    f.bindings,
+    f.addition.intent.operation_id,
+    f.body,
+  );
+  const session = await issueNodeProofSession(
+    f.bindings,
+    f.addition.intent.operation_id,
+    "preparation",
+  );
+  f.verify.mockRestore();
+  const accepted = await acceptNodeProofReport(
+    f.bindings,
+    session.bearer,
+    f.report,
+  );
+  expect(accepted.verified).toBe(true);
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET authorized=0 WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .run();
+  expect(
+    await network.ensureNodeNetwork(f.bindings, f.addition.intent.operation_id),
+  ).toBe(false);
+});
+
+it("uses the accepted proof authority at the next Workflow boundary without aging the scan again", async () => {
+  const f = await fixture(),
+    now = Date.now();
+  await configureBootstrapJob(
+    f.bindings,
+    f.addition.intent.operation_id,
+    f.body,
+  );
+  const session = await issueNodeProofSession(
+    f.bindings,
+    f.addition.intent.operation_id,
+    "preparation",
+  );
+  f.verify.mockRestore();
+  const provider = vi
+    .spyOn(globalThis, "fetch")
+    .mockRejectedValue(new Error("routine_provider_forbidden"));
+  const report = structuredClone(f.report),
+    measurement = report.measurements.find((m) => m.kind === "scan")!;
+  if (measurement.kind !== "scan") throw new Error("fixture_scan_missing");
+  const scan = measurement.scans[0]!;
+  scan.before.observed_at = new Date(now - 116_000).toISOString();
+  scan.started_at = new Date(now - 115_000).toISOString();
+  scan.observed_at = scan.after.observed_at = new Date(
+    now - 109_000,
+  ).toISOString();
+  const accepted = await acceptNodeProofReport(
+    f.bindings,
+    session.bearer,
+    report,
+  );
+  expect(accepted.verified).toBe(true);
+  vi.spyOn(Date, "now").mockReturnValue(now + 30_000);
+  expect(
+    await network.hasVerifiedNodePreparation(
+      env.DB,
+      f.addition.intent.operation_id,
+      f.addition.intent_hash,
+    ),
+  ).toBe(true);
+  expect(
+    await ensureBootstrapNetworkBoundary(
+      f.bindings,
+      f.addition.intent.operation_id,
+    ),
+  ).toBe(true);
+  expect(provider).not.toHaveBeenCalled();
+});
+
+it("requires a fresh signed report to replace expired accepted proof authority", async () => {
+  const f = await fixture(),
+    now = Date.now();
+  f.verify.mockRestore();
+  expect(
+    (await acceptNodeProofReport(f.bindings, f.session.bearer, f.report))
+      .verified,
+  ).toBe(true);
+  const before = await env.DB.prepare(
+    "SELECT proof_sha256 FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .first<{ proof_sha256: string }>();
+  vi.useFakeTimers({ toFake: ["Date"] });
+  vi.setSystemTime(now + 121_000);
+  expect(
+    await network.ensureNodeNetwork(f.bindings, f.addition.intent.operation_id),
+  ).toBe(false);
+  const fresh = structuredClone(f.report);
+  for (const measurement of fresh.measurements) {
+    measurement.observed_at = new Date(
+      Date.parse(measurement.observed_at) + 121_000,
+    ).toISOString();
+    if (measurement.kind === "access")
+      for (const access of measurement.access)
+        access.observed_at = new Date(
+          Date.parse(access.observed_at) + 121_000,
+        ).toISOString();
+    else if (measurement.kind === "scan")
+      for (const scan of measurement.scans) {
+        scan.started_at = new Date(
+          Date.parse(scan.started_at) + 121_000,
+        ).toISOString();
+        scan.observed_at = new Date(
+          Date.parse(scan.observed_at) + 121_000,
+        ).toISOString();
+        for (const control of [scan.before, scan.after])
+          control.observed_at = new Date(
+            Date.parse(control.observed_at) + 121_000,
+          ).toISOString();
+      }
+  }
+  expect(
+    (await acceptNodeProofReport(f.bindings, f.session.bearer, fresh)).verified,
+  ).toBe(true);
+  const after = await env.DB.prepare(
+    "SELECT proof_sha256 FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .first<{ proof_sha256: string }>();
+  expect(after!.proof_sha256).not.toBe(before!.proof_sha256);
 });
 
 it("rejects an unauthorized report before any R2 write or firewall gate", async () => {

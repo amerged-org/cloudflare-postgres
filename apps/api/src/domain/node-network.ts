@@ -1007,6 +1007,8 @@ export async function ensureNodeNetwork(
       preparation = await readNodeNetworkSnapshot(env, operationId);
     if (!preparation || !Number.isSafeInteger(started) || started < 0)
       return false;
+    const accepted = await acceptedPreparation(env, preparation, started, now);
+    if (accepted !== null) return accepted;
     const plan = NodeProofNetworkPlan.parse(JSON.parse(preparation.plan_json)),
       verified = await proof(env, preparation, plan, now());
     if (!verified) return false;
@@ -1081,6 +1083,88 @@ export async function ensureNodeNetwork(
   }
 }
 
+/** Reuse only the exact accepted artifact within its existing authority lifetime. */
+async function acceptedPreparation(
+  env: NodeNetworkEnv,
+  preparation: NodeNetworkSnapshot,
+  started: number,
+  now: () => number,
+): Promise<boolean | null> {
+  if (preparation.status !== "verified") return null;
+  const object = await env.ARCHIVE.get(
+    `node-preparation/${preparation.operation_id}/proof.json`,
+  );
+  if (!object) return false;
+  const artifact = Artifact.safeParse(JSON.parse(await text(object)));
+  if (!artifact.success) return false;
+  if ((await digest(artifact.data)) !== preparation.proof_sha256) return null;
+  if (
+    artifact.data.payload.expires_at !== preparation.proof_expires_at ||
+    !(await hasVerifiedNodePreparation(
+      env.DB,
+      preparation.operation_id,
+      preparation.intent_hash,
+      now(),
+    ))
+  )
+    return false;
+  const plan = NodeProofNetworkPlan.parse(JSON.parse(preparation.plan_json));
+  const job = () =>
+    env.DB.prepare(
+      "SELECT node_id,region_id,input_hash,revision,checkpoint_json,authorized,admitted,cancelled FROM node_bootstrap_jobs WHERE operation_id=?",
+    )
+      .bind(preparation.operation_id)
+      .first<{
+        node_id: string;
+        region_id: string;
+        input_hash: string;
+        revision: number;
+        checkpoint_json: string;
+        authorized: number;
+        admitted: number;
+        cancelled: number;
+      }>();
+  const before = await job();
+  if (
+    before &&
+    (!before.authorized ||
+      before.admitted ||
+      before.cancelled ||
+      before.node_id !== plan.node_id ||
+      before.region_id !== plan.region_id ||
+      !Hash.safeParse(before.input_hash).success)
+  )
+    return false;
+  for (const access of artifact.data.payload.access)
+    if (
+      access.talos_maintenance &&
+      !(await maintenanceAuthority(
+        env,
+        plan,
+        access.talos_maintenance,
+        access.address,
+      ))
+    )
+      return false;
+  if (
+    canonical(await job()) !== canonical(before) ||
+    canonical(await readNodeNetworkSnapshot(env, preparation.operation_id)) !==
+      canonical(preparation)
+  )
+    return false;
+  const finished = now();
+  return (
+    Number.isSafeInteger(finished) &&
+    finished >= started &&
+    hasVerifiedNodePreparation(
+      env.DB,
+      preparation.operation_id,
+      preparation.intent_hash,
+      finished,
+    )
+  );
+}
+
 /** Current Cloudflare custody, never a cached provider authorization. */
 export async function readNodeNetworkSnapshot(
   env: NodeNetworkEnv,
@@ -1109,6 +1193,26 @@ export async function readNodeNetworkSnapshot(
     const plan = NodeProofNetworkPlan.parse(JSON.parse(row.plan_json)),
       addition = await readNodeAddition(env.DB, operationId);
     await assertNodeRecoveryAuthority(env.DB, addition);
+    const job = await env.DB.prepare(
+      "SELECT node_id,region_id,authorized,admitted,cancelled FROM node_bootstrap_jobs WHERE operation_id=?",
+    )
+      .bind(operationId)
+      .first<{
+        node_id: string;
+        region_id: string;
+        authorized: number;
+        admitted: number;
+        cancelled: number;
+      }>();
+    if (
+      job &&
+      (!job.authorized ||
+        job.admitted ||
+        job.cancelled ||
+        job.node_id !== plan.node_id ||
+        job.region_id !== plan.region_id)
+    )
+      return null;
     const region = await env.DB.prepare(
       "SELECT provider,provider_region FROM regions WHERE id=?",
     )
