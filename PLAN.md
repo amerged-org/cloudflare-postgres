@@ -27,7 +27,22 @@ changes and concurrent revocation. The firewall authentication regression reprod
 OAuth calls across three checks; the shared credential-scoped client now makes one, while
 retaining per-request and aggregate deadlines. Fixed-field wire events count actual OAuth and
 resource HTTP attempts without logging provider payloads or credentials. Focused regressions,
-types, lint and formatting pass; final integrated CI and live acceptance remain pending.
+types, lint and formatting pass. Source `44957bf4`, full CI `37578754570`, is delivered
+API-only with the unchanged qualified Native `51dcfff4` image/configuration and retained EU/US
+custody. One controlled resume retained the original created job with zero downloaded/written
+bytes. The programmed path physically removed both older owned source namespaces, then created
+fresh scanners. More than 200 captured routine ownership/transport requests returned HTTP200
+with no provider calls in those request frames. The completed AddNode RPC frame is attributed
+to the exact delivered Worker version, despite its older Workflow-definition UUID; no Workflow
+migration is required. Its buffered wire events recorded 3 OAuth and 66 resource HTTP attempts,
+all in the firewall stage. Repeated input preparation still rechecked a confirmed allocation
+each cycle; a real-D1 regression reproduces that remaining provider poll, and the follow-up
+uses the sealed binding plus fresh CF authority instead. The IPv6 scanner reported
+`outside_scan_capability_gap_ipv6_eaddrnotavail`; its owned Pod uses host networking. Kubernetes
+reports no source IPv6 address, but actual Talos interface assignment has not yet been observed,
+so the OS configuration cause remains unproved. Native later reported `proof_source_pod_failed`.
+One pause stops repeated attempts; US installation/admission and final live acceptance remain
+pending, without a replacement order, EU reset or weakened dual-stack proof.
 
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
