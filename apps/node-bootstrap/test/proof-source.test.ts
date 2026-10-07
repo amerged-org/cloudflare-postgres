@@ -37,6 +37,22 @@ import type {
 
 type Json = Record<string, unknown>;
 const obj = (value: unknown) => value as Json;
+function assertSafeRescueScripts(script: string) {
+  assert.ok(
+    !/(?:^|[\s;&|()])(?:apt(?:-get)?|mkfs(?:\.[A-Za-z0-9_-]+)?|reboot)(?=$|[\s;&|()])|of=\/dev\//m.test(
+      script,
+    ),
+  );
+}
+test("the rescue-script guard still refuses package, filesystem, reboot and install-disk write commands", () => {
+  assert.throws(() => assertSafeRescueScripts("apt-get install nodejs"));
+  assert.throws(() => assertSafeRescueScripts("sudo apt install nodejs"));
+  assert.throws(() => assertSafeRescueScripts("mkfs.ext4 /dev/vda"));
+  assert.throws(() => assertSafeRescueScripts("true; reboot"));
+  assert.throws(() =>
+    assertSafeRescueScripts("dd if=/tmp/image.raw of=/dev/vda"),
+  );
+});
 function fixture() {
   const operation = newOperationId(),
     nodeId = newNodeId(),
@@ -749,12 +765,17 @@ test("rescue staging chunks are bounded, verify actual compressed bytes and only
     cli_bytes: assets.cli_bytes,
     receipt_sha256: null,
   };
-  const bytes = randomBytes(4096),
+  const bytes = Buffer.concat(
+      Array.from({ length: 128 }, (_, i) =>
+        createHash("sha256").update(`pgcf-staging-36-${i}`).digest(),
+      ),
+    ),
     script = proofSourceChunkScript(state, 0, bytes),
     encoded = script.match(
       /<<'PGCF_PROOF_CHUNK'\n([^\n]+)\nPGCF_PROOF_CHUNK/,
     )![1]!;
   assert.deepEqual(gunzipSync(Buffer.from(encoded, "base64")), bytes);
+  assert.ok(encoded.includes("apt"));
   assert.ok(script.includes("proof_current"));
   assert.ok(script.includes("iflag=skip_bytes,count_bytes"));
   const scratch = proofSourceScratchScript(
@@ -773,7 +794,7 @@ test("rescue staging chunks are bounded, verify actual compressed bytes and only
   assert.ok(scratch.includes("source_disk_mounted"));
   assert.ok(scratch.includes("swapon --show"));
   assert.ok(scratch.includes("MemAvailable"));
-  assert.ok(!/apt|mkfs|of=\/dev\/|reboot/.test(scratch + script + cleanup));
+  assertSafeRescueScripts(scratch + script + cleanup);
   assert.ok(!cleanup.includes("rm -rf"));
   assert.ok(execution.includes("outside-scan-command.mjs"));
   assert.ok(

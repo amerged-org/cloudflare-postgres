@@ -79,11 +79,19 @@ successful ownership/transport callbacks: ownership wall-time median383ms, trans
 3,681.5ms across9/18 requests, all HTTP200 in that sample. Both old exact source namespaces
 remained Active without deletion timestamps. A real cleanup-path virtual-clock regression using
 those measured3.7-second authorization/CONNECT and380ms ownership costs reproduced the30-second
-aggregate cleanup exhaustion before any deletion; a120-second deadline is currently rejected
-by its constructor. A narrow aggregate expired-cleanup budget correction is in progress, retaining
-30-second individual commands,540-second session expiry and all ownership/UID/resource-version/
-foreign-child checks. The same Workflow is paused at the unchanged created-job checkpoint before
-any installation disk write. Never reset or replace its job, sealed input, source journals or custody.
+aggregate cleanup exhaustion before any deletion. Source `14957682` changes only the explicit
+expired-source aggregate budget to120 seconds, retaining30-second individual commands,540-second
+session expiry and all ownership/UID/resource-version/foreign-child checks. A108,440ms virtual
+cleanup path with29 measured-cost grants completes exact cleanup;30 seconds performs no deletion
+and120,001ms is refused before grants. All157 native tests, types, lint, formatting and independent
+review passed; local full qualification covered714,947,157 bytes/18 layers with zero unresolved
+findings. CI `37552431256` then failed a test-only unbounded `apt` substring check against compressed
+staging data. Deterministic gzip/base64 bytes reproduce that false positive; the test guard now
+recognizes real package/filesystem/reboot commands and disk-write arguments while accepting the
+encoded data. Production bytes are unchanged by this test correction. No149 image credential,
+push or publication ran. The same Workflow is paused at the unchanged created-job checkpoint
+before any installation disk write. Never reset or replace its job, sealed input, source journals
+or custody.
 The retained EU control node's UID-guarded new-database placement flag is now
 false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.
 Actual-RAM mode and automatic purchases remain disabled pending accepted US/recovery tests,
