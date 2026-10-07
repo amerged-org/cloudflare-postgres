@@ -570,7 +570,6 @@ class ControlSession {
     maxFreeSockets: 1,
     rejectUnauthorized: true,
   });
-  private socket?: TLSSocket;
   private publicSource?: string;
   private heartbeat: Promise<void> | null = null;
   private interval?: ReturnType<typeof setInterval>;
@@ -688,11 +687,7 @@ class ControlSession {
         const socket = incoming.socket as TLSSocket,
           local = socket.localAddress ?? "",
           remote = socket.remoteAddress ?? "";
-        if (
-          socket.authorized !== true ||
-          socket.remotePort !== 443 ||
-          (this.socket && this.socket !== socket)
-        )
+        if (socket.authorized !== true || socket.remotePort !== 443)
           return finish(
             undefined,
             new BootstrapError("outside_scan_control_session_changed"),
@@ -734,7 +729,6 @@ class ControlSession {
               socketRemote: remote,
               keys: this.input.control_keys,
             });
-            this.socket = socket;
             finish(observation);
           } catch (error) {
             finish(undefined, safeFailure(error));

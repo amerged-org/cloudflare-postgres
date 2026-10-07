@@ -69,8 +69,28 @@ CF/source/Namespace/Pod/Cluster identity and actual image checks before and afte
 exact one-key JSON envelope carrying one of66 finite scanner codes. Missing, arbitrary,
 oversized, revoked or identity-mismatched output retains the generic error.36 scoped Native
 cases,180 full Native cases,5 contract cases, types, lint and formatting pass. Scan behavior,
-timeouts, success handling and cleanup stay unchanged. The changed Native image requires one
-qualified delivery before the next controlled resume. US installation/admission and final live
+timeouts, success handling and cleanup stay unchanged. Source `14b60d9`, full CI `37598961993`,
+is delivered once with the matching finite API contract and qualified Native manifest
+`sha256:62e13d74870a41aa71a1c29725c5afb3f5a98afdf8ee0ac5eda90faf13620a56`.
+Qualification covered714,976,857 bytes/18 layers with zero unresolved findings; complete private
+registry readback verified162,118,452 compressed and502,859,776 raw bytes. The completed rollout
+and actual version19/placement19 Running match this image; the process was initially stopped
+and aggregate active count0, so those observations alone did not claim execution. EU data/custody,
+source-network repair and the whole original created US job were preserved.
+
+The same US Workflow resumed once and fresh proof was issued at09:38:28Z. Programmed cleanup
+removed prior owned resources, then both new scanners ran. The retained failure at09:45:50Z is
+`outside_scan_control_session_changed`,441.785 seconds after issuance with98.215 seconds still
+valid. This code is raised before response-body decoding by a physical TLS socket identity
+comparison, not by a changed Cloudflare operation or signed source observation. A reproducing
+signed-HTTPS fixture demonstrates rejection of a replacement authorized socket with valid
+address/port/nonce/source binding. The follow-up removes only stored socket-object identity;
+every fresh TLS authorization/443 check, signed nonce/origin/control-address/local/remote/key
+validation and stable observed public source remains. The original Workflow is paused at
+step412, with its installer still created/revision0 and zero downloaded/written bytes.15 affected
+tests, Native types, scoped lint and formatting pass; reconnects succeed with fresh nonces while
+unauthorized TLS and changed public sources still fail. No new
+provider order, EU reset or source OS write occurred. US installation/admission and final live
 acceptance remain pending, without a replacement order or weakened dual-stack proof.
 
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser

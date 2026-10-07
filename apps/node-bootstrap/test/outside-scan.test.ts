@@ -106,6 +106,8 @@ function nativeFixture(
     openPort?: number;
     source?: string;
     afterChanged?: boolean;
+    reconnectControl?: boolean;
+    unauthorizedControl?: boolean;
     onProbe?: (count: number) => void;
   } = {},
 ) {
@@ -140,7 +142,9 @@ function nativeFixture(
             controls++;
             const response = Object.assign(new EventEmitter(), {
               statusCode: 200,
-              socket,
+              socket: options.reconnectControl
+                ? { ...socket, authorized: !options.unauthorizedControl }
+                : socket,
               destroy: () => {},
             });
             const source =
@@ -283,6 +287,41 @@ test("scans every TCP port exactly once from the bound source with verified fres
   assert.ok(result.scans[0]!.before.observed_at <= result.scans[0]!.started_at);
   assert.notEqual(result.scans[0]!.before.nonce, result.scans[0]!.after.nonce);
   assert.ok(state.controls() >= 2);
+});
+
+test("peer-closed HTTPS controls may reconnect while preserving fresh signed source and TLS identity", async (t) => {
+  const f = fixture(),
+    state = nativeFixture(t, f, { reconnectControl: true });
+  const result = await scanOutsideFamily(f.input, {
+    concurrency: 32,
+    timeoutMs: 50,
+  });
+  assert.equal(state.probes(), 65535);
+  assert.ok(state.controls() >= 2);
+  assert.equal(result.source, f.publicSource);
+  assert.notEqual(result.scans[0]!.before.nonce, result.scans[0]!.after.nonce);
+});
+
+test("a reconnected control still rejects invalid TLS authorization", async (t) => {
+  const f = fixture(),
+    state = nativeFixture(t, f, {
+      reconnectControl: true,
+      unauthorizedControl: true,
+    });
+  await assert.rejects(
+    scanOutsideFamily(f.input),
+    /outside_scan_control_session_changed/,
+  );
+  assert.equal(state.probes(), 0);
+});
+
+test("a reconnected control cannot change its verified public source", async (t) => {
+  const f = fixture();
+  nativeFixture(t, f, { reconnectControl: true, afterChanged: true });
+  await assert.rejects(
+    scanOutsideFamily(f.input),
+    /outside_scan_source_changed/,
+  );
 });
 
 test("unsupported IPv6 is a capability gap, never 65,535 closed ports", async (t) => {

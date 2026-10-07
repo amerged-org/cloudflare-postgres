@@ -117,6 +117,9 @@ Namespace/Pod UID, sealed spec and actual image before and after. Only a single-
 with a recognized code is exposed. Missing, corrupt or mismatched output remains
 `proof_source_pod_failed`; arbitrary logs remain private. Observe the error through the read-only
 proof-status endpoint and correct the demonstrated cause before resuming the same operation.
+The HTTPS control path may reconnect after a normal server close. Every connection must prove TLS
+authorization, port443, exact local/control address, a fresh signed nonce/origin and the same
+observed public source. Physical socket-object continuity is not an installation identity.
 
 US1's purchase, profile, installation binding and reported inspection are already retained; its
 original authorized job is still `created`, before disk writes. Continue that same addition and

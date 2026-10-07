@@ -111,8 +111,9 @@ resolution boundaries, including fresh verification before the first destructive
 credential-scoped client reuses and coalesces OAuth until early expiry or 401 invalidation;
 credential changes replace the client. Uncertain mutations are never replayed. The API repair is
 deployed and the programmed cleanup has removed the old owned probe namespaces. Fresh US proof
-now has a verified global IPv6/default-route prerequisite on the retained source host. The next
-failed-Pod diagnostic repair preserves a bounded, recognized scanner code before cleanup;
+now has a verified global IPv6/default-route prerequisite on the retained source host. Bounded
+failed-Pod diagnostics preserve recognized scanner codes before cleanup. The next correction
+allows freshly authenticated TLS control connections while retaining signed source identity;
 US admission and complete measured live acceptance remain outstanding in PLAN.md.
 
 ```mermaid
