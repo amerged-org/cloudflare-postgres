@@ -360,6 +360,34 @@ the actual Dev migration ledger contains all21 previous migrations, with only002
 The additive migration remains unexecuted. US Ready/SQL/backup/WAL/restore/reclamation and
 software alignment remain unaccepted.
 
+Source `016e03a376`, full CI `37698285477`, is delivered API-only with one tracked
+D1 migration0022. Fresh before/after checks confirmed every old field preserved, the new
+column NULL on both existing jobs and the immutable trigger/ledger entry. The qualified
+Native64 manifest and full configuration remained exact. One original-Workflow resume
+retained the48 MiB acknowledged/pending checkpoint. A fresh preparation led to the explicit
+legacy lifecycle authorization, bound to the same input/instance atrevision13; no disk reset
+or blind write replay occurred. At23:03:55Z the original proof was expired by24.682 seconds,
+yet the job wasrunning atrevision21 with112 MiB acknowledged. Subsequent progress reached
+1.5 GiB without another scan or error. The completed preceding1,800-second capture contained
+502 owned frames and only1 OAuth plus2 GET calls, allfirst-prewrite; routine stages remained
+zero. The continuation capture separately observed1 OAuth plus2 GET at the legacy lifecycle
+boundary; it remains open and must not be counted as a completed-window or lifetime total.
+
+A retained policy audit found V155 in both order configurations and reserved RAM geometry.
+All three actual EU PostgreSQL Pods request/limit1 GiB, so128 MiB activation requires a
+data-preserving transition. A real-D1 regression now permits geometry changes only with the
+entire assigned cohort confirmed manually suspended/hibernated at its current observed
+generation, an owned succeeded suspend operation and no unsettled starts, atomically with
+the policy write. Partial, idle and stale cohorts remain blocked.22 affected RAM/startup
+cases, API types/lint/formatting and independent review pass; no EU suspension occurred.
+Two once-only policy PUTs corrected the configured order toV159/one month/no add-ons and
+activated USactual_ram/128 MiB/max4096 while the exact original demand was still unplaced.
+EU remains reserved. Fresh readback preserved EU Nodes/data/storage/roles/custody/profiles,
+the current US immutable input and monotonically advancing progress, with zero provider calls.
+Caps remainEU3/US1; purchases_enabled1 permits costed individual orders, autoscale_enabled0
+and standing_cost_profileNULL supply no autonomous purchase authority. Finite standing
+spend/count/expiry and any cap increase still require explicit owner approval.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

@@ -139,6 +139,8 @@ export async function configureNodeRegionPolicy(
   value: unknown,
 ): Promise<void> {
   const policy = NodeRegionPolicy.parse(value);
+  // Assigned databases may change request geometry only after confirmed manual
+  // suspension; the next resume still needs a fresh full-peak startup grant.
   const result = await db
     .prepare(
       `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash)
@@ -146,7 +148,13 @@ export async function configureNodeRegionPolicy(
       AND ((COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id),'reserved')=?
         AND (?='reserved' OR (SELECT postgres_memory_request_mib FROM node_region_policies WHERE region_id=r.id) IS ?))
         OR (NOT EXISTS(SELECT 1 FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
-              WHERE d.region_id=r.id AND n.lost_at IS NULL AND d.observed_state<>'deleted')
+              WHERE d.region_id=r.id AND n.lost_at IS NULL AND d.observed_state<>'deleted'
+                AND NOT COALESCE((d.desired_state='suspended' AND d.suspension_reason='manual'
+                  AND d.observed_state='provisioning' AND d.observed_power='hibernated'
+                  AND d.observed_generation=d.generation AND d.deleted_at IS NULL
+                  AND EXISTS(SELECT 1 FROM operations o WHERE o.id=d.power_operation AND o.database_id=d.id
+                    AND o.project_id=d.project_id AND o.kind='database.suspend' AND o.status='succeeded'
+                    AND o.generation<=d.generation)),0))
           AND NOT EXISTS(SELECT 1 FROM database_start_admissions a JOIN nodes n ON n.id=a.node_id
               WHERE n.region_id=r.id AND n.lost_at IS NULL)))
       AND (?='reserved' OR NOT EXISTS(SELECT 1 FROM databases d JOIN size_classes s ON s.id=d.size_class_id
@@ -186,7 +194,7 @@ export async function configureNodeRegionPolicy(
     if (region)
       throw new NodeStateError(
         "conflict",
-        "Placement mode or PostgreSQL request changes require an empty assigned cohort and no unsettled starts; configured limits must cover existing databases",
+        "Placement mode or PostgreSQL request changes require an empty or confirmed manually hibernated assigned cohort and no unsettled starts; configured limits must cover existing databases",
       );
     throw new NodeStateError(
       "not_found",

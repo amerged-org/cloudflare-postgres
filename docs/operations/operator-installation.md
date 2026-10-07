@@ -189,15 +189,21 @@ Do not repeat the purchase, profile import, adoption, registration or disk-write
 already admitted and needs no bootstrap or adoption operation. The sequence below describes US1's
 remaining programmed work and future authorized additions; it does not authorize reinstalling EU.
 
-Keep actual-RAM mode, automatic purchases and autoscaling disabled until US/recovery acceptance,
-reviewed test cleanup and explicit finite owner limits. Then use the guarded
+Keep automatic standing purchases and autoscaling disabled until US/recovery acceptance and
+explicit finite owner limits. Individual costed orders remain separately approved. The retained
+US policy uses actual RAM with a128 MiB request and4096 MiB maximum; EU remains reserved pending
+its controlled data-preserving transition. Use the guarded
 `PUT /v1/regions/{id}/capacity-policy` with `region_id`, `max_nodes`, `purchases_enabled`, `order`,
 `placement_mode`, `maximum_database_memory_mib`, `postgres_memory_request_mib`,
 `standing_cost_profile`, `autoscale_enabled` and `adopt_instance_ids`. Preserve current finite node
 caps. Use `placement_mode:"actual_ram"`, 256 MiB assignment steps, maximum 4096 MiB and the reviewed
 128 MiB PostgreSQL request for this installation. Changing mode or the PostgreSQL request requires
-an empty assigned live cohort and no unsettled startups; configured limits must cover existing
-databases. Cost/node-cap updates do not reset database state.
+an empty assigned live cohort or a completely confirmed manually suspended/hibernated cohort
+at its current observed generation, with owned succeeded suspend operations and no unsettled
+startups. Preserve database, volume, role and credential identities; resume through fresh
+full-peak startup admission after the policy change. Idle sleep and partially stopped cohorts
+do not qualify. Configured limits must cover existing databases. Cost/node-cap updates do not
+reset database state.
 
 The exact regional `order` contains `product_id`, `provider_region`, `image_id`, `term_months` and
 `location`. Use the confirmed V159 offer with `term_months:1` and omit `add_ons`. Its standing
