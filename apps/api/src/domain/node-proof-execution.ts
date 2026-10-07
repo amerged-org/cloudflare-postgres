@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
-import { OperationId, base64urlToBytes } from "@pgcf/contracts";
+import { ErrorCode, OperationId, base64urlToBytes } from "@pgcf/contracts";
+import { z } from "zod";
 import {
   NodeProofExecutionInput,
   NodeProofBinding,
@@ -25,7 +26,8 @@ import {
   bootstrapRelayClaimsSchema,
   signBootstrapRelay,
 } from "@pgcf/contracts/bootstrap-relay";
-import { ApiError } from "../app.ts";
+import { ApiError, DIAGNOSTIC_ID_HEADER } from "../app.ts";
+import { ContaboError } from "../providers/contabo.ts";
 import type { Env, ApiContext } from "../env.ts";
 import { bootstrapJobInput, readBootstrapJob } from "./bootstrap-jobs.ts";
 import { readNodeAddition, assertNodeRecoveryAuthority } from "./node-state.ts";
@@ -52,6 +54,19 @@ import {
 const deny = (): never => {
   throw new ApiError("forbidden", "Network proof execution authority changed");
 };
+const providerDiagnosticCode = z.enum([
+  "invalid_input",
+  "aborted",
+  "timeout",
+  "network_error",
+  "body_limit",
+  "invalid_response",
+  "pagination_incomplete",
+  "provider_rejected",
+  "not_dispatched",
+  "unexpected_status",
+  "authorization_unavailable",
+]);
 export async function prepareNodeProofInput(
   env: Env,
   operationId: string,
@@ -338,37 +353,111 @@ export async function issueNodeProofTransport(
   capability: BootstrapCapability,
   direction: "target" | "source",
 ) {
-  const input = await context(c, operationId);
-  if (direction === "source") await authorizeNodeProofSource(c.env, input);
-  const expected = target(input, capability, direction),
-    identity = await relayIdentity(c.env);
-  if (
-    !identity.allowed_target_regions.includes(expected.region) ||
-    !identity.capabilities.includes(capability)
-  )
-    return deny();
-  const signing = await bootstrapTransportSigningKey(
-    c.env.BOOTSTRAP_RELAY_SIGNING_KEYS,
-  );
-  const token = await signBootstrapRelay({
-    privateKey: signing.privateKey,
-    kid: signing.kid,
-    operation: operationId,
-    node: expected.node,
-    region: expected.region,
-    issuer_region: identity.issuer_region,
-    relay_epoch: identity.relay_epoch,
-    revision: input.claims.inspection_generation + 1,
-    capability,
-    address: expected.ip,
-    ttlSeconds: 30,
-  });
-  await authenticateNodeProofRequest(c, operationId);
-  return NodeBootstrapTransport.parse({
-    token,
-    expectedTarget: { ip: expected.ip, port: expected.port },
-    websocket_url: `${input.api_base_url.replace(/^https:/, "wss:")}/internal/v1/node-proof/${operationId}/relay`,
-  });
+  let stage:
+    | "context"
+    | "source_authority"
+    | "expected_target"
+    | "relay_identity"
+    | "relay_scope"
+    | "signing_key"
+    | "sign_relay"
+    | "session_recheck"
+    | "response_schema" = "context";
+  try {
+    const input = await context(c, operationId);
+    if (direction === "source") {
+      stage = "source_authority";
+      await authorizeNodeProofSource(c.env, input);
+    }
+    stage = "expected_target";
+    const expected = target(input, capability, direction);
+    stage = "relay_identity";
+    const identity = await relayIdentity(c.env);
+    stage = "relay_scope";
+    if (
+      !identity.allowed_target_regions.includes(expected.region) ||
+      !identity.capabilities.includes(capability)
+    )
+      return deny();
+    stage = "signing_key";
+    const signing = await bootstrapTransportSigningKey(
+      c.env.BOOTSTRAP_RELAY_SIGNING_KEYS,
+    );
+    stage = "sign_relay";
+    const token = await signBootstrapRelay({
+      privateKey: signing.privateKey,
+      kid: signing.kid,
+      operation: operationId,
+      node: expected.node,
+      region: expected.region,
+      issuer_region: identity.issuer_region,
+      relay_epoch: identity.relay_epoch,
+      revision: input.claims.inspection_generation + 1,
+      capability,
+      address: expected.ip,
+      ttlSeconds: 30,
+    });
+    stage = "session_recheck";
+    await authenticateNodeProofRequest(c, operationId);
+    stage = "response_schema";
+    return NodeBootstrapTransport.parse({
+      token,
+      expectedTarget: { ip: expected.ip, port: expected.port },
+      websocket_url: `${input.api_base_url.replace(/^https:/, "wss:")}/internal/v1/node-proof/${operationId}/relay`,
+    });
+  } catch (error) {
+    // Diagnostics must never replace the original transport failure.
+    try {
+      const diagnosticId = c.res.headers.get(DIAGNOSTIC_ID_HEADER),
+        code =
+          error instanceof ApiError ? ErrorCode.safeParse(error.code) : null,
+        providerCode =
+          error instanceof ContaboError
+            ? providerDiagnosticCode.safeParse(error.code)
+            : null,
+        providerStatus =
+          error instanceof ContaboError &&
+          typeof error.status === "number" &&
+          Number.isInteger(error.status) &&
+          error.status >= 100 &&
+          error.status <= 599
+            ? error.status
+            : undefined;
+      if (
+        diagnosticId &&
+        /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/.test(diagnosticId)
+      )
+        console.error(
+          JSON.stringify({
+            event: "node_proof_transport_failed",
+            stage,
+            category:
+              error instanceof ApiError
+                ? "api_error"
+                : error instanceof ContaboError
+                  ? "provider_error"
+                  : error instanceof z.ZodError
+                    ? "schema_error"
+                    : error instanceof TypeError
+                      ? "type_error"
+                      : error instanceof Error
+                        ? "error"
+                        : "unknown",
+            ...(code?.success ? { code: code.data } : {}),
+            ...(providerCode?.success
+              ? { provider_code: providerCode.data }
+              : {}),
+            ...(providerStatus !== undefined
+              ? { provider_status: providerStatus }
+              : {}),
+            diagnostic_id: diagnosticId,
+          }),
+        );
+    } catch {
+      // The original error remains authoritative if logging is unavailable.
+    }
+    throw error;
+  }
 }
 export async function relayNodeProof(c: ApiContext, operationId: string) {
   const input = await context(c, operationId),

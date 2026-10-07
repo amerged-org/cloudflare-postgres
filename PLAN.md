@@ -162,7 +162,20 @@ existing check, including before each delete. The observed 4,143 ms slow-grant s
 before the change and completes in a 104,715 ms virtual model after it. This is not live acceptance;
 all prior UID/provider/region/Ready/IP/deletion predicates, 13-kind foreign checks, 256 KiB bound,
 uncertain-delete readback and 30/120/540-second limits remain unchanged.
-The observed aggregate failure is diagnosed; the round-trip fix still requires live acceptance.
+The round-trip fix is delivered from `fb08b4c0`, full CI `37569774122`; local qualification
+covered 714,964,047 bytes/18 layers with zero unresolved findings and private readback verified
+162,116,642 compressed and 502,846,976 raw bytes. One image-only publication and same-Workflow
+resume preserved the original created job and all protected state. Direct RUNNING deployment
+and placement version 18 use qualified Native `51dcfff4`; aggregate active count 0 remains an
+explicit discrepancy. The monitor caught `node_proof_transport_refused` at 04:24:00.463 UTC,
+78.765 seconds after issuance, with 461.235 seconds remaining. Existing automatic work continued;
+a bounded read-only Worker Tail captured 49 owned POST events, including one transport HTTP 500
+with 855 ms elapsed beside HTTP 200 responses. The caught server exception had no recorded
+exception or response code, so its failing stage remains unknown. The API-only diagnostic
+change emits only nine fixed stages, fixed exception categories, a runtime-validated API code,
+eleven known provider codes with bounded HTTP status and the existing server-generated
+diagnostic UUID; it rethrows the original error with the same
+operation order, requests, authority and time limits. Native `51dcfff4` remains unchanged.
 US installation/admission is not accepted.
 Never reset or replace the job, sealed input, source journals or custody.
 The retained EU control node's UID-guarded new-database placement flag is now

@@ -14,10 +14,11 @@ import {
   BOOTSTRAP_RELAY_PROBE_PATH,
   BOOTSTRAP_RELAY_HEADER,
 } from "@pgcf/contracts/bootstrap-relay";
-import { createApp } from "../../src/app.ts";
+import { ApiError, createApp, DIAGNOSTIC_ID_HEADER } from "../../src/app.ts";
 import { NodeBootstrap } from "../../src/bootstrap-container.ts";
 import { issueNodeProofSession } from "../../src/domain/node-proof-session.ts";
 import { installationHash } from "../../src/domain/node-installation.ts";
+import { ContaboError } from "../../src/providers/contabo.ts";
 import { boundInstallationFixture } from "./installation-fixtures.ts";
 import { cleanupFixtures } from "./fixtures.ts";
 import * as network from "../../src/domain/node-network.ts";
@@ -196,6 +197,120 @@ it("authenticates every private proof POST before malformed body parsing", async
   for (const path of ["transport", "access", "report", "ownership"])
     expect((await f.request(path, "{", "invalid")).status).toBe(401);
 });
+it("logs only a fixed transport failure stage correlated with the unchanged server response", async () => {
+  const f = await fixture(),
+    canary = "private-transport-error-canary",
+    failed = new Error(canary),
+    fetch = vi.fn(async () => {
+      throw failed;
+    }),
+    log = vi.spyOn(console, "error").mockImplementation(() => {});
+  f.bindings.BOOTSTRAP_RELAY_SERVICE = { fetch } as unknown as Fetcher;
+  const issue = execution.issueNodeProofTransport;
+  vi.spyOn(execution, "issueNodeProofTransport").mockImplementation(
+    async (...args) => {
+      try {
+        return await issue(...args);
+      } catch (error) {
+        expect(error).toBe(failed);
+        throw error;
+      }
+    },
+  );
+  const response = await f.request(
+    "transport",
+    JSON.stringify({ capability: "rescue_ssh", direction: "target" }),
+  );
+  expect(response.status).toBe(500);
+  expect(await response.json()).toMatchObject({ error: { code: "internal" } });
+  expect(fetch).toHaveBeenCalledTimes(1);
+  const diagnostics = log.mock.calls
+    .map(([message]) => JSON.parse(String(message)))
+    .filter((value) => value.event === "node_proof_transport_failed");
+  expect(diagnostics).toEqual([
+    {
+      event: "node_proof_transport_failed",
+      stage: "relay_identity",
+      category: "error",
+      diagnostic_id: response.headers.get(DIAGNOSTIC_ID_HEADER),
+    },
+  ]);
+  expect(response.headers.get(DIAGNOSTIC_ID_HEADER)).toMatch(
+    /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/,
+  );
+  expect(JSON.stringify(log.mock.calls)).not.toContain(canary);
+  expect(JSON.stringify(log.mock.calls)).not.toContain(f.session.bearer);
+});
+it("validates API diagnostic codes without emitting a forged private code", async () => {
+  const f = await fixture(),
+    canary = "private-code-canary",
+    error = new ApiError("forbidden", "private-message-canary"),
+    log = vi.spyOn(console, "error").mockImplementation(() => {});
+  Object.defineProperty(error, "code", { value: canary });
+  f.bindings.BOOTSTRAP_RELAY_SERVICE = {
+    fetch: async () => {
+      throw error;
+    },
+  } as unknown as Fetcher;
+  await f.request(
+    "transport",
+    JSON.stringify({ capability: "rescue_ssh", direction: "target" }),
+  );
+  const diagnostic = log.mock.calls
+    .map(([message]) => JSON.parse(String(message)))
+    .find((value) => value.event === "node_proof_transport_failed");
+  expect(diagnostic).toMatchObject({
+    stage: "relay_identity",
+    category: "api_error",
+  });
+  expect(diagnostic).not.toHaveProperty("code");
+  expect(JSON.stringify(log.mock.calls)).not.toContain(canary);
+  expect(JSON.stringify(log.mock.calls)).not.toContain(
+    "private-message-canary",
+  );
+});
+it("records bounded provider refusal metadata while preserving the original failure", async () => {
+  const f = await fixture(),
+    failed = new ContaboError("unexpected_status", 429),
+    canary = "private-provider-message-canary",
+    fetch = vi.fn(async () => {
+      throw failed;
+    }),
+    log = vi.spyOn(console, "error").mockImplementation(() => {}),
+    issue = execution.issueNodeProofTransport;
+  Object.defineProperty(failed, "message", { value: canary });
+  vi.spyOn(execution, "issueNodeProofTransport").mockImplementation(
+    async (...args) => {
+      try {
+        return await issue(...args);
+      } catch (error) {
+        expect(error).toBe(failed);
+        throw error;
+      }
+    },
+  );
+  f.bindings.BOOTSTRAP_RELAY_SERVICE = { fetch } as unknown as Fetcher;
+  const response = await f.request(
+    "transport",
+    JSON.stringify({ capability: "rescue_ssh", direction: "target" }),
+  );
+  expect(response.status).toBe(500);
+  expect(await response.json()).toMatchObject({ error: { code: "internal" } });
+  expect(fetch).toHaveBeenCalledTimes(1);
+  const diagnostic = log.mock.calls
+    .map(([message]) => JSON.parse(String(message)))
+    .find((value) => value.event === "node_proof_transport_failed");
+  expect(diagnostic).toEqual({
+    event: "node_proof_transport_failed",
+    stage: "relay_identity",
+    category: "provider_error",
+    provider_code: "unexpected_status",
+    provider_status: 429,
+    diagnostic_id: response.headers.get(DIAGNOSTIC_ID_HEADER),
+  });
+  expect(JSON.stringify(log.mock.calls)).not.toContain(canary);
+  expect(JSON.stringify(log.mock.calls)).not.toContain(f.session.bearer);
+});
 it("issues only the fixed target relay capability and refuses stale authority before relay I/O", async () => {
   const f = await fixture(),
     epoch = crypto.randomUUID();
@@ -213,11 +328,13 @@ it("issues only the fixed target relay capability and refuses stale authority be
     });
   });
   f.bindings.BOOTSTRAP_RELAY_SERVICE = { fetch } as unknown as Fetcher;
+  const log = vi.spyOn(console, "error").mockImplementation(() => {});
   const response = await f.request(
     "transport",
     JSON.stringify({ capability: "rescue_ssh", direction: "target" }),
   );
   expect(response.status).toBe(200);
+  expect(log).not.toHaveBeenCalled();
   const dto = (await response.json()) as {
     token: string;
     expectedTarget: { ip: string; port: number };
