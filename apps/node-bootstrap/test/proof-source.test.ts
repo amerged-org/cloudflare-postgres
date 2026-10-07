@@ -142,7 +142,9 @@ function fixture() {
   };
   const objects = new Map<string, Json>(),
     saved: ProofSourceOwnership[] = [],
-    mutations: string[][] = [];
+    mutations: string[][] = [],
+    logReads: string[][] = [],
+    actions: string[] = [];
   let state: ProofSourceOwnership | null = null,
     loseCreate = false,
     replaceBeforeCleanup = false,
@@ -151,7 +153,10 @@ function fixture() {
     loseInputReply = false,
     changedPod = false,
     foreignChild = false,
-    wrongImage = false;
+    wrongImage = false,
+    failedLogs: string | null = null,
+    failBeforeInput = false,
+    afterLogs: (() => void) | undefined;
   const abort = new AbortController();
   const key = (kind: string, name: string) => `${kind}/${name}`;
   const cluster = {
@@ -220,6 +225,7 @@ function fixture() {
     wait: async () => {},
     kube: async (args, _permit, stdin, options) => {
       assert.ok(options && !options.signal.aborted);
+      actions.push(args[0]!);
       if (args[0] === "get") {
         if (args[1] === "namespace/kube-system") {
           assert.deepEqual(args, [
@@ -259,8 +265,11 @@ function fixture() {
         const value = objects.get(key(args[1]!, args[2]!));
         return { exit_code: 0, stdout: value ? JSON.stringify(value) : "" };
       }
-      if (args[0] === "logs")
-        return { exit_code: 0, stdout: JSON.stringify(measured) };
+      if (args[0] === "logs") {
+        logReads.push(args);
+        afterLogs?.();
+        return { exit_code: 0, stdout: failedLogs ?? JSON.stringify(measured) };
+      }
       mutations.push(args);
       if (args[0] === "create") {
         assert.ok(state?.stage === "intent" || state?.stage === "ready");
@@ -270,7 +279,7 @@ function fixture() {
         m.resourceVersion = "1";
         if (value.kind === "Pod") {
           value.status = {
-            phase: "Running",
+            phase: failBeforeInput ? "Failed" : "Running",
             containerStatuses: [
               {
                 name: "scan",
@@ -310,8 +319,14 @@ function fixture() {
         );
         const pod = objects.get(key("pod", "outside-scan"))!;
         pod.status = {
-          phase: "Succeeded",
-          containerStatuses: [{ state: { terminated: { exitCode: 0 } } }],
+          phase: failedLogs === null ? "Succeeded" : "Failed",
+          containerStatuses: [
+            {
+              name: "scan",
+              imageID: `docker-pullable://${source.image}`,
+              state: { terminated: { exitCode: failedLogs === null ? 0 : 1 } },
+            },
+          ],
         };
         if (cancelOnExec) abort.abort();
         if (loseInputReply) {
@@ -347,6 +362,8 @@ function fixture() {
     objects,
     saved,
     mutations,
+    logReads,
+    actions,
     abort,
     node,
     state: () => state,
@@ -366,6 +383,9 @@ function fixture() {
       unavailable = false;
       cleanupUnavailable = false;
     },
+    revokeAuthority: () => {
+      unavailable = true;
+    },
     loseInputReply: () => {
       loseInputReply = true;
     },
@@ -378,8 +398,195 @@ function fixture() {
     wrongImage: () => {
       wrongImage = true;
     },
+    failPod: (logs: string, beforeInput = false) => {
+      failedLogs = logs;
+      failBeforeInput = beforeInput;
+    },
+    afterLogs: (callback: () => void) => {
+      afterLogs = callback;
+    },
   };
 }
+
+test("an owned failed scanner exposes its finite error before exact cleanup", async () => {
+  const f = fixture();
+  f.failPod('{"error_code":"outside_scan_control_peer_closed"}\n');
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /outside_scan_control_peer_closed/,
+  );
+  assert.equal(f.logReads.length, 1);
+  assert.ok(f.logReads[0]!.includes("--limit-bytes=2048"));
+  assert.ok(f.actions.indexOf("logs") < f.actions.indexOf("delete"));
+  assert.equal(f.mutations.filter((args) => args[0] === "exec").length, 1);
+  assert.equal(f.state()!.stage, "cleaned");
+});
+
+test("a qualified Pod that fails before input upload can report only the known bounded error", async () => {
+  const f = fixture();
+  f.failPod('{"error_code":"outside_scan_command_input_invalid"}\n', true);
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /outside_scan_command_input_invalid/,
+  );
+  assert.equal(f.logReads.length, 1);
+  assert.equal(
+    f.mutations.some((args) => args[0] === "exec"),
+    false,
+  );
+  assert.equal(f.state()!.stage, "cleaned");
+});
+
+test("arbitrary scanner codes never expose private Pod output", async () => {
+  const f = fixture();
+  f.failPod('{"error_code":"outside_scan_private_secret_canary"}\n');
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    (error: unknown) => {
+      assert(error instanceof BootstrapError);
+      assert.equal(error.code, "proof_source_pod_failed");
+      assert.equal(error.message.includes("private_secret_canary"), false);
+      return true;
+    },
+  );
+});
+
+test("extra diagnostic fields cannot turn Pod output into a status error", async () => {
+  const f = fixture();
+  f.failPod(
+    '{"error_code":"outside_scan_deadline","secret":"private-canary"}\n',
+  );
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /proof_source_pod_failed/,
+  );
+});
+
+test("multiple diagnostic records retain the generic Pod failure", async () => {
+  const f = fixture();
+  f.failPod(
+    '{"error_code":"outside_scan_deadline"}\n{"error_code":"outside_scan_cancelled"}\n',
+  );
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /proof_source_pod_failed/,
+  );
+});
+
+test("duplicate error-code fields retain the generic Pod failure", async () => {
+  const f = fixture();
+  f.failPod(
+    '{"error_code":"outside_scan_deadline","error_code":"outside_scan_cancelled"}\n',
+  );
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /proof_source_pod_failed/,
+  );
+});
+
+test("missing diagnostic output retains the generic Pod failure", async () => {
+  const f = fixture();
+  f.failPod("");
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /proof_source_pod_failed/,
+  );
+});
+
+test("diagnostics exceeding two KiB retain the generic failure even with a valid code", async () => {
+  const f = fixture();
+  f.failPod(" ".repeat(2048) + '{"error_code":"outside_scan_deadline"}');
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /proof_source_pod_failed/,
+  );
+});
+
+test("the failed container must have the qualified actual image before any logs are read", async () => {
+  const f = fixture();
+  f.failPod('{"error_code":"outside_scan_deadline"}\n', true);
+  f.wrongImage();
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /proof_source_pod_failed/,
+  );
+  assert.equal(f.logReads.length, 0);
+});
+
+test("changed Namespace ownership after logs prevents diagnostic promotion and Namespace deletion", async () => {
+  const f = fixture();
+  f.failPod('{"error_code":"outside_scan_deadline"}\n');
+  f.afterLogs(() => {
+    obj(f.objects.get(`namespace/${f.state()!.namespace_name}`)!.metadata).uid =
+      randomUUID();
+  });
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /proof_source_pod_failed/,
+  );
+  assert.equal(
+    f.mutations.some(
+      (args) =>
+        args[0] === "delete" &&
+        args.some(
+          (value) =>
+            value.includes("/namespaces/") && !value.includes("/pods/"),
+        ),
+    ),
+    false,
+  );
+  assert.equal(f.objects.has(`namespace/${f.state()!.namespace_name}`), true);
+  assert.equal(f.state()!.stage, "cleanup");
+});
+
+test("changed source Node identity after logs prevents diagnostic promotion and deletion", async () => {
+  const f = fixture();
+  f.failPod('{"error_code":"outside_scan_deadline"}\n');
+  f.afterLogs(() => {
+    f.node.metadata.uid = randomUUID();
+  });
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /proof_source_pod_failed/,
+  );
+  assert.equal(
+    f.mutations.some((args) => args[0] === "delete"),
+    false,
+  );
+  assert.equal(f.state()!.stage, "cleanup");
+});
+
+test("changed Pod UID after logs prevents diagnostic promotion and deletion", async () => {
+  const f = fixture();
+  f.failPod('{"error_code":"outside_scan_deadline"}\n');
+  f.afterLogs(() => {
+    obj(f.objects.get("pod/outside-scan")!.metadata).uid = randomUUID();
+  });
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /proof_source_pod_failed/,
+  );
+  assert.equal(
+    f.mutations.some((args) => args[0] === "delete"),
+    false,
+  );
+  assert.equal(f.state()!.stage, "cleanup");
+});
+
+test("current CF authority refusal after logs prevents diagnostic promotion and cleanup dispatch", async () => {
+  const f = fixture();
+  f.failPod('{"error_code":"outside_scan_deadline"}\n');
+  f.afterLogs(f.revokeAuthority);
+  await assert.rejects(
+    runOwnedOutsideScan(f.source, f.input, f.commands),
+    /proof_source_pod_failed/,
+  );
+  assert.equal(
+    f.mutations.some((args) => args[0] === "delete"),
+    false,
+  );
+  assert.notEqual(f.state()!.stage, "cleaned");
+});
 
 test("installed source executes the real CLI path with exact identity, bounded memory-only input and confirmed UID cleanup", async () => {
   const f = fixture();

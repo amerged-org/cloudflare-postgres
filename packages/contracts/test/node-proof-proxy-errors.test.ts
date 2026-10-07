@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { expect, it } from "vitest";
-import { NodeProofErrorCode, NodeProofStatus } from "../src/node-proof.ts";
+import {
+  NODE_PROOF_OUTSIDE_SCAN_ERROR_CODES,
+  NodeProofOutsideScanErrorCode,
+  NodeProofErrorCode,
+  NodeProofStatus,
+} from "../src/node-proof.ts";
 
 it("accepts the finite proxy and imported packet diagnostics while rejecting unrelated codes", () => {
   const codes = [
@@ -48,7 +53,6 @@ it("accepts the finite proxy and imported packet diagnostics while rejecting unr
       "node_proof_proxy_input_required",
       "node_proof_transport_invented",
       "postjoin_capture_invented",
-      "outside_scan_control_invalid",
       "image_gpt_invalid",
       "node_proof_private_input_https_example_secret",
     ].filter((code) => NodeProofErrorCode.safeParse(code).success),
@@ -68,7 +72,7 @@ it("preserves the exact native five-field and administrative eight-field failed 
     mode: "preparation",
     session_id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
     status: "failed",
-    error_code: "node_proof_transport_refused",
+    error_code: "outside_scan_capability_gap_ipv6_control_timeout",
   });
   const admin = NodeProofStatus.parse({
     ...native,
@@ -104,4 +108,90 @@ it("preserves the exact native five-field and administrative eight-field failed 
       error_code: "node_proof_private_input_https_example_secret",
     }).success,
   ).toBe(false);
+});
+
+it("accepts exactly the reachable finite outside scanner diagnostics", () => {
+  const fixed = [
+    "bounds_invalid",
+    "cancelled",
+    "command_input_invalid",
+    "command_input_limit",
+    "command_input_required",
+    "command_output_limit",
+    "control_http_refused",
+    "control_invalid",
+    "control_peer_closed",
+    "control_response_aborted",
+    "control_response_limit",
+    "control_session_changed",
+    "control_unproven",
+    "deadline",
+    "deadline_invalid",
+    "failed",
+    "incomplete",
+    "input_invalid",
+    "plan_binding",
+    "probe_inconclusive",
+    "probe_invalid",
+    "source_changed",
+    "source_inside_allowlist",
+    "source_not_public",
+    "source_pool_unproven",
+    "source_unproven",
+    "targets_unavailable",
+    "tcp25_control_unproven",
+  ];
+  const bounded = [
+    "eafnosupport",
+    "eprotonosupport",
+    "eaddrnotavail",
+    "eaddrinuse",
+    "eacces",
+    "eperm",
+    "enetunreach",
+    "ehostunreach",
+    "enetdown",
+    "emfile",
+    "enfile",
+    "enobufs",
+    "enomem",
+    "econnreset",
+    "econnaborted",
+    "etimedout",
+    "epipe",
+    "socket_unproven",
+    "control_timeout",
+  ];
+  const codes = [
+    ...fixed.map((suffix) => `outside_scan_${suffix}`),
+    ...[4, 6].flatMap((family) =>
+      bounded.map(
+        (suffix) => `outside_scan_capability_gap_ipv${family}_${suffix}`,
+      ),
+    ),
+  ];
+  expect(codes).toHaveLength(66);
+  expect(new Set(codes).size).toBe(66);
+  expect([...NODE_PROOF_OUTSIDE_SCAN_ERROR_CODES].sort()).toEqual(
+    [...codes].sort(),
+  );
+  expect(NodeProofOutsideScanErrorCode.options).toHaveLength(66);
+  expect(Math.max(...codes.map((code) => code.length))).toBe(48);
+  expect(
+    codes.filter(
+      (code) => !NodeProofOutsideScanErrorCode.safeParse(code).success,
+    ),
+  ).toEqual([]);
+  expect(
+    codes.filter((code) => !NodeProofErrorCode.safeParse(code).success),
+  ).toEqual([]);
+  expect(
+    [
+      "outside_scan_capability_gap_ipv0_control_timeout",
+      "outside_scan_capability_gap_ipv6_econnrefused",
+      "outside_scan_capability_gap_ipv6_private_canary",
+      "outside_scan_private_input_https_example_secret",
+      "outside_scan_invented",
+    ].filter((code) => NodeProofErrorCode.safeParse(code).success),
+  ).toEqual([]);
 });

@@ -10,8 +10,8 @@ installation operation and renews only its bounded proof authority. Routine gran
 use the current operation, sealed addresses and credentials, while Native continues fresh
 Talos/Kubernetes cluster and node identity checks. Identity changes fail closed. OAuth expiry,
 credential changes, concurrent login coalescing and 401 invalidation remain; inventory and
-authority are not cached. Implementation and focused regressions are in progress, not yet
-live acceptance. The earlier prepared f6 API publication was held before its intent; the
+authority are not cached. These API repairs are delivered; complete live acceptance remains
+pending. The earlier prepared f6 API publication was held before its intent; the
 existing US1 operation and paid instance are retained without a replacement or EU reset.
 
 The integrated repair stores the proof-source association transactionally in the existing
@@ -46,12 +46,32 @@ staged scan input, so it does not establish the exact selected-address equality.
 administrator source-identity endpoint exposes the once-sealed public mapping and binding hashes
 through fresh CF checks, without private access material, provider/Native calls, session issuance,
 alarms or storage mutation. Its missing literal route first reproduced HTTP400 through the generic
-mode route; 44 scoped cases, types, lint and formatting pass. The targeted IPv6 repair remains
-held for that exact CF mapping, matching provider lifecycle facts and an unchanged identity/data
-snapshot; the local six-case candidate builder preserves IPv4, credentials and nonnetwork fields.
-Native later reported `proof_source_pod_failed`.
-One pause stops repeated attempts; US installation/admission and final live acceptance remain
-pending, without a replacement order, EU reset or weakened dual-stack proof.
+mode route; 44 scoped cases, types, lint and formatting pass. Source `1b8e0ae`, full CI
+`37585381991`, delivers this getter and the sealed-input allocation repair API-only, retaining
+the qualified Native image and EU/US custody. Matching sealed/provider IPv6 facts and fresh
+Node/Cluster/boot identity authorized one format-preserving source-network repair. The pinned
+Talos1.14.1 dry run succeeded, then exactly one no-reboot apply was accepted at08:22:10Z.
+Readback at08:26:26Z verified both persistent and active configuration hashes, the assigned
+global IPv6 address and physical-interface default route, unchanged IPv4/MAC/boot/Node/Cluster
+identity and all three existing database/storage/role/Secret/custody identities. No EU reset,
+data migration or second apply occurred. A present empty RouteStatus destination represents the
+default route in this pinned Talos release; a fixture regression corrected that comparator
+without another OS write.
+
+The original US Workflow resumed once at08:33:20Z. Fresh owned scanners failed at08:35:54Z;
+Native reported `proof_source_pod_failed`. Their logs disappeared during programmed cleanup
+before the operator could capture the underlying code. The same Workflow was paused at step328,
+with the original installer still `created`, revision0 and zero downloaded/written bytes.
+The completed 30-minute instrumented window contains555 owned request frames and zero actual
+Contabo wire events in any stage; counts describe this capture window, not historical purchases.
+A reproducing failed-Pod test now requires a bounded2KiB diagnostic read before cleanup, fresh
+CF/source/Namespace/Pod/Cluster identity and actual image checks before and after, and only an
+exact one-key JSON envelope carrying one of66 finite scanner codes. Missing, arbitrary,
+oversized, revoked or identity-mismatched output retains the generic error.36 scoped Native
+cases,180 full Native cases,5 contract cases, types, lint and formatting pass. Scan behavior,
+timeouts, success handling and cleanup stay unchanged. The changed Native image requires one
+qualified delivery before the next controlled resume. US installation/admission and final live
+acceptance remain pending, without a replacement order or weakened dual-stack proof.
 
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical

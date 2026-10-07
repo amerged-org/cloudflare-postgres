@@ -111,6 +111,13 @@ Preview the exact format-preserving network change using the pinned client's dry
 nonreboot mode. An uncertain apply requires readback of both persistent and active configurations,
 plus actual address/route, identity and database health; never blindly repeat the write.
 
+A failed owned scanner may report one of the finite `outside_scan_*` codes. Native reads at most
+2KiB from its exact owned Pod before cleanup, checking current authority, source/cluster identity,
+Namespace/Pod UID, sealed spec and actual image before and after. Only a single-key JSON diagnostic
+with a recognized code is exposed. Missing, corrupt or mismatched output remains
+`proof_source_pod_failed`; arbitrary logs remain private. Observe the error through the read-only
+proof-status endpoint and correct the demonstrated cause before resuming the same operation.
+
 US1's purchase, profile, installation binding and reported inspection are already retained; its
 original authorized job is still `created`, before disk writes. Continue that same addition and
 AddNode Workflow through its existing pause/resume control, preserving sealed inputs, credentials,

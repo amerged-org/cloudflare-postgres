@@ -9,6 +9,7 @@ import { OperationId, NodeId, RegionId, Timestamp } from "@pgcf/contracts";
 import { ProviderInstanceId } from "@pgcf/contracts/nodes";
 import {
   NodeProofMeasurement,
+  NodeProofOutsideScanErrorCode,
   nodeProofCleanupErrorCode,
   type NodeProofCleanupOperation,
 } from "@pgcf/contracts/node-proof";
@@ -833,6 +834,63 @@ class SourceRunner {
     )
       return fail("source_identity_changed");
   }
+  private async failedPod(): Promise<never> {
+    let code: string | undefined;
+    try {
+      const identity = async () => {
+        await this.sourceNode();
+        const namespace = await this.get(
+            "namespace",
+            this.state.namespace_name!,
+          ),
+          pod = await this.get(
+            "pod",
+            "outside-scan",
+            this.state.namespace_name!,
+          );
+        if (!namespace || !pod || this.source.kind !== "pod")
+          return fail("pod_failed");
+        this.owned(namespace, "Namespace", this.state.namespace_uid);
+        this.owned(pod, "Pod", this.state.pod_uid);
+        const status = object(pod.status),
+          statuses = status.containerStatuses;
+        if (
+          status.phase !== "Failed" ||
+          !Array.isArray(statuses) ||
+          statuses.length !== 1 ||
+          object(statuses[0]).name !== "scan" ||
+          typeof object(statuses[0]).imageID !== "string" ||
+          !String(object(statuses[0]).imageID).endsWith(
+            `@${this.source.image.split("@")[1]}`,
+          )
+        )
+          return fail("pod_failed");
+      };
+      await identity();
+      const result = await this.kube([
+        "logs",
+        "outside-scan",
+        "--namespace",
+        this.state.namespace_name!,
+        "--container=scan",
+        "--limit-bytes=2048",
+      ]);
+      await identity();
+      if (result.exit_code === 0 && Buffer.byteLength(result.stdout) <= 2048) {
+        const envelope = result.stdout.match(
+          /^[ \t\r\n]*\{[ \t\r\n]*"error_code"[ \t\r\n]*:[ \t\r\n]*"([a-z0-9_]+)"[ \t\r\n]*\}[ \t\r\n]*$/,
+        );
+        if (envelope) {
+          const parsed = NodeProofOutsideScanErrorCode.safeParse(envelope[1]);
+          if (parsed.success) code = parsed.data;
+        }
+      }
+    } catch {
+      // Diagnostic reads never authorize retries or expose arbitrary Pod output.
+    }
+    if (code) throw new BootstrapError(code);
+    return fail("pod_failed");
+  }
   private async namespaceChildren() {
     const batches = [
         "pods,persistentvolumeclaims,secrets,configmaps",
@@ -982,7 +1040,7 @@ class SourceRunner {
       if (!pod) return fail("resource_disappeared");
       this.owned(pod, "Pod", this.state.pod_uid);
       phase = object(pod.status).phase;
-      if (phase === "Failed") return fail("pod_failed");
+      if (phase === "Failed") return this.failedPod();
       if (phase === "Running" || phase === "Succeeded") {
         const statuses = object(pod.status).containerStatuses;
         if (
@@ -1049,7 +1107,7 @@ class SourceRunner {
       if (!pod) return fail("resource_disappeared");
       this.owned(pod, "Pod", this.state.pod_uid);
       const status = object(pod.status);
-      if (status.phase === "Failed") return fail("pod_failed");
+      if (status.phase === "Failed") return this.failedPod();
       if (status.phase === "Succeeded") {
         const statuses = status.containerStatuses;
         if (
