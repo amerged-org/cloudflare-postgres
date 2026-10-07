@@ -402,7 +402,9 @@ async function fixture() {
       configured.operation_id,
       "postjoin",
     ),
-    firewall = vi.spyOn(network, "ensureNodeFirewall").mockResolvedValue(true);
+    firewall = vi
+      .spyOn(network, "ensureNodeFirewall")
+      .mockRejectedValue(new Error("routine_postjoin_firewall_forbidden"));
   return {
     ...f,
     pair,
@@ -479,10 +481,8 @@ it("publishes a complete storage and raw Kubernetes postjoin proof and authorize
   expect(node?.schedulable).toBe(0);
   expect(f.provider.mock.calls.length).toBe(1);
   expect(f.provider.mock.calls[0]![0]).toBe(f.providerId);
-  expect(f.firewall.mock.calls.length).toBe(1);
-  // Assertions never include Env or decrypted job objects in failure diagnostics.
-  expect(f.firewall.mock.calls[0]![0] === f.bindings).toBe(true);
-  expect(f.firewall.mock.calls[0]![1]).toBe(f.job.operation_id);
+  // Admission retains its lifecycle inventory read; routine proof never prepares firewalls.
+  expect(f.firewall).not.toHaveBeenCalled();
   await env.DB.prepare(
     "UPDATE node_bootstrap_jobs SET admission_expires_at=? WHERE operation_id=?",
   )

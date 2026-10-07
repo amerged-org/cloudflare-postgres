@@ -565,6 +565,172 @@ it("distinguishes an existing older source session without exposing its raw jour
   expect(JSON.stringify(status)).not.toContain("203.0.113.111");
 });
 
+async function cleanedSourceHistory(state: DurableObjectState, count: number) {
+  for (let offset = 0; offset < count; offset += 64) {
+    const records: Record<string, unknown> = {};
+    for (let i = offset; i < Math.min(count, offset + 64); i++)
+      records[`proof_owner:source:${i.toString(16).padStart(64, "0")}`] = {
+        session_id: crypto.randomUUID(),
+        state: { stage: "cleaned", namespace_uid: null, pod_uid: null },
+        originalInput: { retained_custody: crypto.randomUUID() },
+      };
+    await state.storage.put(records);
+  }
+}
+
+it("finds interrupted source cleanup beyond a full page of cleaned history without deleting custody", async () => {
+  const f = await fixture();
+  await f.withStore(async (instance, state) => {
+    await cleanedSourceHistory(state, 66);
+    const key = (64).toString(16).padStart(64, "0"),
+      entry = {
+        session_id: crypto.randomUUID(),
+        state: {
+          stage: "cleanup",
+          namespace_uid: crypto.randomUUID(),
+          pod_uid: null,
+        },
+        originalInput: { retained_custody: crypto.randomUUID() },
+      };
+    await state.storage.put(`proof_owner:source:${key}`, entry);
+    const before = await state.storage.list({ prefix: "proof_owner:source:" });
+    expect(
+      await instance.proofOwnership(f.id, f.input.claims.session_id, {
+        action: "expired",
+        kind: "source",
+      }),
+    ).toEqual({ entries: [{ key, ...entry }] });
+    expect(await state.storage.list({ prefix: "proof_owner:source:" })).toEqual(
+      before,
+    );
+  });
+});
+
+it("projects current and dirty source journals after validating historical cleanup without returning archived custody", async () => {
+  const f = await fixture();
+  const status = await f.withStore(async (instance, state) => {
+    await cleanedSourceHistory(state, 66);
+    for (const i of [66, 67])
+      await state.storage.put(
+        `proof_owner:source:${i.toString(16).padStart(64, "0")}`,
+        {
+          session_id: f.input.claims.session_id,
+          state: { stage: "cleaned", namespace_uid: null, pod_uid: null },
+        },
+      );
+    await state.storage.put(
+      `proof_owner:source:${(65).toString(16).padStart(64, "0")}`,
+      {
+        session_id: crypto.randomUUID(),
+        state: {
+          stage: "cleanup",
+          namespace_uid: crypto.randomUUID(),
+          pod_uid: null,
+        },
+      },
+    );
+    const before = await state.storage.list({ prefix: "proof_owner:source:" }),
+      result = await instance.proofJournalStatus(f.id);
+    expect(await state.storage.list({ prefix: "proof_owner:source:" })).toEqual(
+      before,
+    );
+    return result;
+  });
+  expect(status).toMatchObject({ status: "observed", error_code: null });
+  expect(status.journals).toHaveLength(3);
+  expect(
+    status.journals.filter((journal) => journal.matches_current_session),
+  ).toHaveLength(2);
+  expect(
+    status.journals.filter((journal) => journal.stage === "cleanup"),
+  ).toHaveLength(1);
+  expect(f.fetch).not.toHaveBeenCalled();
+  expect(f.container.start).not.toHaveBeenCalled();
+});
+
+it("refuses malformed archived source custody beyond the first page instead of omitting it", async () => {
+  const f = await fixture();
+  await f.withStore(async (instance, state) => {
+    await cleanedSourceHistory(state, 66);
+    await state.storage.put(
+      `proof_owner:source:${(65).toString(16).padStart(64, "0")}`,
+      {
+        session_id: crypto.randomUUID(),
+        state: { stage: "cleaned", namespace_uid: "invalid", pod_uid: null },
+      },
+    );
+    expect(await instance.proofJournalStatus(f.id)).toMatchObject({
+      status: "unavailable",
+      error_code: "proof_status_invalid",
+      journals: [],
+    });
+    await expect(
+      instance.proofOwnership(f.id, f.input.claims.session_id, {
+        action: "expired",
+        kind: "source",
+      }),
+    ).rejects.toThrow("proof_ownership_invalid");
+  });
+});
+
+it("refuses source history beyond sixteen bounded pages without partial cleanup or projection", async () => {
+  const f = await fixture();
+  await f.withStore(async (instance, state) => {
+    await cleanedSourceHistory(state, 1025);
+    await state.storage.put(
+      `proof_owner:source:${(1024).toString(16).padStart(64, "0")}`,
+      {
+        session_id: crypto.randomUUID(),
+        state: { stage: "cleanup", namespace_uid: null, pod_uid: null },
+      },
+    );
+    const calls: DurableObjectListOptions[] = [],
+      transaction = state.storage.transaction.bind(state.storage),
+      spy = vi
+        .spyOn(state.storage, "transaction")
+        .mockImplementation(
+          <T>(callback: (storage: DurableObjectTransaction) => Promise<T>) =>
+            transaction(async (storage) => {
+              const list = storage.list.bind(storage),
+                listing = vi
+                  .spyOn(storage, "list")
+                  .mockImplementation(async (options) => {
+                    calls.push(options ?? {});
+                    return list(options);
+                  });
+              try {
+                return await callback(storage);
+              } finally {
+                listing.mockRestore();
+              }
+            }),
+        );
+    try {
+      await expect(
+        instance.proofOwnership(f.id, f.input.claims.session_id, {
+          action: "expired",
+          kind: "source",
+        }),
+      ).rejects.toThrow("proof_ownership_limit");
+      expect(calls).toHaveLength(16);
+      calls.length = 0;
+      expect(await instance.proofJournalStatus(f.id)).toMatchObject({
+        status: "unavailable",
+        error_code: "proof_journal_limit",
+        journals: [],
+      });
+      expect(calls).toHaveLength(16);
+      for (const options of calls)
+        expect(options).toMatchObject({
+          prefix: "proof_owner:source:",
+          limit: 65,
+        });
+    } finally {
+      spy.mockRestore();
+    }
+  });
+});
+
 it("refuses more than sixty-four retained source journals without returning any records", async () => {
   const f = await fixture();
   const status = await f.withStore(async (instance, state) => {
@@ -605,17 +771,21 @@ it("returns only a fixed invalid code for a malformed source journal", async () 
 it("rechecks current session authority after reading journals before returning the local summary", async () => {
   const f = await fixture();
   const status = await f.withStore(async (instance, state) => {
-    const original = state.storage.list.bind(state.storage);
+    const original = state.storage.transaction.bind(state.storage);
     const spy = vi
-      .spyOn(state.storage, "list")
-      .mockImplementation(async (options) => {
-        const rows = await original(options);
-        await state.storage.put(
-          "proof_current:preparation",
-          crypto.randomUUID(),
-        );
-        return rows;
-      });
+      .spyOn(state.storage, "transaction")
+      .mockImplementation(
+        async <T>(
+          callback: (storage: DurableObjectTransaction) => Promise<T>,
+        ) => {
+          const rows = await original(callback);
+          await state.storage.put(
+            "proof_current:preparation",
+            crypto.randomUUID(),
+          );
+          return rows;
+        },
+      );
     try {
       return await instance.proofJournalStatus(f.id);
     } finally {

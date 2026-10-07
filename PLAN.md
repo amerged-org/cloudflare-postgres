@@ -282,6 +282,18 @@ concurrent revocation block without a disk-write intent; later chunks make no pr
 40 network/report and42 callback cases, API types, scoped lint/formatting and reciprocal review
 pass. This correction is API-only; live US Ready/SQL/TLS/R2/WAL/restore/reclamation remain pending.
 
+The first integrated API-only stand `b6d0e330` failed CI `37676702755` on one stale
+postjoin-test expectation: signed proof and quarantined admission succeeded, then the test
+expected the removed routine firewall call. The corrected fixture forbids that call and retains
+the necessary admission inventory read; all five postjoin cases pass. The stand was not published.
+A CF-only live journal observation at19:45:20Z confirmed62 retained source journals, all cleaned.
+The former64-row limit applied before filtering, so another preparation/postjoin renewal could
+leave66 rows and block the next resume. Reproducing tests now require bounded pagination while
+preserving every custody record and finding interrupted cleanup beyond a page of cleaned history.
+The administrative projection includes only current or unfinished journals after validating
+historical records; malformed/overflow history fails closed without partial authority. Native
+runtime/image, observation freshness and owned-resource deletion guards remain unchanged.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

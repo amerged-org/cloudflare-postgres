@@ -787,7 +787,46 @@ export class NodeBootstrap extends DurableObject<Env> {
       void response?.body?.cancel().catch(() => {});
     }
   }
-  /** Summarize retained source journals locally; never contact or wake the Container. */
+  private async *sourceOwnershipPages(
+    storage: Pick<DurableObjectStorage, "list">,
+  ) {
+    const prefix = "proof_owner:source:",
+      uid = z.uuid().nullable();
+    let startAfter: string | undefined;
+    // At most 1,024 retained journals, read in 64-entry pages with one lookahead.
+    // No row is removed, and an overflow never returns a partial cleanup list.
+    for (let page = 0; page < 16; page++) {
+      const rows = await storage.list<Record<string, unknown>>({
+        prefix,
+        limit: 65,
+        ...(startAfter === undefined ? {} : { startAfter }),
+      });
+      if (page === 15 && rows.size > 64)
+        throw new Error("proof_ownership_limit");
+      const entries = [...rows.entries()].slice(0, 64);
+      for (const [key, value] of entries) {
+        const record = value?.state;
+        if (
+          !/^[a-f0-9]{64}$/.test(key.slice(prefix.length)) ||
+          !z.uuid().safeParse(value?.session_id).success ||
+          !record ||
+          typeof record !== "object" ||
+          Array.isArray(record) ||
+          !NodeProofJournalEntry.shape.stage.safeParse(
+            (record as Record<string, unknown>).stage,
+          ).success ||
+          !uid.safeParse((record as Record<string, unknown>).namespace_uid)
+            .success ||
+          !uid.safeParse((record as Record<string, unknown>).pod_uid).success
+        )
+          throw new Error("proof_ownership_invalid");
+      }
+      yield entries;
+      if (rows.size <= 64) return;
+      startAfter = entries.at(-1)![0];
+    }
+  }
+  /** Project current and unfinished source journals locally; retain archived custody. */
   async proofJournalStatus(operationId: string) {
     const state = await this.#proofObservation(operationId, "preparation"),
       base = {
@@ -803,42 +842,49 @@ export class NodeBootstrap extends DurableObject<Env> {
         journals: [],
       });
     if (state.error_code) return unavailable(state.error_code);
-    const prefix = "proof_owner:source:",
-      rows = await this.ctx.storage.list<Record<string, unknown>>({
-        prefix,
-        limit: 65,
+    const prefix = "proof_owner:source:";
+    let journals: z.infer<typeof NodeProofJournalEntry>[];
+    try {
+      journals = await this.ctx.storage.transaction(async (storage) => {
+        const journals = [];
+        for await (const rows of this.sourceOwnershipPages(storage)) {
+          for (const [key, value] of rows) {
+            const id = key.slice(prefix.length),
+              journal = value.state as {
+                stage: z.infer<typeof NodeProofJournalEntry>["stage"];
+                namespace_uid: string | null;
+                pod_uid: string | null;
+              };
+            if (
+              journal.stage === "cleaned" &&
+              value.session_id !== state.base.session_id
+            )
+              continue;
+            journals.push({
+              key_sha256: await statusIdentifierHash(id),
+              stage: journal.stage,
+              namespace_uid_sha256:
+                journal.namespace_uid === null
+                  ? null
+                  : await statusIdentifierHash(journal.namespace_uid),
+              pod_uid_sha256:
+                journal.pod_uid === null
+                  ? null
+                  : await statusIdentifierHash(journal.pod_uid),
+              matches_current_session:
+                value.session_id === state.base.session_id,
+            });
+            if (journals.length > 64) throw new Error("proof_ownership_limit");
+          }
+        }
+        return journals;
       });
-    if (rows.size > 64) return unavailable("proof_journal_limit");
-    const journals = [];
-    const uid = z.uuid().nullable();
-    for (const [key, value] of rows) {
-      const id = key.slice(prefix.length),
-        record = value?.state;
-      if (
-        !/^[a-f0-9]{64}$/.test(id) ||
-        !z.uuid().safeParse(value?.session_id).success ||
-        !record ||
-        typeof record !== "object" ||
-        Array.isArray(record)
-      )
-        return unavailable("proof_status_invalid");
-      const journal = record as Record<string, unknown>,
-        stage = NodeProofJournalEntry.shape.stage.safeParse(journal.stage),
-        namespace = uid.safeParse(journal.namespace_uid),
-        pod = uid.safeParse(journal.pod_uid);
-      if (!stage.success || !namespace.success || !pod.success)
-        return unavailable("proof_status_invalid");
-      journals.push({
-        key_sha256: await statusIdentifierHash(id),
-        stage: stage.data,
-        namespace_uid_sha256:
-          namespace.data === null
-            ? null
-            : await statusIdentifierHash(namespace.data),
-        pod_uid_sha256:
-          pod.data === null ? null : await statusIdentifierHash(pod.data),
-        matches_current_session: value.session_id === state.base.session_id,
-      });
+    } catch (error) {
+      return unavailable(
+        error instanceof Error && error.message === "proof_ownership_limit"
+          ? "proof_journal_limit"
+          : "proof_status_invalid",
+      );
     }
     const changed = await state.recheck();
     if (changed) return unavailable(changed);
@@ -899,6 +945,22 @@ export class NodeBootstrap extends DurableObject<Env> {
     if (!input) throw new Error("proof_input_unavailable");
     const prefix = `proof_owner:${request.kind}:`;
     if (request.action === "expired") {
+      if (request.kind === "source") {
+        return this.ctx.storage.transaction(async (storage) => {
+          const entries = [];
+          for await (const rows of this.sourceOwnershipPages(storage))
+            for (const [key, value] of rows) {
+              if (
+                value.session_id === sessionId ||
+                (value.state as { stage: string }).stage === "cleaned"
+              )
+                continue;
+              entries.push({ ...value, key: key.slice(prefix.length) });
+              if (entries.length > 64) throw new Error("proof_ownership_limit");
+            }
+          return { entries };
+        });
+      }
       const rows = await this.ctx.storage.list<Record<string, unknown>>({
         prefix,
         limit: 65,

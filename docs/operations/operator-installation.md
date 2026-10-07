@@ -91,9 +91,13 @@ starts a Container, registers another inspection, requests rescue or writes a di
 An unavailable inspector remains unknown rather than being treated as healthy.
 Administrators can also read
 `GET /v1/nodes/additions/{operation-id}/proof/preparation/journal` for the current session
-timestamps and bounded retained source stages, UID hashes and session-match flags. This reads
-local Durable Object records only and grants no cleanup or proof authority. It exposes neither
-private inputs nor credentials and does not wake or contact a Container.
+timestamps and current or unfinished source stages, UID hashes and session-match flags. Historical
+cleaned journals remain in custody but are omitted from this projection after validation. Source
+history is read in at most sixteen 64-entry pages, with one lookahead; malformed or excessive
+history fails closed without returning partial cleanup authority. The response remains limited
+to 64 entries and 32 KiB. This reads local Durable Object records only and grants no cleanup or
+proof authority. It exposes neither private inputs nor credentials and does not wake or contact
+a Container.
 For network evidence, read
 `GET /v1/nodes/additions/{operation-id}/proof/{preparation|postjoin}` with administrator scope.
 This observes the retained native proof session and its fixed error code; it never starts a scan,
