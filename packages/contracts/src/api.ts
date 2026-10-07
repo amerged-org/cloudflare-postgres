@@ -43,6 +43,48 @@ export const HttpsUrl = z.url({ protocol: /^https$/ }).max(2048);
 export const BucketName = z.string().regex(/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/);
 const ProviderName = z.string().regex(/^[a-z][a-z0-9-]{1,31}$/);
 
+/** Administrator-only synchronization after independently verified Kubernetes readback. */
+const BootstrapMaterialDigest = z.string().regex(/^[a-f0-9]{64}$/);
+export const RegionBootstrapMaterialUpdate = z.strictObject({
+  expected_revision: z.number().int().min(1).max(2147483646),
+  kubernetes_version: z.enum(["1.36.3", "1.36.5"]),
+  expected_seed_sha256: BootstrapMaterialDigest,
+  expected_join_sha256: BootstrapMaterialDigest,
+  seed_sha256: BootstrapMaterialDigest,
+  join_sha256: BootstrapMaterialDigest,
+  provenance_sha256: BootstrapMaterialDigest,
+  observed: z.strictObject({
+    observed_at: Timestamp,
+    kube_system_uid: z.uuid(),
+    kubernetes_version: z.enum(["1.36.3", "1.36.5"]),
+    nodes: z
+      .array(
+        z.strictObject({
+          node_id: NodeId,
+          node_uid: z.uuid(),
+          k8s_node_name: z.string().regex(/^[a-z0-9][a-z0-9.-]{0,252}$/),
+          provider_instance_id: z.string().regex(/^[1-9][0-9]{0,18}$/),
+        }),
+      )
+      .min(1)
+      .max(16),
+  }),
+});
+export type RegionBootstrapMaterialUpdate = z.infer<
+  typeof RegionBootstrapMaterialUpdate
+>;
+export const RegionBootstrapMaterialStatus = z.strictObject({
+  region_id: RegionId,
+  revision: z.number().int().min(1).max(2147483647),
+  kubernetes_version: z.enum(["1.36.3", "1.36.5"]),
+  seed_sha256: BootstrapMaterialDigest,
+  join_sha256: BootstrapMaterialDigest,
+  provenance_sha256: BootstrapMaterialDigest.nullable(),
+});
+export type RegionBootstrapMaterialStatus = z.infer<
+  typeof RegionBootstrapMaterialStatus
+>;
+
 // ---------- Lists and cursors ----------
 
 export const LIST_LIMIT_DEFAULT = 50;

@@ -388,6 +388,21 @@ Caps remainEU3/US1; purchases_enabled1 permits costed individual orders, autosca
 and standing_cost_profileNULL supply no autonomous purchase authority. Finite standing
 spend/count/expiry and any cap increase still require explicit owner approval.
 
+The owner requires the same reproducible EU/US software basis. Current EU1.36.3
+material is immutable revision1, and prior current-source/worker composition selected1
+unconditionally. A metadata-only administrator synchronization path now stages immutable
+seed/join revision2 through the existing encryption functions, preserving every old key,
+certificate, UID and ciphertext. An internal active-revision pointer defaults to1. Activation
+changes only Kubernetes version metadata after administrator-verified native readback, with
+exact old/new material hashes, complete fresh Node UID set/CUID and no active installation
+operations. The final atomic CAS retains120-second readback freshness and180-second CF Node
+observations; completed retries validate the exact committed provenance/body and historical
+hashes without another write. New worker jobs persist the selected join reference and fence
+the region revision in their initial INSERT. Historical job references and first-control
+sealing remain1.150 affected API cases, types/lint/formatting and independent review pass.
+Migration0023 and activation remain unexecuted. Existing Native/proof payload contracts and
+the qualified Native64 image are unchanged; live US remains on the accepted016 API stand.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

@@ -340,3 +340,27 @@ each reviewed migration freezes writes, restores and compares data/roles/sequenc
 Cloudflare target's TLS and backup/WAL, and accepts the connection cutover. Do not switch back to
 a stale Neon source after target writes without reconciling them. Credential changes follow the
 separate custody runbook; this completion does not authorize an uncoordinated rotation.
+
+## Synchronize version templates after an accepted Kubernetes upgrade
+
+Use the supported Talos Kubernetes upgrade with a reviewed dry run; never reinstall the EU
+nodes to align patch versions. Verify the actual API-server and every kubelet version while
+preserving Node/Cluster UID, storage, roles, Secrets and certificate/key identities. Record
+actual post-upgrade configuration; never reapply old machine documents that would downgrade
+the components.
+
+After migration0023, administrators can read `GET /v1/regions/{id}/bootstrap-material` and use
+`POST /v1/regions/{id}/bootstrap-material` to synchronize version metadata. The write requires
+expected current revision and old/new plaintext hashes, an exact hash of verified readback,
+Cluster UID, complete physical Node UID/provider/name set and a fresh observation timestamp.
+It accepts no new CA or key payload. The API copies existing material with only the selected
+Kubernetes-version change, stages a new immutable seed/join pair, and atomically selects it
+only when there are no active installation operations and all authority remains current.
+Keep the verified readback within120 seconds and CF Node observations within180 seconds.
+
+A staged revision does not change active configuration. Historic job references and revision1
+remain unchanged; new jobs and current-source checks use the selected active revision. Resolve
+an uncertain response by reading the active revision/provenance and exact hashes; do not
+rewrite old ciphertext or dispatch another physical upgrade. The administrator's native
+readback is the explicit trust boundary: this API validates its identity and provenance,
+rather than claiming to perform the Kubernetes upgrade itself.

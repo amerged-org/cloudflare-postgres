@@ -14,7 +14,7 @@ import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import {
-  joinBundleReference,
+  loadCurrentRegionMaterialReference,
   loadRegionJoinBundle,
 } from "../crypto/bootstrap-credentials.ts";
 import {
@@ -408,7 +408,11 @@ export async function assertNodeProofSourceAuthority(
         await loadRegionJoinBundle(
           env.DB,
           env.CREDENTIAL_KEYS,
-          joinBundleReference(source.region_id, 1),
+          await loadCurrentRegionMaterialReference(
+            env.DB,
+            source.region_id,
+            "join_bundle",
+          ),
         ),
       );
     } catch {
@@ -664,7 +668,11 @@ export async function selectNodeProofSource(
           await loadRegionJoinBundle(
             env.DB,
             env.CREDENTIAL_KEYS,
-            joinBundleReference(node.region_id, 1),
+            await loadCurrentRegionMaterialReference(
+              env.DB,
+              node.region_id,
+              "join_bundle",
+            ),
           ),
         );
       } catch {

@@ -47,7 +47,7 @@ import {
   authenticateNodeProofSession,
 } from "./node-proof-session.ts";
 import {
-  joinBundleReference,
+  loadCurrentRegionMaterialReference,
   loadRegionJoinBundle,
   loadRegionSeed,
   type BootstrapCredentialRef,
@@ -187,7 +187,11 @@ export async function prepareNodeProofInput(
       await loadRegionJoinBundle(
         env.DB,
         env.CREDENTIAL_KEYS,
-        joinBundleReference(plan.region_id, 1),
+        await loadCurrentRegionMaterialReference(
+          env.DB,
+          plan.region_id,
+          "join_bundle",
+        ),
       ),
     );
   let talos_admin_config: string | undefined;

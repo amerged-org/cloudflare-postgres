@@ -15,7 +15,7 @@ import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import {
-  joinBundleReference,
+  loadCurrentRegionMaterialReference,
   loadRegionJoinBundle,
 } from "../crypto/bootstrap-credentials.ts";
 import {
@@ -336,7 +336,11 @@ async function postjoinPayload(
     protectedCluster = await loadRegionJoinBundle(
       env.DB,
       env.CREDENTIAL_KEYS,
-      joinBundleReference(claims.region_id, 1),
+      await loadCurrentRegionMaterialReference(
+        env.DB,
+        claims.region_id,
+        "join_bundle",
+      ),
     );
   const namespace = object(facts.kube_system),
     afterNamespace = object(facts.kube_system_after),

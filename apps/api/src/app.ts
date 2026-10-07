@@ -57,6 +57,7 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/nodes/additions/:id/verify",
   "/v1/nodes/additions/:id/installation-binding",
   "/v1/regions/:id/installation-profile",
+  "/v1/regions/:id/bootstrap-material",
   "/internal/v1/node-installation/:id/inspection",
   "/internal/v1/node-installation/:id/transport",
   "/internal/v1/node-installation/:id/relay",

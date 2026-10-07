@@ -36,6 +36,7 @@ import {
 } from "../crypto/bootstrap-tickets.ts";
 import {
   joinBundleReference,
+  loadCurrentRegionMaterialReference,
   loadRegionJoinBundle,
   loadRegionSeed,
   regionSeedReference,
@@ -190,7 +191,11 @@ export async function configureBootstrapJob(
       "invalid_request",
       "Cloudflare jobs require the configured fixed-source relay",
     );
-  const joinRef = joinBundleReference(spec.region_id, 1);
+  const joinRef = await loadCurrentRegionMaterialReference(
+    env.DB,
+    spec.region_id,
+    "join_bundle",
+  );
   let joinBundle: NodeBootstrapInput["join_bundle"] = null;
   if (spec.role === "worker") {
     const existing = await env.DB.prepare(
@@ -278,8 +283,9 @@ export async function configureBootstrapJob(
   });
   const now = new Date().toISOString();
   const result = await env.DB.prepare(
-    `INSERT INTO node_bootstrap_jobs(operation_id,node_id,region_id,input_hash,inventory_revision,sealed_revision,input_ciphertext,input_iv,input_kid,callback_hash,checkpoint_json,created_at,updated_at)
-    SELECT operation_id,node_id,region_id,?,?,?,?,?,?,?,?,?,? FROM node_additions WHERE operation_id=? AND revision=? AND status IN('audited','bootstrapping') AND provider_instance_id=?
+    `INSERT INTO node_bootstrap_jobs(operation_id,node_id,region_id,input_hash,inventory_revision,sealed_revision,input_ciphertext,input_iv,input_kid,callback_hash,material_ref_json,checkpoint_json,created_at,updated_at)
+    SELECT operation_id,node_id,region_id,?,?,?,?,?,?,?,?,?,?,? FROM node_additions WHERE operation_id=? AND revision=? AND status IN('audited','bootstrapping') AND provider_instance_id=?
+      AND EXISTS(SELECT 1 FROM regions r WHERE r.id=node_additions.region_id AND r.bootstrap_material_revision=?)
     ON CONFLICT(operation_id) DO NOTHING`,
   )
     .bind(
@@ -290,15 +296,26 @@ export async function configureBootstrapJob(
       sealed.iv,
       sealed.kid,
       await hashApiKey(env.API_KEY_PEPPER, callbackBearer),
+      spec.role === "worker" ? JSON.stringify(joinRef) : null,
       JSON.stringify(checkpoint),
       now,
       now,
       operationId,
       value.expected_revision,
       spec.provider_instance_id,
+      joinRef.revision,
     )
     .run();
-  const saved = await readBootstrapJob(env.DB, operationId);
+  const saved = await env.DB.prepare(
+    "SELECT * FROM node_bootstrap_jobs WHERE operation_id=?",
+  )
+    .bind(operationId)
+    .first<BootstrapJobRow>();
+  if (saved === null)
+    throw new ApiError(
+      "conflict",
+      "Regional bootstrap material changed before configuration",
+    );
   if (result.meta.changes !== 1 && saved.input_hash !== inputHash)
     throw new ApiError(
       "conflict",

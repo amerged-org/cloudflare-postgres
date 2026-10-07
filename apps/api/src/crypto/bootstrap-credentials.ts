@@ -155,6 +155,34 @@ export function regionSeedReference(
     revision,
   });
 }
+export async function loadCurrentRegionMaterialReference(
+  db: D1Database,
+  regionId: string,
+  purpose: "join_bundle" | "region_seed",
+): Promise<BootstrapCredentialRef> {
+  valid(RegionId, regionId);
+  valid(z.enum(["join_bundle", "region_seed"]), purpose);
+  try {
+    const row = await db
+      .prepare("SELECT bootstrap_material_revision FROM regions WHERE id=?")
+      .bind(regionId)
+      .first<{ bootstrap_material_revision: number }>();
+    if (!row) throw new CustodyError("region_missing");
+    const revision = valid(
+      z.number().int().min(1).max(2147483647),
+      row.bootstrap_material_revision,
+    );
+    return valid(Reference, {
+      version: 1,
+      region_id: regionId,
+      purpose,
+      revision,
+    });
+  } catch (error) {
+    if (error instanceof CustodyError) throw error;
+    throw new CustodyError("unavailable");
+  }
+}
 function reference(
   input: BootstrapCredentialRef,
   purpose: BootstrapCredentialRef["purpose"],

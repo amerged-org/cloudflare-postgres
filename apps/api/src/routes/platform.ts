@@ -14,6 +14,9 @@ import {
   Region,
   RegionCreate,
   RegionCreated,
+  RegionId,
+  RegionBootstrapMaterialUpdate,
+  RegionBootstrapMaterialStatus,
   SizeClass,
   SizeClassId,
   SizeClassUpsert,
@@ -32,7 +35,13 @@ import {
   getProject,
   listProjects,
 } from "../platform/projects.ts";
-import { createRegion, listNodes, listRegions } from "../platform/regions.ts";
+import {
+  createRegion,
+  listNodes,
+  listRegions,
+  getRegionBootstrapMaterial,
+  updateRegionBootstrapMaterial,
+} from "../platform/regions.ts";
 import { listSizeClasses, upsertSizeClass } from "../platform/size-classes.ts";
 
 const json = (schema: z.ZodType) => ({ "application/json": { schema } });
@@ -221,6 +230,41 @@ export function registerPlatform(app: ApiApp): void {
       responses: response(listEnvelope(Region), 200),
     },
     listRegions,
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/regions/{id}/bootstrap-material",
+      security,
+      tags: ["Regions"],
+      request: { params: z.object({ id: RegionId }) },
+      responses: response(RegionBootstrapMaterialStatus, 200),
+    },
+    async (c) =>
+      getRegionBootstrapMaterial(c, RegionId.parse(c.req.param("id"))),
+  );
+  register(
+    app,
+    {
+      method: "post",
+      path: "/v1/regions/{id}/bootstrap-material",
+      security,
+      tags: ["Regions"],
+      description:
+        "Synchronizes only Kubernetes version metadata after independently verified administrator readback; immutable credentials and historical references remain unchanged.",
+      request: {
+        params: z.object({ id: RegionId }),
+        body: body(RegionBootstrapMaterialUpdate),
+      },
+      responses: response(RegionBootstrapMaterialStatus, 200),
+    },
+    async (c) =>
+      updateRegionBootstrapMaterial(
+        c,
+        RegionId.parse(c.req.param("id")),
+        RegionBootstrapMaterialUpdate.parse(await c.req.json()),
+      ),
   );
   register(
     app,

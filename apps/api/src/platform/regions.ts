@@ -4,6 +4,7 @@ import {
   newAgentKey,
   type RegionCreate,
   type RegionRouteKeyring,
+  type RegionBootstrapMaterialUpdate,
 } from "@pgcf/contracts";
 import {
   deriveRegionKeyring,
@@ -23,6 +24,10 @@ import {
   withIdempotency,
 } from "../middleware/idempotency.ts";
 import { page } from "./pagination.ts";
+import {
+  readRegionBootstrapMaterial,
+  synchronizeRegionBootstrapMaterial,
+} from "../domain/region-material-revisions.ts";
 import { nodeRow, regionRow, type Row } from "./rows.ts";
 
 export async function createRegion(
@@ -116,4 +121,20 @@ export async function listNodes(c: ApiContext): Promise<Response> {
     .bind(...cursor.bindings, pagination.limit + 1)
     .all<Row>();
   return c.json(pagination.envelope(rows.results.map(nodeRow)), 200);
+}
+
+export async function getRegionBootstrapMaterial(
+  c: ApiContext,
+  id: string,
+): Promise<Response> {
+  await requireScope(c, "admin");
+  return c.json(await readRegionBootstrapMaterial(c.env, id));
+}
+export async function updateRegionBootstrapMaterial(
+  c: ApiContext,
+  id: string,
+  body: RegionBootstrapMaterialUpdate,
+): Promise<Response> {
+  await requireScope(c, "admin");
+  return c.json(await synchronizeRegionBootstrapMaterial(c.env, id, body));
 }

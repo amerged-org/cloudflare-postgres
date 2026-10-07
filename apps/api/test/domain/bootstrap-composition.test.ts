@@ -1,5 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import {
+  joinBundleReference,
+  regionSeedReference,
+  storeRegionJoinBundle,
+  storeRegionSeed,
+  loadRegionJoinBundle,
+} from "../../src/crypto/bootstrap-credentials.ts";
 import { afterEach, describe, expect, it } from "vitest";
 import { composeConfiguredNodeBootstrap } from "../../src/domain/bootstrap-composition.ts";
 import { recordNodeInstallationInspection } from "../../src/domain/node-installation.ts";
@@ -45,6 +52,56 @@ describe("provider-bound bootstrap composition", () => {
     expect(input.join_bundle).toEqual(f.bundle);
     expect(input.platform).toBeUndefined();
     expect(input.spec.platform).toBeUndefined();
+  });
+  it("seals the selected active join revision for a new worker while retaining historical material", async () => {
+    const f = await setup(true),
+      id = f.addition.intent.operation_id;
+    const upgraded = { ...f.bundle, kubernetes_version: "1.36.5" };
+    const seed = {
+      version: upgraded.version,
+      cluster_name: upgraded.cluster_name,
+      cluster_endpoint: upgraded.cluster_endpoint,
+      talos_version: upgraded.talos_version,
+      kubernetes_version: upgraded.kubernetes_version,
+      talos_machine_secrets_yaml: upgraded.talos_machine_secrets_yaml,
+      talos_admin_config: upgraded.talos_admin_config,
+    };
+    await storeRegionSeed(
+      env.DB,
+      env.CREDENTIAL_KEYS,
+      regionSeedReference(f.fixture.region, 2),
+      seed,
+    );
+    await storeRegionJoinBundle(
+      env.DB,
+      env.CREDENTIAL_KEYS,
+      joinBundleReference(f.fixture.region, 2),
+      upgraded,
+    );
+    // This fixture represents the completed activation before the worker's composition.
+    await env.DB.prepare(
+      "UPDATE regions SET bootstrap_material_revision=2 WHERE id=?",
+    )
+      .bind(f.fixture.region)
+      .run();
+    await recordNodeInstallationInspection(f.bindings, id, 0, f.inspection);
+    await composeConfiguredNodeBootstrap(f.bindings, id, {
+      provider: f.provider,
+    });
+    const job = await readBootstrapJob(env.DB, id);
+    expect(JSON.parse(job.material_ref_json!)).toEqual(
+      joinBundleReference(f.fixture.region, 2),
+    );
+    expect((await bootstrapJobInput(f.bindings, job)).join_bundle).toEqual(
+      upgraded,
+    );
+    expect(
+      await loadRegionJoinBundle(
+        env.DB,
+        env.CREDENTIAL_KEYS,
+        joinBundleReference(f.fixture.region, 1),
+      ),
+    ).toEqual(f.bundle);
   });
   it("waits for an actual fresh inspection and allocated provider hardware", async () => {
     const f = await setup(),

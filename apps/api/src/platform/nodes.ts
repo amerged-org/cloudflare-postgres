@@ -52,7 +52,7 @@ import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
 import { runNodeCapacity } from "../domain/node-capacity.ts";
 import {
   loadRegionJoinBundle,
-  joinBundleReference,
+  loadCurrentRegionMaterialReference,
 } from "../crypto/bootstrap-credentials.ts";
 
 export const NodeCapacityPolicy = NodeRegionPolicy.safeExtend({
@@ -527,7 +527,11 @@ export async function verifyNodeProofArtifact(
   const protectedCluster = await loadRegionJoinBundle(
     env.DB,
     env.CREDENTIAL_KEYS,
-    joinBundleReference(row.region_id, 1),
+    await loadCurrentRegionMaterialReference(
+      env.DB,
+      row.region_id,
+      "join_bundle",
+    ),
   );
   if (
     protectedCluster.kube_system_uid !== proof.cluster_uid ||

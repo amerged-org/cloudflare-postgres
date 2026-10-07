@@ -26,7 +26,7 @@ import {
 } from "./node-installation.ts";
 import {
   loadRegionJoinBundle,
-  joinBundleReference,
+  loadCurrentRegionMaterialReference,
 } from "../crypto/bootstrap-credentials.ts";
 import { bootstrapPlatformHash } from "../crypto/bootstrap-tickets.ts";
 
@@ -211,7 +211,11 @@ export async function composeConfiguredNodeBootstrap(
       await loadRegionJoinBundle(
         env.DB,
         env.CREDENTIAL_KEYS,
-        joinBundleReference(installed.profile.region_id, 1),
+        await loadCurrentRegionMaterialReference(
+          env.DB,
+          installed.profile.region_id,
+          "join_bundle",
+        ),
       ),
     );
   if (!join && !installed.profile.first_region)
