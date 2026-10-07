@@ -132,6 +132,16 @@ const unavailable = (): never => {
     "Network proof source authority is unavailable or changed",
   );
 };
+const observationPending = Symbol("proof_source_observation_pending");
+type PendingObservation = ApiError & { [observationPending]: true };
+export function isNodeProofSourceObservationPending(
+  error: unknown,
+): error is PendingObservation {
+  return (
+    error instanceof ApiError &&
+    (error as PendingObservation)[observationPending] === true
+  );
+}
 function address(value: string) {
   if (z.ipv4().safeParse(value).success)
     return {
@@ -357,12 +367,11 @@ export async function assertNodeProofSourceAuthority(
   if (source.kind === "pod") {
     const currentNode = async () => {
       const now = Date.now();
-      return !!(await env.DB.prepare(
-        `SELECT 1 present FROM nodes n JOIN regions r ON r.id=n.region_id
+      const node = await env.DB.prepare(
+        `SELECT n.last_observed_at FROM nodes n JOIN regions r ON r.id=n.region_id
          WHERE n.id=? AND n.region_id=? AND n.provider_instance_id=? AND n.node_uid=?
            AND n.k8s_node_name=? AND n.ready=1 AND n.lost_at IS NULL
-           AND r.provider='contabo' AND r.provider_region=?
-           AND n.last_observed_at>=? AND n.last_observed_at<=?`,
+           AND r.provider='contabo' AND r.provider_region=?`,
       )
         .bind(
           source.node_id,
@@ -371,12 +380,23 @@ export async function assertNodeProofSourceAuthority(
           source.node_uid,
           source.node_name,
           region.provider_region,
-          new Date(now - NODE_OBSERVATION_MAX_AGE_MS).toISOString(),
-          new Date(now + 5000).toISOString(),
         )
-        .first());
+        .first<{ last_observed_at: string | null }>();
+      if (!node) return unavailable();
+      const observed =
+        node.last_observed_at === null
+          ? null
+          : Date.parse(node.last_observed_at);
+      if (
+        observed !== null &&
+        (!Number.isFinite(observed) || observed > now + 5000)
+      )
+        return unavailable();
+      return observed === null || observed < now - NODE_OBSERVATION_MAX_AGE_MS
+        ? "stale"
+        : "fresh";
     };
-    if (!(await currentNode())) return unavailable();
+    const beforeObservation = await currentNode();
     const targetProfile = await readNodeInstallationProfile(
         env,
         plan.region_id,
@@ -401,11 +421,19 @@ export async function assertNodeProofSourceAuthority(
       ].includes(source.image) ||
       bundle.kube_system_uid !== source.cluster_uid ||
       canonicalNodeProof(bundle) !==
-        canonicalNodeProof(source.access.join_bundle) ||
-      !(await currentNode()) ||
-      !(await currentTarget())
+        canonicalNodeProof(source.access.join_bundle)
     )
       return unavailable();
+    const afterObservation = await currentNode();
+    if (!(await currentTarget())) return unavailable();
+    if (beforeObservation === "stale" || afterObservation === "stale") {
+      const error = new ApiError(
+        "conflict",
+        "Network proof source authority is unavailable or changed",
+      );
+      Object.defineProperty(error, observationPending, { value: true });
+      throw error;
+    }
     return;
   }
   const addition = await readNodeAddition(env.DB, source.operation_id);

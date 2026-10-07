@@ -171,8 +171,34 @@ family, strict typed Lists/items and complete-list metadata, preserving the 256K
 partial inventories and unknown outcomes still block namespace deletion. Source/runner checks
 and the two new typed/partial inventory guards pass; slower grant models still refuse at the
 existing deadline with namespace ownership retained. These software checks do not establish a
-live cleanup duration or US readiness. One combined CI and qualified changed-image delivery
-precede the next controlled continuation of the original US operation.
+live cleanup duration or US readiness. Source `e3f73c2f`, full CI `37629855698`, is delivered once
+with qualified Native manifest `sha256:1ce363daaa6049f0202ace78540692b03e98a744c36e11d72edebcdb0ab66585`.
+All 18 layers/714,978,389 qualification bytes passed; complete private readback verified
+162,118,733 compressed and 502,861,312 raw bytes. Actual application/deployment/placement version
+22 matched the image, preserving all protected identities and custody. The original Workflow
+resumed once at 13:57:35.722Z. Its fresh session reported `proof_source_pod_failed` at
+14:01:29.812Z, 194.659 seconds after issuance with 345.341 seconds remaining. Both retained
+owned Pods were Failed/exit 1 with no restart or OOM reason; their exact one-key logs reported
+IPv6 and IPv4 control timeouts at 14:00:24Z and 14:00:44Z. Cleanup inventory had not completed,
+so this attempt does not measure the new cleanup path. Both source Nodes remained Ready with
+the same physical identities, but their CF observations became 319 seconds old during a
+312-second regional observation gap. The agent retained its Pod/image and logged cycle/reconcile
+failures plus one reconnect; fresh observations subsequently recovered naturally. A bounded
+Talos read preserved Source UID/Cluster UID/boot/system identity, global IPv6 and network resources;
+captured kernel logs contained no matching conntrack-full, watchdog, OOM or link-down pattern.
+These facts do not isolate the initial network timeout's cause. The Workflow became errored at
+step 1083 when the stale source check threw; no pause was dispatched and the installer remains
+created/revision 0 with zero downloaded/written bytes.
+
+A real-D1 regression now reproduces that headless recovery failure. A retained source with only
+an observation older than 180 seconds makes the proof producer wait after all Node/provider/region,
+Ready/lost, profile, decrypted cluster/certificate custody and target checks pass before and after
+the asynchronous reads. Routine Native grants still reject stale observations. A real fresh
+observation resumes the same association with new bounded claims; expired input is never reused.
+Changed Node/Cluster identity, custody and future timestamps remain blocking. The 38 affected
+source/execution cases pass. This is an API-only recovery correction; the qualified Native image,
+source OS/firewall and original operation remain unchanged. Live installation/admission and final
+acceptance are still pending.
 
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical

@@ -130,6 +130,16 @@ each typed List and item, and refuse nonempty continuation or remaining-item met
 partial or foreign children preserve the namespace; Node/Cluster checks and UID/resourceVersion
 deletion preconditions remain. Observe actual cleanup/report timing before claiming readiness.
 
+If regional telemetry temporarily leaves the retained source observation older than 180 seconds,
+the proof producer waits for fresh observations of that same source. It still validates current
+Node/Cluster identity, Ready/lost state, profile, encrypted custody and target authority before
+and after asynchronous reads. Native grants continue to reject stale authority; waiting does not
+issue a session, reuse expired claims or select another source. Changed identity/custody or a
+future observation timestamp remains blocking. Preserve the same original operation and job
+when recovering an errored orchestration after telemetry returns.
+Do not refresh timestamps manually or increase the freshness limit. Resolve an uncertain
+orchestration control response through reads; never create a replacement order or adoption.
+
 Include ICMP from the actual assigned IPv6 gateway/128 with no destination ports or IPv4 scope
 in an initial provider-firewall plan, alongside its restricted TCP/UDP rules and permanent DROP.
 This permits gateway neighbor discovery; it does not claim arbitrary-path PMTU acceptance.

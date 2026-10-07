@@ -117,6 +117,9 @@ TLS control connections retain signed source identity. Gateway ICMPv6 permits ne
 Completed scan observations remain fresh at report admission; historical start/control times are
 bounded against scan completion. Owned cleanup inventories the same 13 resource collections through
 bounded direct Kubernetes reads, without discovery, and refuses incomplete or foreign resources.
+The producer waits if the retained source observation is stale, while transport access remains
+refused. Real fresh observations permit new bounded authority for that same source; changed
+identities remain blocking and the freshness limit is unchanged.
 US admission and complete measured live acceptance remain outstanding in PLAN.md.
 
 ```mermaid

@@ -38,7 +38,10 @@ import {
 } from "./domain/node-proof-execution.ts";
 import { canonicalNodeProof } from "@pgcf/contracts/node-proof";
 import { installationHash } from "./domain/node-installation.ts";
-import { assertNodeProofSourceAuthority } from "./domain/node-proof-source.ts";
+import {
+  assertNodeProofSourceAuthority,
+  isNodeProofSourceObservationPending,
+} from "./domain/node-proof-source.ts";
 
 const nativeAdmissionCodes = new Set([
   "container_busy",
@@ -1158,9 +1161,16 @@ export class NodeBootstrap extends DurableObject<Env> {
         sourceBinding = candidate;
       }
     }
-    const input = await prepareNodeProofInput(this.env, operationId, mode, {
-      sourceBinding,
-    });
+    let input;
+    try {
+      input = await prepareNodeProofInput(this.env, operationId, mode, {
+        sourceBinding,
+      });
+    } catch (error) {
+      if (isNodeProofSourceObservationPending(error))
+        return { operation_id: operationId, status: "waiting" };
+      throw error;
+    }
     if (!input) return { operation_id: operationId, status: "waiting" };
     const association = proofSourceBinding(input);
     await this.ctx.storage.transaction(async (txn) => {

@@ -1121,6 +1121,138 @@ it("dispatches proof continuation only after authenticated shared artifact verif
   expect(start).toHaveBeenCalledExactlyOnceWith(f.bindings, f.id);
   expect(accept).toHaveBeenCalledWith(f.bindings, f.session.bearer, report);
 });
+it("waits for fresh observations of the retained source before issuing another proof", async () => {
+  const f = await sourceGetterFixture(),
+    first = await execution.prepareNodeProofInput(
+      f.bindings,
+      f.id,
+      "preparation",
+      {
+        sourceBinding: f.association,
+      },
+    ),
+    expired = await issueNodeProofSession(
+      f.bindings,
+      f.id,
+      "preparation",
+      Date.now() - 600_000,
+    ),
+    old = NodeProofExecutionInput.parse({
+      ...first,
+      claims: expired.claims,
+      session_bearer: expired.bearer,
+      control_keys: expired.control_keys,
+    }),
+    posts: NodeProofExecutionInput[] = [];
+  const provider = vi
+    .spyOn(ContaboClient.prototype, "getInstance")
+    .mockRejectedValue(new Error("renewal_provider_forbidden"));
+  const container = {
+    running: true,
+    start: vi.fn(),
+    setInactivityTimeout: async () => {},
+    getTcpPort: () => ({
+      fetch: async (request: Request) => {
+        if (request.method === "POST") {
+          posts.push(NodeProofExecutionInput.parse(await request.json()));
+          return new Response(null, { status: 202 });
+        }
+        return new URL(request.url).pathname === "/"
+          ? new Response(null, { status: 401 })
+          : Response.json({ status: "failed" });
+      },
+    }),
+  };
+  const beforeJob = await readBootstrapJob(env.DB, f.id);
+  await f.withStore(async (instance, state) => {
+    await state.storage.put(
+      "inspection_server_binding_sha256",
+      f.binding.row.binding_sha256,
+    );
+    await state.storage.put(
+      "proof_current:preparation",
+      expired.claims.session_id,
+    );
+    await state.storage.put(`proof_input:${expired.claims.session_id}`, old);
+    Object.defineProperty(state, "container", {
+      configurable: true,
+      value: container,
+    });
+    try {
+      await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
+        .bind(
+          new Date(Date.now() - 181_000).toISOString(),
+          f.selected.source.fixture.node,
+        )
+        .run();
+      expect(await instance.prove(f.id, "preparation")).toEqual({
+        operation_id: f.id,
+        status: "waiting",
+      });
+      expect(posts).toEqual([]);
+      expect(await state.storage.get("proof_current:preparation")).toBe(
+        expired.claims.session_id,
+      );
+      expect(await state.storage.get("proof_source_binding")).toEqual(
+        f.association,
+      );
+      expect(await readBootstrapJob(env.DB, f.id)).toEqual(beforeJob);
+      await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
+        .bind(new Date().toISOString(), f.selected.source.fixture.node)
+        .run();
+      const result = await instance.prove(f.id, "preparation");
+      expect(result).toMatchObject({ status: "running" });
+      expect(posts).toHaveLength(1);
+      expect(posts[0]!.claims.session_id).not.toBe(expired.claims.session_id);
+      expect(Date.parse(posts[0]!.claims.expires_at)).toBeGreaterThan(
+        Date.now(),
+      );
+      expect(posts[0]!.source).toEqual(f.association.source);
+      expect(await state.storage.get("proof_source_binding")).toEqual(
+        f.association,
+      );
+      expect(await readBootstrapJob(env.DB, f.id)).toEqual(beforeJob);
+      expect(provider).not.toHaveBeenCalled();
+      expect(container.start).not.toHaveBeenCalled();
+      const source = f.association.source;
+      if (source.kind !== "pod") throw new Error("fixture_pod_source_missing");
+      await env.DB.prepare(
+        "UPDATE nodes SET node_uid=?,last_observed_at=? WHERE id=?",
+      )
+        .bind(
+          crypto.randomUUID(),
+          new Date(Date.now() - 181_000).toISOString(),
+          source.node_id,
+        )
+        .run();
+      await expect(instance.prove(f.id, "preparation")).rejects.toMatchObject({
+        code: "conflict",
+      });
+      await env.DB.prepare("UPDATE nodes SET node_uid=? WHERE id=?")
+        .bind(source.node_uid, source.node_id)
+        .run();
+      await state.storage.put("proof_source_binding", {
+        ...f.association,
+        source: { ...source, cluster_uid: crypto.randomUUID() },
+      });
+      await expect(instance.prove(f.id, "preparation")).rejects.toMatchObject({
+        code: "conflict",
+      });
+      await state.storage.put("proof_source_binding", f.association);
+      await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
+        .bind(new Date(Date.now() + 60_000).toISOString(), source.node_id)
+        .run();
+      await expect(instance.prove(f.id, "preparation")).rejects.toMatchObject({
+        code: "conflict",
+      });
+      expect(posts).toHaveLength(1);
+      expect(provider).not.toHaveBeenCalled();
+      expect(await readBootstrapJob(env.DB, f.id)).toEqual(beforeJob);
+    } finally {
+      delete (state as { container?: unknown }).container;
+    }
+  });
+});
 it("coalesces running proof sessions without registering a replacement Container job", async () => {
   const f = await fixture();
   const prepare = vi
