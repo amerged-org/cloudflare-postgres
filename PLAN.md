@@ -112,10 +112,25 @@ then exposed a real native `job_cancelled` at 01:49:52.584 UTC for the session i
 93.6 seconds elapsed, with 446.4 seconds remaining before its full 540-second expiry. Full-session
 expiry is excluded; the exact cleanup command and abort origin remain unconfirmed. Both older
 journals stayed at cleanup, with no new scanner or US installation write in that measured attempt.
-A diagnostic-only patch identifies finite cleanup operations and bounded/external abort origins;
-all 30/120/540-second bounds, ownership guards and unknown-delete readback remain unchanged.
-It is not yet delivered or accepted. Never reset or replace the job, sealed input, source journals
-or custody.
+The finite cleanup diagnostics are delivered from `2fce564f`, full CI `37560247666`;
+161 native tests, types, lint and independent review passed. Local qualification covered
+714,959,449 bytes/18 layers with zero unresolved findings; complete private-registry readback
+verified 162,115,839 compressed and 502,842,368 raw bytes. Native manifest
+`sha256:c8727fb4538592d667749ebcc1af4aa0d52d78052891755af8c7341b6e93f781` uses the same protected
+namespace/configuration except its URI. Direct deployment version 16/current placement 16 is
+RUNNING with that exact image, while the aggregate active counter remains 0; the discrepancy is
+retained without assuming its cause. The original created job, EU/US data identities and custody
+remain unchanged. A controlled resume then reported
+`proof_source_cleanup_namespace_inventory_command_deadline` at 02:29:07.128 UTC, 97.945 seconds
+after issuance at 02:27:29.183 UTC, with 442.055 seconds before expiry. The failing operation is
+the combined thirteen-kind namespace inventory under the existing 30-second command bound.
+Both old journals remained at cleanup and no US installation write occurred in that measured
+attempt. The bounded inventory fix uses fixed 4/3/3/3 batches, at most two concurrent reads and
+two fully settled waves. A measured-grant-cost virtual path completes in 115,840 ms; a serial
+model exceeds the aggregate bound. All responses and foreign-child checks precede namespace
+deletion, with the original total 256 KiB output bound and unchanged 30/120/540-second limits,
+UID/resource-version checks and unknown-delete readback. This fix is not yet delivered or
+accepted. Never reset or replace the job, sealed input, source journals or custody.
 The retained EU control node's UID-guarded new-database placement flag is now
 false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.
 Actual-RAM mode and automatic purchases remain disabled pending accepted US/recovery tests,

@@ -619,13 +619,18 @@ test("expired cleanup identifies its namespace inventory command deadline withou
     boundedTimers.push(timer);
     return timer.signal;
   });
+  t.mock.method(
+    AbortSignal,
+    "any",
+    (signals: Iterable<AbortSignal>) => [...signals][0]!,
+  );
   const commands: ProofSourceCommands = {
     ...f.commands,
     kube: async (args, permit, stdin, options) => {
       if (args[0] === "get" && args[1]!.includes(",")) {
         assert.equal(options!.timeout_ms, 30_000);
         boundedTimers
-          .at(-1)!
+          .find((timer) => timer.signal === options!.signal)!
           .abort(new DOMException("bounded cleanup deadline", "TimeoutError"));
         assert.equal(options!.signal.aborted, true);
         throw new BootstrapError("job_cancelled");
@@ -669,13 +674,18 @@ test("expired cleanup identifies a reduced aggregate deadline in its namespace i
     boundedTimers.push(timer);
     return timer.signal;
   });
+  t.mock.method(
+    AbortSignal,
+    "any",
+    (signals: Iterable<AbortSignal>) => [...signals][0]!,
+  );
   const commands: ProofSourceCommands = {
     ...f.commands,
     kube: async (args, permit, stdin, options) => {
       if (args[0] === "get" && args[1]!.includes(",")) {
         assert.ok(options!.timeout_ms > 0 && options!.timeout_ms < 30_000);
         boundedTimers
-          .at(-1)!
+          .find((timer) => timer.signal === options!.signal)!
           .abort(
             new DOMException("remaining aggregate deadline", "TimeoutError"),
           );
@@ -709,6 +719,11 @@ test("a new external abort takes precedence over a concurrent cleanup command de
     boundedTimers.push(timer);
     return timer.signal;
   });
+  t.mock.method(
+    AbortSignal,
+    "any",
+    (signals: Iterable<AbortSignal>) => [...signals][0]!,
+  );
   const commands: ProofSourceCommands = {
     ...f.commands,
     kube: async (args, permit, stdin, options) => {
@@ -716,7 +731,7 @@ test("a new external abort takes precedence over a concurrent cleanup command de
         assert.equal(options!.timeout_ms, 30_000);
         f.abort.abort(new DOMException("new external abort", "AbortError"));
         boundedTimers
-          .at(-1)!
+          .find((timer) => timer.signal === options!.signal)!
           .abort(new DOMException("bounded cleanup deadline", "TimeoutError"));
         throw new BootstrapError("job_cancelled");
       }
@@ -739,7 +754,7 @@ test("a new external abort takes precedence over a concurrent cleanup command de
   assert.equal(f.objects.size, 1);
 });
 
-test("expired cleanup has an aggregate budget for measured grant latency while every command remains bounded to thirty seconds", async (t) => {
+test("serial cleanup grant costs cannot extend aggregate or individual command bounds", async (t) => {
   const f = fixture(),
     assets = await readProofSourceAssets(false),
     original = structuredClone(f.input),
@@ -828,6 +843,108 @@ test("expired cleanup has an aggregate budget for measured grant latency while e
   );
   assert.equal(grants, 0);
   assert.equal(f.objects.size, 2);
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(base + 120_000).toISOString(),
+    ),
+    /proof_source_deadline/,
+  );
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.equal(f.state()!.namespace_uid, ownership.namespace_uid);
+  assert.ok(elapsed >= 120_000);
+  t.diagnostic(
+    JSON.stringify({
+      cleanup_model_elapsed_ms: elapsed,
+      successful_grants: grants,
+    }),
+  );
+});
+
+test("namespace inventory settles bounded paired batches within the measured cleanup budget", async (t) => {
+  const { f, original } = await expiredCleanupFixture(),
+    base = Date.now(),
+    boundedTimers: AbortController[] = [],
+    pending: { at: number; resolve: () => void }[] = [],
+    inventory: string[] = [];
+  let elapsed = 0,
+    scheduled = false,
+    active = 0,
+    maximumActive = 0;
+  const drain = () => {
+    scheduled = false;
+    const next = Math.min(...pending.map((entry) => entry.at));
+    elapsed = next;
+    for (let index = pending.length - 1; index >= 0; index--)
+      if (pending[index]!.at === next) pending.splice(index, 1)[0]!.resolve();
+    if (pending.length) {
+      scheduled = true;
+      setImmediate(drain);
+    }
+  };
+  const latency = (milliseconds: number) =>
+    new Promise<void>((resolve) => {
+      pending.push({ at: elapsed + milliseconds, resolve });
+      if (!scheduled) {
+        scheduled = true;
+        setImmediate(drain);
+      }
+    });
+  t.mock.method(Date, "now", () => base + elapsed);
+  t.mock.method(performance, "now", () => elapsed);
+  t.mock.method(AbortSignal, "timeout", () => {
+    const timer = new AbortController();
+    boundedTimers.push(timer);
+    return timer.signal;
+  });
+  t.mock.method(
+    AbortSignal,
+    "any",
+    (signals: Iterable<AbortSignal>) => [...signals][0]!,
+  );
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    authorizeSource: async () => {
+      await latency(3700);
+      await f.commands.authorizeSource();
+    },
+    readOwnership: async () => {
+      await latency(380);
+      return f.commands.readOwnership!();
+    },
+    saveOwnership: async (state) => {
+      await latency(380);
+      await f.commands.saveOwnership!(state);
+    },
+    kube: async (args, permit, stdin, options) => {
+      assert.ok(options!.timeout_ms > 0 && options!.timeout_ms <= 30_000);
+      const isInventory = args[0] === "get" && args[1]!.includes(",");
+      if (isInventory) {
+        inventory.push(args[1]!);
+        if (args[1]!.split(",").length > 4) {
+          // Reproduce the observed combined command reaching its own bound.
+          // The measured grant costs below do not claim a connection per kind.
+          await latency(options!.timeout_ms);
+          boundedTimers
+            .find((timer) => timer.signal === options!.signal)!
+            .abort(
+              new DOMException("combined inventory deadline", "TimeoutError"),
+            );
+          throw new BootstrapError("job_cancelled");
+        }
+        active++;
+        maximumActive = Math.max(maximumActive, active);
+      }
+      try {
+        await latency(3700);
+        return await f.commands.kube!(args, permit, stdin, options);
+      } finally {
+        if (isInventory) active--;
+      }
+    },
+  };
   await cleanupOwnedProofSource(
     f.source,
     original,
@@ -836,17 +953,124 @@ test("expired cleanup has an aggregate budget for measured grant latency while e
   );
   assert.equal(f.state()!.stage, "cleaned");
   assert.equal(f.objects.size, 0);
+  assert.equal(maximumActive, 2);
+  assert.equal(active, 0);
   assert.deepEqual(
-    f.mutations.map((args) => args[0]),
-    ["delete", "delete"],
+    inventory.map((value) => value.split(",").length).sort(),
+    [3, 3, 3, 4],
   );
-  assert.ok(grants >= 20 && elapsed > 30_000 && elapsed < 120_000);
-  t.diagnostic(
-    JSON.stringify({
-      cleanup_model_elapsed_ms: elapsed,
-      successful_grants: grants,
-    }),
+  assert.equal(
+    new Set(inventory.flatMap((value) => value.split(","))).size,
+    13,
   );
+  assert.ok(elapsed > 108_440 && elapsed < 120_000);
+  t.diagnostic(JSON.stringify({ measured_grant_model_elapsed_ms: elapsed }));
+});
+
+test("a foreign child in the final inventory batch preserves the namespace", async () => {
+  const { f, original, ownership } = await expiredCleanupFixture(),
+    inventory: string[] = [];
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && args[1]!.includes(",")) {
+        inventory.push(args[1]!);
+        if (args[1] === "replicasets.apps,jobs.batch,cronjobs.batch")
+          return {
+            exit_code: 0,
+            stdout: JSON.stringify({
+              apiVersion: "v1",
+              kind: "List",
+              items: [
+                {
+                  apiVersion: "batch/v1",
+                  kind: "Job",
+                  metadata: {
+                    name: "foreign",
+                    namespace: ownership.namespace_name,
+                    uid: randomUUID(),
+                    resourceVersion: "1",
+                  },
+                },
+              ],
+            }),
+          };
+      }
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 120_000).toISOString(),
+    ),
+    /proof_source_namespace_children_unknown/,
+  );
+  assert.equal(inventory.length, 4);
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.equal(f.objects.size, 1);
+});
+
+test("a failed inventory batch waits for its started sibling before refusing namespace deletion", async () => {
+  const { f, original } = await expiredCleanupFixture();
+  let siblingSettled = false;
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[1] === "deployments.apps,statefulsets.apps,daemonsets.apps")
+        throw new Error("inventory_read_unavailable");
+      if (args[1] === "replicasets.apps,jobs.batch,cronjobs.batch") {
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        siblingSettled = true;
+      }
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 120_000).toISOString(),
+    ),
+    /inventory_read_unavailable/,
+  );
+  assert.equal(siblingSettled, true);
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.equal(f.objects.size, 1);
+});
+
+test("inventory batches share the original total output budget", async () => {
+  const { f, original } = await expiredCleanupFixture();
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && args[1]!.includes(","))
+        return {
+          exit_code: 0,
+          stdout: JSON.stringify({
+            apiVersion: "v1",
+            kind: "List",
+            items: [],
+            padding: "x".repeat(70_000),
+          }),
+        };
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 120_000).toISOString(),
+    ),
+    /proof_source_output_limit/,
+  );
+  assert.equal(f.state()!.stage, "cleanup");
+  assert.equal(f.objects.size, 1);
 });
 
 test("Pod source never receives host paths, API tokens or a global signing key", async () => {

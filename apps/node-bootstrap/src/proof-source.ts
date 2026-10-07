@@ -812,29 +812,56 @@ class SourceRunner {
       return fail("source_identity_changed");
   }
   private async namespaceChildren() {
-    const resources =
-      "pods,persistentvolumeclaims,secrets,configmaps,services,serviceaccounts,replicationcontrollers,deployments.apps,statefulsets.apps,daemonsets.apps,replicasets.apps,jobs.batch,cronjobs.batch";
-    const result = await this.kube(
-      [
-        "get",
-        resources,
-        "--namespace",
-        this.state.namespace_name!,
-        "--output=json",
+    const batches = [
+        "pods,persistentvolumeclaims,secrets,configmaps",
+        "services,serviceaccounts,replicationcontrollers",
+        "deployments.apps,statefulsets.apps,daemonsets.apps",
+        "replicasets.apps,jobs.batch,cronjobs.batch",
       ],
-      undefined,
-      true,
-      "namespace_inventory",
-    );
-    if (result.exit_code !== 0) return fail("namespace_children_unknown");
-    const list = object(JSON.parse(result.stdout));
-    if (
-      list.apiVersion !== "v1" ||
-      list.kind !== "List" ||
-      !Array.isArray(list.items)
-    )
-      return fail("namespace_children_unknown");
-    for (const raw of list.items) {
+      results: CommandResult[] = [];
+    let bytes = 0;
+    for (let index = 0; index < batches.length; index += 2) {
+      const settled = await Promise.allSettled(
+        batches
+          .slice(index, index + 2)
+          .map((resources) =>
+            this.kube(
+              [
+                "get",
+                resources,
+                "--namespace",
+                this.state.namespace_name!,
+                "--output=json",
+              ],
+              undefined,
+              true,
+              "namespace_inventory",
+            ),
+          ),
+      );
+      const failed = settled.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
+      for (const result of settled) {
+        if (result.status !== "fulfilled")
+          return fail("namespace_children_unknown");
+        bytes += Buffer.byteLength(result.value.stdout);
+        if (bytes > 256 * 1024) return fail("output_limit");
+        results.push(result.value);
+      }
+    }
+    const items: unknown[] = [];
+    for (const result of results) {
+      if (result.exit_code !== 0) return fail("namespace_children_unknown");
+      const list = object(JSON.parse(result.stdout));
+      if (
+        list.apiVersion !== "v1" ||
+        list.kind !== "List" ||
+        !Array.isArray(list.items)
+      )
+        return fail("namespace_children_unknown");
+      items.push(...list.items);
+    }
+    for (const raw of items) {
       const value = object(raw),
         m = metadata(value);
       if (
