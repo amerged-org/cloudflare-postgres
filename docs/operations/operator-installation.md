@@ -58,6 +58,13 @@ host keys or certificates before work and owned cleanup; changed or unknown iden
 Do not query Contabo for each Kubernetes/Talos command, grant, relay connection or cleanup step.
 Provider reads belong to order/initial mapping, firewall/rescue, hypervisor and uncertain-outcome
 reconciliation, with a fresh matching provider check before the first destructive checkpoint.
+Routine signed-proof admission is also provider-free: validate the current sealed Cloudflare
+plan/configuration, region membership, allocation/leases and signed R2 evidence, then atomically
+fence those records without extending observation freshness. Before the first disk-write intent,
+read current target addresses/hardware and exact firewall ownership, assignments, rules and
+attachment state. These checks never repair provider policy; changed facts or a concurrent CF
+network change block the checkpoint. Later write chunks retain their scoped authority and
+readback checks without repeating provider queries.
 The provider client retains credential-scoped OAuth reuse/coalescing, early-expiry refresh and
 401 invalidation. A credential change closes reuse of the old client; an uncertain mutation is
 resolved through its existing claim and readback rather than replayed.

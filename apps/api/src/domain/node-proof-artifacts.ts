@@ -28,7 +28,6 @@ import { installationHash } from "./node-installation.ts";
 import {
   NODE_PREPARATION_SIGNATURE_DOMAIN,
   canonicalNodePreparationProof,
-  ensureNodeFirewall,
   ensureNodeNetwork,
   ip,
   nodePreparationProofSchema,
@@ -835,7 +834,6 @@ export async function acceptNodeProofReport(
           state.plan,
           measurements.scans,
         );
-  if (!(await ensureNodeFirewall(env, claims.operation_id))) return deny();
   await authenticateNodeProofSession(env, token, claims.operation_id);
   const artifact = await publish(
     env,

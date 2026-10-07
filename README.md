@@ -106,6 +106,8 @@ The programmed installer selects a provider-verified source once and retains its
 Cloudflare across proof renewals. Renewed claims are short-lived; current job/binding authority,
 host keys, TLS, Cluster UID, Node UID and fresh native identity readbacks still fence execution.
 Kubernetes/Talos commands, transport grants and proof cleanup must make zero Contabo calls.
+Routine signed-proof admission likewise uses current Cloudflare/R2 custody. Fresh provider
+address and read-only firewall checks fence the first destructive installation checkpoint.
 Contabo remains at purchase, initial inventory/firewall/rescue, hypervisor and uncertain-provider
 resolution boundaries, including fresh verification before the first destructive write. Its
 credential-scoped client reuses and coalesces OAuth until early expiry or 401 invalidation;

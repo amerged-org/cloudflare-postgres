@@ -52,6 +52,7 @@ import {
 import {
   ContaboClient,
   type ContaboInstance,
+  type ContaboFirewall,
 } from "../../src/providers/contabo.ts";
 import {
   joinBundleReference,
@@ -623,7 +624,52 @@ function providerTarget(
   };
 }
 async function beforeDestructiveWrite() {
-  const f = await prepared(),
+  const tenant = crypto.randomUUID(),
+    customer = crypto.randomUUID();
+  let plan!: ReturnType<typeof peerPlan>;
+  const f = await prepared(true, async (value) => {
+      plan = peerPlan(value);
+      delete value.configuration.spec.peer_ipv4;
+      plan.members = plan.members.slice(0, 1);
+      const member = plan.members[0]!;
+      member.ownership_sha256 = bytesToHex(
+        new Uint8Array(
+          await crypto.subtle.digest(
+            "SHA-256",
+            new TextEncoder().encode(
+              canonicalConfiguration([tenant, customer]),
+            ),
+          ),
+        ),
+      );
+      member.rules_sha256 = bytesToHex(
+        new Uint8Array(
+          await crypto.subtle.digest("SHA-256", new TextEncoder().encode("[]")),
+        ),
+      );
+      value.bindings.BOOTSTRAP_FIREWALL_BINDINGS = JSON.stringify({
+        [member.provider_instance_id]: member.firewall_id,
+      });
+      value.bindings.BOOTSTRAP_OPERATOR_SOURCES = JSON.stringify(
+        plan.operators.ipv4,
+      );
+      value.bindings.BOOTSTRAP_SCAN_CONTROL = JSON.stringify(plan.scan_control);
+      await storePeerPlan(value, plan, { status: "verified" });
+      const row = await env.DB.prepare(
+        "SELECT plan_sha256 FROM node_network_preparations WHERE operation_id=?",
+      )
+        .bind(value.addition.intent.operation_id)
+        .first<{ plan_sha256: string }>();
+      await env.DB.prepare(
+        "INSERT INTO node_network_firewalls(firewall_id,operation_id,plan_sha256) VALUES(?,?,?)",
+      )
+        .bind(
+          member.firewall_id,
+          value.addition.intent.operation_id,
+          row!.plan_sha256,
+        )
+        .run();
+    }),
     current = {
       ...JSON.parse(f.job.checkpoint_json),
       stage: "image_verified",
@@ -645,9 +691,57 @@ async function beforeDestructiveWrite() {
     destructive_intent: true,
     write_intent_offset: 0,
   };
+  const member = plan.members[0]!,
+    firewall: ContaboFirewall = {
+      tenantId: tenant,
+      customerId: customer,
+      firewallId: member.firewall_id,
+      name: "fixture",
+      description: "fixture",
+      status: "active",
+      instanceStatus: [
+        { instanceId: f.spec.provider_instance_id, status: "ok" },
+      ],
+      instances: [
+        {
+          instanceId: f.spec.provider_instance_id,
+          displayName: null,
+          name: f.spec.hostname,
+          productId: f.addition.audit!.product_id,
+          ipConfig: {
+            v4: providerTarget(f).ipConfig!.v4,
+            v6: { ip: "", gateway: "", netmaskCidr: 0 },
+          },
+          regionSlug: "EU",
+          regionName: "EU",
+          dataCenterSlug: "fixture",
+          dataCenterName: "fixture",
+        },
+      ],
+      rules: {
+        inbound: [
+          {
+            protocol: "",
+            destPorts: [],
+            srcCidr: { ipv4: [], ipv6: [] },
+            action: "drop",
+            status: "active",
+            displayName: "Block all traffic",
+          },
+        ],
+      },
+      createdDate: new Date().toISOString(),
+      updatedDate: new Date().toISOString(),
+    };
+  const firewallRead = vi
+    .spyOn(ContaboClient.prototype, "getFirewall")
+    .mockImplementation(async () => structuredClone(firewall));
   return {
     f,
     next,
+    firewall,
+    firewallRead,
+    plan,
     envelope: {
       ...f.identity,
       kind: "checkpoint",
@@ -656,7 +750,244 @@ async function beforeDestructiveWrite() {
     },
   };
 }
+function beforeCheckpointCas(change: () => Promise<void>) {
+  const prepare = env.DB.prepare.bind(env.DB);
+  vi.spyOn(env.DB, "prepare").mockImplementation((sql) => {
+    const statement = prepare(sql);
+    if (sql.startsWith("UPDATE node_bootstrap_jobs SET checkpoint_json")) {
+      const bind = statement.bind.bind(statement);
+      Object.defineProperty(statement, "bind", {
+        value: (...values: unknown[]) => {
+          const bound = bind(...values),
+            run = bound.run.bind(bound);
+          Object.defineProperty(bound, "run", {
+            value: async () => {
+              await change();
+              return run();
+            },
+          });
+          return bound;
+        },
+      });
+    }
+    return statement;
+  });
+}
+async function confirmedFirewallAllocation(
+  f: Awaited<ReturnType<typeof prepared>>,
+  firewall: ContaboFirewall,
+) {
+  const now = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO node_firewall_allocations(operation_id,node_id,region_id,provider_instance_id,provider_region,product_id,image_id,intent_hash,inventory_revision,tenant_id,customer_id,request_id,name,description,state,firewall_id,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,'confirmed',?,?,?)",
+  )
+    .bind(
+      f.job.operation_id,
+      f.job.node_id,
+      f.job.region_id,
+      f.spec.provider_instance_id,
+      f.addition.audit!.provider_region,
+      f.addition.audit!.product_id,
+      f.addition.audit!.image_id,
+      f.addition.intent_hash,
+      f.addition.revision,
+      firewall.tenantId,
+      firewall.customerId,
+      crypto.randomUUID(),
+      crypto.randomUUID(),
+      "fixture",
+      firewall.firewallId,
+      now,
+      now,
+    )
+    .run();
+}
 describe("protected bootstrap authority", () => {
+  it("rejects changed firewall rules before first disk intent without repairing provider state", async () => {
+    const { f, envelope, firewall, firewallRead } =
+        await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id);
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(
+      providerTarget(f),
+    );
+    firewall.rules.inbound.unshift({
+      protocol: "tcp",
+      destPorts: ["5432"],
+      srcCidr: { ipv4: ["203.0.113.99/32"] },
+      action: "accept",
+      status: "active",
+      displayName: "Unexpected public access",
+    });
+    const repair = vi.spyOn(ContaboClient.prototype, "putFirewallRules");
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(firewallRead).toHaveBeenCalledTimes(1);
+    expect(repair).not.toHaveBeenCalled();
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("rejects a foreign firewall owner before the first disk intent", async () => {
+    const { f, envelope, firewall } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id);
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(
+      providerTarget(f),
+    );
+    firewall.tenantId = crypto.randomUUID();
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("rejects an actual IPv6 assignment changed while IPv4 and MAC remain sealed", async () => {
+    const { f, envelope } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id),
+      actual = providerTarget(f);
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue({
+      ...actual,
+      ipConfig: {
+        ...actual.ipConfig!,
+        v6: { ip: "2001:db8::70", gateway: "fe80::1", netmaskCidr: 64 },
+      },
+    });
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("rejects an unconfirmed firewall attachment before the first disk intent", async () => {
+    const { f, envelope, firewall } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id);
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(
+      providerTarget(f),
+    );
+    firewall.instanceStatus[0]!.status = "processing";
+    const assign = vi.spyOn(ContaboClient.prototype, "assignFirewall");
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(assign).not.toHaveBeenCalled();
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("blocks a Cloudflare firewall lease changed during provider readback", async () => {
+    const { f, envelope, firewall, firewallRead } =
+        await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id);
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(
+      providerTarget(f),
+    );
+    firewallRead.mockImplementation(async () => {
+      await env.DB.prepare(
+        "UPDATE node_network_firewalls SET revision=revision+1 WHERE firewall_id=?",
+      )
+        .bind(firewall.firewallId)
+        .run();
+      return structuredClone(firewall);
+    });
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("atomically binds the first disk intent to the exact Cloudflare network snapshot", async () => {
+    const { f, envelope } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id),
+      prepare = env.DB.prepare.bind(env.DB);
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(
+      providerTarget(f),
+    );
+    vi.spyOn(env.DB, "prepare").mockImplementation((sql) => {
+      const statement = prepare(sql);
+      if (sql.startsWith("UPDATE node_bootstrap_jobs SET checkpoint_json")) {
+        const bind = statement.bind.bind(statement);
+        Object.defineProperty(statement, "bind", {
+          value: (...values: unknown[]) => {
+            const bound = bind(...values),
+              run = bound.run.bind(bound);
+            Object.defineProperty(bound, "run", {
+              value: async () => {
+                await prepare(
+                  "UPDATE node_network_preparations SET revision=revision+1 WHERE operation_id=?",
+                )
+                  .bind(f.job.operation_id)
+                  .run();
+                return run();
+              },
+            });
+            return bound;
+          },
+        });
+      }
+      return statement;
+    });
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("fences firewall lease changes between readback and the destructive CAS", async () => {
+    const { f, envelope, firewall } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id);
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(
+      providerTarget(f),
+    );
+    beforeCheckpointCas(async () => {
+      await env.DB.prepare(
+        "UPDATE node_network_firewalls SET revision=revision+1 WHERE firewall_id=?",
+      )
+        .bind(firewall.firewallId)
+        .run();
+    });
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("fences a newly created firewall allocation after a static-binding readback", async () => {
+    const { f, envelope, firewall } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id);
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(
+      providerTarget(f),
+    );
+    beforeCheckpointCas(async () => {
+      await confirmedFirewallAllocation(f, firewall);
+    });
+    const response = await callback(f, envelope);
+    await env.DB.prepare(
+      "DELETE FROM node_firewall_allocations WHERE operation_id=?",
+    )
+      .bind(f.job.operation_id)
+      .run();
+    expect(response.status).toBe(409);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
+  it("fences revocation of a confirmed allocation before the destructive CAS", async () => {
+    const { f, envelope, firewall } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id);
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(
+      providerTarget(f),
+    );
+    await confirmedFirewallAllocation(f, firewall);
+    try {
+      beforeCheckpointCas(async () => {
+        await env.DB.prepare(
+          "UPDATE node_firewall_allocations SET state='blocked' WHERE operation_id=?",
+        )
+          .bind(f.job.operation_id)
+          .run();
+      });
+      expect((await callback(f, envelope)).status).toBe(409);
+      expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(
+        before,
+      );
+    } finally {
+      await env.DB.prepare(
+        "DELETE FROM node_firewall_allocations WHERE operation_id=?",
+      )
+        .bind(f.job.operation_id)
+        .run();
+    }
+  });
+  it("fences regional membership changed after the provider firewall readback", async () => {
+    const { f, envelope } = await beforeDestructiveWrite(),
+      before = await readBootstrapJob(env.DB, f.job.operation_id),
+      added = await fixture();
+    vi.spyOn(ContaboClient.prototype, "getInstance").mockResolvedValue(
+      providerTarget(f),
+    );
+    beforeCheckpointCas(async () => {
+      await env.DB.prepare("UPDATE nodes SET region_id=? WHERE id=?")
+        .bind(f.job.region_id, added.node)
+        .run();
+    });
+    expect((await callback(f, envelope)).status).toBe(409);
+    expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
+  });
   it("verifies the initial network boundary once while keeping fresh Cloudflare proof authority", async () => {
     const f = await prepared(),
       verify = vi.spyOn(network, "ensureNodeNetwork").mockResolvedValue(true);
@@ -720,14 +1051,24 @@ describe("protected bootstrap authority", () => {
     expect(await readBootstrapJob(env.DB, f.job.operation_id)).toEqual(before);
   });
   it("verifies only the first destructive boundary and rejects replayed revisions before provider access", async () => {
-    const { f, envelope, next } = await beforeDestructiveWrite(),
+    const { f, envelope, next, firewallRead } = await beforeDestructiveWrite(),
       provider = vi
         .spyOn(ContaboClient.prototype, "getInstance")
         .mockResolvedValue(providerTarget(f));
     expect((await callback(f, envelope)).status).toBe(200);
     expect(provider).toHaveBeenCalledTimes(1);
+    expect(firewallRead).toHaveBeenCalledTimes(1);
+    expect(provider.mock.calls[0]![1]!.accounting).toEqual({
+      operation_id: f.job.operation_id,
+      stage: "prewrite",
+    });
+    expect(firewallRead.mock.calls[0]![1]!.accounting).toEqual({
+      operation_id: f.job.operation_id,
+      stage: "prewrite",
+    });
     expect((await callback(f, envelope)).status).toBe(409);
     expect(provider).toHaveBeenCalledTimes(1);
+    expect(firewallRead).toHaveBeenCalledTimes(1);
     expect(
       (
         await callback(f, {
@@ -738,6 +1079,7 @@ describe("protected bootstrap authority", () => {
       ).status,
     ).toBe(200);
     expect(provider).toHaveBeenCalledTimes(1);
+    expect(firewallRead).toHaveBeenCalledTimes(1);
   });
   it("leaves the checkpoint untouched when first-write provider verification fails", async () => {
     const { f, envelope } = await beforeDestructiveWrite(),

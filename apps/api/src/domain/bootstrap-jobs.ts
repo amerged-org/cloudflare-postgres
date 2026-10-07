@@ -51,7 +51,13 @@ import {
 } from "./node-state.ts";
 import { contaboClient, issueBootstrapTransport } from "./bootstrap-relay.ts";
 import { hasAllocatedContaboHardware } from "../providers/contabo.ts";
-import { hasVerifiedNodePreparation } from "./node-network.ts";
+import {
+  hasVerifiedNodePreparation,
+  hasNodeNetworkTargetAddresses,
+  readNodeNetworkSnapshot,
+  verifyNodeFirewallSnapshot,
+  type NodeNetworkSnapshot,
+} from "./node-network.ts";
 
 export const NodeBootstrapConfiguration = z.strictObject({
   expected_revision: z.number().int().positive(),
@@ -527,6 +533,7 @@ interface DestructiveProviderAuthority {
   intent_hash: string;
   audit_json: string;
   receipt_json: string;
+  network: NodeNetworkSnapshot;
 }
 async function destructiveProviderAuthority(
   env: Env,
@@ -554,7 +561,7 @@ async function destructiveProviderAuthority(
     "SELECT revision,provider_instance_id,intent_hash,audit_json,receipt_json FROM node_additions WHERE operation_id=?",
   )
     .bind(row.operation_id)
-    .first<DestructiveProviderAuthority>();
+    .first<Omit<DestructiveProviderAuthority, "network">>();
   if (
     !snapshot ||
     snapshot.revision !== addition.revision ||
@@ -569,6 +576,19 @@ async function destructiveProviderAuthority(
     ) !== JSON.stringify(addition.receipt)
   )
     throw new ApiError("conflict", "Provider audit snapshot changed");
+  const network = await readNodeNetworkSnapshot(env, row.operation_id);
+  if (
+    !network ||
+    network.intent_hash !== addition.intent_hash ||
+    network.status !== "verified" ||
+    network.proof_sha256 === null ||
+    network.proof_expires_at === null ||
+    Date.parse(network.proof_expires_at) <= Date.now()
+  )
+    throw new ApiError(
+      "conflict",
+      "Network authority changed before disk write",
+    );
   const actual = await contaboClient(env).getInstance(
     spec.provider_instance_id,
     {
@@ -584,11 +604,19 @@ async function destructiveProviderAuthority(
     actual.imageId !== addition.audit.image_id ||
     (actual.cancelDate !== null && actual.cancelDate !== "") ||
     actual.ipConfig.v4.ip !== spec.hardware.ipv4 ||
+    actual.ipConfig.v4.gateway !== spec.hardware.gateway ||
+    actual.ipConfig.v4.netmaskCidr !== spec.hardware.prefix_length ||
+    !hasNodeNetworkTargetAddresses(network, actual) ||
     actual.macAddress.toLowerCase() !== spec.hardware.mac.toLowerCase()
   )
     throw new ApiError(
       "conflict",
       "Provider inventory changed before disk write",
+    );
+  if (!(await verifyNodeFirewallSnapshot(env, network)))
+    throw new ApiError(
+      "conflict",
+      "Provider firewall changed before disk write",
     );
   const fresh = await readBootstrapJob(env.DB, row.operation_id),
     current = await readNodeAddition(env.DB, row.operation_id);
@@ -606,7 +634,7 @@ async function destructiveProviderAuthority(
       "Destructive checkpoint changed concurrently",
     );
   await authority(env, fresh);
-  return snapshot;
+  return { ...snapshot, network };
 }
 export async function bootstrapCallback(
   c: ApiContext,
@@ -799,7 +827,28 @@ export async function bootstrapCallback(
     WHERE operation_id=? AND input_hash=? AND revision=? AND authorized=1 AND admitted=0 AND cancelled=0
       AND (? IS NULL OR EXISTS(SELECT 1 FROM node_additions a WHERE a.operation_id=node_bootstrap_jobs.operation_id
         AND a.revision=? AND a.provider_instance_id=? AND a.intent_hash=? AND a.audit_json=? AND a.receipt_json=?
-        AND a.slot_held=1 AND a.status IN ('audited','bootstrapping')))`,
+        AND a.slot_held=1 AND a.status IN ('audited','bootstrapping')))
+      AND (? IS NULL OR (
+        EXISTS(SELECT 1 FROM node_network_preparations p WHERE p.operation_id=node_bootstrap_jobs.operation_id
+          AND p.intent_hash=? AND p.plan_sha256=? AND p.plan_json=? AND p.revision=? AND p.status='verified'
+          AND p.readback_at=? AND p.proof_sha256=? AND p.proof_expires_at=?
+          AND julianday(p.proof_expires_at)>julianday('now'))
+        AND EXISTS(SELECT 1 FROM regions r WHERE r.id=node_bootstrap_jobs.region_id
+          AND r.provider='contabo' AND r.provider_region=?)
+        AND NOT EXISTS(SELECT 1 FROM json_each(?) s WHERE NOT EXISTS(
+          SELECT 1 FROM node_network_firewalls l WHERE l.firewall_id=json_extract(s.value,'$.firewall_id')
+            AND l.operation_id=json_extract(s.value,'$.operation_id') AND l.plan_sha256=json_extract(s.value,'$.plan_sha256')
+            AND l.revision=json_extract(s.value,'$.revision')))
+        AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=node_bootstrap_jobs.region_id
+          AND n.id<>node_bootstrap_jobs.node_id AND n.lost_at IS NULL AND NOT EXISTS(
+            SELECT 1 FROM json_each(?,'$.members') m WHERE json_extract(m.value,'$.node_id')=n.id
+              AND json_extract(m.value,'$.provider_instance_id')=n.provider_instance_id))
+        AND NOT EXISTS(SELECT 1 FROM json_each(?,'$.members') m WHERE json_extract(m.value,'$.node_id')<>node_bootstrap_jobs.node_id
+          AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=node_bootstrap_jobs.region_id AND n.lost_at IS NULL
+            AND n.id=json_extract(m.value,'$.node_id') AND n.provider_instance_id=json_extract(m.value,'$.provider_instance_id')))
+        AND ((? IS NULL AND NOT EXISTS(SELECT 1 FROM node_firewall_allocations f WHERE f.operation_id=node_bootstrap_jobs.operation_id))
+          OR EXISTS(SELECT 1 FROM node_firewall_allocations f WHERE f.operation_id=node_bootstrap_jobs.operation_id
+            AND f.firewall_id IS ? AND f.state=? AND f.result_json IS ? AND f.updated_at=?))))`,
   )
     .bind(
       JSON.stringify(checkpoint),
@@ -814,6 +863,25 @@ export async function bootstrapCallback(
       providerAuthority?.intent_hash ?? null,
       providerAuthority?.audit_json ?? null,
       providerAuthority?.receipt_json ?? null,
+      providerAuthority?.network.revision ?? null,
+      providerAuthority?.network.intent_hash ?? null,
+      providerAuthority?.network.plan_sha256 ?? null,
+      providerAuthority?.network.plan_json ?? null,
+      providerAuthority?.network.revision ?? null,
+      providerAuthority?.network.readback_at ?? null,
+      providerAuthority?.network.proof_sha256 ?? null,
+      providerAuthority?.network.proof_expires_at ?? null,
+      providerAuthority?.network.provider_region ?? null,
+      JSON.stringify(providerAuthority?.network.firewall_leases ?? []),
+      providerAuthority?.network.plan_json ?? "{}",
+      providerAuthority?.network.plan_json ?? "{}",
+      providerAuthority?.network.allocation === null || !providerAuthority
+        ? null
+        : 1,
+      providerAuthority?.network.allocation?.firewall_id ?? null,
+      providerAuthority?.network.allocation?.state ?? null,
+      providerAuthority?.network.allocation?.result_json ?? null,
+      providerAuthority?.network.allocation?.updated_at ?? null,
     )
     .run();
   if (result.meta.changes !== 1)

@@ -255,6 +255,33 @@ ownership and never replay the DELETE.65 affected source/runner cases, Native ty
 lint, formatting and independent review pass. The46.965-second transport model is synthetic;
 actual cleanup/admission timing still requires the next live continuation.
 
+Source `64f3b93f`, full CI `37668646906`, is delivered once with qualified Native manifest
+`sha256:74b88ee2fc03c62731270a6589d89b132340c0da4223739f71bc55b633bba7e3`.
+All18 layers/714,980,441 qualification bytes passed; complete private readback verified
+162,119,181 compressed and502,863,360 raw bytes. The first local build stopped before building
+because Docker was unavailable; its artifacts remained, and one fresh local retry followed
+confirmed daemon readiness. No provider action or CI rerun accompanied that retry. Application,
+deployment and placement24 matched the image; the original created US job and all EU protection
+remained. One controlled resume started at18:58:34.902Z. Two reports returned200 but did not
+establish verified CF preparation. The completed30-minute capture contained356 owned requests,
+2 OAuth plus24 provider GET attempts, all in the firewall stage, and zero routine transport
+provider calls. One controlled pause at step349 retained zero downloaded/written bytes.
+
+Exact signed-R2 readback and offline execution of the real proof verifier validated signatures,
+scope, source, access, rules and all timestamp floors at signing. The first failing predicate
+was IPv4 final-control freshness at120001ms. The latest signing age was119.163 seconds; its
+provider-backed handler ended at130.487 seconds. Repeated provider checks inside routine proof
+verification caused the refusal. Reproducing tests require real D1/R2/Ed25519 report verification
+with provider fetch forbidden, while initial firewall/rescue provisioning remains explicit.
+The repair verifies current sealed CF plan, region/member/config scope, allocation and lease
+before/after signed-artifact reads and in the atomic proof CAS, without provider calls. It retains
+the120-second gate. Before the first destructive checkpoint, fresh instance addresses/hardware
+and read-only owned/assigned/exact firewall facts are mandatory, followed by an atomic network,
+proof, expiry, region/member, lease/allocation and existing audit/receipt fence. Changed facts or
+concurrent revocation block without a disk-write intent; later chunks make no provider reads.
+40 network/report and42 callback cases, API types, scoped lint/formatting and reciprocal review
+pass. This correction is API-only; live US Ready/SQL/TLS/R2/WAL/restore/reclamation remain pending.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

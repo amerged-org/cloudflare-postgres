@@ -22,6 +22,7 @@ import {
 import {
   ensureNodeNetwork,
   ensureNodeFirewall,
+  readNodeNetworkSnapshot,
   canonicalNodePreparationProof,
   NODE_PREPARATION_SIGNATURE_DOMAIN,
   type NodeNetworkEnv,
@@ -30,11 +31,115 @@ import {
 import { fixture, cleanupFixtures } from "./fixtures.ts";
 const operations: string[] = [];
 const policies: string[] = [];
+it("verifies a fresh signed proof from sealed Cloudflare state without provider calls", async () => {
+  const f = await setup();
+  await f.settle();
+  await f.sign(await f.payload());
+  const before = f.calls.length;
+  expect(
+    await ensureNodeNetwork(f.settings, f.addition.intent.operation_id),
+  ).toBe(true);
+  expect(f.calls).toHaveLength(before);
+});
+it("blocks changed configured management scope before committing a provider-free proof", async () => {
+  const f = await setup();
+  await f.settle();
+  await f.sign(await f.payload());
+  const before = f.calls.length;
+  f.settings.BOOTSTRAP_OPERATOR_SOURCES = JSON.stringify(["8.8.8.8/32"]);
+  expect(
+    await ensureNodeNetwork(f.settings, f.addition.intent.operation_id),
+  ).toBe(false);
+  expect(
+    await readNodeNetworkSnapshot(f.settings, f.addition.intent.operation_id),
+  ).toBeNull();
+  const row = await env.DB.prepare(
+    "SELECT status,proof_sha256 FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .first();
+  expect(row).toMatchObject({ status: "awaiting_proof", proof_sha256: null });
+  expect(f.calls).toHaveLength(before);
+});
+it("blocks a firewall lease revision change during the R2 proof read without a network CAS", async () => {
+  const f = await setup();
+  await f.settle();
+  await f.sign(await f.payload());
+  const get = env.ARCHIVE.get.bind(env.ARCHIVE);
+  vi.spyOn(env.ARCHIVE, "get").mockImplementation(async (...args) => {
+    const value = await get(...args);
+    await env.DB.prepare(
+      "UPDATE node_network_firewalls SET revision=revision+1 WHERE operation_id=?",
+    )
+      .bind(f.addition.intent.operation_id)
+      .run();
+    return value;
+  });
+  const before = f.calls.length;
+  expect(
+    await ensureNodeNetwork(f.settings, f.addition.intent.operation_id),
+  ).toBe(false);
+  const row = await env.DB.prepare(
+    "SELECT status,proof_sha256 FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .first();
+  expect(row).toMatchObject({ status: "awaiting_proof", proof_sha256: null });
+  expect(f.calls).toHaveLength(before);
+});
+it("fences an allocation created after the last read in the atomic proof CAS", async () => {
+  const f = await setup();
+  await f.settle();
+  await f.sign(await f.payload());
+  const prepare = env.DB.prepare.bind(env.DB);
+  vi.spyOn(env.DB, "prepare").mockImplementation((sql) => {
+    const statement = prepare(sql);
+    if (
+      sql.startsWith("UPDATE node_network_preparations SET status='verified'")
+    ) {
+      const bind = statement.bind.bind(statement);
+      vi.spyOn(statement, "bind").mockImplementation((...values) => {
+        const bound = bind(...values),
+          run = bound.run.bind(bound);
+        vi.spyOn(bound, "run").mockImplementation(async () => {
+          const at = new Date().toISOString();
+          await prepare(
+            `INSERT INTO node_firewall_allocations(operation_id,node_id,region_id,provider_instance_id,provider_region,product_id,image_id,intent_hash,inventory_revision,tenant_id,customer_id,request_id,name,description,state,created_at,updated_at) SELECT operation_id,node_id,region_id,provider_instance_id,'EU',json_extract(audit_json,'$.product_id'),json_extract(audit_json,'$.image_id'),intent_hash,revision,'test','test',?,?,?,'claimed',?,? FROM node_additions WHERE operation_id=?`,
+          )
+            .bind(
+              crypto.randomUUID(),
+              "race-" + crypto.randomUUID(),
+              "fixture",
+              at,
+              at,
+              f.addition.intent.operation_id,
+            )
+            .run();
+          return run();
+        });
+        return bound;
+      });
+    }
+    return statement;
+  });
+  expect(
+    await ensureNodeNetwork(f.settings, f.addition.intent.operation_id),
+  ).toBe(false);
+  const row = await prepare(
+    "SELECT status,proof_sha256 FROM node_network_preparations WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .first();
+  expect(row).toMatchObject({ status: "awaiting_proof", proof_sha256: null });
+});
 afterEach(async () => {
   vi.restoreAllMocks();
   for (const op of operations.splice(0)) {
     await env.ARCHIVE.delete(`node-preparation/${op}/proof.json`);
     await env.DB.batch([
+      env.DB.prepare(
+        "DELETE FROM node_firewall_allocations WHERE operation_id=?",
+      ).bind(op),
       env.DB.prepare(
         "DELETE FROM node_bootstrap_jobs WHERE operation_id=?",
       ).bind(op),
@@ -479,13 +584,24 @@ async function setup(ipv6 = true) {
       ),
     }),
   };
-  const run = (time?: number | (() => number)) =>
-    ensureNodeNetwork(settings, addition.intent.operation_id, {
+  // Existing lifecycle tests explicitly prepare/read back provider firewalls first.
+  const run = async (time?: number | (() => number)) => {
+    const options = {
       fetcher,
       ...(time === undefined
         ? {}
         : { now: typeof time === "function" ? time : () => time }),
-    });
+    };
+    if (
+      !(await ensureNodeFirewall(
+        settings,
+        addition.intent.operation_id,
+        options,
+      ))
+    )
+      return false;
+    return ensureNodeNetwork(settings, addition.intent.operation_id, options);
+  };
   const firewall = () =>
     ensureNodeFirewall(settings, addition.intent.operation_id, { fetcher });
   const settle = async () => {

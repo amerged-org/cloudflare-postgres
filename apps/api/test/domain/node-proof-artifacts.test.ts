@@ -86,6 +86,7 @@ async function fixture() {
     srcCidr: { ipv4: [`${f.relay.ipConfig.v4.ip}/32`], ipv6: [] },
     action: "accept",
     status: "active",
+    displayName: "Approved management",
   };
   const plan = {
     version: 1,
@@ -112,7 +113,15 @@ async function fixture() {
           f.actual.customerId,
         ]),
         rules: { rules: { inbound: [rule] } },
-        rules_sha256: await installationHash([rule]),
+        rules_sha256: await installationHash([
+          {
+            protocol: rule.protocol,
+            destPorts: [...rule.destPorts].sort(),
+            srcCidr: rule.srcCidr,
+            action: rule.action,
+            status: rule.status,
+          },
+        ]),
       },
     ],
   };
@@ -125,6 +134,11 @@ async function fixture() {
   )
     .bind(f.addition.intent.operation_id)
     .run();
+  f.bindings.BOOTSTRAP_OPERATOR_SOURCES = JSON.stringify(["1.1.1.1/32"]);
+  f.bindings.BOOTSTRAP_SCAN_CONTROL = JSON.stringify(plan.scan_control);
+  f.bindings.BOOTSTRAP_FIREWALL_BINDINGS = JSON.stringify({
+    [f.providerId]: plan.members[0]!.firewall_id,
+  });
   await env.DB.prepare(
     "INSERT INTO node_network_preparations(operation_id,intent_hash,plan_sha256,plan_json,status,readback_at,created_at,updated_at) VALUES(?,?,?,?,'awaiting_proof',?,?,?)",
   )
@@ -137,6 +151,11 @@ async function fixture() {
       readback,
       readback,
     )
+    .run();
+  await env.DB.prepare(
+    "INSERT INTO node_network_firewalls(firewall_id,operation_id,plan_sha256) VALUES(?,?,?)",
+  )
+    .bind(plan.members[0]!.firewall_id, plan.operation_id, planHash)
     .run();
   const binding = {
       plan_sha256: planHash,
@@ -229,6 +248,19 @@ async function fixture() {
   };
 }
 
+it("accepts a routine report without any provider fetch", async () => {
+  const f = await fixture();
+  f.firewall.mockRestore();
+  f.verify.mockRestore();
+  const provider = vi
+    .spyOn(globalThis, "fetch")
+    .mockRejectedValue(new Error("routine_provider_forbidden"));
+  await expect(
+    acceptNodeProofReport(f.bindings, f.session.bearer, f.report),
+  ).resolves.toMatchObject({ verified: true });
+  expect(provider).not.toHaveBeenCalled();
+});
+
 it("rejects an unauthorized report before any R2 write or firewall gate", async () => {
   const f = await fixture(),
     put = vi.spyOn(env.ARCHIVE, "put");
@@ -267,7 +299,7 @@ it("accepts a completed fresh scan after cleanup when its historical start remai
     report,
   );
   expect(result.verified).toBe(true);
-  expect(f.firewall).toHaveBeenCalledTimes(1);
+  expect(f.firewall).not.toHaveBeenCalled();
   const stored = await env.ARCHIVE.get(f.alias);
   const document = JSON.parse(await stored!.text());
   expect(await trusted(f, document)).toBe(true);
@@ -427,13 +459,9 @@ async function alias(f: Awaited<ReturnType<typeof fixture>>) {
   return { object: value!, text: await value!.text() };
 }
 function exactGateCalls(f: Awaited<ReturnType<typeof fixture>>) {
-  expect(f.firewall.mock.calls.length).toBe(1);
+  expect(f.firewall.mock.calls.length).toBe(0);
   expect(f.verify.mock.calls.length).toBe(1);
   // Never assert an entire Env object: assertion diagnostics must not print private keys.
-  expect(f.firewall.mock.calls[0]![0] === f.bindings).toBe(true);
-  expect(f.firewall.mock.calls[0]![1] === f.addition.intent.operation_id).toBe(
-    true,
-  );
   expect(f.verify.mock.calls[0]![0] === f.bindings).toBe(true);
   expect(f.verify.mock.calls[0]![1] === f.addition.intent.operation_id).toBe(
     true,
@@ -483,6 +511,11 @@ it("rejects a source inside a member CIDR instead of treating its different host
     f.plan.members[0]!.rules.rules.inbound,
   );
   const planHash = await installationHash(f.plan);
+  await env.DB.prepare(
+    "DELETE FROM node_network_firewalls WHERE operation_id=?",
+  )
+    .bind(f.addition.intent.operation_id)
+    .run();
   await env.DB.prepare(
     "DELETE FROM node_network_preparations WHERE operation_id=?",
   )

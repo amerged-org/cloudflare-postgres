@@ -9,6 +9,7 @@ import {
   base64urlToBytes,
 } from "@pgcf/contracts";
 import { ProviderInstanceId } from "@pgcf/contracts/nodes";
+import { NodeProofNetworkPlan } from "@pgcf/contracts/node-proof";
 import {
   NodeBootstrapCheckpoint,
   NodeBootstrapStage,
@@ -153,6 +154,23 @@ interface Preparation {
   revision: number;
   status: string;
   readback_at: string | null;
+}
+export interface NodeNetworkSnapshot extends Preparation {
+  provider_region: string;
+  proof_sha256: string | null;
+  proof_expires_at: string | null;
+  firewall_leases: {
+    firewall_id: string;
+    operation_id: string;
+    plan_sha256: string;
+    revision: number;
+  }[];
+  allocation: {
+    firewall_id: string | null;
+    state: string;
+    result_json: string | null;
+    updated_at: string;
+  } | null;
 }
 interface Claim {
   request_id: string;
@@ -983,7 +1001,307 @@ export async function ensureNodeNetwork(
   operationId: string,
   options: NodeNetworkOptions = {},
 ): Promise<boolean> {
-  return ensureNodePreparation(env, operationId, options, true);
+  try {
+    const now = options.now ?? Date.now,
+      started = now(),
+      preparation = await readNodeNetworkSnapshot(env, operationId);
+    if (!preparation || !Number.isSafeInteger(started) || started < 0)
+      return false;
+    const plan = NodeProofNetworkPlan.parse(JSON.parse(preparation.plan_json)),
+      verified = await proof(env, preparation, plan, now());
+    if (!verified) return false;
+    const validAt = (time: number) =>
+      Number.isSafeInteger(time) &&
+      time >= started &&
+      Date.parse(verified.expires) > time &&
+      verified.oldest >= time - 120000 &&
+      verified.observed <= time + 5000;
+    if (
+      canonical(await readNodeNetworkSnapshot(env, operationId)) !==
+      canonical(preparation)
+    )
+      return false;
+    const finished = now();
+    if (!validAt(finished)) return false;
+    const result = await env.DB.prepare(
+      `UPDATE node_network_preparations SET status='verified',proof_sha256=?,proof_expires_at=?,revision=revision+1,updated_at=? WHERE operation_id=? AND revision=? AND plan_sha256=? AND plan_json=? AND readback_at=? AND status=?
+       AND EXISTS(SELECT 1 FROM node_additions WHERE operation_id=? AND intent_hash=? AND slot_held=1 AND status IN('audited','bootstrapping','ready'))
+       AND NOT EXISTS(SELECT 1 FROM json_each(?) l WHERE NOT EXISTS(SELECT 1 FROM node_network_firewalls f WHERE f.firewall_id=json_extract(l.value,'$.firewall_id') AND f.operation_id=json_extract(l.value,'$.operation_id') AND f.plan_sha256=json_extract(l.value,'$.plan_sha256') AND f.revision=json_extract(l.value,'$.revision')))
+       AND EXISTS(SELECT 1 FROM regions r WHERE r.id=? AND r.provider='contabo' AND r.provider_region=?)
+       AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=? AND n.id<>? AND n.lost_at IS NULL AND NOT EXISTS(SELECT 1 FROM json_each(?,'$.members') m WHERE n.id=json_extract(m.value,'$.node_id') AND n.provider_instance_id=json_extract(m.value,'$.provider_instance_id')))
+       AND NOT EXISTS(SELECT 1 FROM json_each(?,'$.members') m WHERE json_extract(m.value,'$.node_id')<>? AND NOT EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=? AND n.id=json_extract(m.value,'$.node_id') AND n.provider_instance_id=json_extract(m.value,'$.provider_instance_id') AND n.lost_at IS NULL))
+       AND ((? IS NULL AND NOT EXISTS(SELECT 1 FROM node_firewall_allocations f WHERE f.operation_id=node_network_preparations.operation_id)) OR EXISTS(SELECT 1 FROM node_firewall_allocations f WHERE f.operation_id=node_network_preparations.operation_id AND f.firewall_id IS ? AND f.state=? AND f.result_json IS ? AND f.updated_at=?))
+       AND (? IS NULL OR EXISTS(SELECT 1 FROM node_bootstrap_jobs j WHERE j.operation_id=? AND j.input_hash=? AND j.revision>=? AND j.authorized=1 AND j.admitted=0 AND j.cancelled=0 AND json_extract(j.checkpoint_json,'$.written_bytes')=? AND json_extract(j.checkpoint_json,'$.stage') IN (SELECT value FROM json_each(?)) AND json_extract(j.checkpoint_json,'$.status') NOT IN ('failed','cancelled','released')))`,
+    )
+      .bind(
+        verified.hash,
+        verified.expires,
+        new Date(finished).toISOString(),
+        operationId,
+        preparation.revision,
+        preparation.plan_sha256,
+        preparation.plan_json,
+        preparation.readback_at,
+        preparation.status,
+        operationId,
+        preparation.intent_hash,
+        JSON.stringify(preparation.firewall_leases),
+        plan.region_id,
+        preparation.provider_region,
+        plan.region_id,
+        plan.node_id,
+        preparation.plan_json,
+        preparation.plan_json,
+        plan.node_id,
+        plan.region_id,
+        preparation.allocation === null ? null : 1,
+        preparation.allocation?.firewall_id ?? null,
+        preparation.allocation?.state ?? null,
+        preparation.allocation?.result_json ?? null,
+        preparation.allocation?.updated_at ?? null,
+        verified.maintenance?.input_hash ?? null,
+        operationId,
+        verified.maintenance?.input_hash ?? null,
+        verified.maintenance?.checkpoint_revision ?? null,
+        verified.maintenance?.raw_bytes ?? null,
+        JSON.stringify(
+          verified.maintenance
+            ? NodeBootstrapStage.options.slice(
+                NodeBootstrapStage.options.indexOf(
+                  verified.maintenance.checkpoint_stage,
+                ),
+              )
+            : [],
+        ),
+      )
+      .run();
+    return result.meta.changes === 1 && validAt(now());
+  } catch {
+    return false;
+  }
+}
+
+/** Current Cloudflare custody, never a cached provider authorization. */
+export async function readNodeNetworkSnapshot(
+  env: NodeNetworkEnv,
+  operationId: string,
+): Promise<NodeNetworkSnapshot | null> {
+  try {
+    OperationId.parse(operationId);
+    const row = await env.DB.prepare(
+      "SELECT operation_id,intent_hash,plan_sha256,plan_json,revision,status,readback_at,proof_sha256,proof_expires_at FROM node_network_preparations WHERE operation_id=?",
+    )
+      .bind(operationId)
+      .first<
+        Omit<
+          NodeNetworkSnapshot,
+          "firewall_leases" | "allocation" | "provider_region"
+        >
+      >();
+    if (
+      !row?.readback_at ||
+      row.status === "blocked" ||
+      new TextEncoder().encode(row.plan_json).length > MAX_BODY ||
+      !Timestamp.safeParse(row.readback_at).success ||
+      Date.parse(row.readback_at) > Date.now() + 5000
+    )
+      return null;
+    const plan = NodeProofNetworkPlan.parse(JSON.parse(row.plan_json)),
+      addition = await readNodeAddition(env.DB, operationId);
+    await assertNodeRecoveryAuthority(env.DB, addition);
+    const region = await env.DB.prepare(
+      "SELECT provider,provider_region FROM regions WHERE id=?",
+    )
+      .bind(plan.region_id)
+      .first<{ provider: string; provider_region: string }>();
+    if (
+      !region ||
+      region.provider !== "contabo" ||
+      region.provider_region !== addition.audit?.provider_region ||
+      !addition.slot_held ||
+      !addition.audit ||
+      !["audited", "bootstrapping", "ready"].includes(addition.status) ||
+      plan.operation_id !== operationId ||
+      plan.intent_hash !== row.intent_hash ||
+      plan.intent_hash !== addition.intent_hash ||
+      plan.node_id !== addition.intent.node_id ||
+      plan.region_id !== addition.intent.request.region_id ||
+      plan.provider_instance_id !== addition.provider_instance_id ||
+      (await digest(plan)) !== row.plan_sha256 ||
+      plan.relay.provider_instance_id !==
+        env.BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID
+    )
+      return null;
+    const operators = sources(
+        configured(
+          env.BOOTSTRAP_OPERATOR_SOURCES,
+          z.array(z.string().max(64)).min(1).max(16),
+        ),
+      ),
+      control = configured(
+        env.BOOTSTRAP_SCAN_CONTROL,
+        z.strictObject({
+          ipv4: z.ipv4(),
+          ipv6: z.ipv6(),
+          port: z.number().int().min(1).max(65535),
+        }),
+      ),
+      bindings = configured(
+        env.BOOTSTRAP_FIREWALL_BINDINGS,
+        z.record(ProviderInstanceId, z.uuid()),
+      );
+    if (
+      canonical(operators) !== canonical(plan.operators) ||
+      canonical({
+        ipv4: ip(control.ipv4),
+        ipv6: ip(control.ipv6),
+        port: control.port,
+      }) !== canonical(plan.scan_control)
+    )
+      return null;
+    const nodes = (
+      await env.DB.prepare(
+        "SELECT id,provider_instance_id FROM nodes WHERE region_id=? AND id<>? AND lost_at IS NULL ORDER BY id LIMIT 17",
+      )
+        .bind(plan.region_id, plan.node_id)
+        .all<{ id: string; provider_instance_id: string | null }>()
+    ).results;
+    const expected = [
+      { id: plan.node_id, provider_instance_id: plan.provider_instance_id },
+      ...nodes,
+    ].sort((a, b) => a.id.localeCompare(b.id));
+    if (
+      canonical(expected) !==
+      canonical(
+        plan.members
+          .map((member) => ({
+            id: member.node_id,
+            provider_instance_id: member.provider_instance_id,
+          }))
+          .sort((a, b) => a.id.localeCompare(b.id)),
+      )
+    )
+      return null;
+    const firewall_leases: NodeNetworkSnapshot["firewall_leases"] = [];
+    for (const member of plan.members) {
+      const mapping =
+        bindings[member.provider_instance_id] ??
+        (await installationFirewallBinding(
+          env.DB,
+          operationId,
+          member.provider_instance_id,
+        ));
+      if (
+        mapping !== member.firewall_id ||
+        (await digest(normalizedRules(member.rules.rules.inbound))) !==
+          member.rules_sha256
+      )
+        return null;
+      const lease = await env.DB.prepare(
+        "SELECT firewall_id,operation_id,plan_sha256,revision FROM node_network_firewalls WHERE firewall_id=?",
+      )
+        .bind(member.firewall_id)
+        .first<NodeNetworkSnapshot["firewall_leases"][number]>();
+      if (
+        !lease ||
+        lease.operation_id !== operationId ||
+        lease.plan_sha256 !== row.plan_sha256
+      )
+        return null;
+      firewall_leases.push(lease);
+    }
+    const allocation = await env.DB.prepare(
+      "SELECT firewall_id,state,result_json,updated_at FROM node_firewall_allocations WHERE operation_id=?",
+    )
+      .bind(operationId)
+      .first<NonNullable<NodeNetworkSnapshot["allocation"]>>();
+    if (
+      allocation &&
+      (allocation.state !== "confirmed" ||
+        allocation.firewall_id !==
+          plan.members.find((member) => member.node_id === plan.node_id)
+            ?.firewall_id)
+    )
+      return null;
+    return {
+      ...row,
+      provider_region: region.provider_region,
+      firewall_leases,
+      allocation,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Fresh, read-only provider facts at the first destructive lifecycle boundary. */
+export function hasNodeNetworkTargetAddresses(
+  snapshot: NodeNetworkSnapshot,
+  instance: ContaboInstance,
+): boolean {
+  try {
+    const plan = NodeProofNetworkPlan.parse(JSON.parse(snapshot.plan_json)),
+      target = plan.members.find(
+        (member) =>
+          member.node_id === plan.node_id &&
+          member.provider_instance_id === plan.provider_instance_id,
+      );
+    return (
+      !!target &&
+      instance.id === plan.provider_instance_id &&
+      canonical(primary(instance)) === canonical(target.primary) &&
+      canonical(addresses(instance)) === canonical(target.addresses)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** Never repairs provider policy while authorizing a disk write. */
+export async function verifyNodeFirewallSnapshot(
+  env: NodeNetworkEnv,
+  snapshot: NodeNetworkSnapshot,
+  options: Pick<NodeNetworkOptions, "fetcher"> = {},
+): Promise<boolean> {
+  try {
+    if (
+      canonical(await readNodeNetworkSnapshot(env, snapshot.operation_id)) !==
+      canonical(snapshot)
+    )
+      return false;
+    const client = options.fetcher
+      ? new ContaboClient({
+          clientId: env.CONTABO_CLIENT_ID,
+          clientSecret: env.CONTABO_CLIENT_SECRET,
+          username: env.CONTABO_USERNAME,
+          password: env.CONTABO_PASSWORD,
+          fetcher: options.fetcher,
+          timeoutMs: 5000,
+        })
+      : contaboClient(env);
+    const deadline = Date.now() + 20000,
+      plan = NodeProofNetworkPlan.parse(JSON.parse(snapshot.plan_json));
+    for (const member of plan.members) {
+      const firewall = await client.getFirewall(member.firewall_id, {
+        requestId: crypto.randomUUID(),
+        deadline: Math.min(deadline, Date.now() + 5000),
+        accounting: { operation_id: snapshot.operation_id, stage: "prewrite" },
+      });
+      if (
+        !(await owned(firewall, member)) ||
+        !assigned(firewall, member) ||
+        !exactRules(firewall, member)
+      )
+        return false;
+    }
+    return (
+      Date.now() <= deadline &&
+      canonical(await readNodeNetworkSnapshot(env, snapshot.operation_id)) ===
+        canonical(snapshot)
+    );
+  } catch {
+    return false;
+  }
 }
 
 /** Owned firewall readback permits only the provider's RAM-rescue action. */
@@ -992,7 +1310,7 @@ export async function ensureNodeFirewall(
   operationId: string,
   options: NodeNetworkOptions = {},
 ): Promise<boolean> {
-  return ensureNodePreparation(env, operationId, options, false);
+  return ensureNodePreparation(env, operationId, options);
 }
 
 export async function hasVerifiedNodePreparation(
@@ -1055,7 +1373,6 @@ async function ensureNodePreparation(
   env: NodeNetworkEnv,
   operationId: string,
   options: NodeNetworkOptions,
-  requireProof: boolean,
 ): Promise<boolean> {
   try {
     OperationId.parse(operationId);
@@ -1169,55 +1486,9 @@ async function ensureNodePreparation(
       )
         return false;
     }
-    if (!requireProof)
-      return (
-        Number.isSafeInteger(now()) &&
-        now() >= started &&
-        Date.now() <= deadline
-      );
-    const verified = await proof(env, preparation, plan, now());
-    if (!verified) return false;
-    const validAt = (time: number) =>
-      Number.isSafeInteger(time) &&
-      time >= started &&
-      Date.parse(verified.expires) > time &&
-      verified.oldest >= time - 120000 &&
-      verified.observed <= time + 5000;
-    const finished = now();
-    if (!validAt(finished)) return false;
-
-    const result = await env.DB.prepare(
-      `UPDATE node_network_preparations SET status='verified',proof_sha256=?,proof_expires_at=?,revision=revision+1,updated_at=? WHERE operation_id=? AND revision=? AND plan_sha256=? AND EXISTS(SELECT 1 FROM node_additions WHERE operation_id=? AND intent_hash=? AND slot_held=1 AND status IN('audited','bootstrapping','ready'))
-       AND (? IS NULL OR EXISTS(SELECT 1 FROM node_bootstrap_jobs j WHERE j.operation_id=? AND j.input_hash=? AND j.revision>=? AND j.authorized=1 AND j.admitted=0 AND j.cancelled=0
-         AND json_extract(j.checkpoint_json,'$.written_bytes')=? AND json_extract(j.checkpoint_json,'$.stage') IN (SELECT value FROM json_each(?))
-         AND json_extract(j.checkpoint_json,'$.status') NOT IN ('failed','cancelled','released')))`,
-    )
-      .bind(
-        verified.hash,
-        verified.expires,
-        new Date(finished).toISOString(),
-        operationId,
-        preparation.revision,
-        preparation.plan_sha256,
-        operationId,
-        preparation.intent_hash,
-        verified.maintenance?.input_hash ?? null,
-        operationId,
-        verified.maintenance?.input_hash ?? null,
-        verified.maintenance?.checkpoint_revision ?? null,
-        verified.maintenance?.raw_bytes ?? null,
-        JSON.stringify(
-          verified.maintenance
-            ? NodeBootstrapStage.options.slice(
-                NodeBootstrapStage.options.indexOf(
-                  verified.maintenance.checkpoint_stage,
-                ),
-              )
-            : [],
-        ),
-      )
-      .run();
-    return result.meta.changes === 1 && validAt(now());
+    return (
+      Number.isSafeInteger(now()) && now() >= started && Date.now() <= deadline
+    );
   } catch {
     return false;
   }
