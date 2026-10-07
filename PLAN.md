@@ -216,6 +216,45 @@ partially present fields still reject. All namespace/system-child, complete-list
 identity and deletion guards remain. This changed Native path needs one qualified image delivery;
 the queued API recovery correction is included in that stand. US live acceptance remains pending.
 
+Source `9c02647b`, full CI `37638342051`, is delivered once with qualified Native manifest
+`sha256:d4fbd0afebde3576c3db6822f3aad270da2cf82d6c4eed26d9e033e18872a752`.
+All18 layers/714,978,391 qualification bytes passed; complete private readback verified
+162,118,779 compressed and502,861,312 raw bytes. Actual application/deployment/placement23 and
+one running/active process match the image. Protected EU state, the whole original created US
+job, source IPv6/firewall repairs and all non-image configuration remained unchanged.
+Automatic recovery started the process without a manual restart. The programmed raw inventory
+then removed both previously dirty namespaces. Two fresh scanners completed and their owned
+cleanup confirmed all54 journals cleaned. Access returned HTTP200, followed by report HTTP409
+at15:03:56.402Z before any provider wire event. The retained generic terminal at15:04:00.886Z
+was449.173 seconds after issuance with90.827 seconds remaining. Source control HTTP200 observations
+at15:01:53.418Z/54.061Z preceded submission by122.984/122.341 seconds; redacted bearers support
+source attribution, not an exact operation binding. Completion older than120 seconds remains
+correctly refused. One controlled pause retained the same created/revision0 job at step276,
+with zero downloaded/written bytes. Reduce duplicated cleanup command setup while preserving
+all identity/deletion gates; do not extend observation freshness or increase proxy concurrency.
+Full US admission and SQL/TLS/R2/WAL/restore/physical-reclamation acceptance remain pending.
+
+A second in-flight report returned409 at15:08:51.666Z,125.904–126.603 seconds after the last
+source controls. A third returned200 at15:13:24.555Z, recording1 OAuth and12 provider GET attempts,
+all in the firewall lifecycle stage. Its handler took11,216ms. Native subsequently reported the
+proof, but independent CF readback still showed awaiting_proof with no verified proof hash or
+expiry; HTTP200 is not installation authorization. Its last controls were about128 seconds old
+by handler completion. Preserve the120-second independent final gate and reduce cleanup setup
+overhead instead. Batch the initial exact source identity and owned Pod read, plus the Pod-absence
+and following exact Namespace read, while retaining immediate fresh source checks before each
+DELETE, all13 collection reads and UID/resourceVersion preconditions. These changes require
+reproducing and safety tests and one final qualified delivery before continuation.
+
+The cleanup repair combines two pairs of reads into strict named core Lists, removing two
+standalone kubectl/transport setups per ordinary cleanup. Separate fresh source identity checks
+immediately before each DELETE, all13 raw inventories, concurrency4 and existing freshness,
+command, aggregate, UID/resourceVersion and uncertain-write bounds remain. A further real-shape
+regression reproduced empty successful kubectl stdout when both queried resources are absent;
+only known-successful empty output confirms absence, while failed/unknown reads preserve dirty
+ownership and never replay the DELETE.65 affected source/runner cases, Native types, scoped
+lint, formatting and independent review pass. The46.965-second transport model is synthetic;
+actual cleanup/admission timing still requires the next live continuation.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

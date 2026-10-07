@@ -269,11 +269,13 @@ function fixture() {
       assert.ok(options && !options.signal.aborted);
       actions.push(args[0]!);
       if (args[0] === "get") {
-        if (args[1] === "namespace/kube-system") {
+        if (args[1] === "pod/outside-scan") {
           assert.deepEqual(args, [
             "get",
-            "namespace/kube-system",
-            `node/${source.node_name}`,
+            "pod/outside-scan",
+            `namespace/${args[4]!}`,
+            "--namespace",
+            args[4]!,
             "--ignore-not-found",
             "--output=json",
           ]);
@@ -282,7 +284,30 @@ function fixture() {
             stdout: JSON.stringify({
               apiVersion: "v1",
               kind: "List",
-              items: [cluster, node],
+              items: [
+                objects.get(key("pod", "outside-scan")),
+                objects.get(key("namespace", args[4]!)),
+              ].filter(Boolean),
+            }),
+          };
+        }
+        if (args[1] === "namespace/kube-system") {
+          const readPod = args[3] === "pod/outside-scan",
+            pod = objects.get(key("pod", "outside-scan"));
+          assert.deepEqual(args, [
+            "get",
+            "namespace/kube-system",
+            `node/${source.node_name}`,
+            ...(readPod ? ["pod/outside-scan", "--namespace", args[5]!] : []),
+            "--ignore-not-found",
+            "--output=json",
+          ]);
+          return {
+            exit_code: 0,
+            stdout: JSON.stringify({
+              apiVersion: "v1",
+              kind: "List",
+              items: [cluster, node, ...(readPod && pod ? [pod] : [])],
             }),
           };
         }
@@ -1192,6 +1217,10 @@ test("expired cleanup retains aggregate and individual bounds with coalesced ide
       assert.equal(["create", "exec", "logs"].includes(args[0]!), false);
       // Each real kubectl process opens its own proxy CONNECT, requiring the
       // second grant measured in the successful live callback trace.
+      if (options!.timeout_ms < 3700) {
+        elapsed += options!.timeout_ms;
+        throw new BootstrapError("command_timeout");
+      }
       elapsed += 3700;
       grants++;
       return f.commands.kube!(args, permit, stdin, options);
@@ -1335,11 +1364,14 @@ test("coalesced source identities settle raw collection inventory within the mea
   assert.equal(inventory.length, 13);
   assert.equal(new Set(inventory).size, 13);
   assert.equal(identities.length, 3);
-  for (const args of identities)
+  for (const [index, args] of identities.entries())
     assert.deepEqual(args, [
       "get",
       "namespace/kube-system",
       `node/${f.source.node_name}`,
+      ...(index === 0
+        ? ["pod/outside-scan", "--namespace", f.state()!.namespace_name!]
+        : []),
       "--ignore-not-found",
       "--output=json",
     ]);
@@ -1361,7 +1393,15 @@ async function refusesSourceIdentity(
         identityReads++;
         if (identityReads === atRead) {
           const value = obj(JSON.parse(result.stdout));
+          const pod = (value.items as Json[]).find(
+            (item) => item.kind === "Pod",
+          );
+          if (pod)
+            value.items = (value.items as Json[]).filter(
+              (item) => item !== pod,
+            );
           change(value);
+          if (pod) (value.items as Json[]).push(pod);
           return { ...result, stdout: JSON.stringify(value) };
         }
       }
@@ -1414,6 +1454,223 @@ test("cleanup refreshes the exact source Node UID before deleting its namespace"
   assert.equal(identityReads, 3);
   assert.equal(f.objects.size, 1);
   assert.equal(f.mutations.length, 1);
+});
+
+test("cleanup reads source identities and its initial owned Pod in one core List", async () => {
+  const { f, original, ownership } = await expiredCleanupFixture();
+  let initial = true;
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (initial && args[0] === "get" && args[1] === "namespace/kube-system") {
+        initial = false;
+        assert.deepEqual(args, [
+          "get",
+          "namespace/kube-system",
+          `node/${f.source.node_name}`,
+          "pod/outside-scan",
+          "--namespace",
+          ownership.namespace_name!,
+          "--ignore-not-found",
+          "--output=json",
+        ]);
+      }
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await cleanupOwnedProofSource(
+    f.source,
+    original,
+    commands,
+    new Date(Date.now() + 120_000).toISOString(),
+  );
+  assert.equal(initial, false);
+  assert.equal(f.state()!.stage, "cleaned");
+  assert.equal(f.objects.size, 0);
+});
+
+test("the combined cleanup snapshot refuses missing, extra and foreign identities before deletion", async () => {
+  async function refuses(change: (items: Json[]) => void) {
+    const { f, original } = await expiredCleanupFixture();
+    let first = true;
+    const commands: ProofSourceCommands = {
+      ...f.commands,
+      kube: async (args, permit, stdin, options) => {
+        const result = await f.commands.kube!(args, permit, stdin, options);
+        if (first && args[0] === "get" && args[1] === "namespace/kube-system") {
+          first = false;
+          const list = obj(JSON.parse(result.stdout));
+          change(list.items as Json[]);
+          return { ...result, stdout: JSON.stringify(list) };
+        }
+        return result;
+      },
+    };
+    await assert.rejects(
+      cleanupOwnedProofSource(
+        f.source,
+        original,
+        commands,
+        new Date(Date.now() + 120_000).toISOString(),
+      ),
+      /proof_source_(?:source_identity_changed|uid_changed|resource_not_owned)/,
+    );
+    assert.equal(f.mutations.length, 0);
+    assert.equal(f.objects.size, 2);
+    assert.equal(f.state()!.stage, "cleanup");
+  }
+  await refuses((items) => {
+    items.splice(1, 1);
+  });
+  await refuses((items) => {
+    items.push(structuredClone(items[1]!));
+  });
+  await refuses((items) => {
+    obj(items[2]!.metadata).namespace = "foreign-namespace";
+  });
+  await refuses((items) => {
+    obj(items[1]!.metadata).uid = randomUUID();
+  });
+  await refuses((items) => {
+    obj(items[2]!.metadata).uid = randomUUID();
+  });
+});
+
+test("a missing already-deleted owned Pod retains the fresh source identities and cleans its namespace", async () => {
+  const { f, original } = await expiredCleanupFixture();
+  f.objects.delete("pod/outside-scan");
+  await cleanupOwnedProofSource(
+    f.source,
+    original,
+    f.commands,
+    new Date(Date.now() + 120_000).toISOString(),
+  );
+  assert.equal(f.state()!.stage, "cleaned");
+  assert.equal(f.objects.size, 0);
+  assert.equal(f.mutations.length, 1);
+});
+
+test("Pod absence confirmation also reads its exact namespace before inventory", async () => {
+  const { f, original, ownership } = await expiredCleanupFixture();
+  let paired = 0,
+    separateNamespace = 0;
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && ["pod", "pod/outside-scan"].includes(args[1]!)) {
+        assert.deepEqual(args, [
+          "get",
+          "pod/outside-scan",
+          `namespace/${ownership.namespace_name!}`,
+          "--namespace",
+          ownership.namespace_name!,
+          "--ignore-not-found",
+          "--output=json",
+        ]);
+        paired++;
+      }
+      if (
+        args[0] === "get" &&
+        args[1] === "namespace" &&
+        args[2] === ownership.namespace_name
+      )
+        separateNamespace++;
+      return f.commands.kube!(args, permit, stdin, options);
+    },
+  };
+  await cleanupOwnedProofSource(
+    f.source,
+    original,
+    commands,
+    new Date(Date.now() + 120_000).toISOString(),
+  );
+  assert.equal(paired, 1);
+  assert.equal(separateNamespace, 1);
+  assert.equal(f.state()!.stage, "cleaned");
+  assert.equal(f.objects.size, 0);
+});
+
+test("paired Pod absence readback rejects a replaced namespace before inventory or deletion", async () => {
+  const { f, original } = await expiredCleanupFixture();
+  let inventories = 0;
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      if (args[0] === "get" && args[1]!.startsWith("--raw=")) inventories++;
+      const result = await f.commands.kube!(args, permit, stdin, options);
+      if (args[0] === "get" && args[1] === "pod/outside-scan") {
+        const list = obj(JSON.parse(result.stdout));
+        assert.equal((list.items as Json[]).length, 1);
+        obj((list.items as Json[])[0]!.metadata).uid = randomUUID();
+        return { ...result, stdout: JSON.stringify(list) };
+      }
+      return result;
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 120_000).toISOString(),
+    ),
+    /proof_source_resource_not_owned/,
+  );
+  assert.equal(inventories, 0);
+  assert.equal(f.mutations.length, 1);
+  assert.equal(f.objects.size, 1);
+  assert.equal(f.state()!.stage, "cleanup");
+});
+
+test("paired readback confirms cleanup when kubectl returns empty successful output for two absent objects", async () => {
+  const { f, original, ownership } = await expiredCleanupFixture();
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      const result = await f.commands.kube!(args, permit, stdin, options);
+      if (args[0] === "get" && args[1] === "pod/outside-scan") {
+        assert.equal(f.objects.has("pod/outside-scan"), false);
+        f.objects.delete(`namespace/${ownership.namespace_name}`);
+        return { exit_code: 0, stdout: "" };
+      }
+      return result;
+    },
+  };
+  await cleanupOwnedProofSource(
+    f.source,
+    original,
+    commands,
+    new Date(Date.now() + 120_000).toISOString(),
+  );
+  assert.equal(f.mutations.length, 1);
+  assert.equal(f.objects.size, 0);
+  assert.equal(f.state()!.stage, "cleaned");
+});
+
+test("an uncertain Pod delete followed by an unknown paired readback is never replayed", async () => {
+  const { f, original } = await expiredCleanupFixture();
+  const commands: ProofSourceCommands = {
+    ...f.commands,
+    kube: async (args, permit, stdin, options) => {
+      const result = await f.commands.kube!(args, permit, stdin, options);
+      if (args[0] === "delete") throw new BootstrapError("command_timeout");
+      if (args[0] === "get" && args[1] === "pod/outside-scan")
+        return { exit_code: 1, stdout: "" };
+      return result;
+    },
+  };
+  await assert.rejects(
+    cleanupOwnedProofSource(
+      f.source,
+      original,
+      commands,
+      new Date(Date.now() + 120_000).toISOString(),
+    ),
+    /proof_source_command_failed/,
+  );
+  assert.equal(f.mutations.length, 1);
+  assert.equal(f.objects.size, 1);
+  assert.equal(f.state()!.stage, "cleanup");
 });
 
 test("cleanup inventories every standard collection without Kubernetes discovery", async () => {

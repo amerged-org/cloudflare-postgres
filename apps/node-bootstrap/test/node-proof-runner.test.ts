@@ -183,13 +183,13 @@ function commands(mode: "preparation" | "postjoin" = "preparation") {
         key = (kind: string, name: string) => `${kind}/${ns}/${name}`;
       seen.push(`${direction}:${args[0]}:${args[1]}`);
       if (args[0] === "get") {
-        if (direction === "source" && args[1] === "namespace/kube-system") {
-          assert.equal(source.kind, "pod");
-          if (source.kind !== "pod") throw new Error("pod_source_required");
+        if (direction === "source" && args[1] === "pod/outside-scan") {
           assert.deepEqual(args, [
             "get",
-            "namespace/kube-system",
-            `node/${source.node_name}`,
+            "pod/outside-scan",
+            `namespace/${ns}`,
+            "--namespace",
+            ns,
             "--ignore-not-found",
             "--output=json",
           ]);
@@ -198,7 +198,36 @@ function commands(mode: "preparation" | "postjoin" = "preparation") {
             stdout: JSON.stringify({
               apiVersion: "v1",
               kind: "List",
-              items: [namespace(source.cluster_uid), sourceNode],
+              items: [
+                objects.get(key("pod", "outside-scan")),
+                objects.get(`namespace//${ns}`),
+              ].filter(Boolean),
+            }),
+          };
+        }
+        if (direction === "source" && args[1] === "namespace/kube-system") {
+          assert.equal(source.kind, "pod");
+          if (source.kind !== "pod") throw new Error("pod_source_required");
+          const readPod = args[3] === "pod/outside-scan",
+            pod = objects.get(key("pod", "outside-scan"));
+          assert.deepEqual(args, [
+            "get",
+            "namespace/kube-system",
+            `node/${source.node_name}`,
+            ...(readPod ? ["pod/outside-scan", "--namespace", ns] : []),
+            "--ignore-not-found",
+            "--output=json",
+          ]);
+          return {
+            exit_code: 0,
+            stdout: JSON.stringify({
+              apiVersion: "v1",
+              kind: "List",
+              items: [
+                namespace(source.cluster_uid),
+                sourceNode,
+                ...(readPod && pod ? [pod] : []),
+              ],
             }),
           };
         }

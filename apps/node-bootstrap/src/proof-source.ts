@@ -764,14 +764,20 @@ class SourceRunner {
     )
       return fail("pod_identity_changed");
   }
-  private async sourceNode(cleanup = false) {
-    if (this.source.kind !== "pod") return;
+  private async sourceNode(
+    cleanup = false,
+    readPod = false,
+  ): Promise<Json | null> {
+    if (this.source.kind !== "pod") return null;
     const nodeName = this.source.node_name;
     const result = await this.kube(
       [
         "get",
         "namespace/kube-system",
         `node/${nodeName}`,
+        ...(readPod
+          ? ["pod/outside-scan", "--namespace", this.state.namespace_name!]
+          : []),
         "--ignore-not-found",
         "--output=json",
       ],
@@ -786,7 +792,9 @@ class SourceRunner {
       identities.apiVersion !== "v1" ||
       identities.kind !== "List" ||
       !Array.isArray(identities.items) ||
-      identities.items.length !== 2
+      (readPod
+        ? ![2, 3].includes(identities.items.length)
+        : identities.items.length !== 2)
     )
       return fail("source_identity_changed");
     const items = identities.items.map(object),
@@ -801,12 +809,22 @@ class SourceRunner {
           value.apiVersion === "v1" &&
           value.kind === "Node" &&
           object(value.metadata).name === nodeName,
-      );
+      ),
+      pod = readPod
+        ? items.find(
+            (value) =>
+              value.apiVersion === "v1" &&
+              value.kind === "Pod" &&
+              object(value.metadata).name === "outside-scan" &&
+              object(value.metadata).namespace === this.state.namespace_name,
+          )
+        : undefined;
     if (
       !cluster ||
       object(cluster.metadata).uid !== this.source.cluster_uid ||
       object(cluster.metadata).deletionTimestamp ||
-      !node
+      !node ||
+      (readPod && identities.items.length === 3 && !pod)
     )
       return fail("source_identity_changed");
     const m = metadata(node),
@@ -833,6 +851,54 @@ class SourceRunner {
       )
     )
       return fail("source_identity_changed");
+    return pod ?? null;
+  }
+  private async podAndNamespaceReadback() {
+    const result = await this.kube(
+      [
+        "get",
+        "pod/outside-scan",
+        `namespace/${this.state.namespace_name!}`,
+        "--namespace",
+        this.state.namespace_name!,
+        "--ignore-not-found",
+        "--output=json",
+      ],
+      undefined,
+      true,
+      "owned_pod_readback",
+    );
+    const output = successful(result);
+    // kubectl suppresses all output when every exact name is not found.
+    if (!output.trim()) return { pod: null, namespace: null };
+    const list = object(JSON.parse(output));
+    if (
+      list.apiVersion !== "v1" ||
+      list.kind !== "List" ||
+      !Array.isArray(list.items) ||
+      list.items.length > 2
+    )
+      return fail("resource_not_owned");
+    const items = list.items.map(object),
+      pod = items.find(
+        (item) =>
+          item.apiVersion === "v1" &&
+          item.kind === "Pod" &&
+          object(item.metadata).name === "outside-scan" &&
+          object(item.metadata).namespace === this.state.namespace_name,
+      ),
+      namespace = items.find(
+        (item) =>
+          item.apiVersion === "v1" &&
+          item.kind === "Namespace" &&
+          object(item.metadata).name === this.state.namespace_name,
+      );
+    if (items.length !== Number(Boolean(pod)) + Number(Boolean(namespace)))
+      return fail("resource_not_owned");
+    if (pod) this.owned(pod, "Pod", this.state.pod_uid, true);
+    if (namespace)
+      this.owned(namespace, "Namespace", this.state.namespace_uid, true);
+    return { pod: pod ?? null, namespace: namespace ?? null };
   }
   private async failedPod(): Promise<never> {
     let code: string | undefined;
@@ -1233,18 +1299,24 @@ class SourceRunner {
       )
         return fail("cleanup_unconfirmed");
     } else {
-      await this.sourceNode(true);
+      const initialPod = await this.sourceNode(true, true);
+      let namespaceAfterPod: Json | null | undefined;
       for (const [kind, uid] of [
         ["Pod", this.state.pod_uid],
         ["Namespace", this.state.namespace_uid],
       ] as const) {
-        const actual = await this.get(
-          kind.toLowerCase(),
-          kind === "Pod" ? "outside-scan" : this.state.namespace_name!,
-          kind === "Pod" ? this.state.namespace_name! : undefined,
-          true,
-          kind === "Pod" ? "owned_pod_read" : "owned_namespace_read",
-        );
+        const actual =
+          kind === "Pod"
+            ? initialPod
+            : namespaceAfterPod !== undefined
+              ? namespaceAfterPod
+              : await this.get(
+                  "namespace",
+                  this.state.namespace_name!,
+                  undefined,
+                  true,
+                  "owned_namespace_read",
+                );
         if (!actual) continue;
         const m = this.owned(actual, kind, uid, true);
         if (kind === "Namespace") await this.namespaceChildren();
@@ -1274,16 +1346,27 @@ class SourceRunner {
             /* Confirm deletion below; never force foreign cleanup. */
           }
         }
-        while (
-          await this.get(
-            kind.toLowerCase(),
-            kind === "Pod" ? "outside-scan" : this.state.namespace_name!,
-            kind === "Pod" ? this.state.namespace_name! : undefined,
-            true,
-            kind === "Pod" ? "owned_pod_readback" : "owned_namespace_readback",
+        if (kind === "Pod") {
+          for (;;) {
+            const observed = await this.podAndNamespaceReadback();
+            if (!observed.pod) {
+              namespaceAfterPod = observed.namespace;
+              break;
+            }
+            await this.wait(true);
+          }
+        } else {
+          while (
+            await this.get(
+              "namespace",
+              this.state.namespace_name!,
+              undefined,
+              true,
+              "owned_namespace_readback",
+            )
           )
-        )
-          await this.wait(true);
+            await this.wait(true);
+        }
       }
     }
     await this.save({ stage: "cleaned" }, true);

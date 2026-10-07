@@ -129,6 +129,10 @@ reads per family, the existing 30-second command bounds and a shared 256KiB outp
 each typed List and item, and refuse nonempty continuation or remaining-item metadata. Unknown,
 partial or foreign children preserve the namespace; Node/Cluster checks and UID/resourceVersion
 deletion preconditions remain. Observe actual cleanup/report timing before claiming readiness.
+Cleanup combines the initial source/owned-Pod read and the Pod-absence/owned-Namespace read into
+strict named Lists. It still refreshes the source separately immediately before each DELETE.
+Only successful empty output confirms both requested resources absent; unknown readback retains
+dirty ownership and never causes a blind repeat of the deletion.
 
 If regional telemetry temporarily leaves the retained source observation older than 180 seconds,
 the proof producer waits for fresh observations of that same source. It still validates current
