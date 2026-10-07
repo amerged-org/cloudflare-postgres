@@ -66,6 +66,11 @@ with a bounded response and returns its verified identity, status and fixed erro
 starts a Container, registers another inspection, requests rescue or writes a disk. A stored
 `reported` result means inspection completed; it does not mean the node is installed or admitted.
 An unavailable inspector remains unknown rather than being treated as healthy.
+Administrators can also read
+`GET /v1/nodes/additions/{operation-id}/proof/preparation/journal` for the current session
+timestamps and bounded retained source stages, UID hashes and session-match flags. This reads
+local Durable Object records only and grants no cleanup or proof authority. It exposes neither
+private inputs nor credentials and does not wake or contact a Container.
 For network evidence, read
 `GET /v1/nodes/additions/{operation-id}/proof/{preparation|postjoin}` with administrator scope.
 This observes the retained native proof session and its fixed error code; it never starts a scan,

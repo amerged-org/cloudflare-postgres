@@ -7,6 +7,7 @@ import {
   NodeProofReport,
   NodeProofMode,
   NodeProofStatus,
+  NodeProofJournalStatus,
 } from "@pgcf/contracts/node-proof";
 import { ErrorBody, OperationId } from "@pgcf/contracts";
 import {
@@ -33,6 +34,60 @@ function proofBody<T>(schema: z.ZodType<T>, value: unknown): T {
   return parsed.data;
 }
 export function registerNodeProof(app: ApiApp) {
+  app.openapi(
+    createRoute({
+      method: "get",
+      path: "/v1/nodes/additions/{id}/proof/preparation/journal",
+      security: [{ bearerAuth: [] }],
+      tags: ["Nodes"],
+      middleware: async (c: ApiContext, next: Next) => {
+        await requireScope(c, "admin");
+        await next();
+      },
+      request: { params: z.object({ id: OperationId }) },
+      responses: {
+        200: {
+          description: "Read-only preparation journal hashes and stages",
+          content: { "application/json": { schema: NodeProofJournalStatus } },
+        },
+        400: {
+          description: "Invalid request",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        401: {
+          description: "Invalid credentials",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        403: {
+          description: "Administrator scope required",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        404: {
+          description: "Installation binding unavailable",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        500: {
+          description: "Invalid journal response",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+      },
+    }),
+    async (c) => {
+      await requireScope(c, "admin");
+      const id = OperationId.parse(c.req.param("id"));
+      const binding = await c.env.DB.prepare(
+        "SELECT 1 present FROM node_installation_bindings WHERE operation_id=?",
+      )
+        .bind(id)
+        .first<{ present: number }>();
+      if (!binding)
+        throw new ApiError("not_found", "Installation binding unavailable");
+      const status = await c.env.NODE_BOOTSTRAP.get(
+        c.env.NODE_BOOTSTRAP.idFromName(id),
+      ).proofJournalStatus(id);
+      return c.json(NodeProofJournalStatus.parse(status), 200);
+    },
+  );
   app.openapi(
     createRoute({
       method: "get",

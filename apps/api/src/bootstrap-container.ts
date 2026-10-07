@@ -22,6 +22,8 @@ import {
   NodeProofExecutionInput,
   NodeProofMode,
   NodeProofStatus,
+  NodeProofJournalStatus,
+  NodeProofJournalEntry,
 } from "@pgcf/contracts/node-proof";
 import { prepareNodeProofInput } from "./domain/node-proof-execution.ts";
 import { installationHash } from "./domain/node-installation.ts";
@@ -152,6 +154,15 @@ async function inspectionStatusBody(response: Response, signal: AbortSignal) {
     if (abort) signal.removeEventListener("abort", abort);
     void reader.cancel().catch(() => {});
   }
+}
+
+async function statusIdentifierHash(value: string) {
+  const hash = new Uint8Array(
+    await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
+  );
+  return Array.from(hash, (byte) => byte.toString(16).padStart(2, "0")).join(
+    "",
+  );
 }
 
 export class NodeBootstrap extends DurableObject<Env> {
@@ -456,8 +467,7 @@ export class NodeBootstrap extends DurableObject<Env> {
       void response?.body?.cancel().catch(() => {});
     }
   }
-  /** Read only the existing proof session; never start, mint or register proof work. */
-  async proofStatus(operationId: string, mode: NodeProofMode) {
+  async #proofObservation(operationId: string, mode: NodeProofMode) {
     OperationId.parse(operationId);
     NodeProofMode.parse(mode);
     if (!this.ctx.id.equals(this.env.NODE_BOOTSTRAP.idFromName(operationId)))
@@ -500,7 +510,13 @@ export class NodeBootstrap extends DurableObject<Env> {
         | "proof_input_required"
         | "proof_server_identity_changed"
         | "proof_authority_closed",
-    ) => NodeProofStatus.parse({ ...base, status: "unavailable", error_code });
+    ) => ({
+      base,
+      binding,
+      input: null,
+      error_code,
+      recheck: async () => error_code,
+    });
     if (!session.success) return unavailable("proof_status_invalid");
     if (!session.data || raw === undefined)
       return unavailable("proof_input_required");
@@ -582,6 +598,15 @@ export class NodeBootstrap extends DurableObject<Env> {
     };
     const initial = await authority();
     if (initial) return unavailable(initial);
+    return { base, binding, input, error_code: null, recheck: authority };
+  }
+  /** Observe only the existing native proof; no registration or retry changes. */
+  async proofStatus(operationId: string, mode: NodeProofMode) {
+    const state = await this.#proofObservation(operationId, mode),
+      { base, binding } = state;
+    const unavailable = (error_code: string) =>
+      NodeProofStatus.parse({ ...base, status: "unavailable", error_code });
+    if (state.error_code) return unavailable(state.error_code);
     const container = this.ctx.container;
     if (!container?.running) return unavailable("proof_status_unavailable");
     const signal = AbortSignal.timeout(5000);
@@ -605,7 +630,7 @@ export class NodeBootstrap extends DurableObject<Env> {
         aborted,
       ]);
       const body = await inspectionStatusBody(response, signal),
-        changed = await authority();
+        changed = await state.recheck();
       if (changed) return unavailable(changed);
       if (
         response.status === 404 &&
@@ -620,7 +645,7 @@ export class NodeBootstrap extends DurableObject<Env> {
         !native.success ||
         native.data.operation_id !== operationId ||
         native.data.mode !== mode ||
-        native.data.session_id !== session.data ||
+        native.data.session_id !== base.session_id ||
         (native.data.status === "failed"
           ? native.data.error_code === null
           : native.data.error_code !== null)
@@ -641,6 +666,71 @@ export class NodeBootstrap extends DurableObject<Env> {
       if (abort) signal.removeEventListener("abort", abort);
       void response?.body?.cancel().catch(() => {});
     }
+  }
+  /** Summarize retained source journals locally; never contact or wake the Container. */
+  async proofJournalStatus(operationId: string) {
+    const state = await this.#proofObservation(operationId, "preparation"),
+      base = {
+        ...state.base,
+        issued_at: state.input?.claims.issued_at ?? null,
+        expires_at: state.input?.claims.expires_at ?? null,
+      };
+    const unavailable = (error_code: string) =>
+      NodeProofJournalStatus.parse({
+        ...base,
+        status: "unavailable",
+        error_code,
+        journals: [],
+      });
+    if (state.error_code) return unavailable(state.error_code);
+    const prefix = "proof_owner:source:",
+      rows = await this.ctx.storage.list<Record<string, unknown>>({
+        prefix,
+        limit: 65,
+      });
+    if (rows.size > 64) return unavailable("proof_journal_limit");
+    const journals = [];
+    const uid = z.uuid().nullable();
+    for (const [key, value] of rows) {
+      const id = key.slice(prefix.length),
+        record = value?.state;
+      if (
+        !/^[a-f0-9]{64}$/.test(id) ||
+        !z.uuid().safeParse(value?.session_id).success ||
+        !record ||
+        typeof record !== "object" ||
+        Array.isArray(record)
+      )
+        return unavailable("proof_status_invalid");
+      const journal = record as Record<string, unknown>,
+        stage = NodeProofJournalEntry.shape.stage.safeParse(journal.stage),
+        namespace = uid.safeParse(journal.namespace_uid),
+        pod = uid.safeParse(journal.pod_uid);
+      if (!stage.success || !namespace.success || !pod.success)
+        return unavailable("proof_status_invalid");
+      journals.push({
+        key_sha256: await statusIdentifierHash(id),
+        stage: stage.data,
+        namespace_uid_sha256:
+          namespace.data === null
+            ? null
+            : await statusIdentifierHash(namespace.data),
+        pod_uid_sha256:
+          pod.data === null ? null : await statusIdentifierHash(pod.data),
+        matches_current_session: value.session_id === state.base.session_id,
+      });
+    }
+    const changed = await state.recheck();
+    if (changed) return unavailable(changed);
+    const result = NodeProofJournalStatus.parse({
+      ...base,
+      status: "observed",
+      error_code: null,
+      journals,
+    });
+    if (new TextEncoder().encode(JSON.stringify(result)).length > 32768)
+      return unavailable("proof_journal_limit");
+    return result;
   }
   async getProofInput(
     operationId: string,

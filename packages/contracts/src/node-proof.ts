@@ -178,6 +178,44 @@ export const NodeProofStatus = z.strictObject({
   error_code: NodeProofErrorCode.nullable(),
 });
 export type NodeProofStatus = z.infer<typeof NodeProofStatus>;
+export const NodeProofJournalErrorCode = z.enum([
+  "proof_status_invalid",
+  "proof_status_unavailable",
+  "proof_input_required",
+  "proof_server_identity_changed",
+  "proof_authority_closed",
+  "proof_journal_limit",
+]);
+export const NodeProofJournalEntry = z.strictObject({
+  key_sha256: Hash,
+  stage: z.enum([
+    "intent",
+    "ready",
+    "running",
+    "measured",
+    "cleanup",
+    "cleaned",
+  ]),
+  namespace_uid_sha256: Hash.nullable(),
+  pod_uid_sha256: Hash.nullable(),
+  matches_current_session: z.boolean(),
+});
+export type NodeProofJournalEntry = z.infer<typeof NodeProofJournalEntry>;
+/** A read-only ownership projection; observing a journal grants no proof or cleanup authority. */
+export const NodeProofJournalStatus = z.strictObject({
+  operation_id: OperationId,
+  mode: z.literal("preparation"),
+  session_id: z.uuid().nullable(),
+  binding_sha256: Hash,
+  plan_sha256: Hash.nullable(),
+  input_hash: Hash.nullable(),
+  issued_at: At.nullable(),
+  expires_at: At.nullable(),
+  status: z.enum(["observed", "unavailable"]),
+  error_code: NodeProofJournalErrorCode.nullable(),
+  journals: z.array(NodeProofJournalEntry).max(64),
+});
+export type NodeProofJournalStatus = z.infer<typeof NodeProofJournalStatus>;
 export const NodeProofClaims = z.strictObject({
   version: z.literal(1),
   kid: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/),

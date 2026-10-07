@@ -89,9 +89,24 @@ findings. CI `37552431256` then failed a test-only unbounded `apt` substring che
 staging data. Deterministic gzip/base64 bytes reproduce that false positive; the test guard now
 recognizes real package/filesystem/reboot commands and disk-write arguments while accepting the
 encoded data. Production bytes are unchanged by this test correction. No149 image credential,
-push or publication ran. The same Workflow is paused at the unchanged created-job checkpoint
-before any installation disk write. Never reset or replace its job, sealed input, source journals
-or custody.
+push or publication ran. Source `bae2bbb2`, full CI `37553462417`, passed158 native tests and
+complete local qualification:714,947,157 bytes/18 layers/zero unresolved findings. One registry
+push with complete readback verified162,113,993 compressed and502,830,080 raw bytes; manifest
+`sha256:238240441908357b996e2d8c34279a96afb3037cb14eaf7cc3ffbe060c170d5d`.
+One publication/completed rollout retained the full configuration except its URI, whole created
+job/seals and EU/US custody. Direct running placement/version/image verification passed. Journal
+retention is structural through the same DO namespace/configuration and absence of reset/write
+commands; before/after journal-value equality was not directly inspected. One controlled resume
+hit `ContaboError: unexpected_status`; this code is a provider GET failure, and the original
+vendor status/route is absent from serialized Workflow error metadata. No mutation was replayed.
+The existing same-ID recovery path restarted the Workflow automatically; that does not establish
+proof acceptance. Preparation remains awaiting_proof with no signed artifact, and the original
+bootstrap stayscreated/revision0/downloaded0/written0. Native proof attempts still fail or retry
+before new scanners. A separate bounded administrator preparation-journal getter is implemented
+and under review: current session timestamps plus existing source stages/UID hashes only, with
+local DO reads and no Container contact, session creation, authority or storage mutation. It is
+needed to identify the observed pre-scan wait from actual state. Never reset or replace the job,
+sealed input, source journals or custody.
 The retained EU control node's UID-guarded new-database placement flag is now
 false; its Kubernetes/platform readiness and schedulability, and customer EU1, remain preserved.
 Actual-RAM mode and automatic purchases remain disabled pending accepted US/recovery tests,

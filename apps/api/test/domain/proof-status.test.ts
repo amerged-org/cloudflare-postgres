@@ -432,3 +432,154 @@ it("refuses a replaced current session after native I/O without returning the st
   });
   expect(f.fetch).toHaveBeenCalledTimes(1);
 });
+
+it("reads current proof timing and bounded source journal hashes locally without contacting or starting a container", async () => {
+  const rawHash = async (value: string) =>
+    Array.from(
+      new Uint8Array(
+        await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
+      ),
+      (byte) => byte.toString(16).padStart(2, "0"),
+    ).join("");
+  const f = await fixture(),
+    namespace = crypto.randomUUID(),
+    pod = crypto.randomUUID(),
+    key = "a".repeat(64),
+    secret = crypto.randomUUID();
+  const status = await f.withStore(async (instance, state) => {
+    await state.storage.put(`proof_owner:source:${key}`, {
+      session_id: f.input.claims.session_id,
+      state: { stage: "cleanup", namespace_uid: namespace, pod_uid: pod },
+      originalInput: { bearer: secret, address: "203.0.113.123" },
+    });
+    const fetch = vi.fn(),
+      start = vi.fn(),
+      previous = Object.getOwnPropertyDescriptor(state, "container");
+    Object.defineProperty(state, "container", {
+      configurable: true,
+      value: { running: true, start, getTcpPort: () => ({ fetch }) },
+    });
+    try {
+      const value = await (
+        instance as NodeBootstrap & {
+          proofJournalStatus(id: string): Promise<Record<string, unknown>>;
+        }
+      ).proofJournalStatus(f.id);
+      expect(fetch).not.toHaveBeenCalled();
+      expect(start).not.toHaveBeenCalled();
+      expect(await state.storage.getAlarm()).toBeNull();
+      return value;
+    } finally {
+      if (previous) Object.defineProperty(state, "container", previous);
+      else delete (state as { container?: unknown }).container;
+    }
+  });
+  expect(status).toMatchObject({
+    operation_id: f.id,
+    mode: "preparation",
+    session_id: f.input.claims.session_id,
+    issued_at: f.input.claims.issued_at,
+    expires_at: f.input.claims.expires_at,
+    status: "observed",
+    error_code: null,
+  });
+  expect(status.journals).toEqual([
+    {
+      key_sha256: await rawHash(key),
+      stage: "cleanup",
+      namespace_uid_sha256: await rawHash(namespace),
+      pod_uid_sha256: await rawHash(pod),
+      matches_current_session: true,
+    },
+  ]);
+  expect(JSON.stringify(status)).not.toContain(secret);
+  expect(JSON.stringify(status)).not.toContain("203.0.113.123");
+  expect(JSON.stringify(status)).not.toContain(namespace);
+});
+
+it("distinguishes an existing older source session without exposing its raw journal", async () => {
+  const f = await fixture();
+  const status = await f.withStore(async (instance, state) => {
+    await state.storage.put(`proof_owner:source:${"b".repeat(64)}`, {
+      session_id: crypto.randomUUID(),
+      state: {
+        stage: "running",
+        namespace_uid: crypto.randomUUID(),
+        pod_uid: null,
+      },
+      publicSource: { address: "203.0.113.111" },
+    });
+    return instance.proofJournalStatus(f.id);
+  });
+  expect(status.status).toBe("observed");
+  expect(status.journals[0]).toMatchObject({
+    stage: "running",
+    pod_uid_sha256: null,
+    matches_current_session: false,
+  });
+  expect(JSON.stringify(status)).not.toContain("203.0.113.111");
+});
+
+it("refuses more than sixty-four retained source journals without returning any records", async () => {
+  const f = await fixture();
+  const status = await f.withStore(async (instance, state) => {
+    const records: Record<string, unknown> = {};
+    for (let i = 0; i < 65; i++)
+      records[`proof_owner:source:${i.toString(16).padStart(64, "0")}`] = {
+        session_id: f.input.claims.session_id,
+        state: { stage: "intent", namespace_uid: null, pod_uid: null },
+      };
+    await state.storage.put(records);
+    return instance.proofJournalStatus(f.id);
+  });
+  expect(status).toMatchObject({
+    status: "unavailable",
+    error_code: "proof_journal_limit",
+    journals: [],
+  });
+});
+
+it("returns only a fixed invalid code for a malformed source journal", async () => {
+  const f = await fixture(),
+    secret = crypto.randomUUID();
+  const status = await f.withStore(async (instance, state) => {
+    await state.storage.put(`proof_owner:source:${"c".repeat(64)}`, {
+      session_id: f.input.claims.session_id,
+      state: { stage: secret, namespace_uid: null, pod_uid: null },
+    });
+    return instance.proofJournalStatus(f.id);
+  });
+  expect(status).toMatchObject({
+    status: "unavailable",
+    error_code: "proof_status_invalid",
+    journals: [],
+  });
+  expect(JSON.stringify(status)).not.toContain(secret);
+});
+
+it("rechecks current session authority after reading journals before returning the local summary", async () => {
+  const f = await fixture();
+  const status = await f.withStore(async (instance, state) => {
+    const original = state.storage.list.bind(state.storage);
+    const spy = vi
+      .spyOn(state.storage, "list")
+      .mockImplementation(async (options) => {
+        const rows = await original(options);
+        await state.storage.put(
+          "proof_current:preparation",
+          crypto.randomUUID(),
+        );
+        return rows;
+      });
+    try {
+      return await instance.proofJournalStatus(f.id);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+  expect(status).toMatchObject({
+    status: "unavailable",
+    error_code: "proof_status_invalid",
+    journals: [],
+  });
+});
