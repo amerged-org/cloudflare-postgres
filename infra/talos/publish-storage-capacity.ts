@@ -39,6 +39,7 @@ export interface PublisherConfig {
   context: string;
   proofNotBefore: number;
   proofCompletedAt: number;
+  executionWindow?: "native-bootstrap";
   bindings: Readonly<Record<string, NodeBinding>>;
 }
 export interface ClusterClient {
@@ -173,14 +174,21 @@ function configFromEnvironment(
     bindings: Object.freeze(bindings),
   });
 }
-function validateProofWindow(start: number, end: number, now: number): void {
+function validateProofWindow(
+  start: number,
+  end: number,
+  now: number,
+  executionWindow?: "native-bootstrap",
+): void {
+  const native = executionWindow === "native-bootstrap";
   if (
+    (executionWindow !== undefined && !native) ||
     !Number.isFinite(start) ||
     !Number.isFinite(end) ||
     end < start ||
     end > now ||
-    end - start > maxAgeMs ||
-    now - start > maxAgeMs
+    end - start > (native ? 900_000 : maxAgeMs) ||
+    now - (native ? end : start) > maxAgeMs
   )
     throw new Error("stale_storage_proof");
 }
@@ -257,7 +265,12 @@ export function capacityPlan(
   lvmValue: unknown,
   now: number,
 ): { storageGiB: number; freeBytes: number; patch: Patch } {
-  validateProofWindow(config.proofNotBefore, config.proofCompletedAt, now);
+  validateProofWindow(
+    config.proofNotBefore,
+    config.proofCompletedAt,
+    now,
+    config.executionWindow,
+  );
   const expected = config.bindings[name];
   if (!expected || !nodePattern.test(name))
     throw new Error("unapproved_storage_node");

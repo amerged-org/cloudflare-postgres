@@ -331,7 +331,7 @@ bounded read-only observation of the exact planned objects and fresh physical/cl
 Authority transport, aborted requests and invalid response JSON/schema have finite diagnostics;
 raw storage aborts retain `storage_trial_aborted`, while other unknown storage errors retain
 `storage_trial_failed`. These diagnostics disclose no response bodies or credentials and do not
-extend deadlines or authorize a retry. Continue the same operation with its recorded ownership
+authorize a retry. Continue the same operation with its recorded ownership
 and uncertain-outcome reconciliation; never reset the image or erase trial journals.
 
 Storage readback uses exact Kubernetes REST resources rather than repeated discovery. Each fact
@@ -339,8 +339,13 @@ snapshot keeps its fresh Cloudflare authority calls, initial and final Node/Clus
 Talos disk/partition/version and physical PV/VG/LV comparisons. Independent reads settle in
 batches of at most four; every sibling finishes before an error can enter cleanup. Optional
 trial resources use complete typed name-filtered lists: failed, paged, malformed, duplicate or
-foreign results cannot establish absence. The270-second producer deadline and separately fenced
-serial mutations remain unchanged.
+foreign results cannot establish absence. Every separately fenced mutation retains fresh
+authority, identity and physical checks, with15-second authority requests and20-second native
+commands. The complete guarded Native producer has a900-second work allowance and915-second
+outer cancellation bound. Its historical before-to-after proof is bounded to900 seconds, while
+completion remains fresh within300 seconds and publication binds the current exact physical/CSI
+state. Only the internal Native caller selects this rule. The manual publisher's original
+300-second start-age and duration checks remain unchanged; there is no new CLI/environment option.
 
 Complete US1 installation and admission, then restore an EU1 test database into a separate US1
 target from R2 while keeping the EU source healthy. Compare SQL data and committed markers,

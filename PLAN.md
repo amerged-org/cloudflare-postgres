@@ -645,6 +645,39 @@ strict metadata check now rejects those responses before creation.61 affected te
 types/lint/formatting and independent review pass. The final source retains the same270/285-second
 deadlines and every uncertain-mutation readback; one CI and qualified delivery are pending.
 
+Source `d787e31f`, full CI `37763622970`, delivered qualified Native
+`sha256:7da1bfa25a9dced925bffb05df32961c84d265051619c0b98720f736385a6221` once.
+All18 layers/715,037,273 qualification bytes passed; full registry readback verified162,129,649
+compressed and502,920,192 raw bytes. Actual running image/version33 matched. Protected EU data,
+custody, API bindings, original US input/full image/join and both consumed repair journals stayed
+unchanged. The same Workflow resumed at10:45:16.454Z. Fresh bounded captures confirmed current
+bootstrap callback HTTP200 activity; they do not identify the executing publisher from routing
+alone. The old empty trial was physically confirmed reclaimed at11:04:07.288Z, then round2 began
+at11:05:01.210Z and its Namespace UID was durably recorded. Revision712 stopped with the explicit
+`storage_trial_aborted`; no PVC/Pod/PV/LVM allocation or data write is recorded. One subsequent
+pause succeeded atstep700 with whole job712 unchanged. The completed30-minute capture ending
+11:12:49.173Z recorded zero provider wire events in all stages; counts apply only to that window.
+
+A complete producer regression now advances both wall and monotonic clocks using the observed
+3-second native and1.2-second callback latency model, including retained cleanup, creation,
+physical allocation/write/reclamation and publication. The original270-second aggregate budget
+fails after namespace progress. Raising only that aggregate still exposes the separate historical
+300-second proof-start window. The corrected design keeps current authority, per-request deadlines,
+transport expiry, stable identities and fresh completion/current capacity, while bounding the
+entire guarded Native trial separately. Legacy manual proof rules remain unchanged. These are
+modeled durations; final software checks, delivery and full live acceptance remain pending.
+The complete upper-latency model uses3.5-second native commands,1.2-second fresh callbacks and
+three callbacks per custody save. It completes in856.3 seconds, with554.9 seconds of historical
+trial span and131.9 seconds from completion to publication. The bounded producer allowance is
+900 seconds (the first whole-minute bound covering that model), plus the existing15-second outer
+margin. An internal literal selector is supplied only by Native; no external setting is added.
+Fresh completion remains300 seconds, all15/20-second request bounds and identities remain, and
+the legacy manual300-second start-age/duration predicates are unchanged. Actual live timing is
+still required; the model is not acceptance evidence.
+77 affected tests, strict Native types, scoped lint and independent review pass. Negative checks
+retain stale-completion, future, overlong-history and changed-identity rejection, and the manual
+default rejects the same aged proof. One final CI and qualified delivery remain pending.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

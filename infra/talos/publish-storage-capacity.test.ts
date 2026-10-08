@@ -448,3 +448,36 @@ test("out-of-window smoke capture times and reused revisions refuse publication"
     /invalid_smoke_revisions/,
   );
 });
+
+
+function nativeWindowFixture(startAge = 600_000, completionAge = 20_000) {
+  const f = fixture();
+  f.config.context = "native-bootstrap";
+  f.config.executionWindow = "native-bootstrap";
+  f.config.proofNotBefore = now - startAge;
+  f.config.proofCompletedAt = now - completionAge;
+  const smoke = f.config.bindings[f.name]!.smoke;
+  smoke.before.observed_at = new Date(f.config.proofNotBefore).toISOString();
+  smoke.allocated.observed_at = new Date((f.config.proofNotBefore + f.config.proofCompletedAt) / 2).toISOString();
+  smoke.after.observed_at = new Date(f.config.proofCompletedAt).toISOString();
+  return f;
+}
+
+test("Native bounded work accepts historical start only with fresh completion and unchanged physical identities", () => {
+  const f = nativeWindowFixture();
+  assert.equal(capacityPlan(f.config, f.name, f.node, f.lvm, now).storageGiB, 96);
+  f.node.metadata.uid = randomUUID();
+  assert.throws(() => capacityPlan(f.config, f.name, f.node, f.lvm, now), /foreign_node/);
+  const legacy = nativeWindowFixture();
+  delete legacy.config.executionWindow;
+  assert.throws(() => capacityPlan(legacy.config, legacy.name, legacy.node, legacy.lvm, now), /stale_storage_proof/);
+});
+
+test("Native proof work refuses stale completion, future completion and a historical span beyond its bound", () => {
+  const stale = nativeWindowFixture(800_000, 300_001);
+  assert.throws(() => capacityPlan(stale.config, stale.name, stale.node, stale.lvm, now), /stale_storage_proof/);
+  const future = nativeWindowFixture(600_000, -1);
+  assert.throws(() => capacityPlan(future.config, future.name, future.node, future.lvm, now), /stale_storage_proof/);
+  const tooLong = nativeWindowFixture(901_001, 1000);
+  assert.throws(() => capacityPlan(tooLong.config, tooLong.name, tooLong.node, tooLong.lvm, now), /stale_storage_proof/);
+});

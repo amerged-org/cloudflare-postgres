@@ -295,7 +295,7 @@ class StorageProducer {
   readonly input: NodeBootstrapInput;
   readonly commands: StorageCapacityCommands;
   private trial: NodeStorageTrial | null = null;
-  private readonly end = performance.now() + 270_000;
+  private readonly end = performance.now() + 900_000;
   constructor(input: NodeBootstrapInput, commands: StorageCapacityCommands) {
     this.input = input;
     this.commands = commands;
@@ -959,6 +959,7 @@ class StorageProducer {
         clusterUid: binding.cluster_uid,
         storageNamespaceUid: binding.storage_namespace_uid,
         context: "native-bootstrap",
+        executionWindow: "native-bootstrap",
         proofNotBefore: Date.parse(run.before.observed_at),
         proofCompletedAt: Date.parse(run.after.observed_at),
         bindings: {

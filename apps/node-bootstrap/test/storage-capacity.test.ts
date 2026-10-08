@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { setImmediate } from "node:timers/promises";
 import { randomBytes, randomUUID } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -20,8 +21,7 @@ import { BootstrapError, digest } from "../src/bootstrap.ts";
 import { storageReadbackFixture } from "./storage-readback.fixture.ts";
 import { storageCapacityFixture } from "./storage-capacity.fixture.ts";
 
-function trialFixture() {
-  const f = storageReadbackFixture();
+function trialFixture(f = storageReadbackFixture()) {
   const trialHash = digest(randomBytes(32));
   const script = storageTrialWriteScript(trialHash);
   const trial = NodeStorageTrial.parse({
@@ -382,7 +382,7 @@ test("expiry during awaited authorization refuses the following native mutation"
   const commands = {
     ...f.commands,
     authorize: async () => {
-      if (armed) clock = 300_000;
+      if (armed) clock = 1_000_000;
       return f.commands.authorize();
     },
     kube: async (...args: Parameters<typeof f.commands.kube>) => {
@@ -555,4 +555,82 @@ test("missing or null list metadata cannot establish storage trial absence", asy
     );
     assert.equal(f.mutations.length, 0);
   }
+});
+
+test("the measured full storage flow completes retained cleanup, write, reclaim and publication within its bounded work budget", async (t) => {
+  const f = storageCapacityFixture();
+  const epoch = Date.now();
+  let clock = 0;
+  t.mock.timers.enable({ apis: ["Date"], now: epoch });
+  t.mock.method(performance, "now", () => clock);
+  const advanceTo = (next: number) => {
+    if (next > clock) {
+      t.mock.timers.tick(next - clock);
+      clock = next;
+    }
+  };
+  const latency = async <T>(milliseconds: number, fn: () => Promise<T>) => {
+    const finish = clock + milliseconds;
+    await setImmediate();
+    advanceTo(finish);
+    return await fn();
+  };
+  const old = trialFixture(f).trial;
+  old.runs[0]!.before.observed_at = new Date(epoch - 3600_000).toISOString();
+  await f.commands.saveTrial(old);
+  const cleanup = structuredClone(old);
+  cleanup.runs[0]!.stage = "cleanup";
+  await f.commands.saveTrial(cleanup);
+  const commands = {
+    ...f.commands,
+    authorize: () => latency(1200, f.commands.authorize),
+    readTrial: () => latency(1200, f.commands.readTrial),
+    saveTrial: (trial: NodeStorageTrial) =>
+      latency(3600, () => f.commands.saveTrial(trial)),
+    kube: (...args: Parameters<typeof f.commands.kube>) =>
+      latency(3500, () => f.commands.kube(...args)),
+    talos: (...args: Parameters<typeof f.commands.talos>) =>
+      latency(3500, () => f.commands.talos(...args)),
+    wait: async () => {
+      advanceTo(clock + 1000);
+      await setImmediate();
+    },
+  };
+  try {
+    await publishNodeStorageCapacity(f.input, commands);
+  } catch (error) {
+    console.log(
+      JSON.stringify({
+        simulated_measured_flow_ms: clock,
+        latest_stage: f.trial()!.runs.at(-1)!.stage,
+        rounds: f.trial()!.runs.length,
+        error_code: error instanceof BootstrapError ? error.code : "unknown",
+        old_reclaimed: f.trial()!.runs[0]!.stage === "reclaimed",
+        new_proof_span_ms: f.trial()!.runs.at(-1)!.after
+          ? Date.parse(f.trial()!.runs.at(-1)!.after!.observed_at) -
+            Date.parse(f.trial()!.runs.at(-1)!.before.observed_at)
+          : null,
+      }),
+    );
+    throw error;
+  }
+  const final = f.trial()!;
+  const run = final.runs.at(-1)!;
+  console.log(
+    JSON.stringify({
+      simulated_measured_flow_ms: clock,
+      new_proof_span_ms:
+        Date.parse(run.after!.observed_at) - Date.parse(run.before.observed_at),
+      completion_age_ms: Date.now() - Date.parse(run.after!.observed_at),
+    }),
+  );
+  assert.equal(final.runs[0]!.stage, "reclaimed");
+  assert.equal(run.stage, "published");
+  assert.ok(clock <= 900_000);
+  const proofSpan =
+    Date.parse(run.after!.observed_at) - Date.parse(run.before.observed_at);
+  assert.ok(proofSpan > 300_000 && proofSpan <= 900_000);
+  assert.ok(Date.now() - Date.parse(run.after!.observed_at) <= 300_000);
+  assert.equal(f.objects.size, 0);
+  assert.equal(f.logical_volumes.length, 0);
 });

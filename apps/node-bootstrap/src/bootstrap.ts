@@ -1668,7 +1668,7 @@ export class BootstrapJob {
   private async publishStorageCapacity() {
     const signal = AbortSignal.any([
       this.abort.signal,
-      AbortSignal.timeout(285_000),
+      AbortSignal.timeout(915_000),
     ]);
     const authorize = async () => {
       const authority = await this.authority.read(signal);
