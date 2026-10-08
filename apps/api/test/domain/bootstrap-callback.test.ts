@@ -2751,3 +2751,54 @@ it("consumes only one competing Cilium recovery claim at the exact CF revision",
   expect(replies.map((r) => r.status).sort()).toEqual([200, 409]);
   expect((await readBootstrapJob(env.DB, f.job.operation_id)).revision).toBe(1);
 });
+
+it("logs only a finite owned Cilium rejection reason and bounded ages while retaining HTTP409", async () => {
+  const { f, claimed } = await ciliumRecoveryFixture();
+  const log = vi.spyOn(console, "warn").mockImplementation(() => {});
+  const stale = {
+    ...claimed.cilium_install.recovery_receipt,
+    observed_at: new Date(Date.now() - 120001).toISOString(),
+    completed_at: new Date(Date.now() - 120001).toISOString(),
+  };
+  expect(
+    (
+      await callback(f, {
+        ...f.identity,
+        kind: "checkpoint",
+        expected_revision: 0,
+        payload: {
+          ...claimed,
+          cilium_install: {
+            ...claimed.cilium_install,
+            recovery_receipt: stale,
+          },
+        },
+      })
+    ).status,
+  ).toBe(409);
+  const events = log.mock.calls.flatMap((args) => {
+    if (args.length !== 1 || typeof args[0] !== "string") return [];
+    const value = JSON.parse(args[0]);
+    return value.event === "cilium_recovery_claim_rejected" ? [value] : [];
+  });
+  expect(events).toHaveLength(1);
+  expect(events[0]).toMatchObject({
+    event: "cilium_recovery_claim_rejected",
+    reason: "stale_observation",
+    operation_id: f.job.operation_id,
+  });
+  expect(Object.keys(events[0]).sort()).toEqual([
+    "completed_age_ms",
+    "event",
+    "future_observation",
+    "observed_age_ms",
+    "operation_id",
+    "reason",
+  ]);
+  expect(Number.isInteger(events[0].observed_age_ms)).toBe(true);
+  expect(events[0].observed_age_ms).toBeGreaterThanOrEqual(120001);
+  expect(events[0].observed_age_ms).toBeLessThanOrEqual(600000);
+  expect(JSON.stringify(events)).not.toContain(stale.node_uid);
+  expect(JSON.stringify(events)).not.toContain(stale.input_hash);
+  expect((await readBootstrapJob(env.DB, f.job.operation_id)).revision).toBe(0);
+});

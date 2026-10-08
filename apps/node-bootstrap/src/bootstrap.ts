@@ -1572,38 +1572,28 @@ export class BootstrapJob {
           undefined,
           permit_failure,
         ),
-      authorize: async () => {
-        const authority = await this.authority.read(this.abort.signal);
-        const material = authority.protected_material;
-        if (
-          !authority.checkpoint.sealed_ref ||
-          material?.purpose !== "join_bundle"
-        )
-          throw new BootstrapError("platform_bundle_unsealed");
-        const namespace = record(
-          JSON.parse(
-            (
-              await this.kube([
-                "get",
-                "namespace",
-                "kube-system",
-                "--output=json",
-              ])
-            ).stdout,
-          ),
-        );
-        if (
-          record(namespace.metadata).uid !== material.material.kube_system_uid
-        )
-          throw new BootstrapError("cluster_uid_mismatch");
-        return authority.checkpoint.stage;
-      },
+      authorize: () => this.platformAuthority(),
       checkpoint: async (stage) => {
         await this.checkpoint(stage);
       },
     });
     await installer.install();
     await this.authenticatedReadback();
+  }
+  private async platformAuthority() {
+    const authority = await this.authority.read(this.abort.signal);
+    const material = authority.protected_material;
+    if (!authority.checkpoint.sealed_ref || material?.purpose !== "join_bundle")
+      throw new BootstrapError("platform_bundle_unsealed");
+    const namespace = record(
+      JSON.parse(
+        (await this.kube(["get", "--raw=/api/v1/namespaces/kube-system"]))
+          .stdout,
+      ),
+    );
+    if (record(namespace.metadata).uid !== material.material.kube_system_uid)
+      throw new BootstrapError("cluster_uid_mismatch");
+    return authority.checkpoint.stage;
   }
   private async publishKubeletTrust() {
     await publishKubeletTrust(this.input, {

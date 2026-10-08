@@ -56,6 +56,8 @@ function clusterFixture(
   let chartCrds = "";
   let failInventory = false;
   let changeClusterAfterInventory = false;
+  let renderWait = () => {};
+  let partialRawInventory = false;
   const assets: PlatformAssets = {
     chart_path: "/verified/cilium.tgz",
     values_path: "/verified/cilium.yaml",
@@ -264,11 +266,13 @@ function clusterFixture(
     helm: async (args) => {
       if (args[0] === "show" && args[1] === "crds")
         return { exit_code: 0, stdout: chartCrds };
-      if (args[0] === "template")
+      if (args[0] === "template") {
+        renderWait();
         return {
           exit_code: 0,
           stdout: rendered,
         };
+      }
       if (strictHelm4 && args.includes("--all"))
         throw new BootstrapError("native_command_failed_helm_1");
       if (args.includes("list"))
@@ -312,6 +316,65 @@ function clusterFixture(
       };
     },
     kube: async (args, _permit_failure, stdin) => {
+      const raw = args.find((arg) => arg.startsWith("--raw="));
+      if (raw) {
+        const url = new URL(raw.slice(6), "https://fixture.invalid"),
+          segments = url.pathname.split("/").filter(Boolean);
+        if (
+          segments[0] === "api" &&
+          segments.length === 4 &&
+          ["nodes", "namespaces"].includes(segments[2]!)
+        ) {
+          const kind = segments[2] === "nodes" ? "Node" : "Namespace",
+            value = resources.get(`${kind}//${segments[3]}`);
+          return {
+            exit_code: value ? 0 : 1,
+            stdout: value ? JSON.stringify(value) : "",
+          };
+        }
+        if (
+          failInventory &&
+          url.searchParams.get("fieldSelector") ===
+            "metadata.name=cilium-bootstrap"
+        )
+          return { exit_code: 1, stdout: "" };
+        const plural = segments.at(-1)!,
+          kind = kinds[plural]!;
+        assert.ok(kind, "known_typed_raw_collection_required");
+        const apiVersion =
+            segments[0] === "api" ? "v1" : `${segments[1]}/${segments[2]}`,
+          nsAt = segments.indexOf("namespaces"),
+          namespace =
+            nsAt >= 0 && nsAt < segments.length - 1
+              ? segments[nsAt + 1]
+              : undefined,
+          selector = url.searchParams.get("fieldSelector"),
+          name = selector?.slice("metadata.name=".length);
+        if (changeClusterAfterInventory && plural === "secrets" && !selector)
+          store({
+            apiVersion: "v1",
+            kind: "Namespace",
+            metadata: { name: "kube-system" },
+          });
+        const items = [...resources.values()].filter(
+          (value) =>
+            value.kind === kind &&
+            (namespace === undefined ||
+              object(value.metadata).namespace === namespace) &&
+            (name === undefined || object(value.metadata).name === name),
+        );
+        return {
+          exit_code: 0,
+          stdout: JSON.stringify({
+            apiVersion,
+            kind: `${kind}List`,
+            items,
+            ...(partialRawInventory && selector
+              ? { metadata: { continue: "unread-page" } }
+              : {}),
+          }),
+        };
+      }
       if (failInventory && args.includes("cilium-bootstrap"))
         return { exit_code: 1, stdout: "" };
       if (args.includes("get") && args.includes("secrets,configmaps")) {
@@ -381,6 +444,12 @@ function clusterFixture(
     },
     setClusterReplacement: () => {
       changeClusterAfterInventory = true;
+    },
+    setRenderWait: (run: () => void) => {
+      renderWait = run;
+    },
+    setPartialRawInventory: () => {
+      partialRawInventory = true;
     },
     stage: () => stage,
     setLostResponse: () => {
@@ -525,7 +594,10 @@ test("a remaining chart object or failed inventory read keeps Cilium recovery un
   assert.equal(state.mutations.length, 0);
   state.resources.delete("ConfigMap/kube-system/cilium-bootstrap");
   state.setInventoryFailure();
-  await assert.rejects(state.installer.install(), /platform_readback_invalid/);
+  await assert.rejects(
+    state.installer.install(),
+    /cilium_recovery_inventory_unknown/,
+  );
   assert.equal(state.journal(), undefined);
   assert.equal(state.mutations.length, 0);
 });
@@ -592,6 +664,41 @@ test("the pinned Cilium secrets Namespace and its resources require complete abs
   );
   assert.equal(occupied.journal(), undefined);
   assert.equal(occupied.mutations.length, 0);
+});
+
+test("slow chart preparation does not age the subsequent physical absence receipt", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const state = clusterFixture("cilium_install_intent", false, true);
+  state.setRelease(false);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  state.setRenderWait(() => t.mock.timers.tick(130_000));
+  await state.installer.install();
+  const receipt = state.journal()!.recovery_receipt;
+  assert.ok(
+    Date.parse(receipt.completed_at) - Date.parse(receipt.observed_at) <
+      120_000,
+  );
+});
+
+test("an empty but continued raw collection never establishes complete Cilium absence", async () => {
+  const state = clusterFixture("cilium_install_intent", false, true);
+  state.setRelease(false);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  state.setPartialRawInventory();
+  await assert.rejects(
+    state.installer.install(),
+    /cilium_recovery_inventory_unknown/,
+  );
+  assert.equal(state.journal(), undefined);
+  assert.equal(state.mutations.length, 0);
 });
 
 test("a replaced cluster UID after the complete inventory blocks the recovery CAS", async () => {

@@ -403,3 +403,12 @@ no-effect resolution, not permission to clear a journal or manually repeat an un
 The pinned chart's `cilium-secrets` Namespace is a cluster-scoped install effect. Include it
 and its declared namespaced resources in complete absence readback; do not skip a Namespace
 or accept an already existing one to make recovery advance.
+
+Render and validate the immutable chart before starting the fresh physical absence window.
+Read exact typed REST collections with an encoded name selector, bounded concurrency and
+complete-list checks; a failed read is never absence. Read the sealed Namespace and target
+Node through their exact REST paths. The API's120-second receipt limit remains unchanged.
+`cilium_recovery_claim_rejected` logs only a fixed reason, the owned operation ID and bounded
+observation ages. A409 alone does not identify which predicate failed; retain the diagnostic
+and resolve current journal state before any follow-up. A recorded attempt2 still permits
+only authenticated readback, regardless of the diagnostic reason.

@@ -498,6 +498,30 @@ The reproducer fails before correction;17 affected installation cases, types/lin
 pass afterward. The same Workflow was paused once for the changed image delivery. No
 attempt2 install, provider action, disk rewrite or EU mutation occurred; US1 Ready remains pending.
 
+Source `f0f7a732`, full CI `37734080038`, delivered qualified Native manifest
+`sha256:b8d102c4d4c91dc57ca4316ebec446dad53ecb4d2343c80045e4c11a34d14b6d` once.
+Qualification passed18 layers/715,002,969 bytes; full readback verified162,123,629 compressed
+and502,885,888 raw bytes. Actual running image matched after one original-operation resume.
+The complete absence path reached its claim, which received HTTP409 at06:10:53.548Z;
+the saved job subsequently reported `checkpoint_acknowledgement_uncertain`, with no
+attempt2 journal and no install dispatched. The historical response body/rejection branch
+was not retained, so the precise rejected predicate is not established. The observed path
+took several minutes and produced151 successful authority frames plus69 relay frames by
+06:10:50Z, including redundant Kubernetes discovery. One controlled pause atstep752
+retained the original image/join/intent. The completed earlier30-minute capture recorded
+zero provider wire events; it covers that window only, and overlaps the later capture.
+
+The follow-up uses exact typed REST collections and encoded name selectors for complete
+absence, with four bounded concurrent reads. Unknown/partial lists, mismatched TypeMeta,
+existing effects and changed identities still block. Static chart rendering precedes the
+fresh physical observation window, which keeps the same120-second API limit. A delayed
+130-second render reproduces the former prematurely aged window locally; this does not
+prove the historical409 cause. The remaining sealed-cluster authorization read also uses
+the exact Namespace REST path. Finite rejection diagnostics identify only fixed reasons,
+the owned operation and bounded ages, without payloads, credentials, UIDs or hashes.
+No authority, CAS, expiry, provider boundary or attempt limit is relaxed. Full US1 acceptance
+remains outstanding.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

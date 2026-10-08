@@ -632,8 +632,6 @@ export class PlatformInstaller {
       if (releases.length) recovery = false;
     }
     if (recovery) {
-      const observed_at = new Date().toISOString();
-      const before = await this.ciliumRecoveryIdentity();
       const crds = await this.commands.helm([
         "show",
         "crds",
@@ -712,11 +710,23 @@ export class PlatformInstaller {
         new Set(inventory.map(canonical)).size !== inventory.length
       )
         throw new BootstrapError("cilium_recovery_inventory_unknown");
+      const observed_at = new Date().toISOString();
+      const before = await this.ciliumRecoveryIdentity();
       for (let offset = 0; offset < inventory.length; offset += 4) {
         const results = await Promise.allSettled(
           inventory
             .slice(offset, offset + 4)
-            .map((value) => this.read(value.kind, value.name, value.namespace)),
+            .map(async (value) =>
+              (
+                await this.ciliumCollection(
+                  value.kind,
+                  value.namespace,
+                  value.name,
+                )
+              ).length
+                ? {}
+                : null,
+            ),
         );
         const failed = results.find((result) => result.status === "rejected");
         if (failed?.status === "rejected") throw failed.reason;
@@ -727,30 +737,16 @@ export class PlatformInstaller {
         )
           throw new BootstrapError("cilium_recovery_effect_present");
       }
-      const releases = await this.commands.kube([
-        "get",
-        "secrets,configmaps",
-        "--namespace",
-        "kube-system",
-        "--output=json",
+      const stores = await Promise.allSettled([
+        this.ciliumCollection("Secret", "kube-system"),
+        this.ciliumCollection("ConfigMap", "kube-system"),
       ]);
-      if (
-        releases.exit_code !== 0 ||
-        Buffer.byteLength(releases.stdout) > 1024 * 1024
-      )
-        throw new BootstrapError("cilium_recovery_storage_unknown");
-      const storage = record(JSON.parse(releases.stdout));
-      const storageMetadata = record(storage.metadata ?? {});
-      if (
-        storage.apiVersion !== "v1" ||
-        storage.kind !== "List" ||
-        (storageMetadata.continue !== undefined &&
-          storageMetadata.continue !== "") ||
-        (storageMetadata.remainingItemCount !== undefined &&
-          storageMetadata.remainingItemCount !== 0)
-      )
-        throw new BootstrapError("cilium_recovery_storage_unknown");
-      for (const value of list(storage.items)) {
+      const unknown = stores.find((store) => store.status === "rejected");
+      if (unknown?.status === "rejected") throw unknown.reason;
+      const stored = stores.flatMap((store) =>
+        store.status === "fulfilled" ? store.value : [],
+      );
+      for (const value of stored) {
         const metadata = record(value.metadata),
           labels = record(metadata.labels ?? {});
         if (
@@ -845,8 +841,8 @@ export class PlatformInstaller {
   }
   private async ciliumRecoveryIdentity() {
     await this.commands.authorize();
-    const system = await this.required("Namespace", "kube-system"),
-      node = await this.required("Node", this.input.spec.hostname);
+    const system = await this.ciliumCoreIdentity("Namespace", "kube-system"),
+      node = await this.ciliumCoreIdentity("Node", this.input.spec.hostname);
     const labels = record(record(node.metadata).labels ?? {}),
       status = record(node.status);
     if (
@@ -876,6 +872,73 @@ export class PlatformInstaller {
       node_uid: String(record(node.metadata).uid),
       node_name: this.input.spec.hostname,
     };
+  }
+  private async ciliumCollection(
+    kind: string,
+    namespace?: string,
+    name?: string,
+  ): Promise<Json[]> {
+    const apiVersion = CILIUM_RESOURCE_VERSIONS[kind],
+      resource = (
+        RESOURCES[kind] ?? (kind === "DaemonSet" ? "daemonsets" : "")
+      ).split(".")[0];
+    if (
+      !apiVersion ||
+      !resource ||
+      (namespace && !/^[a-z0-9][a-z0-9-]*$/.test(namespace)) ||
+      (name && !/^[a-z0-9][a-z0-9.-]*$/.test(name))
+    )
+      throw new BootstrapError("cilium_recovery_inventory_unknown");
+    const prefix = apiVersion === "v1" ? "/api/v1" : `/apis/${apiVersion}`,
+      path = `${prefix}${namespace ? `/namespaces/${namespace}` : ""}/${resource}${name ? `?fieldSelector=${encodeURIComponent(`metadata.name=${name}`)}` : ""}`;
+    const result = await this.commands.kube(["get", `--raw=${path}`]);
+    if (
+      result.exit_code !== 0 ||
+      Buffer.byteLength(result.stdout) > 1024 * 1024
+    )
+      throw new BootstrapError("cilium_recovery_inventory_unknown");
+    const value = record(JSON.parse(result.stdout)),
+      metadata = record(value.metadata ?? {});
+    if (
+      value.apiVersion !== apiVersion ||
+      value.kind !== `${kind}List` ||
+      (metadata.continue !== undefined && metadata.continue !== "") ||
+      (metadata.remainingItemCount !== undefined &&
+        metadata.remainingItemCount !== 0)
+    )
+      throw new BootstrapError("cilium_recovery_inventory_unknown");
+    return list(value.items).map((item) => {
+      const typed =
+        item.apiVersion === undefined && item.kind === undefined
+          ? { ...item, apiVersion, kind }
+          : item;
+      if (typed.apiVersion !== apiVersion || typed.kind !== kind)
+        throw new BootstrapError("cilium_recovery_storage_unknown");
+      return typed;
+    });
+  }
+  private async ciliumCoreIdentity(kind: "Namespace" | "Node", name: string) {
+    const result = await this.commands.kube([
+      "get",
+      `--raw=/api/v1/${kind === "Node" ? "nodes" : "namespaces"}/${name}`,
+    ]);
+    if (
+      result.exit_code !== 0 ||
+      Buffer.byteLength(result.stdout) > 1024 * 1024
+    )
+      throw new BootstrapError("cilium_recovery_identity_changed");
+    const value = record(JSON.parse(result.stdout)),
+      metadata = record(value.metadata);
+    if (
+      value.apiVersion !== "v1" ||
+      value.kind !== kind ||
+      metadata.name !== name ||
+      typeof metadata.uid !== "string" ||
+      !metadata.uid ||
+      metadata.deletionTimestamp
+    )
+      throw new BootstrapError("cilium_recovery_identity_changed");
+    return value;
   }
   private async verifyPlatform() {
     const repository = await this.required(

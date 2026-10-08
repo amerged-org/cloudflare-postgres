@@ -483,6 +483,38 @@ export async function authenticateBootstrapCallback(
   )
     throw new ApiError("forbidden", "Bootstrap job is closed");
 }
+type CiliumRejectionReason =
+  | "scope_or_identity_mismatch"
+  | "stale_observation"
+  | "checkpoint_changed"
+  | "CAS_conflict";
+function logCiliumClaimRejection(
+  row: BootstrapJobRow,
+  reason: CiliumRejectionReason,
+  receipt?: { observed_at: string; completed_at: string },
+) {
+  const now = Date.now();
+  const age = (value: string | undefined) => {
+    const at = value === undefined ? NaN : Date.parse(value);
+    return Number.isFinite(at)
+      ? Math.min(600000, Math.max(0, Math.trunc(now - at)))
+      : null;
+  };
+  console.warn(
+    JSON.stringify({
+      event: "cilium_recovery_claim_rejected",
+      reason,
+      operation_id: row.operation_id,
+      observed_age_ms: age(receipt?.observed_at),
+      completed_age_ms: age(receipt?.completed_at),
+      future_observation:
+        receipt !== undefined &&
+        (Date.parse(receipt.observed_at) > now + 5000 ||
+          Date.parse(receipt.completed_at) > now + 5000),
+    }),
+  );
+}
+
 async function authority(
   env: Env,
   row: BootstrapJobRow,
@@ -945,8 +977,18 @@ export async function bootstrapCallback(
   const currentAuthority = await authority(c.env, row);
   if (!currentAuthority.authorized)
     throw new ApiError("forbidden", "Bootstrap job is closed");
-  if (envelope.expected_revision !== row.revision)
+  if (envelope.expected_revision !== row.revision) {
+    if (
+      envelope.kind === "checkpoint" &&
+      envelope.payload.cilium_install !== undefined
+    )
+      logCiliumClaimRejection(
+        row,
+        "checkpoint_changed",
+        envelope.payload.cilium_install.recovery_receipt,
+      );
     throw new ApiError("conflict", "Bootstrap checkpoint revision changed");
+  }
   const input = await bootstrapJobInput(c.env, row);
   let checkpoint = NodeBootstrapCheckpoint.parse(
       JSON.parse(row.checkpoint_json),
@@ -1011,11 +1053,17 @@ export async function bootstrapCallback(
     if (previousCilium !== undefined) {
       if (
         JSON.stringify(next.cilium_install) !== JSON.stringify(previousCilium)
-      )
+      ) {
+        logCiliumClaimRejection(
+          row,
+          "checkpoint_changed",
+          next.cilium_install?.recovery_receipt,
+        );
         throw new ApiError(
           "conflict",
           "Cilium retry authority cannot be erased or replaced",
         );
+      }
     } else if (next.cilium_install !== undefined) {
       const receipt = next.cilium_install.recovery_receipt;
       const preserved = (value: typeof checkpoint) =>
@@ -1029,12 +1077,8 @@ export async function bootstrapCallback(
       const now = Date.now(),
         observed = Date.parse(receipt.observed_at),
         completed = Date.parse(receipt.completed_at);
-      if (
+      const scopeMismatch =
         input.spec.role !== "controlplane" ||
-        checkpoint.stage !== "cilium_install_intent" ||
-        next.stage !== checkpoint.stage ||
-        next.status !== "running" ||
-        next.error_code !== null ||
         material?.purpose !== "join_bundle" ||
         checkpoint.sealed_ref !==
           `join_bundle:${JSON.parse(row.material_ref_json!).revision}` ||
@@ -1043,18 +1087,34 @@ export async function bootstrapCallback(
         receipt.region_id !== row.region_id ||
         receipt.input_hash !== row.input_hash ||
         receipt.node_name !== input.spec.hostname ||
-        receipt.kube_system_uid !== material.material.kube_system_uid ||
+        receipt.kube_system_uid !== material.material.kube_system_uid;
+      const checkpointChanged =
+        checkpoint.stage !== "cilium_install_intent" ||
+        next.stage !== checkpoint.stage ||
+        next.status !== "running" ||
+        next.error_code !== null ||
+        JSON.stringify(preserved(next)) !==
+          JSON.stringify(preserved(checkpoint));
+      const stale =
         observed < now - 120000 ||
         completed < now - 120000 ||
         observed > now + 5000 ||
-        completed > now + 5000 ||
-        JSON.stringify(preserved(next)) !==
-          JSON.stringify(preserved(checkpoint))
-      )
+        completed > now + 5000;
+      if (scopeMismatch || checkpointChanged || stale) {
+        logCiliumClaimRejection(
+          row,
+          scopeMismatch
+            ? "scope_or_identity_mismatch"
+            : checkpointChanged
+              ? "checkpoint_changed"
+              : "stale_observation",
+          receipt,
+        );
         throw new ApiError(
           "conflict",
           "Cilium retry requires current complete bound no-effect readback",
         );
+      }
       ciliumRecovery = {
         observed_at: receipt.observed_at,
         completed_at: receipt.completed_at,
@@ -1243,8 +1303,11 @@ export async function bootstrapCallback(
       providerAuthority?.network.allocation?.updated_at ?? null,
     )
     .run();
-  if (result.meta.changes !== 1)
+  if (result.meta.changes !== 1) {
+    if (ciliumRecovery !== null)
+      logCiliumClaimRejection(row, "CAS_conflict", ciliumRecovery);
     throw new ApiError("conflict", "Bootstrap checkpoint changed concurrently");
+  }
   if (checkpoint.stage === "awaiting_verification") {
     const addition = await readNodeAddition(c.env.DB, operationId);
     await saveNodeBootstrapCheckpoint(

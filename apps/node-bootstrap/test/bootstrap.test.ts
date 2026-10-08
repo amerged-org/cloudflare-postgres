@@ -858,6 +858,52 @@ test("a recovery claim with a lost acknowledgement stops before readback can aut
   assert.equal(reads, 0);
 });
 
+test("platform authorization uses a raw cluster identity read while retaining fresh custody checks", async () => {
+  const input = platformFixture(),
+    current = authority(input),
+    uid = randomUUID();
+  current.checkpoint = { ...current.checkpoint, sealed_ref: "join_bundle:1" };
+  current.protected_material = {
+    purpose: "join_bundle",
+    material: {
+      version: 1,
+      cluster_name: input.spec.cluster_name,
+      cluster_endpoint: input.spec.cluster_endpoint,
+      talos_version: "1.14.1",
+      kubernetes_version: "1.36.5",
+      talos_machine_secrets_yaml: "sealed",
+      talos_admin_config: "sealed",
+      kube_system_uid: uid,
+      kubeconfig: "sealed",
+    },
+  };
+  let reads = 0;
+  const job = new BootstrapJob(input, {
+    request: async () => {
+      reads++;
+      return Response.json(current);
+    },
+  });
+  Reflect.set(job, "kube", async (args: string[]) => {
+    assert.deepEqual(args, ["get", "--raw=/api/v1/namespaces/kube-system"]);
+    return { exit_code: 0, stdout: JSON.stringify({ metadata: { uid } }) };
+  });
+  assert.equal(
+    await Reflect.get(job, "platformAuthority").call(job),
+    current.checkpoint.stage,
+  );
+  assert.equal(reads, 1);
+  Reflect.set(job, "kube", async () => ({
+    exit_code: 0,
+    stdout: JSON.stringify({ metadata: { uid: randomUUID() } }),
+  }));
+  await assert.rejects(
+    Reflect.get(job, "platformAuthority").call(job),
+    /cluster_uid_mismatch/,
+  );
+  assert.equal(reads, 2);
+});
+
 test("native record parsing preserves object boundaries and refuses garbage", () => {
   assert.deepEqual(
     jsonRecords(' {"spec":{"message":"} {"}}\n{"metadata":{"id":"STATE"}} '),
