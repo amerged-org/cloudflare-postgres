@@ -184,5 +184,10 @@
       "path": "infra/platform/base/values/cilium.yaml",
       "sha256": "0de1a09a3fd450916cdb316d41fa9dcfd769708f7a6cb5b49496a64ee9b26b39"
     }
+  },
+  "nativeRuntime": {
+    "rustVersion": "1.99.0",
+    "testBuilderImage": "docker.io/library/rust:1.99.0-alpine3.24@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627",
+    "verificationScope": "Prepared namespace primitive only; no CRI, CNPG, database readiness or first-read acceptance."
   }
 }

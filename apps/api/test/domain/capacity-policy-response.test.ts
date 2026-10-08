@@ -43,6 +43,46 @@ it("returns the exact public capacity policy from PUT and GET after persisting i
   });
 });
 
+it("preserves execution settings for legacy policy callers and applies explicit changes together", async () => {
+  const f = await fixture();
+  const policy = {
+    region_id: f.region,
+    max_nodes: 2,
+    purchases_enabled: false,
+    order: null,
+  };
+  await configureNodeRegionPolicy(env.DB, {
+    ...policy,
+    autoscale_enabled: true,
+    adopt_instance_ids: ["123"],
+  });
+  await configureNodeRegionPolicy(env.DB, { ...policy, max_nodes: 3 });
+  expect(
+    await env.DB.prepare(
+      "SELECT max_nodes,autoscale_enabled,adopt_instance_ids FROM node_region_policies WHERE region_id=?",
+    )
+      .bind(f.region)
+      .first(),
+  ).toEqual({
+    max_nodes: 3,
+    autoscale_enabled: 1,
+    adopt_instance_ids: '["123"]',
+  });
+  await configureNodeRegionPolicy(env.DB, {
+    ...policy,
+    max_nodes: 4,
+    autoscale_enabled: false,
+    adopt_instance_ids: [],
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT max_nodes,autoscale_enabled,adopt_instance_ids FROM node_region_policies WHERE region_id=?",
+    )
+      .bind(f.region)
+      .first(),
+  ).toEqual({ max_nodes: 4, autoscale_enabled: 0, adopt_instance_ids: "[]" });
+});
+
 it("maps stored order JSON and enabled booleans without exposing persistence columns", async () => {
   const f = await fixture();
   const order = {

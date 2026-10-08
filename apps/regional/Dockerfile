@@ -16,6 +16,7 @@ RUN corepack enable && pnpm --version \
 COPY packages/contracts/ packages/contracts/
 COPY apps/regional/tsconfig.json apps/regional/tsconfig.json
 COPY apps/regional/src apps/regional/src
+COPY infra/platform/versions.lock.json infra/platform/versions.lock.json
 RUN pnpm --filter @pgcf/regional build \
  && test -f apps/regional/dist/agent/main.mjs && test -f apps/regional/dist/gateway/main.mjs && test -f apps/regional/dist/bootstrap-relay-main.mjs \
  && mkdir -p /licenses/zod \

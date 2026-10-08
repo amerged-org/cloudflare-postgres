@@ -349,8 +349,9 @@ Warm idle continues to count as awake/running compute. Report active, warm-idle 
 Reduced resident memory does not mean zero RAM or accepted higher density. The owner has now
 required removal of permanent sleeping compute and blanket logical-disk reservations; implement
 that model with atomic wake admission, physical storage headroom and real density evidence.
-Prices and billing remain integrator concerns. Existing V159 purchase permission must be encoded
-in the finite Cloudflare policy; do not invent unlimited numeric authority.
+Prices and billing remain integrator concerns. Encode the explicit owner-selected76% regional V159
+policy with the latest3-managed-VPS ceiling per region and75%/cap notifications; monetary/order
+ceilings remain optional. Keep the operator-selected cap intact during runtime migration.
 
 ## 13. Early wake and readiness
 

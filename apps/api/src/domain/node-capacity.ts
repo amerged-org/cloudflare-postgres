@@ -18,6 +18,8 @@ import {
 } from "./placement.ts";
 import type { DatabaseRow, SizeRow } from "./rows.ts";
 import type { Env } from "../env.ts";
+import { regionalRamWindowSql } from "./memory-capacity.ts";
+import { runInfrastructureAlerts } from "./infrastructure-alerts.ts";
 import {
   NodeAdditionRequest,
   NodeOrderConfiguration,
@@ -177,7 +179,7 @@ export async function runNodeCapacity(
   )
     .bind(regionId)
     .first<{
-      max_nodes: number;
+      max_nodes: number | null;
       autoscale_enabled: number;
       order_config: string | null;
       adopt_instance_ids: string;
@@ -205,16 +207,19 @@ export async function runNodeCapacity(
   const smallest = await env.DB.prepare(
     "SELECT * FROM size_classes WHERE enabled=1 ORDER BY memory_mib,COALESCE(cpu_request_millicores,cpu_millicores),cpu_millicores,storage_gib,id LIMIT 1",
   ).first<SizeRow>();
+  const regionalWindow =
+    policy.placement_mode === "actual_ram"
+      ? await env.DB.prepare(regionalRamWindowSql("?")).bind(regionId).first<{
+          minute: number;
+          working_set_bytes: number;
+          capacity_memory_bytes: number;
+        }>()
+      : null;
   const threshold =
-    policy?.placement_mode === "actual_ram"
-      ? await env.DB.prepare(
-          `SELECT id,node_uid FROM nodes n
-    WHERE n.region_id=? AND n.lost_at IS NULL AND n.database_placement_enabled=1 AND n.memory_expansion_triggered_at IS NOT NULL
-      AND n.node_uid IS NOT NULL AND NOT EXISTS(SELECT 1 FROM node_additions a WHERE a.region_id=n.region_id AND a.request_key='capacity-ram-'||n.node_uid)
-    ORDER BY n.memory_expansion_triggered_at,n.id LIMIT 1`,
-        )
-          .bind(regionId)
-          .first<{ id: string; node_uid: string }>()
+    regionalWindow !== null &&
+    BigInt(regionalWindow.working_set_bytes) * 100n >=
+      BigInt(regionalWindow.capacity_memory_bytes) * 76n
+      ? regionalWindow
       : null;
   const active = await env.DB.prepare(
     "SELECT operation_id FROM node_additions WHERE region_id=? AND slot_held=1 AND status NOT IN('ready','cancelled') ORDER BY created_at LIMIT 1",
@@ -238,7 +243,7 @@ export async function runNodeCapacity(
   if (
     !pending &&
     !threshold &&
-    (policy.placement_mode === "actual_ram" ||
+    ((policy.placement_mode === "actual_ram" && regionalWindow !== null) ||
       !smallest ||
       choosePlacement(
         await placementNodes(env.DB, regionId),
@@ -292,11 +297,15 @@ export async function runNodeCapacity(
     )
       .bind(regionId)
       .first();
-    if (unknown) return { ...result, action: "memory_observations_unknown" };
+    if (unknown || regionalWindow === null)
+      return { ...result, action: "memory_observations_unknown" };
     if (pending) return { ...result, action: "capacity_wait" };
   }
   if (!policy.autoscale_enabled) return { ...result, action: "disabled" };
-  if ((await nodeRegionOccupiedSlots(env.DB, regionId)) >= policy.max_nodes)
+  if (
+    policy.max_nodes !== null &&
+    (await nodeRegionOccupiedSlots(env.DB, regionId)) >= policy.max_nodes
+  )
     return { ...result, action: "cap_reached" };
   let request: NodeAdditionRequest | null = null,
     key: string | null = null;
@@ -314,7 +323,7 @@ export async function runNodeCapacity(
         provider_instance_id: instanceId,
       });
       key = threshold
-        ? `capacity-ram-${threshold.node_uid}`
+        ? `capacity-ram-${threshold.minute}`
         : `capacity-adopt-${instanceId}`;
       break;
     }
@@ -323,7 +332,7 @@ export async function runNodeCapacity(
     const order = NodeOrderConfiguration.parse(JSON.parse(policy.order_config));
     request = { region_id: regionId, mode: "order", order };
     key = threshold
-      ? `capacity-ram-${threshold.node_uid}`
+      ? `capacity-ram-${threshold.minute}`
       : pending
         ? `capacity-order-${pending.id}`
         : `capacity-headroom-${regionId}-${await nodeRegionOccupiedSlots(env.DB, regionId)}`;
@@ -367,6 +376,16 @@ export async function runNodeCapacityCron(env: Env) {
   for (const row of policies.results) {
     const decision = await runNodeCapacity(env, row.region_id);
     decisions.push(decision);
+    try {
+      await runInfrastructureAlerts(env, row.region_id);
+    } catch {
+      console.error(
+        JSON.stringify({
+          event: "infrastructure_alert_check_failed",
+          region_id: row.region_id,
+        }),
+      );
+    }
     if (decision.action !== "idle")
       console.log(
         JSON.stringify({ event: "node_capacity_decision", ...decision }),

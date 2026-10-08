@@ -475,7 +475,8 @@ it("counts a bound actual node once, never by hostname alone, and publishes only
     ),
   ).rejects.toThrow("proofs");
   const wrong = await observe(addition, true);
-  expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(3);
+  // The provider allocation is one VPS; this does not authorize the wrong Node identity below.
+  expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(2);
   await expect(
     verifyNodeCapacity(
       env.DB,

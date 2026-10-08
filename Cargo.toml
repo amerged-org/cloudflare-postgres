@@ -1,0 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
+[workspace]
+members = ["apps/node-runtime"]
+resolver = "3"

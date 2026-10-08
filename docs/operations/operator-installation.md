@@ -205,14 +205,17 @@ import, adoption, registration or disk-write intent. EU1 is already admitted and
 or adoption. The sequence below is the procedure for future authorized additions, not an
 instruction to reinstall either existing customer node.
 
-Keep automatic standing purchases and autoscaling disabled until US/recovery acceptance and
-explicit finite owner limits. Individual costed orders remain separately approved. The retained
+Keep automatic standing purchases and autoscaling disabled until the corrected runtime and
+regional rule are qualified and deployed. The owner's2026-10-08 instruction authorizes V159
+regional76%-RAM expansion, with the latest small ceiling of3 managed VPS per region and75%/cap notices. Individual
+manually costed orders remain a separate explicit path. The retained
 US policy uses actual RAM with a128 MiB request and4096 MiB maximum; EU remains reserved pending
 its controlled data-preserving transition. Use the guarded
 `PUT /v1/regions/{id}/capacity-policy` with `region_id`, `max_nodes`, `purchases_enabled`, `order`,
 `placement_mode`, `maximum_database_memory_mib`, `postgres_memory_request_mib`,
-`standing_cost_profile`, `autoscale_enabled` and `adopt_instance_ids`. Preserve current finite node
-caps. Use `placement_mode:"actual_ram"`, 256 MiB assignment steps, maximum 4096 MiB and the reviewed
+`standing_cost_profile`, `autoscale_enabled` and `adopt_instance_ids`. For this operator policy use
+`max_nodes:3` and explicit `standing_cost_profile.trigger:"ram_76_percent"`; do not use huge
+sentinel counts. Finite caps remain supported for adopters that select them. Use `placement_mode:"actual_ram"`, 256 MiB assignment steps, maximum 4096 MiB and the reviewed
 128 MiB PostgreSQL request for this installation. Changing mode or the PostgreSQL request requires
 an empty assigned live cohort or a completely confirmed manually suspended/hibernated cohort
 at its current observed generation, with owned succeeded suspend operations and no unsettled
@@ -225,8 +228,33 @@ The exact regional `order` contains `product_id`, `provider_region`, `image_id`,
 `location`. Use the confirmed V159 offer with `term_months:1` and omit `add_ons`. Its standing
 profile must bind that exact order and explicit `id`, `owner_reference`, `approved_at`, `expires_at`,
 `currency`, `monthly_amount`, `setup_amount`, `max_orders`, `max_total_monthly_amount` and
-`max_total_setup_amount`. Do not infer unlimited orders or spend from a model approval. Enable
-standing purchases only while these finite limits and expiry authorize the order.
+`max_total_setup_amount`. For the explicit RAM-trigger policy set standing expiry, order-count and
+monetary ceilings to `null`. Unknown currency/monthly/setup prices are also `null`, never zero or
+an invented provider quote. The trigger is limited to V159, one month and no add-ons. Derivative
+purchase authorizations remain short-lived and bound to the exact intent/current policy.
+
+The76% gate is regional actual physical RAM across ten aligned fresh consecutive minutes for every
+Ready, schedulable eligible customer Node UID. Every member keeps its own UID and capacity across
+the window. Sum working-set bytes against physical bytes; a new/missing/unaligned spare makes the
+window unknown rather than allowing an old hot source to buy repeatedly. Keep one regional addition
+in flight. The original queued intent may resume in later minutes only against fresh current
+pressure. After a provider write becomes uncertain, resolve it through reads even if RAM or
+purchasing settings later change; never repost it. Disabling autoscale atomically revokes first
+purchase authority, without preventing reconciliation of an existing write.
+
+Infrastructure notifications use `INFRASTRUCTURE_ALERT_WEBHOOK` (optional service Fetcher) or
+`INFRASTRUCTURE_ALERT_WEBHOOK_URL`, authenticated with the private
+`INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN`. A configured Fetcher takes precedence; do not try a second
+endpoint after an uncertain response. Event IDs are stable across retries, which carry the same
+`Idempotency-Key`. The receiver must persist event-ID/payload dedupe independently of short
+provider idempotency windows. Keep mail credentials and recipient in the adopter service.
+
+The75% RAM warning uses the same complete regional ten-minute window as expansion, with one
+notice per active episode. Unknown measurements do not clear/rearm it. Cap notice counts known
+allocated managed VPS, including control and lost machines; purchase occupancy additionally
+includes unpaid reserved slots. A lost paid server is not free budget. At3 occupied slots no
+fourth order is permitted. Status in `GET /v1/operational-health` records callback acceptance;
+verify provider acceptance/delivery separately before reporting successful notification.
 
 The retained control server's UID-guarded new-database placement flag is already disabled;
 preserve Kubernetes/platform operation and existing data. The flag excludes new placement;
@@ -618,8 +646,10 @@ confirm operation completion plus physical reclamation; R2 archive retention is 
 
 ## Synchronize version templates after an accepted Kubernetes upgrade
 
-This is a separate future maintenance procedure. EU upgrades and template activation are excluded
-from the current operator completion, including after database acceptance.
+The current corrective scope requires supported data-preserving fleet convergence and supersedes
+the earlier EU-upgrade deferral. Qualify the complete release and affected database checks before
+maintenance. The day-two programmed patch lifecycle remains open; this metadata synchronization
+endpoint does not implement an OS/Kubernetes upgrade or credential rotation.
 
 Use the supported Talos Kubernetes upgrade with a reviewed dry run; never reinstall the EU
 nodes to align patch versions. Verify the actual API-server and every kubelet version while

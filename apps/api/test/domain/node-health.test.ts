@@ -96,7 +96,7 @@ it("rechecks node freshness inside pending placement's atomic reservation", asyn
   ).toBeNull();
 });
 
-it("marks a node lost with its exact UID, keeps recovery identity and releases only its active slot", async () => {
+it("marks a node lost with its exact UID and preserves its recovery identity and paid allocation", async () => {
   const f = await fixture();
   const uid = crypto.randomUUID();
   const provider = String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!);
@@ -155,7 +155,7 @@ it("marks a node lost with its exact UID, keeps recovery identity and releases o
     reason: "different replay explanation",
   });
   expect(await replay.json()).toEqual(record);
-  expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(0);
+  expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(1);
   expect(
     await env.DB.prepare(
       "SELECT node_id,archive_path,generation FROM databases WHERE id=?",
@@ -190,16 +190,18 @@ it("marks a node lost with its exact UID, keeps recovery identity and releases o
       },
     }),
   ).rejects.toMatchObject({ code: "capacity_unavailable" });
-  await reserveNodeAddition(env.DB, {
-    request_key: crypto.randomUUID(),
-    request: {
-      region_id: f.region,
-      mode: "adopt",
-      provider_instance_id: String(
-        1 + crypto.getRandomValues(new Uint32Array(1))[0]!,
-      ),
-    },
-  });
+  await expect(
+    reserveNodeAddition(env.DB, {
+      request_key: crypto.randomUUID(),
+      request: {
+        region_id: f.region,
+        mode: "adopt",
+        provider_instance_id: String(
+          1 + crypto.getRandomValues(new Uint32Array(1))[0]!,
+        ),
+      },
+    }),
+  ).rejects.toMatchObject({ code: "capacity_unavailable" });
   expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(1);
   await request(path, f.admin, "POST", {
     expected_node_uid: uid,

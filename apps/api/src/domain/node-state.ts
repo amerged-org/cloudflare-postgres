@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { regionalNodeCountSql } from "./node-capacity-count.ts";
 import {
   bytesToHex,
   newNodeId,
@@ -23,6 +24,7 @@ import {
   StandingNodeCostProfile,
 } from "@pgcf/contracts/nodes";
 import { nodePlacementBindings, nodePlacementGuard } from "./placement.ts";
+import { regionalRamExpansionSql } from "./memory-capacity.ts";
 
 export class NodeStateError extends Error {
   readonly code:
@@ -143,8 +145,8 @@ export async function configureNodeRegionPolicy(
   // suspension; the next resume still needs a fresh full-peak startup grant.
   const result = await db
     .prepare(
-      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash)
-    SELECT r.id,?,?,?,?,?,?,?,? FROM regions r WHERE r.id=? AND r.provider='contabo'
+      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids)
+    SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]') FROM regions r WHERE r.id=? AND r.provider='contabo'
       AND ((COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id),'reserved')=?
         AND (?='reserved' OR (SELECT postgres_memory_request_mib FROM node_region_policies WHERE region_id=r.id) IS ?))
         OR (NOT EXISTS(SELECT 1 FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
@@ -162,7 +164,8 @@ export async function configureNodeRegionPolicy(
         WHERE d.region_id=r.id AND d.observed_state<>'deleted' AND (d.node_id IS NULL OR n.lost_at IS NULL)
           AND (s.memory_mib<256 OR s.memory_mib%256<>0 OR s.memory_mib>? OR s.memory_mib<?)))
     ON CONFLICT(region_id) DO UPDATE SET max_nodes=excluded.max_nodes,purchases_enabled=excluded.purchases_enabled,order_config=excluded.order_config,
-      placement_mode=excluded.placement_mode,maximum_database_memory_mib=excluded.maximum_database_memory_mib,postgres_memory_request_mib=excluded.postgres_memory_request_mib,standing_cost_profile=excluded.standing_cost_profile,standing_cost_profile_hash=excluded.standing_cost_profile_hash`,
+      placement_mode=excluded.placement_mode,maximum_database_memory_mib=excluded.maximum_database_memory_mib,postgres_memory_request_mib=excluded.postgres_memory_request_mib,standing_cost_profile=excluded.standing_cost_profile,standing_cost_profile_hash=excluded.standing_cost_profile_hash,
+      autoscale_enabled=COALESCE(?,node_region_policies.autoscale_enabled),adopt_instance_ids=COALESCE(?,node_region_policies.adopt_instance_ids)`,
     )
     .bind(
       policy.max_nodes,
@@ -177,6 +180,12 @@ export async function configureNodeRegionPolicy(
       policy.standing_cost_profile === null
         ? null
         : await digest(policy.standing_cost_profile),
+      policy.autoscale_enabled === undefined
+        ? null
+        : Number(policy.autoscale_enabled),
+      policy.adopt_instance_ids === undefined
+        ? null
+        : JSON.stringify(policy.adopt_instance_ids),
       policy.region_id,
       policy.placement_mode,
       policy.placement_mode,
@@ -184,6 +193,12 @@ export async function configureNodeRegionPolicy(
       policy.placement_mode,
       policy.maximum_database_memory_mib,
       policy.postgres_memory_request_mib,
+      policy.autoscale_enabled === undefined
+        ? null
+        : Number(policy.autoscale_enabled),
+      policy.adopt_instance_ids === undefined
+        ? null
+        : JSON.stringify(policy.adopt_instance_ids),
     )
     .run();
   if (result.meta.changes !== 1) {
@@ -202,9 +217,7 @@ export async function configureNodeRegionPolicy(
     );
   }
 }
-const slotCount = `(SELECT count(*) FROM nodes WHERE region_id=p.region_id AND lost_at IS NULL)+
-  (SELECT count(*) FROM node_additions a WHERE a.region_id=p.region_id AND a.slot_held=1 AND NOT EXISTS(
-    SELECT 1 FROM nodes n WHERE n.id=a.node_id AND n.region_id=a.region_id AND n.k8s_node_name=json_extract(a.intent_json,'$.requested_hostname') AND n.provider_instance_id=a.provider_instance_id))`;
+const slotCount = regionalNodeCountSql("p.region_id");
 export async function nodeRegionOccupiedSlots(
   db: D1Database,
   regionId: string,
@@ -362,10 +375,14 @@ export async function reserveNodeAddition(
       .prepare(
         `INSERT INTO node_additions(operation_id,node_id,region_id,request_key,request_hash,intent_hash,intent_json,status,requested_instance_id,created_at,updated_at)
       SELECT ?,?,p.region_id,?,?,?,?,'reserved',?,?,? FROM node_region_policies p JOIN regions r ON r.id=p.region_id AND r.provider='contabo'
-      WHERE p.region_id=? AND ${slotCount}<p.max_nodes AND (?<>'order' OR p.order_config=?)
+      WHERE p.region_id=? AND (p.max_nodes IS NULL OR ${slotCount}<p.max_nodes
+        OR (?='recover' AND ${slotCount}<=p.max_nodes)) AND (?<>'order' OR p.order_config=?)
+      AND (?<>'order' OR ? NOT LIKE 'capacity-ram-%' OR COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'')<>'ram_76_percent'
+        OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("p.region_id", "?")}))
       AND ${authority}
       AND (? IS NULL OR NOT EXISTS(SELECT 1 FROM node_additions WHERE slot_held=1 AND status<>'ready' AND (requested_instance_id=? OR provider_instance_id=?)))
-      AND (?=0 OR NOT EXISTS(SELECT 1 FROM node_additions active WHERE active.region_id=p.region_id AND active.slot_held=1 AND active.status NOT IN('ready','cancelled')))
+      AND ((?=0 AND (?<>'order' OR COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'')<>'ram_76_percent'))
+        OR NOT EXISTS(SELECT 1 FROM node_additions active WHERE active.region_id=p.region_id AND active.slot_held=1 AND active.status NOT IN('ready','cancelled')))
       ON CONFLICT(region_id,request_key) DO NOTHING`,
       )
       .bind(
@@ -380,12 +397,17 @@ export async function reserveNodeAddition(
         now,
         request.region_id,
         request.mode,
+        request.mode,
         request.mode === "order" ? canonical(request.order) : null,
+        request.mode,
+        input.request_key,
+        input.request_key,
         ...authorityBindings,
         provider,
         provider,
         provider,
         Number(input.exclusive_region_addition === true),
+        request.mode,
       )
       .run();
     changed = result.meta.changes;
@@ -459,6 +481,7 @@ export async function approveNodePurchase(
   if (
     request.mode !== "order" ||
     addition.status !== "reserved" ||
+    approval.trigger !== undefined ||
     approval.intent_hash !== addition.intent_hash ||
     approval.term_months !== request.order.term_months ||
     approval.location !== request.order.location ||
@@ -471,7 +494,7 @@ export async function approveNodePurchase(
     );
   return changed(db, addition, "approval_json=?", [canonical(approval)]);
 }
-/** Derive an exact, short-lived intent approval from an unexpired owner profile, atomically consuming its caps. */
+/** Derive an exact short-lived approval under the current owner profile and optional ceilings. */
 export async function approveStandingNodePurchase(
   db: D1Database,
   operationId: string,
@@ -504,7 +527,7 @@ export async function approveStandingNodePurchase(
     now = new Date(nowMs).toISOString();
   if (
     Date.parse(profile.approved_at) > nowMs + 5000 ||
-    Date.parse(profile.expires_at) <= nowMs ||
+    (profile.expires_at !== null && Date.parse(profile.expires_at) <= nowMs) ||
     canonical(profile.order) !== canonical(addition.intent.request.order) ||
     row.order_config !== canonical(profile.order) ||
     row.standing_cost_profile_hash !== (await digest(profile))
@@ -513,14 +536,18 @@ export async function approveStandingNodePurchase(
       "approval_required",
       "Standing profile is expired or differs from the configured order",
     );
-  const units = (amount: string) => Number(BigInt(amount.replace(".", "")));
+  const units = (amount: string | null) =>
+    amount === null ? null : Number(BigInt(amount.replace(".", "")));
   const approval = CostedNodeApproval.parse({
     intent_hash: addition.intent_hash,
     owner_reference: profile.owner_reference,
     standing_profile_id: profile.id,
+    ...(profile.trigger === undefined ? {} : { trigger: profile.trigger }),
     approved_at: now,
     expires_at: new Date(
-      Math.min(Date.parse(profile.expires_at), nowMs + 600_000),
+      profile.expires_at === null
+        ? nowMs + 600_000
+        : Math.min(Date.parse(profile.expires_at), nowMs + 600_000),
     ).toISOString(),
     monthly_amount: profile.monthly_amount,
     setup_amount: profile.setup_amount,
@@ -536,7 +563,10 @@ export async function approveStandingNodePurchase(
       WHERE operation_id=? AND revision=? AND status='reserved' AND slot_held=1 AND dispatch_request_id IS NULL AND approval_json=?
         AND EXISTS(SELECT 1 FROM node_standing_approvals a JOIN node_region_policies p ON p.region_id=a.region_id
           WHERE a.operation_id=node_additions.operation_id AND a.profile_id=? AND a.profile_hash=? AND a.profile_hash=p.standing_cost_profile_hash
-            AND p.purchases_enabled=1 AND p.order_config=? AND json_extract(p.standing_cost_profile,'$.expires_at')>?)`,
+            AND p.purchases_enabled=1 AND p.order_config=?
+            AND (json_extract(p.standing_cost_profile,'$.expires_at') IS NULL OR json_extract(p.standing_cost_profile,'$.expires_at')>?)
+            AND (COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'')<>'ram_76_percent'
+              OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("node_additions.region_id", "node_additions.request_key")})))`,
       )
       .bind(
         encoded,
@@ -568,10 +598,15 @@ export async function approveStandingNodePurchase(
         `UPDATE node_additions SET approval_json=?,revision=revision+1,updated_at=?
       WHERE operation_id=? AND revision=? AND status='reserved' AND slot_held=1 AND dispatch_request_id IS NULL AND approval_json IS NULL
         AND EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=node_additions.region_id AND p.purchases_enabled=1
-          AND p.order_config=? AND p.standing_cost_profile_hash=? AND json_extract(p.standing_cost_profile,'$.expires_at')>?
-          AND (SELECT count(*) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=?)<?
-          AND COALESCE((SELECT SUM(monthly_units) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=?),0)+?<=?
-          AND COALESCE((SELECT SUM(setup_units) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=?),0)+?<=?)`,
+          AND p.order_config=? AND p.standing_cost_profile_hash=?
+          AND (json_extract(p.standing_cost_profile,'$.expires_at') IS NULL OR json_extract(p.standing_cost_profile,'$.expires_at')>?)
+          AND (? IS NULL OR (SELECT count(*) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=?)<?)
+          AND (? IS NULL OR (NOT EXISTS(SELECT 1 FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=? AND monthly_units IS NULL)
+            AND COALESCE((SELECT SUM(monthly_units) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=?),0)+?<=?))
+          AND (? IS NULL OR (NOT EXISTS(SELECT 1 FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=? AND setup_units IS NULL)
+            AND COALESCE((SELECT SUM(setup_units) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=?),0)+?<=?))
+          AND (COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'')<>'ram_76_percent'
+            OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("node_additions.region_id", "node_additions.request_key")})))`,
       )
       .bind(
         encoded,
@@ -581,11 +616,16 @@ export async function approveStandingNodePurchase(
         canonical(profile.order),
         row.standing_cost_profile_hash,
         now,
+        profile.max_orders,
         profile.id,
         profile.max_orders,
+        units(profile.max_total_monthly_amount),
+        profile.id,
         profile.id,
         units(profile.monthly_amount),
         units(profile.max_total_monthly_amount),
+        units(profile.max_total_setup_amount),
+        profile.id,
         profile.id,
         units(profile.setup_amount),
         units(profile.max_total_setup_amount),
@@ -645,10 +685,13 @@ export async function claimNodeDispatch(
       `UPDATE node_additions SET status='dispatching',dispatch_request_id=?,revision=revision+1,updated_at=?
     WHERE operation_id=? AND revision=? AND status='reserved' AND slot_held=1 AND dispatch_request_id IS NULL AND approval_json IS NOT NULL
       AND json_extract(approval_json,'$.intent_hash')=intent_hash AND json_extract(approval_json,'$.expires_at')>?
-      AND EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=node_additions.region_id AND p.purchases_enabled=1 AND p.order_config=? AND ${slotCount}<=p.max_nodes)
+      AND EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=node_additions.region_id AND p.purchases_enabled=1 AND p.order_config=? AND (p.max_nodes IS NULL OR ${slotCount}<=p.max_nodes))
       AND (NOT EXISTS(SELECT 1 FROM node_standing_approvals WHERE operation_id=node_additions.operation_id)
         OR EXISTS(SELECT 1 FROM node_standing_approvals a JOIN node_region_policies p ON p.region_id=a.region_id
-          WHERE a.operation_id=node_additions.operation_id AND a.profile_hash=p.standing_cost_profile_hash AND json_extract(p.standing_cost_profile,'$.expires_at')>?))`,
+          WHERE a.operation_id=node_additions.operation_id AND a.profile_hash=p.standing_cost_profile_hash
+            AND (json_extract(p.standing_cost_profile,'$.expires_at') IS NULL OR json_extract(p.standing_cost_profile,'$.expires_at')>?)
+            AND (COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'')<>'ram_76_percent'
+              OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("node_additions.region_id", "node_additions.request_key")}))))`,
     )
     .bind(
       requestId,

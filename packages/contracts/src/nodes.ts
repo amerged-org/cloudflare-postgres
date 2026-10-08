@@ -90,40 +90,66 @@ export const NodeAdditionIntent = z
       });
   });
 export type NodeAdditionIntent = z.infer<typeof NodeAdditionIntent>;
-/** Owner configuration authorizes bounded infrastructure orders, never customer prices. */
+/** Owner infrastructure authority; null ceilings require the explicit approved RAM trigger. */
 export const StandingNodeCostProfile = z
   .strictObject({
     id: Selector,
     order: NodeOrderConfiguration,
     owner_reference: Reference,
     approved_at: Timestamp,
-    expires_at: Timestamp,
-    currency: InfrastructureCurrency,
-    monthly_amount: MonthlyInfrastructureAmount,
-    setup_amount: MonthlyInfrastructureAmount,
-    max_orders: z.number().int().min(1).max(10000),
-    max_total_monthly_amount: MonthlyInfrastructureAmount,
-    max_total_setup_amount: MonthlyInfrastructureAmount,
+    expires_at: Timestamp.nullable(),
+    currency: InfrastructureCurrency.nullable(),
+    monthly_amount: MonthlyInfrastructureAmount.nullable(),
+    setup_amount: MonthlyInfrastructureAmount.nullable(),
+    max_orders: z.number().int().min(1).max(10000).nullable(),
+    max_total_monthly_amount: MonthlyInfrastructureAmount.nullable(),
+    max_total_setup_amount: MonthlyInfrastructureAmount.nullable(),
+    trigger: z.literal("ram_76_percent").optional(),
   })
   .superRefine((profile, context) => {
     const units = (amount: string) => BigInt(amount.replace(".", ""));
     if (
-      Date.parse(profile.expires_at) <= Date.parse(profile.approved_at) ||
-      units(profile.monthly_amount) > units(profile.max_total_monthly_amount) ||
-      units(profile.setup_amount) > units(profile.max_total_setup_amount)
+      (profile.expires_at !== null &&
+        Date.parse(profile.expires_at) <= Date.parse(profile.approved_at)) ||
+      (profile.max_total_monthly_amount !== null &&
+        (profile.monthly_amount === null ||
+          units(profile.monthly_amount) >
+            units(profile.max_total_monthly_amount))) ||
+      (profile.max_total_setup_amount !== null &&
+        (profile.setup_amount === null ||
+          units(profile.setup_amount) >
+            units(profile.max_total_setup_amount))) ||
+      (profile.currency === null &&
+        (profile.monthly_amount !== null || profile.setup_amount !== null)) ||
+      (profile.trigger === undefined &&
+        [
+          profile.expires_at,
+          profile.currency,
+          profile.monthly_amount,
+          profile.setup_amount,
+          profile.max_orders,
+          profile.max_total_monthly_amount,
+          profile.max_total_setup_amount,
+        ].some((value) => value === null)) ||
+      (profile.trigger !== undefined &&
+        (profile.order.product_id !== "V159" ||
+          profile.order.term_months !== 1 ||
+          profile.order.add_ons !== undefined))
     )
       context.addIssue({
         code: "custom",
         message:
-          "Standing approval needs a finite expiry and caps covering one configured order",
+          "Authority must bind monthly V159 without add-ons for RAM expansion; finite monetary caps need known prices and finite profiles need expiry and ceilings",
       });
   });
 export type StandingNodeCostProfile = z.infer<typeof StandingNodeCostProfile>;
 export const NodeRegionPolicy = z
   .strictObject({
     region_id: RegionId,
-    max_nodes: z.number().int().min(1).max(10000),
+    max_nodes: z.number().int().min(1).max(10000).nullable(),
     purchases_enabled: z.boolean().default(false),
+    autoscale_enabled: z.boolean().optional(),
+    adopt_instance_ids: z.array(ProviderInstanceId).max(100).optional(),
     order: NodeOrderConfiguration.nullable().default(null),
     placement_mode: z.enum(["reserved", "actual_ram"]).default("reserved"),
     maximum_database_memory_mib: z
@@ -144,6 +170,17 @@ export const NodeRegionPolicy = z
     standing_cost_profile: StandingNodeCostProfile.nullable().default(null),
   })
   .superRefine((policy, context) => {
+    if (
+      (policy.max_nodes === null ||
+        policy.standing_cost_profile?.trigger !== undefined) &&
+      (policy.standing_cost_profile?.trigger !== "ram_76_percent" ||
+        policy.placement_mode !== "actual_ram")
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "Uncapped nodes require the explicit actual-RAM expansion authority",
+      });
     if (policy.purchases_enabled && policy.order === null)
       context.addIssue({
         code: "custom",
@@ -177,14 +214,27 @@ export const CostedNodeApproval = z
     owner_reference: Reference,
     approved_at: Timestamp,
     expires_at: Timestamp,
-    monthly_amount: MonthlyInfrastructureAmount,
-    setup_amount: MonthlyInfrastructureAmount,
-    currency: InfrastructureCurrency,
+    monthly_amount: MonthlyInfrastructureAmount.nullable(),
+    setup_amount: MonthlyInfrastructureAmount.nullable(),
+    currency: InfrastructureCurrency.nullable(),
     term_months: z.union([z.literal(1), z.literal(12), z.literal(24)]),
     location: z.string().trim().min(1).max(128),
     standing_profile_id: Selector.optional(),
+    trigger: z.literal("ram_76_percent").optional(),
   })
   .superRefine((approval, context) => {
+    if (
+      [approval.monthly_amount, approval.setup_amount, approval.currency].some(
+        (value) => value === null,
+      ) &&
+      (approval.trigger !== "ram_76_percent" ||
+        approval.standing_profile_id === undefined)
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "Unknown cost is permitted only for derived RAM-trigger authority",
+      });
     if (Date.parse(approval.expires_at) <= Date.parse(approval.approved_at))
       context.addIssue({
         code: "custom",

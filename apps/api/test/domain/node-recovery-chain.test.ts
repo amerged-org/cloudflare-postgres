@@ -157,7 +157,8 @@ it("recovers completed same-provider history and chains a later loss without rew
     reason: "confirmed original loss",
   });
   const originalTombstone = (await readNode(original.intent.node_id))!;
-  expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(1);
+  // Losing a node does not release its paid provider allocation.
+  expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(2);
   const recoverOriginal = {
     mode: "recover" as const,
     region_id: f.region,

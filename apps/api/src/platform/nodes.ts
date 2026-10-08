@@ -260,7 +260,7 @@ export async function getCapacityPolicy(
     .bind(id)
     .first<{
       region_id: string;
-      max_nodes: number;
+      max_nodes: number | null;
       purchases_enabled: number;
       order_config: string | null;
       autoscale_enabled: number;
@@ -311,16 +311,9 @@ export async function setCapacityPolicy(
     maximum_database_memory_mib: policy.maximum_database_memory_mib,
     postgres_memory_request_mib: policy.postgres_memory_request_mib,
     standing_cost_profile: policy.standing_cost_profile,
+    autoscale_enabled: policy.autoscale_enabled,
+    adopt_instance_ids: policy.adopt_instance_ids,
   });
-  await c.env.DB.prepare(
-    "UPDATE node_region_policies SET autoscale_enabled=?,adopt_instance_ids=? WHERE region_id=?",
-  )
-    .bind(
-      Number(policy.autoscale_enabled),
-      JSON.stringify(policy.adopt_instance_ids),
-      id,
-    )
-    .run();
   return getCapacityPolicy(c, id);
 }
 export async function configureNodeBootstrap(

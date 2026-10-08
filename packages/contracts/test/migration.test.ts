@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
@@ -143,6 +143,66 @@ beforeEach(async () => {
 });
 
 afterEach(() => db.close());
+
+it("preserves legacy policy and approval bytes when adding explicit uncapped and unknown-cost values", () => {
+  const directory = new URL("../../../apps/api/migrations/", import.meta.url);
+  for (const file of readdirSync(directory)
+    .sort()
+    .filter(
+      (name) =>
+        name.endsWith(".sql") &&
+        name > "0001_init.sql" &&
+        name < "0029_ram_purchase_authority.sql",
+    ))
+    db.exec(readFileSync(new URL(file, directory), "utf8"));
+  const profile = JSON.stringify({
+    id: "legacy-profile",
+    owner_reference: "existing-owner-reference",
+    expires_at: "2027-01-01T00:00:00.000Z",
+  });
+  run(
+    "INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,autoscale_enabled,adopt_instance_ids,placement_mode,standing_cost_profile,standing_cost_profile_hash,maximum_database_memory_mib,postgres_memory_request_mib) VALUES('eu-1',5,1,'{}',1,'[\"123\"]','actual_ram',?,?,4096,128)",
+    profile,
+    "a".repeat(64),
+  );
+  const operation = newOperationId();
+  run(
+    "INSERT INTO node_additions(operation_id,node_id,region_id,request_key,request_hash,intent_hash,intent_json,status,created_at,updated_at) VALUES(?,?,'eu-1','legacy-window',?,?,'{}','reserved',?,?)",
+    operation,
+    newNodeId(),
+    "b".repeat(64),
+    "c".repeat(64),
+    NOW,
+    NOW,
+  );
+  run(
+    "INSERT INTO node_standing_approvals(operation_id,region_id,profile_id,profile_hash,monthly_units,setup_units,created_at) VALUES(?,'eu-1','legacy-profile',?,10000,0,?)",
+    operation,
+    "a".repeat(64),
+    NOW,
+  );
+  const policy = db.prepare("SELECT * FROM node_region_policies").get(),
+    approval = db.prepare("SELECT * FROM node_standing_approvals").get();
+  db.exec(
+    readFileSync(new URL("0029_ram_purchase_authority.sql", directory), "utf8"),
+  );
+  expect(db.prepare("SELECT * FROM node_region_policies").get()).toEqual(
+    policy,
+  );
+  expect(db.prepare("SELECT * FROM node_standing_approvals").get()).toEqual(
+    approval,
+  );
+  run("UPDATE node_region_policies SET max_nodes=NULL");
+  run("UPDATE node_standing_approvals SET monthly_units=NULL,setup_units=NULL");
+  expect(
+    db.prepare("SELECT max_nodes FROM node_region_policies").get(),
+  ).toEqual({ max_nodes: null });
+  expect(
+    db
+      .prepare("SELECT monthly_units,setup_units FROM node_standing_approvals")
+      .get(),
+  ).toEqual({ monthly_units: null, setup_units: null });
+});
 
 it("adds separate scheduling CPU without rewriting legacy limits and rejects invalid storage", () => {
   db.exec(

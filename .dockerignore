@@ -13,6 +13,10 @@
 !infra/talos/
 !infra/talos/publish-storage-capacity.ts
 !LICENSE
+!Cargo.toml
+!Cargo.lock
+!rust-toolchain.toml
+!infra/platform/versions.lock.json
 !apps/
 !apps/**
 !packages/
@@ -25,6 +29,7 @@
 !scripts/e2e/src/node-network-packets.ts
 **/node_modules
 **/dist
+**/target
 **/.wrangler
 **/.local
 **/.env*

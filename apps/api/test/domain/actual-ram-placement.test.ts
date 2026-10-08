@@ -362,9 +362,10 @@ it("accepts a samples-only report without replacing node or orphan inventory", a
   expect(rows).toEqual([{ observed_at: at, orphans: JSON.stringify(orphans) }]);
 });
 
-it("threshold expansion remains due with another open worker, and one exclusive addition consumes that UID trigger", async () => {
+it("regional pressure expands only when all aligned customer-node windows together reach 76 percent, with one exclusive addition", async () => {
   const f = await setup();
-  await seed(f, 76);
+  const sampleAt = Math.floor(Date.now() / 60_000) * 60_000;
+  await seed(f, 76, sampleAt);
   const order = {
     product_id: crypto.randomUUID(),
     provider_region: "test",
@@ -400,14 +401,17 @@ it("threshold expansion remains due with another open worker, and one exclusive 
       f.node,
     )
     .run();
-  await seed({ ...f, node: other, uid: otherUid, provider: otherProvider }, 20);
+  const second = { ...f, node: other, uid: otherUid, provider: otherProvider };
+  await seed(second, 20, sampleAt);
+  expect((await runNodeCapacity(env, f.region, true)).action).toBe("idle");
+  await seed(second, 76, sampleAt + 1);
   expect((await runNodeCapacity(env, f.region, true)).action).toBe("order");
   const attempts = await Promise.allSettled(
     [1, 2].map((i) =>
       reserveNodeAddition(env.DB, {
         request_key:
           i === 1
-            ? `capacity-ram-${f.uid}`
+            ? `capacity-ram-${Math.floor(sampleAt / 60_000)}`
             : "competing-" + crypto.randomUUID(),
         request: { region_id: f.region, mode: "order", order },
         exclusive_region_addition: true,

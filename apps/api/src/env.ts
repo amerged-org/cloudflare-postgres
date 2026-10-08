@@ -4,6 +4,9 @@ import type { Context } from "hono";
 
 export type Env = Cloudflare.Env & {
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
+  INFRASTRUCTURE_ALERT_WEBHOOK?: Fetcher;
+  INFRASTRUCTURE_ALERT_WEBHOOK_URL?: string;
+  INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN?: string;
   ARCHIVE_BINDINGS?: string;
   ARCHIVE_EU?: R2Bucket;
   ARCHIVE_US?: R2Bucket;

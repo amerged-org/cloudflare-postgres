@@ -28,11 +28,16 @@ jobs:
     if: github.event_name != 'workflow_dispatch' || (!inputs.external_probe && !inputs.node_network_probe)
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    outputs:
+      regional_image: ${{ steps.image_inputs.outputs.regional }}
+      node_bootstrap_image: ${{ steps.image_inputs.outputs.node_bootstrap }}
+      postgres_image: ${{ steps.image_inputs.outputs.postgres }}
     steps:
       - name: Check out the revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          fetch-depth: 0
       - name: Set up pnpm at the version in package.json
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
       - name: Set up Node
@@ -42,6 +47,11 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Select affected image inputs
+        id: image_inputs
+        env:
+          PGCF_IMAGE_BEFORE: ${{ github.event.before }}
+        run: node scripts/ci/image-inputs.ts >> "$GITHUB_OUTPUT"
       - name: Check public plan privacy
         run: node scripts/ci/plan-privacy.ts
       - name: Verify the native Talos test client
@@ -69,6 +79,23 @@ jobs:
           node --test infra/talos/publish-storage-capacity.test.ts
           node --test infra/platform/release-candidate.test.ts
           node --test scripts/ci/*.test.ts
+      - name: Check the native prepared runtime against the actual Linux kernel
+        run: |
+          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const lock=JSON.parse(fs.readFileSync("infra/platform/versions.lock.json","utf8")); const channel=/channel\s*=\s*"([^"]+)"/.exec(fs.readFileSync("rust-toolchain.toml","utf8"))?.[1]; assert.equal(channel,lock.nativeRuntime.rustVersion);'
+          PGCF_RUST_BUILDER=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.testBuilderImage')
+          PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
+          PGCF_SLOT_TEST_IMAGE="pgcf-node-runtime-test:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          PGCF_SLOT_TEST_CONTAINER="pgcf-slot-kernel-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          trap 'docker rm --force "$PGCF_SLOT_TEST_CONTAINER" >/dev/null 2>&1 || true' EXIT
+          docker build --platform linux/amd64 --file apps/node-runtime/Dockerfile \
+            --build-arg RUST_BUILDER="$PGCF_RUST_BUILDER" --build-arg RUST_VERSION="$PGCF_RUST_VERSION" \
+            --tag "$PGCF_SLOT_TEST_IMAGE" .
+          timeout 90 docker run --rm --name "$PGCF_SLOT_TEST_CONTAINER" --network none \
+            --cpus 2 --memory 1g --pids-limit 64 --read-only \
+            --tmpfs /tmp:rw,nosuid,nodev,size=16m,mode=1777 \
+            --cap-drop ALL --cap-add SYS_ADMIN --cap-add SETPCAP --cap-add SYS_PTRACE \
+            --security-opt seccomp=unconfined --security-opt no-new-privileges \
+            "$PGCF_SLOT_TEST_IMAGE"
       - name: Render the Kubernetes manifests
         run: |
           command -v kubectl >/dev/null || { echo "kubectl not available on this runner"; exit 1; }
@@ -83,7 +110,7 @@ jobs:
 
   image:
     needs: check
-    if: github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    if: needs.check.outputs.regional_image == 'true' && github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -191,7 +218,7 @@ jobs:
 
   node_bootstrap_image:
     needs: check
-    if: github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    if: needs.check.outputs.node_bootstrap_image == 'true' && github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -286,7 +313,7 @@ jobs:
 
   postgres_image:
     needs: check
-    if: github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    if: needs.check.outputs.postgres_image == 'true' && github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

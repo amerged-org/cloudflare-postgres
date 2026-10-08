@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { DatabaseId, NodeId, RegionId, Timestamp } from "@pgcf/contracts";
+import {
+  DatabaseId,
+  NodeId,
+  RegionId,
+  Timestamp,
+  InfraAlertStatus,
+} from "@pgcf/contracts";
 import { UsageSample } from "@pgcf/contracts/usage";
 import { NODE_OBSERVATION_MAX_AGE_MS } from "./placement.ts";
 
@@ -126,6 +132,8 @@ export function diskHealth(
 }
 export const OperationalRegionHealth = z.strictObject({
   id: RegionId,
+  /** delivered_at records callback acceptance, not downstream email delivery. */
+  infrastructure_alerts: z.array(InfraAlertStatus).max(2).optional(),
   created_at: Timestamp,
   agent: HeartbeatHealth,
 });
@@ -158,18 +166,30 @@ export async function readOperationalHealth(
   if (scope === "regions") {
     const result = await db
       .prepare(
-        `SELECT id,created_at,agent_last_seen_at FROM regions WHERE ${cursor.sql} ORDER BY created_at DESC,id DESC LIMIT ?`,
+        `SELECT id,created_at,agent_last_seen_at,
+          (SELECT json_group_array(json_object('kind',a.kind,'active',a.active,'event_id',a.event_id,
+            'occurred_at',json_extract(a.payload,'$.occurred_at'),'delivered_at',a.delivered_at,'last_attempt_at',a.last_attempt_at))
+           FROM infrastructure_alerts a WHERE a.region_id=regions.id) alerts_json
+          FROM regions WHERE ${cursor.sql} ORDER BY created_at DESC,id DESC LIMIT ?`,
       )
       .bind(...cursor.bindings, limit)
       .all<{
         id: string;
         created_at: string;
         agent_last_seen_at: string | null;
+        alerts_json: string;
       }>();
-    return result.results.map(({ agent_last_seen_at, ...row }) => ({
-      ...row,
-      agent: heartbeatHealth(agent_last_seen_at, null, now),
-    }));
+    return result.results.map(({ agent_last_seen_at, alerts_json, ...row }) => {
+      const alerts = (JSON.parse(alerts_json) as Record<string, unknown>[]).map(
+        (alert) =>
+          InfraAlertStatus.parse({ ...alert, active: alert.active === 1 }),
+      );
+      return {
+        ...row,
+        ...(alerts.length ? { infrastructure_alerts: alerts } : {}),
+        agent: heartbeatHealth(agent_last_seen_at, null, now),
+      };
+    });
   }
   if (scope === "nodes") {
     const result = await db

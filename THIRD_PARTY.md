@@ -100,6 +100,17 @@ Other Alpine packages retain their individual licenses. Preserve upstream notice
 applicable source obligations when redistributing. This temporary image is operator acceptance
 tooling, separate from the product runtime.
 
+## Native Rust runtime primitive
+
+The first-party prepared namespace holder is Apache-2.0. Its only direct crate dependency is
+[libc0.2.190](https://crates.io/crates/libc/0.2.190), licensed `MIT OR Apache-2.0`; Cargo.lock binds
+archive checksum `ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78`.
+Rust1.99.0 and the immutable compiler test image are recorded in versions.lock.json.
+The compiler image is used for isolated tests and is not published as a PGCF runtime. Preserve
+Rust standard-library and libc notices when distributing a static native executable; do not
+attribute their code to the project's Apache license alone. No upstream source is vendored here.
+The primitive is not yet installed on customer servers or integrated with containerd/CNPG.
+
 ## Application dependencies
 
 Direct npm dependencies at the versions resolved in [pnpm-lock.yaml](pnpm-lock.yaml). Licenses are

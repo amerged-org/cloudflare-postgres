@@ -7,6 +7,7 @@ import {
   ProviderInstanceId,
   NodeMarkLost,
   NodeLoss,
+  NodeRegionPolicy,
 } from "../src/nodes.ts";
 
 it("requires an exact node UID and retains the loss identity", () => {
@@ -34,6 +35,61 @@ it("requires an exact node UID and retains the loss identity", () => {
     reason: "confirmed",
   };
   expect(NodeLoss.parse(record)).toEqual(record);
+});
+
+it("allows explicit uncapped RAM-trigger authority only for the approved exact monthly V159 order", () => {
+  const order = {
+    product_id: "V159",
+    provider_region: "EU",
+    image_id: crypto.randomUUID(),
+    term_months: 1,
+    location: "European Union",
+  };
+  const profile = {
+    id: "owner-ram-expansion",
+    trigger: "ram_76_percent",
+    order,
+    owner_reference: "owner-authorized-regional-76-percent",
+    approved_at: new Date().toISOString(),
+    expires_at: null,
+    currency: null,
+    monthly_amount: null,
+    setup_amount: null,
+    max_orders: null,
+    max_total_monthly_amount: null,
+    max_total_setup_amount: null,
+  };
+  const policy = {
+    region_id: "eu-test",
+    max_nodes: null,
+    purchases_enabled: true,
+    order,
+    placement_mode: "actual_ram",
+    maximum_database_memory_mib: 4096,
+    postgres_memory_request_mib: 128,
+    standing_cost_profile: profile,
+  };
+  expect(NodeRegionPolicy.parse(policy).max_nodes).toBeNull();
+  expect(
+    NodeRegionPolicy.safeParse({
+      ...policy,
+      standing_cost_profile: { ...profile, trigger: undefined },
+    }).success,
+  ).toBe(false);
+  expect(
+    NodeRegionPolicy.safeParse({
+      ...policy,
+      standing_cost_profile: { ...profile, max_total_monthly_amount: "1.0000" },
+    }).success,
+  ).toBe(false);
+  const wrong = { ...order, product_id: "V155" };
+  expect(
+    NodeRegionPolicy.safeParse({
+      ...policy,
+      order: wrong,
+      standing_cost_profile: { ...profile, order: wrong },
+    }).success,
+  ).toBe(false);
 });
 
 it("preserves canonical provider decimal IDs and rejects unsafe numeric values", () => {

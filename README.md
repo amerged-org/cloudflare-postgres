@@ -96,14 +96,15 @@ existing data; do not re-adopt or reset US1. Neon migration remains separate and
 including credential rotation, adopter transport/rebinding and sufficient regional capacity.
 
 The approved actual-RAM policy requests regional V159 capacity at at least 76% average physical
-RAM usage over ten fresh consecutive minute samples from the same Node UID, within explicit node
-and standing cost caps. Orders use one month and no storage add-on. Existing capacity remains
+RAM usage over ten fresh aligned consecutive minutes of every eligible customer node, each retaining
+its own Node UID, under the explicit standing regional purchase policy. Orders use one month and no storage add-on. Existing capacity remains
 eligible during rollout under hard RAM, CPU, storage and full PostgreSQL/Barman startup-peak
 guards; there is no 81% placement cutoff. Missing observations remain unknown. Admin assignments
 use 256 MiB steps, with a 4096 MiB PostgreSQL cap in this installation. US uses actual-RAM mode
 with a 128 MiB PostgreSQL request; EU retains reserved mode until its existing databases complete
-the guarded transition. Autonomous purchases remain disabled: finite standing cost/count/expiry
-authority is not configured. Installation profiles are complete; the real RAM-threshold window and load cleanup passed.
+the guarded transition. Autonomous purchases remain disabled until the updated threshold-only policy is qualified and deployed;
+the owner selected a maximum of3 managed VPS per region, a75% RAM warning and a cap notice.
+Monetary and lifetime order-count ceilings are optional under that explicit authority. Installation profiles are complete; the real RAM-threshold window and load cleanup passed.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture

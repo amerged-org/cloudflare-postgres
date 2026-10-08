@@ -28,7 +28,11 @@
       "service_id": "<BOOTSTRAP_RELAY_VPC_SERVICE_ID>",
     },
   ],
+  // Optional generic infrastructure-alert receiver; mail credentials/recipient belong there.
+  // "services": [{ "binding": "INFRASTRUCTURE_ALERT_WEBHOOK", "service": "your-alert-receiver", "entrypoint": "InfrastructureAlertsService" }],
   "vars": {
+    // Alternatively set INFRASTRUCTURE_ALERT_WEBHOOK_URL to the receiver's HTTPS endpoint.
+    // Import INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN as a private Worker secret.
     "DATABASE_CONNECTION_LIMIT_PER_MINUTE": "12000",
     "ARCHIVE_BINDINGS": "{\"<EU_REGION_ID>\":{\"binding\":\"ARCHIVE\",\"bucket\":\"replace-r2-backup-bucket\"},\"<US_REGION_ID>\":{\"binding\":\"ARCHIVE_US\",\"bucket\":\"replace-r2-us-backup-bucket\"}}",
     "BOOTSTRAP_FIREWALL_BINDINGS": "<PROVIDER_INSTANCE_FIREWALL_UUID_MAP_JSON>",

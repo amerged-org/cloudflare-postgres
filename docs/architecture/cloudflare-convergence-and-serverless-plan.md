@@ -26,10 +26,15 @@ is out of scope; configuration, status and operation control are exposed through
 OMH selects entitlements and consumes PGCF; it must not implement a second placement, resource,
 backup, patch or VPS-provisioning controller.
 
-Ordinary expansion uses at least76% actual physical RAM averaged over ten fresh consecutive minute
-buckets of the same physical Node UID. Existing suitable nodes remain eligible while another node
-is provisioned. There is no81% placement stop. The owner has granted V159 purchase authority;
-PGCF must persist and execute that authority with its actual configured finite limits.
+Ordinary expansion uses at least76% actual regional physical RAM over ten fresh consecutive
+aligned minutes. Every eligible customer node must retain its own physical Node UID throughout
+that window; sum actual working-set bytes against physical capacity rather than averaging unlike
+node percentages. Existing suitable nodes remain eligible while another node is provisioned.
+There is no81% placement stop. The owner's latest2026-10-08 instruction adds a small hard ceiling:
+maximum3 managed VPS per region, including retained control and lost allocated servers. Warn the
+operator at75% regional RAM and when the configured node ceiling is reached; do not buy beyond it.
+No additional monetary or lifetime order-count ceiling is required. The authority remains limited
+to V159, one month, no storage add-on and the76% regional RAM purchase cause.
 
 The CPU and disk models must support many small or hibernated databases. A logical customer limit
 is not a permanently consumed allocation. Actual live work, simultaneous starts, persistent data
@@ -217,23 +222,41 @@ partition sizing first; existing-node conversion must have its own proven safe p
 
 ### Expansion and standing purchases
 
-The owner's permission is recorded as present. What remains incomplete is activation of concrete
-machine-readable policy. Reconcile the already approved V159/4vCPU/8GiB/150GiB NVMe/one-month/no
-storage-add-on model and regional price with finite node/count/cumulative-cost/expiry settings.
-Existing test caps EU3/US1 are not silently treated as the owner's intended permanent fleet limits.
-Do not invent numeric unlimited authority; present only genuinely unresolved numeric policy values
-for one configuration decision, without asking again whether V159 purchasing is permitted.
+The owner's latest instruction is explicit: when a zone reaches the76% rule, buy one matching
+V159/4vCPU/8GiB/150GiB NVMe/one-month/no-storage-add-on VPS in that region. This operator installation
+now has `max_nodes:3` in each retained region, including the control role. Monetary/order-count
+ceilings and standing expiry may remain null under the explicit RAM-trigger authority. Persist
+this exact conditional policy; do not substitute huge sentinel values or request permission again.
+Generic adopters can select their own supported ceilings.
 
-Make76%/ten-minute actual RAM the explicit ordinary automatic expansion cause. Remove or separately
-disable the pending-DB CPU/storage fallback that can buy below that threshold. Physical CPU/disk
-pressure still produces visible waits/alerts and protected refusal; additional automatic purchase
-causes need an explicit owner policy rather than hidden fallback behavior.
+The region must have ten fresh consecutive aligned minutes for every Ready, schedulable eligible
+customer node, with each node's physical UID and capacity stable. The regional ratio uses summed
+actual working-set bytes and physical capacity across those samples. Missing/new/unaligned
+capacity stays unknown. A hot older node plus an empty ready spare must not cause repeated orders.
+Control/relay nodes excluded from customer capacity remain excluded. A new-placement closure
+timestamp alone does not hide RAM use of an otherwise eligible customer node.
 
-Retain one active regional addition, original provider request identity, OAuth reuse and uncertain
-order reconciliation. Verify current tariff validity before dispatch through supported provider
-facts; where no binding quote/max-price exists, disclose that limitation, bound allowed products
-and quantities, and reconcile actual invoice/charge data. Stored estimates are not provider-enforced
-price guarantees. Demonstrate threshold→one purchase→approved release→Ready with no agent or laptop.
+Keep one active regional addition and a window-bound idempotency key. Re-evaluate current regional
+pressure before the first purchase attempt; a queued operation can continue across minutes while
+its current region/order/authority and fresh pressure remain valid. Do not abandon its identity
+merely because the sample minute changed. CPU/storage shortage below76% waits or alerts; it is not
+another automatic purchase cause. Existing placement retains hard RAM/CPU/storage/startup checks.
+
+At75%, create one generic infrastructure warning per active fresh-window episode. Unknown RAM
+must not rearm it. At3 known allocated managed VPS, notify the operator and prevent another
+purchase. Hard occupancy also includes unpaid reservations; the notice reports known allocations.
+Lost VPS remain in the paid-fleet count until supported decommission reconciliation; recovery on
+the same provider instance does not buy another VPS. Use a bounded authenticated generic webhook
+or Cloudflare service binding with persistent event-ID dedupe. The adopter's existing mail service
+owns recipient and provider credentials; PGCF has no hardcoded email address or mail vendor.
+Callback acceptance and actual email delivery are distinct observations.
+
+Retain provider request identity, OAuth reuse and uncertain-order reconciliation. Once a provider
+write is recorded or uncertain, resolve its result through reads even if RAM later falls or a
+short-lived derivative authorization expires; never blindly repost. The public Contabo API has
+no supported new-order quote/max-price parameter. Record unknown prices as unknown, not zero or
+verified invoice limits. The owner-selected threshold-only policy does not require a monetary
+ceiling. Demonstrate threshold→one purchase→approved release→Ready without an agent or laptop.
 
 ## 7. Common release and patch management for all three servers
 
@@ -371,10 +394,10 @@ If a path misses its target or late binding is not solved, the gate stays open.
 | C. Shared runtime and credential baseline | B | Accepted shared Regional fix, declared components, coordinated authority rotation | All3 nodes on the approved compatible release; retired keys rejected; no reinstall |
 | D. CPU/RAM capacity model | B,C | Separate request/limit, no sleeping CPU debit, atomic wake admission, real256/4096 profiles | Hibernation frees compute accounting; simultaneous wake/create cannot exceed actual safe headroom |
 | E. Usage-driven disk | B,C | Qualified thin profile, measured pool state, logical quota/growth and supported old-volume transition | Empty quotas do not preallocate full disk; quota/full-pool/reclaim/restore tests preserve other data |
-| F. Headless completion and purchase activation | B,C,D,E | Supported region/restore-secret setup, postjoin fix, exact76% cause, installed finite standing policy | One normal authorized addition reaches Ready without operator execution; interruption buys exactly once |
+| F. Headless completion and purchase activation | B,C,D,E | Supported region/restore-secret setup, postjoin fix, exact76% cause, installed owner-authorized threshold-only policy | One normal authorized addition reaches Ready without operator execution; interruption buys exactly once |
 | G. Programmed patch lifecycle | B,C | Candidate promotion, rollout, drift repair and supported recovery | Install releaseR, upgrade retained nodes toR+1, interrupt/resume, prove runtime convergence and DB lifecycle |
 | H. Rust and shared prestarted compute | B,D,E integration contract; gateway work may proceed with E–G | Late binding, real shared pool, native components, targeted controller, routing snapshots; warm reclaim additional | Multi-database pool-hit first-read target, exclusive assignment, isolation/refill/restart/miss evidence; separate warm/reclaim/cold results |
-| I. Density, operations and migration handover | D–H | Representative tenant workload, finite expansion policy, customer/operator runbooks | Actual resource/latency/backup limits established; all required gates below pass |
+| I. Density, operations and migration handover | D–H | Representative tenant workload, explicit expansion policy, customer/operator runbooks | Actual resource/latency/backup limits established; all required gates below pass |
 
 Use one implementation owner per touched subsystem; independent reviews consume concrete changes,
 not repeated unbounded audit loops. Gather related observed failures before releasing a batch.
@@ -390,7 +413,7 @@ without a specific reason. Documentation is not a reason to rerun an installer.
 | Central customer control | Assign256MiB, change to a selected256MiB step and4096MiB ceiling through the PGCF management API; both regions report matching applied revision/Pod/SQL limits after interruption/resume |
 | Compute overbooking | Confirmed cold-sleep removes CPU debit; warm idle reports real use; concurrent starts reacquire bounded CPU/RAM headroom; noisy neighbor cannot consume an entire host |
 | Disk overbooking | Logical quotas are not fully preallocated; real block use and pool metadata drive admission; quota/growth/full-pool/trim/delete/restore behavior is proved |
-|76% expansion | Ten actual fresh consecutive minutes/sameUID→one approved V159 order; suitable old nodes still place DBs; no81% cutoff or hidden below-threshold static-allocation purchase |
+|76% expansion | Ten actual fresh aligned regional minutes, each member retaining its own UID→one approved V159 order; suitable old nodes still place DBs; no81% cutoff or hidden below-threshold static-allocation purchase |
 | Headless Ready | Purchase, image, network, K8s/platform/secret configuration, storage, proof and admission complete with the laptop disconnected; interrupted uncertain actions are resolved |
 | Patch management | A second release upgrades all retained roles through supported procedures; data/UIDs/configuration remain valid; controlled interruption/recovery and bounded skew are observed |
 | Backup/recovery | SQL/TLS/roles/R2 base/WAL/PITR/restore/deletion with actual physical reclaim pass on the corrected release/storage model, not merely the old thick baseline |
@@ -412,8 +435,8 @@ whether to implement the pool or silently substitute per-database warm retention
 
 - Confirm whether256MiB names the PostgreSQL limit (current contract and this plan's baseline) or
   the entire per-database PostgreSQL/backup envelope. Show both values in PGCF in either case.
-- Encode actual finite regional fleet/cost/count/expiry values from existing owner authorization;
-  the V159 purchase permission itself is already given. Do not invent caps or keep test cap1 forever.
+- Encode the owner's V159 permission and latest small ceiling:3 managed VPS per region,75% RAM
+  warning and cap notice. Monetary/order-count ceilings remain optional; do not erase the hard node cap.
 - Define storage quota offerings separately from physical allocation and a supported stable-ID or
   explicit rebind procedure for converting existing thick volumes. No silent customer-ID switch.
 - Define measured CPU baseline/burst and backup concurrency profiles; no arbitrary fixed per-tenant
@@ -421,9 +444,8 @@ whether to implement the pool or silently substitute per-database warm retention
 - Declare maintenance downtime for the current topology. HA would be a separate explicit topology
   decision; two gateway Pods on one server do not create node-level availability.
 
-Independent API contract, runtime and reproduction work can proceed while these finite policy
-values are settled. Do not repeatedly request already granted permission or silently substitute
-a different economic model to make an existing test pass.
+Implementation proceeds with the explicit policy above. Do not request the same permission again
+or silently substitute a different economic model to make an existing test pass.
 
 ## 13. Primary implementation references
 

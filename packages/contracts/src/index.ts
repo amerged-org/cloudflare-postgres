@@ -17,3 +17,4 @@ export * from "./region-configuration.ts";
 export * from "./releases.ts";
 export * from "./resource-profiles.ts";
 export * from "./region-archive-sources.ts";
+export * from "./infrastructure-alerts.ts";
