@@ -307,33 +307,30 @@ export async function readStorageFacts(
     await authorize();
     return await commands.talos(args);
   };
-  const nodeArgs = ["get", "node", spec.hostname, "--output=json"],
+  const settled = async <T>(reads: Promise<T>[]) => {
+    const results = await Promise.allSettled(reads);
+    const rejected = results.find((result) => result.status === "rejected");
+    if (rejected?.status === "rejected") throw rejected.reason;
+    return results.map((result) => (result as PromiseFulfilledResult<T>).value);
+  };
+  const nodeArgs = ["get", `--raw=/api/v1/nodes/${spec.hostname}`],
     lvmArgs = [
       "get",
-      "lvmnodes.local.openebs.io",
-      spec.hostname,
-      "--namespace=openebs",
-      "--output=json",
-    ];
-  const cluster = await kube([
-    "get",
-    "namespace",
-    "kube-system",
-    "--output=json",
+      `--raw=/apis/local.openebs.io/v1alpha1/namespaces/openebs/lvmnodes/${spec.hostname}`,
+    ],
+    clusterArgs = ["get", "--raw=/api/v1/namespaces/kube-system"],
+    namespaceArgs = ["get", "--raw=/api/v1/namespaces/openebs"];
+  const initial = await settled([
+    kube(clusterArgs),
+    kube(namespaceArgs),
+    kube(nodeArgs),
+    kube(lvmArgs),
   ]);
-  if (namespace(cluster, "kube-system") !== clusterUid)
+  if (namespace(initial[0]!, "kube-system") !== clusterUid)
     return fail("storage_cluster_identity_mismatch");
-  const storageNamespaceUid = namespace(
-    await kube(["get", "namespace", "openebs", "--output=json"]),
-    "openebs",
-  );
-  const firstNode = await kube(nodeArgs),
-    firstIdentity = nodeIdentity(firstNode, spec);
-  const firstLvm = await kube(lvmArgs),
-    firstCsi = lvmnodeIdentity(firstLvm, spec.hostname, firstIdentity.uid);
-  const version = parsed(await talos(["version", "--json"]));
-  if (object(version.version).tag !== `v${TALOS_VERSION}`)
-    return fail("storage_talos_version_mismatch");
+  const storageNamespaceUid = namespace(initial[1]!, "openebs");
+  const firstIdentity = nodeIdentity(initial[2]!, spec),
+    firstCsi = lvmnodeIdentity(initial[3]!, spec.hostname, firstIdentity.uid);
   const readTalos = async (
     kind: string,
     type: string,
@@ -347,18 +344,26 @@ export async function readStorageFacts(
       spec.hardware.ipv4,
       empty,
     );
-  const disks = await readTalos("disks", "Disks.block.talos.dev", "runtime");
+  const initialTalos = await settled([
+    talos(["version", "--json"]).then((result) => [parsed(result)]),
+    readTalos("disks", "Disks.block.talos.dev", "runtime"),
+    readTalos("volumestatus", "VolumeStatuses.block.talos.dev", "runtime"),
+    readTalos(
+      "lvmvolumegroupstatus",
+      "LVMVolumeGroupStatuses.storage.talos.dev",
+      "storage",
+    ),
+  ]);
+  if (object(initialTalos[0]![0]!.version).tag !== `v${TALOS_VERSION}`)
+    return fail("storage_talos_version_mismatch");
+  const disks = initialTalos[1]!;
   const matches = disks.filter(
     (disk) =>
       object(disk.spec).dev_path === spec.hardware.install_disk &&
       physicalBytes(object(disk.spec).size, true) === spec.hardware.disk_bytes,
   );
   if (matches.length !== 1) return fail("storage_install_disk_mismatch");
-  const volumes = await readTalos(
-    "volumestatus",
-    "VolumeStatuses.block.talos.dev",
-    "runtime",
-  );
+  const volumes = initialTalos[2]!;
   const raw = volumes.filter(
       (volume) => object(volume.metadata).id === "r-pgcf-lvm",
     ),
@@ -399,14 +404,23 @@ export async function readStorageFacts(
         "storage",
       ),
     );
-  const group = await readGroup();
-  const physicals = (
-      await readTalos(
-        "lvmphysicalvolumestatus",
-        "LVMPhysicalVolumeStatuses.storage.talos.dev",
-        "storage",
-      )
-    ).filter((record) => object(record.spec).vgName === "pgcf"),
+  const group = physicalGroup(initialTalos[3]!);
+  const physicalAndLogical = await settled([
+    readTalos(
+      "lvmphysicalvolumestatus",
+      "LVMPhysicalVolumeStatuses.storage.talos.dev",
+      "storage",
+    ),
+    readTalos(
+      "lvmlogicalvolumestatus",
+      "LVMLogicalVolumeStatuses.storage.talos.dev",
+      "storage",
+      true,
+    ),
+  ]);
+  const physicals = physicalAndLogical[0]!.filter(
+      (record) => object(record.spec).vgName === "pgcf",
+    ),
     physical = physicals[0];
   if (physicals.length !== 1 || !physical)
     return fail("storage_physical_pv_mismatch");
@@ -431,14 +445,9 @@ export async function readStorageFacts(
     group.total > partitionSize
   )
     return fail("storage_capacity_unsettled");
-  const logical = (
-    await readTalos(
-      "lvmlogicalvolumestatus",
-      "LVMLogicalVolumeStatuses.storage.talos.dev",
-      "storage",
-      true,
-    )
-  ).filter((record) => object(record.spec).vgName === "pgcf");
+  const logical = physicalAndLogical[1]!.filter(
+    (record) => object(record.spec).vgName === "pgcf",
+  );
   const logicalVolumes: StorageLogicalVolume[] = logical
     .map((record) => {
       const value = object(record.spec),
@@ -482,11 +491,17 @@ export async function readStorageFacts(
     return fail("storage_capacity_unsettled");
   if (canonical(await readGroup()) !== canonical(group))
     return fail("storage_capacity_unsettled");
-  const node = await kube(nodeArgs),
+  const final = await settled([
+    kube(nodeArgs),
+    kube(lvmArgs),
+    kube(namespaceArgs),
+    kube(clusterArgs),
+  ]);
+  const node = final[0]!,
     currentNode = nodeIdentity(node, spec);
   if (currentNode.uid !== firstIdentity.uid)
     return fail("storage_node_identity_changed");
-  const lvmnode = await kube(lvmArgs),
+  const lvmnode = final[1]!,
     csi = lvmnodeIdentity(lvmnode, spec.hostname, currentNode.uid);
   if (
     csi.uid !== firstCsi.uid ||
@@ -501,19 +516,9 @@ export async function readStorageFacts(
     csi.free !== group.free
   )
     return fail("storage_capacity_unsettled");
-  if (
-    namespace(
-      await kube(["get", "namespace", "openebs", "--output=json"]),
-      "openebs",
-    ) !== storageNamespaceUid
-  )
+  if (namespace(final[2]!, "openebs") !== storageNamespaceUid)
     return fail("storage_namespace_identity_mismatch");
-  if (
-    namespace(
-      await kube(["get", "namespace", "kube-system", "--output=json"]),
-      "kube-system",
-    ) !== clusterUid
-  )
+  if (namespace(final[3]!, "kube-system") !== clusterUid)
     return fail("storage_cluster_identity_mismatch");
   await authorize();
   return {

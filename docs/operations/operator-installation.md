@@ -324,6 +324,24 @@ Quarantine release keeps separate fresh post-join network, Node identity and cap
 
 ## Acceptance
 
+If final bootstrap verification reports `bootstrap_readback_failed`, inspect the retained
+checkpoint before attributing the cause. A committed storage-trial intent identifies entry into
+the storage publisher; null resource identities do not prove that a create succeeded. Use
+bounded read-only observation of the exact planned objects and fresh physical/cluster identity.
+Authority transport, aborted requests and invalid response JSON/schema have finite diagnostics;
+raw storage aborts retain `storage_trial_aborted`, while other unknown storage errors retain
+`storage_trial_failed`. These diagnostics disclose no response bodies or credentials and do not
+extend deadlines or authorize a retry. Continue the same operation with its recorded ownership
+and uncertain-outcome reconciliation; never reset the image or erase trial journals.
+
+Storage readback uses exact Kubernetes REST resources rather than repeated discovery. Each fact
+snapshot keeps its fresh Cloudflare authority calls, initial and final Node/Cluster/CSI checks,
+Talos disk/partition/version and physical PV/VG/LV comparisons. Independent reads settle in
+batches of at most four; every sibling finishes before an error can enter cleanup. Optional
+trial resources use complete typed name-filtered lists: failed, paged, malformed, duplicate or
+foreign results cannot establish absence. The270-second producer deadline and separately fenced
+serial mutations remain unchanged.
+
 Complete US1 installation and admission, then restore an EU1 test database into a separate US1
 target from R2 while keeping the EU source healthy. Compare SQL data and committed markers,
 verify target backup/WAL and retain the EU Node, volume, role and encrypted custody identities.

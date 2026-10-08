@@ -766,6 +766,43 @@ test("authoritative admission and cancellation fence every destructive stage", (
   );
 });
 
+test("raw authority transport failures expose only a finite diagnostic code", async () => {
+  const input = fixture();
+  const client = new AuthorityClient(input, async () => {
+    throw new TypeError("private transport details must not escape");
+  });
+  await assert.rejects(
+    client.read(new AbortController().signal),
+    (error: unknown) =>
+      error instanceof BootstrapError &&
+      error.code === "authority_transport_failed" &&
+      error.message === "authority_transport_failed",
+  );
+});
+
+test("malformed authority JSON and invalid response schema have distinct finite diagnostics", async () => {
+  const input = fixture();
+  const malformed = new AuthorityClient(
+    input,
+    async () => new Response("private malformed body"),
+  );
+  await assert.rejects(
+    malformed.read(new AbortController().signal),
+    (error: unknown) =>
+      error instanceof BootstrapError &&
+      error.code === "authority_response_json_invalid",
+  );
+  const invalid = new AuthorityClient(input, async () =>
+    Response.json({ private_field: "must not escape" }),
+  );
+  await assert.rejects(
+    invalid.read(new AbortController().signal),
+    (error: unknown) =>
+      error instanceof BootstrapError &&
+      error.code === "authority_response_schema_invalid",
+  );
+});
+
 test("lost checkpoint response is reconciled by readback without a duplicate mutation", async () => {
   const input = fixture();
   let current = authority(input);

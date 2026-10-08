@@ -195,29 +195,45 @@ export function storageReadbackFixture(
     physical_volumes = [pv],
     logical_volumes = [lv];
   const calls: string[][] = [];
-  let authorized = false;
+  let authorizationCredits = 0;
   const commands: StorageReadCommands = {
     authorize: async () => {
-      authorized = true;
+      authorizationCredits++;
       return clusterUid;
     },
     kube: async (args) => {
-      assert.equal(authorized, true);
-      authorized = false;
+      assert.ok(
+        authorizationCredits > 0,
+        "fresh authorization before every native read",
+      );
+      authorizationCredits--;
       calls.push(args);
       assert.equal(args[0], "get");
-      const value = args.includes("kube-system")
-        ? namespace("kube-system", clusterUid)
-        : args.includes("openebs") && args.includes("namespace")
-          ? namespace("openebs", namespaceUid)
-          : args.includes("node")
-            ? node
-            : lvmnode;
+      const raw = args.find((arg) => arg.startsWith("--raw="));
+      const path = raw?.slice("--raw=".length);
+      const value = path
+        ? path.endsWith("/namespaces/kube-system")
+          ? namespace("kube-system", clusterUid)
+          : path.endsWith("/namespaces/openebs")
+            ? namespace("openebs", namespaceUid)
+            : path.includes("/nodes/")
+              ? node
+              : lvmnode
+        : args.includes("kube-system")
+          ? namespace("kube-system", clusterUid)
+          : args.includes("openebs") && args.includes("namespace")
+            ? namespace("openebs", namespaceUid)
+            : args.includes("node")
+              ? node
+              : lvmnode;
       return { exit_code: 0, stdout: JSON.stringify(value) };
     },
     talos: async (args) => {
-      assert.equal(authorized, true);
-      authorized = false;
+      assert.ok(
+        authorizationCredits > 0,
+        "fresh authorization before every native read",
+      );
+      authorizationCredits--;
       calls.push(args);
       assert.ok(!args.includes("--insecure"));
       if (args[0] === "version")

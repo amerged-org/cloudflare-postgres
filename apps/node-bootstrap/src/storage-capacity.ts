@@ -341,20 +341,95 @@ class StorageProducer {
   ): Promise<Json | null> {
     this.check();
     await this.commands.authorize();
-    const result = await this.commands.kube([
-      "get",
-      kind,
-      ...(name ? [name, "--ignore-not-found"] : []),
-      ...(namespace ? ["--namespace", namespace] : []),
-      "--output=json",
-    ]);
-    if (result.exit_code !== 0) return fail();
-    if (!result.stdout.trim() && name) return null;
+    const resources: Record<
+      string,
+      { apiVersion: string; kind: string; plural: string }
+    > = {
+      namespace: { apiVersion: "v1", kind: "Namespace", plural: "namespaces" },
+      configmap: { apiVersion: "v1", kind: "ConfigMap", plural: "configmaps" },
+      pod: { apiVersion: "v1", kind: "Pod", plural: "pods" },
+      resourcequota: {
+        apiVersion: "v1",
+        kind: "ResourceQuota",
+        plural: "resourcequotas",
+      },
+      networkpolicy: {
+        apiVersion: "networking.k8s.io/v1",
+        kind: "NetworkPolicy",
+        plural: "networkpolicies",
+      },
+      persistentvolumeclaim: {
+        apiVersion: "v1",
+        kind: "PersistentVolumeClaim",
+        plural: "persistentvolumeclaims",
+      },
+      persistentvolume: {
+        apiVersion: "v1",
+        kind: "PersistentVolume",
+        plural: "persistentvolumes",
+      },
+      persistentvolumes: {
+        apiVersion: "v1",
+        kind: "PersistentVolume",
+        plural: "persistentvolumes",
+      },
+      "lvmvolumes.local.openebs.io": {
+        apiVersion: "local.openebs.io/v1alpha1",
+        kind: "LVMVolume",
+        plural: "lvmvolumes",
+      },
+    };
+    const resource = resources[kind];
+    if (
+      !resource ||
+      (name && !/^[a-z0-9][a-z0-9.-]*$/.test(name)) ||
+      (namespace && !/^[a-z0-9][a-z0-9-]*$/.test(namespace))
+    )
+      return fail();
+    const prefix =
+      resource.apiVersion === "v1" ? "/api/v1" : `/apis/${resource.apiVersion}`;
+    const path = `${prefix}${namespace ? `/namespaces/${namespace}` : ""}/${resource.plural}${name ? `?fieldSelector=${encodeURIComponent(`metadata.name=${name}`)}` : ""}`;
+    const result = await this.commands.kube(["get", `--raw=${path}`]);
+    if (result.exit_code !== 0 || Buffer.byteLength(result.stdout) > 512 * 1024)
+      return fail();
+    let list: Json;
     try {
-      return object(JSON.parse(result.stdout));
+      list = object(JSON.parse(result.stdout));
     } catch {
       return fail();
     }
+    const metadata = object(list.metadata);
+    if (
+      list.apiVersion !== resource.apiVersion ||
+      list.kind !== `${resource.kind}List` ||
+      (metadata.continue !== undefined && metadata.continue !== "") ||
+      (metadata.remainingItemCount !== undefined &&
+        metadata.remainingItemCount !== 0)
+    )
+      return fail();
+    const values = items(list.items).map((item) => {
+      const value =
+        item.kind === undefined && item.apiVersion === undefined
+          ? { ...item, kind: resource.kind, apiVersion: resource.apiVersion }
+          : item;
+      if (
+        value.kind !== resource.kind ||
+        value.apiVersion !== resource.apiVersion
+      )
+        return fail();
+      const vm = object(value.metadata);
+      if (
+        (name !== undefined && vm.name !== name) ||
+        (namespace !== undefined && vm.namespace !== namespace)
+      )
+        return fail();
+      return value;
+    });
+    if (name !== undefined) {
+      if (values.length > 1) return fail();
+      return values[0] ?? null;
+    }
+    return { ...list, items: values };
   }
   private async mutate(args: string[], stdin: string) {
     this.check();
@@ -1015,5 +1090,16 @@ export async function publishNodeStorageCapacity(
   input: NodeBootstrapInput,
   commands: StorageCapacityCommands,
 ): Promise<void> {
-  await new StorageProducer(input, commands).run();
+  try {
+    await new StorageProducer(input, commands).run();
+  } catch (error) {
+    if (error instanceof BootstrapError) throw error;
+    if (
+      commands.signal.aborted ||
+      (error instanceof Error &&
+        ["AbortError", "TimeoutError"].includes(error.name))
+    )
+      throw new BootstrapError("storage_trial_aborted");
+    throw new BootstrapError("storage_trial_failed");
+  }
 }

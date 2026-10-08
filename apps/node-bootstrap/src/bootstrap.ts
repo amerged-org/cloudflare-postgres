@@ -282,24 +282,55 @@ export class AuthorityClient {
     this.request = request;
   }
   async call(value: NodeBootstrapCallback, signal: AbortSignal) {
-    const response = await this.request(this.input.callback.url, {
-      method: "POST",
-      headers: {
-        authorization: `Bearer ${this.input.callback.bearer}`,
-        "content-type": "application/json",
-      },
-      body: JSON.stringify(NodeBootstrapCallback.parse(value)),
-      signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
-      redirect: "error",
-    });
+    const parsed = NodeBootstrapCallback.safeParse(value);
+    if (!parsed.success)
+      throw new BootstrapError("authority_request_schema_invalid");
+    let response: Response;
+    try {
+      response = await this.request(this.input.callback.url, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${this.input.callback.bearer}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(parsed.data),
+        signal: AbortSignal.any([signal, AbortSignal.timeout(15_000)]),
+        redirect: "error",
+      });
+    } catch (error) {
+      if (error instanceof BootstrapError) throw error;
+      throw new BootstrapError(
+        signal.aborted ||
+          (error instanceof Error &&
+            ["AbortError", "TimeoutError"].includes(error.name))
+          ? "authority_request_aborted"
+          : "authority_transport_failed",
+      );
+    }
     if (!response.ok)
       throw new BootstrapError(
         response.status === 409 ? "checkpoint_conflict" : "authority_refused",
       );
-    const text = await response.text();
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (error) {
+      if (error instanceof BootstrapError) throw error;
+      throw new BootstrapError(
+        signal.aborted ||
+          (error instanceof Error &&
+            ["AbortError", "TimeoutError"].includes(error.name))
+          ? "authority_request_aborted"
+          : "authority_transport_failed",
+      );
+    }
     if (Buffer.byteLength(text) > OUTPUT_LIMIT)
       throw new BootstrapError("authority_response_limit");
-    return JSON.parse(text) as unknown;
+    try {
+      return JSON.parse(text) as unknown;
+    } catch {
+      throw new BootstrapError("authority_response_json_invalid");
+    }
   }
   identity() {
     return {
@@ -312,9 +343,12 @@ export class AuthorityClient {
     };
   }
   async read(signal: AbortSignal, observation_only = false) {
-    const authority = NodeBootstrapAuthority.parse(
+    const parsed = NodeBootstrapAuthority.safeParse(
       await this.call({ ...this.identity(), kind: "read" }, signal),
     );
+    if (!parsed.success)
+      throw new BootstrapError("authority_response_schema_invalid");
+    const authority = parsed.data;
     assertAuthority(this.input, authority, observation_only);
     return authority;
   }

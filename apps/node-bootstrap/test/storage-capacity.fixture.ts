@@ -96,6 +96,68 @@ export function storageCapacityFixture(
     },
     kube: async (args, _permit, stdin) => {
       if (args[0] === "get") {
+        const raw = args.find((arg) => arg.startsWith("--raw="));
+        if (raw) {
+          const url = new URL(raw.slice(6), "https://fixture.invalid"),
+            parts = url.pathname.split("/").filter(Boolean);
+          if (
+            url.pathname.includes("/nodes/") ||
+            url.pathname.includes("/lvmnodes/") ||
+            [
+              "/api/v1/namespaces/kube-system",
+              "/api/v1/namespaces/openebs",
+            ].includes(url.pathname)
+          )
+            return f.commands.kube(args);
+          const plural = parts.at(-1)!,
+            apiVersion = parts[0] === "api" ? "v1" : `${parts[1]}/${parts[2]}`;
+          const kind = (
+            {
+              namespaces: "Namespace",
+              configmaps: "ConfigMap",
+              pods: "Pod",
+              persistentvolumeclaims: "PersistentVolumeClaim",
+              persistentvolumes: "PersistentVolume",
+              lvmvolumes: "LVMVolume",
+              networkpolicies: "NetworkPolicy",
+              resourcequotas: "ResourceQuota",
+            } as Record<string, string>
+          )[plural]!;
+          const nsAt = parts.indexOf("namespaces"),
+            ns = nsAt >= 0 && nsAt < parts.length - 1 ? parts[nsAt + 1]! : "";
+          const name = url.searchParams
+            .get("fieldSelector")
+            ?.slice("metadata.name=".length);
+          let values = [...objects.values()].filter(
+            (value) =>
+              value.kind === kind &&
+              (!ns || obj(value.metadata).namespace === ns) &&
+              (!name || obj(value.metadata).name === name),
+          );
+          if (kind === "ConfigMap" && name === "pgcf-regional")
+            values = [
+              {
+                apiVersion: "v1",
+                kind: "ConfigMap",
+                metadata: {
+                  name,
+                  namespace: "pgcf-system",
+                  uid: randomUUID(),
+                  resourceVersion: "1",
+                },
+                data: { PGCF_POSTGRES_IMAGE: image },
+              },
+            ];
+          return {
+            exit_code: 0,
+            stdout: JSON.stringify({
+              apiVersion,
+              kind: `${kind}List`,
+              metadata: {},
+              items: values,
+            }),
+          };
+        }
         const kind = args[1]!,
           name = args[2]?.startsWith("--") ? undefined : args[2];
         if (

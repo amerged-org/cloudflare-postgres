@@ -82,9 +82,9 @@ allocated SSD and did not run an installer. Those failed selections are historic
 V159 offer supplies the required 150 GiB NVMe without a storage add-on. No new EU worker is needed,
 and EU1 is not reset, re-adopted or decommissioned. First verify an R2 restore into US1 while
 preserving the healthy EU source; the earlier destructive loss and deletion kits are withheld.
-US1's installation profile and binding are sealed, hardware inspection has reported, and its
-original authorized bootstrap job remains at `created`, before installation disk writes.
-Preparation proof, installation/admission and cross-region recovery remain unaccepted. Resume
+US1's installation profile and binding are sealed. The original authorized bootstrap job has
+installed the complete checked Talos image, joined Kubernetes and reached `regional_ready`.
+Final storage verification, admission and cross-region recovery remain unaccepted. Resume
 the same addition and Workflow with their retained seals and journals; do not purchase, re-adopt
 or reset US1. No customer or platform database has been migrated. EU/US operator acceptance comes
 first; Neon migration and public-release polish follow separately.
@@ -94,10 +94,11 @@ RAM usage over ten fresh consecutive minute samples from the same Node UID, with
 and standing cost caps. Orders use one month and no storage add-on. Existing capacity remains
 eligible during rollout under hard RAM, CPU, storage and full PostgreSQL/Barman startup-peak
 guards; there is no 81% placement cutoff. Missing observations remain unknown. Admin assignments
-use 256 MiB steps, with a 4096 MiB PostgreSQL cap in this installation. Actual-RAM mode and automatic
-purchases remain disabled until US/recovery acceptance, reviewed test cleanup and finite owner
-limits are supplied. Profile configuration is complete; policy activation and fresh-node live
-acceptance remain outstanding.
+use 256 MiB steps, with a 4096 MiB PostgreSQL cap in this installation. US uses actual-RAM mode
+with a 128 MiB PostgreSQL request; EU retains reserved mode until its existing databases complete
+the guarded transition. Autonomous purchases remain disabled: finite standing cost/count/expiry
+authority is not configured. Installation profiles are complete; full live acceptance remains
+outstanding.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture

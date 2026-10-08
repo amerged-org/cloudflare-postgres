@@ -2,8 +2,10 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { test } from "node:test";
+import { setImmediate } from "node:timers/promises";
 import { storageReadbackFixture as state } from "./storage-readback.fixture.ts";
 import { readStorageFacts } from "../src/storage-readback.ts";
+import { BootstrapError } from "../src/bootstrap.ts";
 
 const gi = 1024 ** 3;
 
@@ -146,4 +148,73 @@ test("missing measurements and cluster authority changes stop readback before an
     }),
     /storage_cluster_identity_mismatch/,
   );
+});
+
+test("independent storage readbacks overlap in bounded batches and use exact REST identities", async () => {
+  const f = state();
+  let active = 0,
+    peak = 0,
+    simulatedReadMilliseconds = 0;
+  const delayed = async (
+    read: () => Promise<{ exit_code: number; stdout: string }>,
+  ) => {
+    if (active === 0) simulatedReadMilliseconds += 20_000;
+    active++;
+    peak = Math.max(peak, active);
+    try {
+      await setImmediate();
+      return await read();
+    } finally {
+      active--;
+    }
+  };
+  const kubeCalls: string[][] = [];
+  const facts = await readStorageFacts(f.input, {
+    ...f.commands,
+    kube: (args) => {
+      kubeCalls.push(args);
+      return delayed(() => f.commands.kube(args));
+    },
+    talos: (args) => delayed(() => f.commands.talos(args)),
+  });
+  assert.equal(facts.node_uid, f.nodeUid);
+  assert.equal(active, 0);
+  assert.ok(
+    simulatedReadMilliseconds < 270_000,
+    `read budget consumed: ${simulatedReadMilliseconds}`,
+  );
+  assert.ok(peak >= 2 && peak <= 4, `observed concurrent reads: ${peak}`);
+  assert.ok(
+    kubeCalls.every(
+      (args) =>
+        args.length === 2 && args[0] === "get" && args[1]!.startsWith("--raw="),
+    ),
+  );
+});
+
+test("a rejected storage identity batch settles every sibling before returning", async () => {
+  const f = state();
+  const failure = new BootstrapError("storage_node_identity_mismatch");
+  let active = 0,
+    finished = 0;
+  await assert.rejects(
+    readStorageFacts(f.input, {
+      ...f.commands,
+      kube: async (args) => {
+        active++;
+        try {
+          if (args[1]?.includes("/api/v1/nodes/")) throw failure;
+          await setImmediate();
+          return await f.commands.kube(args);
+        } finally {
+          active--;
+          finished++;
+        }
+      },
+    }),
+    (error: unknown) => error === failure,
+  );
+  assert.equal(active, 0);
+  assert.equal(finished, 4);
+  assert.ok(!f.calls.some((args) => args[0] === "version"));
 });

@@ -16,7 +16,7 @@ import {
   storageDeleteRequest,
   publishNodeStorageCapacity,
 } from "../src/storage-capacity.ts";
-import { digest } from "../src/bootstrap.ts";
+import { BootstrapError, digest } from "../src/bootstrap.ts";
 import { storageReadbackFixture } from "./storage-readback.fixture.ts";
 import { storageCapacityFixture } from "./storage-capacity.fixture.ts";
 
@@ -211,7 +211,7 @@ test("metadata deletion alone cannot publish or complete a physically retained L
   f.retainPhysical();
   await assert.rejects(
     publishNodeStorageCapacity(f.input, f.commands),
-    /physical_lv_still_present/,
+    /storage_trial_aborted/,
   );
   assert.equal(f.trial()!.runs[0]!.stage, "cleanup");
   assert.equal(f.logical_volumes.length, 1);
@@ -229,7 +229,7 @@ test("an interruption keeps exact owned UIDs and a fresh resume uses the same PV
   f.stopAfterPod();
   await assert.rejects(
     publishNodeStorageCapacity(f.input, f.commands),
-    /interrupted_after_owned_pod/,
+    /storage_trial_aborted/,
   );
   const first = structuredClone(f.trial()!.runs[0]!);
   assert.ok(first.pvc_uid && first.pod_uid && first.namespace_uid);
@@ -312,7 +312,7 @@ test("a cleanup resume recovers a late Retain allocation through the exact recor
   f.stopAfterPod();
   await assert.rejects(
     publishNodeStorageCapacity(f.input, f.commands),
-    /interrupted_after_owned_pod/,
+    /storage_trial_aborted/,
   );
   const saved = structuredClone(f.trial()!);
   saved.runs[0]!.stage = "cleanup";
@@ -352,7 +352,7 @@ test("an orphan Retain PV remains recoverable after its exact owned PVC has alre
   f.stopAfterPod();
   await assert.rejects(
     publishNodeStorageCapacity(f.input, f.commands),
-    /interrupted_after_owned_pod/,
+    /storage_trial_aborted/,
   );
   const saved = structuredClone(f.trial()!);
   saved.runs[0]!.stage = "cleanup";
@@ -389,9 +389,8 @@ test("expiry during awaited authorization refuses the following native mutation"
       const result = await f.commands.kube(...args);
       if (
         args[0][0] === "get" &&
-        args[0][1] === "namespace" &&
-        args[0][2]?.startsWith("pgcf-storage-") &&
-        !result.stdout
+        args[0][1]?.startsWith("--raw=/api/v1/namespaces?fieldSelector=") &&
+        JSON.parse(result.stdout).items.length === 0
       )
         armed = true;
       return result;
@@ -403,4 +402,157 @@ test("expiry during awaited authorization refuses the following native mutation"
   );
   assert.equal(f.mutations.length, 0);
   assert.equal(f.trial()!.runs[0]!.stage, "intent");
+});
+
+test("a raw storage publisher abort remains finite without attempting a mutation", async () => {
+  const f = storageCapacityFixture();
+  await assert.rejects(
+    publishNodeStorageCapacity(f.input, {
+      ...f.commands,
+      readTrial: async () => {
+        throw new DOMException("private deadline details", "TimeoutError");
+      },
+    }),
+    (error: unknown) =>
+      error instanceof BootstrapError && error.code === "storage_trial_aborted",
+  );
+  assert.equal(f.mutations.length, 0);
+});
+
+test("unknown storage custody failures expose a finite code and preserve existing errors", async () => {
+  const f = storageCapacityFixture();
+  await assert.rejects(
+    publishNodeStorageCapacity(f.input, {
+      ...f.commands,
+      readTrial: async () => {
+        throw new Error("private custody details");
+      },
+    }),
+    (error: unknown) =>
+      error instanceof BootstrapError && error.code === "storage_trial_failed",
+  );
+  const refused = new BootstrapError("authority_refused");
+  await assert.rejects(
+    publishNodeStorageCapacity(f.input, {
+      ...f.commands,
+      readTrial: async () => {
+        throw refused;
+      },
+    }),
+    (error: unknown) => error === refused,
+  );
+  assert.equal(f.mutations.length, 0);
+});
+
+test("continued or failed named storage collections cannot establish absence or dispatch creation", async () => {
+  const f = storageCapacityFixture();
+  const base = f.commands.kube;
+  const intercepted = {
+    ...f.commands,
+    kube: async (args: string[], permit?: boolean, stdin?: string) => {
+      if (
+        args.some((arg) =>
+          arg.startsWith("--raw=/api/v1/namespaces?fieldSelector="),
+        )
+      )
+        return {
+          exit_code: 0,
+          stdout: JSON.stringify({
+            apiVersion: "v1",
+            kind: "NamespaceList",
+            metadata: { continue: "unread" },
+            items: [],
+          }),
+        };
+      return base(args, permit, stdin);
+    },
+  };
+  await assert.rejects(
+    publishNodeStorageCapacity(f.input, intercepted),
+    /storage_trial_readback_invalid/,
+  );
+  assert.equal(f.mutations.length, 0);
+  const refused = {
+    ...f.commands,
+    kube: async (args: string[], permit?: boolean, stdin?: string) => {
+      if (
+        args.some((arg) =>
+          arg.startsWith("--raw=/api/v1/namespaces?fieldSelector="),
+        )
+      )
+        return { exit_code: 1, stdout: "" };
+      return base(args, permit, stdin);
+    },
+  };
+  await assert.rejects(
+    publishNodeStorageCapacity(f.input, refused),
+    /storage_trial_readback_invalid/,
+  );
+  assert.equal(f.mutations.length, 0);
+});
+
+test("an unrelated object in a named collection cannot be treated as an absent trial resource", async () => {
+  const f = storageCapacityFixture(),
+    base = f.commands.kube;
+  await assert.rejects(
+    publishNodeStorageCapacity(f.input, {
+      ...f.commands,
+      kube: async (args, permit, stdin) => {
+        if (
+          args.some((arg) =>
+            arg.startsWith("--raw=/api/v1/namespaces?fieldSelector="),
+          )
+        )
+          return {
+            exit_code: 0,
+            stdout: JSON.stringify({
+              apiVersion: "v1",
+              kind: "NamespaceList",
+              metadata: {},
+              items: [
+                {
+                  apiVersion: "v1",
+                  kind: "Namespace",
+                  metadata: { name: "other-owned-scope", uid: randomUUID() },
+                },
+              ],
+            }),
+          };
+        return base(args, permit, stdin);
+      },
+    }),
+    /storage_trial_readback_invalid/,
+  );
+  assert.equal(f.mutations.length, 0);
+});
+
+test("missing or null list metadata cannot establish storage trial absence", async () => {
+  for (const metadata of [undefined, null]) {
+    const f = storageCapacityFixture(),
+      base = f.commands.kube;
+    await assert.rejects(
+      publishNodeStorageCapacity(f.input, {
+        ...f.commands,
+        kube: async (args, permit, stdin) => {
+          if (
+            args.some((arg) =>
+              arg.startsWith("--raw=/api/v1/namespaces?fieldSelector="),
+            )
+          )
+            return {
+              exit_code: 0,
+              stdout: JSON.stringify({
+                apiVersion: "v1",
+                kind: "NamespaceList",
+                metadata,
+                items: [],
+              }),
+            };
+          return base(args, permit, stdin);
+        },
+      }),
+      /storage_trial_readback_invalid/,
+    );
+    assert.equal(f.mutations.length, 0);
+  }
 });

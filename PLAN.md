@@ -595,6 +595,56 @@ affected cases/types/lint/formatting and independent review pass; wrong digests 
 The original operation was paused once for readback delivery. No component reapply or source
 pin update occurred. US1 admission and full SQL/backup/WAL/restore/reclamation remain pending.
 
+Source `5f7972a0`, full CI `37754616319`, delivered the cloudflared readback pin once with
+qualified Native `sha256:8701a358bc8e62a5cf5697d5064097d4bbbf7d9c9d8baa6569e23bf8b38efb89`.
+All18 layers/715,032,665 qualification bytes passed; full registry readback verified162,128,802
+compressed and502,915,584 raw bytes. The actual running image matched. The original operation
+confirmed `regional_ready` at09:37:07Z, preserving both consumed repair journals and the complete
+installed image. Its final bootstrap verification stopped at revision706 with the generic
+`bootstrap_readback_failed` at09:47:57Z. One bounded read-only inspection confirmed every current
+authenticated Talos prerequisite: exact version/disk, ready expected volumes/STATE and writable
+LVM geometry. Whole job706 and sealed Node/Cluster/boot/system/configuration/custody identities
+remained exact; provider calls and cluster writes were zero. These facts do not reproduce the
+generic failure or establish which later publisher failed. Diagnose that exact path before
+another delivery or mutation. US1 admission and all customer-operation acceptance remain pending.
+The completed1,800-second capture ending09:53:17Z contains zero actual provider wire events;
+this is a bounded-window measurement, not a historical lifetime count.
+
+The retained storage trial proves the publisher was entered: its first intent is committed,
+but every resource/volume UID and allocation field remains null. Its fresh sample preceded the
+generic failure by80.147 seconds; this does not establish the earlier publisher start or prove
+a timeout. A second bounded read-only inspection found all five exact planned trial objects
+absent, with whole job706 and physical/cluster/custody identities unchanged. Provider/customer
+reads and cluster writes were zero. Retained Tail data lacks statuses for some RPC frames, so
+it does not prove every authority callback succeeded. Four failing regressions reproduce raw
+authority transport/JSON/schema and storage-abort errors escaping as the generic diagnostic.
+The narrow correction exposes only fixed error codes while preserving explicit BootstrapErrors,
+all deadlines, authority validation and uncertain-write readback. No timeout increase, retry,
+reinstallation or fictional progress is introduced. The underlying live cause remains unknown
+until the same operation runs this diagnostic correction.
+
+Before dispatching an operator pause, fresh authoritative readback found genuine forward
+progress to revision708: the first storage trial is now `cleanup`, still with every resource,
+volume and allocation field null, and the explicit error is `storage_trial_deadline`.
+The earlier intent-only pause guard refused before any binding or mutation intent. This later
+error establishes the producer's270-second deadline failure; it does not retroactively identify
+the original generic exception. One subsequently bound pause succeeded, and readback confirmed
+the original Workflow paused atstep496 with whole job708 unchanged. The performance correction
+removes redundant Kubernetes discovery and batches independent read-only facts with a maximum
+of four concurrent requests, draining failures before subsequent work. Original authority calls,
+before/after Node/Cluster identity, Talos/PV/VG/LV/CSI comparisons, deadlines and mutation fences
+remain; no observation cache or timeout increase is used. Live re-entry remains pending.
+The regression's fixed20-second command latency makes the actual old serial reader exceed that
+budget at300 seconds; the repaired reader completes at100 seconds with a peak of four and no
+outstanding sibling. These are modeled test times, not live rollout measurements. Existing live
+probe logs show2.172–2.970 seconds per Talos prerequisite and1.918–3.326 seconds for raw Kubernetes
+identity reads. They support the optimization but do not prove the full producer fits its budget;
+that includes allocation, writes, cleanup and publication and still requires live acceptance.
+Final review also reproduced missing/null list metadata incorrectly establishing absence. The
+strict metadata check now rejects those responses before creation.61 affected tests, Native
+types/lint/formatting and independent review pass. The final source retains the same270/285-second
+deadlines and every uncertain-mutation readback; one CI and qualified delivery are pending.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider
@@ -1334,8 +1384,10 @@ observations and a later physical sample settle holds; uncertain starts have no 
 Pending demand caused only by startup RAM or held starts waits below the 76% rolling purchase threshold.
 CPU/storage exhaustion and an empty customer pool retain their independent capacity path.
 
-Changing placement mode or the PostgreSQL request requires no assigned live databases and no
-unsettled starts; unplaced demand may remain. Apply this configuration after harness cleanup and
+Changing placement mode or the PostgreSQL request requires either no assigned databases or the
+entire assigned cohort confirmed manually suspended and hibernated at its current generation,
+with owned succeeded suspend operations and no unsettled starts. Unplaced demand may remain.
+The policy write checks that complete cohort atomically. Apply this configuration after harness cleanup and
 before customer migration. Updating cost or node caps with the same request geometry is allowed.
 D1 keeps projects/external IDs, database/class/node assignments, physical memory history and
 startup holds. Use the guarded admin API; direct table edits bypass lifecycle guards.
