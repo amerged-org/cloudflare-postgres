@@ -23,13 +23,16 @@ import { startNativeProxy, type ProxyConfig } from "./proxy-command.ts";
 import { PlatformInstaller, readPlatformAssets } from "./platform.ts";
 import { publishKubeletTrust } from "./kubelet-trust.ts";
 import { prepareScratch } from "./rescue-scratch.ts";
-import { publishNodeStorageCapacity } from "./storage-capacity.ts";
+import {
+  publishNodeStorageCapacity,
+  NATIVE_STORAGE_EXECUTION_MS,
+} from "./storage-capacity.ts";
 import { NodeStorageTrial } from "@pgcf/contracts/node-bootstrap";
 import { BootstrapError } from "./bootstrap-error.ts";
 export { BootstrapError } from "./bootstrap-error.ts";
 
-export const TALOS_VERSION = "1.14.1";
-export const KUBERNETES_VERSION = "1.36.5";
+import { TALOS_VERSION, KUBERNETES_VERSION } from "./platform-artifacts.ts";
+export { TALOS_VERSION, KUBERNETES_VERSION } from "./platform-artifacts.ts";
 export const CHUNK_BYTES = 16 * 1024 ** 2;
 const MAX_COMMAND_MS = 540_000;
 const OUTPUT_LIMIT = 512 * 1024;
@@ -1668,7 +1671,7 @@ export class BootstrapJob {
   private async publishStorageCapacity() {
     const signal = AbortSignal.any([
       this.abort.signal,
-      AbortSignal.timeout(915_000),
+      AbortSignal.timeout(NATIVE_STORAGE_EXECUTION_MS + 15_000),
     ]);
     const authorize = async () => {
       const authority = await this.authority.read(signal);

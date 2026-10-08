@@ -382,7 +382,7 @@ test("expiry during awaited authorization refuses the following native mutation"
   const commands = {
     ...f.commands,
     authorize: async () => {
-      if (armed) clock = 1_000_000;
+      if (armed) clock = 2_000_000;
       return f.commands.authorize();
     },
     kube: async (...args: Parameters<typeof f.commands.kube>) => {
@@ -557,7 +557,7 @@ test("missing or null list metadata cannot establish storage trial absence", asy
   }
 });
 
-test("the measured full storage flow completes retained cleanup, write, reclaim and publication within its bounded work budget", async (t) => {
+test("the modeled full storage flow completes with twofold observed-latency headroom", async (t) => {
   const f = storageCapacityFixture();
   const epoch = Date.now();
   let clock = 0;
@@ -583,14 +583,14 @@ test("the measured full storage flow completes retained cleanup, write, reclaim 
   await f.commands.saveTrial(cleanup);
   const commands = {
     ...f.commands,
-    authorize: () => latency(1200, f.commands.authorize),
-    readTrial: () => latency(1200, f.commands.readTrial),
+    authorize: () => latency(2400, f.commands.authorize),
+    readTrial: () => latency(2400, f.commands.readTrial),
     saveTrial: (trial: NodeStorageTrial) =>
-      latency(3600, () => f.commands.saveTrial(trial)),
+      latency(7200, () => f.commands.saveTrial(trial)),
     kube: (...args: Parameters<typeof f.commands.kube>) =>
-      latency(3500, () => f.commands.kube(...args)),
+      latency(7000, () => f.commands.kube(...args)),
     talos: (...args: Parameters<typeof f.commands.talos>) =>
-      latency(3500, () => f.commands.talos(...args)),
+      latency(7000, () => f.commands.talos(...args)),
     wait: async () => {
       advanceTo(clock + 1000);
       await setImmediate();
@@ -626,10 +626,10 @@ test("the measured full storage flow completes retained cleanup, write, reclaim 
   );
   assert.equal(final.runs[0]!.stage, "reclaimed");
   assert.equal(run.stage, "published");
-  assert.ok(clock <= 900_000);
+  assert.ok(clock <= 1_800_000);
   const proofSpan =
     Date.parse(run.after!.observed_at) - Date.parse(run.before.observed_at);
-  assert.ok(proofSpan > 300_000 && proofSpan <= 900_000);
+  assert.ok(proofSpan > 300_000 && proofSpan <= 1_800_000);
   assert.ok(Date.now() - Date.parse(run.after!.observed_at) <= 300_000);
   assert.equal(f.objects.size, 0);
   assert.equal(f.logical_volumes.length, 0);

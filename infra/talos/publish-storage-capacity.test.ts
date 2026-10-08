@@ -478,6 +478,6 @@ test("Native proof work refuses stale completion, future completion and a histor
   assert.throws(() => capacityPlan(stale.config, stale.name, stale.node, stale.lvm, now), /stale_storage_proof/);
   const future = nativeWindowFixture(600_000, -1);
   assert.throws(() => capacityPlan(future.config, future.name, future.node, future.lvm, now), /stale_storage_proof/);
-  const tooLong = nativeWindowFixture(901_001, 1000);
+  const tooLong = nativeWindowFixture(1_801_001, 1000);
   assert.throws(() => capacityPlan(tooLong.config, tooLong.name, tooLong.node, tooLong.lvm, now), /stale_storage_proof/);
 });

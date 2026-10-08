@@ -9,6 +9,15 @@ Running is not installation or admission. No new EU worker, EU1 re-adoption, res
 decommissioning is part of this completion. Public
 distribution and installation in a foreign Cloudflare account are separate release work.
 
+For this owner's completion, run all remaining checks once read-only from the laptop using the
+same implementation and existing custody, without consuming admission. Collect every mismatch
+before one combined correction, CI, delivery and resume. If that one programmed attempt fails,
+the owner permits one operator admission using the same checks and existing US1 operation.
+Record the actual path and timing in PLAN Status; do not claim complete automatic acceptance.
+Its remaining proof belongs to the next genuine authorized purchase. Immediately continue the
+real database lifecycle on both customer nodes. EU upgrades and template activation stay paused
+through US database acceptance; document differences and align only a blocking incompatibility.
+
 ## Reviewed deployment inputs
 
 Use a source commit that passed the common CI checks and fully qualified images by immutable
@@ -341,8 +350,8 @@ batches of at most four; every sibling finishes before an error can enter cleanu
 trial resources use complete typed name-filtered lists: failed, paged, malformed, duplicate or
 foreign results cannot establish absence. Every separately fenced mutation retains fresh
 authority, identity and physical checks, with15-second authority requests and20-second native
-commands. The complete guarded Native producer has a900-second work allowance and915-second
-outer cancellation bound. Its historical before-to-after proof is bounded to900 seconds, while
+commands. The complete guarded Native producer has a1800-second work allowance and1815-second
+outer cancellation bound. Its historical before-to-after proof is bounded to1800 seconds, while
 completion remains fresh within300 seconds and publication binds the current exact physical/CSI
 state. Only the internal Native caller selects this rule. The manual publisher's original
 300-second start-age and duration checks remain unchanged; there is no new CLI/environment option.

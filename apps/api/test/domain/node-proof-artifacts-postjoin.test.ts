@@ -36,6 +36,7 @@ import {
 import {
   canonicalNodeVerificationProof,
   nodeVerificationProofSchema,
+  verifyNodeProofArtifact,
 } from "../../src/platform/nodes.ts";
 import { ContaboClient } from "../../src/providers/contabo.ts";
 import { cleanupFixtures } from "./fixtures.ts";
@@ -98,7 +99,7 @@ async function fixture() {
   f.bindings.BOOTSTRAP_VERIFIER_KEYS = JSON.stringify({
     automation: bytesToBase64url(new Uint8Array(publicKey)),
   });
-  // The sole provider stub represents authenticated readback; core proof verification remains real.
+  // Initial installation has already bound provider custody; routine proof must not revisit it.
   f.bindings.CONTABO_CLIENT_ID = "local-unit-client";
   f.bindings.CONTABO_CLIENT_SECRET = "local-unit-secret";
   f.bindings.CONTABO_USERNAME = "local-unit-user";
@@ -136,20 +137,32 @@ async function fixture() {
         provider_instance_id: f.providerId,
         addresses: { ipv4: [f.actual.ipConfig.v4.ip], ipv6: [] },
         primary: { ipv4: [f.actual.ipConfig.v4.ip], ipv6: [] },
-        firewall_id: crypto.randomUUID(),
+        firewall_id: f.binding.row.firewall_id,
         ownership_sha256: await installationHash([
           f.actual.tenantId,
           f.actual.customerId,
         ]),
         rules: { rules: { inbound: [rule] } },
-        rules_sha256: await installationHash([rule]),
+        rules_sha256: await installationHash([
+          {
+            protocol: rule.protocol,
+            destPorts: [...rule.destPorts].sort(),
+            srcCidr: rule.srcCidr,
+            action: rule.action,
+            status: rule.status,
+          },
+        ]),
       },
     ],
   };
   const now = Date.now(),
     at = (offset: number) => new Date(now + offset).toISOString(),
     readback = at(-30_000),
-    planHash = await installationHash(plan);
+    planHash = await installationHash(plan),
+    initialProof = nonce();
+  f.bindings.BOOTSTRAP_OPERATOR_SOURCES = JSON.stringify(["1.1.1.1/32"]);
+  f.bindings.BOOTSTRAP_SCAN_CONTROL = JSON.stringify(plan.scan_control);
+  f.bindings.BOOTSTRAP_FIREWALL_BINDINGS = "{}";
   await env.DB.prepare(
     "DELETE FROM node_network_preparations WHERE operation_id=?",
   )
@@ -164,11 +177,16 @@ async function fixture() {
       planHash,
       JSON.stringify(plan),
       readback,
-      nonce(),
+      initialProof,
       at(300_000),
       readback,
       readback,
     )
+    .run();
+  await env.DB.prepare(
+    "INSERT INTO node_network_firewalls(firewall_id,operation_id,plan_sha256) VALUES(?,?,?)",
+  )
+    .bind(f.binding.row.firewall_id, plan.operation_id, planHash)
     .run();
   const addition = await readNodeAddition(
       env.DB,
@@ -271,10 +289,33 @@ async function fixture() {
     destructive_intent: true,
     storage_trial: trial,
   });
+  const continuation = {
+    version: 1,
+    operation_id: configured.operation_id,
+    node_id: configured.node_id,
+    region_id: configured.region_id,
+    provider_instance_id: f.providerId,
+    input_hash: configured.input_hash,
+    sealed_revision: configured.sealed_revision,
+    intent_hash: addition.intent_hash,
+    binding_sha256: f.binding.row.binding_sha256,
+    plan_sha256: planHash,
+    readback_at: readback,
+    initial_proof_sha256: initialProof,
+    provider_audit_sha256: await installationHash(addition.audit),
+    provider_receipt_sha256: await installationHash(addition.receipt),
+    provider_inventory_sha256: await installationHash(f.actual),
+    authorized_revision: 1,
+    issued_at: at(0),
+  };
   await env.DB.prepare(
-    "UPDATE node_bootstrap_jobs SET authorized=1,revision=1,checkpoint_json=? WHERE operation_id=?",
+    "UPDATE node_bootstrap_jobs SET authorized=1,revision=1,checkpoint_json=?,network_authorization_json=? WHERE operation_id=?",
   )
-    .bind(JSON.stringify(checkpoint), configured.operation_id)
+    .bind(
+      JSON.stringify(checkpoint),
+      JSON.stringify(continuation),
+      configured.operation_id,
+    )
     .run();
   const reference = `${configured.input_hash}:1`;
   await saveNodeBootstrapCheckpoint(
@@ -426,6 +467,9 @@ async function fixture() {
 
 it("publishes a complete storage and raw Kubernetes postjoin proof and authorizes real quarantined admission", async () => {
   const f = await fixture();
+  f.provider.mockRejectedValue(
+    new Error("routine_postjoin_provider_forbidden"),
+  );
   const result = await acceptNodeProofReport(
     f.bindings,
     f.session.bearer,
@@ -479,9 +523,7 @@ it("publishes a complete storage and raw Kubernetes postjoin proof and authorize
     .bind(f.job.node_id)
     .first<{ schedulable: number }>();
   expect(node?.schedulable).toBe(0);
-  expect(f.provider.mock.calls.length).toBe(1);
-  expect(f.provider.mock.calls[0]![0]).toBe(f.providerId);
-  // Admission retains its lifecycle inventory read; routine proof never prepares firewalls.
+  expect(f.provider).not.toHaveBeenCalled();
   expect(f.firewall).not.toHaveBeenCalled();
   await env.DB.prepare(
     "UPDATE node_bootstrap_jobs SET admission_expires_at=? WHERE operation_id=?",
@@ -545,18 +587,14 @@ it("rejects a Node resourceVersion change during the two raw observations before
 });
 
 it("preserves the original release-intent resourceVersion when a newer valid postjoin proof arrives", async () => {
-  const f = await fixture(),
-    saved = {
-      checkpoint_revision: 1,
-      node_uid: f.nodeUid,
-      resource_version: "1",
-      kube_system_uid: f.clusterUid,
-      quarantine: {
-        key: "pgcf.io/quarantine",
-        value: "bootstrap",
-        effect: "NoSchedule",
-      },
-    };
+  const f = await fixture();
+  for (const value of [f.report.postjoin!.node, f.report.postjoin!.node_after])
+    (value.metadata as { resourceVersion: string }).resourceVersion = "1";
+  await acceptNodeProofReport(f.bindings, f.session.bearer, f.report);
+  const authorized = await readBootstrapJob(env.DB, f.job.operation_id),
+    saved = NodeBootstrapAdmissionBinding.parse(
+      JSON.parse(authorized.admission_binding_json!),
+    );
   const checkpoint = NodeBootstrapCheckpoint.parse({
     ...f.checkpoint,
     stage: "quarantine_release_intent",
@@ -569,6 +607,10 @@ it("preserves the original release-intent resourceVersion when a newer valid pos
   )
     .bind(JSON.stringify(checkpoint), JSON.stringify(saved), f.job.operation_id)
     .run();
+  // A lost alias can be renewed from complete fresh observations without changing its release intent.
+  await env.ARCHIVE.delete(f.alias);
+  for (const value of [f.report.postjoin!.node, f.report.postjoin!.node_after])
+    (value.metadata as { resourceVersion: string }).resourceVersion = "2";
   const result = await acceptNodeProofReport(
     f.bindings,
     f.session.bearer,
@@ -580,4 +622,130 @@ it("preserves the original release-intent resourceVersion when a newer valid pos
   expect((await admissionAuthority(f.bindings, job)).admission_authorized).toBe(
     true,
   );
+  expect(f.provider).not.toHaveBeenCalled();
+});
+
+it("rejects a correctly signed foreign-address artifact against sealed assignment without provider access", async () => {
+  const f = await fixture();
+  await acceptNodeProofReport(f.bindings, f.session.bearer, f.report);
+  const object = await env.ARCHIVE.get(f.alias),
+    document = JSON.parse(await object!.text()) as {
+      kid: string;
+      payload: unknown;
+      signature: string;
+    },
+    payload = nodeVerificationProofSchema.parse(document.payload);
+  payload.addresses.ipv6 = "2001:db8::99";
+  payload.scans.push({
+    ...payload.scans[0]!,
+    family: "ipv6",
+    address: payload.addresses.ipv6,
+    source: "2001:db8::98",
+  });
+  const signature = await crypto.subtle.sign(
+    "Ed25519",
+    f.pair.privateKey,
+    encoder.encode(
+      "pgcf-node-verification/v1\n" + canonicalNodeVerificationProof(payload),
+    ),
+  );
+  const text = JSON.stringify({
+    ...document,
+    payload,
+    signature: bytesToBase64url(new Uint8Array(signature)),
+  });
+  await env.ARCHIVE.put(f.alias, text);
+  const addition = await readNodeAddition(env.DB, f.job.operation_id);
+  await expect(
+    verifyNodeProofArtifact(f.bindings, f.job.operation_id, {
+      expected_revision: addition.revision,
+      sha256: await hashText(text),
+    }),
+  ).rejects.toMatchObject({
+    code: "conflict",
+    message: "Proof addresses differ from the sealed network assignment",
+  });
+  expect((await readNodeAddition(env.DB, f.job.operation_id)).revision).toBe(
+    addition.revision,
+  );
+  expect(f.provider).not.toHaveBeenCalled();
+});
+
+it("rejects revocation during the signed artifact read before capacity or admission writes without provider access", async () => {
+  const f = await fixture(),
+    accepted = await acceptNodeProofReport(
+      f.bindings,
+      f.session.bearer,
+      f.report,
+    ),
+    addition = await readNodeAddition(env.DB, f.job.operation_id),
+    get = env.ARCHIVE.get.bind(env.ARCHIVE);
+  vi.spyOn(env.ARCHIVE, "get").mockImplementation(async (...args) => {
+    const object = await get(...args);
+    if (args[0] === f.alias)
+      await env.DB.prepare(
+        "UPDATE node_bootstrap_jobs SET authorized=0 WHERE operation_id=?",
+      )
+        .bind(f.job.operation_id)
+        .run();
+    return object;
+  });
+  await expect(
+    verifyNodeProofArtifact(f.bindings, f.job.operation_id, {
+      expected_revision: addition.revision,
+      sha256: accepted.sha256,
+    }),
+  ).rejects.toMatchObject({
+    code: "conflict",
+    message: "Current sealed installation and network authority are required",
+  });
+  expect((await readNodeAddition(env.DB, f.job.operation_id)).revision).toBe(
+    addition.revision,
+  );
+  expect(f.provider).not.toHaveBeenCalled();
+});
+
+it("rejects renewal when network preparation is revoked during the admission authority read", async () => {
+  const f = await fixture(),
+    accepted = await acceptNodeProofReport(
+      f.bindings,
+      f.session.bearer,
+      f.report,
+    ),
+    addition = await readNodeAddition(env.DB, f.job.operation_id),
+    prepare = env.DB.prepare.bind(env.DB);
+  vi.spyOn(env.DB, "prepare").mockImplementation((sql) => {
+    const statement = prepare(sql);
+    if (sql.startsWith("SELECT 1 valid FROM nodes WHERE id=")) {
+      const bind = statement.bind.bind(statement);
+      Object.defineProperty(statement, "bind", {
+        value: (...values: unknown[]) => {
+          const bound = bind(...values),
+            first = bound.first.bind(bound);
+          Object.defineProperty(bound, "first", {
+            value: async () => {
+              await prepare(
+                "UPDATE node_network_preparations SET status='blocked' WHERE operation_id=?",
+              )
+                .bind(f.job.operation_id)
+                .run();
+              return first();
+            },
+          });
+          return bound;
+        },
+      });
+    }
+    return statement;
+  });
+  await expect(
+    verifyNodeProofArtifact(f.bindings, f.job.operation_id, {
+      expected_revision: addition.revision,
+      sha256: accepted.sha256,
+    }),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect((await readNodeAddition(env.DB, f.job.operation_id)).revision).toBe(
+    addition.revision,
+  );
+  expect(f.provider).not.toHaveBeenCalled();
 });

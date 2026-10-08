@@ -8,6 +8,7 @@ import {
 } from "@pgcf/contracts/node-bootstrap";
 import {
   capacityPlan,
+  NATIVE_STORAGE_EXECUTION_MS,
   parseQuantityBytes,
 } from "../../../infra/talos/publish-storage-capacity.ts";
 import { BootstrapError, canonical, digest, shellQuote } from "./bootstrap.ts";
@@ -17,6 +18,8 @@ import {
   type StorageFacts,
   type StorageReadCommands,
 } from "./storage-readback.ts";
+
+export { NATIVE_STORAGE_EXECUTION_MS };
 
 type Json = Record<string, unknown>;
 const GI = 1024 ** 3;
@@ -295,7 +298,7 @@ class StorageProducer {
   readonly input: NodeBootstrapInput;
   readonly commands: StorageCapacityCommands;
   private trial: NodeStorageTrial | null = null;
-  private readonly end = performance.now() + 900_000;
+  private readonly end = performance.now() + NATIVE_STORAGE_EXECUTION_MS;
   constructor(input: NodeBootstrapInput, commands: StorageCapacityCommands) {
     this.input = input;
     this.commands = commands;

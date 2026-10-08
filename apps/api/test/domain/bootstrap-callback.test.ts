@@ -398,7 +398,7 @@ function peerPlan(value: PeerConfiguration) {
     ...target,
     peer_ipv4: approvedPeers,
   });
-  const addresses = (ipv4: string[]) => ({ ipv4, ipv6: [] });
+  const addresses = (ipv4: string[], ipv6: string[] = []) => ({ ipv4, ipv6 });
   const member = (
     node_id: string,
     provider_instance_id: string,
@@ -1982,8 +1982,45 @@ describe("protected bootstrap authority", () => {
       await env.ARCHIVE.delete(proofKey);
     }
   });
-  it("compares signed inventory and refreshes admission revisions only before release intent", async () => {
-    const f = await prepared(),
+  it("compares signed sealed addresses and refreshes admission revisions only before release intent", async () => {
+    const f = await prepared(true, async (value) => {
+        const plan = peerPlan(value);
+        plan.members.splice(1);
+        value.configuration.spec.peer_ipv4 = [
+          ...plan.relay.addresses.ipv4,
+        ].sort();
+        const member = plan.members[0]!;
+        member.addresses.ipv6.push("2001:0DB8:0000:0000:0000:0000:0000:0042");
+        member.primary.ipv6.push("2001:0DB8:0000:0000:0000:0000:0000:0042");
+        member.rules_sha256 = bytesToHex(
+          new Uint8Array(
+            await crypto.subtle.digest(
+              "SHA-256",
+              new TextEncoder().encode(canonicalConfiguration([])),
+            ),
+          ),
+        );
+        value.bindings.BOOTSTRAP_OPERATOR_SOURCES = JSON.stringify(
+          plan.operators.ipv4,
+        );
+        value.bindings.BOOTSTRAP_SCAN_CONTROL = JSON.stringify(
+          plan.scan_control,
+        );
+        value.bindings.BOOTSTRAP_FIREWALL_BINDINGS = JSON.stringify({
+          [member.provider_instance_id]: member.firewall_id,
+        });
+        await storePeerPlan(value, plan, { status: "verified" });
+        const saved = await env.DB.prepare(
+          "SELECT plan_sha256 FROM node_network_preparations WHERE operation_id=?",
+        )
+          .bind(plan.operation_id)
+          .first<{ plan_sha256: string }>();
+        await env.DB.prepare(
+          "INSERT INTO node_network_firewalls(firewall_id,operation_id,plan_sha256) VALUES(?,?,?)",
+        )
+          .bind(member.firewall_id, plan.operation_id, saved!.plan_sha256)
+          .run();
+      }),
       uid = crypto.randomUUID(),
       clusterUid = crypto.randomUUID(),
       now = new Date().toISOString();
@@ -2032,23 +2069,9 @@ describe("protected bootstrap authority", () => {
       "verify",
     ]);
     if (!("privateKey" in pair)) throw new Error("test_key_pair_invalid");
-    const actual = {
-      status: "running",
-      macAddress: f.spec.hardware.mac,
-      cpuCores: 4,
-      ramMb: 8192,
-      diskMb: 153600,
-      ipConfig: {
-        v4: { ip: f.spec.hardware.ipv4 },
-        v6: { ip: "2001:0DB8:0000:0000:0000:0000:0000:0042" },
-      },
-      additionalIps: [],
-    } as unknown as ContaboInstance & {
-      ipConfig: NonNullable<ContaboInstance["ipConfig"]>;
-    };
     const provider = vi
         .spyOn(ContaboClient.prototype, "getInstance")
-        .mockResolvedValue(actual),
+        .mockRejectedValue(new Error("routine_postjoin_provider_forbidden")),
       workflow = { create: vi.fn(async () => ({})) },
       proofKey = `node-verification/${f.job.operation_id}/${addition.checkpoint!.reference}/proof.json`;
     let expectedRevision = addition.revision;
@@ -2146,7 +2169,7 @@ describe("protected bootstrap authority", () => {
     };
     const reject = async (
       ipv6?: string | null,
-      message = "Proof addresses differ from current provider inventory",
+      message = "Proof addresses differ from the sealed network assignment",
     ) => {
       const response = await submit(ipv6);
       expect(response.status).toBe(409);
@@ -2161,36 +2184,8 @@ describe("protected bootstrap authority", () => {
       expect(workflow.create).not.toHaveBeenCalled();
     };
     try {
-      actual.ipConfig.v4.ip = "192.0.2.250";
-      if (actual.ipConfig.v4.ip === f.spec.hardware.ipv4)
-        actual.ipConfig.v4.ip = "192.0.2.251";
-      await reject();
-      actual.ipConfig.v4.ip = f.spec.hardware.ipv4;
-      actual.ipConfig.v6!.ip = "2001:db8::43";
-      await reject();
-      actual.ipConfig.v6!.ip = "";
-      await reject();
-      delete actual.ipConfig.v6;
-      await reject();
-      actual.ipConfig.v6 = {
-        ip: "2001:0DB8:0000:0000:0000:0000:0000:0042",
-        gateway: "",
-        netmaskCidr: 64,
-      };
+      await reject("2001:db8::43");
       await reject(null);
-      actual.ipConfig.v6.ip = "2001:db8::42";
-      actual.additionalIps = [
-        { v4: { ...actual.ipConfig.v4, ip: "198.51.100.250" } },
-      ];
-      await reject(
-        undefined,
-        "Additional provider addresses require complete verified outside-allowlist scan coverage",
-      );
-      actual.additionalIps = [
-        { v4: { ...actual.ipConfig.v4, ip: f.spec.hardware.ipv4 } },
-        { v4: { ...actual.ipConfig.v4, ip: "" } },
-      ];
-      actual.ipConfig.v6.ip = "2001:0DB8:0000:0000:0000:0000:0000:0042";
       const accepted = await submit();
       expect(accepted.status).toBe(202);
       expect(
@@ -2298,13 +2293,15 @@ describe("protected bootstrap authority", () => {
       )
         .bind(JSON.stringify(checkpoint), f.job.operation_id)
         .run();
-      provider.mockImplementationOnce(async () => {
+      const get = env.ARCHIVE.get.bind(env.ARCHIVE);
+      vi.spyOn(env.ARCHIVE, "get").mockImplementationOnce(async (...args) => {
+        const object = await get(...args);
         await env.DB.prepare(
           "UPDATE node_bootstrap_jobs SET checkpoint_json=?,revision=revision+1 WHERE operation_id=?",
         )
           .bind(JSON.stringify(release), f.job.operation_id)
           .run();
-        return actual;
+        return object;
       });
       expect((await submit(undefined, "15")).status).toBe(409);
       const raced = await readBootstrapJob(env.DB, f.job.operation_id);
@@ -2319,18 +2316,20 @@ describe("protected bootstrap authority", () => {
       )
         .bind(JSON.stringify(checkpoint), f.job.operation_id)
         .run();
-      provider.mockImplementationOnce(async () => {
+      vi.spyOn(env.ARCHIVE, "get").mockImplementationOnce(async (...args) => {
+        const object = await get(...args);
         await env.DB.prepare(
           "UPDATE node_bootstrap_jobs SET cancelled=1 WHERE operation_id=?",
         )
           .bind(f.job.operation_id)
           .run();
-        return actual;
+        return object;
       });
       expect((await submit(undefined, "16")).status).toBe(409);
       const cancelled = await readBootstrapJob(env.DB, f.job.operation_id);
       expect(cancelled.cancelled).toBe(1);
       expect(cancelled.admission_binding_json).toBe(JSON.stringify(binding));
+      expect(provider).not.toHaveBeenCalled();
     } finally {
       provider.mockRestore();
       await env.ARCHIVE.delete(proofKey);

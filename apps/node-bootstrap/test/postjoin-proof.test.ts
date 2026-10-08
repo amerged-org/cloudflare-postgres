@@ -19,6 +19,15 @@ import { canonical, digest } from "../src/bootstrap.ts";
 import type { NodeJoinBundle } from "@pgcf/contracts/node-bootstrap";
 import type { NetworkPlan } from "../../../scripts/e2e/src/node-network-proof.ts";
 
+test("actual single-node Cilium Wireguard spelling preserves zero-peer validation", () => {
+  const actual = debug([]);
+  actual["cilium-status"].encryption.mode = "Wireguard";
+  assert.deepEqual(
+    ciliumWireguardPeers(actual, [], new Date().toISOString(), []),
+    [],
+  );
+});
+
 const key = () => randomBytes(32).toString("base64");
 function debug(peers: unknown[], publicKey = key()) {
   return {

@@ -6,6 +6,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 const annotation = "pgcf.io/storage-gib-total";
 const maxAgeMs = 300_000;
+export const NATIVE_STORAGE_EXECUTION_MS = 1_800_000;
 const uidPattern =
   /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
 const nodePattern = /^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$/;
@@ -187,7 +188,7 @@ function validateProofWindow(
     !Number.isFinite(end) ||
     end < start ||
     end > now ||
-    end - start > (native ? 900_000 : maxAgeMs) ||
+    end - start > (native ? NATIVE_STORAGE_EXECUTION_MS : maxAgeMs) ||
     now - (native ? end : start) > maxAgeMs
   )
     throw new Error("stale_storage_proof");

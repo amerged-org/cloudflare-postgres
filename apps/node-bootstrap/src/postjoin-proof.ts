@@ -66,7 +66,10 @@ function json(text: string): Json {
 function ciliumInterface(raw: unknown) {
   const value = obj(raw),
     mode = obj(obj(value["cilium-status"]).encryption);
-  if (mode.mode !== "wireguard" || (mode.msg !== undefined && mode.msg !== ""))
+  if (
+    !(["wireguard", "Wireguard"] as unknown[]).includes(mode.mode) ||
+    (mode.msg !== undefined && mode.msg !== "")
+  )
     return fail("wireguard_mode");
   const interfaces = rows(obj(obj(value.encryption).wireguard).interfaces, 1);
   if (interfaces.length !== 1) return fail("wireguard_readback_invalid");

@@ -150,6 +150,14 @@ function clusterFixture(
           revision: `main@sha1:${input.spec.platform.reviewed_commit}`,
         },
         lastAppliedRevision: `main@sha1:${input.spec.platform.reviewed_commit}`,
+        ...(next.kind === "HelmRelease" &&
+        object(next.metadata).name === "cilium"
+          ? {
+              lastAttemptedRevision: "1.20.2+a7c12d330dd9",
+              lastAttemptedRevisionDigest: ociDigest,
+              lastAttemptedGeneration: 1,
+            }
+          : {}),
       };
     if (next.kind === "Kustomization")
       object(next.status).inventory = {
@@ -783,13 +791,40 @@ test("a Ready HelmRelease missing reviewed Flux inventory ownership cannot autho
   assert.equal(state.mutations.length, 0);
 });
 
-test("changed current Flux values cannot use last-deployed Helm values to authorize handoff", async () => {
+test("equivalent current Flux values formatting is accepted but changed meaning cannot use last-deployed values", async () => {
   const state = ciliumHandoffFixture();
   const values = state.resources.get(
     "ConfigMap/flux-system/pgcf-cilium-values",
   )!;
   object(values.data)["values.yaml"] += "\n# altered current source\n";
+  await verifyCiliumReadback(state);
+  object(values.data)["values.yaml"] = "kubeProxyReplacement: false\n";
   await assert.rejects(verifyCiliumReadback(state), /cilium_values_mismatch/);
+  assert.equal(state.mutations.length, 0);
+});
+
+test("Ready Cilium handoff must report the current pinned OCI reconciliation revision", async () => {
+  const state = ciliumHandoffFixture();
+  const release = state.resources.get("HelmRelease/flux-system/cilium")!;
+  object(release.status).lastAttemptedRevisionDigest =
+    `sha256:${"0".repeat(64)}`;
+  await assert.rejects(
+    verifyCiliumReadback(state),
+    /cilium_release_unconfirmed/,
+  );
+  object(release.status).lastAttemptedRevisionDigest =
+    "sha256:a7c12d330dd96bfcda3bf057b24be8f36566c34868265f930f776dff6f42d838";
+  object(release.status).lastAttemptedGeneration = 0;
+  await assert.rejects(
+    verifyCiliumReadback(state),
+    /cilium_release_unconfirmed/,
+  );
+  object(release.status).lastAttemptedGeneration = 1;
+  object(release.status).lastAttemptedRevision = "1.20.2+000000000000";
+  await assert.rejects(
+    verifyCiliumReadback(state),
+    /cilium_release_unconfirmed/,
+  );
   assert.equal(state.mutations.length, 0);
 });
 

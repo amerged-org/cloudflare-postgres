@@ -2,6 +2,37 @@
 
 Status (2026-10-08): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
 
+The owner's completion timebox is now one consolidated remaining-check batch, one CI,
+one delivery and one resume. If that programmed attempt does not admit the existing US1,
+run the same checks once through the owner-authorized laptop operator path, record that path
+and measured results in Status, then proceed directly to database acceptance on US1 and
+customer EU1. Do not buy a replacement or reset EU. The next genuine authorized node purchase
+must prove the remaining automatic path; until then list its exact unresolved failures here.
+EU Kubernetes upgrades and bootstrap-template activation are paused through US database
+acceptance. Document actual version/digest differences; align only a blocking incompatibility.
+
+The single read-only residual batch preserved whole job713, sealed input/join and physical
+Node/Cluster/system/boot identities, with zero provider calls, writes or admission consumption.
+Talos, physical storage and all11 admission/quarantine identity predicates passed. Storage
+publication and issued proof/admission gates remain pending. Actual Cilium reports `Wireguard`,
+while the parser expected `wireguard`; the consumed peer array is valid empty, so no null-peer
+exception is added. A subsequently observed job719 `storage_trial_resource_not_owned` was folded
+into the same batch: server dry runs of all five planned objects identified only omitted empty
+NetworkPolicy ingress/egress and the two standard300-second NoExecute Pod tolerations.
+Namespace, ResourceQuota and PVC passed. Product postjoin report admission still reached a
+provider GET, despite the zero-call routine transport windows; that remaining branch uses
+existing sealed installation/network authority in this batch. Typed quantities are compared
+numerically, current Flux/Helm Ready revisions and source digests are used, and Native pins
+derive from `infra/platform/versions.lock.json`. No new journal, approval type or repair path.
+The owner's1800-second work/history allowance retains narrow individual requests and fresh
+completion. Software verification is in progress; none of these facts claims live admission.
+The consolidated correction passes254 complete Native package tests and81 related API cases,
+plus affected types/lint/formatting and independent reviews. Existing unsafe-write reconciliation
+and immutable identities remain; the API also reproduces/refuses a network-revocation race before
+its existing verification writes. One combined CI/delivery/resume is next. If that attempt does
+not admit US1, use the authorized operator path and record automatic admission as unresolved;
+do not start another incremental correction cycle in this goal.
+
 The latest owner direction removes Contabo from routine transport and proof-resource cleanup.
 Provider access belongs to purchase, initial association, firewall/rescue/hypervisor actions,
 uncertain-action resolution and necessary lifecycle verification, including before the first

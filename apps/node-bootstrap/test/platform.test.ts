@@ -209,7 +209,7 @@ test("Flux quota readback accepts Kubernetes canonical pod counts and keeps ever
   );
 });
 
-test("Flux Deployment readback accepts canonical integral CPU limits without changing other resource comparisons", () => {
+test("owned workload quantities accept exact numeric equivalents and retain every nonquantity field", () => {
   const input = platformFixture();
   const [expected] = renderFluxObjects(
     JSON.stringify({
@@ -222,7 +222,16 @@ test("Flux Deployment readback accepts canonical integral CPU limits without cha
             containers: [
               {
                 name: "manager",
-                resources: { limits: { cpu: "1000m", memory: "1Gi" } },
+                resources: {
+                  limits: { cpu: "1000m", memory: "1Gi" },
+                  requests: { cpu: "500m", memory: "64Mi" },
+                },
+              },
+            ],
+            initContainers: [
+              {
+                name: "setup",
+                resources: { requests: { cpu: "100m", memory: "16Mi" } },
               },
             ],
           },
@@ -248,12 +257,170 @@ test("Flux Deployment readback accepts canonical integral CPU limits without cha
   );
   limits.cpu = "1";
   limits.memory = "1073741824";
+  const requests = object(
+    object(
+      objects(object(object(object(actual.spec).template).spec).containers)[0]!
+        .resources,
+    ).requests,
+  );
+  requests.cpu = "0.5";
+  requests.memory = "67108864";
+  const setupRequests = object(
+    object(
+      objects(
+        object(object(object(actual.spec).template).spec).initContainers,
+      )[0]!.resources,
+    ).requests,
+  );
+  setupRequests.cpu = "0.1";
+  setupRequests.memory = "16777216";
+  assertOwnedResource(expected!, actual);
+  requests.cpu = "0.5001";
+  assert.throws(
+    () => assertOwnedResource(expected!, actual),
+    /platform_resource_mismatch/,
+  );
+  requests.cpu = "0.5";
+  limits.memory = "1073741825";
   assert.throws(
     () => assertOwnedResource(expected!, actual),
     /platform_resource_mismatch/,
   );
   limits.memory = "1Gi";
   object(actual.metadata).annotations = {};
+  assert.throws(
+    () => assertOwnedResource(expected!, actual),
+    /platform_resource_mismatch/,
+  );
+});
+
+test("storage quota quantities are semantic while object counts remain integral", () => {
+  const [expected] = renderFluxObjects(
+    JSON.stringify({
+      apiVersion: "v1",
+      kind: "ResourceQuota",
+      metadata: { name: "bounded", namespace: "flux-system" },
+      spec: {
+        hard: {
+          "requests.cpu": "100m",
+          "limits.cpu": "200m",
+          "requests.memory": "64Mi",
+          "requests.storage": "1Gi",
+          "count/persistentvolumeclaims": "1",
+        },
+      },
+    }),
+    platformFixture(),
+  );
+  const actual = structuredClone(expected!);
+  object(actual.metadata).uid = randomUUID();
+  Object.assign(object(object(actual.spec).hard), {
+    "requests.cpu": "0.1",
+    "limits.cpu": "0.2",
+    "requests.memory": "67108864",
+    "requests.storage": "1073741824",
+    "count/persistentvolumeclaims": "1000m",
+  });
+  assertOwnedResource(expected!, actual);
+  object(object(actual.spec).hard)["requests.storage"] = "1073741825";
+  assert.throws(
+    () => assertOwnedResource(expected!, actual),
+    /platform_resource_mismatch/,
+  );
+});
+
+test("deny-all NetworkPolicy readback accepts omitted empty rules without accepting changed selectors or policy types", () => {
+  const [expected] = renderFluxObjects(
+    JSON.stringify({
+      apiVersion: "networking.k8s.io/v1",
+      kind: "NetworkPolicy",
+      metadata: { name: "deny-all", namespace: "flux-system" },
+      spec: {
+        podSelector: {},
+        policyTypes: ["Ingress", "Egress"],
+        ingress: [],
+        egress: [],
+      },
+    }),
+    platformFixture(),
+  );
+  const actual = structuredClone(expected!);
+  object(actual.metadata).uid = randomUUID();
+  delete object(actual.spec).ingress;
+  delete object(actual.spec).egress;
+  assertOwnedResource(expected!, actual);
+  object(actual.spec).egress = [{}];
+  assert.throws(
+    () => assertOwnedResource(expected!, actual),
+    /platform_resource_mismatch/,
+  );
+  delete object(actual.spec).egress;
+  object(actual.spec).policyTypes = ["Ingress"];
+  assert.throws(
+    () => assertOwnedResource(expected!, actual),
+    /platform_resource_mismatch/,
+  );
+  object(actual.spec).policyTypes = ["Ingress", "Egress"];
+  object(actual.spec).podSelector = { matchLabels: { unrelated: "true" } };
+  assert.throws(
+    () => assertOwnedResource(expected!, actual),
+    /platform_resource_mismatch/,
+  );
+  object(actual.spec).podSelector = {};
+  object(actual.metadata).annotations = {};
+  assert.throws(
+    () => assertOwnedResource(expected!, actual),
+    /platform_resource_mismatch/,
+  );
+});
+
+test("owned Pod readback permits only Kubernetes default eviction tolerations beside the exact quarantine toleration", () => {
+  const [expected] = renderFluxObjects(
+    JSON.stringify({
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: { name: "write", namespace: "flux-system" },
+      spec: {
+        tolerations: [
+          {
+            key: "pgcf.io/quarantine",
+            operator: "Equal",
+            value: "bootstrap",
+            effect: "NoSchedule",
+          },
+        ],
+        containers: [{ name: "writer", image: "locked" }],
+      },
+    }),
+    platformFixture(),
+  );
+  const actual = structuredClone(expected!);
+  object(actual.metadata).uid = randomUUID();
+  objects(object(actual.spec).tolerations).push(
+    {
+      key: "node.kubernetes.io/not-ready",
+      operator: "Exists",
+      effect: "NoExecute",
+      tolerationSeconds: 300,
+    },
+    {
+      key: "node.kubernetes.io/unreachable",
+      operator: "Exists",
+      effect: "NoExecute",
+      tolerationSeconds: 300,
+    },
+  );
+  assertOwnedResource(expected!, actual);
+  objects(object(actual.spec).tolerations)[1]!.tolerationSeconds = 301;
+  assert.throws(
+    () => assertOwnedResource(expected!, actual),
+    /platform_resource_mismatch/,
+  );
+  objects(object(actual.spec).tolerations)[1]!.tolerationSeconds = 300;
+  objects(object(actual.spec).tolerations).push({
+    key: "unowned",
+    operator: "Exists",
+  });
   assert.throws(
     () => assertOwnedResource(expected!, actual),
     /platform_resource_mismatch/,

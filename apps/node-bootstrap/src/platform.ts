@@ -17,7 +17,6 @@ import {
   KUBERNETES_VERSION,
 } from "./bootstrap.ts";
 import { PLATFORM_ARTIFACTS } from "./platform-artifacts.ts";
-import { parseQuantityBytes } from "../../../infra/talos/publish-storage-capacity.ts";
 
 type Json = Record<string, unknown>;
 const RESOURCES: Record<string, string> = {
@@ -276,22 +275,118 @@ export function regionalObjects(input: NodeBootstrapInput): Json[] {
   ];
 }
 
+function quantity(value: unknown): [bigint, bigint] {
+  const raw = typeof value === "number" ? String(value) : value;
+  if (typeof raw !== "string" || raw.length > 64)
+    throw new Error("invalid_quantity");
+  const match =
+    /^\+?([0-9]+(?:\.[0-9]*)?|\.[0-9]+)([KMGTPE]i|[numkMGTPE]|[eE][+-]?[0-9]+)?$/.exec(
+      raw,
+    );
+  if (!match) throw new Error("invalid_quantity");
+  const [whole = "", fraction = ""] = match[1]!.split(".");
+  let numerator = BigInt((whole || "0") + fraction),
+    denominator = 10n ** BigInt(fraction.length);
+  const suffix = match[2] ?? "";
+  if (suffix.endsWith("i"))
+    numerator *= 1024n ** BigInt("KMGTPE".indexOf(suffix[0]!) + 1);
+  else {
+    const exponent = /^[eE][+-]?[0-9]+$/.test(suffix)
+      ? Number(suffix.slice(1))
+      : ((
+          {
+            n: -9,
+            u: -6,
+            m: -3,
+            k: 3,
+            M: 6,
+            G: 9,
+            T: 12,
+            P: 15,
+            E: 18,
+          } as Record<string, number>
+        )[suffix] ?? 0);
+    if (!Number.isInteger(exponent) || Math.abs(exponent) > 18)
+      throw new Error("invalid_quantity");
+    if (exponent >= 0) numerator *= 10n ** BigInt(exponent);
+    else denominator *= 10n ** BigInt(-exponent);
+  }
+  return [numerator, denominator];
+}
+
 function contains(
   expected: unknown,
   actual: unknown,
   path = "",
-  quantityKind?: "ResourceQuota" | "Deployment",
+  quantityKind?: "ResourceQuota" | "Deployment" | "Pod" | "NetworkPolicy",
 ): boolean {
+  if (quantityKind === "NetworkPolicy") {
+    if (path === "spec.podSelector")
+      return canonical(expected) === canonical(actual);
+    if (
+      ["spec.ingress", "spec.egress"].includes(path) &&
+      Array.isArray(expected) &&
+      expected.length === 0
+    )
+      return (
+        actual === undefined || (Array.isArray(actual) && actual.length === 0)
+      );
+  }
   if (
-    (quantityKind === "ResourceQuota" && path === "spec.hard.pods") ||
-    (quantityKind === "Deployment" &&
-      /^spec\.template\.spec\.containers\[\d+\]\.resources\.limits\.cpu$/.test(
+    quantityKind === "Pod" &&
+    path === "spec.tolerations" &&
+    Array.isArray(expected) &&
+    Array.isArray(actual)
+  ) {
+    const defaults = [
+      "node.kubernetes.io/not-ready",
+      "node.kubernetes.io/unreachable",
+    ].map((key) => ({
+      key,
+      operator: "Exists",
+      effect: "NoExecute",
+      tolerationSeconds: 300,
+    }));
+    const remaining = [...actual];
+    for (const value of expected) {
+      const index = remaining.findIndex(
+        (candidate) => canonical(candidate) === canonical(value),
+      );
+      if (index < 0) return false;
+      remaining.splice(index, 1);
+    }
+    return (
+      remaining.length <= defaults.length &&
+      remaining.every((value) => {
+        const index = defaults.findIndex(
+          (candidate) => canonical(candidate) === canonical(value),
+        );
+        if (index < 0) return false;
+        defaults.splice(index, 1);
+        return true;
+      })
+    );
+  }
+  if (
+    (quantityKind === "ResourceQuota" &&
+      /^spec\.hard\.[a-zA-Z0-9./-]+$/.test(path)) ||
+    (["Deployment", "Pod"].includes(quantityKind ?? "") &&
+      /^spec\.(?:template\.spec\.)?(?:initContainers|containers)\[\d+\]\.resources\.(?:limits|requests)\.(?:cpu|memory|ephemeral-storage|hugepages-[a-zA-Z0-9]+)$/.test(
         path,
       ))
   ) {
-    if (quantityKind === "Deployment" && expected === actual) return true;
     try {
-      return parseQuantityBytes(expected) === parseQuantityBytes(actual);
+      const [a, b] = quantity(expected),
+        [c, d] = quantity(actual);
+      return (
+        a * d === c * b &&
+        (quantityKind !== "ResourceQuota" ||
+          !(
+            path.slice("spec.hard.".length) === "pods" ||
+            path.slice("spec.hard.".length).startsWith("count/")
+          ) ||
+          (a % b === 0n && c % d === 0n))
+      );
     } catch {
       return false;
     }
@@ -330,7 +425,12 @@ export function assertOwnedResource(expected: Json, actual: Json) {
         ? "ResourceQuota"
         : expected.apiVersion === "apps/v1" && expected.kind === "Deployment"
           ? "Deployment"
-          : undefined,
+          : expected.apiVersion === "v1" && expected.kind === "Pod"
+            ? "Pod"
+            : expected.apiVersion === "networking.k8s.io/v1" &&
+                expected.kind === "NetworkPolicy"
+              ? "NetworkPolicy"
+              : undefined,
     ) ||
     record(actual.metadata).deletionTimestamp ||
     typeof record(actual.metadata).uid !== "string" ||
@@ -412,7 +512,7 @@ export async function readPlatformAssets(
   directory: string,
   input: NodeBootstrapInput,
 ): Promise<PlatformAssets> {
-  const chart_path = join(directory, "cilium-1.20.2.tgz"),
+  const chart_path = join(directory, PLATFORM_ARTIFACTS.cilium.filename),
     values_path = join(directory, "cilium-values.yaml");
   const [chart, values, flux] = await Promise.all([
     readFile(chart_path),
@@ -623,7 +723,7 @@ export class PlatformInstaller {
         this.input.spec.operation_id
     )
       throw new BootstrapError("cilium_release_unconfirmed");
-    if (handoff) await this.verifyCiliumFluxHandoff();
+    if (handoff) await this.verifyCiliumFluxHandoff(version);
     const values = JSON.parse(
       (
         await this.commands.helm([
@@ -665,7 +765,7 @@ export class PlatformInstaller {
     )
       throw new BootstrapError("platform_node_not_ready");
   }
-  private async verifyCiliumFluxHandoff() {
+  private async verifyCiliumFluxHandoff(version: string) {
     const before = await this.ciliumRecoveryIdentity();
     const cilium = await this.commands.ciliumJournal?.();
     if (
@@ -717,11 +817,13 @@ export class PlatformInstaller {
       if (
         typeof text !== "string" ||
         Buffer.byteLength(text) > 256 * 1024 ||
-        digest(text) !== PLATFORM_ARTIFACTS.cilium_values.sha256 ||
         canonical(parse(text)) !== canonical(this.assets.values)
       )
         throw new BootstrapError("cilium_values_mismatch");
-      return { uid: record(value.metadata).uid, values_sha256: digest(text) };
+      return {
+        uid: record(value.metadata).uid,
+        values_sha256: digest(canonical(parse(text))),
+      };
     };
     const valuesIdentity = pinnedValues(valuesBefore);
     assertOwnedResource(
@@ -734,6 +836,14 @@ export class PlatformInstaller {
     );
     for (const value of [repository, kustomization, source, release])
       assertFluxReady(value);
+    if (
+      record(release.status).lastAttemptedGeneration !==
+        record(release.metadata).generation ||
+      record(release.status).lastAttemptedRevision !== version ||
+      record(release.status).lastAttemptedRevisionDigest !==
+        PLATFORM_ARTIFACTS.cilium.oci_digest
+    )
+      throw new BootstrapError("cilium_release_unconfirmed");
     const revision = record(record(repository.status).artifact).revision;
     if (
       typeof revision !== "string" ||

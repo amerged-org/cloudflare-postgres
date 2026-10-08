@@ -18,6 +18,7 @@ import {
   NodeBootstrapAdmissionBinding,
   NodeBootstrapCheckpoint,
 } from "@pgcf/contracts/node-bootstrap";
+import { NodeProofNetworkPlan } from "@pgcf/contracts/node-proof";
 import { z } from "zod";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
@@ -40,6 +41,8 @@ import {
   configureBootstrapJob,
   NodeBootstrapConfiguration,
   readBootstrapJob,
+  admissionAuthority,
+  hasBootstrapNetworkAuthority,
 } from "../domain/bootstrap-jobs.ts";
 import { contaboClient } from "../domain/bootstrap-relay.ts";
 import {
@@ -47,7 +50,7 @@ import {
   stopCancelledNodeAdditionWorkflow,
 } from "../domain/cancel-provider-addition.ts";
 import { hasAllocatedContaboHardware } from "../providers/contabo.ts";
-import { ip } from "../domain/node-network.ts";
+import { ip, readNodeNetworkSnapshot } from "../domain/node-network.ts";
 import { validateRescueConfiguration } from "../domain/rescue-configuration.ts";
 import { runNodeCapacity } from "../domain/node-capacity.ts";
 import {
@@ -541,28 +544,38 @@ export async function verifyNodeProofArtifact(
       "conflict",
       "Proof cluster identity differs from actual sealed Kubernetes readback",
     );
-  const actual = await contaboClient(env).getInstance(
-      proof.provider_instance_id,
-      {
-        requestId: crypto.randomUUID(),
-        accounting: { operation_id: row.operation_id, stage: "inspection" },
-      },
-    ),
+  const network = await readNodeNetworkSnapshot(env, id),
     proofIpv4 = ip(proof.addresses.ipv4),
     proofIpv6 = proof.addresses.ipv6 === null ? null : ip(proof.addresses.ipv6);
   if (
-    !hasAllocatedContaboHardware(actual) ||
-    (actual.ipConfig.v4.ip ? ip(actual.ipConfig.v4.ip) : null) !== proofIpv4 ||
-    (actual.ipConfig.v6?.ip ? ip(actual.ipConfig.v6.ip) : null) !== proofIpv6
+    !network ||
+    (!(await admissionAuthority(env, row)).admission_authorized &&
+      !(await hasBootstrapNetworkAuthority(env, row)))
   )
     throw new ApiError(
       "conflict",
-      "Proof addresses differ from current provider inventory",
+      "Current sealed installation and network authority are required",
+    );
+  const plan = NodeProofNetworkPlan.parse(JSON.parse(network.plan_json)),
+    target = plan.members.find(
+      (member) =>
+        member.node_id === row.node_id &&
+        member.provider_instance_id === proof.provider_instance_id,
     );
   if (
-    actual.additionalIps.some(
-      (address) => address.v4.ip !== "" && ip(address.v4.ip) !== proofIpv4,
-    )
+    !target ||
+    target.primary.ipv4.length !== 1 ||
+    ip(target.primary.ipv4[0]!) !== proofIpv4 ||
+    target.primary.ipv6.length !== (proofIpv6 === null ? 0 : 1) ||
+    (proofIpv6 !== null && ip(target.primary.ipv6[0]!) !== proofIpv6)
+  )
+    throw new ApiError(
+      "conflict",
+      "Proof addresses differ from the sealed network assignment",
+    );
+  if (
+    target.addresses.ipv4.some((address) => ip(address) !== proofIpv4) ||
+    target.addresses.ipv6.some((address) => ip(address) !== proofIpv6)
   )
     throw new ApiError(
       "conflict",
@@ -711,6 +724,11 @@ export async function verifyNodeProofArtifact(
     checkpoint_reference: addition.checkpoint.reference,
     proof_reference: `${proofKey}#${body.sha256}`,
   };
+  if (canonical(await readNodeNetworkSnapshot(env, id)) !== canonical(network))
+    throw new ApiError(
+      "conflict",
+      "Sealed network authority changed during verification",
+    );
   let next = await verifyNodeNetwork(env.DB, id, addition.revision, {
     ...scope,
     verified_at: proof.observed_at,
