@@ -126,8 +126,10 @@ old etcd snapshots still need their original decrypt key in offline custody. Fol
 [Kubernetes encryption procedure](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/).
 
 Coordinate any Talos/Kubernetes change with the encrypted region seed and join bundle before
-allowing another node to bootstrap. The current worker path selects join revision 1; replacing
-live trust alone leaves its retained bundle stale. Revision selection and exact readback must be
-implemented and checked before a coordinated rotation. Preserve the original ciphertext and all
+allowing another node to bootstrap. Both accepted installations still use revision 1; replacing
+live trust alone leaves retained bootstrap custody stale. The version-template synchronization
+endpoint preserves keys and cannot rotate them. Stage and verify complete matching seed/join
+custody through a separately reviewed rotation before permitting customer data or further
+bootstrap; do not overwrite historical revision 1. Preserve the original ciphertext and all
 referenced credential-encryption keys, the region's cluster identity, existing Node/storage UIDs
 and the independent PGCF agent, R2 and Worker secrets.

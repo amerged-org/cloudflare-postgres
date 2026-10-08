@@ -1,56 +1,70 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-08): **Phases 0 and 1 accepted in Dev; US1 admitted; database acceptance in progress.**
+Status (2026-10-08): **Owner-scoped operator completion accepted in Dev: US1 Ready, EU/US database lifecycle and 76% RAM rule passed.**
 
-US1 reached Cloudflare Ready at16:50:20Z through the owner-authorized operator postjoin/admission
-path in198.356 seconds, preserving the original purchase, installation, Node/Cluster identities,
-join revision1 and EU data. The programmed1GiB storage trial completed physical reclamation in
-753.081 seconds and published its proof; it was not repeated by the operator. The one consolidated
-Node correction, source `2bf52e0`, passed CI `37778960682` and was delivered once. Three separate,
-non-overlapping30-minute provider-accounting captures recorded zero Contabo wire calls; these
-are capture-window counts, not historical order totals. Automatic postjoin admission remains open:
-a report returned HTTP409 before the operator pause, and the proof session renewed without admission.
-The operator resolved a confirmed partial network verification before collecting fresh proof.
-No replacement purchase, EU reset, Kubernetes upgrade or template activation occurred.
+The original paid US1 reached Cloudflare Ready at16:50:20Z through the owner-authorized operator
+postjoin/admission path in198.356 seconds. Its original purchase, installation, Node/Cluster
+identities, join revision1 and all EU data remain. The programmed1GiB storage trial wrote, read
+and physically reclaimed its volume in753.081 seconds; the operator did not repeat it. The one
+consolidated Node correction, source `2bf52e0`, passed CI `37778960682` and was delivered once.
+Automatic postjoin admission remains open for the next genuine authorized node purchase: a
+report returned HTTP409 before pause, then its proof session renewed without admission. The
+operator resolved a confirmed partial network result before obtaining fresh observations and
+running the existing verifier, quarantine release and finalization. No replacement VPS was
+purchased. EU upgrades and bootstrap-template activation are excluded from this completion.
 
-The original US database demand then exposed one Regional startup-memory mismatch: the live
-CNPG webhook rejected256MB shared buffers with a128Mi memory request and1024Mi hard limit.
-All other11 resources passed the same server dry-run. The correction uses one shared tuning
-function for manifest and SQL readiness, and checks explicit Pod requests separately from hard
-limits. All12 corrected resources passed server dry-run;113 scoped tests, types, lint, formatting
-and independent review passed. One Regional CI/release will continue the same database demand;
-the accepted API/Native image and EU runtime remain unchanged.
+The database lifecycle passed on both customer nodes through `db.ohmyho.st`, with actual
+PostgreSQL18.6, TLS1.3 and nonsuperuser application roles. EU SQL took2187ms; separate EU restore
+108618ms and healthy-source EU-to-US restore87988ms include observation pacing. The original
+two source markers survived, a third marker committed on US, and temporary restore administration
+was removed. Four databases passed R2 base backups and exact committed WAL checks and were
+subsequently deleted, physically reclaiming four5GiB volumes (20GiB total). All three existing
+EU databases, source markers and encrypted custody are preserved. The older empty US trial had
+timed out during the manifest failure; it was deleted through the supported API without an
+allocation, then one fresh disposable database on the same US1 completed acceptance. No terminal
+operation was reopened and uncertain SQL writes were resolved by reads before further work.
 
-The owner's completion timebox is now one consolidated remaining-check batch, one CI,
-one delivery and one resume. If that programmed attempt does not admit the existing US1,
-run the same checks once through the owner-authorized laptop operator path, record that path
-and measured results in Status, then proceed directly to database acceptance on US1 and
-customer EU1. Do not buy a replacement or reset EU. The next genuine authorized node purchase
-must prove the remaining automatic path; until then list its exact unresolved failures here.
-EU Kubernetes upgrades and bootstrap-template activation are paused through US database
-acceptance. Document actual version/digest differences; align only a blocking incompatibility.
+The observed CNPG webhook failure was256MB shared buffers with128Mi startup request and1024Mi
+hard limit. One shared tuning function now bounds shared buffers by startup memory, SQL readiness
+uses the same function and Pod verification distinguishes requests from limits. All12 resources
+passed server dry-run;113 scoped cases, types/lint/format and independent review passed. Source
+`11555215`, one complete CI `37815727563`, delivered the qualified Regional image only to US:
+`sha256:1886a64e36d2b9ba45e4d876a0a9eb6bab3fb83a6b0fafcb18dbf8647ef66993`.
+All10 image layers and89,782,247 compressed registry bytes were verified. EU Regional901 and
+API/Native2bf remained unchanged. A separate configuration error omitted `/pg` from the US gateway
+URL. One exact configuration CAS corrected only that path, preserving all EU and bootstrap fields;
+Cloudflare SQL then passed without a redeployment or reset.
 
-The single read-only residual batch preserved whole job713, sealed input/join and physical
-Node/Cluster/system/boot identities, with zero provider calls, writes or admission consumption.
-Talos, physical storage and all11 admission/quarantine identity predicates passed. Storage
-publication and issued proof/admission gates remain pending. Actual Cilium reports `Wireguard`,
-while the parser expected `wireguard`; the consumed peer array is valid empty, so no null-peer
-exception is added. A subsequently observed job719 `storage_trial_resource_not_owned` was folded
-into the same batch: server dry runs of all five planned objects identified only omitted empty
-NetworkPolicy ingress/egress and the two standard300-second NoExecute Pod tolerations.
-Namespace, ResourceQuota and PVC passed. Product postjoin report admission still reached a
-provider GET, despite the zero-call routine transport windows; that remaining branch uses
-existing sealed installation/network authority in this batch. Typed quantities are compared
-numerically, current Flux/Helm Ready revisions and source digests are used, and Native pins
-derive from `infra/platform/versions.lock.json`. No new journal, approval type or repair path.
-The owner's1800-second work/history allowance retains narrow individual requests and fresh
-completion. Software verification is in progress; none of these facts claims live admission.
-The consolidated correction passes254 complete Native package tests and81 related API cases,
-plus affected types/lint/formatting and independent reviews. Existing unsafe-write reconciliation
-and immutable identities remain; the API also reproduces/refuses a network-revocation race before
-its existing verification writes. One combined CI/delivery/resume is next. If that attempt does
-not admit US1, use the authorized operator path and record automatic admission as unresolved;
-do not start another incremental correction cycle in this goal.
+Initial association measured1 OAuth plus1 Contabo GET. Three nonempty30-minute routine windows
+recorded zero provider attempts; the final window included390 proof/transport requests and the
+HTTP409 report. Historical lifetime provider totals are unknown. These bounded counts do not
+replace lifecycle accounting or imply zero historical purchase/firewall calls.
+
+Ten real consecutive minute samples of the same physical US Node UID,18:43:01–18:52:04Z,
+averaged79.9062% RAM under a3968MiB disposable allocation. Cloudflare persisted the same value
+and expansion trigger. The existing suitable-node placement and hard CPU/storage/RAM plus512MiB
+Barman startup checks still passed; the dry expansion decision was `disabled`, with zero provider
+calls or purchases. The1024MiB smallest startup peak remained bounded. The first trial correctly
+refused a missing minute when actual kubelet timestamps crossed18:36:59→18:38:00; no observation
+was fabricated. It was deleted and recovered4,179,976,192 bytes before the independent successful
+trial. Final successful-trial cleanup removed the exact Namespace/Pod and recovered4,177,731,584 bytes;
+fresh available RAM returned within the recorded baseline tolerance. Both trials had4096MiB limits and720s
+maximum lifetime. Actual timestamp drift can leave a validly unknown window; do not relax the
+ten-consecutive-minute rule to manufacture an expansion decision.
+
+Autonomous purchases remain disabled: finite standing cost/count/expiry authority is absent;
+current node caps are EU3/US1. Actual allocatable CPU is3000m, with platform reservations EU350m
+and US1510m. The smallest configured database requires250m PostgreSQL plus100m Barman, so CPU
+ceilings are7 EU/4 US minimum-class databases on otherwise empty nodes;22 US projects require
+7700m and110GiB versus1490m/95GiB available. These are configuration ceilings, not demonstrated
+workload density. Existing eligible nodes remain available during expansion; there is no81% stop.
+
+Actual software differences and the customer handover are documented in
+`docs/operations/operator-installation.md`: Talos1.14.1/kernel6.18.51/containerd2.3.5 match;
+Kubernetes is EU1.36.3/US1.36.5, Flux and Regional digests differ. No difference blocked the
+accepted lifecycle. Customer migration remains separate and requires credential rotation after
+the October5 revision1 exposure, the adopter's TCP-to-WSS adapter and deadline policy, restore
+new-ID rebinding, and sufficient explicitly approved regional capacity.
 
 The latest owner direction removes Contabo from routine transport and proof-resource cleanup.
 Provider access belongs to purchase, initial association, firewall/rescue/hypervisor actions,
@@ -2226,6 +2240,7 @@ Earlier failed attempts and corrections remain in Git history.
 
 | Date       | Phase                     | Result and measured limits                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 2026-10-08 | Operator completion accepted | Original US1 Ready via authorized operator postjoin/admission198.356s; programmed1GiB write/read/physical reclaim753.081s. EU/US Cloudflare SQL, TLS1.3/nonsuperuser,4 R2 base/exact-WAL checks and4×5GiB physical deletion passed (20GiB). EU SQL2187ms; separate EU restore108618ms and healthy-source EU→US restore87988ms incl observation pacing. All3 existingEU DBs/source markers/custody preserved. Actual US RAM10 consecutive minutes18:43:01–18:52:04Z79.9062%, stored trigger and continued eligible placement/hard startup checks passed; dry expansion disabled/no purchase. Successful3968MiB load cleanup recovered4,177,731,584B; first missing-minute window correctly refused and cleaned. API/Native2bf CI37778960682 retained; US-onlyRegional115 CI37815727563/digest1886 accepted; EUKube/runtime/templates unchanged. Initialmapping1OAuth+1GET; nonempty30min routinewindow390frames0provider attempts, lifetime total unknown. Automatic postjoin HTTP409/session renewal remains open for next genuine authorized purchase. Rotation/adopter WSS/deadlines/new-ID rebinding/finite purchase caps and22-US capacity are separate migration gates. |
 | 2026-10-03 | 0 accepted                | Fresh first EU Talos/Kubernetes node, five Ready Flux releases, 95 GiB storage. Formal foundation checks passed; second EU node unchanged.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | 2026-10-04 | 1 accepted                | E0–E6 passed. Latest E0–E5 run: Ready 27,644 ms, cold SQL connection 486 ms, commit/rollback 46/49 ms, one base backup and four WAL objects; delete 53,128 ms and zero trial volumes/archives after harness cleanup. Five distinct create/delete ledgers and ten agent restarts passed. Real fault responses preserved storage and generations; a missing ready namespace reported recovery required rather than creating empty storage. The complete 65,535-port scans exposed only operator Talos/Kubernetes APIs and no Cloudflare-accessible port. The observed Kubernetes node publishes one IPv4 and no IPv6; the all-port result covers that IPv4. The separate earlier provider IPv6 refusal check passed; no new all-port IPv6 claim is made. Credential names and independently known expiry dates are inventoried privately.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | 2026-10-04 | 1 backup and availability | A real R2-only outage reproduced a committed marker unarchived for 1,002 s. The corrected persistent timer survived an agent restart and alarmed after 619,301 ms. The subsequent availability proof obtained two distinct failing observations under the active policy and a fresh read connection in 437.681 ms; lifting the exact policy drained WAL, preserved the marker and cleared the timer. Separate restore drill: maximum measured WAL-object delay 52,427 ms after COMMIT, restore verification 304,128 ms including operator pacing, committed markers present, rollback absent, exact 5 GiB reclaimed. These are individual measurements, not a zero-loss or full Phase 4 guarantee.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |

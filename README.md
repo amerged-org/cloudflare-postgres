@@ -21,7 +21,7 @@ existing customer databases remain on Neon until their separate migration is acc
 
 ## Status
 
-**Phases 0 and 1 accepted in Dev; operator completion in progress (2026-10-07).** Both EU nodes and
+**Phases 0 and 1 accepted in Dev; EU/US database acceptance passed (2026-10-08).** Both EU nodes and
 all five Flux releases are Ready, with 95 GiB measured storage per node. The complete Dev path through
 `db.ohmyho.st` reaches real PostgreSQL with verified TLS, continuous WAL archiving and R2 backups.
 
@@ -33,8 +33,8 @@ The R2 outage test proved two failing archive observations under the active bloc
 new connection during the alarm. A separate restore drill preserved committed markers, omitted
 a rolled-back marker and reclaimed its target storage. API full restore, PITR and restore after
 source deletion have passed. EU capacity expansion, signed network verification and placement on
-both nodes have passed. US installation and cross-region recovery with the EU source preserved
-remain pending.
+both nodes have passed. US operator admission and cross-region recovery with the healthy EU
+source preserved have passed; the real76% RAM-rule test passed and automatic postjoin remains open.
 
 Raw 100 MiB and 1 GiB stream checks, slow reception and 600 seconds idle passed. A 10-second
 read load measured 735.604 SQL/s over 50 warmed connections, p95 75.368 ms and zero errors.
@@ -69,25 +69,26 @@ Actual R2 listing, archive summary and hourly backup usage agreed on 7,515,287 b
 The filesystem collector measured actual volume use in Dev. API full restore, PITR and restore
 after source deletion passed with separate volumes, verified SQL and removed temporary admin access.
 An isolated real Cloudflare admission probe refused excess registered attempts before D1 or wake.
-US installation and cross-region recovery still need live acceptance.
+US installation reached Ready through the owner-authorized operator path; cross-region recovery passed.
 Missing samples stay unknown. Cost attribution is deferred.
 The already-admitted second EU node is retained as customer EU1 and serves a real capacity-test
 database. One matching V159 US1 was purchased through the API; its original-request audit and
 allocated 4 vCPU, 8,192 MiB RAM and 153,600 MiB NVMe were verified. Provider Running still requires
 Talos installation, Kubernetes admission and actual customer readiness. Its Cloudflare archive, scoped
 credentials, private Tunnel, gateway service and regional identity are configured. Cross-region
-restore is implemented and delivered, with live acceptance pending. The original EU/US 300 GB SSD
+restore is implemented, delivered and accepted on the retained EU/US nodes. The original EU/US 300 GB SSD
 V155 orders were paid, then cancelled by the owner. A later V155 NVMe-selector API test also
 allocated SSD and did not run an installer. Those failed selections are historical; the current
 V159 offer supplies the required 150 GiB NVMe without a storage add-on. No new EU worker is needed,
-and EU1 is not reset, re-adopted or decommissioned. First verify an R2 restore into US1 while
-preserving the healthy EU source; the earlier destructive loss and deletion kits are withheld.
-US1's installation profile and binding are sealed. The original authorized bootstrap job has
-installed the complete checked Talos image, joined Kubernetes and reached `regional_ready`.
-Final storage verification, admission and cross-region recovery remain unaccepted. Resume
-the same addition and Workflow with their retained seals and journals; do not purchase, re-adopt
-or reset US1. No customer or platform database has been migrated. EU/US operator acceptance comes
-first; Neon migration and public-release polish follow separately.
+and EU1 is not reset, re-adopted or decommissioned. The accepted R2 restore into US1 preserved the healthy EU source; the earlier destructive loss
+and deletion kits remain outside this scope.
+US1 is admitted through the owner-authorized operator postjoin/admission path, preserving its
+original purchase and installation. EU1 and US1 passed real Cloudflare SQL/TLS, application roles,
+R2 base backup/WAL, restore and deletion with physical reclamation. Automatic postjoin admission
+remains open for the next genuine authorized node purchase. Preserve both EU nodes and their
+existing data; do not re-adopt or reset US1. Neon migration remains separate and requires the
+[customer handover gates](docs/operations/operator-installation.md#customer-migration-handover),
+including credential rotation, adopter transport/rebinding and sufficient regional capacity.
 
 The approved actual-RAM policy requests regional V159 capacity at at least 76% average physical
 RAM usage over ten fresh consecutive minute samples from the same Node UID, within explicit node
@@ -97,8 +98,7 @@ guards; there is no 81% placement cutoff. Missing observations remain unknown. A
 use 256 MiB steps, with a 4096 MiB PostgreSQL cap in this installation. US uses actual-RAM mode
 with a 128 MiB PostgreSQL request; EU retains reserved mode until its existing databases complete
 the guarded transition. Autonomous purchases remain disabled: finite standing cost/count/expiry
-authority is not configured. Installation profiles are complete; full live acceptance remains
-outstanding.
+authority is not configured. Installation profiles are complete; the real RAM-threshold window and load cleanup passed.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture

@@ -15,8 +15,8 @@ before one combined correction, CI, delivery and resume. If that one programmed 
 the owner permits one operator admission using the same checks and existing US1 operation.
 Record the actual path and timing in PLAN Status; do not claim complete automatic acceptance.
 Its remaining proof belongs to the next genuine authorized purchase. Immediately continue the
-real database lifecycle on both customer nodes. EU upgrades and template activation stay paused
-through US database acceptance; document differences and align only a blocking incompatibility.
+real database lifecycle on both customer nodes. EU upgrades and template activation are excluded
+from this completion; document differences and align only a blocking incompatibility.
 
 ## Reviewed deployment inputs
 
@@ -190,13 +190,12 @@ requires exact before/after rule and attachment identity checks, one recorded mu
 GET-only resolution of an uncertain result. Keep these lifecycle calls separate from the zero
 provider-call requirement for routine transport.
 
-US1's purchase, profile, installation binding and reported inspection are already retained; its
-original authorized job is still `created`, before disk writes. Continue that same addition and
-AddNode Workflow through its existing pause/resume control, preserving sealed inputs, credentials,
-proof-source association and journals. Resolve an uncertain control response through observation.
-Do not repeat the purchase, profile import, adoption, registration or disk-write intent. EU1 is
-already admitted and needs no bootstrap or adoption operation. The sequence below describes US1's
-remaining programmed work and future authorized additions; it does not authorize reinstalling EU.
+US1's original purchase, profile, inspection, complete installation and admitted job are retained.
+Preserve sealed inputs, credentials, proof-source association and journals; they record completed
+work. Resolve uncertain control responses through observation. Do not repeat purchase, profile
+import, adoption, registration or disk-write intent. EU1 is already admitted and needs no bootstrap
+or adoption. The sequence below is the procedure for future authorized additions, not an
+instruction to reinstall either existing customer node.
 
 Keep automatic standing purchases and autoscaling disabled until US/recovery acceptance and
 explicit finite owner limits. Individual costed orders remain separately approved. The retained
@@ -225,7 +224,9 @@ The retained control server's UID-guarded new-database placement flag is already
 preserve Kubernetes/platform operation and existing data. The flag excludes new placement;
 existing databases must continue to serve, wake, resize and delete normally.
 
-Cloudflare executes the automatic capacity-to-Ready sequence from persisted state:
+Cloudflare implements the capacity-to-Ready sequence below from persisted state. The current
+installation used the owner-authorized operator postjoin/admission fallback; the complete
+automatic path remains to be proved by the next genuine authorized node purchase:
 
 1. Ten fresh consecutive minute samples from the same physical Node UID reach 76% average
    working-set/physical RAM. Cloudflare reserves one regional addition, checks the exact standing
@@ -356,7 +357,7 @@ completion remains fresh within300 seconds and publication binds the current exa
 state. Only the internal Native caller selects this rule. The manual publisher's original
 300-second start-age and duration checks remain unchanged; there is no new CLI/environment option.
 
-Complete US1 installation and admission, then restore an EU1 test database into a separate US1
+For acceptance of a future authorized node, complete installation and admission, then restore an EU1 test database into a separate US
 target from R2 while keeping the EU source healthy. Compare SQL data and committed markers,
 verify target backup/WAL and retain the EU Node, volume, role and encrypted custody identities.
 Earlier loss, deletion and decommissioning kits are withheld; any later loss drill needs a
@@ -369,14 +370,207 @@ source selection. Local tests, a configured image or provider Running do not est
 acceptance. Use the normal Cloudflare SQL endpoint to verify actual placement, roles/TLS, committed
 markers, R2 base backup/WAL and deletion through confirmed physical storage reclamation.
 
-After operator acceptance, inventory the adopter's databases, roles/extensions, client pooling,
-timeouts and required capacity in its own repository. Keep its Neon databases separate until
-each reviewed migration freezes writes, restores and compares data/roles/sequences, verifies the
-Cloudflare target's TLS and backup/WAL, and accepts the connection cutover. Do not switch back to
-a stale Neon source after target writes without reconciling them. Credential changes follow the
-separate custody runbook; this completion does not authorize an uncoordinated rotation.
+## Accepted EU/US checks and observed software
+
+The owner-authorized US operator postjoin/admission completed at16:50:20 UTC in198.356 seconds.
+The programmed1GiB storage trial wrote, read and physically reclaimed its volume in753.081 seconds.
+Automatic postjoin admission remains unproved: a report returned HTTP409 before pause, and its
+session renewed without admission. The next genuine, separately authorized node purchase must
+prove that path; the operator result does not substitute for automatic acceptance.
+
+EU1 and US1 passed real SQL through `db.ohmyho.st`, TLS1.3 and nonsuperuser application roles.
+EU trial SQL took2187ms. A separate EU restore took108618ms; a healthy-source EU-to-US restore
+preserved two committed markers in87988ms, including observation pacing. A third marker committed
+on US. All four databases passed R2 base-backup and exact committed-WAL checks, then each released
+its5GiB physical volume after deletion (20GiB total). The earlier empty timeout trial was deleted
+separately without an allocation. All three existing EU databases and encrypted custody remain.
+
+The original US region configuration omitted `/pg` from its gateway URL. Gateway WebSocket
+upgrade requires this path; a healthy Tunnel and correct service binding alone are insufficient.
+Region registration must use `http://pgcf-gateway.pgcf-system.svc.cluster.local:8080/pg` with the
+configured private VPC binding. The observed URL was corrected once with exact configuration
+comparison before/after; no runtime or database reset was needed.
+
+Actual inventory differs as follows. EU inventory is from October7 and US from October8, with
+later US Regional delivery and both actual SQL readbacks supplementing it. No EU alignment was
+required for the passed database checks.
+
+| Component | EU | US |
+| --- | --- | --- |
+| Talos / kernel / containerd | 1.14.1 / 6.18.51-talos / 2.3.5 | Same |
+| Kubernetes API and kubelet | 1.36.3 | 1.36.5 |
+| Flux source / kustomize / helm / notification | 1.9.5 / 1.9.5 / 1.6.4 / 1.9.4 | 1.9.6 / 1.9.6 / 1.6.5 / 1.9.4 |
+| Additional Flux controllers | Absent from inventory | image-automation1.2.5, image-reflector1.2.5, source-watcher2.2.4 |
+| Cilium / CNPG operator / Barman plugin | 1.20.2 / 1.30.1 / 0.15.1 | Same |
+| CNPG / Barman Helm charts | 0.29.1 / 0.8.1 | Same |
+| cert-manager / OpenEBS / LVM driver | 1.21.2 / 4.6.1 / 1.10.1 | Same |
+| cloudflared | 2026.10.0 | Same |
+| PostgreSQL, actual SQL | 18.6 (Debian18.6-1.pgdg13+2), server180006 | Same |
+| Regional runtime source | 901b3228 | 11555215, CI37815727563 |
+
+The following are actual workload `imageID` digests, not Helm chart or release-content digests.
+Kubernetes component versions are 1.36.3 in EU and 1.36.5 in US; the repositories are
+`registry.k8s.io/<component>`.
+
+| Kubernetes component | EU actual imageID digest | US actual imageID digest |
+| --- | --- | --- |
+| kube-apiserver | `sha256:b4bc06c81fd76f81174e6c19ddacf477acdf1583e7a5846ebbd513493aef6e43` | `sha256:4b3e69973a1d58d3c1f670d3477a9b9f14a03a271823113e8e0c9a333eb84f48` |
+| kube-controller-manager | `sha256:ed56454bf514916079a227f5765b64524fde52106dfcc52978b28634765b78b8` | `sha256:2d717af134451db77ea053c3426bc82edc0e55415eb36e1260313c636ebe9a4d` |
+| kube-scheduler | `sha256:128fc07d278d64c4f2cce416ed0a9f37b23a30cdde6f97873d18c9c78e259df4` | `sha256:3804f66442962cefbe11fcd5330d5e7a797bfb3dc8535c322d005637b404a85f` |
+
+Flux repositories are `ghcr.io/fluxcd/<controller>`. An absent entry means the controller was
+not present in the retained EU inventory, rather than a failed version observation.
+
+| Flux controller | EU version and actual imageID digest | US version and actual imageID digest |
+| --- | --- | --- |
+| source-controller | 1.9.5 / `sha256:6f20d232d596a758c923d2861f23511718fc303b8a2e36a1434a7c736b9f4268` | 1.9.6 / `sha256:6a6693172589f8ff26123a231d5fa6ceb194a6efb4dc647cdf057c959f76a2e3` |
+| kustomize-controller | 1.9.5 / `sha256:a3a955eb2bc432c2eaa94d2d3714e3beae7fdf17586fd23aadf71ab597ac3339` | 1.9.6 / `sha256:2ebeaa341da77d52b6abbbba5efcee0450d47f8b42f0e6f33b08f9020262d606` |
+| helm-controller | 1.6.4 / `sha256:8ff15409e46d354338045f483d58ca9cb35dffa2f87e4addd1f5eba1e6a9175f` | 1.6.5 / `sha256:0d52fff5c4d476277b8fcb6beb9041e269adb5db943fe69f5a806ea0c92b1511` |
+| notification-controller | 1.9.4 / `sha256:840f318265ee26f0d2c48a158bf7896b22aa4e998e320a18646309f0e40b15da` | 1.9.4 / `sha256:840f318265ee26f0d2c48a158bf7896b22aa4e998e320a18646309f0e40b15da` |
+| image-automation-controller | Absent from inventory | 1.2.5 / `sha256:e1a2720d3951694609c39635886d5dcb15b7dffe0b8248461c6693539c522a28` |
+| image-reflector-controller | Absent from inventory | 1.2.5 / `sha256:c83ce5c06fed9ebb308cd5165bd144ee934c720f6b47e0da2180869092063c82` |
+| source-watcher | Absent from inventory | 2.2.4 / `sha256:86743f5a4cd4ea76b9722eb86222d56e8253e776daa0565ecb186ec68ad1d835` |
+
+Talos runtime versions match, but the installer configuration does not prove a shared immutable
+image. The retained EU control configuration names `v1.14.1` by tag without a digest. Customer
+EU1 records installer digest `sha256:d1d2fbf374cd886fdd3b2f19d3bc9e82dcefa9caeb73275810b0f71060cc986e`;
+US1 records `sha256:cd4cb83e5f27cd356956cac01ed6f0c5ed2ec4343d3f46e4efa72706ed92d288`.
+These are configured installer identities, distinct from the running Talos version. No EU
+reinstallation, upgrade or template activation was performed to align them.
+
+Actual Regional digests are EU `sha256:eeaa6ab0c1fc182e9e050d6f104565ec0a3dc4e7482b1950287c31b62ebe607a`
+and US `sha256:1886a64e36d2b9ba45e4d876a0a9eb6bab3fb83a6b0fafcb18dbf8647ef66993`.
+The US correction passed CI qualification of all10 layers and registry readback of89,782,247
+compressed bytes. The configured PostgreSQL image pin is
+`sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115`; actual SQL confirms
+18.6 in both regions. A US PostgreSQL runtime imageID was not separately retained in this audit.
+
+Shared actual controller imageIDs: CNPG `sha256:923c267ec29636db3bee20f993d0ec4973fa22998e1adad37da79e4d32b5bc07`,
+Barman `sha256:c75acad19a36e8176cfe2885761ff1b836c6ef977d7257e298c99a28b5c302ef`,
+Cilium `sha256:2939231d0d3e3ebddcd80fffa168b7ddcc78fdf0dc864d1c8c126ff523c54f01`,
+cert-manager `sha256:70f532fd9cfde0b09d55687200942399d89838bc2d5d5b45152eb799a15912b8`,
+LVM `sha256:41f73aba7f31eee4a033053d9c2f203e007a838c14823f3fd472c50651a98999`, and
+cloudflared `sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07`.
+Chart digests and workload imageIDs identify different artifacts; do not compare them as strings.
+
+The initial admitted-node association capture counted1 OAuth and1 provider GET. Three nonempty
+30-minute routine captures counted zero provider attempts, including390 proof/transport frames
+and a report HTTP409 in the final pre-operator window. Historical lifetime provider totals are
+unknown. Keep lifecycle counts separate and do not sum overlapping capture windows.
+
+## Customer migration handover
+
+Neon migration remains a separate reviewed cutover. EU/US SQL, backup/WAL, restore, physical
+reclamation and the real RAM threshold observation have passed. Preserve EU1 and its
+three existing databases. Do not upgrade EU Kubernetes or activate a bootstrap template in this
+scope, including after US database acceptance. Only a separately reviewed upgrade scope can
+change that instruction.
+
+Before customer data, resolve the October 5 revision-1 credential exposure through
+[the credential procedure](credentials.md). Secure encrypted D1/etcd/configuration backups and SQL
+markers; rehearse targeted rotation, prove replacement access and rejection of retired trust,
+and preserve Node/Cluster/storage identities. API CA rotation alone does not cover etcd,
+bootstrap/trustd, discovery, aggregator, service-account or Secret-at-rest material. Coordinate
+live trust with Cloudflare seed/join custody; the version-template API changes metadata only.
+Retire affected historical active signers and rescue/SSH bootstrap authority after replacement
+verification. Retain required archive-verification/decryption material privately, including
+referenced `CREDENTIAL_KEYS` IDs and old decrypt keys until rewriting/retention permits removal.
+Do not reinstall nodes, overwrite revision 1 or claim rotation is complete.
+
+Inventory source region, roles/grants/extensions, sequences, pools, timeouts and sizing. The
+actual capacity snapshot has **3,000 millicores allocatable** on each customer node. US platform
+reservations consume **1,510**, leaving **1,490** for database reservations. The smallest enabled
+size class requests **250 PostgreSQL + 100 Barman = 350 millicores**: at most **four** such databases
+by configured CPU arithmetic on an otherwise empty US node. The 22-US cohort needs at least
+**7,700**, exceeding the **1,490** available database CPU. At the configured **5 GiB** minimum,
+22 volumes need **110 GiB**, exceeding measured **95 GiB** node storage.
+
+EU1 reserves **350** platform millicores: `(3,000-350)/350` admits at most **seven** minimum-class
+databases if otherwise empty. Its current **1,024 MiB / 500-millicore** database reserves **600**
+including Barman, leaving CPU room for at most five additional minimum-class databases before
+other checks. The snapshot’s original US demand reserved 600 millicores; all trial databases are now deleted.
+Refresh actual placement reservations before the separate customer cutover.
+These are configuration ceilings, not a demonstrated workload density.
+
+Ten real consecutive US minute samples from18:43:01 to18:52:04 UTC averaged **79.9062%** under
+an operation-owned3968MiB allocation. Cloudflare persisted that average and its expansion trigger.
+Existing eligible placement and full CPU/storage/PostgreSQL plus512MiB Barman startup checks
+still passed. The dry capacity decision remained `disabled` and made no provider call: finite
+standing cost/count/expiry authority is absent, caps remain EU3/US1 and autoscaling is disabled.
+The first trial correctly rejected a missing18:37 sample; actual kubelet timestamps crossed
+18:36:59 to18:38:00. Its load was removed and physical available RAM recovered before the
+independent second trial. Never synthesize samples or weaken consecutive-minute validation.
+Both disposable loads used4096MiB limits and720-second automatic deadlines. Final second-load cleanup removed the exact Namespace/Pod and recovered4,177,731,584 bytes;
+fresh available RAM returned within the recorded baseline tolerance. Actual customer workload density remains unaccepted; RAM overbooking
+does not remove CPU, storage or startup checks. Approve sufficient regional capacity before
+committing the22-US cohort.
+
+### Connection and cold starts
+
+The inspected adopter uses `pg` with Neon TCP origins. PGCF’s public transport is verified WSS;
+a TCP DSN hostname swap is insufficient. Use the established Neon serverless `Pool`/`Client`
+WebSocket mode with `pipelineConnect=false` and a `wsProxy` URL containing
+`/v2?database=<URL-encoded-PGCF-ID>&user=<URL-encoded-role>`; see
+[the connection contract](../../README.md). Keep PostgreSQL authentication and TLS. Hints scope
+admission; they are not credentials. Neon supports multiple transports; this recommendation
+follows the inspected adopter and PGCF contracts.
+
+For psql and logical export/import tools, use the existing CLI:
+
+```sh
+node packages/cli/dist/main.js connect --endpoint wss://db.your-domain --database <pgcf-id> --user <role>
+```
+
+Use the printed loopback port, target PGCF ID and role. `sslmode=disable` applies only to
+loopback; public WSS and gateway-to-PostgreSQL TLS remain verified. Keep passwords private;
+never expose a VPS database port.
+
+Dev cold connections measured p95 **9.160 s**, maximum **9.708 s**. The adopter’s **5 s**
+connect timeout can fail before wake. Its **10 s** query/statement defaults are separate from
+the end-to-end request deadline; budget wake plus work explicitly.
+Before cutover, verify one policy: an approved always-warm size class
+(`sleep_after_seconds:null`); prewake with `POST /v1/databases/{id}/resume`, operation/readiness
+polling and `SELECT 1` immediately before traffic; or bounded connection/request deadlines
+covering measured wake plus query/network margin. SQL statement timeouts are separate and do
+not fix shorter connection timeouts. Never retry uncertain writes. These are Dev measurements,
+not accepted US application latency.
+
+### Create, restore and rebind
+
+Use the authorized project-scoped integrator key, persistent mutation `Idempotency-Key`s and
+existing API contracts:
+
+- `POST /v1/databases` with `{project_id,region_id,name,size_class_id}`; save the new database and
+  operation IDs. Poll `GET /v1/operations/{id}` and `GET /v1/databases/{id}`.
+- `POST /v1/databases/{id}/roles` with `{"name":"<role>"}`; await role readback, then obtain
+  `GET /v1/databases/{id}/roles/{role}/connection-uri`. Only integrator responses include the
+  password; save them privately. Administrator responses cannot supply an application password.
+- PGCF archive restore: `POST /v1/databases/{source-id}/restore` with
+  `{"mode":"full","name":"recovered","region_id":"<region>"}` or PITR with `target_time`.
+  It returns a **new database ID** and separate storage. Reuse the same key after an uncertain
+  submission; follow [recovery](recovery.md). This API restores PGCF archives, not a Neon dump.
+
+A separately approved Neon import freezes writes and uses a consistent logical export/import
+through the normal CLI, with reviewed owners, grants, extensions and sequences. For either
+import or restore, rebind the adopter’s provider/database mapping to the new target ID/region,
+update protected role credentials/password revision and versioned registration, drain old
+connections and create a fresh authorized pool. PGCF requires current database/role registration;
+stale or unregistered hints must fail. The adopter’s URL validator accepts Neon pooler hosts only,
+and its durable registration includes Neon-specific target fields. PGCF adapter/registration
+acceptance is therefore a cutover prerequisite: use supported scoped operations; do not bypass
+checks or edit tables to make a DSN swap work.
+
+Compare data/checksums, roles/grants, sequences and committed markers. Verify actual Cloudflare
+TLS/region, target backup/WAL, application transactions and selected timeout/pool behavior.
+Rehearse restore into another new ID and repeat rebinding. Once target writes begin, returning
+to stale Neon requires reconciliation. Delete trials through `DELETE /v1/databases/{id}` and
+confirm operation completion plus physical reclamation; R2 archive retention is separate.
+
 
 ## Synchronize version templates after an accepted Kubernetes upgrade
+
+This is a separate future maintenance procedure. EU upgrades and template activation are excluded
+from the current operator completion, including after database acceptance.
 
 Use the supported Talos Kubernetes upgrade with a reviewed dry run; never reinstall the EU
 nodes to align patch versions. Verify the actual API-server and every kubelet version while
