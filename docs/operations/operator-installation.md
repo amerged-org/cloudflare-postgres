@@ -400,3 +400,6 @@ rewinding any disk, custody or storage progress. A lost claim acknowledgement di
 nothing. Once attempt2 is recorded, resume observes only; it never sends another install.
 Existing, partial, foreign, stale or unknown effects block recovery. This is a programmed
 no-effect resolution, not permission to clear a journal or manually repeat an uncertain write.
+The pinned chart's `cilium-secrets` Namespace is a cluster-scoped install effect. Include it
+and its declared namespaced resources in complete absence readback; do not skip a Namespace
+or accept an already existing one to make recovery advance.

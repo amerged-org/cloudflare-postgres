@@ -462,7 +462,7 @@ server dry runs established that eight and sixteen incoming clients were also in
 the sixteen-client run recorded11 connection drops. The bounded64-client correction passed
 the same actual pinned-chart server dry run with42 CONNECTs, a peak of30 clients, zero drops
 and exit0. It preserved the original cluster/certificate/join/job identities and left zero
-Cilium resources or release records. Three proxy cases pass, including64 admitted clients,
+Cilium CRDs, workloads or release records. Three proxy cases pass, including64 admitted clients,
 the65th refused and failed/closed/pending grants releasing reservations. Targets, independent
 transport grants, TLS, expiry and cleanup remain unchanged; these were read-only diagnostics
 with zero provider calls. The original US Workflow was paused once atstep580 while the safe
@@ -481,6 +481,22 @@ reservation now precedes the asynchronous status read and all execution paths ho
 busy guards.49 real-D1 callback cases,49 affected Native cases, two focused registration/
 admission cases and three proxy cases pass, with types/lint/formatting and independent reviews.
 These software results and the read-only dry run do not establish US1 Ready or final acceptance.
+
+Source `8c670789`, full CI `37731717699`, delivered qualified Native manifest
+`sha256:f892386bc55615820e45c2f34fa5d48f7b375b366b79513b19f95e431295030f` once.
+All18 layers/715,002,457 qualification bytes passed with zero unresolved findings;
+registry readback verified162,123,561 compressed and502,885,376 raw bytes. Actual running
+image evidence matched. One original-operation resume retained the full Talos image,
+sealed join1 and installation authority. At05:40:51Z the programmed recovery stopped
+before consuming its retry claim with `cilium_recovery_chart_effects_unknown`.
+The actual pinned image reproduces this offline: show-CRDs returns empty and the25-object
+render includes the legitimate `v1/Namespace/cilium-secrets`. Our inventory incorrectly
+rejected every Namespace. The correction includes this exact pinned Namespace as a
+cluster-scoped effect and checks its absence alongside its rendered namespaced resources;
+an existing Namespace blocks the claim. Hooks, CRDs and unknown scopes remain refused.
+The reproducer fails before correction;17 affected installation cases, types/lint/formatting
+pass afterward. The same Workflow was paused once for the changed image delivery. No
+attempt2 install, provider action, disk rewrite or EU mutation occurred; US1 Ready remains pending.
 
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical

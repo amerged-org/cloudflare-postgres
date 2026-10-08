@@ -556,6 +556,44 @@ test("rendered hooks and chart CRDs block recovery before any claim or install",
   assert.equal(state.mutations.length, 0);
 });
 
+test("the pinned Cilium secrets Namespace and its resources require complete absence before recovery", async () => {
+  const state = clusterFixture("cilium_install_intent", false, true);
+  state.setRelease(false);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  const rendered =
+    "apiVersion: v1\nkind: Namespace\nmetadata:\n  name: cilium-secrets\n---\napiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cilium-bootstrap\n  namespace: cilium-secrets\n";
+  state.setRendered(rendered);
+  await state.installer.install();
+  assert.equal(state.journal()!.recovery_receipt.resource_count, 2);
+  assert.equal(
+    state.mutations.filter((args) => args[0] === "install").length,
+    1,
+  );
+  const occupied = clusterFixture("cilium_install_intent", false, true);
+  occupied.setRelease(false);
+  occupied.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  occupied.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "cilium-secrets" },
+  });
+  occupied.setRendered(rendered);
+  await assert.rejects(
+    occupied.installer.install(),
+    /cilium_recovery_effect_present/,
+  );
+  assert.equal(occupied.journal(), undefined);
+  assert.equal(occupied.mutations.length, 0);
+});
+
 test("a replaced cluster UID after the complete inventory blocks the recovery CAS", async () => {
   const state = clusterFixture("cilium_install_intent", false, true);
   state.setRelease(false);

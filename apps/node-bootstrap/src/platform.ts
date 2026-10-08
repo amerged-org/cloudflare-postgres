@@ -50,6 +50,7 @@ const RELEASES = [
   "plugin-barman-cloud",
 ];
 const CILIUM_RESOURCE_VERSIONS: Record<string, string> = {
+  Namespace: "v1",
   ConfigMap: "v1",
   Secret: "v1",
   ServiceAccount: "v1",
@@ -656,37 +657,52 @@ export class PlatformInstaller {
         Buffer.byteLength(rendered.stdout) > 1024 * 1024
       )
         throw new BootstrapError("cilium_recovery_inventory_unknown");
-      const objects = parseAllDocuments(rendered.stdout)
-        .filter((document) => document.toJSON() !== null)
-        .map((document) => {
-          if (document.errors.length)
-            throw new BootstrapError("cilium_recovery_inventory_unknown");
-          const value = record(document.toJSON()),
-            metadata = record(value.metadata);
-          if (
-            typeof value.apiVersion !== "string" ||
-            typeof value.kind !== "string" ||
-            CILIUM_RESOURCE_VERSIONS[value.kind] !== value.apiVersion ||
-            value.kind === "CustomResourceDefinition" ||
-            value.kind === "Namespace" ||
-            record(metadata.annotations ?? {})["helm.sh/hook"] !== undefined ||
-            typeof metadata.name !== "string"
-          )
-            throw new BootstrapError("cilium_recovery_chart_effects_unknown");
-          const namespace = ["ClusterRole", "ClusterRoleBinding"].includes(
-            value.kind,
-          )
-            ? undefined
-            : String(metadata.namespace ?? "kube-system");
-          if (namespace !== undefined && namespace !== "kube-system")
-            throw new BootstrapError("cilium_recovery_inventory_unknown");
-          return {
-            apiVersion: value.apiVersion,
-            kind: value.kind,
-            name: metadata.name,
-            ...(namespace === undefined ? {} : { namespace }),
-          };
-        });
+      const documents = parseAllDocuments(rendered.stdout).filter(
+        (document) => document.toJSON() !== null,
+      );
+      const declaredNamespaces = new Set(
+        documents.flatMap((document) => {
+          const value = record(document.toJSON());
+          return value.kind === "Namespace"
+            ? [String(record(value.metadata).name)]
+            : [];
+        }),
+      );
+      const objects = documents.map((document) => {
+        if (document.errors.length)
+          throw new BootstrapError("cilium_recovery_inventory_unknown");
+        const value = record(document.toJSON()),
+          metadata = record(value.metadata);
+        if (
+          typeof value.apiVersion !== "string" ||
+          typeof value.kind !== "string" ||
+          CILIUM_RESOURCE_VERSIONS[value.kind] !== value.apiVersion ||
+          value.kind === "CustomResourceDefinition" ||
+          (value.kind === "Namespace" && metadata.name !== "cilium-secrets") ||
+          record(metadata.annotations ?? {})["helm.sh/hook"] !== undefined ||
+          typeof metadata.name !== "string"
+        )
+          throw new BootstrapError("cilium_recovery_chart_effects_unknown");
+        const namespace = [
+          "Namespace",
+          "ClusterRole",
+          "ClusterRoleBinding",
+        ].includes(value.kind)
+          ? undefined
+          : String(metadata.namespace ?? "kube-system");
+        if (
+          namespace !== undefined &&
+          namespace !== "kube-system" &&
+          !declaredNamespaces.has(namespace)
+        )
+          throw new BootstrapError("cilium_recovery_inventory_unknown");
+        return {
+          apiVersion: value.apiVersion,
+          kind: value.kind,
+          name: metadata.name,
+          ...(namespace === undefined ? {} : { namespace }),
+        };
+      });
       const inventory = objects.sort((a, b) =>
         canonical(a).localeCompare(canonical(b)),
       );
