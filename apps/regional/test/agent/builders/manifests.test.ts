@@ -386,6 +386,20 @@ test("explicit startup memory permits overbooking while preserving the PostgreSQ
   );
 });
 
+test("startup memory keeps shared buffers within CNPG's admitted request", () => {
+  const { db, ctx } = fixture();
+  db.size.memory_mib = 1024;
+  db.size.memory_request_mib = 128;
+  const cluster = object(buildDatabaseManifests(db, ctx), "Cluster");
+  const spec = record(cluster.spec);
+  const parameters = record(record(spec.postgresql).parameters);
+  const resources = record(spec.resources);
+  assert.equal(parameters.shared_buffers, "32MB");
+  assert.equal(parameters.effective_cache_size, "512MB");
+  assert.deepEqual(resources.requests, { cpu: "500m", memory: "128Mi" });
+  assert.deepEqual(resources.limits, { cpu: "500m", memory: "1024Mi" });
+});
+
 test("quota covers two PostgreSQL and Barman pod slots for the supported size examples", () => {
   const { db, ctx } = fixture();
   for (const size of [

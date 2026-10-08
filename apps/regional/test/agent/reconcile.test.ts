@@ -1604,6 +1604,29 @@ test("a claim UID race cannot reclaim a volume rebound to another claim", async 
   assert.ok(await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`));
 });
 
+test("explicit startup Pod requests remain Ready with the unchanged PostgreSQL limit", async () => {
+  const { db, ctx } = fixture();
+  db.size.memory_mib = 1024;
+  db.size.memory_request_mib = 128;
+  const k8s = new MemoryKubernetes();
+  const reconcile = () =>
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile(
+      db,
+      ctx,
+    );
+  assert.equal((await reconcile())?.state, "ready");
+  const pod = k8s.resources.get(
+    k8s.key("Pod", `pgcf-db-${db.id}`, "database-1"),
+  )!;
+  const resources = record(
+    record((record(pod.spec).containers as unknown[])[0]).resources,
+  );
+  assert.equal(record(resources.requests).memory, "128Mi");
+  assert.equal(record(resources.limits).memory, "1024Mi");
+  record(resources.requests).memory = "64Mi";
+  assert.notEqual((await reconcile())?.state, "ready");
+});
+
 test("canonical Cluster quantities satisfy readiness before role authentication", async () => {
   const { db, ctx } = fixture();
   db.size.memory_mib = 1024;

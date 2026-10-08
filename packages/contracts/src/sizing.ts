@@ -64,15 +64,21 @@ export const mib = (value: number): string => `${value}Mi`;
 export const gib = (value: number): string => `${value}Gi`;
 export const millicores = (value: number): string => `${value}m`;
 
-/** CNPG `postgresql.parameters` derived from the size class. */
+/** Size-class tuning; explicit startup memory bounds shared buffers. */
 export function postgresParameters(
   size: Pick<
     DesiredSize,
-    "memory_mib" | "max_connections" | "archive_timeout_seconds"
+    | "memory_mib"
+    | "memory_request_mib"
+    | "max_connections"
+    | "archive_timeout_seconds"
   >,
 ): Record<string, string> {
   return {
-    shared_buffers: `${Math.floor(size.memory_mib / 4)}MB`,
+    shared_buffers: `${Math.max(
+      1,
+      Math.floor((size.memory_request_mib ?? size.memory_mib) / 4),
+    )}MB`,
     effective_cache_size: `${Math.floor(size.memory_mib / 2)}MB`,
     max_connections: String(size.max_connections),
     archive_timeout: `${size.archive_timeout_seconds}s`,

@@ -1,6 +1,25 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-08): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
+Status (2026-10-08): **Phases 0 and 1 accepted in Dev; US1 admitted; database acceptance in progress.**
+
+US1 reached Cloudflare Ready at16:50:20Z through the owner-authorized operator postjoin/admission
+path in198.356 seconds, preserving the original purchase, installation, Node/Cluster identities,
+join revision1 and EU data. The programmed1GiB storage trial completed physical reclamation in
+753.081 seconds and published its proof; it was not repeated by the operator. The one consolidated
+Node correction, source `2bf52e0`, passed CI `37778960682` and was delivered once. Three separate,
+non-overlapping30-minute provider-accounting captures recorded zero Contabo wire calls; these
+are capture-window counts, not historical order totals. Automatic postjoin admission remains open:
+a report returned HTTP409 before the operator pause, and the proof session renewed without admission.
+The operator resolved a confirmed partial network verification before collecting fresh proof.
+No replacement purchase, EU reset, Kubernetes upgrade or template activation occurred.
+
+The original US database demand then exposed one Regional startup-memory mismatch: the live
+CNPG webhook rejected256MB shared buffers with a128Mi memory request and1024Mi hard limit.
+All other11 resources passed the same server dry-run. The correction uses one shared tuning
+function for manifest and SQL readiness, and checks explicit Pod requests separately from hard
+limits. All12 corrected resources passed server dry-run;113 scoped tests, types, lint, formatting
+and independent review passed. One Regional CI/release will continue the same database demand;
+the accepted API/Native image and EU runtime remain unchanged.
 
 The owner's completion timebox is now one consolidated remaining-check batch, one CI,
 one delivery and one resume. If that programmed attempt does not admit the existing US1,

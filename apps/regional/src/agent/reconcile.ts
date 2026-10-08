@@ -1962,12 +1962,15 @@ export class Reconciler {
       : undefined;
     if (!postgres || postgres.image !== ctx.postgresImage) return false;
     const compute = record(postgres.resources);
-    for (const resources of [
-      record(compute.requests),
-      record(compute.limits),
-    ]) {
+    for (const [resources, memoryMib] of [
+      [
+        record(compute.requests),
+        db.size.memory_request_mib ?? db.size.memory_mib,
+      ],
+      [record(compute.limits), db.size.memory_mib],
+    ] as const) {
       if (
-        quantity(resources.memory) !== db.size.memory_mib * 2 ** 20 ||
+        quantity(resources.memory) !== memoryMib * 2 ** 20 ||
         quantity(resources.cpu) * 1000 !== db.size.cpu_millicores
       )
         return false;

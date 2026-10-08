@@ -34,6 +34,7 @@ async function postgresFixture(
   database: ReturnType<typeof fixture>["db"],
   certificateHost: string,
   abortOnQuery?: () => void,
+  sharedBuffersMib = Math.floor(database.size.memory_mib / 4),
 ) {
   const directory = mkdtempSync(join(tmpdir(), "pgcf-readiness-test-"));
   const keyPath = join(directory, "generated-key");
@@ -142,9 +143,7 @@ async function postgresFixture(
                     ],
                     [
                       "shared_buffers_bytes",
-                      String(
-                        Math.floor(database.size.memory_mib / 4) * 2 ** 20,
-                      ),
+                      String(sharedBuffersMib * 2 ** 20),
                       25,
                     ],
                     [
@@ -267,6 +266,42 @@ test("authenticated old PostgreSQL settings cannot acknowledge a resized desired
     assert.equal(
       await probeRoles(
         resized,
+        server.ca,
+        new AbortController().signal,
+        server.factory,
+      ),
+      false,
+    );
+  } finally {
+    await server.close();
+  }
+});
+
+test("readiness authenticates the admitted startup buffers and rejects a stale request", async () => {
+  const { db } = fixture();
+  db.size.memory_mib = 1024;
+  db.size.memory_request_mib = 128;
+  const server = await postgresFixture(
+    db,
+    `database-rw.pgcf-db-${db.id}.svc`,
+    undefined,
+    32,
+  );
+  try {
+    assert.equal(
+      await probeRoles(
+        db,
+        server.ca,
+        new AbortController().signal,
+        server.factory,
+      ),
+      true,
+    );
+    const changed = structuredClone(db);
+    changed.size.memory_request_mib = 64;
+    assert.equal(
+      await probeRoles(
+        changed,
         server.ca,
         new AbortController().signal,
         server.factory,

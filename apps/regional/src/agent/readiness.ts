@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Client } from "pg";
 import type { ClientConfig } from "pg";
-import { DesiredDatabase } from "@pgcf/contracts";
+import { DesiredDatabase, postgresParameters } from "@pgcf/contracts";
 import { databaseNamespace, roleSecretName } from "./builders/index.ts";
 import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 import {
@@ -64,6 +64,10 @@ export async function probeRoles(
   const parsed = DesiredDatabase.safeParse(database);
   if (!parsed.success || parsed.data.desired_state !== "running") return false;
   const db = parsed.data;
+  const sharedBuffersMib = Number.parseInt(
+    postgresParameters(db.size).shared_buffers ?? "",
+    10,
+  );
   const host = `database-rw.${databaseNamespace(db.id)}.svc`;
   const bounded = AbortSignal.any([signal, AbortSignal.timeout(20_000)]);
   for (const role of db.roles) {
@@ -105,8 +109,7 @@ export async function probeRoles(
         active.archive_timeout_seconds !== db.size.archive_timeout_seconds ||
         !/^[0-9]+$/.test(active.shared_buffers_bytes) ||
         !/^[0-9]+$/.test(active.effective_cache_size_bytes) ||
-        Number(active.shared_buffers_bytes) !==
-          Math.floor(db.size.memory_mib / 4) * 2 ** 20 ||
+        Number(active.shared_buffers_bytes) !== sharedBuffersMib * 2 ** 20 ||
         Number(active.effective_cache_size_bytes) !==
           Math.floor(db.size.memory_mib / 2) * 2 ** 20
       )
