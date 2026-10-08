@@ -52,18 +52,26 @@ missing or ambiguous coverage is refused rather than creating an empty database.
 ### Cross-region source access
 
 Complete the target region's ordinary bootstrap and capacity admission first. Before requesting
-the restore, install the private source-read map described in
-[the credential runbook](credentials.md#cross-region-restore-source-credentials) in the target
-regional cluster. It binds the source region ID to the exact source bucket, HTTPS endpoint and
-bucket-scoped read-only S3 credential. The management API keeps no S3 credential map; its source
-catalog reads use the source region's R2 binding.
+restore, create the target/source relationship through the authenticated PGCF API described in
+[the credential runbook](credentials.md#cross-region-restore-source-credentials). It binds the
+source region ID to the exact registered bucket, HTTPS endpoint and supplied bucket-scoped
+Object Read Only S3 credential. Cloudflare stores encrypted custody and publishes the source-read
+map only to the authenticated target region. Provider IAM read-only permission needs a separate
+live check; accepting a credential is not proof of that permission.
 
-The agent creates a separate `recovery-source-credentials` Secret in the target database namespace
-and a recovery-source ObjectStore for the original archive. The target's `pgcf-backup-s3` write
-credential, archive identity and temporary administration HMAC remain tied to the target region.
-Database egress allows HTTPS only to the exact configured source and target R2 endpoint hosts,
-alongside the existing DNS and Kubernetes API rules. Do not widen egress to arbitrary R2 hosts.
-The default same-region restore needs no cross-region source map.
+The existing regional reconciler creates a separate `recovery-source-credentials` Secret in the
+target database namespace and a recovery-source ObjectStore for the original archive. The
+target's `pgcf-backup-s3` write credential, archive identity and temporary administration HMAC
+remain tied to the target region. Database egress allows HTTPS only to the exact configured
+source and target R2 endpoint hosts, alongside the existing DNS and Kubernetes API rules.
+Do not widen egress to arbitrary R2 hosts. Same-region restore uses its ordinary regional
+credential and needs no cross-region relationship.
+
+Use the relationship's expected revision and a stable idempotency key for source-key rotation.
+Unfinished referencing restores block rotation; successful restored targets receive a new
+desired generation through the existing reconcile path. An authoritative desired map never
+falls back to the old manual map when an entry is missing or drifted. The manual map remains
+compatible only while the API field is absent during a consumer-first rollout.
 
 Cross-region acceptance requires a real Dev run: verify the source commit markers over the normal
 Cloudflare SQL endpoint, promotion, nonsuperuser application access, removal of temporary

@@ -5,6 +5,9 @@ import {
   type RegionCreate,
   type RegionRouteKeyring,
   type RegionBootstrapMaterialUpdate,
+  bytesToHex,
+  RegionGatewayConfiguration,
+  type RegionConfigurationUpdate,
 } from "@pgcf/contracts";
 import {
   deriveRegionKeyring,
@@ -35,6 +38,16 @@ export async function createRegion(
   body: RegionCreate,
 ): Promise<Response> {
   await requireScope(c, "admin");
+  if (
+    !RegionGatewayConfiguration.safeParse({
+      gateway_url: body.gateway_url,
+      gateway_binding: body.gateway_binding ?? null,
+    }).success
+  )
+    throw new ApiError(
+      "invalid_request",
+      "Gateway URL must use /pg without credentials, query or fragment; public gateways require HTTPS",
+    );
   return withIdempotency(c, {
     replay: async () => refuseCredentialReplay(),
     execute: async (lease) => {
@@ -137,4 +150,116 @@ export async function updateRegionBootstrapMaterial(
 ): Promise<Response> {
   await requireScope(c, "admin");
   return c.json(await synchronizeRegionBootstrapMaterial(c.env, id, body));
+}
+
+// The heartbeat is deliberately excluded. Credential/material changes, even those made
+// outside this endpoint, fence routing updates without disclosing custody in the response.
+const configurationFields = [
+  "id",
+  "provider",
+  "provider_region",
+  "gateway_url",
+  "gateway_binding",
+  "backup_bucket",
+  "backup_endpoint_url",
+  "agent_key_hash",
+  "created_at",
+  "updated_at",
+  "bootstrap_material_revision",
+  "bootstrap_material_provenance_sha256",
+] as const;
+
+async function regionConfigurationRow(c: ApiContext, id: string): Promise<Row> {
+  const row = await c.env.DB.prepare("SELECT * FROM regions WHERE id=?")
+    .bind(id)
+    .first<Row>();
+  if (!row) throw new ApiError("not_found", "Region not found");
+  return row;
+}
+async function configurationDigest(row: Row): Promise<string> {
+  const value = JSON.stringify(configurationFields.map((field) => row[field]));
+  return bytesToHex(
+    new Uint8Array(
+      await crypto.subtle.digest("SHA-256", new TextEncoder().encode(value)),
+    ),
+  );
+}
+async function configurationResponse(
+  c: ApiContext,
+  row: Row,
+): Promise<Response> {
+  return c.json(
+    {
+      region: regionRow(row),
+      configuration_sha256: await configurationDigest(row),
+    },
+    200,
+  );
+}
+
+export async function getRegionConfiguration(
+  c: ApiContext,
+  id: string,
+): Promise<Response> {
+  await requireScope(c, "admin");
+  return configurationResponse(c, await regionConfigurationRow(c, id));
+}
+
+export async function updateRegionConfiguration(
+  c: ApiContext,
+  id: string,
+  body: RegionConfigurationUpdate,
+): Promise<Response> {
+  await requireScope(c, "admin");
+  if (
+    !RegionGatewayConfiguration.safeParse({
+      gateway_url: body.gateway_url,
+      gateway_binding: body.gateway_binding,
+    }).success
+  )
+    throw new ApiError("invalid_request", "Invalid gateway configuration");
+  const read = async () =>
+    configurationResponse(c, await regionConfigurationRow(c, id));
+  return withIdempotency(c, {
+    // As with other configuration endpoints, replay returns the current safe view;
+    // it never reapplies a previous routing value after a subsequent update.
+    replay: read,
+    execute: async (lease) => {
+      const before = await regionConfigurationRow(c, id);
+      if (
+        (await configurationDigest(before)) !==
+        body.expected_configuration_sha256
+      )
+        throw new ApiError(
+          "conflict",
+          "Region configuration changed; read the current configuration before updating",
+        );
+      const now = new Date(
+        Math.max(Date.now(), Date.parse(String(before.updated_at)) + 1),
+      ).toISOString();
+      const results = await c.env.DB.batch([
+        c.env.DB.prepare(
+          `UPDATE regions SET gateway_url=?,gateway_binding=?,updated_at=?
+          WHERE ${configurationFields.map((field) => `${field} IS ?`).join(" AND ")}`,
+        ).bind(
+          body.gateway_url,
+          body.gateway_binding,
+          now,
+          ...configurationFields.map(
+            (field) => before[field] as string | number | null,
+          ),
+        ),
+        lease.completeStatement(id, 200, {
+          sql: "changes() = 1",
+          bindings: [],
+        }),
+      ]);
+      if (results[0]!.meta.changes !== 1)
+        throw new ApiError(
+          "conflict",
+          "Region configuration changed; read the current configuration before updating",
+        );
+      return read();
+    },
+  });
 }

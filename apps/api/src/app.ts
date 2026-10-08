@@ -11,6 +11,10 @@ import { registerUsage } from "./routes/usage.ts";
 import { registerAgentMetrics } from "./routes/agent-metrics.ts";
 import { registerCosts } from "./routes/costs.ts";
 import { registerOperationalHealth } from "./routes/health.ts";
+import { registerRegionConfiguration } from "./routes/region-configuration.ts";
+import { registerFleetReleases } from "./routes/fleet-releases.ts";
+import { registerResourceProfiles } from "./routes/resource-profiles.ts";
+import { registerRegionArchiveSources } from "./routes/region-archive-sources.ts";
 import { registerNodes } from "./routes/nodes.ts";
 import { registerNodeInstallation } from "./routes/node-installation.ts";
 import { registerNodeProof } from "./routes/node-proof.ts";
@@ -47,8 +51,19 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/projects/:id",
   "/v1/size-classes",
   "/v1/size-classes/:id",
+  "/v1/resource-profiles/:id",
+  "/v1/resource-profiles/:id/rollout",
+  "/v1/resource-profiles/:id/revisions/:revision",
+  "/v1/databases/:id/resource-profile",
   "/v1/regions",
+  "/v1/regions/:id/configuration",
+  "/v1/regions/:target/archive-sources/:source",
+  "/v1/fleet/releases/:id",
+  "/v1/regions/:id/release",
+  "/v1/nodes/:id/release",
+  "/agent/v1/fleet-observations",
   "/v1/nodes",
+  "/v1/nodes/:id/storage",
   "/v1/nodes/additions",
   "/v1/nodes/additions/:id",
   "/v1/nodes/additions/:id/approve",
@@ -340,6 +355,10 @@ export function createApp(): ApiApp {
   registerNodeInstallation(app);
   registerNodeProof(app);
   registerOperationalHealth(app);
+  registerRegionConfiguration(app);
+  registerFleetReleases(app);
+  registerResourceProfiles(app);
+  registerRegionArchiveSources(app);
   app.doc31("/v1/openapi.json", {
     openapi: "3.1.0",
     info: { title: "PGCF API", version },

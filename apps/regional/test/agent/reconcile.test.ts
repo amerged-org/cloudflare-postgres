@@ -1604,6 +1604,35 @@ test("a claim UID race cannot reclaim a volume rebound to another claim", async 
   assert.ok(await k8s.read("Namespace", undefined, `pgcf-db-${db.id}`));
 });
 
+test("a separate CPU request is acknowledged numerically and stale request or limit stays fenced", async () => {
+  const { db, ctx } = fixture();
+  db.size.cpu_millicores = 250;
+  db.size.cpu_request_millicores = 25;
+  const k8s = new MemoryKubernetes();
+  const reconcile = () =>
+    new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile(
+      db,
+      ctx,
+    );
+  assert.equal((await reconcile())?.state, "ready");
+  const pod = k8s.resources.get(
+    k8s.key("Pod", `pgcf-db-${db.id}`, "database-1"),
+  )!;
+  const resources = record(
+    record((record(pod.spec).containers as unknown[])[0]).resources,
+  );
+  assert.equal(record(resources.requests).cpu, "25m");
+  assert.equal(record(resources.limits).cpu, "250m");
+  record(resources.requests).cpu = "0.025";
+  record(resources.limits).cpu = "0.25";
+  assert.equal((await reconcile())?.state, "ready");
+  record(resources.requests).cpu = "250m";
+  assert.notEqual((await reconcile())?.state, "ready");
+  record(resources.requests).cpu = "25m";
+  record(resources.limits).cpu = "25m";
+  assert.notEqual((await reconcile())?.state, "ready");
+});
+
 test("explicit startup Pod requests remain Ready with the unchanged PostgreSQL limit", async () => {
   const { db, ctx } = fixture();
   db.size.memory_mib = 1024;

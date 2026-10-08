@@ -424,7 +424,7 @@ it("threshold expansion remains due with another open worker, and one exclusive 
   ).toBe(1);
 });
 
-it("expands for a valid pending class whose startup peak can never fit an old physical node below the RAM trigger", async () => {
+it("keeps a valid pending class waiting when its startup peak cannot fit below the RAM trigger", async () => {
   const f = await setup(),
     capacity = 1024 * 1024 ** 2;
   await env.DB.prepare(
@@ -496,18 +496,15 @@ it("expands for a valid pending class whose startup peak can never fit an old ph
       .first("memory_expansion_triggered_at"),
   ).toBeNull();
   const decision = await runNodeCapacity(env, f.region, true);
-  try {
-    expect(decision.action).toBe("waiting_for_approval");
-    expect(decision.operation_id).not.toBeNull();
-    expect(
-      await env.DB.prepare(
-        "SELECT status,slot_held,intent_json FROM node_additions WHERE operation_id=?",
-      )
-        .bind(decision.operation_id)
-        .first(),
-    ).toMatchObject({ status: "reserved", slot_held: 1 });
-  } finally {
-    if (decision.operation_id)
-      await (await env.ADD_NODE.get(decision.operation_id)).terminate();
-  }
+  expect(decision).toMatchObject({
+    action: "capacity_wait",
+    operation_id: null,
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) count FROM node_additions WHERE region_id=?",
+    )
+      .bind(f.region)
+      .first("count"),
+  ).toBe(0);
 });

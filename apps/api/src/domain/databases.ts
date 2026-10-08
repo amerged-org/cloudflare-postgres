@@ -5,6 +5,7 @@ import {
   type DatabaseResize,
   databaseMemoryReservationMib,
   databaseCpuReservationMillicores,
+  postgresCpuRequestMillicores,
   newDatabaseId,
   newOperationId,
   newRolePassword,
@@ -14,7 +15,10 @@ import {
 import { ApiError } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import { assertProjectAccess, getAuth } from "../middleware/auth.ts";
-import { withIdempotency } from "../middleware/idempotency.ts";
+import {
+  withIdempotency,
+  type IdempotencyLease,
+} from "../middleware/idempotency.ts";
 import { page } from "../platform/pagination.ts";
 import { keyring } from "../crypto/keyring.ts";
 import {
@@ -32,6 +36,8 @@ import { runNodeCapacity, startupPlacementNodes } from "./node-capacity.ts";
 import {
   startupHeadroomSql,
   startupReservationStatement,
+  nodeCpuHeadroomSql,
+  databaseCpuChargeSql,
 } from "./startup-admission.ts";
 import {
   generateMaintenanceCredential,
@@ -121,9 +127,9 @@ export function databaseInsertStatement(
             AND ${startupHeadroomSql()}
             AND ${nodeMemoryReservationGuard("n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?")}
             AND n.platform_reserved_cpu_millicores IS NOT NULL
-            AND n.allocatable_cpu_millicores-n.platform_reserved_cpu_millicores-COALESCE((SELECT SUM(sc.cpu_millicores+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.cpu_millicores+?
+            AND ${nodeCpuHeadroomSql()}
             AND n.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.storage_gib
-            AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=? AND s.max_connections=?
+            AND s.memory_mib=? AND s.storage_gib=? AND s.cpu_millicores=? AND COALESCE(s.cpu_request_millicores,s.cpu_millicores)=? AND s.max_connections=?
             AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=? AND (${snapshot.authority?.sql ?? "1=1"})`,
     )
     .bind(
@@ -140,11 +146,10 @@ export function databaseInsertStatement(
       ...nodePlacementBindings(Date.parse(snapshot.now)),
       SIDECAR.requestMemoryMib,
       SIDECAR.requestMemoryMib,
-      SIDECAR.requestCpuMillicores,
-      SIDECAR.requestCpuMillicores,
       snapshot.size.memory_mib,
       snapshot.size.storage_gib,
       snapshot.size.cpu_millicores,
+      postgresCpuRequestMillicores(snapshot.size),
       snapshot.size.max_connections,
       snapshot.size.sleep_after_seconds,
       snapshot.size.archive_timeout_seconds,
@@ -287,7 +292,7 @@ export async function createDatabase(
                     reserved_memory_mib:
                       size.memory_mib + SIDECAR.requestMemoryMib,
                     reserved_cpu_millicores:
-                      size.cpu_millicores + SIDECAR.requestCpuMillicores,
+                      databaseCpuReservationMillicores(size),
                     storage_allocated_bytes: size.storage_gib * 2 ** 30,
                   }),
               id,
@@ -343,7 +348,51 @@ export function databaseResizeStatement(
   row: DatabaseRow,
   size: SizeRow,
   now: string,
+  authority?: DatabaseInsertSnapshot["authority"],
 ): D1PreparedStatement {
+  if (row.desired_state === "suspended")
+    return db
+      .prepare(
+        `UPDATE databases SET size_class_id=?,generation=generation+1,observed_generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
+       WHERE id=? AND project_id=? AND generation=? AND size_class_id=? AND updated_at=? AND node_id IS ?
+         AND desired_state='suspended' AND observed_state='provisioning' AND observed_generation=generation
+         AND observed_power='hibernated' AND power_operation IS ? AND suspension_reason IS ? AND deleted_at IS NULL
+         AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
+         AND EXISTS(SELECT 1 FROM size_classes old WHERE old.id=databases.size_class_id
+           AND ${databaseCpuChargeSql("databases", "old")}=0)
+         AND EXISTS(SELECT 1 FROM size_classes target WHERE target.id=? AND target.enabled=1
+           AND target.storage_gib=(SELECT storage_gib FROM size_classes WHERE id=databases.size_class_id)
+           AND target.memory_mib=? AND target.cpu_millicores=? AND COALESCE(target.cpu_request_millicores,target.cpu_millicores)=?
+           AND target.storage_gib=? AND target.max_connections=? AND target.sleep_after_seconds IS ?
+           AND target.archive_timeout_seconds=? AND target.backup_retention_days=?
+           AND (COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=databases.region_id),'reserved')='reserved'
+             OR EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=databases.region_id
+               AND target.memory_mib BETWEEN 256 AND p.maximum_database_memory_mib AND target.memory_mib%256=0
+               AND p.postgres_memory_request_mib BETWEEN 1 AND target.memory_mib)))
+         AND (${authority?.sql ?? "1=1"})`,
+      )
+      .bind(
+        size.id,
+        now,
+        row.id,
+        row.project_id,
+        row.generation,
+        row.size_class_id,
+        row.updated_at,
+        row.node_id,
+        row.power_operation ?? null,
+        row.suspension_reason ?? null,
+        size.id,
+        size.memory_mib,
+        size.cpu_millicores,
+        postgresCpuRequestMillicores(size),
+        size.storage_gib,
+        size.max_connections,
+        size.sleep_after_seconds,
+        size.archive_timeout_seconds,
+        size.backup_retention_days,
+        ...(authority?.bindings ?? []),
+      );
   return db
     .prepare(
       `UPDATE databases SET size_class_id=?,generation=generation+1,observed_state='provisioning',status_message=NULL,updated_at=?
@@ -356,10 +405,11 @@ export function databaseResizeStatement(
           AND n.storage_gib_total IS NOT NULL AND n.platform_reserved_cpu_millicores IS NOT NULL
           AND s.storage_gib=(SELECT old.storage_gib FROM size_classes old WHERE old.id=databases.size_class_id)
           AND ${nodeMemoryReservationGuard("n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?")}
-          AND n.allocatable_cpu_millicores-n.platform_reserved_cpu_millicores-COALESCE((SELECT SUM(sc.cpu_millicores+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.cpu_millicores+?
+          AND ${nodeCpuHeadroomSql("n", "s", "databases")}
           AND n.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.id<>databases.id AND d.observed_state<>'deleted'),0)>=s.storage_gib
-          AND s.memory_mib=? AND s.cpu_millicores=? AND s.storage_gib=? AND s.max_connections=?
-          AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?)`,
+          AND s.memory_mib=? AND s.cpu_millicores=? AND COALESCE(s.cpu_request_millicores,s.cpu_millicores)=? AND s.storage_gib=? AND s.max_connections=?
+          AND s.sleep_after_seconds IS ? AND s.archive_timeout_seconds=? AND s.backup_retention_days=?)
+      AND (${authority?.sql ?? "1=1"})`,
     )
     .bind(
       size.id,
@@ -374,181 +424,246 @@ export function databaseResizeStatement(
       ...nodePlacementBindings(Date.parse(now)),
       SIDECAR.requestMemoryMib,
       SIDECAR.requestMemoryMib,
-      SIDECAR.requestCpuMillicores,
-      SIDECAR.requestCpuMillicores,
       size.memory_mib,
       size.cpu_millicores,
+      postgresCpuRequestMillicores(size),
       size.storage_gib,
       size.max_connections,
       size.sleep_after_seconds,
       size.archive_timeout_seconds,
       size.backup_retention_days,
+      ...(authority?.bindings ?? []),
     );
+}
+
+/** The API and central profile rollout share the same atomic resize and startup admission. */
+export async function scheduleDatabaseResize(
+  db: D1Database,
+  row: DatabaseRow,
+  targetId: string,
+  now: string,
+  lease?: IdempotencyLease,
+  authority?: DatabaseInsertSnapshot["authority"],
+): Promise<string> {
+  if (
+    row.deleted_at !== null ||
+    !["running", "suspended"].includes(row.desired_state)
+  )
+    throw new ApiError("conflict", "Database is deleted");
+  const [previous, target] = await Promise.all([
+    db
+      .prepare("SELECT * FROM size_classes WHERE id=?")
+      .bind(row.size_class_id)
+      .first<SizeRow>(),
+    db
+      .prepare("SELECT * FROM size_classes WHERE id=?")
+      .bind(targetId)
+      .first<SizeRow>(),
+  ]);
+  if (
+    !previous ||
+    !target ||
+    (target.id !== previous.id && target.enabled !== 1)
+  )
+    throw new ApiError("invalid_request", "Size class unavailable");
+  if (!(await databaseMemoryPolicyAllows(db, row.region_id, target.memory_mib)))
+    throw new ApiError(
+      "invalid_request",
+      "Size class exceeds the configured per-database memory maximum",
+    );
+  if (target.storage_gib !== previous.storage_gib)
+    throw new ApiError(
+      "invalid_request",
+      target.storage_gib < previous.storage_gib
+        ? "Storage shrink is not supported"
+        : "Storage-changing resize is not supported",
+    );
+  const sleeping = row.desired_state === "suspended";
+  const op = newOperationId();
+  if (target.id === previous.id) {
+    await db
+      .prepare(
+        `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at)
+       SELECT ?,'database.resize','succeeded',project_id,id,generation,?,?,? FROM databases
+       WHERE id=? AND project_id=? AND generation=? AND size_class_id=? AND updated_at=? AND deleted_at IS NULL
+         AND desired_state=? AND observed_state=? AND observed_generation=generation
+         AND EXISTS(SELECT 1 FROM projects WHERE id=databases.project_id AND deleted_at IS NULL)
+       ON CONFLICT DO NOTHING`,
+      )
+      .bind(
+        op,
+        now,
+        now,
+        now,
+        row.id,
+        row.project_id,
+        row.generation,
+        row.size_class_id,
+        row.updated_at,
+        row.desired_state,
+        row.observed_state,
+      )
+      .run();
+    const existing = await db
+      .prepare(
+        `SELECT o.id FROM operations o JOIN databases d ON d.id=o.database_id AND d.project_id=o.project_id
+       WHERE o.database_id=? AND o.project_id=? AND o.kind='database.resize' AND o.generation=?
+         AND d.generation=? AND d.size_class_id=? AND d.desired_state=? AND d.deleted_at IS NULL`,
+      )
+      .bind(
+        row.id,
+        row.project_id,
+        row.generation,
+        row.generation,
+        row.size_class_id,
+        row.desired_state,
+      )
+      .first<{ id: string }>();
+    if (!existing)
+      throw new ApiError("conflict", "Database changed; retry the request");
+    if (lease)
+      await lease
+        .completeStatement(existing.id, 202, {
+          sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
+          bindings: [existing.id, row.project_id],
+        })
+        .run();
+    return existing.id;
+  }
+  if (
+    row.observed_generation !== row.generation ||
+    row.node_id === null ||
+    (sleeping
+      ? row.observed_state !== "provisioning" ||
+        row.observed_power !== "hibernated"
+      : row.observed_state !== "ready")
+  )
+    throw new ApiError("conflict", "Database configuration is not ready");
+  if (!sleeping) {
+    const node = (await placementNodes(db, row.region_id)).find(
+      (value) => value.id === row.node_id,
+    );
+    if (
+      !node ||
+      !choosePlacement(
+        [
+          {
+            ...node,
+            reserved_memory_mib:
+              node.reserved_memory_mib - databaseMemoryReservationMib(previous),
+            reserved_cpu_millicores:
+              node.reserved_cpu_millicores -
+              databaseCpuReservationMillicores(previous),
+            reserved_storage_gib:
+              node.reserved_storage_gib - previous.storage_gib,
+          },
+        ],
+        row.region_id,
+        target,
+        Date.parse(now),
+        row.node_id,
+      )
+    )
+      throw new ApiError(
+        "capacity_exhausted",
+        "Current node has insufficient memory, CPU or storage",
+      );
+  }
+  const generation = row.generation + 1;
+  const statements = [
+    databaseResizeStatement(db, row, target, now, authority),
+    db
+      .prepare(
+        `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at)
+       SELECT ?,'database.resize','pending',project_id,id,generation,?,? FROM databases
+       WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND size_class_id=?`,
+      )
+      .bind(op, now, now, row.id, row.project_id, generation, target.id),
+  ];
+  if (!sleeping)
+    statements.push(
+      startupReservationStatement(db, {
+        databaseId: row.id,
+        operationId: op,
+        generation,
+        nodeId: row.node_id,
+        now,
+      }),
+    );
+  statements.push(
+    db
+      .prepare(
+        `UPDATE operations SET status='failed',error_code='superseded',error_message='Resource configuration superseded',updated_at=?,completed_at=?
+     WHERE database_id=? AND project_id=? AND kind='database.resize' AND generation<? AND status IN('pending','running')
+       AND EXISTS(SELECT 1 FROM databases d JOIN operations current ON current.database_id=d.id AND current.project_id=d.project_id
+         WHERE d.id=operations.database_id AND d.generation=? AND d.size_class_id=? AND d.updated_at=?
+           AND current.id=? AND current.generation=d.generation AND current.kind='database.resize')`,
+      )
+      .bind(
+        now,
+        now,
+        row.id,
+        row.project_id,
+        generation,
+        generation,
+        target.id,
+        now,
+        op,
+      ),
+  );
+  if (lease)
+    statements.push(
+      lease.completeStatement(op, 202, {
+        sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
+        bindings: [op, row.project_id],
+      }),
+    );
+  const result = await db.batch(statements);
+  if (result[0]!.meta.changes !== 1) {
+    const current = await db
+      .prepare("SELECT * FROM databases WHERE id=?")
+      .bind(row.id)
+      .first<DatabaseRow>();
+    if (
+      !current ||
+      current.generation !== row.generation ||
+      current.desired_state !== row.desired_state ||
+      current.size_class_id !== row.size_class_id ||
+      current.updated_at !== row.updated_at ||
+      sleeping
+    )
+      throw new ApiError("conflict", "Database changed; retry the request");
+    throw new ApiError(
+      "capacity_exhausted",
+      "Current node capacity changed; retry the request",
+    );
+  }
+  return op;
 }
 
 export async function resizeDatabase(
   c: ApiContext,
   id: string,
   body: DatabaseResize,
+  expectedGeneration?: number,
 ): Promise<Response> {
   await databaseForRequest(c, id, true);
   return withIdempotency(c, {
     replay: (op, status) => databaseOperationResponse(c, op, status),
     execute: async (lease) => {
       const row = await databaseForRequest(c, id, true);
-      if (row.deleted_at !== null || row.desired_state !== "running")
-        throw new ApiError("conflict", "Database is not running");
-      const [previous, target] = await Promise.all([
-        c.env.DB.prepare("SELECT * FROM size_classes WHERE id=?")
-          .bind(row.size_class_id)
-          .first<SizeRow>(),
-        c.env.DB.prepare("SELECT * FROM size_classes WHERE id=?")
-          .bind(body.size_class_id)
-          .first<SizeRow>(),
-      ]);
       if (
-        !previous ||
-        !target ||
-        (target.id !== previous.id && target.enabled !== 1)
+        expectedGeneration !== undefined &&
+        row.generation !== expectedGeneration
       )
-        throw new ApiError("invalid_request", "Size class unavailable");
-      if (
-        !(await databaseMemoryPolicyAllows(
-          c.env.DB,
-          row.region_id,
-          target.memory_mib,
-        ))
-      )
-        throw new ApiError(
-          "invalid_request",
-          "Size class exceeds the configured per-database memory maximum",
-        );
-      if (target.storage_gib < previous.storage_gib)
-        throw new ApiError(
-          "invalid_request",
-          "Storage shrink is not supported",
-        );
-      if (target.storage_gib !== previous.storage_gib)
-        throw new ApiError(
-          "invalid_request",
-          "Storage-changing resize is not supported",
-        );
-      const now = new Date().toISOString();
-      if (target.id === previous.id) {
-        const op = newOperationId();
-        await c.env.DB.prepare(
-          `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at,completed_at)
-          SELECT ?,'database.resize','succeeded',project_id,id,generation,?,?,? FROM databases
-          WHERE id=? AND project_id=? AND generation=? AND size_class_id=? AND updated_at=? AND deleted_at IS NULL
-            AND desired_state='running' AND observed_state='ready' AND observed_generation=generation
-            AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
-          ON CONFLICT DO NOTHING`,
-        )
-          .bind(
-            op,
-            now,
-            now,
-            now,
-            id,
-            row.project_id,
-            row.generation,
-            row.size_class_id,
-            row.updated_at,
-          )
-          .run();
-        const existing = await c.env.DB.prepare(
-          `SELECT o.id FROM operations o JOIN databases d ON d.id=o.database_id AND d.project_id=o.project_id
-          WHERE o.database_id=? AND o.project_id=? AND o.kind='database.resize' AND o.generation=?
-            AND d.generation=? AND d.size_class_id=? AND d.desired_state='running' AND d.deleted_at IS NULL`,
-        )
-          .bind(
-            id,
-            row.project_id,
-            row.generation,
-            row.generation,
-            row.size_class_id,
-          )
-          .first<{ id: string }>();
-        if (!existing)
-          throw new ApiError("conflict", "Database changed; retry the request");
-        await lease
-          .completeStatement(existing.id, 202, {
-            sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
-            bindings: [existing.id, row.project_id],
-          })
-          .run();
-        return databaseOperationResponse(c, existing.id);
-      }
-      if (
-        row.observed_state !== "ready" ||
-        row.observed_generation !== row.generation ||
-        row.node_id === null
-      )
-        throw new ApiError("conflict", "Database configuration is not ready");
-      const node = (await placementNodes(c.env.DB, row.region_id)).find(
-        (value) => value.id === row.node_id,
+        throw new ApiError("conflict", "Database generation changed");
+      const op = await scheduleDatabaseResize(
+        c.env.DB,
+        row,
+        body.size_class_id,
+        new Date().toISOString(),
+        lease,
       );
-      if (
-        !node ||
-        !choosePlacement(
-          [
-            {
-              ...node,
-              reserved_memory_mib:
-                node.reserved_memory_mib -
-                databaseMemoryReservationMib(previous),
-              reserved_cpu_millicores:
-                node.reserved_cpu_millicores -
-                databaseCpuReservationMillicores(previous),
-              reserved_storage_gib:
-                node.reserved_storage_gib - previous.storage_gib,
-            },
-          ],
-          row.region_id,
-          target,
-          Date.parse(now),
-          row.node_id,
-        )
-      )
-        throw new ApiError(
-          "capacity_exhausted",
-          "Current node has insufficient memory, CPU or storage",
-        );
-      const op = newOperationId();
-      const generation = row.generation + 1;
-      const result = await c.env.DB.batch([
-        databaseResizeStatement(c.env.DB, row, target, now),
-        c.env.DB.prepare(
-          `INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at)
-          SELECT ?,'database.resize','pending',project_id,id,generation,?,? FROM databases
-          WHERE changes()=1 AND id=? AND project_id=? AND generation=? AND size_class_id=?`,
-        ).bind(op, now, now, id, row.project_id, generation, target.id),
-        startupReservationStatement(c.env.DB, {
-          databaseId: id,
-          operationId: op,
-          generation,
-          nodeId: row.node_id,
-          now,
-        }),
-        lease.completeStatement(op, 202, {
-          sql: "EXISTS(SELECT 1 FROM operations WHERE id=? AND project_id=?)",
-          bindings: [op, row.project_id],
-        }),
-      ]);
-      if (result[0]!.meta.changes !== 1) {
-        const current = await databaseForRequest(c, id, true);
-        if (
-          current.generation !== row.generation ||
-          current.desired_state !== row.desired_state ||
-          current.size_class_id !== row.size_class_id ||
-          current.updated_at !== row.updated_at
-        )
-          throw new ApiError("conflict", "Database changed; retry the request");
-        throw new ApiError(
-          "capacity_exhausted",
-          "Current node capacity changed; retry the request",
-        );
-      }
       hint(c, row.region_id, [id]);
       return databaseOperationResponse(c, op);
     },

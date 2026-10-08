@@ -57,6 +57,23 @@ import {
   loadRegionJoinBundle,
   loadCurrentRegionMaterialReference,
 } from "../crypto/bootstrap-credentials.ts";
+import { readNodeStorageObservation } from "../domain/node-storage.ts";
+
+export async function getNodeStorage(
+  c: ApiContext,
+  id: string,
+): Promise<Response> {
+  await requireScope(c, "admin");
+  const row = await c.env.DB.prepare("SELECT region_id FROM nodes WHERE id=?")
+    .bind(id)
+    .first<{ region_id: string }>();
+  if (!row) throw new ApiError("not_found", "Node not found");
+  return c.json({
+    node_id: id,
+    region_id: row.region_id,
+    sample: await readNodeStorageObservation(c.env.DB, row.region_id, id),
+  });
+}
 
 export const NodeCapacityPolicy = NodeRegionPolicy.safeExtend({
   autoscale_enabled: z.boolean().default(false),

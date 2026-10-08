@@ -17,8 +17,15 @@ export const QUOTA_SLOTS = 2;
 
 export type SizeResources = Pick<
   DesiredSize,
-  "memory_mib" | "cpu_millicores" | "storage_gib"
+  "memory_mib" | "cpu_millicores" | "cpu_request_millicores" | "storage_gib"
 >;
+
+/** Scheduling CPU for PostgreSQL; legacy classes request their full hard limit. */
+export function postgresCpuRequestMillicores(
+  size: Pick<SizeResources, "cpu_millicores" | "cpu_request_millicores">,
+): number {
+  return size.cpu_request_millicores ?? size.cpu_millicores;
+}
 
 /** Memory a placed database reserves on its node: PostgreSQL plus the sidecar request. */
 export function databaseMemoryReservationMib(
@@ -28,9 +35,9 @@ export function databaseMemoryReservationMib(
 }
 
 export function databaseCpuReservationMillicores(
-  size: Pick<SizeResources, "cpu_millicores">,
+  size: Pick<SizeResources, "cpu_millicores" | "cpu_request_millicores">,
 ): number {
-  return size.cpu_millicores + SIDECAR.requestCpuMillicores;
+  return postgresCpuRequestMillicores(size) + SIDECAR.requestCpuMillicores;
 }
 
 export interface ResourceQuotaMath {
@@ -43,11 +50,10 @@ export interface ResourceQuotaMath {
   pods: number;
 }
 
-/** PostgreSQL runs with requests = limits; the sidecar request and limit differ. */
+/** Quotas allow independent PostgreSQL scheduling requests and hard limits. */
 export function resourceQuotaFor(size: SizeResources): ResourceQuotaMath {
   return {
-    requestsCpuMillicores:
-      QUOTA_SLOTS * (size.cpu_millicores + SIDECAR.requestCpuMillicores),
+    requestsCpuMillicores: QUOTA_SLOTS * databaseCpuReservationMillicores(size),
     limitsCpuMillicores:
       QUOTA_SLOTS * (size.cpu_millicores + SIDECAR.limitCpuMillicores),
     requestsMemoryMib:

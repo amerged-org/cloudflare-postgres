@@ -22,7 +22,7 @@ function input() {
     id,
     provider: "contabo",
     provider_region: "test",
-    gateway_url: `https://${["gateway", "invalid"].join(".")}`,
+    gateway_url: `https://${["gateway", "invalid"].join(".")}/pg`,
     backup_bucket: "b-" + crypto.randomUUID(),
     backup_endpoint_url: `https://${["archive", "invalid"].join(".")}`,
   };

@@ -26,6 +26,17 @@ describe("observation ordering on real Workers D1", () => {
       id = created.database.id,
       sampledAt = new Date(Date.now() - 10 * 60_000).toISOString(),
       receivedAfter = new Date().toISOString();
+    const nodeUid = await env.DB.prepare(
+      "SELECT node_uid FROM nodes WHERE id=?",
+    )
+      .bind(f.node)
+      .first<string>("node_uid");
+    const providerInstanceId = String(
+      100_000_000 + crypto.getRandomValues(new Uint32Array(1))[0]!,
+    );
+    await env.DB.prepare("UPDATE nodes SET provider_instance_id=? WHERE id=?")
+      .bind(providerInstanceId, f.node)
+      .run();
     const response = await request("/agent/v1/observations", f.agent, "POST", {
       ...observedBody(
         [
@@ -37,6 +48,9 @@ describe("observation ordering on real Workers D1", () => {
         [
           {
             name: f.nodeName,
+            node_id: f.node,
+            node_uid: nodeUid,
+            provider_instance_id: providerInstanceId,
             ready: true,
             allocatable_memory_mib: 4096,
             allocatable_cpu_millicores: 2000,

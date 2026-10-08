@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   DesiredDatabase,
+  DesiredSize,
   DesiredResponse,
   ObservationRequest,
   ServerLinkMessage,
@@ -23,6 +24,27 @@ const backupEndpoint = new URL(
   "/",
   `https://${["r2", "example", "com"].join(".")}`,
 ).origin;
+
+it("validates separate scheduling CPU without changing legacy desired sizes", () => {
+  const size = desired().size as Record<string, unknown>;
+  expect(DesiredSize.parse(size)).toEqual(size);
+  expect(
+    DesiredSize.parse({
+      ...size,
+      cpu_millicores: 250,
+      cpu_request_millicores: 25,
+    }).cpu_request_millicores,
+  ).toBe(25);
+  for (const request of [0, -1, 0.5, 251]) {
+    expect(
+      DesiredSize.safeParse({
+        ...size,
+        cpu_millicores: 250,
+        cpu_request_millicores: request,
+      }).success,
+    ).toBe(false);
+  }
+});
 
 function desired(): Record<string, unknown> {
   return {

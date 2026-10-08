@@ -1,18 +1,213 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import test from "node:test";
-import { SIDECAR } from "@pgcf/contracts";
+import { SIDECAR, type RecoverySourceCredentialsMap } from "@pgcf/contracts";
 import {
   recoveryFixture,
   crossRegionRecoveryFixture,
 } from "./recovery-fixture.ts";
 import { Reconciler } from "../../src/agent/reconcile.ts";
+import { recoveryBuildContext } from "../../src/agent/recovery.ts";
 import {
   buildDatabaseManifests,
   restoreAdministrationPassword,
 } from "../../src/agent/builders/index.ts";
 import { record } from "../../src/agent/types.ts";
 import { MemoryKubernetes, metrics, authenticate } from "./fixtures.ts";
+
+test("API source credentials build separate read and write Secrets without a regional source Secret", async (t) => {
+  const { db, ctx, source } = crossRegionRecoveryFixture(),
+    k8s = new MemoryKubernetes();
+  t.mock.method(k8s, "read", async () => {
+    throw new Error("source_credentials_must_come_from_api");
+  });
+  const context = await recoveryBuildContext(db, ctx, k8s, {
+    [source.region_id]: {
+      bucket: source.bucket,
+      endpoint_url: source.endpoint_url,
+      access_key_id: "api-source-read-key",
+      secret_access_key: "api-source-read-secret",
+    },
+  });
+  assert.deepEqual(context.recoverySource?.credentials, {
+    accessKeyId: "api-source-read-key",
+    secretAccessKey: "api-source-read-secret",
+  });
+  assert.deepEqual(context.backup.credentials, ctx.backup.credentials);
+  const manifests = buildDatabaseManifests(db, context);
+  const credentials = (name: string) =>
+    record(
+      manifests.find((o) => o.kind === "Secret" && o.metadata.name === name)
+        ?.data,
+    );
+  assert.equal(
+    Buffer.from(
+      String(credentials("recovery-source-credentials").AWS_ACCESS_KEY_ID),
+      "base64",
+    ).toString(),
+    "api-source-read-key",
+  );
+  assert.equal(
+    Buffer.from(
+      String(credentials("archive-credentials").AWS_ACCESS_KEY_ID),
+      "base64",
+    ).toString(),
+    "target-write-key",
+  );
+});
+
+test("missing or malformed explicit source maps never fall back to a regional Secret or target write keys", async (t) => {
+  const { db, ctx, source } = crossRegionRecoveryFixture(),
+    k8s = new MemoryKubernetes();
+  const sources = {
+    [source.region_id]: {
+      bucket: source.bucket,
+      endpoint_url: source.endpoint_url,
+      access_key_id: "legacy-source-read-key",
+      secret_access_key: "legacy-source-read-secret",
+    },
+  };
+  k8s.put({
+    apiVersion: "v1",
+    kind: "Secret",
+    metadata: { name: "pgcf-restore-source-s3", namespace: "pgcf-system" },
+    data: {
+      "sources.json": Buffer.from(JSON.stringify(sources)).toString("base64"),
+    },
+  });
+  const read = t.mock.method(k8s, "read");
+  for (const explicit of [
+    {},
+    { "other-region": sources[source.region_id] },
+    {
+      [source.region_id]: {
+        ...sources[source.region_id],
+        bucket: ctx.backup.bucket,
+      },
+    },
+    {
+      [source.region_id]: {
+        ...sources[source.region_id],
+        endpoint_url: ctx.backup.endpointUrl,
+      },
+    },
+    {
+      [source.region_id]: {
+        ...sources[source.region_id],
+        secret_access_key: "invalid\nsecret",
+      },
+    },
+    null,
+    [],
+  ]) {
+    await assert.rejects(
+      recoveryBuildContext(
+        db,
+        ctx,
+        k8s,
+        explicit as unknown as RecoverySourceCredentialsMap,
+      ),
+      /^Error: recovery_source_credentials_unavailable$/,
+    );
+  }
+  assert.equal(read.mock.callCount(), 0);
+  const legacy = await recoveryBuildContext(db, ctx, k8s);
+  assert.equal(read.mock.callCount(), 1);
+  assert.deepEqual(legacy.recoverySource?.credentials, {
+    accessKeyId: "legacy-source-read-key",
+    secretAccessKey: "legacy-source-read-secret",
+  });
+  assert.equal(k8s.mutations, 0);
+});
+
+test("rotated API source credentials update the existing per-database Secret after generation advances", async () => {
+  const { db, ctx, source } = crossRegionRecoveryFixture(),
+    k8s = new MemoryKubernetes();
+  const sources = {
+    [source.region_id]: {
+      bucket: source.bucket,
+      endpoint_url: source.endpoint_url,
+      access_key_id: "api-source-read-key",
+      secret_access_key: "api-source-read-secret",
+    },
+  };
+  const reconciler = () =>
+    new Reconciler(
+      k8s,
+      new AbortController().signal,
+      Date.now,
+      metrics,
+      authenticate,
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      async () => false,
+    );
+  const firstContext = await recoveryBuildContext(db, ctx, k8s, sources);
+  await reconciler().reconcile(db, firstContext);
+  const namespace = `pgcf-db-${db.id}`;
+  const original = await k8s.read(
+      "Secret",
+      namespace,
+      "recovery-source-credentials",
+    ),
+    originalArchive = await k8s.read(
+      "Secret",
+      namespace,
+      "archive-credentials",
+    ),
+    originalAdmin = await k8s.read("Secret", namespace, "restore-superuser");
+  assert.ok(original);
+  assert.ok(originalArchive);
+  assert.ok(originalAdmin);
+  sources[source.region_id]!.access_key_id = "rotated-api-source-read-key";
+  sources[source.region_id]!.secret_access_key =
+    "rotated-api-source-read-secret";
+  db.generation++;
+  const rotatedContext = await recoveryBuildContext(db, ctx, k8s, sources);
+  assert.deepEqual(rotatedContext.recoverySource?.credentials, {
+    accessKeyId: "rotated-api-source-read-key",
+    secretAccessKey: "rotated-api-source-read-secret",
+  });
+  await reconciler().reconcile(db, rotatedContext);
+  const rotated = await k8s.read(
+    "Secret",
+    namespace,
+    "recovery-source-credentials",
+  );
+  assert.equal(rotated?.metadata.uid, original.metadata.uid);
+  assert.notEqual(
+    rotated?.metadata.resourceVersion,
+    original.metadata.resourceVersion,
+  );
+  assert.equal(
+    Buffer.from(
+      String(record(rotated?.data).AWS_ACCESS_KEY_ID),
+      "base64",
+    ).toString(),
+    "rotated-api-source-read-key",
+  );
+  assert.equal(
+    Buffer.from(
+      String(record(rotated?.data).AWS_SECRET_ACCESS_KEY),
+      "base64",
+    ).toString(),
+    "rotated-api-source-read-secret",
+  );
+  assert.deepEqual(
+    (await k8s.read("Secret", namespace, "archive-credentials"))?.data,
+    originalArchive?.data,
+  );
+  assert.deepEqual(
+    (await k8s.read("Secret", namespace, "restore-superuser"))?.data,
+    originalAdmin?.data,
+  );
+  assert.equal(
+    await k8s.read("Secret", "pgcf-system", "pgcf-restore-source-s3"),
+    null,
+  );
+});
 
 test("cross-region recovery uses separately bound source credentials and exact endpoint egress", () => {
   const { db, ctx, source } = crossRegionRecoveryFixture();

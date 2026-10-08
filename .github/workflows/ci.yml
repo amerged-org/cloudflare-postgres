@@ -67,6 +67,7 @@ jobs:
         run: |
           pnpm test
           node --test infra/talos/publish-storage-capacity.test.ts
+          node --test infra/platform/release-candidate.test.ts
           node --test scripts/ci/*.test.ts
       - name: Render the Kubernetes manifests
         run: |

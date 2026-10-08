@@ -3,6 +3,14 @@ import { z } from "zod";
 import { gatewayActivityReportSchema } from "./gateway-activity.ts";
 import { UsageSample } from "./usage.ts";
 import { ProviderInstanceId } from "./nodes.ts";
+import { FleetDesiredRelease } from "./releases.ts";
+import { RecoverySourceCredentialsMap } from "./region-archive-sources.ts";
+import { NodeStorageSample } from "./node-physical-storage.ts";
+export { RecoverySourceCredentialsMap } from "./region-archive-sources.ts";
+export {
+  NodePhysicalStorage,
+  NodeStorageSample,
+} from "./node-physical-storage.ts";
 import {
   BucketName,
   HttpsUrl,
@@ -80,6 +88,8 @@ export const DesiredSize = z
     /** Explicit startup request for an actual-RAM region; the class remains the hard memory limit. */
     memory_request_mib: z.number().int().positive().max(1048576).optional(),
     cpu_millicores: z.number().int().min(100),
+    /** CPU scheduling share; cpu_millicores remains the hard limit. */
+    cpu_request_millicores: z.number().int().positive().max(256_000).optional(),
     storage_gib: z.number().int().min(1),
     max_connections: z.number().int().min(10),
     archive_timeout_seconds: z.number().int().min(30),
@@ -92,6 +102,15 @@ export const DesiredSize = z
     {
       message:
         "PostgreSQL startup memory request cannot exceed its class limit",
+    },
+  )
+  .refine(
+    (size) =>
+      size.cpu_request_millicores === undefined ||
+      size.cpu_request_millicores <= size.cpu_millicores,
+    {
+      path: ["cpu_request_millicores"],
+      message: "PostgreSQL CPU request cannot exceed its class limit",
     },
   );
 export type DesiredSize = z.infer<typeof DesiredSize>;
@@ -119,21 +138,6 @@ export const RecoverySourceArchive = z.strictObject({
   region: z.literal("auto"),
 });
 export type RecoverySourceArchive = z.infer<typeof RecoverySourceArchive>;
-const ArchiveCredential = z
-  .string()
-  .min(1)
-  .max(4096)
-  .refine((value) => !/[\r\n\0]/.test(value));
-/** Operator-installed regional read credentials; never included in agent desired state. */
-export const RecoverySourceCredentialsMap = z.record(
-  RegionId,
-  z.strictObject({
-    bucket: BucketName,
-    endpoint_url: HttpsUrl,
-    access_key_id: ArchiveCredential,
-    secret_access_key: ArchiveCredential,
-  }),
-);
 
 export const DesiredRecovery = z.strictObject({
   operation_id: OperationId,
@@ -282,6 +286,8 @@ export type DesiredDatabase = z.infer<typeof DesiredDatabase>;
 
 export const DesiredRegion = z.strictObject({
   id: RegionId,
+  /** Authenticated target-region-only source-read custody; omission preserves legacy installations. */
+  recovery_sources: RecoverySourceCredentialsMap.optional(),
   backup: z.strictObject({
     bucket: BucketName,
     endpoint_url: z.url({ protocol: /^https$/ }),
@@ -314,6 +320,7 @@ export type DesiredRegion = z.infer<typeof DesiredRegion>;
 export const DesiredResponse = z
   .strictObject({
     region: DesiredRegion,
+    fleet_release: FleetDesiredRelease.optional(),
     databases: z.array(DesiredDatabase).max(DESIRED_PAGE_LIMIT_MAX),
     next: DatabaseId.nullable(),
   })
@@ -378,6 +385,7 @@ export const NodeObservation = z.strictObject({
   storage_gib_total: Count.nullable(),
   platform_reserved_memory_mib: Count,
   platform_reserved_cpu_millicores: Count.nullable().optional(),
+  storage: NodeStorageSample.optional(),
 });
 export type NodeObservation = z.infer<typeof NodeObservation>;
 

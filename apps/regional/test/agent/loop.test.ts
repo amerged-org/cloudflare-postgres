@@ -14,29 +14,10 @@ import {
   authenticate,
 } from "./fixtures.ts";
 
-test("a cross-region restore selects only its exact configured source-read map before reconciliation", async (t) => {
+test("a cross-region restore selects only its exact API source-read map before reconciliation", async (t) => {
   const { db, ctx, source } = crossRegionRecoveryFixture(),
     k8s = new MemoryKubernetes();
   k8s.backupSecret(ctx);
-  const secret = (endpoint = source.endpoint_url) =>
-    k8s.put({
-      apiVersion: "v1",
-      kind: "Secret",
-      metadata: { name: "pgcf-restore-source-s3", namespace: "pgcf-system" },
-      data: {
-        "sources.json": Buffer.from(
-          JSON.stringify({
-            [source.region_id]: {
-              bucket: source.bucket,
-              endpoint_url: endpoint,
-              access_key_id: "source-read-key",
-              secret_access_key: "source-read-secret",
-            },
-          }),
-        ).toString("base64"),
-      },
-    });
-  secret();
   const observed: unknown[] = [];
   t.mock.method(
     Reconciler.prototype,
@@ -53,6 +34,14 @@ test("a cross-region restore selects only its exact configured source-read map b
         bucket: ctx.backup.bucket,
         endpoint_url: ctx.backup.endpointUrl,
         region: "auto" as const,
+      },
+      recovery_sources: {
+        [source.region_id]: {
+          bucket: source.bucket,
+          endpoint_url: source.endpoint_url,
+          access_key_id: "source-read-key",
+          secret_access_key: "source-read-secret",
+        },
       },
     },
     databases: [db],
@@ -75,12 +64,11 @@ test("a cross-region restore selects only its exact configured source-read map b
     (observed[0] as typeof ctx).backup.credentials,
     ctx.backup.credentials,
   );
-  secret("https://foreign.r2.cloudflarestorage.com");
+  desired.region.recovery_sources[source.region_id]!.endpoint_url =
+    "https://foreign.r2.cloudflarestorage.com";
   await run();
   assert.equal(observed.length, 1);
-  k8s.resources.delete(
-    k8s.key("Secret", "pgcf-system", "pgcf-restore-source-s3"),
-  );
+  desired.region.recovery_sources = {};
   await run();
   assert.equal(observed.length, 1);
   assert.equal(k8s.mutations, 0);

@@ -2,6 +2,14 @@
 
 Approved: **2026-10-05**. **The target architecture is approved; implementation and live acceptance are pending.**
 
+Owner correction (2026-10-08): the [unified control/capacity/release plan](cloudflare-convergence-and-serverless-plan.md)
+now requires the actual-use resource model and uniform three-server patching as part of completion.
+Earlier clauses preserving full sleeping CPU and logical disk reservations are superseded below.
+The Rust implementation and its measured first-read target remain required and unaccepted.
+The owner also explicitly requires Neon's **shared pool of prestarted, unassigned compute**.
+Per-database warm reclaim is an additional mode; it cannot substitute for that pool or satisfy
+its acceptance. The earlier database-bound-only interpretation is withdrawn.
+
 [PLAN.md](../../PLAN.md) remains the canonical scope, roadmap and phase-status record. This document describes the approved architecture and its migration boundaries. It does not claim that the Rust components, routing caches, Actor snapshots or warm-reclaim runtime already exist. Completed Dev results and measured limits belong in PLAN.md Status, not in separate per-change evidence documents.
 
 ## 1. Decision and purpose
@@ -12,7 +20,11 @@ The migration combines a native runtime with changes to the connection and lifec
 
 Measurements validate this chosen architecture, establish its operating limits and guide subsequent improvements. Profiling is not a prerequisite for the Rust decision. Rust itself does not remove PostgreSQL startup, Kubernetes scheduling, network round trips or the memory occupied by a running database.
 
-The latency objective is **a first successful read below one second on the prepared or warm runtime path**, including the normal client connection and authentication path. True Pod-cold startup is measured and reported separately. This is a target for Dev acceptance, not an existing service guarantee.
+The latency objective is **a first successful read below one second when a sleeping database
+is assigned a prestarted unassigned compute from the shared pool**, including ordinary client
+connection and authentication. Already-running warm connections, optional warm reclaim and pool
+miss/on-demand startup are separate measurements. Warm-only success does not satisfy the pool-hit
+target. This is a required Dev acceptance target, not an existing service guarantee.
 
 ## 2. Current implementation and evidence
 
@@ -46,13 +58,144 @@ The portable core is shared by native applications and the Wasm Edge. It contain
 
 Pin the Rust toolchain, dependency lockfile, build inputs and runtime-image digests when implementing the components. Retain upstream notices in THIRD_PARTY.md. Extend the existing single CI workflow with Rust build, conformance, tests and image qualification rather than introducing a second workflow or a language/load test matrix.
 
-## 4. Transfer Neon's prepared-compute principle
+## 4. Required shared prestarted compute pool
 
-Neon's cold-start work prepares compute before a user asks for it, avoids unchanged configuration work, caches connection targets and improves activation notification. Its published result is a reference for those architectural choices, not a latency guarantee for this installation. See [Cold starts just got hot](https://neon.com/blog/cold-starts-just-got-hot) and the pinned [proxy compute connection implementation](https://github.com/neondatabase/neon/blob/fa504217c61bbcaf5c512d75830564541f917f8f/proxy/src/compute/mod.rs#L269-L318).
+The target follows the three mechanisms described in Neon's
+[Cold starts just got hot](https://neon.com/blog/cold-starts-just-got-hot): start unassigned
+compute before demand, apply configuration only when needed, and shorten routing/readiness work.
+Neon described a pool of empty computes receiving an endpoint configuration on assignment, with
+replenishment/recycling and slower on-demand fallback on a pool miss. Its historical latency
+results are reference measurements, not a guarantee for PGCF.
 
-Our database's data remains on its own local PGDATA volume. An unassigned running PostgreSQL process cannot become any customer's database merely by receiving configuration. The prepared compute therefore remains **bound to the same database, Cluster, Pod and PVC**. This transfers the useful preparation principle while retaining the approved storage and recovery architecture.
+**PGCF must implement a shared pool.** Keeping one PostgreSQL process or Pod alive for every idle
+database is not this mechanism. Neither an image cache, spare CPU, pre-pulled containers nor a
+pool of database client connections counts as a prestarted compute pool.
 
-The prepared path keeps PostgreSQL running and its Pod present. It can be always warm or have cold memory pages reclaimed while idle. CNPG remains responsible for the database process, roles, probes, backups and Pod lifecycle; no parallel first-party PostgreSQL supervisor is introduced.
+### Pool and assignment contract
+
+- Cloudflare owns desired ready-slot count, a hard maximum idle-pool resource budget, supported
+  resource/release profiles, maximum slot age, refill policy and observed inventory per region.
+  The regional Rust controller prepares actual isolated runtime environments before any customer
+  request. Each ready slot has an immutable identity and selected release, and is unassigned to
+  any customer or database. Pool size follows bounded regional demand, not the number of sleeping DBs.
+- On a request for an idle database, the existing Actor/lifecycle path atomically claims one
+  compatible ready slot and coalesces other requests for that database. The claim binds region,
+  node, runtime identity, database ID, storage generation, configuration revision and expiry.
+  An uncertain claim is reconciled; two databases cannot own one runtime or one writer volume.
+- The assigned runtime receives the current effective configuration and scoped credentials,
+  connects to the database's actual persistent storage, starts/activates its PostgreSQL instance,
+  and publishes readiness only after the existing storage, TLS, role and fence checks pass.
+  Pool readiness is distinct from database readiness. Unchanged persistent configuration is not
+  reapplied; a new runtime still receives and validates its own identity-bound configuration.
+- Refill happens outside the request's critical path. Empty old-release or aged slots are retired
+  and replaced automatically. Idle pool memory/CPU is real node usage, included in physical
+  capacity and76% calculations; it is not a permanent per-customer reservation.
+- After tenant use, destroy the tenant-bound execution instance before preparing a clean slot.
+  Never return a process with another tenant's memory, credentials, mounts or PostgreSQL state
+  to the unassigned pool. A VM/snapshot optimization may later be accepted only with equivalent
+  proven reset isolation. No shared customer PostgreSQL process is introduced by this requirement.
+- A pool miss follows the bounded ordinary start path and is explicitly measured as a miss.
+  Do not conceal miss rate, add a new VPS merely to fill an idle pool, or present its latency as
+  a pool hit. Explicit suspension continues to require an authorized resume.
+
+### Required storage and CNPG integration work
+
+Neon's storage/compute separation is an enabling architecture, described in its
+[architecture decisions](https://neon.com/blog/architecture-decisions-in-neon). PGCF currently has
+unmodified PostgreSQL with CNPG-owned lifecycle and local PGDATA/PVCs. That is a real integration
+constraint to solve, not a reason to replace the requested pool with per-database warm reclaim.
+
+The first implementation stage must produce a working late-binding contract between a prestarted,
+unassigned runtime and a retained database volume. With local data, candidate slots must be on
+nodes eligible to access that data; a regional pool can have node-affine subsets. No arbitrary US
+slot can use EU local storage. Do not hot-swap PGDATA beneath a running PostgreSQL process, attempt
+to mutate an already running Pod's volume specification, or create an empty replacement database. Kubernetes documents the
+[Pod update restrictions](https://kubernetes.io/docs/concepts/workloads/pods/#pod-update-and-replacement);
+CNPG documents its [instance-manager ownership](https://cloudnative-pg.io/docs/devel/instance_manager/).
+Verify the exact pinned versions during integration; these constraints cannot be waived by a pool label.
+
+Prove which runtime boundary can be prepared before assignment and how CNPG owns the resulting
+PostgreSQL process, Pod identity, storage, backup and recovery throughout that binding. Merely
+creating the ordinary database Pod after a cache hit is insufficient unless the claimed prepared
+runtime actually removes the expensive preparation and passes the pool-hit timing gate.
+
+Unmodified PostgreSQL, customer isolation, retained data, CNPG ownership and no EU reinstall remain
+constraints. If the current CNPG/local-volume integration cannot support the required assignment,
+record the concrete incompatibility and the required runtime/storage architecture change as
+blocking implementation work. Do not silently retain incompatible constraints while marking the
+pool complete, and do not replace the pool target with an easier warm-only benchmark. A wholesale
+Neon Pageserver/Safekeeper deployment is not presumed necessary or already authorized by this plan.
+
+### Pinned runtime-boundary findings
+
+The pinned CNPG1.30.1/[CNPG-I0.6.0](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/go.mod)
+integration has no supported operation that assigns an already running generic Pod to a Cluster.
+[Instance Pods](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/specs/pods.go)
+are created with Cluster-derived names, namespace, environment and the retained instance PVC.
+[Hibernation resume](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/controller/cluster_create.go)
+creates a new instance Pod; an existing name causes reconciliation rather than adoption.
+The [instance manager](https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/cmd/manager/instance/run/cmd.go)
+starts with a fixed Cluster/Pod/namespace/PGDATA identity. CNPG-I's
+[operator lifecycle hook](https://github.com/cloudnative-pg/cnpg-i/blob/v0.6.0/proto/operator_lifecycle.proto)
+can patch a proposed Pod, including its RuntimeClass, before normal Kubernetes creation. It does
+not provide a late PVC-attachment or instance-manager rebinding RPC. Kubernetes1.36.5 also
+[waits for attachment and mounting before invoking its container runtime](https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/kubelet/kubelet.go#L2195-L2241).
+A generic Pod waiting for an unbound tenant PVC therefore cannot be counted as a running slot.
+
+The smallest compatible candidate puts the prepared runtime **below Pod identity**, at the CRI
+sandbox/VM boundary. CNPG still creates the actual database Pod and owns its unchanged instance
+manager, PVC and backup sidecar. A qualified runtime would exclusively assign a previously
+booted, tenant-free sandbox to that Pod, then accept its exact mounts and configuration before
+starting PostgreSQL. [Kata3.32.0 QEMU VMCache](https://github.com/kata-containers/kata-containers/blob/3.32.0/docs/how-to/what-is-vm-cache-and-how-do-I-use-it.md)
+is an upstream example of this boundary; its
+[factory implementation](https://github.com/kata-containers/kata-containers/blob/3.32.0/src/runtime/virtcontainers/factory/factory_linux.go)
+resumes and assigns a blank VM and refills the cache separately. This is a candidate to qualify,
+not an accepted implementation or a latency result. Its empty-cache receive is blocking, so
+PGCF's bounded miss fallback and claim/slot observation contract still need implementation.
+
+The [Talos1.14.1 extension source](https://github.com/siderolabs/extensions/blob/515779a55c15b43088e89b17432181891115cbdf/container-runtime/kata-containers/pkg.yaml)
+provides `kata` and `kata-qemu` handlers, but installs the containerd shim rather than the
+`kata-runtime factory` executable and supervised cache service. A qualified data-preserving
+extension/configuration upgrade is required for that candidate. QEMU VMCache requires KVM;
+the newer Kata Rust runtime's feature support must be checked independently, rather than
+assuming the Go-runtime factory is present. First-party PGCF runtime components remain Rust.
+
+The bounded October8 capability observation found no `/dev/kvm` character device through verified
+host `/dev` mounts on any of the three retained nodes. A separate read of guest-visible
+`/proc/cpuinfo` in those existing node-driver containers found neither `vmx` nor `svm`; each reported
+four CPUs matching its Node capacity. Node/Cluster/driver/DaemonSet identities and template images
+remained stable before and after; no workload, host or provider write occurred. Contabo's
+[Cloud VPS documentation](https://docs.contabo.com/docs/servers-hosting/vps/) and
+[nested-virtualization support policy](https://help.contabo.com/en/support/solutions/articles/103000271595-can-i-setup-nested-virtualization-on-my-server-)
+explicitly exclude nested virtualization for VPS, including the Plus family. Installing a Talos
+extension therefore cannot make this KVM-based candidate work on the retained V159 fleet.
+
+Retaining those VPS requires a software-only prestarted sandbox factory below the CNPG Pod
+boundary, with an actual CRI/network/storage late-binding integration and the same isolation and
+latency proof. The pinned
+[containerd2.3.5 RunPodSandbox path](https://github.com/containerd/containerd/blob/v2.3.5/internal/cri/server/sandbox_run.go#L52-L165)
+requires Pod metadata, generates a new sandbox ID and persists that Pod configuration before
+starting the sandbox; calling it for placeholder Pods is not a later-assignment operation.
+The software-only factory is required research/implementation work, not an existing
+containerd/runc capability or an accepted design. The other direction requires a separately
+approved move to virtualization-capable hardware; the current V159 purchase authorization does
+not authorize it. Neither direction permits silently replacing the shared pool with per-database
+warm retention. No pool state may be reported ready from these findings.
+
+### Required pool acceptance
+
+Start real unassigned slots before requests, then take at least two different hibernated databases
+with no running per-database compute and assign them distinct slots from the shared inventory.
+Preserve their committed data and isolation. Prove refill, assignment after a configuration change,
+concurrent claims, controller restart, expired/uncertain claim, mixed-release rejection, exhaustion
+fallback and clean destruction after use. The data path must never point to a previous tenant.
+
+Measure twenty independent five-minute-idle pool-hit activations through normal Cloudflare SQL,
+with connect_ms and first_read_ms from the same initial timestamp, plus separate30/120-minute
+idle soaks. Show slot creation/readiness timestamps preceding the request, actual per-database
+compute absence before assignment, slot/volume identities, resource use, hit/miss rate and refill
+time. The subsecond first-read target applies to this path. A same-Pod warm/reclaim result cannot
+replace it. Implementation and these real checks are required to complete the workstream.
 
 ## 5. Runtime states and idle policy
 
@@ -61,8 +204,8 @@ The prepared path keeps PostgreSQL running and its Pod present. It can be always
 | `active` | PostgreSQL, its bound Pod and Barman run | Normal authenticated work |
 | Always warm | The same running runtime remains available during idle periods | Normal warm connection; no reclaim or automatic hard sleep |
 | `warm_idle` | The same PostgreSQL process and Pod run; selected cold memory pages may be reclaimed | Admission revokes further reclaim; the kernel brings back the pages actually needed |
-| `waking` | Activation or verification is executing | Wait for the matching verified ready observation |
-| `hibernated` | CNPG has removed the database Pods; PVC/local LVM data remains | Existing complete Pod-cold wake sequence |
+| `waking` | A compatible prestarted pool slot is being claimed/bound, or the measured on-demand fallback is starting | Wait for the matching verified database-ready observation |
+| `hibernated` | No per-database compute runs; persistent volume/data remains | Claim an eligible shared pool slot; use bounded on-demand fallback on a recorded pool miss |
 | Explicitly `suspended` | Integrator/owner admission block with real CNPG hibernation | Refuse connections until an explicit authorized resume |
 
 `warm_idle` is not a stopped database, a frozen process or zero resident memory. Kernel page-in on access is not restoration of a process snapshot. Host filesystem cache may survive real hibernation, but no cache-retention guarantee is made.
@@ -166,7 +309,10 @@ The later module must define and verify both client-facing and backend authentic
 
 Successful proxy-side authentication cannot bypass PostgreSQL's authentication or the target/fence guards. No authentication change is bundled into the first gateway port, and no connection pooling or uncertain-write replay is introduced as an incidental consequence.
 
-## 12. Warm reclaim and the node-local reclaimer
+## 12. Additional warm reclaim and the node-local reclaimer
+
+This mode is additional to the required shared compute pool in section4. It may optimize an
+already assigned idle runtime; it is not pool implementation or evidence for pool-hit latency.
 
 Warm reclaim retains the same database Pod and PostgreSQL process while asking the kernel to recover selected cold memory pages. Talos encrypted swap and optional zswap provide the approved OS path. Do not assume that a custom zram service is available or required. See the pinned [Talos SwapVolumeConfig](https://github.com/siderolabs/talos/blob/v1.14.1/pkg/machinery/config/types/block/swap_volume_config.go) and [ZswapConfig](https://github.com/siderolabs/talos/blob/v1.14.1/pkg/machinery/config/types/block/zswap_config.go).
 
@@ -186,7 +332,11 @@ The next admitted connection or authenticated early wake revokes the reclaim int
 
 Warm-reclaim classes explicitly configure **PostgreSQL memory request below its memory limit**. Set this resource policy once when creating or deliberately converting the class. Do not patch requests on every idle entry/exit: CNPG resource changes can replace the Pod and defeat same-runtime warm wake.
 
-The memory limit remains the size class. The initial PGCF placement reservation also remains the full approved size-class reservation plus platform/sidecar requirements. A lower Kubernetes request is not permission to silently reduce the operator's placement reservation or overcommit a node. Ordinary classes retain their established policy.
+The PostgreSQL memory ceiling remains explicit. Under the current owner-approved actual-use model,
+placement uses fresh physical headroom and bounded simultaneous-start admission. CPU request and
+burst limit are separate; confirmed Pod-cold hibernation releases active compute accounting.
+Warm-idle PostgreSQL/Barman Pods remain alive and retain honest scheduling demand and measured
+usage. Lower requests alone do not implement safe wake admission or resource accounting.
 
 The total Pod already includes a Barman sidecar whose request and limit differ; Pod QoS alone does not establish that the PostgreSQL container can use the intended swap allowance. Verify the actual PostgreSQL request/limit, kubelet LimitedSwap policy, container swap limits and exclusions. The pinned [Kubernetes 1.36 swap documentation](https://v1-36.docs.kubernetes.io/docs/concepts/cluster-administration/swap-memory-management/) is the baseline for this verification.
 
@@ -196,7 +346,11 @@ Before enabling reclaim, verify encrypted swap, free disk capacity, actual node/
 
 Warm idle continues to count as awake/running compute. Report active, warm-idle and hibernated durations separately alongside reserved resources, actual resident memory, swap/zswap observations, page-in behavior and named measurement gaps.
 
-Reduced resident memory does not mean zero RAM, lower placement reservation, accepted higher customer density or a lower monthly VPS invoice. Reservation/density changes require a later explicit capacity decision with wake admission evidence. Prices and billing remain integrator concerns. New paid nodes and production changes still require the owner's explicit costed approval.
+Reduced resident memory does not mean zero RAM or accepted higher density. The owner has now
+required removal of permanent sleeping compute and blanket logical-disk reservations; implement
+that model with atomic wake admission, physical storage headroom and real density evidence.
+Prices and billing remain integrator concerns. Existing V159 purchase permission must be encoded
+in the finite Cloudflare policy; do not invent unlimited numeric authority.
 
 ## 13. Early wake and readiness
 
@@ -210,12 +364,16 @@ Report actual runtime activation separately from time between the user's applica
 
 Implement the approved architecture in this order:
 
+0. **Shared pool/storage integration:** prove and implement the prestarted unassigned-runtime
+   boundary and data/CNPG late binding from section4. Resolve incompatibilities explicitly; the
+   pool must not be dropped or replaced by warm reclaim. This informs the controller contract.
 1. **Rust gateway:** preserve current contracts, authentication passthrough, protocol behavior and persisted fences; qualify the image and live Dev route.
-2. **Rust controller and bootstrap relay:** replace the full regional Node server implementation, add targeted desired-state execution and bounded event-driven work, and preserve all persisted progress.
+2. **Rust controller and bootstrap relay:** replace the full regional Node server implementation; implement shared-slot preparation, exclusive assignment, refill, retirement and observations alongside targeted desired-state execution; preserve persisted progress.
 3. **Warm routing and fingerprints:** publish identity-bound direct targets, separate configuration and activity/power revisions, and implement same-runtime attestations.
 4. **Rust/Wasm Edge and Actor snapshots:** preserve real VPC HTTP/unopened-WebSocket forwarding and add the mutation barrier plus versioned route snapshots/tokens.
-5. **Warm-reclaim Dev acceptance:** configure one approved resource class/node policy and deploy the scoped reclaimer; measure safety, memory and first-read latency.
-6. **Later independent work:** proxy SCRAM, process/VM snapshot research and optional native CLI stream handling.
+5. **Shared-pool Dev acceptance:** execute the section4 multi-database, isolation, refill, restart, exhaustion and subsecond pool-hit first-read checks.
+6. **Additional warm-reclaim acceptance:** configure an approved resource/node policy and measure its separate same-runtime behavior; it cannot close the pool gate.
+7. **Later independent work:** proxy SCRAM, process/VM snapshot research and optional native CLI stream handling.
 
 The controller handoff retains a single reconciler per region. Use the existing `Recreate` ownership model, stop the previous process and confirm termination on a reachable node before starting its replacement. Do not force-delete an uncertain old Pod and allow two executors during a partition. Resume from current Cloudflare desired state and the existing storage/power/fence records; preserve credential Secret UIDs and versions when unchanged.
 
@@ -242,7 +400,10 @@ Use the same pinned driver/client settings, source region, database class and en
 
 Record p50/p95/max, all sample outcomes and the exact versions/digests. Twenty samples use the existing nearest-rank percentile definition; they are bounded Dev acceptance, not a production p99 or latency guarantee.
 
-For the warm-reclaim series, run **twenty independent cycles with five minutes of idle time before each first connection/read**. Each cycle proves the intended idle/reclaim state, same Pod/container/process and Cluster/PVC/storage identities, committed-marker preservation, rollback absence and actual memory/swap observations. Close the client and independently re-establish the next idle cycle. Compare with twenty always-warm fresh connections using the same connect/first-read definitions.
+The mandatory shared-pool series is specified in section4. Pool hits, pool misses, already-warm
+and warm-reclaim activations have separate labels and results.
+
+For the additional warm-reclaim series, run **twenty independent cycles with five minutes of idle time before each first connection/read**. Each cycle proves the intended idle/reclaim state, same Pod/container/process and Cluster/PVC/storage identities, committed-marker preservation, rollback absence and actual memory/swap observations. Close the client and independently re-establish the next idle cycle. Compare with twenty always-warm fresh connections using the same connect/first-read definitions.
 
 Add separate **30-minute and 120-minute idle soaks**, followed by the same first connection/read and safety checks. These longer soaks expose pages brought back by probes, Barman, background activity and kernel behavior; they are not a concurrency/class/language matrix. Keep true Pod-cold samples separate and independently prove removed/replaced Pods.
 
@@ -252,12 +413,19 @@ Measure resident memory and swap/zswap before reclaim, after idle and after the 
 
 Correlate client, Edge/Actor, controller, Kubernetes/PostgreSQL and gateway stages by database, operation, revision and Pod identity. Use local monotonic durations and retain explicit gaps between different clocks. Distinguish configuration work, runtime verification, publication, network/TLS/authentication and memory page-in; do not add phase percentiles or compare different timer endpoints.
 
-The first successful read below one second on the prepared/warm path remains the target to validate. If a run misses it, retain the chosen Rust architecture, record the measured result and identify the remaining constraint. Do not relabel Pod-cold activation, omitted query time or a preload-only result as a successful warm-path measurement. Completed outcomes are recorded in PLAN.md Status.
+The first successful read below one second after assigning a shared prestarted compute remains
+the required pool-hit target. Already-warm/reclaim measurements are additional evidence. If a run misses it, retain the chosen Rust architecture, record the measured result and identify the remaining constraint. Do not relabel Pod-cold activation, omitted query time or a preload-only result as a successful warm-path measurement. Completed outcomes are recorded in PLAN.md Status.
 
 ## 16. Later research boundaries
 
 Freezing a process, CRIU/container checkpoints and microVM snapshots are separate compute-lifecycle research. Warm reclaim does not require them and does not imply that their socket, storage, credential, WAL or runtime-restoration problems have been solved.
 
-A generic interchangeable compute pool would require a different treatment of database state than the current local PGDATA/PVC architecture. No Pageserver/Safekeeper equivalent, branching, shared PostgreSQL runtime, compute autoscaling or reduced sleeping placement reservation is introduced by this migration.
+The shared prestarted compute pool is required work in section4, not later research. Its local
+storage/CNPG assignment constraints must be resolved as part of implementation. A complete Neon
+Pageserver/Safekeeper storage replacement, branching, a shared tenant PostgreSQL process and
+per-database automatic compute resizing are not implied by the pool requirement. Any additional
+architecture change required for correct late binding must be identified and resolved explicitly.
 
-The approved near-term architecture is a native Rust regional stack and full Rust/Wasm Edge, with prepared runtime bound to each database, honest warm-idle resource accounting, versioned admission/routing proofs and safe hard hibernation when requested by policy or explicit suspension.
+The approved target is a native Rust regional stack and full Rust/Wasm Edge, with a shared pool
+of prestarted unassigned compute, configuration-aware assignment, cached verified routing and
+safe hibernation. Warm reclaim remains an additional optimization for an assigned runtime.

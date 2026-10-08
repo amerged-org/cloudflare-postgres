@@ -144,6 +144,46 @@ beforeEach(async () => {
 
 afterEach(() => db.close());
 
+it("adds separate scheduling CPU without rewriting legacy limits and rejects invalid storage", () => {
+  db.exec(
+    readFileSync(
+      new URL(
+        "../../../apps/api/migrations/0024_cpu_request_policy.sql",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  expect(
+    db
+      .prepare(
+        "SELECT cpu_millicores, cpu_request_millicores FROM size_classes WHERE id='small'",
+      )
+      .get(),
+  ).toEqual({ cpu_millicores: 500, cpu_request_millicores: null });
+  run("UPDATE size_classes SET cpu_request_millicores=25 WHERE id='small'");
+  expect(
+    db
+      .prepare(
+        "SELECT cpu_request_millicores FROM size_classes WHERE id='small'",
+      )
+      .get(),
+  ).toEqual({ cpu_request_millicores: 25 });
+  for (const request of [0, -1, 0.5, 501]) {
+    expect(() =>
+      run(
+        "UPDATE size_classes SET cpu_request_millicores=? WHERE id='small'",
+        request,
+      ),
+    ).toThrow();
+  }
+  expect(() =>
+    run(
+      "UPDATE size_classes SET cpu_millicores=100, cpu_request_millicores=101 WHERE id='small'",
+    ),
+  ).toThrow();
+});
+
 describe("0001_init.sql", () => {
   it("adds nullable platform CPU measurement without rewriting existing node values", () => {
     const before = db.prepare("SELECT * FROM nodes WHERE id=?").get(nodeId)!;

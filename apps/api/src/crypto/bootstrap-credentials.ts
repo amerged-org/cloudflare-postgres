@@ -229,15 +229,20 @@ function aad(ref: BootstrapCredentialRef, kid: string): Uint8Array {
     ]),
   );
 }
-async function seal(
+interface EncryptedCustodyDocument {
+  kid: string;
+  iv: string;
+  ciphertext: string;
+}
+async function sealDocument(
   secret: string,
-  ref: BootstrapCredentialRef,
+  identity: (kid: string) => Uint8Array,
   plaintext: string,
-): Promise<EncryptedBootstrapCredential> {
+): Promise<EncryptedCustodyDocument> {
   const ring = keys(secret),
     kid = ring.active,
-    iv = crypto.getRandomValues(new Uint8Array(12));
-  const value = utf8(plaintext, BOOTSTRAP_PLAINTEXT_MAX_BYTES);
+    iv = crypto.getRandomValues(new Uint8Array(12)),
+    value = utf8(plaintext, BOOTSTRAP_PLAINTEXT_MAX_BYTES);
   try {
     const key = await crypto.subtle.importKey(
       "raw",
@@ -250,14 +255,13 @@ async function seal(
       {
         name: "AES-GCM",
         iv,
-        additionalData: Uint8Array.from(aad(ref, kid)),
+        additionalData: Uint8Array.from(identity(kid)),
         tagLength: 128,
       },
       key,
       Uint8Array.from(value),
     );
     return {
-      ...ref,
       kid,
       iv: bytesToBase64url(iv),
       ciphertext: bytesToBase64url(new Uint8Array(ciphertext)),
@@ -266,19 +270,11 @@ async function seal(
     throw new CustodyError("unavailable");
   }
 }
-async function open(
+async function openDocument(
   secret: string,
-  ref: BootstrapCredentialRef,
-  input: EncryptedBootstrapCredential,
+  identity: (kid: string) => Uint8Array,
+  encrypted: EncryptedCustodyDocument,
 ): Promise<string> {
-  const encrypted = valid(Envelope, input);
-  if (
-    encrypted.version !== ref.version ||
-    encrypted.region_id !== ref.region_id ||
-    encrypted.purpose !== ref.purpose ||
-    encrypted.revision !== ref.revision
-  )
-    throw new CustodyError("invalid");
   const iv = base64urlToBytes(encrypted.iv),
     ciphertext = base64urlToBytes(encrypted.ciphertext);
   if (
@@ -303,7 +299,7 @@ async function open(
       {
         name: "AES-GCM",
         iv: Uint8Array.from(iv),
-        additionalData: Uint8Array.from(aad(ref, encrypted.kid)),
+        additionalData: Uint8Array.from(identity(encrypted.kid)),
         tagLength: 128,
       },
       key,
@@ -316,6 +312,73 @@ async function open(
     throw new CustodyError("invalid");
   }
 }
+async function seal(
+  secret: string,
+  ref: BootstrapCredentialRef,
+  plaintext: string,
+): Promise<EncryptedBootstrapCredential> {
+  return {
+    ...ref,
+    ...(await sealDocument(secret, (kid) => aad(ref, kid), plaintext)),
+  };
+}
+async function open(
+  secret: string,
+  ref: BootstrapCredentialRef,
+  input: EncryptedBootstrapCredential,
+): Promise<string> {
+  const encrypted = valid(Envelope, input);
+  if (
+    encrypted.version !== ref.version ||
+    encrypted.region_id !== ref.region_id ||
+    encrypted.purpose !== ref.purpose ||
+    encrypted.revision !== ref.revision
+  )
+    throw new CustodyError("invalid");
+  return openDocument(secret, (kid) => aad(ref, kid), encrypted);
+}
+function documentIdentity(
+  scope: readonly (string | number)[],
+  kid: string,
+): Uint8Array {
+  if (
+    !scope.length ||
+    scope.length > 8 ||
+    scope.some((value) =>
+      typeof value === "string"
+        ? !value || value.length > 512
+        : !Number.isSafeInteger(value),
+    )
+  )
+    throw new CustodyError("invalid");
+  return encoder.encode(
+    JSON.stringify(["pgcf-custody-document/v1", ...scope, kid]),
+  );
+}
+/** Uses the same rotating credential keyring; caller binds the complete domain identity. */
+export function encryptCustodyDocument(
+  secret: string,
+  scope: readonly (string | number)[],
+  plaintext: string,
+) {
+  return sealDocument(secret, (kid) => documentIdentity(scope, kid), plaintext);
+}
+export function decryptCustodyDocument(
+  secret: string,
+  scope: readonly (string | number)[],
+  encrypted: EncryptedCustodyDocument,
+) {
+  valid(
+    z.strictObject({
+      kid: KeyId,
+      iv: z.string().max(16),
+      ciphertext: z.string().max(CIPHERTEXT_MAX_CHARS),
+    }),
+    encrypted,
+  );
+  return openDocument(secret, (kid) => documentIdentity(scope, kid), encrypted);
+}
+
 function agentKey(ref: BootstrapCredentialRef, key: string): string {
   if (
     typeof key !== "string" ||

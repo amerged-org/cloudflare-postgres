@@ -17,6 +17,59 @@ const identifier = (value: string) => {
 const policyMode = (region: string) =>
   `COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=${region}),'reserved')`;
 
+/** A configured scheduling share consumes CPU until the owned runtime is confirmed stopped. */
+export function databaseCpuChargeSql(
+  databaseAlias = "d",
+  sizeAlias = "s",
+  acceptingStopInCurrentBatch = false,
+): string {
+  const database = identifier(databaseAlias),
+    size = identifier(sizeAlias);
+  // The observation batch records its lifecycle fact before completing this exact owned stop.
+  // Both commit together; ordinary admission always requires the completed operation.
+  const completed =
+    "cold_operation.status='succeeded' AND cold_operation.completed_at IS NOT NULL";
+  const stopStatus = acceptingStopInCurrentBatch
+    ? `(cold_operation.status IN('pending','running') OR (${completed}))`
+    : `(${completed})`;
+  return `(CASE WHEN ${database}.desired_state='suspended'
+    AND ${database}.observed_state='provisioning' AND ${database}.observed_power='hibernated'
+    AND ${database}.observed_generation=${database}.generation AND ${database}.deleted_at IS NULL
+    AND EXISTS(SELECT 1 FROM operations cold_operation WHERE cold_operation.id=${database}.power_operation
+      AND cold_operation.database_id=${database}.id AND cold_operation.project_id=${database}.project_id
+      AND cold_operation.generation<=${database}.generation AND ${stopStatus}
+      AND ((${database}.suspension_reason='manual' AND cold_operation.kind='database.suspend')
+        OR (${database}.suspension_reason='idle' AND cold_operation.kind='database.hibernate')))
+    THEN 0 ELSE COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)+${SIDECAR.requestCpuMillicores} END)`;
+}
+
+/** Every start competes in the same atomic SQL budget, including waking an existing database. */
+export function nodeCpuHeadroomSql(
+  nodeAlias = "n",
+  sizeAlias = "s",
+  excludeDatabaseAlias?: string,
+): string {
+  const node = identifier(nodeAlias),
+    size = identifier(sizeAlias),
+    excluded =
+      excludeDatabaseAlias === undefined
+        ? ""
+        : `AND cpu_database.id<>${identifier(excludeDatabaseAlias)}.id`,
+    target = `COALESCE(${size}.cpu_request_millicores,${size}.cpu_millicores)`;
+  return `(${node}.ready=1 AND ${node}.schedulable=1 AND ${node}.lost_at IS NULL AND ${node}.node_uid IS NOT NULL
+    AND julianday(${node}.last_observed_at)>=julianday('now','-180 seconds')
+    AND julianday(${node}.last_observed_at)<=julianday('now','+5 seconds')
+    AND typeof(${node}.allocatable_cpu_millicores)='integer' AND ${node}.allocatable_cpu_millicores BETWEEN 1 AND ${maximumInteger}
+    AND typeof(${node}.platform_reserved_cpu_millicores)='integer'
+    AND ${node}.platform_reserved_cpu_millicores BETWEEN 0 AND ${node}.allocatable_cpu_millicores
+    AND typeof(${target})='integer' AND ${target} BETWEEN 1 AND ${size}.cpu_millicores
+    AND ${node}.allocatable_cpu_millicores-${node}.platform_reserved_cpu_millicores
+      -COALESCE((SELECT SUM(${databaseCpuChargeSql("cpu_database", "cpu_size")})
+        FROM databases cpu_database JOIN size_classes cpu_size ON cpu_size.id=cpu_database.size_class_id
+        WHERE cpu_database.node_id=${node}.id AND cpu_database.observed_state<>'deleted' ${excluded}),0)
+      >=${target}+${SIDECAR.requestCpuMillicores})`;
+}
+
 /** A single startup must fit the permanent physical/allocatable budget even with no concurrent holds. */
 export function startupPhysicalFitSql(
   nodeAlias = "n",
@@ -65,9 +118,10 @@ export function databaseStartupHeadroomSql(
   databaseAlias = "databases",
 ): string {
   const database = identifier(databaseAlias);
-  return `(${policyMode(`${database}.region_id`)}='reserved' OR EXISTS(
+  return `EXISTS(
     SELECT 1 FROM nodes n JOIN size_classes s ON s.id=${database}.size_class_id
-    WHERE n.id=${database}.node_id AND n.region_id=${database}.region_id AND ${startupHeadroomSql()}))`;
+    WHERE n.id=${database}.node_id AND n.region_id=${database}.region_id
+      AND ${nodeCpuHeadroomSql("n", "s", database)} AND ${startupHeadroomSql()})`;
 }
 
 /** Append after the admitted database mutation and its operation INSERT in the same D1 batch.

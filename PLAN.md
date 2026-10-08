@@ -1,6 +1,21 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-08): **Owner-scoped operator completion accepted in Dev: US1 Ready, EU/US database lifecycle and 76% RAM rule passed.**
+Status (2026-10-08, corrected): **Overall product goal NOT achieved. The EU/US database lifecycle and RAM-trigger tests passed; uniform fleet configuration, autonomous rollout, patch management and the approved fast-start architecture remain incomplete.**
+
+The earlier broad completion claim is withdrawn. The owner now requires all three retained
+servers to converge on one approved release, PGCF-owned Cloudflare customer configuration
+managed exclusively through the authenticated API; a PGCF administration UI or dashboard is out of scope,
+no permanent CPU debit for confirmed sleeping databases, no blanket physical allocation of
+logical storage quotas, executable already-granted purchase authority, uniform patch management
+and the fast-start architecture, explicitly including a shared pool of prestarted unassigned
+compute rather than one permanently warm runtime per database. The implementation and acceptance
+sequence is the [unified corrective plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md).
+It supersedes older reservation-preserving and EU-upgrade-deferral clauses. Source implementation
+and live acceptance are tracked separately below; the corrective requirements are not a claim of deployment.
+
+The measured successes below are partial acceptance evidence and remain valid. They are not a
+substitute for the full completion gates in the corrective plan.
+
 
 The original paid US1 reached Cloudflare Ready at16:50:20Z through the owner-authorized operator
 postjoin/admission path in198.356 seconds. Its original purchase, installation, Node/Cluster
@@ -11,7 +26,8 @@ Automatic postjoin admission remains open for the next genuine authorized node p
 report returned HTTP409 before pause, then its proof session renewed without admission. The
 operator resolved a confirmed partial network result before obtaining fresh observations and
 running the existing verifier, quarantine release and finalization. No replacement VPS was
-purchased. EU upgrades and bootstrap-template activation are excluded from this completion.
+purchased. EU upgrades and bootstrap-template activation were deferred during that partial
+acceptance; the current corrective plan requires supported data-preserving convergence.
 
 The database lifecycle passed on both customer nodes through `db.ohmyho.st`, with actual
 PostgreSQL18.6, TLS1.3 and nonsuperuser application roles. EU SQL took2187ms; separate EU restore
@@ -52,12 +68,12 @@ fresh available RAM returned within the recorded baseline tolerance. Both trials
 maximum lifetime. Actual timestamp drift can leave a validly unknown window; do not relax the
 ten-consecutive-minute rule to manufacture an expansion decision.
 
-Autonomous purchases remain disabled: finite standing cost/count/expiry authority is absent;
-current node caps are EU3/US1. Actual allocatable CPU is3000m, with platform reservations EU350m
+Autonomous purchases remain disabled: the existing owner authorization has not been encoded
+in an executable policy with concrete finite cost/count/expiry limits; current test node caps are EU3/US1. Actual allocatable CPU is3000m, with platform reservations EU350m
 and US1510m. The smallest configured database requires250m PostgreSQL plus100m Barman, so CPU
-ceilings are7 EU/4 US minimum-class databases on otherwise empty nodes;22 US projects require
-7700m and110GiB versus1490m/95GiB available. These are configuration ceilings, not demonstrated
-workload density. Existing eligible nodes remain available during expansion; there is no81% stop.
+ceilings in the current rejected allocation model are7 EU/4 US minimum-class databases on
+otherwise empty nodes. That model debits7700m and110GiB for22 US assignments against1490m/95GiB;
+this is not proof of their actual workload requirements or achievable density. Existing eligible nodes remain available during expansion; there is no81% stop.
 
 Actual software differences and the customer handover are documented in
 `docs/operations/operator-installation.md`: Talos1.14.1/kernel6.18.51/containerd2.3.5 match;
@@ -1457,8 +1473,11 @@ defines the warm route cache, direct Pod-IP/TLS path, configuration fingerprints
 
 ### Capacity and placement
 
-A node's allocatable resources are the Kubernetes allocatable values minus a measured platform
-reservation. Storage and CPU keep their hard fit checks, including sleeping assignments.
+A node's allocatable resources are Kubernetes allocatable values minus platform scheduling
+requests; these are not measured continuous CPU consumption. The current implementation still
+charges sleeping assignments for full class CPU and disk sizes. That behavior is rejected by the
+owner and must change through the corrective plan: actual active/pending compute admission and
+physical disk usage, with logical quotas and explicit safety headroom.
 
 Reserved mode is the compatibility default and reserves full PostgreSQL and Barman memory.
 The owner-approved actual-RAM mode uses the node's measured working set divided by physical
@@ -1479,7 +1498,9 @@ steady-state overbooking. Create, restore, wake, resume and running resize atomi
 full target PostgreSQL limit plus Barman's limit during startup. Accepted ready/hibernated/deleted
 observations and a later physical sample settle holds; uncertain starts have no timeout release.
 Pending demand caused only by startup RAM or held starts waits below the 76% rolling purchase threshold.
-CPU/storage exhaustion and an empty customer pool retain their independent capacity path.
+The current implementation also has independent CPU/storage/empty-pool purchase paths. These
+are not the approved ordinary76% RAM trigger and must be removed or explicitly separately
+configured under the corrective plan; do not silently buy because of static class sums.
 
 Changing placement mode or the PostgreSQL request requires either no assigned databases or the
 entire assigned cohort confirmed manually suspended and hibernated at its current generation,
@@ -1775,7 +1796,8 @@ and targeted health/overload checks. Record recovery time and last recoverable t
   PostgreSQL/sidecar peak holds for create, restore, wake, resume and running resize. An accepted
   ready/hibernated/deleted observation plus a later current-UID memory sample settles a hold;
   failed-operation metadata and timeouts do not. Below-76 RAM/start queues do not purchase nodes.
-  Hard CPU/storage exhaustion and absent customer capacity retain their capacity path.
+  The existing below-threshold CPU/storage purchase path is an audited implementation gap;
+  it is superseded by the corrective plan, not an approved hidden purchase trigger.
   Switching placement mode or PostgreSQL request geometry requires an empty assigned live cohort
   and no unsettled starts; unplaced pending demand may remain. Configure actual mode after
   harness cleanup and before customer migration. Existing class assignments must fit the configured
@@ -1896,9 +1918,10 @@ For v1, integrators keep platform databases and latency-sensitive applications r
 Where the application provides enough lead time, authenticated early wake belongs in the
 adopter's application flow. A first-user-action target below one second must be measured in that
 flow; it is not a subsecond cold-start guarantee. CNPG hibernation removes Pods and retains
-volumes. The approved Rust runtime workstream below adds per-database warm idle with bounded
-memory reclaim while keeping the same PostgreSQL process and volume. Warm idle remains awake
-for metering. Shared PostgreSQL processes and process/VM snapshots remain separate later research.
+volumes. The required Rust workstream adds a shared pool of prestarted unassigned compute,
+configuration-aware assignment and verified routing. Per-database warm idle/reclaim is additional
+and cannot satisfy the pool gate; it remains awake for metering. Shared tenant PostgreSQL processes
+and process/VM snapshots remain separate later research.
 
 Build:
 
@@ -1952,8 +1975,9 @@ Build:
 - The current trigger checks resource reservations each minute: after trying pending placements,
   add capacity if a running database remains unplaced or no healthy node can admit the smallest
   enabled size class. CPU/RAM include Barman requests and exclude system/platform reserves;
-  storage uses measured LVM capacity minus existing allocations. Hibernated databases retain
-  reservations. Stale node observations stop purchasing; active additions and node caps prevent
+  storage uses measured LVM capacity minus existing allocations. This historical implementation
+  retains sleeping reservations and is superseded by the actual-use corrective plan.
+  Stale node observations stop purchasing; active additions and node caps prevent
   another reservation. There is no sampled CPU-utilization percentage threshold in v1.
 - Reconcile uncertain provider responses before retrying; a replay must never buy another node.
 - Node caps count live nodes. Marking a node lost frees its slot for a replacement. A matching
@@ -2025,7 +2049,7 @@ the docs.
 
 ### Future node releases and patch management — owner requirement (2026-10-07)
 
-Planned after the current operator live acceptance: provisioning and ongoing upgrades must be
+Required for the overall goal under the current corrective plan: provisioning and ongoing upgrades must be
 one deterministic, programmed lifecycle controlled by Cloudflare, with no AI agent required.
 Bootstrap-image publication alone does not establish acceptance of VPS upgrades.
 
@@ -2060,23 +2084,33 @@ path. Measurements validate the resulting implementation and latency; a CPU prof
 entry gate for this architecture choice. The detailed design is in
 [docs/architecture/rust-runtime-and-cold-starts.md](docs/architecture/rust-runtime-and-cold-starts.md).
 
-Implement in this order, with separate binaries/images in a shared Rust workspace:
+Implement in this order, with separate binaries/images in a shared Rust workspace.
+The shared prestarted compute pool is a mandatory part of this workstream. First prove and
+implement the actual runtime/storage late-binding boundary for CNPG and local volumes; do not
+substitute image caching or per-database warm reclaim if that integration is difficult.
+Cloudflare owns bounded regional ready-slot inventory, release compatibility, exclusive assignment,
+refill/retirement and observations; pooled idle resources count as real platform use.
 
 1. Replace the regional gateway while preserving routing, PostgreSQL/TLS, bounded streams,
    authenticated activity, quiescence and persistent fence contracts.
 2. Replace the regional controller and bootstrap relay. Use targeted desired-state pulls,
    serialized per-database reconciliation, wake-priority queues, Kubernetes watches and immediate
-   database observations; collect inventories, backup statistics and usage independently.
+   database observations; implement shared unassigned compute preparation, exclusive assignment
+   and replenishment. Collect inventories, backup statistics and usage independently.
 3. Publish verified versioned Pod-IP routes with separate TLS identities. Cache them in the
    gateway, bind admission to route revisions, and avoid configuration reapplication when its
    fingerprint and runtime identity are unchanged. A new Pod receives fresh runtime verification.
 4. Move the full Edge Worker to Rust/Wasm while preserving Durable Object bindings, VPC HTTP and
    unopened native WebSocket forwarding. Versioned Actor snapshots and mutation barriers keep D1
    authority while shortening warm admission.
-5. Add a scoped Rust node reclaimer and test `warm_reclaim` on an isolated accepted Dev worker
+5. Prove shared-pool activation of at least two hibernated databases, with slots prepared before
+   their requests, data/tenant isolation, fresh configuration, refill, interruption and pool misses.
+6. Additionally add a scoped Rust node reclaimer and test `warm_reclaim` on an isolated accepted Dev worker
    using encrypted Talos swap/zswap. PostgreSQL, CNPG probes and Barman continue running. Explicit
-   suspend still requires resume; full placement reservations remain unchanged initially.
-6. Separately develop proxy-side SCRAM, snapshot/freezing research and native CLI connection reuse.
+   suspend still requires resume. Apply the newly approved actual-use model: cold-hibernated
+   databases release compute accounting; warm-idle Pods retain honest live demand. Logical storage
+   quotas must not become blanket physical allocations.
+7. Separately develop proxy-side SCRAM, snapshot/freezing research and native CLI connection reuse.
 
 Keep one controller during handoff, preserve persisted execution state and Secrets, and delete
 replaced TypeScript code after successful Dev acceptance. Initial SCRAM remains end to end;
@@ -2085,10 +2119,11 @@ must preserve complete node/orphan inventory; ready notifications follow guarded
 
 Acceptance covers actual Dev SQL, transactions, COPY, role and Pod changes, watch loss, restarts,
 fences and hibernation in the existing single CI/Dev workflow. Measure connection completion and
-first successful read separately. Warm-reclaim acceptance uses twenty independent five-minute
-idle runs and separate thirty-/120-minute soaks. The prepared/warm path targets a first successful
-read below one second; true Pod cold starts are reported separately. This workstream does not
-reopen the accepted v1 latency or claim that the target runtime is already deployed.
+first successful read separately. Shared-pool acceptance uses twenty independent five-minute-idle
+activations and separate thirty-/120-minute soaks, with actual unassigned runtime ready before
+requests and no running per-DB compute. A pool-hit first successful read must be below one second.
+Already-warm/reclaim and pool-miss/on-demand series are separate; they cannot substitute for the
+pool gate. Historical v1 timings are not acceptance of this unimplemented target.
 
 ### Later
 
@@ -2181,7 +2216,7 @@ is distinguished from that target below; selecting Rust is not conditional on a 
 | Edge to region      | VPC HTTP service with unopened native WebSocket forwarding selected in Dev (235 ms capability check); VPC TCP raw streams rejected; signed Tunnel route remains fallback          |
 | Desired state       | Deletion is an explicit tombstone; absence from a pull never deletes; generations only increase and the agent ignores older ones                                                  |
 | Database topology   | One CNPG Cluster with 1 instance per database, namespace per database, pinned to a node                                                                                           |
-| Sleep               | Current: CNPG declarative hibernation. Approved addition: per-database warm reclaim with PostgreSQL running; explicit suspend remains gated until resume.                            |
+| Sleep | Current: CNPG declarative hibernation. Required fast activation: shared prestarted unassigned compute pool with safe data binding. Warm reclaim is additional; explicit suspend stays gated. |
 | Backups             | Barman Cloud plugin to R2; daily base backup, continuous WAL, retention per size class                                                                                            |
 | Metering            | Hourly; derived from lifecycle events, samples and gateway stream counters; no per-minute billing                                                                                 |
 | Budgets             | None in PGCF; integrators suspend and resume                                                                                                                                      |
@@ -2193,7 +2228,8 @@ is distinguished from that target below; selecting Rust is not conditional on a 
 Open questions with defaults:
 
 - **Wake time:** current v1 cold-connect latency is accepted. The Rust workstream measures
-  connect and first read separately, targeting subsecond prepared/warm reads.
+  connect and first read separately, targeting subsecond shared-pool-hit first reads;
+  per-database warm reclaim is additional and cannot replace the shared-pool requirement.
 - **`archive_timeout`:** default 300 s for the smallest class and 60 s for larger ones. R2 Class A
   operations scale with WAL segments.
 - **Sleeping reservation factor:** 1.0 until Phase 4 measurement.
@@ -2240,7 +2276,11 @@ Earlier failed attempts and corrections remain in Git history.
 
 | Date       | Phase                     | Result and measured limits                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| 2026-10-08 | Operator completion accepted | Original US1 Ready via authorized operator postjoin/admission198.356s; programmed1GiB write/read/physical reclaim753.081s. EU/US Cloudflare SQL, TLS1.3/nonsuperuser,4 R2 base/exact-WAL checks and4×5GiB physical deletion passed (20GiB). EU SQL2187ms; separate EU restore108618ms and healthy-source EU→US restore87988ms incl observation pacing. All3 existingEU DBs/source markers/custody preserved. Actual US RAM10 consecutive minutes18:43:01–18:52:04Z79.9062%, stored trigger and continued eligible placement/hard startup checks passed; dry expansion disabled/no purchase. Successful3968MiB load cleanup recovered4,177,731,584B; first missing-minute window correctly refused and cleaned. API/Native2bf CI37778960682 retained; US-onlyRegional115 CI37815727563/digest1886 accepted; EUKube/runtime/templates unchanged. Initialmapping1OAuth+1GET; nonempty30min routinewindow390frames0provider attempts, lifetime total unknown. Automatic postjoin HTTP409/session renewal remains open for next genuine authorized purchase. Rotation/adopter WSS/deadlines/new-ID rebinding/finite purchase caps and22-US capacity are separate migration gates. |
+| 2026-10-08 | ULTRA implementation — local verification, not deployed | CPU requests/limits are separate; confirmed owned cold stops release CPU, while uncertain runtimes retain admission. Atomic create/resize/wake and NodeUID freshness regressions pass. API-only immutable resource profiles now support explicit fan-out through existing operations/cron, cold configuration without wake or CPU recharge, current-proof completion after role/wake changes, superseded outcomes and honest deferred status. Supported region URL/configuration CAS, encrypted target-scoped cross-region archive-read relationships and fleet release assignment/inventory are implemented. Full local API710, contracts164 and Regional442 tests pass, plus4 release-candidate tests; no live policy or purchase activation is inferred. Selected-release generation from versions.lock is candidate-only:10 pinned facts/47 unresolved fields, no fabricated approved release. One final CI/delivery batch remains pending. |
+| 2026-10-08 | Fresh physical storage — retained fleet read only | New collector reached the existing OpenEBS1.10.1 driver through authenticated Kubernetes HTTPS on all3 retained servers; Node/Cluster/Pod/DaemonSet/volume-group identities remained stable. Each VG total103,075,020,800B. US1 free103,075,020,800B/thick0B; EU1 free97,706,311,680B/thick5,368,709,120B; control free92,337,602,560B/thick10,737,418,240B. All thin_pool:null and dm_thin_pool unloaded. Optional identity/freshness-bound observations and admin storage API are implemented with26 affected local tests. Zero provider calls, host writes or new workloads. Thick admission remains intact: the stock driver creates an initially quota-sized thin pool, has no automatic pool growth and may remove the final empty pool. Thin sizing/growth/exhaustion/reclaim and data-preserving conversion remain open. |
+| 2026-10-08 | Shared compute boundary — isolated local proof only | Verified retainedV159 guests expose no /dev/kvm and no vmx/svm; Contabo excludes nested virtualization on VPS. An isolated ARM64 gVisor/PG17.10 experiment prestarted2 tenant-free Sentries, then late-bound2 independently stopped databases while preserving Sentry PIDs, distinct PostgreSQL system IDs and committed markers; other-tenant paths were absent. Slot creation166/168ms; request-to-first-read2790/2620ms, child start2091/2097ms. Exact disposable container removed; no host paths/devices/Docker socket, runtime network or fleet write. This misses the subsecond target and does not prove Cloudflare/CRI/CNPG integration. Stock gVisor network and per-container cgroup limitations remain; the native runc prepared-sandbox assignment direction is under implementation. Shared-pool acceptance and full Rust migration remain open. |
+| 2026-10-08 | Overall completion withdrawn; corrective plan | Read-only audit confirms EU/US/Git Regional drift, different RAM policies, permanent sleeping CPU debit, thick5GiB allocations, inactive purchase policy despite owner permission, hidden below76% fallback orders, incomplete CF profile/region management, unresolved headless admission, absent patch lifecycle and unimplemented approved Rust/fast-start design. Existing SQL/TLS/R2/WAL/restore/physical-reclaim/RAM-trigger evidence remains valid but partial. Unified corrective plan defines all3-server convergence, CF-owned policy replication, measured resource allocation, purchase activation, patch/Rust/cold-start work and explicit live gates. No live change or purchase performed for this planning request. |
+| 2026-10-08 | Partial operator/database acceptance | Original US1 Ready via authorized operator postjoin/admission198.356s; programmed1GiB write/read/physical reclaim753.081s. EU/US Cloudflare SQL, TLS1.3/nonsuperuser,4 R2 base/exact-WAL checks and4×5GiB physical deletion passed (20GiB). EU SQL2187ms; separate EU restore108618ms and healthy-source EU→US restore87988ms incl observation pacing. All3 existingEU DBs/source markers/custody preserved. Actual US RAM10 consecutive minutes18:43:01–18:52:04Z79.9062%, stored trigger and continued eligible placement/hard startup checks passed; dry expansion disabled/no purchase. Successful3968MiB load cleanup recovered4,177,731,584B; first missing-minute window correctly refused and cleaned. API/Native2bf CI37778960682 retained; US-onlyRegional115 CI37815727563/digest1886 accepted; EUKube/runtime/templates unchanged. Initialmapping1OAuth+1GET; nonempty30min routinewindow390frames0provider attempts, lifetime total unknown. Automatic postjoin HTTP409/session renewal remains open for next genuine authorized purchase. Rotation/adopter WSS/deadlines/new-ID rebinding/finite purchase caps and22-US capacity are separate migration gates. |
 | 2026-10-03 | 0 accepted                | Fresh first EU Talos/Kubernetes node, five Ready Flux releases, 95 GiB storage. Formal foundation checks passed; second EU node unchanged.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | 2026-10-04 | 1 accepted                | E0–E6 passed. Latest E0–E5 run: Ready 27,644 ms, cold SQL connection 486 ms, commit/rollback 46/49 ms, one base backup and four WAL objects; delete 53,128 ms and zero trial volumes/archives after harness cleanup. Five distinct create/delete ledgers and ten agent restarts passed. Real fault responses preserved storage and generations; a missing ready namespace reported recovery required rather than creating empty storage. The complete 65,535-port scans exposed only operator Talos/Kubernetes APIs and no Cloudflare-accessible port. The observed Kubernetes node publishes one IPv4 and no IPv6; the all-port result covers that IPv4. The separate earlier provider IPv6 refusal check passed; no new all-port IPv6 claim is made. Credential names and independently known expiry dates are inventoried privately.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | 2026-10-04 | 1 backup and availability | A real R2-only outage reproduced a committed marker unarchived for 1,002 s. The corrected persistent timer survived an agent restart and alarmed after 619,301 ms. The subsequent availability proof obtained two distinct failing observations under the active policy and a fresh read connection in 437.681 ms; lifting the exact policy drained WAL, preserved the marker and cleared the timer. Separate restore drill: maximum measured WAL-object delay 52,427 ms after COMMIT, restore verification 304,128 ms including operator pacing, committed markers present, rollback absent, exact 5 GiB reclaimed. These are individual measurements, not a zero-loss or full Phase 4 guarantee.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |

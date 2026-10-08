@@ -6,7 +6,10 @@ import {
   type SizeResources,
 } from "@pgcf/contracts";
 import { MEMORY_SAMPLE_MAX_AGE_MS } from "./memory-capacity.ts";
-import { startupPhysicalFitSql } from "./startup-admission.ts";
+import {
+  startupPhysicalFitSql,
+  databaseCpuChargeSql,
+} from "./startup-admission.ts";
 
 export const NODE_OBSERVATION_MAX_AGE_MS = 180_000;
 export function nodePlacementGuard(alias = "n"): string {
@@ -217,13 +220,13 @@ export async function placementNodes(
       `SELECT n.*,COALESCE(p.placement_mode,'reserved') placement_mode,p.maximum_database_memory_mib,p.postgres_memory_request_mib,
       m.observed_at memory_latest_observed_at,m.available_bytes memory_latest_available_bytes,m.capacity_memory_bytes memory_latest_capacity_bytes,
       m.working_set_bytes memory_latest_working_set_bytes,m.memory_pressure memory_latest_pressure,
-      COALESCE(SUM(s.memory_mib + ?),0) reserved_memory_mib, COALESCE(SUM(s.cpu_millicores + ?),0) reserved_cpu_millicores, COALESCE(SUM(s.storage_gib),0) reserved_storage_gib
+      COALESCE(SUM(s.memory_mib + ?),0) reserved_memory_mib, COALESCE(SUM(${databaseCpuChargeSql()}),0) reserved_cpu_millicores, COALESCE(SUM(s.storage_gib),0) reserved_storage_gib
     FROM nodes n LEFT JOIN node_region_policies p ON p.region_id=n.region_id LEFT JOIN databases d ON d.node_id=n.id AND d.observed_state <> 'deleted' LEFT JOIN size_classes s ON s.id=d.size_class_id
     LEFT JOIN node_memory_samples m ON m.node_id=n.id AND m.node_uid=n.node_uid
       AND m.observed_at=(SELECT MAX(observed_at) FROM node_memory_samples WHERE node_id=n.id AND node_uid=n.node_uid)
     WHERE n.region_id=? GROUP BY n.id`,
     )
-    .bind(SIDECAR.requestMemoryMib, SIDECAR.requestCpuMillicores, regionId)
+    .bind(SIDECAR.requestMemoryMib, regionId)
     .all<PlacementNode>();
   return result.results;
 }

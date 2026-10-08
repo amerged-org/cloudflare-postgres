@@ -12,7 +12,11 @@ import { recoverQuiescence } from "./lifecycle.ts";
 import { hint } from "./databases.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { recordNodeMemoryObservation } from "./memory-capacity.ts";
-import { recordStartupObservationStatement } from "./startup-admission.ts";
+import { recordNodeStorageObservation } from "./node-storage.ts";
+import {
+  recordStartupObservationStatement,
+  databaseCpuChargeSql,
+} from "./startup-admission.ts";
 
 export function truncateAgentText(value: string): string {
   const bytes = new TextEncoder().encode(value);
@@ -152,6 +156,7 @@ export async function observations(
       provider_instance_id=CASE WHEN nodes.schedulable=0 AND nodes.id=excluded.id AND excluded.provider_instance_id IS NOT NULL THEN excluded.provider_instance_id ELSE nodes.provider_instance_id END,
       node_uid=CASE WHEN nodes.node_uid IS NULL AND excluded.node_uid IS NOT NULL AND nodes.id=excluded.id THEN excluded.node_uid ELSE nodes.node_uid END,
       last_observed_at=excluded.last_observed_at,updated_at=excluded.updated_at WHERE excluded.updated_at>=nodes.updated_at AND nodes.lost_at IS NULL
+      AND (nodes.node_uid IS NULL OR excluded.node_uid IS NOT NULL)
       AND (excluded.node_uid IS NULL OR (nodes.id=excluded.id AND (nodes.provider_instance_id IS NULL OR nodes.provider_instance_id=excluded.provider_instance_id)))`,
     )
       .bind(
@@ -172,6 +177,17 @@ export async function observations(
         Number(node.database_placement_enabled !== false),
       )
       .run();
+    if (
+      node.storage &&
+      Date.parse(node.storage.observed_at) <= Date.parse(body.observed_at)
+    )
+      await recordNodeStorageObservation(
+        c.env.DB,
+        region.id,
+        node,
+        node.storage,
+        receivedAt,
+      );
   }
   for (const sample of body.node_memory_samples ?? []) {
     try {
@@ -329,7 +345,7 @@ export async function observations(
           `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
       SELECT d.id,?,d.node_id,d.size_class_id,d.generation,?,
         json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,
-          'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',s.cpu_millicores+?,
+          'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',${databaseCpuChargeSql("d", "s", true)},
           'storage_allocated_bytes',s.storage_gib*1073741824)
       FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.region_id=?
       AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=? AND kind=? AND generation=?)`,
@@ -337,7 +353,6 @@ export async function observations(
           event,
           body.observed_at,
           SIDECAR.requestMemoryMib,
-          SIDECAR.requestCpuMillicores,
           row.id,
           region.id,
           row.id,
@@ -379,14 +394,13 @@ export async function observations(
         statements.push(
           c.env.DB.prepare(
             `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-        SELECT d.id,'woke',d.node_id,d.size_class_id,d.generation,?,json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',s.cpu_millicores+?,'storage_allocated_bytes',s.storage_gib*1073741824)
+        SELECT d.id,'woke',d.node_id,d.size_class_id,d.generation,?,json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',${databaseCpuChargeSql()},'storage_allocated_bytes',s.storage_gib*1073741824)
         FROM databases d JOIN size_classes s ON s.id=d.size_class_id JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.generation=d.generation AND o.kind IN('database.resume','database.wake')
         WHERE d.id=? AND d.generation=? AND d.observed_generation=d.generation AND d.observed_state='ready' AND d.observed_power='awake' AND d.updated_at=?
         AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=d.id AND kind='woke' AND generation=d.generation)`,
           ).bind(
             body.observed_at,
             SIDECAR.requestMemoryMib,
-            SIDECAR.requestCpuMillicores,
             row.id,
             row.generation,
             now,
@@ -394,13 +408,15 @@ export async function observations(
         );
       statements.push(
         c.env.DB.prepare(
-          `UPDATE operations SET status='succeeded',updated_at=?,completed_at=? WHERE id=? AND database_id=? AND generation=? AND status IN('pending','running') AND kind IN('database.suspend','database.hibernate','database.resume','database.wake')
-        AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.power_operation=operations.id AND d.generation=operations.generation AND d.observed_generation=d.generation AND d.updated_at=? AND d.desired_state=? AND d.observed_power=?)`,
+          `UPDATE operations SET status='succeeded',updated_at=?,completed_at=? WHERE id=? AND database_id=? AND generation<=? AND status IN('pending','running') AND kind IN('database.suspend','database.hibernate','database.resume','database.wake')
+        AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.project_id=operations.project_id AND d.power_operation=operations.id
+          AND d.generation=? AND operations.generation<=d.generation AND d.observed_generation=d.generation AND d.updated_at=? AND d.desired_state=? AND d.observed_power=?)`,
         ).bind(
           now,
           now,
           row.power_operation,
           row.id,
+          row.generation,
           row.generation,
           now,
           row.desired_state,
@@ -408,6 +424,29 @@ export async function observations(
         ),
       );
     }
+    if (observation.state === "hibernated")
+      statements.push(
+        c.env.DB.prepare(
+          `UPDATE operations SET status='succeeded',updated_at=?,completed_at=?
+         WHERE database_id=? AND project_id=? AND kind='database.resize' AND generation<=? AND status IN('pending','running')
+           AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.project_id=operations.project_id
+             AND d.region_id=? AND d.generation=? AND d.observed_generation=d.generation
+             AND d.desired_state='suspended' AND d.observed_state='provisioning' AND d.observed_power='hibernated'
+             AND d.updated_at=? AND EXISTS(SELECT 1 FROM operations stopped WHERE stopped.id=d.power_operation
+               AND stopped.database_id=d.id AND stopped.project_id=d.project_id AND stopped.generation<=d.generation
+               AND stopped.kind IN('database.suspend','database.hibernate') AND stopped.status='succeeded'))
+         AND NOT EXISTS(SELECT 1 FROM operations newer WHERE newer.database_id=operations.database_id AND newer.kind='database.resize' AND newer.generation>operations.generation)`,
+        ).bind(
+          now,
+          now,
+          row.id,
+          row.project_id,
+          observation.generation,
+          region.id,
+          observation.generation,
+          now,
+        ),
+      );
     if (
       observation.state === "ready" &&
       row.observed_generation < observation.generation
@@ -416,15 +455,15 @@ export async function observations(
         c.env.DB.prepare(
           `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
           SELECT d.id,'resized',d.node_id,d.size_class_id,d.generation,?,json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,
-            'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',s.cpu_millicores+?,'storage_allocated_bytes',s.storage_gib*1073741824)
+            'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',${databaseCpuChargeSql()},'storage_allocated_bytes',s.storage_gib*1073741824)
           FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=? AND d.region_id=? AND d.generation=?
             AND d.observed_generation=? AND d.observed_state='ready' AND d.updated_at=?
-            AND EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.project_id=d.project_id AND o.kind='database.resize' AND o.generation=d.generation)
+            AND EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.project_id=d.project_id AND o.kind='database.resize' AND o.generation<=d.generation AND o.status IN('pending','running')
+              AND NOT EXISTS(SELECT 1 FROM operations newer WHERE newer.database_id=o.database_id AND newer.kind='database.resize' AND newer.generation>o.generation))
             AND NOT EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='resized' AND e.generation=d.generation)`,
         ).bind(
           body.observed_at,
           SIDECAR.requestMemoryMib,
-          SIDECAR.requestCpuMillicores,
           row.id,
           region.id,
           observation.generation,
@@ -433,9 +472,10 @@ export async function observations(
         ),
         c.env.DB.prepare(
           `UPDATE operations SET status='succeeded',updated_at=?,completed_at=?
-          WHERE database_id=? AND project_id=? AND kind='database.resize' AND generation=? AND status IN('pending','running')
+          WHERE database_id=? AND project_id=? AND kind='database.resize' AND generation<=? AND status IN('pending','running')
             AND EXISTS(SELECT 1 FROM databases d WHERE d.id=operations.database_id AND d.project_id=operations.project_id AND d.region_id=?
-              AND d.generation=operations.generation AND d.observed_generation=operations.generation AND d.observed_state='ready' AND d.updated_at=?)`,
+              AND d.generation=? AND d.observed_generation=d.generation AND d.observed_state='ready' AND d.updated_at=?)
+            AND NOT EXISTS(SELECT 1 FROM operations newer WHERE newer.database_id=operations.database_id AND newer.kind='database.resize' AND newer.generation>operations.generation)`,
         ).bind(
           now,
           now,
@@ -443,6 +483,7 @@ export async function observations(
           row.project_id,
           observation.generation,
           region.id,
+          observation.generation,
           now,
         ),
       );

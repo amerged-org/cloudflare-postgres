@@ -40,6 +40,15 @@ describe("sizing", () => {
     });
   });
 
+  it("reserves a separate CPU request while bounding both PostgreSQL and Barman limits", () => {
+    const size = { ...small, cpu_millicores: 250, cpu_request_millicores: 25 };
+    expect(databaseCpuReservationMillicores(size)).toBe(125);
+    expect(resourceQuotaFor(size)).toMatchObject({
+      requestsCpuMillicores: 250,
+      limitsCpuMillicores: 1500,
+    });
+  });
+
   it("derives PostgreSQL parameters from the size class", () => {
     expect(postgresParameters(small)).toEqual({
       shared_buffers: "128MB",

@@ -364,7 +364,7 @@ describe("manual in-place resize on real Workers D1", () => {
     ).toBe(0);
   });
 
-  it("a superseding role revision cannot acknowledge an older resize generation", async () => {
+  it("requires the current configuration proof after a concurrent role revision", async () => {
     const f = await ready();
     const target = await size(f);
     const resized = DatabaseWithOperation.parse(
@@ -383,6 +383,21 @@ describe("manual in-place resize on real Workers D1", () => {
           "/agent/v1/observations",
           f.agent,
           "POST",
+          observedBody([observation(f.id, 2)]),
+        )
+      ).json(),
+    ).toEqual({ accepted: 0 });
+    expect(
+      await env.DB.prepare("SELECT status FROM operations WHERE id=?")
+        .bind(resized.operation.id)
+        .first("status"),
+    ).toBe("pending");
+    expect(
+      await (
+        await request(
+          "/agent/v1/observations",
+          f.agent,
+          "POST",
           observedBody([observation(f.id, 3)]),
         )
       ).json(),
@@ -391,7 +406,7 @@ describe("manual in-place resize on real Workers D1", () => {
       await env.DB.prepare("SELECT status FROM operations WHERE id=?")
         .bind(resized.operation.id)
         .first("status"),
-    ).not.toBe("succeeded");
+    ).toBe("succeeded");
   });
 
   it("CAS refuses a stale generation or deletion before a captured resize update", async () => {

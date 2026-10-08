@@ -51,53 +51,59 @@ logs or incident messages.
 
 ### Cross-region restore source credentials
 
-After the target region's ordinary bootstrap, before its first cross-region restore, install
-`pgcf-system/pgcf-restore-source-s3` in that regional Kubernetes cluster. Its `data.sources.json`
-value is base64-encoded JSON keyed by source region ID. Each value binds a bucket-scoped read-only
-credential to that source's exact archive bucket and HTTPS endpoint. The API Worker holds no
-copy of this S3 map.
+Manage source-read relationships through the authenticated PGCF API before requesting a
+cross-region restore. The target region's ordinary backup write credential remains separate.
+Supply a bucket-scoped R2 **Object Read Only** credential for the source region; the API checks
+registered bucket/endpoint identity and encrypted custody. It cannot infer R2 IAM permissions
+from an S3 key. Live acceptance must prove reads succeed and writes are denied before the
+credential is used for customer recovery.
 
-Prepare this JSON in owner-only private custody, replacing every placeholder:
+Use `GET /v1/regions/{target}/archive-sources/{source}` to read the current revision and source
+configuration match status. A missing relationship returns404. Create it with revision0, or
+rotate it against the revision returned by GET:
 
-```json
+```http
+PUT /v1/regions/{target}/archive-sources/{source}
+Authorization: Bearer <admin-key>
+Idempotency-Key: <stable-key-for-this-creation-or-rotation>
+Content-Type: application/json
+
 {
-  "<source-region-id>": {
-    "bucket": "<source-archive-bucket>",
-    "endpoint_url": "https://<source-r2-endpoint-host>",
-    "access_key_id": "<source-read-only-access-key-id>",
-    "secret_access_key": "<source-read-only-secret-access-key>"
+  "expected_revision": 0,
+  "bucket": "<registered-source-archive-bucket>",
+  "endpoint_url": "https://<registered-source-r2-endpoint-host>",
+  "credentials": {
+    "access_key_id": "<source-object-read-only-access-key-id>",
+    "secret_access_key": "<source-object-read-only-secret-access-key>"
   }
 }
 ```
 
-Encode the private JSON without printing it and apply this Secret through the authenticated
-target Kubernetes API:
+Keep the request body in private custody; never put it in Git, logs or shell history. GET and
+PUT responses contain relationship metadata and revisions, never credentials. Cloudflare
+stores the credential under the existing rotating encryption keyring with authenticated
+binding to both region IDs and the relationship revision. Only the authenticated target
+region receives its configured source-read map in desired state. A drifted source is omitted
+from an explicit authoritative map; the regional consumer fails closed for that source.
 
-```yaml
-apiVersion: v1
-kind: Secret
-metadata:
-  name: pgcf-restore-source-s3
-  namespace: pgcf-system
-type: Opaque
-data:
-  sources.json: <base64-of-private-source-map>
-```
+Rotation waits until all referencing restore operations have succeeded. It atomically advances
+established target database generations so the existing reconciler updates their separate
+`recovery-source-credentials` Secrets. Idempotent replay does not advance generations twice.
+It preserves target backup credentials, archive paths, storage generations, source data and
+temporary restore-administration derivation. Check the target's observed configuration and a
+real source read before retiring the old key. Keep every credential encryption key still needed
+to decrypt stored custody.
 
-Verify privately that the installed entry matches the source region's actual bucket and endpoint,
-then check a real restore read before retiring an old credential. The agent copies only the
-selected source entry into the target database's separate `recovery-source-credentials` Secret.
-Keep the target's ordinary `pgcf-backup-s3` write credentials unchanged; its own backups and
-temporary restore administration use those target credentials. The namespace permits HTTPS
-egress to the exact configured source and target R2 endpoint hosts. A same-region restore uses
-the ordinary regional credential and needs no source-map entry.
+For consumer-first deployment, install the D1 migration and compatible regional consumer before
+enabling the API producer. The earlier local `pgcf-system/pgcf-restore-source-s3` map is a legacy
+compatibility input only when desired state omits `recovery_sources`. An explicit API map,
+including an empty map, never falls back to that Secret or to the target's write key. Normal
+setup and rotation use the PGCF API; no direct Kubernetes Secret installation is required.
 
-Keep the source-read credential and map entry while any non-deleted restored target references
-that source region. This includes successful, promoted targets: their recovery metadata persists
-and the current reconciler still verifies the source ObjectStore on every running reconciliation.
-SQL completion alone does not authorize removing the entry. Remove it only after all referencing
-targets are deleted and it is no longer needed for planned archive recovery. Preserve private
-custody and the operator backup; never commit the JSON, encoded Secret or credential values.
+Keep a source-read credential while any non-deleted restored target references its source.
+Successful promoted targets retain recovery metadata and still verify the source ObjectStore.
+SQL completion alone does not authorize retiring the source key. Preserve private custody and
+the operator backup; never commit requests, encoded Secrets or credential values.
 
 ## Talos and Kubernetes material
 

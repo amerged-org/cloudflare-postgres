@@ -16,6 +16,8 @@ import {
 import type { ApiContext } from "../env.ts";
 import { agentRegion } from "./agent-auth.ts";
 import type { DatabaseRow, RoleRow } from "./rows.ts";
+import { readDesiredFleetRelease } from "./fleet-releases.ts";
+import { desiredRegionArchiveSources } from "./region-archive-sources.ts";
 
 interface DesiredRow extends DatabaseRow, DesiredSize {
   k8s_node_name: string;
@@ -62,7 +64,7 @@ export async function desired(
         }
       : undefined;
   const result = await c.env.DB.prepare(
-    `SELECT d.*,n.k8s_node_name,s.memory_mib,s.cpu_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
+    `SELECT d.*,n.k8s_node_name,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json,
     o.id creation_operation_id,o.generation creation_generation,o.status creation_status,
     EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready,
@@ -167,6 +169,9 @@ export async function desired(
             ? { memory_request_mib: scheduling.postgres_memory_request_mib }
             : {}),
           cpu_millicores: row.cpu_millicores,
+          ...(row.cpu_request_millicores == null
+            ? {}
+            : { cpu_request_millicores: row.cpu_request_millicores }),
           storage_gib: row.storage_gib,
           max_connections: row.max_connections,
           archive_timeout_seconds: row.archive_timeout_seconds,
@@ -190,10 +195,16 @@ export async function desired(
       }),
     );
   }
+  const fleetRelease = await readDesiredFleetRelease(c.env.DB, region.id);
+  const recoverySources = await desiredRegionArchiveSources(c.env, region.id);
   return c.json(
     DesiredResponse.parse({
+      ...(fleetRelease ? { fleet_release: fleetRelease } : {}),
       region: {
         id: region.id,
+        ...(recoverySources === undefined
+          ? {}
+          : { recovery_sources: recoverySources }),
         ...(scheduling ? { scheduling } : {}),
         backup: {
           bucket: region.backup_bucket,

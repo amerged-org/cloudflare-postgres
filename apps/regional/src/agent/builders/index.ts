@@ -15,6 +15,7 @@ import {
   mib,
   millicores,
   postgresParameters,
+  postgresCpuRequestMillicores,
   resourceQuotaFor,
 } from "@pgcf/contracts";
 import type { K8sObject } from "@pgcf/contracts";
@@ -648,6 +649,7 @@ export function buildDatabaseManifests(
         resources: {
           requests: {
             ...compute,
+            cpu: millicores(postgresCpuRequestMillicores(db.size)),
             memory: mib(db.size.memory_request_mib ?? db.size.memory_mib),
           },
           limits: { ...compute },

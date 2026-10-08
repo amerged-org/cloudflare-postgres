@@ -7,6 +7,7 @@ import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
 import { cleanupRetainedArchives } from "./domain/retained-archives.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
 import { runNodeCapacityCron } from "./domain/node-capacity.ts";
+import { runResourceProfileRollouts } from "./domain/resource-profiles.ts";
 
 export async function runCron(
   env: Env,
@@ -19,6 +20,7 @@ export async function runCron(
 }> {
   const timestamp = new Date(now).toISOString(),
     cutoff = new Date(now - 20 * 60_000).toISOString();
+  await runResourceProfileRollouts(env, now);
   await env.DB.prepare(
     "INSERT INTO power_timeout_cursor(singleton,database_id) VALUES(1,NULL) ON CONFLICT(singleton) DO NOTHING",
   ).run();

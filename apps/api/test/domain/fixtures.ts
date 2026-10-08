@@ -182,8 +182,18 @@ export async function fixture(memory = 4096, storage: number | null = 30) {
   }
   statements.push(
     env.DB.prepare(
-      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES (?,?,?,1,?,2000,?,128,100,?,?,?)",
-    ).bind(node, region, nodeName, memory, storage, now, now, now),
+      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid) VALUES (?,?,?,1,?,2000,?,128,100,?,?,?,?)",
+    ).bind(
+      node,
+      region,
+      nodeName,
+      memory,
+      storage,
+      now,
+      now,
+      now,
+      crypto.randomUUID(),
+    ),
   );
   await env.DB.batch(statements);
   fixtures.push({

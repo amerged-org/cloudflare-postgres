@@ -14,14 +14,18 @@ resources remain protected; server loss is recovered from R2.
 - Databases sleep when idle and wake on the next connection.
 - Continuous backups to R2 with point-in-time recovery.
 - Usage and infrastructure-cost metrics per database. You put your own pricing on top.
-- Horizontal scaling: Cloudflare adds Contabo VPS through the Contabo API within your caps.
+- Capacity and Contabo provisioning are implemented; complete autonomous admission and standing-policy activation remain under acceptance.
 
 [ohmyho.st](https://ohmyho.st) is the first adopter. Its Neon migration follows operator acceptance;
 existing customer databases remain on Neon until their separate migration is accepted.
 
 ## Status
 
-**Phases 0 and 1 accepted in Dev; EU/US database acceptance passed (2026-10-08).** Both EU nodes and
+**Overall product completion remains open (2026-10-08 correction).** The EU/US database lifecycle
+and RAM-trigger tests passed, but uniform fleet configuration, automatic admission, patch management
+and the approved fast-start architecture are incomplete. See the
+[unified corrective plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md).
+The earlier broad completion statement is withdrawn. The following are partial Dev results. Both EU nodes and
 all five Flux releases are Ready, with 95 GiB measured storage per node. The complete Dev path through
 `db.ohmyho.st` reaches real PostgreSQL with verified TLS, continuous WAL archiving and R2 backups.
 
@@ -51,7 +55,8 @@ implemented. Manual Dev suspend/resume preserved data and storage and verified c
 Automatic idle sleep and one wake for ten concurrent connections passed in Dev. Instrumented cold
 connections have a twenty-run p50/p95/max of 8.412/9.160/9.708 seconds, accepted by the owner for v1.
 The owner-approved [Rust runtime and cold-start architecture](docs/architecture/rust-runtime-and-cold-starts.md)
-defines native regional services, a Rust/Wasm Edge and per-database warm reclaim; implementation
+requires native regional services, a Rust/Wasm Edge and a shared pool of prestarted unassigned
+compute. Per-database warm reclaim is additional and cannot replace the pool; implementation
 and Dev acceptance are pending. All twenty starts preserved data, the original cluster/claim and credential
 UIDs/versions, and each caused one wake. The stale readiness snapshot
 is corrected; a verified read-only SQL archive check is deployed, but the first complete cold
@@ -283,7 +288,7 @@ configuration fails explicitly. Unit tests do not replace the live phase accepta
 
 - [PLAN.md](PLAN.md): scope, architecture, phases, decisions and status.
 - [Rust runtime and cold starts](docs/architecture/rust-runtime-and-cold-starts.md): approved
-  target architecture, migration sequence, warm routing and warm-reclaim acceptance.
+  target architecture, shared prestarted compute pool, routing and additional warm-reclaim acceptance.
 - [AGENTS.md](AGENTS.md): contributor and coding-agent brief.
 - [THIRD_PARTY.md](THIRD_PARTY.md): upstream components and licenses.
 - [infra/](infra/README.md): Talos, platform and backup recipes.

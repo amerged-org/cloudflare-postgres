@@ -51,6 +51,30 @@ it("assigns database RAM in 256 MiB increments", () => {
   );
 });
 
+it("separates a PostgreSQL scheduling share from its hard CPU limit", () => {
+  const body = {
+    memory_mib: 256,
+    cpu_millicores: 250,
+    cpu_request_millicores: 25,
+    storage_gib: 1,
+    max_connections: 50,
+    sleep_after_seconds: 60,
+    archive_timeout_seconds: 60,
+    backup_retention_days: 7,
+    enabled: true,
+  };
+  expect(SizeClassUpsert.parse(body).cpu_request_millicores).toBe(25);
+  for (const request of [0, -1, 0.5, 251]) {
+    expect(
+      SizeClassUpsert.safeParse({ ...body, cpu_request_millicores: request })
+        .success,
+    ).toBe(false);
+  }
+  const legacy: Record<string, unknown> = { ...body };
+  delete legacy.cpu_request_millicores;
+  expect(SizeClassUpsert.parse(legacy)).toEqual(legacy);
+});
+
 it("reserves only the exact internal maintenance role in customer creation", () => {
   expect(RoleCreate.safeParse({ name: MAINTENANCE_ROLE }).success).toBe(false);
   expect(RoleCreate.parse({ name: "pgcf_customer" }).name).toBe(

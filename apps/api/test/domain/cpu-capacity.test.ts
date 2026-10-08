@@ -2,6 +2,7 @@
 import { env } from "cloudflare:workers";
 import {
   archiveDestinationPath,
+  DatabaseWithOperation,
   newDatabaseId,
   newOperationId,
 } from "@pgcf/contracts";
@@ -13,6 +14,52 @@ import { cleanupFixtures, fixture, request, observedBody } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
 describe("measured CPU admission on real Workers D1", () => {
+  it("accounts configured scheduling requests instead of burst limits in persisted placement", async () => {
+    const f = await fixture(8192, 60);
+    await env.DB.prepare(
+      "UPDATE size_classes SET cpu_millicores=250,cpu_request_millicores=25 WHERE id=?",
+    )
+      .bind(f.size)
+      .run();
+    await env.DB.prepare(
+      "UPDATE nodes SET allocatable_cpu_millicores=350 WHERE id=?",
+    )
+      .bind(f.node)
+      .run();
+    const first = DatabaseWithOperation.parse(
+      await (await f.create("first-share")).json(),
+    );
+    expect(
+      await env.DB.prepare("SELECT node_id FROM databases WHERE id=?")
+        .bind(first.database.id)
+        .first("node_id"),
+    ).toBe(f.node);
+    expect(
+      (await placementNodes(env.DB, f.region))[0]?.reserved_cpu_millicores,
+    ).toBe(125);
+    const size = (await env.DB.prepare("SELECT * FROM size_classes WHERE id=?")
+      .bind(f.size)
+      .first<SizeRow>())!;
+    expect(
+      choosePlacement(await placementNodes(env.DB, f.region), f.region, size)
+        ?.id,
+    ).toBe(f.node);
+    const second = DatabaseWithOperation.parse(
+      await (await f.create("second-share")).json(),
+    );
+    expect(
+      await env.DB.prepare("SELECT node_id FROM databases WHERE id=?")
+        .bind(second.database.id)
+        .first("node_id"),
+    ).toBe(f.node);
+    expect(
+      (await placementNodes(env.DB, f.region))[0]?.reserved_cpu_millicores,
+    ).toBe(250);
+    expect(
+      choosePlacement(await placementNodes(env.DB, f.region), f.region, size),
+    ).toBeNull();
+  });
+
   it("does not place a CPU-exhausted node with spare memory and storage", () => {
     const node = {
       last_observed_at: new Date().toISOString(),

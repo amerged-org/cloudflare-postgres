@@ -5,6 +5,7 @@ import { createHash, X509Certificate } from "node:crypto";
 import { checkServerIdentity } from "node:tls";
 import {
   ApiException,
+  AppsV1Api,
   CoreV1Api,
   CustomObjectsApi,
   KubeConfig,
@@ -16,6 +17,7 @@ import type { K8sObject } from "@pgcf/contracts";
 import { record, string, uid } from "./types.ts";
 import type { Kubernetes, Resource } from "./types.ts";
 import { KubeletTrustReader, type KubeletTrust } from "./kubelet-trust.ts";
+import type { StorageMetricsKubernetes } from "./node-storage.ts";
 
 const CUSTOM: Record<
   string,
@@ -43,10 +45,67 @@ const CUSTOM: Record<
     version: "v1alpha1",
     plural: "lvmvolumes",
   },
+  LVMNode: {
+    group: "local.openebs.io",
+    version: "v1alpha1",
+    plural: "lvmnodes",
+  },
 };
 
 export interface VolumeStatsKubernetes extends Kubernetes {
   statsSummary?(node: Resource): Promise<unknown>;
+}
+
+/** Authenticated API-server proxy to the fixed read-only existing storage exporter. */
+export async function openEbsMetrics(
+  config: KubeConfig,
+  podName: string,
+  signal: AbortSignal,
+): Promise<string> {
+  if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(podName) || podName.length > 63)
+    throw new Error("storage_pod_invalid");
+  const cluster = config.getCurrentCluster();
+  if (!cluster || cluster.skipTLSVerify || (!cluster.caData && !cluster.caFile))
+    throw new Error("storage_proxy_tls_invalid");
+  const url = new URL(cluster.server);
+  if (
+    url.protocol !== "https:" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  )
+    throw new Error("storage_proxy_tls_invalid");
+  url.pathname = `${url.pathname.replace(/\/$/, "")}/api/v1/namespaces/openebs/pods/${podName}:9500/proxy/metrics`;
+  const options: https.RequestOptions = {
+    method: "GET",
+    signal: AbortSignal.any([signal, AbortSignal.timeout(5000)]),
+    rejectUnauthorized: true,
+  };
+  await config.applyToHTTPSOptions(options);
+  options.rejectUnauthorized = true;
+  if (!options.ca) throw new Error("storage_proxy_tls_invalid");
+  return new Promise((resolve, reject) => {
+    const request = https.request(url, options, (response) => {
+      if (response.statusCode !== 200) {
+        response.destroy();
+        reject(new Error("storage_metrics_unavailable"));
+        return;
+      }
+      const chunks: Buffer[] = [];
+      let bytes = 0;
+      response.on("error", reject);
+      response.on("data", (chunk: Buffer) => {
+        bytes += chunk.length;
+        if (bytes > 2 * 1024 * 1024)
+          response.destroy(new Error("storage_metrics_too_large"));
+        else chunks.push(chunk);
+      });
+      response.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    });
+    request.on("error", () => reject(new Error("storage_metrics_unavailable")));
+    request.end();
+  });
 }
 
 export async function kubeletSummary(
@@ -242,13 +301,14 @@ export async function inventoryPages(
 export function kubernetesFromConfig(
   signal: AbortSignal,
   explicitFile?: string,
-): VolumeStatsKubernetes {
+): VolumeStatsKubernetes & StorageMetricsKubernetes {
   const config = new KubeConfig();
   if (explicitFile) config.loadFromFile(explicitFile);
   else if (process.env.KUBERNETES_SERVICE_HOST) config.loadFromCluster();
   else throw new Error("explicit_kubeconfig_required");
   const core = config.makeApiClient(CoreV1Api);
   const network = config.makeApiClient(NetworkingV1Api);
+  const apps = config.makeApiClient(AppsV1Api);
   const custom = config.makeApiClient(CustomObjectsApi);
   const options = requestOptions(signal);
   const applyOptions = requestOptions(signal, "application/apply-patch+yaml");
@@ -258,9 +318,10 @@ export function kubernetesFromConfig(
     if (!type) throw new Error("unsupported_resource_kind");
     return type;
   };
-  const k8s: VolumeStatsKubernetes = {
+  const k8s: VolumeStatsKubernetes & StorageMetricsKubernetes = {
     statsSummary: async (node) =>
       kubeletSummary(config, node, signal, await trust.read(node)),
+    openEbsMetrics: (podName) => openEbsMetrics(config, podName, signal),
     async read(kind, namespace, name) {
       const namespaced = { namespace: namespace ?? "", name };
       try {
@@ -293,6 +354,9 @@ export function kubernetesFromConfig(
           case "Pod":
             value = await core.readNamespacedPod(namespaced, options);
             break;
+          case "DaemonSet":
+            value = await apps.readNamespacedDaemonSet(namespaced, options);
+            break;
           case "PersistentVolumeClaim":
             value = await core.readNamespacedPersistentVolumeClaim(
               namespaced,
@@ -310,9 +374,12 @@ export function kubernetesFromConfig(
         }
         return {
           ...record(value),
-          apiVersion: CUSTOM[kind]
-            ? `${CUSTOM[kind]!.group}/${CUSTOM[kind]!.version}`
-            : "v1",
+          apiVersion:
+            kind === "DaemonSet"
+              ? "apps/v1"
+              : CUSTOM[kind]
+                ? `${CUSTOM[kind]!.group}/${CUSTOM[kind]!.version}`
+                : "v1",
           kind,
         } as Resource;
       } catch (error) {

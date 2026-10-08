@@ -20,7 +20,11 @@ export const keyRow = (row: Row): ApiKey =>
     revoked_at: row.revoked_at,
   });
 export const sizeRow = (row: Row): SizeClass =>
-  SizeClass.parse({ ...row, enabled: row.enabled === 1 });
+  SizeClass.parse({
+    ...row,
+    cpu_request_millicores: row.cpu_request_millicores ?? undefined,
+    enabled: row.enabled === 1,
+  });
 export const regionRow = (row: Row): Region =>
   Region.parse({
     id: row.id,

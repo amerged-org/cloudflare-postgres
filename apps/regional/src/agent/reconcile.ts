@@ -24,7 +24,10 @@ import type {
   DesiredDatabase,
   K8sObject,
 } from "@pgcf/contracts";
-import { ARCHIVE_DESTINATION_PATTERN } from "@pgcf/contracts";
+import {
+  ARCHIVE_DESTINATION_PATTERN,
+  postgresCpuRequestMillicores,
+} from "@pgcf/contracts";
 import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 import {
   buildCaConfigMap,
@@ -1962,16 +1965,17 @@ export class Reconciler {
       : undefined;
     if (!postgres || postgres.image !== ctx.postgresImage) return false;
     const compute = record(postgres.resources);
-    for (const [resources, memoryMib] of [
+    for (const [resources, memoryMib, cpuMillicores] of [
       [
         record(compute.requests),
         db.size.memory_request_mib ?? db.size.memory_mib,
+        postgresCpuRequestMillicores(db.size),
       ],
-      [record(compute.limits), db.size.memory_mib],
+      [record(compute.limits), db.size.memory_mib, db.size.cpu_millicores],
     ] as const) {
       if (
         quantity(resources.memory) !== memoryMib * 2 ** 20 ||
-        quantity(resources.cpu) * 1000 !== db.size.cpu_millicores
+        quantity(resources.cpu) * 1000 !== cpuMillicores
       )
         return false;
     }

@@ -5,6 +5,10 @@ import {
   AgentActivityRequest,
   AgentUsageRequest,
 } from "@pgcf/contracts";
+import {
+  FleetNodeReleaseObservation,
+  type FleetDesiredRelease,
+} from "@pgcf/contracts/releases";
 import type { AgentConfig } from "./config.ts";
 
 export const API_TIMEOUT_MS = 20_000;
@@ -123,10 +127,28 @@ export class AgentApi {
     )
       throw new Error("usage_ack_invalid");
   }
+  async fleetObservations(
+    value: FleetNodeReleaseObservation,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const body = JSON.stringify(FleetNodeReleaseObservation.parse(value));
+    if (Buffer.byteLength(body) > 64 * 1024)
+      throw new Error("fleet_inventory_too_large");
+    const response = await this.request(
+      "/agent/v1/fleet-observations",
+      signal,
+      body,
+    );
+    const reply = JSON.parse(await boundedText(response, 4096)) as {
+      accepted?: unknown;
+    };
+    if (reply.accepted !== true) throw new Error("fleet_inventory_ack_invalid");
+  }
   async desired(signal: AbortSignal): Promise<DesiredResponse> {
     const pullSignal = AbortSignal.any([signal, AbortSignal.timeout(60_000)]);
     let after: string | undefined;
     let region: DesiredResponse["region"] | undefined;
+    let fleet: FleetDesiredRelease | undefined;
     const databases: DesiredResponse["databases"] = [];
     const ids = new Set<string>();
     const cursors = new Set<string>();
@@ -150,13 +172,25 @@ export class AgentApi {
         (region && JSON.stringify(region) !== JSON.stringify(value.region))
       )
         throw new Error("desired_region_changed");
+      if (
+        page > 0 &&
+        JSON.stringify(fleet) !== JSON.stringify(value.fleet_release)
+      )
+        throw new Error("desired_fleet_release_changed");
+      fleet = value.fleet_release;
       region = value.region;
       for (const database of value.databases) {
         if (ids.has(database.id)) throw new Error("desired_duplicate_database");
         ids.add(database.id);
         databases.push(database);
       }
-      if (value.next === null) return { region, databases, next: null };
+      if (value.next === null)
+        return {
+          region,
+          databases,
+          next: null,
+          ...(fleet ? { fleet_release: fleet } : {}),
+        };
       if (
         !value.databases.length ||
         cursors.has(value.next) ||

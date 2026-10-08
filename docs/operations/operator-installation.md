@@ -1,5 +1,13 @@
 # Existing-account installation
 
+Current scope correction (2026-10-08): the overall product goal remains open. The accepted results
+below cover the operator/database subset. All three servers must now converge through the
+[unified corrective plan](../architecture/cloudflare-convergence-and-serverless-plan.md), including
+central CF customer policy, actual-use capacity, standing purchase activation, patching and fast
+starts. Earlier EU-upgrade deferrals and static reservation descriptions are historical current-state
+constraints, not the desired final product. Follow supported data-preserving procedures.
+
+
 This guide completes the operator's existing Cloudflare/Contabo installation. Preserve the first
 EU control/relay node and its imported credentials. Retain the already-admitted second EU node as
 customer EU1 (formerly EU2), with its installation, Node identity, data and custody unchanged.
@@ -223,6 +231,47 @@ standing purchases only while these finite limits and expiry authorize the order
 The retained control server's UID-guarded new-database placement flag is already disabled;
 preserve Kubernetes/platform operation and existing data. The flag excludes new placement;
 existing databases must continue to serve, wake, resize and delete normally.
+
+### API-only resource profiles and regional configuration
+
+The corrective implementation adds these management routes; deploy the matching API/Regional
+release and additive migrations before using them. No PGCF administration UI is part of the product.
+
+| Route | Purpose |
+| --- | --- |
+| `PUT /v1/resource-profiles/{id}` | Create an immutable resource revision using `expected_revision` and `resources` |
+| `GET /v1/resource-profiles/{id}/revisions/{revision}` | Read the exact resource snapshot, generated size-class ID and SHA256 |
+| `PUT /v1/databases/{id}/resource-profile` | Assign `profile_id` and `profile_revision` using the database's `expected_generation` |
+| `GET /v1/databases/{id}/resource-profile` | Read the selected/target revision and actual application state |
+| `PUT /v1/resource-profiles/{id}/rollout` | Select `profile_revision` for all databases currently assigned to that profile; `expected_revision` is the previous rollout target, or0 before its first selection |
+| `GET /v1/resource-profiles/{id}/rollout` | Read assigned, applied, deferred and pending counts |
+| `GET/PUT /v1/regions/{id}/configuration` | Read/change the gateway URL and binding through configuration-hash CAS; the route must end in `/pg` |
+| `GET /v1/nodes/{id}/storage` | Read a fresh identity-bound physical LVM observation, or `sample:null` when unavailable |
+
+Profile creation, rollout selection and regional configuration require administrator scope.
+Database assignment retains project authorization. Use `Idempotency-Key` for mutations and retain
+returned operation IDs. An immutable profile revision cannot be changed through the size-class API.
+An enabled revision may be selected for rollout; creating a revision alone does not promote it.
+The existing cron processes at most eight assignments per invocation and resumes through existing
+configuration generations and database operations. Capacity conflicts leave the current desired
+state intact for retry; they are not successful application.
+
+PostgreSQL CPU request and hard CPU limit are separate fields. An omitted request preserves the
+legacy request-equals-limit behavior. Use qualified resource values; a smaller request does not
+prove workload density or remove PostgreSQL/Barman startup checks. Memory remains the PostgreSQL
+container limit, with backup/system overhead reported separately.
+
+A confirmed sleeping database accepts future compute configuration while remaining suspended.
+Its unchanged no-Pod fact retains zero active CPU charge. `deferred_until_wake` explicitly means
+that no running PostgreSQL has yet proved the new settings. The next wake reacquires fresh hard
+CPU/RAM startup admission and must report current configuration readiness before `applied:true`.
+An uncertain stop or degraded observation is pending. A newer resource revision supersedes an
+unfinished older resize explicitly; stale observations cannot acknowledge the current revision.
+
+Physical storage reporting does not enable thin allocation. Current thick quotas still debit
+real extents. A missing/old/mismatched sample stays unknown, and `thin_pool:null` means no thin pool
+exists, not free thin capacity. Qualify pool sizing, growth, metadata exhaustion, final-volume
+reclaim and existing-volume migration before changing storage admission.
 
 Cloudflare implements the capacity-to-Ready sequence below from persisted state. The current
 installation used the owner-authorized operator postjoin/admission fallback; the complete

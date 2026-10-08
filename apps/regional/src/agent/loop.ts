@@ -4,7 +4,13 @@ import type {
   DesiredDatabase,
   DesiredResponse,
   ObservationRequest,
+  NodeStorageSample,
 } from "@pgcf/contracts";
+import type { FleetNodeReleaseObservation } from "@pgcf/contracts/releases";
+import {
+  collectFleetInventory,
+  FLEET_INVENTORY_INTERVAL_MS,
+} from "./fleet-inventory.ts";
 import type { BuildContext } from "./builders/index.ts";
 import { backoff } from "./api-client.ts";
 import {
@@ -22,10 +28,18 @@ import {
   type PowerCoordinator,
 } from "./power.ts";
 import type { AuthenticationProbe } from "./readiness.ts";
+import {
+  nodeStorageSample,
+  type StorageMetricsKubernetes,
+} from "./node-storage.ts";
 
 export interface ControlApi {
   desired(signal: AbortSignal): Promise<DesiredResponse>;
   observations(value: ObservationRequest, signal: AbortSignal): Promise<void>;
+  fleetObservations?(
+    value: FleetNodeReleaseObservation,
+    signal: AbortSignal,
+  ): Promise<void>;
 }
 
 interface Retry {
@@ -36,6 +50,11 @@ interface Retry {
 
 export class AgentLoop {
   private retries = new Map<string, Retry>();
+  private lastFleetInventory = -Infinity;
+  private fleetInventoryInFlight: Promise<void> | undefined;
+  private storageSamples = new Map<string, NodeStorageSample>();
+  private lastStorageSample = -Infinity;
+  private storageSampling: Promise<void> | undefined;
   private waiting: (() => void) | undefined;
   private hinted = false;
   private wakePending = false;
@@ -146,7 +165,12 @@ export class AgentLoop {
           const observation = await this.reconcile.reconcile(
             db,
             db.desired_state === "running"
-              ? await recoveryBuildContext(db, await buildContext(), this.k8s)
+              ? await recoveryBuildContext(
+                  db,
+                  await buildContext(),
+                  this.k8s,
+                  desired.region.recovery_sources,
+                )
               : undefined,
           );
           this.retries.delete(db.id);
@@ -205,7 +229,15 @@ export class AgentLoop {
       await this.api.observations(
         {
           observed_at: new Date(this.now()).toISOString(),
-          nodes: nodeObservations(nodes, pods, namespaces),
+          nodes: nodeObservations(nodes, pods, namespaces).map((node) => {
+            const storage = node.node_uid
+              ? this.storageSamples.get(node.node_uid)
+              : undefined;
+            return storage &&
+              Date.parse(storage.observed_at) >= this.now() - 120_000
+              ? { ...node, storage }
+              : node;
+          }),
           databases: observations,
           orphans: orphanObservations(
             namespaces,
@@ -215,8 +247,63 @@ export class AgentLoop {
         this.signal,
       );
       postOutcome = "completed";
+      // The existing exporter performs lvs/vgs per scrape; do not put this slow read on wake's hot path.
+      if (
+        !this.storageSampling &&
+        (this.k8s as StorageMetricsKubernetes).openEbsMetrics &&
+        this.now() - this.lastStorageSample >= 60_000
+      ) {
+        this.lastStorageSample = this.now();
+        this.storageSampling = (async () => {
+          const samples = new Map<string, NodeStorageSample>();
+          for (const node of nodes) {
+            if (this.signal.aborted) return;
+            const sample = await nodeStorageSample(
+              this.k8s as StorageMetricsKubernetes,
+              node,
+              this.now,
+            );
+            if (sample) samples.set(sample.node_uid, sample);
+          }
+          this.storageSamples = samples;
+        })()
+          .catch(() => {
+            if (!this.signal.aborted) this.log("node_storage_sample_failed");
+          })
+          .finally(() => {
+            this.storageSampling = undefined;
+          });
+      }
     } finally {
       finishPost(postOutcome);
+    }
+    // Fleet inventory is bounded/coalesced outside the wake/reconcile critical path.
+    if (
+      desired.fleet_release &&
+      this.api.fleetObservations &&
+      !this.fleetInventoryInFlight &&
+      this.now() - this.lastFleetInventory >= FLEET_INVENTORY_INTERVAL_MS
+    ) {
+      this.lastFleetInventory = this.now();
+      const selected = desired.fleet_release;
+      this.fleetInventoryInFlight = (async () => {
+        const reports = await collectFleetInventory(
+          this.k8s,
+          selected,
+          this.now,
+          this.signal,
+        );
+        for (const report of reports) {
+          if (this.signal.aborted) return;
+          await this.api.fleetObservations!(report, this.signal);
+        }
+      })()
+        .catch(() => {
+          if (!this.signal.aborted) this.log("fleet_inventory_failed");
+        })
+        .finally(() => {
+          this.fleetInventoryInFlight = undefined;
+        });
     }
     for (const id of this.retries.keys())
       if (!desired.databases.some((db) => db.id === id))

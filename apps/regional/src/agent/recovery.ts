@@ -21,42 +21,44 @@ export async function recoveryBuildContext(
   db: DesiredDatabase,
   ctx: BuildContext,
   k8s: Kubernetes,
+  recoverySources?: RecoverySourceCredentialsMap,
 ): Promise<BuildContext> {
   const source = db.recovery?.source_archive;
   if (!source) return ctx;
-  const secret = await k8s.read(
-    "Secret",
-    "pgcf-system",
-    "pgcf-restore-source-s3",
-  );
   const unavailable = () =>
     new Error("recovery_source_credentials_unavailable");
-  if (
-    !secret ||
-    secret.kind !== "Secret" ||
-    secret.metadata.name !== "pgcf-restore-source-s3" ||
-    secret.metadata.namespace !== "pgcf-system" ||
-    secret.metadata.deletionTimestamp
-  )
-    throw unavailable();
-  const encoded = record(secret.data)["sources.json"];
-  if (
-    typeof encoded !== "string" ||
-    !encoded ||
-    encoded.length > 128 * 1024 ||
-    !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
-      encoded,
-    )
-  )
-    throw unavailable();
-  let parsed: ReturnType<typeof RecoverySourceCredentialsMap.safeParse>;
-  try {
-    parsed = RecoverySourceCredentialsMap.safeParse(
-      JSON.parse(Buffer.from(encoded, "base64").toString("utf8")),
+  let sources: unknown = recoverySources;
+  if (recoverySources === undefined) {
+    const secret = await k8s.read(
+      "Secret",
+      "pgcf-system",
+      "pgcf-restore-source-s3",
     );
-  } catch {
-    throw unavailable();
+    if (
+      !secret ||
+      secret.kind !== "Secret" ||
+      secret.metadata.name !== "pgcf-restore-source-s3" ||
+      secret.metadata.namespace !== "pgcf-system" ||
+      secret.metadata.deletionTimestamp
+    )
+      throw unavailable();
+    const encoded = record(secret.data)["sources.json"];
+    if (
+      typeof encoded !== "string" ||
+      !encoded ||
+      encoded.length > 128 * 1024 ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(
+        encoded,
+      )
+    )
+      throw unavailable();
+    try {
+      sources = JSON.parse(Buffer.from(encoded, "base64").toString("utf8"));
+    } catch {
+      throw unavailable();
+    }
   }
+  const parsed = RecoverySourceCredentialsMap.safeParse(sources);
   if (!parsed.success) throw unavailable();
   const selected = parsed.data[source.region_id];
   if (

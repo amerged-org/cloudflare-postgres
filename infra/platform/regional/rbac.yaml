@@ -103,6 +103,41 @@ subjects:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
+  name: pgcf-storage-observer
+  namespace: openebs
+  labels:
+    app.kubernetes.io/part-of: pgcf
+rules:
+  # Fresh lvs/vgs through authenticated Kubernetes HTTPS; no exec or host writer.
+  - apiGroups: [""]
+    resources: [pods/proxy]
+    verbs: [get]
+  - apiGroups: [apps]
+    resources: [daemonsets]
+    verbs: [get]
+  - apiGroups: [local.openebs.io]
+    resources: [lvmnodes]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pgcf-storage-observer
+  namespace: openebs
+  labels:
+    app.kubernetes.io/part-of: pgcf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pgcf-storage-observer
+subjects:
+  - kind: ServiceAccount
+    name: pgcf-agent
+    namespace: pgcf-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
   name: pgcf-agent
   namespace: pgcf-system
   labels:

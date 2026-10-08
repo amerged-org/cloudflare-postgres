@@ -1,5 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
-import { DatabaseId, RegionId, SIDECAR } from "@pgcf/contracts";
+import {
+  DatabaseId,
+  RegionId,
+  SIDECAR,
+  databaseCpuReservationMillicores,
+  postgresCpuRequestMillicores,
+} from "@pgcf/contracts";
 import {
   choosePlacement,
   placementNodes,
@@ -27,6 +33,7 @@ import { startAddNode } from "../platform/nodes.ts";
 import {
   startupHeadroomSql,
   startupReservationStatement,
+  nodeCpuHeadroomSql,
 } from "./startup-admission.ts";
 
 /** Read selection avoids busy workers; the final mutation still checks the same guard atomically. */
@@ -36,11 +43,10 @@ export async function startupPlacementNodes(
   sizeClassId: string,
 ): Promise<PlacementNode[]> {
   const nodes = await placementNodes(db, regionId);
-  if (!nodes.some((node) => node.placement_mode === "actual_ram")) return nodes;
   const available = await db
     .prepare(
       `SELECT n.id FROM nodes n JOIN size_classes s ON s.id=? AND s.enabled=1
-    WHERE n.region_id=? AND ${startupHeadroomSql()}`,
+    WHERE n.region_id=? AND ${nodeCpuHeadroomSql()} AND ${startupHeadroomSql()}`,
     )
     .bind(sizeClassId, regionId)
     .all<{ id: string }>();
@@ -98,9 +104,10 @@ export async function placePendingDatabases(
           AND ${startupHeadroomSql()}
           AND n.platform_reserved_cpu_millicores IS NOT NULL AND n.storage_gib_total IS NOT NULL
           AND ${nodeMemoryReservationGuard("n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?")}
-          AND n.allocatable_cpu_millicores-n.platform_reserved_cpu_millicores-COALESCE((SELECT SUM(sc.cpu_millicores+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.cpu_millicores+?
+          AND ${nodeCpuHeadroomSql()}
           AND n.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.storage_gib
-          AND s.memory_mib=? AND s.cpu_millicores=? AND s.storage_gib=?)`,
+          AND s.memory_mib=? AND s.cpu_millicores=?
+          AND COALESCE(s.cpu_request_millicores,s.cpu_millicores)=? AND s.storage_gib=?)`,
         )
         .bind(
           node.id,
@@ -116,10 +123,9 @@ export async function placePendingDatabases(
           ...nodePlacementBindings(),
           SIDECAR.requestMemoryMib,
           SIDECAR.requestMemoryMib,
-          SIDECAR.requestCpuMillicores,
-          SIDECAR.requestCpuMillicores,
           size.memory_mib,
           size.cpu_millicores,
+          postgresCpuRequestMillicores(size),
           size.storage_gib,
         ),
       db
@@ -134,8 +140,7 @@ export async function placePendingDatabases(
             memory_mib: size.memory_mib,
             cpu_millicores: size.cpu_millicores,
             reserved_memory_mib: size.memory_mib + SIDECAR.requestMemoryMib,
-            reserved_cpu_millicores:
-              size.cpu_millicores + SIDECAR.requestCpuMillicores,
+            reserved_cpu_millicores: databaseCpuReservationMillicores(size),
             storage_allocated_bytes: size.storage_gib * 2 ** 30,
           }),
           row.id,
@@ -198,7 +203,7 @@ export async function runNodeCapacity(
     .bind(regionId)
     .first<{ id: string; size_class_id: string }>();
   const smallest = await env.DB.prepare(
-    "SELECT * FROM size_classes WHERE enabled=1 ORDER BY memory_mib,cpu_millicores,storage_gib,id LIMIT 1",
+    "SELECT * FROM size_classes WHERE enabled=1 ORDER BY memory_mib,COALESCE(cpu_request_millicores,cpu_millicores),cpu_millicores,storage_gib,id LIMIT 1",
   ).first<SizeRow>();
   const threshold =
     policy?.placement_mode === "actual_ram"
@@ -288,6 +293,7 @@ export async function runNodeCapacity(
       .bind(regionId)
       .first();
     if (unknown) return { ...result, action: "memory_observations_unknown" };
+    if (pending) return { ...result, action: "capacity_wait" };
   }
   if (!policy.autoscale_enabled) return { ...result, action: "disabled" };
   if ((await nodeRegionOccupiedSlots(env.DB, regionId)) >= policy.max_nodes)

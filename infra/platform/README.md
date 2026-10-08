@@ -224,6 +224,30 @@ updates the LVMNode when its VG fields **or ownership** change; it has no heartb
 Neither that timestamp nor a changed resource version alone proves a fresh VG measurement. The
 publisher never uses them as measurement timestamps.
 
+### Physical storage observations
+
+The Regional agent now samples the existing OpenEBS node driver's `/metrics` through the
+authenticated Kubernetes HTTPS Pod proxy. Each pinned LVM1.10.1 scrape executes `vgs`/`lvs`,
+unlike the change-only LVMNode resource. Current Node, namespace, driver Pod/DaemonSet and
+running-image identities are checked around the read. The scoped `openebs` observer Role
+permits GET only; it adds no `pods/exec`, node proxy, host writer or separate collector.
+`GET /v1/nodes/{id}/storage` exposes the latest fresh physical observation to administrators.
+Unknown, stale or changed-node observations cannot become zero usage or qualified capacity.
+
+VG total/free, thick allocated extents and thin-pool data/metadata consumption are separate
+facts. Percentage-derived allocation uses a conservative upper bound for LVM's reported
+precision. This reporting does **not** qualify thin storage or remove the existing thick
+quota debit. The three retained hosts were read with the new code on2026-10-08: each dedicated
+VG measured103,075,020,800 bytes, with thick allocation US0, EU1 5GiB and control10GiB;
+none has a thin pool and `dm_thin_pool` is not loaded. No host write or provider call occurred.
+
+Do not switch `pgcf-lvm` in place. The pinned [driver implementation](https://github.com/openebs/lvm-localpv/blob/e8a234cbfeef5fa16fde1330c8de2d91e31831f1/pkg/lvm/lvm_util.go)
+creates `pgcf_thinpool` from the first thin volume's requested size and attempts to remove it
+after the last thin volume is deleted. It does not implement automatic pool growth. Thin
+qualification therefore still requires supported Talos module loading, explicit pool sizing
+and growth, error-before-full behavior, metadata safety, discard/reclaim and a data-preserving
+transition from the retained thick volumes. The existing data and StorageClass remain intact.
+
 Each binding's `smoke` object must contain three **actual, approved readbacks**: `before` the L2
 smoke PVC allocation, `allocated` while its logical volume exists, and `after` its verified deletion
 and storage reclamation. Each readback contains these fields:

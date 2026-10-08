@@ -18,6 +18,7 @@
     "./node-proof": "./src/node-proof.ts",
     "./bootstrap-relay": "./src/bootstrap-relay.ts",
     "./nodes": "./src/nodes.ts",
+    "./releases": "./src/releases.ts",
     "./client": "./src/client.ts"
   },
   "scripts": {
