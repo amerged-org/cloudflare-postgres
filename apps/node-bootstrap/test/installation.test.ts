@@ -49,6 +49,15 @@ function clusterFixture(
   let observedHelmVersion: string | undefined;
   const ociDigest =
     "sha256:a7c12d330dd96bfcda3bf057b24be8f36566c34868265f930f776dff6f42d838";
+  const cloudflaredPin = parse(
+    readFileSync(
+      new URL(
+        "../../../infra/platform/regional/kustomization.yaml",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  ).images.find((image: { name: string }) => image.name === "cloudflared");
   const pinnedCiliumValues = readFileSync(
     new URL("../../../infra/platform/base/values/cilium.yaml", import.meta.url),
     "utf8",
@@ -337,7 +346,7 @@ function clusterFixture(
                   name: container,
                   image:
                     container === "cloudflared"
-                      ? "docker.io/cloudflare/cloudflared@sha256:072c067d25ccbe61d46e18f0d0723255f2bb5304f7317caa95b27031520ff92c"
+                      ? `${cloudflaredPin.newName}@${cloudflaredPin.digest}`
                       : input.spec.platform.regional_image,
                 },
               ],
@@ -1246,6 +1255,49 @@ test("stale release readiness and unregistered LVM storage cannot reach regional
   );
   assert.equal(state.mutations.length, 0);
   assert.equal(state.stage(), "platform_sync_intent");
+});
+
+test("regional readback accepts the cloudflared digest from the unchanged reviewed Kustomization", async () => {
+  const state = clusterFixture("regional_install_intent");
+  for (const value of [
+    ...state.assets.flux,
+    ...platformSyncObjects(state.input),
+    ...regionalObjects(state.input),
+  ])
+    state.store(value);
+  state.populateRegional();
+  const reviewed = parse(
+    readFileSync(
+      new URL(
+        "../../../infra/platform/regional/kustomization.yaml",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  const pin = reviewed.images.find(
+    (image: { name: string }) => image.name === "cloudflared",
+  );
+  const deployment = state.resources.get(
+    "Deployment/pgcf-system/pgcf-cloudflared",
+  )!;
+  (
+    object(object(object(deployment.spec).template).spec).containers as Json[]
+  )[0]!.image = `${pin.newName}@${pin.digest}`;
+  await (
+    state.installer as unknown as { verifyRegional(): Promise<void> }
+  ).verifyRegional();
+  assert.equal(state.mutations.length, 0);
+  (
+    object(object(object(deployment.spec).template).spec).containers as Json[]
+  )[0]!.image = `${pin.newName}@sha256:${"0".repeat(64)}`;
+  await assert.rejects(
+    (
+      state.installer as unknown as { verifyRegional(): Promise<void> }
+    ).verifyRegional(),
+    /regional_deployment_mismatch/,
+  );
+  assert.equal(state.mutations.length, 0);
 });
 
 test("regional image mismatch and stale Deployment status prevent platform completion", async () => {

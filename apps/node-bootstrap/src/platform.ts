@@ -1492,7 +1492,7 @@ export class PlatformInstaller {
         ) ||
         image !==
           (container === "cloudflared"
-            ? "docker.io/cloudflare/cloudflared@sha256:072c067d25ccbe61d46e18f0d0723255f2bb5304f7317caa95b27031520ff92c"
+            ? PLATFORM_ARTIFACTS.cloudflared.image
             : this.input.spec.platform!.regional_image) ||
         record(deployment.spec).replicas !== (container === "agent" ? 1 : 2)
       )

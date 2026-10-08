@@ -579,6 +579,22 @@ reproduced first;41 affected cases, types/lint/formatting and independent review
 The original operation was paused once for the changed readback image. Both consumed journals
 remain immutable; full US1 admission and customer-operation acceptance are still pending.
 
+Source `49dadaa2`, full CI `37750099518`, delivered Native
+`sha256:7c1251b3f6fb93cfa6dc6e5d5936fc567c0bf4b8ded1c8c3589ef20b7e69af5f` once.
+Qualification passed18 layers/715,032,661 bytes; complete registry readback verified162,128,780
+compressed and502,915,584 raw bytes. Actual running image matched. The same operation confirmed
+`platform_ready` at08:55:03Z and entered regional installation at08:55:49Z. Regional readback
+then reported `regional_deployment_mismatch`. One bounded read-only inspection established
+that all three Deployments were owned/Ready with correct replicas and quarantine tolerations,
+and the regional ConfigMap/Kustomization matched. Only Native's stale cloudflared image digest
+differed: the deployed `sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07`
+matches the unchanged reviewed Git manifest and version lock. Whole job702 and sealed physical
+identities/custody stayed exact; provider/cluster writes were zero. The narrow correction binds
+Native's expected image to that existing pin. The actual-pin reproducer fails first, then43
+affected cases/types/lint/formatting and independent review pass; wrong digests still reject.
+The original operation was paused once for readback delivery. No component reapply or source
+pin update occurred. US1 admission and full SQL/backup/WAL/restore/reclamation remain pending.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

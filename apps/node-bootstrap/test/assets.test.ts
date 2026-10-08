@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { downloadBootstrapAssets } from "../src/build-assets.ts";
 import { PLATFORM_ARTIFACTS } from "../src/platform-artifacts.ts";
-import { parseAllDocuments } from "yaml";
+import { parse, parseAllDocuments } from "yaml";
 
 test("bootstrap asset download rejects checksum changes and bounds streamed bytes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pgcf-assets-test-"));
@@ -57,4 +57,36 @@ test("the Native Cilium handoff digest matches the reviewed platform OCI source 
       value.kind === "OCIRepository" && value.metadata.name === "cilium-chart",
   );
   assert.equal(PLATFORM_ARTIFACTS.cilium.oci_digest, cilium.spec.ref.digest);
+});
+
+test("Native regional readback pins the same cloudflared image as reviewed Kustomize and version lock", async () => {
+  const kustomization = parse(
+    await readFile(
+      new URL(
+        "../../../infra/platform/regional/kustomization.yaml",
+        import.meta.url,
+      ),
+      "utf8",
+    ),
+  );
+  const image = kustomization.images.find(
+    (value: { name: string }) => value.name === "cloudflared",
+  );
+  const lock = JSON.parse(
+    await readFile(
+      new URL("../../../infra/platform/versions.lock.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const lockedImage = lock.regional.images.find(
+    (value: { name: string }) => value.name === "cloudflared",
+  );
+  assert.equal(
+    PLATFORM_ARTIFACTS.cloudflared.image,
+    `${image.newName}@${image.digest}`,
+  );
+  assert.equal(
+    PLATFORM_ARTIFACTS.cloudflared.image,
+    `${lockedImage.reference}@${lockedImage.indexDigest}`,
+  );
 });

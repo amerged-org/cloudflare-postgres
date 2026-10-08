@@ -8,6 +8,10 @@ export const HELM_ARTIFACT = {
     "31c5794dd55c66a51e6b7d2e2ac7a114ae8b1de41ff1d9ba51748ac973b06a08",
 };
 export const PLATFORM_ARTIFACTS = {
+  cloudflared: {
+    image:
+      "docker.io/cloudflare/cloudflared@sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07",
+  },
   cilium: {
     version: "1.20.2",
     oci_digest:

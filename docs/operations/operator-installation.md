@@ -436,3 +436,8 @@ reviewed Git/Kustomization and Ready HelmRelease, plus the referenced values Con
 ownership, exact pinned content and stable UID. Application version, deployed status,
 bootstrap-operation label, exact Helm values and physical identity remain required.
 Do not strip arbitrary version metadata or repeat an install to resolve this representation.
+
+Regional readback must use the same cloudflared image digest as the reviewed regional
+Kustomize manifest and version lock. A stale verifier constant does not authorize replacing
+the deployed component. Confirm current ownership/readiness/replicas/tolerations and fix
+only the expected pinned value, retaining the original regional installation intent.
