@@ -412,3 +412,19 @@ Node through their exact REST paths. The API's120-second receipt limit remains u
 observation ages. A409 alone does not identify which predicate failed; retain the diagnostic
 and resolve current journal state before any follow-up. A recorded attempt2 still permits
 only authenticated readback, regardless of the diagnostic reason.
+
+Kubernetes canonicalizes integral Quantity values: a ResourceQuota hard pod count of `1000`
+can read back as `1k`. Compare this field numerically with the exact integral parser, while
+retaining every other namespace, ownership and spec check. A representation difference does
+not authorize applying Flux again or clearing its saved intent; resume the existing readback.
+The same narrow numerical comparison handles Deployment container CPU limits (`1000m`/`1`);
+every other field remains strict.
+
+If the retained Flux intent has exactly the observed missing pinned Services `source-watcher`
+and `webhook-receiver` or Deployment `helm-controller`, the serialized executor may record one
+Flux repair intent in Cloudflare. It requires fresh complete43-object inspection, matching
+physical identities, exact ownership of every existing object and their unchanged UID/spec
+set. The executor rechecks Namespace UID and ownership before creating only that subset.
+An uncertain claim dispatches nothing; a consumed repair never permits another create.
+Resolve partial or unknown results through exact authenticated readback. Never reapply the
+whole Flux manifest, erase either repair journal or reset the original installation checkpoint.

@@ -2802,3 +2802,261 @@ it("logs only a finite owned Cilium rejection reason and bounded ages while reta
   expect(JSON.stringify(events)).not.toContain(stale.input_hash);
   expect((await readBootstrapJob(env.DB, f.job.operation_id)).revision).toBe(0);
 });
+
+async function fluxRepairFixture() {
+  const { f, checkpoint, claimed } = await ciliumRecoveryFixture();
+  const current = {
+    ...checkpoint,
+    stage: "flux_install_intent",
+    cilium_install: claimed.cilium_install,
+  };
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(current), f.job.operation_id)
+    .run();
+  const receipt = {
+    version: 1,
+    operation_id: f.job.operation_id,
+    node_id: f.job.node_id,
+    region_id: f.region,
+    input_hash: f.job.input_hash,
+    kube_system_uid: claimed.cilium_install.recovery_receipt.kube_system_uid,
+    node_uid: claimed.cilium_install.recovery_receipt.node_uid,
+    node_name: f.spec.hostname,
+    manifest_sha256:
+      "9c1fda7e401429531ed1478f67ba06b3edff6513b75da7ee47bde9f1c4d4251c",
+    inventory_sha256: hash(),
+    resource_count: 43,
+    present_resource_count: 40,
+    missing: [
+      {
+        kind: "Service",
+        name: "source-watcher",
+        namespace: "flux-system",
+        spec_sha256: hash(),
+      },
+      {
+        kind: "Service",
+        name: "webhook-receiver",
+        namespace: "flux-system",
+        spec_sha256: hash(),
+      },
+      {
+        kind: "Deployment",
+        name: "helm-controller",
+        namespace: "flux-system",
+        spec_sha256: hash(),
+      },
+    ],
+    present_set_sha256: hash(),
+    prior_command_closed: true,
+    observed_at: new Date().toISOString(),
+    completed_at: new Date().toISOString(),
+  };
+  const repair = {
+    ...current,
+    status: "running",
+    error_code: null,
+    flux_repair: { attempt: 1, state: "intent", receipt },
+  };
+  return { f, current, receipt, repair };
+}
+
+it("claims one exact missing Flux subset repair while preserving the original intent and consumed Cilium attempt", async () => {
+  const { f, current, repair } = await fluxRepairFixture();
+  expect(
+    (
+      await callback(f, {
+        ...f.identity,
+        kind: "checkpoint",
+        expected_revision: 0,
+        payload: repair,
+      })
+    ).status,
+  ).toBe(200);
+  const saved = await readBootstrapJob(env.DB, f.job.operation_id);
+  const { flux_repair, status, error_code, ...preserved } = JSON.parse(
+    saved.checkpoint_json,
+  );
+  expect(preserved).toEqual(
+    Object.fromEntries(
+      Object.entries(current).filter(
+        ([k]) => !["status", "error_code"].includes(k),
+      ),
+    ),
+  );
+  expect(flux_repair).toEqual(repair.flux_repair);
+  expect(status).toBe("running");
+  expect(error_code).toBeNull();
+  expect(saved.revision).toBe(1);
+  expect(
+    (
+      await callback(f, {
+        ...f.identity,
+        kind: "checkpoint",
+        expected_revision: 0,
+        payload: repair,
+      })
+    ).status,
+  ).toBe(409);
+});
+
+it("rejects stale or out-of-scope Flux repair and leaves all prior installation authority intact", async () => {
+  const { f, repair } = await fluxRepairFixture();
+  const send = (payload: unknown) =>
+    callback(f, {
+      ...f.identity,
+      kind: "checkpoint",
+      expected_revision: 0,
+      payload,
+    });
+  expect(
+    (await send({ ...repair, written_bytes: repair.written_bytes + 512 }))
+      .status,
+  ).toBe(409);
+  expect((await send({ ...repair, sealed_ref: "join_bundle:2" })).status).toBe(
+    409,
+  );
+  const stale = {
+    ...repair.flux_repair.receipt,
+    observed_at: new Date(Date.now() - 120001).toISOString(),
+    completed_at: new Date(Date.now() - 120001).toISOString(),
+  };
+  expect(
+    (
+      await send({
+        ...repair,
+        flux_repair: { ...repair.flux_repair, receipt: stale },
+      })
+    ).status,
+  ).toBe(409);
+  const nodeChanged = {
+    ...repair.flux_repair.receipt,
+    node_uid: crypto.randomUUID(),
+  };
+  expect(
+    (
+      await send({
+        ...repair,
+        flux_repair: { ...repair.flux_repair, receipt: nodeChanged },
+      })
+    ).status,
+  ).toBe(409);
+  const unrelated = {
+    ...repair.flux_repair.receipt,
+    missing: [
+      {
+        kind: "Service",
+        name: "unrelated",
+        namespace: "flux-system",
+        spec_sha256: hash(),
+      },
+    ],
+    present_resource_count: 42,
+  };
+  expect(
+    (
+      await send({
+        ...repair,
+        flux_repair: { ...repair.flux_repair, receipt: unrelated },
+      })
+    ).status,
+  ).toBe(400);
+  const duplicate = {
+    ...repair.flux_repair.receipt,
+    missing: [
+      repair.flux_repair.receipt.missing[0],
+      repair.flux_repair.receipt.missing[0],
+    ],
+    present_resource_count: 41,
+  };
+  expect(
+    (
+      await send({
+        ...repair,
+        flux_repair: { ...repair.flux_repair, receipt: duplicate },
+      })
+    ).status,
+  ).toBe(400);
+  expect((await readBootstrapJob(env.DB, f.job.operation_id)).revision).toBe(0);
+});
+
+it("never erases or expands a consumed Flux subset repair and permits only retained readback progress", async () => {
+  const { f, current, repair } = await fluxRepairFixture();
+  expect(
+    (
+      await callback(f, {
+        ...f.identity,
+        kind: "checkpoint",
+        expected_revision: 0,
+        payload: repair,
+      })
+    ).status,
+  ).toBe(200);
+  const send = (payload: unknown) =>
+    callback(f, {
+      ...f.identity,
+      kind: "checkpoint",
+      expected_revision: 1,
+      payload,
+    });
+  expect(
+    (await send({ ...current, status: "running", error_code: null })).status,
+  ).toBe(409);
+  const replaced = {
+    ...repair.flux_repair.receipt,
+    present_set_sha256: hash(),
+  };
+  expect(
+    (
+      await send({
+        ...repair,
+        flux_repair: { ...repair.flux_repair, receipt: replaced },
+      })
+    ).status,
+  ).toBe(409);
+  expect(
+    (
+      await send({
+        ...repair,
+        flux_repair: { ...repair.flux_repair, attempt: 2 },
+      })
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await send({
+        ...repair,
+        status: "waiting",
+        error_code: "flux_repair_unconfirmed",
+      })
+    ).status,
+  ).toBe(200);
+  expect(
+    JSON.parse(
+      (await readBootstrapJob(env.DB, f.job.operation_id)).checkpoint_json,
+    ).flux_repair,
+  ).toEqual(repair.flux_repair);
+});
+
+it("atomically grants only one competing missing Flux subset repair", async () => {
+  const { f, repair } = await fluxRepairFixture();
+  const responses = await Promise.all([
+    callback(f, {
+      ...f.identity,
+      kind: "checkpoint",
+      expected_revision: 0,
+      payload: repair,
+    }),
+    callback(f, {
+      ...f.identity,
+      request_id: crypto.randomUUID(),
+      kind: "checkpoint",
+      expected_revision: 0,
+      payload: repair,
+    }),
+  ]);
+  expect(responses.map((x) => x.status).sort()).toEqual([200, 409]);
+  expect((await readBootstrapJob(env.DB, f.job.operation_id)).revision).toBe(1);
+});

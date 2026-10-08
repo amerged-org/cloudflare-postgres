@@ -22,6 +22,8 @@ const key = (value: Json) =>
   `${value.kind}/${object(value.metadata).namespace ?? ""}/${object(value.metadata).name}`;
 const kinds: Record<string, string> = {
   namespaces: "Namespace",
+  resourcequotas: "ResourceQuota",
+  services: "Service",
   deployments: "Deployment",
   daemonsets: "DaemonSet",
   nodes: "Node",
@@ -51,6 +53,12 @@ function clusterFixture(
     | import("@pgcf/contracts/node-bootstrap").NodeCiliumInstallJournal
     | undefined;
   let lostRecoveryAck = false;
+  let fluxRepairJournal:
+    import("@pgcf/contracts/node-bootstrap").NodeFluxRepairJournal | undefined;
+  let lostFluxRepairAck = false;
+  let partialFluxCreate = false;
+  let revokeFluxNamespaceAtDispatch = false;
+  let fluxNamespaceReads = 0;
   let rendered =
     "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cilium-bootstrap\n  namespace: kube-system\n";
   let chartCrds = "";
@@ -250,6 +258,12 @@ function clusterFixture(
   const installer = new PlatformInstaller(input, assets, {
     priorCommandClosed: () => recovery,
     ciliumJournal: async () => recoveryJournal,
+    fluxJournal: async () => fluxRepairJournal,
+    claimFluxRepair: async (journal) => {
+      fluxRepairJournal = journal;
+      if (lostFluxRepairAck)
+        throw new BootstrapError("checkpoint_acknowledgement_uncertain");
+    },
     claimCiliumRetry: async (journal) => {
       recoveryJournal = journal;
       if (lostRecoveryAck)
@@ -327,6 +341,15 @@ function clusterFixture(
         ) {
           const kind = segments[2] === "nodes" ? "Node" : "Namespace",
             value = resources.get(`${kind}//${segments[3]}`);
+          if (kind === "Namespace" && segments[3] === "flux-system") {
+            fluxNamespaceReads++;
+            if (
+              revokeFluxNamespaceAtDispatch &&
+              fluxNamespaceReads === 2 &&
+              value
+            )
+              object(value.metadata).annotations = {};
+          }
           return {
             exit_code: value ? 0 : 1,
             stdout: value ? JSON.stringify(value) : "",
@@ -397,9 +420,12 @@ function clusterFixture(
           }),
         };
       }
-      if (args.includes("apply")) {
+      if (args.includes("apply") || args.includes("create")) {
         mutations.push(args);
-        for (const document of parseAllDocuments(stdin!)) {
+        const documents = parseAllDocuments(stdin!);
+        for (const document of args.includes("create") && partialFluxCreate
+          ? documents.slice(0, 1)
+          : documents) {
           const value = object(document.toJSON());
           store(value);
           if (
@@ -408,7 +434,8 @@ function clusterFixture(
           )
             populateRegional();
         }
-        if (lose_response) throw new Error("lost native response");
+        if (lose_response || (args.includes("create") && partialFluxCreate))
+          throw new Error("lost native response");
         return { exit_code: 0, stdout: "" };
       }
       const kind = kinds[args[args.indexOf("get") + 1]!.split(".")[0]!]!;
@@ -430,6 +457,16 @@ function clusterFixture(
     populateRegional,
     installer,
     journal: () => recoveryJournal,
+    fluxJournal: () => fluxRepairJournal,
+    setLostFluxRepairAck: () => {
+      lostFluxRepairAck = true;
+    },
+    setPartialFluxCreate: () => {
+      partialFluxCreate = true;
+    },
+    revokeFluxNamespaceAtDispatch: () => {
+      revokeFluxNamespaceAtDispatch = true;
+    },
     setLostRecoveryAck: () => {
       lostRecoveryAck = true;
     },
@@ -764,6 +801,172 @@ test("mismatched Helm storage TypeMeta cannot prove zero release effects", async
   );
   assert.equal(state.journal(), undefined);
   assert.equal(state.mutations.length, 0);
+});
+
+function partialFluxFixture() {
+  const state = clusterFixture("flux_install_intent", false, true);
+  const owned = (kind: string, name: string): Json => ({
+    apiVersion: kind === "Deployment" ? "apps/v1" : "v1",
+    kind,
+    metadata: {
+      name,
+      namespace: "flux-system",
+      annotations: { "pgcf.io/bootstrap-input": state.input.input_hash },
+    },
+    ...(kind === "Deployment"
+      ? {
+          spec: {
+            replicas: 1,
+            template: {
+              spec: { containers: [{ name: "manager", image: "flux" }] },
+            },
+          },
+        }
+      : {}),
+  });
+  state.assets.flux.push(
+    owned("Service", "source-watcher"),
+    owned("Service", "webhook-receiver"),
+    owned("Deployment", "helm-controller"),
+  );
+  while (state.assets.flux.length < 43)
+    state.assets.flux.push(
+      owned("ConfigMap", `fixture-${state.assets.flux.length}`),
+    );
+  for (const value of state.assets.flux)
+    if (
+      !["source-watcher", "webhook-receiver", "helm-controller"].includes(
+        String(object(value.metadata).name),
+      )
+    )
+      state.store(value);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  return state;
+}
+
+test("a complete owned Flux inspection claims one repair and creates only the three absent pinned objects", async () => {
+  const state = partialFluxFixture();
+  await state.installer.install();
+  assert.equal(state.stage(), "regional_ready");
+  assert.equal(state.fluxJournal()!.attempt, 1);
+  assert.equal(state.fluxJournal()!.receipt.resource_count, 43);
+  assert.equal(state.fluxJournal()!.receipt.present_resource_count, 40);
+  assert.equal(state.fluxJournal()!.receipt.missing.length, 3);
+  assert.equal(
+    state.mutations.filter((args) => args.includes("create")).length,
+    1,
+  );
+  assert.equal(
+    state.mutations.filter((args) => args.includes("apply")).length,
+    2,
+  );
+  assert.ok(!state.checkpoints.includes("flux_install_intent"));
+});
+
+test("a lost Flux repair acknowledgement consumes the intent without dispatching or retrying creation", async () => {
+  const state = partialFluxFixture();
+  state.setLostFluxRepairAck();
+  await assert.rejects(
+    state.installer.install(),
+    /checkpoint_acknowledgement_uncertain/,
+  );
+  assert.equal(state.fluxJournal()!.attempt, 1);
+  assert.equal(state.mutations.length, 0);
+  await assert.rejects(
+    state.installer.install(),
+    /platform_resource_unconfirmed/,
+  );
+  assert.equal(state.mutations.length, 0);
+});
+
+test("partial uncertain Flux creation is resolved by readback and never created again", async () => {
+  const state = partialFluxFixture();
+  state.setPartialFluxCreate();
+  await assert.rejects(
+    state.installer.install(),
+    /platform_resource_unconfirmed/,
+  );
+  assert.equal(state.fluxJournal()!.attempt, 1);
+  assert.equal(
+    state.mutations.filter((args) => args.includes("create")).length,
+    1,
+  );
+  await assert.rejects(
+    state.installer.install(),
+    /platform_resource_unconfirmed/,
+  );
+  assert.equal(
+    state.mutations.filter((args) => args.includes("create")).length,
+    1,
+  );
+});
+
+test("unowned present Flux resources and incomplete raw inventory prevent repair consumption", async () => {
+  const unowned = partialFluxFixture();
+  object(
+    unowned.resources.get("ConfigMap/flux-system/fixture-5")!.metadata,
+  ).annotations = {};
+  await assert.rejects(
+    unowned.installer.install(),
+    /platform_resource_mismatch/,
+  );
+  assert.equal(unowned.fluxJournal(), undefined);
+  assert.equal(unowned.mutations.length, 0);
+  const incomplete = partialFluxFixture();
+  incomplete.setPartialRawInventory();
+  await assert.rejects(
+    incomplete.installer.install(),
+    /cilium_recovery_inventory_unknown/,
+  );
+  assert.equal(incomplete.fluxJournal(), undefined);
+  assert.equal(incomplete.mutations.length, 0);
+});
+
+test("same-UID Flux Namespace ownership revocation before dispatch blocks repair creation", async () => {
+  const state = partialFluxFixture();
+  state.revokeFluxNamespaceAtDispatch();
+  await assert.rejects(state.installer.install(), /platform_resource_mismatch/);
+  assert.equal(state.fluxJournal()!.attempt, 1);
+  assert.equal(state.mutations.length, 0);
+});
+
+test("replacement of a present Flux object after consumed repair blocks readback authority", async () => {
+  const state = partialFluxFixture();
+  state.setLostFluxRepairAck();
+  await assert.rejects(
+    state.installer.install(),
+    /checkpoint_acknowledgement_uncertain/,
+  );
+  const namespace = state.resources.get("Namespace//flux-system")!;
+  object(namespace.metadata).uid = randomUUID();
+  await assert.rejects(state.installer.install(), /platform_resource_mismatch/);
+  assert.equal(state.mutations.length, 0);
+});
+
+test("canonical Flux quota readback completes its existing intent without reapplying Flux", async () => {
+  const state = clusterFixture("flux_install_intent");
+  state.assets.flux.splice(1, 0, {
+    apiVersion: "v1",
+    kind: "ResourceQuota",
+    metadata: {
+      name: "critical-pods",
+      namespace: "flux-system",
+      annotations: { "pgcf.io/bootstrap-input": state.input.input_hash },
+    },
+    spec: { hard: { pods: "1000" } },
+  });
+  for (const value of state.assets.flux) state.store(value);
+  const quota = state.resources.get("ResourceQuota/flux-system/critical-pods")!;
+  object(object(quota.spec).hard).pods = "1k";
+  await state.installer.install();
+  assert.equal(state.stage(), "regional_ready");
+  assert.equal(state.checkpoints[0], "flux_installed");
+  assert.ok(!state.checkpoints.includes("flux_install_intent"));
+  assert.equal(state.mutations.length, 2);
 });
 
 test("partly applied Flux intent refuses missing objects without applying them again", async () => {

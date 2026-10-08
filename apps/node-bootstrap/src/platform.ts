@@ -6,7 +6,10 @@ import type {
   NodeBootstrapInput,
   NodeBootstrapStage,
 } from "@pgcf/contracts/node-bootstrap";
-import { NodeCiliumInstallJournal } from "@pgcf/contracts/node-bootstrap";
+import {
+  NodeCiliumInstallJournal,
+  NodeFluxRepairJournal,
+} from "@pgcf/contracts/node-bootstrap";
 import {
   BootstrapError,
   canonical,
@@ -14,6 +17,7 @@ import {
   KUBERNETES_VERSION,
 } from "./bootstrap.ts";
 import { PLATFORM_ARTIFACTS } from "./platform-artifacts.ts";
+import { parseQuantityBytes } from "../../../infra/talos/publish-storage-capacity.ts";
 
 type Json = Record<string, unknown>;
 const RESOURCES: Record<string, string> = {
@@ -271,12 +275,33 @@ export function regionalObjects(input: NodeBootstrapInput): Json[] {
   ];
 }
 
-function contains(expected: unknown, actual: unknown): boolean {
+function contains(
+  expected: unknown,
+  actual: unknown,
+  path = "",
+  quantityKind?: "ResourceQuota" | "Deployment",
+): boolean {
+  if (
+    (quantityKind === "ResourceQuota" && path === "spec.hard.pods") ||
+    (quantityKind === "Deployment" &&
+      /^spec\.template\.spec\.containers\[\d+\]\.resources\.limits\.cpu$/.test(
+        path,
+      ))
+  ) {
+    if (quantityKind === "Deployment" && expected === actual) return true;
+    try {
+      return parseQuantityBytes(expected) === parseQuantityBytes(actual);
+    } catch {
+      return false;
+    }
+  }
   if (Array.isArray(expected))
     return (
       Array.isArray(actual) &&
       expected.length === actual.length &&
-      expected.every((item, index) => contains(item, actual[index]))
+      expected.every((item, index) =>
+        contains(item, actual[index], `${path}[${index}]`, quantityKind),
+      )
     );
   if (expected && typeof expected === "object")
     return (
@@ -284,14 +309,28 @@ function contains(expected: unknown, actual: unknown): boolean {
       typeof actual === "object" &&
       !Array.isArray(actual) &&
       Object.entries(expected).every(([key, value]) =>
-        contains(value, (actual as Json)[key]),
+        contains(
+          value,
+          (actual as Json)[key],
+          path ? `${path}.${key}` : key,
+          quantityKind,
+        ),
       )
     );
   return expected === actual;
 }
 export function assertOwnedResource(expected: Json, actual: Json) {
   if (
-    !contains(expected, actual) ||
+    !contains(
+      expected,
+      actual,
+      "",
+      expected.apiVersion === "v1" && expected.kind === "ResourceQuota"
+        ? "ResourceQuota"
+        : expected.apiVersion === "apps/v1" && expected.kind === "Deployment"
+          ? "Deployment"
+          : undefined,
+    ) ||
     record(actual.metadata).deletionTimestamp ||
     typeof record(actual.metadata).uid !== "string" ||
     !record(actual.metadata).uid
@@ -407,6 +446,8 @@ export interface PlatformCommands {
   priorCommandClosed?(): boolean;
   ciliumJournal?(): Promise<NodeCiliumInstallJournal | undefined>;
   claimCiliumRetry?(journal: NodeCiliumInstallJournal): Promise<void>;
+  fluxJournal?(): Promise<NodeFluxRepairJournal | undefined>;
+  claimFluxRepair?(journal: NodeFluxRepairJournal): Promise<void>;
 }
 
 export class PlatformInstaller {
@@ -536,7 +577,15 @@ export class PlatformInstaller {
       await this.commands.checkpoint(intent);
       await this.commands.authorize();
       await this.apply(objects);
-    } else await this.readObjects(objects);
+    } else if (
+      stage === "flux_install_intent" &&
+      intent === "flux_install_intent" &&
+      this.commands.fluxJournal &&
+      this.commands.claimFluxRepair &&
+      this.commands.priorCommandClosed?.() === true
+    )
+      await this.repairFlux();
+    else await this.readObjects(objects);
     if (verify) await verify();
     if (STAGES.indexOf(stage) < STAGES.indexOf(complete))
       await this.commands.checkpoint(complete);
@@ -877,11 +926,11 @@ export class PlatformInstaller {
     kind: string,
     namespace?: string,
     name?: string,
+    apiVersion = CILIUM_RESOURCE_VERSIONS[kind],
   ): Promise<Json[]> {
-    const apiVersion = CILIUM_RESOURCE_VERSIONS[kind],
-      resource = (
-        RESOURCES[kind] ?? (kind === "DaemonSet" ? "daemonsets" : "")
-      ).split(".")[0];
+    const resource = (
+      RESOURCES[kind] ?? (kind === "DaemonSet" ? "daemonsets" : "")
+    ).split(".")[0];
     if (
       !apiVersion ||
       !resource ||
@@ -939,6 +988,241 @@ export class PlatformInstaller {
     )
       throw new BootstrapError("cilium_recovery_identity_changed");
     return value;
+  }
+  private async inspectFlux() {
+    const present: { expected: Json; actual: Json }[] = [],
+      missing: Json[] = [];
+    for (let offset = 0; offset < this.assets.flux.length; offset += 4) {
+      const results = await Promise.allSettled(
+        this.assets.flux.slice(offset, offset + 4).map(async (expected) => {
+          const metadata = record(expected.metadata);
+          const found = await this.ciliumCollection(
+            String(expected.kind),
+            metadata.namespace as string | undefined,
+            String(metadata.name),
+            String(expected.apiVersion),
+          );
+          if (found.length > 1)
+            throw new BootstrapError("platform_resource_mismatch");
+          if (!found.length) return { expected, actual: null };
+          const actual = found[0]!,
+            observed = record(actual.metadata);
+          if (
+            observed.name !== metadata.name ||
+            observed.namespace !== metadata.namespace
+          )
+            throw new BootstrapError("platform_resource_mismatch");
+          assertOwnedResource(expected, actual);
+          return { expected, actual };
+        }),
+      );
+      const failed = results.find((result) => result.status === "rejected");
+      if (failed?.status === "rejected") throw failed.reason;
+      for (const result of results)
+        if (result.status === "fulfilled") {
+          if (result.value.actual)
+            present.push({
+              expected: result.value.expected,
+              actual: result.value.actual,
+            });
+          else missing.push(result.value.expected);
+        }
+    }
+    return { present, missing };
+  }
+  private async repairFlux() {
+    if (this.assets.flux.length !== 43)
+      throw new BootstrapError("platform_resource_unconfirmed");
+    const inventory = this.assets.flux
+      .map((value) => {
+        const metadata = record(value.metadata),
+          kind = String(value.kind),
+          apiVersion = String(value.apiVersion);
+        const versions: Record<string, string> = {
+          ...CILIUM_RESOURCE_VERSIONS,
+          ResourceQuota: "v1",
+          CustomResourceDefinition: "apiextensions.k8s.io/v1",
+        };
+        if (
+          versions[kind] !== apiVersion ||
+          !/^[a-z0-9][a-z0-9.-]*$/.test(String(metadata.name)) ||
+          (metadata.namespace !== undefined &&
+            metadata.namespace !== "flux-system")
+        )
+          throw new BootstrapError("platform_resource_invalid");
+        return {
+          kind,
+          name: String(metadata.name),
+          ...(metadata.namespace === undefined
+            ? {}
+            : { namespace: String(metadata.namespace) }),
+          spec_sha256: digest(canonical(value)),
+        };
+      })
+      .sort((a, b) => canonical(a).localeCompare(canonical(b)));
+    if (
+      new Set(
+        inventory.map(
+          (value) => `${value.kind}/${value.namespace ?? ""}/${value.name}`,
+        ),
+      ).size !== 43
+    )
+      throw new BootstrapError("platform_resource_invalid");
+    const inventory_sha256 = digest(canonical(inventory));
+    const journal = await this.commands.fluxJournal!();
+    const observed_at = new Date().toISOString(),
+      before = await this.ciliumRecoveryIdentity();
+    const cilium = await this.commands.ciliumJournal?.();
+    if (
+      cilium &&
+      (cilium.recovery_receipt.node_uid !== before.node_uid ||
+        cilium.recovery_receipt.kube_system_uid !== before.kube_system_uid)
+    )
+      throw new BootstrapError("platform_resource_mismatch");
+    if (
+      journal &&
+      (journal.receipt.input_hash !== this.input.input_hash ||
+        journal.receipt.operation_id !== this.input.spec.operation_id ||
+        journal.receipt.node_id !== this.input.spec.node_id ||
+        journal.receipt.region_id !== this.input.spec.region_id ||
+        journal.receipt.inventory_sha256 !== inventory_sha256 ||
+        journal.receipt.node_uid !== before.node_uid ||
+        journal.receipt.kube_system_uid !== before.kube_system_uid ||
+        journal.receipt.node_name !== before.node_name ||
+        journal.receipt.manifest_sha256 !== PLATFORM_ARTIFACTS.flux.sha256)
+    )
+      throw new BootstrapError("platform_resource_mismatch");
+    const presentSetDigest = (
+      present: { expected: Json; actual: Json }[],
+      excluded: NodeFluxRepairJournal["receipt"]["missing"],
+    ) =>
+      digest(
+        canonical(
+          present
+            .filter(
+              ({ expected }) =>
+                !excluded.some(
+                  (value) =>
+                    value.kind === expected.kind &&
+                    value.name === record(expected.metadata).name &&
+                    value.namespace === record(expected.metadata).namespace,
+                ),
+            )
+            .map(({ expected, actual }) => ({
+              spec_sha256: digest(canonical(expected)),
+              uid: record(actual.metadata).uid,
+            }))
+            .sort((a, b) => canonical(a).localeCompare(canonical(b))),
+        ),
+      );
+    let observed = await this.inspectFlux();
+    if (
+      journal &&
+      presentSetDigest(observed.present, journal.receipt.missing) !==
+        journal.receipt.present_set_sha256
+    )
+      throw new BootstrapError("platform_resource_mismatch");
+    const namespace = observed.present.find(
+      ({ expected }) =>
+        expected.kind === "Namespace" &&
+        record(expected.metadata).name === "flux-system",
+    );
+    if (!namespace) throw new BootstrapError("platform_resource_unconfirmed");
+    const namespaceUid = record(namespace.actual.metadata).uid;
+    const currentNamespace = await this.ciliumCoreIdentity(
+      "Namespace",
+      "flux-system",
+    );
+    const after = await this.ciliumRecoveryIdentity();
+    assertOwnedResource(namespace.expected, currentNamespace);
+    if (
+      canonical(after) !== canonical(before) ||
+      record(currentNamespace.metadata).uid !== namespaceUid ||
+      this.commands.priorCommandClosed?.() !== true
+    )
+      throw new BootstrapError("platform_resource_mismatch");
+    if (observed.missing.length) {
+      if (journal || observed.missing.length > 3)
+        throw new BootstrapError("platform_resource_unconfirmed");
+      const missing = observed.missing.map((value) => {
+        const metadata = record(value.metadata);
+        return {
+          kind: value.kind,
+          name: metadata.name,
+          namespace: metadata.namespace,
+          spec_sha256: digest(canonical(value)),
+        };
+      });
+      const repair = NodeFluxRepairJournal.parse({
+        attempt: 1,
+        state: "intent",
+        receipt: {
+          version: 1,
+          operation_id: this.input.spec.operation_id,
+          node_id: this.input.spec.node_id,
+          region_id: this.input.spec.region_id,
+          input_hash: this.input.input_hash,
+          ...before,
+          manifest_sha256: PLATFORM_ARTIFACTS.flux.sha256,
+          inventory_sha256,
+          resource_count: 43,
+          present_resource_count: observed.present.length,
+          missing,
+          present_set_sha256: presentSetDigest(observed.present, []),
+          prior_command_closed: true,
+          observed_at,
+          completed_at: new Date().toISOString(),
+        },
+      });
+      await this.commands.claimFluxRepair!(repair);
+      const persisted = await this.commands.fluxJournal!();
+      if (canonical(persisted) !== canonical(repair))
+        throw new BootstrapError("checkpoint_not_committed");
+      await this.commands.authorize();
+      const dispatchIdentity = await this.ciliumRecoveryIdentity(),
+        dispatchNamespace = await this.ciliumCoreIdentity(
+          "Namespace",
+          "flux-system",
+        );
+      assertOwnedResource(namespace.expected, dispatchNamespace);
+      if (
+        canonical(dispatchIdentity) !== canonical(before) ||
+        record(dispatchNamespace.metadata).uid !== namespaceUid ||
+        this.commands.priorCommandClosed?.() !== true
+      )
+        throw new BootstrapError("platform_resource_mismatch");
+      try {
+        await this.commands.kube(
+          ["create", "--validate=false", "--filename=-"],
+          true,
+          observed.missing.map((value) => stringify(value)).join("---\n"),
+        );
+      } catch {
+        // The persisted repair intent is consumed; only owned readback can resolve this outcome.
+      }
+      observed = await this.inspectFlux();
+      if (observed.missing.length)
+        throw new BootstrapError("platform_resource_unconfirmed");
+      if (
+        presentSetDigest(observed.present, repair.receipt.missing) !==
+        repair.receipt.present_set_sha256
+      )
+        throw new BootstrapError("platform_resource_mismatch");
+      const completedIdentity = await this.ciliumRecoveryIdentity(),
+        completedNamespace = await this.ciliumCoreIdentity(
+          "Namespace",
+          "flux-system",
+        );
+      assertOwnedResource(namespace.expected, completedNamespace);
+      if (
+        canonical(completedIdentity) !== canonical(before) ||
+        record(completedNamespace.metadata).uid !== namespaceUid
+      )
+        throw new BootstrapError("platform_resource_mismatch");
+    }
+    for (const { actual } of observed.present)
+      if (actual.kind === "Deployment")
+        assertWorkloadReady("Deployment", actual);
   }
   private async verifyPlatform() {
     const repository = await this.required(

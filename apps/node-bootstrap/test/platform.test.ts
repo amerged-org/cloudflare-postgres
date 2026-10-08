@@ -152,6 +152,114 @@ test("readback verifies the owned spec as well as its annotation, and rejects re
   );
 });
 
+test("Flux quota readback accepts Kubernetes canonical pod counts and keeps every owned field exact", () => {
+  const input = platformFixture();
+  const [expected] = renderFluxObjects(
+    JSON.stringify({
+      apiVersion: "v1",
+      kind: "ResourceQuota",
+      metadata: { name: "critical-pods", namespace: "flux-system" },
+      spec: {
+        hard: { pods: "1000" },
+        scopeSelector: {
+          matchExpressions: [
+            {
+              operator: "In",
+              scopeName: "PriorityClass",
+              values: ["system-node-critical", "system-cluster-critical"],
+            },
+          ],
+        },
+      },
+    }),
+    input,
+  );
+  const actual = structuredClone(expected!);
+  object(actual.metadata).uid = randomUUID();
+  object(object(actual.spec).hard).pods = "1k";
+  assertOwnedResource(expected!, actual);
+  const changedLimit = structuredClone(actual);
+  object(object(changedLimit.spec).hard).pods = "1001";
+  assert.throws(
+    () => assertOwnedResource(expected!, changedLimit),
+    /platform_resource_mismatch/,
+  );
+  const fractionalLimit = structuredClone(actual);
+  object(object(fractionalLimit.spec).hard).pods = "1000001m";
+  assert.throws(
+    () => assertOwnedResource(expected!, fractionalLimit),
+    /platform_resource_mismatch/,
+  );
+  const unowned = structuredClone(actual);
+  object(unowned.metadata).annotations = {};
+  assert.throws(
+    () => assertOwnedResource(expected!, unowned),
+    /platform_resource_mismatch/,
+  );
+  const changedScope = structuredClone(actual);
+  object(changedScope.spec).scopeSelector = {};
+  assert.throws(
+    () => assertOwnedResource(expected!, changedScope),
+    /platform_resource_mismatch/,
+  );
+  const configMap = { ...expected!, kind: "ConfigMap" };
+  assert.throws(
+    () => assertOwnedResource(configMap, { ...actual, kind: "ConfigMap" }),
+    /platform_resource_mismatch/,
+  );
+});
+
+test("Flux Deployment readback accepts canonical integral CPU limits without changing other resource comparisons", () => {
+  const input = platformFixture();
+  const [expected] = renderFluxObjects(
+    JSON.stringify({
+      apiVersion: "apps/v1",
+      kind: "Deployment",
+      metadata: { name: "source-controller", namespace: "flux-system" },
+      spec: {
+        template: {
+          spec: {
+            containers: [
+              {
+                name: "manager",
+                resources: { limits: { cpu: "1000m", memory: "1Gi" } },
+              },
+            ],
+          },
+        },
+      },
+    }),
+    input,
+  );
+  const actual = structuredClone(expected!);
+  object(actual.metadata).uid = randomUUID();
+  const limits = object(
+    object(
+      objects(object(object(object(actual.spec).template).spec).containers)[0]!
+        .resources,
+    ).limits,
+  );
+  limits.cpu = "1";
+  assertOwnedResource(expected!, actual);
+  limits.cpu = "1001m";
+  assert.throws(
+    () => assertOwnedResource(expected!, actual),
+    /platform_resource_mismatch/,
+  );
+  limits.cpu = "1";
+  limits.memory = "1073741824";
+  assert.throws(
+    () => assertOwnedResource(expected!, actual),
+    /platform_resource_mismatch/,
+  );
+  limits.memory = "1Gi";
+  object(actual.metadata).annotations = {};
+  assert.throws(
+    () => assertOwnedResource(expected!, actual),
+    /platform_resource_mismatch/,
+  );
+});
+
 test("readiness requires current controller observation and exact desired replicas", () => {
   const deployment = {
     metadata: { generation: 3 },

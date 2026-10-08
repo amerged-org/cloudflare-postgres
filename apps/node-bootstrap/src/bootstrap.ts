@@ -1556,6 +1556,15 @@ export class BootstrapJob {
       ciliumJournal: async () =>
         (await this.authority.read(this.abort.signal)).checkpoint
           .cilium_install,
+      fluxJournal: async () =>
+        (await this.authority.read(this.abort.signal)).checkpoint.flux_repair,
+      claimFluxRepair: async (journal) => {
+        await this.checkpoint(
+          "flux_install_intent",
+          { flux_repair: journal },
+          true,
+        );
+      },
       claimCiliumRetry: async (journal) => {
         await this.checkpoint(
           "cilium_install_intent",

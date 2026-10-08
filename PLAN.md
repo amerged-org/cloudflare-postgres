@@ -522,6 +522,39 @@ the owned operation and bounded ages, without payloads, credentials, UIDs or has
 No authority, CAS, expiry, provider boundary or attempt limit is relaxed. Full US1 acceptance
 remains outstanding.
 
+Source `6b792ea9`, full CI `37738340444`, delivered Native
+`sha256:a7b439aec4369fd4cfbe1001db169bec1716fc1b1f2105f2e1a96cbaf6107e2a` once.
+Qualification passed18 layers/715,005,011 bytes; full readback verified162,124,143 compressed
+and502,887,936 raw bytes. Actual running image matched. The original operation consumed its
+single attempt2 claim after25 absent resources and zero Helm storage records, with matching
+physical identities. Its fresh window measured46,129ms (06:54:46.922Z–06:55:33.051Z).
+Programmed Cilium installation reached `cilium_installed` at06:59:41Z, then Flux intent at
+07:03:56Z. Flux readback stopped with `platform_resource_mismatch`. One bounded read-only
+probe confirmed the exact mismatch: expected ResourceQuota hard pod count `1000`, actual
+Kubernetes canonical quantity `1k`; the Namespace and all ownership/custody/physical identities
+matched, and the whole job stayed at revision679. No provider or cluster write occurred.
+The correction uses the existing exact integral Quantity parser only for v1 ResourceQuota
+`spec.hard.pods`, retaining all other predicates. The reproducer first fails, then26 affected
+tests/types/lint/formatting and independent review pass. The integration resumes the retained
+Flux intent without another Flux apply. The original Workflow was paused once for this
+changed Native delivery; its consumed Cilium journal remains immutable. US1 Ready and the
+SQL/backup/WAL/restore/reclamation acceptance are still pending.
+
+Before publishing the quota-only local correction, a complete bounded43-object live readback
+confirmed34 exact matches, six Ready Deployments with CPU limit `1000m` canonicalized to `1`,
+and three genuinely absent objects: Services `source-watcher`/`webhook-receiver` and Deployment
+`helm-controller` in `flux-system`. Whole job682, physical identities and sealed custody stayed
+unchanged; provider/cluster writes were zero. One server dry run of each exact missing manifest
+passed current Kubernetes admission, also without writes. This does not establish the cause
+of the original partial apply. The composed correction narrowly normalizes the observed CPU
+limits and adds one Cloudflare CAS-bound Flux repair journal. A fresh complete inspection must
+confirm every present object is owned and bind its UID/spec set; only the exact absent pinned
+objects may be created after acknowledged intent persistence. Namespace ownership is checked
+again immediately before dispatch. Unknown claim or create outcomes retain the journal and
+use readback only; existing Flux objects are never reapplied. A reproduced same-UID ownership
+revocation blocks creation.66 affected Native and54 real-D1 callback cases, types/lint/formatting
+and independent reviews pass locally. No repair dispatch or final US acceptance has occurred.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

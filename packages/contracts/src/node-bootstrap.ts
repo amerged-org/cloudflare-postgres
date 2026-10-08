@@ -368,6 +368,62 @@ export const NodeCiliumInstallJournal = z.strictObject({
 });
 export type NodeCiliumInstallJournal = z.infer<typeof NodeCiliumInstallJournal>;
 
+export const NodeFluxMissingResource = z.discriminatedUnion("kind", [
+  z.strictObject({
+    kind: z.literal("Service"),
+    name: z.enum(["source-watcher", "webhook-receiver"]),
+    namespace: z.literal("flux-system"),
+    spec_sha256: Digest,
+  }),
+  z.strictObject({
+    kind: z.literal("Deployment"),
+    name: z.literal("helm-controller"),
+    namespace: z.literal("flux-system"),
+    spec_sha256: Digest,
+  }),
+]);
+export const NodeFluxRepairReceipt = z
+  .strictObject({
+    version: z.literal(1),
+    operation_id: OperationId,
+    node_id: NodeId,
+    region_id: RegionId,
+    input_hash: Digest,
+    kube_system_uid: z.uuid(),
+    node_uid: z.uuid(),
+    node_name: z.string().regex(/^[a-z][a-z0-9-]{0,61}[a-z0-9]$/),
+    manifest_sha256: z.literal(
+      "9c1fda7e401429531ed1478f67ba06b3edff6513b75da7ee47bde9f1c4d4251c",
+    ),
+    inventory_sha256: Digest,
+    resource_count: z.literal(43),
+    present_resource_count: z.number().int().min(40).max(42),
+    missing: z.array(NodeFluxMissingResource).min(1).max(3),
+    present_set_sha256: Digest,
+    prior_command_closed: z.literal(true),
+    observed_at: z.iso.datetime({ precision: 3 }),
+    completed_at: z.iso.datetime({ precision: 3 }),
+  })
+  .refine(
+    (value) =>
+      value.present_resource_count + value.missing.length ===
+        value.resource_count &&
+      new Set(
+        value.missing.map(
+          (item) => `${item.kind}/${item.namespace}/${item.name}`,
+        ),
+      ).size === value.missing.length &&
+      Date.parse(value.observed_at) <= Date.parse(value.completed_at),
+    "Flux repair requires complete unique ordered inspection",
+  );
+export type NodeFluxRepairReceipt = z.infer<typeof NodeFluxRepairReceipt>;
+export const NodeFluxRepairJournal = z.strictObject({
+  attempt: z.literal(1),
+  state: z.literal("intent"),
+  receipt: NodeFluxRepairReceipt,
+});
+export type NodeFluxRepairJournal = z.infer<typeof NodeFluxRepairJournal>;
+
 export const NodeBootstrapCheckpoint = z.strictObject({
   stage: NodeBootstrapStage,
   status: z.enum([
@@ -392,6 +448,7 @@ export const NodeBootstrapCheckpoint = z.strictObject({
   admission_receipt: NodeBootstrapAdmissionReceipt.nullable(),
   storage_trial: NodeStorageTrial.nullable().optional(),
   cilium_install: NodeCiliumInstallJournal.optional(),
+  flux_repair: NodeFluxRepairJournal.optional(),
   error_code: z
     .string()
     .regex(/^[a-z][a-z0-9_]{0,63}$/)
