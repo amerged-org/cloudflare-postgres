@@ -376,3 +376,8 @@ The initial Talos reboot uses `--wait=false` because the installer separately ve
 boot ID and authenticated OS/storage readback before bootstrapping Kubernetes. Talos
 MachineReady can depend on that later bootstrap/CNI work. A stored reboot or bootstrap intent
 requires observation on resume, never blind redispatch of the mutation.
+
+The pinned Helm4 preflight uses `helm list` without the removed `--all` flag; its default
+includes every release state. Keep the exact namespace/filter and reject any existing
+Cilium release before recording or dispatching a new install intent. Do not treat an old
+Helm flag error as evidence that the cluster needs reset or an installation repeated.

@@ -584,7 +584,6 @@ export class PlatformInstaller {
             "list",
             "--namespace",
             "kube-system",
-            "--all",
             "--filter=^cilium$",
             "--output=json",
           ])

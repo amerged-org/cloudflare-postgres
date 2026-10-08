@@ -420,6 +420,25 @@ and independent join review pass. One controlled pause atstep303 preserved the f
 original operation/input and already-sealed join1 credentials. A changed qualified Native
 image is required for these measured software corrections; no EU or provider action occurred.
 
+Source `65f17cbd`, full CI `37723131617`, is delivered with newly qualified Native
+manifest `sha256:8e24e5cb6bdee46eb1437b107996d9c974159bddf6ed507f457042d3bed873a7`.
+Qualification passed18 layers/714,984,023 bytes with zero unresolved findings; complete
+private readback verified162,119,661 compressed and502,866,944 raw bytes. One tracked
+migration0023 retained all active revisions1/provenanceNULL, with no material activation.
+All EU/data/custody and the complete original US image/join1 were preserved. Pre-intent
+capture refused one waiting-diagnostic update640→641 and a normal regional heartbeat; exact
+checkpoint/crypto equality and valid monotonic heartbeat handling resolved those metadata
+guards without another build/push or unsafe mutation replay. One publication and one original
+resume produced actualrunning Native placement/image evidence. The retained-join correction
+advanced immediately tokubernetes_joined/revision642. Next, Helm preflight failed with
+native_command_failed_helm_1 before Cilium install intent. The exact command was reproduced
+offline against the actual qualified image: Helm4.3.0 rejects the obsolete`helm list --all`
+flag and already lists every state by default. Removing only that flag retains exact
+namespace/filter/JSON and existing-pending-release refusal.44 affected cases, Native
+types/lint/formatting and independent review pass. One controlled pause atstep352 preserves
+the joined cluster and full image. A changed Native delivery is needed for this concrete
+compatibility defect; no existing cluster installation is repeated.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

@@ -36,6 +36,7 @@ const kinds: Record<string, string> = {
 
 function clusterFixture(
   initialStage: NodeBootstrapStage = "kubernetes_joined",
+  strictHelm4 = false,
 ) {
   const input = platformFixture();
   let stage = initialStage;
@@ -233,10 +234,21 @@ function clusterFixture(
       stage = next;
     },
     helm: async (args) => {
+      if (strictHelm4 && args.includes("--all"))
+        throw new BootstrapError("native_command_failed_helm_1");
       if (args.includes("list"))
         return {
           exit_code: 0,
-          stdout: JSON.stringify(release ? [{ name: "cilium" }] : []),
+          stdout: JSON.stringify(
+            release
+              ? [
+                  {
+                    name: "cilium",
+                    status: strictHelm4 ? "pending-install" : "deployed",
+                  },
+                ]
+              : [],
+          ),
         };
       if (args.includes("install")) {
         mutations.push(args);
@@ -343,6 +355,17 @@ test("new-region installation records each intent and resolves lost native respo
 
 test("an existing Cilium release is never overwritten by a first-region bootstrap job", async () => {
   const state = clusterFixture();
+  state.setRelease(true);
+  await assert.rejects(
+    state.installer.install(),
+    /cilium_release_already_exists/,
+  );
+  assert.equal(state.mutations.length, 0);
+  assert.equal(state.checkpoints.length, 0);
+});
+
+test("Helm 4 preflight includes every release state without its removed all flag", async () => {
+  const state = clusterFixture("kubernetes_joined", true);
   state.setRelease(true);
   await assert.rejects(
     state.installer.install(),
