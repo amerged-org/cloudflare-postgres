@@ -952,7 +952,8 @@ export async function bootstrapCallback(
       JSON.parse(row.checkpoint_json),
     ),
     ref: BootstrapCredentialRef | null = null,
-    providerAuthority: DestructiveProviderAuthority | null = null;
+    providerAuthority: DestructiveProviderAuthority | null = null,
+    ciliumRecovery: { observed_at: string; completed_at: string } | null = null;
   if (envelope.kind === "seal") {
     const supplied = envelope.payload,
       material = supplied.material;
@@ -1006,6 +1007,59 @@ export async function bootstrapCallback(
     };
   } else {
     const next = envelope.payload;
+    const previousCilium = checkpoint.cilium_install;
+    if (previousCilium !== undefined) {
+      if (
+        JSON.stringify(next.cilium_install) !== JSON.stringify(previousCilium)
+      )
+        throw new ApiError(
+          "conflict",
+          "Cilium retry authority cannot be erased or replaced",
+        );
+    } else if (next.cilium_install !== undefined) {
+      const receipt = next.cilium_install.recovery_receipt;
+      const preserved = (value: typeof checkpoint) =>
+        Object.fromEntries(
+          Object.entries(value).filter(
+            ([key]) =>
+              !["cilium_install", "status", "error_code"].includes(key),
+          ),
+        );
+      const material = currentAuthority.protected_material;
+      const now = Date.now(),
+        observed = Date.parse(receipt.observed_at),
+        completed = Date.parse(receipt.completed_at);
+      if (
+        input.spec.role !== "controlplane" ||
+        checkpoint.stage !== "cilium_install_intent" ||
+        next.stage !== checkpoint.stage ||
+        next.status !== "running" ||
+        next.error_code !== null ||
+        material?.purpose !== "join_bundle" ||
+        checkpoint.sealed_ref !==
+          `join_bundle:${JSON.parse(row.material_ref_json!).revision}` ||
+        receipt.operation_id !== row.operation_id ||
+        receipt.node_id !== row.node_id ||
+        receipt.region_id !== row.region_id ||
+        receipt.input_hash !== row.input_hash ||
+        receipt.node_name !== input.spec.hostname ||
+        receipt.kube_system_uid !== material.material.kube_system_uid ||
+        observed < now - 120000 ||
+        completed < now - 120000 ||
+        observed > now + 5000 ||
+        completed > now + 5000 ||
+        JSON.stringify(preserved(next)) !==
+          JSON.stringify(preserved(checkpoint))
+      )
+        throw new ApiError(
+          "conflict",
+          "Cilium retry requires current complete bound no-effect readback",
+        );
+      ciliumRecovery = {
+        observed_at: receipt.observed_at,
+        completed_at: receipt.completed_at,
+      };
+    }
     const storageChanged =
       JSON.stringify(checkpoint.storage_trial ?? null) !==
       JSON.stringify(next.storage_trial ?? null);
@@ -1113,6 +1167,11 @@ export async function bootstrapCallback(
   const result = await c.env.DB.prepare(
     `UPDATE node_bootstrap_jobs SET checkpoint_json=?,material_ref_json=COALESCE(?,material_ref_json),network_authorization_json=COALESCE(network_authorization_json,?),revision=revision+1,updated_at=?
     WHERE operation_id=? AND input_hash=? AND revision=? AND sealed_revision=? AND authorized=1 AND admitted=0 AND cancelled=0
+      AND (? IS NULL OR (checkpoint_json=? AND material_ref_json IS ?
+        AND json_extract(checkpoint_json,'$.stage')='cilium_install_intent'
+        AND json_extract(checkpoint_json,'$.cilium_install') IS NULL
+        AND julianday(?)>=julianday('now','-120 seconds') AND julianday(?)<=julianday('now','+5 seconds')
+        AND julianday(?)>=julianday('now','-120 seconds') AND julianday(?)<=julianday('now','+5 seconds')))
       AND (? IS NULL OR EXISTS(SELECT 1 FROM node_additions a WHERE a.operation_id=node_bootstrap_jobs.operation_id
         AND a.revision=? AND a.provider_instance_id=? AND a.intent_hash=? AND a.audit_json=? AND a.receipt_json=?
         AND a.slot_held=1 AND a.status IN ('audited','bootstrapping')))
@@ -1148,6 +1207,13 @@ export async function bootstrapCallback(
       row.input_hash,
       row.revision,
       row.sealed_revision,
+      ciliumRecovery === null ? null : 1,
+      row.checkpoint_json,
+      row.material_ref_json,
+      ciliumRecovery?.observed_at ?? null,
+      ciliumRecovery?.observed_at ?? null,
+      ciliumRecovery?.completed_at ?? null,
+      ciliumRecovery?.completed_at ?? null,
       providerAuthority?.revision ?? null,
       providerAuthority?.revision ?? null,
       providerAuthority?.provider_instance_id ?? null,

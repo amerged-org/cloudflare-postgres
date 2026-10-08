@@ -829,6 +829,35 @@ test("a rejected checkpoint cannot manufacture acknowledged progress", async () 
   );
 });
 
+test("a recovery claim with a lost acknowledgement stops before readback can authorize dispatch", async () => {
+  const input = fixture(),
+    current = authority(input);
+  let writes = 0,
+    reads = 0;
+  const request: typeof fetch = async (_url, init) => {
+    const envelope = NodeBootstrapCallback.parse(
+      JSON.parse(String(init?.body)),
+    );
+    if (envelope.kind === "checkpoint") {
+      writes++;
+      throw new Error("acknowledgement_lost");
+    }
+    reads++;
+    return Response.json(current);
+  };
+  await assert.rejects(
+    new AuthorityClient(input, request).checkpoint(
+      current,
+      { ...current.checkpoint, status: "running" },
+      AbortSignal.timeout(1000),
+      true,
+    ),
+    /checkpoint_acknowledgement_uncertain/,
+  );
+  assert.equal(writes, 1);
+  assert.equal(reads, 0);
+});
+
 test("native record parsing preserves object boundaries and refuses garbage", () => {
   assert.deepEqual(
     jsonRecords(' {"spec":{"message":"} {"}}\n{"metadata":{"id":"STATE"}} '),

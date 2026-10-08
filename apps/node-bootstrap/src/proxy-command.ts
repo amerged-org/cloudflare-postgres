@@ -15,6 +15,7 @@ import {
 } from "@pgcf/contracts/node-bootstrap";
 
 export const LOOPBACK = [127, 0, 0, 1].join(".");
+const MAX_NATIVE_PROXY_CONNECTIONS = 64;
 export const ProxyConfig = z.strictObject({
   spec: NodeBootstrapInput.shape.spec,
   input_hash: NodeBootstrapInput.shape.input_hash,
@@ -132,10 +133,11 @@ export async function startNativeProxy(
 ) {
   if (config.spec.transport.mode !== "relay") throw new Error("relay_required");
   const sockets = new Set<Duplex>();
+  const clients = new Set<Duplex>();
   const server = createServer((_request, response) => {
     response.writeHead(405).end();
   });
-  server.maxConnections = 8;
+  server.maxConnections = MAX_NATIVE_PROXY_CONNECTIONS;
   server.headersTimeout = 10_000;
   server.requestTimeout = 15_000;
   server.on("connect", (request, socket, head) => {
@@ -148,17 +150,25 @@ export async function startNativeProxy(
     if (
       !capability ||
       head.length > 64 * 1024 ||
-      sockets.size >= 8 ||
+      clients.size >= MAX_NATIVE_PROXY_CONNECTIONS ||
       signal.aborted
     ) {
       socket.end("HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n");
       return;
     }
     socket.pause();
+    clients.add(socket);
     sockets.add(socket);
-    socket.once("close", () => sockets.delete(socket));
+    socket.once("close", () => {
+      clients.delete(socket);
+      sockets.delete(socket);
+    });
     void openCapability(config, capability, signal)
       .then((bridge) => {
+        if (socket.destroyed || !clients.has(socket) || signal.aborted) {
+          bridge.destroy();
+          return;
+        }
         sockets.add(bridge);
         bridge.once("close", () => sockets.delete(bridge));
         const close = () => {

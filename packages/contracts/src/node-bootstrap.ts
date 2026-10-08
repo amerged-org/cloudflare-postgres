@@ -326,6 +326,48 @@ export const NodeBootstrapStage = z.enum([
 ]);
 export type NodeBootstrapStage = z.infer<typeof NodeBootstrapStage>;
 
+export const NodeCiliumInstallRecoveryReceipt = z
+  .strictObject({
+    version: z.literal(1),
+    operation_id: OperationId,
+    node_id: NodeId,
+    region_id: RegionId,
+    input_hash: Digest,
+    kube_system_uid: z.uuid(),
+    node_uid: z.uuid(),
+    node_name: z.string().regex(/^[a-z][a-z0-9-]{0,61}[a-z0-9]$/),
+    chart_sha256: z.literal(
+      "b2afd87b7f75f875f92a14559f14f59b7babbb479d968e3fd625a20bf30ec20e",
+    ),
+    values_sha256: z.literal(
+      "0de1a09a3fd450916cdb316d41fa9dcfd769708f7a6cb5b49496a64ee9b26b39",
+    ),
+    effective_values_sha256: Digest,
+    inventory_sha256: Digest,
+    resource_count: z.number().int().min(1).max(128),
+    absent_resource_count: z.number().int().min(1).max(128),
+    release_storage_count: z.literal(0),
+    prior_command_closed: z.literal(true),
+    observed_at: z.iso.datetime({ precision: 3 }),
+    completed_at: z.iso.datetime({ precision: 3 }),
+  })
+  .refine(
+    (value) =>
+      value.resource_count === value.absent_resource_count &&
+      Date.parse(value.observed_at) <= Date.parse(value.completed_at),
+    "Cilium recovery requires complete ordered absence readback",
+  );
+export type NodeCiliumInstallRecoveryReceipt = z.infer<
+  typeof NodeCiliumInstallRecoveryReceipt
+>;
+/** Absence is legacy attempt 1. The one durable attempt 2 never permits another dispatch. */
+export const NodeCiliumInstallJournal = z.strictObject({
+  attempt: z.literal(2),
+  state: z.literal("intent"),
+  recovery_receipt: NodeCiliumInstallRecoveryReceipt,
+});
+export type NodeCiliumInstallJournal = z.infer<typeof NodeCiliumInstallJournal>;
+
 export const NodeBootstrapCheckpoint = z.strictObject({
   stage: NodeBootstrapStage,
   status: z.enum([
@@ -349,6 +391,7 @@ export const NodeBootstrapCheckpoint = z.strictObject({
     .nullable(),
   admission_receipt: NodeBootstrapAdmissionReceipt.nullable(),
   storage_trial: NodeStorageTrial.nullable().optional(),
+  cilium_install: NodeCiliumInstallJournal.optional(),
   error_code: z
     .string()
     .regex(/^[a-z][a-z0-9_]{0,63}$/)

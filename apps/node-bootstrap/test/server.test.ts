@@ -11,6 +11,79 @@ import { LOOPBACK } from "../src/proxy-command.ts";
 import { authorized, createBootstrapServer } from "../src/server.ts";
 import { authority, fixture } from "./fixture.ts";
 
+test("installation registration reserves the executor before awaiting authoritative status", async () => {
+  const first = fixture(),
+    second = fixture();
+  let release!: () => void, entered!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const began = new Promise<void>((resolve) => {
+    entered = resolve;
+  });
+  const bearer = randomBytes(32).toString("base64url");
+  const runtime = createBootstrapServer(bearer, {
+    request: async (_url, init) => {
+      const envelope = NodeBootstrapCallback.parse(
+        JSON.parse(String(init?.body)),
+      );
+      const input =
+        envelope.operation_id === first.spec.operation_id ? first : second;
+      if (input === first) {
+        entered();
+        await held;
+      }
+      const current = authority(input);
+      return Response.json({
+        ...current,
+        checkpoint: {
+          ...current.checkpoint,
+          stage: "awaiting_verification",
+          status: "awaiting_verification",
+        },
+      });
+    },
+  });
+  runtime.server.listen(0, LOOPBACK);
+  await once(runtime.server, "listening");
+  const address = runtime.server.address();
+  assert.ok(address && typeof address !== "string");
+  const url = `http://${LOOPBACK}:${address.port}/v1/jobs`,
+    headers = {
+      authorization: `Bearer ${bearer}`,
+      "content-type": "application/json",
+    };
+  let pending: Promise<Response> | undefined;
+  try {
+    pending = fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(first),
+    });
+    await Promise.race([
+      began,
+      new Promise<never>((_resolve, reject) => {
+        const timer = setTimeout(
+          () => reject(new Error("registration_status_not_reached")),
+          1000,
+        );
+        timer.unref();
+      }),
+    ]);
+    const blocked = await fetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(second),
+    });
+    assert.equal(blocked.status, 409);
+    assert.deepEqual(await blocked.json(), { error_code: "container_busy" });
+  } finally {
+    release();
+    if (pending) await pending;
+    await runtime.stop();
+  }
+});
+
 test("actual child entry emits only the fixed JSON event for invalid private configuration", () => {
   const canary = randomBytes(32).toString("base64url");
   const entry = fileURLToPath(new URL("../src/server.ts", import.meta.url));

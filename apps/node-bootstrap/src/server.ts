@@ -51,6 +51,7 @@ export function createBootstrapServer(
 ) {
   if (bearer.length < 32) throw new BootstrapError("server_bearer_required");
   const jobs = new Map<string, { job: BootstrapJob; running: boolean }>();
+  let installationRegistration = false;
   const inspections = new Map<
     string,
     {
@@ -106,6 +107,8 @@ export function createBootstrapServer(
           return;
         }
         if (
+          installationRegistration ||
+          [...jobs.values()].some((entry) => entry.running) ||
           [...inspections.values()].some((entry) => entry.running) ||
           [...proofs.values()].some((entry) => entry.running)
         )
@@ -184,8 +187,10 @@ export function createBootstrapServer(
           return;
         }
         if (
+          installationRegistration ||
           Array.from(jobs.values()).some((entry) => entry.running) ||
-          Array.from(inspections.values()).some((entry) => entry.running)
+          Array.from(inspections.values()).some((entry) => entry.running) ||
+          Array.from(proofs.values()).some((entry) => entry.running)
         )
           throw new BootstrapError("container_busy");
         const entry = {
@@ -252,28 +257,38 @@ export function createBootstrapServer(
           return;
         }
         if (
+          installationRegistration ||
           Array.from(jobs.values()).some((entry) => entry.running) ||
-          Array.from(inspections.values()).some((entry) => entry.running)
+          Array.from(inspections.values()).some((entry) => entry.running) ||
+          Array.from(proofs.values()).some((entry) => entry.running)
         )
           throw new BootstrapError("container_busy");
-        const job = new BootstrapJob(input, options);
-        const status = await job.status();
-        const installation = ![
-          "awaiting_verification",
-          "quarantine_release_intent",
-          "quarantine_released",
-        ].includes(status.checkpoint.stage);
-        const entry = { job, running: installation };
-        jobs.set(input.spec.operation_id, entry);
-        // The HTTP request starts work; every meaningful progress point is external and durable.
-        if (installation)
-          void job
-            .start()
-            .catch(() => {})
-            .finally(() => {
-              entry.running = false;
-            });
-        reply(response, 202, status);
+        installationRegistration = true;
+        try {
+          const job = new BootstrapJob(input, {
+            ...options,
+            serialized_executor: true,
+          });
+          const status = await job.status();
+          const installation = ![
+            "awaiting_verification",
+            "quarantine_release_intent",
+            "quarantine_released",
+          ].includes(status.checkpoint.stage);
+          const entry = { job, running: installation };
+          jobs.set(input.spec.operation_id, entry);
+          // The HTTP request starts work; every meaningful progress point is external and durable.
+          if (installation)
+            void job
+              .start()
+              .catch(() => {})
+              .finally(() => {
+                entry.running = false;
+              });
+          reply(response, 202, status);
+        } finally {
+          installationRegistration = false;
+        }
         return;
       }
       const matched = /^\/v1\/jobs\/([^/]+)(\/(?:cancel|admit))?$/.exec(path);
@@ -299,7 +314,13 @@ export function createBootstrapServer(
         });
       } else if (request.method === "POST" && matched[2] === "/admit") {
         request.resume();
-        if (entry.running) throw new BootstrapError("container_busy");
+        if (
+          installationRegistration ||
+          [...jobs.values()].some((value) => value.running) ||
+          [...proofs.values()].some((value) => value.running) ||
+          [...inspections.values()].some((value) => value.running)
+        )
+          throw new BootstrapError("container_busy");
         entry.running = true;
         try {
           reply(response, 200, await entry.job.admit());

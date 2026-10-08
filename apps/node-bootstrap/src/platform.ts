@@ -6,7 +6,13 @@ import type {
   NodeBootstrapInput,
   NodeBootstrapStage,
 } from "@pgcf/contracts/node-bootstrap";
-import { BootstrapError, canonical, digest } from "./bootstrap.ts";
+import { NodeCiliumInstallJournal } from "@pgcf/contracts/node-bootstrap";
+import {
+  BootstrapError,
+  canonical,
+  digest,
+  KUBERNETES_VERSION,
+} from "./bootstrap.ts";
 import { PLATFORM_ARTIFACTS } from "./platform-artifacts.ts";
 
 type Json = Record<string, unknown>;
@@ -17,10 +23,15 @@ const RESOURCES: Record<string, string> = {
   ServiceAccount: "serviceaccounts",
   ClusterRole: "clusterroles.rbac.authorization.k8s.io",
   ClusterRoleBinding: "clusterrolebindings.rbac.authorization.k8s.io",
+  Role: "roles.rbac.authorization.k8s.io",
+  RoleBinding: "rolebindings.rbac.authorization.k8s.io",
+  PodDisruptionBudget: "poddisruptionbudgets.policy",
   Service: "services",
   Deployment: "deployments.apps",
   NetworkPolicy: "networkpolicies.networking.k8s.io",
   Secret: "secrets",
+  Pod: "pods",
+  Endpoints: "endpoints",
   ConfigMap: "configmaps",
   GitRepository: "gitrepositories.source.toolkit.fluxcd.io",
   Kustomization: "kustomizations.kustomize.toolkit.fluxcd.io",
@@ -38,6 +49,22 @@ const RELEASES = [
   "cloudnative-pg",
   "plugin-barman-cloud",
 ];
+const CILIUM_RESOURCE_VERSIONS: Record<string, string> = {
+  ConfigMap: "v1",
+  Secret: "v1",
+  ServiceAccount: "v1",
+  Service: "v1",
+  Pod: "v1",
+  Endpoints: "v1",
+  DaemonSet: "apps/v1",
+  Deployment: "apps/v1",
+  ClusterRole: "rbac.authorization.k8s.io/v1",
+  ClusterRoleBinding: "rbac.authorization.k8s.io/v1",
+  Role: "rbac.authorization.k8s.io/v1",
+  RoleBinding: "rbac.authorization.k8s.io/v1",
+  NetworkPolicy: "networking.k8s.io/v1",
+  PodDisruptionBudget: "policy/v1",
+};
 const STAGES: NodeBootstrapStage[] = [
   "kubernetes_joined",
   "cilium_install_intent",
@@ -376,6 +403,9 @@ export interface PlatformCommands {
   ): Promise<{ exit_code: number; stdout: string }>;
   authorize(): Promise<NodeBootstrapStage>;
   checkpoint(stage: NodeBootstrapStage): Promise<void>;
+  priorCommandClosed?(): boolean;
+  ciliumJournal?(): Promise<NodeCiliumInstallJournal | undefined>;
+  claimCiliumRetry?(journal: NodeCiliumInstallJournal): Promise<void>;
 }
 
 export class PlatformInstaller {
@@ -423,6 +453,8 @@ export class PlatformInstaller {
       "--ignore-not-found",
       "--output=json",
     ]);
+    if (result.exit_code !== 0)
+      throw new BootstrapError("platform_readback_invalid");
     return result.stdout.trim() ? record(JSON.parse(result.stdout)) : null;
   }
   private async required(
@@ -577,21 +609,201 @@ export class PlatformInstaller {
   }
   private async installCilium() {
     const stage = await this.commands.authorize();
-    if (STAGES.indexOf(stage) < STAGES.indexOf("cilium_install_intent")) {
-      const existing = JSON.parse(
-        (
-          await this.commands.helm([
-            "list",
-            "--namespace",
-            "kube-system",
-            "--filter=^cilium$",
-            "--output=json",
-          ])
-        ).stdout,
+    let recovery =
+      stage === "cilium_install_intent" &&
+      (await this.commands.ciliumJournal?.()) === undefined &&
+      this.commands.priorCommandClosed?.() === true;
+    if (recovery) {
+      const existing = await this.commands.helm([
+        "list",
+        "--namespace",
+        "kube-system",
+        "--filter=^cilium$",
+        "--output=json",
+      ]);
+      const releases = JSON.parse(existing.stdout);
+      if (
+        existing.exit_code !== 0 ||
+        !Array.isArray(releases) ||
+        releases.length > 1
+      )
+        throw new BootstrapError("cilium_recovery_storage_unknown");
+      if (releases.length) recovery = false;
+    }
+    if (recovery) {
+      const observed_at = new Date().toISOString();
+      const before = await this.ciliumRecoveryIdentity();
+      const crds = await this.commands.helm([
+        "show",
+        "crds",
+        this.assets.chart_path,
+      ]);
+      if (crds.exit_code !== 0 || crds.stdout.trim())
+        throw new BootstrapError("cilium_recovery_chart_effects_unknown");
+      const rendered = await this.commands.helm([
+        "template",
+        "cilium",
+        this.assets.chart_path,
+        "--namespace",
+        "kube-system",
+        "--values",
+        this.assets.values_path,
+        "--include-crds",
+        "--dry-run=server",
+      ]);
+      if (
+        rendered.exit_code !== 0 ||
+        Buffer.byteLength(rendered.stdout) > 1024 * 1024
+      )
+        throw new BootstrapError("cilium_recovery_inventory_unknown");
+      const objects = parseAllDocuments(rendered.stdout)
+        .filter((document) => document.toJSON() !== null)
+        .map((document) => {
+          if (document.errors.length)
+            throw new BootstrapError("cilium_recovery_inventory_unknown");
+          const value = record(document.toJSON()),
+            metadata = record(value.metadata);
+          if (
+            typeof value.apiVersion !== "string" ||
+            typeof value.kind !== "string" ||
+            CILIUM_RESOURCE_VERSIONS[value.kind] !== value.apiVersion ||
+            value.kind === "CustomResourceDefinition" ||
+            value.kind === "Namespace" ||
+            record(metadata.annotations ?? {})["helm.sh/hook"] !== undefined ||
+            typeof metadata.name !== "string"
+          )
+            throw new BootstrapError("cilium_recovery_chart_effects_unknown");
+          const namespace = ["ClusterRole", "ClusterRoleBinding"].includes(
+            value.kind,
+          )
+            ? undefined
+            : String(metadata.namespace ?? "kube-system");
+          if (namespace !== undefined && namespace !== "kube-system")
+            throw new BootstrapError("cilium_recovery_inventory_unknown");
+          return {
+            apiVersion: value.apiVersion,
+            kind: value.kind,
+            name: metadata.name,
+            ...(namespace === undefined ? {} : { namespace }),
+          };
+        });
+      const inventory = objects.sort((a, b) =>
+        canonical(a).localeCompare(canonical(b)),
       );
-      if (!Array.isArray(existing) || existing.length)
-        throw new BootstrapError("cilium_release_already_exists");
-      await this.commands.checkpoint("cilium_install_intent");
+      if (
+        !inventory.length ||
+        inventory.length > 128 ||
+        new Set(inventory.map(canonical)).size !== inventory.length
+      )
+        throw new BootstrapError("cilium_recovery_inventory_unknown");
+      for (let offset = 0; offset < inventory.length; offset += 4) {
+        const results = await Promise.allSettled(
+          inventory
+            .slice(offset, offset + 4)
+            .map((value) => this.read(value.kind, value.name, value.namespace)),
+        );
+        const failed = results.find((result) => result.status === "rejected");
+        if (failed?.status === "rejected") throw failed.reason;
+        if (
+          results.some(
+            (result) => result.status === "fulfilled" && result.value !== null,
+          )
+        )
+          throw new BootstrapError("cilium_recovery_effect_present");
+      }
+      const releases = await this.commands.kube([
+        "get",
+        "secrets,configmaps",
+        "--namespace",
+        "kube-system",
+        "--output=json",
+      ]);
+      if (
+        releases.exit_code !== 0 ||
+        Buffer.byteLength(releases.stdout) > 1024 * 1024
+      )
+        throw new BootstrapError("cilium_recovery_storage_unknown");
+      const storage = record(JSON.parse(releases.stdout));
+      const storageMetadata = record(storage.metadata ?? {});
+      if (
+        storage.apiVersion !== "v1" ||
+        storage.kind !== "List" ||
+        (storageMetadata.continue !== undefined &&
+          storageMetadata.continue !== "") ||
+        (storageMetadata.remainingItemCount !== undefined &&
+          storageMetadata.remainingItemCount !== 0)
+      )
+        throw new BootstrapError("cilium_recovery_storage_unknown");
+      for (const value of list(storage.items)) {
+        const metadata = record(value.metadata),
+          labels = record(metadata.labels ?? {});
+        if (
+          value.apiVersion !== "v1" ||
+          !["Secret", "ConfigMap"].includes(String(value.kind)) ||
+          metadata.namespace !== "kube-system" ||
+          typeof metadata.name !== "string"
+        )
+          throw new BootstrapError("cilium_recovery_storage_unknown");
+        if (
+          metadata.name.startsWith("sh.helm.release.v1.cilium.") ||
+          labels.name === "cilium" ||
+          labels.NAME === "cilium"
+        )
+          throw new BootstrapError("cilium_recovery_release_present");
+      }
+      await this.commands.authorize();
+      const after = await this.ciliumRecoveryIdentity();
+      if (
+        canonical(after) !== canonical(before) ||
+        this.commands.priorCommandClosed?.() !== true ||
+        !this.commands.claimCiliumRetry
+      )
+        throw new BootstrapError("cilium_recovery_identity_changed");
+      await this.commands.claimCiliumRetry(
+        NodeCiliumInstallJournal.parse({
+          attempt: 2,
+          state: "intent",
+          recovery_receipt: {
+            version: 1,
+            operation_id: this.input.spec.operation_id,
+            node_id: this.input.spec.node_id,
+            region_id: this.input.spec.region_id,
+            input_hash: this.input.input_hash,
+            ...before,
+            chart_sha256: PLATFORM_ARTIFACTS.cilium.sha256,
+            values_sha256: PLATFORM_ARTIFACTS.cilium_values.sha256,
+            effective_values_sha256: digest(canonical(this.assets.values)),
+            inventory_sha256: digest(canonical(inventory)),
+            resource_count: inventory.length,
+            absent_resource_count: inventory.length,
+            release_storage_count: 0,
+            prior_command_closed: true,
+            observed_at,
+            completed_at: new Date().toISOString(),
+          },
+        }),
+      );
+    }
+    if (
+      STAGES.indexOf(stage) < STAGES.indexOf("cilium_install_intent") ||
+      recovery
+    ) {
+      if (!recovery) {
+        const existing = JSON.parse(
+          (
+            await this.commands.helm([
+              "list",
+              "--namespace",
+              "kube-system",
+              "--filter=^cilium$",
+              "--output=json",
+            ])
+          ).stdout,
+        );
+        if (!Array.isArray(existing) || existing.length)
+          throw new BootstrapError("cilium_release_already_exists");
+        await this.commands.checkpoint("cilium_install_intent");
+      }
       await this.commands.authorize();
       try {
         await this.commands.helm([
@@ -614,6 +826,40 @@ export class PlatformInstaller {
     await this.verifyCilium();
     if (STAGES.indexOf(stage) < STAGES.indexOf("cilium_installed"))
       await this.commands.checkpoint("cilium_installed");
+  }
+  private async ciliumRecoveryIdentity() {
+    await this.commands.authorize();
+    const system = await this.required("Namespace", "kube-system"),
+      node = await this.required("Node", this.input.spec.hostname);
+    const labels = record(record(node.metadata).labels ?? {}),
+      status = record(node.status);
+    if (
+      labels["pgcf.io/node-id"] !== this.input.spec.node_id ||
+      labels["pgcf.io/region"] !== this.input.spec.region_id ||
+      labels["pgcf.io/provider-instance-id"] !==
+        this.input.spec.provider_instance_id ||
+      record(status.nodeInfo).kubeletVersion !== `v${KUBERNETES_VERSION}` ||
+      !list(status.addresses).some(
+        (address) =>
+          address.type === "InternalIP" &&
+          address.address === this.input.spec.hardware.ipv4,
+      )
+    )
+      throw new BootstrapError("cilium_recovery_identity_changed");
+    if (
+      !list(record(node.spec).taints).some(
+        (taint) =>
+          taint.key === QUARANTINE.key &&
+          taint.value === QUARANTINE.value &&
+          taint.effect === QUARANTINE.effect,
+      )
+    )
+      throw new BootstrapError("cilium_recovery_identity_changed");
+    return {
+      kube_system_uid: String(record(system.metadata).uid),
+      node_uid: String(record(node.metadata).uid),
+      node_name: this.input.spec.hostname,
+    };
   }
   private async verifyPlatform() {
     const repository = await this.required(

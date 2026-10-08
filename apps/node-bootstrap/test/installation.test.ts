@@ -37,6 +37,7 @@ const kinds: Record<string, string> = {
 function clusterFixture(
   initialStage: NodeBootstrapStage = "kubernetes_joined",
   strictHelm4 = false,
+  recovery = false,
 ) {
   const input = platformFixture();
   let stage = initialStage;
@@ -46,6 +47,15 @@ function clusterFixture(
   const checkpoints: NodeBootstrapStage[] = [];
   const mutations: string[][] = [];
   const resources = new Map<string, Json>();
+  let recoveryJournal:
+    | import("@pgcf/contracts/node-bootstrap").NodeCiliumInstallJournal
+    | undefined;
+  let lostRecoveryAck = false;
+  let rendered =
+    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cilium-bootstrap\n  namespace: kube-system\n";
+  let chartCrds = "";
+  let failInventory = false;
+  let changeClusterAfterInventory = false;
   const assets: PlatformAssets = {
     chart_path: "/verified/cilium.tgz",
     values_path: "/verified/cilium.yaml",
@@ -137,13 +147,24 @@ function clusterFixture(
   store({
     apiVersion: "v1",
     kind: "Node",
-    metadata: { name: input.spec.hostname },
+    metadata: {
+      name: input.spec.hostname,
+      labels: {
+        "pgcf.io/node-id": input.spec.node_id,
+        "pgcf.io/region": input.spec.region_id,
+        "pgcf.io/provider-instance-id": input.spec.provider_instance_id,
+      },
+    },
     spec: {
       taints: [
         { key: "pgcf.io/quarantine", value: "bootstrap", effect: "NoSchedule" },
       ],
     },
-    status: { conditions: [{ type: "Ready", status: "True" }] },
+    status: {
+      conditions: [{ type: "Ready", status: "True" }],
+      nodeInfo: { kubeletVersion: "v1.36.5" },
+      addresses: [{ type: "InternalIP", address: input.spec.hardware.ipv4 }],
+    },
   });
   for (const name of [
     "cilium",
@@ -225,6 +246,13 @@ function clusterFixture(
       });
   };
   const installer = new PlatformInstaller(input, assets, {
+    priorCommandClosed: () => recovery,
+    ciliumJournal: async () => recoveryJournal,
+    claimCiliumRetry: async (journal) => {
+      recoveryJournal = journal;
+      if (lostRecoveryAck)
+        throw new BootstrapError("checkpoint_acknowledgement_uncertain");
+    },
     authorize: async () => {
       if (refuse_authority) throw new BootstrapError("job_cancelled");
       return stage;
@@ -234,6 +262,13 @@ function clusterFixture(
       stage = next;
     },
     helm: async (args) => {
+      if (args[0] === "show" && args[1] === "crds")
+        return { exit_code: 0, stdout: chartCrds };
+      if (args[0] === "template")
+        return {
+          exit_code: 0,
+          stdout: rendered,
+        };
       if (strictHelm4 && args.includes("--all"))
         throw new BootstrapError("native_command_failed_helm_1");
       if (args.includes("list"))
@@ -277,6 +312,28 @@ function clusterFixture(
       };
     },
     kube: async (args, _permit_failure, stdin) => {
+      if (failInventory && args.includes("cilium-bootstrap"))
+        return { exit_code: 1, stdout: "" };
+      if (args.includes("get") && args.includes("secrets,configmaps")) {
+        if (changeClusterAfterInventory)
+          store({
+            apiVersion: "v1",
+            kind: "Namespace",
+            metadata: { name: "kube-system" },
+          });
+        return {
+          exit_code: 0,
+          stdout: JSON.stringify({
+            apiVersion: "v1",
+            kind: "List",
+            items: [...resources.values()].filter(
+              (value) =>
+                ["Secret", "ConfigMap"].includes(String(value.kind)) &&
+                object(value.metadata).namespace === "kube-system",
+            ),
+          }),
+        };
+      }
       if (args.includes("apply")) {
         mutations.push(args);
         for (const document of parseAllDocuments(stdin!)) {
@@ -309,6 +366,22 @@ function clusterFixture(
     store,
     populateRegional,
     installer,
+    journal: () => recoveryJournal,
+    setLostRecoveryAck: () => {
+      lostRecoveryAck = true;
+    },
+    setRendered: (value: string) => {
+      rendered = value;
+    },
+    setChartCrds: (value: string) => {
+      chartCrds = value;
+    },
+    setInventoryFailure: () => {
+      failInventory = true;
+    },
+    setClusterReplacement: () => {
+      changeClusterAfterInventory = true;
+    },
     stage: () => stage,
     setLostResponse: () => {
       lose_response = true;
@@ -381,6 +454,171 @@ test("resuming an uncertain Helm install never sends another install when its re
   await assert.rejects(state.installer.install(), /native_command_failed/);
   assert.equal(state.mutations.length, 0);
   assert.equal(state.stage(), "cilium_install_intent");
+});
+
+test("a closed first Cilium attempt with complete fresh absence consumes one retry before installing", async () => {
+  const state = clusterFixture("cilium_install_intent", false, true);
+  state.setRelease(false);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  await state.installer.install();
+  assert.equal(state.journal()!.attempt, 2);
+  assert.equal(state.journal()!.recovery_receipt.resource_count, 1);
+  assert.equal(state.journal()!.recovery_receipt.absent_resource_count, 1);
+  assert.equal(
+    state.mutations.filter((args) => args[0] === "install").length,
+    1,
+  );
+});
+
+test("a committed retry with a lost checkpoint acknowledgement never dispatches or retries Helm", async () => {
+  const state = clusterFixture("cilium_install_intent", false, true);
+  state.setRelease(false);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  state.setLostRecoveryAck();
+  await assert.rejects(
+    state.installer.install(),
+    /checkpoint_acknowledgement_uncertain/,
+  );
+  assert.equal(state.journal()!.attempt, 2);
+  assert.equal(state.mutations.length, 0);
+  await assert.rejects(state.installer.install(), /native_command_failed/);
+  assert.equal(state.mutations.length, 0);
+});
+
+test("a deployed first Cilium attempt resolves from its owned release without claiming or dispatching recovery", async () => {
+  const state = clusterFixture("cilium_install_intent", false, true);
+  await state.installer.install();
+  assert.equal(state.journal(), undefined);
+  assert.equal(
+    state.mutations.filter((args) => args[0] === "install").length,
+    0,
+  );
+  assert.ok(state.checkpoints.includes("cilium_installed"));
+});
+
+test("a remaining chart object or failed inventory read keeps Cilium recovery unclaimed", async () => {
+  const state = clusterFixture("cilium_install_intent", false, true);
+  state.setRelease(false);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  state.store({
+    apiVersion: "v1",
+    kind: "ConfigMap",
+    metadata: { name: "cilium-bootstrap", namespace: "kube-system" },
+  });
+  await assert.rejects(
+    state.installer.install(),
+    /cilium_recovery_effect_present/,
+  );
+  assert.equal(state.journal(), undefined);
+  assert.equal(state.mutations.length, 0);
+  state.resources.delete("ConfigMap/kube-system/cilium-bootstrap");
+  state.setInventoryFailure();
+  await assert.rejects(state.installer.install(), /platform_readback_invalid/);
+  assert.equal(state.journal(), undefined);
+  assert.equal(state.mutations.length, 0);
+});
+
+test("rendered hooks and chart CRDs block recovery before any claim or install", async () => {
+  const state = clusterFixture("cilium_install_intent", false, true);
+  state.setRelease(false);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  state.setRendered(
+    "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cilium-bootstrap\n  annotations:\n    helm.sh/hook: pre-install\n",
+  );
+  await assert.rejects(
+    state.installer.install(),
+    /cilium_recovery_chart_effects_unknown/,
+  );
+  state.setChartCrds(
+    "apiVersion: apiextensions.k8s.io/v1\nkind: CustomResourceDefinition\n",
+  );
+  await assert.rejects(
+    state.installer.install(),
+    /cilium_recovery_chart_effects_unknown/,
+  );
+  assert.equal(state.journal(), undefined);
+  assert.equal(state.mutations.length, 0);
+});
+
+test("a replaced cluster UID after the complete inventory blocks the recovery CAS", async () => {
+  const state = clusterFixture("cilium_install_intent", false, true);
+  state.setRelease(false);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  state.setClusterReplacement();
+  await assert.rejects(
+    state.installer.install(),
+    /cilium_recovery_identity_changed/,
+  );
+  assert.equal(state.journal(), undefined);
+  assert.equal(state.mutations.length, 0);
+});
+
+test("changed node scope or address prevents a Cilium recovery claim", async () => {
+  const state = clusterFixture("cilium_install_intent", false, true);
+  state.setRelease(false);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  const node = state.resources.get(`Node//${state.input.spec.hostname}`)!;
+  object(object(node.metadata).labels)["pgcf.io/node-id"] = "foreign";
+  await assert.rejects(
+    state.installer.install(),
+    /cilium_recovery_identity_changed/,
+  );
+  object(object(node.metadata).labels)["pgcf.io/node-id"] =
+    state.input.spec.node_id;
+  object(node.status).addresses = [
+    { type: "InternalIP", address: "192.0.2.199" },
+  ];
+  await assert.rejects(
+    state.installer.install(),
+    /cilium_recovery_identity_changed/,
+  );
+  assert.equal(state.journal(), undefined);
+  assert.equal(state.mutations.length, 0);
+});
+
+test("mismatched Helm storage TypeMeta cannot prove zero release effects", async () => {
+  const state = clusterFixture("cilium_install_intent", false, true);
+  state.setRelease(false);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  state.store({
+    apiVersion: "apps/v1",
+    kind: "Secret",
+    metadata: { name: "unrelated", namespace: "kube-system" },
+  });
+  await assert.rejects(
+    state.installer.install(),
+    /cilium_recovery_storage_unknown/,
+  );
+  assert.equal(state.journal(), undefined);
+  assert.equal(state.mutations.length, 0);
 });
 
 test("partly applied Flux intent refuses missing objects without applying them again", async () => {

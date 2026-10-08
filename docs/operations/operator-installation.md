@@ -312,12 +312,15 @@ Confirm that the old Workflow is terminal before creating a fresh adoption with 
 key. Once any guarded installation progress exists, cancellation is refused; resume the original
 operation instead. Failed inventory reads preserve the firewall's original dispatch boundary.
 
-Preparation proofs have a short expiry. A multi-minute install can pause when its proof expires;
-collect fresh measurements and a signed artifact for the same operation and immutable network
-plan, then let normal verification renew the recorded proof. Resume with the same sealed input,
-credentials and native checkpoint, including saved write offsets. A renewed proof does not
-authorize restarting a disk write or resetting an uncertain checkpoint. Quarantine release keeps
-its separate fresh post-join network, Node identity and capacity proofs.
+Preparation proofs have a short expiry. The first destructive checkpoint verifies fresh provider
+facts and the accepted proof, then stores immutable installation continuation authority in
+Cloudflare. Later installation commands use that authority, current operation/binding/plan and
+short transport grants with fresh physical identities; they do not repeat provider inventory or
+full preparation scans whenever the original proof ages. A legacy job missing continuation
+authority needs one verified lifecycle-boundary backfill. Resume with the same sealed input,
+credentials and native checkpoint, including saved write offsets. Neither a renewed proof nor
+continuation authority permits restarting a disk write or resetting an uncertain checkpoint.
+Quarantine release keeps separate fresh post-join network, Node identity and capacity proofs.
 
 ## Acceptance
 
@@ -381,3 +384,19 @@ The pinned Helm4 preflight uses `helm list` without the removed `--all` flag; it
 includes every release state. Keep the exact namespace/filter and reject any existing
 Cilium release before recording or dispatching a new install intent. Do not treat an old
 Helm flag error as evidence that the cluster needs reset or an installation repeated.
+
+The Native CONNECT proxy permits at most64 incoming clients, counting each tunnel once and
+retaining both socket ends for cleanup. Helm's measured discovery/validation pool reached30
+clients; the prior sixteen-client limit dropped valid connections. This bounded concurrency
+does not change authorized addresses, ports, fresh per-connection grants, TLS or expiry.
+
+A retained Cilium install intent normally resolves through exact authenticated release and
+workload readback. The serialized Native executor may consume one persisted attempt2 only
+after the prior command has closed, the pinned chart has no separate CRD/pre-install effects,
+all rendered resource identities and Helm Secret/ConfigMap records are confirmed absent, and
+the same quarantined Node UID and sealed Cluster UID remain fresh. Cloudflare validates the
+bound receipt and consumes the claim atomically without clearing the original intent or
+rewinding any disk, custody or storage progress. A lost claim acknowledgement dispatches
+nothing. Once attempt2 is recorded, resume observes only; it never sends another install.
+Existing, partial, foreign, stale or unknown effects block recovery. This is a programmed
+no-effect resolution, not permission to clear a journal or manually repeat an uncertain write.

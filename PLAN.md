@@ -1,6 +1,6 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-07): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
+Status (2026-10-08): **Phases 0 and 1 accepted in Dev; operator completion is in progress.**
 
 The latest owner direction removes Contabo from routine transport and proof-resource cleanup.
 Provider access belongs to purchase, initial association, firewall/rescue/hypervisor actions,
@@ -438,6 +438,49 @@ namespace/filter/JSON and existing-pending-release refusal.44 affected cases, Na
 types/lint/formatting and independent review pass. One controlled pause atstep352 preserves
 the joined cluster and full image. A changed Native delivery is needed for this concrete
 compatibility defect; no existing cluster installation is repeated.
+
+Source `888260d2`, full CI `37726457006`, delivered the Helm4 preflight correction once
+with qualified Native manifest
+`sha256:3a17c7ce025506c912c24b67b3d20f853e4981195505e0de270b40474f9d63fd`.
+Qualification covered18 layers/714,984,025 bytes with zero unresolved findings; complete
+registry readback verified162,119,652 compressed and502,866,944 raw bytes. The actual
+running placement matched that image. The same US operation passed the preflight and
+stored `cilium_install_intent`; subsequent reads found no Cilium Helm release, CRDs or
+workloads. A pinned Helm server dry run reproduced a failed discovery lookup. Exact
+local proxy tracing established the issuer: the fifth authorized CONNECT received a local
+HTTP403 because four tunnels occupied eight entries in a set containing both socket ends.
+The same authenticated Kubernetes discovery read succeeded separately. This is our Native
+connection-accounting defect, not an observed Contabo or Kubernetes permission failure.
+These diagnostics performed no provider calls or cluster writes and retained the same
+sealed cluster identity. The original install response was discarded, so these three empty
+resource groups alone do not authorize repeating its uncertain write. Full effect-absence
+resolution and a bounded persisted recovery are required before the same job can continue.
+
+The connection correction counts incoming clients once and retains both socket ends for
+cleanup, including failed grants and clients closing before a grant completes. Actual Helm
+server dry runs established that eight and sixteen incoming clients were also insufficient:
+the sixteen-client run recorded11 connection drops. The bounded64-client correction passed
+the same actual pinned-chart server dry run with42 CONNECTs, a peak of30 clients, zero drops
+and exit0. It preserved the original cluster/certificate/join/job identities and left zero
+Cilium resources or release records. Three proxy cases pass, including64 admitted clients,
+the65th refused and failed/closed/pending grants releasing reservations. Targets, independent
+transport grants, TLS, expiry and cleanup remain unchanged; these were read-only diagnostics
+with zero provider calls. The original US Workflow was paused once atstep580 while the safe
+same-intent recovery correction was prepared; no image reinstall or EU write occurred.
+
+The recovery correction retains the original Cilium intent and appends exactly one attempt2
+claim after the serialized executor confirms its prior command closed, the pinned chart has
+no separate CRD/hooks, all rendered resources and complete Helm storage are absent, and
+fresh Node ownership labels/address/version/quarantine, Node UID and sealed Cluster UID
+match before and after. Cloudflare binds the receipt to the exact job, checkpoint, material
+and revision with120-second freshness and an atomic single-winner claim. A lost claim
+acknowledgement dispatches nothing; consumed authority cannot be erased or replaced, and
+later resumes observe only. Existing deployed releases advance through readback without a
+second install. Reproducing tests also exposed registration before reservation: a shared
+reservation now precedes the asynchronous status read and all execution paths honor the same
+busy guards.49 real-D1 callback cases,49 affected Native cases, two focused registration/
+admission cases and three proxy cases pass, with types/lint/formatting and independent reviews.
+These software results and the read-only dry run do not establish US1 Ready or final acceptance.
 
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical

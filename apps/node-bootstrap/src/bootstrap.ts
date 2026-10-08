@@ -322,6 +322,7 @@ export class AuthorityClient {
     previous: NodeBootstrapAuthority,
     checkpoint: NodeBootstrapCheckpoint,
     signal: AbortSignal,
+    requireAcknowledgment = false,
   ) {
     try {
       await this.call(
@@ -334,6 +335,8 @@ export class AuthorityClient {
         signal,
       );
     } catch {
+      if (requireAcknowledgment)
+        throw new BootstrapError("checkpoint_acknowledgement_uncertain");
       // A lost HTTP response can be a committed CAS. The subsequent authoritative read decides.
     }
     const next = await this.read(signal);
@@ -590,6 +593,7 @@ export interface BootstrapOptions {
   operator_direct?: boolean;
   proxy_command_path?: string;
   platform_assets_directory?: string;
+  serialized_executor?: boolean;
 }
 
 export class BootstrapJob {
@@ -605,6 +609,7 @@ export class BootstrapJob {
   private nativeProxy: Awaited<ReturnType<typeof startNativeProxy>> | null =
     null;
   private seed: NodeRegionSeed | null = null;
+  private activeCommands = 0;
   constructor(input: NodeBootstrapInput, options: BootstrapOptions = {}) {
     this.input = validateInput(input);
     this.options = options;
@@ -667,14 +672,20 @@ export class BootstrapJob {
     signal = this.abort.signal,
     timeout_ms = MAX_COMMAND_MS,
   ) {
-    const result = await this.run({
-      executable,
-      args,
-      signal,
-      timeout_ms,
-      env: this.env,
-      ...(stdin === undefined ? {} : { stdin }),
-    });
+    this.activeCommands++;
+    let result: Awaited<ReturnType<CommandRunner>>;
+    try {
+      result = await this.run({
+        executable,
+        args,
+        signal,
+        timeout_ms,
+        env: this.env,
+        ...(stdin === undefined ? {} : { stdin }),
+      });
+    } finally {
+      this.activeCommands--;
+    }
     if (result.exit_code && !permit_failure) {
       const bounded =
         ["ssh", "ssh-keygen", "talosctl", "kubectl", "helm"].includes(
@@ -705,6 +716,7 @@ export class BootstrapJob {
   private async checkpoint(
     stage: NodeBootstrapStage,
     fields: Partial<NodeBootstrapCheckpoint> = {},
+    requireAcknowledgment = false,
   ) {
     const previous = await this.authority.read(this.abort.signal);
     return await this.authority.checkpoint(
@@ -717,6 +729,7 @@ export class BootstrapJob {
         ...fields,
       },
       this.abort.signal,
+      requireAcknowledgment,
     );
   }
   private async inspectRescue() {
@@ -1538,6 +1551,18 @@ export class BootstrapJob {
       this.input,
     );
     const installer = new PlatformInstaller(this.input, assets, {
+      priorCommandClosed: () =>
+        this.options.serialized_executor === true && this.activeCommands === 0,
+      ciliumJournal: async () =>
+        (await this.authority.read(this.abort.signal)).checkpoint
+          .cilium_install,
+      claimCiliumRetry: async (journal) => {
+        await this.checkpoint(
+          "cilium_install_intent",
+          { cilium_install: journal },
+          true,
+        );
+      },
       kube: (args, permit_failure, stdin) =>
         this.kube(args, permit_failure, stdin),
       helm: (args, permit_failure) =>

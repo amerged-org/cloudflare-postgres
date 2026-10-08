@@ -6,6 +6,7 @@ import { test } from "node:test";
 import { createBootstrapServer } from "../src/server.ts";
 import { BootstrapError } from "../src/bootstrap-error.ts";
 import { proofExecutionFixture } from "./node-proof.fixture.ts";
+import { fixture } from "./fixture.ts";
 
 test("proof registration authenticates before private input and coalesces exact sessions without exposing keys", async () => {
   const { input } = await proofExecutionFixture(),
@@ -46,6 +47,13 @@ test("proof registration authenticates before private input and coalesces exact 
     assert.equal((await register(input)).status, 202);
     assert.equal((await register(input)).status, 202);
     assert.equal(runs, 1);
+    const install = await fetch(`${base}/v1/jobs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(fixture()),
+    });
+    assert.equal(install.status, 409);
+    assert.deepEqual(await install.json(), { error_code: "container_busy" });
     assert.equal(
       (
         await register({
