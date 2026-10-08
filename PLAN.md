@@ -555,6 +555,30 @@ use readback only; existing Flux objects are never reapplied. A reproduced same-
 revocation blocks creation.66 affected Native and54 real-D1 callback cases, types/lint/formatting
 and independent reviews pass locally. No repair dispatch or final US acceptance has occurred.
 
+Source `001fadbc`, full CI `37745087265`, delivered Native
+`sha256:8dbe6e380888c9d71bc5a2897522410dd22435795ea23495072a8af78482ce4b` once.
+All18 layers/715,026,009 qualification bytes passed; complete readback verified162,127,757
+compressed and502,908,928 raw bytes. The actual running image matched. The same operation
+consumed its Flux subset repair at08:01:16Z, confirmed `flux_installed` at08:02:50Z and entered
+`platform_sync_intent` at08:03:05Z. During reconciliation, Cilium readback remained blocked.
+One bounded read-only probe established the exact cause: deployed chart version
+`1.20.2+a7c12d330dd9` rather than literal `1.20.2`, with exact application version, bootstrap
+operation label and values. The suffix matches the full pinned OCI digest. GitRepository,
+Kustomization and Cilium HelmRelease were Ready. A subsequent bounded remaining-platform read
+observed the four other HelmReleases Ready, exact OCI content/source and storage/CSI values;
+one normal job revision/timestamp update693→694 prevents claiming whole-row equality for
+that second probe, while checkpoint, input, authorization and custody remained exact.
+No provider or cluster writes occurred in either probe.
+
+The correction permits only the original chart version before platform synchronization and
+the exact pinned digest suffix afterward, requiring current owned reviewed Git/Kustomization,
+OCI digest plus original chart-byte hash, exact Ready HelmRelease and referenced values
+ConfigMap ownership/content/UID, and stable physical identities. No wildcard version or
+reinstall is permitted. The failure and a same-UID ConfigMap ownership/content failure were
+reproduced first;41 affected cases, types/lint/formatting and independent review pass locally.
+The original operation was paused once for the changed readback image. Both consumed journals
+remain immutable; full US1 admission and customer-operation acceptance are still pending.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

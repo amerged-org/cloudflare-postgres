@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { downloadBootstrapAssets } from "../src/build-assets.ts";
+import { PLATFORM_ARTIFACTS } from "../src/platform-artifacts.ts";
+import { parseAllDocuments } from "yaml";
 
 test("bootstrap asset download rejects checksum changes and bounds streamed bytes", async () => {
   const directory = await mkdtemp(join(tmpdir(), "pgcf-assets-test-"));
@@ -41,4 +43,18 @@ test("bootstrap asset download rejects checksum changes and bounds streamed byte
   } finally {
     await rm(directory, { recursive: true, force: true });
   }
+});
+
+test("the Native Cilium handoff digest matches the reviewed platform OCI source pin", async () => {
+  const sources = parseAllDocuments(
+    await readFile(
+      new URL("../../../infra/platform/base/sources.yaml", import.meta.url),
+      "utf8",
+    ),
+  ).map((document) => document.toJSON());
+  const cilium = sources.find(
+    (value) =>
+      value.kind === "OCIRepository" && value.metadata.name === "cilium-chart",
+  );
+  assert.equal(PLATFORM_ARTIFACTS.cilium.oci_digest, cilium.spec.ref.digest);
 });

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { parseAllDocuments } from "yaml";
+import { parse, parseAllDocuments } from "yaml";
 import {
   NodeBootstrapCallback,
   type NodeBootstrapStage,
@@ -24,6 +25,7 @@ const kinds: Record<string, string> = {
   namespaces: "Namespace",
   resourcequotas: "ResourceQuota",
   services: "Service",
+  ocirepositories: "OCIRepository",
   deployments: "Deployment",
   daemonsets: "DaemonSet",
   nodes: "Node",
@@ -44,6 +46,17 @@ function clusterFixture(
   const input = platformFixture();
   let stage = initialStage;
   let release = initialStage !== "kubernetes_joined";
+  let observedHelmVersion: string | undefined;
+  const ociDigest =
+    "sha256:a7c12d330dd96bfcda3bf057b24be8f36566c34868265f930f776dff6f42d838";
+  const pinnedCiliumValues = readFileSync(
+    new URL("../../../infra/platform/base/values/cilium.yaml", import.meta.url),
+    "utf8",
+  );
+  const fluxLabels = {
+    "kustomize.toolkit.fluxcd.io/name": "pgcf-platform",
+    "kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+  };
   let lose_response = false;
   let refuse_authority = false;
   const checkpoints: NodeBootstrapStage[] = [];
@@ -59,6 +72,8 @@ function clusterFixture(
   let partialFluxCreate = false;
   let revokeFluxNamespaceAtDispatch = false;
   let fluxNamespaceReads = 0;
+  let replaceCurrentValuesDuringProof = false;
+  let currentValuesReads = 0;
   let rendered =
     "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: cilium-bootstrap\n  namespace: kube-system\n";
   let chartCrds = "";
@@ -69,7 +84,7 @@ function clusterFixture(
   const assets: PlatformAssets = {
     chart_path: "/verified/cilium.tgz",
     values_path: "/verified/cilium.yaml",
-    values: { ipam: { mode: "kubernetes" } },
+    values: parse(pinnedCiliumValues),
     flux: [
       {
         apiVersion: "v1",
@@ -126,6 +141,20 @@ function clusterFixture(
           revision: `main@sha1:${input.spec.platform.reviewed_commit}`,
         },
         lastAppliedRevision: `main@sha1:${input.spec.platform.reviewed_commit}`,
+      };
+    if (next.kind === "Kustomization")
+      object(next.status).inventory = {
+        entries: [
+          {
+            id: "flux-system_cilium-chart_source.toolkit.fluxcd.io_OCIRepository",
+            v: "v1",
+          },
+          {
+            id: "flux-system_cilium_helm.toolkit.fluxcd.io_HelmRelease",
+            v: "v2",
+          },
+          { id: "flux-system_pgcf-cilium-values__ConfigMap", v: "v1" },
+        ],
       };
     return next;
   };
@@ -186,8 +215,70 @@ function clusterFixture(
     store({
       apiVersion: "helm.toolkit.fluxcd.io/v2",
       kind: "HelmRelease",
-      metadata: { name, namespace: "flux-system" },
+      metadata: { name, namespace: "flux-system", labels: fluxLabels },
+      ...(name === "cilium"
+        ? {
+            spec: {
+              releaseName: "cilium",
+              targetNamespace: "kube-system",
+              storageNamespace: "kube-system",
+              chartRef: {
+                kind: "OCIRepository",
+                name: "cilium-chart",
+                namespace: "flux-system",
+              },
+              valuesFrom: [
+                {
+                  kind: "ConfigMap",
+                  name: "pgcf-cilium-values",
+                  valuesKey: "values.yaml",
+                },
+              ],
+            },
+          }
+        : {}),
     });
+  store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  store({
+    apiVersion: "source.toolkit.fluxcd.io/v1",
+    kind: "OCIRepository",
+    metadata: {
+      name: "cilium-chart",
+      namespace: "flux-system",
+      labels: fluxLabels,
+    },
+    spec: {
+      url: "oci://quay.io/cilium/charts/cilium",
+      ref: { digest: ociDigest },
+      layerSelector: {
+        mediaType: "application/vnd.cncf.helm.chart.content.v1.tar+gzip",
+        operation: "copy",
+      },
+    },
+    status: {
+      observedGeneration: 1,
+      artifact: {
+        revision: ociDigest,
+        digest:
+          "sha256:b2afd87b7f75f875f92a14559f14f59b7babbb479d968e3fd625a20bf30ec20e",
+      },
+      conditions: [{ type: "Ready", status: "True", observedGeneration: 1 }],
+    },
+  });
+  store({
+    apiVersion: "v1",
+    kind: "ConfigMap",
+    metadata: {
+      name: "pgcf-cilium-values",
+      namespace: "flux-system",
+      labels: fluxLabels,
+    },
+    data: { "values.yaml": pinnedCiliumValues },
+  });
   store({
     apiVersion: "storage.k8s.io/v1",
     kind: "StorageClass",
@@ -318,7 +409,16 @@ function clusterFixture(
                 name: "cilium",
                 namespace: "kube-system",
                 chart: "cilium",
-                version: "1.20.2",
+                version:
+                  observedHelmVersion ??
+                  ([
+                    "platform_sync_intent",
+                    "platform_ready",
+                    "regional_install_intent",
+                    "regional_ready",
+                  ].includes(stage)
+                    ? "1.20.2+a7c12d330dd9"
+                    : "1.20.2"),
                 appVersion: "1.20.2",
                 status: "deployed",
                 labels: {
@@ -444,6 +544,11 @@ function clusterFixture(
         ? args[args.indexOf("--namespace") + 1]
         : "";
       const value = resources.get(`${kind}/${namespace}/${name}`);
+      if (kind === "ConfigMap" && name === "pgcf-cilium-values" && value) {
+        currentValuesReads++;
+        if (replaceCurrentValuesDuringProof && currentValuesReads === 2)
+          object(value.metadata).uid = randomUUID();
+      }
       return { exit_code: 0, stdout: value ? JSON.stringify(value) : "" };
     },
   });
@@ -495,6 +600,12 @@ function clusterFixture(
     setCancelled: () => {
       refuse_authority = true;
     },
+    replaceCurrentValuesDuringProof: () => {
+      replaceCurrentValuesDuringProof = true;
+    },
+    setHelmVersion: (value: string) => {
+      observedHelmVersion = value;
+    },
     setRelease: (value: boolean) => {
       release = value;
     },
@@ -541,6 +652,143 @@ test("an existing Cilium release is never overwritten by a first-region bootstra
   );
   assert.equal(state.mutations.length, 0);
   assert.equal(state.checkpoints.length, 0);
+});
+
+function ciliumHandoffFixture() {
+  const state = clusterFixture("platform_sync_intent");
+  for (const value of [
+    ...state.assets.flux,
+    ...platformSyncObjects(state.input),
+  ])
+    state.store(value);
+  state.store({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  const release = state.resources.get("HelmRelease/flux-system/cilium")!;
+  object(release.metadata).labels = {
+    "kustomize.toolkit.fluxcd.io/name": "pgcf-platform",
+    "kustomize.toolkit.fluxcd.io/namespace": "flux-system",
+  };
+  release.spec = {
+    releaseName: "cilium",
+    targetNamespace: "kube-system",
+    storageNamespace: "kube-system",
+    chartRef: {
+      kind: "OCIRepository",
+      name: "cilium-chart",
+      namespace: "flux-system",
+    },
+    valuesFrom: [
+      {
+        kind: "ConfigMap",
+        name: "pgcf-cilium-values",
+        valuesKey: "values.yaml",
+      },
+    ],
+  };
+  state.store({
+    apiVersion: "source.toolkit.fluxcd.io/v1",
+    kind: "OCIRepository",
+    metadata: {
+      name: "cilium-chart",
+      namespace: "flux-system",
+      labels: object(release.metadata).labels,
+    },
+    spec: {
+      url: "oci://quay.io/cilium/charts/cilium",
+      ref: {
+        digest:
+          "sha256:a7c12d330dd96bfcda3bf057b24be8f36566c34868265f930f776dff6f42d838",
+      },
+      layerSelector: {
+        mediaType: "application/vnd.cncf.helm.chart.content.v1.tar+gzip",
+        operation: "copy",
+      },
+    },
+    status: {
+      observedGeneration: 1,
+      artifact: {
+        revision:
+          "sha256:a7c12d330dd96bfcda3bf057b24be8f36566c34868265f930f776dff6f42d838",
+        digest:
+          "sha256:b2afd87b7f75f875f92a14559f14f59b7babbb479d968e3fd625a20bf30ec20e",
+      },
+      conditions: [{ type: "Ready", status: "True", observedGeneration: 1 }],
+    },
+  });
+  state.setHelmVersion("1.20.2+a7c12d330dd9");
+  return state;
+}
+
+const verifyCiliumReadback = (state: ReturnType<typeof clusterFixture>) =>
+  (
+    state.installer as unknown as { verifyCilium(): Promise<void> }
+  ).verifyCilium();
+
+test("reviewed Flux handoff accepts only the exact pinned OCI chart suffix", async () => {
+  const state = ciliumHandoffFixture();
+  await verifyCiliumReadback(state);
+  assert.equal(state.mutations.length, 0);
+});
+
+test("a digest suffix before Flux handoff and an unreviewed suffix after it are rejected", async () => {
+  const before = clusterFixture("cilium_installed");
+  before.setHelmVersion("1.20.2+a7c12d330dd9");
+  await assert.rejects(
+    verifyCiliumReadback(before),
+    /cilium_release_unconfirmed/,
+  );
+  assert.equal(before.mutations.length, 0);
+  const after = ciliumHandoffFixture();
+  after.setHelmVersion("1.20.2+000000000000");
+  await assert.rejects(
+    verifyCiliumReadback(after),
+    /cilium_release_unconfirmed/,
+  );
+  assert.equal(after.mutations.length, 0);
+});
+
+test("a changed OCI chart byte digest cannot authorize the Flux version suffix", async () => {
+  const state = ciliumHandoffFixture();
+  const source = state.resources.get("OCIRepository/flux-system/cilium-chart")!;
+  object(object(source.status).artifact).digest = `sha256:${"0".repeat(64)}`;
+  await assert.rejects(
+    verifyCiliumReadback(state),
+    /cilium_release_unconfirmed/,
+  );
+  assert.equal(state.mutations.length, 0);
+});
+
+test("a Ready HelmRelease missing reviewed Flux inventory ownership cannot authorize handoff", async () => {
+  const state = ciliumHandoffFixture();
+  const kustomization = state.resources.get(
+    "Kustomization/flux-system/pgcf-platform",
+  )!;
+  object(kustomization.status).inventory = { entries: [] };
+  await assert.rejects(
+    verifyCiliumReadback(state),
+    /cilium_release_unconfirmed/,
+  );
+  assert.equal(state.mutations.length, 0);
+});
+
+test("changed current Flux values cannot use last-deployed Helm values to authorize handoff", async () => {
+  const state = ciliumHandoffFixture();
+  const values = state.resources.get(
+    "ConfigMap/flux-system/pgcf-cilium-values",
+  )!;
+  object(values.data)["values.yaml"] += "\n# altered current source\n";
+  await assert.rejects(verifyCiliumReadback(state), /cilium_values_mismatch/);
+  assert.equal(state.mutations.length, 0);
+});
+
+test("a replacement current Flux values UID during the proof blocks chart handoff", async () => {
+  const state = ciliumHandoffFixture();
+  state.replaceCurrentValuesDuringProof();
+  await assert.rejects(verifyCiliumReadback(state), /cilium_values_mismatch/);
+  assert.equal(state.mutations.length, 0);
 });
 
 test("Helm 4 preflight includes every release state without its removed all flag", async () => {

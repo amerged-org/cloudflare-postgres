@@ -38,6 +38,7 @@ const RESOURCES: Record<string, string> = {
   Endpoints: "endpoints",
   ConfigMap: "configmaps",
   GitRepository: "gitrepositories.source.toolkit.fluxcd.io",
+  OCIRepository: "ocirepositories.source.toolkit.fluxcd.io",
   Kustomization: "kustomizations.kustomize.toolkit.fluxcd.io",
 };
 const QUARANTINE = {
@@ -605,17 +606,24 @@ export class PlatformInstaller {
         ).stdout,
       ),
     );
+    const stage = await this.commands.authorize();
+    const handoff =
+      STAGES.indexOf(stage) >= STAGES.indexOf("platform_sync_intent");
+    const version = handoff
+      ? `${PLATFORM_ARTIFACTS.cilium.version}+${PLATFORM_ARTIFACTS.cilium.oci_digest.slice("sha256:".length, "sha256:".length + 12)}`
+      : PLATFORM_ARTIFACTS.cilium.version;
     if (
       metadata.name !== "cilium" ||
       metadata.namespace !== "kube-system" ||
       metadata.chart !== "cilium" ||
-      metadata.version !== PLATFORM_ARTIFACTS.cilium.version ||
+      metadata.version !== version ||
       metadata.appVersion !== PLATFORM_ARTIFACTS.cilium.version ||
       metadata.status !== "deployed" ||
       record(metadata.labels)["pgcf.io/bootstrap-operation"] !==
         this.input.spec.operation_id
     )
       throw new BootstrapError("cilium_release_unconfirmed");
+    if (handoff) await this.verifyCiliumFluxHandoff();
     const values = JSON.parse(
       (
         await this.commands.helm([
@@ -656,6 +664,167 @@ export class PlatformInstaller {
       )
     )
       throw new BootstrapError("platform_node_not_ready");
+  }
+  private async verifyCiliumFluxHandoff() {
+    const before = await this.ciliumRecoveryIdentity();
+    const cilium = await this.commands.ciliumJournal?.();
+    if (
+      cilium &&
+      (cilium.recovery_receipt.node_uid !== before.node_uid ||
+        cilium.recovery_receipt.kube_system_uid !== before.kube_system_uid)
+    )
+      throw new BootstrapError("cilium_release_unconfirmed");
+    const namespaceExpected = this.assets.flux.find(
+      (value) =>
+        value.kind === "Namespace" &&
+        record(value.metadata).name === "flux-system",
+    );
+    if (!namespaceExpected)
+      throw new BootstrapError("cilium_release_unconfirmed");
+    const namespaceBefore = await this.required("Namespace", "flux-system");
+    assertOwnedResource(namespaceExpected, namespaceBefore);
+    const sync = platformSyncObjects(this.input);
+    const repository = await this.required(
+        "GitRepository",
+        "pgcf-platform",
+        "flux-system",
+      ),
+      kustomization = await this.required(
+        "Kustomization",
+        "pgcf-platform",
+        "flux-system",
+      ),
+      source = await this.required(
+        "OCIRepository",
+        "cilium-chart",
+        "flux-system",
+      ),
+      release = await this.required("HelmRelease", "cilium", "flux-system");
+    const valuesBefore = await this.required(
+      "ConfigMap",
+      "pgcf-cilium-values",
+      "flux-system",
+    );
+    const pinnedValues = (value: Json) => {
+      const labels = record(record(value.metadata).labels ?? {}),
+        data = record(value.data ?? {}),
+        text = data["values.yaml"];
+      if (
+        labels["kustomize.toolkit.fluxcd.io/name"] !== "pgcf-platform" ||
+        labels["kustomize.toolkit.fluxcd.io/namespace"] !== "flux-system"
+      )
+        throw new BootstrapError("cilium_release_unconfirmed");
+      if (
+        typeof text !== "string" ||
+        Buffer.byteLength(text) > 256 * 1024 ||
+        digest(text) !== PLATFORM_ARTIFACTS.cilium_values.sha256 ||
+        canonical(parse(text)) !== canonical(this.assets.values)
+      )
+        throw new BootstrapError("cilium_values_mismatch");
+      return { uid: record(value.metadata).uid, values_sha256: digest(text) };
+    };
+    const valuesIdentity = pinnedValues(valuesBefore);
+    assertOwnedResource(
+      sync.find((value) => value.kind === "GitRepository")!,
+      repository,
+    );
+    assertOwnedResource(
+      sync.find((value) => value.kind === "Kustomization")!,
+      kustomization,
+    );
+    for (const value of [repository, kustomization, source, release])
+      assertFluxReady(value);
+    const revision = record(record(repository.status).artifact).revision;
+    if (
+      typeof revision !== "string" ||
+      !revision.endsWith(`sha1:${this.input.spec.platform!.reviewed_commit}`) ||
+      record(kustomization.status).lastAppliedRevision !== revision
+    )
+      throw new BootstrapError("platform_source_revision_mismatch");
+    const entries = list(
+      record(record(kustomization.status).inventory).entries,
+    );
+    for (const [id, version] of [
+      ["flux-system_cilium-chart_source.toolkit.fluxcd.io_OCIRepository", "v1"],
+      ["flux-system_cilium_helm.toolkit.fluxcd.io_HelmRelease", "v2"],
+      ["flux-system_pgcf-cilium-values__ConfigMap", "v1"],
+    ])
+      if (
+        entries.filter((entry) => entry.id === id && entry.v === version)
+          .length !== 1
+      )
+        throw new BootstrapError("cilium_release_unconfirmed");
+    for (const value of [source, release]) {
+      const labels = record(record(value.metadata).labels ?? {});
+      if (
+        labels["kustomize.toolkit.fluxcd.io/name"] !== "pgcf-platform" ||
+        labels["kustomize.toolkit.fluxcd.io/namespace"] !== "flux-system"
+      )
+        throw new BootstrapError("cilium_release_unconfirmed");
+    }
+    if (
+      !contains(
+        {
+          apiVersion: "source.toolkit.fluxcd.io/v1",
+          spec: {
+            url: "oci://quay.io/cilium/charts/cilium",
+            ref: { digest: PLATFORM_ARTIFACTS.cilium.oci_digest },
+            layerSelector: {
+              mediaType: "application/vnd.cncf.helm.chart.content.v1.tar+gzip",
+              operation: "copy",
+            },
+          },
+        },
+        source,
+      ) ||
+      record(record(source.status).artifact).revision !==
+        PLATFORM_ARTIFACTS.cilium.oci_digest ||
+      record(record(source.status).artifact).digest !==
+        `sha256:${PLATFORM_ARTIFACTS.cilium.sha256}`
+    )
+      throw new BootstrapError("cilium_release_unconfirmed");
+    if (
+      !contains(
+        {
+          apiVersion: "helm.toolkit.fluxcd.io/v2",
+          spec: {
+            releaseName: "cilium",
+            targetNamespace: "kube-system",
+            storageNamespace: "kube-system",
+            chartRef: {
+              kind: "OCIRepository",
+              name: "cilium-chart",
+              namespace: "flux-system",
+            },
+            valuesFrom: [
+              {
+                kind: "ConfigMap",
+                name: "pgcf-cilium-values",
+                valuesKey: "values.yaml",
+              },
+            ],
+          },
+        },
+        release,
+      )
+    )
+      throw new BootstrapError("cilium_release_unconfirmed");
+    const valuesAfter = await this.required(
+      "ConfigMap",
+      "pgcf-cilium-values",
+      "flux-system",
+    );
+    if (canonical(pinnedValues(valuesAfter)) !== canonical(valuesIdentity))
+      throw new BootstrapError("cilium_values_mismatch");
+    const namespaceAfter = await this.required("Namespace", "flux-system");
+    assertOwnedResource(namespaceExpected, namespaceAfter);
+    const after = await this.ciliumRecoveryIdentity();
+    if (
+      canonical(after) !== canonical(before) ||
+      record(namespaceAfter.metadata).uid !==
+        record(namespaceBefore.metadata).uid
+    )
+      throw new BootstrapError("cilium_release_unconfirmed");
   }
   private async installCilium() {
     const stage = await this.commands.authorize();

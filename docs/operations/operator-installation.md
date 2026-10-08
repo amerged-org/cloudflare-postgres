@@ -428,3 +428,11 @@ set. The executor rechecks Namespace UID and ownership before creating only that
 An uncertain claim dispatches nothing; a consumed repair never permits another create.
 Resolve partial or unknown results through exact authenticated readback. Never reapply the
 whole Flux manifest, erase either repair journal or reset the original installation checkpoint.
+
+Flux adds the pinned OCI digest prefix to Cilium's chart version during handoff. Before platform
+synchronization require the original `1.20.2`; afterward require only the exact pinned
+`1.20.2+a7c12d330dd9`. Verify the full OCI digest, original chart-byte hash, current owned
+reviewed Git/Kustomization and Ready HelmRelease, plus the referenced values ConfigMap's
+ownership, exact pinned content and stable UID. Application version, deployed status,
+bootstrap-operation label, exact Helm values and physical identity remain required.
+Do not strip arbitrary version metadata or repeat an install to resolve this representation.

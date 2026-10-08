@@ -10,6 +10,8 @@ export const HELM_ARTIFACT = {
 export const PLATFORM_ARTIFACTS = {
   cilium: {
     version: "1.20.2",
+    oci_digest:
+      "sha256:a7c12d330dd96bfcda3bf057b24be8f36566c34868265f930f776dff6f42d838",
     url: "https://helm.cilium.io/cilium-1.20.2.tgz",
     sha256: "b2afd87b7f75f875f92a14559f14f59b7babbb479d968e3fd625a20bf30ec20e",
     max_bytes: 1024 * 1024,
