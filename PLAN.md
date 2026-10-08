@@ -403,6 +403,23 @@ sealing remain1.150 affected API cases, types/lint/formatting and independent re
 Migration0023 and activation remain unexecuted. Existing Native/proof payload contracts and
 the qualified Native64 image are unchanged; live US remains on the accepted016 API stand.
 
+The original US job completed all4,453,302,272 raw image bytes at00:08:18Z, then
+advanced through GPT completion, rescue reboot, authenticated maintenance and configuration.
+The initial Talos reboot command timed out after its9-minute subprocess limit: pinned
+talosctl defaults to waiting for MachineReady, while Kubernetes bootstrap follows that
+command. Programmed re-entry confirmed changed boot ID and authenticated readback without
+repeating reboot/apply, then entered Kubernetes bootstrap. A subsequent read failed once,
+after which immutable join_bundle:1 was already sealed. Re-entry nevertheless requested
+new kubeconfig credentials and attempted a second exact seal, producingcredentials_not_sealed.
+The reproducing Native fixture fails with that exact code. The correction reuses the sealed
+kubeconfig, freshly verifies the same kube-system UID and rechecks exact CF material before
+continuing; first generation/sealing and strict unknown-seal recovery remain. The initial
+reboot now uses--wait=false while retaining separate changed-boot/authenticated checks;
+re-entry still skips reboot entirely.31 complete bootstrap cases, Native types/lint/format
+and independent join review pass. One controlled pause atstep303 preserved the full image,
+original operation/input and already-sealed join1 credentials. A changed qualified Native
+image is required for these measured software corrections; no EU or provider action occurred.
+
 Final operator acceptance requires programmed US1 Ready, Cloudflare SQL with nonsuperuser
 roles and TLS, R2 base backup and post-commit WAL, restore, and deletion with measured physical
 LV/VG reclamation. Report the instrumented resume-to-Ready/first-SQL duration and actual provider

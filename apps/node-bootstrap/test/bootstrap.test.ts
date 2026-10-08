@@ -976,6 +976,64 @@ test("clean reboot verification refuses the old boot ID and accepts an observed 
   await Reflect.get(job, "confirmReboot").call(job, boot);
 });
 
+test("initial reboot returns without waiting for MachineReady and still verifies a changed boot before bootstrap", async () => {
+  const input = platformFixture();
+  let current = authority(input),
+    boot = randomUUID();
+  current.checkpoint = {
+    ...current.checkpoint,
+    stage: "config_applied",
+    destructive_intent: true,
+    written_bytes: input.spec.image.raw_bytes,
+    downloaded_bytes: input.spec.image.compressed_bytes,
+    sealed_ref: "region_seed:1",
+  };
+  let rebootRequests = 0,
+    bootReads = 0,
+    authenticatedReads = 0;
+  const job = new BootstrapJob(input, {
+    request: async (_url, init) => {
+      const message = NodeBootstrapCallback.parse(
+        JSON.parse(String(init?.body)),
+      );
+      if (message.kind === "checkpoint")
+        current = {
+          ...current,
+          revision: current.revision + 1,
+          checkpoint: message.payload,
+        };
+      return Response.json(current);
+    },
+    run: async (command) => {
+      if (command.args.includes("read")) {
+        bootReads++;
+        return { exit_code: 0, stdout: boot };
+      }
+      if (command.args.includes("reboot")) {
+        assert.ok(command.args.includes("--wait=false"));
+        assert.equal(current.checkpoint.stage, "talos_reboot_intent");
+        rebootRequests++;
+        boot = randomUUID();
+        return { exit_code: 0, stdout: "" };
+      }
+      if (command.args.includes("bootstrap")) {
+        assert.equal(current.checkpoint.stage, "kubernetes_bootstrap_intent");
+        assert.equal(bootReads, 2);
+        assert.equal(authenticatedReads, 1);
+        throw new BootstrapError("test_after_authenticated_reboot");
+      }
+      throw new Error("unexpected_test_command");
+    },
+  });
+  Reflect.set(job, "setup", async () => {});
+  Reflect.set(job, "prepareConfig", async () => {});
+  Reflect.set(job, "authenticatedReadback", async () => {
+    authenticatedReads++;
+  });
+  await assert.rejects(job.start(), /test_after_authenticated_reboot/);
+  assert.equal(rebootRequests, 1);
+});
+
 function resumedDiskWrite(prefixExitCode = 0) {
   const chunkBytes = 16 * 1024 ** 2;
   const writtenBytes = 32 * chunkBytes;
@@ -1138,7 +1196,10 @@ test("an uncertain GPT relocation resumes with partition readback and never repe
   assert.equal(current.checkpoint.status, "waiting");
 });
 
-test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and reads back without another bootstrap", async () => {
+async function resumeKubernetesBootstrap(
+  retainedJoinBundle = false,
+  changedClusterUid = false,
+) {
   const input = platformFixture();
   let current = authority(input);
   const uid = randomUUID();
@@ -1209,6 +1270,15 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
     ],
     "current-context": input.spec.cluster_name,
   });
+  if (retainedJoinBundle) {
+    const seed = current.protected_material!.material;
+    current.protected_material = {
+      purpose: "join_bundle",
+      material: { ...seed, kube_system_uid: uid, kubeconfig },
+    };
+    current.checkpoint.sealed_ref = "join_bundle:1";
+  }
+  const initialMaterial = canonical(current.protected_material);
   const calls: string[][] = [];
   const job = new BootstrapJob(input, {
     request: async (_url, init) => {
@@ -1224,6 +1294,11 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
         if (message.payload.storage_trial)
           await storage.commands.saveTrial(message.payload.storage_trial);
       }
+      if (message.kind === "seal" && retainedJoinBundle)
+        return Response.json(
+          { error: "immutable_join_custody" },
+          { status: 409 },
+        );
       if (message.kind === "seal")
         current = {
           ...current,
@@ -1312,12 +1387,30 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
           }),
         };
       if (args.includes("kubeconfig")) {
-        await writeFile(args[args.indexOf("kubeconfig") + 1]!, kubeconfig, {
-          mode: 0o600,
-        });
+        const renewed = parse(kubeconfig);
+        if (retainedJoinBundle)
+          renewed.users[0].user["client-certificate-data"] =
+            randomBytes(32).toString("base64");
+        await writeFile(
+          args[args.indexOf("kubeconfig") + 1]!,
+          retainedJoinBundle ? stringify(renewed) : kubeconfig,
+          {
+            mode: 0o600,
+          },
+        );
         return { exit_code: 0, stdout: "" };
       }
       if (command.executable === "kubectl" && !args.includes("deployment")) {
+        if (
+          changedClusterUid &&
+          args.includes("namespace") &&
+          args.includes("kube-system")
+        )
+          return {
+            exit_code: 0,
+            stdout: JSON.stringify({ metadata: { uid: randomUUID() } }),
+          };
+
         const action = args.findIndex((arg) =>
           ["get", "create", "patch", "delete", "logs"].includes(arg),
         );
@@ -1397,6 +1490,10 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
       observed.protected_material.material.kube_system_uid === uid,
   );
   assert.equal(canonical(current.protected_material), retainedBundle);
+  if (retainedJoinBundle) {
+    assert.equal(canonical(current.protected_material), initialMaterial);
+    assert.ok(!calls.some((args) => args.includes("kubeconfig")));
+  }
   assert.equal(canonical(input), immutableInput);
   const storageTrial = observed.checkpoint.storage_trial!;
   assert.equal(storageTrial.input_hash, input.input_hash);
@@ -1413,4 +1510,17 @@ test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and 
   );
   assert.equal(storage.logical_volumes.length, 0);
   assert.equal(storage.objects.size, 0);
+}
+
+test("restart after uncertain Kubernetes bootstrap recovers the sealed seed and reads back without another bootstrap", async () => {
+  await resumeKubernetesBootstrap();
+});
+test("restart reuses an already sealed join bundle without generating replacement credentials", async () => {
+  await resumeKubernetesBootstrap(true);
+});
+test("restart blocks a changed cluster UID before reusing sealed join custody", async () => {
+  await assert.rejects(
+    resumeKubernetesBootstrap(true, true),
+    /cluster_uid_mismatch/,
+  );
 });

@@ -1954,7 +1954,7 @@ export class BootstrapJob {
         authority = await this.checkpoint("talos_reboot_intent", {
           pre_reboot_boot_id: await this.bootId(),
         });
-        await this.talos(["reboot"], false, true);
+        await this.talos(["reboot", "--wait=false"], false, true);
       }
       await this.confirmReboot(authority.checkpoint.pre_reboot_boot_id);
       await this.authenticatedReadback();
@@ -1966,9 +1966,15 @@ export class BootstrapJob {
           await this.talos(["bootstrap"], false, true);
         }
         // Kubeconfig and kube-system UID are the evidence, including after an uncertain bootstrap.
+        const retained =
+          authority.protected_material?.purpose === "join_bundle"
+            ? authority.protected_material
+            : null;
         const file = join(this.directory, "observed-kubeconfig");
-        await this.talos(["kubeconfig", file, "--merge=false", "--force"]);
-        const rawConfig = await readFile(file, "utf8");
+        if (!retained)
+          await this.talos(["kubeconfig", file, "--merge=false", "--force"]);
+        const rawConfig =
+          retained?.material.kubeconfig ?? (await readFile(file, "utf8"));
         await this.writeKubeconfig(rawConfig);
         const namespace = record(
           JSON.parse(
@@ -1990,16 +1996,23 @@ export class BootstrapJob {
           authority.protected_material.material.kube_system_uid !== uid
         )
           throw new BootstrapError("cluster_uid_mismatch");
-        const bundle = NodeJoinBundle.parse({
-          ...this.seed,
-          kube_system_uid: uid,
-          kubeconfig: rawConfig,
-        });
-        authority = await this.authority.seal(
-          await this.authority.read(this.abort.signal),
-          { purpose: "join_bundle", material: bundle },
-          this.abort.signal,
-        );
+        if (retained) {
+          const fresh = await this.authority.read(this.abort.signal);
+          if (canonical(fresh.protected_material) !== canonical(retained))
+            throw new BootstrapError("sealed_join_bundle_changed");
+          authority = fresh;
+        } else {
+          const bundle = NodeJoinBundle.parse({
+            ...this.seed,
+            kube_system_uid: uid,
+            kubeconfig: rawConfig,
+          });
+          authority = await this.authority.seal(
+            await this.authority.read(this.abort.signal),
+            { purpose: "join_bundle", material: bundle },
+            this.abort.signal,
+          );
+        }
         await this.ensureCoreDNSQuarantineToleration(uid);
       } else {
         const namespace = record(

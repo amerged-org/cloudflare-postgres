@@ -364,3 +364,15 @@ an uncertain response by reading the active revision/provenance and exact hashes
 rewrite old ciphertext or dispatch another physical upgrade. The administrator's native
 readback is the explicit trust boundary: this API validates its identity and provenance,
 rather than claiming to perform the Kubernetes upgrade itself.
+
+## Resume after Kubernetes bootstrap custody is sealed
+
+After a join bundle is sealed, resume with its exact retained kubeconfig and certificate/key
+material. Verify the current kube-system UID and current Cloudflare material before continuing.
+Do not request replacement credentials or reseal a different bundle at the same revision.
+A lost seal response is resolved by authoritative reads; equality remains mandatory.
+
+The initial Talos reboot uses `--wait=false` because the installer separately verifies changed
+boot ID and authenticated OS/storage readback before bootstrapping Kubernetes. Talos
+MachineReady can depend on that later bootstrap/CNI work. A stored reboot or bootstrap intent
+requires observation on resume, never blind redispatch of the mutation.
