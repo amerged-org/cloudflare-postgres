@@ -181,6 +181,57 @@ async function errorCode(
   return fields.find((field) => field.startsWith("C"))!.slice(1);
 }
 
+async function assertRealRateDenied(
+  original: Parameters<typeof open>[0],
+  attempted: Parameters<typeof open>[0],
+  window: { epoch: number },
+): Promise<number> {
+  const before = (await stats()).length;
+  let rolloverAdmissions = 0;
+  if (Math.floor(Date.now() / 60_000) !== window.epoch) {
+    let stable = false;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const epoch = Math.floor(Date.now() / 60_000);
+      const probe = await open(original);
+      const after = Math.floor(Date.now() / 60_000);
+      if (
+        JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome === "accepted"
+      )
+        rolloverAdmissions++;
+      else expect(await errorCode(probe)).toBe("53300");
+      if (epoch === after) {
+        window.epoch = epoch;
+        stable = true;
+        break;
+      }
+    }
+    expect(
+      stable,
+      "original bucket must be occupied in one observed real epoch",
+    ).toBe(true);
+  }
+  let denied = await open(attempted);
+  if (JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome === "accepted") {
+    // The actual Miniflare limiter resets at a real wall-clock minute, independently of Edge fake timers.
+    expect(
+      Math.floor(Date.now() / 60_000),
+      "rate_scope_same_window_unexpected_admission",
+    ).toBeGreaterThan(window.epoch);
+    rolloverAdmissions++;
+    // Probe the original scope too: an incorrectly independent alias must not masquerade as a reset.
+    const originalProbe = await open(original);
+    expect(
+      JSON.parse(logs.mock.calls.at(-1)![0] as string).outcome,
+      "rate_scope_reciprocal_violation",
+    ).toBe("53300");
+    expect(await errorCode(originalProbe)).toBe("53300");
+    denied = await open(attempted);
+  }
+  expect(await errorCode(denied)).toBe("53300");
+  expect(await stats()).toHaveLength(before + rolloverAdmissions);
+  return rolloverAdmissions;
+}
+
 function passwordFrame(body: Uint8Array): Uint8Array {
   const frame = new Uint8Array(5 + body.length);
   frame[0] = 0x70;
@@ -884,9 +935,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     );
     expect(await stats()).toHaveLength(1_000);
     expect(logs.mock.calls).toHaveLength(1_000);
-    const denied = await open();
-    expect(await errorCode(denied)).toBe("53300");
-    expect(await stats()).toHaveLength(1_000);
+    // The real limiter has its own wall-clock window; rate denial is checked separately.
     const beforeAdvance = idleUpgradeDiagnostics(idle);
     const timersBeforeAdvance = vi.getTimerCount();
     await vi.advanceTimersByTimeAsync(ADMISSION_DEADLINE_MS);
@@ -1030,12 +1079,63 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       .TEST_RATE_LIMITER;
     const bindings = { ...testEnv, CONNECTION_RATE_LIMITER: limiter };
     const ip = [192, 0, 2, 2].join(".");
+    const window = { epoch: Math.floor(Date.now() / 60_000) };
     const first = await open({ ip, bindings });
     first.socket.send(encodeStartup({ user: "app", database }));
     await expect.poll(async () => (await stats()).length).toBe(1);
-    const second = await open({ ip, bindings });
-    expect(await errorCode(second)).toBe("53300");
+    await assertRealRateDenied({ ip, bindings }, { ip, bindings }, window);
+  });
+
+  it("keeps real limiter scope checks when the previous cohort belongs to an older window", async () => {
+    const limiter = (env as typeof env & { TEST_RATE_LIMITER: RateLimit })
+      .TEST_RATE_LIMITER;
+    const bindings = { ...testEnv, CONNECTION_RATE_LIMITER: limiter };
+    const previousWindow = () => ({
+      epoch: Math.floor(Date.now() / 60_000) - 1,
+    });
+    expect(
+      await assertRealRateDenied(
+        { bindings, ip: "2001:db8:10::1" },
+        { bindings, ip: "2001:0db8:0010:0000:0:0:0:2" },
+        previousWindow(),
+      ),
+    ).toBeGreaterThan(0);
+    // An independent bucket must fail after a stable original-scope proof, even with stale setup metadata.
+    await expect(
+      assertRealRateDenied(
+        { bindings, ip: "2001:db8:20::1" },
+        { bindings, ip: "2001:db8:30::1" },
+        previousWindow(),
+      ),
+    ).rejects.toThrow(
+      /rate_scope_same_window_unexpected_admission|rate_scope_reciprocal_violation/,
+    );
+    // A priming probe itself may straddle a real window; count actual successful admissions, not a fixed total.
+    expect(await stats()).toHaveLength(
+      idleUpgradeDiagnostics([]).outcomes.accepted ?? 0,
+    );
+  });
+
+  it("refuses an independent alias when original admission already consumed the current window but setup recorded an older epoch", async () => {
+    const limiter = (env as typeof env & { TEST_RATE_LIMITER: RateLimit })
+      .TEST_RATE_LIMITER;
+    const bindings = { ...testEnv, CONNECTION_RATE_LIMITER: limiter };
+    const original = { bindings, ip: "2001:db8:40::1" };
+    await open(original);
     expect(await stats()).toHaveLength(1);
+    await expect(
+      assertRealRateDenied(
+        original,
+        { bindings, ip: "2001:db8:50::1" },
+        { epoch: Math.floor(Date.now() / 60_000) - 1 },
+      ),
+    ).rejects.toThrow(
+      /rate_scope_same_window_unexpected_admission|rate_scope_reciprocal_violation/,
+    );
+    // A priming probe itself may straddle a real window; count actual successful admissions, not a fixed total.
+    expect(await stats()).toHaveLength(
+      idleUpgradeDiagnostics([]).outcomes.accepted ?? 0,
+    );
   });
 
   it("isolates database admission buckets when one tenant floods a shared source network", async () => {
@@ -1061,19 +1161,23 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const ip = [0x2001, 0xdb8, 0xa, 0xb, 0, 0, 0, 1]
       .map((part) => part.toString(16))
       .join(":");
+    const window = { epoch: Math.floor(Date.now() / 60_000) };
     const first = await open({ ip, bindings });
     first.socket.send(encodeStartup({ user: "app", database }));
     await expect.poll(async () => (await stats()).length).toBe(1);
-    const flood = await open({ ip, bindings });
-    expect(await errorCode(flood)).toBe("53300");
+    const rollover = await assertRealRateDenied(
+      { ip, bindings },
+      { ip, bindings },
+      window,
+    );
     const independent = await open({ ip, bindings, database: other });
     const startup = encodeStartup({ user: "app", database: other });
     independent.socket.send(startup);
     await expect
-      .poll(async () => (await stats())[1]?.bytes)
+      .poll(async () => (await stats())[1 + rollover]?.bytes)
       .toEqual([...startup]);
     expect(independent.messages[0]?.[0]).not.toBe(0x45);
-    expect(await stats()).toHaveLength(2);
+    expect(await stats()).toHaveLength(2 + rollover);
   });
 
   it("isolates admitted roles on one database and shared source network", async () => {
@@ -1089,19 +1193,23 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       .bind(otherRole, database)
       .run();
     await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, database);
+    const window = { epoch: Math.floor(Date.now() / 60_000) };
     const first = await open({ bindings });
     first.socket.send(encodeStartup({ user: "app", database }));
     await expect.poll(async () => (await stats()).length).toBe(1);
-    const flood = await open({ bindings });
-    expect(await errorCode(flood)).toBe("53300");
+    const rollover = await assertRealRateDenied(
+      { bindings },
+      { bindings },
+      window,
+    );
     const independent = await open({ bindings, user: otherRole });
     const startup = encodeStartup({ user: otherRole, database });
     independent.socket.send(startup);
     await expect
-      .poll(async () => (await stats())[1]?.bytes)
+      .poll(async () => (await stats())[1 + rollover]?.bytes)
       .toEqual([...startup]);
     expect(independent.messages[0]?.[0]).not.toBe(0x45);
-    expect(await stats()).toHaveLength(2);
+    expect(await stats()).toHaveLength(2 + rollover);
   });
 
   it("shares IPv6 admission across equivalent hosts in one /64 while preserving other /64s", async () => {
@@ -1113,38 +1221,46 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       0xdb8,
       ...crypto.getRandomValues(new Uint16Array(2)),
     ].map((part) => part.toString(16));
-    const first = await open({
+    const original = {
       ip: [...prefix, "0", "0", "0", "1"].join(":"),
       bindings,
-    });
+    };
+    const window = { epoch: Math.floor(Date.now() / 60_000) };
+    const first = await open(original);
     first.socket.send(encodeStartup({ user: "app", database }));
     await expect.poll(async () => (await stats()).length).toBe(1);
-    const sameSubnet = await open({ ip: `${prefix.join(":")}::2`, bindings });
-    expect(await errorCode(sameSubnet)).toBe("53300");
+    const rollover = await assertRealRateDenied(
+      original,
+      { ip: `${prefix.join(":")}::2`, bindings },
+      window,
+    );
     prefix[3] = ((parseInt(prefix[3]!, 16) + 1) & 0xffff).toString(16);
     const otherSubnet = await open({ ip: `${prefix.join(":")}::2`, bindings });
     otherSubnet.socket.send(encodeStartup({ user: "app", database }));
-    await expect.poll(async () => (await stats()).length).toBe(2);
+    await expect.poll(async () => (await stats()).length).toBe(2 + rollover);
   });
 
   it("does not reset admission through caller Worker or forwarded-client headers", async () => {
     const limiter = (env as typeof env & { TEST_RATE_LIMITER: RateLimit })
       .TEST_RATE_LIMITER;
     const bindings = { ...testEnv, CONNECTION_RATE_LIMITER: limiter };
+    const window = { epoch: Math.floor(Date.now() / 60_000) };
     const first = await open({ bindings });
     first.socket.send(encodeStartup({ user: "app", database }));
     await expect.poll(async () => (await stats()).length).toBe(1);
-    const denied = await open({
-      bindings,
-      headers: {
-        "CF-Worker": ["claimed-worker", "invalid"].join("."),
-        "X-Real-IP": [192, 0, 2, 7].join("."),
-        "X-Forwarded-For": [192, 0, 2, 8].join("."),
-        "X-Tenant-ID": crypto.randomUUID(),
+    await assertRealRateDenied(
+      { bindings },
+      {
+        bindings,
+        headers: {
+          "CF-Worker": ["claimed-worker", "invalid"].join("."),
+          "X-Real-IP": [192, 0, 2, 7].join("."),
+          "X-Forwarded-For": [192, 0, 2, 8].join("."),
+          "X-Tenant-ID": crypto.randomUUID(),
+        },
       },
-    });
-    expect(await errorCode(denied)).toBe("53300");
-    expect(await stats()).toHaveLength(1);
+      window,
+    );
   });
 
   it("rejects malformed or oversized client IPs before a gateway connection", async () => {
@@ -1164,13 +1280,15 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     const limiter = (env as typeof env & { TEST_RATE_LIMITER: RateLimit })
       .TEST_RATE_LIMITER;
     const bindings = { ...testEnv, DATABASE_CONNECTION_RATE_LIMITER: limiter };
+    const window = { epoch: Math.floor(Date.now() / 60_000) };
     const first = await open({ bindings });
     first.socket.send(encodeStartup({ user: "app", database }));
     await expect.poll(async () => (await stats()).length).toBe(1);
-    const denied = await open({ ip: [192, 0, 2, 9].join("."), bindings });
-    denied.socket.send(encodeStartup({ user: "app", database }));
-    expect(await errorCode(denied)).toBe("53300");
-    expect(await stats()).toHaveLength(1);
+    let rollover = await assertRealRateDenied(
+      { bindings },
+      { ip: [192, 0, 2, 9].join("."), bindings },
+      window,
+    );
     const otherRole = "reader";
     await testEnv.DB.prepare(
       `INSERT INTO roles (database_id, name, owner, password_ciphertext, password_iv,
@@ -1180,9 +1298,11 @@ describe("native edge admission with real Workers D1 and route-token modules", (
       .bind(otherRole, database)
       .run();
     await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, database);
-    const deniedRole = await open({ bindings, user: otherRole });
-    expect(await errorCode(deniedRole)).toBe("53300");
-    expect(await stats()).toHaveLength(1);
+    rollover += await assertRealRateDenied(
+      { bindings },
+      { bindings, user: otherRole },
+      window,
+    );
     const other = newDatabaseId();
     await testEnv.DB.batch([
       testEnv.DB.prepare(
@@ -1201,7 +1321,7 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     await seedKnownDatabase(testEnv.DB, testEnv.DATABASE_ACTOR, other);
     const independent = await open({ bindings, database: other });
     independent.socket.send(encodeStartup({ user: "app", database: other }));
-    await expect.poll(async () => (await stats()).length).toBe(2);
+    await expect.poll(async () => (await stats()).length).toBe(2 + rollover);
   });
 
   it("rejects malformed and reserved hints without contacting a gateway", async () => {

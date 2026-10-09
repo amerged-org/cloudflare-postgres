@@ -24,7 +24,10 @@ import {
 type Json = Record<string, unknown>;
 const obj = (value: unknown) => value as Json;
 
-function commands(mode: "preparation" | "postjoin" = "preparation") {
+function commands(
+  mode: "preparation" | "postjoin" = "preparation",
+  measuredAt = () => new Date().toISOString(),
+) {
   const f = proofExecutionFixture(mode),
     objects = new Map<string, Json>(),
     receipts = new Map<string, Json>(),
@@ -130,17 +133,18 @@ function commands(mode: "preparation" | "postjoin" = "preparation") {
       if (name === "access") {
         assert.equal(receipts.size, 2);
         assert.equal(objects.size, 0);
+        const observedAt = measuredAt();
         return Response.json({
           purpose: "pgcf-node-measurement/v1",
           kind: "access",
           binding_sha256: hash(body.binding),
-          observed_at: new Date().toISOString(),
+          observed_at: observedAt,
           access: [
             {
               provider_instance_id: f.input.claims.provider_instance_id,
               address: f.input.bootstrap.spec.hardware.ipv4,
               relay_source: f.input.plan.relay.addresses.ipv4[0],
-              observed_at: new Date().toISOString(),
+              observed_at: observedAt,
               checks: [
                 { port: 22, outcome: "connected" },
                 { port: 50000, outcome: "refused" },
@@ -555,6 +559,31 @@ test("loopback proxy rejects an unbound CONNECT target before authority HTTP", a
     await proxy.close();
   }
 });
+test("one access measurement retains a single sample time when the wall clock advances between fields", async () => {
+  let epoch: number | undefined;
+  let samples = 0;
+  const f = commands("preparation", () => {
+    epoch ??= Date.now();
+    return new Date(epoch + samples++).toISOString();
+  });
+  const access: Json[] = [];
+  const request = f.options.request!;
+  f.options.request = async (url, init) => {
+    const response = await request(url, init);
+    if (new URL(String(url)).pathname.endsWith("/access"))
+      access.push(obj(await response.clone().json()));
+    return response;
+  };
+  await runNodeProof(f.input, f.options);
+  assert.equal(access.length, 1);
+  const measurement = access[0]!;
+  for (const entry of measurement.access as Json[])
+    assert.ok(
+      String(entry.observed_at) <= String(measurement.observed_at),
+      "child access sample cannot be newer than its containing measurement",
+    );
+});
+
 test("preparation runs both complete outside families, cleans exact source resources and reports once after fresh access", async () => {
   const f = commands(),
     report = await runNodeProof(f.input, f.options);
