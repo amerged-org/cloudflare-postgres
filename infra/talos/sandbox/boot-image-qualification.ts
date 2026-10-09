@@ -111,6 +111,79 @@ async function command(
     });
   });
 }
+/** Docker28 lacks this flag; newer containerd stores need it to select an indexed AMD64 base. */
+export async function inspectBootBaseImage(
+  image: string,
+  directory: string,
+): Promise<{
+  Id: string;
+  Os: string;
+  Architecture: string;
+  RootFS: { Type: string; Layers: string[] };
+}> {
+  const help = await command(
+      ["image", "inspect", "--help"],
+      join(directory, "base-inspect-help.private.log"),
+      30000,
+    ),
+    version = await command(
+      ["version", "--format", "{{.Client.APIVersion}}"],
+      join(directory, "base-inspect-api.private.log"),
+      30000,
+    );
+  const api = /^1\.(\d+)$/.exec(version.stdout.trim());
+  check(
+    help.code === 0 && version.code === 0 && api,
+    "boot_base_inspection_capability_invalid",
+  );
+  const platformFlag =
+    /^\s+--platform\s/m.test(help.stdout) && Number(api[1]) >= 49;
+  const inspected = await command(
+    [
+      "image",
+      "inspect",
+      ...(platformFlag ? ["--platform", "linux/amd64"] : []),
+      image,
+    ],
+    join(directory, "base-identity.private.log"),
+    30000,
+  );
+  check(inspected.code === 0, "boot_base_identity_failed");
+  let values: unknown;
+  try {
+    values = JSON.parse(inspected.stdout);
+  } catch {
+    throw Error("boot_base_identity_json_invalid");
+  }
+  check(
+    Array.isArray(values) &&
+      values.length === 1 &&
+      values[0] &&
+      typeof values[0] === "object",
+    "boot_base_identity_ambiguous",
+  );
+  const actual = values[0] as {
+    Id: string;
+    Os: string;
+    Architecture: string;
+    RootFS: { Type: string; Layers: string[] };
+  };
+  check(
+    actual.Os === "linux" && actual.Architecture === "amd64",
+    "boot_base_platform_invalid",
+  );
+  check(
+    /^sha256:[a-f0-9]{64}$/.test(actual.Id) &&
+      actual.RootFS?.Type === "layers" &&
+      Array.isArray(actual.RootFS.Layers) &&
+      actual.RootFS.Layers.length > 0 &&
+      actual.RootFS.Layers.every(
+        (v) => typeof v === "string" && /^sha256:[a-f0-9]{64}$/.test(v),
+      ),
+    "boot_base_layers_missing",
+  );
+  return actual;
+}
 export async function buildBootTools(directory: string) {
   const platform = await command(
     ["info", "--format", "{{.Architecture}}"],
@@ -426,6 +499,45 @@ async function writePayload(directory: string, bytes: Buffer) {
   await writeFile(path, bytes, { mode: 0o600, flag: "wx" });
   return path;
 }
+export async function expandBootInitrd(
+  input: string,
+  output: string,
+  limit = 2 * 1024 ** 3,
+) {
+  check(
+    Number.isSafeInteger(limit) && limit > 0 && limit <= 2 * 1024 ** 3,
+    "boot_initrd_expansion_limit",
+  );
+  let expanded = 0;
+  async function* bounded(stream: AsyncIterable<Buffer>) {
+    for await (const b of stream) {
+      expanded += b.length;
+      check(expanded <= limit, "boot_initrd_expansion_limit");
+      yield b;
+    }
+  }
+  const inputSize = (await stat(input)).size;
+  check(inputSize > 0, "boot_initrd_decompression_failed");
+  let consumed = 0;
+  while (consumed < inputSize) {
+    // Node ends at the first frame; Talos appends the system-extension CPIO in another frame.
+    const decoder = createZstdDecompress();
+    await pipeline(
+      bounded(createReadStream(input, { start: consumed }).pipe(decoder)),
+      createWriteStream(output, {
+        mode: 0o600,
+        flags: consumed === 0 ? "wx" : "a",
+      }),
+    );
+    check(
+      Number.isSafeInteger(decoder.bytesWritten) &&
+        decoder.bytesWritten > 0 &&
+        decoder.bytesWritten <= inputSize - consumed,
+      "boot_initrd_frame_consumption_invalid",
+    );
+    consumed += decoder.bytesWritten;
+  }
+}
 export async function inspectNestedBootPayload(
   uki: string,
   prefix: string,
@@ -465,18 +577,7 @@ export async function inspectNestedBootPayload(
     await sourceInput(linuxPath, prefix + "/kernel", "sha256:" + ukihash),
     await sourceInput(initrdPath, prefix + "/initrd.zstd", "sha256:" + ukihash),
   );
-  let expanded = 0;
-  async function* bounded(stream: AsyncIterable<Buffer>) {
-    for await (const b of stream) {
-      expanded += b.length;
-      check(expanded <= 2 * 1024 ** 3, "boot_initrd_expansion_limit");
-      yield b;
-    }
-  }
-  await pipeline(
-    bounded(createReadStream(initrdPath).pipe(createZstdDecompress())),
-    createWriteStream(cpioPath, { mode: 0o600, flags: "wx" }),
-  );
+  await expandBootInitrd(initrdPath, cpioPath);
   inputs.push(
     await sourceInput(
       cpioPath,
@@ -655,21 +756,11 @@ export async function qualifyBootImages(
       180000,
     );
     check(pull.code === 0, "boot_base_pull_failed");
-    const inspected = await command(
-      [
-        "image",
-        "inspect",
-        "--platform",
-        "linux/amd64",
-        TALOS_SANDBOX_BUILD_INPUTS.baseInstaller,
-        "--format",
-        "{{json .RootFS.Layers}}",
-      ],
-      join(work, "base-identity.private.log"),
-      30000,
+    const inspected = await inspectBootBaseImage(
+      TALOS_SANDBOX_BUILD_INPUTS.baseInstaller,
+      work,
     );
-    check(inspected.code === 0, "boot_base_identity_failed");
-    const baseDiffIDs = JSON.parse(inspected.stdout);
+    const baseDiffIDs = inspected.RootFS.Layers;
     check(
       Array.isArray(baseDiffIDs) && baseDiffIDs.length > 0,
       "boot_base_layers_missing",

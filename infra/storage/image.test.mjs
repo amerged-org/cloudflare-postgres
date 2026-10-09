@@ -39,13 +39,25 @@ function run(script) {
 
 test("the storage extension preserves official driver and LVM bytes, configuration and licenses", () => {
   assert.ok(image, "PGCF_TEST_STORAGE_IMAGE must name the actual built image");
-  const inspected = spawnSync(
-    "docker",
-    ["image", "inspect", "--platform=linux/amd64", image],
-    { encoding: "utf8", timeout: 30_000 },
+  const inspected = spawnSync("docker", ["image", "inspect", image], {
+    encoding: "utf8",
+    timeout: 30_000,
+    maxBuffer: 1024 * 1024,
+  });
+  assert.equal(
+    inspected.status,
+    0,
+    (
+      inspected.error?.message ||
+      inspected.stderr ||
+      "storage image inspection failed"
+    ).slice(0, 4096),
   );
-  assert.equal(inspected.status, 0);
-  const [actual] = JSON.parse(inspected.stdout);
+  const images = JSON.parse(inspected.stdout);
+  assert.equal(images.length, 1, "one actual built image must be inspected");
+  const [actual] = images;
+  assert.equal(actual.Os, "linux", "storage image must target Linux");
+  assert.equal(actual.Architecture, "amd64", "storage image must target AMD64");
   const config = Object.fromEntries(
     Object.keys(sources.driver.runtime_config).map((key) => [
       key,

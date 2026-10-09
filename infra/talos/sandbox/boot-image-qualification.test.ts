@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, open, rm } from "node:fs/promises";
+import { mkdtemp, open, rm, writeFile, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { zstdCompressSync } from "node:zlib";
 import {
   crc32,
   ukiSections,
@@ -11,7 +13,50 @@ import {
   readBootGpt,
   squashfsXattrs,
 } from "./boot-format.ts";
-import { validateBootFacts } from "./boot-image-qualification.ts";
+import {
+  validateBootFacts,
+  inspectBootBaseImage,
+  expandBootInitrd,
+} from "./boot-image-qualification.ts";
+test(
+  "actual loaded base inspection preserves AMD64 image ID and diffID binding",
+  { skip: !process.env.PGCF_TEST_BOOT_BASE_IMAGE },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pgcf-boot-base-test-"));
+    try {
+      const actual = await inspectBootBaseImage(
+        process.env.PGCF_TEST_BOOT_BASE_IMAGE!,
+        directory,
+      );
+      const independently = spawnSync(
+        "docker",
+        [
+          "image",
+          "inspect",
+          ...(process.env.PGCF_TEST_BOOT_BASE_PLAIN_INSPECT
+            ? []
+            : ["--platform", "linux/amd64"]),
+          process.env.PGCF_TEST_BOOT_BASE_IMAGE!,
+          "--format",
+          "{{json .}}",
+        ],
+        { encoding: "utf8", timeout: 30000, maxBuffer: 1024 * 1024 },
+      );
+      assert.equal(
+        independently.status,
+        0,
+        independently.stderr.slice(0, 4096),
+      );
+      const bound = JSON.parse(independently.stdout);
+      assert.equal(actual.Id, bound.Id);
+      assert.equal(actual.Os, "linux");
+      assert.equal(actual.Architecture, "amd64");
+      assert.deepEqual(actual.RootFS.Layers, bound.RootFS.Layers);
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);
 function uki(
   names = [".linux", ".initrd", ".profile", ".cmdline", ".profile", ".cmdline"],
 ) {
@@ -71,6 +116,53 @@ function cpio(files: { name: string; body: string; mode?: number }[]) {
   }
   return Buffer.concat(blocks);
 }
+test("initrd expansion consumes both actual Zstd frames and keeps one aggregate expansion bound", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-zstd-initrd-"));
+  try {
+    const base = cpio([{ name: "rootfs.sqsh", body: "hsqs-base" }]),
+      extension = cpio([{ name: "0.sqsh", body: "hsqs-extension" }]),
+      input = join(directory, "initrd.zstd"),
+      output = join(directory, "initrd.cpio"),
+      compressed = Buffer.concat([
+        zstdCompressSync(base),
+        zstdCompressSync(extension),
+      ]);
+    await writeFile(input, compressed, { mode: 0o600 });
+    await expandBootInitrd(input, output);
+    assert.deepEqual(await readFile(output), Buffer.concat([base, extension]));
+    assert.deepEqual(
+      cpioEntries(await readFile(output)).map((value) => [
+        value.archive,
+        value.name,
+      ]),
+      [
+        [0, "rootfs.sqsh"],
+        [1, "0.sqsh"],
+      ],
+    );
+    await assert.rejects(
+      expandBootInitrd(
+        input,
+        join(directory, "too-large.cpio"),
+        base.length + extension.length - 1,
+      ),
+      /boot_initrd_expansion_limit/,
+    );
+    await writeFile(
+      join(directory, "invalid.zstd"),
+      Buffer.concat([zstdCompressSync(base), Buffer.from("invalid frame")]),
+      { mode: 0o600 },
+    );
+    await assert.rejects(
+      expandBootInitrd(
+        join(directory, "invalid.zstd"),
+        join(directory, "invalid.cpio"),
+      ),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 test("observed UKI multiple profiles are valid while duplicate boot payloads, wrong architecture and overlapping sections refuse", () => {
   assert.equal(
     ukiSections(uki()).filter((s) => s.name === ".profile").length,

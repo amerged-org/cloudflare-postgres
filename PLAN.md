@@ -2301,7 +2301,7 @@ docs/operations       operator installation, recovery and credential runbooks
 Only completed real runs establish phase acceptance. Local checks are identified separately.
 Earlier failed attempts and corrections remain in Git history.
 
-The current corrective batch remains unpublished. The retained fleet passed six actual
+The current corrective batch is not deployed. The retained fleet passed six actual
 server dry-runs for RuntimeClass and admission-policy object shapes, with no persisted objects
 or changed cluster identities. Local rendering of all five immutable charts confirms fifteen
 workload image references and the separately configured Barman sidecar; four Flux controllers
@@ -2431,6 +2431,32 @@ cgroup readback. Both omitted-override and false-ready cases were reproduced bef
 24 affected cases and all305 Native tests pass (22.799s), with types/lint/format green. Keep the
 driver's runtime alias and workload ownership consistent in the approved release composition;
 no post-build source-lock rewrite or invented image digest is required.
+CI37911580829/source217abac passed the complete common check:849 API,190 contract,305 Native
+and445 Regional cases, Rust checks, the two real kernel cases and the actual containerd sandbox
+probe. Regional, NodeBootstrap and PostgreSQL image jobs qualified and published their artifacts.
+The storage test then exposed Docker28's unsupported inspect-platform flag; the same unconditional
+call existed in whole-OS qualification. Both callers are corrected locally without changing the
+shared image qualifier. The complete Talos image still needs its full scan and boot acceptance.
+Successful image jobs remain valid; selection must retain their qualified outputs when an
+independent image job fails, while unfinished OS outputs remain selected.
+Anonymous full registry readback independently verified the Regional and public PostgreSQL copy:
+11 layers,309,753,132 compressed and977,155,072 expanded bytes, exactly matching their CI digests.
+The private bootstrap package is inaccessible to the current registry login. The documented local
+build path therefore qualified the same217 public source separately:149 committed Docker inputs,
+9 qualifier inputs,18 layers,715,444,811 scanned opaque bytes,51 reviewed findings and0 unresolved;
+build42.912s/qualification52.406s. This local image has its own digest and is not claimed to be
+byte-identical to CI. No image deployment or new server purchase follows from these results.
+The local composed-image preflight exposed one additional decoder defect: Node Zstd stopped after
+the first installer-initrd frame. The second frame contains both expected PGCF binaries and the
+correct recipe. A reproduced260-versus520-byte case now verifies bounded expansion of every frame,
+invalid-tail rejection and the aggregate2GiB cap; all7 scoped checks pass and independent review
+confirmed complete CPIO/archive coverage. The preserved installer/raw outputs then passed the full
+gate in448.919s:5638 inputs/7,452,884,835 payload bytes,104 canonical findings all reviewed,0 unresolved,
+and same-raw AMD64 Talos1.14.2 maintenance boot in68.747s with2 expected extensions.
+Installer151,360,000 bytes; compressed raw245,552,992 bytes; expanded raw4,453,302,272 bytes.
+These are local source217 artifacts with the explicitly corrected qualifier; publication and
+fleet acceptance still await the final CI. Its selection now preserves seven already-qualified
+artifact inputs and reruns only storage plus the unfinished sandbox/Talos path.
 
 | Date       | Phase                     | Result and measured limits                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
