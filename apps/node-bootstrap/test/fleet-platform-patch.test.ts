@@ -455,8 +455,11 @@ test("separate native controller/gateway pins reconcile through distinct logical
   );
 });
 
-import { fleetPlatformSourceObjects } from "../src/fleet-platform-patch.ts";
-test("the selected OpenEBS wrapper and cgroup mount reach the existing platform Kustomization without dropping unrelated overrides", () => {
+import {
+  fleetPlatformSourceObjects,
+  fleetOpenEbsDriverImage,
+} from "../src/fleet-platform-patch.ts";
+test("the approved OpenEBS image reaches the platform without a post-build lock pin or lost overrides", () => {
   const { input } = patchFixture();
   input.spec.platform_source_commit = "a".repeat(40);
   const driver = "ghcr.io/example/openebs-wrapper:v1@sha256:" + "b".repeat(64),
@@ -464,6 +467,11 @@ test("the selected OpenEBS wrapper and cgroup mount reach the existing platform 
       target: { kind: "ConfigMap", name: "retained" },
       patch: "retained",
     };
+  const selectedDriver = input.spec.components.find(
+    (pin) => pin.name === "openebs-lvm",
+  )!;
+  selectedDriver.reference = driver;
+  selectedDriver.sha256 = "b".repeat(64);
   const source = {
     apiVersion: "source.toolkit.fluxcd.io/v1",
     kind: "GitRepository",
@@ -504,7 +512,12 @@ test("the selected OpenEBS wrapper and cgroup mount reach the existing platform 
     },
     {
       lock: {
-        charts: [{ name: "openebs", enabledEngine: { driverImage: driver } }],
+        charts: [
+          {
+            name: "openebs",
+            enabledEngine: { name: "lvm-localpv", appVersion: "1.10.1" },
+          },
+        ],
       },
       flux: [],
       flux_deprecated: [],
@@ -525,5 +538,171 @@ test("the selected OpenEBS wrapper and cgroup mount reach the existing platform 
   assert.equal(
     selected.spec.postRenderers[0].kustomize.patches[0].target.name,
     "openebs-lvm-localpv-node",
+  );
+});
+
+test("OpenEBS selection keeps legacy locked pins and refuses malformed approved image authority", () => {
+  const { input } = patchFixture(),
+    driver = "ghcr.io/example/openebs-wrapper:v1@sha256:" + "b".repeat(64);
+  const pin = input.spec.components.find(
+    (value) => value.name === "openebs-lvm",
+  )!;
+  const assets = {
+    lock: {
+      charts: [{ name: "openebs", enabledEngine: { driverImage: driver } }],
+    },
+    flux: [],
+    flux_deprecated: [],
+    relay: {},
+  };
+  pin.kind = "chart";
+  assert.equal(fleetOpenEbsDriverImage(input, assets), driver);
+  pin.kind = "image";
+  pin.reference = driver;
+  pin.sha256 = "b".repeat(64);
+  assert.equal(
+    fleetOpenEbsDriverImage(input, {
+      ...assets,
+      lock: { charts: [{ name: "openebs", enabledEngine: {} }] },
+    }),
+    driver,
+  );
+  pin.sha256 = "a".repeat(64);
+  assert.throws(
+    () => fleetOpenEbsDriverImage(input, assets),
+    /patch_platform_target_mismatch/,
+  );
+  pin.reference = "ghcr.io/example/openebs-wrapper:latest";
+  assert.throws(
+    () => fleetOpenEbsDriverImage(input, assets),
+    /patch_platform_target_mismatch/,
+  );
+});
+
+test("OpenEBS readiness requires both the spec-selected actual image and its host cgroup view", () => {
+  const { input } = patchFixture(),
+    commit = "a".repeat(40),
+    driver = "ghcr.io/example/driver:v1@sha256:" + "b".repeat(64);
+  input.spec.platform_source_commit = commit;
+  input.spec.roles.customer.components = ["openebs-lvm"];
+  const pin = input.spec.components.find(
+    (value) => value.name === "openebs-lvm",
+  )!;
+  pin.reference = driver;
+  pin.sha256 = "b".repeat(64);
+  const resource = (
+    kind: string,
+    name: string,
+    spec: object,
+    status: object = {},
+  ) => ({
+    kind,
+    metadata: { name, namespace: "flux-system", generation: 1 },
+    spec,
+    status: {
+      observedGeneration: 1,
+      conditions: [{ type: "Ready", status: "True", observedGeneration: 1 }],
+      ...status,
+    },
+  });
+  const daemon = {
+    kind: "DaemonSet",
+    metadata: { name: "openebs-lvm-localpv-node", namespace: "openebs" },
+    spec: {
+      template: {
+        spec: {
+          volumes: [
+            {
+              name: "pgcf-host-cgroup",
+              hostPath: { path: "/sys/fs/cgroup", type: "Directory" },
+            },
+          ],
+          containers: [
+            {
+              name: "openebs-lvm-plugin",
+              image: driver,
+              securityContext: { privileged: true },
+              volumeMounts: [
+                {
+                  name: "pgcf-host-cgroup",
+                  mountPath: "/sys/fs/cgroup",
+                  readOnly: false,
+                },
+              ],
+            },
+          ],
+        },
+      },
+    },
+  };
+  const state: FleetPlatformState = {
+    resources: new Map<string, Record<string, unknown>>([
+      [
+        "GitRepository/flux-system/pgcf-platform",
+        resource(
+          "GitRepository",
+          "pgcf-platform",
+          { ref: { commit } },
+          { artifact: { revision: `main@sha1:${commit}` } },
+        ),
+      ],
+      [
+        "Kustomization/flux-system/pgcf-platform",
+        resource(
+          "Kustomization",
+          "pgcf-platform",
+          {},
+          { lastAppliedRevision: `main@sha1:${commit}` },
+        ),
+      ],
+      [
+        "Kustomization/flux-system/pgcf-regional",
+        resource(
+          "Kustomization",
+          "pgcf-regional",
+          { path: "./infra/platform/regional" },
+          { lastAppliedRevision: `main@sha1:${commit}` },
+        ),
+      ],
+      ["DaemonSet/openebs/openebs-lvm-localpv-node", daemon],
+    ]),
+    pods: [],
+    uids: {},
+  };
+  const assets = {
+    lock: { charts: [{ name: "openebs", enabledEngine: {} }] },
+    flux: [],
+    flux_deprecated: [],
+    relay: {},
+  };
+  assert.equal(
+    fleetPlatformReadback(input, state, assets).platform_ready,
+    false,
+  );
+  state.pods.push({
+    metadata: { uid: randomUUID(), ownerReferences: [{ controller: true }] },
+    spec: {
+      nodeName: input.k8s_node_name,
+      containers: [{ name: "driver", image: driver }],
+    },
+    status: {
+      containerStatuses: [
+        {
+          name: "driver",
+          ready: true,
+          imageID: `containerd://sha256:${pin.sha256}`,
+          state: { running: { startedAt: new Date().toISOString() } },
+        },
+      ],
+    },
+  });
+  assert.equal(
+    fleetPlatformReadback(input, state, assets).platform_ready,
+    true,
+  );
+  daemon.spec.template.spec.containers[0]!.volumeMounts = [];
+  assert.equal(
+    fleetPlatformReadback(input, state, assets).platform_ready,
+    false,
   );
 });

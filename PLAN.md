@@ -2411,6 +2411,26 @@ The failed-push selector regression reproduced8 incorrectly skipped artifacts. I
 types, lint and format pass; an actual read-only GitHub lookup selects successfulCI37851000610
 and all9 pending artifact profiles. An API-only change after a successful baseline still skips
 unchanged images. Neither correction changes the live fleet.
+CI37907089984/source11662b3 passed the Rust checks and Worker build, then was cancelled during
+application tests before any image job executed: pre-delivery review found that F21's OpenEBS
+override still read only the lock and ignored the approved release's built driver image. That
+integration correction must pass before the next consolidated CI. The retained TypeScript
+controller also needs its compatible bridge image before fleet/pool/thin activation; otherwise its
+older strict desired-state contract rejects the new fields. Create the owned thick canary before
+those activations, and retain its exact binding for gateway-first SQL acceptance.
+The operator's changed IPv4/IPv6 egress caused management TCP timeouts. One scoped US firewall
+update replaced only those two operator sources, preserving relay access, ports, default deny and
+the original instance binding. The provider's transient processing state was resolved by reads;
+the PUT was never repeated. This network-maintenance action used8 provider HTTP calls
+(3 OAuth,4 GET,1 PUT), distinct from routine transport. Fresh authenticated Kubernetes access now
+confirms the original US Node/Cluster/DMI identity and Ready at Talos1.14.1/Kubernetes1.36.5.
+No EU firewall, server configuration, database or purchase changed. Reconcile the temporary
+operator access back to the retained approved network policy after physical qualification.
+The OpenEBS correction now consumes the approved image for Helm configuration and physical image/
+cgroup readback. Both omitted-override and false-ready cases were reproduced before correction;
+24 affected cases and all305 Native tests pass (22.799s), with types/lint/format green. Keep the
+driver's runtime alias and workload ownership consistent in the approved release composition;
+no post-build source-lock rewrite or invented image digest is required.
 
 | Date       | Phase                     | Result and measured limits                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

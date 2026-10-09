@@ -6,6 +6,11 @@ Talos/Kubernetes transport without Contabo, Rescue, disk reinstallation or SSH.
 
 ## Start, inspect and resume
 
+When migrating an older strict-contract controller, install its compatible qualified TypeScript
+bridge before selecting a fleet release or enabling pool/thin policy. Until then, leave those
+optional settings unset. Create the owned thick-volume canary before release activation so the
+gateway-first patch can bind its retained storage and prove real SQL before controller replacement.
+
 1. Qualify immutable artifacts through the single CI and approve their release through
    `PUT /v1/fleet/releases/{id}`. Select the release for the region and assign it to every current
    member with the existing region/node release APIs. The reviewed `platform_source_commit` pins
@@ -87,6 +92,12 @@ status/resource-version changes do not invalidate a configuration CAS. The selec
 Kustomization while preserving unrelated values. The reviewed source chooses
 separate `native-controller` and `native-gateway` images when present, with `regional` only as the
 legacy composition. Do not activate unqualified Rust binaries by changing an image label.
+
+The approved release's `openebs-lvm` image selects the qualified wrapper independently of its
+build-source lock. Pin its tag and digest; if the role also lists `image/openebs/lvm-driver`,
+supersede that stock alias with the same wrapper reference/digest/version. Retaining the stock
+digest would demand both old and new runtime images and prevent convergence. Preserve the hash
+of the actual public source lock; never substitute a privately modified lock under that hash.
 
 The native gateway's retained thick exemption comes only from the current CF-owned cohort.
 Native checks its physical Node assignment, archive generation, Namespace/CNPG/ledger/power-anchor

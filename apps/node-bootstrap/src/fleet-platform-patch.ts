@@ -60,6 +60,27 @@ function component(input: FleetPatchInput, name: string) {
   if (!value) throw new BootstrapError("patch_component_pin_missing");
   return value;
 }
+/** Approved build artifacts are selected after qualification, without rewriting their source lock. */
+export function fleetOpenEbsDriverImage(
+  input: FleetPatchInput,
+  assets: FleetPlatformAssets,
+) {
+  const pin = input.spec.components.find(
+    (value) => value.name === "openebs-lvm" && value.kind === "image",
+  );
+  if (!pin) return selectedOpenEbsDriverImage(assets.lock);
+  if (
+    !/^[a-z0-9][a-z0-9./:_-]*@sha256:[a-f0-9]{64}$/.test(pin.reference) ||
+    !pin.reference.endsWith(`@sha256:${pin.sha256}`)
+  )
+    throw new BootstrapError("patch_platform_target_mismatch");
+  try {
+    openEbsDriverValues(pin.reference);
+  } catch {
+    throw new BootstrapError("patch_platform_target_mismatch");
+  }
+  return pin.reference;
+}
 /** Legacy bootstrap transport stays on its original source; qualified native roles select one overlay. */
 export function fleetRegionalRuntime(input: FleetPatchInput) {
   const has = (name: string) =>
@@ -653,7 +674,7 @@ export function fleetPlatformReadback(
       platformReady &&
       (!(
         Array.isArray(assets.lock.charts) &&
-        selectedOpenEbsDriverImage(assets.lock)
+        fleetOpenEbsDriverImage(input, assets)
       ) ||
         openEbsCgroupReadback(
           state.resources.get("DaemonSet/openebs/openebs-lvm-localpv-node"),
@@ -662,7 +683,9 @@ export function fleetPlatformReadback(
         .filter(
           (v) =>
             wanted.has(v.name) &&
-            (v.kind === "chart" || v.name.startsWith("image/")),
+            (v.kind === "chart" ||
+              v.name.startsWith("image/") ||
+              v.name === "openebs-lvm"),
         )
         .every((v) => has(v.name)),
     regional_ready:
@@ -940,7 +963,7 @@ export function fleetPlatformSourceObjects(
       spec: { ...spec, ref: { commit: input.spec.platform_source_commit } },
     },
   ];
-  const driver = selectedOpenEbsDriverImage(assets.lock);
+  const driver = fleetOpenEbsDriverImage(input, assets);
   if (driver) {
     const platform = required(state, "Kustomization", "pgcf-platform"),
       platformSpec = object(platform.spec),

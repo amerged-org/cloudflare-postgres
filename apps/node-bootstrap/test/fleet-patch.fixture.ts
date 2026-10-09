@@ -40,7 +40,7 @@ export function patchFixture() {
       name,
       kind: name === "api" || name === "edge" ? "worker_bundle" : "image",
       version: "1.0.0",
-      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
+      reference: `registry.example/${name}${name === "openebs-lvm" ? ":1.0.0" : ""}@sha256:${"d".repeat(64)}`,
       sha256: "d".repeat(64),
     })),
     roles: { control_relay: role, customer: structuredClone(role) },

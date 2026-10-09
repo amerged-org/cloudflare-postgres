@@ -113,11 +113,17 @@ the Kubernetes API/aggregator CAs, service-account signer, discovery secret and 
 encryption key may live outside the legacy `machine`/`cluster` document. Emit field names and
 validation booleans only. A missing legacy field does not establish absence of the credential.
 
-The pinned [Talos CA command](https://github.com/siderolabs/talos/blob/v1.14.1/cmd/talosctl/cmd/talos/rotate-ca.go)
+For the October5 incident, comparison of retained private custody found all nine later US
+authority fingerprints different from the disclosed EU authorities. Revision1 alone does not
+establish US exposure. Retire the shared EU control/customer cluster's disclosed authority;
+refresh live fingerprints before acting. This comparison is neither live trust verification nor
+rotation acceptance. Disposable laboratory keys must never become fleet custody.
+
+The pinned [Talos CA command](https://github.com/siderolabs/talos/blob/v1.14.2/cmd/talosctl/cmd/talos/rotate-ca.go)
 supports separate Talos and Kubernetes API CA rotation. For Talos only, explicitly set
 `--talos=true --kubernetes=false`; both default to true. Start with `--dry-run=true` and an explicit
 current node topology. Capture **both** output streams directly to owner-only private files even
-in dry-run: the [Talos rotator](https://github.com/siderolabs/talos/blob/v1.14.1/pkg/rotate/pki/talos/talos.go)
+in dry-run: the [Talos rotator](https://github.com/siderolabs/talos/blob/v1.14.2/pkg/rotate/pki/talos/talos.go)
 prints CA private keys and a new admin configuration. Dry-run skips configuration changes and
 actual new-key connectivity checks, so it is not rotation acceptance. Use `--dry-run=false` only
 for the planned live change, retaining the original configuration in encrypted offline custody.
@@ -130,6 +136,11 @@ support accepted trust during a transition. For Secret-at-rest encryption, retai
 key until all stored Secrets have been rewritten with the new first key and verified readable;
 old etcd snapshots still need their original decrypt key in offline custody. Follow the
 [Kubernetes encryption procedure](https://kubernetes.io/docs/tasks/administer-cluster/encrypt-data/).
+After replacing the Kubernetes bootstrap token, inspect and explicitly retire any retained old
+`bootstrap-token-<id>` Secret with its verified UID after the new token is ready; applying the new
+manifest is not proof of old-token removal. For API CA rotation, observe each kubelet pass through
+its supported restart and return healthy under the replacement authority, rather than accepting
+configuration acknowledgement alone.
 
 Coordinate any Talos/Kubernetes change with the encrypted region seed and join bundle before
 allowing another node to bootstrap. Both accepted installations still use revision 1; replacing
