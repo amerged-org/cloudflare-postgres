@@ -11,6 +11,8 @@ import { NodeInspectionInput } from "@pgcf/contracts/node-installation";
 import { runInspection } from "./inspector.ts";
 import { NodeProofExecutionInput } from "@pgcf/contracts/node-proof";
 import { runNodeProof } from "./node-proof-runner.ts";
+import { runThinStorage } from "./thin-storage.ts";
+import { runFleetPatch } from "./fleet-patch.ts";
 import {
   BootstrapError,
   BootstrapJob,
@@ -47,11 +49,15 @@ export function createBootstrapServer(
   options: BootstrapOptions & {
     inspection?: typeof runInspection;
     proof?: typeof runNodeProof;
+    patch?: typeof runFleetPatch;
+    thinStorage?: typeof runThinStorage;
   } = {},
 ) {
   if (bearer.length < 32) throw new BootstrapError("server_bearer_required");
   const jobs = new Map<string, { job: BootstrapJob; running: boolean }>();
   let installationRegistration = false;
+  let patchRunning = false;
+  let patchRegistered = false;
   const inspections = new Map<
     string,
     {
@@ -86,6 +92,57 @@ export function createBootstrapServer(
         return;
       }
       const path = request.url ?? "";
+      if (request.method === "POST" && path === "/v1/thin-storage") {
+        if (
+          patchRunning ||
+          installationRegistration ||
+          [...jobs.values()].some((v) => v.running) ||
+          [...inspections.values()].some((v) => v.running) ||
+          [...proofs.values()].some((v) => v.running)
+        )
+          throw new BootstrapError("container_busy");
+        patchRunning = true;
+        patchRegistered = true;
+        try {
+          reply(
+            response,
+            200,
+            await (options.thinStorage ?? runThinStorage)(await body(request), {
+              run: options.run,
+              request: options.request,
+            }),
+          );
+        } finally {
+          patchRunning = false;
+        }
+        return;
+      }
+      if (request.method === "POST" && path === "/v1/patches") {
+        if (
+          patchRunning ||
+          installationRegistration ||
+          [...jobs.values()].some((v) => v.running) ||
+          [...inspections.values()].some((v) => v.running) ||
+          [...proofs.values()].some((v) => v.running)
+        )
+          throw new BootstrapError("container_busy");
+        patchRunning = true;
+        patchRegistered = true;
+        try {
+          reply(
+            response,
+            200,
+            await (options.patch ?? runFleetPatch)(await body(request), {
+              run: options.run,
+              request: options.request,
+            }),
+          );
+        } finally {
+          patchRunning = false;
+        }
+        return;
+      }
+      if (patchRegistered) throw new BootstrapError("patch_container_only");
       if (request.method === "POST" && path === "/v1/proofs") {
         const input = NodeProofExecutionInput.parse(await body(request)),
           key = `${input.claims.operation_id}:${input.claims.mode}`,

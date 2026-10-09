@@ -12,8 +12,45 @@ import {
   renderFluxObjects,
 } from "../src/platform.ts";
 import { platformFixture } from "./fixture.ts";
+import versions from "../../../infra/platform/versions.lock.json" with { type: "json" };
 const object = (value: unknown) => value as Record<string, unknown>;
 const objects = (value: unknown) => value as Array<Record<string, unknown>>;
+
+test("selected storage driver values retain the qualified digest through the pinned Helm chart", () => {
+  const reference = `ghcr.io/amerged-org/pgcf-regional:lvm-thin-sha-${"a".repeat(40)}@sha256:${"b".repeat(64)}`;
+  const sync = platformSyncObjects(platformFixture(), {
+    charts: [{ name: "openebs", enabledEngine: { driverImage: reference } }],
+  });
+  const patch = objects(object(sync[1]!.spec).patches)[0]!;
+  const spec = object(JSON.parse(String(patch.patch)).spec);
+  const image = object(
+    object(object(object(spec.values)["lvm-localpv"]).lvmPlugin).image,
+  );
+  assert.equal(`${image.registry}/${image.repository}:${image.tag}`, reference);
+  assert.equal(object(patch.target).name, "openebs");
+  const renderer = objects(spec.postRenderers)[0]!;
+  const renderedPatch = objects(object(renderer.kustomize).patches)[0]!;
+  const daemon = object(JSON.parse(String(renderedPatch.patch)));
+  const template = object(object(object(daemon.spec).template).spec);
+  const volume = objects(template.volumes)[0]!;
+  assert.deepEqual(volume.hostPath, {
+    path: "/sys/fs/cgroup",
+    type: "Directory",
+  });
+  const mount = objects(objects(template.containers)[0]!.volumeMounts)[0]!;
+  assert.equal(mount.mountPath, "/sys/fs/cgroup");
+  assert.equal(mount.readOnly, false);
+  assert.throws(() =>
+    platformSyncObjects(platformFixture(), {
+      charts: [
+        {
+          name: "openebs",
+          enabledEngine: { driverImage: "unqualified:latest" },
+        },
+      ],
+    }),
+  );
+});
 
 test("private platform custody is bound to the immutable public spec before native commands", () => {
   const input = platformFixture();
@@ -83,7 +120,7 @@ test("first-region manifests pin both source revision and regional digest, with 
   );
 });
 
-test("Flux manifest adds only the scoped quarantine toleration and retains upstream controller settings", () => {
+test("Flux manifest pins the locked controller image and adds the scoped quarantine toleration", () => {
   const input = platformFixture();
   const original = {
     apiVersion: "apps/v1",
@@ -115,7 +152,12 @@ test("Flux manifest adds only the scoped quarantine toleration and retains upstr
       effect: "NoSchedule",
     },
   ]);
-  assert.deepEqual(podSpec.containers, original.spec.template.spec.containers);
+  assert.deepEqual(podSpec.containers, [
+    {
+      ...original.spec.template.spec.containers[0],
+      image: versions.flux.images["source-controller"],
+    },
+  ]);
   assert.equal(
     parseAllDocuments(
       rendered.map((item) => JSON.stringify(item)).join("\n---\n"),

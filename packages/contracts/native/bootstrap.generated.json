@@ -1,0 +1,251 @@
+{
+  "version": 1,
+  "limits": {
+    "frameBytes": 65536,
+    "connectionMemoryBytes": 524288,
+    "memoryBytes": 33554432,
+    "connections": 32,
+    "nonceEntries": 4096,
+    "queuedMessages": 32,
+    "incomingFrames": 65536,
+    "totalBytes": 1073741824,
+    "controlFrames": 128,
+    "connectMs": 5000,
+    "sessionMs": 600000
+  },
+  "wire": {
+    "path": "/_pgcf/bootstrap-relay",
+    "identityPath": "/_pgcf/bootstrap-relay/identity",
+    "probePath": "/_pgcf/bootstrap-relay/probe",
+    "header": "X-PGCF-Bootstrap",
+    "prefix": "br1",
+    "purpose": "pgcf-bootstrap-relay/v1\n"
+  },
+  "maxTokenLength": 2048,
+  "maxTokenSeconds": 60,
+  "ports": { "rescue_ssh": 22, "talos_api": 50000, "kubernetes_api": 6443 },
+  "capabilities": ["rescue_ssh", "talos_api", "kubernetes_api"],
+  "patterns": {
+    "region": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$",
+    "node": "^nod_[a-z0-9]{20}$",
+    "operation": "^op_[a-z0-9]{20}$"
+  },
+  "schemas": {
+    "claims": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "v": { "type": "number", "const": 1 },
+        "region": { "$ref": "#/$defs/RegionId" },
+        "issuer_region": { "$ref": "#/$defs/RegionId" },
+        "relay_epoch": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "purpose": { "type": "string", "const": "bootstrap" },
+        "operation": { "$ref": "#/$defs/OperationId" },
+        "node": { "$ref": "#/$defs/NodeId" },
+        "revision": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "capability": {
+          "type": "string",
+          "enum": ["rescue_ssh", "talos_api", "kubernetes_api"]
+        },
+        "target": {
+          "type": "object",
+          "properties": {
+            "address": {
+              "anyOf": [
+                {
+                  "type": "string",
+                  "format": "ipv4",
+                  "pattern": "^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$"
+                },
+                {
+                  "type": "string",
+                  "format": "ipv6",
+                  "pattern": "^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$"
+                }
+              ]
+            },
+            "port": {
+              "anyOf": [
+                { "type": "number", "const": 22 },
+                { "type": "number", "const": 50000 },
+                { "type": "number", "const": 6443 }
+              ]
+            }
+          },
+          "required": ["address", "port"],
+          "additionalProperties": false
+        },
+        "nonce": { "type": "string", "pattern": "^[A-Za-z0-9_-]{32}$" },
+        "kid": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
+        },
+        "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+        "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+      },
+      "required": [
+        "v",
+        "region",
+        "issuer_region",
+        "relay_epoch",
+        "purpose",
+        "operation",
+        "node",
+        "revision",
+        "capability",
+        "target",
+        "nonce",
+        "kid",
+        "iat",
+        "exp"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "RegionId": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+        },
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" }
+      }
+    },
+    "identity": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "v": { "type": "number", "const": 1 },
+        "region": { "$ref": "#/$defs/RegionId" },
+        "issuer_region": { "$ref": "#/$defs/RegionId" },
+        "relay_epoch": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "allowed_target_regions": {
+          "minItems": 1,
+          "maxItems": 16,
+          "type": "array",
+          "items": { "$ref": "#/$defs/RegionId" }
+        },
+        "capabilities": {
+          "minItems": 1,
+          "maxItems": 3,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "enum": ["rescue_ssh", "talos_api", "kubernetes_api"]
+          }
+        }
+      },
+      "required": [
+        "v",
+        "region",
+        "issuer_region",
+        "relay_epoch",
+        "allowed_target_regions",
+        "capabilities"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "RegionId": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+        }
+      }
+    },
+    "probe": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "version": { "type": "number", "const": 1 },
+        "relay_epoch": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "operation_id": { "$ref": "#/$defs/OperationId" },
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "region_id": { "$ref": "#/$defs/RegionId" },
+        "revision": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "address": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "ipv4",
+              "pattern": "^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$"
+            },
+            {
+              "type": "string",
+              "format": "ipv6",
+              "pattern": "^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$"
+            }
+          ]
+        },
+        "source": {
+          "anyOf": [
+            {
+              "type": "string",
+              "format": "ipv4",
+              "pattern": "^(?:(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])\\.){3}(?:25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9][0-9]|[0-9])$"
+            },
+            {
+              "type": "string",
+              "format": "ipv6",
+              "pattern": "^(([0-9a-fA-F]{1,4}:){7}[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,7}:|([0-9a-fA-F]{1,4}:){1,6}:[0-9a-fA-F]{1,4}|([0-9a-fA-F]{1,4}:){1,5}(:[0-9a-fA-F]{1,4}){1,2}|([0-9a-fA-F]{1,4}:){1,4}(:[0-9a-fA-F]{1,4}){1,3}|([0-9a-fA-F]{1,4}:){1,3}(:[0-9a-fA-F]{1,4}){1,4}|([0-9a-fA-F]{1,4}:){1,2}(:[0-9a-fA-F]{1,4}){1,5}|[0-9a-fA-F]{1,4}:((:[0-9a-fA-F]{1,4}){1,6})|:((:[0-9a-fA-F]{1,4}){1,7}|:))$"
+            }
+          ]
+        },
+        "port": {
+          "anyOf": [
+            { "type": "number", "const": 22 },
+            { "type": "number", "const": 50000 },
+            { "type": "number", "const": 6443 }
+          ]
+        },
+        "outcome": {
+          "type": "string",
+          "enum": ["connected", "refused", "timed_out"]
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      },
+      "required": [
+        "version",
+        "relay_epoch",
+        "operation_id",
+        "node_id",
+        "region_id",
+        "revision",
+        "address",
+        "source",
+        "port",
+        "outcome",
+        "observed_at"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
+        "RegionId": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+        }
+      }
+    }
+  }
+}

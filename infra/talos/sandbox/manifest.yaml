@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+version: v1alpha1
+metadata:
+  name: pgcf-sandbox-controller
+  version: PGCF_EXTENSION_VERSION
+  author: PGCF contributors
+  description: Prestarted unassigned namespace holders and the containerd sandbox controller.
+  compatibility:
+    talos:
+      version: "= vPGCF_TALOS_VERSION"

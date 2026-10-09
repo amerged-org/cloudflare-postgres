@@ -23,6 +23,11 @@ const TOKEN_PREFIX = "v2";
 const SIGNATURE_DOMAIN = "pgcf-route/v2\n";
 const KEY_DOMAIN = "pgcf-route-key/v1\n";
 const SIGNATURE_BYTES = 32;
+/** Authoritative wire constants for generated native consumers. */
+export const ROUTE_TOKEN_PREFIX = TOKEN_PREFIX;
+export const ROUTE_TOKEN_SIGNATURE_DOMAIN = SIGNATURE_DOMAIN;
+export const ROUTE_TOKEN_SIGNATURE_BYTES = SIGNATURE_BYTES;
+export const ROUTE_TOKEN_KEY_DOMAIN = KEY_DOMAIN;
 
 const kidPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 const cidPattern =

@@ -29,6 +29,26 @@ const bucket = ["pgcf", "archive", "test"].join("-");
 const endpointHost = ["backup", "example", "test"].join(".");
 const caCrt = ["CERTIFICATE", randomBytes(32).toString("base64")].join("\n");
 
+test("uses the persisted per-database release image instead of regional defaults", () => {
+  const { db, ctx } = fixture();
+  const image = `registry.example/postgres:18.7@sha256:${"e".repeat(64)}`;
+  Object.assign(db, {
+    postgres: {
+      release_id: "release-18-7",
+      image,
+      version: "18.7",
+      configuration_schema_revision: 1,
+    },
+  });
+  assert.equal(
+    (
+      buildDatabaseManifests(db, ctx).find((r) => r.kind === "Cluster")
+        ?.spec as Record<string, unknown>
+    )?.imageName,
+    image,
+  );
+});
+
 function fixture(): { db: DesiredDatabase; ctx: BuildContext } {
   return {
     db: {

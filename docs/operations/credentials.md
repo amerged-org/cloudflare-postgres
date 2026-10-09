@@ -139,3 +139,36 @@ custody through a separately reviewed rotation before permitting customer data o
 bootstrap; do not overwrite historical revision 1. Preserve the original ciphertext and all
 referenced credential-encryption keys, the region's cluster identity, existing Node/storage UIDs
 and the independent PGCF agent, R2 and Worker secrets.
+
+### Stage and activate replacement cluster custody
+
+The administrator-only `POST /v1/regions/{id}/bootstrap-material/stage` accepts complete private
+`seed`/`join` documents, exact old/new plaintext hashes, expected current revision and fresh
+complete Node/Cluster topology. Use a protected JSON file and an `Idempotency-Key`; never paste
+the body into logs or shell history. It stores an immutable encrypted revision N+1 and returns
+only revisions and hashes. The active pointer remains N. Software versions, cluster name,
+endpoint and Cluster UID must remain unchanged; use the separate patch path for upgrades.
+
+After the separately rehearsed physical rotation, call `POST .../bootstrap-material/activate`
+with the same hashes and a fresh `verified` readback plus its canonical `verification_sha256`.
+The readback identifies its trusted administrator/Native source, exact private transcript hash,
+unchanged complete topology and nine explicit old/new-authority check hashes: Talos/Kubernetes/
+etcd/aggregator CAs, service-account signer, trustd/bootstrap tokens, discovery secret and
+Secret-at-rest key. Network/client authorities require `rejected`; discovery and encryption
+keys require `retired_from_live_configuration`. Old keys can still decrypt historical ciphertext
+offline and must remain in protected custody. This is trusted-admin verified readback, not
+cryptographic attestation derived from caller assertions. The API executes no
+CA command, token rotation, encryption rewrite or credential test.
+
+Activation checks120-second readback freshness,180-second Node observations, current envelopes
+and idle installation/patch/uncertain thin-action boundaries in the pointer CAS. Ordinary finite
+read leases do not block it. Read the active revision/hash to resolve a lost response; exact
+replay never rotates keys again or overwrites historical ciphertext. A staged pair alone does
+not reserve a maintenance window: keep other mutation admission closed through the physical
+rotation. Refresh material-bound host/proof receipts before resuming bootstrap or new thin/warm
+authority. Retain every old ciphertext/decryption key needed by historical custody and snapshots.
+
+Pinned Talos1.14.1 and1.14.2 have identical relevant CA rotator/configuration source. Each stock
+`rotate-ca` invocation generates fresh keys, so a dry run does not select the later live keys and
+an interrupted run must be resolved from the actual issuing/accepted trust before continuing.
+Reuse the same privately persisted planned material; do not blindly rerun the command.

@@ -1,0 +1,134 @@
+{
+  "limits": {
+    "max_slots": 16,
+    "max_age_seconds": 300,
+    "lease_ms": 30000,
+    "observation_max_age_ms": 120000,
+    "node_max_age_ms": 180000,
+    "clock_skew_ms": 5000
+  },
+  "policy_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "version": { "type": "number", "const": 1 },
+      "target_slots": { "type": "integer", "minimum": 0, "maximum": 16 },
+      "max_idle_cpu_millicores": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 2000
+      },
+      "max_idle_memory_mib": {
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 2048
+      },
+      "per_slot_cpu_millicores": {
+        "type": "integer",
+        "minimum": 1,
+        "maximum": 500
+      },
+      "per_slot_memory_mib": {
+        "type": "integer",
+        "minimum": 16,
+        "maximum": 512
+      },
+      "max_age_seconds": { "type": "integer", "minimum": 1, "maximum": 300 },
+      "profile": {
+        "type": "object",
+        "properties": {
+          "release_id": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
+          },
+          "image": {
+            "type": "string",
+            "maxLength": 512,
+            "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+          },
+          "holder_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "controller_sha256": {
+            "type": "string",
+            "pattern": "^[a-f0-9]{64}$"
+          },
+          "containerd_version": { "type": "string", "const": "2.3.6" },
+          "runc_version": { "type": "string", "const": "1.5.2" },
+          "architecture": { "type": "string", "enum": ["amd64", "arm64"] }
+        },
+        "required": [
+          "release_id",
+          "image",
+          "holder_sha256",
+          "controller_sha256",
+          "containerd_version",
+          "runc_version",
+          "architecture"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "required": [
+      "version",
+      "target_slots",
+      "max_idle_cpu_millicores",
+      "max_idle_memory_mib",
+      "per_slot_cpu_millicores",
+      "per_slot_memory_mib",
+      "max_age_seconds",
+      "profile"
+    ],
+    "additionalProperties": false
+  },
+  "lease": {
+    "node_id": "nod_aaaaaaaaaaaaaaaaaaaa",
+    "node_uid": "01234567-89ab-4def-8123-0123456789ab",
+    "region_id": "eu-test",
+    "revision": 1,
+    "policy": {
+      "version": 1,
+      "target_slots": 2,
+      "max_idle_cpu_millicores": 100,
+      "max_idle_memory_mib": 128,
+      "per_slot_cpu_millicores": 25,
+      "per_slot_memory_mib": 32,
+      "max_age_seconds": 120,
+      "profile": {
+        "release_id": "qualified-release",
+        "image": "registry.invalid/controller@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "holder_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "controller_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "containerd_version": "2.3.6",
+        "runc_version": "1.5.2",
+        "architecture": "amd64"
+      }
+    },
+    "updated_at": "2026-10-09T00:00:00.000Z",
+    "purpose": "pgcf-compute-pool/v1",
+    "material_revision": 1,
+    "assignment_revision": 1,
+    "region_revision": 1,
+    "node_observed_at": "2026-10-09T00:00:00.000Z",
+    "issued_at": "2026-10-09T00:00:00.000Z",
+    "expires_at": "2026-10-09T00:00:30.000Z"
+  },
+  "invalid_budget_policy": {
+    "version": 1,
+    "target_slots": 16,
+    "max_idle_cpu_millicores": 100,
+    "max_idle_memory_mib": 128,
+    "per_slot_cpu_millicores": 25,
+    "per_slot_memory_mib": 32,
+    "max_age_seconds": 120,
+    "profile": {
+      "release_id": "qualified-release",
+      "image": "registry.invalid/controller@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "holder_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "controller_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "containerd_version": "2.3.6",
+      "runc_version": "1.5.2",
+      "architecture": "amd64"
+    }
+  },
+  "valid_policy": true,
+  "invalid_budget_accepted": false
+}

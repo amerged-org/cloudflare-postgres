@@ -13,6 +13,7 @@ export default tseslint.config(
     ignores: [
       "**/node_modules/**",
       "**/dist/**",
+      "apps/edge-rust/build/**",
       "**/.wrangler/**",
       "**/worker-configuration.d.ts",
       ".local/**",

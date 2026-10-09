@@ -40,7 +40,10 @@ export const regionRow = (row: Row): Region =>
   });
 export const nodeRow = (row: Row): Node =>
   Node.parse({
-    ...row,
+    // Project the public schema explicitly to keep internal observation columns private.
+    ...Object.fromEntries(
+      Object.keys(Node.shape).map((key) => [key, row[key]]),
+    ),
     platform_reserved_cpu_millicores:
       row.platform_reserved_cpu_millicores ?? null,
     ready: row.ready === 1,

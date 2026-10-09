@@ -2,6 +2,9 @@
 import {
   ARCHIVE_SERVER_NAME,
   DesiredDatabase,
+  DesiredDatabaseStorage,
+  DesiredStorageStartup,
+  thinStorageAuthorityMatches,
   DesiredResponse,
   type DesiredCreation,
   type DesiredRecovery,
@@ -19,8 +22,16 @@ import type { DatabaseRow, RoleRow } from "./rows.ts";
 import { readDesiredFleetRelease } from "./fleet-releases.ts";
 import { desiredRegionArchiveSources } from "./region-archive-sources.ts";
 
+import {
+  desiredRegionStorageNodes,
+  storageWriteAuthorityForDatabase,
+} from "./node-thin-storage.ts";
 interface DesiredRow extends DatabaseRow, DesiredSize {
   k8s_node_name: string;
+  storage_startup_operation: string | null;
+  storage_startup_generation: number | null;
+  storage_startup_node_uid: string | null;
+  storage_startup_budget: number | null;
   roles_json: string;
   creation_operation_id: string | null;
   creation_generation: number | null;
@@ -47,13 +58,14 @@ export async function desired(
 ): Promise<Response> {
   const region = await agentRegion(c);
   const policy = await c.env.DB.prepare(
-    "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib FROM node_region_policies WHERE region_id=?",
+    "SELECT placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,compute_pool_json FROM node_region_policies WHERE region_id=?",
   )
     .bind(region.id)
     .first<{
       placement_mode: string;
       maximum_database_memory_mib: number | null;
       postgres_memory_request_mib: number | null;
+      compute_pool_json: string | null;
     }>();
   const scheduling =
     policy?.placement_mode === "actual_ram"
@@ -63,8 +75,9 @@ export async function desired(
           postgres_memory_request_mib: policy.postgres_memory_request_mib,
         }
       : undefined;
+  const storageNodes = await desiredRegionStorageNodes(c.env, region.id);
   const result = await c.env.DB.prepare(
-    `SELECT d.*,n.k8s_node_name,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
+    `SELECT d.*,n.k8s_node_name,a.operation_id storage_startup_operation,a.generation storage_startup_generation,a.node_uid storage_startup_node_uid,a.storage_budget_bytes storage_startup_budget,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json,
     o.id creation_operation_id,o.generation creation_generation,o.status creation_status,
     EXISTS(SELECT 1 FROM lifecycle_events e WHERE e.database_id=d.id AND e.kind='ready') ever_ready,
@@ -72,6 +85,7 @@ export async function desired(
     x.operation_id restore_operation_id,x.source_database_id,x.source_archive_path,x.source_storage_generation,x.backup_id,x.target_time,ro.status restore_status,
     src.region_id source_region_id,sr.backup_bucket source_backup_bucket,sr.backup_endpoint_url source_backup_endpoint_url
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
+    LEFT JOIN database_start_admissions a ON a.database_id=d.id AND a.generation=d.generation AND a.storage_budget_bytes>0 AND a.budget_bytes>0
     LEFT JOIN operations o ON o.id=substr(d.archive_path,-23) AND o.kind='database.create' AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation
     LEFT JOIN maintenance_credentials m ON m.database_id=d.id
     LEFT JOIN database_restores x ON x.target_database_id=d.id
@@ -115,6 +129,33 @@ export async function desired(
           }),
         });
     }
+    const storage = row.storage_profile_json
+      ? DesiredDatabaseStorage.parse(JSON.parse(row.storage_profile_json))
+      : undefined;
+    const storageAuthority = storage
+      ? await storageWriteAuthorityForDatabase(c.env, row)
+      : undefined;
+    const physical = storageNodes.find(
+      (value) => value.node_id === row.node_id,
+    );
+    const startup =
+      storage &&
+      row.desired_state === "running" &&
+      row.storage_startup_operation &&
+      physical &&
+      row.storage_startup_node_uid === storage.node_uid &&
+      row.storage_startup_budget ===
+        Math.max(storage.startup_reserve_bytes, row.storage_gib * 1024 ** 3) &&
+      row.storage_startup_generation === row.generation &&
+      thinStorageAuthorityMatches(storage, physical, row.k8s_node_name)
+        ? DesiredStorageStartup.parse({
+            operation_id: row.storage_startup_operation,
+            generation: row.generation,
+            node_uid: storage.node_uid,
+            budget_bytes: row.storage_startup_budget,
+            expires_at: physical.expires_at,
+          })
+        : undefined;
     databases.push(
       DesiredDatabase.parse({
         id: row.id,
@@ -163,6 +204,20 @@ export async function desired(
           : {}),
         node: row.k8s_node_name,
         pg_major: row.pg_major,
+        ...(storage ? { storage } : {}),
+        ...(storageAuthority ? { storage_authority: storageAuthority } : {}),
+        ...(startup ? { storage_startup: startup } : {}),
+        ...(row.desired_postgres_release_id
+          ? {
+              postgres: {
+                release_id: row.desired_postgres_release_id,
+                image: row.desired_postgres_image,
+                version: row.desired_postgres_version,
+                configuration_schema_revision:
+                  row.desired_postgres_schema_revision,
+              },
+            }
+          : {}),
         size: {
           memory_mib: row.memory_mib,
           ...(scheduling && row.desired_state === "running"
@@ -202,6 +257,10 @@ export async function desired(
       ...(fleetRelease ? { fleet_release: fleetRelease } : {}),
       region: {
         id: region.id,
+        ...(policy?.compute_pool_json
+          ? { compute_pool: JSON.parse(policy.compute_pool_json) }
+          : {}),
+        ...(storageNodes.length ? { storage_nodes: storageNodes } : {}),
         ...(recoverySources === undefined
           ? {}
           : { recovery_sources: recoverySources }),

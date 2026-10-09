@@ -19,11 +19,20 @@
     "./bootstrap-relay": "./src/bootstrap-relay.ts",
     "./nodes": "./src/nodes.ts",
     "./releases": "./src/releases.ts",
-    "./client": "./src/client.ts"
+    "./fleet-patches": "./src/fleet-patches.ts",
+    "./compute-pool": "./src/compute-pool.ts",
+    "./node-host-configuration": "./src/node-host-configuration.ts",
+    "./storage-write-authority": "./src/storage-write-authority.ts",
+    "./database-storage": "./src/database-storage.ts",
+    "./node-thin-storage": "./src/node-thin-storage.ts",
+    "./client": "./src/client.ts",
+    "./reclaim": "./src/reclaim.ts",
+    "./fleet-updates": "./src/fleet-updates.ts",
+    "./region-material-rotation": "./src/region-material-rotation.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",
-    "test": "vitest run --passWithNoTests"
+    "test": "node native/generate.ts --check && vitest run --passWithNoTests"
   },
   "dependencies": {
     "zod": "^4.6.5"

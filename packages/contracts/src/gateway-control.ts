@@ -7,6 +7,8 @@ import type { RouteKeyring } from "./route-token.ts";
 export const GATEWAY_CONTROL_PATH_PREFIX = "/_pgcf/gateway/";
 export const GATEWAY_CONTROL_HEADER = "X-PGCF-Control";
 export const GATEWAY_CONTROL_MAX_LENGTH = 1024;
+export const GATEWAY_CONTROL_TOKEN_PREFIX = "gc1";
+export const GATEWAY_CONTROL_MAX_LIFETIME_SECONDS = 30;
 export const GATEWAY_RETIRE_HOLD_MS = 65_000;
 export const GATEWAY_FENCE_NAMESPACE = "pgcf-system";
 export const GATEWAY_FENCE_LABEL = "pgcf.io/gateway-fence";
@@ -70,6 +72,8 @@ const encoder = new TextEncoder(),
   decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 const signingPurpose = "pgcf-gateway-control/v1\n";
 const keyPurpose = "pgcf-gateway-control-key/v1\n";
+export const GATEWAY_CONTROL_SIGNING_PURPOSE = signingPurpose;
+export const GATEWAY_CONTROL_KEY_PURPOSE = keyPurpose;
 async function hmac(key: Uint8Array, value: string): Promise<Uint8Array> {
   const imported = await crypto.subtle.importKey(
     "raw",
@@ -94,8 +98,12 @@ export async function signGatewayControl(input: {
   now?: number;
   ttlSeconds?: number;
 }): Promise<string> {
-  const ttl = input.ttlSeconds ?? 30;
-  if (!Number.isInteger(ttl) || ttl < 1 || ttl > 30)
+  const ttl = input.ttlSeconds ?? GATEWAY_CONTROL_MAX_LIFETIME_SECONDS;
+  if (
+    !Number.isInteger(ttl) ||
+    ttl < 1 ||
+    ttl > GATEWAY_CONTROL_MAX_LIFETIME_SECONDS
+  )
     throw new Error("invalid control lifetime");
   const now = input.now ?? Date.now();
   if (!Number.isFinite(now) || now < 0)
@@ -120,7 +128,7 @@ export async function signGatewayControl(input: {
     await hmac(key, keyPurpose),
     signingPurpose + payload,
   );
-  return `gc1.${payload}.${bytesToBase64url(signature)}`;
+  return `${GATEWAY_CONTROL_TOKEN_PREFIX}.${payload}.${bytesToBase64url(signature)}`;
 }
 export async function verifyGatewayControl(
   value: unknown,
@@ -136,7 +144,8 @@ export async function verifyGatewayControl(
     if (typeof value !== "string" || value.length > GATEWAY_CONTROL_MAX_LENGTH)
       return { ok: false };
     const parts = value.split(".");
-    if (parts.length !== 3 || parts[0] !== "gc1") return { ok: false };
+    if (parts.length !== 3 || parts[0] !== GATEWAY_CONTROL_TOKEN_PREFIX)
+      return { ok: false };
     const bytes = base64urlToBytes(parts[1]!),
       signature = base64urlToBytes(parts[2]!);
     if (
@@ -165,7 +174,7 @@ export async function verifyGatewayControl(
       difference !== 0 ||
       !Number.isFinite(now) ||
       claims.exp <= claims.iat ||
-      claims.exp - claims.iat > 30 ||
+      claims.exp - claims.iat > GATEWAY_CONTROL_MAX_LIFETIME_SECONDS ||
       now < claims.iat ||
       now > claims.exp ||
       claims.region !== expected.region ||

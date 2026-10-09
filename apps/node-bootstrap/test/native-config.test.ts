@@ -21,7 +21,7 @@ const client = process.env.PGCF_TEST_TALOSCTL;
 test("pinned native client generates and validates both roles while recovered seed keys remain identical", async () => {
   assert.ok(
     client,
-    "PGCF_TEST_TALOSCTL must select the checksum-verified Talos 1.14.1 client",
+    `PGCF_TEST_TALOSCTL must select the checksum-verified Talos ${TALOS_VERSION} client`,
   );
   const input = fixture();
   const samePrefixPeer = [192, 0, 3, 42].join(".");

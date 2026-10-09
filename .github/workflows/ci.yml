@@ -27,11 +27,17 @@ jobs:
   check:
     if: github.event_name != 'workflow_dispatch' || (!inputs.external_probe && !inputs.node_network_probe)
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 45
     outputs:
       regional_image: ${{ steps.image_inputs.outputs.regional }}
       node_bootstrap_image: ${{ steps.image_inputs.outputs.node_bootstrap }}
       postgres_image: ${{ steps.image_inputs.outputs.postgres }}
+      storage_image: ${{ steps.image_inputs.outputs.storage }}
+      rust_gateway_image: ${{ steps.image_inputs.outputs.rust_gateway }}
+      native_controller_image: ${{ steps.image_inputs.outputs.native_controller }}
+      rust_bootstrap_relay_image: ${{ steps.image_inputs.outputs.rust_bootstrap_relay }}
+      native_reclaimer_image: ${{ steps.image_inputs.outputs.native_reclaimer }}
+      sandbox_controller_image: ${{ steps.image_inputs.outputs.sandbox_controller }}
     steps:
       - name: Check out the revision
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -47,6 +53,40 @@ jobs:
           cache: pnpm
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Set up the pinned Rust and Worker build tools
+        run: |
+          PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
+          PGCF_WORKER_BUILD_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").rustEdge.workerBuildVersion')
+          rustup toolchain install "$PGCF_RUST_VERSION" --profile minimal \
+            --component rustfmt --component clippy --target wasm32-unknown-unknown
+          cargo install worker-build --version "$PGCF_WORKER_BUILD_VERSION" --locked
+      - name: Verify the pinned Worker build binaries
+        run: |
+          node --input-type=module <<'JS'
+          import assert from 'node:assert/strict';
+          import { createHash } from 'node:crypto';
+          import { execFileSync } from 'node:child_process';
+          import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          const { archives } = JSON.parse(readFileSync('infra/platform/versions.lock.json', 'utf8')).rustEdge;
+          assert.deepEqual(archives.map(x => x.environmentVariable).sort(), ['ESBUILD_BIN', 'WASM_BINDGEN_BIN', 'WASM_OPT_BIN']);
+          const directory = join(process.env.RUNNER_TEMP, 'pgcf-worker-build-tools');
+          mkdirSync(directory, { recursive: true });
+          const sha256 = bytes => createHash('sha256').update(bytes).digest('hex');
+          for (const tool of archives) {
+            assert.equal(tool.os, 'linux'); assert.equal(tool.architecture, 'amd64');
+            assert.match(tool.name, /^[a-z-]+$/); assert.match(tool.member, /^[A-Za-z0-9._/-]+$/); assert.ok(!tool.member.split('/').includes('..'));
+            const response = await fetch(tool.url, { signal: AbortSignal.timeout(180_000) });
+            assert.equal(response.ok, true); assert.equal(new URL(response.url).protocol, 'https:');
+            const archive = Buffer.from(await response.arrayBuffer());
+            assert.ok(archive.length < 128 * 1024 * 1024); assert.equal(sha256(archive), tool.sha256);
+            const file = join(directory, tool.name + '.tgz'); writeFileSync(file, archive);
+            const binary = execFileSync('tar', ['-xOf', file, tool.member], { timeout: 30_000, maxBuffer: 192 * 1024 * 1024 });
+            assert.equal(sha256(binary), tool.binarySha256);
+            const executable = join(directory, tool.name); writeFileSync(executable, binary, { mode: 0o755 });
+            appendFileSync(process.env.GITHUB_ENV, `${tool.environmentVariable}=${executable}\n`);
+          }
+          JS
       - name: Select affected image inputs
         id: image_inputs
         env:
@@ -57,28 +97,49 @@ jobs:
       - name: Verify the native Talos test client
         run: |
           PGCF_TEST_TALOSCTL="$RUNNER_TEMP/pgcf-test-talosctl"
+          PGCF_TEST_TALOSCTL_URL=$(node -p 'require("./infra/platform/versions.lock.json").bootstrapClients.talos.archives.find(v => v.os === "linux" && v.architecture === "amd64").url')
+          PGCF_TEST_TALOSCTL_SHA=$(node -p 'require("./infra/platform/versions.lock.json").bootstrapClients.talos.archives.find(v => v.os === "linux" && v.architecture === "amd64").sha256')
           curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
             --connect-timeout 15 --max-time 120 \
             --output "$PGCF_TEST_TALOSCTL" \
-            https://github.com/siderolabs/talos/releases/download/v1.14.1/talosctl-linux-amd64
-          printf '%s  %s\n' 7233ece94c94296a033a6ddb5efe0baf508a94c71de7e6c7b286500705924208 \
+            "$PGCF_TEST_TALOSCTL_URL"
+          printf '%s  %s\n' "$PGCF_TEST_TALOSCTL_SHA" \
             "$PGCF_TEST_TALOSCTL" | sha256sum --check --status
           chmod 755 "$PGCF_TEST_TALOSCTL"
           printf 'PGCF_TEST_TALOSCTL=%s\n' "$PGCF_TEST_TALOSCTL" >> "$GITHUB_ENV"
       - name: Lint
-        run: pnpm lint
+        run: |
+          pnpm lint
+          pnpm exec eslint --no-ignore infra/talos/sandbox/*.ts
       - name: Check formatting
         run: pnpm format:check
       - name: Typecheck
         run: |
           pnpm typecheck
           pnpm exec tsc -p scripts/ci/tsconfig.json
+          pnpm exec tsc -p infra/talos/sandbox/tsconfig.json
+      - name: Check the native runtime and Worker contracts
+        run: |
+          node packages/contracts/native/generate.ts --check
+          node packages/contracts/native/generate-controller.ts --check
+          node packages/contracts/native/generate-power.ts --check
+          node packages/contracts/native/generate-measurements.ts --check
+          node packages/contracts/native/generate-bootstrap.ts --check
+          node packages/contracts/native/generate-reclaim.ts --check
+          cargo fmt --all -- --check
+          cargo test --workspace --locked
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo clippy -p pgcf-edge-rust --target wasm32-unknown-unknown --locked -- -D warnings
+      - name: Build the Worker once for actual Workerd tests
+        run: pnpm -r --if-present build
       - name: Test
         run: |
           pnpm test
           node --test infra/talos/publish-storage-capacity.test.ts
           node --test infra/platform/release-candidate.test.ts
+          node --test infra/talos/sandbox/*.test.ts
           node --test scripts/ci/*.test.ts
+          node packages/contracts/native/generate-compute-pool.ts --check
       - name: Check the native prepared runtime against the actual Linux kernel
         run: |
           node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const lock=JSON.parse(fs.readFileSync("infra/platform/versions.lock.json","utf8")); const channel=/channel\s*=\s*"([^"]+)"/.exec(fs.readFileSync("rust-toolchain.toml","utf8"))?.[1]; assert.equal(channel,lock.nativeRuntime.rustVersion);'
@@ -96,6 +157,8 @@ jobs:
             --cap-drop ALL --cap-add SYS_ADMIN --cap-add SETPCAP --cap-add SYS_PTRACE \
             --security-opt seccomp=unconfined --security-opt no-new-privileges \
             "$PGCF_SLOT_TEST_IMAGE"
+      - name: Check the shared sandbox against ordinary containerd and isolated CRI namespaces
+        run: node infra/talos/sandbox/run-proof.ts
       - name: Render the Kubernetes manifests
         run: |
           command -v kubectl >/dev/null || { echo "kubectl not available on this runner"; exit 1; }
@@ -411,7 +474,7 @@ jobs:
           node scripts/ci/image-qualification.ts --profile postgres registry "$public_image" \
             "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
             "$RUNNER_TEMP/pgcf-postgres-image-gate/qualification.json" "$RUNNER_TEMP/pgcf-postgres-image-gate/public-postgres-sha.json"
-          node --input-type=module -e 'import {readFileSync} from "node:fs"; import assert from "node:assert/strict"; const read=p=>JSON.parse(readFileSync(p,"utf8")); assert.deepEqual(read(process.argv[1]),read(process.argv[2]));' \
+          node --input-type=module -e 'import {readFileSync} from "node:fs"; import {assertEquivalentRegistryReadbacks} from "./scripts/ci/registry.ts"; const read=p=>JSON.parse(readFileSync(p,"utf8")); assertEquivalentRegistryReadbacks(read(process.argv[1]),read(process.argv[2]));' \
             "$RUNNER_TEMP/pgcf-postgres-image-gate/registry-sha.json" "$RUNNER_TEMP/pgcf-postgres-image-gate/public-postgres-sha.json"
           echo "Public PostgreSQL digest: $public_image@$digest" >> "$GITHUB_STEP_SUMMARY"
       - name: Remove image qualification files
@@ -491,3 +554,178 @@ jobs:
       - name: Remove private acceptance files
         if: always()
         run: rm -f "$RUNNER_TEMP/pgcf-node-network.enc.json" "$RUNNER_TEMP/pgcf-e6-native.json"
+
+  storage_image:
+    needs: check
+    if: needs.check.outputs.storage_image == 'true' && github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/amerged-org/pgcf-regional
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install qualification dependencies
+        run: CI=true pnpm install --frozen-lockfile --ignore-scripts
+      - name: Build and check the pinned storage image
+        run: |
+          mkdir -m 700 "$RUNNER_TEMP/pgcf-storage-image-gate"
+          docker buildx build --platform linux/amd64 --load --provenance=false --sbom=false \
+            --network none --file infra/storage/Dockerfile \
+            --iidfile "$RUNNER_TEMP/pgcf-storage-image-gate/image.id" \
+            --tag "$IMAGE:lvm-thin-sha-${GITHUB_SHA::12}" \
+            --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label 'org.opencontainers.image.licenses=Apache-2.0 AND GPL-3.0-only' \
+            infra/storage
+          PGCF_TEST_STORAGE_IMAGE="$IMAGE:lvm-thin-sha-${GITHUB_SHA::12}" node --test infra/storage/image.test.mjs
+          node scripts/ci/image-qualification.ts --profile storage runtime "$(cat "$RUNNER_TEMP/pgcf-storage-image-gate/image.id")"
+          node scripts/ci/image-qualification.ts --profile storage qualify "$IMAGE:lvm-thin-sha-${GITHUB_SHA::12}" \
+            "$(cat "$RUNNER_TEMP/pgcf-storage-image-gate/image.id")" "$GITHUB_SHA" \
+            "https://github.com/$GITHUB_REPOSITORY" "$RUNNER_TEMP/pgcf-storage-image-gate/qualification.json"
+      - name: Publish only the qualified storage tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          PGCF_STORAGE_ID=$(cat "$RUNNER_TEMP/pgcf-storage-image-gate/image.id")
+          node scripts/ci/image-qualification.ts --profile storage verify "$IMAGE:lvm-thin-sha-${GITHUB_SHA::12}" \
+            "$PGCF_STORAGE_ID" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" "$RUNNER_TEMP/pgcf-storage-image-gate/qualification.json"
+          docker push "$IMAGE:lvm-thin-sha-${GITHUB_SHA::12}"
+          node scripts/ci/image-qualification.ts --profile storage registry "$IMAGE:lvm-thin-sha-${GITHUB_SHA::12}" \
+            "$PGCF_STORAGE_ID" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/pgcf-storage-image-gate/qualification.json" "$RUNNER_TEMP/pgcf-storage-image-gate/registry.json"
+          cat "$RUNNER_TEMP/pgcf-storage-image-gate/qualification.json" >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/pgcf-storage-image-gate/registry.json" >> "$GITHUB_STEP_SUMMARY"
+      - name: Remove storage qualification files
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/pgcf-storage-image-gate"
+
+  native_runtime_images:
+    needs: check
+    if: (needs.check.outputs.rust_gateway_image == 'true' || needs.check.outputs.native_controller_image == 'true' || needs.check.outputs.rust_bootstrap_relay_image == 'true' || needs.check.outputs.native_reclaimer_image == 'true' || needs.check.outputs.sandbox_controller_image == 'true') && github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      extension_ref: ${{ steps.native_artifacts.outputs.extension_ref }}
+      recipe_ref: ${{ steps.native_artifacts.outputs.recipe_ref }}
+      installer_ref: ${{ steps.native_artifacts.outputs.installer_ref }}
+      raw_url: ${{ steps.native_artifacts.outputs.raw_url }}
+    env:
+      IMAGE: ghcr.io/amerged-org/pgcf-regional
+      PGCF_BUILD_GATEWAY: ${{ needs.check.outputs.rust_gateway_image }}
+      PGCF_BUILD_CONTROLLER: ${{ needs.check.outputs.native_controller_image }}
+      PGCF_BUILD_RELAY: ${{ needs.check.outputs.rust_bootstrap_relay_image }}
+      PGCF_BUILD_RECLAIMER: ${{ needs.check.outputs.native_reclaimer_image }}
+      PGCF_BUILD_SANDBOX: ${{ needs.check.outputs.sandbox_controller_image }}
+    steps:
+      - name: Check out the revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install qualification dependencies
+        run: CI=true pnpm install --frozen-lockfile --ignore-scripts
+      - name: Reserve disk for complete OS byte qualification
+        if: env.PGCF_BUILD_SANDBOX == 'true'
+        run: |
+          # This job runs on a fresh GitHub-hosted VM. These SDKs are not used by Node/Rust/Docker.
+          PGCF_FREE_BYTES=$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+          if [ "$PGCF_FREE_BYTES" -lt $((35 * 1024 * 1024 * 1024)) ]; then
+            sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /usr/share/swift
+          fi
+          PGCF_FREE_BYTES=$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
+          test "$PGCF_FREE_BYTES" -ge $((35 * 1024 * 1024 * 1024))
+      - name: Build, qualify and publish only selected native artifacts
+        id: native_artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PGCF_RUST_BUILDER=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.testBuilderImage')
+          PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          mkdir -m 700 "$RUNNER_TEMP/pgcf-native-image-gate"
+          for PGCF_PROFILE in rust-gateway native-controller rust-bootstrap-relay native-reclaimer sandbox-controller; do
+            case "$PGCF_PROFILE" in
+              rust-gateway) [ "$PGCF_BUILD_GATEWAY" = true ] || continue; PGCF_DOCKERFILE=apps/native-gateway/Dockerfile ;;
+              native-controller) [ "$PGCF_BUILD_CONTROLLER" = true ] || continue; PGCF_DOCKERFILE=apps/native-controller/Dockerfile ;;
+              rust-bootstrap-relay) [ "$PGCF_BUILD_RELAY" = true ] || continue; PGCF_DOCKERFILE=apps/native-bootstrap-relay/Dockerfile ;;
+              native-reclaimer) [ "$PGCF_BUILD_RECLAIMER" = true ] || continue; PGCF_DOCKERFILE=apps/native-reclaimer/Dockerfile ;;
+              sandbox-controller) [ "$PGCF_BUILD_SANDBOX" = true ] || continue; PGCF_DOCKERFILE=apps/sandbox-controller/Dockerfile ;;
+            esac
+            PGCF_GATE="$RUNNER_TEMP/pgcf-native-image-gate/$PGCF_PROFILE"
+            mkdir -m 700 "$PGCF_GATE"
+            PGCF_NATIVE_TAG="$IMAGE:$PGCF_PROFILE-sha-${GITHUB_SHA::12}"
+            docker buildx build --platform linux/amd64 --load --provenance=false --sbom=false \
+              --file "$PGCF_DOCKERFILE" --iidfile "$PGCF_GATE/image.id" \
+              --build-arg RUST_BUILDER="$PGCF_RUST_BUILDER" --build-arg RUST_VERSION="$PGCF_RUST_VERSION" \
+              --build-arg SOURCE_COMMIT="$GITHUB_SHA" --tag "$PGCF_NATIVE_TAG" \
+              --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
+              --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+              --label 'org.opencontainers.image.licenses=Apache-2.0' .
+            PGCF_NATIVE_ID=$(cat "$PGCF_GATE/image.id")
+            node scripts/ci/image-qualification.ts --profile "$PGCF_PROFILE" runtime "$PGCF_NATIVE_ID"
+            node scripts/ci/image-qualification.ts --profile "$PGCF_PROFILE" qualify "$PGCF_NATIVE_TAG" \
+              "$PGCF_NATIVE_ID" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" "$PGCF_GATE/qualification.json"
+            node scripts/ci/image-qualification.ts --profile "$PGCF_PROFILE" verify "$PGCF_NATIVE_TAG" \
+              "$PGCF_NATIVE_ID" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" "$PGCF_GATE/qualification.json"
+            docker push "$PGCF_NATIVE_TAG"
+            node scripts/ci/image-qualification.ts --profile "$PGCF_PROFILE" registry "$PGCF_NATIVE_TAG" \
+              "$PGCF_NATIVE_ID" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+              "$PGCF_GATE/qualification.json" "$PGCF_GATE/registry.json"
+            cat "$PGCF_GATE/qualification.json" >> "$GITHUB_STEP_SUMMARY"
+            cat "$PGCF_GATE/registry.json" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [ "$PGCF_BUILD_SANDBOX" = true ]; then
+            bash infra/talos/sandbox/ci-artifacts.sh "$RUNNER_TEMP/pgcf-native-image-gate/sandbox-controller/qualification.json"
+          fi
+      - name: Attest the public Talos qualification and publication results
+        if: success() && env.PGCF_BUILD_SANDBOX == 'true'
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
+        with:
+          subject-path: |
+            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/whole-os-qualification.json
+            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/publication.json
+          show-summary: false
+      - name: Retain exact native qualification and publication receipts
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: pgcf-native-qualification-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/pgcf-native-image-gate/*/qualification.json
+            ${{ runner.temp }}/pgcf-native-image-gate/*/registry.json
+            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/extension-gate/qualification.json
+            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/extension-gate/registry.json
+            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/recipe-gate/qualification.json
+            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/recipe-gate/registry.json
+            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/installer-gate/transport.json
+            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/installer-gate/registry.json
+            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/whole-os-qualification.json
+            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/publication-state.json
+            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/publication.json
+          if-no-files-found: warn
+          retention-days: 90
+          overwrite: false
+      - name: Remove native qualification files
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/pgcf-native-image-gate"

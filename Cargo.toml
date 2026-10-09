@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
 [workspace]
-members = ["apps/node-runtime"]
+members = ["apps/edge-rust", "apps/native-controller", "apps/sandbox-controller", "apps/node-runtime", "packages/native-protocol", "apps/native-gateway", "apps/native-reclaimer", "apps/native-bootstrap-relay"]
 resolver = "3"

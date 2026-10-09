@@ -2,13 +2,16 @@
 import {
   databaseMemoryReservationMib,
   databaseCpuReservationMillicores,
+  computePoolOverhead,
   SIDECAR,
   type SizeResources,
 } from "@pgcf/contracts";
 import { MEMORY_SAMPLE_MAX_AGE_MS } from "./memory-capacity.ts";
+import { nodeThinStorageHeadroomSql } from "./storage-capacity.ts";
 import {
   startupPhysicalFitSql,
   databaseCpuChargeSql,
+  computePoolOverheadSql,
 } from "./startup-admission.ts";
 
 export const NODE_OBSERVATION_MAX_AGE_MS = 180_000;
@@ -90,6 +93,12 @@ export interface PlacementNode {
   storage_gib_total: number | null;
   reserved_memory_mib: number;
   reserved_storage_gib: number;
+  compute_pool_cpu_millicores?: number | null;
+  compute_pool_memory_mib?: number | null;
+  thin_storage_selected?: number | boolean;
+  thin_storage_available?: number | boolean;
+  thin_storage_maximum_quota_gib?: number | null;
+  thin_storage_retained_thick?: number | boolean;
   last_observed_at?: string | null;
   lost_at?: string | null;
   database_placement_enabled?: number | boolean;
@@ -107,12 +116,22 @@ export interface PlacementNode {
   memory_latest_working_set_bytes?: number | null;
   memory_latest_pressure?: boolean | number | null;
 }
+function hostOverhead(node: PlacementNode) {
+  return computePoolOverhead({
+    per_slot_cpu_millicores: node.compute_pool_cpu_millicores ?? 0,
+    per_slot_memory_mib: node.compute_pool_memory_mib ?? 0,
+  });
+}
 function physicalStartupFits(
   node: PlacementNode,
   size: SizeResources,
 ): boolean {
   const mib = 1024 ** 2,
-    peak = (size.memory_mib + SIDECAR.limitMemoryMib) * mib,
+    peak =
+      (size.memory_mib +
+        SIDECAR.limitMemoryMib +
+        hostOverhead(node).memory_mib) *
+      mib,
     allocatable = node.allocatable_memory_mib * mib,
     platform = node.platform_reserved_memory_mib * mib,
     physical = node.memory_latest_capacity_bytes;
@@ -144,8 +163,13 @@ export function choosePlacement(
   const needed = databaseMemoryReservationMib(size);
   return (
     nodes
-      .filter(
-        (n) =>
+      .filter((n) => {
+        const overhead = hostOverhead(n);
+        return (
+          Number.isSafeInteger(overhead.cpu_millicores) &&
+          overhead.cpu_millicores >= 0 &&
+          Number.isSafeInteger(overhead.memory_mib) &&
+          overhead.memory_mib >= 0 &&
           n.region_id === regionId &&
           n.ready &&
           n.schedulable &&
@@ -163,8 +187,7 @@ export function choosePlacement(
           n.allocatable_cpu_millicores -
             n.platform_reserved_cpu_millicores! -
             n.reserved_cpu_millicores >=
-            databaseCpuReservationMillicores(size) &&
-          n.storage_gib_total !== null &&
+            databaseCpuReservationMillicores(size) + overhead.cpu_millicores &&
           (n.placement_mode === "actual_ram"
             ? n.node_uid != null &&
               physicalStartupFits(n, size) &&
@@ -192,9 +215,16 @@ export function choosePlacement(
             : n.allocatable_memory_mib -
                 n.platform_reserved_memory_mib -
                 n.reserved_memory_mib >=
-              needed) &&
-          n.storage_gib_total - n.reserved_storage_gib >= size.storage_gib,
-      )
+              needed + overhead.memory_mib) &&
+          (n.thin_storage_selected
+            ? (existingNodeId !== undefined && n.thin_storage_retained_thick) ||
+              (n.thin_storage_available &&
+                n.thin_storage_maximum_quota_gib != null &&
+                size.storage_gib <= n.thin_storage_maximum_quota_gib)
+            : n.storage_gib_total !== null &&
+              n.storage_gib_total - n.reserved_storage_gib >= size.storage_gib)
+        );
+      })
       .sort(
         (a, b) =>
           (a.placement_mode === "actual_ram"
@@ -214,19 +244,33 @@ export function choosePlacement(
 export async function placementNodes(
   db: D1Database,
   regionId: string,
+  existingDatabaseId?: string,
 ): Promise<PlacementNode[]> {
   const result = await db
     .prepare(
       `SELECT n.*,COALESCE(p.placement_mode,'reserved') placement_mode,p.maximum_database_memory_mib,p.postgres_memory_request_mib,
       m.observed_at memory_latest_observed_at,m.available_bytes memory_latest_available_bytes,m.capacity_memory_bytes memory_latest_capacity_bytes,
       m.working_set_bytes memory_latest_working_set_bytes,m.memory_pressure memory_latest_pressure,
-      COALESCE(SUM(s.memory_mib + ?),0) reserved_memory_mib, COALESCE(SUM(${databaseCpuChargeSql()}),0) reserved_cpu_millicores, COALESCE(SUM(s.storage_gib),0) reserved_storage_gib
+      ${computePoolOverheadSql("n", "cpu_millicores")} compute_pool_cpu_millicores,
+      ${computePoolOverheadSql("n", "memory_mib")} compute_pool_memory_mib,
+      EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=n.id) thin_storage_selected,
+      ${nodeThinStorageHeadroomSql("n", "storage_probe", existingDatabaseId === undefined ? undefined : "storage_existing")} thin_storage_available,
+      (SELECT json_extract(t.profile_json,'$.maximum_quota_gib') FROM node_thin_storage t WHERE t.node_id=n.id) thin_storage_maximum_quota_gib,
+      ${existingDatabaseId === undefined ? "0" : "storage_existing.id IS NOT NULL AND storage_existing.storage_profile_json IS NULL"} thin_storage_retained_thick,
+      COALESCE(SUM(s.memory_mib + ?+${computePoolOverheadSql("d", "memory_mib")}),0) reserved_memory_mib, COALESCE(SUM(${databaseCpuChargeSql()}),0) reserved_cpu_millicores,
+      COALESCE(SUM(CASE WHEN d.storage_profile_json IS NULL THEN s.storage_gib ELSE 0 END),0) reserved_storage_gib
     FROM nodes n LEFT JOIN node_region_policies p ON p.region_id=n.region_id LEFT JOIN databases d ON d.node_id=n.id AND d.observed_state <> 'deleted' LEFT JOIN size_classes s ON s.id=d.size_class_id
+    CROSS JOIN (SELECT 1 storage_gib) storage_probe
+    ${existingDatabaseId === undefined ? "" : "LEFT JOIN databases storage_existing ON storage_existing.id=? AND storage_existing.node_id=n.id"}
     LEFT JOIN node_memory_samples m ON m.node_id=n.id AND m.node_uid=n.node_uid
       AND m.observed_at=(SELECT MAX(observed_at) FROM node_memory_samples WHERE node_id=n.id AND node_uid=n.node_uid)
     WHERE n.region_id=? GROUP BY n.id`,
     )
-    .bind(SIDECAR.requestMemoryMib, regionId)
+    .bind(
+      SIDECAR.requestMemoryMib,
+      ...(existingDatabaseId === undefined ? [] : [existingDatabaseId]),
+      regionId,
+    )
     .all<PlacementNode>();
   return result.results;
 }

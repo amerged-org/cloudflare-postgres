@@ -5,11 +5,23 @@ export interface ImageInputs {
   regional: boolean;
   node_bootstrap: boolean;
   postgres: boolean;
+  storage: boolean;
+  rust_gateway: boolean;
+  native_controller: boolean;
+  rust_bootstrap_relay: boolean;
+  native_reclaimer: boolean;
+  sandbox_controller: boolean;
 }
 const all = (): ImageInputs => ({
   regional: true,
   node_bootstrap: true,
   postgres: true,
+  storage: true,
+  rust_gateway: true,
+  native_controller: true,
+  rust_bootstrap_relay: true,
+  native_reclaimer: true,
+  sandbox_controller: true,
 });
 // Explicit inputs copied by the two repository-root Dockerfiles.
 const sharedNodeInputs = new Set([
@@ -25,6 +37,7 @@ const sharedNodeInputs = new Set([
   "apps/node-bootstrap/package.json",
   "scripts/e2e/package.json",
   "infra/platform/versions.lock.json",
+  "infra/platform/openebs-image.ts",
 ]);
 // These also govern qualification of PostgreSQL, despite not entering its image filesystem.
 const sharedQualificationInputs = new Set([
@@ -42,6 +55,8 @@ const nativeInputs = new Set([
   "apps/node-bootstrap/tsconfig.json",
   "infra/talos/publish-storage-capacity.ts",
   "infra/platform/base/values/cilium.yaml",
+  "infra/platform/image-manifest.ts",
+  "infra/talos/sandbox/runtime-admission.ts",
   "scripts/e2e/src/node-network-native.ts",
   "scripts/e2e/src/node-network-packets.ts",
 ]);
@@ -77,6 +92,12 @@ export function selectImageInputs(
     regional: false,
     node_bootstrap: false,
     postgres: false,
+    storage: false,
+    rust_gateway: false,
+    native_controller: false,
+    rust_bootstrap_relay: false,
+    native_reclaimer: false,
+    sandbox_controller: false,
   };
   for (const path of paths) {
     if (sharedQualificationInputs.has(path)) return all();
@@ -97,6 +118,62 @@ export function selectImageInputs(
     )
       result.node_bootstrap = true;
     if (postgresInputs.has(path)) result.postgres = true;
+    if (path.startsWith("infra/storage/")) result.storage = true;
+    if (path === "scripts/ci/storage-reviewed-findings.json")
+      result.storage = true;
+    if (
+      [
+        "Cargo.toml",
+        "Cargo.lock",
+        "rust-toolchain.toml",
+        "LICENSE",
+        ".dockerignore",
+        "infra/platform/versions.lock.json",
+      ].includes(path) ||
+      path.startsWith("packages/native-protocol/") ||
+      path.startsWith("packages/contracts/native/")
+    ) {
+      result.rust_gateway = true;
+      result.native_controller = true;
+      result.rust_bootstrap_relay = true;
+      result.native_reclaimer = true;
+      result.sandbox_controller = true;
+    }
+    if (path === ".dockerignore") result.storage = true;
+    if (path.startsWith("apps/native-gateway/")) result.rust_gateway = true;
+    if (
+      path === "apps/native-gateway/Cargo.toml" ||
+      path === "apps/native-gateway/build.rs" ||
+      (path.startsWith("apps/native-gateway/src/") &&
+        path !== "apps/native-gateway/src/main.rs")
+    )
+      result.rust_bootstrap_relay = true;
+    if (path.startsWith("apps/native-bootstrap-relay/"))
+      result.rust_bootstrap_relay = true;
+    if (path.startsWith("apps/native-reclaimer/"))
+      result.native_reclaimer = true;
+    if (path.startsWith("apps/native-controller/"))
+      result.native_controller = true;
+    if (
+      path === "apps/native-controller/Cargo.toml" ||
+      path === "apps/native-controller/build.rs" ||
+      (path.startsWith("apps/native-controller/src/") &&
+        path !== "apps/native-controller/src/main.rs")
+    )
+      result.native_reclaimer = true;
+    if (path === "apps/native-gateway/license-bundle.sh") {
+      result.native_controller = true;
+      result.rust_bootstrap_relay = true;
+      result.native_reclaimer = true;
+      result.sandbox_controller = true;
+    }
+    if (
+      path.startsWith("apps/sandbox-controller/") ||
+      path.startsWith("apps/node-runtime/") ||
+      path.startsWith("infra/talos/sandbox/") ||
+      path === "scripts/ci/talos-reviewed-findings.json"
+    )
+      result.sandbox_controller = true;
   }
   return result;
 }

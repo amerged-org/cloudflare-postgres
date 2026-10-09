@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
 import {
   DatabaseWithOperation,
   newOperationId,
@@ -7,6 +8,7 @@ import {
 } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { powerTransitionStatements } from "../../src/domain/lifecycle.ts";
+import { databaseCpuChargeSql } from "../../src/domain/startup-admission.ts";
 import type { DatabaseRow } from "../../src/domain/rows.ts";
 import {
   cleanupFixtures,
@@ -19,6 +21,68 @@ import {
 afterEach(async () => {
   vi.restoreAllMocks();
   await cleanupFixtures();
+});
+
+it("publishes targeted database readiness without replacing an unmeasured orphan inventory", async () => {
+  const f = await fixture();
+  const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  const stub = env.REGION_LINK.get(env.REGION_LINK.idFromName(f.region));
+  const at = new Date().toISOString();
+  const orphans = [{ namespace: "owned-orphan", database_id: null }];
+  await stub.reportOrphans(at, orphans);
+  const body = observedBody([observation(created.database.id, 1)]);
+  const partial = {
+    observed_at: body.observed_at,
+    nodes: [],
+    databases: body.databases,
+  };
+  const response = await request(
+    "/agent/v1/observations",
+    f.agent,
+    "POST",
+    partial,
+  );
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ accepted: 1 });
+  const rows = await runInDurableObject(stub, (_instance, state) =>
+    state.storage.sql
+      .exec<{ observed_at: string; orphans: string }>(
+        "SELECT observed_at,orphans FROM orphan_reports",
+      )
+      .toArray(),
+  );
+  expect(rows).toEqual([{ observed_at: at, orphans: JSON.stringify(orphans) }]);
+  const cpuCharge = () =>
+    env.DB.prepare(
+      `SELECT ${databaseCpuChargeSql()} AS cpu FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=?`,
+    )
+      .bind(created.database.id)
+      .first<number>("cpu");
+  const before = await cpuCharge();
+  expect(before).toBeGreaterThan(0);
+  const measuredAt = new Date(Date.parse(at) + 1000).toISOString();
+  const measured = await request("/agent/v1/observations", f.agent, "POST", {
+    observed_at: measuredAt,
+    nodes: [],
+    databases: [],
+    orphans: [],
+  });
+  expect(measured.status).toBe(200);
+  expect(await measured.json()).toEqual({ accepted: 0 });
+  const replaced = await runInDurableObject(stub, (_instance, state) =>
+    state.storage.sql
+      .exec<{ observed_at: string; orphans: string }>(
+        "SELECT observed_at,orphans FROM orphan_reports",
+      )
+      .toArray(),
+  );
+  expect(replaced).toEqual([{ observed_at: measuredAt, orphans: "[]" }]);
+  expect(await cpuCharge()).toBe(before);
+  expect(
+    await env.DB.prepare("SELECT observed_state FROM databases WHERE id=?")
+      .bind(created.database.id)
+      .first("observed_state"),
+  ).toBe("ready");
 });
 
 it("a matching established wake completes with truthful unknown archive health", async () => {

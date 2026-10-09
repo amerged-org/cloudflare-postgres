@@ -144,7 +144,11 @@ test("collects stable actual Node/runtime facts and leaves unobservable release 
     reports = await collectFleetInventory(f.k8s, f.desired);
   assert.equal(reports.length, 1);
   assert.deepEqual(reports[0]!.facts, {
+    configuration_schema_revision: 1,
+    boot_id: record(record(f.node.status).nodeInfo).bootID,
     kubernetes_version: "1.36.5",
+    kubelet_version: "1.36.5",
+    kubernetes_control_plane: false,
     talos_version: "1.14.1",
     components: [
       {
@@ -169,6 +173,24 @@ test("keeps unqualified runtime child digests distinct from configured release d
     [{ name: "regional", runtime_image_sha256: "f".repeat(64) }],
   );
   statuses[0]!.ready = false;
+  assert.deepEqual(
+    (await collectFleetInventory(f.k8s, f.desired))[0]!.facts.components,
+    [],
+  );
+});
+test("an explicit cluster-scoped platform workload can run on the control node while the customer worker is observed", async () => {
+  const f = inventoryFixture();
+  const component = f.desired.release.spec.components.find(
+    (v) => v.name === "regional",
+  )!;
+  component.workload!.scope = "cluster";
+  record(f.pod.spec).nodeName = "control-node";
+  assert.equal(
+    (await collectFleetInventory(f.k8s, f.desired))[0]!.facts.components[0]
+      ?.sha256,
+    "d".repeat(64),
+  );
+  delete component.workload!.scope;
   assert.deepEqual(
     (await collectFleetInventory(f.k8s, f.desired))[0]!.facts.components,
     [],

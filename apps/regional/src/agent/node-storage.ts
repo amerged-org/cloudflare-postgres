@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { NodePhysicalStorage, NodeStorageSample } from "@pgcf/contracts";
 import lock from "../../../../infra/platform/versions.lock.json" with { type: "json" };
+import { openEbsDriverImage } from "../../../../infra/platform/openebs-image.ts";
 import { condition } from "./observe.ts";
 import { record, string, type Kubernetes, type Resource } from "./types.ts";
 
@@ -12,9 +13,7 @@ interface Metric {
 export interface StorageMetricsKubernetes extends Kubernetes {
   openEbsMetrics?(podName: string): Promise<string>;
 }
-const driverImage = lock.charts
-  .find((chart) => chart.name === "openebs")
-  ?.renderedImages.find((image) => /(?:^|\/)lvm-driver:/.test(image));
+const driverImage = openEbsDriverImage(lock);
 const image = (value: string) => value.replace(/^docker\.io\//, "");
 const digest = (value: unknown) =>
   typeof value === "string"

@@ -23,7 +23,7 @@
     "BOOTSTRAP_OPERATOR_SOURCES": "<OPERATOR_HOST_CIDRS_JSON>",
     "BOOTSTRAP_RELAY_PROVIDER_INSTANCE_ID": "<RELAY_PROVIDER_INSTANCE_ID>",
     "BOOTSTRAP_SCAN_CONTROL": "<DUAL_STACK_SCAN_POSITIVE_CONTROL_JSON>",
-    "NODE_BOOTSTRAP_CALLBACK_URL": "<NODE_BOOTSTRAP_CALLBACK_URL>",
+    "NODE_BOOTSTRAP_CALLBACK_URL": "https://api.invalid/",
     "BOOTSTRAP_RELAY_URL": "<BOOTSTRAP_RELAY_URL>",
     "BOOTSTRAP_RELAY_ISSUER_REGION": "<BOOTSTRAP_RELAY_ISSUER_REGION>",
     "BOOTSTRAP_VERIFIER_KEYS": "<DEDICATED_VERIFIER_PUBLIC_KEYS_JSON>",
@@ -46,6 +46,11 @@
     { "tag": "v3", "new_sqlite_classes": ["NodeBootstrap"] },
   ],
   "workflows": [
+    {
+      "binding": "PATCH_NODE",
+      "name": "pgcf-patch-node",
+      "class_name": "PatchNode",
+    },
     { "binding": "ADD_NODE", "name": "pgcf-add-node", "class_name": "AddNode" },
   ],
   "triggers": { "crons": ["* * * * *"] },

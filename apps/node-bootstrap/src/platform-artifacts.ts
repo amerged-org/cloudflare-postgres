@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import lock from "../../../infra/platform/versions.lock.json" with { type: "json" };
+import { selectedImageManifestDigest } from "../../../infra/platform/image-manifest.ts";
 
 export const TALOS_VERSION = lock.target.talosVersion;
 export const KUBERNETES_VERSION = lock.target.kubernetesVersion;
@@ -12,14 +13,13 @@ const cilium = lock.charts.find((chart) => chart.name === "cilium");
 const cloudflared = lock.regional.images.find(
   (image) => image.name === "cloudflared",
 );
-if (
-  !cilium?.ociManifestDigest ||
-  !cilium.archiveURL ||
-  !cloudflared?.indexDigest
-)
+const cloudflaredManifest = cloudflared
+  ? selectedImageManifestDigest(cloudflared)
+  : undefined;
+if (!cilium?.ociManifestDigest || !cilium.archiveURL || !cloudflaredManifest)
   throw new Error("bootstrap_version_lock_invalid");
 export const PLATFORM_ARTIFACTS = {
-  cloudflared: { image: `${cloudflared.reference}@${cloudflared.indexDigest}` },
+  cloudflared: { image: `${cloudflared!.reference}@${cloudflaredManifest}` },
   cilium: {
     version: cilium.chartVersion,
     filename: `cilium-${cilium.chartVersion}.tgz`,

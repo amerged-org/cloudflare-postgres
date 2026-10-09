@@ -192,7 +192,7 @@ async function nodeRow(db: D1Database, id: string): Promise<NodeReleaseRow> {
   if (!row) throw new ApiError("not_found", "Node not found");
   return row;
 }
-function mismatches(
+export function mismatches(
   spec: FleetReleaseSpec,
   roleName: "control_relay" | "customer",
   facts: FleetNodeReleaseObservation["facts"],
@@ -220,6 +220,43 @@ function mismatches(
     facts.configuration_schema_revision !== spec.configuration_schema_revision
   )
     result.push("configuration_schema_revision");
+  if (spec.platform_source_commit) {
+    if (facts.platform_source_commit === undefined)
+      result.push("unobserved/platform_source_commit");
+    else if (facts.platform_source_commit !== spec.platform_source_commit)
+      result.push("platform_source_commit");
+  }
+  if (role.kubernetes_images) {
+    const proof = facts.kubernetes_image_provenance,
+      keys = proof?.control_plane
+        ? (["kubelet", "apiServer", "controllerManager", "scheduler"] as const)
+        : (["kubelet"] as const);
+    if (!proof) result.push("unobserved/kubernetes_images");
+    else {
+      if (
+        facts.kubernetes_control_plane !== proof.control_plane ||
+        facts.kubelet_version?.replace(/^v/, "") !==
+          proof.kubelet_version.replace(/^v/, "")
+      )
+        result.push("kubernetes_images/identity");
+      for (const key of keys) {
+        const value = proof.images[key],
+          expected = role.kubernetes_images[key];
+        if (!value) result.push(`unobserved/kubernetes_images/${key}`);
+        else if (
+          value.configuration !== expected ||
+          value.runtime_sha256 !== expected.slice(-64)
+        )
+          result.push(`kubernetes_images/${key}`);
+        if (key !== "kubelet") {
+          if (facts.kubernetes_static_images?.[key] === undefined)
+            result.push(`unobserved/kubernetes_static_images/${key}`);
+          else if (facts.kubernetes_static_images[key] !== expected.slice(-64))
+            result.push(`kubernetes_static_images/${key}`);
+        }
+      }
+    }
+  }
   const wantedNames = new Set([...role.components, ...role.talos_extensions]);
   const observed = new Map(
     facts.components.map((value) => [value.name, value]),
@@ -276,6 +313,43 @@ export async function readFleetNodeRelease(
         : differences.length
           ? "pending"
           : "converged";
+    }
+  }
+  if (
+    state === "converged" &&
+    (await db
+      .prepare(
+        `SELECT 1 waiting FROM fleet_patch_operations h WHERE h.node_id=? AND h.node_uid=? AND h.release_id=? AND h.assignment_revision=? AND h.stage='host_ready' AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations f WHERE f.finalization_of=h.operation_id AND f.stage='complete' AND f.state='confirmed') LIMIT 1`,
+      )
+      .bind(row.node_id, row.node_uid, row.release_id, row.revision)
+      .first())
+  ) {
+    state = "pending";
+    differences.push("unobserved/regional_runtime_activation");
+  }
+  if (
+    state === "converged" &&
+    desired?.spec.roles[row.role!].host_configuration_required &&
+    !(await db
+      .prepare(
+        `SELECT 1 current FROM node_host_configurations h JOIN regions r ON r.id=h.region_id JOIN node_compute_pool_policies p ON p.node_id=h.node_id JOIN node_compute_pool_observations o ON o.node_id=h.node_id WHERE h.node_id=? AND h.node_uid=? AND h.release_id=? AND h.material_revision=r.bootstrap_material_revision AND o.node_uid=h.node_uid AND o.policy_revision=p.revision AND o.material_revision=h.material_revision AND julianday(o.observed_at)>=julianday('now','-120 seconds') AND EXISTS(SELECT 1 FROM fleet_patch_operations f WHERE f.node_id=h.node_id AND f.node_uid=h.node_uid AND f.release_id=h.release_id AND f.assignment_revision=? AND f.material_revision=h.material_revision AND f.stage='complete' AND f.state='confirmed')`,
+      )
+      .bind(row.node_id, row.node_uid, row.release_id, row.revision)
+      .first())
+  ) {
+    state = "pending";
+    differences.push("unobserved/current_material_runtime");
+  }
+  if (state === "converged") {
+    const { readCurrentNodeThinStorage } =
+        await import("./node-thin-storage.ts"),
+      storage = await readCurrentNodeThinStorage({ DB: db }, id);
+    if (
+      (desired?.spec.thin_storage_qualification || storage) &&
+      !storage?.authority?.write_allowed
+    ) {
+      state = "pending";
+      differences.push("unobserved/current_material_storage");
     }
   }
   return FleetNodeReleaseStatus.parse({
@@ -371,11 +445,133 @@ export async function observeFleetNodeRelease(
     Date.parse(input.observed_at) > now + 5000
   )
     return conflict("Fleet observation is not fresh");
+  // Only the qualified Native patch completion writes a new deployment receipt.
+  // Ordinary Regional inventory can retain that receipt, never create one.
+  if (
+    input.facts.talos_provenance !== undefined ||
+    input.facts.kubernetes_image_provenance !== undefined
+  )
+    return conflict(
+      "Deployment provenance is written by the qualified patch executor",
+    );
+  const before = await nodeRow(c.env.DB, input.node_id);
+  if (before.region_id !== region.id || !before.release_id || !before.role)
+    return conflict("Fleet observation authority or node identity changed");
+  const selected = await release(c.env.DB, before.release_id),
+    role = selected.spec.roles[before.role],
+    old = before.facts_json
+      ? FleetNodeReleaseObservation.shape.facts.parse(
+          JSON.parse(before.facts_json),
+        )
+      : null,
+    receipt = old?.talos_provenance,
+    version = (value: string | undefined) => value?.replace(/^v/, "");
+  if (
+    input.facts.components.some((component) =>
+      role.talos_extensions.includes(component.name),
+    )
+  )
+    return conflict(
+      "Loaded OS extension facts are written by the qualified patch executor",
+    );
+  const receiptCurrent = !!(
+    receipt &&
+    old &&
+    before.node_uid === input.node_uid &&
+    before.assigned_uid === input.node_uid &&
+    before.observed_uid === input.node_uid &&
+    before.lost_at === null &&
+    before.revision === input.assignment_revision &&
+    before.observed_revision === input.assignment_revision &&
+    before.agent_key_hash === region.agent_key_hash &&
+    before.observed_agent_key_hash === region.agent_key_hash &&
+    receipt.node_uid === input.node_uid &&
+    receipt.boot_id === old.boot_id &&
+    receipt.installer === old.talos_installer &&
+    receipt.installer === role.talos_installer &&
+    old.talos_schematic_sha256 === role.talos_schematic_sha256 &&
+    version(old.talos_version) === version(role.talos_version)
+  );
+  // Missing runtime identity cannot extend the lifetime of the previous proof.
+  // Keep its original timestamp so a later valid report can recover or it becomes stale.
+  if (receiptCurrent && (!input.facts.boot_id || !input.facts.talos_version))
+    return conflict(
+      "Fresh boot identity and Talos version are required for deployment provenance",
+    );
+  const preserve =
+    receiptCurrent &&
+    input.facts.boot_id === old!.boot_id &&
+    version(input.facts.talos_version) === version(old!.talos_version) &&
+    (input.facts.talos_installer === undefined ||
+      input.facts.talos_installer === old!.talos_installer) &&
+    (input.facts.talos_schematic_sha256 === undefined ||
+      input.facts.talos_schematic_sha256 === old!.talos_schematic_sha256);
+  const kubeProof = old?.kubernetes_image_provenance;
+  const preserveKube =
+    preserve &&
+    !!kubeProof &&
+    input.facts.kubernetes_control_plane === kubeProof.control_plane &&
+    version(input.facts.kubelet_version) ===
+      version(kubeProof.kubelet_version) &&
+    version(input.facts.kubelet_version) === version(old?.kubelet_version) &&
+    version(input.facts.kubelet_version) === version(role.kubernetes_version) &&
+    !!role.kubernetes_images &&
+    Object.entries(kubeProof.images).every(
+      ([name, value]) =>
+        value.configuration ===
+          role.kubernetes_images?.[
+            name as keyof typeof role.kubernetes_images
+          ] && value.runtime_sha256 === value.configuration.slice(-64),
+    );
+  const facts = preserve
+    ? {
+        ...input.facts,
+        talos_installer: old!.talos_installer,
+        talos_schematic_sha256: old!.talos_schematic_sha256,
+        talos_provenance: receipt,
+        components: [
+          ...input.facts.components,
+          ...old!.components.filter(
+            (component) =>
+              role.talos_extensions.includes(component.name) &&
+              selected.spec.components.some(
+                (pin) =>
+                  pin.name === component.name &&
+                  pin.version === component.version &&
+                  pin.sha256 === component.sha256,
+              ),
+          ),
+        ],
+        ...(preserveKube ? { kubernetes_image_provenance: kubeProof } : {}),
+      }
+    : input.facts;
+  // Fence the exact prior observation. A concurrent Native receipt must win over
+  // a partial merge prepared before that receipt was committed.
+  const previous =
+    before.facts_json === null
+      ? {
+          sql: "NOT EXISTS(SELECT 1 FROM fleet_node_release_observations o WHERE o.node_id=?)",
+          bindings: [input.node_id],
+        }
+      : {
+          sql: `EXISTS(SELECT 1 FROM fleet_node_release_observations o WHERE o.node_id=? AND o.node_uid=?
+        AND o.assignment_revision=? AND o.agent_key_hash=? AND o.observed_at=? AND o.facts_json=?)`,
+          bindings: [
+            input.node_id,
+            before.observed_uid,
+            before.observed_revision,
+            before.observed_agent_key_hash,
+            before.observed_at,
+            before.facts_json,
+          ],
+        };
   const result = await c.env.DB.prepare(
     `INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at)
     SELECT ?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id JOIN fleet_node_releases a ON a.node_id=n.id
-      WHERE n.id=? AND n.region_id=? AND n.node_uid=? AND n.lost_at IS NULL AND r.agent_key_hash=? AND a.node_uid=n.node_uid AND a.revision=?)
+      WHERE n.id=? AND n.region_id=? AND n.node_uid=? AND n.lost_at IS NULL AND r.agent_key_hash=? AND a.node_uid=n.node_uid AND a.revision=?
+        AND a.release_id=? AND a.role=? AND EXISTS(SELECT 1 FROM fleet_releases f WHERE f.id=a.release_id AND f.spec_sha256=?))
       AND julianday(?)>=julianday('now','-180 seconds') AND julianday(?)<=julianday('now','+5 seconds')
+      AND (${previous.sql})
     ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,assignment_revision=excluded.assignment_revision,
       agent_key_hash=excluded.agent_key_hash,facts_json=excluded.facts_json,observed_at=excluded.observed_at,received_at=excluded.received_at
       WHERE excluded.observed_at>fleet_node_release_observations.observed_at
@@ -388,7 +584,7 @@ export async function observeFleetNodeRelease(
       input.node_uid,
       input.assignment_revision,
       region.agent_key_hash,
-      canonical(input.facts),
+      canonical(facts),
       input.observed_at,
       new Date(now).toISOString(),
       input.node_id,
@@ -396,8 +592,12 @@ export async function observeFleetNodeRelease(
       input.node_uid,
       region.agent_key_hash,
       input.assignment_revision,
+      before.release_id,
+      before.role,
+      selected.spec_sha256,
       input.observed_at,
       input.observed_at,
+      ...previous.bindings,
     )
     .run();
   if (result.meta.changes !== 1)

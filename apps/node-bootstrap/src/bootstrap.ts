@@ -34,6 +34,50 @@ export { BootstrapError } from "./bootstrap-error.ts";
 import { TALOS_VERSION, KUBERNETES_VERSION } from "./platform-artifacts.ts";
 export { TALOS_VERSION, KUBERNETES_VERSION } from "./platform-artifacts.ts";
 export const CHUNK_BYTES = 16 * 1024 ** 2;
+export function bootstrapStorageDocuments(spec: NodeBootstrapSpec) {
+  return [
+    {
+      apiVersion: "v1alpha1",
+      kind: "VolumeConfig",
+      name: "EPHEMERAL",
+      provisioning: {
+        diskSelector: { match: "system_disk" },
+        grow: false,
+        minSize: `${spec.storage.ephemeral_gib}GiB`,
+        maxSize: `${spec.storage.ephemeral_gib}GiB`,
+      },
+      mount: { secure: true },
+    },
+    {
+      apiVersion: "v1alpha1",
+      kind: "RawVolumeConfig",
+      name: "pgcf-lvm",
+      provisioning: {
+        diskSelector: { match: "system_disk" },
+        grow: false,
+        minSize: `${spec.storage.lvm_gib}GiB`,
+        maxSize: `${spec.storage.lvm_gib}GiB`,
+      },
+    },
+    {
+      apiVersion: "v1alpha1",
+      kind: "LVMVolumeGroupConfig",
+      name: "pgcf",
+      provisioning: {
+        volumeSelector: { match: 'volume.partition_label == "r-pgcf-lvm"' },
+      },
+    },
+    ...(spec.postjoin_release
+      ? [
+          {
+            apiVersion: "v1alpha1",
+            kind: "KernelModuleConfig",
+            name: "dm_thin_pool",
+          },
+        ]
+      : []),
+  ];
+}
 const MAX_COMMAND_MS = 540_000;
 const OUTPUT_LIMIT = 512 * 1024;
 const RECORD = "\n__PGCF_RECORD__\n";
@@ -243,6 +287,51 @@ function assertBundleIdentity(
   ) {
     throw new BootstrapError("cluster_identity_mismatch");
   }
+}
+
+/** Custody can retain an obsolete local proxy. Each execution pins only its current authorized bridge. */
+export function nativeTalosConfig(
+  text: string,
+  address: string,
+  proxyUrl: string,
+) {
+  const config = record(parse(text)),
+    contexts = record(config.contexts),
+    context = record(contexts[String(config.context)]);
+  if (!context.ca || !context.crt || !context.key)
+    throw new BootstrapError("talosconfig_credentials_invalid");
+  context["proxy-url"] = proxyUrl;
+  context.endpoints = [address];
+  context.nodes = [address];
+  return stringify(config);
+}
+export function nativeKubeconfig(
+  text: string,
+  endpoint: string,
+  proxyUrl?: string,
+) {
+  const config = record(parse(text)),
+    clusters = array(config.clusters);
+  if (clusters.length !== 1)
+    throw new BootstrapError("kubeconfig_cluster_invalid");
+  const cluster = record(clusters[0]!.cluster);
+  if (
+    cluster.server !== endpoint ||
+    cluster["insecure-skip-tls-verify"] ||
+    !cluster["certificate-authority-data"]
+  )
+    throw new BootstrapError("kubeconfig_identity_invalid");
+  const users = array(config.users);
+  if (
+    users.length !== 1 ||
+    !record(users[0]!.user)["client-certificate-data"] ||
+    !record(users[0]!.user)["client-key-data"] ||
+    record(users[0]!.user).exec
+  )
+    throw new BootstrapError("kubeconfig_credentials_invalid");
+  if (proxyUrl) cluster["proxy-url"] = proxyUrl;
+  else delete cluster["proxy-url"];
+  return stringify(config);
 }
 
 export function assertAuthority(
@@ -1199,39 +1288,7 @@ export class BootstrapJob {
         hostDNS: { enabled: true, forwardKubeDNSToHost: true },
       },
     ];
-    const storage = [
-      {
-        apiVersion: "v1alpha1",
-        kind: "VolumeConfig",
-        name: "EPHEMERAL",
-        provisioning: {
-          diskSelector: { match: "system_disk" },
-          grow: false,
-          minSize: `${spec.storage.ephemeral_gib}GiB`,
-          maxSize: `${spec.storage.ephemeral_gib}GiB`,
-        },
-        mount: { secure: true },
-      },
-      {
-        apiVersion: "v1alpha1",
-        kind: "RawVolumeConfig",
-        name: "pgcf-lvm",
-        provisioning: {
-          diskSelector: { match: "system_disk" },
-          grow: false,
-          minSize: `${spec.storage.lvm_gib}GiB`,
-          maxSize: `${spec.storage.lvm_gib}GiB`,
-        },
-      },
-      {
-        apiVersion: "v1alpha1",
-        kind: "LVMVolumeGroupConfig",
-        name: "pgcf",
-        provisioning: {
-          volumeSelector: { match: 'volume.partition_label == "r-pgcf-lvm"' },
-        },
-      },
-    ];
+    const storage = bootstrapStorageDocuments(spec);
     const reservations = {
       apiVersion: "v1alpha1",
       kind: "KubeletConfig",
@@ -1358,32 +1415,17 @@ export class BootstrapJob {
       await this.checkpoint("config_prepared");
   }
   private async writeKubeconfig(text: string) {
-    const config = record(parse(text));
-    const clusters = array(config.clusters);
-    if (clusters.length !== 1)
-      throw new BootstrapError("kubeconfig_cluster_invalid");
-    const cluster = record(clusters[0]!.cluster);
-    if (
-      cluster.server !== this.input.spec.cluster_endpoint ||
-      cluster["insecure-skip-tls-verify"] ||
-      !cluster["certificate-authority-data"]
-    ) {
-      throw new BootstrapError("kubeconfig_identity_invalid");
-    }
-    const users = array(config.users);
-    if (
-      users.length !== 1 ||
-      !record(users[0]!.user)["client-certificate-data"] ||
-      !record(users[0]!.user)["client-key-data"] ||
-      record(users[0]!.user).exec
-    ) {
-      throw new BootstrapError("kubeconfig_credentials_invalid");
-    }
-    if (this.nativeProxy) cluster["proxy-url"] = this.nativeProxy.url;
-    else delete cluster["proxy-url"];
-    await writeFile(join(this.directory, "kubeconfig"), stringify(config), {
-      mode: 0o600,
-    });
+    await writeFile(
+      join(this.directory, "kubeconfig"),
+      nativeKubeconfig(
+        text,
+        this.input.spec.cluster_endpoint,
+        this.nativeProxy?.url,
+      ),
+      {
+        mode: 0o600,
+      },
+    );
   }
   private async authenticatedReadback() {
     const version = await this.talos(["version", "--json"]);

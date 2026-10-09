@@ -13,6 +13,17 @@ import {
 } from "./domain/bootstrap-jobs.ts";
 import { readNodeAddition } from "./domain/node-state.ts";
 import {
+  fleetPatchInput,
+  recordFleetPatchFailure,
+} from "./domain/fleet-patches.ts";
+import {
+  thinStorageInput,
+  prepareThinStorageLease,
+  readThinStorageLeaseRow,
+} from "./domain/node-thin-storage-execution.ts";
+import { NodeId } from "@pgcf/contracts";
+import { FleetPatchStatus } from "@pgcf/contracts/fleet-patches";
+import {
   prepareNodeInspectionInput,
   assertNodeInspectionInputCurrent,
 } from "./domain/node-inspection.ts";
@@ -181,6 +192,130 @@ async function statusIdentifierHash(value: string) {
 }
 
 export class NodeBootstrap extends DurableObject<Env> {
+  async thinStorage(nodeId: string) {
+    NodeId.parse(nodeId);
+    if (
+      !this.ctx.id.equals(
+        this.env.NODE_BOOTSTRAP.idFromName(`thin-storage:${nodeId}`),
+      )
+    )
+      throw new Error("thin_storage_container_identity_mismatch");
+    const input = await thinStorageInput(this.env, nodeId),
+      container = this.ctx.container;
+    if (!container) throw new Error("thin_storage_container_unavailable");
+    const serverBearer = await this.ctx.blockConcurrencyWhile(async () => {
+      const existing = await this.ctx.storage.get<string>(
+        "thinStorageServerBearer",
+      );
+      if (existing) return existing;
+      const value = crypto.randomUUID() + crypto.randomUUID();
+      await this.ctx.storage.put("thinStorageServerBearer", value);
+      return value;
+    });
+    if (!container.running)
+      container.start({
+        enableInternet: true,
+        env: { PORT: "8080", PGCF_BOOTSTRAP_SERVER_BEARER: serverBearer },
+      });
+    await this.ctx.storage.put("thinStorageNodeId", nodeId);
+    await container.setInactivityTimeout(120000);
+    await this.ctx.storage.setAlarm(Date.parse(input.lease.expires_at) + 1000);
+    await this.#waitForPort(container);
+    const current = await thinStorageInput(this.env, nodeId);
+    if (current.lease.revision !== input.lease.revision)
+      throw new Error("thin_storage_container_input_changed");
+    // The container bearer is fixed at start. A separate current lease bearer is only inside private input.
+    const response = await container.getTcpPort(8080).fetch(
+      new Request("http://localhost:8080/v1/thin-storage", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${serverBearer}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(current),
+        signal: AbortSignal.timeout(95000),
+      }),
+    );
+    if (!response.ok) {
+      const raw = (await response.json().catch(() => null)) as {
+        error_code?: unknown;
+      } | null;
+      const code =
+        typeof raw?.error_code === "string" &&
+        /^thin_storage_[a-z0-9_]{1,80}$/.test(raw.error_code)
+          ? raw.error_code
+          : "thin_storage_executor_unconfirmed";
+      await this.env.DB.prepare(
+        "UPDATE node_thin_storage SET status='blocked',error_code=? WHERE node_id=? AND lease_id=? AND lease_revision=?",
+      )
+        .bind(code, nodeId, input.lease.operation_id, input.lease.revision)
+        .run();
+      throw new Error(code);
+    }
+    const result = await response.json();
+    await this.ctx.storage.setAlarm(
+      Math.max(
+        Date.now() + 1000,
+        Date.parse(input.lease.issued_at) +
+          input.lease.profile.guard_seconds * 500,
+      ),
+    );
+    return result;
+  }
+  async patch(operationId: string) {
+    OperationId.parse(operationId);
+    if (
+      !this.ctx.id.equals(
+        this.env.NODE_BOOTSTRAP.idFromName(`fleet-patch:${operationId}`),
+      )
+    )
+      throw new Error("patch_container_identity_mismatch");
+    const input = await fleetPatchInput(this.env, operationId),
+      container = this.ctx.container;
+    if (!container) throw new Error("patch_container_unavailable");
+    if (!container.running)
+      container.start({
+        enableInternet: true,
+        env: {
+          PORT: "8080",
+          PGCF_BOOTSTRAP_SERVER_BEARER: input.callback.bearer,
+        },
+      });
+    await container.setInactivityTimeout(660_000);
+    await this.ctx.storage.setAlarm(Date.now() + 660_000);
+    await this.#waitForPort(container);
+    const current = await fleetPatchInput(this.env, operationId);
+    if (current.status.revision !== input.status.revision)
+      throw new Error("patch_container_input_changed");
+    const response = await container.getTcpPort(8080).fetch(
+      new Request("http://localhost:8080/v1/patches", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${input.callback.bearer}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(current),
+        signal: AbortSignal.timeout(610_000),
+      }),
+    );
+    if (!response.ok) {
+      const raw = await inspectionStatusBody(
+        response,
+        AbortSignal.timeout(5000),
+      ).catch(() => null);
+      const code =
+        typeof raw === "object" &&
+        raw !== null &&
+        "error_code" in raw &&
+        typeof raw.error_code === "string" &&
+        /^patch_[a-z0-9_]{1,80}$/.test(raw.error_code)
+          ? raw.error_code
+          : "patch_executor_refused";
+      await recordFleetPatchFailure(this.env, operationId, code);
+      throw new Error(code);
+    }
+    return FleetPatchStatus.parse(await response.json());
+  }
   private proofTurn: Promise<void> = Promise.resolve();
   async #registrationAuthority(operationId: string, admission: boolean) {
     const row = await readBootstrapJob(this.env.DB, operationId),
@@ -1311,6 +1446,33 @@ export class NodeBootstrap extends DurableObject<Env> {
     return bootstrapJobStatus(await readBootstrapJob(this.env.DB, operationId));
   }
   override async alarm() {
-    await this.ctx.container?.destroy();
+    const nodeId = await this.ctx.storage.get<string>("thinStorageNodeId");
+    if (!nodeId) {
+      await this.ctx.container?.destroy();
+      return;
+    }
+    try {
+      const row = await readThinStorageLeaseRow(this.env, nodeId);
+      if (row.error_code) {
+        await this.ctx.container?.destroy();
+        return;
+      }
+      const prepared = await prepareThinStorageLease(this.env, nodeId);
+      if (prepared) {
+        await this.thinStorage(nodeId);
+        return;
+      }
+      const current = await readThinStorageLeaseRow(this.env, nodeId);
+      if (current.lease_expires_at)
+        await this.ctx.storage.setAlarm(
+          Math.max(
+            Date.now() + 1000,
+            Date.parse(current.lease_expires_at) + 1000,
+          ),
+        );
+    } catch {
+      // A dispatched action remains durable; a timer never clears or repeats an unknown write.
+      await this.ctx.container?.destroy();
+    }
   }
 }

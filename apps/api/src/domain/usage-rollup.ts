@@ -92,10 +92,17 @@ export function computeUsageHour(
           awake ? resources.cpu_millicores * seconds : 0,
           resources.reserved_memory_mib * seconds,
           resources.reserved_cpu_millicores * seconds,
-          resources.storage_allocated_bytes * seconds,
+          resources.storage_allocated_bytes === null
+            ? null
+            : resources.storage_allocated_bytes * seconds,
         ];
-        for (const [index, key] of resourceMetrics.entries())
-          if (metrics[key] !== null) metrics[key] += values[index]!;
+        for (const [index, key] of resourceMetrics.entries()) {
+          const value = values[index];
+          if (value == null) {
+            metrics[key] = null;
+            gaps.add(key);
+          } else if (metrics[key] !== null) metrics[key] += value;
+        }
       }
     }
     cursor = until;

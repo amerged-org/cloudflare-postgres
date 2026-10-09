@@ -14,15 +14,10 @@ spec:
   dependsOn:
     - name: cilium
       namespace: flux-system
-  chart:
-    spec:
-      chart: openebs
-      version: 4.6.1
-      sourceRef:
-        kind: HelmRepository
-        name: openebs-charts
-        namespace: flux-system
-      interval: 1h
+  chartRef:
+    kind: OCIRepository
+    name: openebs-chart
+    namespace: flux-system
   install:
     crds: CreateReplace
     remediation:

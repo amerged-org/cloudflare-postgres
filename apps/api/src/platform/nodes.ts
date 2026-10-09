@@ -269,6 +269,8 @@ export async function getCapacityPolicy(
       maximum_database_memory_mib: number | null;
       postgres_memory_request_mib: number | null;
       standing_cost_profile: string | null;
+      compute_pool_json: string | null;
+      thin_storage_json: string | null;
     }>();
   if (!row)
     throw new ApiError("not_found", "Region capacity policy is not configured");
@@ -283,6 +285,12 @@ export async function getCapacityPolicy(
       placement_mode: row.placement_mode,
       maximum_database_memory_mib: row.maximum_database_memory_mib,
       postgres_memory_request_mib: row.postgres_memory_request_mib,
+      ...(row.compute_pool_json
+        ? { compute_pool: JSON.parse(row.compute_pool_json) }
+        : {}),
+      ...(row.thin_storage_json
+        ? { thin_storage: JSON.parse(row.thin_storage_json) }
+        : {}),
       standing_cost_profile:
         row.standing_cost_profile === null
           ? null
@@ -311,6 +319,12 @@ export async function setCapacityPolicy(
     maximum_database_memory_mib: policy.maximum_database_memory_mib,
     postgres_memory_request_mib: policy.postgres_memory_request_mib,
     standing_cost_profile: policy.standing_cost_profile,
+    ...(policy.compute_pool === undefined
+      ? {}
+      : { compute_pool: policy.compute_pool }),
+    ...(policy.thin_storage === undefined
+      ? {}
+      : { thin_storage: policy.thin_storage }),
     autoscale_enabled: policy.autoscale_enabled,
     adopt_instance_ids: policy.adopt_instance_ids,
   });

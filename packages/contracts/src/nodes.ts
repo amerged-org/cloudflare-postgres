@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { ThinStorageProfile } from "./database-storage.ts";
 import { z } from "zod";
 import { Timestamp } from "./api.ts";
 import { NodeId, OperationId, RegionId } from "./ids.ts";
@@ -6,6 +7,7 @@ import {
   MonthlyInfrastructureAmount,
   InfrastructureCurrency,
 } from "./costs.ts";
+import { ComputePoolPolicy } from "./compute-pool.ts";
 
 export const ProviderInstanceId = z
   .string()
@@ -168,6 +170,8 @@ export const NodeRegionPolicy = z
       .nullable()
       .default(null),
     standing_cost_profile: StandingNodeCostProfile.nullable().default(null),
+    compute_pool: ComputePoolPolicy.nullable().optional(),
+    thin_storage: ThinStorageProfile.nullable().optional(),
   })
   .superRefine((policy, context) => {
     if (

@@ -65,6 +65,14 @@ const IDENTITY = `SELECT pg_catalog.current_database() AS database,
 const SWITCH = `WITH switched AS MATERIALIZED (SELECT pg_catalog.pg_switch_wal() AS lsn)
   SELECT lsn::pg_catalog.text AS lsn,pg_catalog.pg_walfile_name(lsn-1) AS segment FROM switched`;
 const ARCHIVE_STATUS = `SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_ls_archive_statusdir() WHERE name=$1) AS done`;
+/** Authoritative statements for the native controller migration. */
+export const SLEEP_SQL = Object.freeze({
+  CLEAR,
+  GUARD,
+  IDENTITY,
+  SWITCH,
+  ARCHIVE_STATUS,
+});
 class Refusal extends Error {
   readonly reason: SleepRefusal;
   constructor(reason: SleepRefusal) {

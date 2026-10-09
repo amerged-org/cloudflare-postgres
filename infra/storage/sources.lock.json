@@ -1,0 +1,52 @@
+{
+  "version": 1,
+  "platform": "linux/amd64",
+  "driver": {
+    "version": "1.10.1",
+    "upstream_image": "docker.io/openebs/lvm-driver",
+    "image_index_digest": "sha256:41f73aba7f31eee4a033053d9c2f203e007a838c14823f3fd472c50651a98999",
+    "source": "https://github.com/openebs/lvm-localpv",
+    "source_commit": "e8a234cbfeef5fa16fde1330c8de2d91e31831f1",
+    "license": "Apache-2.0",
+    "binary_sha256": "50a9ede8031deae0adf2431f960c0979b305b54dc7950b170a54cc4613d4fdb1",
+    "lvm_binary_sha256": "fdc5aa9706d9982553ff4ee8497e4236dbfba4e790a8b81883789739e0176546",
+    "runtime_config": {
+      "Env": [
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+      ],
+      "Entrypoint": ["/usr/local/bin/lvm-driver"],
+      "Cmd": null,
+      "User": "",
+      "WorkingDir": "/",
+      "StopSignal": null,
+      "ExposedPorts": {
+        "7676/tcp": {}
+      },
+      "Volumes": null
+    }
+  },
+  "thin_tools": {
+    "package": "thin-provisioning-tools",
+    "package_version": "1.1.0-r0",
+    "version": "1.1.0",
+    "architecture": "x86_64",
+    "url": "https://dl-cdn.alpinelinux.org/alpine/v3.22/community/x86_64/thin-provisioning-tools-1.1.0-r0.apk",
+    "bytes": 919148,
+    "sha256": "88d98bb7034823d5184d873e8eef05ae6ec9a9880fdcd6c1bbc12e1484fdd829",
+    "signature_verification": "apk uses the inherited official Alpine signing keys; --allow-untrusted is prohibited",
+    "upstream_source": "https://github.com/jthornber/thin-provisioning-tools",
+    "aports_commit": "762509bd43991ba3eea658b94856ce648b9038b2",
+    "source_archive_url": "https://distfiles.alpinelinux.org/distfiles/v3.22/thin-provisioning-tools-1.1.0.tar.gz",
+    "source_archive_sha256": "fef778119046e6057aabcc087685aafefe62eb3a65febba639482e72c85a59ed",
+    "source_archive_sha512": "8cf3953743334b5a34504695757fa2de5a5fb5bdb8c7aed859995154fc004f52c3ef041558d307a2309c2de8dcdcbd8a0537bd3408fd78c7ff2f641f28944c1e",
+    "binary_sha256": "940fee125b98d0381c4084d791d1975e99758f774869f145543636eacecd796d",
+    "binary_bytes": 2005240,
+    "license": "GPL-3.0-only",
+    "license_sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986"
+  },
+  "container_assembly": {
+    "first_party_license": "Apache-2.0",
+    "inherit_other_upstream_package_licenses": true,
+    "corresponding_source_path": "/usr/share/pgcf/thin-provisioning-tools-1.1.0.tar.gz"
+  }
+}

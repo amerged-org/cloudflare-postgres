@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "constants": {
+    "ID_ALPHABET": "abcdefghijklmnopqrstuvwxyz0123456789",
+    "SLEEP_SQL": {
+      "CLEAR": "SELECT pg_catalog.pg_stat_clear_snapshot()",
+      "GUARD": "SELECT\n  (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_stat_activity\n    WHERE datid IS NOT NULL AND pid <> pg_catalog.pg_backend_pid()\n      AND (state IS DISTINCT FROM 'idle' OR xact_start IS NOT NULL)) AS busy,\n  (SELECT pg_catalog.count(*)::pg_catalog.int4 FROM pg_catalog.pg_prepared_xacts) AS prepared",
+      "IDENTITY": "SELECT pg_catalog.current_database() AS database,\n  pg_catalog.pg_is_in_recovery() AS recovery,\n  (SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid=pg_catalog.pg_backend_pid()) AS tls,\n  r.rolsuper,r.rolcreatedb,r.rolcreaterole,r.rolreplication,r.rolbypassrls,\n  pg_catalog.pg_has_role(r.oid,'pg_read_all_stats','MEMBER') AS stats\n  FROM pg_catalog.pg_roles r WHERE r.rolname=$1\n    AND r.rolname=pg_catalog.current_setting('session_authorization')",
+      "SWITCH": "WITH switched AS MATERIALIZED (SELECT pg_catalog.pg_switch_wal() AS lsn)\n  SELECT lsn::pg_catalog.text AS lsn,pg_catalog.pg_walfile_name(lsn-1) AS segment FROM switched",
+      "ARCHIVE_STATUS": "SELECT EXISTS(SELECT 1 FROM pg_catalog.pg_ls_archive_statusdir() WHERE name=$1) AS done"
+    },
+    "SLEEP_REFUSALS": [
+      "invalid_input",
+      "not_quiescent",
+      "sql_busy",
+      "prepared_work",
+      "sql_unknown",
+      "probe_unavailable",
+      "switch_unknown",
+      "archive_timeout",
+      "aborted"
+    ],
+    "WAKE_PHASES": [
+      "wake_prepare",
+      "desired_apply",
+      "archive_metrics",
+      "ca_publication",
+      "desired_applied",
+      "role_runtime_auth",
+      "volume_identity",
+      "runtime_unchanged",
+      "fence_release",
+      "observation_post"
+    ],
+    "GATEWAY_RETIRE_HOLD_MS": 65000,
+    "STORAGE_PROTECTION_LEDGER_KEY": "storage-protection.json",
+    "STORAGE_AUTHORITY_LEDGER_KEY": "write-authority"
+  }
+}

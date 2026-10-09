@@ -48,6 +48,10 @@ const BootstrapMaterialDigest = z.string().regex(/^[a-f0-9]{64}$/);
 export const RegionBootstrapMaterialUpdate = z.strictObject({
   expected_revision: z.number().int().min(1).max(2147483646),
   kubernetes_version: z.enum(["1.36.3", "1.36.5"]),
+  talos_version: z
+    .string()
+    .regex(/^v?\d+\.\d+\.\d+$/)
+    .optional(),
   expected_seed_sha256: BootstrapMaterialDigest,
   expected_join_sha256: BootstrapMaterialDigest,
   seed_sha256: BootstrapMaterialDigest,
@@ -57,6 +61,10 @@ export const RegionBootstrapMaterialUpdate = z.strictObject({
     observed_at: Timestamp,
     kube_system_uid: z.uuid(),
     kubernetes_version: z.enum(["1.36.3", "1.36.5"]),
+    talos_version: z
+      .string()
+      .regex(/^v?\d+\.\d+\.\d+$/)
+      .optional(),
     nodes: z
       .array(
         z.strictObject({
@@ -77,6 +85,10 @@ export const RegionBootstrapMaterialStatus = z.strictObject({
   region_id: RegionId,
   revision: z.number().int().min(1).max(2147483647),
   kubernetes_version: z.enum(["1.36.3", "1.36.5"]),
+  talos_version: z
+    .string()
+    .regex(/^v?\d+\.\d+\.\d+$/)
+    .optional(),
   seed_sha256: BootstrapMaterialDigest,
   join_sha256: BootstrapMaterialDigest,
   provenance_sha256: BootstrapMaterialDigest.nullable(),

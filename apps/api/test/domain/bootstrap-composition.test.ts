@@ -16,7 +16,10 @@ import {
 } from "../../src/domain/bootstrap-jobs.ts";
 import { boundInstallationFixture } from "./installation-fixtures.ts";
 import { cleanupFixtures } from "./fixtures.ts";
+import { standingPostjoinFixture } from "./postjoin-fixture.ts";
+import { readNodePostjoinRelease } from "../../src/domain/node-postjoin-release.ts";
 const regions: string[] = [];
+const releases: string[] = [];
 afterEach(async () => {
   for (const region of regions.splice(0))
     await env.DB.batch([
@@ -28,6 +31,10 @@ afterEach(async () => {
       ).bind(region),
     ]);
   await cleanupFixtures();
+  for (const id of releases.splice(0))
+    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
+      .bind(id)
+      .run();
 });
 async function setup(worker = false) {
   const f = await boundInstallationFixture(worker);
@@ -35,6 +42,39 @@ async function setup(worker = false) {
   return f;
 }
 describe("provider-bound bootstrap composition", () => {
+  it("seals the selected common postjoin release while retaining the original Factory installation image", async () => {
+    const f = await setup(true),
+      id = f.addition.intent.operation_id,
+      selected = await standingPostjoinFixture(f.fixture.region);
+    releases.push(selected.id);
+    const expected = (await readNodePostjoinRelease(env, f.fixture.region))
+      .reference;
+    await recordNodeInstallationInspection(f.bindings, id, 0, f.inspection);
+    await composeConfiguredNodeBootstrap(f.bindings, id, {
+      provider: f.provider,
+      postjoinRelease: expected,
+    });
+    const input = await bootstrapJobInput(
+      f.bindings,
+      await readBootstrapJob(env.DB, id),
+    );
+    expect(input.spec.postjoin_release).toEqual(expected);
+    expect(input.spec.image).toEqual(f.inspection.image);
+    await env.DB.prepare(
+      "UPDATE fleet_region_releases SET revision=2 WHERE region_id=?",
+    )
+      .bind(f.fixture.region)
+      .run();
+    // Existing sealed/destructive intent is immutable, including after policy changes.
+    await composeConfiguredNodeBootstrap(f.bindings, id, {
+      provider: f.provider,
+      postjoinRelease: expected,
+    });
+    expect(
+      (await bootstrapJobInput(f.bindings, await readBootstrapJob(env.DB, id)))
+        .spec,
+    ).toEqual(input.spec);
+  });
   it("joins an existing region using its protected cluster material without another platform", async () => {
     const f = await setup(true),
       id = f.addition.intent.operation_id;

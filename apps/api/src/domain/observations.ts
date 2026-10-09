@@ -3,6 +3,7 @@ import {
   newNodeId,
   ObservationRequest,
   SIDECAR,
+  postgresImageIdMatches,
   type DatabaseObservation,
 } from "@pgcf/contracts";
 import { ApiError } from "../app.ts";
@@ -16,8 +17,11 @@ import { recordNodeStorageObservation } from "./node-storage.ts";
 import {
   recordStartupObservationStatement,
   databaseCpuChargeSql,
+  computePoolOverheadSql,
 } from "./startup-admission.ts";
 
+import { DatabaseRuntimeAttestation } from "@pgcf/contracts/reclaim";
+import { thinStorageDeletionConfirmedSql } from "./storage-capacity.ts";
 export function truncateAgentText(value: string): string {
   const bytes = new TextEncoder().encode(value);
   return bytes.length <= 4096
@@ -39,6 +43,23 @@ export function observationApplies(
     observation.generation !== row.generation ||
     observation.generation < row.observed_generation ||
     receivedAt < row.updated_at
+  )
+    return false;
+  if (
+    observation.state === "ready" &&
+    row.storage_protected_at != null &&
+    (row.storage_protected_generation == null ||
+      row.storage_protected_generation >= row.generation)
+  )
+    return false;
+  if (
+    observation.state === "ready" &&
+    row.desired_postgres_image &&
+    (observation.postgres?.image !== row.desired_postgres_image ||
+      !postgresImageIdMatches(
+        row.desired_postgres_image,
+        observation.postgres?.image_id ?? "",
+      ))
   )
     return false;
   if (
@@ -300,15 +321,36 @@ export async function observations(
       backup?.last_completed_at ?? null,
       backup?.last_failed_at ?? null,
     ].flatMap((value) => [backupAt, backupAt, value]);
+    const runtime = observation.runtime_attestation;
+    if (
+      runtime &&
+      (runtime.database_id !== row.id ||
+        runtime.generation !== row.generation ||
+        runtime.storage_generation !== (row.storage_generation ?? 1) ||
+        runtime.observed_at < receivedAt - 30000 ||
+        runtime.observed_at > receivedAt + 1000)
+    )
+      continue;
     const statements = [
       c.env.DB.prepare(
-        `UPDATE databases SET observed_state=?,observed_power=?,observed_generation=CASE WHEN ? THEN ? ELSE observed_generation END,status_message=?,
+        `UPDATE databases SET runtime_attestation_json=?,observed_postgres_image=CASE WHEN ?='ready' THEN ? ELSE observed_postgres_image END,observed_postgres_image_id=CASE WHEN ?='ready' THEN ? ELSE observed_postgres_image_id END,
+        observed_state=?,observed_power=?,observed_generation=CASE WHEN ? THEN ? ELSE observed_generation END,status_message=?,
       archiving_health_since=CASE WHEN archiving_health<>(${archiveHealth}) THEN ? ELSE archiving_health_since END,archiving_health=(${archiveHealth}),${backupUpdate},updated_at=?
       WHERE id=? AND region_id=? AND generation=? AND observed_generation<=? AND updated_at=? AND desired_state=? AND observed_state=?
+      AND ${runtime ? "EXISTS(SELECT 1 FROM nodes rn WHERE rn.id=databases.node_id AND rn.node_uid=?)" : "1=1"}
+      AND ${observation.state === "deleted" ? thinStorageDeletionConfirmedSql() : "1=1"}
+      AND ${observation.state === "ready" ? "(storage_protected_at IS NULL OR storage_protected_generation<generation)" : "1=1"}
       AND EXISTS(SELECT 1 FROM nodes n WHERE n.id=databases.node_id AND n.region_id=databases.region_id AND (databases.desired_state='deleted' OR n.lost_at IS NULL))
       AND (?<>'ready' OR NOT EXISTS(SELECT 1 FROM database_restores x WHERE x.target_database_id=databases.id)
         OR EXISTS(SELECT 1 FROM database_restores x JOIN operations o ON o.id=x.operation_id WHERE x.target_database_id=databases.id AND x.operation_id=? AND o.status IN('pending','running','succeeded') AND ?=databases.storage_generation))`,
       ).bind(
+        observation.state === "ready" && runtime
+          ? JSON.stringify(DatabaseRuntimeAttestation.parse(runtime))
+          : null,
+        observation.state,
+        observation.postgres?.image ?? null,
+        observation.state,
+        observation.postgres?.image_id ?? null,
         observation.state === "hibernated" ? "provisioning" : observation.state,
         observation.state === "hibernated"
           ? "hibernated"
@@ -334,6 +376,7 @@ export async function observations(
         row.updated_at,
         row.desired_state,
         row.observed_state,
+        ...(runtime ? [runtime.node_uid] : []),
         observation.state,
         observation.recovery?.operation_id ?? null,
         observation.recovery?.storage_generation ?? null,
@@ -345,8 +388,8 @@ export async function observations(
           `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
       SELECT d.id,?,d.node_id,d.size_class_id,d.generation,?,
         json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,
-          'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',${databaseCpuChargeSql("d", "s", true)},
-          'storage_allocated_bytes',s.storage_gib*1073741824)
+          'reserved_memory_mib',s.memory_mib+?+CASE WHEN ${databaseCpuChargeSql("d", "s", true)}=0 THEN 0 ELSE ${computePoolOverheadSql("d", "memory_mib")} END,'reserved_cpu_millicores',${databaseCpuChargeSql("d", "s", true)},
+          'storage_allocated_bytes',CASE WHEN d.storage_profile_json IS NULL THEN s.storage_gib*1073741824 ELSE NULL END)
       FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE changes()=1 AND d.id=? AND d.region_id=?
       AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=? AND kind=? AND generation=?)`,
         ).bind(
@@ -394,7 +437,7 @@ export async function observations(
         statements.push(
           c.env.DB.prepare(
             `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-        SELECT d.id,'woke',d.node_id,d.size_class_id,d.generation,?,json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',${databaseCpuChargeSql()},'storage_allocated_bytes',s.storage_gib*1073741824)
+        SELECT d.id,'woke',d.node_id,d.size_class_id,d.generation,?,json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,'reserved_memory_mib',s.memory_mib+?+CASE WHEN ${databaseCpuChargeSql("d", "s", true)}=0 THEN 0 ELSE ${computePoolOverheadSql("d", "memory_mib")} END,'reserved_cpu_millicores',${databaseCpuChargeSql()},'storage_allocated_bytes',CASE WHEN d.storage_profile_json IS NULL THEN s.storage_gib*1073741824 ELSE NULL END)
         FROM databases d JOIN size_classes s ON s.id=d.size_class_id JOIN operations o ON o.id=d.power_operation AND o.database_id=d.id AND o.generation=d.generation AND o.kind IN('database.resume','database.wake')
         WHERE d.id=? AND d.generation=? AND d.observed_generation=d.generation AND d.observed_state='ready' AND d.observed_power='awake' AND d.updated_at=?
         AND NOT EXISTS(SELECT 1 FROM lifecycle_events WHERE database_id=d.id AND kind='woke' AND generation=d.generation)`,
@@ -455,7 +498,7 @@ export async function observations(
         c.env.DB.prepare(
           `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
           SELECT d.id,'resized',d.node_id,d.size_class_id,d.generation,?,json_object('memory_mib',s.memory_mib,'cpu_millicores',s.cpu_millicores,
-            'reserved_memory_mib',s.memory_mib+?,'reserved_cpu_millicores',${databaseCpuChargeSql()},'storage_allocated_bytes',s.storage_gib*1073741824)
+            'reserved_memory_mib',s.memory_mib+?+CASE WHEN ${databaseCpuChargeSql("d", "s", true)}=0 THEN 0 ELSE ${computePoolOverheadSql("d", "memory_mib")} END,'reserved_cpu_millicores',${databaseCpuChargeSql()},'storage_allocated_bytes',CASE WHEN d.storage_profile_json IS NULL THEN s.storage_gib*1073741824 ELSE NULL END)
           FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=? AND d.region_id=? AND d.generation=?
             AND d.observed_generation=? AND d.observed_state='ready' AND d.updated_at=?
             AND EXISTS(SELECT 1 FROM operations o WHERE o.database_id=d.id AND o.project_id=d.project_id AND o.kind='database.resize' AND o.generation<=d.generation AND o.status IN('pending','running')
@@ -536,10 +579,11 @@ export async function observations(
     accepted += result[0]!.meta.changes;
   }
   if (
-    body.node_memory_samples === undefined ||
-    body.nodes.length ||
-    body.databases.length ||
-    body.orphans.length
+    body.orphans !== undefined &&
+    (body.node_memory_samples === undefined ||
+      body.nodes.length ||
+      body.databases.length ||
+      body.orphans.length)
   )
     await c.env.REGION_LINK.get(
       c.env.REGION_LINK.idFromName(region.id),

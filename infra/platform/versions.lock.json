@@ -1,16 +1,34 @@
 {
   "schemaVersion": 1,
-  "verifiedOn": "2026-10-06",
+  "verifiedOn": "2026-10-09",
   "target": {
-    "talosVersion": "1.14.1",
+    "talosVersion": "1.14.2",
     "kubernetesVersion": "1.36.5",
-    "topology": "Single-node feasibility baseline; no availability guarantee."
+    "topology": "Single-node feasibility baseline; no availability guarantee.",
+    "kubernetesImages": {
+      "kubelet": "ghcr.io/siderolabs/kubelet:v1.36.5@sha256:1454c067accc4b2e913e0385edffc122c1464912eff53a1d56ed4640c46919dd",
+      "apiServer": "registry.k8s.io/kube-apiserver:v1.36.5@sha256:78487f7b4b1a588d9630f758f6677895eabe00d93c4cbbea3d6b06e5f476a371",
+      "controllerManager": "registry.k8s.io/kube-controller-manager:v1.36.5@sha256:a7b63e85c7914ff6d49d97004a09b8a469efa6fe41f58d2c1faa2606ed8cb742",
+      "scheduler": "registry.k8s.io/kube-scheduler:v1.36.5@sha256:249bcbdb401e4882c125e5b6958aab09954ea59d06289af380e60dd58115405e"
+    }
   },
   "flux": {
+    "components": [
+      "source-controller",
+      "kustomize-controller",
+      "helm-controller",
+      "notification-controller"
+    ],
     "version": "v2.9.6",
     "releaseURL": "https://github.com/fluxcd/flux2/releases/tag/v2.9.6",
     "installManifestURL": "https://github.com/fluxcd/flux2/releases/download/v2.9.6/install.yaml",
-    "installManifestSha256": "9c1fda7e401429531ed1478f67ba06b3edff6513b75da7ee47bde9f1c4d4251c"
+    "installManifestSha256": "9c1fda7e401429531ed1478f67ba06b3edff6513b75da7ee47bde9f1c4d4251c",
+    "images": {
+      "source-controller": "ghcr.io/fluxcd/source-controller:v1.9.6@sha256:d10ea2ebeb475de80a6d3caf792578b1eaaa0366c55442d20d7e5f6f78fad3ec",
+      "kustomize-controller": "ghcr.io/fluxcd/kustomize-controller:v1.9.6@sha256:cdab039ed285bfcac5605b92b2f0799c2bff24639b0dc4208671c7b3e828891a",
+      "helm-controller": "ghcr.io/fluxcd/helm-controller:v1.6.5@sha256:777f34e82f901d247cab555e67cdb278a8da509cca7668f5b951bbf15b85f4ad",
+      "notification-controller": "ghcr.io/fluxcd/notification-controller:v1.9.4@sha256:69e484e937549694240d5754541feed0993a162000dbc07e7e262b9f41340348"
+    }
   },
   "charts": [
     {
@@ -23,9 +41,9 @@
       "documentationURL": "https://docs.cilium.io/en/stable/installation/k8s-install-helm/",
       "releaseURL": "https://github.com/cilium/cilium/releases/tag/v1.20.2",
       "renderedImages": [
-        "quay.io/cilium/cilium-envoy:v1.37.6-1789133542-cbec91f666af0bf742da986d43832932dbb26b82@sha256:af7382699576b9e65e9184efa52eeca0b58aea70ad6e511bf260c91d9f740463",
-        "quay.io/cilium/cilium:v1.20.2@sha256:2939231d0d3e3ebddcd80fffa168b7ddcc78fdf0dc864d1c8c126ff523c54f01",
-        "quay.io/cilium/operator-generic:v1.20.2@sha256:64d8798350e8569b8e7622563fed6e44dce2625f311e4651b774816516c744fc"
+        "quay.io/cilium/cilium-envoy:v1.37.6-1789133542-cbec91f666af0bf742da986d43832932dbb26b82@sha256:33b00117d392f24ee5161f66242d12f58ceb62bf80a2bdd66eaf505d77933cb0",
+        "quay.io/cilium/cilium:v1.20.2@sha256:9d308e3f7f05972b0b0604c40d2b0f08fa2f6a55084fef1e1aaadb469e430639",
+        "quay.io/cilium/operator-generic:v1.20.2@sha256:5bb0f9d871dd7b80461f8e3056896daa51e7d9b70ffe51c3e2126b4c35c02b5e"
       ],
       "archiveURL": "https://helm.cilium.io/cilium-1.20.2.tgz"
     },
@@ -33,11 +51,9 @@
       "name": "openebs",
       "chartVersion": "4.6.1",
       "appVersion": "4.6.1",
-      "source": "https://openebs.github.io/openebs",
-      "indexURL": "https://openebs.github.io/openebs/index.yaml",
-      "archiveURL": "https://openebs.github.io/openebs/openebs-4.6.1.tgz",
-      "archiveSha256": "ac308a4252f67104bb147fc0f22f85f0a172ac65f433a06689c62efd4478633c",
-      "digestEnforcement": "Flux follows this version and the current repository index; this historical archive checksum is operator-verified, not an OCIRepository digest constraint.",
+      "source": "oci://ghcr.io/openebs/charts/openebs",
+      "archiveURL": "https://ghcr.io/v2/openebs/charts/openebs/blobs/sha256:fbe1f382c9bddca4d840958495c90c1f84d28f1a739ce1612a3254f4feabf08d",
+      "archiveSha256": "fbe1f382c9bddca4d840958495c90c1f84d28f1a739ce1612a3254f4feabf08d",
       "enabledEngine": {
         "name": "lvm-localpv",
         "chartVersion": "1.10.1",
@@ -48,13 +64,14 @@
       "documentationURL": "https://openebs.io/docs/main/quickstart-guide/installation",
       "releaseURL": "https://github.com/openebs/openebs/releases/tag/v4.6.1",
       "renderedImages": [
-        "docker.io/openebs/lvm-driver:1.10.1",
-        "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0",
-        "registry.k8s.io/sig-storage/csi-provisioner:v6.1.0",
-        "registry.k8s.io/sig-storage/csi-resizer:v2.0.0",
-        "registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0",
-        "registry.k8s.io/sig-storage/snapshot-controller:v8.2.0"
-      ]
+        "docker.io/openebs/lvm-driver:1.10.1@sha256:ae4b9e0b57c64e35fc8f742496420bc8f9d3aadd990e1a0e19b4083fafdd6639",
+        "registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.13.0@sha256:8e66117d3b5e336901fc2ff508b3eb6105f8cf3b70f631e8102441e9562c8875",
+        "registry.k8s.io/sig-storage/csi-provisioner:v6.1.0@sha256:6b5a502366ecd4ed81bcdc768699fe431ab70437324f5a7883e9f49a5d640863",
+        "registry.k8s.io/sig-storage/csi-resizer:v2.0.0@sha256:25b17c4f84b0ab061da6397caf407c7251a571df5c4071e4917942684c61689a",
+        "registry.k8s.io/sig-storage/csi-snapshotter:v8.2.0@sha256:339a83a86e6e1eead14413fe494b43de8bc48243d146c2810b39dd741d26ca6a",
+        "registry.k8s.io/sig-storage/snapshot-controller:v8.2.0@sha256:9d4d1a60c620cf5f0beabd9914e34f4443ef2569f8ba8fba56bab95f380087fa"
+      ],
+      "ociManifestDigest": "sha256:7e22babd055db1058f4325e6e13230eb75945f3623ceb71b4d2060ffab4ba379"
     },
     {
       "name": "cert-manager",
@@ -66,10 +83,10 @@
       "documentationURL": "https://cert-manager.io/docs/installation/helm/",
       "releaseURL": "https://github.com/cert-manager/cert-manager/releases/tag/v1.21.2",
       "renderedImages": [
-        "quay.io/jetstack/cert-manager-cainjector:v1.21.2",
-        "quay.io/jetstack/cert-manager-controller:v1.21.2",
-        "quay.io/jetstack/cert-manager-startupapicheck:v1.21.2",
-        "quay.io/jetstack/cert-manager-webhook:v1.21.2"
+        "quay.io/jetstack/cert-manager-cainjector:v1.21.2@sha256:aa2bc58725d92a643f5069dde58abc93b65566ded8951348873ac9ee7efef66c",
+        "quay.io/jetstack/cert-manager-controller:v1.21.2@sha256:57bb397c639e0e94184ba67848e5dad04284f24645e521e764a0ee5f5002f286",
+        "quay.io/jetstack/cert-manager-startupapicheck:v1.21.2@sha256:ed347b0ab607058f139b83f41567109456b9776330b63da8086a120afb7f1729",
+        "quay.io/jetstack/cert-manager-webhook:v1.21.2@sha256:b929259301ee75270ab4651d5e6bd4ba7b6624b1ce48ba767d064295a9312101"
       ]
     },
     {
@@ -82,7 +99,7 @@
       "documentationURL": "https://github.com/cloudnative-pg/charts/blob/cloudnative-pg-v0.29.1/.github/workflows/release-publish.yml",
       "releaseURL": "https://github.com/cloudnative-pg/charts/releases/tag/cloudnative-pg-v0.29.1",
       "renderedImages": [
-        "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1"
+        "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.1@sha256:b0f9805bd5f98592e7320b5ea624dd10a7a6ef8e477df5650655c94f0b242497"
       ]
     },
     {
@@ -95,9 +112,9 @@
       "documentationURL": "https://github.com/cloudnative-pg/charts/blob/plugin-barman-cloud-v0.8.1/.github/workflows/release-publish.yml",
       "releaseURL": "https://github.com/cloudnative-pg/charts/releases/tag/plugin-barman-cloud-v0.8.1",
       "renderedImages": [
-        "ghcr.io/cloudnative-pg/plugin-barman-cloud:v0.15.1"
+        "ghcr.io/cloudnative-pg/plugin-barman-cloud:v0.15.1@sha256:e982a3b8813703e5c0e58c49aef7e15fe41bbe396c949c480627bda6a3a067b9"
       ],
-      "runtimeSidecarImage": "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.15.1"
+      "runtimeSidecarImage": "ghcr.io/cloudnative-pg/plugin-barman-cloud-sidecar:v0.15.1@sha256:eb61ec74fddfcadc956fa49d99306daf9d6ec84b59594b183614037e2b5a5785"
     }
   ],
   "regional": {
@@ -108,7 +125,8 @@
         "reference": "docker.io/cloudflare/cloudflared",
         "version": "2026.10.0",
         "indexDigest": "sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07",
-        "releaseURL": "https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0"
+        "releaseURL": "https://github.com/cloudflare/cloudflared/releases/tag/2026.10.0",
+        "manifestDigest": "sha256:1a50cc8893b3f0dd283805d2efcd3336210aced60a83d967fb2bbc8ab69b5f35"
       },
       {
         "name": "pgcf-regional",
@@ -123,7 +141,7 @@
       "note": "Unmodified PostgreSQL 18.6 engine and pgvector 0.8.7, qualified in CI 37511566358. Exact private/public manifest equality and anonymous manifest/configuration plus complete compressed/uncompressed layer readback passed."
     }
   },
-  "verificationScope": "Official chart versions, chart/app mappings, registry manifest digests, archive checksums, offline Helm lint/render and Kustomize build. Container image tag references remain as shipped by the pinned charts except digest defaults already shipped by Cilium; image signature and tag-to-digest verification are not claimed.",
+  "verificationScope": "Official chart versions, immutable OCI archives and Linux/amd64 workload manifest/configuration digests; exact digest overrides are included in the Helm values and checked against this lock. Image signature, vulnerability qualification and live convergence are separate release gates.",
   "bootstrapClients": {
     "helm": {
       "version": "4.3.0",
@@ -150,14 +168,14 @@
         {
           "os": "linux",
           "architecture": "amd64",
-          "url": "https://github.com/siderolabs/talos/releases/download/v1.14.1/talosctl-linux-amd64",
-          "sha256": "7233ece94c94296a033a6ddb5efe0baf508a94c71de7e6c7b286500705924208"
+          "url": "https://github.com/siderolabs/talos/releases/download/v1.14.2/talosctl-linux-amd64",
+          "sha256": "c6c9552b0e5f767352c595fa1c0af4f186f697488646872955057d23990a66c4"
         },
         {
           "os": "linux",
           "architecture": "arm64",
-          "url": "https://github.com/siderolabs/talos/releases/download/v1.14.1/talosctl-linux-arm64",
-          "sha256": "812406cfc3bd83a937108d5f4872a48645b96de3c01e1f3d82445e8cbd1e7a21"
+          "url": "https://github.com/siderolabs/talos/releases/download/v1.14.2/talosctl-linux-arm64",
+          "sha256": "5b7119f9cc68c1e6dcd394564208a9ae417c5cc9e8e2585fa173082e53f5e6d7"
         }
       ]
     },
@@ -182,12 +200,65 @@
   "bootstrapValues": {
     "cilium": {
       "path": "infra/platform/base/values/cilium.yaml",
-      "sha256": "0de1a09a3fd450916cdb316d41fa9dcfd769708f7a6cb5b49496a64ee9b26b39"
+      "sha256": "ae15533e01a89cee28277be2d0ba3539823c8ed695d8a79ee23d27d559566922"
     }
+  },
+  "rustEdge": {
+    "workerVersion": "0.8.7",
+    "workerBuildVersion": "0.8.7",
+    "wasmBindgenVersion": "0.2.129",
+    "wasmOptVersion": "132",
+    "esbuildVersion": "0.28.2",
+    "workerLicense": "Apache-2.0",
+    "wasmBindgenLicense": "MIT OR Apache-2.0",
+    "wasmOptLicense": "Apache-2.0",
+    "esbuildLicense": "MIT",
+    "workerArchiveSha256": "4057bce8ec66c80b7e270d884c312e2a4ff60eb997fd02936656106c06a964e5",
+    "workerBuildArchiveSha256": "1051c05ef088889a30ad3bad40c22a716ba8ca8d02a3fb01cef8c143ba952222",
+    "wasmBindgenArchiveSha256": "9bb54f33acc68fd454578d9820b0bde1a1a3d17aa17bb7b6595806d02886d409",
+    "archives": [
+      {
+        "name": "wasm-bindgen",
+        "version": "0.2.129",
+        "os": "linux",
+        "architecture": "amd64",
+        "url": "https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.129/wasm-bindgen-0.2.129-x86_64-unknown-linux-musl.tar.gz",
+        "sha256": "82d12bb940e2d4e72e0d5605387fc1b8ca179044e012b620f0ce4e7440e8320e",
+        "member": "wasm-bindgen-0.2.129-x86_64-unknown-linux-musl/wasm-bindgen",
+        "binarySha256": "fb59da714982a04273e9e4b09a85e523e5dd04de35b1a4a8b1641785ee7a71cf",
+        "environmentVariable": "WASM_BINDGEN_BIN"
+      },
+      {
+        "name": "wasm-opt",
+        "version": "132",
+        "os": "linux",
+        "architecture": "amd64",
+        "url": "https://github.com/WebAssembly/binaryen/releases/download/version_132/binaryen-version_132-x86_64-linux.tar.gz",
+        "sha256": "195ddc94f9bc89f45abdabb0b9eea86023d727ba90eac8b35b80f2544fc30572",
+        "member": "binaryen-version_132/bin/wasm-opt",
+        "binarySha256": "1014958e6f20d412f1542320b43970214b0fb1ed780595e8f7c0d8761ed53725",
+        "environmentVariable": "WASM_OPT_BIN"
+      },
+      {
+        "name": "esbuild",
+        "version": "0.28.2",
+        "os": "linux",
+        "architecture": "amd64",
+        "url": "https://registry.npmjs.org/@esbuild/linux-x64/-/linux-x64-0.28.2.tgz",
+        "sha256": "9573bb2233aab0f9ea7647d5cca9726113cc1768de61d66b17267f4db84488f6",
+        "member": "package/bin/esbuild",
+        "binarySha256": "e1698a3d5c6c0798fee4fd3b5cc816651f460c63d390a7a26ea4beb0b1884100",
+        "environmentVariable": "ESBUILD_BIN"
+      }
+    ]
   },
   "nativeRuntime": {
     "rustVersion": "1.99.0",
     "testBuilderImage": "docker.io/library/rust:1.99.0-alpine3.24@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627",
     "verificationScope": "Prepared namespace primitive only; no CRI, CNPG, database readiness or first-read acceptance."
+  },
+  "talosBoot": {
+    "imager": "ghcr.io/siderolabs/imager@sha256:89d1b1e2be167632745abf7f6834220a255a0182714f3d91670ecad55a3c41ff",
+    "baseInstaller": "ghcr.io/siderolabs/installer-base@sha256:a47d7d4ed3ff5e3467494a0e62483767a5ba00d731b963cdcbc917abd83553d6"
   }
 }

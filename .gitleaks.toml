@@ -1,0 +1,50 @@
+# SPDX-License-Identifier: Apache-2.0
+# Keep every built-in detector. These reviewed exceptions require BOTH the exact
+# repository-relative file AND exact public/test value, only for generic-api-key.
+# Other values, other paths and all other rules remain active.
+[extend]
+useDefault = true
+
+[[rules]]
+id = "generic-api-key"
+
+# Public RFC6455 Section1.3 sample nonce; integration tests still require separately signed grants. https://www.rfc-editor.org/rfc/rfc6455#section-1.3
+[[rules.allowlists]]
+description = "Reviewed public/test values in apps/native-bootstrap-relay/tests/transport.rs"
+condition = "AND"
+regexTarget = "secret"
+paths = [
+  '''^apps/native\-bootstrap\-relay/tests/transport\.rs$''',
+]
+regexes = [
+  '''^dGhlIHNhbXBsZSBub25jZQ==$''',
+]
+
+# Exact explicit unit backup/recovery values and deterministic restore HMAC from generate-controller.ts. Rust consumes these vectors only under cfg(test); both encoded/decoded HMAC representations are listed.
+[[rules.allowlists]]
+description = "Reviewed public/test values in packages/contracts/native/controller-vectors.generated.json"
+condition = "AND"
+regexTarget = "secret"
+paths = [
+  '''^packages/contracts/native/controller\-vectors\.generated\.json$''',
+]
+regexes = [
+  '''^NZabTUPloNlTKM_NEdMrPdnuqUhcmEpQc7dhEyA\-Ajw$''',
+  '''^TlphYlRVUGxvTmxUS01fTkVkTXJQZG51cVVoY21FcFFjN2RoRXlBLUFqdw==$''',
+  '''^c291cmNlLXNlY3JldA==$''',
+  '''^dW5pdC1zZWNyZXQ=$''',
+]
+
+# Exact public Go checksums from pinned OpenEBS source e8a234cbfeef5fa16fde1330c8de2d91e31831f1/go.sum; retained as provenance, never credentials.
+[[rules.allowlists]]
+description = "Reviewed public/test values in scripts/ci/storage-reviewed-findings.json"
+condition = "AND"
+regexTarget = "secret"
+paths = [
+  '''^scripts/ci/storage\-reviewed\-findings\.json$''',
+]
+regexes = [
+  '''^dTlxFls/eikpJxmAC7MVE8oOeP1zryV7iRyIjB0gky4=$''',
+  '''^hqK/t4AKgbqWkdkcAeI8XLmbK\+4m4G5YeQRrmiotGlw=$''',
+  '''^jC\+153630BMdlFukegoEL8E/yT7aLyQkIVuwhmwDgJM=$''',
+]

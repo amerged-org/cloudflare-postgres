@@ -74,6 +74,11 @@
     },
   ],
   "workflows": [
+    {
+      "binding": "PATCH_NODE",
+      "name": "pgcf-patch-node",
+      "class_name": "PatchNode",
+    },
     { "binding": "ADD_NODE", "name": "pgcf-add-node", "class_name": "AddNode" },
   ],
   "triggers": { "crons": ["* * * * *"] },

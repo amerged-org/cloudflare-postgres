@@ -15,7 +15,10 @@ COPY packages/contracts/ packages/contracts/
 COPY apps/node-bootstrap/tsconfig.json apps/node-bootstrap/tsconfig.json
 COPY apps/node-bootstrap/src apps/node-bootstrap/src
 COPY infra/talos/publish-storage-capacity.ts infra/talos/publish-storage-capacity.ts
+COPY infra/talos/sandbox/runtime-admission.ts infra/talos/sandbox/runtime-admission.ts
 COPY infra/platform/versions.lock.json infra/platform/versions.lock.json
+COPY infra/platform/openebs-image.ts infra/platform/openebs-image.ts
+COPY infra/platform/image-manifest.ts infra/platform/image-manifest.ts
 COPY scripts/e2e/src/node-network-native.ts scripts/e2e/src/node-network-native.ts
 COPY scripts/e2e/src/node-network-packets.ts scripts/e2e/src/node-network-packets.ts
 RUN pnpm --filter @pgcf/node-bootstrap build \
@@ -33,6 +36,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
  && rm -rf /var/lib/apt/lists/*
 COPY apps/node-bootstrap/src/build-assets.ts apps/node-bootstrap/src/platform-artifacts.ts /workspace/apps/node-bootstrap/src/
 COPY infra/platform/versions.lock.json /workspace/infra/platform/versions.lock.json
+COPY infra/platform/openebs-image.ts /workspace/infra/platform/openebs-image.ts
+COPY infra/platform/image-manifest.ts /workspace/infra/platform/image-manifest.ts
+COPY infra/talos/sandbox/runtime-admission.ts /workspace/infra/talos/sandbox/runtime-admission.ts
 RUN node /workspace/apps/node-bootstrap/src/build-assets.ts --clients / "$TARGETARCH"
 COPY infra/platform/base/values/cilium.yaml /assets/cilium-values.yaml
 RUN node /workspace/apps/node-bootstrap/src/build-assets.ts /assets

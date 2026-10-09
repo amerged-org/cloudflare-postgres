@@ -1,0 +1,291 @@
+[
+  {
+    "name": "applied-oci",
+    "pin": {
+      "name": "cnpg",
+      "kind": "chart",
+      "reference": "oci://registry.example/cnpg@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "version": "1.30.1",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "release": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 1,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 }
+        ],
+        "history": [
+          {
+            "chartVersion": "1.30.1",
+            "ociDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "deployed"
+          }
+        ]
+      }
+    },
+    "source": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 1,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 }
+        ],
+        "artifact": {
+          "revision": "1.30.1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "spec": {
+        "url": "oci://registry.example/cnpg",
+        "ref": {
+          "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    "chart": null,
+    "ready": true,
+    "observed": {
+      "name": "cnpg",
+      "version": "1.30.1",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  {
+    "name": "normalized-chart-version",
+    "pin": {
+      "name": "cnpg",
+      "kind": "chart",
+      "reference": "oci://registry.example/cnpg@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "version": "1.30.1",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "release": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 1,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 }
+        ],
+        "history": [
+          {
+            "chartVersion": "1.30.1+aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "ociDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "deployed"
+          }
+        ]
+      }
+    },
+    "source": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 1,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 }
+        ],
+        "artifact": {
+          "revision": "1.30.1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "spec": {
+        "url": "oci://registry.example/cnpg",
+        "ref": {
+          "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    "chart": null,
+    "ready": true,
+    "observed": {
+      "name": "cnpg",
+      "version": "1.30.1",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  },
+  {
+    "name": "source-revision-mismatch",
+    "pin": {
+      "name": "cnpg",
+      "kind": "chart",
+      "reference": "oci://registry.example/cnpg@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "version": "1.30.1",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "release": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 1,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 }
+        ],
+        "history": [
+          {
+            "chartVersion": "1.30.1",
+            "ociDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "deployed"
+          }
+        ]
+      }
+    },
+    "source": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 1,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 }
+        ],
+        "artifact": {
+          "revision": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      },
+      "spec": {
+        "url": "oci://registry.example/cnpg",
+        "ref": {
+          "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    "chart": null,
+    "ready": true,
+    "observed": null
+  },
+  {
+    "name": "unobserved-generation",
+    "pin": {
+      "name": "cnpg",
+      "kind": "chart",
+      "reference": "oci://registry.example/cnpg@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "version": "1.30.1",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "release": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 0,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 }
+        ],
+        "history": [
+          {
+            "chartVersion": "1.30.1",
+            "ociDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "deployed"
+          }
+        ]
+      }
+    },
+    "source": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 1,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 }
+        ],
+        "artifact": {
+          "revision": "1.30.1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "spec": {
+        "url": "oci://registry.example/cnpg",
+        "ref": {
+          "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    "chart": null,
+    "ready": false,
+    "observed": null
+  },
+  {
+    "name": "stalled-release",
+    "pin": {
+      "name": "cnpg",
+      "kind": "chart",
+      "reference": "oci://registry.example/cnpg@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "version": "1.30.1",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "release": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 1,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 },
+          { "type": "Stalled", "status": "True", "observedGeneration": 1 }
+        ],
+        "history": [
+          {
+            "chartVersion": "1.30.1",
+            "ociDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "deployed"
+          }
+        ]
+      }
+    },
+    "source": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 1,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 }
+        ],
+        "artifact": {
+          "revision": "1.30.1@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      },
+      "spec": {
+        "url": "oci://registry.example/cnpg",
+        "ref": {
+          "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    "chart": null,
+    "ready": false,
+    "observed": null
+  },
+  {
+    "name": "applied-http-chart",
+    "pin": {
+      "name": "cnpg",
+      "kind": "chart",
+      "reference": "https://charts.example/cnpg",
+      "version": "1.30.1",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "release": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 1,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 }
+        ],
+        "history": [
+          {
+            "chartVersion": "1.30.1",
+            "ociDigest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "status": "deployed"
+          }
+        ]
+      }
+    },
+    "source": null,
+    "chart": {
+      "metadata": { "generation": 1 },
+      "status": {
+        "observedGeneration": 1,
+        "conditions": [
+          { "type": "Ready", "status": "True", "observedGeneration": 1 }
+        ],
+        "artifact": {
+          "digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      }
+    },
+    "ready": true,
+    "observed": {
+      "name": "cnpg",
+      "version": "1.30.1",
+      "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    }
+  }
+]

@@ -36,6 +36,8 @@ import {
 export const MAX_PAYLOAD_BYTES = 32 * 1024 * 1024;
 export const MAX_FRAME_BYTES = 64 * 1024;
 export const MAX_STARTUP_BUFFER_BYTES = 64 * 1024;
+export const DEFAULT_DATABASE_CONNECTION_LIMIT = 200;
+export const DEFAULT_TOTAL_CONNECTION_LIMIT = 2_000;
 export {
   DEFAULT_MEMORY_LIMIT_BYTES,
   DEFAULT_DATABASE_MEMORY_LIMIT_BYTES,
@@ -113,8 +115,9 @@ export interface Gateway {
 }
 
 export function createGateway(options: GatewayOptions): Gateway {
-  const databaseLimit = options.databaseLimit ?? 200;
-  const totalLimit = options.totalLimit ?? 2_000;
+  const databaseLimit =
+    options.databaseLimit ?? DEFAULT_DATABASE_CONNECTION_LIMIT;
+  const totalLimit = options.totalLimit ?? DEFAULT_TOTAL_CONNECTION_LIMIT;
   const heartbeatMs = options.heartbeatMs ?? 30_000;
   const drainMs = options.drainMs ?? 30_000;
   const startupTimeoutMs = options.startupTimeoutMs ?? 10_000;

@@ -19,11 +19,17 @@ import {
 } from "../../src/workflows/add-node.ts";
 import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
 import { cleanupFixtures, fixture, observedBody, request } from "./fixtures.ts";
+import { standingPostjoinFixture } from "./postjoin-fixture.ts";
 const workflows: string[] = [];
+const releases: string[] = [];
 afterEach(async () => {
   for (const id of workflows.splice(0))
     await (await env.ADD_NODE.get(id)).terminate();
   await cleanupFixtures();
+  for (const id of releases.splice(0))
+    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
+      .bind(id)
+      .run();
 });
 const providerId = () => String(BigInt("1" + randomString("0123456789", 9)));
 const order = () => ({
@@ -326,6 +332,17 @@ describe("node composition with actual Workers/D1", () => {
       CONTABO_ORDER_DEFAULT_USER: "root",
       CONTABO_ORDER_SSH_KEY_IDS: JSON.stringify([providerId()]),
     };
+    await expect(
+      dispatchNodeOrder(settings, addition.intent.operation_id, {
+        order: post,
+      }),
+    ).rejects.toMatchObject({ code: "conflict" });
+    expect(post).not.toHaveBeenCalled();
+    expect(
+      (await readNodeAddition(env.DB, addition.intent.operation_id))
+        .dispatch_request_id,
+    ).toBeNull();
+    releases.push((await standingPostjoinFixture(f.region)).id);
     await dispatchNodeOrder(settings, addition.intent.operation_id, {
       order: post,
     });

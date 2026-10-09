@@ -14,13 +14,29 @@ cainjector:
     - key: pgcf.io/quarantine
       operator: Exists
       effect: NoSchedule
+  image:
+    repository: quay.io/jetstack/cert-manager-cainjector
+    tag: v1.21.2
+    digest: sha256:aa2bc58725d92a643f5069dde58abc93b65566ded8951348873ac9ee7efef66c
 webhook:
   tolerations:
     - key: pgcf.io/quarantine
       operator: Exists
       effect: NoSchedule
+  image:
+    repository: quay.io/jetstack/cert-manager-webhook
+    tag: v1.21.2
+    digest: sha256:b929259301ee75270ab4651d5e6bd4ba7b6624b1ce48ba767d064295a9312101
 startupapicheck:
   tolerations:
     - key: pgcf.io/quarantine
       operator: Exists
       effect: NoSchedule
+  image:
+    repository: quay.io/jetstack/cert-manager-startupapicheck
+    tag: v1.21.2
+    digest: sha256:ed347b0ab607058f139b83f41567109456b9776330b63da8086a120afb7f1729
+image:
+  repository: quay.io/jetstack/cert-manager-controller
+  tag: v1.21.2
+  digest: sha256:57bb397c639e0e94184ba67848e5dad04284f24645e521e764a0ee5f5002f286

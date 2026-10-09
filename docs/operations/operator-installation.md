@@ -55,6 +55,34 @@ the account's general S3 endpoint. Choose a North America location hint when cre
 the hint does not guarantee jurisdiction. `ARCHIVE_BINDINGS` must map each exact region ID to its
 actual Worker binding and bucket. A mismatching or missing binding fails closed.
 
+## Rust/Wasm Edge artifact
+
+The complete replacement entry lives in `apps/edge-rust`; the management API and
+DatabaseActor stay in TypeScript. Build the selected source once using the Rust toolchain
+and `rustEdge` tools from `infra/platform/versions.lock.json`. Verify the pinned tool
+archives and exact members before using `WASM_BINDGEN_BIN`, `WASM_OPT_BIN` and
+`ESBUILD_BIN`. The common CI workflow performs this preparation.
+
+`pnpm --filter @pgcf/edge-rust build` creates `build/index.js`, `build/index_bg.wasm`
+and the compatibility entry `build/worker/shim.mjs`. Preserve their checksums and upstream
+notices with the release artifact. `pnpm --filter @pgcf/edge-rust test` loads those already
+built bytes in real local workerd instances with the actual DatabaseActor, D1, rate-limit
+and Fetcher bindings; it does not rebuild the Worker. Local fixtures prove binding and
+protocol behavior. They do not replace Dev PostgreSQL/TLS and VPC transport acceptance.
+
+Start the private deployment configuration from `apps/edge-rust/wrangler.example.jsonc`
+and preserve the existing Worker name, hostname, DatabaseActor binding, rate-limit
+namespaces, regional VPC/service bindings and `ROUTE_MASTER_KEYS` secret. The example
+intentionally has no custom build command: delivery uses the qualified artifact instead
+of compiling again. Do not activate the replacement until the selected bytes pass Dev
+database acceptance. Record the actual Worker version and result in PLAN.md Status.
+
+Successful upgrades return the unopened upstream WebSocket directly to Cloudflare.
+PostgreSQL bytes are not relayed through a TypeScript or Wasm application loop. Only
+bounded local refusal sockets parse their own startup/SCRAM exchange. Request aborts and
+the absolute admission deadline cancel the exact Actor waiter; a cancellation never
+retries the gateway connection or application SQL.
+
 ## Private bootstrap transport
 
 The relay runs on the explicitly selected first EU node using
@@ -205,12 +233,17 @@ import, adoption, registration or disk-write intent. EU1 is already admitted and
 or adoption. The sequence below is the procedure for future authorized additions, not an
 instruction to reinstall either existing customer node.
 
-Keep automatic standing purchases and autoscaling disabled until the corrected runtime and
-regional rule are qualified and deployed. The owner's2026-10-08 instruction authorizes V159
+The corrected API/Regional source6978033 is deployed in both regions after CI37851000610;
+both live policies now have max_nodes3. Keep autoscaling disabled until the selected full release
+and installation templates are accepted. The actual EU installation profile is still missing;
+this is configuration work, not a missing purchase approval. The owner's2026-10-08 instruction authorizes V159
 regional76%-RAM expansion, with the latest small ceiling of3 managed VPS per region and75%/cap notices. Individual
 manually costed orders remain a separate explicit path. The retained
-US policy uses actual RAM with a128 MiB request and4096 MiB maximum; EU remains reserved pending
-its controlled data-preserving transition. Use the guarded
+EU and US policies both use actual RAM with a128 MiB request and4096 MiB maximum. The controlled
+EU transition completed in135s: all3 databases were confirmed manually hibernated before changing
+policy and resumed through fresh full-peak admission. Their storage generations, roles, custody
+and application table hashes are unchanged. Both regions record the exact V159 standing authority;
+only template/release acceptance keeps automatic expansion disabled. Use the guarded
 `PUT /v1/regions/{id}/capacity-policy` with `region_id`, `max_nodes`, `purchases_enabled`, `order`,
 `placement_mode`, `maximum_database_memory_mib`, `postgres_memory_request_mib`,
 `standing_cost_profile`, `autoscale_enabled` and `adopt_instance_ids`. For this operator policy use
@@ -232,6 +265,16 @@ profile must bind that exact order and explicit `id`, `owner_reference`, `approv
 monetary ceilings to `null`. Unknown currency/monthly/setup prices are also `null`, never zero or
 an invented provider quote. The trigger is limited to V159, one month and no add-ons. Derivative
 purchase authorizations remain short-lived and bound to the exact intent/current policy.
+
+The owner-warning integration is live in Dev. The API uses one authenticated service binding;
+recipient and provider credentials remain solely in the adopter's private Mail Gateway secrets.
+The actual warning event at77.2919% RAM was provider-confirmed delivered. Ten consecutive fresh
+US1 samples later averaged80.0101%; identical live replay returned200 with the same single
+provider receipt. Test load is removed and NodeReady is unchanged. A subsequent197-event
+two-minute API window recorded zero Contabo attempts. Callback acceptance alone still does not
+prove delivery; retain the provider's exact message-status readback. Do not lower the node cap
+or fabricate a third allocation merely to send a cap-notice test. Autoscaling remains off for
+the full installation/release acceptance gate, not missing purchase permission.
 
 The76% gate is regional actual physical RAM across ten aligned fresh consecutive minutes for every
 Ready, schedulable eligible customer Node UID. Every member keeps its own UID and capacity across
@@ -255,6 +298,9 @@ allocated managed VPS, including control and lost machines; purchase occupancy a
 includes unpaid reserved slots. A lost paid server is not free budget. At3 occupied slots no
 fourth order is permitted. Status in `GET /v1/operational-health` records callback acceptance;
 verify provider acceptance/delivery separately before reporting successful notification.
+The generic notification source is deployed; the recipient callback and actual mail acceptance
+are not yet active or accepted. Configure the cap before enabling the callback so an older
+historical lower-cap episode cannot be delivered as the current policy.
 
 The retained control server's UID-guarded new-database placement flag is already disabled;
 preserve Kubernetes/platform operation and existing data. The flag excludes new placement;
@@ -468,9 +514,9 @@ Region registration must use `http://pgcf-gateway.pgcf-system.svc.cluster.local:
 configured private VPC binding. The observed URL was corrected once with exact configuration
 comparison before/after; no runtime or database reset was needed.
 
-Actual inventory differs as follows. EU inventory is from October7 and US from October8, with
-later US Regional delivery and both actual SQL readbacks supplementing it. No EU alignment was
-required for the passed database checks.
+Actual inventory differs as follows. The original inventory is from October7/8, supplemented by
+the October9 common Regional delivery and fresh read-only Talos/Kubernetes checks on all3 nodes.
+The remaining OS/cluster differences still require the supported programmed patch path.
 
 | Component | EU | US |
 | --- | --- | --- |
@@ -483,7 +529,7 @@ required for the passed database checks.
 | cert-manager / OpenEBS / LVM driver | 1.21.2 / 4.6.1 / 1.10.1 | Same |
 | cloudflared | 2026.10.0 | Same |
 | PostgreSQL, actual SQL | 18.6 (Debian18.6-1.pgdg13+2), server180006 | Same |
-| Regional runtime source | 901b3228 | 11555215, CI37815727563 |
+| Regional runtime source | 6978033, CI37851000610 | Same |
 
 The following are actual workload `imageID` digests, not Helm chart or release-content digests.
 Kubernetes component versions are 1.36.3 in EU and 1.36.5 in US; the repositories are
@@ -515,9 +561,9 @@ US1 records `sha256:cd4cb83e5f27cd356956cac01ed6f0c5ed2ec4343d3f46e4efa72706ed92
 These are configured installer identities, distinct from the running Talos version. No EU
 reinstallation, upgrade or template activation was performed to align them.
 
-Actual Regional digests are EU `sha256:eeaa6ab0c1fc182e9e050d6f104565ec0a3dc4e7482b1950287c31b62ebe607a`
-and US `sha256:1886a64e36d2b9ba45e4d876a0a9eb6bab3fb83a6b0fafcb18dbf8647ef66993`.
-The US correction passed CI qualification of all10 layers and registry readback of89,782,247
+Both actual Regional digests are now
+`sha256:ee08af77e5d3adf875bc9bb4ef7fbc2d54fe0434d2af185cc6508c61d48571da`.
+The common correction passed CI qualification of all10 layers and anonymous registry readback of89,798,172
 compressed bytes. The configured PostgreSQL image pin is
 `sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115`; actual SQL confirms
 18.6 in both regions. A US PostgreSQL runtime imageID was not separately retained in this audit.
@@ -537,11 +583,12 @@ unknown. Keep lifecycle counts separate and do not sum overlapping capture windo
 
 ## Customer migration handover
 
-Neon migration remains a separate reviewed cutover. EU/US SQL, backup/WAL, restore, physical
-reclamation and the real RAM threshold observation have passed. Preserve EU1 and its
-three existing databases. Do not upgrade EU Kubernetes or activate a bootstrap template in this
-scope, including after US database acceptance. Only a separately reviewed upgrade scope can
-change that instruction.
+Neon migration remains a separate reviewed cutover. The earlier EU/US SQL, backup/WAL, restore,
+physical-reclamation and RAM-threshold checks are partial baseline evidence. The approved
+corrective plan now requires supported in-place fleet convergence, programmed patching and
+shared-pool fast-start acceptance before customer migration. Preserve EU1 and all three existing
+databases; the earlier EU-upgrade deferral does not override this approved corrective scope.
+Neither alignment nor template selection authorizes an EU reinstall or a customer cutover.
 
 Before customer data, resolve the October 5 revision-1 credential exposure through
 [the credential procedure](credentials.md). Secure encrypted D1/etcd/configuration backups and SQL
@@ -572,8 +619,9 @@ These are configuration ceilings, not a demonstrated workload density.
 Ten real consecutive US minute samples from18:43:01 to18:52:04 UTC averaged **79.9062%** under
 an operation-owned3968MiB allocation. Cloudflare persisted that average and its expansion trigger.
 Existing eligible placement and full CPU/storage/PostgreSQL plus512MiB Barman startup checks
-still passed. The dry capacity decision remained `disabled` and made no provider call: finite
-standing cost/count/expiry authority is absent, caps remain EU3/US1 and autoscaling is disabled.
+still passed. At that historical test the dry capacity decision was `disabled` and made no provider
+call. Since October9 both live caps are3 and the exact V159 standing authority is recorded; the
+full installation-template/release gate still keeps autoscaling disabled.
 The first trial correctly rejected a missing18:37 sample; actual kubelet timestamps crossed
 18:36:59 to18:38:00. Its load was removed and physical available RAM recovered before the
 independent second trial. Never synthesize samples or weaken consecutive-minute validation.

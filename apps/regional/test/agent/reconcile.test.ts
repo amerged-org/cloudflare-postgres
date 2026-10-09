@@ -22,6 +22,40 @@ import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 
 const signal = () => new AbortController().signal;
 
+test("per-database PostgreSQL patches require the running primary imageID and report the actual digest", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  const image = `registry.example/postgres:18.7@sha256:${"e".repeat(64)}`;
+  db.postgres = {
+    release_id: "release-18-7",
+    image,
+    version: "18.7",
+    configuration_schema_revision: 1,
+  };
+  const read = k8s.read.bind(k8s);
+  let wrong = true;
+  k8s.read = async (...args) => {
+    const result = await read(...args);
+    if (wrong && result?.kind === "Pod")
+      record(
+        (record(result.status).containerStatuses as unknown[])[0],
+      ).imageID = `containerd://sha256:${"f".repeat(64)}`;
+    return result;
+  };
+  const reconciler = new Reconciler(
+    k8s,
+    signal(),
+    Date.now,
+    metrics,
+    authenticate,
+  );
+  assert.notEqual((await reconciler.reconcile(db, ctx))?.state, "ready");
+  wrong = false;
+  const observed = await reconciler.reconcile(db, ctx);
+  assert.equal(observed?.state, "ready");
+  assert.deepEqual(observed?.postgres, { image, image_id: image });
+});
+
 test("established availability survives unavailable archive measurements only with current runtime authentication", async () => {
   const { db, ctx } = fixture(),
     k8s = new MemoryKubernetes();

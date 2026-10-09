@@ -3,6 +3,7 @@ import type { ApiKey } from "@pgcf/contracts";
 import type { Context } from "hono";
 
 export type Env = Cloudflare.Env & {
+  PATCH_NODE: Workflow<{ operation_id: string }>;
   DATABASE_CONNECTION_LIMIT_PER_MINUTE?: string;
   INFRASTRUCTURE_ALERT_WEBHOOK?: Fetcher;
   INFRASTRUCTURE_ALERT_WEBHOOK_URL?: string;

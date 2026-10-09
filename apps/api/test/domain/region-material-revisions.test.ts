@@ -196,6 +196,7 @@ it("does not activate an immutable staged pair and resolves an exact replay with
     "region_id",
     "revision",
     "seed_sha256",
+    "talos_version",
   ]);
 });
 
@@ -392,4 +393,95 @@ it("fences expired administrator readback at the actual D1 activation boundary",
     (await loadCurrentRegionMaterialReference(env.DB, f.region, "join_bundle"))
       .revision,
   ).toBe(1);
+});
+
+it("keeps old custody current until every active or uncertain thin-storage action has resolved", async () => {
+  const f = await setup(),
+    now = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO node_thin_storage(node_id,node_uid,cluster_uid,address,volume_group_uuid,profile_revision,profile_sha256,profile_json,material_revision,status,lease_id,lease_expires_at,action_json,created_at,updated_at) VALUES(?,?,?,'192.0.2.10','retained-vg',1,?,'{}',1,'selected','op_abcdefghijklmnopqrst',?,?,?,?)`,
+  )
+    .bind(
+      f.node,
+      f.uid,
+      f.body.observed.kube_system_uid,
+      "a".repeat(64),
+      new Date(Date.now() + 60000).toISOString(),
+      JSON.stringify({
+        kind: "initialize",
+        state: "dispatched",
+        nonce: "op_abcdefghijklmnopqrst",
+        target_data_bytes: 1024 ** 3,
+        target_metadata_bytes: 128 * 1024 ** 2,
+        expected_pool_uuid: null,
+        driver_pod_uid: crypto.randomUUID(),
+        boot_id: crypto.randomUUID(),
+        dispatched_at: now,
+        deadline_at: new Date(Date.now() + 60000).toISOString(),
+      }),
+      now,
+      now,
+    )
+    .run();
+  const send = () =>
+    request(
+      `/v1/regions/${f.region}/bootstrap-material`,
+      f.admin,
+      "POST",
+      f.body,
+    );
+  expect((await send()).status).toBe(409);
+  expect((await send()).status).toBe(409);
+  expect(
+    (await loadCurrentRegionMaterialReference(env.DB, f.region, "join_bundle"))
+      .revision,
+  ).toBe(1);
+});
+
+it("advances metadata around an ordinary finite read lease without clearing it or its monotonic counters and resolves the same replay", async () => {
+  const f = await setup(),
+    now = new Date().toISOString(),
+    expires = new Date(Date.now() + 60000).toISOString();
+  await env.DB.prepare(
+    `INSERT INTO node_thin_storage(node_id,node_uid,cluster_uid,address,volume_group_uuid,profile_revision,profile_sha256,profile_json,material_revision,status,authority_revision,authority_json,authority_received_at,lease_revision,lease_id,lease_expires_at,created_at,updated_at) VALUES(?,?,?,'192.0.2.10','retained-vg',1,?,'{}',1,'ready',41,'{}',?,7,'op_abcdefghijklmnopqrst',?,?,?)`,
+  )
+    .bind(
+      f.node,
+      f.uid,
+      f.body.observed.kube_system_uid,
+      "a".repeat(64),
+      now,
+      expires,
+      now,
+      now,
+    )
+    .run();
+  const before = await env.DB.prepare(
+    "SELECT material_revision,authority_revision,lease_revision,lease_id,lease_expires_at FROM node_thin_storage WHERE node_id=?",
+  )
+    .bind(f.node)
+    .first();
+  const send = () =>
+    request(
+      `/v1/regions/${f.region}/bootstrap-material`,
+      f.admin,
+      "POST",
+      f.body,
+    );
+  expect((await send()).status).toBe(200);
+  expect((await send()).status).toBe(200);
+  expect(
+    (await loadCurrentRegionMaterialReference(env.DB, f.region, "join_bundle"))
+      .revision,
+  ).toBe(2);
+  expect(
+    await env.DB.prepare(
+      "SELECT material_revision,authority_revision,lease_revision,lease_id,lease_expires_at FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first(),
+  ).toEqual(before);
+  expect(
+    (await f.rows()).results.filter((row) => row.revision === 2),
+  ).toHaveLength(2);
 });

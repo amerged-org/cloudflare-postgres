@@ -13,8 +13,17 @@ export * from "./gateway-activity.ts";
 export * from "./costs.ts";
 
 export * from "./nodes.ts";
+export * from "./compute-pool.ts";
 export * from "./region-configuration.ts";
 export * from "./releases.ts";
 export * from "./resource-profiles.ts";
 export * from "./region-archive-sources.ts";
 export * from "./infrastructure-alerts.ts";
+
+export * from "./database-admission.ts";
+
+export * from "./node-host-configuration.ts";
+
+export * from "./edge-policy.ts";
+
+export * from "./reclaim.ts";

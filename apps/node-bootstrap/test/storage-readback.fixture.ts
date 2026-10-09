@@ -4,6 +4,7 @@ import { randomBytes, randomUUID } from "node:crypto";
 import type { NodeBootstrapInput } from "@pgcf/contracts/node-bootstrap";
 import { fixture } from "./fixture.ts";
 import type { StorageReadCommands } from "../src/storage-readback.ts";
+import { TALOS_VERSION } from "../src/platform-artifacts.ts";
 
 const gi = 1024 ** 3;
 function lvmUuid() {
@@ -239,7 +240,7 @@ export function storageReadbackFixture(
       if (args[0] === "version")
         return {
           exit_code: 0,
-          stdout: JSON.stringify({ version: { tag: "v1.14.1" } }),
+          stdout: JSON.stringify({ version: { tag: `v${TALOS_VERSION}` } }),
         };
       assert.equal(args[0], "get");
       const values: Record<string, unknown[]> = {

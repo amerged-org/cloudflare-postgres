@@ -11,9 +11,90 @@ import {
   imageProfile,
   verifyNativeArtifacts,
   postgresBase,
+  classifyReviewedTalosBoot,
 } from "./reviewed-findings.ts";
 import postgresReview from "./postgres-reviewed-findings.json" with { type: "json" };
+import storageReview from "./storage-reviewed-findings.json" with { type: "json" };
 import type { CanonicalFinding } from "./scanner.ts";
+import talosReview from "./talos-reviewed-findings.json" with { type: "json" };
+
+test("Talos boot review accepts only the exact observed public spans with immutable parent identity", () => {
+  const provenance = {
+    talosVersion: talosReview.talosVersion,
+    baseInstaller: talosReview.baseInstaller,
+    baseDiffIDs: talosReview.baseDiffIDs,
+  };
+  const values: CanonicalFinding[] = talosReview.files.flatMap((file) => {
+    const paths =
+      file.artifact === "installer"
+        ? ["usr/bin/installer"]
+        : file.artifact === "rootfs-init"
+          ? [
+              "installer-uki/rootfs.sqsh/usr/bin/init",
+              "raw-uki/rootfs.sqsh/usr/bin/init",
+            ]
+          : ["installer-uki/squash-2.pseudo", "raw-uki/squash-4.pseudo"];
+    return paths.flatMap((path) =>
+      file.findings.map((span) => ({
+        File: path,
+        RuleID: span.RuleID,
+        StartLine: span.StartLine,
+        EndLine: span.EndLine,
+        StartColumn: span.StartColumn,
+        EndColumn: span.EndColumn,
+        Match: "REDACTED",
+        Secret: "REDACTED",
+        Tags: [],
+        span: span.span,
+        input: {
+          kind: "layer-file" as const,
+          layer: file.artifact === "installer" ? 0 : null,
+          tarEntry: file.artifact === "installer" ? 1 : null,
+          path,
+          sourcePath: "unused",
+          size: file.size,
+          sha256: file.sha256,
+          boundDigest: file.boundDigest,
+        },
+      })),
+    );
+  });
+  assert.equal(values.length, 104);
+  assert.deepEqual(classifyReviewedTalosBoot(values, provenance), {
+    resolved: 104,
+    unresolved: 0,
+  });
+  const v = values[0]!;
+  for (const changed of [
+    { ...v, StartLine: v.StartLine + 1 },
+    { ...v, RuleID: "unreviewed" },
+    { ...v, input: { ...v.input, sha256: "0".repeat(64) } },
+    { ...v, input: { ...v.input, boundDigest: "sha256:" + "0".repeat(64) } },
+    { ...v, input: { ...v.input, path: "custom-extension/usr/bin/init" } },
+    { ...v, span: { ...v.span!, byteStart: v.span!.byteStart + 1 } },
+  ])
+    assert.deepEqual(classifyReviewedTalosBoot([changed], provenance), {
+      resolved: 0,
+      unresolved: 1,
+    });
+  assert.deepEqual(
+    classifyReviewedTalosBoot(
+      [...values, { ...v, EndColumn: v.EndColumn + 1 }],
+      provenance,
+    ),
+    { resolved: 104, unresolved: 1 },
+  );
+  assert.equal(
+    classifyReviewedTalosBoot(values, { ...provenance, talosVersion: "1.14.3" })
+      .resolved,
+    0,
+  );
+  assert.equal(
+    classifyReviewedTalosBoot(values, { ...provenance, baseDiffIDs: [] })
+      .resolved,
+    0,
+  );
+});
 
 test("PostgreSQL resolves only independently reviewed public code and self-test spans in the pinned flattened assembly", () => {
   const digest = "sha256:" + "f".repeat(64);
@@ -112,10 +193,16 @@ test("PostgreSQL resolves only independently reviewed public code and self-test 
   );
 });
 
-function finding(file = reviewedFiles[0]!, index = 0): CanonicalFinding {
-  const span = file.findings[index]!;
-  assert.ok(file.boundDigest && file.layer !== null && file.tarEntry !== null);
-  return {
+test("storage resolves only six exact official Go checksum spans in its original upstream layer", () => {
+  const file = storageReview.files[0]!;
+  const proof = {
+    profile: "storage" as const,
+    baseImage: storageReview.base.image,
+    baseDiffIDs: storageReview.base.diffIDs,
+    imageDiffIDs: [...storageReview.base.diffIDs, `sha256:${"a".repeat(64)}`],
+    packages: [],
+  };
+  const values: CanonicalFinding[] = file.findings.map((span) => ({
     File: file.path,
     RuleID: span.rule,
     StartLine: span.startLine,
@@ -133,6 +220,71 @@ function finding(file = reviewedFiles[0]!, index = 0): CanonicalFinding {
       sha256: file.sha256,
       size: file.size,
       boundDigest: file.boundDigest,
+      sourcePath: "unused",
+    },
+    span: span.span,
+  }));
+  assert.deepEqual(classifyReviewed(values, proof), {
+    resolved: 6,
+    unresolved: 0,
+  });
+  const first = values[0]!;
+  for (const changed of [
+    { ...first, RuleID: "new-rule" },
+    { ...first, span: { ...first.span!, sha256: "0".repeat(64) } },
+    { ...first, input: { ...first.input, sha256: "0".repeat(64) } },
+    { ...first, input: { ...first.input, tarEntry: file.tarEntry + 1 } },
+  ])
+    assert.deepEqual(classifyReviewed([changed], proof), {
+      resolved: 0,
+      unresolved: 1,
+    });
+  assert.deepEqual(classifyReviewed(values, { ...proof, baseDiffIDs: [] }), {
+    resolved: 0,
+    unresolved: 6,
+  });
+  assert.deepEqual(
+    classifyReviewed(values, { ...proof, profile: "rust-gateway" }),
+    { resolved: 0, unresolved: 6 },
+  );
+});
+
+// Native review binds official whole-file bytes; this fixture supplies the separately checked image packaging.
+const nativeFixtureDigest = "sha256:" + "d".repeat(64);
+function finding(file = reviewedFiles[0]!, index = 0): CanonicalFinding {
+  const span = file.findings[index]!;
+  const binding = file.nativeArtifact
+    ? {
+        layer: reviewedBase.diffIDs.length + 2,
+        tarEntry: 0,
+        boundDigest: nativeFixtureDigest,
+      }
+    : {
+        layer: file.layer,
+        tarEntry: file.tarEntry,
+        boundDigest: file.boundDigest,
+      };
+  assert.ok(
+    binding.boundDigest && binding.layer !== null && binding.tarEntry !== null,
+  );
+  return {
+    File: file.path,
+    RuleID: span.rule,
+    StartLine: span.startLine,
+    EndLine: span.endLine,
+    StartColumn: span.startColumn,
+    EndColumn: span.endColumn,
+    Match: "REDACTED",
+    Secret: "REDACTED",
+    Tags: [],
+    input: {
+      kind: "layer-file",
+      layer: binding.layer,
+      tarEntry: binding.tarEntry,
+      path: file.path,
+      sha256: file.sha256,
+      size: file.size,
+      boundDigest: binding.boundDigest,
       sourcePath: "unused",
     },
     span: span.span,
@@ -369,7 +521,7 @@ test("bootstrap resolves exactly the thirty-one source-reviewed native spans and
       const value = finding(file, index);
       return {
         ...value,
-        input: { ...value.input, boundDigest: native[0]!.boundDigest! },
+        input: { ...value.input, boundDigest: nativeFixtureDigest },
       };
     }),
   );
@@ -381,7 +533,7 @@ test("bootstrap resolves exactly the thirty-one source-reviewed native spans and
       ...reviewedBase.diffIDs,
       "sha256:" + "a".repeat(64),
       "sha256:" + "b".repeat(64),
-      native[0]!.boundDigest!,
+      nativeFixtureDigest,
     ],
     nativeArtifacts: native.map((file) => ({
       path: file.path,
@@ -415,7 +567,7 @@ test("Helm resolves only twelve exact pinned public Go checksum spans and reject
       ...reviewedBase.diffIDs,
       "sha256:" + "a".repeat(64),
       "sha256:" + "b".repeat(64),
-      helm.boundDigest!,
+      nativeFixtureDigest,
     ],
     nativeArtifacts: verifyNativeArtifacts(native, "node-bootstrap"),
   };
@@ -478,7 +630,7 @@ test("native spans require the bootstrap profile and exact public-artifact prove
         ...reviewedBase.diffIDs,
         "sha256:" + "a".repeat(64),
         "sha256:" + "b".repeat(64),
-        native[0]!.boundDigest!,
+        nativeFixtureDigest,
       ],
       nativeArtifacts: artifacts,
     };
@@ -605,6 +757,26 @@ test("only the explicit bootstrap profile permits proven absent reviewed runtime
       "node-bootstrap",
     ),
   );
+});
+
+test("storage and Rust artifacts cannot inherit Node or bootstrap finding exceptions", async () => {
+  const proof = await provenance();
+  const value = finding(reviewedFiles[0]!);
+  for (const profile of [
+    "storage",
+    "rust-gateway",
+    "native-controller",
+    "sandbox-controller",
+    "sandbox-extension",
+    "talos-recipe",
+  ] as const) {
+    assert.equal(imageProfile(profile), profile);
+    assert.deepEqual(classifyReviewed([value], { ...proof, profile }), {
+      resolved: 0,
+      unresolved: 1,
+    });
+    assert.deepEqual(readPackageProvenance("", [], profile), []);
+  }
 });
 
 test("bootstrap subset provenance never waives a shipped package or a new finding", async () => {

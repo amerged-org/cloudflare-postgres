@@ -26,8 +26,38 @@ lvm-localpv:
       - key: pgcf.io/quarantine
         operator: Exists
         effect: NoSchedule
+    driverRegistrar:
+      image:
+        registry: registry.k8s.io/
+        repository: sig-storage/csi-node-driver-registrar
+        tag: v2.13.0@sha256:8e66117d3b5e336901fc2ff508b3eb6105f8cf3b70f631e8102441e9562c8875
   lvmController:
     tolerations:
       - key: pgcf.io/quarantine
         operator: Exists
         effect: NoSchedule
+    provisioner:
+      image:
+        registry: registry.k8s.io/
+        repository: sig-storage/csi-provisioner
+        tag: v6.1.0@sha256:6b5a502366ecd4ed81bcdc768699fe431ab70437324f5a7883e9f49a5d640863
+    resizer:
+      image:
+        registry: registry.k8s.io/
+        repository: sig-storage/csi-resizer
+        tag: v2.0.0@sha256:25b17c4f84b0ab061da6397caf407c7251a571df5c4071e4917942684c61689a
+    snapshotter:
+      image:
+        registry: registry.k8s.io/
+        repository: sig-storage/csi-snapshotter
+        tag: v8.2.0@sha256:339a83a86e6e1eead14413fe494b43de8bc48243d146c2810b39dd741d26ca6a
+    snapshotController:
+      image:
+        registry: registry.k8s.io/
+        repository: sig-storage/snapshot-controller
+        tag: v8.2.0@sha256:9d4d1a60c620cf5f0beabd9914e34f4443ef2569f8ba8fba56bab95f380087fa
+  lvmPlugin:
+    image:
+      registry: docker.io/
+      repository: openebs/lvm-driver
+      tag: 1.10.1@sha256:ae4b9e0b57c64e35fc8f742496420bc8f9d3aadd990e1a0e19b4083fafdd6639

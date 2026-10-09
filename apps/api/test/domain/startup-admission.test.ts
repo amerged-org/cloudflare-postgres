@@ -3,9 +3,14 @@ import { env } from "cloudflare:workers";
 import { DatabaseWithOperation } from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
-import { recoverQuiescence } from "../../src/domain/lifecycle.ts";
+import {
+  recoverQuiescence,
+  powerTransitionStatements,
+} from "../../src/domain/lifecycle.ts";
 import {
   recordStartupReadyStatement,
+  databaseStartupHeadroomSql,
+  databaseCpuChargeSql,
   recordStartupObservationStatement,
   releaseCoveredStartupReservationsStatement,
 } from "../../src/domain/startup-admission.ts";
@@ -509,4 +514,79 @@ it("does not let a stale busy refusal reopen a same-timestamp confirmed hibernat
       "SELECT COUNT(*) count FROM database_start_admissions",
     ).first("count"),
   ).toBe(0);
+});
+
+it("accounts one assigned host in startup and active CPU while idle pool RAM stays in the physical sample", async () => {
+  const f = await coldDatabases(1),
+    id = f.databases[0]!;
+  const pool = {
+    version: 1,
+    target_slots: 4,
+    max_idle_cpu_millicores: 400,
+    max_idle_memory_mib: 128,
+    per_slot_cpu_millicores: 100,
+    per_slot_memory_mib: 32,
+    max_age_seconds: 300,
+    profile: {
+      release_id: "fixture-runtime",
+      image: `registry.invalid/runtime@sha256:${"a".repeat(64)}`,
+      holder_sha256: "b".repeat(64),
+      controller_sha256: "c".repeat(64),
+      containerd_version: "2.3.6",
+      runc_version: "1.5.2",
+      architecture: "amd64",
+    },
+  };
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET compute_pool_json=? WHERE region_id=?",
+  )
+    .bind(JSON.stringify(pool), f.region)
+    .run();
+  expect(
+    await env.DB.prepare(
+      `SELECT ${databaseCpuChargeSql()} charge FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=?`,
+    )
+      .bind(id)
+      .first("charge"),
+  ).toBe(0);
+  await sample(f, 1024 * mib);
+  expect(
+    await env.DB.prepare(
+      `SELECT ${databaseStartupHeadroomSql("d")} fits FROM databases d WHERE d.id=?`,
+    )
+      .bind(id)
+      .first("fits"),
+  ).toBe(0);
+  const row = await env.DB.prepare("SELECT * FROM databases WHERE id=?")
+    .bind(id)
+    .first<import("../../src/domain/rows.ts").DatabaseRow>();
+  const exact = await env.DB.batch(
+    powerTransitionStatements(
+      env.DB,
+      row!,
+      "resume",
+      "op_" + crypto.randomUUID().replaceAll("-", "").slice(0, 20),
+      new Date().toISOString(),
+    ),
+  );
+  expect(exact[0]!.meta.changes).toBe(0);
+  expect((await resume(f, id)).status).toBe(409);
+  await sample(f, 1056 * mib, Date.now() + 1);
+  const result = DatabaseWithOperation.parse(
+    await (await resume(f, id)).json(),
+  );
+  expect(
+    await env.DB.prepare(
+      "SELECT budget_bytes FROM database_start_admissions WHERE operation_id=?",
+    )
+      .bind(result.operation.id)
+      .first("budget_bytes"),
+  ).toBe(1056 * mib);
+  expect(
+    await env.DB.prepare(
+      `SELECT ${databaseCpuChargeSql()} charge FROM databases d JOIN size_classes s ON s.id=d.size_class_id WHERE d.id=?`,
+    )
+      .bind(id)
+      .first("charge"),
+  ).toBe(700);
 });

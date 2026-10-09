@@ -8,6 +8,7 @@ export const BOOTSTRAP_RELAY_IDENTITY_PATH = `${BOOTSTRAP_RELAY_PATH}/identity`;
 export const BOOTSTRAP_RELAY_PROBE_PATH = `${BOOTSTRAP_RELAY_PATH}/probe`;
 export const BOOTSTRAP_RELAY_HEADER = "X-PGCF-Bootstrap";
 export const BOOTSTRAP_RELAY_TOKEN_MAX_LENGTH = 2048;
+export const BOOTSTRAP_RELAY_TOKEN_PREFIX = "br1";
 export const BOOTSTRAP_RELAY_MAX_TOKEN_SECONDS = 60;
 export const bootstrapCapabilitySchema = z.enum([
   "rescue_ssh",
@@ -89,6 +90,7 @@ export type BootstrapVerificationKeys = ReadonlyMap<string, BootstrapCryptoKey>;
 const encoder = new TextEncoder(),
   decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 const purpose = "pgcf-bootstrap-relay/v1\n";
+export const BOOTSTRAP_RELAY_SIGNATURE_PURPOSE = purpose;
 const validClock = (value: number) => Number.isSafeInteger(value) && value >= 0;
 
 export async function importBootstrapVerificationKeys(
@@ -169,7 +171,7 @@ export async function signBootstrapRelay(input: {
     input.privateKey,
     encoder.encode(purpose + payload),
   );
-  return `br1.${payload}.${bytesToBase64url(new Uint8Array(signature))}`;
+  return `${BOOTSTRAP_RELAY_TOKEN_PREFIX}.${payload}.${bytesToBase64url(new Uint8Array(signature))}`;
 }
 
 export async function verifyBootstrapRelay(
@@ -191,7 +193,8 @@ export async function verifyBootstrapRelay(
     )
       return { ok: false };
     const parts = token.split(".");
-    if (parts.length !== 3 || parts[0] !== "br1") return { ok: false };
+    if (parts.length !== 3 || parts[0] !== BOOTSTRAP_RELAY_TOKEN_PREFIX)
+      return { ok: false };
     const payload = base64urlToBytes(parts[1]!),
       signature = base64urlToBytes(parts[2]!);
     if (

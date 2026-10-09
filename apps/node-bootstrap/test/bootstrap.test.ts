@@ -21,6 +21,7 @@ import {
   AuthorityClient,
   BootstrapJob,
   BootstrapError,
+  TALOS_VERSION,
   assertAuthority,
   canonical,
   inputHash,
@@ -1007,7 +1008,7 @@ test("authenticated readback uses the pinned Talos JSON flag and real writable L
       if (args.includes(" version "))
         return {
           exit_code: 0,
-          stdout: JSON.stringify({ version: { tag: "v1.14.1" } }),
+          stdout: JSON.stringify({ version: { tag: `v${TALOS_VERSION}` } }),
         };
       if (args.includes("get disks"))
         return {
@@ -1338,7 +1339,7 @@ async function resumeKubernetesBootstrap(
       version: 1,
       cluster_name: input.spec.cluster_name,
       cluster_endpoint: input.spec.cluster_endpoint,
-      talos_version: "1.14.1",
+      talos_version: TALOS_VERSION,
       kubernetes_version: "1.36.5",
       talos_machine_secrets_yaml: randomUUID(),
       talos_admin_config: admin,
@@ -1448,7 +1449,7 @@ async function resumeKubernetesBootstrap(
       if (args.includes("version"))
         return {
           exit_code: 0,
-          stdout: JSON.stringify({ version: { tag: "v1.14.1" } }),
+          stdout: JSON.stringify({ version: { tag: `v${TALOS_VERSION}` } }),
         };
       if (args.includes("disks"))
         return {

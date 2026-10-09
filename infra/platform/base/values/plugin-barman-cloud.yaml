@@ -1,8 +1,12 @@
 replicaCount: 1
 image:
-  tag: v0.15.1
+  tag: v0.15.1@sha256:e982a3b8813703e5c0e58c49aef7e15fe41bbe396c949c480627bda6a3a067b9
+  registry: ghcr.io
+  repository: cloudnative-pg/plugin-barman-cloud
 sidecarImage:
-  tag: v0.15.1
+  tag: v0.15.1@sha256:eb61ec74fddfcadc956fa49d99306daf9d6ec84b59594b183614037e2b5a5785
+  registry: ghcr.io
+  repository: cloudnative-pg/plugin-barman-cloud-sidecar
 crds:
   create: true
 certificate:

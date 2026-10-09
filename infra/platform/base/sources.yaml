@@ -55,10 +55,15 @@ spec:
     operation: copy
 ---
 apiVersion: source.toolkit.fluxcd.io/v1
-kind: HelmRepository
+kind: OCIRepository
 metadata:
-  name: openebs-charts
+  name: openebs-chart
   namespace: flux-system
 spec:
   interval: 1h
-  url: https://openebs.github.io/openebs
+  url: oci://ghcr.io/openebs/charts/openebs
+  ref:
+    digest: sha256:7e22babd055db1058f4325e6e13230eb75945f3623ceb71b4d2060ffab4ba379
+  layerSelector:
+    mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
+    operation: copy

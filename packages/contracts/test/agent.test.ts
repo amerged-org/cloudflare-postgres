@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import {
   DesiredDatabase,
+  postgresImageIdMatches,
   DesiredSize,
   DesiredResponse,
   ObservationRequest,
@@ -383,6 +384,48 @@ describe("archive path", () => {
 });
 
 describe("DesiredDatabase", () => {
+  it("accepts only immutable same-major supported PostgreSQL pins and verified runtime imageIDs", () => {
+    const image = `registry.example/postgres:18.7@sha256:${"a".repeat(64)}`;
+    const postgres = {
+      release_id: "release-18-7",
+      image,
+      version: "18.7",
+      configuration_schema_revision: 1,
+    };
+    expect(DesiredDatabase.safeParse({ ...desired(), postgres }).success).toBe(
+      true,
+    );
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        postgres: { ...postgres, image: "registry.example/postgres:latest" },
+      }).success,
+    ).toBe(false);
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        postgres: { ...postgres, version: "19.1" },
+      }).success,
+    ).toBe(false);
+    expect(
+      DesiredDatabase.safeParse({
+        ...desired(),
+        postgres: { ...postgres, configuration_schema_revision: 2 },
+      }).success,
+    ).toBe(false);
+    expect(
+      postgresImageIdMatches(image, `containerd://sha256:${"a".repeat(64)}`),
+    ).toBe(true);
+    expect(postgresImageIdMatches(image, `docker-pullable://${image}`)).toBe(
+      true,
+    );
+    expect(
+      postgresImageIdMatches(image, `containerd://sha256:${"b".repeat(64)}`),
+    ).toBe(false);
+    expect(
+      postgresImageIdMatches(image, `untrusted://sha256:${"a".repeat(64)}`),
+    ).toBe(false);
+  });
   it("accepts a complete database", () => {
     expect(DesiredDatabase.safeParse(desired()).success).toBe(true);
     expect(
@@ -731,9 +774,24 @@ describe("ObservationRequest", () => {
     expect(ObservationRequest.safeParse(observation()).success).toBe(true);
   });
 
+  it("preserves an unknown orphan inventory separately from an authoritative empty inventory", () => {
+    const targeted = observation();
+    targeted.nodes = [];
+    delete targeted.orphans;
+    const parsed = ObservationRequest.parse(targeted);
+    expect(Object.hasOwn(parsed, "orphans")).toBe(false);
+    expect(parsed.orphans).toBeUndefined();
+    expect(
+      ObservationRequest.parse({ ...targeted, orphans: [] }).orphans,
+    ).toEqual([]);
+    expect(
+      ObservationRequest.safeParse({ ...targeted, orphans: null }).success,
+    ).toBe(false);
+  });
+
   it("rejects a missing field, a wrong enum and an extra field", () => {
     const missing = observation();
-    delete missing.orphans;
+    delete missing.nodes;
     expect(ObservationRequest.safeParse(missing).success).toBe(false);
     const wrongState = observation();
     wrongState.databases = [

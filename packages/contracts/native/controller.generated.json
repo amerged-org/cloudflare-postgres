@@ -1,0 +1,4406 @@
+{
+  "version": 1,
+  "schemas": {
+    "DesiredDatabase": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/DatabaseId" },
+        "generation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "storage_generation": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "recovery": {
+          "type": "object",
+          "properties": {
+            "operation_id": { "$ref": "#/$defs/OperationId" },
+            "source_database_id": { "$ref": "#/$defs/DatabaseId" },
+            "source_archive_path": {
+              "type": "string",
+              "pattern": "^s3:\\/\\/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\\/([a-z][a-z0-9-]{1,30}[a-z0-9])\\/([a-z][a-z0-9]{19})\\/g([1-9][0-9]{0,15})-(op_[a-z0-9]{20})$"
+            },
+            "source_storage_generation": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "source_archive": {
+              "type": "object",
+              "properties": {
+                "region_id": { "$ref": "#/$defs/RegionId" },
+                "bucket": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"
+                },
+                "endpoint_url": {
+                  "type": "string",
+                  "maxLength": 2048,
+                  "format": "uri"
+                },
+                "region": { "type": "string", "const": "auto" }
+              },
+              "required": ["region_id", "bucket", "endpoint_url", "region"],
+              "additionalProperties": false
+            },
+            "backup_id": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}$" },
+            "target_time": { "$ref": "#/$defs/Timestamp" },
+            "status": { "$ref": "#/$defs/OperationStatus" },
+            "ever_ready": { "type": "boolean" }
+          },
+          "required": [
+            "operation_id",
+            "source_database_id",
+            "source_archive_path",
+            "source_storage_generation",
+            "backup_id",
+            "status",
+            "ever_ready"
+          ],
+          "additionalProperties": false
+        },
+        "desired_state": {
+          "type": "string",
+          "enum": ["running", "suspended", "deleted"]
+        },
+        "power": {
+          "type": "object",
+          "properties": {
+            "operation": { "$ref": "#/$defs/OperationId" },
+            "revision": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "mode": { "type": "string", "enum": ["quiesce", "running"] },
+            "reason": {
+              "anyOf": [
+                { "type": "string", "enum": ["manual", "idle"] },
+                { "type": "null" }
+              ]
+            }
+          },
+          "required": ["operation", "revision", "mode", "reason"],
+          "additionalProperties": false
+        },
+        "node": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+        },
+        "pg_major": { "type": "number", "const": 18 },
+        "postgres": {
+          "type": "object",
+          "properties": {
+            "release_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
+            },
+            "image": {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^[A-Za-z0-9./_:-]+@sha256:[a-f0-9]{64}$"
+            },
+            "version": {
+              "type": "string",
+              "pattern": "^18\\.[0-9]+(?:\\.[0-9]+)?$"
+            },
+            "configuration_schema_revision": { "type": "number", "const": 1 }
+          },
+          "required": [
+            "release_id",
+            "image",
+            "version",
+            "configuration_schema_revision"
+          ],
+          "additionalProperties": false
+        },
+        "storage": {
+          "type": "object",
+          "properties": {
+            "backend": { "type": "string", "const": "lvm-thin-v1" },
+            "storage_class": {
+              "type": "string",
+              "pattern": "^pgcf-lvm-thin-v1-[a-f0-9]{16}$"
+            },
+            "volume_attributes_class": {
+              "type": "string",
+              "pattern": "^pgcf-lvm-thin-v1-[a-f0-9]{16}$"
+            },
+            "profile_revision": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "profile_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "node_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "volume_group_uuid": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+            },
+            "pool_uuid": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+            },
+            "startup_reserve_bytes": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "write_bytes_per_second": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "write_iops_per_second": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "guard_seconds": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 120
+            },
+            "drain_seconds": { "type": "integer", "minimum": 1, "maximum": 120 }
+          },
+          "required": [
+            "backend",
+            "storage_class",
+            "volume_attributes_class",
+            "profile_revision",
+            "profile_sha256",
+            "node_uid",
+            "volume_group_uuid",
+            "pool_uuid",
+            "startup_reserve_bytes",
+            "write_bytes_per_second",
+            "write_iops_per_second",
+            "guard_seconds",
+            "drain_seconds"
+          ],
+          "additionalProperties": false
+        },
+        "storage_authority": { "type": "string", "maxLength": 4096 },
+        "storage_startup": {
+          "type": "object",
+          "properties": {
+            "operation_id": { "$ref": "#/$defs/OperationId" },
+            "generation": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "node_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "budget_bytes": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "expires_at": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+            }
+          },
+          "required": [
+            "operation_id",
+            "generation",
+            "node_uid",
+            "budget_bytes",
+            "expires_at"
+          ],
+          "additionalProperties": false
+        },
+        "size": {
+          "type": "object",
+          "properties": {
+            "memory_mib": {
+              "type": "integer",
+              "minimum": 256,
+              "maximum": 9007199254740991
+            },
+            "memory_request_mib": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 1048576
+            },
+            "cpu_millicores": {
+              "type": "integer",
+              "minimum": 100,
+              "maximum": 9007199254740991
+            },
+            "cpu_request_millicores": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 256000
+            },
+            "storage_gib": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            },
+            "max_connections": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 9007199254740991
+            },
+            "archive_timeout_seconds": {
+              "type": "integer",
+              "minimum": 30,
+              "maximum": 9007199254740991
+            },
+            "backup_retention_days": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": [
+            "memory_mib",
+            "cpu_millicores",
+            "storage_gib",
+            "max_connections",
+            "archive_timeout_seconds",
+            "backup_retention_days"
+          ],
+          "additionalProperties": false
+        },
+        "roles": {
+          "default": [],
+          "maxItems": 100,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": { "$ref": "#/$defs/RoleName" },
+              "owner": { "type": "boolean" },
+              "password": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_-]{43}$"
+              },
+              "revision": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              }
+            },
+            "required": ["name", "owner", "password", "revision"],
+            "additionalProperties": false
+          }
+        },
+        "maintenance": {
+          "type": "object",
+          "properties": {
+            "role": { "type": "string", "const": "pgcf_maintenance" },
+            "password": { "type": "string", "pattern": "^[A-Za-z0-9_-]{43}$" },
+            "revision": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          "required": ["role", "password", "revision"],
+          "additionalProperties": false
+        },
+        "creation": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "operation_id": { "$ref": "#/$defs/OperationId" },
+                "generation": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 9007199254740991
+                },
+                "status": { "$ref": "#/$defs/OperationStatus" },
+                "ever_ready": { "type": "boolean" }
+              },
+              "required": [
+                "operation_id",
+                "generation",
+                "status",
+                "ever_ready"
+              ],
+              "additionalProperties": false
+            },
+            { "type": "null" }
+          ]
+        },
+        "archive": {
+          "type": "object",
+          "properties": {
+            "destination_path": {
+              "type": "string",
+              "pattern": "^s3:\\/\\/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\\/([a-z][a-z0-9-]{1,30}[a-z0-9])\\/([a-z][a-z0-9]{19})\\/g([1-9][0-9]{0,15})-(op_[a-z0-9]{20})$"
+            },
+            "server_name": { "type": "string", "const": "database" }
+          },
+          "required": ["destination_path", "server_name"],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "desired_state",
+        "node",
+        "pg_major",
+        "size",
+        "roles",
+        "archive"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "RegionId": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+        },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        },
+        "OperationStatus": {
+          "type": "string",
+          "enum": ["pending", "running", "succeeded", "failed"]
+        },
+        "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
+      }
+    },
+    "DesiredResponse": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "region": {
+          "type": "object",
+          "properties": {
+            "id": { "$ref": "#/$defs/RegionId" },
+            "compute_pool": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "version": { "type": "number", "const": 1 },
+                    "target_slots": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 16
+                    },
+                    "max_idle_cpu_millicores": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 2000
+                    },
+                    "max_idle_memory_mib": {
+                      "type": "integer",
+                      "minimum": 16,
+                      "maximum": 2048
+                    },
+                    "per_slot_cpu_millicores": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 500
+                    },
+                    "per_slot_memory_mib": {
+                      "type": "integer",
+                      "minimum": 16,
+                      "maximum": 512
+                    },
+                    "max_age_seconds": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 300
+                    },
+                    "profile": {
+                      "type": "object",
+                      "properties": {
+                        "release_id": {
+                          "type": "string",
+                          "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
+                        },
+                        "image": {
+                          "type": "string",
+                          "maxLength": 512,
+                          "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+                        },
+                        "holder_sha256": {
+                          "type": "string",
+                          "pattern": "^[a-f0-9]{64}$"
+                        },
+                        "controller_sha256": {
+                          "type": "string",
+                          "pattern": "^[a-f0-9]{64}$"
+                        },
+                        "containerd_version": {
+                          "type": "string",
+                          "const": "2.3.6"
+                        },
+                        "runc_version": { "type": "string", "const": "1.5.2" },
+                        "architecture": {
+                          "type": "string",
+                          "enum": ["amd64", "arm64"]
+                        }
+                      },
+                      "required": [
+                        "release_id",
+                        "image",
+                        "holder_sha256",
+                        "controller_sha256",
+                        "containerd_version",
+                        "runc_version",
+                        "architecture"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "version",
+                    "target_slots",
+                    "max_idle_cpu_millicores",
+                    "max_idle_memory_mib",
+                    "per_slot_cpu_millicores",
+                    "per_slot_memory_mib",
+                    "max_age_seconds",
+                    "profile"
+                  ],
+                  "additionalProperties": false
+                },
+                { "type": "null" }
+              ]
+            },
+            "storage_nodes": {
+              "maxItems": 1000,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "node_id": { "$ref": "#/$defs/NodeId" },
+                  "name": {
+                    "type": "string",
+                    "maxLength": 253,
+                    "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+                  },
+                  "node_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "cluster_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "profile_revision": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "profile_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "storage_class": {
+                    "type": "string",
+                    "pattern": "^pgcf-lvm-thin-v1-[a-f0-9]{16}$"
+                  },
+                  "volume_group_uuid": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                  },
+                  "pool_uuid": {
+                    "anyOf": [
+                      {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                      },
+                      { "type": "null" }
+                    ]
+                  },
+                  "driver_pod_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "driver_image": {
+                    "type": "string",
+                    "pattern": "^[^\\s]+@sha256:[a-f0-9]{64}$"
+                  },
+                  "observed_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+                  },
+                  "captured_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+                  },
+                  "expires_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+                  },
+                  "write_allowed": { "type": "boolean" },
+                  "physical": {
+                    "type": "object",
+                    "properties": {
+                      "volume_group_uuid": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                      },
+                      "total_bytes": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "free_bytes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "thick_allocated_bytes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "thin_pool": {
+                        "anyOf": [
+                          {
+                            "type": "object",
+                            "properties": {
+                              "name": {
+                                "type": "string",
+                                "const": "pgcf_thinpool"
+                              },
+                              "data_total_bytes": {
+                                "type": "integer",
+                                "exclusiveMinimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "data_used_bytes_upper_bound": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "metadata_total_bytes": {
+                                "type": "integer",
+                                "exclusiveMinimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "metadata_used_bytes_upper_bound": {
+                                "type": "integer",
+                                "minimum": 0,
+                                "maximum": 9007199254740991
+                              }
+                            },
+                            "required": [
+                              "name",
+                              "data_total_bytes",
+                              "data_used_bytes_upper_bound",
+                              "metadata_total_bytes",
+                              "metadata_used_bytes_upper_bound"
+                            ],
+                            "additionalProperties": false
+                          },
+                          { "type": "null" }
+                        ]
+                      }
+                    },
+                    "required": [
+                      "volume_group_uuid",
+                      "total_bytes",
+                      "free_bytes",
+                      "thick_allocated_bytes",
+                      "thin_pool"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "physical_lvs": {
+                    "maxItems": 8192,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "name": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z0-9_.+[\\]-]{1,128}$"
+                        },
+                        "lv_uuid": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                        },
+                        "size_bytes": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "segtype": {
+                          "type": "string",
+                          "pattern": "^[a-z0-9-]{1,32}$"
+                        }
+                      },
+                      "required": ["name", "lv_uuid", "size_bytes", "segtype"],
+                      "additionalProperties": false
+                    }
+                  },
+                  "active_lv_uuids": {
+                    "maxItems": 8192,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                    }
+                  },
+                  "data_accounting_complete": { "type": "boolean" },
+                  "protections": {
+                    "maxItems": 4096,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "database_id": { "$ref": "#/$defs/DatabaseId" },
+                        "generation": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "operation_id": {
+                          "anyOf": [
+                            { "$ref": "#/$defs/OperationId" },
+                            { "type": "null" }
+                          ]
+                        },
+                        "storage_uid": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "namespace_uid": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "cluster_uid": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "node_uid": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "profile_sha256": {
+                          "type": "string",
+                          "pattern": "^[a-f0-9]{64}$"
+                        },
+                        "requested_at": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "hibernation_on": { "type": "boolean", "const": true },
+                        "pods_absent": { "type": "boolean", "const": true }
+                      },
+                      "required": [
+                        "database_id",
+                        "generation",
+                        "operation_id",
+                        "storage_uid",
+                        "namespace_uid",
+                        "cluster_uid",
+                        "node_uid",
+                        "profile_sha256",
+                        "requested_at",
+                        "hibernation_on",
+                        "pods_absent"
+                      ],
+                      "additionalProperties": false
+                    }
+                  },
+                  "volumes": {
+                    "maxItems": 4096,
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "database_id": { "$ref": "#/$defs/DatabaseId" },
+                        "generation": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "storage_generation": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "storage_uid": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "namespace_uid": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "cluster_uid": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "volume_handle": {
+                          "type": "string",
+                          "pattern": "^pvc-[a-f0-9-]{36}$"
+                        },
+                        "lv_uuid": {
+                          "type": "string",
+                          "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                        },
+                        "pvc_uid": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "pv_uid": {
+                          "type": "string",
+                          "format": "uuid",
+                          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                        },
+                        "storage_class": {
+                          "anyOf": [
+                            { "type": "string", "const": "pgcf-lvm" },
+                            {
+                              "type": "string",
+                              "pattern": "^pgcf-lvm-thin-v1-[a-f0-9]{16}$"
+                            }
+                          ]
+                        },
+                        "volume_attributes_class": {
+                          "anyOf": [
+                            {
+                              "type": "string",
+                              "pattern": "^pgcf-lvm-thin-v1-[a-f0-9]{16}$"
+                            },
+                            { "type": "null" }
+                          ]
+                        },
+                        "quiesced": { "type": "boolean" },
+                        "io": {
+                          "maxItems": 8,
+                          "type": "array",
+                          "items": {
+                            "type": "object",
+                            "properties": {
+                              "pod_uid": {
+                                "type": "string",
+                                "format": "uuid",
+                                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                              },
+                              "write_bytes_per_second": {
+                                "type": "integer",
+                                "exclusiveMinimum": 0,
+                                "maximum": 9007199254740991
+                              },
+                              "write_iops_per_second": {
+                                "type": "integer",
+                                "exclusiveMinimum": 0,
+                                "maximum": 9007199254740991
+                              }
+                            },
+                            "required": [
+                              "pod_uid",
+                              "write_bytes_per_second",
+                              "write_iops_per_second"
+                            ],
+                            "additionalProperties": false
+                          }
+                        }
+                      },
+                      "required": [
+                        "database_id",
+                        "generation",
+                        "storage_generation",
+                        "storage_uid",
+                        "namespace_uid",
+                        "cluster_uid",
+                        "volume_handle",
+                        "lv_uuid",
+                        "pvc_uid",
+                        "pv_uid",
+                        "storage_class",
+                        "volume_attributes_class",
+                        "io"
+                      ],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "name",
+                  "node_uid",
+                  "cluster_uid",
+                  "revision",
+                  "profile_revision",
+                  "profile_sha256",
+                  "storage_class",
+                  "volume_group_uuid",
+                  "pool_uuid",
+                  "driver_pod_uid",
+                  "driver_image",
+                  "observed_at",
+                  "captured_at",
+                  "expires_at",
+                  "write_allowed",
+                  "physical",
+                  "physical_lvs",
+                  "active_lv_uuids",
+                  "data_accounting_complete",
+                  "protections",
+                  "volumes"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "recovery_sources": {
+              "type": "object",
+              "propertyNames": { "$ref": "#/$defs/RegionId" },
+              "additionalProperties": {
+                "type": "object",
+                "properties": {
+                  "access_key_id": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  },
+                  "secret_access_key": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096
+                  },
+                  "bucket": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"
+                  },
+                  "endpoint_url": {
+                    "type": "string",
+                    "maxLength": 2048,
+                    "format": "uri"
+                  }
+                },
+                "required": [
+                  "access_key_id",
+                  "secret_access_key",
+                  "bucket",
+                  "endpoint_url"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "backup": {
+              "type": "object",
+              "properties": {
+                "bucket": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"
+                },
+                "endpoint_url": { "type": "string", "format": "uri" },
+                "region": { "type": "string", "const": "auto" }
+              },
+              "required": ["bucket", "endpoint_url", "region"],
+              "additionalProperties": false
+            },
+            "scheduling": {
+              "type": "object",
+              "properties": {
+                "placement_mode": { "type": "string", "const": "actual_ram" },
+                "maximum_database_memory_mib": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 1048576,
+                  "multipleOf": 256
+                },
+                "postgres_memory_request_mib": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 1048576
+                }
+              },
+              "required": [
+                "placement_mode",
+                "maximum_database_memory_mib",
+                "postgres_memory_request_mib"
+              ],
+              "additionalProperties": false
+            }
+          },
+          "required": ["id", "backup"],
+          "additionalProperties": false
+        },
+        "fleet_release": {
+          "type": "object",
+          "properties": {
+            "region_id": { "$ref": "#/$defs/RegionId" },
+            "region_revision": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "release": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
+                },
+                "spec": {
+                  "type": "object",
+                  "properties": {
+                    "version": { "type": "number", "const": 1 },
+                    "versions_lock_sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "configuration_schema_revision": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 2147483647
+                    },
+                    "platform_source_commit": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{40}$"
+                    },
+                    "storage_authority_keys_sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    },
+                    "thin_storage_qualification": {
+                      "type": "object",
+                      "properties": {
+                        "profile_sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        },
+                        "driver_image": {
+                          "type": "string",
+                          "maxLength": 512,
+                          "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
+                        },
+                        "host_extension_image": {
+                          "type": "string",
+                          "maxLength": 512,
+                          "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
+                        },
+                        "kernel_version": {
+                          "type": "string",
+                          "maxLength": 128,
+                          "pattern": "^\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+                        },
+                        "receipt_sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        },
+                        "qualified_at": {
+                          "type": "string",
+                          "format": "date-time",
+                          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+                        },
+                        "gates": {
+                          "type": "object",
+                          "properties": {
+                            "data_full": { "type": "boolean", "const": true },
+                            "metadata_full": {
+                              "type": "boolean",
+                              "const": true
+                            },
+                            "noflush_quiescence": {
+                              "type": "boolean",
+                              "const": true
+                            },
+                            "resume_marker": {
+                              "type": "boolean",
+                              "const": true
+                            },
+                            "startup_bound": {
+                              "type": "boolean",
+                              "const": true
+                            },
+                            "trim_delete_recreate": {
+                              "type": "boolean",
+                              "const": true
+                            },
+                            "retained_thick_preservation": {
+                              "type": "boolean",
+                              "const": true
+                            }
+                          },
+                          "required": [
+                            "data_full",
+                            "metadata_full",
+                            "noflush_quiescence",
+                            "resume_marker",
+                            "startup_bound",
+                            "trim_delete_recreate",
+                            "retained_thick_preservation"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": [
+                        "profile_sha256",
+                        "driver_image",
+                        "host_extension_image",
+                        "kernel_version",
+                        "receipt_sha256",
+                        "qualified_at",
+                        "gates"
+                      ],
+                      "additionalProperties": false
+                    },
+                    "components": {
+                      "minItems": 1,
+                      "maxItems": 128,
+                      "type": "array",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "name": {
+                            "type": "string",
+                            "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+                          },
+                          "kind": {
+                            "type": "string",
+                            "enum": ["image", "chart", "worker_bundle"]
+                          },
+                          "version": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 128
+                          },
+                          "reference": {
+                            "type": "string",
+                            "minLength": 1,
+                            "maxLength": 512,
+                            "pattern": "^[^\\s\\p{C}]+$"
+                          },
+                          "sha256": {
+                            "type": "string",
+                            "pattern": "^[0-9a-f]{64}$"
+                          },
+                          "workload": {
+                            "type": "object",
+                            "properties": {
+                              "namespace": {
+                                "type": "string",
+                                "maxLength": 63,
+                                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?$"
+                              },
+                              "selector": {
+                                "type": "object",
+                                "propertyNames": {
+                                  "type": "string",
+                                  "minLength": 1,
+                                  "maxLength": 253
+                                },
+                                "additionalProperties": {
+                                  "type": "string",
+                                  "maxLength": 63
+                                }
+                              },
+                              "scope": {
+                                "type": "string",
+                                "enum": ["node", "cluster"]
+                              }
+                            },
+                            "required": ["namespace", "selector"],
+                            "additionalProperties": false
+                          }
+                        },
+                        "required": [
+                          "name",
+                          "kind",
+                          "version",
+                          "reference",
+                          "sha256"
+                        ],
+                        "additionalProperties": false
+                      }
+                    },
+                    "roles": {
+                      "type": "object",
+                      "properties": {
+                        "control_relay": {
+                          "type": "object",
+                          "properties": {
+                            "host_configuration_required": {
+                              "type": "boolean"
+                            },
+                            "kubernetes_images": {
+                              "type": "object",
+                              "properties": {
+                                "kubelet": {
+                                  "type": "string",
+                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
+                                },
+                                "apiServer": {
+                                  "type": "string",
+                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
+                                },
+                                "controllerManager": {
+                                  "type": "string",
+                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
+                                },
+                                "scheduler": {
+                                  "type": "string",
+                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
+                                }
+                              },
+                              "required": [
+                                "kubelet",
+                                "apiServer",
+                                "controllerManager",
+                                "scheduler"
+                              ],
+                              "additionalProperties": false
+                            },
+                            "talos_version": {
+                              "type": "string",
+                              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+                            },
+                            "talos_installer": {
+                              "type": "string",
+                              "maxLength": 512,
+                              "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
+                            },
+                            "talos_schematic_sha256": {
+                              "type": "string",
+                              "pattern": "^[0-9a-f]{64}$"
+                            },
+                            "talos_extensions": {
+                              "maxItems": 32,
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+                              }
+                            },
+                            "kubernetes_version": {
+                              "type": "string",
+                              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+                            },
+                            "components": {
+                              "minItems": 1,
+                              "maxItems": 128,
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+                              }
+                            }
+                          },
+                          "required": [
+                            "talos_version",
+                            "talos_installer",
+                            "talos_schematic_sha256",
+                            "talos_extensions",
+                            "kubernetes_version",
+                            "components"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "customer": {
+                          "type": "object",
+                          "properties": {
+                            "host_configuration_required": {
+                              "type": "boolean"
+                            },
+                            "kubernetes_images": {
+                              "type": "object",
+                              "properties": {
+                                "kubelet": {
+                                  "type": "string",
+                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
+                                },
+                                "apiServer": {
+                                  "type": "string",
+                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
+                                },
+                                "controllerManager": {
+                                  "type": "string",
+                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
+                                },
+                                "scheduler": {
+                                  "type": "string",
+                                  "pattern": "^[^\\s@]+:v\\d+\\.\\d+\\.\\d+@sha256:[0-9a-f]{64}$"
+                                }
+                              },
+                              "required": [
+                                "kubelet",
+                                "apiServer",
+                                "controllerManager",
+                                "scheduler"
+                              ],
+                              "additionalProperties": false
+                            },
+                            "talos_version": {
+                              "type": "string",
+                              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+                            },
+                            "talos_installer": {
+                              "type": "string",
+                              "maxLength": 512,
+                              "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
+                            },
+                            "talos_schematic_sha256": {
+                              "type": "string",
+                              "pattern": "^[0-9a-f]{64}$"
+                            },
+                            "talos_extensions": {
+                              "maxItems": 32,
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+                              }
+                            },
+                            "kubernetes_version": {
+                              "type": "string",
+                              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+                            },
+                            "components": {
+                              "minItems": 1,
+                              "maxItems": 128,
+                              "type": "array",
+                              "items": {
+                                "type": "string",
+                                "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+                              }
+                            }
+                          },
+                          "required": [
+                            "talos_version",
+                            "talos_installer",
+                            "talos_schematic_sha256",
+                            "talos_extensions",
+                            "kubernetes_version",
+                            "components"
+                          ],
+                          "additionalProperties": false
+                        }
+                      },
+                      "required": ["control_relay", "customer"],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": [
+                    "version",
+                    "versions_lock_sha256",
+                    "configuration_schema_revision",
+                    "components",
+                    "roles"
+                  ],
+                  "additionalProperties": false
+                },
+                "spec_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "approved_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+                }
+              },
+              "required": ["id", "spec", "spec_sha256", "approved_at"],
+              "additionalProperties": false
+            },
+            "nodes": {
+              "maxItems": 1000,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "node_id": { "$ref": "#/$defs/NodeId" },
+                  "node_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "k8s_node_name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 253
+                  },
+                  "role": {
+                    "type": "string",
+                    "enum": ["control_relay", "customer"]
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 2147483647
+                  }
+                },
+                "required": [
+                  "node_id",
+                  "node_uid",
+                  "k8s_node_name",
+                  "role",
+                  "revision"
+                ],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["region_id", "region_revision", "release", "nodes"],
+          "additionalProperties": false
+        },
+        "databases": {
+          "maxItems": 200,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "$ref": "#/$defs/DatabaseId" },
+              "generation": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "storage_generation": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "recovery": {
+                "type": "object",
+                "properties": {
+                  "operation_id": { "$ref": "#/$defs/OperationId" },
+                  "source_database_id": { "$ref": "#/$defs/DatabaseId" },
+                  "source_archive_path": {
+                    "type": "string",
+                    "pattern": "^s3:\\/\\/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\\/([a-z][a-z0-9-]{1,30}[a-z0-9])\\/([a-z][a-z0-9]{19})\\/g([1-9][0-9]{0,15})-(op_[a-z0-9]{20})$"
+                  },
+                  "source_storage_generation": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "source_archive": {
+                    "type": "object",
+                    "properties": {
+                      "region_id": { "$ref": "#/$defs/RegionId" },
+                      "bucket": {
+                        "type": "string",
+                        "pattern": "^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"
+                      },
+                      "endpoint_url": {
+                        "type": "string",
+                        "maxLength": 2048,
+                        "format": "uri"
+                      },
+                      "region": { "type": "string", "const": "auto" }
+                    },
+                    "required": [
+                      "region_id",
+                      "bucket",
+                      "endpoint_url",
+                      "region"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "backup_id": {
+                    "type": "string",
+                    "pattern": "^[0-9]{8}T[0-9]{6}$"
+                  },
+                  "target_time": { "$ref": "#/$defs/Timestamp" },
+                  "status": { "$ref": "#/$defs/OperationStatus" },
+                  "ever_ready": { "type": "boolean" }
+                },
+                "required": [
+                  "operation_id",
+                  "source_database_id",
+                  "source_archive_path",
+                  "source_storage_generation",
+                  "backup_id",
+                  "status",
+                  "ever_ready"
+                ],
+                "additionalProperties": false
+              },
+              "desired_state": {
+                "type": "string",
+                "enum": ["running", "suspended", "deleted"]
+              },
+              "power": {
+                "type": "object",
+                "properties": {
+                  "operation": { "$ref": "#/$defs/OperationId" },
+                  "revision": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "mode": { "type": "string", "enum": ["quiesce", "running"] },
+                  "reason": {
+                    "anyOf": [
+                      { "type": "string", "enum": ["manual", "idle"] },
+                      { "type": "null" }
+                    ]
+                  }
+                },
+                "required": ["operation", "revision", "mode", "reason"],
+                "additionalProperties": false
+              },
+              "node": {
+                "type": "string",
+                "maxLength": 253,
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+              },
+              "pg_major": { "type": "number", "const": 18 },
+              "postgres": {
+                "type": "object",
+                "properties": {
+                  "release_id": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
+                  },
+                  "image": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "pattern": "^[A-Za-z0-9./_:-]+@sha256:[a-f0-9]{64}$"
+                  },
+                  "version": {
+                    "type": "string",
+                    "pattern": "^18\\.[0-9]+(?:\\.[0-9]+)?$"
+                  },
+                  "configuration_schema_revision": {
+                    "type": "number",
+                    "const": 1
+                  }
+                },
+                "required": [
+                  "release_id",
+                  "image",
+                  "version",
+                  "configuration_schema_revision"
+                ],
+                "additionalProperties": false
+              },
+              "storage": {
+                "type": "object",
+                "properties": {
+                  "backend": { "type": "string", "const": "lvm-thin-v1" },
+                  "storage_class": {
+                    "type": "string",
+                    "pattern": "^pgcf-lvm-thin-v1-[a-f0-9]{16}$"
+                  },
+                  "volume_attributes_class": {
+                    "type": "string",
+                    "pattern": "^pgcf-lvm-thin-v1-[a-f0-9]{16}$"
+                  },
+                  "profile_revision": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "profile_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "node_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "volume_group_uuid": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                  },
+                  "pool_uuid": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                  },
+                  "startup_reserve_bytes": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "write_bytes_per_second": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "write_iops_per_second": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "guard_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 120
+                  },
+                  "drain_seconds": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 120
+                  }
+                },
+                "required": [
+                  "backend",
+                  "storage_class",
+                  "volume_attributes_class",
+                  "profile_revision",
+                  "profile_sha256",
+                  "node_uid",
+                  "volume_group_uuid",
+                  "pool_uuid",
+                  "startup_reserve_bytes",
+                  "write_bytes_per_second",
+                  "write_iops_per_second",
+                  "guard_seconds",
+                  "drain_seconds"
+                ],
+                "additionalProperties": false
+              },
+              "storage_authority": { "type": "string", "maxLength": 4096 },
+              "storage_startup": {
+                "type": "object",
+                "properties": {
+                  "operation_id": { "$ref": "#/$defs/OperationId" },
+                  "generation": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "node_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "budget_bytes": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "expires_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+                  }
+                },
+                "required": [
+                  "operation_id",
+                  "generation",
+                  "node_uid",
+                  "budget_bytes",
+                  "expires_at"
+                ],
+                "additionalProperties": false
+              },
+              "size": {
+                "type": "object",
+                "properties": {
+                  "memory_mib": {
+                    "type": "integer",
+                    "minimum": 256,
+                    "maximum": 9007199254740991
+                  },
+                  "memory_request_mib": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 1048576
+                  },
+                  "cpu_millicores": {
+                    "type": "integer",
+                    "minimum": 100,
+                    "maximum": 9007199254740991
+                  },
+                  "cpu_request_millicores": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 256000
+                  },
+                  "storage_gib": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  },
+                  "max_connections": {
+                    "type": "integer",
+                    "minimum": 10,
+                    "maximum": 9007199254740991
+                  },
+                  "archive_timeout_seconds": {
+                    "type": "integer",
+                    "minimum": 30,
+                    "maximum": 9007199254740991
+                  },
+                  "backup_retention_days": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": [
+                  "memory_mib",
+                  "cpu_millicores",
+                  "storage_gib",
+                  "max_connections",
+                  "archive_timeout_seconds",
+                  "backup_retention_days"
+                ],
+                "additionalProperties": false
+              },
+              "roles": {
+                "default": [],
+                "maxItems": 100,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "name": { "$ref": "#/$defs/RoleName" },
+                    "owner": { "type": "boolean" },
+                    "password": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9_-]{43}$"
+                    },
+                    "revision": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": ["name", "owner", "password", "revision"],
+                  "additionalProperties": false
+                }
+              },
+              "maintenance": {
+                "type": "object",
+                "properties": {
+                  "role": { "type": "string", "const": "pgcf_maintenance" },
+                  "password": {
+                    "type": "string",
+                    "pattern": "^[A-Za-z0-9_-]{43}$"
+                  },
+                  "revision": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  }
+                },
+                "required": ["role", "password", "revision"],
+                "additionalProperties": false
+              },
+              "creation": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "operation_id": { "$ref": "#/$defs/OperationId" },
+                      "generation": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 9007199254740991
+                      },
+                      "status": { "$ref": "#/$defs/OperationStatus" },
+                      "ever_ready": { "type": "boolean" }
+                    },
+                    "required": [
+                      "operation_id",
+                      "generation",
+                      "status",
+                      "ever_ready"
+                    ],
+                    "additionalProperties": false
+                  },
+                  { "type": "null" }
+                ]
+              },
+              "archive": {
+                "type": "object",
+                "properties": {
+                  "destination_path": {
+                    "type": "string",
+                    "pattern": "^s3:\\/\\/([a-z0-9][a-z0-9-]{1,61}[a-z0-9])\\/([a-z][a-z0-9-]{1,30}[a-z0-9])\\/([a-z][a-z0-9]{19})\\/g([1-9][0-9]{0,15})-(op_[a-z0-9]{20})$"
+                  },
+                  "server_name": { "type": "string", "const": "database" }
+                },
+                "required": ["destination_path", "server_name"],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "id",
+              "generation",
+              "desired_state",
+              "node",
+              "pg_major",
+              "size",
+              "roles",
+              "archive"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "next": {
+          "anyOf": [{ "$ref": "#/$defs/DatabaseId" }, { "type": "null" }]
+        }
+      },
+      "required": ["region", "databases", "next"],
+      "additionalProperties": false,
+      "$defs": {
+        "RegionId": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+        },
+        "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        },
+        "OperationStatus": {
+          "type": "string",
+          "enum": ["pending", "running", "succeeded", "failed"]
+        },
+        "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
+      }
+    },
+    "DatabaseObservation": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "id": { "$ref": "#/$defs/DatabaseId" },
+        "generation": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9007199254740991
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "provisioning",
+            "hibernated",
+            "ready",
+            "error",
+            "deleting",
+            "deleted"
+          ]
+        },
+        "postgres": {
+          "type": "object",
+          "properties": {
+            "image": {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^[^\\s]+@sha256:[a-f0-9]{64}$"
+            },
+            "image_id": { "type": "string", "maxLength": 1024 }
+          },
+          "required": ["image", "image_id"],
+          "additionalProperties": false
+        },
+        "recovery": {
+          "type": "object",
+          "properties": {
+            "operation_id": { "$ref": "#/$defs/OperationId" },
+            "storage_generation": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "verified": { "type": "boolean", "const": true }
+          },
+          "required": ["operation_id", "storage_generation", "verified"],
+          "additionalProperties": false
+        },
+        "power": {
+          "type": "object",
+          "properties": {
+            "operation": { "$ref": "#/$defs/OperationId" },
+            "revision": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "state": { "type": "string", "enum": ["hibernated", "awake"] },
+            "refusal": {
+              "type": "string",
+              "enum": ["busy", "archive", "unknown"]
+            }
+          },
+          "required": ["operation", "revision", "state"],
+          "additionalProperties": false
+        },
+        "message": { "type": "string", "maxLength": 4096 },
+        "backup": {
+          "type": "object",
+          "properties": {
+            "health": {
+              "type": "string",
+              "enum": ["ok", "failing", "unknown"]
+            },
+            "observed_at": { "$ref": "#/$defs/Timestamp" },
+            "last_completed_at": {
+              "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+            },
+            "last_failed_at": {
+              "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+            }
+          },
+          "required": [
+            "health",
+            "observed_at",
+            "last_completed_at",
+            "last_failed_at"
+          ],
+          "additionalProperties": false
+        },
+        "runtime_attestation": {
+          "type": "object",
+          "properties": {
+            "v": { "type": "number", "const": 1 },
+            "database_id": { "$ref": "#/$defs/DatabaseId" },
+            "generation": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "storage_generation": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "node_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "boot_id": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "cluster_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "namespace_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "cnpg_cluster_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "storage_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "pvc_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "pv_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "pod_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "container_id": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "postgres_image_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "memory_request_bytes": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "memory_limit_bytes": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "observed_at": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "configuration_fingerprint": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            }
+          },
+          "required": [
+            "v",
+            "database_id",
+            "generation",
+            "storage_generation",
+            "node_uid",
+            "boot_id",
+            "cluster_uid",
+            "namespace_uid",
+            "cnpg_cluster_uid",
+            "storage_uid",
+            "pvc_uid",
+            "pv_uid",
+            "pod_uid",
+            "container_id",
+            "postgres_image_sha256",
+            "memory_request_bytes",
+            "memory_limit_bytes",
+            "observed_at",
+            "configuration_fingerprint"
+          ],
+          "additionalProperties": false
+        },
+        "archive": {
+          "type": "object",
+          "properties": {
+            "continuous": { "type": "boolean" },
+            "ready_wal_files": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                { "type": "null" }
+              ]
+            },
+            "health": { "type": "string", "enum": ["ok", "failing", "unknown"] }
+          },
+          "required": ["continuous", "ready_wal_files"],
+          "additionalProperties": false
+        }
+      },
+      "required": ["id", "generation", "state", "archive"],
+      "additionalProperties": false,
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
+    "ObservationRequest": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "observed_at": { "$ref": "#/$defs/Timestamp" },
+        "nodes": {
+          "maxItems": 1000,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "node_id": { "$ref": "#/$defs/NodeId" },
+              "provider_instance_id": {
+                "type": "string",
+                "pattern": "^[1-9]\\d{0,19}$"
+              },
+              "node_uid": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "name": {
+                "type": "string",
+                "maxLength": 253,
+                "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+              },
+              "ready": { "type": "boolean" },
+              "database_placement_enabled": {
+                "type": "boolean",
+                "const": false
+              },
+              "allocatable_memory_mib": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "allocatable_cpu_millicores": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "storage_gib_total": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  { "type": "null" }
+                ]
+              },
+              "platform_reserved_memory_mib": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "platform_reserved_cpu_millicores": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  { "type": "null" }
+                ]
+              },
+              "storage": {
+                "type": "object",
+                "properties": {
+                  "node_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "observed_at": {
+                    "type": "string",
+                    "format": "date-time",
+                    "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+                  },
+                  "physical": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "volume_group_uuid": {
+                            "type": "string",
+                            "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                          },
+                          "total_bytes": {
+                            "type": "integer",
+                            "exclusiveMinimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "free_bytes": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "thick_allocated_bytes": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          "thin_pool": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "name": {
+                                    "type": "string",
+                                    "const": "pgcf_thinpool"
+                                  },
+                                  "data_total_bytes": {
+                                    "type": "integer",
+                                    "exclusiveMinimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "data_used_bytes_upper_bound": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "metadata_total_bytes": {
+                                    "type": "integer",
+                                    "exclusiveMinimum": 0,
+                                    "maximum": 9007199254740991
+                                  },
+                                  "metadata_used_bytes_upper_bound": {
+                                    "type": "integer",
+                                    "minimum": 0,
+                                    "maximum": 9007199254740991
+                                  }
+                                },
+                                "required": [
+                                  "name",
+                                  "data_total_bytes",
+                                  "data_used_bytes_upper_bound",
+                                  "metadata_total_bytes",
+                                  "metadata_used_bytes_upper_bound"
+                                ],
+                                "additionalProperties": false
+                              },
+                              { "type": "null" }
+                            ]
+                          }
+                        },
+                        "required": [
+                          "volume_group_uuid",
+                          "total_bytes",
+                          "free_bytes",
+                          "thick_allocated_bytes",
+                          "thin_pool"
+                        ],
+                        "additionalProperties": false
+                      },
+                      { "type": "null" }
+                    ]
+                  }
+                },
+                "required": ["node_uid", "observed_at", "physical"],
+                "additionalProperties": false
+              }
+            },
+            "required": [
+              "name",
+              "ready",
+              "allocatable_memory_mib",
+              "allocatable_cpu_millicores",
+              "storage_gib_total",
+              "platform_reserved_memory_mib"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "databases": {
+          "maxItems": 10000,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "$ref": "#/$defs/DatabaseId" },
+              "generation": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 9007199254740991
+              },
+              "state": {
+                "type": "string",
+                "enum": [
+                  "provisioning",
+                  "hibernated",
+                  "ready",
+                  "error",
+                  "deleting",
+                  "deleted"
+                ]
+              },
+              "postgres": {
+                "type": "object",
+                "properties": {
+                  "image": {
+                    "type": "string",
+                    "maxLength": 512,
+                    "pattern": "^[^\\s]+@sha256:[a-f0-9]{64}$"
+                  },
+                  "image_id": { "type": "string", "maxLength": 1024 }
+                },
+                "required": ["image", "image_id"],
+                "additionalProperties": false
+              },
+              "recovery": {
+                "type": "object",
+                "properties": {
+                  "operation_id": { "$ref": "#/$defs/OperationId" },
+                  "storage_generation": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "verified": { "type": "boolean", "const": true }
+                },
+                "required": ["operation_id", "storage_generation", "verified"],
+                "additionalProperties": false
+              },
+              "power": {
+                "type": "object",
+                "properties": {
+                  "operation": { "$ref": "#/$defs/OperationId" },
+                  "revision": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "state": {
+                    "type": "string",
+                    "enum": ["hibernated", "awake"]
+                  },
+                  "refusal": {
+                    "type": "string",
+                    "enum": ["busy", "archive", "unknown"]
+                  }
+                },
+                "required": ["operation", "revision", "state"],
+                "additionalProperties": false
+              },
+              "message": { "type": "string", "maxLength": 4096 },
+              "backup": {
+                "type": "object",
+                "properties": {
+                  "health": {
+                    "type": "string",
+                    "enum": ["ok", "failing", "unknown"]
+                  },
+                  "observed_at": { "$ref": "#/$defs/Timestamp" },
+                  "last_completed_at": {
+                    "anyOf": [
+                      { "$ref": "#/$defs/Timestamp" },
+                      { "type": "null" }
+                    ]
+                  },
+                  "last_failed_at": {
+                    "anyOf": [
+                      { "$ref": "#/$defs/Timestamp" },
+                      { "type": "null" }
+                    ]
+                  }
+                },
+                "required": [
+                  "health",
+                  "observed_at",
+                  "last_completed_at",
+                  "last_failed_at"
+                ],
+                "additionalProperties": false
+              },
+              "runtime_attestation": {
+                "type": "object",
+                "properties": {
+                  "v": { "type": "number", "const": 1 },
+                  "database_id": { "$ref": "#/$defs/DatabaseId" },
+                  "generation": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "storage_generation": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "node_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "boot_id": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "cluster_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "namespace_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "cnpg_cluster_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "storage_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "pvc_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "pv_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "pod_uid": {
+                    "type": "string",
+                    "format": "uuid",
+                    "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                  },
+                  "container_id": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "postgres_image_sha256": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  },
+                  "memory_request_bytes": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "memory_limit_bytes": {
+                    "type": "integer",
+                    "exclusiveMinimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "observed_at": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "configuration_fingerprint": {
+                    "type": "string",
+                    "pattern": "^[a-f0-9]{64}$"
+                  }
+                },
+                "required": [
+                  "v",
+                  "database_id",
+                  "generation",
+                  "storage_generation",
+                  "node_uid",
+                  "boot_id",
+                  "cluster_uid",
+                  "namespace_uid",
+                  "cnpg_cluster_uid",
+                  "storage_uid",
+                  "pvc_uid",
+                  "pv_uid",
+                  "pod_uid",
+                  "container_id",
+                  "postgres_image_sha256",
+                  "memory_request_bytes",
+                  "memory_limit_bytes",
+                  "observed_at",
+                  "configuration_fingerprint"
+                ],
+                "additionalProperties": false
+              },
+              "archive": {
+                "type": "object",
+                "properties": {
+                  "continuous": { "type": "boolean" },
+                  "ready_wal_files": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      { "type": "null" }
+                    ]
+                  },
+                  "health": {
+                    "type": "string",
+                    "enum": ["ok", "failing", "unknown"]
+                  }
+                },
+                "required": ["continuous", "ready_wal_files"],
+                "additionalProperties": false
+              }
+            },
+            "required": ["id", "generation", "state", "archive"],
+            "additionalProperties": false
+          }
+        },
+        "orphans": {
+          "maxItems": 1000,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "namespace": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 63
+              },
+              "database_id": {
+                "anyOf": [
+                  { "type": "string", "maxLength": 253 },
+                  { "type": "null" }
+                ]
+              }
+            },
+            "required": ["namespace", "database_id"],
+            "additionalProperties": false
+          }
+        },
+        "node_memory_samples": {
+          "maxItems": 1000,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "node_id": { "$ref": "#/$defs/NodeId" },
+              "provider_instance_id": {
+                "type": "string",
+                "pattern": "^[1-9]\\d{0,19}$"
+              },
+              "node_uid": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "memory": {
+                "anyOf": [
+                  {
+                    "type": "object",
+                    "properties": {
+                      "node_uid": {
+                        "type": "string",
+                        "format": "uuid",
+                        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                      },
+                      "observed_at": { "$ref": "#/$defs/Timestamp" },
+                      "working_set_bytes": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "capacity_memory_bytes": {
+                        "type": "integer",
+                        "exclusiveMinimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      "available_bytes": {
+                        "anyOf": [
+                          {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          { "type": "null" }
+                        ]
+                      },
+                      "memory_pressure": { "type": ["boolean", "null"] }
+                    },
+                    "required": [
+                      "node_uid",
+                      "observed_at",
+                      "working_set_bytes",
+                      "capacity_memory_bytes",
+                      "available_bytes",
+                      "memory_pressure"
+                    ],
+                    "additionalProperties": false
+                  },
+                  { "type": "null" }
+                ]
+              }
+            },
+            "required": [
+              "node_id",
+              "provider_instance_id",
+              "node_uid",
+              "memory"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["observed_at", "nodes", "databases"],
+      "additionalProperties": false,
+      "$defs": {
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        },
+        "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
+      }
+    },
+    "ServerLinkMessage": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "type": { "type": "string", "const": "welcome" },
+            "protocol": { "type": "number", "const": 1 }
+          },
+          "required": ["type", "protocol"],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "type": { "type": "string", "const": "desired" },
+            "ids": {
+              "maxItems": 200,
+              "type": "array",
+              "items": { "$ref": "#/$defs/DatabaseId" }
+            }
+          },
+          "required": ["type"],
+          "additionalProperties": false
+        }
+      ],
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
+      }
+    },
+    "GatewayControlReport": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "database": { "$ref": "#/$defs/DatabaseId" },
+        "operation": { "$ref": "#/$defs/OperationId" },
+        "revision": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "mode": { "type": "string", "enum": ["quiesce", "running", "retired"] },
+        "pod": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["idle", "busy", "closed", "running", "retired"]
+        },
+        "connections": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "busyConnections": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "pendingDials": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        }
+      },
+      "required": [
+        "database",
+        "operation",
+        "revision",
+        "mode",
+        "pod",
+        "status",
+        "connections",
+        "busyConnections",
+        "pendingDials"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
+      }
+    },
+    "GatewayIntent": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "database": { "$ref": "#/$defs/DatabaseId" },
+        "operation": { "$ref": "#/$defs/OperationId" },
+        "revision": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "mode": { "type": "string", "enum": ["quiesce", "running", "retired"] }
+      },
+      "required": ["database", "operation", "revision", "mode"],
+      "additionalProperties": false,
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
+      }
+    },
+    "GatewayActivityReport": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "region": { "$ref": "#/$defs/RegionId" },
+        "database": { "$ref": "#/$defs/DatabaseId" },
+        "revision": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "pod": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "processEpoch": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "epoch": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "startedAt": { "$ref": "#/$defs/Timestamp" },
+        "counterStartedAt": { "$ref": "#/$defs/Timestamp" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" },
+        "history": {
+          "type": "string",
+          "enum": [
+            "complete",
+            "partial",
+            "current_process_absence",
+            "unavailable"
+          ]
+        },
+        "countersSince": {
+          "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+        },
+        "ingressBytes": {
+          "anyOf": [
+            { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
+        },
+        "egressBytes": {
+          "anyOf": [
+            { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
+        },
+        "totalConnections": {
+          "anyOf": [
+            { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
+        },
+        "connectionMilliseconds": {
+          "anyOf": [
+            { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+            { "type": "null" }
+          ]
+        },
+        "connections": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "authenticatedConnections": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "busyConnections": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "pendingDials": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "lastActivityAt": {
+          "anyOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }]
+        }
+      },
+      "required": [
+        "region",
+        "database",
+        "revision",
+        "pod",
+        "processEpoch",
+        "epoch",
+        "startedAt",
+        "counterStartedAt",
+        "observedAt",
+        "history",
+        "countersSince",
+        "ingressBytes",
+        "egressBytes",
+        "totalConnections",
+        "connectionMilliseconds",
+        "connections",
+        "authenticatedConnections",
+        "busyConnections",
+        "pendingDials",
+        "lastActivityAt"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "RegionId": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+        },
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
+    "AgentActivityRequest": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "databases": {
+          "minItems": 1,
+          "maxItems": 25,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "id": { "$ref": "#/$defs/DatabaseId" },
+              "revision": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "observed_at": { "$ref": "#/$defs/Timestamp" },
+              "last_activity_at": { "$ref": "#/$defs/Timestamp" },
+              "idle_observed_since": { "$ref": "#/$defs/Timestamp" },
+              "connections": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000000
+              },
+              "busy_connections": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000000
+              },
+              "pending_dials": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 1000000
+              },
+              "expected_gateway_pods": {
+                "minItems": 1,
+                "maxItems": 16,
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                }
+              },
+              "reports": {
+                "minItems": 1,
+                "maxItems": 16,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "region": { "$ref": "#/$defs/RegionId" },
+                    "database": { "$ref": "#/$defs/DatabaseId" },
+                    "revision": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "pod": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "processEpoch": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "epoch": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "startedAt": { "$ref": "#/$defs/Timestamp" },
+                    "counterStartedAt": { "$ref": "#/$defs/Timestamp" },
+                    "observedAt": { "$ref": "#/$defs/Timestamp" },
+                    "history": {
+                      "type": "string",
+                      "enum": [
+                        "complete",
+                        "partial",
+                        "current_process_absence",
+                        "unavailable"
+                      ]
+                    },
+                    "countersSince": {
+                      "anyOf": [
+                        { "$ref": "#/$defs/Timestamp" },
+                        { "type": "null" }
+                      ]
+                    },
+                    "ingressBytes": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        { "type": "null" }
+                      ]
+                    },
+                    "egressBytes": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        { "type": "null" }
+                      ]
+                    },
+                    "totalConnections": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        { "type": "null" }
+                      ]
+                    },
+                    "connectionMilliseconds": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        { "type": "null" }
+                      ]
+                    },
+                    "connections": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "authenticatedConnections": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "busyConnections": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "pendingDials": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "lastActivityAt": {
+                      "anyOf": [
+                        { "$ref": "#/$defs/Timestamp" },
+                        { "type": "null" }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "region",
+                    "database",
+                    "revision",
+                    "pod",
+                    "processEpoch",
+                    "epoch",
+                    "startedAt",
+                    "counterStartedAt",
+                    "observedAt",
+                    "history",
+                    "countersSince",
+                    "ingressBytes",
+                    "egressBytes",
+                    "totalConnections",
+                    "connectionMilliseconds",
+                    "connections",
+                    "authenticatedConnections",
+                    "busyConnections",
+                    "pendingDials",
+                    "lastActivityAt"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "id",
+              "revision",
+              "observed_at",
+              "last_activity_at",
+              "connections",
+              "busy_connections",
+              "pending_dials",
+              "expected_gateway_pods",
+              "reports"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["databases"],
+      "additionalProperties": false,
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        },
+        "RegionId": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+        }
+      }
+    },
+    "AgentUsageRequest": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "samples": {
+          "minItems": 1,
+          "maxItems": 25,
+          "type": "array",
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "properties": {
+                  "database_id": { "$ref": "#/$defs/DatabaseId" },
+                  "producer_id": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z0-9_-]{1,128}$"
+                  },
+                  "sequence": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "observed_at": { "$ref": "#/$defs/Timestamp" },
+                  "source": { "type": "string", "const": "agent" },
+                  "storage_used_bytes": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      { "type": "null" }
+                    ]
+                  },
+                  "storage_allocated_bytes": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      { "type": "null" }
+                    ]
+                  }
+                },
+                "required": [
+                  "database_id",
+                  "producer_id",
+                  "sequence",
+                  "observed_at",
+                  "source",
+                  "storage_used_bytes",
+                  "storage_allocated_bytes"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "database_id": { "$ref": "#/$defs/DatabaseId" },
+                  "producer_id": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z0-9_-]{1,128}$"
+                  },
+                  "sequence": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "observed_at": { "$ref": "#/$defs/Timestamp" },
+                  "source": { "type": "string", "const": "backup" },
+                  "backup_bytes": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      { "type": "null" }
+                    ]
+                  }
+                },
+                "required": [
+                  "database_id",
+                  "producer_id",
+                  "sequence",
+                  "observed_at",
+                  "source",
+                  "backup_bytes"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "database_id": { "$ref": "#/$defs/DatabaseId" },
+                  "producer_id": {
+                    "type": "string",
+                    "pattern": "^[a-zA-Z0-9_-]{1,128}$"
+                  },
+                  "sequence": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 9007199254740991
+                  },
+                  "observed_at": { "$ref": "#/$defs/Timestamp" },
+                  "source": { "type": "string", "const": "gateway" },
+                  "interval_start": { "$ref": "#/$defs/Timestamp" },
+                  "interval_end": { "$ref": "#/$defs/Timestamp" },
+                  "expected_producers": {
+                    "minItems": 1,
+                    "maxItems": 16,
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "pattern": "^[a-zA-Z0-9_-]{1,128}$"
+                    }
+                  },
+                  "ingress_bytes": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      { "type": "null" }
+                    ]
+                  },
+                  "egress_bytes": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      { "type": "null" }
+                    ]
+                  },
+                  "connections": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      { "type": "null" }
+                    ]
+                  },
+                  "connection_seconds": {
+                    "anyOf": [
+                      {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 9007199254740991
+                      },
+                      { "type": "null" }
+                    ]
+                  }
+                },
+                "required": [
+                  "database_id",
+                  "producer_id",
+                  "sequence",
+                  "observed_at",
+                  "source",
+                  "interval_start",
+                  "interval_end",
+                  "expected_producers",
+                  "ingress_bytes",
+                  "egress_bytes",
+                  "connections",
+                  "connection_seconds"
+                ],
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
+      },
+      "required": ["samples"],
+      "additionalProperties": false,
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
+    "UsageSample": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "oneOf": [
+        {
+          "type": "object",
+          "properties": {
+            "database_id": { "$ref": "#/$defs/DatabaseId" },
+            "producer_id": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_-]{1,128}$"
+            },
+            "sequence": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "observed_at": { "$ref": "#/$defs/Timestamp" },
+            "source": { "type": "string", "const": "agent" },
+            "storage_used_bytes": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                { "type": "null" }
+              ]
+            },
+            "storage_allocated_bytes": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                { "type": "null" }
+              ]
+            }
+          },
+          "required": [
+            "database_id",
+            "producer_id",
+            "sequence",
+            "observed_at",
+            "source",
+            "storage_used_bytes",
+            "storage_allocated_bytes"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "database_id": { "$ref": "#/$defs/DatabaseId" },
+            "producer_id": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_-]{1,128}$"
+            },
+            "sequence": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "observed_at": { "$ref": "#/$defs/Timestamp" },
+            "source": { "type": "string", "const": "backup" },
+            "backup_bytes": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                { "type": "null" }
+              ]
+            }
+          },
+          "required": [
+            "database_id",
+            "producer_id",
+            "sequence",
+            "observed_at",
+            "source",
+            "backup_bytes"
+          ],
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "properties": {
+            "database_id": { "$ref": "#/$defs/DatabaseId" },
+            "producer_id": {
+              "type": "string",
+              "pattern": "^[a-zA-Z0-9_-]{1,128}$"
+            },
+            "sequence": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "observed_at": { "$ref": "#/$defs/Timestamp" },
+            "source": { "type": "string", "const": "gateway" },
+            "interval_start": { "$ref": "#/$defs/Timestamp" },
+            "interval_end": { "$ref": "#/$defs/Timestamp" },
+            "expected_producers": {
+              "minItems": 1,
+              "maxItems": 16,
+              "type": "array",
+              "items": { "type": "string", "pattern": "^[a-zA-Z0-9_-]{1,128}$" }
+            },
+            "ingress_bytes": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                { "type": "null" }
+              ]
+            },
+            "egress_bytes": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                { "type": "null" }
+              ]
+            },
+            "connections": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                { "type": "null" }
+              ]
+            },
+            "connection_seconds": {
+              "anyOf": [
+                { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+                { "type": "null" }
+              ]
+            }
+          },
+          "required": [
+            "database_id",
+            "producer_id",
+            "sequence",
+            "observed_at",
+            "source",
+            "interval_start",
+            "interval_end",
+            "expected_producers",
+            "ingress_bytes",
+            "egress_bytes",
+            "connections",
+            "connection_seconds"
+          ],
+          "additionalProperties": false
+        }
+      ],
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "Timestamp": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d\\.\\d{3}(?:Z))$"
+        }
+      }
+    },
+    "NodeThinStorageAuthority": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "name": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$"
+        },
+        "node_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "cluster_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "revision": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "profile_revision": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "profile_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "storage_class": {
+          "type": "string",
+          "pattern": "^pgcf-lvm-thin-v1-[a-f0-9]{16}$"
+        },
+        "volume_group_uuid": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+        },
+        "pool_uuid": {
+          "anyOf": [
+            {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+            },
+            { "type": "null" }
+          ]
+        },
+        "driver_pod_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "driver_image": {
+          "type": "string",
+          "pattern": "^[^\\s]+@sha256:[a-f0-9]{64}$"
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+        },
+        "captured_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+        },
+        "write_allowed": { "type": "boolean" },
+        "physical": {
+          "type": "object",
+          "properties": {
+            "volume_group_uuid": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+            },
+            "total_bytes": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "free_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "thick_allocated_bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "thin_pool": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "name": { "type": "string", "const": "pgcf_thinpool" },
+                    "data_total_bytes": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "data_used_bytes_upper_bound": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "metadata_total_bytes": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "metadata_used_bytes_upper_bound": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "name",
+                    "data_total_bytes",
+                    "data_used_bytes_upper_bound",
+                    "metadata_total_bytes",
+                    "metadata_used_bytes_upper_bound"
+                  ],
+                  "additionalProperties": false
+                },
+                { "type": "null" }
+              ]
+            }
+          },
+          "required": [
+            "volume_group_uuid",
+            "total_bytes",
+            "free_bytes",
+            "thick_allocated_bytes",
+            "thin_pool"
+          ],
+          "additionalProperties": false
+        },
+        "physical_lvs": {
+          "maxItems": 8192,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9_.+[\\]-]{1,128}$"
+              },
+              "lv_uuid": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+              },
+              "size_bytes": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "segtype": { "type": "string", "pattern": "^[a-z0-9-]{1,32}$" }
+            },
+            "required": ["name", "lv_uuid", "size_bytes", "segtype"],
+            "additionalProperties": false
+          }
+        },
+        "active_lv_uuids": {
+          "maxItems": 8192,
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+          }
+        },
+        "data_accounting_complete": { "type": "boolean" },
+        "protections": {
+          "maxItems": 4096,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "database_id": { "$ref": "#/$defs/DatabaseId" },
+              "generation": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "operation_id": {
+                "anyOf": [{ "$ref": "#/$defs/OperationId" }, { "type": "null" }]
+              },
+              "storage_uid": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "namespace_uid": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "cluster_uid": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "node_uid": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "profile_sha256": {
+                "type": "string",
+                "pattern": "^[a-f0-9]{64}$"
+              },
+              "requested_at": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 9007199254740991
+              },
+              "hibernation_on": { "type": "boolean", "const": true },
+              "pods_absent": { "type": "boolean", "const": true }
+            },
+            "required": [
+              "database_id",
+              "generation",
+              "operation_id",
+              "storage_uid",
+              "namespace_uid",
+              "cluster_uid",
+              "node_uid",
+              "profile_sha256",
+              "requested_at",
+              "hibernation_on",
+              "pods_absent"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "volumes": {
+          "maxItems": 4096,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "database_id": { "$ref": "#/$defs/DatabaseId" },
+              "generation": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "storage_generation": {
+                "type": "integer",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991
+              },
+              "storage_uid": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "namespace_uid": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "cluster_uid": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "volume_handle": {
+                "type": "string",
+                "pattern": "^pvc-[a-f0-9-]{36}$"
+              },
+              "lv_uuid": {
+                "type": "string",
+                "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+              },
+              "pvc_uid": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "pv_uid": {
+                "type": "string",
+                "format": "uuid",
+                "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+              },
+              "storage_class": {
+                "anyOf": [
+                  { "type": "string", "const": "pgcf-lvm" },
+                  {
+                    "type": "string",
+                    "pattern": "^pgcf-lvm-thin-v1-[a-f0-9]{16}$"
+                  }
+                ]
+              },
+              "volume_attributes_class": {
+                "anyOf": [
+                  {
+                    "type": "string",
+                    "pattern": "^pgcf-lvm-thin-v1-[a-f0-9]{16}$"
+                  },
+                  { "type": "null" }
+                ]
+              },
+              "quiesced": { "type": "boolean" },
+              "io": {
+                "maxItems": 8,
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "properties": {
+                    "pod_uid": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "write_bytes_per_second": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "write_iops_per_second": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "pod_uid",
+                    "write_bytes_per_second",
+                    "write_iops_per_second"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            },
+            "required": [
+              "database_id",
+              "generation",
+              "storage_generation",
+              "storage_uid",
+              "namespace_uid",
+              "cluster_uid",
+              "volume_handle",
+              "lv_uuid",
+              "pvc_uid",
+              "pv_uid",
+              "storage_class",
+              "volume_attributes_class",
+              "io"
+            ],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": [
+        "node_id",
+        "name",
+        "node_uid",
+        "cluster_uid",
+        "revision",
+        "profile_revision",
+        "profile_sha256",
+        "storage_class",
+        "volume_group_uuid",
+        "pool_uuid",
+        "driver_pod_uid",
+        "driver_image",
+        "observed_at",
+        "captured_at",
+        "expires_at",
+        "write_allowed",
+        "physical",
+        "physical_lvs",
+        "active_lv_uuids",
+        "data_accounting_complete",
+        "protections",
+        "volumes"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" },
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
+      }
+    },
+    "ComputePoolPolicy": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "version": { "type": "number", "const": 1 },
+        "target_slots": { "type": "integer", "minimum": 0, "maximum": 16 },
+        "max_idle_cpu_millicores": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2000
+        },
+        "max_idle_memory_mib": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 2048
+        },
+        "per_slot_cpu_millicores": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500
+        },
+        "per_slot_memory_mib": {
+          "type": "integer",
+          "minimum": 16,
+          "maximum": 512
+        },
+        "max_age_seconds": { "type": "integer", "minimum": 1, "maximum": 300 },
+        "profile": {
+          "type": "object",
+          "properties": {
+            "release_id": {
+              "type": "string",
+              "pattern": "^[a-z0-9][a-z0-9._-]{0,95}$"
+            },
+            "image": {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^[^\\s@]+@sha256:[a-f0-9]{64}$"
+            },
+            "holder_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "controller_sha256": {
+              "type": "string",
+              "pattern": "^[a-f0-9]{64}$"
+            },
+            "containerd_version": { "type": "string", "const": "2.3.6" },
+            "runc_version": { "type": "string", "const": "1.5.2" },
+            "architecture": { "type": "string", "enum": ["amd64", "arm64"] }
+          },
+          "required": [
+            "release_id",
+            "image",
+            "holder_sha256",
+            "controller_sha256",
+            "containerd_version",
+            "runc_version",
+            "architecture"
+          ],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "version",
+        "target_slots",
+        "max_idle_cpu_millicores",
+        "max_idle_memory_mib",
+        "per_slot_cpu_millicores",
+        "per_slot_memory_mib",
+        "max_age_seconds",
+        "profile"
+      ],
+      "additionalProperties": false
+    },
+    "FleetReleaseFacts": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "boot_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "platform_source_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "talos_provenance": {
+          "type": "object",
+          "properties": {
+            "method": { "type": "string", "const": "deploymentreceipt" },
+            "installer": {
+              "type": "string",
+              "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
+            },
+            "node_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "cluster_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "boot_id": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            }
+          },
+          "required": [
+            "method",
+            "installer",
+            "node_uid",
+            "cluster_uid",
+            "boot_id"
+          ],
+          "additionalProperties": false
+        },
+        "configuration_schema_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "talos_version": {
+          "type": "string",
+          "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+        },
+        "talos_installer": {
+          "type": "string",
+          "maxLength": 512,
+          "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
+        },
+        "talos_schematic_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "runtime_image_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "kubernetes_version": {
+          "type": "string",
+          "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+        },
+        "kubelet_version": {
+          "type": "string",
+          "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+        },
+        "kubernetes_control_plane": { "type": "boolean" },
+        "kubernetes_static_images": {
+          "type": "object",
+          "properties": {
+            "apiServer": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "controllerManager": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "scheduler": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+          },
+          "additionalProperties": false
+        },
+        "kubernetes_image_provenance": {
+          "type": "object",
+          "properties": {
+            "method": {
+              "type": "string",
+              "enum": ["native_runtime_readback", "pinned_configuration_boot"]
+            },
+            "configuration_boot_id": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "configuration_observed_at": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+            },
+            "observed_at": {
+              "type": "string",
+              "format": "date-time",
+              "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+            },
+            "kubelet_version": {
+              "type": "string",
+              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+            },
+            "control_plane": { "type": "boolean" },
+            "images": {
+              "type": "object",
+              "properties": {
+                "kubelet": {
+                  "type": "object",
+                  "properties": {
+                    "configuration": { "type": "string", "maxLength": 512 },
+                    "runtime_sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    }
+                  },
+                  "required": ["configuration", "runtime_sha256"],
+                  "additionalProperties": false
+                },
+                "apiServer": {
+                  "type": "object",
+                  "properties": {
+                    "configuration": { "type": "string", "maxLength": 512 },
+                    "runtime_sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    }
+                  },
+                  "required": ["configuration", "runtime_sha256"],
+                  "additionalProperties": false
+                },
+                "controllerManager": {
+                  "type": "object",
+                  "properties": {
+                    "configuration": { "type": "string", "maxLength": 512 },
+                    "runtime_sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    }
+                  },
+                  "required": ["configuration", "runtime_sha256"],
+                  "additionalProperties": false
+                },
+                "scheduler": {
+                  "type": "object",
+                  "properties": {
+                    "configuration": { "type": "string", "maxLength": 512 },
+                    "runtime_sha256": {
+                      "type": "string",
+                      "pattern": "^[0-9a-f]{64}$"
+                    }
+                  },
+                  "required": ["configuration", "runtime_sha256"],
+                  "additionalProperties": false
+                }
+              },
+              "required": ["kubelet"],
+              "additionalProperties": false
+            }
+          },
+          "required": [
+            "method",
+            "observed_at",
+            "kubelet_version",
+            "control_plane",
+            "images"
+          ],
+          "additionalProperties": false
+        },
+        "components": {
+          "maxItems": 128,
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+              },
+              "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+              "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+              "runtime_image_sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            },
+            "required": ["name"],
+            "additionalProperties": false
+          }
+        }
+      },
+      "required": ["components"],
+      "additionalProperties": false
+    },
+    "FleetNodeReleaseObservation": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "node_id": { "$ref": "#/$defs/NodeId" },
+        "node_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "assignment_revision": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+        },
+        "facts": {
+          "type": "object",
+          "properties": {
+            "boot_id": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "platform_source_commit": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{40}$"
+            },
+            "talos_provenance": {
+              "type": "object",
+              "properties": {
+                "method": { "type": "string", "const": "deploymentreceipt" },
+                "installer": {
+                  "type": "string",
+                  "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
+                },
+                "node_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "cluster_uid": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "boot_id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                }
+              },
+              "required": [
+                "method",
+                "installer",
+                "node_uid",
+                "cluster_uid",
+                "boot_id"
+              ],
+              "additionalProperties": false
+            },
+            "configuration_schema_revision": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 2147483647
+            },
+            "talos_version": {
+              "type": "string",
+              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+            },
+            "talos_installer": {
+              "type": "string",
+              "maxLength": 512,
+              "pattern": "^[^\\s@]+@sha256:[0-9a-f]{64}$"
+            },
+            "talos_schematic_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "runtime_image_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "kubernetes_version": {
+              "type": "string",
+              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+            },
+            "kubelet_version": {
+              "type": "string",
+              "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+            },
+            "kubernetes_control_plane": { "type": "boolean" },
+            "kubernetes_static_images": {
+              "type": "object",
+              "properties": {
+                "apiServer": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                "controllerManager": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "scheduler": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+              },
+              "additionalProperties": false
+            },
+            "kubernetes_image_provenance": {
+              "type": "object",
+              "properties": {
+                "method": {
+                  "type": "string",
+                  "enum": [
+                    "native_runtime_readback",
+                    "pinned_configuration_boot"
+                  ]
+                },
+                "configuration_boot_id": {
+                  "type": "string",
+                  "format": "uuid",
+                  "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                },
+                "configuration_observed_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+                },
+                "observed_at": {
+                  "type": "string",
+                  "format": "date-time",
+                  "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+                },
+                "kubelet_version": {
+                  "type": "string",
+                  "pattern": "^v?\\d+\\.\\d+\\.\\d+(?:[-+][A-Za-z0-9.-]+)?$"
+                },
+                "control_plane": { "type": "boolean" },
+                "images": {
+                  "type": "object",
+                  "properties": {
+                    "kubelet": {
+                      "type": "object",
+                      "properties": {
+                        "configuration": { "type": "string", "maxLength": 512 },
+                        "runtime_sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        }
+                      },
+                      "required": ["configuration", "runtime_sha256"],
+                      "additionalProperties": false
+                    },
+                    "apiServer": {
+                      "type": "object",
+                      "properties": {
+                        "configuration": { "type": "string", "maxLength": 512 },
+                        "runtime_sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        }
+                      },
+                      "required": ["configuration", "runtime_sha256"],
+                      "additionalProperties": false
+                    },
+                    "controllerManager": {
+                      "type": "object",
+                      "properties": {
+                        "configuration": { "type": "string", "maxLength": 512 },
+                        "runtime_sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        }
+                      },
+                      "required": ["configuration", "runtime_sha256"],
+                      "additionalProperties": false
+                    },
+                    "scheduler": {
+                      "type": "object",
+                      "properties": {
+                        "configuration": { "type": "string", "maxLength": 512 },
+                        "runtime_sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        }
+                      },
+                      "required": ["configuration", "runtime_sha256"],
+                      "additionalProperties": false
+                    }
+                  },
+                  "required": ["kubelet"],
+                  "additionalProperties": false
+                }
+              },
+              "required": [
+                "method",
+                "observed_at",
+                "kubelet_version",
+                "control_plane",
+                "images"
+              ],
+              "additionalProperties": false
+            },
+            "components": {
+              "maxItems": 128,
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9][a-z0-9._/-]{0,127}$"
+                  },
+                  "version": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 128
+                  },
+                  "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                  "runtime_image_sha256": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  }
+                },
+                "required": ["name"],
+                "additionalProperties": false
+              }
+            }
+          },
+          "required": ["components"],
+          "additionalProperties": false
+        }
+      },
+      "required": [
+        "node_id",
+        "node_uid",
+        "assignment_revision",
+        "observed_at",
+        "facts"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "NodeId": { "type": "string", "pattern": "^nod_[a-z0-9]{20}$" }
+      }
+    },
+    "DatabaseRuntimeAttestation": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "v": { "type": "number", "const": 1 },
+        "database_id": { "$ref": "#/$defs/DatabaseId" },
+        "generation": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "storage_generation": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "node_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "boot_id": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "cluster_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "namespace_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "cnpg_cluster_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "storage_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "pvc_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "pv_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "pod_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "container_id": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+        "postgres_image_sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        "memory_request_bytes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "memory_limit_bytes": {
+          "type": "integer",
+          "exclusiveMinimum": 0,
+          "maximum": 9007199254740991
+        },
+        "observed_at": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9007199254740991
+        },
+        "configuration_fingerprint": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      },
+      "required": [
+        "v",
+        "database_id",
+        "generation",
+        "storage_generation",
+        "node_uid",
+        "boot_id",
+        "cluster_uid",
+        "namespace_uid",
+        "cnpg_cluster_uid",
+        "storage_uid",
+        "pvc_uid",
+        "pv_uid",
+        "pod_uid",
+        "container_id",
+        "postgres_image_sha256",
+        "memory_request_bytes",
+        "memory_limit_bytes",
+        "observed_at",
+        "configuration_fingerprint"
+      ],
+      "additionalProperties": false,
+      "$defs": {
+        "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
+      }
+    }
+  },
+  "constants": {
+    "ARCHIVE_IDENTITY_QUERY": "SELECT pg_catalog.current_database() AS database,pg_catalog.current_setting('session_authorization') AS role,\n pg_catalog.pg_is_in_recovery() AS recovery,pg_catalog.host(pg_catalog.inet_server_addr()) AS server_address,\n (SELECT ssl FROM pg_catalog.pg_stat_ssl WHERE pid=pg_catalog.pg_backend_pid()) AS tls,\n r.rolsuper,r.rolcreatedb,r.rolcreaterole,r.rolreplication,r.rolbypassrls,\n NOT EXISTS(SELECT 1 FROM pg_catalog.pg_auth_members m JOIN pg_catalog.pg_roles granted ON granted.oid=m.roleid WHERE m.member=r.oid AND granted.rolname<>'pg_read_all_stats') AS only_stats,\n pg_catalog.pg_has_role(r.oid,'pg_read_all_stats','MEMBER') AS stats,\n pg_catalog.has_function_privilege(r.oid,'pg_catalog.pg_ls_archive_statusdir()','EXECUTE') AS archive_listing\n FROM pg_catalog.pg_roles r WHERE r.rolname=$1 AND r.rolname=pg_catalog.current_setting('session_authorization')",
+    "ARCHIVE_QUERY": "SELECT (SELECT pg_catalog.count(*)::text FROM pg_catalog.pg_ls_archive_statusdir() WHERE name LIKE '%.ready') AS ready_wal_files,\n archived_count::text,COALESCE(EXTRACT(EPOCH FROM last_archived_time)::text,'-1') AS last_archived_time,failed_count::text\n FROM pg_catalog.pg_stat_archiver",
+    "ARCHIVE_FAILURE_MS": 600000,
+    "WAL_BACKLOG_LIMIT": 32,
+    "SIDECAR": {
+      "requestCpuMillicores": 100,
+      "requestMemoryMib": 128,
+      "limitCpuMillicores": 500,
+      "limitMemoryMib": 512
+    },
+    "QUOTA_SLOTS": 2,
+    "OWNER_ROLE_NAME": "app",
+    "MAINTENANCE_ROLE": "pgcf_maintenance",
+    "MAINTENANCE_BOOTSTRAP_SQL": [
+      "CREATE ROLE pgcf_maintenance LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS",
+      "GRANT pg_read_all_stats TO pgcf_maintenance",
+      "GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal() TO pgcf_maintenance",
+      "GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_archive_statusdir() TO pgcf_maintenance"
+    ],
+    "STORAGE_AUTHORITY_LEDGER_KEY": "write-authority",
+    "AGENT_PROTOCOL_VERSION": 1,
+    "CONFIGURATION_SCHEMA_REVISION": 1
+  }
+}

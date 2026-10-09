@@ -126,6 +126,7 @@ export class AgentLoop {
             credentials,
           },
           postgresImage: this.postgresImage,
+          computePool: desired.region.compute_pool,
           systemNamespace: "pgcf-system",
           cnpgNamespace: "cnpg-system",
           storageClass: "pgcf-lvm",

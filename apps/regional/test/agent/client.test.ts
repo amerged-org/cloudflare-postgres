@@ -270,7 +270,7 @@ test("empty and stale snapshots, reordered hints and failed pulls never delete o
   loop.hint();
   await loop.cycle();
   assert.equal(k8s.actions.length, before);
-  assert.equal(reports.at(-1)?.orphans[0]?.database_id, db.id);
+  assert.equal(reports.at(-1)?.orphans?.[0]?.database_id, db.id);
   snapshot = desired(db);
   await loop.cycle();
   loop.hint();

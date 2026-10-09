@@ -50,3 +50,10 @@ operator:
     - key: pgcf.io/quarantine
       operator: Exists
       effect: NoSchedule
+  image:
+    override: quay.io/cilium/operator-generic:v1.20.2@sha256:5bb0f9d871dd7b80461f8e3056896daa51e7d9b70ffe51c3e2126b4c35c02b5e
+envoy:
+  image:
+    override: quay.io/cilium/cilium-envoy:v1.37.6-1789133542-cbec91f666af0bf742da986d43832932dbb26b82@sha256:33b00117d392f24ee5161f66242d12f58ceb62bf80a2bdd66eaf505d77933cb0
+image:
+  override: quay.io/cilium/cilium:v1.20.2@sha256:9d308e3f7f05972b0b0604c40d2b0f08fa2f6a55084fef1e1aaadb469e430639

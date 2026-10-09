@@ -25,11 +25,11 @@ export const ROLE_NAME_PATTERN = /^[a-z][a-z0-9_]{0,62}$/;
 /** The CNPG owner role of every database (`initdb.owner`). */
 export const OWNER_ROLE_NAME = "app";
 
-const RESERVED_ROLE_NAMES: ReadonlySet<string> = new Set([
+export const RESERVED_ROLE_NAMES: ReadonlySet<string> = new Set([
   "postgres",
   "streaming_replica",
 ]);
-const RESERVED_ROLE_PREFIXES = ["pg_", "cnpg_"] as const;
+export const RESERVED_ROLE_PREFIXES = ["pg_", "cnpg_"] as const;
 
 export function isReservedRoleName(name: string): boolean {
   return (

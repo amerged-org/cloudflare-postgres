@@ -1,6 +1,6 @@
 # Regional platform releases
 
-This directory contains the platform release baseline for a fresh Talos **1.14.1** / Kubernetes
+This directory contains the platform release baseline for a fresh Talos **1.14.2** / Kubernetes
 **1.36.5** cluster. It supplies Cilium **1.20.2**, OpenEBS **4.6.1** with only LocalPV LVM
 **1.10.1**, cert-manager **v1.21.2**, CloudNativePG chart **0.29.1** / operator **1.30.1**, and the
 Barman Cloud plugin chart **0.8.1** / plugin **v0.15.1**. Flux **v2.9.6** reconciles these
@@ -9,12 +9,16 @@ and agent) are a separate Flux Kustomization in [regional](regional); see
 [Regional components](#regional-components).
 
 [versions.lock.json](versions.lock.json) records the official sources, checked chart/app mappings,
-OCI manifest digests, archive checksums and rendered image references. The four OCI chart sources
-are pinned by digest. OpenEBS uses its
-[documented HTTP Helm repository](https://openebs.io/docs/main/quickstart-guide/installation): its
-version is fixed and its archive matched the recorded repository-index checksum, but Flux still
-follows the current HTTP index. Images keep the exact references shipped by the pinned charts. The
-`regional` section lists the cloudflared digest and the regional image reference.
+OCI manifest digests, archive checksums and rendered image references. All five chart sources
+are pinned by OCI digest, including the official `ghcr.io/openebs/charts/openebs` artifact.
+Its912 chart-file payloads match the formerly selected HTTP archive; the gzip packaging and
+archive checksums differ. The Helm release name and storage namespace remain unchanged.
+The checked Helm values select the exact Linux/amd64 image manifests in the version lock,
+including the Barman runtime sidecar. Contract tests reject drift between these values and the
+lock; offline Helm rendering verifies the actual workload references. Both initial bootstrap and
+retained-node patches select the same four locked Flux controllers. The `regional` section
+distinguishes cloudflared's selected architecture manifest from its upstream index.
+These integrity checks do not establish vulnerability clearance or live fleet convergence.
 
 The earlier platform baseline ran in the Contabo lab; live acceptance of this updated baseline
 is recorded in [PLAN.md](../../PLAN.md). The approved deployment retains the EU control/relay

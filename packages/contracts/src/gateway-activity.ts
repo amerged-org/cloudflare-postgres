@@ -9,6 +9,8 @@ import type { RouteKeyring } from "./route-token.ts";
 export const GATEWAY_ACTIVITY_PATH = "/_pgcf/gateway/activity";
 export const GATEWAY_ACTIVITY_HEADER = "X-PGCF-Activity";
 export const GATEWAY_ACTIVITY_MAX_LENGTH = 1024;
+export const GATEWAY_ACTIVITY_TOKEN_PREFIX = "ga1";
+export const GATEWAY_ACTIVITY_MAX_LIFETIME_SECONDS = 30;
 const Count = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 export const gatewayActivityClaimsSchema = z.strictObject({
   v: z.literal(1),
@@ -119,6 +121,8 @@ const encoder = new TextEncoder(),
   decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: false });
 const keyPurpose = "pgcf-gateway-activity-key/v1\n",
   signingPurpose = "pgcf-gateway-activity/v1\n";
+export const GATEWAY_ACTIVITY_SIGNING_PURPOSE = signingPurpose;
+export const GATEWAY_ACTIVITY_KEY_PURPOSE = keyPurpose;
 async function hmac(key: Uint8Array, value: string): Promise<Uint8Array> {
   const imported = await crypto.subtle.importKey(
     "raw",
@@ -140,12 +144,12 @@ export async function signGatewayActivity(input: {
   now?: number;
   ttlSeconds?: number;
 }): Promise<string> {
-  const ttl = input.ttlSeconds ?? 30,
+  const ttl = input.ttlSeconds ?? GATEWAY_ACTIVITY_MAX_LIFETIME_SECONDS,
     now = input.now ?? Date.now();
   if (
     !Number.isInteger(ttl) ||
     ttl < 1 ||
-    ttl > 30 ||
+    ttl > GATEWAY_ACTIVITY_MAX_LIFETIME_SECONDS ||
     !Number.isFinite(now) ||
     now < 0
   )
@@ -165,7 +169,7 @@ export async function signGatewayActivity(input: {
       exp: iat + ttl,
     });
   const payload = bytesToBase64url(encoder.encode(JSON.stringify(claims)));
-  return `ga1.${payload}.${bytesToBase64url(await hmac(await hmac(key, keyPurpose), signingPurpose + payload))}`;
+  return `${GATEWAY_ACTIVITY_TOKEN_PREFIX}.${payload}.${bytesToBase64url(await hmac(await hmac(key, keyPurpose), signingPurpose + payload))}`;
 }
 export async function verifyGatewayActivity(
   value: unknown,
@@ -180,7 +184,8 @@ export async function verifyGatewayActivity(
     if (typeof value !== "string" || value.length > GATEWAY_ACTIVITY_MAX_LENGTH)
       return { ok: false };
     const parts = value.split(".");
-    if (parts.length !== 3 || parts[0] !== "ga1") return { ok: false };
+    if (parts.length !== 3 || parts[0] !== GATEWAY_ACTIVITY_TOKEN_PREFIX)
+      return { ok: false };
     const bytes = base64urlToBytes(parts[1]!),
       signature = base64urlToBytes(parts[2]!);
     if (
@@ -210,7 +215,7 @@ export async function verifyGatewayActivity(
       difference !== 0 ||
       !Number.isFinite(now) ||
       claims.exp <= claims.iat ||
-      claims.exp - claims.iat > 30 ||
+      claims.exp - claims.iat > GATEWAY_ACTIVITY_MAX_LIFETIME_SECONDS ||
       now < claims.iat ||
       now >= claims.exp ||
       claims.region !== expected.region ||

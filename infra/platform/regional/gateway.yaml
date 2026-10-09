@@ -83,6 +83,12 @@ spec:
                   fieldPath: metadata.uid
             - name: PGCF_GATEWAY_PORT
               value: "8080"
+            # Literal substitutions are owned by the high-trust Native Kustomization,
+            # never a Regional-writable ConfigMap or an untrusted storage ledger.
+            - name: PGCF_STORAGE_AUTHORITY_KEYS
+              value: '${PGCF_STORAGE_AUTHORITY_KEYS}'
+            - name: PGCF_STORAGE_AUTHORITY_KEYS_SHA256
+              value: '${PGCF_STORAGE_AUTHORITY_KEYS_SHA256}'
           ports:
             - name: http
               containerPort: 8080

@@ -22,9 +22,9 @@ assignment, containerd's ordinary child OCI specifications select the namespace 
 returned PID. Each PostgreSQL/Barman child retains its own runc-enforced cgroup and actual mounts.
 A slot is destroyed after tenant use; it never returns to unassigned inventory.
 
-The pinned containerd 2.3.5 [external sandbox-controller API](https://github.com/containerd/containerd/blob/v2.3.5/api/services/sandbox/v1/sandbox.proto),
-[multiple-task runc service](https://github.com/containerd/containerd/blob/v2.3.5/cmd/containerd-shim-runc-v2/task/service.go#L223-L255),
-and [Pod namespace selection](https://github.com/containerd/containerd/blob/v2.3.5/internal/cri/opts/spec_opts.go#L347-L365)
+The pinned containerd 2.3.6 [external sandbox-controller API](https://github.com/containerd/containerd/blob/v2.3.6/api/services/sandbox/v1/sandbox.proto),
+[multiple-task runc service](https://github.com/containerd/containerd/blob/v2.3.6/cmd/containerd-shim-runc-v2/task/service.go#L223-L255),
+and [Pod namespace selection](https://github.com/containerd/containerd/blob/v2.3.6/internal/cri/opts/spec_opts.go#L347-L365)
 provide this integration seam. The actual adapter and CRI/Cilium/CNPG conformance have not yet
 been implemented or proved. Shared Pod PID/user namespace modes must be rejected until the
 slot also provides their required isolation; ordinary CNPG separate-container PID mode is the

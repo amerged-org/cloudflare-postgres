@@ -1,0 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
+[proxy_plugins.pgcf]
+  type = "sandbox"
+  address = "/run/pgcf-sandbox/controller.sock"
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.pgcf]
+  runtime_type = "io.containerd.runc.v2"
+  sandboxer = "pgcf"

@@ -265,6 +265,14 @@ export class MemoryKubernetes implements Kubernetes {
         },
         status: {
           podIP: [127, 0, 0, 1].join("."),
+          containerStatuses: [
+            {
+              name: "postgres",
+              ready: true,
+              state: { running: {} },
+              imageID: clusterSpec.imageName,
+            },
+          ],
           conditions: [{ type: "Ready", status: "True" }],
         },
       });

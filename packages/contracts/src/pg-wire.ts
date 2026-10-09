@@ -14,8 +14,8 @@ export const STARTUP_MAX_LENGTH = 10000;
 export const MAX_PRELUDES = 2;
 export const DEFAULT_MAX_BUFFERED = 64 * 1024;
 // Protocol 3.0 sends a 4-byte secret; 3.2 allows up to 256 bytes.
-const CANCEL_MIN_LENGTH = 16;
-const CANCEL_MAX_LENGTH = 12 + 256;
+export const CANCEL_MIN_LENGTH = 16;
+export const CANCEL_MAX_LENGTH = 12 + 256;
 
 /** SSLRequest: 00 00 00 08 04 d2 16 2f. Returns a fresh copy. */
 export function encodeSslRequest(): Uint8Array {

@@ -1,0 +1,546 @@
+{
+  "differences": [
+    {
+      "name": "measured_monotonic_delta",
+      "previous": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000002",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T00:01:40.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 100,
+        "egressBytes": 200,
+        "totalConnections": 4,
+        "connectionMilliseconds": 3000,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "current": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000002",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T00:01:55.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 150,
+        "egressBytes": 300,
+        "totalConnections": 5,
+        "connectionMilliseconds": 3500,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "continuous": true,
+      "expected_producers": [
+        "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003"
+      ],
+      "result": [
+        {
+          "database_id": "aaaaaaaaaaaaaaaaaaaa",
+          "producer_id": "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003",
+          "sequence": 115000,
+          "observed_at": "1970-01-01T00:01:55.000Z",
+          "source": "gateway",
+          "interval_start": "1970-01-01T00:01:40.000Z",
+          "interval_end": "1970-01-01T00:01:55.000Z",
+          "expected_producers": [
+            "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003"
+          ],
+          "ingress_bytes": 50,
+          "egress_bytes": 100,
+          "connections": 1,
+          "connection_seconds": 0.5
+        }
+      ]
+    },
+    {
+      "name": "inventory_gap_stays_unknown",
+      "previous": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000002",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T00:01:40.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 100,
+        "egressBytes": 200,
+        "totalConnections": 4,
+        "connectionMilliseconds": 3000,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "current": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000002",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T00:01:55.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 150,
+        "egressBytes": 300,
+        "totalConnections": 5,
+        "connectionMilliseconds": 3500,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "continuous": false,
+      "expected_producers": [
+        "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003"
+      ],
+      "result": [
+        {
+          "database_id": "aaaaaaaaaaaaaaaaaaaa",
+          "producer_id": "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003",
+          "sequence": 115000,
+          "observed_at": "1970-01-01T00:01:55.000Z",
+          "source": "gateway",
+          "interval_start": "1970-01-01T00:01:40.000Z",
+          "interval_end": "1970-01-01T00:01:55.000Z",
+          "expected_producers": [
+            "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003"
+          ],
+          "ingress_bytes": null,
+          "egress_bytes": null,
+          "connections": null,
+          "connection_seconds": null
+        }
+      ]
+    },
+    {
+      "name": "process_restart_stays_unknown",
+      "previous": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000002",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T00:01:40.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 100,
+        "egressBytes": 200,
+        "totalConnections": 4,
+        "connectionMilliseconds": 3000,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "current": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000004",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T00:01:55.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 150,
+        "egressBytes": 300,
+        "totalConnections": 5,
+        "connectionMilliseconds": 3500,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "continuous": true,
+      "expected_producers": [
+        "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000004_01234567-89ab-4def-8123-000000000003"
+      ],
+      "result": [
+        {
+          "database_id": "aaaaaaaaaaaaaaaaaaaa",
+          "producer_id": "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000004_01234567-89ab-4def-8123-000000000003",
+          "sequence": 115000,
+          "observed_at": "1970-01-01T00:01:55.000Z",
+          "source": "gateway",
+          "interval_start": "1970-01-01T00:01:40.000Z",
+          "interval_end": "1970-01-01T00:01:55.000Z",
+          "expected_producers": [
+            "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000004_01234567-89ab-4def-8123-000000000003"
+          ],
+          "ingress_bytes": null,
+          "egress_bytes": null,
+          "connections": null,
+          "connection_seconds": null
+        }
+      ]
+    },
+    {
+      "name": "counter_regression_stays_unknown",
+      "previous": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000002",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T00:01:40.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 100,
+        "egressBytes": 200,
+        "totalConnections": 4,
+        "connectionMilliseconds": 3000,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "current": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000002",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T00:01:55.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 99,
+        "egressBytes": 300,
+        "totalConnections": 5,
+        "connectionMilliseconds": 3500,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "continuous": true,
+      "expected_producers": [
+        "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003"
+      ],
+      "result": [
+        {
+          "database_id": "aaaaaaaaaaaaaaaaaaaa",
+          "producer_id": "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003",
+          "sequence": 115000,
+          "observed_at": "1970-01-01T00:01:55.000Z",
+          "source": "gateway",
+          "interval_start": "1970-01-01T00:01:40.000Z",
+          "interval_end": "1970-01-01T00:01:55.000Z",
+          "expected_producers": [
+            "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003"
+          ],
+          "ingress_bytes": null,
+          "egress_bytes": null,
+          "connections": null,
+          "connection_seconds": null
+        }
+      ]
+    },
+    {
+      "name": "cross_hour_never_distributes_counter_delta",
+      "previous": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000002",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T00:59:59.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 100,
+        "egressBytes": 200,
+        "totalConnections": 4,
+        "connectionMilliseconds": 3000,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "current": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000002",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T01:00:01.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 150,
+        "egressBytes": 300,
+        "totalConnections": 5,
+        "connectionMilliseconds": 3500,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "continuous": true,
+      "expected_producers": [
+        "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003"
+      ],
+      "result": [
+        {
+          "database_id": "aaaaaaaaaaaaaaaaaaaa",
+          "producer_id": "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003",
+          "sequence": 3600000,
+          "observed_at": "1970-01-01T01:00:01.000Z",
+          "source": "gateway",
+          "interval_start": "1970-01-01T00:59:59.000Z",
+          "interval_end": "1970-01-01T01:00:00.000Z",
+          "expected_producers": [
+            "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003"
+          ],
+          "ingress_bytes": null,
+          "egress_bytes": null,
+          "connections": null,
+          "connection_seconds": null
+        },
+        {
+          "database_id": "aaaaaaaaaaaaaaaaaaaa",
+          "producer_id": "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003",
+          "sequence": 3601000,
+          "observed_at": "1970-01-01T01:00:01.000Z",
+          "source": "gateway",
+          "interval_start": "1970-01-01T01:00:00.000Z",
+          "interval_end": "1970-01-01T01:00:01.000Z",
+          "expected_producers": [
+            "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003"
+          ],
+          "ingress_bytes": null,
+          "egress_bytes": null,
+          "connections": null,
+          "connection_seconds": null
+        }
+      ]
+    },
+    {
+      "name": "backward_clock_does_not_emit_interval",
+      "previous": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000002",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T00:01:40.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 100,
+        "egressBytes": 200,
+        "totalConnections": 4,
+        "connectionMilliseconds": 3000,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "current": {
+        "region": "eu-test",
+        "database": "aaaaaaaaaaaaaaaaaaaa",
+        "revision": 1,
+        "pod": "01234567-89ab-4def-8123-000000000001",
+        "processEpoch": "01234567-89ab-4def-8123-000000000002",
+        "epoch": "01234567-89ab-4def-8123-000000000003",
+        "startedAt": "1970-01-01T00:00:00.000Z",
+        "counterStartedAt": "1970-01-01T00:00:00.000Z",
+        "observedAt": "1970-01-01T00:01:39.000Z",
+        "history": "complete",
+        "countersSince": "1970-01-01T00:00:00.000Z",
+        "ingressBytes": 150,
+        "egressBytes": 300,
+        "totalConnections": 5,
+        "connectionMilliseconds": 3500,
+        "connections": 0,
+        "authenticatedConnections": 0,
+        "busyConnections": 0,
+        "pendingDials": 0,
+        "lastActivityAt": "1970-01-01T00:00:50.000Z"
+      },
+      "continuous": true,
+      "expected_producers": [
+        "gw_01234567-89ab-4def-8123-000000000001_01234567-89ab-4def-8123-000000000002_01234567-89ab-4def-8123-000000000003"
+      ],
+      "result": []
+    }
+  ],
+  "checkpoints": [
+    {
+      "name": "empty",
+      "data": {},
+      "identity": {
+        "storage": "01234567-89ab-4def-8123-000000000005",
+        "namespace": "01234567-89ab-4def-8123-000000000006",
+        "cluster": "01234567-89ab-4def-8123-000000000007",
+        "fence": "01234567-89ab-4def-8123-000000000008",
+        "state": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000006\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000007\",\"node\":\"node-test\",\"archivePath\":\"s3://test/eu-test/db/g1-op\"}"
+      },
+      "result": {
+        "version": 1,
+        "identity": {
+          "storage": "01234567-89ab-4def-8123-000000000005",
+          "namespace": "01234567-89ab-4def-8123-000000000006",
+          "cluster": "01234567-89ab-4def-8123-000000000007",
+          "fence": "01234567-89ab-4def-8123-000000000008",
+          "state": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000006\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000007\",\"node\":\"node-test\",\"archivePath\":\"s3://test/eu-test/db/g1-op\"}"
+        },
+        "outbox": []
+      },
+      "rejected": false
+    },
+    {
+      "name": "persisted_baseline",
+      "data": {
+        "measurements.json": "{\"version\":1,\"identity\":{\"storage\":\"01234567-89ab-4def-8123-000000000005\",\"namespace\":\"01234567-89ab-4def-8123-000000000006\",\"cluster\":\"01234567-89ab-4def-8123-000000000007\",\"fence\":\"01234567-89ab-4def-8123-000000000008\",\"state\":\"{\\\"namespaceUid\\\":\\\"01234567-89ab-4def-8123-000000000006\\\",\\\"clusterUid\\\":\\\"01234567-89ab-4def-8123-000000000007\\\",\\\"node\\\":\\\"node-test\\\",\\\"archivePath\\\":\\\"s3://test/eu-test/db/g1-op\\\"}\"},\"outbox\":[],\"baseline\":{\"sampledAt\":\"1970-01-01T00:01:55.000Z\",\"inventory\":[{\"name\":\"gateway\",\"uid\":\"01234567-89ab-4def-8123-000000000001\",\"ip\":\"10.0.0.7\",\"restarts\":0}],\"keyUid\":\"01234567-89ab-4def-8123-000000000009\",\"keyVersion\":\"1\",\"reports\":[{\"region\":\"eu-test\",\"database\":\"aaaaaaaaaaaaaaaaaaaa\",\"revision\":1,\"pod\":\"01234567-89ab-4def-8123-000000000001\",\"processEpoch\":\"01234567-89ab-4def-8123-000000000002\",\"epoch\":\"01234567-89ab-4def-8123-000000000003\",\"startedAt\":\"1970-01-01T00:00:00.000Z\",\"counterStartedAt\":\"1970-01-01T00:00:00.000Z\",\"observedAt\":\"1970-01-01T00:01:55.000Z\",\"history\":\"complete\",\"countersSince\":\"1970-01-01T00:00:00.000Z\",\"ingressBytes\":150,\"egressBytes\":300,\"totalConnections\":5,\"connectionMilliseconds\":3500,\"connections\":0,\"authenticatedConnections\":0,\"busyConnections\":0,\"pendingDials\":0,\"lastActivityAt\":\"1970-01-01T00:00:50.000Z\"}]}}"
+      },
+      "identity": {
+        "storage": "01234567-89ab-4def-8123-000000000005",
+        "namespace": "01234567-89ab-4def-8123-000000000006",
+        "cluster": "01234567-89ab-4def-8123-000000000007",
+        "fence": "01234567-89ab-4def-8123-000000000008",
+        "state": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000006\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000007\",\"node\":\"node-test\",\"archivePath\":\"s3://test/eu-test/db/g1-op\"}"
+      },
+      "result": {
+        "version": 1,
+        "identity": {
+          "storage": "01234567-89ab-4def-8123-000000000005",
+          "namespace": "01234567-89ab-4def-8123-000000000006",
+          "cluster": "01234567-89ab-4def-8123-000000000007",
+          "fence": "01234567-89ab-4def-8123-000000000008",
+          "state": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000006\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000007\",\"node\":\"node-test\",\"archivePath\":\"s3://test/eu-test/db/g1-op\"}"
+        },
+        "outbox": [],
+        "baseline": {
+          "sampledAt": "1970-01-01T00:01:55.000Z",
+          "inventory": [
+            {
+              "name": "gateway",
+              "uid": "01234567-89ab-4def-8123-000000000001",
+              "ip": "10.0.0.7",
+              "restarts": 0
+            }
+          ],
+          "keyUid": "01234567-89ab-4def-8123-000000000009",
+          "keyVersion": "1",
+          "reports": [
+            {
+              "region": "eu-test",
+              "database": "aaaaaaaaaaaaaaaaaaaa",
+              "revision": 1,
+              "pod": "01234567-89ab-4def-8123-000000000001",
+              "processEpoch": "01234567-89ab-4def-8123-000000000002",
+              "epoch": "01234567-89ab-4def-8123-000000000003",
+              "startedAt": "1970-01-01T00:00:00.000Z",
+              "counterStartedAt": "1970-01-01T00:00:00.000Z",
+              "observedAt": "1970-01-01T00:01:55.000Z",
+              "history": "complete",
+              "countersSince": "1970-01-01T00:00:00.000Z",
+              "ingressBytes": 150,
+              "egressBytes": 300,
+              "totalConnections": 5,
+              "connectionMilliseconds": 3500,
+              "connections": 0,
+              "authenticatedConnections": 0,
+              "busyConnections": 0,
+              "pendingDials": 0,
+              "lastActivityAt": "1970-01-01T00:00:50.000Z"
+            }
+          ]
+        }
+      },
+      "rejected": false
+    },
+    {
+      "name": "changed_custody",
+      "data": {
+        "measurements.json": "{\"version\":1,\"identity\":{\"storage\":\"01234567-89ab-4def-8123-000000000063\",\"namespace\":\"01234567-89ab-4def-8123-000000000006\",\"cluster\":\"01234567-89ab-4def-8123-000000000007\",\"fence\":\"01234567-89ab-4def-8123-000000000008\",\"state\":\"{\\\"namespaceUid\\\":\\\"01234567-89ab-4def-8123-000000000006\\\",\\\"clusterUid\\\":\\\"01234567-89ab-4def-8123-000000000007\\\",\\\"node\\\":\\\"node-test\\\",\\\"archivePath\\\":\\\"s3://test/eu-test/db/g1-op\\\"}\"},\"outbox\":[]}"
+      },
+      "identity": {
+        "storage": "01234567-89ab-4def-8123-000000000005",
+        "namespace": "01234567-89ab-4def-8123-000000000006",
+        "cluster": "01234567-89ab-4def-8123-000000000007",
+        "fence": "01234567-89ab-4def-8123-000000000008",
+        "state": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000006\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000007\",\"node\":\"node-test\",\"archivePath\":\"s3://test/eu-test/db/g1-op\"}"
+      },
+      "rejected": true
+    },
+    {
+      "name": "idle_window_without_baseline",
+      "data": {
+        "measurements.json": "{\"version\":1,\"identity\":{\"storage\":\"01234567-89ab-4def-8123-000000000005\",\"namespace\":\"01234567-89ab-4def-8123-000000000006\",\"cluster\":\"01234567-89ab-4def-8123-000000000007\",\"fence\":\"01234567-89ab-4def-8123-000000000008\",\"state\":\"{\\\"namespaceUid\\\":\\\"01234567-89ab-4def-8123-000000000006\\\",\\\"clusterUid\\\":\\\"01234567-89ab-4def-8123-000000000007\\\",\\\"node\\\":\\\"node-test\\\",\\\"archivePath\\\":\\\"s3://test/eu-test/db/g1-op\\\"}\"},\"outbox\":[],\"idleObservedSince\":\"1970-01-01T00:01:40.000Z\"}"
+      },
+      "identity": {
+        "storage": "01234567-89ab-4def-8123-000000000005",
+        "namespace": "01234567-89ab-4def-8123-000000000006",
+        "cluster": "01234567-89ab-4def-8123-000000000007",
+        "fence": "01234567-89ab-4def-8123-000000000008",
+        "state": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000006\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000007\",\"node\":\"node-test\",\"archivePath\":\"s3://test/eu-test/db/g1-op\"}"
+      },
+      "rejected": true
+    },
+    {
+      "name": "unknown_outbox_record",
+      "data": {
+        "measurements.json": "{\"version\":1,\"identity\":{\"storage\":\"01234567-89ab-4def-8123-000000000005\",\"namespace\":\"01234567-89ab-4def-8123-000000000006\",\"cluster\":\"01234567-89ab-4def-8123-000000000007\",\"fence\":\"01234567-89ab-4def-8123-000000000008\",\"state\":\"{\\\"namespaceUid\\\":\\\"01234567-89ab-4def-8123-000000000006\\\",\\\"clusterUid\\\":\\\"01234567-89ab-4def-8123-000000000007\\\",\\\"node\\\":\\\"node-test\\\",\\\"archivePath\\\":\\\"s3://test/eu-test/db/g1-op\\\"}\"},\"outbox\":[{}]}"
+      },
+      "identity": {
+        "storage": "01234567-89ab-4def-8123-000000000005",
+        "namespace": "01234567-89ab-4def-8123-000000000006",
+        "cluster": "01234567-89ab-4def-8123-000000000007",
+        "fence": "01234567-89ab-4def-8123-000000000008",
+        "state": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000006\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000007\",\"node\":\"node-test\",\"archivePath\":\"s3://test/eu-test/db/g1-op\"}"
+      },
+      "rejected": true
+    }
+  ]
+}

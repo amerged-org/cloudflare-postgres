@@ -91,9 +91,18 @@ export async function openCapability(
   ) {
     throw new Error("transport_endpoint_mismatch");
   }
+  return connectRelayTransport(transport, config.callback.bearer, signal);
+}
+
+/** Caller validates the operation-bound grant and exact callback origin/path before opening. */
+export async function connectRelayTransport(
+  transport: NodeBootstrapTransport,
+  bearer: string,
+  signal: AbortSignal,
+): Promise<Duplex> {
   const socket = new WebSocket(transport.websocket_url, {
     headers: {
-      authorization: `Bearer ${config.callback.bearer}`,
+      authorization: `Bearer ${bearer}`,
       [BOOTSTRAP_RELAY_HEADER]: transport.token,
     },
     handshakeTimeout: 15_000,
@@ -132,6 +141,27 @@ export async function startNativeProxy(
   signal: AbortSignal,
 ) {
   if (config.spec.transport.mode !== "relay") throw new Error("relay_required");
+  return startCapabilityProxy(
+    (authority) =>
+      (["talos_api", "kubernetes_api"] as const).find((candidate) => {
+        const target = capabilityTarget(config, candidate);
+        return authority === `${target.ip}:${target.port}`;
+      }),
+    (capability) => openCapability(config, capability, signal),
+    signal,
+  );
+}
+
+export async function startCapabilityProxy(
+  capabilityFor: (
+    authority: string | undefined,
+  ) => "talos_api" | "kubernetes_api" | undefined,
+  open: (
+    capability: "talos_api" | "kubernetes_api",
+    authority?: string,
+  ) => Promise<Duplex>,
+  signal: AbortSignal,
+) {
   const sockets = new Set<Duplex>();
   const clients = new Set<Duplex>();
   const server = createServer((_request, response) => {
@@ -141,12 +171,7 @@ export async function startNativeProxy(
   server.headersTimeout = 10_000;
   server.requestTimeout = 15_000;
   server.on("connect", (request, socket, head) => {
-    const capability = (["talos_api", "kubernetes_api"] as const).find(
-      (candidate) => {
-        const target = capabilityTarget(config, candidate);
-        return request.url === `${target.ip}:${target.port}`;
-      },
-    );
+    const capability = capabilityFor(request.url);
     if (
       !capability ||
       head.length > 64 * 1024 ||
@@ -163,7 +188,7 @@ export async function startNativeProxy(
       clients.delete(socket);
       sockets.delete(socket);
     });
-    void openCapability(config, capability, signal)
+    void open(capability, request.url)
       .then((bridge) => {
         if (socket.destroyed || !clients.has(socket) || signal.aborted) {
           bridge.destroy();

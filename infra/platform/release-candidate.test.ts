@@ -4,6 +4,7 @@ import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { deriveFleetReleaseCandidate } from "./release-candidate.ts";
+import { selectedImageManifestDigest } from "./image-manifest.ts";
 
 const bytes = await readFile(new URL("./versions.lock.json", import.meta.url));
 test("derives only pinned existing lock evidence and reports unresolved provenance without inventing a release", () => {
@@ -41,12 +42,11 @@ test("derives only pinned existing lock evidence and reports unresolved provenan
   assert.ok(
     candidate.unresolved.includes("roles/control_relay/talos_schematic_sha256"),
   );
-  assert.ok(candidate.unresolved.includes("components/barman/sha256"));
-  assert.ok(candidate.unresolved.includes("components/flux-source/sha256"));
   assert.equal(
-    candidate.components.some((component) => component.name === "barman"),
-    false,
+    candidate.components.find((component) => component.name === "barman")?.reference,
+    lock.charts.find((chart: {name:string})=>chart.name==="plugin-barman-cloud").runtimeSidecarImage,
   );
+  assert.equal(candidate.components.find(component=>component.name==="flux-source")?.reference, lock.flux.images["source-controller"]);
 });
 test("hashes exact source bytes and rejects evidence that contradicts an authoritative digest or version", () => {
   const lock = JSON.parse(bytes.toString()),
@@ -75,8 +75,8 @@ test("hashes exact source bytes and rejects evidence that contradicts an authori
     () => deriveFleetReleaseCandidate(JSON.stringify(lock)),
     /release_lock_component_conflict:cloudflared/,
   );
-  lock.fleetRelease.components[0]!.sha256 = cloudflared.indexDigest.slice(7);
-  lock.fleetRelease.components[0]!.reference = `${cloudflared.reference}@${cloudflared.indexDigest}`;
+  lock.fleetRelease.components[0]!.sha256 = selectedImageManifestDigest(cloudflared)!.slice(7);
+  lock.fleetRelease.components[0]!.reference = `${cloudflared.reference}@${selectedImageManifestDigest(cloudflared)}`;
   lock.fleetRelease.components[0]!.version = "99.0.0";
   assert.throws(
     () => deriveFleetReleaseCandidate(JSON.stringify(lock)),
@@ -176,4 +176,27 @@ test("rejects duplicate evidence, unpinned images and inconsistent role referenc
     () => deriveFleetReleaseCandidate(JSON.stringify(wrong)),
     /release_lock_release_spec_invalid/,
   );
+});
+test("accepts an explicit reviewed source commit outside the lock without a self-commit reference",()=>{
+  const bytes=JSON.stringify(completeLock()),commit="e".repeat(40),candidate=deriveFleetReleaseCandidate(bytes,commit);
+  assert.equal(candidate.spec?.platform_source_commit,commit);
+  assert.equal(candidate.versions_lock_sha256,createHash("sha256").update(bytes).digest("hex"));
+  assert.throws(()=>deriveFleetReleaseCandidate(bytes,"main"),/release_lock_release_spec_invalid/);
+});
+test("selected amd64 manifest overrides an index and an invalid explicit selection cannot fall back",()=>{
+  const index=`sha256:${"a".repeat(64)}`,manifest=`sha256:${"b".repeat(64)}`;
+  assert.equal(selectedImageManifestDigest({indexDigest:index,manifestDigest:manifest}),manifest);
+  assert.equal(selectedImageManifestDigest({indexDigest:index}),index);
+  assert.throws(()=>selectedImageManifestDigest({indexDigest:index,manifestDigest:"latest"}),/image_selected_manifest_invalid/);
+});
+test("selected OpenEBS implementation is an image with a stable logical alias despite a wrapper repository",()=>{
+  const lock=completeLock() as ReturnType<typeof completeLock>&{charts:unknown[]};
+  const selected=`registry.example/pgcf-openebs-lvm:1.10.1-pgcf@sha256:${"f".repeat(64)}`;
+  lock.charts=[{name:"openebs",chartVersion:"4.6.1",appVersion:"4.6.1",archiveURL:"https://charts.invalid/openebs-4.6.1.tgz",archiveSha256:"e".repeat(64),renderedImages:["docker.io/openebs/lvm-driver:1.10.1"],enabledEngine:{name:"lvm-localpv",chartVersion:"1.10.1",appVersion:"1.10.1",driverImage:selected}}];
+  lock.fleetRelease.components=lock.fleetRelease.components.filter(v=>v.name!=="openebs-lvm");
+  for(const role of Object.values(lock.fleetRelease.roleComponents)) role.push("openebs","image/openebs/lvm-driver");
+  const candidate=deriveFleetReleaseCandidate(JSON.stringify(lock));
+  assert.equal(candidate.spec?.components.find(v=>v.name==="openebs-lvm")?.kind,"image");
+  assert.equal(candidate.spec?.components.find(v=>v.name==="openebs-lvm")?.reference,selected);
+  assert.equal(candidate.spec?.components.find(v=>v.name==="image/openebs/lvm-driver")?.reference,selected);
 });

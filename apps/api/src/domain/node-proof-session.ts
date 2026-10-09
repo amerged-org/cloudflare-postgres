@@ -26,7 +26,7 @@ const unavailable = (): never => {
 const unauthorized = (): never => {
   throw new ApiError("unauthorized", "Invalid network proof authority");
 };
-async function signer(env: Env) {
+export async function nodeProofSigningKey(env: Env) {
   const key = await bootstrapTransportSigningKey(
     env.BOOTSTRAP_RELAY_SIGNING_KEYS,
   );
@@ -115,7 +115,7 @@ export async function issueNodeProofSession(
   now = Date.now(),
 ) {
   const state = await current(env, operationId),
-    key = await signer(env);
+    key = await nodeProofSigningKey(env);
   if (
     mode === "postjoin" &&
     (!state.job || state.addition.checkpoint?.stage !== "joined")
@@ -237,7 +237,7 @@ export async function signNodeProofDocument<T>(
   payload: T,
   canonicalize: (value: T) => string = canonicalNodeProof,
 ) {
-  const key = await signer(env);
+  const key = await nodeProofSigningKey(env);
   const signature = await crypto.subtle.sign(
     "Ed25519",
     key.privateKey,

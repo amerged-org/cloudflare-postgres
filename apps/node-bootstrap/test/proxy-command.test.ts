@@ -103,6 +103,11 @@ test("CONNECT accounting admits sixty-four clients once and frees closed or fail
     (node) =>
       ts.isFunctionDeclaration(node) && node.name?.text === "startNativeProxy",
   )!;
+  const sharedDeclaration = tree.statements.find(
+    (node) =>
+      ts.isFunctionDeclaration(node) &&
+      node.name?.text === "startCapabilityProxy",
+  )!;
   const limit = tree.statements.find(
     (node) =>
       ts.isVariableStatement(node) &&
@@ -114,6 +119,8 @@ test("CONNECT accounting admits sixty-four clients once and frees closed or fail
     limit.getText(tree) +
       "\n" +
       declaration.getText(tree).replace(/^export /, "") +
+      "\n" +
+      sharedDeclaration.getText(tree).replace(/^export /, "") +
       "\nglobalThis.start = startNativeProxy;",
     { compilerOptions: { target: ts.ScriptTarget.ES2022 } },
   ).outputText;

@@ -51,14 +51,34 @@ export interface ResourceQuotaMath {
 }
 
 /** Quotas allow independent PostgreSQL scheduling requests and hard limits. */
-export function resourceQuotaFor(size: SizeResources): ResourceQuotaMath {
+export function resourceQuotaFor(
+  size: SizeResources,
+  overhead: { cpu_millicores: number; memory_mib: number } = {
+    cpu_millicores: 0,
+    memory_mib: 0,
+  },
+): ResourceQuotaMath {
+  if (
+    ![overhead.cpu_millicores, overhead.memory_mib].every(
+      (v) => Number.isSafeInteger(v) && v >= 0,
+    )
+  )
+    throw new TypeError("invalid assigned runtime overhead");
   return {
-    requestsCpuMillicores: QUOTA_SLOTS * databaseCpuReservationMillicores(size),
+    requestsCpuMillicores:
+      QUOTA_SLOTS *
+      (databaseCpuReservationMillicores(size) + overhead.cpu_millicores),
     limitsCpuMillicores:
-      QUOTA_SLOTS * (size.cpu_millicores + SIDECAR.limitCpuMillicores),
+      QUOTA_SLOTS *
+      (size.cpu_millicores +
+        SIDECAR.limitCpuMillicores +
+        overhead.cpu_millicores),
     requestsMemoryMib:
-      QUOTA_SLOTS * (size.memory_mib + SIDECAR.requestMemoryMib),
-    limitsMemoryMib: QUOTA_SLOTS * (size.memory_mib + SIDECAR.limitMemoryMib),
+      QUOTA_SLOTS *
+      (size.memory_mib + SIDECAR.requestMemoryMib + overhead.memory_mib),
+    limitsMemoryMib:
+      QUOTA_SLOTS *
+      (size.memory_mib + SIDECAR.limitMemoryMib + overhead.memory_mib),
     // One local LVM volume per database; volumes are hard-sized.
     requestsStorageGib: size.storage_gib,
     persistentVolumeClaims: 1,

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream, readFileSync } from "node:fs";
 import {
   chmod,
   mkdir,
@@ -28,12 +28,19 @@ import {
   safeFindingCounts,
   type ScanInput,
 } from "./scanner.ts";
+import storageSources from "../../infra/storage/sources.lock.json" with { type: "json" };
+import sandboxSources from "../../apps/sandbox-controller/proto/sources.json" with { type: "json" };
+import versions from "../../infra/platform/versions.lock.json" with { type: "json" };
 import { verifyRegistry, promotionArguments } from "./registry.ts";
 import {
   classifyReviewed,
   readPackageProvenance,
   reviewedBase,
   postgresBase,
+  storageBase,
+  rustBuilder,
+  rustVersion,
+  isRustProfile,
   reviewedFiles,
   reviewedManifestPaths,
   imageProfile,
@@ -43,6 +50,9 @@ import {
   type ImageProfile,
 } from "./reviewed-findings.ts";
 
+import { sandboxImagePlan } from "../../infra/talos/sandbox/images.ts";
+const isScratchProfile = (profile: ImageProfile) =>
+  isRustProfile(profile) || profile === "talos-recipe";
 const scannerVersion = "8.30.1";
 // SHA256 values from the official v8.30.1 release checksums, not a moving tag.
 const scannerArchives: Record<string, string> = {
@@ -99,20 +109,40 @@ export function validateDockerfile(
       .filter((line) => /^\s*FROM\b/i.test(line))
       .map((line) => line.trim()),
     expected =
-      profile === "postgres"
-        ? [`FROM ${postgresBase} AS postgres`, "FROM scratch"]
-        : [
-            `FROM ${reviewedBase.image} AS build`,
-            ...(profile === "node-bootstrap"
-              ? [`FROM ${reviewedBase.image} AS clients`]
-              : []),
-            `FROM ${reviewedBase.image}`,
-          ];
+      profile === "talos-recipe"
+        ? ["FROM scratch"]
+        : profile === "storage"
+          ? [`FROM ${storageBase}`]
+          : profile === "sandbox-controller" || profile === "sandbox-extension"
+            ? [
+                "FROM ${RUST_BUILDER} AS build",
+                "FROM scratch AS talos-extension",
+                "FROM scratch AS runtime",
+              ]
+            : isRustProfile(profile)
+              ? ["FROM ${RUST_BUILDER} AS build", "FROM scratch"]
+              : profile === "postgres"
+                ? [`FROM ${postgresBase} AS postgres`, "FROM scratch"]
+                : [
+                    `FROM ${reviewedBase.image} AS build`,
+                    ...(profile === "node-bootstrap"
+                      ? [`FROM ${reviewedBase.image} AS clients`]
+                      : []),
+                    `FROM ${reviewedBase.image}`,
+                  ];
   requireCheck(
     JSON.stringify(from) === JSON.stringify(expected),
     "Dockerfile base or stage topology differs from the pinned profile",
   );
-  return profile === "postgres" ? postgresBase : reviewedBase.image;
+  return profile === "talos-recipe"
+    ? "scratch"
+    : profile === "storage"
+      ? storageBase
+      : isRustProfile(profile)
+        ? rustBuilder
+        : profile === "postgres"
+          ? postgresBase
+          : reviewedBase.image;
 }
 
 export function safeArchivePath(name: string): string {
@@ -379,6 +409,14 @@ export function assertScanResult(
 }
 
 type ToolStage =
+  | "runtime_thin_check"
+  | "runtime_thin_repair"
+  | "runtime_rust_gateway"
+  | "runtime_native_controller"
+  | "runtime_rust_bootstrap_relay"
+  | "runtime_native_reclaimer"
+  | "runtime_sandbox_controller"
+  | "runtime_sandbox_holder"
   | "runtime_postgres"
   | "runtime_help"
   | "runtime_agent"
@@ -453,12 +491,104 @@ export interface RuntimeCheck {
   exit: number;
   stdout?: string;
   stderr?: string;
-  version?: "talos" | "kubectl" | "helm" | "ssh";
+  version?:
+    | "talos"
+    | "kubectl"
+    | "helm"
+    | "ssh"
+    | "rust-gateway"
+    | "native-controller"
+    | "rust-bootstrap-relay"
+    | "native-reclaimer"
+    | "sandbox-controller"
+    | "sandbox-holder";
 }
 export function runtimeChecks(
   profileInput: ImageProfile = "regional",
 ): RuntimeCheck[] {
   const profile = imageProfile(profileInput);
+  if (profile === "talos-recipe") return [];
+  if (profile === "storage")
+    return [
+      {
+        stage: "runtime_thin_check",
+        entrypoint: "/usr/sbin/thin_check",
+        args: ["--version"],
+        exit: 0,
+        stdout: storageSources.thin_tools.version,
+        stderr: "",
+      },
+      {
+        stage: "runtime_thin_repair",
+        entrypoint: "/usr/sbin/thin_repair",
+        args: ["--version"],
+        exit: 0,
+        stdout: storageSources.thin_tools.version,
+        stderr: "",
+      },
+    ];
+  if (profile === "rust-gateway")
+    return [
+      {
+        stage: "runtime_rust_gateway",
+        entrypoint: "/pgcf-native-gateway",
+        args: ["--version"],
+        exit: 0,
+        stderr: "",
+        version: "rust-gateway",
+      },
+    ];
+  if (profile === "native-controller")
+    return [
+      {
+        stage: "runtime_native_controller",
+        entrypoint: "/pgcf-native-controller",
+        args: ["--version"],
+        exit: 0,
+        stderr: "",
+        version: "native-controller",
+      },
+    ];
+  if (profile === "rust-bootstrap-relay" || profile === "native-reclaimer")
+    return [
+      {
+        stage:
+          profile === "rust-bootstrap-relay"
+            ? "runtime_rust_bootstrap_relay"
+            : "runtime_native_reclaimer",
+        entrypoint:
+          profile === "rust-bootstrap-relay"
+            ? "/pgcf-native-bootstrap-relay"
+            : "/pgcf-native-reclaimer",
+        args: ["--version"],
+        exit: 0,
+        stderr: "",
+        version: profile,
+      },
+    ];
+  if (profile === "sandbox-controller" || profile === "sandbox-extension")
+    return [
+      {
+        stage: "runtime_sandbox_controller",
+        entrypoint:
+          (profile === "sandbox-extension" ? "/rootfs" : "") +
+          "/usr/local/bin/pgcf-sandbox-controller",
+        args: ["--version"],
+        exit: 0,
+        stderr: "",
+        version: "sandbox-controller",
+      },
+      {
+        stage: "runtime_sandbox_holder",
+        entrypoint:
+          (profile === "sandbox-extension" ? "/rootfs" : "") +
+          "/usr/local/bin/pgcf-node-runtime",
+        args: ["--version"],
+        exit: 0,
+        stderr: "",
+        version: "sandbox-holder",
+      },
+    ];
   if (profile === "postgres")
     return [
       {
@@ -595,9 +725,15 @@ export function runtimeChecks(
     },
   ];
 }
+export interface RuntimeBuildIdentity {
+  sourceRevision: string;
+  versionsLockSha256: string;
+  cargoLockSha256: string;
+}
 export function validateRuntimeResult(
   check: RuntimeCheck,
   result: { stdout: string; stderr: string; exit: number | null },
+  identity?: RuntimeBuildIdentity,
 ): void {
   requireCheck(
     result.exit === check.exit &&
@@ -605,10 +741,115 @@ export function validateRuntimeResult(
       (check.stderr === undefined || result.stderr.trim() === check.stderr),
     `runtime_result_invalid:${check.stage}`,
   );
+  if (
+    check.version === "rust-gateway" ||
+    check.version === "native-controller" ||
+    check.version === "rust-bootstrap-relay" ||
+    check.version === "native-reclaimer" ||
+    check.version === "sandbox-controller" ||
+    check.version === "sandbox-holder"
+  ) {
+    let value: Record<string, unknown>;
+    try {
+      value = JSON.parse(result.stdout) as Record<string, unknown>;
+    } catch {
+      throw new QualificationFailure(`runtime_version_invalid:${check.stage}`);
+    }
+    const program =
+      check.version === "rust-gateway"
+        ? "pgcf-native-gateway"
+        : check.version === "native-controller"
+          ? "pgcf-native-controller"
+          : check.version === "rust-bootstrap-relay"
+            ? "pgcf-native-bootstrap-relay"
+            : check.version === "native-reclaimer"
+              ? "pgcf-native-reclaimer"
+              : check.version === "sandbox-controller"
+                ? "pgcf-sandbox-controller"
+                : "pgcf-node-runtime";
+    const packagePath =
+      check.version === "rust-gateway"
+        ? "native-gateway"
+        : check.version === "native-controller"
+          ? "native-controller"
+          : check.version === "rust-bootstrap-relay"
+            ? "native-bootstrap-relay"
+            : check.version === "native-reclaimer"
+              ? "native-reclaimer"
+              : check.version === "sandbox-controller"
+                ? "sandbox-controller"
+                : "node-runtime";
+    const sourceVersion = /^version\s*=\s*"([^"\r\n]+)"\s*$/m.exec(
+      readFileSync(`apps/${packagePath}/Cargo.toml`, "utf8"),
+    )?.[1];
+    requireCheck(
+      value.program === program &&
+        sourceVersion &&
+        value.version === sourceVersion &&
+        value.rustVersion === rustVersion &&
+        typeof value.sourceRevision === "string" &&
+        /^[a-f0-9]{40}$/.test(value.sourceRevision) &&
+        typeof value.versionsLockSha256 === "string" &&
+        /^[a-f0-9]{64}$/.test(value.versionsLockSha256) &&
+        typeof value.cargoLockSha256 === "string" &&
+        /^[a-f0-9]{64}$/.test(value.cargoLockSha256) &&
+        (check.version !== "sandbox-controller" ||
+          value.containerdApiVersion ===
+            sandboxSources.versions.containerd.replace(/^v/, "")) &&
+        (check.version !== "sandbox-holder" || value.protocol === 1),
+      `runtime_version_invalid:${check.stage}`,
+    );
+    if (check.version === "native-controller") {
+      const sha = (path: string) =>
+        createHash("sha256").update(readFileSync(path)).digest("hex");
+      requireCheck(
+        value.protocolSha256 ===
+          sha("packages/contracts/native/protocol.generated.json") &&
+          value.controllerContractSha256 ===
+            sha("packages/contracts/native/controller.generated.json") &&
+          value.configurationSchemaRevision ===
+            JSON.parse(
+              readFileSync(
+                "packages/contracts/native/controller.generated.json",
+                "utf8",
+              ),
+            ).constants.CONFIGURATION_SCHEMA_REVISION,
+        `runtime_generated_input_invalid:${check.stage}`,
+      );
+    }
+    if (
+      check.version === "rust-bootstrap-relay" ||
+      check.version === "native-reclaimer"
+    ) {
+      const sha = (path: string) =>
+        createHash("sha256").update(readFileSync(path)).digest("hex");
+      const contract =
+        check.version === "rust-bootstrap-relay" ? "bootstrap" : "reclaim";
+      const field =
+        check.version === "rust-bootstrap-relay"
+          ? "bootstrapContractSha256"
+          : "reclaimContractSha256";
+      requireCheck(
+        value.protocolSha256 ===
+          sha("packages/contracts/native/protocol.generated.json") &&
+          value[field] ===
+            sha(`packages/contracts/native/${contract}.generated.json`),
+        `runtime_generated_input_invalid:${check.stage}`,
+      );
+    }
+    if (identity)
+      requireCheck(
+        value.sourceRevision === identity.sourceRevision &&
+          value.versionsLockSha256 === identity.versionsLockSha256 &&
+          value.cargoLockSha256 === identity.cargoLockSha256,
+        `runtime_provenance_invalid:${check.stage}`,
+      );
+  }
   if (check.version === "talos")
     requireCheck(
       /^Client:\r?\n/.test(result.stdout) &&
-        /(?:^|\n)\s*Tag:\s*v1\.14\.1\s*(?:\n|$)/.test(result.stdout) &&
+        /(?:^|\n)\s*Tag:\s*v([^\s]+)\s*(?:\n|$)/.exec(result.stdout)?.[1] ===
+          versions.target.talosVersion &&
         /(?:^|\n)\s*OS\/Arch:\s*linux\/amd64\s*(?:\n|$)/.test(result.stdout),
       "runtime_version_invalid:runtime_talos",
     );
@@ -620,14 +861,15 @@ export function validateRuntimeResult(
       throw new QualificationFailure("runtime_version_invalid:runtime_kubectl");
     }
     requireCheck(
-      version?.clientVersion?.gitVersion === "v1.36.5" &&
+      version?.clientVersion?.gitVersion ===
+        `v${versions.target.kubernetesVersion}` &&
         version.clientVersion.platform === "linux/amd64",
       "runtime_version_invalid:runtime_kubectl",
     );
   }
   if (check.version === "helm")
     requireCheck(
-      result.stdout.trim() === "v4.3.0",
+      result.stdout.trim() === `v${versions.bootstrapClients.helm.version}`,
       "runtime_version_invalid:runtime_helm",
     );
   if (check.version === "ssh")
@@ -639,6 +881,7 @@ export function validateRuntimeResult(
 export async function qualifyRuntime(
   image: string,
   profile: ImageProfile = "regional",
+  identity?: RuntimeBuildIdentity,
 ): Promise<void> {
   for (const check of runtimeChecks(profile)) {
     const result = await command(
@@ -664,7 +907,7 @@ export async function qualifyRuntime(
       process.env,
       [check.exit],
     );
-    validateRuntimeResult(check, result);
+    validateRuntimeResult(check, result, identity);
   }
 }
 
@@ -672,6 +915,265 @@ async function hashFile(path: string): Promise<string> {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(path)) hash.update(chunk);
   return hash.digest("hex");
+}
+
+function requiredImageFile(
+  files: readonly LayerFile[],
+  path: string,
+): LayerFile {
+  const file = files.findLast((file) => file.path === path);
+  requireCheck(file, `image_artifact_missing:${path}`);
+  return file;
+}
+
+export async function verifyStorageAssembly(
+  files: readonly LayerFile[],
+  directory: string,
+): Promise<void> {
+  const expected = [
+    ["usr/local/bin/lvm-driver", storageSources.driver.binary_sha256],
+    ["sbin/lvm", storageSources.driver.lvm_binary_sha256],
+    ["usr/sbin/pdata_tools", storageSources.thin_tools.binary_sha256],
+    [
+      "usr/share/licenses/pgcf-thin-tools/COPYING",
+      storageSources.thin_tools.license_sha256,
+    ],
+    [
+      "usr/share/pgcf/thin-provisioning-tools-1.1.0.tar.gz",
+      storageSources.thin_tools.source_archive_sha256,
+    ],
+    [
+      "usr/share/pgcf/storage-sources.lock.json",
+      await hashFile("infra/storage/sources.lock.json"),
+    ],
+  ] as const;
+  for (const [path, sha256] of expected) {
+    const file = requiredImageFile(files, path);
+    requireCheck(
+      file.sha256 === sha256 &&
+        (await hashFile(join(directory, file.scanPath))) === sha256,
+      `storage_artifact_changed:${path}`,
+    );
+  }
+}
+
+export function rustArtifactPaths(profile: ImageProfile) {
+  if (profile === "rust-gateway") return ["pgcf-native-gateway"];
+  if (profile === "native-controller") return ["pgcf-native-controller"];
+  if (profile === "rust-bootstrap-relay")
+    return ["pgcf-native-bootstrap-relay"];
+  if (profile === "native-reclaimer") return ["pgcf-native-reclaimer"];
+  const prefix = profile === "sandbox-extension" ? "rootfs/" : "";
+  return [
+    prefix + "usr/local/bin/pgcf-sandbox-controller",
+    prefix + "usr/local/bin/pgcf-node-runtime",
+  ];
+}
+
+export async function verifyRustAssembly(
+  files: readonly LayerFile[],
+  directory: string,
+  profile: ImageProfile,
+  sourceRevision?: string,
+): Promise<{ path: string; sha256: string; size: number }[]> {
+  requireCheck(isRustProfile(profile), "Rust artifact profile required");
+  const binaries = rustArtifactPaths(profile),
+    licenseRoot =
+      profile === "sandbox-extension"
+        ? "rootfs/usr/local/share/licenses/pgcf-sandbox"
+        : "licenses";
+  const extensionFiles =
+    profile === "sandbox-extension"
+      ? [
+          "manifest.yaml",
+          "rootfs/usr/local/etc/containers/pgcf-sandbox-controller.yaml",
+          "rootfs/etc/cri/conf.d/20-pgcf-prestarted.part",
+        ]
+      : [];
+  requireCheck(
+    files.every(
+      (file) =>
+        binaries.includes(file.path) ||
+        extensionFiles.includes(file.path) ||
+        file.path.startsWith(licenseRoot + "/"),
+    ),
+    "Unexpected scratch runtime file",
+  );
+  const artifacts = [];
+  for (const path of binaries) {
+    const file = requiredImageFile(files, path);
+    const header = Buffer.alloc(20),
+      handle = await open(join(directory, file.scanPath), "r");
+    try {
+      await handle.read(header, 0, header.length, 0);
+    } finally {
+      await handle.close();
+    }
+    requireCheck(
+      header.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])) &&
+        header[4] === 2 &&
+        header[5] === 1 &&
+        header.readUInt16LE(18) === 62,
+      "Rust artifact is not Linux/amd64 ELF",
+    );
+    artifacts.push({ path, sha256: file.sha256, size: file.size });
+  }
+  const inputs = [
+    ["Cargo.lock", "Cargo.lock"],
+    ["versions.lock.json", "infra/platform/versions.lock.json"],
+    [
+      "protocol.generated.json",
+      "packages/contracts/native/protocol.generated.json",
+    ],
+    [
+      "constants.generated.rs",
+      "packages/native-protocol/src/constants.generated.rs",
+    ],
+    ...(profile === "rust-bootstrap-relay"
+      ? [
+          [
+            "bootstrap.generated.json",
+            "packages/contracts/native/bootstrap.generated.json",
+          ],
+        ]
+      : []),
+    ...(profile === "native-reclaimer"
+      ? [
+          [
+            "reclaim.generated.json",
+            "packages/contracts/native/reclaim.generated.json",
+          ],
+        ]
+      : []),
+    ...(profile === "native-controller"
+      ? [
+          [
+            "controller.generated.json",
+            "packages/contracts/native/controller.generated.json",
+          ],
+          [
+            "power.generated.json",
+            "packages/contracts/native/power.generated.json",
+          ],
+          [
+            "measurements.generated.json",
+            "packages/contracts/native/measurements.generated.json",
+          ],
+        ]
+      : []),
+    ...(profile === "sandbox-controller" || profile === "sandbox-extension"
+      ? [
+          [
+            "compute-pool.generated.json",
+            "packages/contracts/native/compute-pool.generated.json",
+          ],
+          [
+            "reclaim.generated.json",
+            "packages/contracts/native/reclaim.generated.json",
+          ],
+        ]
+      : []),
+  ];
+  for (const [name, source] of inputs) {
+    const file = requiredImageFile(files, `${licenseRoot}/provenance/${name}`);
+    requireCheck(
+      file.sha256 === (await hashFile(source!)),
+      "Rust generated input provenance changed",
+    );
+  }
+  const license = requiredImageFile(files, `${licenseRoot}/pgcf/LICENSE`);
+  requireCheck(
+    license.sha256 === (await hashFile("LICENSE")),
+    "First-party license changed",
+  );
+  requiredImageFile(files, `${licenseRoot}/rust/LICENSE-MIT`);
+  requiredImageFile(files, `${licenseRoot}/rust/LICENSE-APACHE`);
+  requireCheck(
+    files.some((file) =>
+      new RegExp("^" + licenseRoot + "/(?:crates|rust)/[^/]+/.+").test(
+        file.path,
+      ),
+    ),
+    "Compiled crate notices missing",
+  );
+  if (profile === "sandbox-extension") {
+    requireCheck(
+      sourceRevision && /^[a-f0-9]{40}$/.test(sourceRevision),
+      "Extension source revision required",
+    );
+    for (const [path, source] of [
+      ["manifest.yaml", "infra/talos/sandbox/manifest.yaml"],
+      [
+        "rootfs/usr/local/etc/containers/pgcf-sandbox-controller.yaml",
+        "infra/talos/sandbox/service.yaml",
+      ],
+      [
+        "rootfs/etc/cri/conf.d/20-pgcf-prestarted.part",
+        "infra/talos/sandbox/20-pgcf-prestarted.part",
+      ],
+    ]) {
+      const expected = (await readFile(source!, "utf8"))
+        .replace("PGCF_EXTENSION_VERSION", "0.1.0-" + sourceRevision)
+        .replace("PGCF_TALOS_VERSION", versions.target.talosVersion);
+      const file = requiredImageFile(files, path!);
+      requireCheck(
+        file.sha256 === createHash("sha256").update(expected).digest("hex"),
+        "Extension manifest/service/CRI bytes differ from source",
+      );
+    }
+  }
+  return artifacts;
+}
+
+export async function verifyTalosRecipeAssembly(
+  files: readonly LayerFile[],
+  directory: string,
+  revision: string,
+) {
+  const recipePath = "rootfs/usr/local/share/pgcf/talos-recipe.json",
+    licensePath = "rootfs/usr/local/share/licenses/pgcf-recipe/LICENSE";
+  requireCheck(
+    files.length === 3 &&
+      files.every((file) =>
+        [recipePath, licensePath, "manifest.yaml"].includes(file.path),
+      ),
+    "Unexpected recipe extension file",
+  );
+  const recipeFile = requiredImageFile(files, recipePath);
+  requireCheck(recipeFile.size <= 65536, "Recipe extension too large");
+  const text = await readFile(join(directory, recipeFile.scanPath), "utf8");
+  let value;
+  try {
+    value = JSON.parse(text);
+  } catch {
+    throw new QualificationFailure("Recipe extension JSON invalid");
+  }
+  requireCheck(
+    value.source_commit === revision &&
+      value.architecture === "amd64" &&
+      Array.isArray(value.system_extensions),
+    "Recipe source binding changed",
+  );
+  const plan = sandboxImagePlan({
+    sourceCommit: revision,
+    architecture: value.architecture,
+    sandboxExtension: value.sandbox_extension,
+    otherExtensions: value.system_extensions.filter(
+      (entry: string) => entry !== value.sandbox_extension,
+    ),
+  });
+  for (const [path, expected] of [
+    [recipePath, JSON.stringify(plan.recipe, null, 2) + "\n"],
+    ["manifest.yaml", JSON.stringify(plan.schematicManifest, null, 2) + "\n"],
+    [licensePath, await readFile("LICENSE", "utf8")],
+  ]) {
+    const file = requiredImageFile(files, path!);
+    requireCheck(
+      file.sha256 === createHash("sha256").update(expected!).digest("hex"),
+      "Recipe extension differs from canonical qualified inputs",
+    );
+  }
+  return plan.recipeSha256;
 }
 
 export async function installScanner(directory: string): Promise<string> {
@@ -835,10 +1337,179 @@ export async function readLayerArchive(
   }
 }
 
+/** Inspect the pinned imager's Docker archive; assembled OS acceptance is a separate gate. */
+export async function inspectTalosInstallerArchive(
+  archive: string,
+  directory: string,
+  expected: { talosVersion: string; baseDiffIDs: string[] },
+) {
+  requireCheck(
+    /^\d+\.\d+\.\d+$/.test(expected.talosVersion) &&
+      Array.isArray(expected.baseDiffIDs) &&
+      expected.baseDiffIDs.length > 0 &&
+      expected.baseDiffIDs.length <= 32 &&
+      expected.baseDiffIDs.every((value) => digestPattern.test(value)),
+    "Invalid Talos installer version",
+  );
+  await mkdir(directory, { mode: 0o700, recursive: true });
+  requireCheck(
+    ((await stat(directory)).mode & 0o777) === 0o700,
+    "Installer inspection directory is not private",
+  );
+  const archiveSize = (await stat(archive)).size;
+  requireCheck(
+    archiveSize > 0 && archiveSize <= 8 * 1024 ** 3,
+    "Talos installer archive size invalid",
+  );
+  const archiveSha256 = await hashFile(archive),
+    entries = await extractImageArchive(archive, join(directory, "archive"));
+  const readMetadata = async (name: string) => {
+    const path = entries.get(safeArchivePath(name));
+    requireCheck(
+      path && (await stat(path)).size <= 1024 * 1024,
+      "Talos installer metadata missing or too large",
+    );
+    return readFile(path);
+  };
+  const manifestBytes = await readMetadata("manifest.json"),
+    manifest = JSON.parse(manifestBytes.toString()) as Array<{
+      Config: string;
+      Layers: string[];
+    }>;
+  requireCheck(
+    Array.isArray(manifest) &&
+      manifest.length === 1 &&
+      typeof manifest[0]?.Config === "string" &&
+      Array.isArray(manifest[0].Layers) &&
+      manifest[0].Layers.length > 0 &&
+      manifest[0].Layers.length <= 32 &&
+      manifest[0].Layers.every((layer) => typeof layer === "string"),
+    "Talos installer manifest invalid",
+  );
+  const selected = manifest[0]!,
+    listed = new Set([
+      "manifest.json",
+      safeArchivePath(selected.Config),
+      ...selected.Layers.map(safeArchivePath),
+    ]);
+  requireCheck(
+    listed.size === selected.Layers.length + 2 &&
+      entries.size === listed.size &&
+      [...entries.keys()].every((name) => listed.has(name)),
+    "Unexpected Talos installer outer entry",
+  );
+  const configBytes = await readMetadata(selected.Config),
+    configDigest =
+      "sha256:" + createHash("sha256").update(configBytes).digest("hex");
+  requireCheck(
+    selected.Config === configDigest,
+    "Talos installer config digest mismatch",
+  );
+  const config = JSON.parse(configBytes.toString()) as ImageConfig & {
+    config: { Entrypoint?: unknown; Env?: unknown };
+  };
+  requireCheck(
+    config.os === "linux" &&
+      config.architecture === "amd64" &&
+      config.rootfs?.type === "layers" &&
+      Array.isArray(config.rootfs.diff_ids) &&
+      config.rootfs.diff_ids.length === selected.Layers.length &&
+      config.rootfs.diff_ids.every((value) => digestPattern.test(value)),
+    "Talos installer platform identity invalid",
+  );
+  requireCheck(
+    JSON.stringify(config.config?.Entrypoint) ===
+      JSON.stringify(["/bin/installer"]) &&
+      Array.isArray(config.config.Env) &&
+      config.config.Env.filter(
+        (value) => typeof value === "string" && value.startsWith("VERSION="),
+      ).join() === `VERSION=v${expected.talosVersion}` &&
+      config.config.Labels?.["alpha.talos.dev/version"] ===
+        `v${expected.talosVersion}` &&
+      config.config.Labels?.["org.opencontainers.image.source"] ===
+        "https://github.com/siderolabs/talos",
+    "Talos installer upstream identity mismatch",
+  );
+  validateBasePrefix(config.rootfs.diff_ids, expected.baseDiffIDs);
+  const scanDirectory = join(directory, "files");
+  await mkdir(scanDirectory, { mode: 0o700 });
+  const files: LayerFile[] = [],
+    layerDigests: string[] = [],
+    inputs: ScanInput[] = [
+      {
+        kind: "tar-metadata",
+        layer: null,
+        tarEntry: null,
+        path: "installer-outer-archive",
+        sourcePath: resolve(archive),
+        sha256: archiveSha256,
+        size: archiveSize,
+        boundDigest: "sha256:" + archiveSha256,
+      },
+      ...(await metadataInputs(
+        configBytes,
+        "image-config",
+        directory,
+        configDigest,
+      )),
+      ...(await metadataInputs(
+        manifestBytes,
+        "image-manifest",
+        directory,
+        "sha256:" + createHash("sha256").update(manifestBytes).digest("hex"),
+      )),
+    ];
+  for (const [index, name] of selected.Layers.entries()) {
+    const path = entries.get(safeArchivePath(name));
+    requireCheck(path, "Talos installer layer missing");
+    const compressedDigest = "sha256:" + (await hashFile(path));
+    requireCheck(
+      name === compressedDigest.slice(7) + ".tar.gz",
+      "Talos installer compressed layer digest mismatch",
+    );
+    layerDigests.push(compressedDigest);
+    const layer = await readLayerArchive(
+      path,
+      scanDirectory,
+      index,
+      config.rootfs.diff_ids[index]!,
+    );
+    files.push(...layer.files);
+    inputs.push(
+      layer.metadata,
+      ...layer.files.map((file): ScanInput => ({
+        kind: "layer-file",
+        layer: index,
+        tarEntry: file.tarEntry!,
+        path: file.path,
+        sha256: file.sha256,
+        size: file.size,
+        sourcePath: join(scanDirectory, file.scanPath),
+        boundDigest: config.rootfs.diff_ids[index],
+      })),
+    );
+  }
+  requireCheck(
+    (await hashFile(archive)) === archiveSha256,
+    "Talos installer archive changed during inspection",
+  );
+  return {
+    archiveSha256,
+    archiveSize,
+    configDigest,
+    diffIDs: config.rootfs.diff_ids,
+    layerDigests,
+    scanDirectory,
+    files,
+    inputs,
+  };
+}
+
 interface QualificationReport {
   version: 2;
   profile?: ImageProfile;
   nativeArtifacts?: NativeArtifactProvenance[];
+  recipeSha256?: string;
   canonicalFindings: number;
   opaqueExpectedBytes: number;
   opaqueDetectorBytes: number;
@@ -855,8 +1526,11 @@ interface QualificationReport {
   archiveSha256: string;
   revision: string;
   source: string;
-  baseImage: string;
-  baseImageId: string;
+  baseImage: string | null;
+  baseImageId: string | null;
+  builderImage?: string;
+  builderImageId?: string;
+  compiledArtifacts?: { path: string; sha256: string; size: number }[];
   diffIDs: string[];
   layers: number;
   regularFiles: number;
@@ -864,6 +1538,61 @@ interface QualificationReport {
   rawExit: number;
   resolved: number;
   unresolved: number;
+}
+
+export function validateProfileProvenance(
+  report: Pick<
+    QualificationReport,
+    | "baseImage"
+    | "baseImageId"
+    | "builderImage"
+    | "builderImageId"
+    | "compiledArtifacts"
+    | "recipeSha256"
+  >,
+  profile: ImageProfile,
+): void {
+  if (profile === "storage")
+    requireCheck(
+      report.baseImage === storageBase &&
+        typeof report.baseImageId === "string" &&
+        digestPattern.test(report.baseImageId),
+      "Storage base provenance mismatch",
+    );
+  if (profile === "talos-recipe")
+    requireCheck(
+      report.baseImage === null &&
+        report.baseImageId === null &&
+        report.builderImage === undefined &&
+        report.builderImageId === undefined &&
+        report.compiledArtifacts === undefined &&
+        typeof report.recipeSha256 === "string" &&
+        /^[a-f0-9]{64}$/.test(report.recipeSha256),
+      "Talos recipe scratch provenance mismatch",
+    );
+  if (isRustProfile(profile)) {
+    const paths = rustArtifactPaths(profile);
+    requireCheck(
+      report.baseImage === null &&
+        report.baseImageId === null &&
+        report.builderImage === rustBuilder &&
+        typeof report.builderImageId === "string" &&
+        digestPattern.test(report.builderImageId) &&
+        Array.isArray(report.compiledArtifacts) &&
+        report.compiledArtifacts.length === paths.length &&
+        paths.every(
+          (path) =>
+            report.compiledArtifacts!.filter(
+              (artifact) =>
+                artifact.path === path &&
+                /^[a-f0-9]{64}$/.test(artifact.sha256) &&
+                Number.isSafeInteger(artifact.size) &&
+                artifact.size > 0,
+            ).length === 1,
+        ),
+      "Rust scratch provenance mismatch",
+    );
+  }
 }
 
 async function inspectImage(image: string): Promise<{
@@ -954,23 +1683,32 @@ export async function qualify(
     const dockerfile = await readFile(
       profile === "postgres"
         ? "infra/postgres/Dockerfile"
-        : `apps/${profile === "regional" ? "regional" : "node-bootstrap"}/Dockerfile`,
+        : profile === "storage"
+          ? "infra/storage/Dockerfile"
+          : profile === "talos-recipe"
+            ? "infra/talos/sandbox/recipe.Dockerfile"
+            : `apps/${profile === "rust-gateway" ? "native-gateway" : profile === "rust-bootstrap-relay" ? "native-bootstrap-relay" : profile === "sandbox-extension" ? "sandbox-controller" : profile}/Dockerfile`,
       "utf8",
     );
-    const baseImage = validateDockerfile(dockerfile, profile);
-    await command("base_pull", "docker", [
-      "pull",
-      "--platform",
-      "linux/amd64",
-      baseImage,
-    ]);
-    const base = await inspectImage(baseImage);
-    requireCheck(
-      base.Architecture === "amd64" &&
-        base.Os === "linux" &&
-        digestPattern.test(base.Id),
-      "Unexpected official base platform",
-    );
+    const sourceImage = validateDockerfile(dockerfile, profile);
+    const baseImage = isScratchProfile(profile) ? null : sourceImage;
+    let base: Awaited<ReturnType<typeof inspectImage>> | null = null;
+    if (profile !== "talos-recipe") {
+      await command("base_pull", "docker", [
+        "pull",
+        "--platform",
+        "linux/amd64",
+        sourceImage,
+      ]);
+      base = await inspectImage(sourceImage);
+      requireCheck(
+        base.Architecture === "amd64" &&
+          base.Os === "linux" &&
+          digestPattern.test(base.Id),
+        "Unexpected official base platform",
+      );
+    }
+    const baseDiffIDs = isScratchProfile(profile) ? [] : base!.RootFS.Layers;
     const archive = join(directory, "image.tar");
     await writeFile(archive, "", { flag: "wx", mode: 0o600 });
     await command("image_save", "docker", [
@@ -1041,7 +1779,8 @@ export async function qualify(
         config.rootfs.diff_ids.length === 1,
         "PostgreSQL assembly must contain exactly one flattened filesystem layer",
       );
-    } else validateBasePrefix(config.rootfs.diff_ids, base.RootFS.Layers);
+    } else if (!isScratchProfile(profile))
+      validateBasePrefix(config.rootfs.diff_ids, baseDiffIDs);
     requireCheck(
       config.rootfs.diff_ids.length === descriptor.Layers.length,
       "Saved layer count differs from config",
@@ -1104,6 +1843,21 @@ export async function qualify(
         })),
       );
     }
+    const compiledArtifacts = isRustProfile(profile)
+      ? await verifyRustAssembly(files, scanDirectory, profile, revision)
+      : undefined;
+    if (profile === "storage")
+      await verifyStorageAssembly(files, scanDirectory);
+    const recipeSha256 =
+      profile === "talos-recipe"
+        ? await verifyTalosRecipeAssembly(files, scanDirectory, revision)
+        : undefined;
+    if (isRustProfile(profile))
+      await qualifyRuntime(image, profile, {
+        sourceRevision: revision,
+        versionsLockSha256: await hashFile("infra/platform/versions.lock.json"),
+        cargoLockSha256: await hashFile("Cargo.lock"),
+      });
     const scanner = await installScanner(directory);
     const prepared = await prepareInputs(inputs, directory);
     const original = await runPass(
@@ -1149,7 +1903,7 @@ export async function qualify(
     const nativeArtifacts = verifyNativeArtifacts(files, profile);
     const classification = classifyReviewed(canonical, {
       baseImage,
-      baseDiffIDs: base.RootFS.Layers,
+      baseDiffIDs,
       imageDiffIDs: config.rootfs.diff_ids,
       packages,
       profile,
@@ -1170,7 +1924,7 @@ export async function qualify(
           classifyFindings(
             [{ ...finding, File: file.scanPath }],
             [file],
-            base.RootFS.Layers.length,
+            baseDiffIDs.length,
           ).resolved === 1,
         "Reviewed V8 report context changed",
       );
@@ -1179,13 +1933,21 @@ export async function qualify(
       version: 2,
       profile,
       nativeArtifacts,
+      ...(recipeSha256 ? { recipeSha256 } : {}),
       imageId,
       configDigest,
       archiveSha256,
       revision,
       source,
       baseImage,
-      baseImageId: base.Id,
+      baseImageId: isScratchProfile(profile) ? null : base!.Id,
+      ...(isRustProfile(profile)
+        ? {
+            builderImage: sourceImage,
+            builderImageId: base!.Id,
+            compiledArtifacts,
+          }
+        : {}),
       diffIDs: config.rootfs.diff_ids,
       layers: descriptor.Layers.length,
       regularFiles: files.length,
@@ -1221,6 +1983,7 @@ export async function qualify(
         candidate: {
           profile,
           nativeArtifacts,
+          ...(recipeSha256 ? { recipeSha256 } : {}),
           imageId,
           configDigest,
           archiveSha256,
@@ -1228,13 +1991,24 @@ export async function qualify(
           sourceRevision: revision,
           sourceUriSha256: createHash("sha256").update(source).digest("hex"),
           baseImage,
-          baseImageId: base.Id,
-          baseDiffIDs: base.RootFS.Layers,
+          baseImageId: isScratchProfile(profile) ? null : base!.Id,
+          ...(isRustProfile(profile)
+            ? {
+                builderImage: sourceImage,
+                builderImageId: base!.Id,
+                compiledArtifacts,
+              }
+            : {}),
+          baseDiffIDs,
           implementationSha256: createHash("sha256")
             .update(await readFile("scripts/ci/image-qualification.ts"))
             .update(await readFile("scripts/ci/scanner.ts"))
             .update(await readFile("scripts/ci/reviewed-findings.ts"))
             .update(await readFile("scripts/ci/reviewed-findings.json"))
+            .update(
+              await readFile("scripts/ci/postgres-reviewed-findings.json"),
+            )
+            .update(await readFile("scripts/ci/storage-reviewed-findings.json"))
             .digest("hex"),
         },
         findings: canonical.map((finding) => ({
@@ -1250,7 +2024,7 @@ export async function qualify(
           boundDigest: finding.input.boundDigest,
           officialBaseMembership:
             finding.input.layer !== null &&
-            finding.input.layer < base.RootFS.Layers.length,
+            finding.input.layer < baseDiffIDs.length,
           tarBodyOffset:
             finding.input.kind === "layer-file"
               ? files.find(
@@ -1322,6 +2096,7 @@ async function main(): Promise<void> {
       await readFile(reportPath, "utf8"),
     ) as QualificationReport;
     validateNativeProvenance(report.nativeArtifacts ?? [], profile);
+    validateProfileProvenance(report, profile);
     requireCheck(
       imageProfile(report.profile) === profile &&
         report.version === 2 &&

@@ -101,7 +101,7 @@ export const UsageResourceSnapshot = z
     cpu_millicores: Integer,
     reserved_memory_mib: Integer,
     reserved_cpu_millicores: Integer,
-    storage_allocated_bytes: Integer,
+    storage_allocated_bytes: Integer.nullable(),
   })
   .meta({ id: "UsageResourceSnapshot" });
 export type UsageResourceSnapshot = z.infer<typeof UsageResourceSnapshot>;

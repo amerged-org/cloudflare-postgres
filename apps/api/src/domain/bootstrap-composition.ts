@@ -2,6 +2,7 @@
 import {
   NodeBootstrapSpec,
   NodeJoinBundle,
+  type NodePostjoinRelease,
 } from "@pgcf/contracts/node-bootstrap";
 import { NodeInstallationInspection } from "@pgcf/contracts/node-installation";
 import { z } from "zod";
@@ -29,6 +30,7 @@ import {
   loadCurrentRegionMaterialReference,
 } from "../crypto/bootstrap-credentials.ts";
 import { bootstrapPlatformHash } from "../crypto/bootstrap-tickets.ts";
+import { readNodePostjoinRelease } from "./node-postjoin-release.ts";
 
 const Addresses = z.strictObject({
   ipv4: z.array(z.ipv4()).max(4),
@@ -66,6 +68,7 @@ export async function composeConfiguredNodeBootstrap(
   options: {
     provider?: Pick<ContaboClient, "getInstance">;
     now?: () => number;
+    postjoinRelease?: NodePostjoinRelease;
   } = {},
 ) {
   const addition = await readNodeAddition(env.DB, operationId);
@@ -77,6 +80,13 @@ export async function composeConfiguredNodeBootstrap(
     .first();
   if (existing)
     return bootstrapJobStatus(await readBootstrapJob(env.DB, operationId));
+  if (options.postjoinRelease)
+    await readNodePostjoinRelease(
+      env,
+      addition.intent.request.region_id,
+      options.postjoinRelease,
+      addition.intent.node_id,
+    );
   if (
     !addition.audit ||
     !addition.provider_instance_id ||
@@ -224,6 +234,9 @@ export async function composeConfiguredNodeBootstrap(
     platform = role === "controlplane" ? first!.platform : undefined;
   const spec = NodeBootstrapSpec.parse({
     version: 1,
+    ...(options.postjoinRelease
+      ? { postjoin_release: options.postjoinRelease }
+      : {}),
     operation_id: operationId,
     node_id: addition.intent.node_id,
     region_id: installed.profile.region_id,

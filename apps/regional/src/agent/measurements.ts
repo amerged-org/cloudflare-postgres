@@ -77,7 +77,7 @@ interface Checkpoint {
 }
 type Subject = Pick<
   DesiredDatabase,
-  "id" | "generation" | "node" | "desired_state"
+  "id" | "generation" | "node" | "desired_state" | "storage"
 > & { archive: Pick<DesiredDatabase["archive"], "destination_path"> };
 interface Work {
   db: Subject;
@@ -572,6 +572,7 @@ export class RegionalMeasurements {
         generation: db.generation,
         node: db.node,
         desired_state: db.desired_state,
+        ...(db.storage ? { storage: db.storage } : {}),
         archive: { destination_path: db.archive.destination_path },
       }))
       .sort((a, b) => a.id.localeCompare(b.id));
@@ -711,6 +712,7 @@ export class RegionalMeasurements {
       const claim = matches.length === 1 ? matches[0] : undefined;
       const owners = record(claim?.metadata).ownerReferences;
       if (
+        !db.storage &&
         claim &&
         claim.metadata.namespace === namespace.metadata.name &&
         (!primary || claim.metadata.name === primary) &&
@@ -1280,3 +1282,13 @@ export class RegionalMeasurements {
     }
   }
 }
+
+// Native behavioral conformance consumes the existing implementation and limits.
+export {
+  DATA as MEASUREMENT_CHECKPOINT_KEY,
+  CURSOR as MEASUREMENT_CURSOR_ANNOTATION,
+  CHECKPOINT_BYTES as MEASUREMENT_CHECKPOINT_BYTES,
+  MAX_OUTBOX as MEASUREMENT_MAX_OUTBOX,
+  readCheckpoint as measurementCheckpoint,
+  differences as measurementDifferences,
+};

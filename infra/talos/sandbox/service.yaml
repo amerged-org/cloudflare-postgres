@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: Apache-2.0
+name: pgcf-sandbox-controller
+runnerMode: host
+container:
+  entrypoint: /usr/local/bin/pgcf-sandbox-controller
+  args:
+    - --cri-host-context
+    - /var/lib/pgcf-sandbox/settings.json
+depends:
+  - service: cri
+  - path: /var/lib/pgcf-sandbox/settings.json
+  - path: /var/lib/pgcf-sandbox/agent-key
+  - network:
+      - addresses
+  - time: true
+restart: always
+logToConsole: false

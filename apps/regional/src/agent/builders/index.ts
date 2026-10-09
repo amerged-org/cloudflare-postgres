@@ -17,6 +17,8 @@ import {
   postgresParameters,
   postgresCpuRequestMillicores,
   resourceQuotaFor,
+  computePoolOverhead,
+  ComputePoolPolicy,
 } from "@pgcf/contracts";
 import type { K8sObject } from "@pgcf/contracts";
 
@@ -35,6 +37,7 @@ export interface BuildContext {
   agentSelector: { namespace: string; podLabels: Record<string, string> };
   storageClass: "pgcf-lvm";
   recoveryFinalized?: boolean;
+  computePool?: ComputePoolPolicy | null;
 }
 
 const DNS_LABEL = /^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$/;
@@ -104,6 +107,7 @@ function endpointLabels(
 }
 
 function validateContext(ctx: BuildContext): URL {
+  if (ctx.computePool != null) ComputePoolPolicy.parse(ctx.computePool);
   let endpoint: URL;
   try {
     endpoint = new URL(ctx.backup.endpointUrl);
@@ -215,7 +219,7 @@ export function buildDatabaseManifests(
     namespace,
     labels: { ...labels },
   });
-  const quota = resourceQuotaFor(db.size);
+  const quota = resourceQuotaFor(db.size, computePoolOverhead(ctx.computePool));
   const compute = {
     cpu: millicores(db.size.cpu_millicores),
     memory: mib(db.size.memory_mib),
@@ -592,11 +596,14 @@ export function buildDatabaseManifests(
       metadata: metadata(CLUSTER_NAME),
       spec: {
         instances: 1,
+        ...(db.storage
+          ? { stopDelay: db.storage.drain_seconds, smartShutdownTimeout: 0 }
+          : {}),
         probes: {
           startup: { periodSeconds: 1, failureThreshold: 3600 },
           readiness: { periodSeconds: 1 },
         },
-        imageName: ctx.postgresImage,
+        imageName: db.postgres?.image ?? ctx.postgresImage,
         inheritedMetadata: { labels: { ...labels } },
         enableSuperuserAccess: Boolean(db.recovery && !ctx.recoveryFinalized),
         ...(db.recovery && !ctx.recoveryFinalized
@@ -656,8 +663,15 @@ export function buildDatabaseManifests(
         },
         seccompProfile: { type: "RuntimeDefault" },
         storage: {
-          storageClass: ctx.storageClass,
+          storageClass: db.storage?.storage_class ?? ctx.storageClass,
           size: gib(db.size.storage_gib),
+          ...(db.storage
+            ? {
+                pvcTemplate: {
+                  volumeAttributesClassName: db.storage.volume_attributes_class,
+                },
+              }
+            : {}),
         },
         postgresql: {
           parameters: postgresParameters(db.size),

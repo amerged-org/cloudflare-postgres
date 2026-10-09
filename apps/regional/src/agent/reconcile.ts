@@ -10,6 +10,7 @@ import {
 import { BackupHealthCollector } from "./backup-health.ts";
 import { administerRecovery, type RecoveryAdministrator } from "./recovery.ts";
 import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 import {
   archiveProbeOptions,
   probeArchive,
@@ -27,6 +28,8 @@ import type {
 import {
   ARCHIVE_DESTINATION_PATTERN,
   postgresCpuRequestMillicores,
+  postgresImageIdMatches,
+  DesiredDatabaseStorage,
 } from "@pgcf/contracts";
 import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 import {
@@ -55,6 +58,27 @@ import { record, string, uid } from "./types.ts";
 import type { Kubernetes, Resource, Log } from "./types.ts";
 import { probeRoles, credentialSecretMatches } from "./readiness.ts";
 import type { AuthenticationProbe } from "./readiness.ts";
+
+function postgresRuntime(
+  pod: Resource | undefined,
+): { image: string; image_id: string } | undefined {
+  const containers = record(pod?.spec).containers;
+  const statuses = record(pod?.status).containerStatuses;
+  const container = Array.isArray(containers)
+    ? containers.map(record).find((c) => c.name === "postgres")
+    : undefined;
+  const status = Array.isArray(statuses)
+    ? statuses.map(record).find((c) => c.name === "postgres")
+    : undefined;
+  const image = string(container?.image),
+    imageId = string(status?.imageID);
+  return image &&
+    imageId &&
+    status?.ready === true &&
+    record(status.state).running
+    ? { image, image_id: imageId }
+    : undefined;
+}
 
 type ApplyStage =
   | "storage_binding"
@@ -263,6 +287,7 @@ interface StorageState {
   archivePath: string;
   recoveryMappedOperation?: string;
   recoveryIntent?: string;
+  storage?: DesiredDatabase["storage"];
 }
 interface ArchiveObservation extends ArchiveProgress {
   pendingSince: number | null;
@@ -452,7 +477,9 @@ function stateFromStorage(fence: Resource): StorageState {
       state.node.length === 0 ||
       state.node.length > 253 ||
       typeof state.archivePath !== "string" ||
-      !ARCHIVE_DESTINATION_PATTERN.test(state.archivePath)
+      !ARCHIVE_DESTINATION_PATTERN.test(state.archivePath) ||
+      (state.storage !== undefined &&
+        !DesiredDatabaseStorage.safeParse(state.storage).success)
     )
       throw new Error();
     return state as unknown as StorageState;
@@ -582,6 +609,7 @@ export class Reconciler {
     db: DesiredDatabase,
     ctx?: BuildContext,
   ): Promise<PowerObservation | null> {
+    if (ctx && db.postgres) ctx = { ...ctx, postgresImage: db.postgres.image };
     const phaseLog =
       db.desired_state === "running" && db.power?.mode === "running"
         ? this.log
@@ -626,6 +654,8 @@ export class Reconciler {
     } catch {
       return recoveryRequired(db, "storage history is invalid");
     }
+    if (storage && !isDeepStrictEqual(storage.storage, db.storage))
+      return recoveryRequired(db, "immutable storage profile changed");
     const recoveryIntent = db.recovery
       ? JSON.stringify([
           db.recovery.operation_id,
@@ -804,6 +834,7 @@ export class Reconciler {
         clusterUid: null,
         node: db.node,
         archivePath: db.archive.destination_path,
+        ...(db.storage ? { storage: db.storage } : {}),
         ...(recoveryIntent ? { recoveryIntent } : {}),
       };
       if (namespace) storage.namespaceUid = uid(namespace);
@@ -1335,6 +1366,13 @@ export class Reconciler {
     const observation: PowerObservation = {
       id: db.id,
       generation: db.generation,
+      ...(databaseReady && db.postgres
+        ? {
+            postgres: postgresRuntime(
+              runtimeResources.find((r) => r.kind === "Pod"),
+            ),
+          }
+        : {}),
       ...(databaseReady && db.recovery
         ? {
             recovery: {
@@ -1964,6 +2002,14 @@ export class Reconciler {
       ? containers.map(record).find((value) => value.name === "postgres")
       : undefined;
     if (!postgres || postgres.image !== ctx.postgresImage) return false;
+    if (db.postgres) {
+      const runtime = postgresRuntime(pod);
+      if (
+        !runtime ||
+        !postgresImageIdMatches(db.postgres.image, runtime.image_id)
+      )
+        return false;
+    }
     const compute = record(postgres.resources);
     for (const [resources, memoryMib, cpuMillicores] of [
       [
@@ -1999,7 +2045,14 @@ export class Reconciler {
       claim.metadata.labels?.["cnpg.io/cluster"] !== "database" ||
       !ownedByCluster(claim, cluster) ||
       record(claim.status).phase !== "Bound" ||
-      record(claim.spec).storageClassName !== ctx.storageClass ||
+      record(claim.spec).storageClassName !==
+        (db.storage?.storage_class ?? ctx.storageClass) ||
+      (db.storage !== undefined &&
+        (record(claim.spec).volumeAttributesClassName !==
+          db.storage.volume_attributes_class ||
+          record(claim.status).currentVolumeAttributesClassName !==
+            db.storage.volume_attributes_class ||
+          record(claim.status).modifyVolumeStatus !== undefined)) ||
       quantity(
         record(record(record(claim.spec).resources).requests).storage,
       ) !==
@@ -2024,7 +2077,8 @@ export class Reconciler {
       reference.namespace !== namespace ||
       reference.name !== claimName ||
       reference.uid !== claim.metadata.uid ||
-      record(volume.spec).storageClassName !== ctx.storageClass ||
+      record(volume.spec).storageClassName !==
+        (db.storage?.storage_class ?? ctx.storageClass) ||
       record(volume.status).phase !== "Bound" ||
       record(record(volume.spec).csi).driver !== "local.csi.openebs.io" ||
       quantity(record(record(volume.spec).capacity).storage) !==
@@ -2299,7 +2353,7 @@ export class Reconciler {
       const handle = string(csi.volumeHandle);
       const claimUid = string(claim.uid);
       if (
-        spec.storageClassName !== "pgcf-lvm" ||
+        spec.storageClassName !== (db.storage?.storage_class ?? "pgcf-lvm") ||
         csi.driver !== "local.csi.openebs.io" ||
         !handle ||
         !claimUid

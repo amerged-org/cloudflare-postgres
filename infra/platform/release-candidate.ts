@@ -5,6 +5,8 @@ import {
   FleetReleaseComponent,
   FleetReleaseSpec,
 } from "../../packages/contracts/src/releases.ts";
+import { selectedOpenEbsDriverImage } from "./openebs-image.ts";
+import { selectedImageManifestDigest } from "./image-manifest.ts";
 
 type Component = FleetReleaseSpec["components"][number];
 interface LockRecord {
@@ -58,6 +60,7 @@ export interface FleetReleaseCandidate {
  */
 export function deriveFleetReleaseCandidate(
   lockBytes: Uint8Array | string,
+  platformSourceCommit?:string,
 ): FleetReleaseCandidate {
   const bytes =
     typeof lockBytes === "string"
@@ -164,6 +167,7 @@ export function deriveFleetReleaseCandidate(
       name === "plugin-barman-cloud" ? "chart/plugin-barman-cloud" : name;
     const manifest = digest(chart.ociManifestDigest),
       source = text(chart.source);
+    const selectedDriver=name==="openebs"?selectedOpenEbsDriverImage(lock):undefined;
     add(
       alias,
       "chart",
@@ -179,14 +183,16 @@ export function deriveFleetReleaseCandidate(
       const reference = text(rawReference);
       if (!reference) throw new Error("release_lock_workload_invalid");
       const repo = image(reference).repository,
-        workloadName = `image/${name}/${repo.split("/").at(-1)}`;
-      addImage(workloadName, reference);
+        driver=name==="openebs"&&(repo.endsWith("/lvm-driver")||(selectedDriver&&repo===image(selectedDriver).repository)),
+        workloadName = `image/${name}/${driver?"lvm-driver":repo.split("/").at(-1)}`;
+      addImage(workloadName, driver&&selectedDriver?selectedDriver:reference,driver&&selectedDriver?text(object(chart.enabledEngine).appVersion):undefined);
     }
     if (chart.enabledEngine !== undefined) {
       const engine = object(chart.enabledEngine);
       const engineName = text(engine.name);
       if (!engineName) throw new Error("release_lock_engine_invalid");
-      add(
+      if(selectedDriver&&engineName==="lvm-localpv") addImage("openebs-lvm",selectedDriver,text(engine.appVersion));
+      else add(
         engineName === "lvm-localpv" ? "openebs-lvm" : `chart/${engineName}`,
         "chart",
         text(engine.chartVersion),
@@ -213,7 +219,7 @@ export function deriveFleetReleaseCandidate(
       name === "pgcf-regional" ? "regional" : name,
       entry.reference,
       text(entry.version),
-      entry.indexDigest,
+      selectedImageManifestDigest(entry),
     );
   }
   for (const name of ["api", "edge"])
@@ -225,10 +231,13 @@ export function deriveFleetReleaseCandidate(
     "flux-helm",
     "flux-notification",
   ])
-    add(name, "image", undefined, undefined, undefined);
+    addImage(name, object(object(lock.flux).images)[`${name.slice("flux-".length)}-controller`]);
   // Additional pinned chart workloads, Talos extensions and explicitly selected Flux controllers.
   for (const component of supplied.values())
     components.set(component.name, component);
+  if(components.has("native-controller")&&components.has("native-gateway")&&!Object.values(object(extra.roleComponents)).some(value=>Array.isArray(value)&&value.includes("regional"))) {
+    components.delete("regional");for(const key of unresolved)if(key.startsWith("components/regional/"))unresolved.delete(key);
+  }
   const componentList = [...components.values()].sort((left, right) =>
     left.name.localeCompare(right.name),
   );
@@ -248,10 +257,12 @@ export function deriveFleetReleaseCandidate(
     constructedRoles[name] = {
       talos_version: target.talosVersion,
       kubernetes_version: target.kubernetesVersion,
+      ...(target.kubernetesImages===undefined?{}:{kubernetes_images:target.kubernetesImages}),
       talos_installer: role.installerImage,
       talos_schematic_sha256: role.schematicSha256,
       talos_extensions: role.extensions,
       components: roleComponents[name],
+      ...(role.hostConfigurationRequired===undefined?{}:{host_configuration_required:role.hostConfigurationRequired}),
     };
   }
   if (
@@ -263,6 +274,8 @@ export function deriveFleetReleaseCandidate(
     version: 1,
     versions_lock_sha256: versionsLockSha256,
     configuration_schema_revision: extra.configurationSchemaRevision,
+    ...(platformSourceCommit===undefined?{}:{platform_source_commit:platformSourceCommit}),
+    ...(extra.storageAuthorityKeysSha256===undefined?{}:{storage_authority_keys_sha256:extra.storageAuthorityKeysSha256}),
     components: componentList,
     roles: constructedRoles,
   });
@@ -282,8 +295,9 @@ export function deriveFleetReleaseCandidate(
 }
 export async function readFleetReleaseCandidate(
   path = new URL("./versions.lock.json", import.meta.url),
+  platformSourceCommit?:string,
 ): Promise<FleetReleaseCandidate> {
-  return deriveFleetReleaseCandidate(await readFile(path));
+  return deriveFleetReleaseCandidate(await readFile(path),platformSourceCommit);
 }
 if (import.meta.main)
   process.stdout.write(

@@ -1,0 +1,50 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "pgcf-edge-dev",
+  "main": "build/worker/shim.mjs",
+  "compatibility_date": "2026-10-02",
+  "limits": {
+    "cpu_ms": 300000,
+  },
+  "routes": [
+    {
+      "pattern": "<DB_ENDPOINT_HOST>",
+      "custom_domain": true,
+    },
+  ],
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "DATABASE_ACTOR",
+        "class_name": "DatabaseActor",
+        "script_name": "<MANAGEMENT_API_WORKER>",
+      },
+    ],
+  },
+  "ratelimits": [
+    // Configure limits for the installation's new WebSocket handshakes.
+    // SQL statements on an existing connection do not consume these buckets.
+    // Counters are per Cloudflare location and eventually consistent.
+    {
+      "name": "DATABASE_CONNECTION_RATE_LIMITER",
+      "namespace_id": "<DATABASE_RATE_LIMIT_NAMESPACE_ID>",
+      // Aggregate per database across all roles and source networks.
+      "simple": {
+        "limit": 120,
+        "period": 60,
+      },
+    },
+    {
+      "name": "CONNECTION_RATE_LIMITER",
+      "namespace_id": "<RATE_LIMIT_NAMESPACE_ID>",
+      // Per database + role + normalized network, never the whole endpoint.
+      "simple": {
+        "limit": 120,
+        "period": 60,
+      },
+    },
+  ],
+  "secrets": {
+    "required": ["ROUTE_MASTER_KEYS"],
+  },
+}

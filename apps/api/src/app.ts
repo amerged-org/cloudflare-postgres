@@ -13,9 +13,18 @@ import { registerCosts } from "./routes/costs.ts";
 import { registerOperationalHealth } from "./routes/health.ts";
 import { registerRegionConfiguration } from "./routes/region-configuration.ts";
 import { registerFleetReleases } from "./routes/fleet-releases.ts";
+import { registerFleetPatches } from "./routes/fleet-patches.ts";
+import { registerFleetUpdates } from "./routes/fleet-updates.ts";
 import { registerResourceProfiles } from "./routes/resource-profiles.ts";
 import { registerRegionArchiveSources } from "./routes/region-archive-sources.ts";
 import { registerNodes } from "./routes/nodes.ts";
+import { authenticateThinStorage } from "./domain/node-thin-storage-execution.ts";
+import { RECLAIM_LIMITS } from "@pgcf/contracts/reclaim";
+import { authenticateReclaimRequest } from "./domain/warm-reclaim.ts";
+import { registerReclaim } from "./routes/reclaim.ts";
+import { registerNodeThinStorage } from "./routes/node-thin-storage.ts";
+import { registerComputePool } from "./routes/compute-pool.ts";
+import { registerNodeHostConfiguration } from "./routes/node-host-configuration.ts";
 import { registerNodeInstallation } from "./routes/node-installation.ts";
 import { registerNodeProof } from "./routes/node-proof.ts";
 import { authenticateNodeProofRequest } from "./domain/node-proof-session.ts";
@@ -42,6 +51,18 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/costs",
   "/v1/operational-health",
   "/v1/nodes/:id/mark-lost",
+  "/v1/nodes/:id/compute-pool",
+  "/v1/nodes/:id/storage-profile",
+  "/v1/databases/:id/warm-reclaim",
+  "/v1/nodes/:id/warm-reclaim-qualification",
+  "/agent/v1/nodes/:id/reclaim",
+  "/agent/v1/nodes/:id/reclaim-observations",
+  "/v1/nodes/:id/host-configuration",
+  "/v1/nodes/:id/compute-pool/observations",
+  "/agent/v1/nodes/:id/compute-pool",
+  "/agent/v1/nodes/:id/storage-guard",
+  "/internal/v1/node-thin-storage/:id",
+  "/internal/v1/node-thin-storage/:id/relay",
   "/v1/costs/node-facts",
   "/healthz",
   "/v1/openapi.json",
@@ -61,6 +82,11 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/fleet/releases/:id",
   "/v1/regions/:id/release",
   "/v1/nodes/:id/release",
+  "/v1/nodes/:id/patches",
+  "/v1/fleet/patches/:operation_id",
+  "/v1/fleet/patches/:operation_id/resume",
+  "/internal/v1/fleet-patches/:operation_id",
+  "/internal/v1/fleet-patches/:operation_id/relay",
   "/agent/v1/fleet-observations",
   "/v1/nodes",
   "/v1/nodes/:id/storage",
@@ -283,12 +309,27 @@ export function createApp(): ApiApp {
     const privateProfile =
       /^\/v1\/regions\/[^/]+\/installation-profile$/.test(path) &&
       c.req.method === "PUT";
+    const privateRotation =
+      /^\/v1\/regions\/[^/]+\/bootstrap-material\/stage$/.test(path) &&
+      c.req.method === "POST";
     let maximum = JSON_BODY_MAX_BYTES;
     const proof =
       /^\/internal\/v1\/node-proof\/(op_[a-z0-9]{20})\/(?:transport|access|report|ownership)$/.exec(
         path,
       );
-    if (proof && c.req.method === "POST") {
+    const thinStorage =
+      /^\/internal\/v1\/node-thin-storage\/(nod_[a-z0-9]{20})$/.exec(path);
+    const reclaim =
+      /^\/agent\/v1\/nodes\/(nod_[a-z0-9]{20})\/reclaim-observations$/.exec(
+        path,
+      );
+    if (reclaim && c.req.method === "POST") {
+      await authenticateReclaimRequest(c, reclaim[1]!);
+      maximum = RECLAIM_LIMITS.max_envelope_bytes;
+    } else if (thinStorage && c.req.method === "POST") {
+      await authenticateThinStorage(c, thinStorage[1]!);
+      maximum = 2 * 1024 * 1024;
+    } else if (proof && c.req.method === "POST") {
       await authenticateNodeProofRequest(c, proof[1]!);
       maximum = 512 * 1024;
     } else if (path === "/source-control" && c.req.method === "POST") {
@@ -299,7 +340,7 @@ export function createApp(): ApiApp {
       maximum = 512 * 1024;
     } else if (inspection && c.req.method === "POST") {
       await authenticateNodeInstallationInspection(c, inspection[1]!);
-    } else if (privateBootstrap || privateProfile) {
+    } else if (privateBootstrap || privateProfile || privateRotation) {
       await requireScope(c, "admin");
       maximum = 512 * 1024;
     }
@@ -352,11 +393,17 @@ export function createApp(): ApiApp {
   registerAgentMetrics(app);
   registerCosts(app);
   registerNodes(app);
+  registerComputePool(app);
+  registerNodeThinStorage(app);
+  registerReclaim(app);
+  registerNodeHostConfiguration(app);
   registerNodeInstallation(app);
   registerNodeProof(app);
   registerOperationalHealth(app);
   registerRegionConfiguration(app);
   registerFleetReleases(app);
+  registerFleetPatches(app);
+  registerFleetUpdates(app);
   registerResourceProfiles(app);
   registerRegionArchiveSources(app);
   app.doc31("/v1/openapi.json", {

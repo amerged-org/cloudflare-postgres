@@ -220,3 +220,92 @@ transfer. Verify target contents, nonsuperuser roles and TLS through Cloudflare,
 target base backup and archived WAL, before changing application connections. Retain the Neon
 source through acceptance; after target writes, a rollback must reconcile them rather than point
 clients at stale data. Keep adapter changes and customer prices outside this generic service.
+
+## Thin storage admission and protective recovery
+
+Thin storage is enabled explicitly per node only after the selected driver, fixed pool and
+host expiry guard have passed qualification. An unqualified, stale or identity-mismatched
+selection stays closed; it never silently falls back to thick provisioning. Customer activation
+requires the immutable selected release's complete-profile qualification receipt, including
+dirty-writeback and full-pool acceptance; driver-only readiness cannot enable placement. No such
+live receipt is inferred from local tests. Existing thick volumes keep their backend and data.
+A selected thin volume keeps its immutable class,
+profile hash, Node UID, volume-group UUID and pool UUID; logical quota growth is forward-only
+within the configured finite maximum.
+
+Administrators read or CAS-select a profile with `GET`/`PUT /v1/nodes/{id}/storage-profile`.
+PUT includes `expected_revision`, the physical `node_uid`, literal management `address`,
+`volume_group_uuid`, the complete finite `profile` and `allow_new_databases:false`.
+`Idempotency-Key` protects repeated requests. Selection records desired policy; it neither
+acknowledges a physical mutation nor supplies qualification. An active or uncertain Native pool
+action blocks reselection. The approved release must pin the exact driver and storage verifier.
+The regional capacity policy accepts an optional `thin_storage` standing template: omission
+preserves it, explicit null clears it. Future purchases seal that template before ordering;
+customer placement still waits for the actual joined node's qualified physical report.
+
+Cloudflare admits starts from the **already allocated** pool's actual data and metadata
+headroom, verified live write limits and outstanding startup holds. Logical quota totals do
+not reserve thin extents. Free space elsewhere in the volume group becomes placeable only
+after a bounded pool growth has completed and Native has read back its larger geometry.
+Profiles explicitly configure quotas, IO limits, guard/drain windows and reserves; they have
+no unbounded or guessed defaults. Thin starts require the region's actual-RAM policy.
+
+The existing startup ledger captures both the full RAM peak and the bounded storage debit.
+A thin start temporarily debits the greater of its configured startup reserve and current logical
+quota until actual Ready, later RAM and Native LV/Pod IO-limit proof cover it. This bounds uncapped
+startup writes and dirty writeback; established or sleeping databases do not permanently debit
+that quota. Mapping headroom includes these in-flight bytes and established writers' bounded
+64KiB chunk exposure. These holds reserve admission runway; they do not preallocate extents.
+The RAM peak includes PostgreSQL, the Barman limit and one assigned host allowance. Idle pool
+memory is already present in actual Node measurements and is not subtracted again. Permission
+expiry and an operation timeout do not release uncertain capacity. Accepted readiness or a
+verified stopped runtime must be followed by later bound RAM and Native physical observations
+before their holds are released.
+
+When the host guard protects a running database, Native proves the bound Cluster is hibernated
+and its Pods are absent. Cloudflare keeps the running intent and records that exact generation
+and prior operation. A stale same-generation Regional Ready report cannot overwrite this
+stop. Once current Node, RAM, CPU and physical storage checks permit it, the normal capacity
+turn issues one real resume operation and advances the generation. Manual suspension,
+deletion and a newer intent take precedence. No application SQL is replayed.
+
+A thin deletion stays pending until a fresh Native read after the delete intent proves the
+retained actual LV UUID absent from both physical and active inventories. An ordinary Regional
+deleted report cannot supply that proof. Database deletion and the configured R2 archive
+retention remain separate operations. Thin physical allocation metrics stay null until a real
+measurement exists; neither a logical quota nor zero stands in for an unknown measurement.
+
+See PLAN.md Status for the selected source, qualified images and completed live checks. Local
+D1 and Workerd tests alone do not activate this feature or establish live storage acceptance.
+
+
+## Optional warm reclaim
+
+The default idle path remains Pod-cold hibernation. Administrators explicitly configure a database
+with `GET`/`PUT /v1/databases/{id}/warm-reclaim` (`expected_revision`, `expected_generation`, and a
+nullable policy containing only idle seconds, episode budget and step bytes). PostgreSQL CPU/RAM
+ceilings continue to come from its effective resource policy. Warm idle retains the same running
+Pod, PostgreSQL, Barman and their active CPU accounting; it does not count as a shared-pool hit.
+
+`GET`/`PUT /v1/nodes/{id}/warm-reclaim-qualification` records an independently accepted isolated
+worker proof bound to the current Node UID, boot, sealed cluster/material and selected release.
+A control-plane node, missing qualification or stale/mismatched runtime proof cannot issue reclaim.
+None of the three retained nodes is implicitly qualified by deploying this source. The approved
+isolated-worker and actual encrypted-swap acceptance remain required before any live trial.
+
+The protected host publisher uses the existing regional identity to fetch
+`GET /agent/v1/nodes/{id}/reclaim` and post bounded observations to
+`POST /agent/v1/nodes/{id}/reclaim-observations`. It publishes a two-second envelope of CF-signed,
+five-second maximum rc1 scopes. The unprivileged reclaimer receives public verification keys and
+local identity snapshots; it receives no CF write credential, PostgreSQL credential or CRI socket.
+
+The Actor persists one idle episode with its own revision. Renewal cannot replenish its budget
+or change its runtime scope. Before a connection uses the warm route, the Actor persists a higher
+revoked revision and waits for its exact same-runtime revoked acknowledgement, or for the last
+issued reclaim lease plus clock skew to expire. A lost reply, signer failure or Actor eviction
+keeps this barrier closed. An already-running bounded kernel call may finish after the revoke
+acknowledgement; no further step can be scheduled. Admission still reads current authoritative
+state and never treats a reclaim result as hibernation, CPU release or permission to replay SQL.
+
+See PLAN.md for actual deployment and kernel acceptance. The local authority tests do not establish
+swap safety, reclaimed-memory savings or first-read performance on the retained fleet.

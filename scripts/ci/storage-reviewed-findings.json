@@ -1,0 +1,114 @@
+{
+  "version": 1,
+  "profile": "storage",
+  "base": {
+    "image": "docker.io/openebs/lvm-driver@sha256:41f73aba7f31eee4a033053d9c2f203e007a838c14823f3fd472c50651a98999",
+    "diffIDs": [
+      "sha256:418dccb7d85a63a6aa574439840f7a6fa6fd2321b3e2394568a317735e867d35",
+      "sha256:78d44d4a6e64d2bdd18318eb72d19fd948a1a042ecfef737c98f5629ac3c0f91",
+      "sha256:09377a3ebddfb1235a385adeb4dc90fbe530ff6cf90b017f5898a12f4c0d79ab",
+      "sha256:86e085e1fcbf085137d209de6d18e47fe358f9162d2e999b617fc0a0bf34a25c",
+      "sha256:324ac9c39e4c5566063a82153cb12c64f2c8dd14434c3fddefa42a8a1b473d7f"
+    ]
+  },
+  "review": {
+    "source_commit": "e8a234cbfeef5fa16fde1330c8de2d91e31831f1",
+    "source_url": "https://github.com/openebs/lvm-localpv/blob/e8a234cbfeef5fa16fde1330c8de2d91e31831f1/go.sum",
+    "reason": "Six scanner spans are two copies of three public Go dependency build-info h1 checksums, matched byte-for-byte to the pinned source go.sum. No credential or private key is present in these spans. Full-file hash, original upstream layer/entry/digest and every span remain mandatory.",
+    "public_go_sum_lines": [
+      "golang.org/x/oauth2 v0.34.0 h1:hqK/t4AKgbqWkdkcAeI8XLmbK+4m4G5YeQRrmiotGlw=",
+      "k8s.io/api v0.34.1 h1:jC+153630BMdlFukegoEL8E/yT7aLyQkIVuwhmwDgJM=",
+      "k8s.io/apimachinery v0.34.1 h1:dTlxFls/eikpJxmAC7MVE8oOeP1zryV7iRyIjB0gky4="
+    ]
+  },
+  "files": [
+    {
+      "path": "usr/local/bin/lvm-driver",
+      "sha256": "50a9ede8031deae0adf2431f960c0979b305b54dc7950b170a54cc4613d4fdb1",
+      "size": 79665427,
+      "layer": 4,
+      "tarEntry": 3,
+      "boundDigest": "sha256:324ac9c39e4c5566063a82153cb12c64f2c8dd14434c3fddefa42a8a1b473d7f",
+      "findings": [
+        {
+          "rule": "generic-api-key",
+          "startLine": 47224,
+          "endLine": 47224,
+          "startColumn": 19,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 35044629,
+            "byteEndExclusive": 35044691,
+            "size": 62,
+            "sha256": "9c70001625e1433287175c43c078805448dcca24ff2dcd03f8340ae980aa36dd"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 47234,
+          "endLine": 47234,
+          "startColumn": 13,
+          "endColumn": 71,
+          "span": {
+            "byteStart": 35045479,
+            "byteEndExclusive": 35045538,
+            "size": 59,
+            "sha256": "39fa24cbbc070c9bda675e53ac18d785fcfe2b5f614a31ebcfb482d2e18e89f9"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 47235,
+          "endLine": 47235,
+          "startColumn": 13,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 35045550,
+            "byteEndExclusive": 35045618,
+            "size": 68,
+            "sha256": "e16e69151a65e52e69cb78ca5df3e41fe7744f7c9d50660050309f6d002dd7d1"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 170268,
+          "endLine": 170268,
+          "startColumn": 19,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 53813760,
+            "byteEndExclusive": 53813822,
+            "size": 62,
+            "sha256": "9c70001625e1433287175c43c078805448dcca24ff2dcd03f8340ae980aa36dd"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 170278,
+          "endLine": 170278,
+          "startColumn": 13,
+          "endColumn": 71,
+          "span": {
+            "byteStart": 53814610,
+            "byteEndExclusive": 53814669,
+            "size": 59,
+            "sha256": "39fa24cbbc070c9bda675e53ac18d785fcfe2b5f614a31ebcfb482d2e18e89f9"
+          }
+        },
+        {
+          "rule": "generic-api-key",
+          "startLine": 170279,
+          "endLine": 170279,
+          "startColumn": 13,
+          "endColumn": 80,
+          "span": {
+            "byteStart": 53814681,
+            "byteEndExclusive": 53814749,
+            "size": 68,
+            "sha256": "e16e69151a65e52e69cb78ca5df3e41fe7744f7c9d50660050309f6d002dd7d1"
+          }
+        }
+      ]
+    }
+  ]
+}

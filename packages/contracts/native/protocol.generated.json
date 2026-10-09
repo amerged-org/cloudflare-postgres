@@ -1,0 +1,869 @@
+{
+  "version": 1,
+  "constants": {
+    "ROUTE_TOKEN_SIGN_TTL_SECONDS": 30,
+    "ADMISSION_DEADLINE_MS": 30000,
+    "DECOY_AUTH_MAX_BYTES": 4096,
+    "DECOY_DEADLINE_MS": 10000,
+    "DECOY_MAX_BYTES": 65536,
+    "DECOY_MAX_FRAMES": 128,
+    "DECOY_SCRAM_ITERATIONS": 4096,
+    "ROUTE_TOKEN_MAX_LENGTH": 512,
+    "ROUTE_TOKEN_MAX_LIFETIME_SECONDS": 30,
+    "ROUTE_TOKEN_SKEW_SECONDS": 5,
+    "ROUTE_KEY_MIN_BYTES": 32,
+    "SSL_REQUEST_CODE": 80877103,
+    "GSSENC_REQUEST_CODE": 80877104,
+    "CANCEL_REQUEST_CODE": 80877102,
+    "STARTUP_MIN_LENGTH": 8,
+    "STARTUP_MAX_LENGTH": 10000,
+    "MAX_PRELUDES": 2,
+    "DEFAULT_MAX_BUFFERED": 65536,
+    "CANCEL_MIN_LENGTH": 16,
+    "CANCEL_MAX_LENGTH": 268,
+    "ROUTE_TOKEN_SIGNATURE_BYTES": 32,
+    "GATEWAY_CONTROL_MAX_LENGTH": 1024,
+    "GATEWAY_CONTROL_MAX_LIFETIME_SECONDS": 30,
+    "GATEWAY_ACTIVITY_MAX_LENGTH": 1024,
+    "GATEWAY_ACTIVITY_MAX_LIFETIME_SECONDS": 30,
+    "GATEWAY_RETIRE_HOLD_MS": 65000,
+    "DEFAULT_MEMORY_LIMIT_BYTES": 201326592,
+    "DEFAULT_DATABASE_MEMORY_LIMIT_BYTES": 100663296,
+    "MAX_PAYLOAD_BYTES": 33554432,
+    "MAX_FRAME_BYTES": 65536,
+    "MAX_STARTUP_BUFFER_BYTES": 65536,
+    "DEFAULT_DATABASE_CONNECTION_LIMIT": 200,
+    "DEFAULT_TOTAL_CONNECTION_LIMIT": 2000,
+    "MAX_ACTIVITY_RECORDS": 2000,
+    "STORAGE_AUTHORITY_MAX_LENGTH": 4096,
+    "STORAGE_AUTHORITY_MAX_SECONDS": 120,
+    "STORAGE_AUTHORITY_SKEW_MS": 5000
+  },
+  "wire": {
+    "routeKeyDomain": "pgcf-route-key/v1\n",
+    "routeHeader": "X-PGCF-Route",
+    "decoySaltDomain": "pgcf.edge.decoy-scram-salt/v1\n",
+    "routeTokenPrefix": "v2",
+    "routeSignatureDomain": "pgcf-route/v2\n",
+    "controlSigningPurpose": "pgcf-gateway-control/v1\n",
+    "controlTokenPrefix": "gc1",
+    "controlKeyPurpose": "pgcf-gateway-control-key/v1\n",
+    "activitySigningPurpose": "pgcf-gateway-activity/v1\n",
+    "activityTokenPrefix": "ga1",
+    "activityKeyPurpose": "pgcf-gateway-activity-key/v1\n",
+    "controlPathPrefix": "/_pgcf/gateway/",
+    "controlHeader": "X-PGCF-Control",
+    "activityPath": "/_pgcf/gateway/activity",
+    "activityHeader": "X-PGCF-Activity",
+    "fenceNamespace": "pgcf-system",
+    "fenceLabel": "pgcf.io/gateway-fence",
+    "fenceSelector": "pgcf.io/gateway-fence=true",
+    "storageAuthorityLedgerKey": "write-authority",
+    "storageAuthorityPrefix": "sa1",
+    "storageAuthorityDomain": "pgcf-storage-authority/v1\n"
+  },
+  "patterns": {
+    "database": "^[a-z][a-z0-9]{19}$",
+    "region": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$",
+    "role": "^[a-z][a-z0-9_]{0,62}$",
+    "operation": "^op_[a-z0-9]{20}$",
+    "uuid": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$",
+    "storageAuthorityKid": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$",
+    "storageLvmUuid": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+  },
+  "reservedRoles": ["postgres", "streaming_replica"],
+  "reservedRolePrefixes": ["pg_", "cnpg_"],
+  "gatewayRegion": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "id": { "$ref": "#/$defs/RegionId" },
+      "gateway_url": { "type": "string", "maxLength": 2048, "format": "uri" },
+      "gateway_binding": {
+        "anyOf": [
+          { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" },
+          { "type": "null" }
+        ]
+      }
+    },
+    "required": ["id", "gateway_url", "gateway_binding"],
+    "additionalProperties": false,
+    "$defs": {
+      "RegionId": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+      }
+    }
+  },
+  "databaseAdmission": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "oneOf": [
+      {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "const": true },
+          "region": {
+            "type": "object",
+            "properties": {
+              "id": { "$ref": "#/$defs/RegionId" },
+              "gateway_url": {
+                "type": "string",
+                "maxLength": 2048,
+                "format": "uri"
+              },
+              "gateway_binding": {
+                "anyOf": [
+                  { "type": "string", "pattern": "^[A-Z][A-Z0-9_]{0,63}$" },
+                  { "type": "null" }
+                ]
+              }
+            },
+            "required": ["id", "gateway_url", "gateway_binding"],
+            "additionalProperties": false
+          }
+        },
+        "required": ["ok", "region"],
+        "additionalProperties": false
+      },
+      {
+        "type": "object",
+        "properties": {
+          "ok": { "type": "boolean", "const": false },
+          "sqlstate": {
+            "type": "string",
+            "enum": ["53300", "3D000", "28P01", "57P03", "08006"]
+          }
+        },
+        "required": ["ok", "sqlstate"],
+        "additionalProperties": false
+      }
+    ],
+    "$defs": {
+      "RegionId": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+      }
+    }
+  },
+  "routeClaims": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "v": { "type": "number", "const": 2 },
+      "db": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+      "user": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" },
+      "cid": {
+        "type": "string",
+        "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+      },
+      "rg": { "type": "string", "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$" },
+      "kid": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
+      },
+      "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+      "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+    },
+    "required": ["v", "db", "user", "cid", "rg", "kid", "iat", "exp"],
+    "additionalProperties": false,
+    "$defs": {
+      "RoleName": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,62}$" }
+    }
+  },
+  "controlClaims": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "v": { "type": "number", "const": 1 },
+      "region": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+      },
+      "database": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+      "operation": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+      "revision": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "pod": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "action": {
+        "type": "string",
+        "enum": ["begin", "status", "close", "release", "retire"]
+      },
+      "kid": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
+      },
+      "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+      "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+    },
+    "required": [
+      "v",
+      "region",
+      "database",
+      "operation",
+      "revision",
+      "pod",
+      "action",
+      "kid",
+      "iat",
+      "exp"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "RegionId": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+      },
+      "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+      "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
+    }
+  },
+  "activityClaims": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "v": { "type": "number", "const": 1 },
+      "region": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+      },
+      "database": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+      "revision": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "pod": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "nonce": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "kid": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
+      },
+      "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+      "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 }
+    },
+    "required": [
+      "v",
+      "region",
+      "database",
+      "revision",
+      "pod",
+      "nonce",
+      "kid",
+      "iat",
+      "exp"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "RegionId": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9-]{1,30}[a-z0-9]$"
+      },
+      "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
+    }
+  },
+  "intent": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "database": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+      "operation": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+      "revision": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "mode": { "type": "string", "enum": ["quiesce", "running", "retired"] }
+    },
+    "required": ["database", "operation", "revision", "mode"],
+    "additionalProperties": false,
+    "$defs": {
+      "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+      "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
+    }
+  },
+  "storageWriteClaims": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "v": { "type": "number", "const": 1 },
+      "kid": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
+      },
+      "database_id": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+      "generation": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "authority_revision": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "storage_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "node_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "volume_group_uuid": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+      },
+      "pool_uuid": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+      },
+      "profile_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+      "volume_handle": { "type": "string", "pattern": "^pvc-[a-f0-9-]{36}$" },
+      "lv_uuid": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+      },
+      "pvc_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "pv_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "pod_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "observed_at": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "iat": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+      "exp": { "type": "integer", "minimum": 0, "maximum": 9007199254740991 },
+      "guard_seconds": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 120
+      },
+      "drain_seconds": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 120
+      },
+      "write_allowed": { "type": "boolean" }
+    },
+    "required": [
+      "v",
+      "kid",
+      "database_id",
+      "generation",
+      "authority_revision",
+      "storage_uid",
+      "node_uid",
+      "volume_group_uuid",
+      "pool_uuid",
+      "profile_sha256",
+      "volume_handle",
+      "lv_uuid",
+      "pvc_uid",
+      "pv_uid",
+      "pod_uid",
+      "observed_at",
+      "iat",
+      "exp",
+      "guard_seconds",
+      "drain_seconds",
+      "write_allowed"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
+    }
+  },
+  "reclaimClaims": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "v": { "type": "number", "const": 1 },
+      "kid": {
+        "type": "string",
+        "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$"
+      },
+      "database_id": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+      "operation_id": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" },
+      "intent_revision": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "generation": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "storage_generation": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "node_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "boot_id": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "cluster_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "namespace_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "cnpg_cluster_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "storage_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "pvc_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "pv_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "pod_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "container_id": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+      "postgres_image_sha256": {
+        "type": "string",
+        "pattern": "^[a-f0-9]{64}$"
+      },
+      "mode": { "type": "string", "enum": ["reclaim", "revoked"] },
+      "budget_bytes": { "type": "integer", "minimum": 0, "maximum": 134217728 },
+      "step_bytes": { "type": "integer", "minimum": 0, "maximum": 8388608 },
+      "memory_request_bytes": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "memory_limit_bytes": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "issued_at": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "expires_at": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      }
+    },
+    "required": [
+      "v",
+      "kid",
+      "database_id",
+      "operation_id",
+      "intent_revision",
+      "generation",
+      "storage_generation",
+      "node_uid",
+      "boot_id",
+      "cluster_uid",
+      "namespace_uid",
+      "cnpg_cluster_uid",
+      "storage_uid",
+      "pvc_uid",
+      "pv_uid",
+      "pod_uid",
+      "container_id",
+      "postgres_image_sha256",
+      "mode",
+      "budget_bytes",
+      "step_bytes",
+      "memory_request_bytes",
+      "memory_limit_bytes",
+      "issued_at",
+      "expires_at"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+      "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
+    }
+  },
+  "legacyStorageBinding": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "database_id": { "$ref": "#/$defs/DatabaseId" },
+      "storage_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "namespace_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "cluster_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "physical_generation": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "volume_identity": {
+        "type": "object",
+        "properties": {
+          "handle": { "type": "string", "pattern": "^pvc-[a-f0-9-]{36}$" },
+          "claimUid": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "volumeUid": {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          "lvUuid": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+          }
+        },
+        "required": ["handle", "claimUid", "volumeUid"],
+        "additionalProperties": false
+      }
+    },
+    "required": [
+      "database_id",
+      "storage_uid",
+      "namespace_uid",
+      "cluster_uid",
+      "physical_generation",
+      "volume_identity"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
+    }
+  },
+  "storageHostLease": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+      "purpose": { "type": "string", "const": "pgcf-storage-host/v1" },
+      "node_uid": {
+        "type": "string",
+        "format": "uuid",
+        "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+      },
+      "boot_id": {
+        "anyOf": [
+          {
+            "type": "string",
+            "format": "uuid",
+            "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+          },
+          { "type": "null" }
+        ]
+      },
+      "material_revision": {
+        "type": "integer",
+        "exclusiveMinimum": 0,
+        "maximum": 9007199254740991
+      },
+      "issued_at": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "expires_at": {
+        "type": "integer",
+        "minimum": 0,
+        "maximum": 9007199254740991
+      },
+      "legacy": {
+        "maxItems": 2000,
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "database_id": { "$ref": "#/$defs/DatabaseId" },
+            "generation": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "namespace": {
+              "type": "string",
+              "pattern": "^pgcf-db-[a-z0-9]{20}$"
+            }
+          },
+          "required": ["database_id", "generation", "namespace"],
+          "additionalProperties": false
+        }
+      },
+      "databases": {
+        "maxItems": 4096,
+        "type": "array",
+        "items": {
+          "type": "object",
+          "properties": {
+            "database_id": { "$ref": "#/$defs/DatabaseId" },
+            "generation": {
+              "type": "integer",
+              "exclusiveMinimum": 0,
+              "maximum": 9007199254740991
+            },
+            "authority_revision": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 9007199254740991
+            },
+            "write_blocked": { "type": "boolean" },
+            "desired_state": {
+              "type": "string",
+              "enum": ["running", "suspended", "deleted"]
+            },
+            "node_uid": {
+              "type": "string",
+              "format": "uuid",
+              "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+            },
+            "volume_group_uuid": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+            },
+            "pool_uuid": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+            },
+            "profile_sha256": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+            "startup_expires_at": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                { "type": "null" }
+              ]
+            },
+            "startup_operation_id": {
+              "anyOf": [{ "$ref": "#/$defs/OperationId" }, { "type": "null" }]
+            },
+            "volume": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "storage_generation": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "storage_uid": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "namespace_uid": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "cluster_uid": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "node_uid": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "volume_group_uuid": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                    },
+                    "pool_uuid": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                    },
+                    "volume_handle": {
+                      "type": "string",
+                      "pattern": "^pvc-[a-f0-9-]{36}$"
+                    },
+                    "lv_uuid": {
+                      "type": "string",
+                      "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                    },
+                    "pvc_uid": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    },
+                    "pv_uid": {
+                      "type": "string",
+                      "format": "uuid",
+                      "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+                    }
+                  },
+                  "required": [
+                    "storage_generation",
+                    "storage_uid",
+                    "namespace_uid",
+                    "cluster_uid",
+                    "node_uid",
+                    "volume_group_uuid",
+                    "pool_uuid",
+                    "volume_handle",
+                    "lv_uuid",
+                    "pvc_uid",
+                    "pv_uid"
+                  ],
+                  "additionalProperties": false
+                },
+                { "type": "null" }
+              ]
+            },
+            "runtime_authority": {
+              "anyOf": [
+                { "type": "string", "maxLength": 4096 },
+                { "type": "null" }
+              ]
+            },
+            "drain": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "operation_id": { "$ref": "#/$defs/OperationId" },
+                    "kind": {
+                      "type": "string",
+                      "enum": [
+                        "database.suspend",
+                        "database.hibernate",
+                        "database.delete"
+                      ]
+                    },
+                    "generation": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "authority_revision": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "expires_at": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 9007199254740991
+                    },
+                    "budget_bytes": {
+                      "type": "integer",
+                      "exclusiveMinimum": 0,
+                      "maximum": 9007199254740991
+                    }
+                  },
+                  "required": [
+                    "operation_id",
+                    "kind",
+                    "generation",
+                    "authority_revision",
+                    "expires_at",
+                    "budget_bytes"
+                  ],
+                  "additionalProperties": false
+                },
+                { "type": "null" }
+              ]
+            }
+          },
+          "required": [
+            "database_id",
+            "generation",
+            "authority_revision",
+            "write_blocked",
+            "desired_state",
+            "node_uid",
+            "volume_group_uuid",
+            "pool_uuid",
+            "profile_sha256",
+            "startup_expires_at",
+            "startup_operation_id",
+            "volume",
+            "runtime_authority"
+          ],
+          "additionalProperties": false
+        }
+      }
+    },
+    "required": [
+      "purpose",
+      "node_uid",
+      "boot_id",
+      "material_revision",
+      "issued_at",
+      "expires_at",
+      "legacy",
+      "databases"
+    ],
+    "additionalProperties": false,
+    "$defs": {
+      "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" },
+      "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
+    }
+  }
+}

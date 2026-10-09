@@ -5,12 +5,24 @@ import {
   encodeEncryptionDeclined,
   encodeErrorResponse,
 } from "@pgcf/contracts/pg-wire";
-import { parseRouteKeyring } from "@pgcf/contracts/route-token";
+import {
+  DECOY_DEADLINE_MS,
+  DECOY_MAX_BYTES,
+  DECOY_MAX_FRAMES,
+  DECOY_AUTH_MAX_BYTES,
+  DECOY_SCRAM_ITERATIONS,
+  decoySalt,
+} from "@pgcf/contracts";
+export {
+  DECOY_DEADLINE_MS,
+  DECOY_MAX_BYTES,
+  DECOY_MAX_FRAMES,
+  DECOY_AUTH_MAX_BYTES,
+  DECOY_SCRAM_ITERATIONS,
+  DECOY_SALT_DOMAIN,
+} from "@pgcf/contracts";
 
-export const DECOY_DEADLINE_MS = 10_000;
-export const DECOY_MAX_BYTES = 64 * 1024;
-export const DECOY_MAX_FRAMES = 128;
-const AUTH_MAX_BYTES = 4096;
+const AUTH_MAX_BYTES = DECOY_AUTH_MAX_BYTES;
 const utf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const encoder = new TextEncoder();
 function authentication(code: number, text: string): Uint8Array {
@@ -25,29 +37,6 @@ function authentication(code: number, text: string): Uint8Array {
 }
 function base64(bytes: Uint8Array): string {
   return btoa(String.fromCharCode(...bytes));
-}
-async function salt(
-  secret: string,
-  database: string,
-  user: string,
-): Promise<string> {
-  const ring = parseRouteKeyring(secret),
-    master = ring.keys.get(ring.active)!;
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new Uint8Array(master),
-    { name: "HMAC", hash: "SHA-256" },
-    false,
-    ["sign"],
-  );
-  const derived = await crypto.subtle.sign(
-    "HMAC",
-    key,
-    encoder.encode(
-      "pgcf.edge.decoy-scram-salt/v1\n" + JSON.stringify([database, user]),
-    ),
-  );
-  return base64(new Uint8Array(derived).subarray(0, 16));
 }
 
 /** Unknown routes only. Never authenticate, retain a password, or forward frontend bytes. */
@@ -209,10 +198,15 @@ export function decoyResponse(
           }
           nonce =
             clientNonce + base64(crypto.getRandomValues(new Uint8Array(18)));
-          const derived = await salt(secret, hints.database, hints.user);
+          const derived = await decoySalt(secret, hints.database, hints.user);
           if (closed) break;
           phase = "final";
-          socket.send(authentication(11, `r=${nonce},s=${derived},i=4096`));
+          socket.send(
+            authentication(
+              11,
+              `r=${nonce},s=${derived},i=${DECOY_SCRAM_ITERATIONS}`,
+            ),
+          );
         } else {
           const final = utf8.decode(body),
             parts = final.split(",");

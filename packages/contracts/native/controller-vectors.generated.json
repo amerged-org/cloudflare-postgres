@@ -1,0 +1,3853 @@
+[
+  {
+    "name": "entry-request-limit-split",
+    "db": {
+      "id": "dbbbbbbbbbbbbbbbbbbb",
+      "generation": 1,
+      "desired_state": "running",
+      "node": "native-test-node",
+      "pg_major": 18,
+      "size": {
+        "memory_mib": 256,
+        "memory_request_mib": 128,
+        "cpu_millicores": 250,
+        "cpu_request_millicores": 25,
+        "storage_gib": 5,
+        "max_connections": 20,
+        "archive_timeout_seconds": 60,
+        "backup_retention_days": 7
+      },
+      "roles": [
+        {
+          "name": "app",
+          "owner": true,
+          "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+          "revision": 1
+        },
+        {
+          "name": "reader_query",
+          "owner": false,
+          "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+          "revision": 2
+        }
+      ],
+      "maintenance": {
+        "role": "pgcf_maintenance",
+        "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+        "revision": 1
+      },
+      "creation": {
+        "operation_id": "op_cccccccccccccccccccc",
+        "generation": 1,
+        "status": "pending",
+        "ever_ready": false
+      },
+      "archive": {
+        "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+        "server_name": "database"
+      }
+    },
+    "ctx": {
+      "backup": {
+        "bucket": "native-controller-test",
+        "endpointUrl": "https://backup.example.invalid",
+        "region": "auto",
+        "credentials": {
+          "accessKeyId": "unit-access",
+          "secretAccessKey": "unit-secret"
+        }
+      },
+      "postgresImage": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "systemNamespace": "pgcf-system",
+      "cnpgNamespace": "cnpg-system",
+      "storageClass": "pgcf-lvm",
+      "gatewaySelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+      },
+      "agentSelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+      }
+    },
+    "manifests": [
+      {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+          "name": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "pod-security.kubernetes.io/enforce": "restricted",
+            "pod-security.kubernetes.io/enforce-version": "latest"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+          "name": "database-resources",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "hard": {
+            "requests.cpu": "250m",
+            "limits.cpu": "1500m",
+            "requests.memory": "768Mi",
+            "limits.memory": "1536Mi",
+            "requests.storage": "5Gi",
+            "persistentvolumeclaims": "1",
+            "pods": "2"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "LimitRange",
+        "metadata": {
+          "name": "container-defaults",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "limits": [
+            {
+              "type": "Container",
+              "defaultRequest": { "cpu": "25m", "memory": "64Mi" },
+              "default": { "cpu": "100m", "memory": "128Mi" }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "default-deny",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": { "podSelector": {}, "policyTypes": ["Ingress", "Egress"] }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "gateway-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+                  }
+                }
+              ],
+              "ports": [{ "port": 5432, "protocol": "TCP" }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "agent-management-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+                  }
+                }
+              ],
+              "ports": [
+                { "port": 5432, "protocol": "TCP" },
+                { "port": 9187, "protocol": "TCP" }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "database-boundaries",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": { "cnpg.io/cluster": "database" }
+          },
+          "ingress": [
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-gateway",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "5432", "protocol": "TCP" }] }]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-agent",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "5432", "protocol": "TCP" },
+                    { "port": "9187", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "cloudnative-pg"
+                  }
+                },
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "plugin-barman-cloud"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "8000", "protocol": "TCP" }] }]
+            }
+          ],
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s:k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "53", "protocol": "UDP" },
+                    { "port": "53", "protocol": "TCP" }
+                  ],
+                  "rules": { "dns": [{ "matchPattern": "*" }] }
+                }
+              ]
+            },
+            {
+              "toEntities": ["kube-apiserver"],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "443", "protocol": "TCP" },
+                    { "port": "6443", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "toFQDNs": [{ "matchName": "backup.example.invalid" }],
+              "toPorts": [{ "ports": [{ "port": "443", "protocol": "TCP" }] }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-app",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "YXBw",
+          "password": "cHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcA=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cmVhZGVyX3F1ZXJ5",
+          "password": "cXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcQ=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "maintenance-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cGdjZl9tYWludGVuYW5jZQ==",
+          "password": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycg=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "archive-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "type": "Opaque",
+        "data": {
+          "AWS_ACCESS_KEY_ID": "dW5pdC1hY2Nlc3M=",
+          "AWS_SECRET_ACCESS_KEY": "dW5pdC1zZWNyZXQ="
+        }
+      },
+      {
+        "apiVersion": "barmancloud.cnpg.io/v1",
+        "kind": "ObjectStore",
+        "metadata": {
+          "name": "archive",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "configuration": {
+            "destinationPath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+            "endpointURL": "https://backup.example.invalid",
+            "s3Credentials": {
+              "accessKeyId": {
+                "name": "archive-credentials",
+                "key": "AWS_ACCESS_KEY_ID"
+              },
+              "secretAccessKey": {
+                "name": "archive-credentials",
+                "key": "AWS_SECRET_ACCESS_KEY"
+              }
+            },
+            "wal": { "compression": "gzip" },
+            "data": { "compression": "gzip" }
+          },
+          "retentionPolicy": "7d",
+          "instanceSidecarConfiguration": {
+            "env": [{ "name": "AWS_DEFAULT_REGION", "value": "auto" }],
+            "resources": {
+              "requests": { "cpu": "100m", "memory": "128Mi" },
+              "limits": { "cpu": "500m", "memory": "512Mi" }
+            }
+          }
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "Cluster",
+        "metadata": {
+          "name": "database",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "instances": 1,
+          "probes": {
+            "startup": { "periodSeconds": 1, "failureThreshold": 3600 },
+            "readiness": { "periodSeconds": 1 }
+          },
+          "imageName": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "inheritedMetadata": {
+            "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+          },
+          "enableSuperuserAccess": false,
+          "bootstrap": {
+            "initdb": {
+              "database": "dbbbbbbbbbbbbbbbbbbb",
+              "owner": "app",
+              "secret": { "name": "role-app" },
+              "postInitApplicationSQL": [
+                "CREATE ROLE pgcf_maintenance LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS",
+                "GRANT pg_read_all_stats TO pgcf_maintenance",
+                "GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal() TO pgcf_maintenance",
+                "GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_archive_statusdir() TO pgcf_maintenance"
+              ]
+            }
+          },
+          "affinity": {
+            "nodeSelector": { "kubernetes.io/hostname": "native-test-node" }
+          },
+          "resources": {
+            "requests": { "cpu": "25m", "memory": "128Mi" },
+            "limits": { "cpu": "250m", "memory": "256Mi" }
+          },
+          "seccompProfile": { "type": "RuntimeDefault" },
+          "storage": { "storageClass": "pgcf-lvm", "size": "5Gi" },
+          "postgresql": {
+            "parameters": {
+              "shared_buffers": "32MB",
+              "effective_cache_size": "128MB",
+              "max_connections": "20",
+              "archive_timeout": "60s"
+            },
+            "pg_hba": ["hostnossl all all all reject"]
+          },
+          "managed": {
+            "roles": [
+              {
+                "name": "reader_query",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "passwordSecret": {
+                  "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c"
+                }
+              },
+              {
+                "name": "pgcf_maintenance",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "inRoles": ["pg_read_all_stats"],
+                "passwordSecret": { "name": "maintenance-credentials" }
+              }
+            ]
+          },
+          "plugins": [
+            {
+              "name": "barman-cloud.cloudnative-pg.io",
+              "enabled": true,
+              "isWALArchiver": true,
+              "parameters": {
+                "barmanObjectName": "archive",
+                "serverName": "database"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "ScheduledBackup",
+        "metadata": {
+          "name": "daily-backup",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "schedule": "0 0 3 * * *",
+          "immediate": true,
+          "backupOwnerReference": "cluster",
+          "cluster": { "name": "database" },
+          "method": "plugin",
+          "pluginConfiguration": { "name": "barman-cloud.cloudnative-pg.io" }
+        }
+      }
+    ],
+    "configuration_input": [
+      "pgcf-config/v1",
+      18,
+      "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      [256, 128, 250, 25, 5, 20, 60, 7],
+      1,
+      "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+      "database",
+      [
+        ["app", true, 1],
+        ["reader_query", false, 2]
+      ],
+      1,
+      null
+    ],
+    "configuration_fingerprint": "1fd3f1b2a56c9b21e1e3b7881f80050a87d337b0dd73396d7a62a96d0377cade"
+  },
+  {
+    "name": "legacy-no-maintenance",
+    "db": {
+      "id": "dbbbbbbbbbbbbbbbbbbb",
+      "generation": 1,
+      "desired_state": "running",
+      "node": "native-test-node",
+      "pg_major": 18,
+      "size": {
+        "memory_mib": 512,
+        "cpu_millicores": 500,
+        "storage_gib": 5,
+        "max_connections": 20,
+        "archive_timeout_seconds": 60,
+        "backup_retention_days": 7
+      },
+      "roles": [
+        {
+          "name": "app",
+          "owner": true,
+          "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+          "revision": 1
+        },
+        {
+          "name": "reader_query",
+          "owner": false,
+          "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+          "revision": 2
+        }
+      ],
+      "creation": {
+        "operation_id": "op_cccccccccccccccccccc",
+        "generation": 1,
+        "status": "pending",
+        "ever_ready": false
+      },
+      "archive": {
+        "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+        "server_name": "database"
+      }
+    },
+    "ctx": {
+      "backup": {
+        "bucket": "native-controller-test",
+        "endpointUrl": "https://backup.example.invalid",
+        "region": "auto",
+        "credentials": {
+          "accessKeyId": "unit-access",
+          "secretAccessKey": "unit-secret"
+        }
+      },
+      "postgresImage": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "systemNamespace": "pgcf-system",
+      "cnpgNamespace": "cnpg-system",
+      "storageClass": "pgcf-lvm",
+      "gatewaySelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+      },
+      "agentSelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+      }
+    },
+    "manifests": [
+      {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+          "name": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "pod-security.kubernetes.io/enforce": "restricted",
+            "pod-security.kubernetes.io/enforce-version": "latest"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+          "name": "database-resources",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "hard": {
+            "requests.cpu": "1200m",
+            "limits.cpu": "2000m",
+            "requests.memory": "1280Mi",
+            "limits.memory": "2048Mi",
+            "requests.storage": "5Gi",
+            "persistentvolumeclaims": "1",
+            "pods": "2"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "LimitRange",
+        "metadata": {
+          "name": "container-defaults",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "limits": [
+            {
+              "type": "Container",
+              "defaultRequest": { "cpu": "25m", "memory": "64Mi" },
+              "default": { "cpu": "100m", "memory": "128Mi" }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "default-deny",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": { "podSelector": {}, "policyTypes": ["Ingress", "Egress"] }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "gateway-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+                  }
+                }
+              ],
+              "ports": [{ "port": 5432, "protocol": "TCP" }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "agent-management-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+                  }
+                }
+              ],
+              "ports": [
+                { "port": 5432, "protocol": "TCP" },
+                { "port": 9187, "protocol": "TCP" }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "database-boundaries",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": { "cnpg.io/cluster": "database" }
+          },
+          "ingress": [
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-gateway",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "5432", "protocol": "TCP" }] }]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-agent",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "5432", "protocol": "TCP" },
+                    { "port": "9187", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "cloudnative-pg"
+                  }
+                },
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "plugin-barman-cloud"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "8000", "protocol": "TCP" }] }]
+            }
+          ],
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s:k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "53", "protocol": "UDP" },
+                    { "port": "53", "protocol": "TCP" }
+                  ],
+                  "rules": { "dns": [{ "matchPattern": "*" }] }
+                }
+              ]
+            },
+            {
+              "toEntities": ["kube-apiserver"],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "443", "protocol": "TCP" },
+                    { "port": "6443", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "toFQDNs": [{ "matchName": "backup.example.invalid" }],
+              "toPorts": [{ "ports": [{ "port": "443", "protocol": "TCP" }] }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-app",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "YXBw",
+          "password": "cHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcA=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cmVhZGVyX3F1ZXJ5",
+          "password": "cXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcQ=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "archive-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "type": "Opaque",
+        "data": {
+          "AWS_ACCESS_KEY_ID": "dW5pdC1hY2Nlc3M=",
+          "AWS_SECRET_ACCESS_KEY": "dW5pdC1zZWNyZXQ="
+        }
+      },
+      {
+        "apiVersion": "barmancloud.cnpg.io/v1",
+        "kind": "ObjectStore",
+        "metadata": {
+          "name": "archive",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "configuration": {
+            "destinationPath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+            "endpointURL": "https://backup.example.invalid",
+            "s3Credentials": {
+              "accessKeyId": {
+                "name": "archive-credentials",
+                "key": "AWS_ACCESS_KEY_ID"
+              },
+              "secretAccessKey": {
+                "name": "archive-credentials",
+                "key": "AWS_SECRET_ACCESS_KEY"
+              }
+            },
+            "wal": { "compression": "gzip" },
+            "data": { "compression": "gzip" }
+          },
+          "retentionPolicy": "7d",
+          "instanceSidecarConfiguration": {
+            "env": [{ "name": "AWS_DEFAULT_REGION", "value": "auto" }],
+            "resources": {
+              "requests": { "cpu": "100m", "memory": "128Mi" },
+              "limits": { "cpu": "500m", "memory": "512Mi" }
+            }
+          }
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "Cluster",
+        "metadata": {
+          "name": "database",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "instances": 1,
+          "probes": {
+            "startup": { "periodSeconds": 1, "failureThreshold": 3600 },
+            "readiness": { "periodSeconds": 1 }
+          },
+          "imageName": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "inheritedMetadata": {
+            "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+          },
+          "enableSuperuserAccess": false,
+          "bootstrap": {
+            "initdb": {
+              "database": "dbbbbbbbbbbbbbbbbbbb",
+              "owner": "app",
+              "secret": { "name": "role-app" }
+            }
+          },
+          "affinity": {
+            "nodeSelector": { "kubernetes.io/hostname": "native-test-node" }
+          },
+          "resources": {
+            "requests": { "cpu": "500m", "memory": "512Mi" },
+            "limits": { "cpu": "500m", "memory": "512Mi" }
+          },
+          "seccompProfile": { "type": "RuntimeDefault" },
+          "storage": { "storageClass": "pgcf-lvm", "size": "5Gi" },
+          "postgresql": {
+            "parameters": {
+              "shared_buffers": "128MB",
+              "effective_cache_size": "256MB",
+              "max_connections": "20",
+              "archive_timeout": "60s"
+            },
+            "pg_hba": ["hostnossl all all all reject"]
+          },
+          "managed": {
+            "roles": [
+              {
+                "name": "reader_query",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "passwordSecret": {
+                  "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c"
+                }
+              }
+            ]
+          },
+          "plugins": [
+            {
+              "name": "barman-cloud.cloudnative-pg.io",
+              "enabled": true,
+              "isWALArchiver": true,
+              "parameters": {
+                "barmanObjectName": "archive",
+                "serverName": "database"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "ScheduledBackup",
+        "metadata": {
+          "name": "daily-backup",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "schedule": "0 0 3 * * *",
+          "immediate": true,
+          "backupOwnerReference": "cluster",
+          "cluster": { "name": "database" },
+          "method": "plugin",
+          "pluginConfiguration": { "name": "barman-cloud.cloudnative-pg.io" }
+        }
+      }
+    ],
+    "configuration_input": [
+      "pgcf-config/v1",
+      18,
+      "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      [512, 512, 500, 500, 5, 20, 60, 7],
+      1,
+      "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+      "database",
+      [
+        ["app", true, 1],
+        ["reader_query", false, 2]
+      ],
+      null,
+      null
+    ],
+    "configuration_fingerprint": "420604fa5d2621109d597a9af0e3a347b891ec0544e6ec590373aac9a42fa548"
+  },
+  {
+    "name": "selected-image",
+    "db": {
+      "id": "dbbbbbbbbbbbbbbbbbbb",
+      "generation": 1,
+      "desired_state": "running",
+      "node": "native-test-node",
+      "pg_major": 18,
+      "size": {
+        "memory_mib": 256,
+        "memory_request_mib": 128,
+        "cpu_millicores": 250,
+        "cpu_request_millicores": 25,
+        "storage_gib": 5,
+        "max_connections": 20,
+        "archive_timeout_seconds": 60,
+        "backup_retention_days": 7
+      },
+      "roles": [
+        {
+          "name": "app",
+          "owner": true,
+          "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+          "revision": 1
+        },
+        {
+          "name": "reader_query",
+          "owner": false,
+          "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+          "revision": 2
+        }
+      ],
+      "maintenance": {
+        "role": "pgcf_maintenance",
+        "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+        "revision": 1
+      },
+      "creation": {
+        "operation_id": "op_cccccccccccccccccccc",
+        "generation": 1,
+        "status": "pending",
+        "ever_ready": false
+      },
+      "archive": {
+        "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+        "server_name": "database"
+      },
+      "postgres": {
+        "release_id": "release-18-7",
+        "image": "registry.example/postgres:18.7@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "version": "18.7",
+        "configuration_schema_revision": 1
+      }
+    },
+    "ctx": {
+      "backup": {
+        "bucket": "native-controller-test",
+        "endpointUrl": "https://backup.example.invalid",
+        "region": "auto",
+        "credentials": {
+          "accessKeyId": "unit-access",
+          "secretAccessKey": "unit-secret"
+        }
+      },
+      "postgresImage": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "systemNamespace": "pgcf-system",
+      "cnpgNamespace": "cnpg-system",
+      "storageClass": "pgcf-lvm",
+      "gatewaySelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+      },
+      "agentSelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+      }
+    },
+    "manifests": [
+      {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+          "name": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "pod-security.kubernetes.io/enforce": "restricted",
+            "pod-security.kubernetes.io/enforce-version": "latest"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+          "name": "database-resources",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "hard": {
+            "requests.cpu": "250m",
+            "limits.cpu": "1500m",
+            "requests.memory": "768Mi",
+            "limits.memory": "1536Mi",
+            "requests.storage": "5Gi",
+            "persistentvolumeclaims": "1",
+            "pods": "2"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "LimitRange",
+        "metadata": {
+          "name": "container-defaults",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "limits": [
+            {
+              "type": "Container",
+              "defaultRequest": { "cpu": "25m", "memory": "64Mi" },
+              "default": { "cpu": "100m", "memory": "128Mi" }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "default-deny",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": { "podSelector": {}, "policyTypes": ["Ingress", "Egress"] }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "gateway-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+                  }
+                }
+              ],
+              "ports": [{ "port": 5432, "protocol": "TCP" }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "agent-management-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+                  }
+                }
+              ],
+              "ports": [
+                { "port": 5432, "protocol": "TCP" },
+                { "port": 9187, "protocol": "TCP" }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "database-boundaries",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": { "cnpg.io/cluster": "database" }
+          },
+          "ingress": [
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-gateway",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "5432", "protocol": "TCP" }] }]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-agent",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "5432", "protocol": "TCP" },
+                    { "port": "9187", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "cloudnative-pg"
+                  }
+                },
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "plugin-barman-cloud"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "8000", "protocol": "TCP" }] }]
+            }
+          ],
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s:k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "53", "protocol": "UDP" },
+                    { "port": "53", "protocol": "TCP" }
+                  ],
+                  "rules": { "dns": [{ "matchPattern": "*" }] }
+                }
+              ]
+            },
+            {
+              "toEntities": ["kube-apiserver"],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "443", "protocol": "TCP" },
+                    { "port": "6443", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "toFQDNs": [{ "matchName": "backup.example.invalid" }],
+              "toPorts": [{ "ports": [{ "port": "443", "protocol": "TCP" }] }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-app",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "YXBw",
+          "password": "cHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcA=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cmVhZGVyX3F1ZXJ5",
+          "password": "cXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcQ=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "maintenance-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cGdjZl9tYWludGVuYW5jZQ==",
+          "password": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycg=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "archive-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "type": "Opaque",
+        "data": {
+          "AWS_ACCESS_KEY_ID": "dW5pdC1hY2Nlc3M=",
+          "AWS_SECRET_ACCESS_KEY": "dW5pdC1zZWNyZXQ="
+        }
+      },
+      {
+        "apiVersion": "barmancloud.cnpg.io/v1",
+        "kind": "ObjectStore",
+        "metadata": {
+          "name": "archive",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "configuration": {
+            "destinationPath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+            "endpointURL": "https://backup.example.invalid",
+            "s3Credentials": {
+              "accessKeyId": {
+                "name": "archive-credentials",
+                "key": "AWS_ACCESS_KEY_ID"
+              },
+              "secretAccessKey": {
+                "name": "archive-credentials",
+                "key": "AWS_SECRET_ACCESS_KEY"
+              }
+            },
+            "wal": { "compression": "gzip" },
+            "data": { "compression": "gzip" }
+          },
+          "retentionPolicy": "7d",
+          "instanceSidecarConfiguration": {
+            "env": [{ "name": "AWS_DEFAULT_REGION", "value": "auto" }],
+            "resources": {
+              "requests": { "cpu": "100m", "memory": "128Mi" },
+              "limits": { "cpu": "500m", "memory": "512Mi" }
+            }
+          }
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "Cluster",
+        "metadata": {
+          "name": "database",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "instances": 1,
+          "probes": {
+            "startup": { "periodSeconds": 1, "failureThreshold": 3600 },
+            "readiness": { "periodSeconds": 1 }
+          },
+          "imageName": "registry.example/postgres:18.7@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "inheritedMetadata": {
+            "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+          },
+          "enableSuperuserAccess": false,
+          "bootstrap": {
+            "initdb": {
+              "database": "dbbbbbbbbbbbbbbbbbbb",
+              "owner": "app",
+              "secret": { "name": "role-app" },
+              "postInitApplicationSQL": [
+                "CREATE ROLE pgcf_maintenance LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS",
+                "GRANT pg_read_all_stats TO pgcf_maintenance",
+                "GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal() TO pgcf_maintenance",
+                "GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_archive_statusdir() TO pgcf_maintenance"
+              ]
+            }
+          },
+          "affinity": {
+            "nodeSelector": { "kubernetes.io/hostname": "native-test-node" }
+          },
+          "resources": {
+            "requests": { "cpu": "25m", "memory": "128Mi" },
+            "limits": { "cpu": "250m", "memory": "256Mi" }
+          },
+          "seccompProfile": { "type": "RuntimeDefault" },
+          "storage": { "storageClass": "pgcf-lvm", "size": "5Gi" },
+          "postgresql": {
+            "parameters": {
+              "shared_buffers": "32MB",
+              "effective_cache_size": "128MB",
+              "max_connections": "20",
+              "archive_timeout": "60s"
+            },
+            "pg_hba": ["hostnossl all all all reject"]
+          },
+          "managed": {
+            "roles": [
+              {
+                "name": "reader_query",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "passwordSecret": {
+                  "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c"
+                }
+              },
+              {
+                "name": "pgcf_maintenance",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "inRoles": ["pg_read_all_stats"],
+                "passwordSecret": { "name": "maintenance-credentials" }
+              }
+            ]
+          },
+          "plugins": [
+            {
+              "name": "barman-cloud.cloudnative-pg.io",
+              "enabled": true,
+              "isWALArchiver": true,
+              "parameters": {
+                "barmanObjectName": "archive",
+                "serverName": "database"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "ScheduledBackup",
+        "metadata": {
+          "name": "daily-backup",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "schedule": "0 0 3 * * *",
+          "immediate": true,
+          "backupOwnerReference": "cluster",
+          "cluster": { "name": "database" },
+          "method": "plugin",
+          "pluginConfiguration": { "name": "barman-cloud.cloudnative-pg.io" }
+        }
+      }
+    ],
+    "configuration_input": [
+      "pgcf-config/v1",
+      18,
+      "registry.example/postgres:18.7@sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      [256, 128, 250, 25, 5, 20, 60, 7],
+      1,
+      "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+      "database",
+      [
+        ["app", true, 1],
+        ["reader_query", false, 2]
+      ],
+      1,
+      null
+    ],
+    "configuration_fingerprint": "001f71097d953525417061424dd254c86156f2685c785f967bdc29f6eaca4791"
+  },
+  {
+    "name": "assigned-sandbox-overhead",
+    "db": {
+      "id": "dbbbbbbbbbbbbbbbbbbb",
+      "generation": 1,
+      "desired_state": "running",
+      "node": "native-test-node",
+      "pg_major": 18,
+      "size": {
+        "memory_mib": 256,
+        "memory_request_mib": 128,
+        "cpu_millicores": 250,
+        "cpu_request_millicores": 25,
+        "storage_gib": 5,
+        "max_connections": 20,
+        "archive_timeout_seconds": 60,
+        "backup_retention_days": 7
+      },
+      "roles": [
+        {
+          "name": "app",
+          "owner": true,
+          "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+          "revision": 1
+        },
+        {
+          "name": "reader_query",
+          "owner": false,
+          "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+          "revision": 2
+        }
+      ],
+      "maintenance": {
+        "role": "pgcf_maintenance",
+        "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+        "revision": 1
+      },
+      "creation": {
+        "operation_id": "op_cccccccccccccccccccc",
+        "generation": 1,
+        "status": "pending",
+        "ever_ready": false
+      },
+      "archive": {
+        "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+        "server_name": "database"
+      }
+    },
+    "ctx": {
+      "backup": {
+        "bucket": "native-controller-test",
+        "endpointUrl": "https://backup.example.invalid",
+        "region": "auto",
+        "credentials": {
+          "accessKeyId": "unit-access",
+          "secretAccessKey": "unit-secret"
+        }
+      },
+      "postgresImage": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "systemNamespace": "pgcf-system",
+      "cnpgNamespace": "cnpg-system",
+      "storageClass": "pgcf-lvm",
+      "gatewaySelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+      },
+      "agentSelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+      },
+      "computePool": {
+        "version": 1,
+        "target_slots": 2,
+        "max_idle_cpu_millicores": 200,
+        "max_idle_memory_mib": 256,
+        "per_slot_cpu_millicores": 50,
+        "per_slot_memory_mib": 64,
+        "max_age_seconds": 60,
+        "profile": {
+          "release_id": "native-compute-test",
+          "image": "registry.example/runtime@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "holder_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "controller_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "containerd_version": "2.3.6",
+          "runc_version": "1.5.2",
+          "architecture": "amd64"
+        }
+      }
+    },
+    "manifests": [
+      {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+          "name": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "pod-security.kubernetes.io/enforce": "restricted",
+            "pod-security.kubernetes.io/enforce-version": "latest"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+          "name": "database-resources",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "hard": {
+            "requests.cpu": "350m",
+            "limits.cpu": "1600m",
+            "requests.memory": "896Mi",
+            "limits.memory": "1664Mi",
+            "requests.storage": "5Gi",
+            "persistentvolumeclaims": "1",
+            "pods": "2"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "LimitRange",
+        "metadata": {
+          "name": "container-defaults",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "limits": [
+            {
+              "type": "Container",
+              "defaultRequest": { "cpu": "25m", "memory": "64Mi" },
+              "default": { "cpu": "100m", "memory": "128Mi" }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "default-deny",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": { "podSelector": {}, "policyTypes": ["Ingress", "Egress"] }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "gateway-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+                  }
+                }
+              ],
+              "ports": [{ "port": 5432, "protocol": "TCP" }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "agent-management-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+                  }
+                }
+              ],
+              "ports": [
+                { "port": 5432, "protocol": "TCP" },
+                { "port": 9187, "protocol": "TCP" }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "database-boundaries",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": { "cnpg.io/cluster": "database" }
+          },
+          "ingress": [
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-gateway",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "5432", "protocol": "TCP" }] }]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-agent",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "5432", "protocol": "TCP" },
+                    { "port": "9187", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "cloudnative-pg"
+                  }
+                },
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "plugin-barman-cloud"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "8000", "protocol": "TCP" }] }]
+            }
+          ],
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s:k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "53", "protocol": "UDP" },
+                    { "port": "53", "protocol": "TCP" }
+                  ],
+                  "rules": { "dns": [{ "matchPattern": "*" }] }
+                }
+              ]
+            },
+            {
+              "toEntities": ["kube-apiserver"],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "443", "protocol": "TCP" },
+                    { "port": "6443", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "toFQDNs": [{ "matchName": "backup.example.invalid" }],
+              "toPorts": [{ "ports": [{ "port": "443", "protocol": "TCP" }] }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-app",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "YXBw",
+          "password": "cHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcA=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cmVhZGVyX3F1ZXJ5",
+          "password": "cXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcQ=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "maintenance-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cGdjZl9tYWludGVuYW5jZQ==",
+          "password": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycg=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "archive-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "type": "Opaque",
+        "data": {
+          "AWS_ACCESS_KEY_ID": "dW5pdC1hY2Nlc3M=",
+          "AWS_SECRET_ACCESS_KEY": "dW5pdC1zZWNyZXQ="
+        }
+      },
+      {
+        "apiVersion": "barmancloud.cnpg.io/v1",
+        "kind": "ObjectStore",
+        "metadata": {
+          "name": "archive",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "configuration": {
+            "destinationPath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+            "endpointURL": "https://backup.example.invalid",
+            "s3Credentials": {
+              "accessKeyId": {
+                "name": "archive-credentials",
+                "key": "AWS_ACCESS_KEY_ID"
+              },
+              "secretAccessKey": {
+                "name": "archive-credentials",
+                "key": "AWS_SECRET_ACCESS_KEY"
+              }
+            },
+            "wal": { "compression": "gzip" },
+            "data": { "compression": "gzip" }
+          },
+          "retentionPolicy": "7d",
+          "instanceSidecarConfiguration": {
+            "env": [{ "name": "AWS_DEFAULT_REGION", "value": "auto" }],
+            "resources": {
+              "requests": { "cpu": "100m", "memory": "128Mi" },
+              "limits": { "cpu": "500m", "memory": "512Mi" }
+            }
+          }
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "Cluster",
+        "metadata": {
+          "name": "database",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "instances": 1,
+          "probes": {
+            "startup": { "periodSeconds": 1, "failureThreshold": 3600 },
+            "readiness": { "periodSeconds": 1 }
+          },
+          "imageName": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "inheritedMetadata": {
+            "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+          },
+          "enableSuperuserAccess": false,
+          "bootstrap": {
+            "initdb": {
+              "database": "dbbbbbbbbbbbbbbbbbbb",
+              "owner": "app",
+              "secret": { "name": "role-app" },
+              "postInitApplicationSQL": [
+                "CREATE ROLE pgcf_maintenance LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS",
+                "GRANT pg_read_all_stats TO pgcf_maintenance",
+                "GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal() TO pgcf_maintenance",
+                "GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_archive_statusdir() TO pgcf_maintenance"
+              ]
+            }
+          },
+          "affinity": {
+            "nodeSelector": { "kubernetes.io/hostname": "native-test-node" }
+          },
+          "resources": {
+            "requests": { "cpu": "25m", "memory": "128Mi" },
+            "limits": { "cpu": "250m", "memory": "256Mi" }
+          },
+          "seccompProfile": { "type": "RuntimeDefault" },
+          "storage": { "storageClass": "pgcf-lvm", "size": "5Gi" },
+          "postgresql": {
+            "parameters": {
+              "shared_buffers": "32MB",
+              "effective_cache_size": "128MB",
+              "max_connections": "20",
+              "archive_timeout": "60s"
+            },
+            "pg_hba": ["hostnossl all all all reject"]
+          },
+          "managed": {
+            "roles": [
+              {
+                "name": "reader_query",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "passwordSecret": {
+                  "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c"
+                }
+              },
+              {
+                "name": "pgcf_maintenance",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "inRoles": ["pg_read_all_stats"],
+                "passwordSecret": { "name": "maintenance-credentials" }
+              }
+            ]
+          },
+          "plugins": [
+            {
+              "name": "barman-cloud.cloudnative-pg.io",
+              "enabled": true,
+              "isWALArchiver": true,
+              "parameters": {
+                "barmanObjectName": "archive",
+                "serverName": "database"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "ScheduledBackup",
+        "metadata": {
+          "name": "daily-backup",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "schedule": "0 0 3 * * *",
+          "immediate": true,
+          "backupOwnerReference": "cluster",
+          "cluster": { "name": "database" },
+          "method": "plugin",
+          "pluginConfiguration": { "name": "barman-cloud.cloudnative-pg.io" }
+        }
+      }
+    ],
+    "configuration_input": [
+      "pgcf-config/v1",
+      18,
+      "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      [256, 128, 250, 25, 5, 20, 60, 7],
+      1,
+      "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+      "database",
+      [
+        ["app", true, 1],
+        ["reader_query", false, 2]
+      ],
+      1,
+      null
+    ],
+    "configuration_fingerprint": "1fd3f1b2a56c9b21e1e3b7881f80050a87d337b0dd73396d7a62a96d0377cade"
+  },
+  {
+    "name": "thin-runtime-storage",
+    "db": {
+      "id": "dbbbbbbbbbbbbbbbbbbb",
+      "generation": 1,
+      "desired_state": "running",
+      "node": "native-test-node",
+      "pg_major": 18,
+      "size": {
+        "memory_mib": 256,
+        "memory_request_mib": 128,
+        "cpu_millicores": 250,
+        "cpu_request_millicores": 25,
+        "storage_gib": 5,
+        "max_connections": 20,
+        "archive_timeout_seconds": 60,
+        "backup_retention_days": 7
+      },
+      "roles": [
+        {
+          "name": "app",
+          "owner": true,
+          "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+          "revision": 1
+        },
+        {
+          "name": "reader_query",
+          "owner": false,
+          "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+          "revision": 2
+        }
+      ],
+      "maintenance": {
+        "role": "pgcf_maintenance",
+        "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+        "revision": 1
+      },
+      "creation": {
+        "operation_id": "op_cccccccccccccccccccc",
+        "generation": 1,
+        "status": "pending",
+        "ever_ready": false
+      },
+      "archive": {
+        "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+        "server_name": "database"
+      },
+      "storage": {
+        "backend": "lvm-thin-v1",
+        "storage_class": "pgcf-lvm-thin-v1-ffffffffffffffff",
+        "volume_attributes_class": "pgcf-lvm-thin-v1-ffffffffffffffff",
+        "profile_revision": 1,
+        "profile_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "node_uid": "01234567-89ab-4def-8123-012345678901",
+        "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+        "pool_uuid": "bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg",
+        "startup_reserve_bytes": 1048576,
+        "write_bytes_per_second": 1048576,
+        "write_iops_per_second": 10,
+        "guard_seconds": 15,
+        "drain_seconds": 10
+      }
+    },
+    "ctx": {
+      "backup": {
+        "bucket": "native-controller-test",
+        "endpointUrl": "https://backup.example.invalid",
+        "region": "auto",
+        "credentials": {
+          "accessKeyId": "unit-access",
+          "secretAccessKey": "unit-secret"
+        }
+      },
+      "postgresImage": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "systemNamespace": "pgcf-system",
+      "cnpgNamespace": "cnpg-system",
+      "storageClass": "pgcf-lvm",
+      "gatewaySelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+      },
+      "agentSelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+      }
+    },
+    "manifests": [
+      {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+          "name": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "pod-security.kubernetes.io/enforce": "restricted",
+            "pod-security.kubernetes.io/enforce-version": "latest"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+          "name": "database-resources",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "hard": {
+            "requests.cpu": "250m",
+            "limits.cpu": "1500m",
+            "requests.memory": "768Mi",
+            "limits.memory": "1536Mi",
+            "requests.storage": "5Gi",
+            "persistentvolumeclaims": "1",
+            "pods": "2"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "LimitRange",
+        "metadata": {
+          "name": "container-defaults",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "limits": [
+            {
+              "type": "Container",
+              "defaultRequest": { "cpu": "25m", "memory": "64Mi" },
+              "default": { "cpu": "100m", "memory": "128Mi" }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "default-deny",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": { "podSelector": {}, "policyTypes": ["Ingress", "Egress"] }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "gateway-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+                  }
+                }
+              ],
+              "ports": [{ "port": 5432, "protocol": "TCP" }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "agent-management-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+                  }
+                }
+              ],
+              "ports": [
+                { "port": 5432, "protocol": "TCP" },
+                { "port": 9187, "protocol": "TCP" }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "database-boundaries",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": { "cnpg.io/cluster": "database" }
+          },
+          "ingress": [
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-gateway",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "5432", "protocol": "TCP" }] }]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-agent",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "5432", "protocol": "TCP" },
+                    { "port": "9187", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "cloudnative-pg"
+                  }
+                },
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "plugin-barman-cloud"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "8000", "protocol": "TCP" }] }]
+            }
+          ],
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s:k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "53", "protocol": "UDP" },
+                    { "port": "53", "protocol": "TCP" }
+                  ],
+                  "rules": { "dns": [{ "matchPattern": "*" }] }
+                }
+              ]
+            },
+            {
+              "toEntities": ["kube-apiserver"],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "443", "protocol": "TCP" },
+                    { "port": "6443", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "toFQDNs": [{ "matchName": "backup.example.invalid" }],
+              "toPorts": [{ "ports": [{ "port": "443", "protocol": "TCP" }] }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-app",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "YXBw",
+          "password": "cHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcA=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cmVhZGVyX3F1ZXJ5",
+          "password": "cXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcQ=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "maintenance-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cGdjZl9tYWludGVuYW5jZQ==",
+          "password": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycg=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "archive-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "type": "Opaque",
+        "data": {
+          "AWS_ACCESS_KEY_ID": "dW5pdC1hY2Nlc3M=",
+          "AWS_SECRET_ACCESS_KEY": "dW5pdC1zZWNyZXQ="
+        }
+      },
+      {
+        "apiVersion": "barmancloud.cnpg.io/v1",
+        "kind": "ObjectStore",
+        "metadata": {
+          "name": "archive",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "configuration": {
+            "destinationPath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+            "endpointURL": "https://backup.example.invalid",
+            "s3Credentials": {
+              "accessKeyId": {
+                "name": "archive-credentials",
+                "key": "AWS_ACCESS_KEY_ID"
+              },
+              "secretAccessKey": {
+                "name": "archive-credentials",
+                "key": "AWS_SECRET_ACCESS_KEY"
+              }
+            },
+            "wal": { "compression": "gzip" },
+            "data": { "compression": "gzip" }
+          },
+          "retentionPolicy": "7d",
+          "instanceSidecarConfiguration": {
+            "env": [{ "name": "AWS_DEFAULT_REGION", "value": "auto" }],
+            "resources": {
+              "requests": { "cpu": "100m", "memory": "128Mi" },
+              "limits": { "cpu": "500m", "memory": "512Mi" }
+            }
+          }
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "Cluster",
+        "metadata": {
+          "name": "database",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "instances": 1,
+          "stopDelay": 10,
+          "smartShutdownTimeout": 0,
+          "probes": {
+            "startup": { "periodSeconds": 1, "failureThreshold": 3600 },
+            "readiness": { "periodSeconds": 1 }
+          },
+          "imageName": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "inheritedMetadata": {
+            "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+          },
+          "enableSuperuserAccess": false,
+          "bootstrap": {
+            "initdb": {
+              "database": "dbbbbbbbbbbbbbbbbbbb",
+              "owner": "app",
+              "secret": { "name": "role-app" },
+              "postInitApplicationSQL": [
+                "CREATE ROLE pgcf_maintenance LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS",
+                "GRANT pg_read_all_stats TO pgcf_maintenance",
+                "GRANT EXECUTE ON FUNCTION pg_catalog.pg_switch_wal() TO pgcf_maintenance",
+                "GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_archive_statusdir() TO pgcf_maintenance"
+              ]
+            }
+          },
+          "affinity": {
+            "nodeSelector": { "kubernetes.io/hostname": "native-test-node" }
+          },
+          "resources": {
+            "requests": { "cpu": "25m", "memory": "128Mi" },
+            "limits": { "cpu": "250m", "memory": "256Mi" }
+          },
+          "seccompProfile": { "type": "RuntimeDefault" },
+          "storage": {
+            "storageClass": "pgcf-lvm-thin-v1-ffffffffffffffff",
+            "size": "5Gi",
+            "pvcTemplate": {
+              "volumeAttributesClassName": "pgcf-lvm-thin-v1-ffffffffffffffff"
+            }
+          },
+          "postgresql": {
+            "parameters": {
+              "shared_buffers": "32MB",
+              "effective_cache_size": "128MB",
+              "max_connections": "20",
+              "archive_timeout": "60s"
+            },
+            "pg_hba": ["hostnossl all all all reject"]
+          },
+          "managed": {
+            "roles": [
+              {
+                "name": "reader_query",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "passwordSecret": {
+                  "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c"
+                }
+              },
+              {
+                "name": "pgcf_maintenance",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "inRoles": ["pg_read_all_stats"],
+                "passwordSecret": { "name": "maintenance-credentials" }
+              }
+            ]
+          },
+          "plugins": [
+            {
+              "name": "barman-cloud.cloudnative-pg.io",
+              "enabled": true,
+              "isWALArchiver": true,
+              "parameters": {
+                "barmanObjectName": "archive",
+                "serverName": "database"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "ScheduledBackup",
+        "metadata": {
+          "name": "daily-backup",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "schedule": "0 0 3 * * *",
+          "immediate": true,
+          "backupOwnerReference": "cluster",
+          "cluster": { "name": "database" },
+          "method": "plugin",
+          "pluginConfiguration": { "name": "barman-cloud.cloudnative-pg.io" }
+        }
+      }
+    ],
+    "configuration_input": [
+      "pgcf-config/v1",
+      18,
+      "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      [256, 128, 250, 25, 5, 20, 60, 7],
+      1,
+      "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+      "database",
+      [
+        ["app", true, 1],
+        ["reader_query", false, 2]
+      ],
+      1,
+      [
+        "lvm-thin-v1",
+        "pgcf-lvm-thin-v1-ffffffffffffffff",
+        "pgcf-lvm-thin-v1-ffffffffffffffff",
+        1,
+        "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "01234567-89ab-4def-8123-012345678901",
+        "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+        "bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg",
+        1048576,
+        1048576,
+        10,
+        15,
+        10
+      ]
+    ],
+    "configuration_fingerprint": "327d7243c955d19b55766eace220efcb46495c0d3de75b719a2ec51127ad82b7"
+  },
+  {
+    "name": "cross-region-restore-administration",
+    "db": {
+      "id": "dbbbbbbbbbbbbbbbbbbb",
+      "generation": 1,
+      "desired_state": "running",
+      "node": "native-test-node",
+      "pg_major": 18,
+      "size": {
+        "memory_mib": 256,
+        "memory_request_mib": 128,
+        "cpu_millicores": 250,
+        "cpu_request_millicores": 25,
+        "storage_gib": 5,
+        "max_connections": 20,
+        "archive_timeout_seconds": 60,
+        "backup_retention_days": 7
+      },
+      "roles": [
+        {
+          "name": "app",
+          "owner": true,
+          "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+          "revision": 1
+        },
+        {
+          "name": "reader_query",
+          "owner": false,
+          "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+          "revision": 2
+        }
+      ],
+      "maintenance": {
+        "role": "pgcf_maintenance",
+        "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+        "revision": 1
+      },
+      "archive": {
+        "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+        "server_name": "database"
+      },
+      "recovery": {
+        "operation_id": "op_cccccccccccccccccccc",
+        "source_database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_archive_path": "s3://native-controller-source/us-test/sbbbbbbbbbbbbbbbbbbb/g1-op_dddddddddddddddddddd",
+        "source_storage_generation": 1,
+        "source_archive": {
+          "region_id": "us-test",
+          "bucket": "native-controller-source",
+          "endpoint_url": "https://source.example.invalid",
+          "region": "auto"
+        },
+        "backup_id": "20261009T000000",
+        "target_time": "2026-10-09T00:00:01.000Z",
+        "status": "pending",
+        "ever_ready": false
+      }
+    },
+    "ctx": {
+      "backup": {
+        "bucket": "native-controller-test",
+        "endpointUrl": "https://backup.example.invalid",
+        "region": "auto",
+        "credentials": {
+          "accessKeyId": "unit-access",
+          "secretAccessKey": "unit-secret"
+        }
+      },
+      "postgresImage": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "systemNamespace": "pgcf-system",
+      "cnpgNamespace": "cnpg-system",
+      "storageClass": "pgcf-lvm",
+      "gatewaySelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+      },
+      "agentSelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+      },
+      "recoveryFinalized": false,
+      "recoverySource": {
+        "bucket": "native-controller-source",
+        "endpointUrl": "https://source.example.invalid",
+        "region": "auto",
+        "credentials": {
+          "accessKeyId": "source-access",
+          "secretAccessKey": "source-secret"
+        }
+      }
+    },
+    "manifests": [
+      {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+          "name": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "pod-security.kubernetes.io/enforce": "restricted",
+            "pod-security.kubernetes.io/enforce-version": "latest"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+          "name": "database-resources",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "hard": {
+            "requests.cpu": "250m",
+            "limits.cpu": "1500m",
+            "requests.memory": "768Mi",
+            "limits.memory": "1536Mi",
+            "requests.storage": "5Gi",
+            "persistentvolumeclaims": "1",
+            "pods": "2"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "LimitRange",
+        "metadata": {
+          "name": "container-defaults",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "limits": [
+            {
+              "type": "Container",
+              "defaultRequest": { "cpu": "25m", "memory": "64Mi" },
+              "default": { "cpu": "100m", "memory": "128Mi" }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "default-deny",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": { "podSelector": {}, "policyTypes": ["Ingress", "Egress"] }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "gateway-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+                  }
+                }
+              ],
+              "ports": [{ "port": 5432, "protocol": "TCP" }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "agent-management-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+                  }
+                }
+              ],
+              "ports": [
+                { "port": 5432, "protocol": "TCP" },
+                { "port": 9187, "protocol": "TCP" }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "database-boundaries",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": { "cnpg.io/cluster": "database" }
+          },
+          "ingress": [
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-gateway",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "5432", "protocol": "TCP" }] }]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-agent",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "5432", "protocol": "TCP" },
+                    { "port": "9187", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "cloudnative-pg"
+                  }
+                },
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "plugin-barman-cloud"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "8000", "protocol": "TCP" }] }]
+            }
+          ],
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s:k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "53", "protocol": "UDP" },
+                    { "port": "53", "protocol": "TCP" }
+                  ],
+                  "rules": { "dns": [{ "matchPattern": "*" }] }
+                }
+              ]
+            },
+            {
+              "toEntities": ["kube-apiserver"],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "443", "protocol": "TCP" },
+                    { "port": "6443", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "toFQDNs": [
+                { "matchName": "backup.example.invalid" },
+                { "matchName": "source.example.invalid" }
+              ],
+              "toPorts": [{ "ports": [{ "port": "443", "protocol": "TCP" }] }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-app",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "YXBw",
+          "password": "cHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcA=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cmVhZGVyX3F1ZXJ5",
+          "password": "cXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcQ=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "maintenance-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cGdjZl9tYWludGVuYW5jZQ==",
+          "password": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycg=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "archive-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "type": "Opaque",
+        "data": {
+          "AWS_ACCESS_KEY_ID": "dW5pdC1hY2Nlc3M=",
+          "AWS_SECRET_ACCESS_KEY": "dW5pdC1zZWNyZXQ="
+        }
+      },
+      {
+        "apiVersion": "barmancloud.cnpg.io/v1",
+        "kind": "ObjectStore",
+        "metadata": {
+          "name": "archive",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "configuration": {
+            "destinationPath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+            "endpointURL": "https://backup.example.invalid",
+            "s3Credentials": {
+              "accessKeyId": {
+                "name": "archive-credentials",
+                "key": "AWS_ACCESS_KEY_ID"
+              },
+              "secretAccessKey": {
+                "name": "archive-credentials",
+                "key": "AWS_SECRET_ACCESS_KEY"
+              }
+            },
+            "wal": { "compression": "gzip" },
+            "data": { "compression": "gzip" }
+          },
+          "retentionPolicy": "7d",
+          "instanceSidecarConfiguration": {
+            "env": [{ "name": "AWS_DEFAULT_REGION", "value": "auto" }],
+            "resources": {
+              "requests": { "cpu": "100m", "memory": "128Mi" },
+              "limits": { "cpu": "500m", "memory": "512Mi" }
+            }
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "recovery-source-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "type": "Opaque",
+        "data": {
+          "AWS_ACCESS_KEY_ID": "c291cmNlLWFjY2Vzcw==",
+          "AWS_SECRET_ACCESS_KEY": "c291cmNlLXNlY3JldA=="
+        }
+      },
+      {
+        "apiVersion": "barmancloud.cnpg.io/v1",
+        "kind": "ObjectStore",
+        "metadata": {
+          "name": "recovery-source",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "configuration": {
+            "destinationPath": "s3://native-controller-source/us-test/sbbbbbbbbbbbbbbbbbbb/g1-op_dddddddddddddddddddd",
+            "endpointURL": "https://source.example.invalid",
+            "s3Credentials": {
+              "accessKeyId": {
+                "name": "recovery-source-credentials",
+                "key": "AWS_ACCESS_KEY_ID"
+              },
+              "secretAccessKey": {
+                "name": "recovery-source-credentials",
+                "key": "AWS_SECRET_ACCESS_KEY"
+              }
+            },
+            "wal": { "compression": "gzip" },
+            "data": { "compression": "gzip" }
+          },
+          "instanceSidecarConfiguration": {
+            "env": [{ "name": "AWS_DEFAULT_REGION", "value": "auto" }],
+            "resources": {
+              "requests": { "cpu": "100m", "memory": "128Mi" },
+              "limits": { "cpu": "500m", "memory": "512Mi" }
+            }
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "restore-superuser",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cG9zdGdyZXM=",
+          "password": "TlphYlRVUGxvTmxUS01fTkVkTXJQZG51cVVoY21FcFFjN2RoRXlBLUFqdw=="
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "Cluster",
+        "metadata": {
+          "name": "database",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "instances": 1,
+          "probes": {
+            "startup": { "periodSeconds": 1, "failureThreshold": 3600 },
+            "readiness": { "periodSeconds": 1 }
+          },
+          "imageName": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "inheritedMetadata": {
+            "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+          },
+          "enableSuperuserAccess": true,
+          "superuserSecret": { "name": "restore-superuser" },
+          "externalClusters": [
+            {
+              "name": "origin",
+              "plugin": {
+                "name": "barman-cloud.cloudnative-pg.io",
+                "parameters": {
+                  "barmanObjectName": "recovery-source",
+                  "serverName": "database"
+                }
+              }
+            }
+          ],
+          "bootstrap": {
+            "recovery": {
+              "source": "origin",
+              "database": "sbbbbbbbbbbbbbbbbbbb",
+              "owner": "app",
+              "secret": { "name": "role-app" },
+              "recoveryTarget": {
+                "backupID": "20261009T000000",
+                "targetTime": "2026-10-09T00:00:01.000Z"
+              }
+            }
+          },
+          "affinity": {
+            "nodeSelector": { "kubernetes.io/hostname": "native-test-node" }
+          },
+          "resources": {
+            "requests": { "cpu": "25m", "memory": "128Mi" },
+            "limits": { "cpu": "250m", "memory": "256Mi" }
+          },
+          "seccompProfile": { "type": "RuntimeDefault" },
+          "storage": { "storageClass": "pgcf-lvm", "size": "5Gi" },
+          "postgresql": {
+            "parameters": {
+              "shared_buffers": "32MB",
+              "effective_cache_size": "128MB",
+              "max_connections": "20",
+              "archive_timeout": "60s"
+            },
+            "pg_hba": ["hostnossl all all all reject"]
+          },
+          "managed": {
+            "roles": [
+              {
+                "name": "reader_query",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "passwordSecret": {
+                  "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c"
+                }
+              },
+              {
+                "name": "pgcf_maintenance",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "inRoles": ["pg_read_all_stats"],
+                "passwordSecret": { "name": "maintenance-credentials" }
+              }
+            ]
+          },
+          "plugins": [
+            {
+              "name": "barman-cloud.cloudnative-pg.io",
+              "enabled": true,
+              "isWALArchiver": true,
+              "parameters": {
+                "barmanObjectName": "archive",
+                "serverName": "database"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "ScheduledBackup",
+        "metadata": {
+          "name": "daily-backup",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "schedule": "0 0 3 * * *",
+          "immediate": true,
+          "backupOwnerReference": "cluster",
+          "cluster": { "name": "database" },
+          "method": "plugin",
+          "pluginConfiguration": { "name": "barman-cloud.cloudnative-pg.io" }
+        }
+      }
+    ],
+    "configuration_input": [
+      "pgcf-config/v1",
+      18,
+      "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      [256, 128, 250, 25, 5, 20, 60, 7],
+      1,
+      "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+      "database",
+      [
+        ["app", true, 1],
+        ["reader_query", false, 2]
+      ],
+      1,
+      null
+    ],
+    "configuration_fingerprint": "1fd3f1b2a56c9b21e1e3b7881f80050a87d337b0dd73396d7a62a96d0377cade"
+  },
+  {
+    "name": "cross-region-restore-finalized",
+    "db": {
+      "id": "dbbbbbbbbbbbbbbbbbbb",
+      "generation": 1,
+      "desired_state": "running",
+      "node": "native-test-node",
+      "pg_major": 18,
+      "size": {
+        "memory_mib": 256,
+        "memory_request_mib": 128,
+        "cpu_millicores": 250,
+        "cpu_request_millicores": 25,
+        "storage_gib": 5,
+        "max_connections": 20,
+        "archive_timeout_seconds": 60,
+        "backup_retention_days": 7
+      },
+      "roles": [
+        {
+          "name": "app",
+          "owner": true,
+          "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+          "revision": 1
+        },
+        {
+          "name": "reader_query",
+          "owner": false,
+          "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+          "revision": 2
+        }
+      ],
+      "maintenance": {
+        "role": "pgcf_maintenance",
+        "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+        "revision": 1
+      },
+      "archive": {
+        "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+        "server_name": "database"
+      },
+      "recovery": {
+        "operation_id": "op_cccccccccccccccccccc",
+        "source_database_id": "sbbbbbbbbbbbbbbbbbbb",
+        "source_archive_path": "s3://native-controller-source/us-test/sbbbbbbbbbbbbbbbbbbb/g1-op_dddddddddddddddddddd",
+        "source_storage_generation": 1,
+        "source_archive": {
+          "region_id": "us-test",
+          "bucket": "native-controller-source",
+          "endpoint_url": "https://source.example.invalid",
+          "region": "auto"
+        },
+        "backup_id": "20261009T000000",
+        "target_time": "2026-10-09T00:00:01.000Z",
+        "status": "pending",
+        "ever_ready": false
+      }
+    },
+    "ctx": {
+      "backup": {
+        "bucket": "native-controller-test",
+        "endpointUrl": "https://backup.example.invalid",
+        "region": "auto",
+        "credentials": {
+          "accessKeyId": "unit-access",
+          "secretAccessKey": "unit-secret"
+        }
+      },
+      "postgresImage": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "systemNamespace": "pgcf-system",
+      "cnpgNamespace": "cnpg-system",
+      "storageClass": "pgcf-lvm",
+      "gatewaySelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+      },
+      "agentSelector": {
+        "namespace": "pgcf-system",
+        "podLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+      },
+      "recoveryFinalized": true,
+      "recoverySource": {
+        "bucket": "native-controller-source",
+        "endpointUrl": "https://source.example.invalid",
+        "region": "auto",
+        "credentials": {
+          "accessKeyId": "source-access",
+          "secretAccessKey": "source-secret"
+        }
+      }
+    },
+    "manifests": [
+      {
+        "apiVersion": "v1",
+        "kind": "Namespace",
+        "metadata": {
+          "name": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "pod-security.kubernetes.io/enforce": "restricted",
+            "pod-security.kubernetes.io/enforce-version": "latest"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "ResourceQuota",
+        "metadata": {
+          "name": "database-resources",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "hard": {
+            "requests.cpu": "250m",
+            "limits.cpu": "1500m",
+            "requests.memory": "768Mi",
+            "limits.memory": "1536Mi",
+            "requests.storage": "5Gi",
+            "persistentvolumeclaims": "1",
+            "pods": "2"
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "LimitRange",
+        "metadata": {
+          "name": "container-defaults",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "limits": [
+            {
+              "type": "Container",
+              "defaultRequest": { "cpu": "25m", "memory": "64Mi" },
+              "default": { "cpu": "100m", "memory": "128Mi" }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "default-deny",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": { "podSelector": {}, "policyTypes": ["Ingress", "Egress"] }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "gateway-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-gateway" }
+                  }
+                }
+              ],
+              "ports": [{ "port": 5432, "protocol": "TCP" }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "networking.k8s.io/v1",
+        "kind": "NetworkPolicy",
+        "metadata": {
+          "name": "agent-management-ingress",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "podSelector": { "matchLabels": { "cnpg.io/cluster": "database" } },
+          "policyTypes": ["Ingress"],
+          "ingress": [
+            {
+              "from": [
+                {
+                  "namespaceSelector": {
+                    "matchLabels": {
+                      "kubernetes.io/metadata.name": "pgcf-system"
+                    }
+                  },
+                  "podSelector": {
+                    "matchLabels": { "app.kubernetes.io/name": "pgcf-agent" }
+                  }
+                }
+              ],
+              "ports": [
+                { "port": 5432, "protocol": "TCP" },
+                { "port": 9187, "protocol": "TCP" }
+              ]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "cilium.io/v2",
+        "kind": "CiliumNetworkPolicy",
+        "metadata": {
+          "name": "database-boundaries",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "endpointSelector": {
+            "matchLabels": { "cnpg.io/cluster": "database" }
+          },
+          "ingress": [
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-gateway",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "5432", "protocol": "TCP" }] }]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:app.kubernetes.io/name": "pgcf-agent",
+                    "k8s:io.kubernetes.pod.namespace": "pgcf-system"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "5432", "protocol": "TCP" },
+                    { "port": "9187", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "fromEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "cloudnative-pg"
+                  }
+                },
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "cnpg-system",
+                    "k8s:app.kubernetes.io/name": "plugin-barman-cloud"
+                  }
+                }
+              ],
+              "toPorts": [{ "ports": [{ "port": "8000", "protocol": "TCP" }] }]
+            }
+          ],
+          "egress": [
+            {
+              "toEndpoints": [
+                {
+                  "matchLabels": {
+                    "k8s:io.kubernetes.pod.namespace": "kube-system",
+                    "k8s:k8s-app": "kube-dns"
+                  }
+                }
+              ],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "53", "protocol": "UDP" },
+                    { "port": "53", "protocol": "TCP" }
+                  ],
+                  "rules": { "dns": [{ "matchPattern": "*" }] }
+                }
+              ]
+            },
+            {
+              "toEntities": ["kube-apiserver"],
+              "toPorts": [
+                {
+                  "ports": [
+                    { "port": "443", "protocol": "TCP" },
+                    { "port": "6443", "protocol": "TCP" }
+                  ]
+                }
+              ]
+            },
+            {
+              "toFQDNs": [
+                { "matchName": "backup.example.invalid" },
+                { "matchName": "source.example.invalid" }
+              ],
+              "toPorts": [{ "ports": [{ "port": "443", "protocol": "TCP" }] }]
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-app",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "YXBw",
+          "password": "cHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcA=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cmVhZGVyX3F1ZXJ5",
+          "password": "cXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcXFxcQ=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "maintenance-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": {
+            "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb",
+            "cnpg.io/reload": "true"
+          }
+        },
+        "type": "kubernetes.io/basic-auth",
+        "data": {
+          "username": "cGdjZl9tYWludGVuYW5jZQ==",
+          "password": "cnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycnJycg=="
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "archive-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "type": "Opaque",
+        "data": {
+          "AWS_ACCESS_KEY_ID": "dW5pdC1hY2Nlc3M=",
+          "AWS_SECRET_ACCESS_KEY": "dW5pdC1zZWNyZXQ="
+        }
+      },
+      {
+        "apiVersion": "barmancloud.cnpg.io/v1",
+        "kind": "ObjectStore",
+        "metadata": {
+          "name": "archive",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "configuration": {
+            "destinationPath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+            "endpointURL": "https://backup.example.invalid",
+            "s3Credentials": {
+              "accessKeyId": {
+                "name": "archive-credentials",
+                "key": "AWS_ACCESS_KEY_ID"
+              },
+              "secretAccessKey": {
+                "name": "archive-credentials",
+                "key": "AWS_SECRET_ACCESS_KEY"
+              }
+            },
+            "wal": { "compression": "gzip" },
+            "data": { "compression": "gzip" }
+          },
+          "retentionPolicy": "7d",
+          "instanceSidecarConfiguration": {
+            "env": [{ "name": "AWS_DEFAULT_REGION", "value": "auto" }],
+            "resources": {
+              "requests": { "cpu": "100m", "memory": "128Mi" },
+              "limits": { "cpu": "500m", "memory": "512Mi" }
+            }
+          }
+        }
+      },
+      {
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+          "name": "recovery-source-credentials",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "type": "Opaque",
+        "data": {
+          "AWS_ACCESS_KEY_ID": "c291cmNlLWFjY2Vzcw==",
+          "AWS_SECRET_ACCESS_KEY": "c291cmNlLXNlY3JldA=="
+        }
+      },
+      {
+        "apiVersion": "barmancloud.cnpg.io/v1",
+        "kind": "ObjectStore",
+        "metadata": {
+          "name": "recovery-source",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "configuration": {
+            "destinationPath": "s3://native-controller-source/us-test/sbbbbbbbbbbbbbbbbbbb/g1-op_dddddddddddddddddddd",
+            "endpointURL": "https://source.example.invalid",
+            "s3Credentials": {
+              "accessKeyId": {
+                "name": "recovery-source-credentials",
+                "key": "AWS_ACCESS_KEY_ID"
+              },
+              "secretAccessKey": {
+                "name": "recovery-source-credentials",
+                "key": "AWS_SECRET_ACCESS_KEY"
+              }
+            },
+            "wal": { "compression": "gzip" },
+            "data": { "compression": "gzip" }
+          },
+          "instanceSidecarConfiguration": {
+            "env": [{ "name": "AWS_DEFAULT_REGION", "value": "auto" }],
+            "resources": {
+              "requests": { "cpu": "100m", "memory": "128Mi" },
+              "limits": { "cpu": "500m", "memory": "512Mi" }
+            }
+          }
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "Cluster",
+        "metadata": {
+          "name": "database",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "instances": 1,
+          "probes": {
+            "startup": { "periodSeconds": 1, "failureThreshold": 3600 },
+            "readiness": { "periodSeconds": 1 }
+          },
+          "imageName": "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "inheritedMetadata": {
+            "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+          },
+          "enableSuperuserAccess": false,
+          "externalClusters": [
+            {
+              "name": "origin",
+              "plugin": {
+                "name": "barman-cloud.cloudnative-pg.io",
+                "parameters": {
+                  "barmanObjectName": "recovery-source",
+                  "serverName": "database"
+                }
+              }
+            }
+          ],
+          "bootstrap": {
+            "recovery": {
+              "source": "origin",
+              "database": "dbbbbbbbbbbbbbbbbbbb",
+              "owner": "app",
+              "secret": { "name": "role-app" },
+              "recoveryTarget": {
+                "backupID": "20261009T000000",
+                "targetTime": "2026-10-09T00:00:01.000Z"
+              }
+            }
+          },
+          "affinity": {
+            "nodeSelector": { "kubernetes.io/hostname": "native-test-node" }
+          },
+          "resources": {
+            "requests": { "cpu": "25m", "memory": "128Mi" },
+            "limits": { "cpu": "250m", "memory": "256Mi" }
+          },
+          "seccompProfile": { "type": "RuntimeDefault" },
+          "storage": { "storageClass": "pgcf-lvm", "size": "5Gi" },
+          "postgresql": {
+            "parameters": {
+              "shared_buffers": "32MB",
+              "effective_cache_size": "128MB",
+              "max_connections": "20",
+              "archive_timeout": "60s"
+            },
+            "pg_hba": ["hostnossl all all all reject"]
+          },
+          "managed": {
+            "roles": [
+              {
+                "name": "reader_query",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "passwordSecret": {
+                  "name": "role-h-1e7636804b5ef0e0a24870efce236d6a639e8637d64bad9f4f16164c"
+                }
+              },
+              {
+                "name": "pgcf_maintenance",
+                "ensure": "present",
+                "login": true,
+                "superuser": false,
+                "createdb": false,
+                "createrole": false,
+                "replication": false,
+                "bypassrls": false,
+                "inherit": true,
+                "inRoles": ["pg_read_all_stats"],
+                "passwordSecret": { "name": "maintenance-credentials" }
+              }
+            ]
+          },
+          "plugins": [
+            {
+              "name": "barman-cloud.cloudnative-pg.io",
+              "enabled": true,
+              "isWALArchiver": true,
+              "parameters": {
+                "barmanObjectName": "archive",
+                "serverName": "database"
+              }
+            }
+          ]
+        }
+      },
+      {
+        "apiVersion": "postgresql.cnpg.io/v1",
+        "kind": "ScheduledBackup",
+        "metadata": {
+          "name": "daily-backup",
+          "namespace": "pgcf-db-dbbbbbbbbbbbbbbbbbbb",
+          "labels": { "pgcf.io/database-id": "dbbbbbbbbbbbbbbbbbbb" }
+        },
+        "spec": {
+          "schedule": "0 0 3 * * *",
+          "immediate": true,
+          "backupOwnerReference": "cluster",
+          "cluster": { "name": "database" },
+          "method": "plugin",
+          "pluginConfiguration": { "name": "barman-cloud.cloudnative-pg.io" }
+        }
+      }
+    ],
+    "configuration_input": [
+      "pgcf-config/v1",
+      18,
+      "registry.example/postgres:18.7@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      [256, 128, 250, 25, 5, 20, 60, 7],
+      1,
+      "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+      "database",
+      [
+        ["app", true, 1],
+        ["reader_query", false, 2]
+      ],
+      1,
+      null
+    ],
+    "configuration_fingerprint": "1fd3f1b2a56c9b21e1e3b7881f80050a87d337b0dd73396d7a62a96d0377cade"
+  }
+]

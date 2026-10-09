@@ -16,4 +16,6 @@ images:
   - name: cloudflared
     newName: docker.io/cloudflare/cloudflared
     # cloudflared 2026.10.0 multi-arch index
-    digest: sha256:9b49eed8f62806d5d45ddf59ecefb5710429598ea6d3fcccd2af938f621b2b07
+    digest:
+      # cloudflared 2026.10.0 Linux/amd64 manifest, derived from versions.lock.json
+      sha256:1a50cc8893b3f0dd283805d2efcd3336210aced60a83d967fb2bbc8ab69b5f35

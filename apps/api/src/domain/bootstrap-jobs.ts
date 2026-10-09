@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import lock from "../../../../infra/platform/versions.lock.json" with { type: "json" };
 import {
   hashApiKey,
   NodeId,
@@ -1088,7 +1089,10 @@ export async function bootstrapCallback(
         receipt.region_id !== row.region_id ||
         receipt.input_hash !== row.input_hash ||
         receipt.node_name !== input.spec.hostname ||
-        receipt.kube_system_uid !== material.material.kube_system_uid;
+        receipt.kube_system_uid !== material.material.kube_system_uid ||
+        receipt.chart_sha256 !==
+          lock.charts.find((chart) => chart.name === "cilium")?.archiveSha256 ||
+        receipt.values_sha256 !== lock.bootstrapValues.cilium.sha256;
       const checkpointChanged =
         checkpoint.stage !== "cilium_install_intent" ||
         next.stage !== checkpoint.stage ||
@@ -1393,6 +1397,7 @@ export async function bootstrapCallback(
 export async function admissionAuthority(
   env: Env,
   row: BootstrapJobRow,
+  options: { requirePostjoinRelease?: boolean } = {},
 ): Promise<
   Pick<NodeBootstrapAuthority, "admission_authorized" | "admission_binding">
 > {
@@ -1442,6 +1447,54 @@ export async function admissionAuthority(
       capacity.platform_reserved_cpu_millicores,
     )
     .first();
+  if (actual && options.requirePostjoinRelease !== false) {
+    const input = await bootstrapJobInput(env, row),
+      expected = input.spec.postjoin_release;
+    if (expected) {
+      const child = await env.DB.prepare(
+        `SELECT p.updated_at FROM fleet_patch_operations p
+        JOIN regions r ON r.id=p.region_id JOIN fleet_region_releases f ON f.region_id=p.region_id
+        JOIN node_host_configurations h ON h.node_id=p.node_id AND h.node_uid=p.node_uid
+        WHERE p.bootstrap_operation_id=? AND p.node_id=? AND p.node_uid=? AND p.cluster_uid=?
+        AND p.release_id=? AND p.spec_sha256=? AND p.region_revision=? AND f.release_id=p.release_id AND f.revision=p.region_revision
+        AND p.material_revision=r.bootstrap_material_revision AND h.material_revision=p.material_revision
+        AND h.revision=p.host_configuration_revision AND h.sha256=p.host_configuration_sha256
+        AND p.stage='complete' AND p.state='confirmed'`,
+      )
+        .bind(
+          row.operation_id,
+          row.node_id,
+          binding.node_uid,
+          binding.kube_system_uid,
+          expected.release_id,
+          expected.spec_sha256,
+          expected.region_revision,
+        )
+        .first<{ updated_at: string }>();
+      // A reboot/node-label update changes RV. Only a real post-release network proof may renew its admission binding.
+      if (
+        !child ||
+        Date.parse(addition.network.verified_at) < Date.parse(child.updated_at)
+      )
+        return denied;
+      const { readNodePostjoinRelease } =
+        await import("./node-postjoin-release.ts");
+      try {
+        await readNodePostjoinRelease(
+          env,
+          row.region_id,
+          expected,
+          row.node_id,
+        );
+        const { bootstrapThinStorageQualified } =
+          await import("./node-thin-storage-bootstrap.ts");
+        if (!(await bootstrapThinStorageQualified(env, row.operation_id)))
+          return denied;
+      } catch {
+        return denied;
+      }
+    }
+  }
   return { admission_authorized: actual !== null, admission_binding: binding };
 }
 function validateAdmissionReceipt(

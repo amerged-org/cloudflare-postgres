@@ -111,6 +111,87 @@ Rust standard-library and libc notices when distributing a static native executa
 attribute their code to the project's Apache license alone. No upstream source is vendored here.
 The primitive is not yet installed on customer servers or integrated with containerd/CNPG.
 
+The native sandbox-controller adapter uses unchanged Apache-2.0 protobuf definitions from
+[containerd 2.3.6](https://github.com/containerd/containerd/tree/v2.3.6/api),
+[Kubernetes CRI API 0.36.5](https://github.com/kubernetes/cri-api/tree/v0.36.5) and
+[containerd ttrpc 1.2.7](https://github.com/containerd/ttrpc/tree/v1.2.7).
+Exact source paths and SHA256 values are retained in
+`apps/sandbox-controller/proto/sources.json`, with all three upstream licenses beside them.
+The adapter's direct crates are tonic/tonic-prost/tonic-prost-build 0.14.6 (MIT),
+prost/prost-types 0.14.4 (Apache-2.0), tokio 1.53.2 and tokio-stream 0.1.19 (MIT),
+tower 0.5.3 (MIT), hyper-util 0.1.21 (MIT), serde 1.0.229 and serde_json 1.0.151
+(MIT OR Apache-2.0), plus libc above. Cargo.lock retains exact archive checksums and
+transitive versions. The isolated Linux boundary proof uses official containerd 2.3.6
+and runc 1.5.2 (both Apache-2.0); these local test binaries are not shipped in a published
+PGCF image. Preserve all upstream notices when packaging a future runtime or Talos extension.
+Its Cloudflare policy consumer also uses pinned reqwest 0.13.5 (MIT OR Apache-2.0), rustls
+0.23.45 (Apache-2.0 OR ISC OR MIT), webpki-roots 1.0.9 (MPL-2.0), time 0.3.55
+(MIT OR Apache-2.0), sha2 0.11.0 (MIT OR Apache-2.0), and jsonschema 0.58.6 (MIT).
+The native gateway and controller use rustls-pki-types 1.15.1 (MIT OR Apache-2.0)
+directly for PEM parsing; the unmaintained rustls-pemfile wrapper is not shipped.
+The scratch artifact includes the actual Cargo dependency notices, Rust notices, generated
+shared contract bytes and exact Cargo.lock rather than shipping a compiler or test runtime.
+The common boot asset producer uses official Talos imager 1.14.2 (MPL-2.0), with
+the imager and installer-base references pinned under `talosBoot` in
+[versions.lock.json](infra/platform/versions.lock.json). The imager reference is
+`ghcr.io/siderolabs/imager@sha256:89d1b1e2be167632745abf7f6834220a255a0182714f3d91670ecad55a3c41ff`,
+and installer-base 1.14.2 at
+`ghcr.io/siderolabs/installer-base@sha256:a47d7d4ed3ff5e3467494a0e62483767a5ba00d731b963cdcbc917abd83553d6`.
+Their manifests and SHA256 headers were verified against the official anonymous GHCR API.
+PGCF extension/service/recipe files remain Apache-2.0; compiled upstream dependencies keep
+the notices inside the system-extension rootfs.
+The disposable public runtime proof pins official containerd-static 2.3.6 AMD64 SHA256
+`96eece214bedf3b77d2c2fd04245baaa3de36a1be1d10addf358dca71ae876d2` and runc 1.5.2 AMD64
+SHA256 `599f6f94ff8c5057241eff0d54c3c74f95c34935b6457b33fe545defc61e9488` (Apache-2.0).
+For native ARM64 the matching hashes are containerd
+`b188111644bf19c3f482f0f0d4b7b93461a3653e60521289519cc474f5bce511` and runc
+`d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0`.
+All eleven vendored containerd protobuf files are byte-identical between 2.3.5 and 2.3.6;
+their source metadata now names the selected 2.3.6 release.
+Its test-only Alpine tools pin iproute2 7.0.0-r0 (GPL-2.0-or-later) and busybox-static
+1.37.0-r31 (GPL-2.0-only); they are not shipped in the PGCF runtime/system extension.
+
+## Assembled Talos boot qualification tools
+
+The disposable inspection and maintenance-boot fixture in
+[BootProof.Dockerfile](infra/talos/sandbox/BootProof.Dockerfile) uses
+`debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f`.
+It runs only on the local/CI inspection host and is not published or installed on fleet nodes.
+Node and the official Talos client come from the existing pinned build inputs and client archive
+checksums. Debian package copyright files under `/usr/share/doc/*/copyright` and
+`/usr/share/common-licenses` remain in this fixture, including all transitive package notices.
+
+| Direct package | Exact Debian version | Upstream licensing and purpose |
+| --- | --- | --- |
+| [QEMU](https://www.qemu.org/) `qemu-system-x86` | `1:10.0.13+ds-0+deb13u1` | GPL-2.0 as a whole, with compatible per-file licenses; isolated AMD64 maintenance boot. |
+| [squashfs-tools](https://github.com/plougher/squashfs-tools) | `1:4.6.1-1+b1` | GPL-2.0-or-later; complete root-filesystem and extended-attribute extraction. |
+| [util-linux](https://www.kernel.org/pub/linux/utils/util-linux/) | `2.41.5-0+deb13u1` | GPL/LGPL/BSD/ISC/Expat and other per-file licenses recorded by Debian; read-only partition mounts and loop-device checks. |
+| [XZ Utils](https://tukaani.org/xz/) `xz-utils` | `5.8.1-1+deb13u2` | 0BSD with bundled GPL/LGPL and other per-file notices; bounded raw-image decompression. |
+| [GCC runtime](https://gcc.gnu.org/) `libstdc++6`, `libatomic1` | `14.2.0-19` | GPL-3.0 with GCC Runtime Library Exception and the package's other notices; inspection-tool runtime libraries. |
+| [Debian ca-certificates](https://packages.debian.org/trixie/ca-certificates) | `20250419` | GPL-2.0-or-later packaging and MPL-2.0 certificate material; verified public tool downloads. |
+
+## Rust/Wasm Edge Worker
+
+The complete Edge application uses the official
+[workers-rs 0.8.7](https://github.com/cloudflare/workers-rs) SDK (`worker`,
+`worker-sys` and `worker-macros`, Apache-2.0). `Cargo.lock` records the exact runtime
+crate archives and their transitive dependencies. The verified `worker` archive
+SHA256 is `4057bce8ec66c80b7e270d884c312e2a4ff60eb997fd02936656106c06a964e5`.
+The shared native protocol crate remains first-party Apache-2.0.
+
+The host bindings use wasm-bindgen 0.2.129, js-sys/web-sys 0.3.106 and
+wasm-bindgen-futures 0.4.79 (`MIT OR Apache-2.0`), serde-wasm-bindgen 0.6.5 (MIT),
+and futures-channel/futures-util 0.3.34 (`MIT OR Apache-2.0`). Preserve their
+notices and the Rust standard-library notices with distributed Worker artifacts.
+
+The build-only `worker-build` 0.8.7 tool is Apache-2.0; its verified crate archive
+SHA256 is `1051c05ef088889a30ad3bad40c22a716ba8ca8d02a3fb01cef8c143ba952222`.
+It selects wasm-bindgen CLI 0.2.129, Binaryen wasm-opt 132 (Apache-2.0) and
+esbuild 0.28.2 (MIT). These tools are not Worker runtime dependencies. Generated
+SDK/wasm-bindgen host glue retains upstream licensing; the admission and decoy
+state machines are first-party Rust. No maintained TypeScript Edge wrapper is
+included in that artifact.
+
 ## Application dependencies
 
 Direct npm dependencies at the versions resolved in [pnpm-lock.yaml](pnpm-lock.yaml). Licenses are

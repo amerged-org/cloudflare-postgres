@@ -15,6 +15,14 @@ import {
 } from "../src/node-bootstrap.ts";
 
 describe("private bootstrap contracts", () => {
+  it("accepts retained and security-fix Talos patches within the supported 1.14 line", () => {
+    const version = NodeRegionSeed.shape.talos_version;
+    expect(version.safeParse("1.14.1").success).toBe(true);
+    expect(version.safeParse("1.14.2").success).toBe(true);
+    expect(version.safeParse("1.15.0").success).toBe(false);
+    expect(version.safeParse("2.14.2").success).toBe(false);
+    expect(version.safeParse("1.14.2-unknown").success).toBe(false);
+  });
   it("keeps peer routes optional and bounds them to distinct IPv4 addresses", () => {
     const peers = NodeBootstrapSpec.shape.peer_ipv4;
     expect(peers.safeParse(undefined).success).toBe(true);

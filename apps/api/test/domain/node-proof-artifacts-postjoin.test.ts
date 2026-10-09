@@ -10,6 +10,7 @@ import {
   NodeBootstrapCheckpoint,
   NodeStorageTrial,
   NodeBootstrapAdmissionBinding,
+  NodeJoinBundle,
 } from "@pgcf/contracts/node-bootstrap";
 import {
   NodeProofReport,
@@ -18,6 +19,7 @@ import {
 import {
   joinBundleReference,
   storeRegionJoinBundle,
+  importRegionAgentKey,
 } from "../../src/crypto/bootstrap-credentials.ts";
 import {
   admissionAuthority,
@@ -41,8 +43,15 @@ import {
 import { ContaboClient } from "../../src/providers/contabo.ts";
 import { cleanupFixtures } from "./fixtures.ts";
 import { boundInstallationFixture } from "./installation-fixtures.ts";
+import { standingPostjoinFixture } from "./postjoin-fixture.ts";
+import {
+  readNodePostjoinRelease,
+  prepareNodePostjoinRuntime,
+} from "../../src/domain/node-postjoin-release.ts";
+import { ensureBootstrapFleetPatch } from "../../src/domain/fleet-patches.ts";
 
 const regions: string[] = [],
+  releases: string[] = [],
   operations: string[] = [],
   encoder = new TextEncoder();
 const hashText = async (text: string) =>
@@ -74,9 +83,13 @@ afterEach(async () => {
       ).bind(region),
     ]);
   await cleanupFixtures();
+  for (const id of releases.splice(0))
+    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
+      .bind(id)
+      .run();
 });
 
-async function fixture() {
+async function fixture(future = false) {
   const f = await boundInstallationFixture();
   regions.push(f.fixture.region);
   operations.push(f.addition.intent.operation_id);
@@ -188,6 +201,20 @@ async function fixture() {
   )
     .bind(f.binding.row.firewall_id, plan.operation_id, planHash)
     .run();
+  const selected = future
+    ? await standingPostjoinFixture(
+        f.fixture.region,
+        NodeJoinBundle.parse({
+          ...f.bundle,
+          cluster_name: f.body.spec.cluster_name,
+          cluster_endpoint: f.body.spec.cluster_endpoint,
+        }),
+      )
+    : null;
+  if (selected) releases.push(selected.id);
+  const postjoin = selected
+    ? (await readNodePostjoinRelease(f.bindings, f.fixture.region)).reference
+    : undefined;
   const addition = await readNodeAddition(
       env.DB,
       f.addition.intent.operation_id,
@@ -197,6 +224,7 @@ async function fixture() {
       expected_revision: addition.revision,
       spec: {
         ...f.body.spec,
+        ...(postjoin ? { postjoin_release: postjoin } : {}),
         inventory_revision: addition.revision,
         rescue_host_fingerprint: f.binding.rescue.ssh_host_fingerprint,
       },
@@ -212,19 +240,20 @@ async function fixture() {
       addition.intent.operation_id,
     ),
     input = await bootstrapJobInput(f.bindings, configured),
-    clusterUid = crypto.randomUUID(),
+    clusterUid = future ? f.bundle.kube_system_uid : crypto.randomUUID(),
     nodeUid = crypto.randomUUID(),
     lvmUid = crypto.randomUUID(),
     vgUid = crypto.randomUUID();
   await storeRegionJoinBundle(
     f.bindings.DB,
     f.bindings.CREDENTIAL_KEYS,
-    joinBundleReference(f.fixture.region, 1),
+    joinBundleReference(f.fixture.region, future ? 2 : 1),
     {
       ...f.bundle,
       kube_system_uid: clusterUid,
       cluster_name: input.spec.cluster_name,
       cluster_endpoint: input.spec.cluster_endpoint,
+      ...(future ? { kubernetes_version: "1.36.5" } : {}),
     },
   );
   const before = {
@@ -464,6 +493,126 @@ async function fixture() {
       `node-proof-history/${configured.operation_id}/postjoin/${session.claims.session_id}/${sha}.json`,
   };
 }
+
+it("prepares the future host service only from a verified quarantined physical UID, without admitting or pausing existing members", async () => {
+  const f = await fixture(true);
+  await acceptNodeProofReport(f.bindings, f.session.bearer, f.report);
+  const job = await readBootstrapJob(env.DB, f.job.operation_id);
+  expect(
+    (
+      await admissionAuthority(f.bindings, job, {
+        requirePostjoinRelease: false,
+      })
+    ).admission_authorized,
+  ).toBe(true);
+  await importRegionAgentKey(
+    env.DB,
+    f.bindings,
+    f.fixture.region,
+    f.fixture.agent,
+  );
+  const status = await prepareNodePostjoinRuntime(
+    f.bindings,
+    f.job.operation_id,
+  );
+  expect(status.node_uid).toBe(f.nodeUid);
+  expect(status.cluster_uid).toBe(f.clusterUid);
+  expect(
+    (await env.DB.prepare("SELECT schedulable FROM nodes WHERE id=?")
+      .bind(job.node_id)
+      .first<{ schedulable: number }>())!.schedulable,
+  ).toBe(0);
+  expect((await readBootstrapJob(env.DB, job.operation_id)).admitted).toBe(0);
+  expect((await admissionAuthority(f.bindings, job)).admission_authorized).toBe(
+    false,
+  );
+  const create = vi.fn(async () => undefined),
+    bindings = {
+      ...f.bindings,
+      PATCH_NODE: { create } as unknown as typeof f.bindings.PATCH_NODE,
+    };
+  const child = await ensureBootstrapFleetPatch(bindings, job.operation_id),
+    again = await ensureBootstrapFleetPatch(bindings, job.operation_id);
+  expect(child.stage).toBe("preflight");
+  expect(again.operation_id).toBe(child.operation_id);
+  expect(
+    (await env.DB.prepare(
+      "SELECT database_placement_closed_at FROM nodes WHERE id=?",
+    )
+      .bind(job.node_id)
+      .first<{ database_placement_closed_at: string | null }>())!
+      .database_placement_closed_at,
+  ).toBeNull();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE nodes SET ready=0 WHERE id=?").bind(job.node_id),
+    env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET admission_expires_at=? WHERE operation_id=?",
+    ).bind(new Date(Date.now() - 1000).toISOString(), job.operation_id),
+  ]);
+  expect(
+    (await ensureBootstrapFleetPatch(bindings, job.operation_id)).operation_id,
+  ).toBe(child.operation_id);
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET authorized=0 WHERE operation_id=?",
+  )
+    .bind(job.operation_id)
+    .run();
+  await expect(
+    ensureBootstrapFleetPatch(bindings, job.operation_id),
+  ).rejects.toMatchObject({ code: "conflict" });
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET authorized=1 WHERE operation_id=?",
+  )
+    .bind(job.operation_id)
+    .run();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE nodes SET ready=1 WHERE id=?").bind(job.node_id),
+    env.DB.prepare(
+      "UPDATE fleet_patch_operations SET stage='complete',state='confirmed',updated_at=? WHERE operation_id=?",
+    ).bind(new Date().toISOString(), child.operation_id),
+  ]);
+  expect(
+    (
+      await admissionAuthority(
+        f.bindings,
+        await readBootstrapJob(env.DB, job.operation_id),
+      )
+    ).admission_authorized,
+  ).toBe(false);
+  await env.ARCHIVE.delete(f.alias);
+  for (const value of [f.report.postjoin!.node, f.report.postjoin!.node_after])
+    (value.metadata as { resourceVersion: string }).resourceVersion = "3";
+  await acceptNodeProofReport(f.bindings, f.session.bearer, f.report);
+  const renewed = await readBootstrapJob(env.DB, job.operation_id);
+  expect(JSON.parse(renewed.admission_binding_json!).resource_version).toBe(
+    "3",
+  );
+  expect(
+    (await admissionAuthority(f.bindings, renewed)).admission_authorized,
+  ).toBe(false); // F21 +fresh RV alone cannot replace the required real thin/host/IO qualification.
+  const originalAddition = await readNodeAddition(env.DB, job.operation_id);
+  await env.DB.prepare(
+    "UPDATE node_additions SET checkpoint_json=json_set(checkpoint_json,'$.reference',?) WHERE operation_id=?",
+  )
+    .bind("changed-original-parent", job.operation_id)
+    .run();
+  await expect(
+    ensureBootstrapFleetPatch(bindings, job.operation_id),
+  ).rejects.toMatchObject({ code: "conflict" });
+  await env.DB.prepare(
+    "UPDATE node_additions SET checkpoint_json=? WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(originalAddition.checkpoint), job.operation_id)
+    .run();
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET admitted=1 WHERE operation_id=?",
+  )
+    .bind(job.operation_id)
+    .run();
+  await expect(
+    prepareNodePostjoinRuntime(f.bindings, job.operation_id),
+  ).rejects.toMatchObject({ code: "conflict" });
+});
 
 it("publishes a complete storage and raw Kubernetes postjoin proof and authorizes real quarantined admission", async () => {
   const f = await fixture();

@@ -2,7 +2,10 @@
 import {
   FleetNodeReleaseObservation,
   type FleetDesiredRelease,
+  fleetChartObservation,
+  fleetFluxReady,
 } from "@pgcf/contracts/releases";
+import { CONFIGURATION_SCHEMA_REVISION } from "@pgcf/contracts";
 import { record, string, type Kubernetes, type Resource } from "./types.ts";
 
 export const FLEET_INVENTORY_INTERVAL_MS = 60_000;
@@ -47,6 +50,78 @@ export async function collectFleetInventory(
   const stop = () => signal?.aborted || now() - started >= 20_000;
   if (stop()) return [];
   const pods = await k8s.list("Pod");
+  const chartPins = desired.release.spec.components.filter(
+      (v) => v.kind === "chart",
+    ),
+    charts: FleetNodeReleaseObservation["facts"]["components"] = [];
+  let platformCommit: string | undefined;
+  if (chartPins.length || desired.release.spec.platform_source_commit) {
+    const namespace = await k8s.read("Namespace", undefined, "flux-system");
+    if (
+      namespace?.metadata.uid &&
+      !namespace.metadata.deletionTimestamp &&
+      !stop()
+    ) {
+      const reads = await Promise.allSettled([
+        k8s.list("HelmRelease", "flux-system"),
+        k8s.list("OCIRepository", "flux-system"),
+        k8s.list("HelmChart", "flux-system"),
+        k8s.read("GitRepository", "flux-system", "pgcf-platform"),
+        k8s.read("Kustomization", "flux-system", "pgcf-platform"),
+        k8s.read("Kustomization", "flux-system", "pgcf-regional"),
+      ]);
+      const after = await k8s.read("Namespace", undefined, "flux-system");
+      if (
+        reads.every((v) => v.status === "fulfilled") &&
+        after?.metadata.uid === namespace.metadata.uid &&
+        !after.metadata.deletionTimestamp &&
+        !stop()
+      ) {
+        const values = reads.map(
+            (v) =>
+              (v as PromiseFulfilledResult<Resource[] | Resource | null>).value,
+          ),
+          releases = values[0] as Resource[],
+          sources = values[1] as Resource[],
+          artifacts = values[2] as Resource[];
+        for (const pin of chartPins) {
+          const name =
+              pin.name === "chart/plugin-barman-cloud"
+                ? "plugin-barman-cloud"
+                : pin.name,
+            release = releases.find((v) => v.metadata.name === name),
+            sourceName = record(record(release?.spec).chartRef).name,
+            chartRef = string(record(release?.status).helmChart);
+          const observed = fleetChartObservation(
+            pin,
+            release,
+            sources.find((v) => v.metadata.name === sourceName),
+            artifacts.find(
+              (v) => `${v.metadata.namespace}/${v.metadata.name}` === chartRef,
+            ),
+          );
+          if (observed) charts.push(observed);
+        }
+        const source = values[3] as Resource | null,
+          platform = values[4] as Resource | null,
+          regional = values[5] as Resource | null,
+          target = desired.release.spec.platform_source_commit;
+        if (
+          target &&
+          fleetFluxReady(source) &&
+          fleetFluxReady(platform) &&
+          fleetFluxReady(regional) &&
+          record(record(source?.spec).ref).commit === target &&
+          [
+            record(record(source?.status).artifact).revision,
+            record(platform?.status).lastAppliedRevision,
+            record(regional?.status).lastAppliedRevision,
+          ].every((v) => typeof v === "string" && v.endsWith(`sha1:${target}`))
+        )
+          platformCommit = target;
+      }
+    }
+  }
   const result: FleetNodeReleaseObservation[] = [];
   for (const assignment of desired.nodes) {
     if (stop()) return result;
@@ -59,6 +134,7 @@ export async function collectFleetInventory(
     )
       continue;
     const information = record(record(node.status).nodeInfo),
+      bootId = string(information.bootID),
       kubelet = string(information.kubeletVersion);
     const kubeVersion =
       kubelet && /^v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.-]+)?$/.test(kubelet)
@@ -75,6 +151,7 @@ export async function collectFleetInventory(
       ...desired.release.spec.roles[assignment.role].talos_extensions,
     ]);
     const components: FleetNodeReleaseObservation["facts"]["components"] = [];
+    components.push(...charts.filter((v) => wanted.has(v.name)));
     for (const component of desired.release.spec.components) {
       if (stop()) return result;
       if (
@@ -94,7 +171,8 @@ export async function collectFleetInventory(
       const candidates = pods
         .filter(
           (pod) =>
-            record(pod.spec).nodeName === assignment.k8s_node_name &&
+            (ownership.scope === "cluster" ||
+              record(pod.spec).nodeName === assignment.k8s_node_name) &&
             !pod.metadata.deletionTimestamp &&
             pod.metadata.namespace === ownership.namespace &&
             Object.entries(ownership.selector).every(
@@ -160,7 +238,9 @@ export async function collectFleetInventory(
           Object.entries(ownership.selector).some(
             ([key, value]) => fresh.metadata.labels?.[key] !== value,
           ) ||
-          record(fresh.spec).nodeName !== assignment.k8s_node_name ||
+          (ownership.scope !== "cluster" &&
+            record(fresh.spec).nodeName !== assignment.k8s_node_name) ||
+          record(fresh.spec).nodeName !== record(pod.spec).nodeName ||
           freshStatus?.ready !== true ||
           freshStatus.imageID !== status?.imageID ||
           freshStatus.restartCount !== status?.restartCount
@@ -189,12 +269,85 @@ export async function collectFleetInventory(
             : {}),
         });
     }
+    const controlPlane = [
+      "node-role.kubernetes.io/control-plane",
+      "node-role.kubernetes.io/master",
+    ].some((key) => Object.hasOwn(node.metadata.labels ?? {}, key));
+    let staticImages: FleetNodeReleaseObservation["facts"]["kubernetes_static_images"];
+    if (controlPlane) {
+      staticImages = {};
+      const ns = await k8s.read("Namespace", undefined, "kube-system");
+      if (ns?.metadata.uid && !ns.metadata.deletionTimestamp)
+        for (const [name, label] of Object.entries({
+          apiServer: "kube-apiserver",
+          controllerManager: "kube-controller-manager",
+          scheduler: "kube-scheduler",
+        }) as ["apiServer" | "controllerManager" | "scheduler", string][]) {
+          if (stop()) return result;
+          const candidates = pods.filter(
+            (pod) =>
+              pod.metadata.namespace === "kube-system" &&
+              pod.metadata.labels?.component === label &&
+              record(pod.spec).nodeName === assignment.k8s_node_name &&
+              !pod.metadata.deletionTimestamp &&
+              controllerUid(pod) === assignment.node_uid,
+          );
+          if (candidates.length !== 1) continue;
+          const original = candidates[0]!,
+            fresh = await k8s.read(
+              "Pod",
+              "kube-system",
+              original.metadata.name,
+            ),
+            statuses = record(fresh?.status).containerStatuses,
+            oldStatuses = record(original.status).containerStatuses;
+          if (
+            !fresh ||
+            fresh.metadata.uid !== original.metadata.uid ||
+            fresh.metadata.deletionTimestamp ||
+            controllerUid(fresh) !== assignment.node_uid ||
+            record(fresh.spec).nodeName !== assignment.k8s_node_name ||
+            !Array.isArray(statuses) ||
+            statuses.length !== 1 ||
+            !Array.isArray(oldStatuses) ||
+            oldStatuses.length !== 1
+          )
+            continue;
+          const current = record(statuses[0]),
+            oldStatus = record(oldStatuses[0]),
+            sha = digest(current.imageID);
+          if (
+            current.ready === true &&
+            record(record(current.state).running).startedAt &&
+            sha &&
+            current.imageID === oldStatus.imageID &&
+            current.restartCount === oldStatus.restartCount
+          )
+            staticImages[name] = sha;
+        }
+      const afterNamespace = await k8s.read(
+        "Namespace",
+        undefined,
+        "kube-system",
+      );
+      if (
+        !ns ||
+        afterNamespace?.metadata.uid !== ns.metadata.uid ||
+        afterNamespace?.metadata.deletionTimestamp
+      )
+        staticImages = {};
+    }
     const after = await k8s.read("Node", undefined, assignment.k8s_node_name);
     if (
       !after ||
       after.metadata.uid !== assignment.node_uid ||
       after.metadata.deletionTimestamp ||
       !ready(after) ||
+      [
+        "node-role.kubernetes.io/control-plane",
+        "node-role.kubernetes.io/master",
+      ].some((key) => Object.hasOwn(after.metadata.labels ?? {}, key)) !==
+        controlPlane ||
       [
         "kubeletVersion",
         "osImage",
@@ -217,7 +370,17 @@ export async function collectFleetInventory(
         assignment_revision: assignment.revision,
         observed_at: new Date(now()).toISOString(),
         facts: {
-          ...(kubeVersion ? { kubernetes_version: kubeVersion } : {}),
+          configuration_schema_revision: CONFIGURATION_SCHEMA_REVISION,
+          ...(platformCommit ? { platform_source_commit: platformCommit } : {}),
+          ...(bootId &&
+          /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(bootId)
+            ? { boot_id: bootId }
+            : {}),
+          ...(kubeVersion
+            ? { kubernetes_version: kubeVersion, kubelet_version: kubeVersion }
+            : {}),
+          kubernetes_control_plane: controlPlane,
+          ...(staticImages ? { kubernetes_static_images: staticImages } : {}),
           ...(talosVersion ? { talos_version: talosVersion } : {}),
           components,
         },

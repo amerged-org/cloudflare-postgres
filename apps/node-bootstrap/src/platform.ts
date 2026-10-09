@@ -17,6 +17,13 @@ import {
   KUBERNETES_VERSION,
 } from "./bootstrap.ts";
 import { PLATFORM_ARTIFACTS } from "./platform-artifacts.ts";
+import versions from "../../../infra/platform/versions.lock.json" with { type: "json" };
+import {
+  selectedOpenEbsDriverImage,
+  openEbsDriverValues,
+  openEbsCgroupPostRenderers,
+  openEbsCgroupReadback,
+} from "../../../infra/platform/openebs-image.ts";
 
 type Json = Record<string, unknown>;
 const RESOURCES: Record<string, string> = {
@@ -124,6 +131,33 @@ function manifestObject(
   );
 }
 
+/** Explicit active controller composition; shared vendor RBAC/CRDs remain pinned to the same artifact. */
+export function selectFluxObjects(
+  values: Json[],
+  components: readonly string[] = versions.flux.components,
+): Json[] {
+  const available = new Set([
+    "source-controller",
+    "kustomize-controller",
+    "helm-controller",
+    "notification-controller",
+    "image-automation-controller",
+    "image-reflector-controller",
+    "source-watcher",
+  ]);
+  if (
+    !components.length ||
+    new Set(components).size !== components.length ||
+    components.some((name) => !available.has(name))
+  )
+    throw new BootstrapError("patch_flux_components_invalid");
+  return values.filter(
+    (value) =>
+      value.kind !== "Deployment" ||
+      components.includes(String(record(value.metadata).name)),
+  );
+}
+
 export function renderFluxObjects(
   text: string,
   input: NodeBootstrapInput,
@@ -131,38 +165,51 @@ export function renderFluxObjects(
   const documents = parseAllDocuments(text);
   if (!documents.length || documents.some((document) => document.errors.length))
     throw new BootstrapError("platform_manifest_invalid");
-  return documents.map((document) => {
-    const value = record(document.toJSON());
-    const metadata = record(value.metadata);
-    if (
-      typeof value.kind !== "string" ||
-      !RESOURCES[value.kind] ||
-      typeof metadata.name !== "string" ||
-      !/^[a-z0-9][a-z0-9.-]*$/.test(metadata.name)
-    )
-      throw new BootstrapError("platform_manifest_invalid");
-    if (value.kind === "Deployment") {
-      const spec = record(record(record(value.spec).template).spec);
-      const tolerations =
-        spec.tolerations === undefined ? [] : list(spec.tolerations);
+  return selectFluxObjects(
+    documents.map((document) => {
+      const value = record(document.toJSON());
+      const metadata = record(value.metadata);
       if (
-        tolerations.some(
-          (item) =>
-            item.key === QUARANTINE.key &&
-            canonical(item) !== canonical(QUARANTINE),
-        )
+        typeof value.kind !== "string" ||
+        !RESOURCES[value.kind] ||
+        typeof metadata.name !== "string" ||
+        !/^[a-z0-9][a-z0-9.-]*$/.test(metadata.name)
       )
-        throw new BootstrapError("flux_toleration_mismatch");
-      if (!tolerations.some((item) => item.key === QUARANTINE.key))
-        spec.tolerations = [...tolerations, QUARANTINE];
-    }
-    return owned(value, input);
-  });
+        throw new BootstrapError("platform_manifest_invalid");
+      if (value.kind === "Deployment") {
+        const spec = record(record(record(value.spec).template).spec);
+        const pinnedImage = record(versions.flux.images)[String(metadata.name)];
+        if (typeof pinnedImage === "string") {
+          const manager = list(spec.containers).find(
+            (container) => container.name === "manager",
+          );
+          if (manager) manager.image = pinnedImage;
+        }
+        const tolerations =
+          spec.tolerations === undefined ? [] : list(spec.tolerations);
+        if (
+          tolerations.some(
+            (item) =>
+              item.key === QUARANTINE.key &&
+              canonical(item) !== canonical(QUARANTINE),
+          )
+        )
+          throw new BootstrapError("flux_toleration_mismatch");
+        if (!tolerations.some((item) => item.key === QUARANTINE.key))
+          spec.tolerations = [...tolerations, QUARANTINE];
+      }
+      return owned(value, input);
+    }),
+  );
 }
 
-export function platformSyncObjects(input: NodeBootstrapInput): Json[] {
+export function platformSyncObjects(
+  input: NodeBootstrapInput,
+  releaseLock: unknown = versions,
+): Json[] {
   if (!input.spec.platform)
     throw new BootstrapError("platform_installation_missing");
+  const driverImage = selectedOpenEbsDriverImage(releaseLock);
   return [
     manifestObject(
       "GitRepository",
@@ -195,6 +242,36 @@ export function platformSyncObjects(input: NodeBootstrapInput): Json[] {
             name,
             namespace: "flux-system",
           })),
+          ...(driverImage
+            ? {
+                patches: [
+                  {
+                    target: {
+                      group: "helm.toolkit.fluxcd.io",
+                      version: "v2",
+                      kind: "HelmRelease",
+                      name: "openebs",
+                      namespace: "flux-system",
+                    },
+                    patch: JSON.stringify({
+                      apiVersion: "helm.toolkit.fluxcd.io/v2",
+                      kind: "HelmRelease",
+                      metadata: { name: "openebs", namespace: "flux-system" },
+                      spec: {
+                        postRenderers: openEbsCgroupPostRenderers(),
+                        values: {
+                          "lvm-localpv": {
+                            lvmPlugin: {
+                              image: openEbsDriverValues(driverImage),
+                            },
+                          },
+                        },
+                      },
+                    }),
+                  },
+                ],
+              }
+            : {}),
         },
       },
       input,
@@ -275,7 +352,7 @@ export function regionalObjects(input: NodeBootstrapInput): Json[] {
   ];
 }
 
-function quantity(value: unknown): [bigint, bigint] {
+export function quantity(value: unknown): [bigint, bigint] {
   const raw = typeof value === "number" ? String(value) : value;
   if (typeof raw !== "string" || raw.length > 64)
     throw new Error("invalid_quantity");
@@ -479,7 +556,7 @@ export function assertWorkloadReady(
       throw new BootstrapError("platform_workload_not_ready");
   }
 }
-function assertFluxReady(value: Json) {
+export function assertFluxReady(value: Json) {
   const metadata = record(value.metadata),
     status = record(value.status);
   const conditions = list(status.conditions);
@@ -1310,7 +1387,7 @@ export class PlatformInstaller {
     return { present, missing };
   }
   private async repairFlux() {
-    if (this.assets.flux.length !== 43)
+    if (!this.assets.flux.length)
       throw new BootstrapError("platform_resource_unconfirmed");
     const inventory = this.assets.flux
       .map((value) => {
@@ -1344,7 +1421,7 @@ export class PlatformInstaller {
         inventory.map(
           (value) => `${value.kind}/${value.namespace ?? ""}/${value.name}`,
         ),
-      ).size !== 43
+      ).size !== this.assets.flux.length
     )
       throw new BootstrapError("platform_resource_invalid");
     const inventory_sha256 = digest(canonical(inventory));
@@ -1526,6 +1603,28 @@ export class PlatformInstaller {
       throw new BootstrapError("platform_source_revision_mismatch");
     for (const name of RELEASES)
       assertFluxReady(await this.required("HelmRelease", name, "flux-system"));
+    const driverImage = selectedOpenEbsDriverImage(versions);
+    if (driverImage) {
+      const driver = await this.required(
+        "DaemonSet",
+        "openebs-lvm-localpv-node",
+        "openebs",
+      );
+      assertWorkloadReady("DaemonSet", driver);
+      const containers = list(
+        record(record(record(driver.spec).template).spec).containers,
+      );
+      if (
+        containers.filter(
+          (container) =>
+            container.name === "openebs-lvm-plugin" &&
+            container.image === driverImage,
+        ).length !== 1
+      )
+        throw new BootstrapError("platform_storage_driver_image_mismatch");
+      if (!openEbsCgroupReadback(driver))
+        throw new BootstrapError("platform_storage_cgroup_view_unconfirmed");
+    }
     const storage = await this.required("StorageClass", "pgcf-lvm");
     if (
       storage.provisioner !== "local.csi.openebs.io" ||

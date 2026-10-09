@@ -1,11 +1,35 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
+import { DatabaseRuntimeAttestation } from "./reclaim.ts";
+import { ComputePoolPolicy } from "./compute-pool.ts";
 import { gatewayActivityReportSchema } from "./gateway-activity.ts";
 import { UsageSample } from "./usage.ts";
 import { ProviderInstanceId } from "./nodes.ts";
-import { FleetDesiredRelease } from "./releases.ts";
+import { FleetDesiredRelease, FleetReleaseId } from "./releases.ts";
 import { RecoverySourceCredentialsMap } from "./region-archive-sources.ts";
 import { NodeStorageSample } from "./node-physical-storage.ts";
+import {
+  DesiredDatabaseStorage,
+  DesiredStorageStartup,
+  NodeThinStorageAuthority,
+} from "./database-storage.ts";
+import { STORAGE_AUTHORITY_MAX_LENGTH } from "./storage-write-authority.ts";
+export {
+  DesiredDatabaseStorage,
+  DesiredStorageStartup,
+  DatabaseStorageVolumeReceipt,
+  NodeStorageProtectionProof,
+  NodeThinStorageAuthority,
+  ThinStorageProfile,
+  thinStorageAuthorityMatches,
+  thinStorageVolumeReclaimed,
+  thinStorageClass,
+  thinStorageClassObject,
+  thinVolumeAttributesClassObject,
+  thinMetadataEstimateBytes,
+  thinWriteExposure,
+} from "./database-storage.ts";
+export * from "./storage-write-authority.ts";
 export { RecoverySourceCredentialsMap } from "./region-archive-sources.ts";
 export {
   NodePhysicalStorage,
@@ -35,6 +59,30 @@ import {
 export const AGENT_PROTOCOL_VERSION = 1;
 export const DESIRED_PAGE_LIMIT_MAX = 200;
 export const PG_MAJOR = 18;
+export const CONFIGURATION_SCHEMA_REVISION = 1;
+export const DesiredPostgres = z.strictObject({
+  release_id: FleetReleaseId,
+  image: z
+    .string()
+    .max(512)
+    .regex(/^[A-Za-z0-9./_:-]+@sha256:[a-f0-9]{64}$/),
+  version: z.string().regex(/^18\.[0-9]+(?:\.[0-9]+)?$/),
+  configuration_schema_revision: z.literal(CONFIGURATION_SCHEMA_REVISION),
+});
+export type DesiredPostgres = z.infer<typeof DesiredPostgres>;
+export function postgresImageIdMatches(
+  image: string,
+  imageId: string,
+): boolean {
+  const digest = image.match(/@sha256:([a-f0-9]{64})$/)?.[1];
+  return (
+    digest !== undefined &&
+    /^(?:(?:docker-pullable|docker|containerd):\/\/)?(?:[^\s]+@)?sha256:[a-f0-9]{64}$/.test(
+      imageId,
+    ) &&
+    imageId.endsWith(`sha256:${digest}`)
+  );
+}
 /** Barman `serverName` for every database; the path prefix already makes it unique. */
 export const ARCHIVE_SERVER_NAME = "database";
 
@@ -169,6 +217,11 @@ export const DesiredDatabase = z
       .optional(),
     node: K8sNodeName,
     pg_major: z.literal(PG_MAJOR),
+    postgres: DesiredPostgres.optional(),
+    storage: DesiredDatabaseStorage.optional(),
+    /** CF-only signed, short-lived write gate; never part of power/configuration fingerprints. */
+    storage_authority: z.string().max(STORAGE_AUTHORITY_MAX_LENGTH).optional(),
+    storage_startup: DesiredStorageStartup.optional(),
     size: DesiredSize,
     roles: z.array(DesiredRole).max(100).default([]),
     maintenance: MaintenanceCredential.optional(),
@@ -286,6 +339,10 @@ export type DesiredDatabase = z.infer<typeof DesiredDatabase>;
 
 export const DesiredRegion = z.strictObject({
   id: RegionId,
+  /** Current authoritative region pool template, including assigned per-Pod overhead. */
+  compute_pool: ComputePoolPolicy.nullable().optional(),
+  /** High-trust Native physical readbacks; ordinary Regional observations cannot mint these. */
+  storage_nodes: z.array(NodeThinStorageAuthority).max(1000).optional(),
   /** Authenticated target-region-only source-read custody; omission preserves legacy installations. */
   recovery_sources: RecoverySourceCredentialsMap.optional(),
   backup: z.strictObject({
@@ -437,6 +494,15 @@ export const DatabaseObservation = z
     id: DatabaseId,
     generation: z.number().int().min(1),
     state: z.enum(DATABASE_OBSERVED_STATES),
+    postgres: z
+      .strictObject({
+        image: z
+          .string()
+          .max(512)
+          .regex(/^[^\s]+@sha256:[a-f0-9]{64}$/),
+        image_id: z.string().max(1024),
+      })
+      .optional(),
     recovery: z
       .strictObject({
         operation_id: OperationId,
@@ -454,6 +520,7 @@ export const DatabaseObservation = z
       .optional(),
     message: z.string().max(TEXT_MAX_LENGTH).optional(),
     backup: BackupObservation.optional(),
+    runtime_attestation: DatabaseRuntimeAttestation.optional(),
     archive: z.strictObject({
       continuous: z.boolean(),
       ready_wal_files: Count.nullable(),
@@ -508,7 +575,8 @@ export const ObservationRequest = z
     observed_at: Timestamp,
     nodes: z.array(NodeObservation).max(1000),
     databases: z.array(DatabaseObservation).max(10_000),
-    orphans: z.array(Orphan).max(1000),
+    /** Omitted for a targeted database report; only a measured inventory replaces orphan state. */
+    orphans: z.array(Orphan).max(1000).optional(),
     /** Partial background samples; an empty inventory here does not replace the region inventory. */
     node_memory_samples: z.array(NodeMemoryObservation).max(1000).optional(),
   })

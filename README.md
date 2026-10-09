@@ -274,8 +274,9 @@ remains the integrator's responsibility.
 
 ## Development checks
 
-The native configuration test requires the checksum-verified Talos 1.14.1 client for your
-operating system from the [official release](https://github.com/siderolabs/talos/releases/tag/v1.14.1):
+The native configuration test requires the Talos client selected by `bootstrapClients.talos`
+in [versions.lock.json](infra/platform/versions.lock.json). Download the entry for your operating
+system/architecture from its pinned URL and verify its SHA-256 before execution:
 
 ```sh
 export PGCF_TEST_TALOSCTL=/absolute/path/to/verified/talosctl

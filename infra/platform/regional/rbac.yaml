@@ -67,7 +67,7 @@ rules:
   # Delete flow: find the PV bound to a database, set reclaim policy Delete, then wait for it.
   - apiGroups: [""]
     resources: [persistentvolumeclaims]
-    verbs: [get]
+    verbs: [get, list, watch]
   - apiGroups: [""]
     resources: [persistentvolumes]
     verbs: [get, list, patch, delete]
@@ -78,6 +78,13 @@ rules:
   - apiGroups: [""]
     resources: [nodes, pods]
     verbs: [get, list]
+  # Native controller shared watches only enqueue exact database identities.
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [watch]
+  - apiGroups: [postgresql.cnpg.io]
+    resources: [clusters]
+    verbs: [watch]
   # Verified kubelet summaries measure whole-filesystem use, including WAL; no node proxy access.
   - apiGroups: [""]
     resources: [nodes/stats]
@@ -100,6 +107,40 @@ subjects:
 ---
 # The agent publishes the CNPG server CA of each database as ConfigMap ca-<id> for the gateway and
 # reads the shared R2 credential it copies into each database namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pgcf-fleet-observer
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/part-of: pgcf
+rules:
+  - apiGroups: [source.toolkit.fluxcd.io]
+    resources: [gitrepositories, ocirepositories, helmcharts]
+    verbs: [get, list]
+  - apiGroups: [helm.toolkit.fluxcd.io]
+    resources: [helmreleases]
+    verbs: [get, list]
+  - apiGroups: [kustomize.toolkit.fluxcd.io]
+    resources: [kustomizations]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: pgcf-fleet-observer
+  namespace: flux-system
+  labels:
+    app.kubernetes.io/part-of: pgcf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: pgcf-fleet-observer
+subjects:
+  - kind: ServiceAccount
+    name: pgcf-agent
+    namespace: pgcf-system
+---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
@@ -190,6 +231,33 @@ roleRef:
   apiGroup: rbac.authorization.k8s.io
   kind: Role
   name: pgcf-gateway
+subjects:
+  - kind: ServiceAccount
+    name: pgcf-gateway
+    namespace: pgcf-system
+---
+# Exact ready writer PodUID/IP discovery for TLS routing; no workload or Secret access.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pgcf-gateway-endpoints
+  labels:
+    app.kubernetes.io/part-of: pgcf
+rules:
+  - apiGroups: [discovery.k8s.io]
+    resources: [endpointslices]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pgcf-gateway-endpoints
+  labels:
+    app.kubernetes.io/part-of: pgcf
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: pgcf-gateway-endpoints
 subjects:
   - kind: ServiceAccount
     name: pgcf-gateway

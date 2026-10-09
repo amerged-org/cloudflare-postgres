@@ -1,0 +1,14 @@
+{
+  "name": "@pgcf/edge-rust",
+  "version": "0.1.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "type": "module",
+  "scripts": {
+    "build": "worker-build --release",
+    "test": "node --test test/worker.node-test.ts"
+  },
+  "devDependencies": {
+    "wrangler": "^4.142.0"
+  }
+}

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
+import lock from "../../../../infra/platform/versions.lock.json" with { type: "json" };
 import {
   createExecutionContext,
   waitOnExecutionContext,
@@ -2549,10 +2550,9 @@ async function ciliumRecoveryFixture() {
     kube_system_uid: clusterUid,
     node_uid: crypto.randomUUID(),
     node_name: f.spec.hostname,
-    chart_sha256:
-      "b2afd87b7f75f875f92a14559f14f59b7babbb479d968e3fd625a20bf30ec20e",
-    values_sha256:
-      "0de1a09a3fd450916cdb316d41fa9dcfd769708f7a6cb5b49496a64ee9b26b39",
+    chart_sha256: lock.charts.find((chart) => chart.name === "cilium")!
+      .archiveSha256,
+    values_sha256: lock.bootstrapValues.cilium.sha256,
     effective_values_sha256: hash(),
     inventory_sha256: hash(),
     resource_count: 12,
@@ -2570,6 +2570,97 @@ async function ciliumRecoveryFixture() {
   };
   return { f, checkpoint, receipt, claimed };
 }
+
+it("refuses old or changed Cilium asset pins for a fresh retry claim", async () => {
+  const { f, claimed } = await ciliumRecoveryFixture();
+  const send = (receipt: unknown) =>
+    callback(f, {
+      ...f.identity,
+      kind: "checkpoint",
+      expected_revision: 0,
+      payload: {
+        ...claimed,
+        cilium_install: {
+          ...claimed.cilium_install,
+          recovery_receipt: receipt,
+        },
+      },
+    });
+  expect(
+    (
+      await send({
+        ...claimed.cilium_install.recovery_receipt,
+        values_sha256:
+          "0de1a09a3fd450916cdb316d41fa9dcfd769708f7a6cb5b49496a64ee9b26b39",
+      })
+    ).status,
+  ).toBe(409);
+  expect(
+    (
+      await send({
+        ...claimed.cilium_install.recovery_receipt,
+        chart_sha256: hash(),
+      })
+    ).status,
+  ).toBe(409);
+  expect((await readBootstrapJob(env.DB, f.job.operation_id)).revision).toBe(0);
+});
+
+it("reads historical consumed Cilium assets without erasing or replacing their immutable receipt", async () => {
+  const { f, claimed } = await ciliumRecoveryFixture();
+  const historical = {
+    ...claimed,
+    cilium_install: {
+      ...claimed.cilium_install,
+      recovery_receipt: {
+        ...claimed.cilium_install.recovery_receipt,
+        values_sha256:
+          "0de1a09a3fd450916cdb316d41fa9dcfd769708f7a6cb5b49496a64ee9b26b39",
+      },
+    },
+  };
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(historical), f.job.operation_id)
+    .run();
+  const response = await callback(f, { ...f.identity, kind: "read" });
+  expect(response.status).toBe(200);
+  expect(
+    NodeBootstrapAuthority.parse(await response.json()).checkpoint
+      .cilium_install,
+  ).toEqual(historical.cilium_install);
+  const waiting = {
+    ...historical,
+    status: "waiting",
+    error_code: "cilium_release_unconfirmed",
+  };
+  expect(
+    (
+      await callback(f, {
+        ...f.identity,
+        kind: "checkpoint",
+        expected_revision: 0,
+        payload: waiting,
+      })
+    ).status,
+  ).toBe(200);
+  expect(
+    (
+      await callback(f, {
+        ...f.identity,
+        kind: "checkpoint",
+        expected_revision: 1,
+        payload: { ...waiting, cilium_install: claimed.cilium_install },
+      })
+    ).status,
+  ).toBe(409);
+  expect(
+    JSON.parse(
+      (await readBootstrapJob(env.DB, f.job.operation_id)).checkpoint_json,
+    ).cilium_install,
+  ).toEqual(historical.cilium_install);
+});
 
 it("claims exactly one Cilium retry from complete fresh no-effect readback without rewinding the original intent", async () => {
   const { f, checkpoint, claimed } = await ciliumRecoveryFixture();

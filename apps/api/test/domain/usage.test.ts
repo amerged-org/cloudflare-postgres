@@ -638,3 +638,29 @@ describe("hourly usage", () => {
     ).rejects.toThrow("Invalid usage recorder");
   });
 });
+
+it("keeps known compute usage while thin physical allocation remains unknown", () => {
+  const id = newDatabaseId();
+  const usage = computeUsageHour(
+    { id, project_id: "prj_" + id, created_at: iso(epoch) },
+    epoch,
+    [
+      {
+        id: 1,
+        kind: "ready",
+        occurred_at: iso(epoch),
+        resource_snapshot: JSON.stringify({
+          ...resources,
+          storage_allocated_bytes: null,
+        }),
+      },
+    ],
+    [],
+    epoch + 3 * USAGE_HOUR_MS,
+  );
+  expect(usage.metrics.memory_mib_seconds).toBe(512 * 3600);
+  expect(usage.metrics.cpu_millicore_seconds).toBe(500 * 3600);
+  expect(usage.metrics.reserved_storage_byte_seconds).toBeNull();
+  expect(usage.gaps).toContain("reserved_storage_byte_seconds");
+  expect(usage.gaps).not.toContain("resource_snapshot");
+});

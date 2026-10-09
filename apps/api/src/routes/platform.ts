@@ -25,6 +25,15 @@ import {
 import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import {
+  RegionMaterialRotationStage,
+  RegionMaterialRotationActivate,
+  RegionMaterialRotationStaged,
+} from "@pgcf/contracts/region-material-rotation";
+import {
+  stageRegionBootstrapRotation,
+  activateRegionBootstrapRotation,
+} from "../domain/region-material-revisions.ts";
+import {
   createApiKey,
   deleteApiKey,
   listApiKeys,
@@ -264,6 +273,52 @@ export function registerPlatform(app: ApiApp): void {
         c,
         RegionId.parse(c.req.param("id")),
         RegionBootstrapMaterialUpdate.parse(await c.req.json()),
+      ),
+  );
+  register(
+    app,
+    {
+      method: "post",
+      path: "/v1/regions/{id}/bootstrap-material/stage",
+      security,
+      tags: ["Regions"],
+      description:
+        "Stages private complete matching next-revision cluster custody. Does not activate it, execute rotation or authorize bootstrap.",
+      request: {
+        headers,
+        params: z.object({ id: RegionId }),
+        body: body(RegionMaterialRotationStage),
+      },
+      responses: response(RegionMaterialRotationStaged, 200),
+    },
+    async (c) =>
+      stageRegionBootstrapRotation(
+        c,
+        RegionId.parse(c.req.param("id")),
+        RegionMaterialRotationStage.parse(await c.req.json()),
+      ),
+  );
+  register(
+    app,
+    {
+      method: "post",
+      path: "/v1/regions/{id}/bootstrap-material/activate",
+      security,
+      tags: ["Regions"],
+      description:
+        "Activates exact staged custody after fresh complete trusted-admin or reviewed Native readback and explicit retired-authority evidence. This is a trusted administrator boundary, not cryptographic attestation or physical rotation.",
+      request: {
+        headers,
+        params: z.object({ id: RegionId }),
+        body: body(RegionMaterialRotationActivate),
+      },
+      responses: response(RegionBootstrapMaterialStatus, 200),
+    },
+    async (c) =>
+      activateRegionBootstrapRotation(
+        c,
+        RegionId.parse(c.req.param("id")),
+        RegionMaterialRotationActivate.parse(await c.req.json()),
       ),
   );
   register(

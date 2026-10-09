@@ -49,6 +49,20 @@ describe("sizing", () => {
     });
   });
 
+  it("includes assigned sandbox overhead in both requests and limits for each Pod", () => {
+    expect(
+      resourceQuotaFor(
+        { ...small, cpu_request_millicores: 25 },
+        { cpu_millicores: 50, memory_mib: 64 },
+      ),
+    ).toMatchObject({
+      requestsCpuMillicores: 350,
+      limitsCpuMillicores: 2100,
+      requestsMemoryMib: 1408,
+      limitsMemoryMib: 2176,
+    });
+  });
+
   it("derives PostgreSQL parameters from the size class", () => {
     expect(postgresParameters(small)).toEqual({
       shared_buffers: "128MB",

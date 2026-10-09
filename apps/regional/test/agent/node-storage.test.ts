@@ -7,6 +7,8 @@ import {
 } from "../../src/agent/node-storage.ts";
 import { MemoryKubernetes } from "./fixtures.ts";
 import type { Resource } from "../../src/agent/types.ts";
+import lock from "../../../../infra/platform/versions.lock.json" with { type: "json" };
+import { openEbsDriverImage } from "../../../../infra/platform/openebs-image.ts";
 
 const vg = "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef";
 const group = (free = 7000) =>
@@ -89,7 +91,7 @@ function driverFixture() {
     metadata: { name: "pgcf-node" },
     status: { conditions: [{ type: "Ready", status: "True" }] },
   });
-  const driverImage = "openebs/lvm-driver:1.10.1";
+  const driverImage = openEbsDriverImage(lock);
   const ds = k8s.put({
     apiVersion: "apps/v1",
     kind: "DaemonSet",

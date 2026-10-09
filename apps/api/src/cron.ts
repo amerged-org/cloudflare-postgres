@@ -5,6 +5,7 @@ import { reconcileDatabaseActors } from "./domain/database-actor-sync.ts";
 import { recoverQuiescence } from "./domain/lifecycle.ts";
 import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
 import { cleanupRetainedArchives } from "./domain/retained-archives.ts";
+import { runFleetUpdates } from "./domain/fleet-updates.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
 import { runNodeCapacityCron } from "./domain/node-capacity.ts";
 import { runResourceProfileRollouts } from "./domain/resource-profiles.ts";
@@ -149,5 +150,6 @@ export async function runCron(
   const usage = await runUsageCron(env.DB, now, env);
   await runNodeCapacityCron(env);
   await cleanupRetainedArchives(env, now);
+  await runFleetUpdates(env, now);
   return { failed: result.meta.changes + recovered, purged, hinted, usage };
 }

@@ -6,6 +6,7 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
+import { gzipSync } from "node:zlib";
 import { test } from "node:test";
 import tar from "tar-stream";
 import {
@@ -20,14 +21,180 @@ import {
   validateDockerfile,
   runtimeChecks,
   validateRuntimeResult,
+  validateProfileProvenance,
+  verifyRustAssembly,
+  verifyTalosRecipeAssembly,
+  inspectTalosInstallerArchive,
+  type LayerFile,
 } from "./image-qualification.ts";
+
+test("imager installer archives bind every layer and upstream identity without fabricated PGCF labels", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-installer-archive-"));
+  const sha = (bytes: Buffer) =>
+    createHash("sha256").update(bytes).digest("hex");
+  const archive = async (entries: Array<[string, Buffer]>) => {
+    const pack = tar.pack();
+    for (const [name, bytes] of entries) pack.entry({ name }, bytes);
+    pack.finalize();
+    const chunks: Buffer[] = [];
+    for await (const chunk of pack) {
+      assert.ok(Buffer.isBuffer(chunk));
+      chunks.push(chunk);
+    }
+    return Buffer.concat(chunks);
+  };
+  const base = await archive([
+    ["bin/installer", Buffer.from("public installer fixture")],
+  ]);
+  const payload = await archive([
+    [
+      "usr/install/amd64/vmlinuz.efi",
+      Buffer.from("public UKI fixture; nested parsing is a separate gate"),
+    ],
+  ]);
+  const layers = [gzipSync(base), gzipSync(payload)],
+    names = layers.map((layer) => sha(layer) + ".tar.gz"),
+    diffIDs = [base, payload].map((layer) => "sha256:" + sha(layer));
+  const make = async (
+    name: string,
+    version: string,
+    extra = false,
+    corrupt = false,
+  ) => {
+    const config = Buffer.from(
+      JSON.stringify({
+        architecture: "amd64",
+        os: "linux",
+        rootfs: { type: "layers", diff_ids: diffIDs },
+        config: {
+          Entrypoint: ["/bin/installer"],
+          Env: ["VERSION=v" + version],
+          Labels: {
+            "alpha.talos.dev/version": "v" + version,
+            "org.opencontainers.image.source":
+              "https://github.com/siderolabs/talos",
+          },
+        },
+      }),
+    );
+    const configName = "sha256:" + sha(config),
+      manifest = Buffer.from(
+        JSON.stringify([{ Config: configName, RepoTags: null, Layers: names }]),
+      );
+    const entries: Array<[string, Buffer]> = [
+      [configName, config],
+      [names[0]!, layers[0]!],
+      [names[1]!, corrupt ? gzipSync(Buffer.from("corrupt")) : layers[1]!],
+      ["manifest.json", manifest],
+    ];
+    if (extra)
+      entries.push(["unlisted", Buffer.from("never ignore an extra payload")]);
+    const path = join(directory, name + ".tar");
+    await writeFile(path, await archive(entries));
+    return path;
+  };
+  try {
+    const expected = { talosVersion: "1.14.1", baseDiffIDs: [diffIDs[0]!] };
+    const path = await make("valid", expected.talosVersion);
+    const result = await inspectTalosInstallerArchive(
+      path,
+      join(directory, "valid"),
+      expected,
+    );
+    assert.equal(result.archiveSha256, sha(await readFile(path)));
+    assert.deepEqual(result.diffIDs, diffIDs);
+    assert.deepEqual(
+      result.layerDigests,
+      layers.map((layer) => "sha256:" + sha(layer)),
+    );
+    assert.equal(result.files.length, 2);
+    assert.ok(
+      result.inputs.some(
+        (input) => input.path === "usr/install/amd64/vmlinuz.efi",
+      ),
+    );
+    await assert.rejects(
+      inspectTalosInstallerArchive(
+        await make("version", "1.14.2"),
+        join(directory, "version"),
+        expected,
+      ),
+      /identity/,
+    );
+    await assert.rejects(
+      inspectTalosInstallerArchive(
+        await make("extra", expected.talosVersion, true),
+        join(directory, "extra"),
+        expected,
+      ),
+      /entry/,
+    );
+    await assert.rejects(
+      inspectTalosInstallerArchive(
+        await make("corrupt", expected.talosVersion, false, true),
+        join(directory, "corrupt"),
+        expected,
+      ),
+      /digest/,
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 import {
   reviewedBase,
   postgresBase,
+  storageBase,
+  rustBuilder,
+  rustVersion,
   reviewedFiles,
   reviewedManifestPaths,
   verifyNativeArtifacts,
 } from "./reviewed-findings.ts";
+import { sandboxImagePlan } from "../../infra/talos/sandbox/images.ts";
+import versions from "../../infra/platform/versions.lock.json" with { type: "json" };
+
+test("bootstrap runtime checks follow changed lock versions without second constants", () => {
+  const previous = [
+    versions.target.talosVersion,
+    versions.target.kubernetesVersion,
+    versions.bootstrapClients.helm.version,
+  ] as const;
+  try {
+    versions.target.talosVersion = "1.14.2";
+    versions.target.kubernetesVersion = "1.36.6";
+    versions.bootstrapClients.helm.version = "4.3.1";
+    const checks = runtimeChecks("node-bootstrap");
+    for (const [name, stdout] of [
+      [
+        "talosctl",
+        `Client:\n\tTag: v${versions.target.talosVersion}\n\tOS/Arch: linux/amd64\n`,
+      ],
+      [
+        "kubectl",
+        JSON.stringify({
+          clientVersion: {
+            gitVersion: `v${versions.target.kubernetesVersion}`,
+            platform: "linux/amd64",
+          },
+        }),
+      ],
+      ["helm", `v${versions.bootstrapClients.helm.version}`],
+    ])
+      assert.doesNotThrow(() =>
+        validateRuntimeResult(
+          checks.find((check) => check.entrypoint === name)!,
+          { exit: 0, stderr: "", stdout: stdout! },
+        ),
+      );
+  } finally {
+    [
+      versions.target.talosVersion,
+      versions.target.kubernetesVersion,
+      versions.bootstrapClients.helm.version,
+    ] = previous;
+  }
+});
 
 test("published PostgreSQL consumer pins retain the version tag required by CNPG admission", async () => {
   const sources = JSON.parse(
@@ -280,7 +447,7 @@ test("runtime profiles invoke every shipped entry and exact native client versio
   assert.doesNotThrow(() =>
     validateRuntimeResult(talos, {
       exit: 0,
-      stdout: "Client:\n\tTag: v1.14.1\n\tOS/Arch: linux/amd64\n",
+      stdout: `Client:\n\tTag: v${versions.target.talosVersion}\n\tOS/Arch: linux/amd64\n`,
       stderr: "",
     }),
   );
@@ -870,4 +1037,405 @@ test("inspection parsing and output-limit errors return fixed safe reasons", asy
   });
   assert.equal(overflow.status, 1);
   assert.match(overflow.stderr, /tool_output_limit:image_inspect/);
+});
+
+test("storage and Rust profiles bind their own sources without a fictitious runtime base", async () => {
+  const storage = await readFile("infra/storage/Dockerfile", "utf8");
+  assert.equal(validateDockerfile(storage, "storage"), storageBase);
+  for (const profile of [
+    "rust-gateway",
+    "native-controller",
+    "sandbox-controller",
+    "sandbox-extension",
+  ] as const) {
+    assert.equal(
+      validateDockerfile(
+        profile === "rust-gateway" || profile === "native-controller"
+          ? "ARG RUST_BUILDER\nFROM ${RUST_BUILDER} AS build\nFROM scratch\n"
+          : "ARG RUST_BUILDER\nFROM ${RUST_BUILDER} AS build\nFROM scratch AS talos-extension\nFROM scratch AS runtime\n",
+        profile,
+      ),
+      rustBuilder,
+    );
+    assert.throws(() =>
+      validateDockerfile(`FROM ${reviewedBase.image}\n`, profile),
+    );
+    assert.deepEqual(reviewedManifestPaths([], profile), []);
+    assert.throws(() =>
+      reviewedManifestPaths(["app/node_modules/x/package.json"], profile),
+    );
+  }
+  const check = runtimeChecks("rust-gateway")[0]!;
+  const identity = {
+    sourceRevision: "a".repeat(40),
+    versionsLockSha256: "b".repeat(64),
+    cargoLockSha256: "c".repeat(64),
+  };
+  const version = {
+    program: "pgcf-native-gateway",
+    version: "0.1.0",
+    rustVersion,
+    ...identity,
+  };
+  assert.doesNotThrow(() =>
+    validateRuntimeResult(
+      check,
+      { stdout: JSON.stringify(version), stderr: "", exit: 0 },
+      identity,
+    ),
+  );
+  assert.throws(() =>
+    validateRuntimeResult(
+      check,
+      {
+        stdout: JSON.stringify({ ...version, sourceRevision: "d".repeat(40) }),
+        stderr: "",
+        exit: 0,
+      },
+      identity,
+    ),
+  );
+  assert.throws(() =>
+    validateRuntimeResult(
+      check,
+      {
+        stdout: JSON.stringify({ ...version, sourceRevision: null }),
+        stderr: "",
+        exit: 0,
+      },
+      identity,
+    ),
+  );
+  assert.throws(() =>
+    validateRuntimeResult(
+      check,
+      {
+        stdout: JSON.stringify({ ...version, rustVersion: "0.0" }),
+        stderr: "",
+        exit: 0,
+      },
+      identity,
+    ),
+  );
+  assert.equal(runtimeChecks("storage")[0]!.entrypoint, "/usr/sbin/thin_check");
+  const controller = runtimeChecks("native-controller")[0]!;
+  const protocol = await readFile(
+    "packages/contracts/native/protocol.generated.json",
+  );
+  const contract = await readFile(
+    "packages/contracts/native/controller.generated.json",
+  );
+  const controllerVersion = {
+    ...version,
+    program: "pgcf-native-controller",
+    protocolSha256: createHash("sha256").update(protocol).digest("hex"),
+    controllerContractSha256: createHash("sha256")
+      .update(contract)
+      .digest("hex"),
+    configurationSchemaRevision: JSON.parse(contract.toString()).constants
+      .CONFIGURATION_SCHEMA_REVISION,
+  };
+  const result = (value: unknown) => ({
+    stdout: JSON.stringify(value),
+    stderr: "",
+    exit: 0,
+  });
+  assert.doesNotThrow(() =>
+    validateRuntimeResult(controller, result(controllerVersion), identity),
+  );
+  assert.throws(
+    () =>
+      validateRuntimeResult(
+        controller,
+        result({
+          ...controllerVersion,
+          controllerContractSha256: "d".repeat(64),
+        }),
+        identity,
+      ),
+    /runtime_generated_input_invalid/,
+  );
+  assert.throws(
+    () =>
+      validateRuntimeResult(
+        controller,
+        result({ ...controllerVersion, configurationSchemaRevision: 0 }),
+        identity,
+      ),
+    /runtime_generated_input_invalid/,
+  );
+});
+
+test("relay and reclaimer qualification require their own compiled contracts and source identity", async () => {
+  for (const [profile, packageName, contractName, field] of [
+    [
+      "rust-bootstrap-relay",
+      "native-bootstrap-relay",
+      "bootstrap",
+      "bootstrapContractSha256",
+    ],
+    [
+      "native-reclaimer",
+      "native-reclaimer",
+      "reclaim",
+      "reclaimContractSha256",
+    ],
+  ] as const) {
+    const check = runtimeChecks(profile)[0]!;
+    assert.equal(check.entrypoint, `/pgcf-${packageName}`);
+    assert.deepEqual(reviewedManifestPaths([], profile), []);
+    assert.throws(() =>
+      reviewedManifestPaths(["app/node_modules/pkg/package.json"], profile),
+    );
+    assert.equal(
+      validateDockerfile(
+        "ARG RUST_BUILDER\nFROM ${RUST_BUILDER} AS build\nFROM scratch\n",
+        profile,
+      ),
+      rustBuilder,
+    );
+    const sha = async (path: string) =>
+      createHash("sha256")
+        .update(await readFile(path))
+        .digest("hex");
+    const identity = {
+      sourceRevision: "a".repeat(40),
+      versionsLockSha256: "b".repeat(64),
+      cargoLockSha256: "c".repeat(64),
+    };
+    const version = {
+      program: `pgcf-${packageName}`,
+      version: "0.1.0",
+      rustVersion,
+      ...identity,
+      protocolSha256: await sha(
+        "packages/contracts/native/protocol.generated.json",
+      ),
+      [field]: await sha(
+        `packages/contracts/native/${contractName}.generated.json`,
+      ),
+    };
+    const result = (value: unknown) => ({
+      stdout: JSON.stringify(value),
+      stderr: "",
+      exit: 0,
+    });
+    assert.doesNotThrow(() =>
+      validateRuntimeResult(check, result(version), identity),
+    );
+    assert.throws(
+      () =>
+        validateRuntimeResult(
+          check,
+          result({ ...version, [field]: "d".repeat(64) }),
+          identity,
+        ),
+      /runtime_generated_input_invalid/,
+    );
+    assert.throws(
+      () =>
+        validateRuntimeResult(
+          check,
+          result({ ...version, protocolSha256: "d".repeat(64) }),
+          identity,
+        ),
+      /runtime_generated_input_invalid/,
+    );
+    assert.throws(
+      () =>
+        validateRuntimeResult(
+          check,
+          result({ ...version, sourceRevision: "d".repeat(40) }),
+          identity,
+        ),
+      /runtime_provenance_invalid/,
+    );
+  }
+});
+
+test("Rust publication requires real compiled artifact identities and no claimed shipped builder prefix", () => {
+  const report = {
+    baseImage: null,
+    baseImageId: null,
+    builderImage: rustBuilder,
+    builderImageId: `sha256:${"a".repeat(64)}`,
+    compiledArtifacts: [
+      { path: "pgcf-native-gateway", sha256: "b".repeat(64), size: 1024 },
+    ],
+  };
+  assert.doesNotThrow(() => validateProfileProvenance(report, "rust-gateway"));
+  assert.throws(() =>
+    validateProfileProvenance(
+      { ...report, compiledArtifacts: [] },
+      "rust-gateway",
+    ),
+  );
+  assert.throws(() =>
+    validateProfileProvenance(
+      { ...report, baseImage: rustBuilder },
+      "rust-gateway",
+    ),
+  );
+  assert.throws(() => validateProfileProvenance(report, "sandbox-controller"));
+});
+test("Talos extension assembly admits only exact source-bound manifests, binaries and notices", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-extension-assembly-")),
+    files: LayerFile[] = [],
+    revision = "a".repeat(40),
+    root = "rootfs/usr/local/share/licenses/pgcf-sandbox";
+  const add = async (path: string, bytes: Buffer | string) => {
+    const body = Buffer.from(bytes),
+      scanPath = String(files.length);
+    await writeFile(join(directory, scanPath), body);
+    files.push({
+      path,
+      scanPath,
+      layer: 0,
+      sha256: createHash("sha256").update(body).digest("hex"),
+      size: body.length,
+    });
+  };
+  try {
+    const elf = Buffer.alloc(20);
+    elf.set([0x7f, 0x45, 0x4c, 0x46, 2, 1]);
+    elf.writeUInt16LE(62, 18);
+    await add("rootfs/usr/local/bin/pgcf-sandbox-controller", elf);
+    await add("rootfs/usr/local/bin/pgcf-node-runtime", elf);
+    for (const [name, source] of [
+      ["Cargo.lock", "Cargo.lock"],
+      ["versions.lock.json", "infra/platform/versions.lock.json"],
+      [
+        "protocol.generated.json",
+        "packages/contracts/native/protocol.generated.json",
+      ],
+      [
+        "constants.generated.rs",
+        "packages/native-protocol/src/constants.generated.rs",
+      ],
+      [
+        "compute-pool.generated.json",
+        "packages/contracts/native/compute-pool.generated.json",
+      ],
+      [
+        "reclaim.generated.json",
+        "packages/contracts/native/reclaim.generated.json",
+      ],
+    ])
+      await add(`${root}/provenance/${name}`, await readFile(source!));
+    await add(`${root}/pgcf/LICENSE`, await readFile("LICENSE"));
+    // The real image must carry upstream notice files; these unit bytes exercise path/provenance isolation only.
+    await add(`${root}/rust/LICENSE-MIT`, "Rust MIT notice");
+    await add(`${root}/rust/LICENSE-APACHE`, "Rust Apache notice");
+    await add(`${root}/crates/example/LICENSE`, "Upstream notice");
+    for (const [path, source] of [
+      ["manifest.yaml", "infra/talos/sandbox/manifest.yaml"],
+      [
+        "rootfs/usr/local/etc/containers/pgcf-sandbox-controller.yaml",
+        "infra/talos/sandbox/service.yaml",
+      ],
+      [
+        "rootfs/etc/cri/conf.d/20-pgcf-prestarted.part",
+        "infra/talos/sandbox/20-pgcf-prestarted.part",
+      ],
+    ])
+      await add(
+        path!,
+        (await readFile(source!, "utf8"))
+          .replace("PGCF_EXTENSION_VERSION", "0.1.0-" + revision)
+          .replace("PGCF_TALOS_VERSION", versions.target.talosVersion),
+      );
+    assert.equal(
+      (
+        await verifyRustAssembly(
+          files,
+          directory,
+          "sandbox-extension",
+          revision,
+        )
+      ).length,
+      2,
+    );
+    await assert.rejects(
+      verifyRustAssembly(files, directory, "sandbox-extension", "b".repeat(40)),
+    );
+    await assert.rejects(
+      verifyRustAssembly(
+        files.filter((file) => !file.path.endsWith("/reclaim.generated.json")),
+        directory,
+        "sandbox-extension",
+        revision,
+      ),
+    );
+    await add("rootfs/var/lib/pgcf-sandbox/agent-key", "forbidden");
+    await assert.rejects(
+      verifyRustAssembly(files, directory, "sandbox-extension", revision),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test("public recipe profile verifies its canonical source inputs and cannot claim a shipped compiler or base", async () => {
+  const revision = "d".repeat(40),
+    plan = sandboxImagePlan({
+      sourceCommit: revision,
+      architecture: "amd64",
+      sandboxExtension: "ghcr.io/example/sandbox@sha256:" + "a".repeat(64),
+      otherExtensions: [],
+    }),
+    directory = await mkdtemp(join(tmpdir(), "pgcf-recipe-assembly-")),
+    files: LayerFile[] = [];
+  try {
+    for (const [path, body] of [
+      ["manifest.yaml", JSON.stringify(plan.schematicManifest, null, 2) + "\n"],
+      [
+        "rootfs/usr/local/share/pgcf/talos-recipe.json",
+        JSON.stringify(plan.recipe, null, 2) + "\n",
+      ],
+      [
+        "rootfs/usr/local/share/licenses/pgcf-recipe/LICENSE",
+        await readFile("LICENSE", "utf8"),
+      ],
+    ]) {
+      const scanPath = String(files.length);
+      await writeFile(join(directory, scanPath), body!);
+      files.push({
+        path: path!,
+        scanPath,
+        layer: 0,
+        sha256: createHash("sha256").update(body!).digest("hex"),
+        size: Buffer.byteLength(body!),
+      });
+    }
+    assert.equal(
+      await verifyTalosRecipeAssembly(files, directory, revision),
+      plan.recipeSha256,
+    );
+    await assert.rejects(
+      verifyTalosRecipeAssembly(files, directory, "e".repeat(40)),
+    );
+    assert.equal(
+      validateDockerfile(
+        await readFile("infra/talos/sandbox/recipe.Dockerfile", "utf8"),
+        "talos-recipe",
+      ),
+      "scratch",
+    );
+    assert.deepEqual(runtimeChecks("talos-recipe"), []);
+    const report = {
+      baseImage: null,
+      baseImageId: null,
+      recipeSha256: plan.recipeSha256,
+    };
+    assert.doesNotThrow(() =>
+      validateProfileProvenance(report, "talos-recipe"),
+    );
+    assert.throws(() =>
+      validateProfileProvenance(
+        { ...report, baseImage: rustBuilder },
+        "talos-recipe",
+      ),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });

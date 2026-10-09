@@ -23,6 +23,7 @@ import {
 } from "@pgcf/contracts/route-token";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../../src/app.ts";
+import { nodeRow } from "../../src/platform/rows.ts";
 import { keyring } from "../../src/crypto/keyring.ts";
 import {
   purgeIdempotency,
@@ -680,6 +681,19 @@ describe("API platform on real Workers D1", () => {
     )
       .bind(node, region.id, `node-${crypto.randomUUID()}`, now, now)
       .run();
+    await env.DB.prepare(
+      "UPDATE nodes SET warm_reclaim_qualification_json=? WHERE id=?",
+    )
+      .bind(
+        JSON.stringify({ version: 1, private_observation: "internal-proof" }),
+        node,
+      )
+      .run();
+    const stored = await env.DB.prepare("SELECT * FROM nodes WHERE id=?")
+      .bind(node)
+      .first<Record<string, unknown>>();
+    expect(() => nodeRow(stored!)).not.toThrow();
+    expect(() => nodeRow({ ...stored!, allocatable_memory_mib: -1 })).toThrow();
     const listing = await worker.fetch(request("/v1/nodes", admin.key), env);
     const observed = (
       await listing.json<{
@@ -692,6 +706,8 @@ describe("API platform on real Workers D1", () => {
       }>()
     ).data;
     expect(observed).toHaveLength(1);
+    expect(listing.status).toBe(200);
+    expect(observed[0]).not.toHaveProperty("warm_reclaim_qualification_json");
     expect(observed[0]).toMatchObject({
       id: node,
       ready: true,

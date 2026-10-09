@@ -6,6 +6,25 @@ fn main() {
     use pgcf_node_runtime::{linux, protocol};
     use std::{path::Path, time::Duration};
     let args: Vec<_> = std::env::args().collect();
+    if args.len() == 2 && args[1] == "--version" {
+        fn field(value: Option<&str>) -> String {
+            value
+                .filter(|s| {
+                    s.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b))
+                })
+                .map_or_else(|| "null".into(), |s| format!("\"{s}\""))
+        }
+        println!(
+            "{{\"program\":\"pgcf-node-runtime\",\"version\":\"{}\",\"protocol\":1,\"sourceRevision\":{},\"rustVersion\":{},\"versionsLockSha256\":{},\"cargoLockSha256\":{}}}",
+            env!("CARGO_PKG_VERSION"),
+            field(option_env!("PGCF_SOURCE_REVISION").filter(|s| s.len() == 40)),
+            field(option_env!("PGCF_RUST_VERSION")),
+            field(option_env!("PGCF_VERSIONS_LOCK_SHA256")),
+            field(option_env!("PGCF_CARGO_LOCK_SHA256"))
+        );
+        return;
+    }
     let result = (|| {
         if args.len() != 5 {
             return Err("usage: pgcf-node-runtime SOCKET_PATH SLOT_ID CONTROLLER_UID LIFETIME_MS");

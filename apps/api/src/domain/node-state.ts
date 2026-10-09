@@ -145,8 +145,8 @@ export async function configureNodeRegionPolicy(
   // suspension; the next resume still needs a fresh full-peak startup grant.
   const result = await db
     .prepare(
-      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids)
-    SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]') FROM regions r WHERE r.id=? AND r.provider='contabo'
+      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,compute_pool_json,thin_storage_json)
+    SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,? FROM regions r WHERE r.id=? AND r.provider='contabo'
       AND ((COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id),'reserved')=?
         AND (?='reserved' OR (SELECT postgres_memory_request_mib FROM node_region_policies WHERE region_id=r.id) IS ?))
         OR (NOT EXISTS(SELECT 1 FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
@@ -165,7 +165,7 @@ export async function configureNodeRegionPolicy(
           AND (s.memory_mib<256 OR s.memory_mib%256<>0 OR s.memory_mib>? OR s.memory_mib<?)))
     ON CONFLICT(region_id) DO UPDATE SET max_nodes=excluded.max_nodes,purchases_enabled=excluded.purchases_enabled,order_config=excluded.order_config,
       placement_mode=excluded.placement_mode,maximum_database_memory_mib=excluded.maximum_database_memory_mib,postgres_memory_request_mib=excluded.postgres_memory_request_mib,standing_cost_profile=excluded.standing_cost_profile,standing_cost_profile_hash=excluded.standing_cost_profile_hash,
-      autoscale_enabled=COALESCE(?,node_region_policies.autoscale_enabled),adopt_instance_ids=COALESCE(?,node_region_policies.adopt_instance_ids)`,
+      autoscale_enabled=COALESCE(?,node_region_policies.autoscale_enabled),adopt_instance_ids=COALESCE(?,node_region_policies.adopt_instance_ids),compute_pool_json=CASE WHEN ?=1 THEN excluded.compute_pool_json ELSE node_region_policies.compute_pool_json END,thin_storage_json=CASE WHEN ?=1 THEN excluded.thin_storage_json ELSE node_region_policies.thin_storage_json END`,
     )
     .bind(
       policy.max_nodes,
@@ -186,6 +186,8 @@ export async function configureNodeRegionPolicy(
       policy.adopt_instance_ids === undefined
         ? null
         : JSON.stringify(policy.adopt_instance_ids),
+      policy.compute_pool == null ? null : canonical(policy.compute_pool),
+      policy.thin_storage == null ? null : canonical(policy.thin_storage),
       policy.region_id,
       policy.placement_mode,
       policy.placement_mode,
@@ -199,6 +201,8 @@ export async function configureNodeRegionPolicy(
       policy.adopt_instance_ids === undefined
         ? null
         : JSON.stringify(policy.adopt_instance_ids),
+      Number(policy.compute_pool !== undefined),
+      Number(policy.thin_storage !== undefined),
     )
     .run();
   if (result.meta.changes !== 1) {

@@ -1,0 +1,32 @@
+# SPDX-License-Identifier: Apache-2.0
+[package]
+name = "pgcf-native-controller"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.99"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+webpki-roots = "=1.0.9"
+pgcf-native-protocol = { path = "../../packages/native-protocol" }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+tokio = { version = "=1.53.2", features = ["rt-multi-thread", "net", "io-util", "macros", "sync", "time", "signal", "fs"] }
+futures-util = { version = "=0.3.34", features = ["sink"] }
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls-no-provider", "json", "stream"] }
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = { version = "=1.15.1", default-features = false, features = ["std"] }
+tokio-tungstenite = { version = "=0.30.0", features = ["rustls-tls-webpki-roots"] }
+jsonschema = { version = "=0.58.6", default-features = false }
+x509-parser = { version = "=0.18.1", default-features = false }
+tokio-postgres = "=0.7.18"
+tokio-postgres-rustls = { version = "=0.14.0", features = ["ring"] }
+sha2 = "=0.11.0"
+hmac = "=0.13.0"
+base64 = "=0.23.1"
+time = { version = "=0.3.55", features = ["formatting", "parsing"] }
+
+[dev-dependencies]
+tokio-rustls = {version="=0.26.6",default-features=false,features=["ring","tls12"]}
+rcgen = { version = "=0.14.10", default-features = false, features = ["ring", "pem"] }

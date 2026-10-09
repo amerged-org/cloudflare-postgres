@@ -41,7 +41,13 @@ import {
   ensureNodePreparationProof,
   ensureNodeVerificationProof,
 } from "../domain/node-proof.ts";
-import { NodeBootstrapCheckpoint } from "@pgcf/contracts/node-bootstrap";
+import {
+  NodeBootstrapCheckpoint,
+  type NodePostjoinRelease,
+} from "@pgcf/contracts/node-bootstrap";
+import { readNodePostjoinRelease } from "../domain/node-postjoin-release.ts";
+import { ensureBootstrapFleetPatch } from "../domain/fleet-patches.ts";
+import { ensureBootstrapThinStorage } from "../domain/node-thin-storage-bootstrap.ts";
 
 function orderInput(
   env: Env,
@@ -87,6 +93,7 @@ export async function dispatchNodeOrder(
   env: Env,
   operationId: string,
   provider: Pick<ContaboClient, "order"> = contaboClient(env),
+  postjoinRelease?: NodePostjoinRelease,
 ): Promise<void> {
   let addition = await readNodeAddition(env.DB, operationId);
   if (
@@ -95,6 +102,11 @@ export async function dispatchNodeOrder(
   )
     return;
   // Validate all local configuration before persisting the irreversible dispatch claim.
+  await readNodePostjoinRelease(
+    env,
+    addition.intent.request.region_id,
+    postjoinRelease,
+  );
   const input = orderInput(env, addition);
   const claim = await claimNodeDispatch(env.DB, operationId, addition.revision);
   if (!claim.claimed) return;
@@ -429,6 +441,23 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
         });
         return { operation_id: id, status: "ready" };
       }
+      const existingJob = await this.env.DB.prepare(
+        "SELECT operation_id FROM node_bootstrap_jobs WHERE operation_id=?",
+      )
+        .bind(id)
+        .first();
+      const postjoinRelease = existingJob
+        ? undefined
+        : await step.do(
+            "selected-postjoin-release",
+            async () =>
+              (
+                await readNodePostjoinRelease(
+                  this.env,
+                  addition.intent.request.region_id,
+                )
+              ).reference,
+          );
       if (
         addition.status === "reserved" &&
         addition.intent.request.mode === "order"
@@ -438,7 +467,7 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
           { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" },
           async () => {
             try {
-              await dispatchNodeOrder(this.env, id);
+              await dispatchNodeOrder(this.env, id, undefined, postjoinRelease);
             } catch (error) {
               if (!(
                 error instanceof NodeStateError &&
@@ -505,7 +534,8 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
           await step.do(
             `compose-inspected-${cycle}`,
             { retries: { limit: 0, delay: "1 second" }, timeout: "2 minutes" },
-            () => composeConfiguredNodeBootstrap(this.env, id),
+            () =>
+              composeConfiguredNodeBootstrap(this.env, id, { postjoinRelease }),
           );
         }
         const job = await this.env.DB.prepare(
@@ -520,6 +550,28 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
             async () => {
               const job = await readBootstrapJob(this.env.DB, id);
               if (job.admission_authorized) {
+                const input = await bootstrapJobInput(this.env, job);
+                if (input.spec.postjoin_release) {
+                  const patch = await ensureBootstrapFleetPatch(this.env, id);
+                  if (patch.stage !== "complete" || patch.state !== "confirmed")
+                    return {
+                      operation_id: id,
+                      postjoin_operation_id: patch.operation_id,
+                    };
+                  if (
+                    !(await ensureBootstrapThinStorage(this.env, id)).qualified
+                  )
+                    return {
+                      operation_id: id,
+                      postjoin_operation_id: patch.operation_id,
+                    };
+                  if (
+                    !(await ensureNodeVerificationProof(this.env, id, {
+                      notBefore: patch.updated_at,
+                    }))
+                  )
+                    return { operation_id: id };
+                }
                 if (!(await finalizeNodeAdmission(this.env, id))) {
                   await this.env.NODE_BOOTSTRAP.get(
                     this.env.NODE_BOOTSTRAP.idFromName(id),
@@ -543,6 +595,14 @@ export class AddNode extends WorkflowEntrypoint<Env, { operation_id: string }> {
                   return { operation_id: id };
                 if (!(await ensureBootstrapNetworkBoundary(this.env, id)))
                   return { operation_id: id };
+                const input = await bootstrapJobInput(this.env, job);
+                if (input.spec.postjoin_release)
+                  await readNodePostjoinRelease(
+                    this.env,
+                    job.region_id,
+                    input.spec.postjoin_release,
+                    job.node_id,
+                  );
                 await this.env.NODE_BOOTSTRAP.get(
                   this.env.NODE_BOOTSTRAP.idFromName(id),
                 ).start(id);

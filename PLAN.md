@@ -1,6 +1,18 @@
 # cloudflare-postgres — Plan
 
-Status (2026-10-08, corrected): **Overall product goal NOT achieved. The EU/US database lifecycle and RAM-trigger tests passed; uniform fleet configuration, autonomous rollout, patch management and the approved fast-start architecture remain incomplete.**
+Status (2026-10-09, corrected): **Overall product goal NOT achieved. The EU/US database lifecycle and RAM-trigger tests passed; uniform fleet configuration, autonomous rollout, patch management and the approved fast-start architecture remain incomplete.**
+
+The corrected API and both regional runtimes now run source `6978033`, accepted by CI
+`37851000610`. Both live regional policies have `max_nodes:3`, counting retained control and lost
+allocations. Both regions now use the same actual-RAM policy, with a128MiB PostgreSQL request and
+4096MiB maximum. The controlled EU transition completed in135s through confirmed suspension and
+fresh startup admission; all3 retained databases returned Ready with unchanged storage and
+application table hashes. The exact V159 standing authority is recorded in both regions.
+Automatic expansion remains off until the current approved installation templates
+and full release are ready; the missing EU installation profile is a configuration gap, not
+missing owner permission. The notification receiver is deployed from source `f08b9cc0`, full CI `37860011792`; the actual75%
+warning, provider-confirmed delivery and identical-event replay are accepted. Matching Regional images do not close the
+remaining Kubernetes, Talos schematic, resource-policy, patch or fast-start gates.
 
 The earlier broad completion claim is withdrawn. The owner now requires all three retained
 servers to converge on one approved release, PGCF-owned Cloudflare customer configuration
@@ -81,7 +93,7 @@ this is not proof of their actual workload requirements or achievable density. E
 
 Actual software differences and the customer handover are documented in
 `docs/operations/operator-installation.md`: Talos1.14.1/kernel6.18.51/containerd2.3.5 match;
-Kubernetes is EU1.36.3/US1.36.5, Flux and Regional digests differ. No difference blocked the
+Kubernetes is EU1.36.3/US1.36.5 and Flux differs; Regional source and RAM policy now match. No difference blocked the
 accepted lifecycle. Customer migration remains separate and requires credential rotation after
 the October5 revision1 exposure, the adopter's TCP-to-WSS adapter and deadline policy, restore
 new-ID rebinding, and sufficient explicitly approved regional capacity.
@@ -2278,8 +2290,83 @@ docs/operations       operator installation, recovery and credential runbooks
 Only completed real runs establish phase acceptance. Local checks are identified separately.
 Earlier failed attempts and corrections remain in Git history.
 
+The current corrective batch remains unpublished. The retained fleet passed six actual
+server dry-runs for RuntimeClass and admission-policy object shapes, with no persisted objects
+or changed cluster identities. Local rendering of all five immutable charts confirms fifteen
+workload image references and the separately configured Barman sidecar; four Flux controllers
+and cloudflared now select the same architecture digests as the version lock. Twenty-four
+affected bootstrap/release tests pass. Fifty-two image-input/qualification tests pass, including
+the new relay/reclaimer contracts; a further regression removes duplicated Talos/Kubernetes/Helm
+version constants from the qualifier. These are source and shape checks, not fast-start, thin
+storage, image or fleet acceptance. Before release, the batch also corrects the observed two-node
+activation dependency: every regional host must be prepared before the shared compute runtime
+is activated, and PostgreSQL convergence applies to the current node. The complete physical,
+CI and live gates below remain open.
+
+The same unpublished batch now wires bounded official update discovery and administrator policy/
+candidate routes into the existing API and Cron; eighteen affected API/maintenance tests pass.
+No policy is inserted or enabled automatically, and candidates remain explicitly awaiting an
+actual qualification channel. The publication verifier now streams every compressed and expanded
+registry layer before writing its receipt; seven focused corruption/identity/deadline cases pass.
+A real stock Talos installer archive was inspected in5.087s:144,645,632 bytes,2 layers,1334 files
+and1375 scan inputs, with the exact official base diffID. This establishes archive framing and
+hash binding only. The composed PGCF installer/raw image still needs nested-payload scanning and
+its own isolated boot proof. Production Node dependency audit reports0 advisories across89
+dependencies; after removing the informational unmaintained PEM wrapper, OSV reports0 matches
+across315 locked registry crates. The parser change passed22 actual TLS/CA/transport cases.
+Neither dependency result establishes OS-image clearance, exposed-key rotation or full security
+acceptance. No fleet mutation, order or customer migration was performed for this batch.
+
+The final candidate targets Talos1.14.2 (kernel6.18.54, containerd2.3.6, runc1.5.2)
+because the previously selected containerd2.3.5 is affected by CVE-2026-53493. Official
+imager, installer-base and all three CLI downloads are digest-bound in the version lock.
+The stock1.14.2 diagnostic scanned4888 inputs/10,373,878,998 payload bytes in320.085s;
+104 detections were independently resolved to exact public upstream byte spans. The stock
+maintenance boot passed in55.977s. Correcting the imager's double-counted boot geometry produced
+a4,453,302,272-byte raw image/231,981,404-byte compressed image and a51.579s maintenance boot.
+These stock measurements do not qualify the composed PGCF image. The final image must pass its
+own complete-byte scan, extension/recipe identity and isolated boot before immutable publication.
+The public-source scan's16 candidates are test fixtures/public checksums, not credentials.
+
+Local common checks cover823 API,445 Regional,30 CLI,237 end-to-end utility and19 actual
+Rust-Edge Workerd tests. The native Rust snapshot passed141 top-level tests plus its nested
+Worker probe;2 physical-kernel tests remain separate. Stale orphan-inventory and Talos fixture
+expectations were corrected in their affected suites rather than weakening runtime identity
+checks. Final protected-volume drain and publication changes still require their affected checks
+and the single final CI run. A fresh read-only fleet check on October9 confirms3 Ready nodes,
+10 Ready Helm releases and all3 retained EU database identities, with0 provider calls/0 writes.
+Migrations0031–0037 passed a2.322s local rehearsal on the real exported D1 baseline:
+all269,730 existing rows across46 tables retain every old field and rowid; foreign-key and
+integrity checks pass. Populated uncertain/acknowledged startup holds also pass the separate
+D1 rebuild regression. The protected-volume drain now reserves physical writeback headroom
+without inventing another tenant RAM allocation; it cannot authorize tenant Create/Start.
+Its scoped30 D1,6 Native and17 Rust cases pass; actual US physical drain/delete remains open.
+The retained official Talos1.14.2 and Kubernetes1.36.5 SBOMs pass full Sigstore verification
+against their expected release signing identities in0.921s/1.036s, including default TUF trust
+and transparency evidence. The verification binary was independently signature-verified before
+execution. This closes those two SBOM provenance gaps, not platform-image or vulnerability review.
+The prepared API bundle passes Wrangler4.145.0 dry-run without warnings (438.41KiB compressed);
+all existing bindings are preserved and only the required PatchNode Workflow binding is added.
+The publication transport passes19 interruption/identity/readback tests. Exact public receipts
+are retained by the existing CI, and successful boot qualification/publication reports are
+attested. The final source delta scanner examined28 changed/new files (822,555 bytes) with0
+candidates. No installer/raw publication or fleet upgrade is inferred from these local checks.
+Protected manual suspension also passes18 native Power cases and strict Clippy after reproducing
+the absent-PostgreSQL failure. It requires current stop authority, positive hibernation, zero
+Pods/sessions and exact retained volume/fence identity; local WAL and prior uncertain progress
+remain, and archive completion is reported unknown. The normal Git secret guard identified the
+same16 independently reviewed public/test values. Exact rule+file+value exceptions now clear only
+those values; changed values, other paths and unrelated token rules still block. Image scanning
+and the independent real-credential scan are unchanged.
+
 | Date       | Phase                     | Result and measured limits                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 2026-10-09 | Live regional warning, delivery, dedupe and small ceiling | Both live regional max_nodes values are3. Exact OMH sourcef08b9cc0 passes all13 CI37860011792 jobs, applies only Dev schema179 and the existing Mail Gateway; ingress, minute schedule and previous secrets are preserved. PGCF697 activates one private Fetcher binding/secret in15.554s with all previous Native/bindings/3nodes/3retained databases/custody unchanged. Actual US1 RAM warning fired at77.2919%; later10 fresh consecutive samples,00:02:07–00:11:10Z, average80.0101% on the same physical NodeUID. Resend confirms delivered; actual identical service-binding replay200 retains one receipt/messageID and unchanged attempt/acceptance times. The3968MiB load had4096MiB limit/960s deadline; exact owned Namespace is absent, NodeReady unchanged, available RAM5,812,072,448B versus5,631,000,576B before. Subsequent00:35:41–00:37:42Z API tail197events/0Contabo attempts. First rejected tail collection is excluded. Purchases0, autoscaleoff until full release/templates pass, no customer migration. Cap-notice live mail awaits a genuine third allocation; no false threshold/recipient is synthesized. |
+| 2026-10-09 | Uniform live RAM authority and preserved EU data | Both regional policies now use actual_ram,128MiB PostgreSQL request,4096MiB maximum and max_nodes3. Exact V159/one-month/no-add-on ram76 standing authority is recorded; monetary/order/expiry fields are null under the owner decision. Controlled EU suspend→policy→fresh-peak resume completed in135s; all3 retained databases are Ready, generation+2, same storage generations/roles/custody/application-table hashes, including2 original committed rows. Cloudflare SQL after transition894/899/820ms, TLS1.3, nonsuperuser, PostgreSQL18.6. Autoscaling stays off for the unaccepted template/full-release gate; Contabo0, purchases0, EU resets0. |
+| 2026-10-09 | Actual256MiB entry-class SQL, R2 and physical deletion | One disposable US1 database used a CF-owned resource-profile revision with PostgreSQL256MiB/250m,1GiB logical disk and the unchanged Barman resource limits. Cloudflare first read10675ms after idle, TLS1.3/nonsuperuser/PostgreSQL18.6;2000 committed rows and50 queries over20000 generated rows each (p50123ms,p95203ms). R2 reports1 base backup/5 WAL objects/7,137,282bytes. Supported deletion succeeded and returned1,073,741,824 physical bytes; current VG free103,075,020,800bytes, thick allocation0. Automatic60s idle removed the Pod before cgroup peak measurement, so backup peak and lower scheduling requests are not qualified. This validates256MiB functionality on source697, not the unshipped Rust/thin fast-start release. Contabo0, purchases0. |
+| 2026-10-09 | Corrective API/Regional delivery and live small ceiling | Source6978033 passes fullCI37851000610, including all3 image jobs. D1 migrations0024–0030 preserved all36 legacy table row hashes in the207,312,164-byte local export rehearsal; live migration/readback preserves3nodes,3EU databases, roles,6custody envelopes and originalUSReady/admitted authority. API publication/readback15.224s; Regional source-intent→Ready EU20.957s, US201.362s including one explicit server-rejected Flux CAS and operator resolution. Both run digest ee08af77e5d3adf875bc9bb4ef7fbc2d54fe0434d2af185cc6508c61d48571da; anonymous readback verified10layers/89,798,172 compressed bytes. Fresh SQL over Cloudflare passes all3 retained databases withTLS1.3/nonsuperuser/PostgreSQL18.6 in802/825/672ms. Both live caps are3; autoscale remainsoff, no new order, provider call, EU reset or customer migration. Notification source is deployed but recipient callback/mail acceptance remains pending. |
+| 2026-10-09 | Thin-storage prerequisites, US-only module | Fresh US1 is empty of customer DB/PVC/PV/LV allocations. One signed Talos no-reboot apply adds only dm_thin_pool; config revision1→2,8.454s intent-to-readback, unchangedNode/Cluster/DMI/boot and all30 original config/key documents, module dynamic/live. No LV/SC/PVC write or provider call. The pinned OpenEBS image lacks thin_check/thin_repair; a checksum/signature-pinned tools derivative passes local metadata smoke/corruption rejection but awaits CI/publication and real scratch lifecycle. This explicitly leaves a temporary US module configuration difference; thin customer placement remains unqualified. |
+| 2026-10-09 | Native shared runtime boundary — actual isolated Linux | Official containerd2.3.5/runc1.5.2 proof prestarts2 tenant-free holders and genuine version3 TaskServices, assigns each once, then creates ordinary daemon TasksService tasks with separate late-bound data mounts/markers, shared assigned net/IPC/UTS, private child PID/mount and actual32MiB cgroup limits. Stop/task/metadata cleanup passed; disposable container removed, no fleet/provider write. Create+Start+duplicate-refusal observations4.954/2.455ms are assignment measurements, not SQL latency. CRI/CNI/CNPG, leased pool lifecycle and Cloudflare first-read acceptance remain open. |
 | 2026-10-08 | Latest small VPS ceiling and infrastructure notifications | Owner adds maximum3 managed VPS per EU/US region, existing control/allocated lost servers included;75% actual regional RAM warning and cap notice go to the owner through the configured integration mail service. Hard occupancy includes unpaid reservations, notice counts assigned provider allocations; same-provider recovery does not add a VPS. A real-D1 regression reproduced a fourth purchase after one paid node became lost; canonical counting now blocks reservation and first dispatch. Generic bearer-authenticated Fetcher/HTTPS callbacks use stable event IDs, durable episodes,60s retry pacing and5s deadline; unknown RAM does not rearm warning,2xx means callback accepted only.27 affected PGCF tests pass. OMH owns the recipient/Resend integration with durable receipts; no address/provider key is hardcoded into PGCF. Neither alert deployment, real mail acceptance nor live max_nodes3 policy activation is yet claimed. |
 | 2026-10-08 | Consolidated owner-policy/native implementation — local, not deployed | Threshold-only V159 authority with null ceilings/unknown prices is implemented through existing policy/approval storage; legacy rows/hashes survive migration0029. Regional RAM uses10 aligned fresh minutes/each member's stableUID; an empty/new/unaligned spare suppresses repeat orders. Reservation/grant/renewal/first dispatch share the same fresh SQL; one active addition, manual costed bootstrap and uncertain-result reads remain. Autoscale revocation and policy execution settings update atomically. Local723API/166contracts/80Edge/254Bootstrap/442Regional/30CLI/237other tests passed. Initial CI37842734589 stopped at2 old Edge fixtures missing currentNodeUID/CPU/freshness; reproduced locally, fixtures corrected, all80Edge checks passed. No image was published by that failed CI. A real Regional Docker build reproduced missing versions.lock COPY; corrected build passes. Native Rust1.99/libc0.2.190 workspace has10 ordinary tests plus2 actual Linux kernel checks; currentAMD64 artifact under local emulation bound an authenticated namespaceFD to the same preparedPID in32.653041ms including independent readbacks, privateIPC/UTS, zero capabilities/NoNewPrivs, second-claim refusal and destruction. This is not database latency or full pool acceptance. Signed-hex slot-ID acceptance and zero-byteSCM_RIGHTS descriptor leaks were reproduced and fixed. Changed-image selection prevents unchanged artifact rebuilds after a coherent final stand. No live policy, node reinstall, extra provider order or customer migration occurred. |
 | 2026-10-08 | Owner policy supersedes finite-cap request | Owner explicitly confirmed: no additional limits are required; buy a V159 in a zone when it reaches76% actual RAM. Implement one-month150GiB NVMe/no-add-on regional expansion with no monetary/node/order/standing-expiry ceiling, while preserving optional adopter caps, one addition in flight, uncertain-write reconciliation and all hard placement/startup limits. Regional pressure uses10 aligned fresh consecutive minutes of every eligible customer node, each retaining its own NodeUID; an old hot node plus a new empty spare cannot trigger an order loop. Prices remain unknown where the API supplies no quote; no fictitious zero or guaranteed invoice cap. Policy changes remain local pending final qualification and deployment. |

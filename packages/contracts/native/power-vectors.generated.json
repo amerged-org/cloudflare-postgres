@@ -1,0 +1,1706 @@
+{
+  "intents": [
+    {
+      "name": "absent",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 1,
+        "desired_state": "running",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        }
+      },
+      "intent": null
+    },
+    {
+      "name": "manual",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "desired_state": "suspended",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce",
+          "reason": "manual"
+        }
+      },
+      "intent": {
+        "database": "dbbbbbbbbbbbbbbbbbbb",
+        "operation": "op_dddddddddddddddddddd",
+        "revision": 2,
+        "mode": "quiesce"
+      }
+    },
+    {
+      "name": "idle",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "desired_state": "suspended",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce",
+          "reason": "idle"
+        }
+      },
+      "intent": {
+        "database": "dbbbbbbbbbbbbbbbbbbb",
+        "operation": "op_dddddddddddddddddddd",
+        "revision": 2,
+        "mode": "quiesce"
+      }
+    },
+    {
+      "name": "running",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 3,
+        "desired_state": "running",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_eeeeeeeeeeeeeeeeeeee",
+          "revision": 3,
+          "mode": "running",
+          "reason": null
+        }
+      },
+      "intent": {
+        "database": "dbbbbbbbbbbbbbbbbbbb",
+        "operation": "op_eeeeeeeeeeeeeeeeeeee",
+        "revision": 3,
+        "mode": "running"
+      }
+    },
+    {
+      "name": "wrong-revision",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "desired_state": "suspended",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 1,
+          "mode": "quiesce",
+          "reason": "manual"
+        }
+      },
+      "rejected": true
+    },
+    {
+      "name": "wrong-state",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "desired_state": "running",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce",
+          "reason": "manual"
+        }
+      },
+      "rejected": true
+    },
+    {
+      "name": "wrong-reason",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "desired_state": "suspended",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce",
+          "reason": false
+        }
+      },
+      "rejected": true
+    }
+  ],
+  "progress": [
+    {
+      "name": "sql_busy",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "desired_state": "suspended",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce",
+          "reason": "manual"
+        }
+      },
+      "observation": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "state": "error",
+        "message": "sleep refused: busy",
+        "archive": { "continuous": false, "ready_wal_files": null },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "state": "awake",
+          "refusal": "busy"
+        }
+      },
+      "progress": {
+        "target": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce"
+        },
+        "phase": "refused",
+        "startedAt": 100000,
+        "anchor": {
+          "storageUid": "01234567-89ab-4def-8123-000000000007",
+          "storageState": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000001\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000002\",\"node\":\"native-test-node\",\"archivePath\":\"s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc\"}",
+          "volumeIdentity": "{\"claimUid\":\"01234567-89ab-4def-8123-000000000003\",\"volumeUid\":\"01234567-89ab-4def-8123-000000000004\",\"handle\":\"pvc-01234567-89ab-4def-8123-000000000003\"}",
+          "physicalGeneration": 1,
+          "namespaceUid": "01234567-89ab-4def-8123-000000000001",
+          "clusterUid": "01234567-89ab-4def-8123-000000000002",
+          "node": "native-test-node",
+          "archivePath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "claimName": "database-1",
+          "claimUid": "01234567-89ab-4def-8123-000000000003",
+          "volumeName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "volumeUid": "01234567-89ab-4def-8123-000000000004",
+          "handle": "pvc-01234567-89ab-4def-8123-000000000003",
+          "affinity": "null",
+          "lvmName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "lvmNamespace": "openebs",
+          "lvmUid": "01234567-89ab-4def-8123-000000000005"
+        },
+        "proofIntent": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce"
+        },
+        "gateways": [
+          {
+            "name": "gateway-1",
+            "uid": "01234567-89ab-4def-8123-00000000000b",
+            "ip": "10.20.0.1",
+            "restarts": 0
+          },
+          {
+            "name": "gateway-2",
+            "uid": "01234567-89ab-4def-8123-00000000000c",
+            "ip": "10.20.0.2",
+            "restarts": 0
+          }
+        ],
+        "keyUid": "01234567-89ab-4def-8123-00000000000a",
+        "keyVersion": "10",
+        "refusal": "busy"
+      },
+      "intent": {
+        "database": "dbbbbbbbbbbbbbbbbbbb",
+        "operation": "op_dddddddddddddddddddd",
+        "revision": 2,
+        "mode": "quiesce"
+      },
+      "hibernation": null,
+      "probes": 1
+    },
+    {
+      "name": "switch_unknown",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "desired_state": "suspended",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce",
+          "reason": "manual"
+        }
+      },
+      "observation": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "state": "error",
+        "message": "sleep refused: unknown",
+        "archive": { "continuous": false, "ready_wal_files": null },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "state": "awake",
+          "refusal": "unknown"
+        }
+      },
+      "progress": {
+        "target": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce"
+        },
+        "phase": "refused",
+        "startedAt": 100000,
+        "anchor": {
+          "storageUid": "01234567-89ab-4def-8123-000000000007",
+          "storageState": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000001\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000002\",\"node\":\"native-test-node\",\"archivePath\":\"s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc\"}",
+          "volumeIdentity": "{\"claimUid\":\"01234567-89ab-4def-8123-000000000003\",\"volumeUid\":\"01234567-89ab-4def-8123-000000000004\",\"handle\":\"pvc-01234567-89ab-4def-8123-000000000003\"}",
+          "physicalGeneration": 1,
+          "namespaceUid": "01234567-89ab-4def-8123-000000000001",
+          "clusterUid": "01234567-89ab-4def-8123-000000000002",
+          "node": "native-test-node",
+          "archivePath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "claimName": "database-1",
+          "claimUid": "01234567-89ab-4def-8123-000000000003",
+          "volumeName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "volumeUid": "01234567-89ab-4def-8123-000000000004",
+          "handle": "pvc-01234567-89ab-4def-8123-000000000003",
+          "affinity": "null",
+          "lvmName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "lvmNamespace": "openebs",
+          "lvmUid": "01234567-89ab-4def-8123-000000000005"
+        },
+        "proofIntent": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce"
+        },
+        "gateways": [
+          {
+            "name": "gateway-1",
+            "uid": "01234567-89ab-4def-8123-00000000000b",
+            "ip": "10.20.0.1",
+            "restarts": 0
+          },
+          {
+            "name": "gateway-2",
+            "uid": "01234567-89ab-4def-8123-00000000000c",
+            "ip": "10.20.0.2",
+            "restarts": 0
+          }
+        ],
+        "keyUid": "01234567-89ab-4def-8123-00000000000a",
+        "keyVersion": "10",
+        "refusal": "unknown"
+      },
+      "intent": {
+        "database": "dbbbbbbbbbbbbbbbbbbb",
+        "operation": "op_dddddddddddddddddddd",
+        "revision": 2,
+        "mode": "quiesce"
+      },
+      "hibernation": null,
+      "probes": 1
+    },
+    {
+      "name": "archive_timeout",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "desired_state": "suspended",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce",
+          "reason": "manual"
+        }
+      },
+      "observation": null,
+      "progress": {
+        "target": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce"
+        },
+        "phase": "archive",
+        "startedAt": 100000,
+        "anchor": {
+          "storageUid": "01234567-89ab-4def-8123-000000000007",
+          "storageState": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000001\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000002\",\"node\":\"native-test-node\",\"archivePath\":\"s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc\"}",
+          "volumeIdentity": "{\"claimUid\":\"01234567-89ab-4def-8123-000000000003\",\"volumeUid\":\"01234567-89ab-4def-8123-000000000004\",\"handle\":\"pvc-01234567-89ab-4def-8123-000000000003\"}",
+          "physicalGeneration": 1,
+          "namespaceUid": "01234567-89ab-4def-8123-000000000001",
+          "clusterUid": "01234567-89ab-4def-8123-000000000002",
+          "node": "native-test-node",
+          "archivePath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "claimName": "database-1",
+          "claimUid": "01234567-89ab-4def-8123-000000000003",
+          "volumeName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "volumeUid": "01234567-89ab-4def-8123-000000000004",
+          "handle": "pvc-01234567-89ab-4def-8123-000000000003",
+          "affinity": "null",
+          "lvmName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "lvmNamespace": "openebs",
+          "lvmUid": "01234567-89ab-4def-8123-000000000005"
+        },
+        "proofIntent": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce"
+        },
+        "gateways": [
+          {
+            "name": "gateway-1",
+            "uid": "01234567-89ab-4def-8123-00000000000b",
+            "ip": "10.20.0.1",
+            "restarts": 0
+          },
+          {
+            "name": "gateway-2",
+            "uid": "01234567-89ab-4def-8123-00000000000c",
+            "ip": "10.20.0.2",
+            "restarts": 0
+          }
+        ],
+        "keyUid": "01234567-89ab-4def-8123-00000000000a",
+        "keyVersion": "10",
+        "segment": "000000010000000000000001"
+      },
+      "intent": {
+        "database": "dbbbbbbbbbbbbbbbbbbb",
+        "operation": "op_dddddddddddddddddddd",
+        "revision": 2,
+        "mode": "quiesce"
+      },
+      "hibernation": null,
+      "probes": 1
+    },
+    {
+      "name": "safe",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "desired_state": "suspended",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce",
+          "reason": "manual"
+        }
+      },
+      "observation": null,
+      "progress": {
+        "target": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce"
+        },
+        "phase": "hibernating",
+        "startedAt": 100000,
+        "anchor": {
+          "storageUid": "01234567-89ab-4def-8123-000000000007",
+          "storageState": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000001\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000002\",\"node\":\"native-test-node\",\"archivePath\":\"s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc\"}",
+          "volumeIdentity": "{\"claimUid\":\"01234567-89ab-4def-8123-000000000003\",\"volumeUid\":\"01234567-89ab-4def-8123-000000000004\",\"handle\":\"pvc-01234567-89ab-4def-8123-000000000003\"}",
+          "physicalGeneration": 1,
+          "namespaceUid": "01234567-89ab-4def-8123-000000000001",
+          "clusterUid": "01234567-89ab-4def-8123-000000000002",
+          "node": "native-test-node",
+          "archivePath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "claimName": "database-1",
+          "claimUid": "01234567-89ab-4def-8123-000000000003",
+          "volumeName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "volumeUid": "01234567-89ab-4def-8123-000000000004",
+          "handle": "pvc-01234567-89ab-4def-8123-000000000003",
+          "affinity": "null",
+          "lvmName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "lvmNamespace": "openebs",
+          "lvmUid": "01234567-89ab-4def-8123-000000000005"
+        },
+        "proofIntent": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce"
+        },
+        "gateways": [
+          {
+            "name": "gateway-1",
+            "uid": "01234567-89ab-4def-8123-00000000000b",
+            "ip": "10.20.0.1",
+            "restarts": 0
+          },
+          {
+            "name": "gateway-2",
+            "uid": "01234567-89ab-4def-8123-00000000000c",
+            "ip": "10.20.0.2",
+            "restarts": 0
+          }
+        ],
+        "keyUid": "01234567-89ab-4def-8123-00000000000a",
+        "keyVersion": "10",
+        "segment": "000000010000000000000001"
+      },
+      "intent": {
+        "database": "dbbbbbbbbbbbbbbbbbbb",
+        "operation": "op_dddddddddddddddddddd",
+        "revision": 2,
+        "mode": "quiesce"
+      },
+      "hibernation": "on",
+      "probes": 1
+    },
+    {
+      "name": "confirmed",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "desired_state": "suspended",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce",
+          "reason": "manual"
+        }
+      },
+      "observation": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "state": "hibernated",
+        "archive": { "continuous": false, "ready_wal_files": null },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "state": "hibernated"
+        }
+      },
+      "progress": {
+        "target": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce"
+        },
+        "phase": "hibernated",
+        "startedAt": 100000,
+        "anchor": {
+          "storageUid": "01234567-89ab-4def-8123-000000000007",
+          "storageState": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000001\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000002\",\"node\":\"native-test-node\",\"archivePath\":\"s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc\"}",
+          "volumeIdentity": "{\"claimUid\":\"01234567-89ab-4def-8123-000000000003\",\"volumeUid\":\"01234567-89ab-4def-8123-000000000004\",\"handle\":\"pvc-01234567-89ab-4def-8123-000000000003\"}",
+          "physicalGeneration": 1,
+          "namespaceUid": "01234567-89ab-4def-8123-000000000001",
+          "clusterUid": "01234567-89ab-4def-8123-000000000002",
+          "node": "native-test-node",
+          "archivePath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "claimName": "database-1",
+          "claimUid": "01234567-89ab-4def-8123-000000000003",
+          "volumeName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "volumeUid": "01234567-89ab-4def-8123-000000000004",
+          "handle": "pvc-01234567-89ab-4def-8123-000000000003",
+          "affinity": "null",
+          "lvmName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "lvmNamespace": "openebs",
+          "lvmUid": "01234567-89ab-4def-8123-000000000005"
+        },
+        "proofIntent": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce"
+        },
+        "gateways": [
+          {
+            "name": "gateway-1",
+            "uid": "01234567-89ab-4def-8123-00000000000b",
+            "ip": "10.20.0.1",
+            "restarts": 0
+          },
+          {
+            "name": "gateway-2",
+            "uid": "01234567-89ab-4def-8123-00000000000c",
+            "ip": "10.20.0.2",
+            "restarts": 0
+          }
+        ],
+        "keyUid": "01234567-89ab-4def-8123-00000000000a",
+        "keyVersion": "10",
+        "segment": "000000010000000000000001"
+      },
+      "intent": {
+        "database": "dbbbbbbbbbbbbbbbbbbb",
+        "operation": "op_dddddddddddddddddddd",
+        "revision": 2,
+        "mode": "quiesce"
+      },
+      "hibernation": "on",
+      "probes": 1
+    },
+    {
+      "name": "cold-configuration",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 3,
+        "desired_state": "suspended",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 3,
+          "mode": "quiesce",
+          "reason": "manual"
+        }
+      },
+      "observation": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 3,
+        "state": "hibernated",
+        "archive": { "continuous": false, "ready_wal_files": null },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 3,
+          "state": "hibernated"
+        }
+      },
+      "progress": {
+        "target": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 3,
+          "mode": "quiesce"
+        },
+        "phase": "hibernated",
+        "startedAt": 100000,
+        "anchor": {
+          "storageUid": "01234567-89ab-4def-8123-000000000007",
+          "storageState": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000001\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000002\",\"node\":\"native-test-node\",\"archivePath\":\"s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc\"}",
+          "volumeIdentity": "{\"claimUid\":\"01234567-89ab-4def-8123-000000000003\",\"volumeUid\":\"01234567-89ab-4def-8123-000000000004\",\"handle\":\"pvc-01234567-89ab-4def-8123-000000000003\"}",
+          "physicalGeneration": 1,
+          "namespaceUid": "01234567-89ab-4def-8123-000000000001",
+          "clusterUid": "01234567-89ab-4def-8123-000000000002",
+          "node": "native-test-node",
+          "archivePath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "claimName": "database-1",
+          "claimUid": "01234567-89ab-4def-8123-000000000003",
+          "volumeName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "volumeUid": "01234567-89ab-4def-8123-000000000004",
+          "handle": "pvc-01234567-89ab-4def-8123-000000000003",
+          "affinity": "null",
+          "lvmName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "lvmNamespace": "openebs",
+          "lvmUid": "01234567-89ab-4def-8123-000000000005"
+        },
+        "proofIntent": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "mode": "quiesce"
+        },
+        "gateways": [
+          {
+            "name": "gateway-1",
+            "uid": "01234567-89ab-4def-8123-00000000000b",
+            "ip": "10.20.0.1",
+            "restarts": 0
+          },
+          {
+            "name": "gateway-2",
+            "uid": "01234567-89ab-4def-8123-00000000000c",
+            "ip": "10.20.0.2",
+            "restarts": 0
+          }
+        ],
+        "keyUid": "01234567-89ab-4def-8123-00000000000a",
+        "keyVersion": "10",
+        "segment": "000000010000000000000001"
+      },
+      "intent": {
+        "database": "dbbbbbbbbbbbbbbbbbbb",
+        "operation": "op_dddddddddddddddddddd",
+        "revision": 3,
+        "mode": "quiesce"
+      },
+      "hibernation": "on",
+      "probes": 1
+    },
+    {
+      "name": "wake",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 3,
+        "desired_state": "running",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_eeeeeeeeeeeeeeeeeeee",
+          "revision": 3,
+          "mode": "running",
+          "reason": null
+        }
+      },
+      "observation": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 2,
+        "state": "hibernated",
+        "archive": { "continuous": false, "ready_wal_files": null },
+        "power": {
+          "operation": "op_dddddddddddddddddddd",
+          "revision": 2,
+          "state": "hibernated"
+        }
+      },
+      "prepared": "proceed",
+      "progress": {
+        "target": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_eeeeeeeeeeeeeeeeeeee",
+          "revision": 3,
+          "mode": "running"
+        },
+        "phase": "wake",
+        "startedAt": 100000,
+        "anchor": {
+          "storageUid": "01234567-89ab-4def-8123-000000000007",
+          "storageState": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000001\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000002\",\"node\":\"native-test-node\",\"archivePath\":\"s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc\"}",
+          "volumeIdentity": "{\"claimUid\":\"01234567-89ab-4def-8123-000000000003\",\"volumeUid\":\"01234567-89ab-4def-8123-000000000004\",\"handle\":\"pvc-01234567-89ab-4def-8123-000000000003\"}",
+          "physicalGeneration": 1,
+          "namespaceUid": "01234567-89ab-4def-8123-000000000001",
+          "clusterUid": "01234567-89ab-4def-8123-000000000002",
+          "node": "native-test-node",
+          "archivePath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "claimName": "database-1",
+          "claimUid": "01234567-89ab-4def-8123-000000000003",
+          "volumeName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "volumeUid": "01234567-89ab-4def-8123-000000000004",
+          "handle": "pvc-01234567-89ab-4def-8123-000000000003",
+          "affinity": "null",
+          "lvmName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "lvmNamespace": "openebs",
+          "lvmUid": "01234567-89ab-4def-8123-000000000005"
+        }
+      },
+      "intent": {
+        "database": "dbbbbbbbbbbbbbbbbbbb",
+        "operation": "op_dddddddddddddddddddd",
+        "revision": 2,
+        "mode": "quiesce"
+      },
+      "hibernation": "off",
+      "probes": 1
+    },
+    {
+      "name": "awake",
+      "db": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 3,
+        "desired_state": "running",
+        "node": "native-test-node",
+        "pg_major": 18,
+        "size": {
+          "memory_mib": 256,
+          "memory_request_mib": 128,
+          "cpu_millicores": 250,
+          "cpu_request_millicores": 25,
+          "storage_gib": 5,
+          "max_connections": 20,
+          "archive_timeout_seconds": 60,
+          "backup_retention_days": 7
+        },
+        "roles": [
+          {
+            "name": "app",
+            "owner": true,
+            "password": "ppppppppppppppppppppppppppppppppppppppppppp",
+            "revision": 1
+          },
+          {
+            "name": "reader_query",
+            "owner": false,
+            "password": "qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq",
+            "revision": 2
+          }
+        ],
+        "maintenance": {
+          "role": "pgcf_maintenance",
+          "password": "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr",
+          "revision": 1
+        },
+        "creation": {
+          "operation_id": "op_cccccccccccccccccccc",
+          "generation": 1,
+          "status": "pending",
+          "ever_ready": false
+        },
+        "archive": {
+          "destination_path": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "server_name": "database"
+        },
+        "power": {
+          "operation": "op_eeeeeeeeeeeeeeeeeeee",
+          "revision": 3,
+          "mode": "running",
+          "reason": null
+        }
+      },
+      "observation": {
+        "id": "dbbbbbbbbbbbbbbbbbbb",
+        "generation": 3,
+        "state": "ready",
+        "archive": { "continuous": true, "ready_wal_files": 0 },
+        "power": {
+          "operation": "op_eeeeeeeeeeeeeeeeeeee",
+          "revision": 3,
+          "state": "awake"
+        }
+      },
+      "prepared": "proceed",
+      "progress": {
+        "target": {
+          "database": "dbbbbbbbbbbbbbbbbbbb",
+          "operation": "op_eeeeeeeeeeeeeeeeeeee",
+          "revision": 3,
+          "mode": "running"
+        },
+        "phase": "awake",
+        "startedAt": 100000,
+        "anchor": {
+          "storageUid": "01234567-89ab-4def-8123-000000000007",
+          "storageState": "{\"namespaceUid\":\"01234567-89ab-4def-8123-000000000001\",\"clusterUid\":\"01234567-89ab-4def-8123-000000000002\",\"node\":\"native-test-node\",\"archivePath\":\"s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc\"}",
+          "volumeIdentity": "{\"claimUid\":\"01234567-89ab-4def-8123-000000000003\",\"volumeUid\":\"01234567-89ab-4def-8123-000000000004\",\"handle\":\"pvc-01234567-89ab-4def-8123-000000000003\"}",
+          "physicalGeneration": 1,
+          "namespaceUid": "01234567-89ab-4def-8123-000000000001",
+          "clusterUid": "01234567-89ab-4def-8123-000000000002",
+          "node": "native-test-node",
+          "archivePath": "s3://native-controller-test/eu-test/dbbbbbbbbbbbbbbbbbbb/g1-op_cccccccccccccccccccc",
+          "claimName": "database-1",
+          "claimUid": "01234567-89ab-4def-8123-000000000003",
+          "volumeName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "volumeUid": "01234567-89ab-4def-8123-000000000004",
+          "handle": "pvc-01234567-89ab-4def-8123-000000000003",
+          "affinity": "null",
+          "lvmName": "pvc-01234567-89ab-4def-8123-000000000003",
+          "lvmNamespace": "openebs",
+          "lvmUid": "01234567-89ab-4def-8123-000000000005"
+        }
+      },
+      "intent": {
+        "database": "dbbbbbbbbbbbbbbbbbbb",
+        "operation": "op_eeeeeeeeeeeeeeeeeeee",
+        "revision": 3,
+        "mode": "running"
+      },
+      "hibernation": "off",
+      "probes": 1
+    }
+  ],
+  "reclamation": [
+    {
+      "name": "reclaimed_after_last_pool_removed",
+      "db": {
+        "node": "native-test-node",
+        "storage": {
+          "backend": "lvm-thin-v1",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_attributes_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "node_uid": "01234567-89ab-4def-8123-000000000004",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": "bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg",
+          "startup_reserve_bytes": 1048576,
+          "write_bytes_per_second": 1048576,
+          "write_iops_per_second": 10,
+          "guard_seconds": 2,
+          "drain_seconds": 1
+        }
+      },
+      "nodes": [
+        {
+          "node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "name": "native-test-node",
+          "node_uid": "01234567-89ab-4def-8123-000000000004",
+          "cluster_uid": "01234567-89ab-4def-8123-000000000005",
+          "revision": 3,
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": null,
+          "driver_pod_uid": "01234567-89ab-4def-8123-000000000006",
+          "driver_image": "ghcr.io/test/driver@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "observed_at": "1970-01-01T00:01:40.001Z",
+          "captured_at": "1970-01-01T00:01:40.001Z",
+          "expires_at": "1970-01-01T00:01:42.001Z",
+          "write_allowed": false,
+          "physical": {
+            "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+            "total_bytes": 10000000,
+            "free_bytes": 10000000,
+            "thick_allocated_bytes": 0,
+            "thin_pool": null
+          },
+          "physical_lvs": [],
+          "active_lv_uuids": [],
+          "data_accounting_complete": true,
+          "protections": [],
+          "volumes": []
+        }
+      ],
+      "lv": "cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh",
+      "after": 100000,
+      "now": 100002,
+      "expected": true
+    },
+    {
+      "name": "physical_lv_still_present",
+      "db": {
+        "node": "native-test-node",
+        "storage": {
+          "backend": "lvm-thin-v1",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_attributes_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "node_uid": "01234567-89ab-4def-8123-000000000004",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": "bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg",
+          "startup_reserve_bytes": 1048576,
+          "write_bytes_per_second": 1048576,
+          "write_iops_per_second": 10,
+          "guard_seconds": 2,
+          "drain_seconds": 1
+        }
+      },
+      "nodes": [
+        {
+          "node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "name": "native-test-node",
+          "node_uid": "01234567-89ab-4def-8123-000000000004",
+          "cluster_uid": "01234567-89ab-4def-8123-000000000005",
+          "revision": 3,
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": null,
+          "driver_pod_uid": "01234567-89ab-4def-8123-000000000006",
+          "driver_image": "ghcr.io/test/driver@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "observed_at": "1970-01-01T00:01:40.001Z",
+          "captured_at": "1970-01-01T00:01:40.001Z",
+          "expires_at": "1970-01-01T00:01:42.001Z",
+          "write_allowed": false,
+          "physical": {
+            "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+            "total_bytes": 10000000,
+            "free_bytes": 10000000,
+            "thick_allocated_bytes": 0,
+            "thin_pool": null
+          },
+          "physical_lvs": [
+            {
+              "name": "owned",
+              "lv_uuid": "cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh",
+              "size_bytes": 1048576,
+              "segtype": "thin"
+            }
+          ],
+          "active_lv_uuids": [],
+          "data_accounting_complete": true,
+          "protections": [],
+          "volumes": []
+        }
+      ],
+      "lv": "cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh",
+      "after": 100000,
+      "now": 100002,
+      "expected": false
+    },
+    {
+      "name": "active_kernel_device_still_present",
+      "db": {
+        "node": "native-test-node",
+        "storage": {
+          "backend": "lvm-thin-v1",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_attributes_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "node_uid": "01234567-89ab-4def-8123-000000000004",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": "bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg",
+          "startup_reserve_bytes": 1048576,
+          "write_bytes_per_second": 1048576,
+          "write_iops_per_second": 10,
+          "guard_seconds": 2,
+          "drain_seconds": 1
+        }
+      },
+      "nodes": [
+        {
+          "node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "name": "native-test-node",
+          "node_uid": "01234567-89ab-4def-8123-000000000004",
+          "cluster_uid": "01234567-89ab-4def-8123-000000000005",
+          "revision": 3,
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": null,
+          "driver_pod_uid": "01234567-89ab-4def-8123-000000000006",
+          "driver_image": "ghcr.io/test/driver@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "observed_at": "1970-01-01T00:01:40.001Z",
+          "captured_at": "1970-01-01T00:01:40.001Z",
+          "expires_at": "1970-01-01T00:01:42.001Z",
+          "write_allowed": false,
+          "physical": {
+            "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+            "total_bytes": 10000000,
+            "free_bytes": 10000000,
+            "thick_allocated_bytes": 0,
+            "thin_pool": null
+          },
+          "physical_lvs": [],
+          "active_lv_uuids": ["cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh"],
+          "data_accounting_complete": true,
+          "protections": [],
+          "volumes": []
+        }
+      ],
+      "lv": "cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh",
+      "after": 100000,
+      "now": 100002,
+      "expected": false
+    },
+    {
+      "name": "physical_accounting_incomplete",
+      "db": {
+        "node": "native-test-node",
+        "storage": {
+          "backend": "lvm-thin-v1",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_attributes_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "node_uid": "01234567-89ab-4def-8123-000000000004",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": "bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg",
+          "startup_reserve_bytes": 1048576,
+          "write_bytes_per_second": 1048576,
+          "write_iops_per_second": 10,
+          "guard_seconds": 2,
+          "drain_seconds": 1
+        }
+      },
+      "nodes": [
+        {
+          "node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "name": "native-test-node",
+          "node_uid": "01234567-89ab-4def-8123-000000000004",
+          "cluster_uid": "01234567-89ab-4def-8123-000000000005",
+          "revision": 3,
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": null,
+          "driver_pod_uid": "01234567-89ab-4def-8123-000000000006",
+          "driver_image": "ghcr.io/test/driver@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "observed_at": "1970-01-01T00:01:40.001Z",
+          "captured_at": "1970-01-01T00:01:40.001Z",
+          "expires_at": "1970-01-01T00:01:42.001Z",
+          "write_allowed": false,
+          "physical": {
+            "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+            "total_bytes": 10000000,
+            "free_bytes": 10000000,
+            "thick_allocated_bytes": 0,
+            "thin_pool": null
+          },
+          "physical_lvs": [],
+          "active_lv_uuids": [],
+          "data_accounting_complete": false,
+          "protections": [],
+          "volumes": []
+        }
+      ],
+      "lv": "cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh",
+      "after": 100000,
+      "now": 100002,
+      "expected": false
+    },
+    {
+      "name": "stale_predelete_report",
+      "db": {
+        "node": "native-test-node",
+        "storage": {
+          "backend": "lvm-thin-v1",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_attributes_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "node_uid": "01234567-89ab-4def-8123-000000000004",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": "bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg",
+          "startup_reserve_bytes": 1048576,
+          "write_bytes_per_second": 1048576,
+          "write_iops_per_second": 10,
+          "guard_seconds": 2,
+          "drain_seconds": 1
+        }
+      },
+      "nodes": [
+        {
+          "node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "name": "native-test-node",
+          "node_uid": "01234567-89ab-4def-8123-000000000004",
+          "cluster_uid": "01234567-89ab-4def-8123-000000000005",
+          "revision": 3,
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": null,
+          "driver_pod_uid": "01234567-89ab-4def-8123-000000000006",
+          "driver_image": "ghcr.io/test/driver@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "observed_at": "1970-01-01T00:01:39.999Z",
+          "captured_at": "1970-01-01T00:01:40.001Z",
+          "expires_at": "1970-01-01T00:01:42.001Z",
+          "write_allowed": false,
+          "physical": {
+            "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+            "total_bytes": 10000000,
+            "free_bytes": 10000000,
+            "thick_allocated_bytes": 0,
+            "thin_pool": null
+          },
+          "physical_lvs": [],
+          "active_lv_uuids": [],
+          "data_accounting_complete": true,
+          "protections": [],
+          "volumes": []
+        }
+      ],
+      "lv": "cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh",
+      "after": 100000,
+      "now": 100002,
+      "expected": false
+    },
+    {
+      "name": "replacement_node_uid",
+      "db": {
+        "node": "native-test-node",
+        "storage": {
+          "backend": "lvm-thin-v1",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_attributes_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "node_uid": "01234567-89ab-4def-8123-000000000004",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": "bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg",
+          "startup_reserve_bytes": 1048576,
+          "write_bytes_per_second": 1048576,
+          "write_iops_per_second": 10,
+          "guard_seconds": 2,
+          "drain_seconds": 1
+        }
+      },
+      "nodes": [
+        {
+          "node_id": "nod_nnnnnnnnnnnnnnnnnnnn",
+          "name": "native-test-node",
+          "node_uid": "01234567-89ab-4def-8123-0000000003e7",
+          "cluster_uid": "01234567-89ab-4def-8123-000000000005",
+          "revision": 3,
+          "profile_revision": 1,
+          "profile_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "storage_class": "pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa",
+          "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+          "pool_uuid": null,
+          "driver_pod_uid": "01234567-89ab-4def-8123-000000000006",
+          "driver_image": "ghcr.io/test/driver@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "observed_at": "1970-01-01T00:01:40.001Z",
+          "captured_at": "1970-01-01T00:01:40.001Z",
+          "expires_at": "1970-01-01T00:01:42.001Z",
+          "write_allowed": false,
+          "physical": {
+            "volume_group_uuid": "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+            "total_bytes": 10000000,
+            "free_bytes": 10000000,
+            "thick_allocated_bytes": 0,
+            "thin_pool": null
+          },
+          "physical_lvs": [],
+          "active_lv_uuids": [],
+          "data_accounting_complete": true,
+          "protections": [],
+          "volumes": []
+        }
+      ],
+      "lv": "cdefgh-cdef-cdef-cdef-cdef-cdef-cdefgh",
+      "after": 100000,
+      "now": 100002,
+      "expected": false
+    }
+  ]
+}

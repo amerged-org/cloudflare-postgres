@@ -23,6 +23,31 @@ const CUSTOM: Record<
   string,
   { group: string; version: string; plural: string }
 > = {
+  GitRepository: {
+    group: "source.toolkit.fluxcd.io",
+    version: "v1",
+    plural: "gitrepositories",
+  },
+  OCIRepository: {
+    group: "source.toolkit.fluxcd.io",
+    version: "v1",
+    plural: "ocirepositories",
+  },
+  HelmChart: {
+    group: "source.toolkit.fluxcd.io",
+    version: "v1",
+    plural: "helmcharts",
+  },
+  HelmRelease: {
+    group: "helm.toolkit.fluxcd.io",
+    version: "v2",
+    plural: "helmreleases",
+  },
+  Kustomization: {
+    group: "kustomize.toolkit.fluxcd.io",
+    version: "v1",
+    plural: "kustomizations",
+  },
   Cluster: { group: "postgresql.cnpg.io", version: "v1", plural: "clusters" },
   Backup: { group: "postgresql.cnpg.io", version: "v1", plural: "backups" },
   ScheduledBackup: {

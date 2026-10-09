@@ -402,7 +402,10 @@ async function storedInspectionInput(env: Env, operationId: string) {
   return input;
 }
 
-async function boundedIdentity(response: Response, signal: AbortSignal) {
+export async function readBootstrapRelayIdentity(
+  response: Response,
+  signal: AbortSignal,
+) {
   if (!response.ok || !response.body) return deny();
   const reader = response.body.getReader(),
     chunks: Uint8Array[] = [];
@@ -471,7 +474,7 @@ export async function issueNodeInspectionTransport(
   )
     return deny();
   const signal = AbortSignal.timeout(10000);
-  const identity = await boundedIdentity(
+  const identity = await readBootstrapRelayIdentity(
     await env.BOOTSTRAP_RELAY_SERVICE.fetch(
       new URL(BOOTSTRAP_RELAY_IDENTITY_PATH, relay),
       { signal },

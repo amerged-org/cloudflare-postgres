@@ -1,0 +1,79 @@
+{
+  "versions": {
+    "containerd": "v2.3.6",
+    "cri-api": "v0.36.5",
+    "ttrpc": "v1.2.7"
+  },
+  "files": [
+    {
+      "path": "cri.proto",
+      "sha256": "6d130c2651d335bfc755d25efc63072a1cd1eba3591ead6422dc0a27f20167f3",
+      "source": "https://github.com/kubernetes/cri-api/blob/v0.36.5/pkg/apis/runtime/v1/api.proto"
+    },
+    {
+      "path": "proto/status.proto",
+      "sha256": "393b484cdd6abd8d06fefa8c546470e6b61a7495a8f5ba4da0fb0c8afd3322d7",
+      "source": "https://github.com/containerd/ttrpc/blob/v1.2.7/proto/status.proto"
+    },
+    {
+      "path": "runtime/bootstrap/v1/bootstrap.proto",
+      "sha256": "76693460c6fd45cb68425ea31f013e905156dc5b97104d2def20c50f27d3e96f",
+      "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/runtime/bootstrap/v1/bootstrap.proto"
+    },
+    {
+      "path": "runtime/task/v3/shim.proto",
+      "sha256": "6a3a8c4113287b6500390a3cd15c129859b6db1817d30841921068f4aede6d94",
+      "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/runtime/task/v3/shim.proto"
+    },
+    {
+      "path": "services/containers/v1/containers.proto",
+      "sha256": "2b45c8f670571a67201a58119b500c5dff3eccc6f24b69ce366d403a55f86f4f",
+      "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/services/containers/v1/containers.proto"
+    },
+    {
+      "path": "services/sandbox/v1/sandbox.proto",
+      "sha256": "05d12707d76d2ec4de1c66eb8b309586c487715cd0dcf001c07223b2f4309ffb",
+      "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/services/sandbox/v1/sandbox.proto"
+    },
+    {
+      "path": "services/tasks/v1/tasks.proto",
+      "sha256": "c40768f92ffca0b7c80b8caa93e6575bcb87ec4fc591f1099c8b793cf6a98242",
+      "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/services/tasks/v1/tasks.proto"
+    },
+    {
+      "path": "ttrpc.proto",
+      "sha256": "f6923fffbedf0a5446d216a3c3f42e50235fd2aabb1b8e1ab2c619e80bcfa0f0",
+      "source": "https://github.com/containerd/ttrpc/blob/v1.2.7/request.proto"
+    },
+    {
+      "path": "types/descriptor.proto",
+      "sha256": "f98bec409b5e535e2a8d81dacc549180e1dadb31bd6ac46f7aedc6ab0020e447",
+      "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/types/descriptor.proto"
+    },
+    {
+      "path": "types/metrics.proto",
+      "sha256": "3356f446ee0e7f41b69fac7f70dbf7c545bc915d3550241e48c11a90de6cd664",
+      "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/types/metrics.proto"
+    },
+    {
+      "path": "types/mount.proto",
+      "sha256": "c7a31fa848f002cead05a23adfdd9e29a459cd01ae573b7b61b060b3056754d7",
+      "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/types/mount.proto"
+    },
+    {
+      "path": "types/platform.proto",
+      "sha256": "b648d50a7309c7ae400931bff32b38389ea2f0365cca37c85c0ef19313a1b911",
+      "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/types/platform.proto"
+    },
+    {
+      "path": "types/sandbox.proto",
+      "sha256": "98a41057aa2c27a18c27591027778b1eb6059f08d3585365e3e11667f270aa9e",
+      "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/types/sandbox.proto"
+    },
+    {
+      "path": "types/task/task.proto",
+      "sha256": "c05245dcad502ec63a9cf8296b973f300fba3a61d38acd621048849227873253",
+      "source": "https://github.com/containerd/containerd/blob/v2.3.6/api/types/task/task.proto"
+    }
+  ]
+}

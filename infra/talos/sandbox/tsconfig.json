@@ -1,0 +1,13 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "include": [
+    "boot-format.ts",
+    "boot-image-qualification.ts",
+    "boot-inspect-worker.ts",
+    "boot-image-qualification.test.ts",
+    "images.ts",
+    "images.test.ts",
+    "publish-artifacts.ts",
+    "publish-artifacts.test.ts"
+  ]
+}

@@ -6,6 +6,7 @@ export { DatabaseActor } from "./database-actor.ts";
 export { RegionLink } from "./region-link.ts";
 export { NodeBootstrap } from "./bootstrap-container.ts";
 export { AddNode } from "./workflows/add-node.ts";
+export { PatchNode } from "./workflows/patch-node.ts";
 
 const app = createApp();
 

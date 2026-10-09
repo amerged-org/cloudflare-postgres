@@ -34,10 +34,16 @@ import {
 import { startAddNode } from "../platform/nodes.ts";
 import {
   startupHeadroomSql,
+  computePoolOverheadSql,
   startupReservationStatement,
   nodeCpuHeadroomSql,
 } from "./startup-admission.ts";
 
+import {
+  nodeStoragePlacementSql,
+  selectedStorageProfileSql,
+} from "./storage-capacity.ts";
+import { recoverStorageProtectedDatabases } from "./lifecycle.ts";
 /** Read selection avoids busy workers; the final mutation still checks the same guard atomically. */
 export async function startupPlacementNodes(
   db: D1Database,
@@ -48,7 +54,7 @@ export async function startupPlacementNodes(
   const available = await db
     .prepare(
       `SELECT n.id FROM nodes n JOIN size_classes s ON s.id=? AND s.enabled=1
-    WHERE n.region_id=? AND ${nodeCpuHeadroomSql()} AND ${startupHeadroomSql()}`,
+    WHERE n.region_id=? AND ${nodeCpuHeadroomSql()} AND ${startupHeadroomSql()} AND ${nodeStoragePlacementSql()}`,
     )
     .bind(sizeClassId, regionId)
     .all<{ id: string }>();
@@ -93,25 +99,26 @@ export async function placePendingDatabases(
     const results = await db.batch([
       db
         .prepare(
-          `UPDATE databases SET node_id=?,status_message=NULL,updated_at=?
-        WHERE id=? AND project_id=? AND region_id=? AND node_id IS NULL AND generation=? AND updated_at=?
-        AND desired_state='running' AND deleted_at IS NULL AND size_class_id=?
+          `UPDATE databases SET node_id=?,storage_profile_json=(SELECT ${selectedStorageProfileSql("storage_node")} FROM nodes storage_node WHERE storage_node.id=?),status_message=NULL,updated_at=?
+        WHERE (id=? AND project_id=? AND region_id=? AND node_id IS NULL AND generation=? AND updated_at=?)
+        AND (desired_state='running' AND deleted_at IS NULL AND size_class_id=?)
         AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL)
         AND EXISTS(SELECT 1 FROM operations o WHERE o.id=? AND o.database_id=databases.id AND o.project_id=databases.project_id
           AND o.kind IN('database.create','database.restore') AND o.status='pending')
         AND EXISTS(SELECT 1 FROM nodes n JOIN size_classes s ON s.id=databases.size_class_id AND s.enabled=1
-          WHERE n.id=? AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1
-          AND ${nodePlacementGuard()}
+          WHERE (n.id=? AND n.region_id=databases.region_id AND n.ready=1 AND n.schedulable=1)
+          AND ((${nodePlacementGuard()})
           AND ${nodeDatabasePlacementGuard()}
           AND ${startupHeadroomSql()}
-          AND n.platform_reserved_cpu_millicores IS NOT NULL AND n.storage_gib_total IS NOT NULL
-          AND ${nodeMemoryReservationGuard("n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?")}
-          AND ${nodeCpuHeadroomSql()}
-          AND n.storage_gib_total-COALESCE((SELECT SUM(sc.storage_gib) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.storage_gib
-          AND s.memory_mib=? AND s.cpu_millicores=?
-          AND COALESCE(s.cpu_request_millicores,s.cpu_millicores)=? AND s.storage_gib=?)`,
+          AND n.platform_reserved_cpu_millicores IS NOT NULL)
+          AND (${nodeMemoryReservationGuard(`n.allocatable_memory_mib-n.platform_reserved_memory_mib-COALESCE((SELECT SUM(sc.memory_mib+?+${computePoolOverheadSql("d", "memory_mib")}) FROM databases d JOIN size_classes sc ON sc.id=d.size_class_id WHERE d.node_id=n.id AND d.observed_state<>'deleted'),0)>=s.memory_mib+?+${computePoolOverheadSql("n", "memory_mib")}`)}
+          AND ${nodeCpuHeadroomSql()})
+          AND ${nodeStoragePlacementSql()}
+          AND (s.memory_mib=? AND s.cpu_millicores=?
+          AND COALESCE(s.cpu_request_millicores,s.cpu_millicores)=? AND s.storage_gib=?))`,
         )
         .bind(
+          node.id,
           node.id,
           now,
           row.id,
@@ -133,7 +140,7 @@ export async function placePendingDatabases(
       db
         .prepare(
           `INSERT INTO lifecycle_events(database_id,kind,node_id,size_class_id,generation,occurred_at,resource_snapshot)
-        SELECT id,'created',node_id,size_class_id,generation,?,? FROM databases
+        SELECT id,'created',node_id,size_class_id,generation,?,json_set(?,'$.storage_allocated_bytes',CASE WHEN storage_profile_json IS NULL THEN ? ELSE NULL END,'$.reserved_cpu_millicores',?+${computePoolOverheadSql("databases", "cpu_millicores")},'$.reserved_memory_mib',?+${computePoolOverheadSql("databases", "memory_mib")}) FROM databases
         WHERE changes()=1 AND id=? AND node_id=? AND updated_at=?`,
         )
         .bind(
@@ -145,6 +152,9 @@ export async function placePendingDatabases(
             reserved_cpu_millicores: databaseCpuReservationMillicores(size),
             storage_allocated_bytes: size.storage_gib * 2 ** 30,
           }),
+          size.storage_gib * 2 ** 30,
+          databaseCpuReservationMillicores(size),
+          size.memory_mib + SIDECAR.requestMemoryMib,
           row.id,
           node.id,
           now,
@@ -185,11 +195,15 @@ export async function runNodeCapacity(
       adopt_instance_ids: string;
       placement_mode: "reserved" | "actual_ram";
     }>();
+  const recovered = dryRun
+    ? []
+    : await recoverStorageProtectedDatabases(env.DB, regionId);
   const placed = dryRun ? [] : await placePendingDatabases(env.DB, regionId);
-  if (placed.length)
-    await env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId)).notify(
-      placed,
-    );
+  if (placed.length || recovered.length)
+    await env.REGION_LINK.get(env.REGION_LINK.idFromName(regionId)).notify([
+      ...recovered,
+      ...placed,
+    ]);
   const result = {
     region_id: regionId,
     dry_run: dryRun,

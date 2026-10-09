@@ -1,0 +1,485 @@
+// SPDX-License-Identifier: Apache-2.0
+import assert from "node:assert/strict";
+import test from "node:test";
+import { fleetResourcePatch } from "../src/fleet-platform-patch.ts";
+
+function applyTests(
+  value: Record<string, unknown>,
+  patch: { op: string; path: string; value: unknown }[],
+) {
+  for (const item of patch.filter((v) => v.op === "test")) {
+    let current: unknown = value;
+    for (const key of item.path.slice(1).split("/"))
+      current = (current as Record<string, unknown>)[
+        key.replaceAll("~1", "/").replaceAll("~0", "~")
+      ];
+    assert.deepEqual(current, item.value);
+  }
+}
+test("Flux controller status-only resourceVersion changes do not invalidate the exact prior-spec CAS", () => {
+  const actual = {
+    metadata: {
+      uid: "5d29558c-2616-40f6-8e11-57ddab4713c1",
+      resourceVersion: "288438",
+    },
+    spec: {
+      images: [{ name: "regional", digest: "sha256:old" }],
+      postBuild: { substitute: { REGION: "us" } },
+    },
+  };
+  const patch = fleetResourcePatch(actual, actual.metadata.uid, {
+    ...actual.spec,
+    images: [{ name: "regional", digest: "sha256:new" }],
+  });
+  actual.metadata.resourceVersion = "292755";
+  applyTests(actual, patch);
+  assert.equal(
+    patch.some((v) => v.path.includes("resourceVersion")),
+    false,
+  );
+  assert.deepEqual(patch.at(-1)!.value, {
+    images: [{ name: "regional", digest: "sha256:new" }],
+    postBuild: { substitute: { REGION: "us" } },
+  });
+});
+test("a concurrent desired-spec or immutable UID change fails the same CAS", () => {
+  const actual = {
+    metadata: {
+      uid: "5d29558c-2616-40f6-8e11-57ddab4713c1",
+      resourceVersion: "1",
+    },
+    spec: {
+      images: [{ name: "regional", digest: "sha256:old" }],
+      postBuild: { substitute: { REGION: "us" } },
+    },
+  };
+  const patch = fleetResourcePatch(actual, actual.metadata.uid, {
+    ...actual.spec,
+    images: [{ name: "regional", digest: "sha256:new" }],
+  });
+  actual.spec.postBuild.substitute.REGION = "eu";
+  assert.throws(() => applyTests(actual, patch));
+  actual.spec.postBuild.substitute.REGION = "us";
+  actual.metadata.uid = "6d29558c-2616-40f6-8e11-57ddab4713c1";
+  assert.throws(() => applyTests(actual, patch));
+});
+
+import { selectFluxObjects } from "../src/platform.ts";
+test("the verified vendor Flux artifact declares seven Deployments while the selected common composition runs four", () => {
+  // Metadata boundary from the pinned upstream composition; no fabricated ready/runtime proof.
+  const names = [
+    "helm-controller",
+    "image-automation-controller",
+    "image-reflector-controller",
+    "kustomize-controller",
+    "notification-controller",
+    "source-controller",
+    "source-watcher",
+  ];
+  const values = names.map((name) => ({
+    kind: "Deployment",
+    metadata: { name },
+  }));
+  const shared = { kind: "ClusterRole", metadata: { name: "crd-controller" } };
+  assert.equal(
+    selectFluxObjects([...values, shared]).filter(
+      (v) => v.kind === "Deployment",
+    ).length,
+    4,
+  );
+  assert.ok(selectFluxObjects([...values, shared]).includes(shared));
+  assert.throws(() => selectFluxObjects(values, ["unknown"]));
+});
+
+import { pruneDeprecatedFlux } from "../src/fleet-platform-patch.ts";
+import { patchFixture } from "./fleet-patch.fixture.ts";
+test("optional Flux cleanup binds original owner and exact current spec, resolves unknown deletion by reads and never deletes a replacement", async () => {
+  const { input } = patchFixture();
+  input.initial_bootstrap_input_sha256 = "a".repeat(64);
+  const expected = {
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: { name: "image-reflector-controller", namespace: "flux-system" },
+    spec: {
+      selector: { matchLabels: { app: "image-reflector-controller" } },
+      template: {
+        spec: {
+          containers: [
+            { name: "manager", image: "vendor@sha256:" + "a".repeat(64) },
+          ],
+        },
+      },
+    },
+  };
+  const uid = "5d29558c-2616-40f6-8e11-57ddab4713c1",
+    key = "Deployment/flux-system/image-reflector-controller",
+    assets = { lock: {}, flux: [], flux_deprecated: [expected], relay: {} };
+  let actual: Record<string, unknown> | undefined = {
+    ...structuredClone(expected),
+    metadata: {
+      ...expected.metadata,
+      uid,
+      resourceVersion: "41",
+      annotations: {
+        "pgcf.io/bootstrap-input": input.initial_bootstrap_input_sha256,
+      },
+    },
+  };
+  const pod = (actual.spec as typeof expected.spec).template.spec as Record<
+    string,
+    unknown
+  >;
+  pod.tolerations = [
+    {
+      key: "pgcf.io/quarantine",
+      operator: "Equal",
+      value: "bootstrap",
+      effect: "NoSchedule",
+    },
+  ];
+  let writes = 0;
+  const commands = {
+    authorize: async () => {},
+    kube: async (args: string[], stdin?: string) => {
+      if (args[0] === "get")
+        return JSON.stringify({ items: actual ? [actual] : [] });
+      writes++;
+      assert.deepEqual(JSON.parse(stdin!).preconditions, {
+        uid,
+        resourceVersion: "41",
+      });
+      actual = undefined;
+      throw Error("lost_delete_reply");
+    },
+  };
+  await pruneDeprecatedFlux(input, assets, { [key]: uid }, commands);
+  await pruneDeprecatedFlux(input, assets, { [key]: uid }, commands);
+  assert.equal(writes, 1);
+  actual = {
+    ...expected,
+    metadata: {
+      ...expected.metadata,
+      uid: "6d29558c-2616-40f6-8e11-57ddab4713c1",
+      resourceVersion: "42",
+    },
+  };
+  await assert.rejects(
+    pruneDeprecatedFlux(input, assets, { [key]: uid }, commands),
+    /patch_flux_prune_identity_changed/,
+  );
+  assert.equal(writes, 1);
+});
+
+import {
+  fleetPlatformReadback,
+  reconcileFleetRegional,
+  type FleetPlatformState,
+} from "../src/fleet-platform-patch.ts";
+import { FleetPatchInput } from "@pgcf/contracts/fleet-patches";
+import { randomUUID, createHash } from "node:crypto";
+test("separate native controller/gateway pins reconcile through distinct logical images and prove actual selected runtime digests", async () => {
+  const fixture = patchFixture(),
+    commit = "f".repeat(40),
+    controller = {
+      name: "native-controller",
+      kind: "image" as const,
+      version: "1.0.0",
+      reference: "registry.example/pgcf-regional@sha256:" + "1".repeat(64),
+      sha256: "1".repeat(64),
+      workload: {
+        namespace: "pgcf-system",
+        selector: { app: "agent" },
+        scope: "cluster" as const,
+      },
+    },
+    gateway = {
+      ...controller,
+      name: "native-gateway",
+      reference: "registry.example/pgcf-regional@sha256:" + "2".repeat(64),
+      sha256: "2".repeat(64),
+      workload: {
+        namespace: "pgcf-system",
+        selector: { app: "gateway" },
+        scope: "cluster" as const,
+      },
+    };
+  const input = FleetPatchInput.parse({
+    ...fixture.input,
+    spec: {
+      ...fixture.input.spec,
+      platform_source_commit: commit,
+      components: [...fixture.input.spec.components, controller, gateway],
+      roles: {
+        ...fixture.input.spec.roles,
+        customer: {
+          ...fixture.input.spec.roles.customer,
+          components: [controller.name, gateway.name, "cloudflared"],
+        },
+      },
+    },
+  });
+  const resource = (
+    kind: string,
+    name: string,
+    spec: object,
+    status: object = {},
+  ) => ({
+    apiVersion: "test/v1",
+    kind,
+    metadata: {
+      uid: randomUUID(),
+      name,
+      namespace: "flux-system",
+      generation: 1,
+    },
+    spec,
+    status: {
+      observedGeneration: 1,
+      conditions: [{ type: "Ready", status: "True", observedGeneration: 1 }],
+      ...status,
+    },
+  });
+  const source = resource(
+      "GitRepository",
+      "pgcf-platform",
+      { ref: { commit } },
+      { artifact: { revision: `sha1:${commit}` } },
+    ),
+    platform = resource(
+      "Kustomization",
+      "pgcf-platform",
+      {},
+      { lastAppliedRevision: `sha1:${commit}` },
+    ),
+    regional = resource(
+      "Kustomization",
+      "pgcf-regional",
+      {
+        path: "./infra/platform/regional",
+        sourceRef: { name: "pgcf-platform" },
+        images: [
+          { name: "unrelated", newName: "retained", digest: "sha256:old" },
+        ],
+      },
+      { lastAppliedRevision: `sha1:${commit}` },
+    );
+  const keys = { test: "A".repeat(43) },
+    keyText = JSON.stringify(keys),
+    sha256 = createHash("sha256").update(keyText).digest("hex");
+  input.storage_authority = { keys, sha256 };
+  input.spec.storage_authority_keys_sha256 = sha256;
+  input.retained_thick_storage = [];
+  const workload = (app: string) => {
+    const value = resource(
+      "Deployment",
+      app === "agent" ? "pgcf-agent" : "pgcf-gateway",
+      {
+        replicas: 1,
+        selector: { matchLabels: { app } },
+        template: {
+          spec: {
+            containers: [
+              {
+                name: app,
+                env:
+                  app === "gateway"
+                    ? [
+                        { name: "PGCF_STORAGE_AUTHORITY_KEYS", value: keyText },
+                        {
+                          name: "PGCF_STORAGE_AUTHORITY_KEYS_SHA256",
+                          value: sha256,
+                        },
+                        {
+                          name: "PGCF_GATEWAY_LEGACY_BINDINGS_JSON",
+                          value: "[]",
+                        },
+                      ]
+                    : [],
+              },
+            ],
+          },
+        },
+      },
+      {
+        replicas: 1,
+        updatedReplicas: 1,
+        readyReplicas: 1,
+        availableReplicas: 1,
+      },
+    );
+    value.metadata.namespace = "pgcf-system";
+    return value;
+  };
+  const resources = new Map(
+    [source, platform, regional].map((value) => [
+      `${value.kind}/flux-system/${value.metadata.name}`,
+      value,
+    ]),
+  );
+  const pins = [
+    controller,
+    gateway,
+    input.spec.components.find((v) => v.name === "cloudflared")!,
+  ];
+  const pods = pins.map((pin) => ({
+    metadata: {
+      uid: randomUUID(),
+      namespace: pin.workload?.namespace ?? "other",
+      labels: pin.workload?.selector ?? {},
+      ownerReferences: [{ controller: true, uid: randomUUID() }],
+    },
+    spec: {
+      nodeName:
+        pin.workload?.scope === "cluster"
+          ? "control-node"
+          : input.k8s_node_name,
+      containers: [{ name: "run", image: pin.reference }],
+    },
+    status: {
+      containerStatuses: [
+        {
+          name: "run",
+          ready: true,
+          imageID: `containerd://${pin.reference}`,
+          state: { running: { startedAt: new Date().toISOString() } },
+        },
+      ],
+    },
+  }));
+  const state: FleetPlatformState = {
+      resources,
+      pods,
+      uids: Object.fromEntries(
+        [...resources].map(([key, value]) => [key, value.metadata.uid]),
+      ),
+    },
+    assets = { lock: {}, flux: [], flux_deprecated: [], relay: {} };
+  for (const app of ["agent", "gateway"]) {
+    const value = workload(app);
+    resources.set(`Deployment/pgcf-system/${value.metadata.name}`, value);
+    state.uids[`Deployment/pgcf-system/${value.metadata.name}`] =
+      value.metadata.uid;
+  }
+  let mutations = 0;
+  await reconcileFleetRegional(
+    input,
+    state,
+    assets,
+    state.uids,
+    {
+      authorize: async () => {},
+      kube: async (args, stdin) => {
+        if (args[0] === "get") return JSON.stringify(regional);
+        mutations++;
+        const patch = JSON.parse(stdin!) as {
+          op: string;
+          path: string;
+          value: unknown;
+        }[];
+        applyTests(regional, patch);
+        regional.spec = patch.find(
+          (v) => v.op === "replace" && v.path === "/spec",
+        )!.value as typeof regional.spec;
+        return JSON.stringify(regional);
+      },
+    },
+    [],
+  );
+  assert.equal(mutations, 1);
+  const images = (
+    regional.spec as {
+      images: { name: string; newName: string; digest: string }[];
+    }
+  ).images;
+  assert.equal(
+    images.find((v) => v.name === "pgcf-native-controller")?.digest,
+    `sha256:${controller.sha256}`,
+  );
+  assert.equal(
+    images.find((v) => v.name === "pgcf-native-gateway")?.digest,
+    `sha256:${gateway.sha256}`,
+  );
+  assert.equal(images.find((v) => v.name === "unrelated")?.newName, "retained");
+  assert.equal(
+    fleetPlatformReadback(input, state, assets, []).regional_ready,
+    true,
+  );
+  pods[1]!.status.containerStatuses[0]!.imageID = `containerd://registry.example/pgcf-regional@sha256:${"3".repeat(64)}`;
+  assert.equal(
+    fleetPlatformReadback(input, state, assets, []).regional_ready,
+    false,
+  );
+});
+
+import { fleetPlatformSourceObjects } from "../src/fleet-platform-patch.ts";
+test("the selected OpenEBS wrapper and cgroup mount reach the existing platform Kustomization without dropping unrelated overrides", () => {
+  const { input } = patchFixture();
+  input.spec.platform_source_commit = "a".repeat(40);
+  const driver = "ghcr.io/example/openebs-wrapper:v1@sha256:" + "b".repeat(64),
+    other = {
+      target: { kind: "ConfigMap", name: "retained" },
+      patch: "retained",
+    };
+  const source = {
+    apiVersion: "source.toolkit.fluxcd.io/v1",
+    kind: "GitRepository",
+    metadata: {
+      name: "pgcf-platform",
+      namespace: "flux-system",
+      uid: "source",
+    },
+    spec: {
+      url: "https://github.com/amerged-org/cloudflare-postgres",
+      ref: { branch: "main" },
+    },
+  };
+  const platform = {
+    apiVersion: "kustomize.toolkit.fluxcd.io/v1",
+    kind: "Kustomization",
+    metadata: {
+      name: "pgcf-platform",
+      namespace: "flux-system",
+      uid: "platform",
+    },
+    spec: {
+      path: "./infra/platform",
+      sourceRef: { kind: "GitRepository", name: "pgcf-platform" },
+      patches: [other],
+      postBuild: { substitute: { KEEP: "yes" } },
+    },
+  };
+  const values = fleetPlatformSourceObjects(
+    input,
+    {
+      resources: new Map<string, Record<string, unknown>>([
+        ["GitRepository/flux-system/pgcf-platform", source],
+        ["Kustomization/flux-system/pgcf-platform", platform],
+      ]),
+      pods: [],
+      uids: {},
+    },
+    {
+      lock: {
+        charts: [{ name: "openebs", enabledEngine: { driverImage: driver } }],
+      },
+      flux: [],
+      flux_deprecated: [],
+      relay: {},
+    },
+  );
+  const spec = values[1]!.spec as {
+    patches: (typeof other)[];
+    postBuild: unknown;
+  };
+  assert.deepEqual(spec.postBuild, platform.spec.postBuild);
+  assert.deepEqual(spec.patches[0], other);
+  const selected = JSON.parse(spec.patches[1]!.patch);
+  assert.equal(
+    selected.spec.values["lvm-localpv"].lvmPlugin.image.tag,
+    "v1@sha256:" + "b".repeat(64),
+  );
+  assert.equal(
+    selected.spec.postRenderers[0].kustomize.patches[0].target.name,
+    "openebs-lvm-localpv-node",
+  );
+});

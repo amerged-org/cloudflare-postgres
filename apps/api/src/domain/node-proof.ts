@@ -75,6 +75,7 @@ export async function ensureNodePreparationProof(
 export async function ensureNodeVerificationProof(
   env: Env,
   operationId: string,
+  options: { notBefore?: string } = {},
 ): Promise<boolean> {
   const binding = await readNodeInstallationBinding(env.DB, operationId);
   if (!binding) return true;
@@ -98,6 +99,10 @@ export async function ensureNodeVerificationProof(
   if (row.admitted) return true;
   if (
     row.admission_authorized &&
+    (!options.notBefore ||
+      (addition.network &&
+        Date.parse(addition.network.verified_at) >=
+          Date.parse(options.notBefore))) &&
     row.admission_expires_at &&
     Date.parse(row.admission_expires_at) > Date.now()
   )

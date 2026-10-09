@@ -59,9 +59,14 @@ function admission(f: Awaited<ReturnType<typeof parents>>): Admission {
     ready_sample_observed_at: null,
   };
 }
-function insert(row: Admission) {
+function insert(
+  row: Admission,
+  table:
+    | "database_start_admissions"
+    | "migration_start_admissions" = "database_start_admissions",
+) {
   return env.DB.prepare(
-    `INSERT INTO database_start_admissions(${Object.keys(row).join(",")}) VALUES(${Object.keys(
+    `INSERT INTO ${table}(${Object.keys(row).join(",")}) VALUES(${Object.keys(
       row,
     )
       .map(() => "?")
@@ -72,7 +77,6 @@ function insert(row: Admission) {
 }
 
 it("adds a ledger to populated D1 without rewriting parents and cascades it when the operation is removed", async () => {
-  await env.DB.prepare("DROP TABLE database_start_admissions").run();
   const f = await parents();
   const before = await env.DB.prepare("SELECT * FROM databases WHERE id=?")
     .bind(f.database)
@@ -83,7 +87,18 @@ it("adds a ledger to populated D1 without rewriting parents and cascades it when
   const migration = (
     env as typeof env & { TEST_MIGRATIONS: D1Migration[] }
   ).TEST_MIGRATIONS.find((value) => value.name.startsWith("0019"))!;
-  await env.DB.batch(migration.queries.map((query) => env.DB.prepare(query)));
+  await env.DB.batch(
+    migration.queries.map((query) =>
+      env.DB.prepare(
+        query
+          .replaceAll("database_start_admissions", "migration_start_admissions")
+          .replaceAll(
+            "database_start_admission_immutable",
+            "migration_start_admission_immutable",
+          ),
+      ),
+    ),
+  );
   expect(
     await env.DB.prepare("SELECT * FROM databases WHERE id=?")
       .bind(f.database)
@@ -95,7 +110,7 @@ it("adds a ledger to populated D1 without rewriting parents and cascades it when
       .first(),
   ).toEqual(operation);
   const row = admission(f);
-  await insert(row);
+  await insert(row, "migration_start_admissions");
   // Old, uncertain starts keep their full hold regardless of operation status.
   await env.DB.prepare(
     "UPDATE operations SET status='failed',error_code='unknown',completed_at=updated_at WHERE id=?",
@@ -104,7 +119,7 @@ it("adds a ledger to populated D1 without rewriting parents and cascades it when
     .run();
   expect(
     await env.DB.prepare(
-      "SELECT * FROM database_start_admissions WHERE operation_id=?",
+      "SELECT * FROM migration_start_admissions WHERE operation_id=?",
     )
       .bind(f.operation)
       .first(),
@@ -117,7 +132,7 @@ it("adds a ledger to populated D1 without rewriting parents and cascades it when
     .run();
   expect(
     await env.DB.prepare(
-      "SELECT * FROM database_start_admissions WHERE operation_id=?",
+      "SELECT * FROM migration_start_admissions WHERE operation_id=?",
     )
       .bind(f.operation)
       .first(),
@@ -127,13 +142,14 @@ it("adds a ledger to populated D1 without rewriting parents and cascades it when
       .bind(f.database)
       .first("id"),
   ).toBe(f.database);
+  await env.DB.prepare("DROP TABLE migration_start_admissions").run();
 });
 
 it("rejects a second hold for the same generation, unsafe byte budgets and incomplete readiness", async () => {
   const f = await parents(),
     row = admission(f);
   await expect(insert({ ...row, budget_bytes: 0 })).rejects.toThrow(
-    "CHECK constraint failed",
+    "database_storage_drain_only",
   );
   await expect(
     insert({ ...row, budget_bytes: Number.MAX_SAFE_INTEGER + 1 }),
@@ -163,7 +179,7 @@ it("rejects a second hold for the same generation, unsafe byte budgets and incom
     )
       .bind(f.operation)
       .first(),
-  ).toEqual(row);
+  ).toEqual({ ...row, storage_budget_bytes: 0, storage_volume_json: null });
 });
 
 it("preserves the grant identity and sample while accepting only one complete readiness acknowledgement", async () => {
@@ -219,5 +235,11 @@ it("preserves the grant identity and sample while accepting only one complete re
     )
       .bind(f.operation)
       .first(),
-  ).toEqual({ ...row, ready_at: ready, ready_sample_observed_at: sample });
+  ).toEqual({
+    ...row,
+    ready_at: ready,
+    ready_sample_observed_at: sample,
+    storage_budget_bytes: 0,
+    storage_volume_json: null,
+  });
 });

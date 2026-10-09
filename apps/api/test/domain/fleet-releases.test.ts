@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
+import { FleetNodeReleaseObservation } from "@pgcf/contracts/releases";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
+  vi.restoreAllMocks();
   // Existing fixture cleanup removes assigned rows through their node/region FKs.
   await cleanupFixtures();
   for (const id of releases.splice(0))
@@ -34,7 +36,7 @@ function spec() {
     talos_version: "1.14.1",
     talos_installer: `registry.example/talos@sha256:${"a".repeat(64)}`,
     talos_schematic_sha256: "b".repeat(64),
-    talos_extensions: [],
+    talos_extensions: [] as string[],
     kubernetes_version: "1.36.5",
     components: names.slice(3),
   };
@@ -418,4 +420,381 @@ it("stores partial authenticated runtime inventory as pending and exposes actual
   expect(status.observed_facts).toEqual(observation.facts);
   expect(status.mismatches).toContain("unobserved/talos_installer");
   expect(status.mismatches).toContain("unobserved/components/regional");
+});
+
+const kubeImagePins = {
+  kubelet: `registry.example/kubelet:v1.36.5@sha256:${"1".repeat(64)}`,
+  apiServer: `registry.example/kube-apiserver:v1.36.5@sha256:${"2".repeat(64)}`,
+  controllerManager: `registry.example/kube-controller-manager:v1.36.5@sha256:${"3".repeat(64)}`,
+  scheduler: `registry.example/kube-scheduler:v1.36.5@sha256:${"4".repeat(64)}`,
+};
+async function receiptFixture(kubernetesImages = false, extensions = false) {
+  const f = await setup();
+  if (kubernetesImages)
+    for (const role of Object.values(f.value.roles))
+      Object.assign(role, { kubernetes_images: kubeImagePins });
+  if (extensions) {
+    const component = {
+      name: "pgcf-sandbox-controller",
+      kind: "image",
+      version: "0.1.0",
+      reference: "registry.example/extension@sha256:" + "d".repeat(64),
+      sha256: "d".repeat(64),
+    };
+    f.value.components.push(component);
+    for (const role of Object.values(f.value.roles))
+      role.talos_extensions.push(component.name);
+  }
+  await f.approve();
+  await f.assignRegion();
+  await f.assignNode();
+  const boot = crypto.randomUUID();
+  const native = FleetNodeReleaseObservation.parse({
+    ...f.inventory(),
+    observed_at: new Date(Date.now() - 1000).toISOString(),
+    facts: {
+      ...f.inventory().facts,
+      boot_id: boot,
+      components: [
+        ...f.inventory().facts.components,
+        ...f.value.components
+          .filter((component) =>
+            f.value.roles.customer.talos_extensions.includes(component.name),
+          )
+          .map(({ name, version, sha256 }) => ({ name, version, sha256 })),
+      ],
+      talos_provenance: {
+        method: "deploymentreceipt",
+        installer: f.value.roles.customer.talos_installer,
+        node_uid: f.uid,
+        cluster_uid: crypto.randomUUID(),
+        boot_id: boot,
+      },
+    },
+  });
+  const key = await env.DB.prepare(
+    "SELECT agent_key_hash FROM regions WHERE id=?",
+  )
+    .bind(f.region)
+    .first<string>("agent_key_hash");
+  const seed = async () =>
+    env.DB.prepare(
+      `INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at)
+    VALUES(?,?,?,?,?,?,?) ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,assignment_revision=excluded.assignment_revision,
+      agent_key_hash=excluded.agent_key_hash,facts_json=excluded.facts_json,observed_at=excluded.observed_at,received_at=excluded.received_at`,
+    )
+      .bind(
+        f.node,
+        f.uid,
+        1,
+        key,
+        JSON.stringify(native.facts),
+        native.observed_at,
+        native.observed_at,
+      )
+      .run();
+  await seed();
+  const partial = () =>
+    FleetNodeReleaseObservation.parse({
+      node_id: f.node,
+      node_uid: f.uid,
+      assignment_revision: 1,
+      observed_at: new Date().toISOString(),
+      facts: {
+        boot_id: boot,
+        talos_version: `v${f.value.roles.customer.talos_version}`,
+        kubernetes_version: f.value.roles.customer.kubernetes_version,
+        components: [
+          { name: "regional", runtime_image_sha256: "e".repeat(64) },
+        ],
+      },
+    });
+  const observe = (value: FleetNodeReleaseObservation) =>
+    request("/agent/v1/fleet-observations", f.agent, "POST", value);
+  const stored = async () =>
+    (await env.DB.prepare(
+      "SELECT facts_json,observed_at FROM fleet_node_release_observations WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first<{ facts_json: string; observed_at: string }>())!;
+  return { ...f, native, boot, key, seed, partial, observe, stored };
+}
+it("retains Native OS receipt across same-boot partial inventory without carrying stale Kubernetes components", async () => {
+  const f = await receiptFixture(),
+    partial = f.partial();
+  expect((await f.observe(partial)).status).toBe(200);
+  const row = await f.stored(),
+    facts = JSON.parse(row.facts_json);
+  expect(facts).toMatchObject({
+    talos_installer: f.native.facts.talos_installer,
+    talos_schematic_sha256: f.native.facts.talos_schematic_sha256,
+    talos_provenance: f.native.facts.talos_provenance,
+  });
+  expect(facts.components).toEqual(partial.facts.components);
+  expect((await f.observe(partial)).status).toBe(200);
+});
+it("missing boot or Talos version cannot refresh a retained Native OS receipt", async () => {
+  const f = await receiptFixture(),
+    before = await f.stored(),
+    missingBoot = f.partial();
+  delete missingBoot.facts.boot_id;
+  expect((await f.observe(missingBoot)).status).toBe(409);
+  expect(await f.stored()).toEqual(before);
+  const missingVersion = f.partial();
+  delete missingVersion.facts.talos_version;
+  expect((await f.observe(missingVersion)).status).toBe(409);
+  expect(await f.stored()).toEqual(before);
+});
+it("changed boot or Talos version invalidates prior Native OS provenance", async () => {
+  const f = await receiptFixture(),
+    reboot = f.partial();
+  reboot.facts.boot_id = crypto.randomUUID();
+  expect((await f.observe(reboot)).status).toBe(200);
+  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
+    "talos_provenance",
+  );
+  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
+    "talos_installer",
+  );
+  await f.seed();
+  const changedVersion = f.partial();
+  changedVersion.facts.talos_version = "1.14.2";
+  expect((await f.observe(changedVersion)).status).toBe(200);
+  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
+    "talos_provenance",
+  );
+});
+it("ordinary Regional observations cannot mint a Native deployment receipt", async () => {
+  const f = await receiptFixture();
+  await env.DB.prepare(
+    "DELETE FROM fleet_node_release_observations WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  const supplied = f.partial();
+  supplied.facts = { ...f.native.facts };
+  supplied.observed_at = new Date().toISOString();
+  expect((await f.observe(supplied)).status).toBe(409);
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) n FROM fleet_node_release_observations WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first("n"),
+  ).toBe(0);
+});
+it("changed assignment or agent key cannot carry a previous Native receipt", async () => {
+  const f = await receiptFixture();
+  await f.assignNode(1);
+  const next = f.partial();
+  next.assignment_revision = 2;
+  expect((await f.observe(next)).status).toBe(200);
+  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
+    "talos_provenance",
+  );
+  await f.seed();
+  await env.DB.prepare(
+    "UPDATE fleet_node_release_observations SET assignment_revision=2,agent_key_hash=? WHERE node_id=?",
+  )
+    .bind("f".repeat(64), f.node)
+    .run();
+  const current = f.partial();
+  current.assignment_revision = 2;
+  expect((await f.observe(current)).status).toBe(200);
+  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
+    "talos_installer",
+  );
+});
+it("a concurrent Native receipt is never overwritten by a stale partial-inventory merge", async () => {
+  const f = await receiptFixture(),
+    partial = f.partial(),
+    newFacts = structuredClone(f.native.facts);
+  newFacts.talos_provenance!.cluster_uid = crypto.randomUUID();
+  const at = new Date(Date.now() + 1).toISOString();
+  partial.observed_at = new Date(Date.now() + 1000).toISOString();
+  const prepare = env.DB.prepare.bind(env.DB);
+  let raced = false;
+  vi.spyOn(env.DB, "prepare").mockImplementation((sql) => {
+    const statement = prepare(sql);
+    if (!sql.includes("INSERT INTO fleet_node_release_observations"))
+      return statement;
+    return new Proxy(statement, {
+      get(target, key) {
+        if (key === "bind")
+          return (...parameters: unknown[]) => {
+            const bound = target.bind(...parameters);
+            return new Proxy(bound, {
+              get(inner, property) {
+                if (property === "run")
+                  return async () => {
+                    if (!raced) {
+                      raced = true;
+                      await prepare(
+                        "UPDATE fleet_node_release_observations SET facts_json=?,observed_at=? WHERE node_id=?",
+                      )
+                        .bind(JSON.stringify(newFacts), at, f.node)
+                        .run();
+                    }
+                    return inner.run();
+                  };
+                const value = Reflect.get(inner, property);
+                return typeof value === "function" ? value.bind(inner) : value;
+              },
+            });
+          };
+        const value = Reflect.get(target, key);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  });
+  expect((await f.observe(partial)).status).toBe(409);
+  expect(raced).toBe(true);
+  expect(await f.stored()).toEqual({
+    facts_json: JSON.stringify(newFacts),
+    observed_at: at,
+  });
+});
+it("malformed old installer or schematic receipt never becomes refreshed target provenance", async () => {
+  const f = await receiptFixture(),
+    wrongInstaller = structuredClone(f.native.facts);
+  wrongInstaller.talos_installer = `registry.example/old-talos@sha256:${"e".repeat(64)}`;
+  wrongInstaller.talos_provenance!.installer = wrongInstaller.talos_installer;
+  await env.DB.prepare(
+    "UPDATE fleet_node_release_observations SET facts_json=? WHERE node_id=?",
+  )
+    .bind(JSON.stringify(wrongInstaller), f.node)
+    .run();
+  expect((await f.observe(f.partial())).status).toBe(200);
+  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
+    "talos_provenance",
+  );
+  await f.seed();
+  const wrongSchematic = structuredClone(f.native.facts);
+  wrongSchematic.talos_schematic_sha256 = "f".repeat(64);
+  await env.DB.prepare(
+    "UPDATE fleet_node_release_observations SET facts_json=? WHERE node_id=?",
+  )
+    .bind(JSON.stringify(wrongSchematic), f.node)
+    .run();
+  expect((await f.observe(f.partial())).status).toBe(200);
+  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
+    "talos_installer",
+  );
+});
+it("replaced physical Node UID cannot inherit another machine's Native receipt", async () => {
+  const f = await receiptFixture(),
+    replacement = crypto.randomUUID();
+  await env.DB.prepare("UPDATE nodes SET node_uid=? WHERE id=?")
+    .bind(replacement, f.node)
+    .run();
+  expect((await f.assignNode(1, replacement)).status).toBe(200);
+  const partial = f.partial();
+  partial.node_uid = replacement;
+  partial.assignment_revision = 2;
+  expect((await f.observe(partial)).status).toBe(200);
+  expect(JSON.parse((await f.stored()).facts_json)).not.toHaveProperty(
+    "talos_provenance",
+  );
+});
+
+it("requires the observed current Ready Flux source commit when the release pins its platform source", async () => {
+  const { mismatches } = await import("../../src/domain/fleet-releases.ts");
+  const { FleetReleaseSpec } = await import("@pgcf/contracts/releases");
+  const release = FleetReleaseSpec.parse({
+    ...spec(),
+    platform_source_commit: "a".repeat(40),
+  });
+  const facts = {
+    configuration_schema_revision: 1,
+    talos_version: release.roles.customer.talos_version,
+    talos_installer: release.roles.customer.talos_installer,
+    talos_schematic_sha256: release.roles.customer.talos_schematic_sha256,
+    kubernetes_version: release.roles.customer.kubernetes_version,
+    components: release.components
+      .filter((v) => release.roles.customer.components.includes(v.name))
+      .map(({ name, version, sha256 }) => ({ name, version, sha256 })),
+  };
+  expect(mismatches(release, "customer", facts)).toEqual([
+    "unobserved/platform_source_commit",
+  ]);
+  expect(
+    mismatches(release, "customer", {
+      ...facts,
+      platform_source_commit: "b".repeat(40),
+    }),
+  ).toEqual(["platform_source_commit"]);
+  expect(
+    mismatches(release, "customer", {
+      ...facts,
+      platform_source_commit: "a".repeat(40),
+    }),
+  ).toEqual([]);
+});
+
+it("retains Native kubelet image provenance at its original timestamp only across the same current boot/key/assignment and versions", async () => {
+  const f = await receiptFixture(true),
+    proof = {
+      method: "native_runtime_readback" as const,
+      observed_at: new Date(Date.now() - 60000).toISOString(),
+      kubelet_version: "1.36.5",
+      control_plane: false,
+      images: {
+        kubelet: {
+          configuration: kubeImagePins.kubelet,
+          runtime_sha256: "1".repeat(64),
+        },
+      },
+    };
+  Object.assign(f.native.facts, {
+    kubelet_version: "1.36.5",
+    kubernetes_control_plane: false,
+    kubernetes_image_provenance: proof,
+  });
+  await f.seed();
+  const partial = f.partial();
+  Object.assign(partial.facts, {
+    kubelet_version: "v1.36.5",
+    kubernetes_control_plane: false,
+  });
+  expect((await f.observe(partial)).status).toBe(200);
+  expect(
+    JSON.parse((await f.stored()).facts_json).kubernetes_image_provenance,
+  ).toEqual(proof);
+  const forged = structuredClone(partial);
+  forged.facts.kubernetes_image_provenance = {
+    ...proof,
+    observed_at: new Date().toISOString(),
+  };
+  expect((await f.observe(forged)).status).toBe(409);
+  const changed = structuredClone(partial);
+  changed.facts.kubelet_version = "1.36.4";
+  changed.observed_at = new Date(
+    Date.parse(partial.observed_at) + 100,
+  ).toISOString();
+  expect((await f.observe(changed)).status).toBe(200);
+  expect(
+    JSON.parse((await f.stored()).facts_json).kubernetes_image_provenance,
+  ).toBeUndefined();
+});
+
+it("retains only selected boot-bound loaded extensions while ordinary reports cannot forge them or carry them across a reboot", async () => {
+  const f = await receiptFixture(false, true),
+    ext = f.native.facts.components.find(
+      (c) => c.name === "pgcf-sandbox-controller",
+    )!;
+  expect((await f.observe(f.partial())).status).toBe(200);
+  expect(JSON.parse((await f.stored()).facts_json).components).toContainEqual(
+    ext,
+  );
+  const forged = f.partial();
+  forged.observed_at = new Date(Date.now() + 1).toISOString();
+  forged.facts.components.push({ ...ext, sha256: "f".repeat(64) });
+  expect((await f.observe(forged)).status).toBe(409);
+  const changed = f.partial();
+  changed.observed_at = new Date(Date.now() + 2).toISOString();
+  changed.facts.boot_id = crypto.randomUUID();
+  expect((await f.observe(changed)).status).toBe(200);
+  expect(
+    JSON.parse((await f.stored()).facts_json).components,
+  ).not.toContainEqual(ext);
 });
