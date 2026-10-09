@@ -80,7 +80,7 @@ impl HostProc {
         let pidns = copy(crate::host_context::HOST_PID_NAMESPACE_FD)?;
         let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
         if unsafe { libc::fstatfs(root.as_raw_fd(), fs.as_mut_ptr()) } < 0
-            || unsafe { fs.assume_init() }.f_type as i64 != libc::PROC_SUPER_MAGIC
+            || i128::from(unsafe { fs.assume_init() }.f_type) != i128::from(libc::PROC_SUPER_MAGIC)
         {
             return Err(unknown());
         }

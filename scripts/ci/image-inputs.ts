@@ -236,12 +236,164 @@ export function changedImageInputs(input: {
     return all();
   }
 }
+interface SuccessfulRunInputs {
+  eventName: string;
+  head?: string;
+  ref?: string;
+  repository?: string;
+  workflowRef?: string;
+  runId?: string;
+  token?: string;
+  cwd?: string;
+  request?: typeof fetch;
+}
+const workflowPath = ".github/workflows/ci.yml";
+function metadataObject(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new Error("Image baseline metadata unavailable");
+  return value as Record<string, unknown>;
+}
+/** Failed pushes publish no complete artifact set, so event.before is not an image baseline. */
+export async function changedImageInputsFromSuccessfulRun(
+  input: SuccessfulRunInputs,
+): Promise<{ baseline: string | null; inputs: ImageInputs }> {
+  const unknown = () => ({ baseline: null, inputs: all() });
+  const repository = input.repository;
+  if (
+    input.eventName !== "push" ||
+    input.ref !== "refs/heads/main" ||
+    !repository ||
+    !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository) ||
+    input.workflowRef !== `${repository}/${workflowPath}@refs/heads/main` ||
+    !input.head ||
+    !/^[a-f0-9]{40}$/i.test(input.head) ||
+    /^0{40}$/.test(input.head) ||
+    !input.runId ||
+    !/^[1-9][0-9]*$/.test(input.runId) ||
+    !input.token
+  )
+    return unknown();
+  const options = {
+    cwd: input.cwd ?? process.cwd(),
+    timeout: 10000,
+    maxBuffer: 2 * 1024 * 1024,
+    stdio: ["ignore", "pipe", "pipe"] as ["ignore", "pipe", "pipe"],
+  };
+  try {
+    if (
+      execFileSync("git", ["rev-parse", "--verify", "HEAD"], options)
+        .toString()
+        .trim()
+        .toLowerCase() !== input.head.toLowerCase()
+    )
+      return unknown();
+    const request = input.request ?? fetch,
+      deadline = AbortSignal.timeout(20000);
+    async function metadata(suffix: string): Promise<Record<string, unknown>> {
+      const response = await request(
+        `https://api.github.com/repos/${repository}/actions/workflows/ci.yml${suffix}`,
+        {
+          headers: {
+            Accept: "application/vnd.github+json",
+            Authorization: `Bearer ${input.token}`,
+            "X-GitHub-Api-Version": "2026-03-10",
+            "User-Agent": "pgcf-image-inputs",
+          },
+          redirect: "error",
+          signal: AbortSignal.any([deadline, AbortSignal.timeout(10000)]),
+        },
+      );
+      if (response.status !== 200 || !response.body)
+        throw new Error("Image baseline read unavailable");
+      let size = 0;
+      const chunks: Buffer[] = [];
+      for await (const chunk of response.body) {
+        size += chunk.length;
+        if (size > 2 * 1024 * 1024)
+          throw new Error("Image baseline metadata bound");
+        chunks.push(Buffer.from(chunk));
+      }
+      return metadataObject(JSON.parse(Buffer.concat(chunks).toString("utf8")));
+    }
+    const workflow = await metadata("");
+    if (
+      !Number.isSafeInteger(workflow.id) ||
+      Number(workflow.id) <= 0 ||
+      workflow.path !== workflowPath
+    )
+      return unknown();
+    const runs = (
+      await metadata("/runs?branch=main&event=push&status=success&per_page=100")
+    ).workflow_runs;
+    if (!Array.isArray(runs) || runs.length > 100) return unknown();
+    const candidates: { sha: string; number: number }[] = [];
+    for (const raw of runs) {
+      const run = metadataObject(raw);
+      // Explicitly exclude supplemental dispatch, forks, other branches and other workflows.
+      if (
+        run.event !== "push" ||
+        run.head_branch !== "main" ||
+        run.path !== workflowPath ||
+        run.workflow_id !== workflow.id ||
+        run.status !== "completed" ||
+        run.conclusion !== "success" ||
+        metadataObject(run.repository).full_name !== repository ||
+        metadataObject(run.head_repository).full_name !== repository ||
+        String(run.id) === input.runId
+      )
+        continue;
+      if (
+        typeof run.head_sha !== "string" ||
+        !/^[a-f0-9]{40}$/i.test(run.head_sha) ||
+        /^0{40}$/.test(run.head_sha) ||
+        !Number.isSafeInteger(run.run_number) ||
+        Number(run.run_number) <= 0 ||
+        !Number.isSafeInteger(run.id) ||
+        Number(run.id) <= 0
+      )
+        return unknown();
+      candidates.push({ sha: run.head_sha, number: Number(run.run_number) });
+    }
+    candidates.sort((a, b) => b.number - a.number);
+    for (const candidate of candidates) {
+      try {
+        execFileSync(
+          "git",
+          ["merge-base", "--is-ancestor", candidate.sha, input.head],
+          options,
+        );
+      } catch (error) {
+        if ((error as { status?: number }).status === 1) continue;
+        return unknown();
+      }
+      return {
+        baseline: candidate.sha,
+        inputs: changedImageInputs({
+          eventName: input.eventName,
+          before: candidate.sha,
+          head: input.head,
+          cwd: input.cwd,
+        }),
+      };
+    }
+  } catch {
+    return unknown();
+  }
+  return unknown();
+}
 if (import.meta.main) {
-  const result = changedImageInputs({
+  const result = await changedImageInputsFromSuccessfulRun({
     eventName: process.env.GITHUB_EVENT_NAME ?? "",
-    before: process.env.PGCF_IMAGE_BEFORE,
     head: process.env.GITHUB_SHA,
+    ref: process.env.GITHUB_REF,
+    repository: process.env.GITHUB_REPOSITORY,
+    workflowRef: process.env.GITHUB_WORKFLOW_REF,
+    runId: process.env.GITHUB_RUN_ID,
+    token: process.env.GH_TOKEN,
   });
-  for (const [name, selected] of Object.entries(result))
+  process.stderr.write(
+    `Image comparison baseline: ${result.baseline ?? "unknown; all artifacts selected"}\n`,
+  );
+  for (const [name, selected] of Object.entries(result.inputs))
     process.stdout.write(`${name}=${selected}\n`);
 }
