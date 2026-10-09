@@ -113,6 +113,11 @@ test("only a changed recorded configuration boot with healthy vendor kubelet and
       ],
     },
   }));
+  const terminal = structuredClone(pods[0]!);
+  terminal.metadata.uid = randomUUID();
+  (terminal.status as Record<string, unknown>).phase = "Succeeded";
+  terminal.status.containerStatuses[0]!.ready = false;
+  pods.push(terminal);
   const resource = (type: string, id: string, spec: object) =>
       JSON.stringify({ metadata: { type, id }, spec }),
     commands = {

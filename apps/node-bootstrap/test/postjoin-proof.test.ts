@@ -650,6 +650,21 @@ test("interrupted traffic closes the camera and never returns a proof", async ()
 });
 test("an actual singleton peer array allows only real stable Node and namespace readbacks, without creating traffic objects", async () => {
   const f = caseFixture();
+  const read = f.commands.kube;
+  f.commands.kube = async (args, input) => {
+    const result = await read(args, input);
+    if (args[0] === "get" && args[1] === "pods" && args.includes("-l")) {
+      const value = JSON.parse(result.stdout),
+        terminal = structuredClone(value.items[0]);
+      terminal.metadata.uid = randomUUID();
+      terminal.metadata.name = "cilium-previous";
+      terminal.status.phase = "Succeeded";
+      terminal.status.containerStatuses[0].ready = false;
+      value.items.push(terminal);
+      return { ...result, stdout: JSON.stringify(value) };
+    }
+    return result;
+  };
   const proof = await collectPostjoinProof(
     f.input,
     f.bundle,

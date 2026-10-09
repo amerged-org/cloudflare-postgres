@@ -139,7 +139,8 @@ export async function observeKubernetesImages(
         (pod) =>
           object(pod.spec).nodeName === input.k8s_node_name &&
           object(object(pod.metadata).labels).component === component &&
-          !object(pod.metadata).deletionTimestamp,
+          !object(pod.metadata).deletionTimestamp &&
+          !["Succeeded", "Failed"].includes(String(object(pod.status).phase)),
       );
       if (selected.length !== 1) continue;
       const pod = selected[0]!,

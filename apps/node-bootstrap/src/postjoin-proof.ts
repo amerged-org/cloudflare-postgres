@@ -687,7 +687,9 @@ class Collector {
         "json",
       ]),
     );
-    const pods = rows(list.items, 2);
+    const pods = rows(list.items, 10000).filter(
+      (pod) => !["Succeeded", "Failed"].includes(String(obj(pod.status).phase)),
+    );
     if (pods.length !== 1) return fail("cilium_agent_identity");
     const pod = pods[0]!,
       m = metadata(pod),

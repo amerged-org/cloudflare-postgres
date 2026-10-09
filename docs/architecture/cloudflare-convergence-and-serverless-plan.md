@@ -6,9 +6,9 @@ Status: **all 13 final acceptance gates remain open**. Owner direction: 2026-10-
 US admission, database lifecycle and RAM measurements remain partial evidence.
 
 The owner's execution order in section10 supersedes earlier dependencies and permission to
-develop large work packages in parallel. Current work is gate1: native Linux/AMD64 CI parity,
-green CI and delivery of the current generic policy configuration. Existing later-gate code
-remains unchanged; this sequencing decision does not discard it.
+develop large work packages in parallel. Execution gate1 passed live; current work is gate2:
+R1 retained-fleet preflight and supported upgrades. Existing later-gate code remains unchanged;
+this sequencing decision does not discard it.
 
 R1 is the official Image Factory Talos1.14.2 / Kubernetes1.36.5 fleet release without a custom
 OS image. R2 adds the sandbox extension and proves interrupted upgrade/resume. Upstream bytes
@@ -51,10 +51,10 @@ is an additional mode and cannot substitute for that pool. The subsequent Neon c
 
 ## 2. What is proved, what is not
 
-The reported live API/Regional baseline remains6978033; no subsequent API deployment is claimed.
-EU's actual-RAM transition took135s and preserved all3 retained database hashes. The live node
-ceilings and personal notification setup were removed; generic controls still need current-release
-delivery and acceptance.
+The live API is0cbf616 after successful main CI37998729329; D1 remains at0038. Execution gate1
+passed live configuration/defaults and retained SQL checks. The fixed node ceilings and personal
+notification setup are removed. US custody revision2 is active after live authority rotation;
+EU rotation remains required before customer data. Measured results are recorded in PLAN.md Status.
 
 Historical live evidence includes operator-assisted US1 Ready in198.356s, EU/US SQL/TLS and
 nonsuperuser roles, four R2 base/WAL checks, healthy-source EU-to-US restore in87,988ms,

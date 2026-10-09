@@ -10,7 +10,7 @@ import { FleetDesiredRelease } from "@pgcf/contracts/releases";
 import { collectFleetInventory } from "../../src/agent/fleet-inventory.ts";
 import { AgentApi } from "../../src/agent/api-client.ts";
 import { AgentLoop } from "../../src/agent/loop.ts";
-import { record } from "../../src/agent/types.ts";
+import { record, type Resource } from "../../src/agent/types.ts";
 import { fixture, MemoryKubernetes } from "./fixtures.ts";
 
 function inventoryFixture() {
@@ -52,6 +52,7 @@ function inventoryFixture() {
       ],
     },
     status: {
+      phase: "Running",
       containerStatuses: [
         {
           name: "agent",
@@ -139,6 +140,78 @@ function inventoryFixture() {
   });
   return { k8s, node, pod, desired };
 }
+function putTerminalPod(
+  k8s: MemoryKubernetes,
+  original: Resource,
+  name: string,
+  phase: "Succeeded" | "Failed",
+) {
+  const pod = k8s.put({
+    ...structuredClone(original),
+    metadata: { ...original.metadata, name },
+  });
+  const containers = record(pod.spec).containers as Record<string, unknown>[];
+  containers[0]!.image = String(containers[0]!.image).replace(
+    "d".repeat(64),
+    "f".repeat(64),
+  );
+  const statuses = record(pod.status).containerStatuses as Record<
+    string,
+    unknown
+  >[];
+  record(pod.status).phase = phase;
+  statuses[0]!.imageID = containers[0]!.image;
+  statuses[0]!.ready = false;
+  statuses[0]!.state = {
+    terminated: { exitCode: phase === "Succeeded" ? 0 : 1 },
+  };
+}
+function staticInventoryFixture() {
+  const f = inventoryFixture();
+  f.node.metadata.labels = { "node-role.kubernetes.io/control-plane": "" };
+  f.desired.nodes[0]!.role = "control_relay";
+  f.k8s.put({
+    apiVersion: "v1",
+    kind: "Namespace",
+    metadata: { name: "kube-system" },
+  });
+  const image = `registry.example/kube-apiserver@sha256:${"d".repeat(64)}`;
+  const pod = f.k8s.put({
+    ...structuredClone(f.pod),
+    metadata: {
+      name: "kube-apiserver-one",
+      namespace: "kube-system",
+      labels: { component: "kube-apiserver" },
+    },
+    spec: {
+      nodeName: f.node.metadata.name,
+      containers: [{ name: "kube-apiserver", image }],
+    },
+    status: {
+      phase: "Running",
+      containerStatuses: [
+        {
+          name: "kube-apiserver",
+          ready: true,
+          restartCount: 0,
+          imageID: image,
+          state: { running: { startedAt: new Date().toISOString() } },
+        },
+      ],
+    },
+  });
+  Object.assign(pod.metadata, {
+    ownerReferences: [
+      {
+        controller: true,
+        uid: f.node.metadata.uid!,
+        kind: "Node",
+        name: f.node.metadata.name,
+      },
+    ],
+  });
+  return { ...f, pod };
+}
 test("collects stable actual Node/runtime facts and leaves unobservable release facts absent", async () => {
   const f = inventoryFixture(),
     reports = await collectFleetInventory(f.k8s, f.desired);
@@ -160,6 +233,60 @@ test("collects stable actual Node/runtime facts and leaves unobservable release 
     ],
   });
   assert.equal(f.k8s.mutations, 0);
+});
+test("ignores terminal old workload Pods while observing the Ready current release", async () => {
+  const f = inventoryFixture();
+  putTerminalPod(f.k8s, f.pod, "agent-completed", "Succeeded");
+  putTerminalPod(f.k8s, f.pod, "agent-failed", "Failed");
+  assert.deepEqual(
+    (await collectFleetInventory(f.k8s, f.desired))[0]!.facts.components,
+    [
+      {
+        name: "regional",
+        version: "1.0.0",
+        sha256: "d".repeat(64),
+        runtime_image_sha256: "d".repeat(64),
+      },
+    ],
+  );
+});
+test("refuses a workload Pod that becomes terminal during its fresh read", async () => {
+  const f = inventoryFixture();
+  const original = f.k8s.read.bind(f.k8s);
+  f.k8s.read = async (...args) => {
+    const value = await original(...args);
+    if (args[0] === "Pod" && value) record(value.status).phase = "Succeeded";
+    return value;
+  };
+  assert.deepEqual(
+    (await collectFleetInventory(f.k8s, f.desired))[0]!.facts.components,
+    [],
+  );
+});
+test("ignores terminal old static Pods while observing the Ready current image", async () => {
+  const f = staticInventoryFixture();
+  putTerminalPod(f.k8s, f.pod, "kube-apiserver-completed", "Succeeded");
+  putTerminalPod(f.k8s, f.pod, "kube-apiserver-failed", "Failed");
+  assert.deepEqual(
+    (await collectFleetInventory(f.k8s, f.desired))[0]!.facts
+      .kubernetes_static_images,
+    { apiServer: "d".repeat(64) },
+  );
+});
+test("refuses a static Pod that becomes terminal during its fresh read", async () => {
+  const f = staticInventoryFixture();
+  const original = f.k8s.read.bind(f.k8s);
+  f.k8s.read = async (...args) => {
+    const value = await original(...args);
+    if (args[0] === "Pod" && value && args[1] === "kube-system")
+      record(value.status).phase = "Failed";
+    return value;
+  };
+  assert.deepEqual(
+    (await collectFleetInventory(f.k8s, f.desired))[0]!.facts
+      .kubernetes_static_images,
+    {},
+  );
 });
 test("keeps unqualified runtime child digests distinct from configured release digests", async () => {
   const f = inventoryFixture();

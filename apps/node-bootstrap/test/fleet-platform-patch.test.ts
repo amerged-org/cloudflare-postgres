@@ -847,3 +847,137 @@ test("a denied Flux read or an unowned fixed-name collision cannot authorize cre
   );
   assert.equal(writes, 0);
 });
+
+test("release image observations ignore terminal rollout Pods but still require an active Ready pinned Pod", () => {
+  const { input } = patchFixture(),
+    commit = "f".repeat(40),
+    pin = input.spec.components.find((value) => value.name === "regional")!;
+  input.spec.platform_source_commit = commit;
+  pin.workload = {
+    namespace: "pgcf-system",
+    selector: { "app.kubernetes.io/name": "pgcf-agent" },
+    scope: "cluster",
+  };
+  input.spec.roles.customer.components = [pin.name];
+  const resource = (
+    kind: string,
+    name: string,
+    spec: object,
+    status: object,
+  ) => ({
+    kind,
+    metadata: {
+      name,
+      namespace: "flux-system",
+      uid: randomUUID(),
+      generation: 1,
+    },
+    spec,
+    status: {
+      observedGeneration: 1,
+      conditions: [{ type: "Ready", status: "True", observedGeneration: 1 }],
+      ...status,
+    },
+  });
+  const source = resource(
+      "GitRepository",
+      "pgcf-platform",
+      { ref: { commit } },
+      { artifact: { revision: `sha1:${commit}` } },
+    ),
+    platform = resource(
+      "Kustomization",
+      "pgcf-platform",
+      {},
+      { lastAppliedRevision: `sha1:${commit}` },
+    ),
+    regional = resource(
+      "Kustomization",
+      "pgcf-regional",
+      { path: "./infra/platform/regional" },
+      { lastAppliedRevision: `sha1:${commit}` },
+    ),
+    workload = resource(
+      "Deployment",
+      "pgcf-agent",
+      {
+        replicas: 1,
+        selector: { matchLabels: pin.workload.selector },
+        template: {
+          spec: { containers: [{ name: "agent", image: pin.reference }] },
+        },
+      },
+      {
+        replicas: 1,
+        updatedReplicas: 1,
+        readyReplicas: 1,
+        availableReplicas: 1,
+      },
+    );
+  workload.metadata.namespace = "pgcf-system";
+  const active = {
+      metadata: {
+        uid: randomUUID(),
+        namespace: "pgcf-system",
+        labels: pin.workload.selector,
+        ownerReferences: [{ controller: true, uid: randomUUID() }],
+      },
+      spec: {
+        nodeName: input.k8s_node_name,
+        containers: [{ name: "agent", image: pin.reference }],
+      },
+      status: {
+        phase: "Running",
+        containerStatuses: [
+          {
+            name: "agent",
+            ready: true,
+            imageID: pin.reference,
+            state: { running: { startedAt: new Date().toISOString() } },
+          },
+        ],
+      },
+    },
+    succeeded = structuredClone(active),
+    failed = structuredClone(active);
+  succeeded.metadata.uid = randomUUID();
+  succeeded.status.phase = "Succeeded";
+  succeeded.status.containerStatuses[0]!.ready = false;
+  succeeded.spec.containers[0]!.image =
+    "registry.example/regional@sha256:" + "e".repeat(64);
+  failed.metadata.uid = randomUUID();
+  failed.status.phase = "Failed";
+  failed.status.containerStatuses[0]!.ready = false;
+  const values = [source, platform, regional, workload],
+    state: FleetPlatformState = {
+      resources: new Map(
+        values.map((value) => [
+          `${value.kind}/${value.metadata.namespace}/${value.metadata.name}`,
+          value,
+        ]),
+      ),
+      pods: [succeeded, failed, active],
+      uids: {},
+    },
+    assets = { lock: {}, flux: [], flux_deprecated: [], relay: {} };
+  assert.equal(
+    fleetPlatformReadback(input, state, assets).regional_ready,
+    true,
+  );
+  succeeded.status.phase = "Pending";
+  assert.equal(
+    fleetPlatformReadback(input, state, assets).regional_ready,
+    false,
+  );
+  succeeded.status.phase = "Succeeded";
+  active.status.containerStatuses[0]!.ready = false;
+  assert.equal(
+    fleetPlatformReadback(input, state, assets).regional_ready,
+    false,
+  );
+  state.pods = [succeeded, failed];
+  assert.equal(
+    fleetPlatformReadback(input, state, assets).regional_ready,
+    false,
+  );
+});

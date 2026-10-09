@@ -412,6 +412,7 @@ function pinnedPods(
       spec = object(pod.spec);
     return (
       !metadata.deletionTimestamp &&
+      !["Succeeded", "Failed"].includes(String(object(pod.status).phase)) &&
       (ownership === undefined ||
         (metadata.namespace === ownership.namespace &&
           Object.entries(ownership.selector).every(
@@ -657,6 +658,10 @@ export function fleetPlatformReadback(
         (value) =>
           state.resources.has(resourceKey(value)) ||
           state.pods.some((pod) => {
+            if (
+              ["Succeeded", "Failed"].includes(String(object(pod.status).phase))
+            )
+              return false;
             const selector = object(object(value.spec).selector).matchLabels;
             return (
               selector &&

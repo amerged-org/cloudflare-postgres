@@ -29,6 +29,14 @@ function controllerUid(pod: Resource): string | undefined {
     .filter((owner) => owner.controller === true);
   return controllers.length === 1 ? string(controllers[0]!.uid) : undefined;
 }
+function activePod(pod: Resource): boolean {
+  const phase = record(pod.status).phase;
+  return (
+    !pod.metadata.deletionTimestamp &&
+    phase !== "Succeeded" &&
+    phase !== "Failed"
+  );
+}
 function ready(node: Resource): boolean {
   const conditions = record(node.status).conditions;
   return (
@@ -173,7 +181,7 @@ export async function collectFleetInventory(
           (pod) =>
             (ownership.scope === "cluster" ||
               record(pod.spec).nodeName === assignment.k8s_node_name) &&
-            !pod.metadata.deletionTimestamp &&
+            activePod(pod) &&
             pod.metadata.namespace === ownership.namespace &&
             Object.entries(ownership.selector).every(
               ([key, value]) => pod.metadata.labels?.[key] === value,
@@ -233,7 +241,7 @@ export async function collectFleetInventory(
         if (
           !fresh ||
           fresh.metadata.uid !== pod.metadata.uid ||
-          fresh.metadata.deletionTimestamp ||
+          !activePod(fresh) ||
           controllerUid(fresh) !== controllerUid(pod) ||
           Object.entries(ownership.selector).some(
             ([key, value]) => fresh.metadata.labels?.[key] !== value,
@@ -289,7 +297,7 @@ export async function collectFleetInventory(
               pod.metadata.namespace === "kube-system" &&
               pod.metadata.labels?.component === label &&
               record(pod.spec).nodeName === assignment.k8s_node_name &&
-              !pod.metadata.deletionTimestamp &&
+              activePod(pod) &&
               controllerUid(pod) === assignment.node_uid,
           );
           if (candidates.length !== 1) continue;
@@ -304,7 +312,7 @@ export async function collectFleetInventory(
           if (
             !fresh ||
             fresh.metadata.uid !== original.metadata.uid ||
-            fresh.metadata.deletionTimestamp ||
+            !activePod(fresh) ||
             controllerUid(fresh) !== assignment.node_uid ||
             record(fresh.spec).nodeName !== assignment.k8s_node_name ||
             !Array.isArray(statuses) ||
