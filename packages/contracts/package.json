@@ -18,6 +18,7 @@
     "./node-proof": "./src/node-proof.ts",
     "./bootstrap-relay": "./src/bootstrap-relay.ts",
     "./nodes": "./src/nodes.ts",
+    "./node-operator": "./src/node-operator.ts",
     "./releases": "./src/releases.ts",
     "./fleet-patches": "./src/fleet-patches.ts",
     "./compute-pool": "./src/compute-pool.ts",

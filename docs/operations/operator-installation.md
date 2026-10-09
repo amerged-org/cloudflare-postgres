@@ -1,12 +1,9 @@
 # Existing-account installation
 
-Current scope correction (2026-10-08): the overall product goal remains open. The accepted results
-below cover the operator/database subset. All three servers must now converge through the
-[unified corrective plan](../architecture/cloudflare-convergence-and-serverless-plan.md), including
-central CF customer policy, actual-use capacity, standing purchase activation, patching and fast
-starts. Earlier EU-upgrade deferrals and static reservation descriptions are historical current-state
-constraints, not the desired final product. Follow supported data-preserving procedures.
-
+Current scope (2026-10-09): the overall product goal remains open. Follow the ordered
+[execution gates](../architecture/cloudflare-convergence-and-serverless-plan.md#10-execution-order-and-release-gates)
+and record measured acceptance in [PLAN.md Status](../../PLAN.md#11-status). Preserve existing
+nodes, data and custody through supported upgrades.
 
 This guide completes the operator's existing Cloudflare/Contabo installation. Preserve the first
 EU control/relay node and its imported credentials. Retain the already-admitted second EU node as
@@ -17,14 +14,16 @@ Running is not installation or admission. No new EU worker, EU1 re-adoption, res
 decommissioning is part of this completion. Public
 distribution and installation in a foreign Cloudflare account are separate release work.
 
-For this owner's completion, run all remaining checks once read-only from the laptop using the
-same implementation and existing custody, without consuming admission. Collect every mismatch
-before one combined correction, CI, delivery and resume. If that one programmed attempt fails,
-the owner permits one operator admission using the same checks and existing US1 operation.
-Record the actual path and timing in PLAN Status; do not claim complete automatic acceptance.
-Its remaining proof belongs to the next genuine authorized purchase. Immediately continue the
-real database lifecycle on both customer nodes. EU upgrades and template activation are excluded
-from this completion; document differences and align only a blocking incompatibility.
+Complete the native Linux/AMD64 CI preflight and deliver the reviewed generic configuration first.
+R1 then converges all three retained servers on official Image Factory Talos 1.14.2,
+Kubernetes 1.36.5 and the pinned platform through data-preserving upgrades. R2 adds the sandbox
+extension and proves interrupted upgrade/resume. Continue the remaining gates in their documented
+order; later implementations stay unchanged until their gate begins.
+
+Retain US1's existing Ready operation. Prove fully unattended threshold-to-V159-to-Ready on the
+next authorized threshold-driven purchase at its execution gate. Use the Cloudflare relay for
+fleet management, including operator checks; remove temporary laptop firewall sources once the
+permanent relay entry is verified. Do not reopen the historical US1 fallback or reinstall EU nodes.
 
 ## Reviewed deployment inputs
 
@@ -94,6 +93,19 @@ hostname is needed. Retain signing keys privately, with explicit issuer and allo
 Verify the real VPC-to-Tunnel identity and the relay's current process epoch before enabling
 bootstrap jobs. Native SSH, Talos and Kubernetes sessions still verify their host keys or
 certificates end to end. Broken transport never replays a native command.
+
+An administrator can open `GET /v1/nodes/{id}/operator/kubernetes?node_uid=<UUID>`
+with its administrator Bearer key and a WebSocket upgrade. This uses the existing Cloudflare
+relay and only the node's sealed Kubernetes endpoint on port 6443; it returns no relay capability,
+cluster credentials or kubeconfig. `PgcfClient.operatorKubernetesRequest` prepares the private
+WSS URL and Authorization header for a caller-owned WebSocket connector; do not log its headers
+or follow redirects. Validate the upgrade's `X-PGCF-Node-UID`, `X-PGCF-Cluster-UID`,
+`X-PGCF-Node-Name` and `X-PGCF-Material-Revision` with
+`PgcfClient.parseOperatorKubernetesResponse`. These headers are Cloudflare's expected identity.
+The operator retains Kubernetes mTLS credentials and CA validation client-side, then independently
+reads `/api/v1/namespaces/kube-system` and `/api/v1/nodes/{node_name}` through the tunnel before
+any write. Their actual UIDs must match the expected cluster and Node UIDs. Missing or different
+identities stop the operation. This endpoint does not reopen terminal AddNode jobs.
 
 Select and seal the provider-verified proof source association once per installation in
 Cloudflare. Reuse that association across proof renewals with fresh expiring claims. Each grant

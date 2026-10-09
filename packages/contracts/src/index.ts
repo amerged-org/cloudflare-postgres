@@ -13,6 +13,7 @@ export * from "./gateway-activity.ts";
 export * from "./costs.ts";
 
 export * from "./nodes.ts";
+export * from "./node-operator.ts";
 export * from "./compute-pool.ts";
 export * from "./region-configuration.ts";
 export * from "./releases.ts";

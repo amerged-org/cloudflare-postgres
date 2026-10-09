@@ -19,6 +19,7 @@ import {
   nodeAdditionHostname,
   type NodeAdditionRequest,
 } from "../src/nodes.ts";
+import { nodeOperatorKubernetesHeaders } from "../src/node-operator.ts";
 
 afterEach(() => {
   vi.useRealTimers();
@@ -26,6 +27,48 @@ afterEach(() => {
 });
 
 const baseUrl = `https://${["api", "invalid"].join(".")}`;
+
+it("prepares a private operator WebSocket request without native fetch or URL credentials", () => {
+  const apiKey = newApiKey().key,
+    nodeId = newNodeId(),
+    nodeUid = crypto.randomUUID(),
+    fetcher = vi.fn<typeof fetch>(),
+    client = new PgcfClient({ baseUrl, apiKey, fetch: fetcher });
+  const descriptor = client.operatorKubernetesRequest(nodeId, nodeUid);
+  expect(descriptor).toEqual({
+    url: `${baseUrl.replace("https:", "wss:")}/v1/nodes/${nodeId}/operator/kubernetes?node_uid=${nodeUid}`,
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  expect(descriptor.url).not.toContain(apiKey);
+  expect(fetcher).not.toHaveBeenCalled();
+  expect(() =>
+    client.operatorKubernetesRequest(`${nodeId}/other`, nodeUid),
+  ).toThrow(PgcfClientError);
+  expect(() => client.operatorKubernetesRequest(nodeId, "invalid")).toThrow(
+    PgcfClientError,
+  );
+});
+
+it("validates operator response binding and rejects a different requested node UID", () => {
+  const client = new PgcfClient({ baseUrl, apiKey: newApiKey().key }),
+    binding = {
+      node_uid: crypto.randomUUID(),
+      cluster_uid: crypto.randomUUID(),
+      node_name: "pgcf-node-fixture",
+      material_revision: 2,
+    },
+    headers = new Headers(nodeOperatorKubernetesHeaders(binding));
+  expect(
+    client.parseOperatorKubernetesResponse(headers, binding.node_uid),
+  ).toEqual(binding);
+  expect(() =>
+    client.parseOperatorKubernetesResponse(headers, crypto.randomUUID()),
+  ).toThrow(PgcfClientError);
+  expect(() =>
+    client.parseOperatorKubernetesResponse(new Headers(), binding.node_uid),
+  ).toThrow(PgcfClientError);
+});
+
 function fixtures() {
   const now = new Date().toISOString();
   const database = {

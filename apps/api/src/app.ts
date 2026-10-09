@@ -18,6 +18,7 @@ import { registerFleetUpdates } from "./routes/fleet-updates.ts";
 import { registerResourceProfiles } from "./routes/resource-profiles.ts";
 import { registerRegionArchiveSources } from "./routes/region-archive-sources.ts";
 import { registerNodes } from "./routes/nodes.ts";
+import { registerNodeOperator } from "./routes/node-operator.ts";
 import { authenticateThinStorage } from "./domain/node-thin-storage-execution.ts";
 import { RECLAIM_LIMITS } from "@pgcf/contracts/reclaim";
 import { authenticateReclaimRequest } from "./domain/warm-reclaim.ts";
@@ -89,6 +90,7 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/internal/v1/fleet-patches/:operation_id/relay",
   "/agent/v1/fleet-observations",
   "/v1/nodes",
+  "/v1/nodes/:id/operator/kubernetes",
   "/v1/nodes/:id/storage",
   "/v1/nodes/additions",
   "/v1/nodes/additions/:id",
@@ -393,6 +395,7 @@ export function createApp(): ApiApp {
   registerAgentMetrics(app);
   registerCosts(app);
   registerNodes(app);
+  registerNodeOperator(app);
   registerComputePool(app);
   registerNodeThinStorage(app);
   registerReclaim(app);
