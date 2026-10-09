@@ -51,8 +51,8 @@ const sharedQualificationInputs = new Set([
   "scripts/ci/image-qualification.ts",
   "scripts/ci/scanner.ts",
   "scripts/ci/registry.ts",
-  "scripts/ci/reviewed-findings.ts",
-  "scripts/ci/reviewed-findings.json",
+  "scripts/ci/image-profiles.ts",
+  "scripts/ci/toolchain.mjs",
 ]);
 const nativeInputs = new Set([
   "apps/node-bootstrap/Dockerfile",
@@ -70,7 +70,6 @@ const postgresInputs = new Set([
   "infra/postgres/.dockerignore",
   "infra/postgres/sources.lock.json",
   "infra/postgres/image.test.mjs",
-  "scripts/ci/postgres-reviewed-findings.json",
 ]);
 function validPath(path: string): boolean {
   return (
@@ -124,8 +123,6 @@ export function selectImageInputs(
       result.node_bootstrap = true;
     if (postgresInputs.has(path)) result.postgres = true;
     if (path.startsWith("infra/storage/")) result.storage = true;
-    if (path === "scripts/ci/storage-reviewed-findings.json")
-      result.storage = true;
     if (
       [
         "Cargo.toml",
@@ -175,8 +172,7 @@ export function selectImageInputs(
     if (
       path.startsWith("apps/sandbox-controller/") ||
       path.startsWith("apps/node-runtime/") ||
-      path.startsWith("infra/talos/sandbox/") ||
-      path === "scripts/ci/talos-reviewed-findings.json"
+      path.startsWith("infra/talos/sandbox/")
     )
       result.sandbox_controller = true;
   }

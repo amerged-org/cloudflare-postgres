@@ -25,6 +25,7 @@ import {
   type ScanInput,
 } from "./scanner.ts";
 import { installScanner, readLayerArchive } from "./image-qualification.ts";
+import { selectOwnedFiles } from "./image-profiles.ts";
 
 let directory: string;
 let scanner: string;
@@ -65,6 +66,31 @@ async function scan(value: ScanInput, pass: "opaque" | "family" = "opaque") {
     result: await runPass(scanner, prepared[pass], work, pass),
   };
 }
+
+test("image scope scans every authored bundle byte without scanning the upstream runtime", async () => {
+  const values = await Promise.all([
+    input(Buffer.from(credential()), "usr/local/bin/node"),
+    input(Buffer.from(credential()), "app/node_modules/upstream/index.js"),
+    input(Buffer.from(credential()), "app/agent.mjs"),
+    ...[
+      "app/gateway.mjs",
+      "app/bootstrap-relay.mjs",
+      "app/package.json",
+      "app/LICENSE",
+    ].map((path) => input(Buffer.from("public authored fixture"), path)),
+  ]);
+  const owned = selectOwnedFiles(values, "regional");
+  const work = await mkdtemp(join(directory, "owned-scope-"));
+  const prepared = await prepareInputs(owned, work);
+  const result = await runPass(scanner, prepared.opaque, work, "owned");
+  const findings = await mapFindings(result.findings, prepared.opaque.aliases);
+  assert.deepEqual(
+    findings.map((finding) => finding.input.path),
+    ["app/agent.mjs"],
+  );
+  assert.equal(result.detectorBytes, prepared.opaque.expectedBytes);
+  assert.equal(owned.length, 5);
+});
 
 test("opaque aliases retain bytes from excluded dependency paths", async () => {
   const value = await input(

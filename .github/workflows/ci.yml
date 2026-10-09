@@ -49,19 +49,26 @@ jobs:
           fetch-depth: 0
       - name: Set up pnpm at the version in package.json
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Set up the pinned Rust and Worker build tools
         run: |
           PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
+          PGCF_RUST_TARGETS=$(node -p 'require("./infra/platform/versions.lock.json").ciToolchain.rustTargets.join(",")')
           PGCF_WORKER_BUILD_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").rustEdge.workerBuildVersion')
           rustup toolchain install "$PGCF_RUST_VERSION" --profile minimal \
-            --component rustfmt --component clippy --target wasm32-unknown-unknown
+            --component rustfmt --component clippy --target "$PGCF_RUST_TARGETS"
+          node scripts/ci/toolchain.mjs check-rust
           cargo install worker-build --version "$PGCF_WORKER_BUILD_VERSION" --locked
       - name: Verify the pinned Worker build binaries
         run: |
@@ -170,7 +177,6 @@ jobs:
           node packages/contracts/native/generate-compute-pool.ts --check
       - name: Check the native prepared runtime against the actual Linux kernel
         run: |
-          node --input-type=module -e 'import fs from "node:fs"; import assert from "node:assert/strict"; const lock=JSON.parse(fs.readFileSync("infra/platform/versions.lock.json","utf8")); const channel=/channel\s*=\s*"([^"]+)"/.exec(fs.readFileSync("rust-toolchain.toml","utf8"))?.[1]; assert.equal(channel,lock.nativeRuntime.rustVersion);'
           PGCF_RUST_BUILDER=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.testBuilderImage')
           PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')
           PGCF_SLOT_TEST_IMAGE="pgcf-node-runtime-test:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
@@ -225,12 +231,18 @@ jobs:
       - name: Set up pnpm at the version in package.json
         if: steps.entries.outputs.present == 'true'
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
       - name: Set up Node
         if: steps.entries.outputs.present == 'true'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Validate the native CI toolchain
+        if: steps.entries.outputs.present == 'true'
+        run: node scripts/ci/toolchain.mjs check
       - name: Install qualification dependencies
         if: steps.entries.outputs.present == 'true'
         run: CI=true pnpm install --frozen-lockfile --ignore-scripts
@@ -269,7 +281,7 @@ jobs:
             "$(cat "$RUNNER_TEMP/pgcf-image-gate/image.id")" "$GITHUB_SHA" \
             "https://github.com/$GITHUB_REPOSITORY" "$RUNNER_TEMP/pgcf-image-gate/qualification.json"
           {
-            echo 'Image qualification (all payload bytes and metadata, unchanged gitleaks 8.30.1 rules):'
+            echo 'Image qualification (PGCF-built files and image metadata; upstream digest provenance checked separately):'
             echo '```json'
             cat "$RUNNER_TEMP/pgcf-image-gate/qualification.json"
             echo '```'
@@ -328,11 +340,16 @@ jobs:
           test -f apps/node-bootstrap/src/proxy-command.ts
       - name: Set up pnpm at the version in package.json
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
       - name: Install qualification dependencies
         run: CI=true pnpm install --frozen-lockfile --ignore-scripts
       - name: Build the linux/amd64 image
@@ -366,7 +383,7 @@ jobs:
             "$(cat "$RUNNER_TEMP/pgcf-bootstrap-image-gate/image.id")" "$GITHUB_SHA" \
             "https://github.com/$GITHUB_REPOSITORY" "$RUNNER_TEMP/pgcf-bootstrap-image-gate/qualification.json"
           {
-            echo 'Image qualification (all payload bytes and metadata, unchanged gitleaks 8.30.1 rules):'
+            echo 'Image qualification (PGCF-built files and image metadata; upstream digest provenance checked separately):'
             echo '```json'
             cat "$RUNNER_TEMP/pgcf-bootstrap-image-gate/qualification.json"
             echo '```'
@@ -419,11 +436,16 @@ jobs:
           persist-credentials: false
       - name: Set up pnpm at the version in package.json
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24
+          node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
       - name: Install qualification dependencies
         run: CI=true pnpm install --frozen-lockfile --ignore-scripts
       - name: Build the linux/amd64 image
@@ -458,7 +480,7 @@ jobs:
             "$(cat "$RUNNER_TEMP/pgcf-postgres-image-gate/image.id")" "$GITHUB_SHA" \
             "https://github.com/$GITHUB_REPOSITORY" "$RUNNER_TEMP/pgcf-postgres-image-gate/qualification.json"
           {
-            echo 'Image qualification (all payload bytes and metadata, unchanged gitleaks 8.30.1 rules):'
+            echo 'Image qualification (PGCF-built files and image metadata; upstream digest provenance checked separately):'
             echo '```json'
             cat "$RUNNER_TEMP/pgcf-postgres-image-gate/qualification.json"
             echo '```'
@@ -523,10 +545,13 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
       - name: Set up Node
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 24.6.0
+          node-version: ${{ steps.toolchain.outputs.node }}
       - name: Set up pnpm for the full node proof
         if: inputs.node_network_probe
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
@@ -598,11 +623,16 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: 24
+          node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
       - name: Install qualification dependencies
         run: CI=true pnpm install --frozen-lockfile --ignore-scripts
       - name: Build and check the pinned storage image
@@ -645,15 +675,11 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
-      contents: write
+      contents: read
       packages: write
-      id-token: write
-      attestations: write
     outputs:
       extension_ref: ${{ steps.native_artifacts.outputs.extension_ref }}
       recipe_ref: ${{ steps.native_artifacts.outputs.recipe_ref }}
-      installer_ref: ${{ steps.native_artifacts.outputs.installer_ref }}
-      raw_url: ${{ steps.native_artifacts.outputs.raw_url }}
     env:
       IMAGE: ghcr.io/amerged-org/pgcf-regional
       PGCF_BUILD_GATEWAY: ${{ needs.check.outputs.rust_gateway_image }}
@@ -666,23 +692,18 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
+      - name: Read CI toolchain pins
+        id: toolchain
+        run: node scripts/ci/toolchain.mjs github-output >> "$GITHUB_OUTPUT"
       - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
-          node-version: 24
+          node-version: ${{ steps.toolchain.outputs.node }}
           cache: pnpm
+      - name: Validate the native CI toolchain
+        run: node scripts/ci/toolchain.mjs check
       - name: Install qualification dependencies
         run: CI=true pnpm install --frozen-lockfile --ignore-scripts
-      - name: Reserve disk for complete OS byte qualification
-        if: env.PGCF_BUILD_SANDBOX == 'true'
-        run: |
-          # This job runs on a fresh GitHub-hosted VM. These SDKs are not used by Node/Rust/Docker.
-          PGCF_FREE_BYTES=$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
-          if [ "$PGCF_FREE_BYTES" -lt $((35 * 1024 * 1024 * 1024)) ]; then
-            sudo rm -rf -- /usr/local/lib/android /usr/share/dotnet /usr/share/swift
-          fi
-          PGCF_FREE_BYTES=$(df -PB1 "$RUNNER_TEMP" | awk 'NR==2 {print $4}')
-          test "$PGCF_FREE_BYTES" -ge $((35 * 1024 * 1024 * 1024))
       - name: Build, qualify and publish only selected native artifacts
         id: native_artifacts
         env:
@@ -726,14 +747,6 @@ jobs:
           if [ "$PGCF_BUILD_SANDBOX" = true ]; then
             bash infra/talos/sandbox/ci-artifacts.sh "$RUNNER_TEMP/pgcf-native-image-gate/sandbox-controller/qualification.json"
           fi
-      - name: Attest the public Talos qualification and publication results
-        if: success() && env.PGCF_BUILD_SANDBOX == 'true'
-        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4.1.0
-        with:
-          subject-path: |
-            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/whole-os-qualification.json
-            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/publication.json
-          show-summary: false
       - name: Retain exact native qualification and publication receipts
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -746,11 +759,6 @@ jobs:
             ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/extension-gate/registry.json
             ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/recipe-gate/qualification.json
             ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/recipe-gate/registry.json
-            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/installer-gate/transport.json
-            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/installer-gate/registry.json
-            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/whole-os-qualification.json
-            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/publication-state.json
-            ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/publication.json
           if-no-files-found: warn
           retention-days: 90
           overwrite: false

@@ -299,6 +299,21 @@ configuration does not block capacity decisions.
 
 ## Development checks
 
+CI and native Linux preflight use the same toolchain guard. `ciToolchain` in
+[versions.lock.json](infra/platform/versions.lock.json) pins Node, Docker client/server, Buildx,
+Ubuntu and the Rust targets; the existing `nativeRuntime.rustVersion` and `packageManager` remain
+the Rust and pnpm authorities. Install those versions on the native Ubuntu AMD64 host, then run:
+
+```sh
+node scripts/ci/toolchain.mjs node-version
+node scripts/ci/toolchain.mjs check-rust
+```
+
+The guard checks the actual host, Docker daemon, tool versions and installed Rust targets before
+checks/builds. An unsupported environment stops with a named reason; it is not retried or accepted
+as equivalent. Passing this guard establishes toolchain compatibility, not a passing build or
+native/live acceptance. The single CI workflow contains the subsequent check/build commands.
+
 The native configuration test requires the Talos client selected by `bootstrapClients.talos`
 in [versions.lock.json](infra/platform/versions.lock.json). Download the entry for your operating
 system/architecture from its pinned URL and verify its SHA-256 before execution:

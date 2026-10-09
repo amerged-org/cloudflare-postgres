@@ -34,17 +34,3 @@ regexes = [
   '''^c291cmNlLXNlY3JldA==$''',
   '''^dW5pdC1zZWNyZXQ=$''',
 ]
-
-# Exact public Go checksums from pinned OpenEBS source e8a234cbfeef5fa16fde1330c8de2d91e31831f1/go.sum; retained as provenance, never credentials.
-[[rules.allowlists]]
-description = "Reviewed public/test values in scripts/ci/storage-reviewed-findings.json"
-condition = "AND"
-regexTarget = "secret"
-paths = [
-  '''^scripts/ci/storage\-reviewed\-findings\.json$''',
-]
-regexes = [
-  '''^dTlxFls/eikpJxmAC7MVE8oOeP1zryV7iRyIjB0gky4=$''',
-  '''^hqK/t4AKgbqWkdkcAeI8XLmbK\+4m4G5YeQRrmiotGlw=$''',
-  '''^jC\+153630BMdlFukegoEL8E/yT7aLyQkIVuwhmwDgJM=$''',
-]

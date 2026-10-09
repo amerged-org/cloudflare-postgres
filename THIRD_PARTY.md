@@ -158,25 +158,6 @@ their source metadata now names the selected 2.3.6 release.
 Its test-only Alpine tools pin iproute2 7.0.0-r0 (GPL-2.0-or-later) and busybox-static
 1.37.0-r31 (GPL-2.0-only); they are not shipped in the PGCF runtime/system extension.
 
-## Assembled Talos boot qualification tools
-
-The disposable inspection and maintenance-boot fixture in
-[BootProof.Dockerfile](infra/talos/sandbox/BootProof.Dockerfile) uses
-`debian:trixie-slim@sha256:a29215f6a35e51e22adffa17f89e9d2ef06214e64a2bad10d765c46aea49f11f`.
-It runs only on the local/CI inspection host and is not published or installed on fleet nodes.
-Node and the official Talos client come from the existing pinned build inputs and client archive
-checksums. Debian package copyright files under `/usr/share/doc/*/copyright` and
-`/usr/share/common-licenses` remain in this fixture, including all transitive package notices.
-
-| Direct package | Exact Debian version | Upstream licensing and purpose |
-| --- | --- | --- |
-| [QEMU](https://www.qemu.org/) `qemu-system-x86` | `1:10.0.13+ds-0+deb13u1` | GPL-2.0 as a whole, with compatible per-file licenses; isolated AMD64 maintenance boot. |
-| [squashfs-tools](https://github.com/plougher/squashfs-tools) | `1:4.6.1-1+b1` | GPL-2.0-or-later; complete root-filesystem and extended-attribute extraction. |
-| [util-linux](https://www.kernel.org/pub/linux/utils/util-linux/) | `2.41.5-0+deb13u1` | GPL/LGPL/BSD/ISC/Expat and other per-file licenses recorded by Debian; read-only partition mounts and loop-device checks. |
-| [XZ Utils](https://tukaani.org/xz/) `xz-utils` | `5.8.1-1+deb13u2` | 0BSD with bundled GPL/LGPL and other per-file notices; bounded raw-image decompression. |
-| [GCC runtime](https://gcc.gnu.org/) `libstdc++6`, `libatomic1` | `14.2.0-19` | GPL-3.0 with GCC Runtime Library Exception and the package's other notices; inspection-tool runtime libraries. |
-| [Debian ca-certificates](https://packages.debian.org/trixie/ca-certificates) | `20250419` | GPL-2.0-or-later packaging and MPL-2.0 certificate material; verified public tool downloads. |
-
 ## Rust/Wasm Edge Worker
 
 The complete Edge application uses the official

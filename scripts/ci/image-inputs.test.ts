@@ -111,14 +111,6 @@ test("actual storage and native inputs select only their affected runtime artifa
     }),
   );
   assert.deepEqual(
-    selectImageInputs(["scripts/ci/storage-reviewed-findings.json"], "push"),
-    selected({ storage: true }),
-  );
-  assert.deepEqual(
-    selectImageInputs(["scripts/ci/talos-reviewed-findings.json"], "push"),
-    selected({ sandbox_controller: true }),
-  );
-  assert.deepEqual(
     selectImageInputs(["infra/storage/Dockerfile"], "push"),
     selected({ storage: true }),
   );
@@ -157,7 +149,7 @@ test("common Docker inputs and qualification changes invalidate every affected p
     selected({ regional: true, node_bootstrap: true }),
   );
   assert.deepEqual(
-    selectImageInputs(["scripts/ci/reviewed-findings.json"], "push"),
+    selectImageInputs(["scripts/ci/image-profiles.ts"], "push"),
     selected({
       regional: true,
       node_bootstrap: true,
@@ -235,13 +227,7 @@ test("PostgreSQL inputs stay scoped and manual, unavailable or malformed compari
     sandbox_controller: true,
   });
   assert.deepEqual(
-    selectImageInputs(
-      [
-        "infra/postgres/sources.lock.json",
-        "scripts/ci/postgres-reviewed-findings.json",
-      ],
-      "push",
-    ),
+    selectImageInputs(["infra/postgres/sources.lock.json"], "push"),
     selected({ postgres: true }),
   );
   assert.deepEqual(selectImageInputs([], "workflow_dispatch"), all);

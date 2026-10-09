@@ -6,14 +6,12 @@ import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Readable } from "node:stream";
-import { gzipSync } from "node:zlib";
 import { test } from "node:test";
 import tar from "tar-stream";
 import {
   safeArchivePath,
   extractLayer,
   validateBasePrefix,
-  classifyFindings,
   assertScanResult,
   validateImageIdentity,
   validateManifestBinding,
@@ -24,133 +22,18 @@ import {
   validateProfileProvenance,
   verifyRustAssembly,
   verifyTalosRecipeAssembly,
-  inspectTalosInstallerArchive,
   type LayerFile,
 } from "./image-qualification.ts";
 
-test("imager installer archives bind every layer and upstream identity without fabricated PGCF labels", async () => {
-  const directory = await mkdtemp(join(tmpdir(), "pgcf-installer-archive-"));
-  const sha = (bytes: Buffer) =>
-    createHash("sha256").update(bytes).digest("hex");
-  const archive = async (entries: Array<[string, Buffer]>) => {
-    const pack = tar.pack();
-    for (const [name, bytes] of entries) pack.entry({ name }, bytes);
-    pack.finalize();
-    const chunks: Buffer[] = [];
-    for await (const chunk of pack) {
-      assert.ok(Buffer.isBuffer(chunk));
-      chunks.push(chunk);
-    }
-    return Buffer.concat(chunks);
-  };
-  const base = await archive([
-    ["bin/installer", Buffer.from("public installer fixture")],
-  ]);
-  const payload = await archive([
-    [
-      "usr/install/amd64/vmlinuz.efi",
-      Buffer.from("public UKI fixture; nested parsing is a separate gate"),
-    ],
-  ]);
-  const layers = [gzipSync(base), gzipSync(payload)],
-    names = layers.map((layer) => sha(layer) + ".tar.gz"),
-    diffIDs = [base, payload].map((layer) => "sha256:" + sha(layer));
-  const make = async (
-    name: string,
-    version: string,
-    extra = false,
-    corrupt = false,
-  ) => {
-    const config = Buffer.from(
-      JSON.stringify({
-        architecture: "amd64",
-        os: "linux",
-        rootfs: { type: "layers", diff_ids: diffIDs },
-        config: {
-          Entrypoint: ["/bin/installer"],
-          Env: ["VERSION=v" + version],
-          Labels: {
-            "alpha.talos.dev/version": "v" + version,
-            "org.opencontainers.image.source":
-              "https://github.com/siderolabs/talos",
-          },
-        },
-      }),
-    );
-    const configName = "sha256:" + sha(config),
-      manifest = Buffer.from(
-        JSON.stringify([{ Config: configName, RepoTags: null, Layers: names }]),
-      );
-    const entries: Array<[string, Buffer]> = [
-      [configName, config],
-      [names[0]!, layers[0]!],
-      [names[1]!, corrupt ? gzipSync(Buffer.from("corrupt")) : layers[1]!],
-      ["manifest.json", manifest],
-    ];
-    if (extra)
-      entries.push(["unlisted", Buffer.from("never ignore an extra payload")]);
-    const path = join(directory, name + ".tar");
-    await writeFile(path, await archive(entries));
-    return path;
-  };
-  try {
-    const expected = { talosVersion: "1.14.1", baseDiffIDs: [diffIDs[0]!] };
-    const path = await make("valid", expected.talosVersion);
-    const result = await inspectTalosInstallerArchive(
-      path,
-      join(directory, "valid"),
-      expected,
-    );
-    assert.equal(result.archiveSha256, sha(await readFile(path)));
-    assert.deepEqual(result.diffIDs, diffIDs);
-    assert.deepEqual(
-      result.layerDigests,
-      layers.map((layer) => "sha256:" + sha(layer)),
-    );
-    assert.equal(result.files.length, 2);
-    assert.ok(
-      result.inputs.some(
-        (input) => input.path === "usr/install/amd64/vmlinuz.efi",
-      ),
-    );
-    await assert.rejects(
-      inspectTalosInstallerArchive(
-        await make("version", "1.14.2"),
-        join(directory, "version"),
-        expected,
-      ),
-      /identity/,
-    );
-    await assert.rejects(
-      inspectTalosInstallerArchive(
-        await make("extra", expected.talosVersion, true),
-        join(directory, "extra"),
-        expected,
-      ),
-      /entry/,
-    );
-    await assert.rejects(
-      inspectTalosInstallerArchive(
-        await make("corrupt", expected.talosVersion, false, true),
-        join(directory, "corrupt"),
-        expected,
-      ),
-      /digest/,
-    );
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
 import {
-  reviewedBase,
+  nodeBase,
   postgresBase,
   storageBase,
   rustBuilder,
   rustVersion,
-  reviewedFiles,
-  reviewedManifestPaths,
+  nativeArtifactPins,
   verifyNativeArtifacts,
-} from "./reviewed-findings.ts";
+} from "./image-profiles.ts";
 import { sandboxImagePlan } from "../../infra/talos/sandbox/images.ts";
 import versions from "../../infra/platform/versions.lock.json" with { type: "json" };
 
@@ -234,7 +117,7 @@ test("published PostgreSQL consumer pins retain the version tag required by CNPG
   assert.match(reference, /@sha256:[a-f0-9]{64}$/);
 });
 
-test("PostgreSQL qualification binds its own upstream and cannot inherit Node reviews", () => {
+test("PostgreSQL qualification binds its pinned upstream independently from Node", () => {
   assert.deepEqual(
     parseQualificationArguments(["--profile", "postgres", "runtime", "image"]),
     {
@@ -255,13 +138,7 @@ test("PostgreSQL qualification binds its own upstream and cannot inherit Node re
       "postgres",
     ),
   );
-  assert.throws(() =>
-    validateDockerfile(`FROM ${reviewedBase.image}\n`, "postgres"),
-  );
-  assert.deepEqual(reviewedManifestPaths([], "postgres"), []);
-  assert.throws(() =>
-    reviewedManifestPaths(["app/node_modules/package.json"], "postgres"),
-  );
+  assert.throws(() => validateDockerfile(`FROM ${nodeBase}\n`, "postgres"));
   const check = runtimeChecks("postgres")[0]!;
   assert.equal(check.entrypoint, "/usr/lib/postgresql/18/bin/postgres");
   assert.doesNotThrow(() =>
@@ -398,13 +275,10 @@ test("the single CI workflow qualifies all three image profiles before independe
 });
 
 test("Dockerfile profiles bind every FROM and the exact pinned stage topology", () => {
-  const regional = `FROM ${reviewedBase.image} AS build\nFROM ${reviewedBase.image}\n`,
-    bootstrap = `FROM ${reviewedBase.image} AS build\nFROM ${reviewedBase.image} AS clients\nFROM ${reviewedBase.image}\n`;
-  assert.equal(validateDockerfile(regional, "regional"), reviewedBase.image);
-  assert.equal(
-    validateDockerfile(bootstrap, "node-bootstrap"),
-    reviewedBase.image,
-  );
+  const regional = `FROM ${nodeBase} AS build\nFROM ${nodeBase}\n`,
+    bootstrap = `FROM ${nodeBase} AS build\nFROM ${nodeBase} AS clients\nFROM ${nodeBase}\n`;
+  assert.equal(validateDockerfile(regional, "regional"), nodeBase);
+  assert.equal(validateDockerfile(bootstrap, "node-bootstrap"), nodeBase);
   assert.throws(() => validateDockerfile(regional, "node-bootstrap"));
   assert.throws(() => validateDockerfile(bootstrap, "regional"));
   assert.throws(() =>
@@ -417,10 +291,7 @@ test("Dockerfile profiles bind every FROM and the exact pinned stage topology", 
     ),
   );
   assert.throws(() =>
-    validateDockerfile(
-      regional.replace(reviewedBase.image, "node:24-slim"),
-      "regional",
-    ),
+    validateDockerfile(regional.replace(nodeBase, "node:24-slim"), "regional"),
   );
 });
 
@@ -575,22 +446,6 @@ test("fails closed on malformed or truncated layer archives", async () => {
   }
 });
 
-test("bootstrap package absence cannot be inferred from link-only package roots", async () => {
-  const file = reviewedFiles.find((file) => file.package)!,
-    root = file.path.slice(0, file.path.lastIndexOf("/")),
-    pack = tar.pack(),
-    paths: string[] = [];
-  pack.entry({ name: root, type: "symlink", linkname: "elsewhere" });
-  pack.finalize();
-  const directory = await mkdtemp(join(tmpdir(), "pgcf-layer-test-"));
-  try {
-    await extractLayer(Readable.from(pack), directory, 0, paths);
-    assert.throws(() => reviewedManifestPaths(paths, "node-bootstrap"));
-  } finally {
-    await rm(directory, { recursive: true, force: true });
-  }
-});
-
 test("requires the pinned official base diffIDs as an exact ordered prefix", () => {
   const base = ["sha256:" + "a".repeat(64), "sha256:" + "b".repeat(64)];
   assert.doesNotThrow(() =>
@@ -649,49 +504,6 @@ test("binds config digest and source/revision labels to the exact built image", 
       "https://github.com/public/product",
     ),
   );
-});
-
-test("only resolves the exact verified official Node public integer finding", () => {
-  const file = {
-    scanPath: "0/0",
-    path: "usr/local/include/node/v8-internal.h",
-    layer: 0,
-    sha256: "eb74fc0740b7f858a03e319e077c1698d2083325f3154c67771b120fb48f8520",
-    size: 70804,
-    publicLine: [
-      "const int ",
-      "kApiTaggedSize",
-      " = ",
-      "kApiInt32Size",
-      ";",
-    ].join(""),
-  };
-  const finding = {
-    File: "0/0",
-    RuleID: "generic-api-key",
-    StartLine: 187,
-    EndLine: 187,
-    StartColumn: 12,
-    EndColumn: 42,
-    Match: ["kApiTaggedSize", " = ", "REDACTED", ";"].join(""),
-    Secret: "REDACTED",
-  };
-  assert.equal(classifyFindings([finding], [file], 1).resolved, 1);
-  for (const altered of [
-    { ...file, layer: 1 },
-    { ...file, sha256: "0".repeat(64) },
-    { ...file, size: 1 },
-    { ...file, publicLine: "private" },
-    { ...file, path: "app/v8-internal.h" },
-  ])
-    assert.equal(classifyFindings([finding], [altered], 1).unresolved, 1);
-  for (const altered of [
-    { ...finding, StartLine: 186 },
-    { ...finding, RuleID: "other" },
-    { ...finding, Match: "other" },
-    { ...finding, Secret: "other" },
-  ])
-    assert.equal(classifyFindings([altered], [file], 1).unresolved, 1);
 });
 
 test("scanner errors and inconsistent exit codes fail closed", () => {
@@ -756,6 +568,8 @@ async function inspectionProbe(
     profile?: string;
     reportProfile?: string;
     nativeArtifacts?: unknown;
+    action?: "verify" | "registry" | "promote";
+    reportOverrides?: Record<string, unknown>;
   } = {},
 ): Promise<{
   status: number | null;
@@ -799,15 +613,15 @@ async function inspectionProbe(
       report,
       JSON.stringify({
         version: 2,
+        scanScope: "pgcf-built-files-and-image-metadata",
+        canonicalFindings: 0,
+        resolved: 0,
         ...(options.reportProfile ? { profile: options.reportProfile } : {}),
         ...(options.reportProfile === "node-bootstrap"
           ? {
               nativeArtifacts:
                 options.nativeArtifacts ??
-                verifyNativeArtifacts(
-                  reviewedFiles.filter((file) => file.nativeArtifact),
-                  "node-bootstrap",
-                ),
+                verifyNativeArtifacts(nativeArtifactPins(), "node-bootstrap"),
             }
           : {}),
         imageId,
@@ -817,18 +631,22 @@ async function inspectionProbe(
         rawExit: 0,
         opaqueExpectedBytes: 0,
         opaqueDetectorBytes: 0,
+        ...options.reportOverrides,
       }),
     );
     const result = spawnSync(
       process.execPath,
       [
         "scripts/ci/image-qualification.ts",
-        "verify",
+        options.action ?? "verify",
         "fixture:qualified",
         imageId,
         revision,
         source,
         report,
+        ...(options.action && options.action !== "verify"
+          ? [join(directory, "registry.json")]
+          : []),
         ...(options.profile ? ["--profile", options.profile] : []),
       ],
       {
@@ -866,6 +684,42 @@ test("verification supports the Ubuntu Docker 28.0.4 inspect flags", async () =>
   assert.ok(result.calls.every((args) => !args.includes("--platform")));
 });
 
+test("publication actions reject waived findings and receipts outside the current scan scope", async () => {
+  for (const reportOverrides of [
+    { rawExit: 2, canonicalFindings: 1, resolved: 1 },
+    { scanScope: undefined },
+    { scanScope: "whole-upstream-image" },
+    { canonicalFindings: 1 },
+    { resolved: 1 },
+    { unresolved: 1 },
+    { rawExit: 2 },
+  ]) {
+    const result = await inspectionProbe([inspectedImage], { reportOverrides });
+    assert.equal(
+      result.status,
+      1,
+      "a stale or inconsistent receipt must not authorize verification",
+    );
+    assert.match(
+      result.stderr,
+      /Qualification report does not authorize this image/,
+    );
+    assert.deepEqual(result.calls, []);
+  }
+  for (const action of ["registry", "promote"] as const) {
+    const result = await inspectionProbe([inspectedImage], {
+      action,
+      reportOverrides: { rawExit: 2, canonicalFindings: 1, resolved: 1 },
+    });
+    assert.equal(result.status, 1);
+    assert.match(
+      result.stderr,
+      /Qualification report does not authorize this image/,
+    );
+    assert.deepEqual(result.calls, []);
+  }
+});
+
 test("publication verification cannot reuse a report from another image profile", async () => {
   const wrong = await inspectionProbe([inspectedImage], {
     profile: "node-bootstrap",
@@ -888,10 +742,7 @@ test("bootstrap publication refuses missing or changed artifact proofs even with
   });
   assert.equal(missing.status, 1);
   assert.deepEqual(missing.calls, []);
-  const native = verifyNativeArtifacts(
-    reviewedFiles.filter((file) => file.nativeArtifact),
-    "node-bootstrap",
-  );
+  const native = verifyNativeArtifacts(nativeArtifactPins(), "node-bootstrap");
   const changed = await inspectionProbe([inspectedImage], {
     profile: "node-bootstrap",
     reportProfile: "node-bootstrap",
@@ -1057,13 +908,7 @@ test("storage and Rust profiles bind their own sources without a fictitious runt
       ),
       rustBuilder,
     );
-    assert.throws(() =>
-      validateDockerfile(`FROM ${reviewedBase.image}\n`, profile),
-    );
-    assert.deepEqual(reviewedManifestPaths([], profile), []);
-    assert.throws(() =>
-      reviewedManifestPaths(["app/node_modules/x/package.json"], profile),
-    );
+    assert.throws(() => validateDockerfile(`FROM ${nodeBase}\n`, profile));
   }
   const check = runtimeChecks("rust-gateway")[0]!;
   const identity = {
@@ -1183,10 +1028,6 @@ test("relay and reclaimer qualification require their own compiled contracts and
   ] as const) {
     const check = runtimeChecks(profile)[0]!;
     assert.equal(check.entrypoint, `/pgcf-${packageName}`);
-    assert.deepEqual(reviewedManifestPaths([], profile), []);
-    assert.throws(() =>
-      reviewedManifestPaths(["app/node_modules/pkg/package.json"], profile),
-    );
     assert.equal(
       validateDockerfile(
         "ARG RUST_BUILDER\nFROM ${RUST_BUILDER} AS build\nFROM scratch\n",

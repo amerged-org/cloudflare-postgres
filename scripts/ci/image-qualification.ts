@@ -33,22 +33,19 @@ import sandboxSources from "../../apps/sandbox-controller/proto/sources.json" wi
 import versions from "../../infra/platform/versions.lock.json" with { type: "json" };
 import { verifyRegistry, promotionArguments } from "./registry.ts";
 import {
-  classifyReviewed,
-  readPackageProvenance,
-  reviewedBase,
+  nodeBase,
+  selectOwnedFiles,
   postgresBase,
   storageBase,
   rustBuilder,
   rustVersion,
   isRustProfile,
-  reviewedFiles,
-  reviewedManifestPaths,
   imageProfile,
   verifyNativeArtifacts,
   validateNativeProvenance,
   type NativeArtifactProvenance,
   type ImageProfile,
-} from "./reviewed-findings.ts";
+} from "./image-profiles.ts";
 
 import { sandboxImagePlan } from "../../infra/talos/sandbox/images.ts";
 const isScratchProfile = (profile: ImageProfile) =>
@@ -63,13 +60,6 @@ const scannerArchives: Record<string, string> = {
     "dfe101a4db2255fc85120ac7f3d25e4342c3c20cf749f2c20a18081af1952709",
 };
 const digestPattern = /^sha256:[a-f0-9]{64}$/;
-const publicNodeLine = [
-  "const int ",
-  "kApiTaggedSize",
-  " = ",
-  "kApiInt32Size",
-  ";",
-].join("");
 
 class QualificationFailure extends Error {}
 
@@ -124,11 +114,11 @@ export function validateDockerfile(
               : profile === "postgres"
                 ? [`FROM ${postgresBase} AS postgres`, "FROM scratch"]
                 : [
-                    `FROM ${reviewedBase.image} AS build`,
+                    `FROM ${nodeBase} AS build`,
                     ...(profile === "node-bootstrap"
-                      ? [`FROM ${reviewedBase.image} AS clients`]
+                      ? [`FROM ${nodeBase} AS clients`]
                       : []),
-                    `FROM ${reviewedBase.image}`,
+                    `FROM ${nodeBase}`,
                   ];
   requireCheck(
     JSON.stringify(from) === JSON.stringify(expected),
@@ -142,7 +132,7 @@ export function validateDockerfile(
         ? rustBuilder
         : profile === "postgres"
           ? postgresBase
-          : reviewedBase.image;
+          : nodeBase;
 }
 
 export function safeArchivePath(name: string): string {
@@ -217,7 +207,6 @@ export interface LayerFile {
   layer: number;
   sha256: string;
   size: number;
-  publicLine?: string;
   tarEntry?: number;
   bodyOffset?: number;
 }
@@ -265,13 +254,6 @@ export async function extractLayer(
       tarEntry: entry,
       bodyOffset: (header as Header & { byteOffset: number }).byteOffset,
     };
-    if (
-      path === "usr/local/include/node/v8-internal.h" &&
-      metadata.size === 70804
-    )
-      file.publicLine = (await readFile(join(directory, scanPath), "utf8"))
-        .split("\n")[186]
-        ?.trim();
     files.push(file);
   });
   return files;
@@ -365,37 +347,6 @@ export function validateManifestBinding(
       ),
     "Saved manifest config or ordered layer blobs mismatch",
   );
-}
-
-export function classifyFindings(
-  findings: Finding[],
-  files: LayerFile[],
-  baseLayerCount: number,
-): { resolved: number; unresolved: number } {
-  let resolved = 0;
-  for (const finding of findings) {
-    const file = files.find(
-      (entry) => entry.scanPath === finding.File.replace(/^\.\//, ""),
-    );
-    if (
-      file &&
-      file.layer < baseLayerCount &&
-      file.path === "usr/local/include/node/v8-internal.h" &&
-      file.sha256 ===
-        "eb74fc0740b7f858a03e319e077c1698d2083325f3154c67771b120fb48f8520" &&
-      file.size === 70804 &&
-      file.publicLine === publicNodeLine &&
-      finding.RuleID === "generic-api-key" &&
-      finding.StartLine === 187 &&
-      finding.EndLine === 187 &&
-      finding.StartColumn === 12 &&
-      finding.EndColumn === 42 &&
-      finding.Match === ["kApiTaggedSize", " = ", "REDACTED", ";"].join("") &&
-      finding.Secret === "REDACTED"
-    )
-      resolved++;
-  }
-  return { resolved, unresolved: findings.length - resolved };
 }
 
 export function assertScanResult(
@@ -1343,176 +1294,9 @@ export async function readLayerArchive(
   }
 }
 
-/** Inspect the pinned imager's Docker archive; assembled OS acceptance is a separate gate. */
-export async function inspectTalosInstallerArchive(
-  archive: string,
-  directory: string,
-  expected: { talosVersion: string; baseDiffIDs: string[] },
-) {
-  requireCheck(
-    /^\d+\.\d+\.\d+$/.test(expected.talosVersion) &&
-      Array.isArray(expected.baseDiffIDs) &&
-      expected.baseDiffIDs.length > 0 &&
-      expected.baseDiffIDs.length <= 32 &&
-      expected.baseDiffIDs.every((value) => digestPattern.test(value)),
-    "Invalid Talos installer version",
-  );
-  await mkdir(directory, { mode: 0o700, recursive: true });
-  requireCheck(
-    ((await stat(directory)).mode & 0o777) === 0o700,
-    "Installer inspection directory is not private",
-  );
-  const archiveSize = (await stat(archive)).size;
-  requireCheck(
-    archiveSize > 0 && archiveSize <= 8 * 1024 ** 3,
-    "Talos installer archive size invalid",
-  );
-  const archiveSha256 = await hashFile(archive),
-    entries = await extractImageArchive(archive, join(directory, "archive"));
-  const readMetadata = async (name: string) => {
-    const path = entries.get(safeArchivePath(name));
-    requireCheck(
-      path && (await stat(path)).size <= 1024 * 1024,
-      "Talos installer metadata missing or too large",
-    );
-    return readFile(path);
-  };
-  const manifestBytes = await readMetadata("manifest.json"),
-    manifest = JSON.parse(manifestBytes.toString()) as Array<{
-      Config: string;
-      Layers: string[];
-    }>;
-  requireCheck(
-    Array.isArray(manifest) &&
-      manifest.length === 1 &&
-      typeof manifest[0]?.Config === "string" &&
-      Array.isArray(manifest[0].Layers) &&
-      manifest[0].Layers.length > 0 &&
-      manifest[0].Layers.length <= 32 &&
-      manifest[0].Layers.every((layer) => typeof layer === "string"),
-    "Talos installer manifest invalid",
-  );
-  const selected = manifest[0]!,
-    listed = new Set([
-      "manifest.json",
-      safeArchivePath(selected.Config),
-      ...selected.Layers.map(safeArchivePath),
-    ]);
-  requireCheck(
-    listed.size === selected.Layers.length + 2 &&
-      entries.size === listed.size &&
-      [...entries.keys()].every((name) => listed.has(name)),
-    "Unexpected Talos installer outer entry",
-  );
-  const configBytes = await readMetadata(selected.Config),
-    configDigest =
-      "sha256:" + createHash("sha256").update(configBytes).digest("hex");
-  requireCheck(
-    selected.Config === configDigest,
-    "Talos installer config digest mismatch",
-  );
-  const config = JSON.parse(configBytes.toString()) as ImageConfig & {
-    config: { Entrypoint?: unknown; Env?: unknown };
-  };
-  requireCheck(
-    config.os === "linux" &&
-      config.architecture === "amd64" &&
-      config.rootfs?.type === "layers" &&
-      Array.isArray(config.rootfs.diff_ids) &&
-      config.rootfs.diff_ids.length === selected.Layers.length &&
-      config.rootfs.diff_ids.every((value) => digestPattern.test(value)),
-    "Talos installer platform identity invalid",
-  );
-  requireCheck(
-    JSON.stringify(config.config?.Entrypoint) ===
-      JSON.stringify(["/bin/installer"]) &&
-      Array.isArray(config.config.Env) &&
-      config.config.Env.filter(
-        (value) => typeof value === "string" && value.startsWith("VERSION="),
-      ).join() === `VERSION=v${expected.talosVersion}` &&
-      config.config.Labels?.["alpha.talos.dev/version"] ===
-        `v${expected.talosVersion}` &&
-      config.config.Labels?.["org.opencontainers.image.source"] ===
-        "https://github.com/siderolabs/talos",
-    "Talos installer upstream identity mismatch",
-  );
-  validateBasePrefix(config.rootfs.diff_ids, expected.baseDiffIDs);
-  const scanDirectory = join(directory, "files");
-  await mkdir(scanDirectory, { mode: 0o700 });
-  const files: LayerFile[] = [],
-    layerDigests: string[] = [],
-    inputs: ScanInput[] = [
-      {
-        kind: "tar-metadata",
-        layer: null,
-        tarEntry: null,
-        path: "installer-outer-archive",
-        sourcePath: resolve(archive),
-        sha256: archiveSha256,
-        size: archiveSize,
-        boundDigest: "sha256:" + archiveSha256,
-      },
-      ...(await metadataInputs(
-        configBytes,
-        "image-config",
-        directory,
-        configDigest,
-      )),
-      ...(await metadataInputs(
-        manifestBytes,
-        "image-manifest",
-        directory,
-        "sha256:" + createHash("sha256").update(manifestBytes).digest("hex"),
-      )),
-    ];
-  for (const [index, name] of selected.Layers.entries()) {
-    const path = entries.get(safeArchivePath(name));
-    requireCheck(path, "Talos installer layer missing");
-    const compressedDigest = "sha256:" + (await hashFile(path));
-    requireCheck(
-      name === compressedDigest.slice(7) + ".tar.gz",
-      "Talos installer compressed layer digest mismatch",
-    );
-    layerDigests.push(compressedDigest);
-    const layer = await readLayerArchive(
-      path,
-      scanDirectory,
-      index,
-      config.rootfs.diff_ids[index]!,
-    );
-    files.push(...layer.files);
-    inputs.push(
-      layer.metadata,
-      ...layer.files.map((file): ScanInput => ({
-        kind: "layer-file",
-        layer: index,
-        tarEntry: file.tarEntry!,
-        path: file.path,
-        sha256: file.sha256,
-        size: file.size,
-        sourcePath: join(scanDirectory, file.scanPath),
-        boundDigest: config.rootfs.diff_ids[index],
-      })),
-    );
-  }
-  requireCheck(
-    (await hashFile(archive)) === archiveSha256,
-    "Talos installer archive changed during inspection",
-  );
-  return {
-    archiveSha256,
-    archiveSize,
-    configDigest,
-    diffIDs: config.rootfs.diff_ids,
-    layerDigests,
-    scanDirectory,
-    files,
-    inputs,
-  };
-}
-
 interface QualificationReport {
   version: 2;
+  scanScope: "pgcf-built-files-and-image-metadata";
   profile?: ImageProfile;
   nativeArtifacts?: NativeArtifactProvenance[];
   recipeSha256?: string;
@@ -1794,7 +1578,6 @@ export async function qualify(
     const scanDirectory = join(directory, "files");
     await mkdir(scanDirectory, { mode: 0o700 });
     const files: LayerFile[] = [];
-    const layerPaths: string[] = [];
     const inputs: ScanInput[] = await metadataInputs(
       configBytes,
       "image-config",
@@ -1832,23 +1615,26 @@ export async function qualify(
         scanDirectory,
         index,
         config.rootfs.diff_ids[index]!,
-        layerPaths,
       );
       files.push(...result.files);
-      inputs.push(result.metadata);
-      inputs.push(
-        ...result.files.map((file): ScanInput => ({
-          kind: "layer-file",
-          layer: index,
-          tarEntry: file.tarEntry!,
-          path: file.path,
-          sha256: file.sha256,
-          size: file.size,
-          sourcePath: join(scanDirectory, file.scanPath),
-          boundDigest: config.rootfs.diff_ids[index],
-        })),
-      );
+      // Scratch artifacts contain only our assembled outputs, including their tar metadata.
+      if (isScratchProfile(profile)) inputs.push(result.metadata);
     }
+    // Upstream files are bound by immutable source/package checks and the full image digests.
+    // Only PGCF-produced files enter the secret scanner; no upstream finding waivers exist.
+    const ownedFiles = selectOwnedFiles(files, profile);
+    inputs.push(
+      ...ownedFiles.map((file): ScanInput => ({
+        kind: "layer-file",
+        layer: file.layer,
+        tarEntry: file.tarEntry!,
+        path: file.path,
+        sha256: file.sha256,
+        size: file.size,
+        sourcePath: join(scanDirectory, file.scanPath),
+        boundDigest: config.rootfs.diff_ids[file.layer],
+      })),
+    );
     const compiledArtifacts = isRustProfile(profile)
       ? await verifyRustAssembly(files, scanDirectory, profile, revision)
       : undefined;
@@ -1879,64 +1665,11 @@ export async function qualify(
       ...(await mapFindings(opaque.findings, prepared.opaque.aliases)),
       ...(await mapFindings(family.findings, prepared.family.aliases)),
     ]);
-    const manifests: { name: string; version: string }[] = [];
-    for (const path of reviewedManifestPaths(layerPaths, profile)) {
-      const matching = files.filter((file) => file.path === path),
-        expected = reviewedFiles.find(
-          (file) => file.path.replace(/https\.d\.ts$/, "package.json") === path,
-        )?.package;
-      requireCheck(
-        matching.length && expected,
-        "Reviewed runtime package manifest missing",
-      );
-      for (const file of matching) {
-        const manifest = JSON.parse(
-          await readFile(join(scanDirectory, file.scanPath), "utf8"),
-        ) as { name: string; version: string };
-        requireCheck(
-          manifest.name === expected.name &&
-            manifest.version === expected.version,
-          "Reviewed runtime package manifest identity changed",
-        );
-        manifests.push({ name: manifest.name, version: manifest.version });
-      }
-    }
-    const packages = readPackageProvenance(
-      await readFile("pnpm-lock.yaml", "utf8"),
-      manifests,
-      profile,
-    );
     const nativeArtifacts = verifyNativeArtifacts(files, profile);
-    const classification = classifyReviewed(canonical, {
-      baseImage,
-      baseDiffIDs,
-      imageDiffIDs: config.rootfs.diff_ids,
-      packages,
-      profile,
-      nativeArtifacts,
-    });
-    // Retain the already-reviewed V8 redacted-report consistency check as an additional guard.
-    for (const finding of canonical.filter(
-      (finding) =>
-        finding.input.path === "usr/local/include/node/v8-internal.h",
-    )) {
-      const file = files.find(
-        (file) =>
-          file.layer === finding.input.layer &&
-          file.tarEntry === finding.input.tarEntry,
-      );
-      requireCheck(
-        file &&
-          classifyFindings(
-            [{ ...finding, File: file.scanPath }],
-            [file],
-            baseDiffIDs.length,
-          ).resolved === 1,
-        "Reviewed V8 report context changed",
-      );
-    }
+    const classification = { resolved: 0, unresolved: canonical.length };
     const report: QualificationReport = {
       version: 2,
+      scanScope: "pgcf-built-files-and-image-metadata",
       profile,
       nativeArtifacts,
       ...(recipeSha256 ? { recipeSha256 } : {}),
@@ -1956,7 +1689,7 @@ export async function qualify(
         : {}),
       diffIDs: config.rootfs.diff_ids,
       layers: descriptor.Layers.length,
-      regularFiles: files.length,
+      regularFiles: ownedFiles.length,
       scanner: `gitleaks ${scannerVersion}`,
       rawExit: canonical.length ? 2 : 0,
       canonicalFindings: canonical.length,
@@ -2009,12 +1742,7 @@ export async function qualify(
           implementationSha256: createHash("sha256")
             .update(await readFile("scripts/ci/image-qualification.ts"))
             .update(await readFile("scripts/ci/scanner.ts"))
-            .update(await readFile("scripts/ci/reviewed-findings.ts"))
-            .update(await readFile("scripts/ci/reviewed-findings.json"))
-            .update(
-              await readFile("scripts/ci/postgres-reviewed-findings.json"),
-            )
-            .update(await readFile("scripts/ci/storage-reviewed-findings.json"))
+            .update(await readFile("scripts/ci/image-profiles.ts"))
             .digest("hex"),
         },
         findings: canonical.map((finding) => ({
@@ -2109,8 +1837,11 @@ async function main(): Promise<void> {
         report.imageId === imageId &&
         report.revision === revision &&
         report.source === source &&
+        report.scanScope === "pgcf-built-files-and-image-metadata" &&
+        report.canonicalFindings === 0 &&
+        report.resolved === 0 &&
         report.unresolved === 0 &&
-        (report.rawExit === 0 || report.rawExit === 2) &&
+        report.rawExit === 0 &&
         report.opaqueExpectedBytes === report.opaqueDetectorBytes,
       "Qualification report does not authorize this image",
     );

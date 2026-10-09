@@ -152,7 +152,9 @@
           "os": "linux",
           "architecture": "amd64",
           "url": "https://get.helm.sh/helm-v4.3.0-linux-amd64.tar.gz",
-          "sha256": "86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb"
+          "sha256": "86584a54def73570558f66f5111cc53dfed56689637ae32c1201205d494f54fb",
+          "binarySha256": "57ce7fc4ea77b28ee6fa91ae071abcade74d3f524e80c9decff5877a5ac8eda4",
+          "binaryBytes": 65908896
         },
         {
           "os": "linux",
@@ -169,7 +171,9 @@
           "os": "linux",
           "architecture": "amd64",
           "url": "https://github.com/siderolabs/talos/releases/download/v1.14.2/talosctl-linux-amd64",
-          "sha256": "c6c9552b0e5f767352c595fa1c0af4f186f697488646872955057d23990a66c4"
+          "sha256": "c6c9552b0e5f767352c595fa1c0af4f186f697488646872955057d23990a66c4",
+          "binarySha256": "c6c9552b0e5f767352c595fa1c0af4f186f697488646872955057d23990a66c4",
+          "binaryBytes": 118386850
         },
         {
           "os": "linux",
@@ -186,7 +190,9 @@
           "os": "linux",
           "architecture": "amd64",
           "url": "https://dl.k8s.io/release/v1.36.5/bin/linux/amd64/kubectl",
-          "sha256": "33bc88a24c3b09cf55bfd59e6ca977881b61fc3f25ab65bc80c65b430248648e"
+          "sha256": "33bc88a24c3b09cf55bfd59e6ca977881b61fc3f25ab65bc80c65b430248648e",
+          "binarySha256": "33bc88a24c3b09cf55bfd59e6ca977881b61fc3f25ab65bc80c65b430248648e",
+          "binaryBytes": 59584674
         },
         {
           "os": "linux",
@@ -273,5 +279,19 @@
   "talosBoot": {
     "imager": "ghcr.io/siderolabs/imager@sha256:89d1b1e2be167632745abf7f6834220a255a0182714f3d91670ecad55a3c41ff",
     "baseInstaller": "ghcr.io/siderolabs/installer-base@sha256:a47d7d4ed3ff5e3467494a0e62483767a5ba00d731b963cdcbc917abd83553d6"
+  },
+  "ciToolchain": {
+    "node": "24.21.0",
+    "dockerClient": "28.0.4",
+    "dockerServer": "28.0.4",
+    "buildx": "0.37.2",
+    "platform": "linux",
+    "architecture": "x64",
+    "distribution": "ubuntu",
+    "distributionVersion": "24.04",
+    "rustTargets": [
+      "x86_64-unknown-linux-gnu",
+      "wasm32-unknown-unknown"
+    ]
   }
 }
