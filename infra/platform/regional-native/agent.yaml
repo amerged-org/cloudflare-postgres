@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgcf-agent
+  namespace: pgcf-system
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: agent
+          image: pgcf-native-controller
+          command: [/pgcf-native-controller]
+          args: []
+          # This controller has no HTTP listener. Cloudflare observes its authenticated
+          # desired-state link and release manifest; a separate version process is not health.
+          env:
+            - name: PGCF_CLUSTER_UID
+              value: "${PGCF_CLUSTER_UID}"

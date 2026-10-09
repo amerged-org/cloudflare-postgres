@@ -1,0 +1,19 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pgcf-gateway
+  namespace: pgcf-system
+spec:
+  template:
+    spec:
+      securityContext:
+        runAsUser: 65532
+        runAsGroup: 65532
+      containers:
+        - name: gateway
+          image: pgcf-native-gateway
+          command: [/pgcf-native-gateway]
+          args: []
+          env:
+            - name: PGCF_GATEWAY_LEGACY_BINDINGS_JSON
+              value: "${PGCF_GATEWAY_LEGACY_BINDINGS_JSON}"

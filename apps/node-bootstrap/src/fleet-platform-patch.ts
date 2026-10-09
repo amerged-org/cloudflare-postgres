@@ -60,6 +60,106 @@ function component(input: FleetPatchInput, name: string) {
   if (!value) throw new BootstrapError("patch_component_pin_missing");
   return value;
 }
+/** Legacy bootstrap transport stays on its original source; qualified native roles select one overlay. */
+export function fleetRegionalRuntime(input: FleetPatchInput) {
+  const has = (name: string) =>
+    input.spec.components.some(
+      (value) => value.name === name && value.kind === "image",
+    );
+  const controller = has("native-controller"),
+    gateway = has("native-gateway");
+  if (controller && !gateway)
+    throw new BootstrapError("patch_regional_composition_incomplete");
+  return {
+    native: controller,
+    native_gateway: gateway,
+    path: controller
+      ? "./infra/platform/regional-native"
+      : gateway
+        ? "./infra/platform/regional-gateway-native"
+        : "./infra/platform/regional",
+    native_relay: has("native-bootstrap-relay"),
+  };
+}
+export function fleetRegionalImages(input: FleetPatchInput) {
+  const runtime = fleetRegionalRuntime(input),
+    regional = input.spec.components.find((value) => value.name === "regional"),
+    selected = [
+      ...(regional ? [{ pin: regional, name: "pgcf-regional" }] : []),
+      ...(runtime.native
+        ? [
+            {
+              pin: component(input, "native-controller"),
+              name: "pgcf-native-controller",
+            },
+          ]
+        : []),
+      ...(runtime.native_gateway
+        ? [
+            {
+              pin: component(input, "native-gateway"),
+              name: "pgcf-native-gateway",
+            },
+          ]
+        : []),
+      { pin: component(input, "cloudflared"), name: "cloudflared" },
+    ];
+  if (!runtime.native && !regional)
+    throw new BootstrapError("patch_regional_component_missing");
+  return selected.map(({ pin, name }) => ({
+    name,
+    newName: imageRepository(pin.reference),
+    digest: `sha256:${pin.sha256}`,
+  }));
+}
+export function fleetRelayImages(input: FleetPatchInput) {
+  const pin =
+    input.spec.components.find(
+      (value) => value.name === "native-bootstrap-relay",
+    ) ??
+    input.spec.components.find((value) => value.name === "bootstrap-relay") ??
+    input.spec.components.find((value) => value.name === "regional");
+  if (!pin) throw new BootstrapError("patch_relay_component_missing");
+  const tunnel = component(input, "cloudflared");
+  return [
+    {
+      name:
+        pin.name === "native-bootstrap-relay"
+          ? "pgcf-native-bootstrap-relay"
+          : "pgcf-regional",
+      newName: imageRepository(pin.reference),
+      digest: `sha256:${pin.sha256}`,
+    },
+    {
+      name: "cloudflared",
+      newName: imageRepository(tunnel.reference),
+      digest: `sha256:${tunnel.sha256}`,
+    },
+  ];
+}
+function deploymentOverlay(
+  base: Record<string, unknown>,
+  patch: Record<string, unknown>,
+) {
+  if (resourceKey(base) !== resourceKey(patch) || base.kind !== "Deployment")
+    throw new BootstrapError("patch_relay_artifact_invalid");
+  const before = object(object(object(base.spec).template).spec),
+    overlay = object(object(object(patch.spec).template).spec),
+    original = objects(before.containers),
+    changes = objects(overlay.containers);
+  if (
+    changes.some(
+      (value) => !original.some((entry) => entry.name === value.name),
+    )
+  )
+    throw new BootstrapError("patch_relay_container_unknown");
+  const wanted = object(merge(base, patch)),
+    pod = object(object(object(wanted.spec).template).spec);
+  pod.containers = original.map((value) =>
+    merge(value, changes.find((entry) => entry.name === value.name) ?? {}),
+  );
+  return wanted;
+}
 export async function readFleetPlatformAssets(
   input: FleetPatchInput,
   signal: AbortSignal,
@@ -145,12 +245,22 @@ export async function readFleetPlatformAssets(
     relayDocs = parseAllDocuments(relayText);
   if (relayDocs.some((v) => v.errors.length) || relayDocs.length !== 1)
     throw new BootstrapError("patch_relay_artifact_invalid");
-  const relay = object(relayDocs[0]!.toJSON());
+  let relay = object(relayDocs[0]!.toJSON());
   if (
     relay.kind !== "Deployment" ||
     object(relay.metadata).name !== "pgcf-bootstrap-relay"
   )
     throw new BootstrapError("patch_relay_artifact_invalid");
+  if (fleetRegionalRuntime(input).native_relay) {
+    const patchText = await read(
+        prefix + "infra/platform/bootstrap-relay-native/relay.yaml",
+        128 * 1024,
+      ),
+      patchDocs = parseAllDocuments(patchText);
+    if (patchDocs.length !== 1 || patchDocs[0]!.errors.length)
+      throw new BootstrapError("patch_relay_artifact_invalid");
+    relay = deploymentOverlay(relay, object(patchDocs[0]!.toJSON()));
+  }
   return {
     lock,
     flux: fluxObjects,
@@ -223,7 +333,36 @@ function pinnedPods(
   pin: FleetReleaseComponent,
   input: FleetPatchInput,
 ): boolean {
-  const ownership = pin.workload;
+  let ownership = pin.workload;
+  const nativeWorkloads: Record<string, { namespace: string; name: string }> = {
+    "native-controller": { namespace: "pgcf-system", name: "pgcf-agent" },
+    "native-gateway": { namespace: "pgcf-system", name: "pgcf-gateway" },
+    "native-bootstrap-relay": {
+      namespace: "pgcf-bootstrap-transport",
+      name: "pgcf-bootstrap-relay",
+    },
+  };
+  const runtime = fleetRegionalRuntime(input),
+    legacyControllerOnly =
+      pin.name === "regional" && runtime.native_gateway && !runtime.native,
+    declared = legacyControllerOnly
+      ? { namespace: "pgcf-system", name: "pgcf-agent" }
+      : nativeWorkloads[pin.name];
+  // First-party roles can share one registry repository while shipping different binaries/digests.
+  // Gateway-first leaves only the legacy controller on the Regional image.
+  if (declared && (!ownership || legacyControllerOnly)) {
+    const selectedName = ownership?.selector["app.kubernetes.io/name"];
+    if (selectedName !== undefined && selectedName !== declared.name)
+      return false;
+    ownership = {
+      namespace: ownership?.namespace ?? declared.namespace,
+      selector: {
+        ...ownership?.selector,
+        "app.kubernetes.io/name": declared.name,
+      },
+      scope: ownership?.scope ?? "cluster",
+    };
+  }
   if (ownership) {
     const workloads = [...state.resources.values()].filter(
       (value) =>
@@ -359,8 +498,98 @@ export function fleetPlatformReadback(
     revision(sourceRevision, commit!);
   const regionalReady =
     platformReady &&
+    object(regional.spec).path === fleetRegionalRuntime(input).path &&
     ready(regional) &&
     revision(object(regional.status).lastAppliedRevision, commit!);
+  let runtimeReady = true;
+  for (const [name, deployment, namespace, containerName, binary] of [
+    [
+      "native-controller",
+      "pgcf-agent",
+      "pgcf-system",
+      "agent",
+      "/pgcf-native-controller",
+    ],
+    [
+      "native-gateway",
+      "pgcf-gateway",
+      "pgcf-system",
+      "gateway",
+      "/pgcf-native-gateway",
+    ],
+    [
+      "native-bootstrap-relay",
+      "pgcf-bootstrap-relay",
+      "pgcf-bootstrap-transport",
+      "relay",
+      "/pgcf-native-bootstrap-relay",
+    ],
+  ] as const) {
+    if (!wanted.has(name)) continue;
+    const pin = component(input, name),
+      workload = state.resources.get(`Deployment/${namespace}/${deployment}`),
+      pod = object(object(object(workload?.spec ?? {}).template).spec),
+      containers = pod.containers === undefined ? [] : objects(pod.containers),
+      selected = containers.filter((value) => value.name === containerName),
+      container = selected[0];
+    const executableReady =
+      selected.length === 1 &&
+      canonical(container!.command) === canonical([binary]) &&
+      (container!.args === undefined || canonical(container!.args) === "[]") &&
+      imageRepository(String(container!.image)) ===
+        imageRepository(pin.reference) &&
+      imageDigest(container!.image) === pin.sha256;
+    const httpProbe = (value: unknown, path: string, host?: string) => {
+      const probe = object(value ?? {}),
+        get = object(probe.httpGet ?? {});
+      return (
+        get.path === path &&
+        get.port === "http" &&
+        get.host === host &&
+        probe.exec === undefined &&
+        probe.tcpSocket === undefined &&
+        probe.grpc === undefined
+      );
+    };
+    const portReady =
+      containers.length > 0 &&
+      (container?.ports === undefined ? [] : objects(container.ports)).some(
+        (value) =>
+          value.name === "http" &&
+          value.containerPort ===
+            (name === "native-bootstrap-relay" ? 8082 : 8080),
+      );
+    const env = container?.env === undefined ? [] : objects(container.env);
+    const roleReady =
+      name === "native-controller"
+        ? env.filter((value) => value.name === "PGCF_CLUSTER_UID").length ===
+            1 &&
+          env.some(
+            (value) =>
+              value.name === "PGCF_CLUSTER_UID" &&
+              value.value === input.status.cluster_uid &&
+              value.valueFrom === undefined,
+          )
+        : portReady &&
+          (name === "native-gateway"
+            ? httpProbe(container?.livenessProbe, "/healthz") &&
+              httpProbe(container?.readinessProbe, "/readyz")
+            : pod.hostNetwork === true &&
+              httpProbe(
+                container?.livenessProbe,
+                "/_pgcf/bootstrap-relay/identity",
+                "127.0.0.1",
+              ) &&
+              httpProbe(
+                container?.readinessProbe,
+                "/_pgcf/bootstrap-relay/identity",
+                "127.0.0.1",
+              ));
+    if (!executableReady || !roleReady) {
+      runtimeReady = false;
+      issues.push(`unobserved/runtime-wiring/${name}`);
+    }
+  }
   let storageAuthorityReady = true;
   if (
     input.storage_authority ||
@@ -438,6 +667,7 @@ export function fleetPlatformReadback(
         .every((v) => has(v.name)),
     regional_ready:
       regionalReady &&
+      runtimeReady &&
       storageAuthorityReady &&
       [
         "regional",
@@ -499,6 +729,12 @@ export async function readFleetFluxIdentities(
 function merge(current: unknown, wanted: unknown): unknown {
   if (!wanted || typeof wanted !== "object" || Array.isArray(wanted))
     return structuredClone(wanted);
+  const patch = wanted as Record<string, unknown>;
+  if (patch.$patch === "replace") {
+    const replacement = { ...patch };
+    delete replacement.$patch;
+    return structuredClone(replacement);
+  }
   const next = {
     ...(current && typeof current === "object" && !Array.isArray(current)
       ? (current as Record<string, unknown>)
@@ -842,31 +1078,22 @@ export async function reconcileFleetRegional(
       input.spec.components.find((v) => v.name === "native-bootstrap-relay") ??
       input.spec.components.find((v) => v.name === "bootstrap-relay") ??
       regional,
-    cloudflared = component(input, "cloudflared");
+    cloudflared = component(input, "cloudflared"),
+    runtime = fleetRegionalRuntime(input);
   if (
     spec.suspend === true ||
-    spec.path !== "./infra/platform/regional" ||
+    ![
+      "./infra/platform/regional",
+      "./infra/platform/regional-gateway-native",
+      "./infra/platform/regional-native",
+    ].includes(String(spec.path)) ||
     object(spec.sourceRef).name !== "pgcf-platform"
   )
     throw new BootstrapError("patch_regional_source_invalid");
   if (!controller || !gateway)
     throw new BootstrapError("patch_regional_component_missing");
   const images = spec.images === undefined ? [] : objects(spec.images),
-    selected = [
-      ...(regional ? [{ pin: regional, name: "pgcf-regional" }] : []),
-      ...(controller.name === "native-controller"
-        ? [{ pin: controller, name: "pgcf-native-controller" }]
-        : []),
-      ...(gateway.name === "native-gateway"
-        ? [{ pin: gateway, name: "pgcf-native-gateway" }]
-        : []),
-      { pin: cloudflared, name: "cloudflared" },
-    ],
-    targets = selected.map(({ pin, name }) => ({
-      name,
-      newName: imageRepository(pin.reference),
-      digest: `sha256:${pin.sha256}`,
-    }));
+    targets = fleetRegionalImages(input);
   const retained = images.filter(
     (value) =>
       !targets.some(
@@ -880,12 +1107,16 @@ export async function reconcileFleetRegional(
       metadata: { name: metadata.name, namespace: metadata.namespace },
       spec: {
         ...spec,
+        path: runtime.path,
         images: [...retained, ...targets],
         postBuild: {
           ...object(spec.postBuild ?? {}),
           substitute: {
             ...object(object(spec.postBuild ?? {}).substitute ?? {}),
             PGCF_CLUSTER_UID: input.status.cluster_uid,
+            ...(runtime.native
+              ? { PGCF_POSTGRES_IMAGE: component(input, "postgres").reference }
+              : {}),
             ...(legacyBindings === undefined
               ? {}
               : {

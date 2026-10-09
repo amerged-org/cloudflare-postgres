@@ -1,0 +1,9 @@
+# Selected only by a release containing both qualified native runtime images.
+# The common regional resources remain the single source for RBAC, network, services and limits.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../regional-gateway-native
+patches:
+  - path: agent.yaml
+  - path: config.yaml

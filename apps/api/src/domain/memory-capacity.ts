@@ -3,7 +3,6 @@ import type { NodeMemoryObservation } from "@pgcf/contracts";
 import { releaseCoveredStartupReservationsStatement } from "./startup-admission.ts";
 
 export const MEMORY_SAMPLE_MAX_AGE_MS = 90_000;
-export const MEMORY_THRESHOLD_PPM = 760_000;
 const minuteMs = 60_000;
 export interface MemorySample {
   node_uid: string;
@@ -17,6 +16,7 @@ export function memoryCapacityWindow(
   nodeUid: string,
   samples: readonly MemorySample[],
   now = Date.now(),
+  thresholdPpm: number | null = null,
 ): {
   complete: boolean;
   admissible: boolean;
@@ -70,7 +70,12 @@ export function memoryCapacityWindow(
     sum += BigInt(sample.working_set_bytes!);
   }
   const denominator = BigInt(capacity!) * 10n;
-  const expand = sum * 100n >= denominator * 76n;
+  const expand =
+    thresholdPpm !== null &&
+    Number.isInteger(thresholdPpm) &&
+    thresholdPpm >= 1 &&
+    thresholdPpm <= 1_000_000 &&
+    sum * 1_000_000n >= denominator * BigInt(thresholdPpm);
   return {
     complete: true,
     admissible:
@@ -143,7 +148,7 @@ export async function recordNodeMemoryObservation(
     db
       .prepare(
         `UPDATE nodes SET memory_window_observed_at=?,memory_window_valid=?,memory_utilization_ppm=?,
-      memory_expansion_triggered_at=CASE WHEN ?=1 AND database_placement_enabled=1 AND EXISTS(SELECT 1 FROM node_region_policies WHERE region_id=nodes.region_id AND placement_mode='actual_ram') THEN COALESCE(memory_expansion_triggered_at,?) ELSE memory_expansion_triggered_at END
+      memory_expansion_triggered_at=CASE WHEN database_placement_enabled=1 AND EXISTS(SELECT 1 FROM node_region_policies WHERE region_id=nodes.region_id AND placement_mode='actual_ram' AND ? >= ram_expansion_threshold_ppm) THEN COALESCE(memory_expansion_triggered_at,?) ELSE memory_expansion_triggered_at END
       WHERE id=? AND region_id=? AND node_uid=? AND lost_at IS NULL
         AND (memory_window_observed_at IS NULL OR memory_window_observed_at<=?)
         AND NOT EXISTS(SELECT 1 FROM node_memory_samples WHERE node_id=nodes.id AND node_uid=nodes.node_uid AND observed_at>?)`,
@@ -152,7 +157,7 @@ export async function recordNodeMemoryObservation(
         window.observed_at,
         Number(window.complete),
         window.utilization_ppm,
-        Number(window.expand),
+        window.utilization_ppm,
         new Date(receivedAt).toISOString(),
         observation.node_id,
         regionId,
@@ -222,7 +227,7 @@ export function regionalRamWindowSql(regionExpression: string): string {
       AND SUM(w.capacity_min*10) BETWEEN 1 AND ${Number.MAX_SAFE_INTEGER}`;
 }
 
-/** Shared decision/atomic approval predicate; no per-node latched trigger authorizes a purchase. */
+/** Shared current-policy approval predicate. Quotient/remainder arithmetic stays in SQLite int64. */
 export function regionalRamExpansionSql(
   regionExpression: string,
   requestKeyExpression?: string,
@@ -232,12 +237,17 @@ export function regionalRamExpansionSql(
       ? undefined
       : regionSqlExpression(requestKeyExpression);
   return `EXISTS(SELECT 1 FROM (${regionalRamWindowSql(regionExpression)}) regional_ram
-    WHERE regional_ram.working_set_bytes*100>=regional_ram.capacity_memory_bytes*76
+    JOIN node_region_policies ram_policy ON ram_policy.region_id=${regionSqlExpression(regionExpression)}
+    WHERE ram_policy.ram_expansion_threshold_ppm IS NOT NULL
+      AND regional_ram.working_set_bytes >=
+        (regional_ram.capacity_memory_bytes/1000000)*ram_policy.ram_expansion_threshold_ppm
+        + ((regional_ram.capacity_memory_bytes%1000000)*ram_policy.ram_expansion_threshold_ppm+999999)/1000000
       ${
         key === undefined
           ? ""
           : `AND EXISTS(SELECT 1 FROM (SELECT ${key} request_key) ram_key
-        WHERE ram_key.request_key='capacity-ram-'||CAST(CAST(substr(ram_key.request_key,14) AS INTEGER) AS TEXT)
-          AND CAST(substr(ram_key.request_key,14) AS INTEGER) BETWEEN 1 AND regional_ram.minute)`
+        WHERE (ram_key.request_key='capacity-ram-'||CAST(CAST(substr(ram_key.request_key,14) AS INTEGER) AS TEXT)
+          AND CAST(substr(ram_key.request_key,14) AS INTEGER) BETWEEN 1 AND regional_ram.minute)
+          OR ram_key.request_key LIKE 'capacity-order-%' OR ram_key.request_key LIKE 'capacity-headroom-%')`
       })`;
 }

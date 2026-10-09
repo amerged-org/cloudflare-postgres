@@ -1086,8 +1086,14 @@ export async function verifyRustAssembly(
     license.sha256 === (await hashFile("LICENSE")),
     "First-party license changed",
   );
-  requiredImageFile(files, `${licenseRoot}/rust/LICENSE-MIT`);
-  requiredImageFile(files, `${licenseRoot}/rust/LICENSE-APACHE`);
+  // Preserve the pinned toolchain's actual notice layout copied by license-bundle.sh.
+  for (const notice of [
+    "licenses/MIT.txt",
+    "licenses/Apache-2.0.txt",
+    "COPYRIGHT.html",
+    "COPYRIGHT-library.html",
+  ])
+    requiredImageFile(files, `${licenseRoot}/rust/${notice}`);
   requireCheck(
     files.some((file) =>
       new RegExp("^" + licenseRoot + "/(?:crates|rust)/[^/]+/.+").test(

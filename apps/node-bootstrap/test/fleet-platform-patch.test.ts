@@ -281,6 +281,24 @@ test("separate native controller/gateway pins reconcile through distinct logical
             containers: [
               {
                 name: app,
+                image:
+                  app === "agent" ? controller.reference : gateway.reference,
+                command: [
+                  app === "agent"
+                    ? "/pgcf-native-controller"
+                    : "/pgcf-native-gateway",
+                ],
+                ...(app === "gateway"
+                  ? {
+                      ports: [{ name: "http", containerPort: 8080 }],
+                      livenessProbe: {
+                        httpGet: { path: "/healthz", port: "http" },
+                      },
+                      readinessProbe: {
+                        httpGet: { path: "/readyz", port: "http" },
+                      },
+                    }
+                  : {}),
                 env:
                   app === "gateway"
                     ? [
@@ -294,7 +312,12 @@ test("separate native controller/gateway pins reconcile through distinct logical
                           value: "[]",
                         },
                       ]
-                    : [],
+                    : [
+                        {
+                          name: "PGCF_CLUSTER_UID",
+                          value: input.status.cluster_uid,
+                        },
+                      ],
               },
             ],
           },
@@ -386,6 +409,10 @@ test("separate native controller/gateway pins reconcile through distinct logical
     [],
   );
   assert.equal(mutations, 1);
+  assert.equal(
+    (regional.spec as { path: string }).path,
+    "./infra/platform/regional-native",
+  );
   const images = (
     regional.spec as {
       images: { name: string; newName: string; digest: string }[];
@@ -404,6 +431,23 @@ test("separate native controller/gateway pins reconcile through distinct logical
     fleetPlatformReadback(input, state, assets, []).regional_ready,
     true,
   );
+  const agent = resources.get("Deployment/pgcf-system/pgcf-agent")!,
+    agentContainer = (
+      agent.spec as {
+        template: { spec: { containers: { command: string[] }[] } };
+      }
+    ).template.spec.containers[0]!;
+  agentContainer.command = ["node", "/app/agent.mjs"];
+  assert.ok(
+    fleetPlatformReadback(input, state, assets, []).issues.includes(
+      "unobserved/runtime-wiring/native-controller",
+    ),
+  );
+  assert.equal(
+    fleetPlatformReadback(input, state, assets, []).regional_ready,
+    false,
+  );
+  agentContainer.command = ["/pgcf-native-controller"];
   pods[1]!.status.containerStatuses[0]!.imageID = `containerd://registry.example/pgcf-regional@sha256:${"3".repeat(64)}`;
   assert.equal(
     fleetPlatformReadback(input, state, assets, []).regional_ready,

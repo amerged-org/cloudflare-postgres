@@ -6,7 +6,10 @@ import {
   configureNodeRegionPolicy,
   reserveNodeAddition,
 } from "../../src/domain/node-state.ts";
-import { recordNodeMemoryObservation } from "../../src/domain/memory-capacity.ts";
+import {
+  regionalRamExpansionSql,
+  recordNodeMemoryObservation,
+} from "../../src/domain/memory-capacity.ts";
 import { runNodeCapacity } from "../../src/domain/node-capacity.ts";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
 
@@ -27,6 +30,7 @@ async function setup() {
     purchases_enabled: false,
     order,
     placement_mode: "actual_ram",
+    ram_expansion_threshold_ppm: 760_000,
     maximum_database_memory_mib: 4096,
     postgres_memory_request_mib: 128,
   });
@@ -111,7 +115,7 @@ it("does not order again for another old hot source after a newly Ready spare lo
   await samples(f, otherHot, 90, 10, at);
   expect((await runNodeCapacity(env, f.region, true)).action).toBe("order");
   const completed = await reserveNodeAddition(env.DB, {
-    request_key: `capacity-ram-${f.node.uid}`,
+    request_key: `capacity-ram-${Math.floor(at / 60_000)}`,
     request: { region_id: f.region, mode: "order", order: f.order },
   });
   await env.DB.prepare(
@@ -182,4 +186,92 @@ it("counts a Ready customer node's RAM when only its new-placement timestamp is 
     .bind(new Date().toISOString(), f.node.id)
     .run();
   expect((await runNodeCapacity(env, f.region, true)).action).toBe("order");
+});
+
+it("uses an exact configured ppm boundary for large byte windows and refuses an unconfigured threshold", async () => {
+  const f = await setup();
+  const physicalCapacity = 900_719_925_474_097;
+  await samples(f, f.node, 80, 10, Date.now(), physicalCapacity);
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET ram_expansion_threshold_ppm=830001 WHERE region_id=?",
+  )
+    .bind(f.region)
+    .run();
+  const required =
+    (BigInt(physicalCapacity) * 10n * 830_001n + 999_999n) / 1_000_000n;
+  await env.DB.prepare(
+    "UPDATE node_memory_samples SET working_set_bytes=? WHERE node_id=?",
+  )
+    .bind(Number(required / 10n), f.node.id)
+    .run();
+  await env.DB.prepare(
+    "UPDATE node_memory_samples SET working_set_bytes=working_set_bytes+? WHERE node_id=? AND minute=(SELECT MAX(minute) FROM node_memory_samples WHERE node_id=?)",
+  )
+    .bind(Number(required % 10n), f.node.id, f.node.id)
+    .run();
+  const expanded = () =>
+    env.DB.prepare(
+      `SELECT ${regionalRamExpansionSql("p.region_id")} expand FROM node_region_policies p WHERE p.region_id=?`,
+    )
+      .bind(f.region)
+      .first("expand");
+  expect(await expanded()).toBe(1);
+  expect((await runNodeCapacity(env, f.region, true)).action).toBe("order");
+  await env.DB.prepare(
+    "UPDATE node_memory_samples SET working_set_bytes=working_set_bytes-1 WHERE node_id=? AND minute=(SELECT MAX(minute) FROM node_memory_samples WHERE node_id=?)",
+  )
+    .bind(f.node.id, f.node.id)
+    .run();
+  expect(await expanded()).toBe(0);
+  expect((await runNodeCapacity(env, f.region, true)).action).toBe("idle");
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET ram_expansion_threshold_ppm=NULL WHERE region_id=?",
+  )
+    .bind(f.region)
+    .run();
+  expect(await expanded()).toBe(0);
+  expect((await runNodeCapacity(env, f.region, true)).action).not.toBe("order");
+});
+
+it("gates reserved-mode automatic purchases by measured RAM while keeping existing-instance adoption available", async () => {
+  const f = await setup();
+  await env.DB.prepare(
+    "UPDATE nodes SET allocatable_cpu_millicores=1 WHERE id=?",
+  )
+    .bind(f.node.id)
+    .run();
+  await samples(f, f.node, 75);
+  const policy = {
+    region_id: f.region,
+    purchases_enabled: true,
+    autoscale_enabled: true,
+    order: f.order,
+    placement_mode: "reserved",
+  };
+  await configureNodeRegionPolicy(env.DB, {
+    ...policy,
+    ram_expansion_threshold_ppm: 800_000,
+  });
+  expect((await runNodeCapacity(env, f.region, true)).action).toBe(
+    "capacity_wait",
+  );
+  await configureNodeRegionPolicy(env.DB, {
+    ...policy,
+    ram_expansion_threshold_ppm: 700_000,
+  });
+  expect((await runNodeCapacity(env, f.region, true)).action).toBe("order");
+  // A migrated reserved policy can predate threshold configuration.
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET ram_expansion_threshold_ppm=NULL WHERE region_id=?",
+  )
+    .bind(f.region)
+    .run();
+  expect((await runNodeCapacity(env, f.region, true)).action).not.toBe("order");
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    purchases_enabled: false,
+    autoscale_enabled: true,
+    adopt_instance_ids: ["987654321"],
+  });
+  expect((await runNodeCapacity(env, f.region, true)).action).toBe("adopt");
 });

@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: pgcf-regional
+  namespace: pgcf-system
+data:
+  PGCF_POSTGRES_IMAGE: "${PGCF_POSTGRES_IMAGE}"

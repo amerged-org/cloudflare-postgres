@@ -4,6 +4,7 @@ import {
   FleetReleaseSpec,
   FleetNodeReleaseObservation,
   fleetChartObservation,
+  thinStorageReleaseGuardPinned,
 } from "../src/releases.ts";
 
 const names = [
@@ -28,7 +29,7 @@ function spec() {
     talos_version: "1.14.1",
     talos_installer: `registry.example/talos@sha256:${"a".repeat(64)}`,
     talos_schematic_sha256: "b".repeat(64),
-    talos_extensions: [],
+    talos_extensions: [] as string[],
     kubernetes_version: "1.36.5",
     components: names.slice(3),
   };
@@ -60,6 +61,60 @@ it("requires explicit digests, complete product layers and closed role reference
   const duplicate = spec();
   duplicate.components.push(duplicate.components[0]!);
   expect(FleetReleaseSpec.safeParse(duplicate).success).toBe(false);
+});
+it("qualified thin releases require a pinned verifier and native gateway while thick-only releases remain valid", () => {
+  const base = spec();
+  for (const name of ["pgcf-sandbox-controller", "native-gateway"])
+    base.components.push({
+      name,
+      kind: "image",
+      version: "1.0.0",
+      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
+      sha256: "d".repeat(64),
+    });
+  for (const role of Object.values(base.roles)) {
+    Object.assign(role, { host_configuration_required: true });
+    role.talos_extensions.push("pgcf-sandbox-controller");
+    role.components.push("native-gateway");
+  }
+  const qualified = Object.assign(base, {
+    storage_authority_keys_sha256: "a".repeat(64),
+    thin_storage_qualification: {
+      profile_sha256: "b".repeat(64),
+      driver_image: `registry.example/openebs-lvm@sha256:${"d".repeat(64)}`,
+      host_extension_image: `registry.example/pgcf-sandbox-controller@sha256:${"d".repeat(64)}`,
+      kernel_version: "6.18.54",
+      receipt_sha256: "c".repeat(64),
+      qualified_at: "2026-10-09T00:00:00.000Z",
+      gates: {
+        data_full: true,
+        metadata_full: true,
+        noflush_quiescence: true,
+        resume_marker: true,
+        startup_bound: true,
+        trim_delete_recreate: true,
+        retained_thick_preservation: true,
+      },
+    },
+  });
+  expect(FleetReleaseSpec.safeParse(qualified).success).toBe(true);
+  const missingPin = structuredClone(qualified) as Partial<typeof qualified>;
+  delete missingPin.storage_authority_keys_sha256;
+  expect(FleetReleaseSpec.safeParse(missingPin).success).toBe(false);
+  const noGateway = structuredClone(qualified);
+  noGateway.components = noGateway.components.filter(
+    (c) => c.name !== "native-gateway",
+  );
+  for (const role of Object.values(noGateway.roles))
+    role.components = role.components.filter((n) => n !== "native-gateway");
+  expect(FleetReleaseSpec.safeParse(noGateway).success).toBe(false);
+  const thickOnlySuccessor = structuredClone(noGateway) as Partial<
+    typeof noGateway
+  >;
+  delete thickOnlySuccessor.thin_storage_qualification;
+  const acceptedThickRelease = FleetReleaseSpec.parse(thickOnlySuccessor);
+  expect(thinStorageReleaseGuardPinned(acceptedThickRelease)).toBe(false);
+  expect(FleetReleaseSpec.safeParse(spec()).success).toBe(true);
 });
 it("does not treat a release-id claim or partial duplicate inventory as component observations", () => {
   expect(

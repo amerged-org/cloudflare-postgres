@@ -49,6 +49,7 @@ import {
   prepareNodePostjoinRuntime,
 } from "../../src/domain/node-postjoin-release.ts";
 import { ensureBootstrapFleetPatch } from "../../src/domain/fleet-patches.ts";
+import { storageAuthorityPublicKeys } from "../../src/domain/storage-authority.ts";
 
 const regions: string[] = [],
   releases: string[] = [],
@@ -209,6 +210,7 @@ async function fixture(future = false) {
           cluster_name: f.body.spec.cluster_name,
           cluster_endpoint: f.body.spec.cluster_endpoint,
         }),
+        (await storageAuthorityPublicKeys(f.bindings)).sha256,
       )
     : null;
   if (selected) releases.push(selected.id);

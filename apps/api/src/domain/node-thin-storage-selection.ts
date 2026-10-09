@@ -8,7 +8,10 @@ import {
   NodeThinStorageSelection,
   NodeThinStorageState,
 } from "@pgcf/contracts/node-thin-storage";
-import { FleetReleaseSpec } from "@pgcf/contracts/releases";
+import {
+  FleetReleaseSpec,
+  thinStorageReleaseGuardPinned,
+} from "@pgcf/contracts/releases";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
@@ -137,6 +140,7 @@ export async function configureNodeThinStorage(
     return conflict("Thin driver differs from the selected immutable release");
   const keys = await storageAuthorityPublicKeys(env);
   if (
+    !thinStorageReleaseGuardPinned(spec) ||
     !spec.storage_authority_keys_sha256 ||
     spec.storage_authority_keys_sha256 !== keys.sha256
   )

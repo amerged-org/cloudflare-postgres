@@ -12,6 +12,7 @@ import {
 } from "../../src/domain/node-state.ts";
 import { newNodeId } from "@pgcf/contracts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+import { runNodeCapacityCron } from "../../src/domain/node-capacity.ts";
 import { recordNodeMemoryObservation } from "../../src/domain/memory-capacity.ts";
 
 afterEach(async () => {
@@ -19,7 +20,7 @@ afterEach(async () => {
   await cleanupFixtures();
 });
 
-async function ramAuthority(percent = 80) {
+async function ramAuthority(percent = 80, trigger = "ram_76_percent") {
   const f = await fixture(8192, 60),
     uid = crypto.randomUUID(),
     provider = String(
@@ -39,7 +40,7 @@ async function ramAuthority(percent = 80) {
   };
   const profile = {
     id: crypto.randomUUID(),
-    trigger: "ram_76_percent",
+    trigger,
     order,
     owner_reference: "owner-regional-76-percent-no-ceilings",
     approved_at: new Date().toISOString(),
@@ -57,6 +58,7 @@ async function ramAuthority(percent = 80) {
     purchases_enabled: true,
     order,
     placement_mode: "actual_ram",
+    ram_expansion_threshold_ppm: 760_000,
     maximum_database_memory_mib: 4096,
     postgres_memory_request_mib: 128,
     standing_cost_profile: profile,
@@ -214,7 +216,7 @@ it("rechecks fresh regional membership before the first purchase and resumes the
   ).toBe(true);
 });
 
-it("resolves an uncertain already-dispatched order even if RAM falls and never claims a second purchase", async () => {
+it("resolves an uncertain order after threshold and switch changes without a second purchase", async () => {
   const f = await ramAuthority();
   const reserved = await f.reserve();
   const dispatch = await claimNodeDispatch(
@@ -228,11 +230,17 @@ it("resolves an uncertain already-dispatched order even if RAM falls and never c
     reserved.intent.operation_id,
     dispatch.addition.revision,
   );
-  await env.DB.prepare(
-    "UPDATE node_region_policies SET autoscale_enabled=0,purchases_enabled=0 WHERE region_id=?",
-  )
-    .bind(f.region)
-    .run();
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    purchases_enabled: false,
+    autoscale_enabled: false,
+    order: f.order,
+    placement_mode: "actual_ram",
+    ram_expansion_threshold_ppm: 920_001,
+    maximum_database_memory_mib: 4096,
+    postgres_memory_request_mib: 128,
+    standing_cost_profile: f.profile,
+  });
   await env.DB.prepare("DELETE FROM node_memory_samples WHERE node_id=?")
     .bind(f.node)
     .run();
@@ -336,6 +344,7 @@ it("atomically updates automatic expansion with owner policy so a queued order c
       adopt_instance_ids: [],
       order: f.order,
       placement_mode: "actual_ram",
+      ram_expansion_threshold_ppm: 760_000,
       maximum_database_memory_mib: 4096,
       postgres_memory_request_mib: 128,
       standing_cost_profile: f.profile,
@@ -581,4 +590,146 @@ it("keeps an owner profile's order count across profile updates", async () => {
       (await f.reserve()).intent.operation_id,
     ),
   ).rejects.toMatchObject({ code: "approval_required" });
+});
+
+it("revalidates a changed threshold on the same undispatched intent without a second ledger charge", async () => {
+  const f = await ramAuthority(80);
+  const approved = await approveStandingNodePurchase(
+    env.DB,
+    (await f.reserve()).intent.operation_id,
+  );
+  const operationId = approved.intent.operation_id;
+  const policy = {
+    region_id: f.region,
+    purchases_enabled: true,
+    autoscale_enabled: true,
+    order: f.order,
+    placement_mode: "actual_ram",
+    maximum_database_memory_mib: 4096,
+    postgres_memory_request_mib: 128,
+    standing_cost_profile: f.profile,
+  };
+  await configureNodeRegionPolicy(env.DB, {
+    ...policy,
+    ram_expansion_threshold_ppm: 850_000,
+  });
+  await expect(
+    claimNodeDispatch(env.DB, operationId, approved.revision),
+  ).rejects.toMatchObject({ code: "approval_required" });
+  await configureNodeRegionPolicy(env.DB, {
+    ...policy,
+    ram_expansion_threshold_ppm: 790_001,
+  });
+  const dispatched = await claimNodeDispatch(
+    env.DB,
+    operationId,
+    approved.revision,
+  );
+  expect(dispatched.claimed).toBe(true);
+  expect(dispatched.addition.intent).toEqual(approved.intent);
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) n FROM node_standing_approvals WHERE operation_id=?",
+    )
+      .bind(operationId)
+      .first("n"),
+  ).toBe(1);
+  expect(
+    await env.DB.prepare(
+      "SELECT a.profile_hash=p.standing_cost_profile_hash current FROM node_standing_approvals a JOIN node_region_policies p ON p.region_id=a.region_id WHERE a.operation_id=?",
+    )
+      .bind(operationId)
+      .first("current"),
+  ).toBe(1);
+});
+
+it("enforces current RAM and one regional addition for generic standing authority", async () => {
+  const f = await ramAuthority(80, "regional_actual_ram");
+  const reserved = await f.reserve();
+  const approved = await approveStandingNodePurchase(
+    env.DB,
+    reserved.intent.operation_id,
+  );
+  expect(approved.approval?.trigger).toBe("regional_actual_ram");
+  await expect(
+    reserveNodeAddition(env.DB, {
+      request_key: `capacity-ram-${f.minute - 1}`,
+      request: { region_id: f.region, mode: "order", order: f.order },
+    }),
+  ).rejects.toMatchObject({ code: "capacity_unavailable" });
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET autoscale_enabled=0 WHERE region_id=?",
+  )
+    .bind(f.region)
+    .run();
+  await expect(
+    claimNodeDispatch(env.DB, approved.intent.operation_id, approved.revision),
+  ).rejects.toMatchObject({ code: "approval_required" });
+});
+
+it("keeps a threshold-blocked reserved intent waiting and completes capacity checks for other regions", async () => {
+  const f = await ramAuthority(80);
+  const other = await fixture();
+  await configureNodeRegionPolicy(env.DB, { region_id: other.region });
+  const approved = await approveStandingNodePurchase(
+    env.DB,
+    (await f.reserve()).intent.operation_id,
+  );
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    purchases_enabled: true,
+    autoscale_enabled: true,
+    order: f.order,
+    placement_mode: "actual_ram",
+    maximum_database_memory_mib: 4096,
+    postgres_memory_request_mib: 128,
+    standing_cost_profile: f.profile,
+    ram_expansion_threshold_ppm: 850_000,
+  });
+  const start = vi
+    .spyOn(env.ADD_NODE, "create")
+    .mockResolvedValue({} as Awaited<ReturnType<typeof env.ADD_NODE.create>>);
+  const decisions = await runNodeCapacityCron(env);
+  expect(decisions).toEqual(
+    expect.arrayContaining([
+      expect.objectContaining({
+        region_id: f.region,
+        action: "waiting_for_approval",
+        operation_id: approved.intent.operation_id,
+      }),
+      expect.objectContaining({ region_id: other.region }),
+    ]),
+  );
+  expect(start).not.toHaveBeenCalled();
+});
+
+it("rechecks RAM for an old automatic headroom key before its first provider write", async () => {
+  const f = await ramAuthority(80);
+  const reserved = await reserveNodeAddition(env.DB, {
+    request_key: `capacity-headroom-${f.region}-1`,
+    request: { region_id: f.region, mode: "order", order: f.order },
+  });
+  const approved = await approveStandingNodePurchase(
+    env.DB,
+    reserved.intent.operation_id,
+  );
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    purchases_enabled: true,
+    autoscale_enabled: true,
+    order: f.order,
+    placement_mode: "reserved",
+    standing_cost_profile: f.profile,
+    ram_expansion_threshold_ppm: 850_000,
+  });
+  await expect(
+    claimNodeDispatch(env.DB, approved.intent.operation_id, approved.revision),
+  ).rejects.toMatchObject({ code: "approval_required" });
+  expect(
+    await env.DB.prepare(
+      "SELECT dispatch_request_id FROM node_additions WHERE operation_id=?",
+    )
+      .bind(approved.intent.operation_id)
+      .first("dispatch_request_id"),
+  ).toBeNull();
 });

@@ -23,6 +23,7 @@ it("keeps CPU-unplaceable demand waiting below the RAM threshold even with a fin
     region_id: f.region,
     max_nodes: 2,
     placement_mode: "actual_ram" as const,
+    ram_expansion_threshold_ppm: 800_000,
     maximum_database_memory_mib: 4096,
     postgres_memory_request_mib: 128,
   };

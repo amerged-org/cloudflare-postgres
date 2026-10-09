@@ -85,7 +85,8 @@ export async function desired(
     x.operation_id restore_operation_id,x.source_database_id,x.source_archive_path,x.source_storage_generation,x.backup_id,x.target_time,ro.status restore_status,
     src.region_id source_region_id,sr.backup_bucket source_backup_bucket,sr.backup_endpoint_url source_backup_endpoint_url
     FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id JOIN size_classes s ON s.id=d.size_class_id
-    LEFT JOIN database_start_admissions a ON a.database_id=d.id AND a.generation=d.generation AND a.storage_budget_bytes>0 AND a.budget_bytes>0
+    LEFT JOIN database_start_admissions a ON a.database_id=d.id AND a.generation=d.generation AND a.storage_budget_bytes>0 AND a.budget_bytes>0 AND a.ready_at IS NULL
+      AND (d.storage_protected_at IS NULL OR d.storage_protected_generation<d.generation)
     LEFT JOIN operations o ON o.id=substr(d.archive_path,-23) AND o.kind='database.create' AND o.database_id=d.id AND o.project_id=d.project_id AND o.generation<=d.generation
     LEFT JOIN maintenance_credentials m ON m.database_id=d.id
     LEFT JOIN database_restores x ON x.target_database_id=d.id

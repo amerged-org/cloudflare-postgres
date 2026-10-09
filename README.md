@@ -95,16 +95,17 @@ existing data; do not re-adopt or reset US1. Neon migration remains separate and
 [customer handover gates](docs/operations/operator-installation.md#customer-migration-handover),
 including credential rotation, adopter transport/rebinding and sufficient regional capacity.
 
-The approved actual-RAM policy requests regional V159 capacity at at least 76% average physical
-RAM usage over ten fresh aligned consecutive minutes of every eligible customer node, each retaining
-its own Node UID, under the explicit standing regional purchase policy. Orders use one month and no storage add-on. Existing capacity remains
-eligible during rollout under hard RAM, CPU, storage and full PostgreSQL/Barman startup-peak
-guards; there is no 81% placement cutoff. Missing observations remain unknown. Admin assignments
-use 256 MiB steps, with a 4096 MiB PostgreSQL cap in this installation. US uses actual-RAM mode
-with a 128 MiB PostgreSQL request; EU retains reserved mode until its existing databases complete
-the guarded transition. Autonomous purchases remain disabled until the updated threshold-only policy is qualified and deployed;
-the owner selected a maximum of3 managed VPS per region, a75% RAM warning and a cap notice.
-Monetary and lifetime order-count ceilings are optional under that explicit authority. Installation profiles are complete; the real RAM-threshold window and load cleanup passed.
+The actual-RAM expansion threshold and automatic-purchase switch are operator settings exposed
+through the authenticated Cloudflare management API. Expansion requires ten fresh aligned
+consecutive minutes from every eligible customer node, each retaining its own Node UID.
+Existing capacity remains eligible during rollout under hard RAM, CPU, storage and full
+PostgreSQL/Barman startup-peak guards; there is no 81% placement cutoff. Missing observations
+remain unknown. Fresh installations do not purchase automatically or send notifications.
+An optional `max_nodes` limit can be removed with `null`; no fixed three-node ceiling is required.
+This installation's selected standing policy remains V159, one month, no storage add-on and a
+76% expansion threshold. Updating its live configuration and completing autonomous rollout
+remain acceptance work. Monetary and lifetime order-count ceilings are optional under explicit
+operator authority. The real RAM-threshold window and load cleanup passed.
 See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
 
 ## Architecture
@@ -129,7 +130,8 @@ bounded direct Kubernetes reads, without discovery, and refuses incomplete or fo
 The producer waits if the retained source observation is stale, while transport access remains
 refused. Real fresh observations permit new bounded authority for that same source; changed
 identities remain blocking and the freshness limit is unchanged.
-US admission and complete measured live acceptance remain outstanding in PLAN.md.
+The original US node remains Ready through the owner-authorized operator path. Autonomous
+addition and the corrective common-runtime acceptance remain outstanding in PLAN.md.
 
 ```mermaid
 flowchart LR
@@ -271,6 +273,29 @@ const restored = await client.restoreDatabase(sourceId,
 Keep `logicalOperationKey` stable for retries of that management operation. The client does not
 retry uncertain writes or expose server response bodies in errors. PostgreSQL client pooling
 remains the integrator's responsibility.
+
+### Optional infrastructure notifications
+
+Warnings are disabled by default. Use authenticated
+`PUT /v1/regions/{region_id}/capacity-policy` to set `ram_warning_threshold_ppm` to the desired
+parts-per-million RAM threshold (for example, `800000` means 80%). Set it to `null` to disable
+RAM warnings. A cap notice additionally requires both a finite `max_nodes` and
+`cap_warning_enabled: true`; set the flag to `false` to disable it. RAM warnings use the same
+fresh, complete ten-minute regional measurements as capacity decisions.
+
+Configure either an `INFRASTRUCTURE_ALERT_WEBHOOK` service binding or an HTTPS
+`INFRASTRUCTURE_ALERT_WEBHOOK_URL`, plus your own `INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN` secret.
+The adopter's receiving service verifies the bearer token and durably deduplicates the
+`event_id` / `Idempotency-Key` together with the exact request body before acknowledging it.
+That service owns its delivery credentials, sender and recipient; it may use Resend or another
+mail provider. PGCF supplies no default recipient or mail-provider credentials.
+
+PGCF retries an unacknowledged event with its original ID and body, at least 60 seconds apart,
+with a five-second callback deadline. A successful callback records acceptance by the receiving
+service; provider-confirmed email delivery belongs to that service. Inspect event status through
+`GET /v1/operational-health?scope=regions`. Disabling a warning deactivates its pending episode;
+current warning policy and measurements are checked before delivery. Missing delivery
+configuration does not block capacity decisions.
 
 ## Development checks
 

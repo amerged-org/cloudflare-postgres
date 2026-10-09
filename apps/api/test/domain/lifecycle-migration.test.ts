@@ -5,45 +5,76 @@ import { DatabaseWithOperation, newOperationId } from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
 
-afterEach(cleanupFixtures);
 const migrations = (env as typeof env & { TEST_MIGRATIONS: D1Migration[] })
   .TEST_MIGRATIONS;
-async function preLifecycle() {
-  for (const column of [
-    "suspension_reason",
-    "observed_power",
-    "power_operation",
-  ])
-    await env.DB.prepare(`ALTER TABLE databases DROP COLUMN ${column}`).run();
-  const rows = (
-    await env.DB.prepare("SELECT * FROM operations ORDER BY id").all()
-  ).results;
-  await env.DB.prepare("DROP TABLE operations").run();
-  const previous = migrations.find((value) => value.name.startsWith("0006"))!;
-  for (const query of previous.queries.filter((value) =>
-    /CREATE TABLE operations_resize\s*\(|CREATE (UNIQUE )?INDEX/.test(
-      value.trim(),
+const prefix = "lifecycle_history_";
+const names = new Set(
+  migrations
+    .filter((m) => m.name < "0009")
+    .flatMap((m) =>
+      m.queries.flatMap((query) =>
+        [
+          ...query.matchAll(
+            /\bCREATE\s+(?:UNIQUE\s+)?(?:TABLE|INDEX|TRIGGER)\s+([a-z][a-z0-9_]*)/g,
+          ),
+        ].map((match) => match[1]!),
+      ),
     ),
-  ))
-    await env.DB.prepare(
-      query.replace(/\boperations_resize\b/g, "operations"),
-    ).run();
-  for (const row of rows)
-    await env.DB.prepare(
-      `INSERT INTO operations(${Object.keys(row).join(",")}) VALUES(${Object.keys(
-        row,
+);
+const historicalSQL = (query: string) =>
+  query.replace(/\b[a-z][a-z0-9_]*\b/g, (name) =>
+    names.has(name) ? prefix + name : name,
+  );
+const history = {
+  prepare: (query: string) => env.DB.prepare(historicalSQL(query)),
+};
+afterEach(async () => {
+  for (const type of ["trigger", "table"]) {
+    const objects = (
+      await env.DB.prepare(
+        "SELECT name FROM sqlite_master WHERE type=? AND name GLOB ? ORDER BY rowid DESC",
       )
-        .map(() => "?")
-        .join(",")})`,
+        .bind(type, prefix + "*")
+        .all<{ name: string }>()
+    ).results;
+    for (const object of objects)
+      await env.DB.prepare(`DROP ${type.toUpperCase()} ${object.name}`).run();
+  }
+  await cleanupFixtures();
+});
+async function preLifecycle() {
+  // Rehearse the genuine pre-0008 schema without downgrading today's guarded tables.
+  for (const migration of migrations.filter((m) => m.name < "0008"))
+    await env.DB.batch(
+      migration.queries.map((query) => history.prepare(query)),
+    );
+  const tables = (
+    await env.DB.prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name GLOB ? ORDER BY rowid",
     )
-      .bind(...Object.values(row))
-      .run();
+      .bind(prefix + "*")
+      .all<{ name: string }>()
+  ).results;
+  for (const table of tables) {
+    const source = table.name.slice(prefix.length);
+    const columns = (
+      await env.DB.prepare(`PRAGMA table_info(${table.name})`).all<{
+        name: string;
+      }>()
+    ).results
+      .map((row) => row.name)
+      .join(",");
+    // Lifecycle/sample inserts may already have created their revision row.
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO ${table.name}(${columns}) SELECT ${columns} FROM ${source}`,
+    ).run();
+  }
 }
 async function migrate() {
   await env.DB.batch(
     migrations
       .find((value) => value.name.startsWith("0008"))!
-      .queries.map((query) => env.DB.prepare(query)),
+      .queries.map((query) => history.prepare(query)),
   );
 }
 
@@ -84,22 +115,26 @@ it("the actual D1 lifecycle migration preserves every parent, ciphertext, operat
   for (const table of tables) {
     before.set(
       table,
-      (await env.DB.prepare(`SELECT * FROM ${table} ORDER BY 1`).all()).results,
+      (await history.prepare(`SELECT * FROM ${table} ORDER BY 1`).all())
+        .results,
     );
     keys.set(
       table,
-      (await env.DB.prepare(`PRAGMA foreign_key_list(${table})`).all()).results,
+      (await history.prepare(`PRAGMA foreign_key_list(${table})`).all())
+        .results,
     );
   }
   const indexes = (
-    await env.DB.prepare(
-      "SELECT name,sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name",
-    ).all()
+    await history
+      .prepare(
+        "SELECT name,sql FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name",
+      )
+      .all()
   ).results;
   await migrate();
   for (const table of tables) {
     const after = (
-      await env.DB.prepare(`SELECT * FROM ${table} ORDER BY 1`).all()
+      await history.prepare(`SELECT * FROM ${table} ORDER BY 1`).all()
     ).results;
     expect(
       after.map((row) =>
@@ -109,24 +144,28 @@ it("the actual D1 lifecycle migration preserves every parent, ciphertext, operat
       ),
     ).toEqual(before.get(table));
     expect(
-      (await env.DB.prepare(`PRAGMA foreign_key_list(${table})`).all()).results,
+      (await history.prepare(`PRAGMA foreign_key_list(${table})`).all())
+        .results,
     ).toEqual(keys.get(table));
   }
   for (const index of indexes)
     expect(
-      await env.DB.prepare("SELECT name,sql FROM sqlite_master WHERE name=?")
+      await history
+        .prepare("SELECT name,sql FROM sqlite_master WHERE name=?")
         .bind(index.name)
         .first(),
     ).toEqual(index);
   expect(
-    (await env.DB.prepare("PRAGMA foreign_key_check").all()).results,
+    (await history.prepare("PRAGMA foreign_key_check").all()).results,
   ).toEqual([]);
   // Physical metadata cleanup retains the pre-existing cascades, including its measurement trigger.
   await env.DB.batch([
-    env.DB.prepare("DELETE FROM operations WHERE database_id=?").bind(id),
-    env.DB.prepare("DELETE FROM roles WHERE database_id=?").bind(id),
-    env.DB.prepare("DELETE FROM lifecycle_events WHERE database_id=?").bind(id),
-    env.DB.prepare("DELETE FROM databases WHERE id=?").bind(id),
+    history.prepare("DELETE FROM operations WHERE database_id=?").bind(id),
+    history.prepare("DELETE FROM roles WHERE database_id=?").bind(id),
+    history
+      .prepare("DELETE FROM lifecycle_events WHERE database_id=?")
+      .bind(id),
+    history.prepare("DELETE FROM databases WHERE id=?").bind(id),
   ]);
   for (const table of [
     "maintenance_credentials",
@@ -136,9 +175,8 @@ it("the actual D1 lifecycle migration preserves every parent, ciphertext, operat
     "usage_rollup_progress",
   ])
     expect(
-      await env.DB.prepare(
-        `SELECT COUNT(*) n FROM ${table} WHERE database_id=?`,
-      )
+      await history
+        .prepare(`SELECT COUNT(*) n FROM ${table} WHERE database_id=?`)
         .bind(id)
         .first("n"),
     ).toBe(0);
@@ -149,18 +187,17 @@ it("legacy suspension becomes manual with a genuine monotonic intent, while runn
   const id = DatabaseWithOperation.parse(await (await f.create()).json())
     .database.id;
   await preLifecycle();
-  await env.DB.prepare(
-    "UPDATE databases SET desired_state='suspended' WHERE id=?",
-  )
+  await history
+    .prepare("UPDATE databases SET desired_state='suspended' WHERE id=?")
     .bind(id)
     .run();
-  const archive = await env.DB.prepare(
-    "SELECT archive_path FROM databases WHERE id=?",
-  )
+  const archive = await history
+    .prepare("SELECT archive_path FROM databases WHERE id=?")
     .bind(id)
     .first("archive_path");
   await migrate();
-  const row = await env.DB.prepare("SELECT * FROM databases WHERE id=?")
+  const row = await history
+    .prepare("SELECT * FROM databases WHERE id=?")
     .bind(id)
     .first();
   expect(row).toMatchObject({
@@ -171,9 +208,10 @@ it("legacy suspension becomes manual with a genuine monotonic intent, while runn
     archive_path: archive,
   });
   expect(
-    await env.DB.prepare(
-      "SELECT kind,status,generation FROM operations WHERE id=? AND database_id=?",
-    )
+    await history
+      .prepare(
+        "SELECT kind,status,generation FROM operations WHERE id=? AND database_id=?",
+      )
       .bind(row!.power_operation, id)
       .first(),
   ).toEqual({ kind: "database.suspend", status: "pending", generation: 2 });

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import test from "node:test";
+import { createHash } from "node:crypto";
 import {
   thinLvmFacts,
   thinPoolCommand,
@@ -8,6 +9,7 @@ import {
   thinPodCgroupPaths,
   thinWriterPods,
   thinDeletingVolume,
+  assertThinStorageHostSettings,
 } from "../src/thin-storage.ts";
 import type {
   NodeThinStorageInput,
@@ -40,6 +42,93 @@ const input = {
     profile,
   },
 } as NodeThinStorageInput;
+test("thin host qualification requires actual bound verifier settings even when absent files would byte-match", () => {
+  const keys = { cf: "A".repeat(43) },
+    settings = {
+      cloudflare: {
+        node_id: "nod_abcdefghijklmnopqrst",
+        node_uid: input.lease.node_uid,
+        region_id: "us-dev",
+        material_revision: 1,
+        api_url: "https://api.invalid",
+        agent_key_file: "/var/lib/pgcf-sandbox/agent-key",
+        storage_authority: {
+          keys,
+          sha256: createHash("sha256")
+            .update(JSON.stringify(keys))
+            .digest("hex"),
+          legacy_database_ids: [],
+        },
+      },
+    };
+  const scope = {
+    ...input,
+    lease: {
+      ...input.lease,
+      node_id: settings.cloudflare.node_id,
+      region_id: settings.cloudflare.region_id,
+      material_revision: 1,
+      cluster_uid: "33333333-3333-4333-8333-333333333333",
+      release_id: "guard-fixture",
+      databases: [],
+    },
+    host_configuration: {
+      status: {
+        version: 1,
+        node_id: settings.cloudflare.node_id,
+        node_uid: input.lease.node_uid,
+        region_id: settings.cloudflare.region_id,
+        cluster_uid: "33333333-3333-4333-8333-333333333333",
+        material_revision: 1,
+        revision: 1,
+        sha256: "a".repeat(64),
+        release_id: "guard-fixture",
+        pool_policy_revision: 1,
+        profile_sha256: "b".repeat(64),
+        created_at: "2026-10-09T00:00:00.000Z",
+      },
+      files: [
+        {
+          path: "/var/lib/pgcf-sandbox/settings.json",
+          permissions: 384,
+          content: JSON.stringify(settings),
+        },
+        {
+          path: "/var/lib/pgcf-sandbox/agent-key",
+          permissions: 384,
+          content: "test-only\n",
+        },
+      ],
+    },
+    callback: {
+      url: "https://api.invalid/internal/storage",
+      bearer: "a".repeat(32),
+    },
+  } as NodeThinStorageInput;
+  assert.doesNotThrow(() => assertThinStorageHostSettings(scope));
+  const absent = structuredClone(scope);
+  const cfg = JSON.parse(absent.host_configuration.files[0].content);
+  delete cfg.cloudflare.storage_authority;
+  absent.host_configuration.files[0].content = JSON.stringify(cfg);
+  assert.throws(
+    () => assertThinStorageHostSettings(absent),
+    /host_guard_unqualified/,
+  );
+  const wrong = structuredClone(scope);
+  const changed = JSON.parse(wrong.host_configuration.files[0].content);
+  changed.cloudflare.storage_authority.sha256 = "f".repeat(64);
+  wrong.host_configuration.files[0].content = JSON.stringify(changed);
+  assert.throws(
+    () => assertThinStorageHostSettings(wrong),
+    /host_guard_unqualified/,
+  );
+  const rebound = structuredClone(scope);
+  rebound.lease.material_revision = 2;
+  assert.throws(
+    () => assertThinStorageHostSettings(rebound),
+    /host_guard_unqualified/,
+  );
+});
 const action = {
   kind: "initialize",
   state: "pending",

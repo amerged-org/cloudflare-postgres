@@ -641,6 +641,103 @@ it("desired state replicates the immutable storage profile and the real startup 
   });
   expect(database.storage_authority).toBeUndefined();
 });
+it("a retained protected generation emits no startup grant but a real newer recovery does", async () => {
+  const f = await protectiveStop(),
+    id = f.created.database.id;
+  await accepted(f, { ...f.authority, revision: 3, write_allowed: true });
+  const holds = () =>
+    env.DB.prepare(
+      "SELECT operation_id,generation,budget_bytes,storage_budget_bytes,ready_at FROM database_start_admissions WHERE database_id=? ORDER BY generation",
+    )
+      .bind(id)
+      .all();
+  const retained = (await holds()).results;
+  expect(retained[0]!.ready_at).not.toBeNull();
+  const desired = async () =>
+    DesiredResponse.parse(
+      await (await request("/agent/v1/desired", f.agent)).json(),
+    ).databases.find((db) => db.id === id)!;
+  const host = async () => {
+    const response = await request(
+      `/agent/v1/nodes/${f.node}/storage-guard`,
+      f.agent,
+    );
+    expect(response.status).toBe(200);
+    return (await response.json()) as {
+      databases: {
+        database_id: string;
+        startup_operation_id: string | null;
+        startup_expires_at: number | null;
+      }[];
+    };
+  };
+  expect((await desired()).storage_startup).toBeUndefined();
+  expect(
+    (await host()).databases.find((db) => db.database_id === id),
+  ).toMatchObject({ startup_operation_id: null, startup_expires_at: null });
+  expect((await holds()).results).toEqual(retained);
+  const resumed = DatabaseWithOperation.parse(
+    await (
+      await request(
+        `/v1/databases/${id}/resume`,
+        f.integrator,
+        "POST",
+        undefined,
+        crypto.randomUUID(),
+      )
+    ).json(),
+  );
+  expect(resumed.operation.kind).toBe("database.resume");
+  expect(resumed.database.generation).toBe(2);
+  expect((await desired()).storage_startup?.operation_id).toBe(
+    resumed.operation.id,
+  );
+  expect(
+    (await host()).databases.find((db) => db.database_id === id)
+      ?.startup_operation_id,
+  ).toBe(resumed.operation.id);
+  expect((await holds()).results[0]).toEqual(retained[0]);
+});
+it("an uncertain unready hold stays reserved but cannot restart its protected generation", async () => {
+  const f = await thinFixture(),
+    created = DatabaseWithOperation.parse(await (await f.create()).json()),
+    id = created.database.id;
+  await env.DB.prepare(
+    "UPDATE databases SET storage_protected_at=?,storage_protected_generation=generation,storage_protected_operation=? WHERE id=?",
+  )
+    .bind(new Date().toISOString(), created.operation.id, id)
+    .run();
+  const before = await env.DB.prepare(
+    "SELECT operation_id,budget_bytes,storage_budget_bytes,ready_at FROM database_start_admissions WHERE database_id=?",
+  )
+    .bind(id)
+    .first();
+  expect(before!.ready_at).toBeNull();
+  const page = DesiredResponse.parse(
+    await (await request("/agent/v1/desired", f.agent)).json(),
+  );
+  expect(
+    page.databases.find((db) => db.id === id)!.storage_startup,
+  ).toBeUndefined();
+  const response = await request(
+    `/agent/v1/nodes/${f.node}/storage-guard`,
+    f.agent,
+  );
+  expect(response.status).toBe(200);
+  const host = (await response.json()) as {
+    databases: { database_id: string; startup_operation_id: string | null }[];
+  };
+  expect(
+    host.databases.find((db) => db.database_id === id)!.startup_operation_id,
+  ).toBeNull();
+  expect(
+    await env.DB.prepare(
+      "SELECT operation_id,budget_bytes,storage_budget_bytes,ready_at FROM database_start_admissions WHERE database_id=?",
+    )
+      .bind(id)
+      .first(),
+  ).toEqual(before);
+});
 it("thin quota growth preserves the physical receipt and class while shrink remains forbidden", async () => {
   const f = await thinFixture(),
     created = DatabaseWithOperation.parse(await (await f.create()).json()),

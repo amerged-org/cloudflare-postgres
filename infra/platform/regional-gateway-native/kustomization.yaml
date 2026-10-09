@@ -1,0 +1,7 @@
+# Gateway-first migration: retain the qualified legacy Regional controller.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../regional
+patches:
+  - path: gateway.yaml

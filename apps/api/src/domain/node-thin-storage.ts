@@ -49,18 +49,23 @@ export interface NodeThinStorageRow {
 export function qualifiedThinStorageSql(alias = "t") {
   if (!/^[a-z][a-z0-9_]*$/.test(alias))
     throw new Error("invalid_thin_authority_alias");
-  return `EXISTS(SELECT 1 FROM nodes qn JOIN regions qr ON qr.id=qn.region_id JOIN fleet_node_releases qa ON qa.node_id=qn.id JOIN fleet_region_releases qf ON qf.region_id=qn.region_id JOIN fleet_releases qs ON qs.id=qa.release_id JOIN node_host_configurations qh ON qh.node_id=qn.id AND qh.node_uid=qn.node_uid JOIN fleet_node_release_observations qo ON qo.node_id=qn.id AND qo.node_uid=qn.node_uid AND qo.assignment_revision=qa.revision AND qo.agent_key_hash=qr.agent_key_hash JOIN fleet_patch_operations qp ON qp.node_id=qn.id
-    WHERE ((qn.id=${alias}.node_id AND qn.node_uid=${alias}.node_uid AND qn.ready=1 AND qn.lost_at IS NULL)
-    AND (qa.node_uid=qn.node_uid AND qa.release_id=qf.release_id AND qr.bootstrap_material_revision=${alias}.material_revision)
-    AND (qh.release_id=qs.id AND qh.cluster_uid=${alias}.cluster_uid AND qh.material_revision=${alias}.material_revision AND json_extract(qo.facts_json,'$.boot_id')=json_extract(${alias}.qualification_json,'$.boot_id'))
-    AND (julianday(qo.observed_at)>=julianday('now','-180 seconds') AND julianday(qo.observed_at)<=julianday('now','+5 seconds') AND julianday(qo.received_at)>=julianday('now','-180 seconds') AND julianday(qo.received_at)<=julianday('now','+5 seconds')))
-    AND ((json_extract(${alias}.qualification_json,'$.profile_revision')=${alias}.profile_revision AND json_extract(${alias}.qualification_json,'$.profile_sha256')=json_extract(qs.spec_json,'$.thin_storage_qualification.profile_sha256') AND json_extract(${alias}.qualification_json,'$.release_id')=qs.id AND json_extract(${alias}.qualification_json,'$.spec_sha256')=qs.spec_sha256)
-    AND (json_extract(${alias}.qualification_json,'$.assignment_revision')=qa.revision AND json_extract(${alias}.qualification_json,'$.region_revision')=qf.revision AND json_extract(qs.spec_json,'$.thin_storage_qualification.driver_image')=${alias}.qualified_driver_image)
-    AND (json_extract(qs.spec_json,'$.thin_storage_qualification.host_extension_image')=json_extract(${alias}.qualification_json,'$.software.host_extension_image') AND json_extract(qs.spec_json,'$.thin_storage_qualification.kernel_version')=json_extract(${alias}.qualification_json,'$.software.kernel_version') AND json_extract(${alias}.qualification_json,'$.software.host_configuration_sha256')=qh.sha256)
-    AND (qp.node_id=qn.id AND qp.node_uid=qn.node_uid AND qp.cluster_uid=${alias}.cluster_uid AND qp.release_id=qs.id))
-      AND ((qp.spec_sha256=qs.spec_sha256 AND qp.assignment_revision=qa.revision AND qp.region_revision=qf.revision AND qp.material_revision=${alias}.material_revision)
-      AND (qp.stage='complete' AND qp.state='confirmed' AND qp.error_code IS NULL AND qp.host_configuration_revision=qh.revision AND qp.host_configuration_sha256=qh.sha256)
-      AND (json_extract(qp.observed_json,'$.host_configuration_sha256')=qh.sha256 AND json_extract(qp.observed_json,'$.runtime_admission_sha256')=qh.profile_sha256 AND json_extract(qp.observed_json,'$.node_ready')=1 AND json_extract(qp.observed_json,'$.boot_id')=json_extract(${alias}.qualification_json,'$.boot_id'))))`;
+  return `EXISTS(SELECT 1 FROM nodes qn JOIN regions qr ON qr.id=qn.region_id JOIN fleet_node_releases qa ON qa.node_id=qn.id JOIN fleet_region_releases qf ON qf.region_id=qn.region_id JOIN fleet_releases qs ON qs.id=qa.release_id JOIN node_host_configurations qh ON qh.node_id=qn.id AND qh.node_uid=qn.node_uid JOIN fleet_node_release_observations qo ON qo.node_id=qn.id AND qo.node_uid=qn.node_uid AND qo.assignment_revision=qa.revision AND qo.agent_key_hash=qr.agent_key_hash JOIN fleet_patch_operations qp ON qp.node_id=qn.id JOIN json_each(qs.spec_json,'$.components') qverifier ON json_extract(qverifier.value,'$.name')='native-gateway' AND json_extract(qverifier.value,'$.kind')='image' JOIN json_each(qs.spec_json,'$.roles.'||qa.role||'.components') qgatewayrole ON qgatewayrole.value='native-gateway'
+    WHERE (
+      (((qn.id=${alias}.node_id AND qn.node_uid=${alias}.node_uid) AND (qn.ready=1 AND qn.lost_at IS NULL))
+        AND (qa.node_uid=qn.node_uid AND (qa.release_id=qf.release_id AND qr.bootstrap_material_revision=${alias}.material_revision)))
+      AND ((length(json_extract(qs.spec_json,'$.storage_authority_keys_sha256'))=64 AND json_extract(qs.spec_json,'$.storage_authority_keys_sha256') NOT GLOB '*[^0-9a-f]*')
+        AND ((qh.release_id=qs.id AND qh.cluster_uid=${alias}.cluster_uid) AND (qh.material_revision=${alias}.material_revision AND json_extract(qo.facts_json,'$.boot_id')=json_extract(${alias}.qualification_json,'$.boot_id'))))
+    ) AND (
+      (((julianday(qo.observed_at)>=julianday('now','-180 seconds') AND julianday(qo.observed_at)<=julianday('now','+5 seconds')) AND (julianday(qo.received_at)>=julianday('now','-180 seconds') AND julianday(qo.received_at)<=julianday('now','+5 seconds')))
+        AND ((json_extract(${alias}.qualification_json,'$.profile_revision')=${alias}.profile_revision AND json_extract(${alias}.qualification_json,'$.profile_sha256')=json_extract(qs.spec_json,'$.thin_storage_qualification.profile_sha256')) AND (json_extract(${alias}.qualification_json,'$.release_id')=qs.id AND json_extract(${alias}.qualification_json,'$.spec_sha256')=qs.spec_sha256)))
+      AND ((json_extract(${alias}.qualification_json,'$.assignment_revision')=qa.revision AND (json_extract(${alias}.qualification_json,'$.region_revision')=qf.revision AND json_extract(qs.spec_json,'$.thin_storage_qualification.driver_image')=${alias}.qualified_driver_image))
+        AND (json_extract(qs.spec_json,'$.thin_storage_qualification.host_extension_image')=json_extract(${alias}.qualification_json,'$.software.host_extension_image') AND (json_extract(qs.spec_json,'$.thin_storage_qualification.kernel_version')=json_extract(${alias}.qualification_json,'$.software.kernel_version') AND json_extract(${alias}.qualification_json,'$.software.host_configuration_sha256')=qh.sha256)))
+    ) AND (
+      (((qp.node_id=qn.id AND qp.node_uid=qn.node_uid) AND (qp.cluster_uid=${alias}.cluster_uid AND qp.release_id=qs.id))
+        AND ((qp.spec_sha256=qs.spec_sha256 AND qp.assignment_revision=qa.revision) AND (qp.region_revision=qf.revision AND qp.material_revision=${alias}.material_revision)))
+      AND (((qp.stage='complete' AND qp.state='confirmed') AND (qp.error_code IS NULL AND (qp.host_configuration_revision=qh.revision AND qp.host_configuration_sha256=qh.sha256)))
+        AND ((json_extract(qp.observed_json,'$.host_configuration_sha256')=qh.sha256 AND json_extract(qp.observed_json,'$.runtime_admission_sha256')=qh.profile_sha256) AND (json_extract(qp.observed_json,'$.node_ready')=1 AND json_extract(qp.observed_json,'$.boot_id')=json_extract(${alias}.qualification_json,'$.boot_id'))))
+    ))`;
 }
 
 export async function readCurrentNodeThinStorage(
@@ -255,7 +260,7 @@ export async function hostStorageLease(
   const rows = await c.env.DB.prepare(
     `SELECT d.*,COUNT(*) OVER() host_snapshot_count,s.storage_gib,a.node_uid startup_node_uid,a.storage_budget_bytes,a.operation_id startup_operation,
  (SELECT json_object('operation_id',stop.id,'kind',stop.kind,'generation',stop.generation) FROM operations stop WHERE ${currentStorageStopSql()} ORDER BY stop.created_at DESC LIMIT 1) stop_operation
- FROM databases d JOIN size_classes s ON s.id=d.size_class_id LEFT JOIN database_start_admissions a ON a.database_id=d.id AND a.generation=d.generation AND a.node_uid=? AND a.storage_budget_bytes>0 AND a.budget_bytes>0 WHERE d.node_id=? AND d.region_id=? AND (d.deleted_at IS NULL OR d.storage_profile_json IS NOT NULL) ORDER BY d.id`,
+ FROM databases d JOIN size_classes s ON s.id=d.size_class_id LEFT JOIN database_start_admissions a ON a.database_id=d.id AND a.generation=d.generation AND a.node_uid=? AND a.storage_budget_bytes>0 AND a.budget_bytes>0 AND a.ready_at IS NULL AND (d.storage_protected_at IS NULL OR d.storage_protected_generation<d.generation) WHERE d.node_id=? AND d.region_id=? AND (d.deleted_at IS NULL OR d.storage_profile_json IS NOT NULL) ORDER BY d.id`,
   )
     .bind(node.node_uid, id, region.id)
     .all<

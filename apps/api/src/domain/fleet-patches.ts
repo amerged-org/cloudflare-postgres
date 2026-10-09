@@ -17,7 +17,10 @@ import {
   FleetPatchFacts,
   retainedTalosInstallationMatches,
 } from "@pgcf/contracts/fleet-patches";
-import { FleetReleaseSpec } from "@pgcf/contracts/releases";
+import {
+  FleetReleaseSpec,
+  thinStorageReleaseGuardPinned,
+} from "@pgcf/contracts/releases";
 import {
   BOOTSTRAP_PORTS,
   BOOTSTRAP_RELAY_IDENTITY_PATH,
@@ -124,6 +127,35 @@ const parentAuthoritySql = ` AND (fleet_patch_operations.bootstrap_operation_id 
 export const fleetPatchAuthoritySql =
   baseFleetPatchAuthoritySql + parentAuthoritySql;
 const authoritySql = fleetPatchAuthoritySql;
+/** Platform writes affect the regional cluster, including retained thin members. */
+async function retainedThinPatchRequiresHost(
+  env: Env,
+  regionId: string,
+  releaseId: string,
+): Promise<boolean> {
+  const selected = await env.DB.prepare(
+    "SELECT 1 present FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id AND n.node_uid=t.node_uid WHERE n.region_id=? AND n.lost_at IS NULL LIMIT 1",
+  )
+    .bind(regionId)
+    .first();
+  if (!selected) return false;
+  const release = await env.DB.prepare(
+    "SELECT spec_json FROM fleet_releases WHERE id=?",
+  )
+    .bind(releaseId)
+    .first<{ spec_json: string }>();
+  const spec = FleetReleaseSpec.safeParse(
+    release ? JSON.parse(release.spec_json) : null,
+  );
+  if (
+    !spec.success ||
+    !thinStorageReleaseGuardPinned(spec.data) ||
+    spec.data.storage_authority_keys_sha256 !==
+      (await storageAuthorityPublicKeys(env)).sha256
+  )
+    return closed();
+  return true;
+}
 export async function assertFleetPatchAuthority(
   env: Env,
   row: PatchRow,
@@ -143,6 +175,10 @@ export async function assertFleetPatchAuthority(
       .first())
   )
     return closed();
+  if (await retainedThinPatchRequiresHost(env, row.region_id, row.release_id)) {
+    if (!row.host_configuration_revision || !row.host_configuration_sha256)
+      return closed();
+  }
   if (row.bootstrap_operation_id) await assertBootstrapFleetParent(env, row);
   if (row.host_configuration_revision && row.host_configuration_sha256)
     await loadNodeHostConfiguration(env, {
@@ -786,6 +822,11 @@ async function prepareFleetPatchInsert(
   if (!count || count.count !== clusterNodes.results.length || !count.count)
     return closed();
   const selectedSpec = FleetReleaseSpec.parse(JSON.parse(selected.spec_json));
+  await retainedThinPatchRequiresHost(
+    env,
+    selected.region_id,
+    input.release_id,
+  );
   const host = selectedSpec.roles[selected.role].host_configuration_required
     ? await ensureNodeHostConfiguration(env, {
         node_id: nodeId,

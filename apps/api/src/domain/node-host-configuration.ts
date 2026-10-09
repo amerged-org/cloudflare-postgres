@@ -24,6 +24,10 @@ import { readBootstrapJob, admissionAuthority } from "./bootstrap-jobs.ts";
 import { storageAuthorityPublicKeys } from "./storage-authority.ts";
 import { retainedThickStorageAssignments } from "./storage-capacity.ts";
 import { DatabaseId } from "@pgcf/contracts";
+import {
+  FleetReleaseSpec,
+  thinStorageReleaseGuardPinned,
+} from "@pgcf/contracts/releases";
 
 interface Row extends HostStatus {
   kid: string;
@@ -67,7 +71,7 @@ async function authority(
   requireFresh = true,
 ) {
   const source = await env.DB.prepare(
-    `SELECT n.region_id,n.node_uid,p.revision pool_policy_revision,p.release_id,p.policy_json,s.spec_json,r.bootstrap_material_revision material_revision FROM nodes n JOIN regions r ON r.id=n.region_id JOIN node_compute_pool_policies p ON p.node_id=n.id AND p.node_uid=n.node_uid JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid AND a.release_id=p.release_id JOIN fleet_region_releases f ON f.region_id=n.region_id AND f.release_id=p.release_id JOIN fleet_releases s ON s.id=p.release_id WHERE n.id=? AND n.node_uid=? AND n.lost_at IS NULL AND (?=0 OR(n.ready=1 AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds')))`,
+    `SELECT n.region_id,n.node_uid,p.revision pool_policy_revision,p.release_id,p.policy_json,s.spec_json,r.bootstrap_material_revision material_revision,EXISTS(SELECT 1 FROM node_thin_storage thin WHERE thin.node_id=n.id AND thin.node_uid=n.node_uid) thin_selected FROM nodes n JOIN regions r ON r.id=n.region_id JOIN node_compute_pool_policies p ON p.node_id=n.id AND p.node_uid=n.node_uid JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid AND a.release_id=p.release_id JOIN fleet_region_releases f ON f.region_id=n.region_id AND f.release_id=p.release_id JOIN fleet_releases s ON s.id=p.release_id WHERE n.id=? AND n.node_uid=? AND n.lost_at IS NULL AND (?=0 OR(n.ready=1 AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds')))`,
   )
     .bind(nodeId, nodeUid, Number(requireFresh))
     .first<{
@@ -78,8 +82,17 @@ async function authority(
       policy_json: string;
       material_revision: number;
       spec_json: string;
+      thin_selected: number;
     }>();
   if (!source) return closed();
+  if (
+    source.thin_selected ||
+    JSON.parse(source.spec_json).thin_storage_qualification
+  ) {
+    const spec = FleetReleaseSpec.safeParse(JSON.parse(source.spec_json));
+    if (!spec.success || !thinStorageReleaseGuardPinned(spec.data))
+      return closed();
+  }
   const policy = ComputePoolPolicy.parse(JSON.parse(source.policy_json)),
     ref = await loadCurrentRegionMaterialReference(
       env.DB,
@@ -180,7 +193,7 @@ export async function ensureNodeHostConfiguration(
   );
   const stored = await env.DB.prepare(
     `INSERT INTO node_host_configurations(node_id,node_uid,region_id,cluster_uid,material_revision,revision,sha256,release_id,pool_policy_revision,profile_sha256,kid,iv,ciphertext,created_at)
- SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id JOIN node_compute_pool_policies p ON p.node_id=n.id AND p.node_uid=n.node_uid JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid AND a.release_id=p.release_id JOIN fleet_region_releases f ON f.region_id=n.region_id AND f.release_id=p.release_id WHERE n.id=? AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND r.bootstrap_material_revision=? AND p.release_id=? AND p.revision=? AND p.policy_json=? AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds'))
+ SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id JOIN node_compute_pool_policies p ON p.node_id=n.id AND p.node_uid=n.node_uid JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid AND a.release_id=p.release_id JOIN fleet_region_releases f ON f.region_id=n.region_id AND f.release_id=p.release_id WHERE n.id=? AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND r.bootstrap_material_revision=? AND p.release_id=? AND p.revision=? AND p.policy_json=? AND ?=EXISTS(SELECT 1 FROM node_thin_storage thin WHERE thin.node_id=n.id AND thin.node_uid=n.node_uid) AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds'))
  ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,region_id=excluded.region_id,cluster_uid=excluded.cluster_uid,material_revision=excluded.material_revision,revision=excluded.revision,sha256=excluded.sha256,release_id=excluded.release_id,pool_policy_revision=excluded.pool_policy_revision,profile_sha256=excluded.profile_sha256,kid=excluded.kid,iv=excluded.iv,ciphertext=excluded.ciphertext,created_at=excluded.created_at WHERE node_host_configurations.revision=?`,
   )
     .bind(
@@ -204,6 +217,7 @@ export async function ensureNodeHostConfiguration(
       status.release_id,
       status.pool_policy_revision,
       source.policy_json,
+      source.thin_selected,
       previous?.revision ?? 0,
     )
     .run();

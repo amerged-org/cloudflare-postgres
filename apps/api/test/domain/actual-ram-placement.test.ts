@@ -33,6 +33,7 @@ async function setup() {
     purchases_enabled: false,
     order: null,
     placement_mode: "actual_ram",
+    ram_expansion_threshold_ppm: 760_000,
     maximum_database_memory_mib: 4096,
     postgres_memory_request_mib: 128,
   });
@@ -379,6 +380,7 @@ it("regional pressure expands only when all aligned customer-node windows togeth
     purchases_enabled: false,
     order,
     placement_mode: "actual_ram",
+    ram_expansion_threshold_ppm: 760_000,
     maximum_database_memory_mib: 4096,
     postgres_memory_request_mib: 128,
   });
@@ -452,6 +454,7 @@ it("keeps a valid pending class waiting when its startup peak cannot fit below t
     purchases_enabled: false,
     order,
     placement_mode: "actual_ram",
+    ram_expansion_threshold_ppm: 760_000,
     maximum_database_memory_mib: 4096,
     postgres_memory_request_mib: 128,
   });

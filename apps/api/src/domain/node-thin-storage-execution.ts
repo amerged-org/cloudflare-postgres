@@ -20,7 +20,11 @@ import {
   BOOTSTRAP_RELAY_PATH,
   signBootstrapRelay,
 } from "@pgcf/contracts/bootstrap-relay";
-import { FleetReleaseSpec } from "@pgcf/contracts/releases";
+import {
+  FleetReleaseSpec,
+  thinStorageReleaseGuardPinned,
+} from "@pgcf/contracts/releases";
+import { storageAuthorityPublicKeys } from "./storage-authority.ts";
 import { loadNodeHostConfiguration } from "./node-host-configuration.ts";
 import { installationHash } from "./node-installation.ts";
 import sources from "../../../../infra/storage/sources.lock.json" with { type: "json" };
@@ -74,6 +78,14 @@ export async function readThinStorageLeaseRow(env: Env, nodeId: string) {
       }
     >();
   if (!row) return closed();
+  const spec = FleetReleaseSpec.safeParse(JSON.parse(row.spec_json));
+  if (
+    !spec.success ||
+    !thinStorageReleaseGuardPinned(spec.data) ||
+    spec.data.storage_authority_keys_sha256 !==
+      (await storageAuthorityPublicKeys(env)).sha256
+  )
+    return closed();
   return row;
 }
 export async function thinStorageCallbackBearer(

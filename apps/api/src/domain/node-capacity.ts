@@ -190,6 +190,7 @@ export async function runNodeCapacity(
     .bind(regionId)
     .first<{
       max_nodes: number | null;
+      ram_expansion_threshold_ppm: number | null;
       autoscale_enabled: number;
       order_config: string | null;
       adopt_instance_ids: string;
@@ -222,7 +223,8 @@ export async function runNodeCapacity(
     "SELECT * FROM size_classes WHERE enabled=1 ORDER BY memory_mib,COALESCE(cpu_request_millicores,cpu_millicores),cpu_millicores,storage_gib,id LIMIT 1",
   ).first<SizeRow>();
   const regionalWindow =
-    policy.placement_mode === "actual_ram"
+    policy.placement_mode === "actual_ram" ||
+    policy.ram_expansion_threshold_ppm !== null
       ? await env.DB.prepare(regionalRamWindowSql("?")).bind(regionId).first<{
           minute: number;
           working_set_bytes: number;
@@ -231,8 +233,10 @@ export async function runNodeCapacity(
       : null;
   const threshold =
     regionalWindow !== null &&
-    BigInt(regionalWindow.working_set_bytes) * 100n >=
-      BigInt(regionalWindow.capacity_memory_bytes) * 76n
+    policy.ram_expansion_threshold_ppm !== null &&
+    BigInt(regionalWindow.working_set_bytes) * 1_000_000n >=
+      BigInt(regionalWindow.capacity_memory_bytes) *
+        BigInt(policy.ram_expansion_threshold_ppm)
       ? regionalWindow
       : null;
   const active = await env.DB.prepare(
@@ -241,10 +245,21 @@ export async function runNodeCapacity(
     .bind(regionId)
     .first<{ operation_id: string }>();
   if (active) {
+    let addition;
+    try {
+      addition = dryRun
+        ? await readNodeAddition(env.DB, active.operation_id)
+        : await approveStandingNodePurchase(env.DB, active.operation_id);
+    } catch (error) {
+      if (error instanceof NodeStateError && error.code === "approval_required")
+        return {
+          ...result,
+          action: "waiting_for_approval",
+          operation_id: active.operation_id,
+        };
+      throw error;
+    }
     if (!dryRun) await startAddNode(env, active.operation_id);
-    const addition = dryRun
-      ? await readNodeAddition(env.DB, active.operation_id)
-      : await approveStandingNodePurchase(env.DB, active.operation_id);
     return {
       ...result,
       action:
@@ -343,13 +358,17 @@ export async function runNodeCapacity(
     }
   }
   if (request === null && policy.order_config !== null) {
+    if (threshold === null)
+      return {
+        ...result,
+        action:
+          regionalWindow === null
+            ? "memory_observations_unknown"
+            : "capacity_wait",
+      };
     const order = NodeOrderConfiguration.parse(JSON.parse(policy.order_config));
     request = { region_id: regionId, mode: "order", order };
-    key = threshold
-      ? `capacity-ram-${threshold.minute}`
-      : pending
-        ? `capacity-order-${pending.id}`
-        : `capacity-headroom-${regionId}-${await nodeRegionOccupiedSlots(env.DB, regionId)}`;
+    key = `capacity-ram-${threshold.minute}`;
   }
   if (request === null || key === null)
     return { ...result, action: "selection_unconfigured" };

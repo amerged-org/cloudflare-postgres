@@ -107,6 +107,16 @@ jobs:
             "$PGCF_TEST_TALOSCTL" | sha256sum --check --status
           chmod 755 "$PGCF_TEST_TALOSCTL"
           printf 'PGCF_TEST_TALOSCTL=%s\n' "$PGCF_TEST_TALOSCTL" >> "$GITHUB_ENV"
+      - name: Verify the locked Kubernetes manifest test client
+        run: |
+          PGCF_TEST_KUBECTL="$RUNNER_TEMP/pgcf-test-kubectl"
+          PGCF_TEST_KUBECTL_URL=$(node -p 'require("./infra/platform/versions.lock.json").bootstrapClients.kubectl.archives.find(v => v.os === "linux" && v.architecture === "amd64").url')
+          PGCF_TEST_KUBECTL_SHA=$(node -p 'require("./infra/platform/versions.lock.json").bootstrapClients.kubectl.archives.find(v => v.os === "linux" && v.architecture === "amd64").sha256')
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 120 --output "$PGCF_TEST_KUBECTL" "$PGCF_TEST_KUBECTL_URL"
+          printf '%s  %s\n' "$PGCF_TEST_KUBECTL_SHA" "$PGCF_TEST_KUBECTL" | sha256sum --check --status
+          chmod 755 "$PGCF_TEST_KUBECTL"
+          printf 'PGCF_TEST_KUBECTL=%s\n' "$PGCF_TEST_KUBECTL" >> "$GITHUB_ENV"
       - name: Lint
         run: |
           pnpm lint
@@ -161,11 +171,11 @@ jobs:
         run: node infra/talos/sandbox/run-proof.ts
       - name: Render the Kubernetes manifests
         run: |
-          command -v kubectl >/dev/null || { echo "kubectl not available on this runner"; exit 1; }
-          for dir in infra/platform infra/platform/regional infra/platform/bootstrap-relay; do
+          test -x "$PGCF_TEST_KUBECTL"
+          for dir in infra/platform infra/platform/regional infra/platform/regional-gateway-native infra/platform/regional-native infra/platform/bootstrap-relay infra/platform/bootstrap-relay-native; do
             if [ -f "$dir/kustomization.yaml" ]; then
               echo "kubectl kustomize $dir"
-              kubectl kustomize "$dir" > /dev/null
+              "$PGCF_TEST_KUBECTL" kustomize "$dir" > /dev/null
             else
               echo "skipping $dir: no kustomization.yaml"
             fi

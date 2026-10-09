@@ -6,6 +6,8 @@ import {
   type FleetReleaseComponent,
 } from "@pgcf/contracts/releases";
 import { installationHash } from "../../src/domain/node-installation.ts";
+import { env } from "cloudflare:workers";
+import { storageAuthorityPublicKeys } from "../../src/domain/storage-authority.ts";
 export async function installThinQualifiedFixture(
   db: D1Database,
   nodeId: string,
@@ -42,6 +44,7 @@ export async function installThinQualifiedFixture(
     "edge",
     "node-bootstrap",
     "regional",
+    "native-gateway",
     "postgres",
     "barman",
     "cloudflared",
@@ -125,7 +128,8 @@ export async function installThinQualifiedFixture(
       versions_lock_sha256: "f".repeat(64),
       configuration_schema_revision: 1,
       storage_authority_keys_sha256:
-        options.storageKeysSha256 ?? "0".repeat(64),
+        options.storageKeysSha256 ??
+        (await storageAuthorityPublicKeys(env)).sha256,
       thin_storage_qualification: qualification,
       components,
       roles: { control_relay: role, customer: structuredClone(role) },

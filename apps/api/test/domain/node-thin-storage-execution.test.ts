@@ -17,6 +17,8 @@ import {
   waitOnExecutionContext,
 } from "cloudflare:test";
 import type { Env } from "../../src/env.ts";
+import { installThinQualifiedFixture } from "./thin-qualified-fixture.ts";
+import { ThinStorageProfile } from "@pgcf/contracts";
 const releases: string[] = [];
 afterEach(async () => {
   await cleanupFixtures();
@@ -105,6 +107,13 @@ it("the actual D1 lease keeps an uncertain dispatched pool action and invalidate
     ...env,
     NODE_BOOTSTRAP_CALLBACK_URL: "https://api.invalid",
   } as Env;
+  const qualified = await installThinQualifiedFixture(
+    env.DB,
+    f.node,
+    ThinStorageProfile.parse(profile),
+    clusterUid,
+  );
+  releases.push(qualified.releaseId);
   const call = async (key: string) => {
     const context = createExecutionContext();
     const response = await createApp().fetch(

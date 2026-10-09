@@ -77,6 +77,8 @@ async function setup() {
     "cloudnative-pg",
     "openebs-lvm",
     "sandbox-controller",
+    "native-gateway",
+    "pgcf-sandbox-controller",
   ];
   const components = names.map((name) => ({
     name,
@@ -89,7 +91,7 @@ async function setup() {
     talos_version: "1.14.1",
     talos_installer: `registry.invalid/talos@sha256:${"b".repeat(64)}`,
     talos_schematic_sha256: "c".repeat(64),
-    talos_extensions: [],
+    talos_extensions: ["pgcf-sandbox-controller"],
     kubernetes_version: "1.36.5",
     components: names.slice(3),
     host_configuration_required: true,

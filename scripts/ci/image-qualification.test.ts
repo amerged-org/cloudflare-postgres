@@ -1324,8 +1324,10 @@ test("Talos extension assembly admits only exact source-bound manifests, binarie
       await add(`${root}/provenance/${name}`, await readFile(source!));
     await add(`${root}/pgcf/LICENSE`, await readFile("LICENSE"));
     // The real image must carry upstream notice files; these unit bytes exercise path/provenance isolation only.
-    await add(`${root}/rust/LICENSE-MIT`, "Rust MIT notice");
-    await add(`${root}/rust/LICENSE-APACHE`, "Rust Apache notice");
+    await add(`${root}/rust/licenses/MIT.txt`, "Rust MIT notice");
+    await add(`${root}/rust/licenses/Apache-2.0.txt`, "Rust Apache notice");
+    await add(`${root}/rust/COPYRIGHT.html`, "Rust distribution notices");
+    await add(`${root}/rust/COPYRIGHT-library.html`, "Rust library notices");
     await add(`${root}/crates/example/LICENSE`, "Upstream notice");
     for (const [path, source] of [
       ["manifest.yaml", "infra/talos/sandbox/manifest.yaml"],

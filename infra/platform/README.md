@@ -8,6 +8,19 @@ components; it does not upgrade Talos or Kubernetes. The regional components (`c
 and agent) are a separate Flux Kustomization in [regional](regional); see
 [Regional components](#regional-components).
 
+The default regional composition retains the TypeScript agent and gateway. A qualified release
+containing `regional` and `native-gateway` selects
+[`regional-gateway-native`](regional-gateway-native), preserving the legacy controller while
+replacing only the gateway. A release containing both `native-controller` and `native-gateway`
+selects [`regional-native`](regional-native), which reuses the gateway-first composition and
+adds the controller patch. Both reuse the same services, RBAC, network policies and resource limits. The existing fleet patch
+sets the exact selected image digests, cluster UID, PostgreSQL image and retained storage bindings.
+Future-node postjoin activation uses that same release path before admission; the original
+Factory bootstrap input remains unchanged. A single legacy `regional_image` is never interpreted
+as both native binaries. The controller has no HTTP listener; its authenticated Cloudflare link
+and release observation establish control-plane convergence. Gateway probes use its real
+`/healthz` and `/readyz` handlers.
+
 [versions.lock.json](versions.lock.json) records the official sources, checked chart/app mappings,
 OCI manifest digests, archive checksums and rendered image references. All five chart sources
 are pinned by OCI digest, including the official `ghcr.io/openebs/charts/openebs` artifact.
@@ -133,11 +146,11 @@ releases. [regional/flux-sync.example.yaml](regional/flux-sync.example.yaml) is 
 private installation configuration; it depends on the `pgcf-platform` Kustomization (CRDs, Cilium)
 and is excluded from the build.
 
-| Workload           | Replicas | Role                                                                                                                              |
-| ------------------ | -------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| Workload           | Replicas | Role                                                                                                                                                                                 |
+| ------------------ | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `pgcf-cloudflared` | 2        | Remotely managed Cloudflare Tunnel. No inbound ports; metrics on localhost. If the Phase 1 transport spike selects a Tunnel hostname, its hostname rule targets the gateway Service. |
-| `pgcf-gateway`     | 2        | WebSocket-to-PostgreSQL bridge on port 8080 (`/healthz`, `/readyz`, 45 s termination grace). Service `pgcf-gateway`.              |
-| `pgcf-agent`       | 1        | Reconciles desired state into Kubernetes. Strategy `Recreate`, so two agents never overlap.                                       |
+| `pgcf-gateway`     | 2        | WebSocket-to-PostgreSQL bridge on port 8080 (`/healthz`, `/readyz`, 45 s termination grace). Service `pgcf-gateway`.                                                                 |
+| `pgcf-agent`       | 1        | Reconciles desired state into Kubernetes. Strategy `Recreate`, so two agents never overlap.                                                                                          |
 
 Gateway and agent are two commands (`node /app/gateway.mjs`, `node /app/agent.mjs`) of one image
 referenced as `pgcf-regional`. `regional/kustomization.yaml` maps it to the GHCR repository with an
@@ -189,14 +202,14 @@ Prepare these runtime inputs from the approved cluster inventory and actual meas
 from whatever cluster happens to be selected in a terminal. Keep their values in private operator
 configuration; the publisher never prints them.
 
-| Environment variable | Meaning |
-| --- | --- |
-| `PGCF_STORAGE_KUBE_CONTEXT` | Explicit Kubernetes context for this cluster. `kubectl` consumes its private credentials; the publisher does not read or print their file. |
-| `PGCF_STORAGE_EXPECTED_CLUSTER_UID` | Expected UID of the cluster's `kube-system` namespace. |
-| `PGCF_STORAGE_EXPECTED_NAMESPACE_UID` | Expected UID of the pinned OpenEBS installation's `openebs` namespace. |
-| `PGCF_STORAGE_BINDINGS_JSON` | Object keyed by approved Node name. Each value contains `node_uid`, `lvmnode_uid`, `lvmnode_resource_version`, `vg_uuid` and the approved `smoke` readbacks described below, captured from the actual dedicated `pgcf` VG smoke run. |
-| `PGCF_STORAGE_PROOF_NOT_BEFORE` | UTC ISO timestamp when the bounded VG-proof window began. |
-| `PGCF_STORAGE_PROOF_COMPLETED_AT` | UTC ISO timestamp when that proof completed. |
+| Environment variable                  | Meaning                                                                                                                                                                                                                              |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `PGCF_STORAGE_KUBE_CONTEXT`           | Explicit Kubernetes context for this cluster. `kubectl` consumes its private credentials; the publisher does not read or print their file.                                                                                           |
+| `PGCF_STORAGE_EXPECTED_CLUSTER_UID`   | Expected UID of the cluster's `kube-system` namespace.                                                                                                                                                                               |
+| `PGCF_STORAGE_EXPECTED_NAMESPACE_UID` | Expected UID of the pinned OpenEBS installation's `openebs` namespace.                                                                                                                                                               |
+| `PGCF_STORAGE_BINDINGS_JSON`          | Object keyed by approved Node name. Each value contains `node_uid`, `lvmnode_uid`, `lvmnode_resource_version`, `vg_uuid` and the approved `smoke` readbacks described below, captured from the actual dedicated `pgcf` VG smoke run. |
+| `PGCF_STORAGE_PROOF_NOT_BEFORE`       | UTC ISO timestamp when the bounded VG-proof window began.                                                                                                                                                                            |
+| `PGCF_STORAGE_PROOF_COMPLETED_AT`     | UTC ISO timestamp when that proof completed.                                                                                                                                                                                         |
 
 Use Node 24.6 or newer, from the repository root:
 
@@ -256,14 +269,14 @@ Each binding's `smoke` object must contain three **actual, approved readbacks**:
 smoke PVC allocation, `allocated` while its logical volume exists, and `after` its verified deletion
 and storage reclamation. Each readback contains these fields:
 
-| Readback field | Authentic source |
-| --- | --- |
-| `observed_at` | UTC ISO timestamp captured by the operator/readback tool when it received the authenticated API response. |
-| `node_uid` | The bound Node UID, also matched to the LVMNode's Node owner reference. |
-| `lvmnode_uid` | `LVMNode.metadata.uid`. |
-| `resource_version` | `LVMNode.metadata.resourceVersion` from that response. |
-| `vg_uuid` | The dedicated `pgcf` entry's `uuid`. |
-| `size`, `free` | That same entry's measured `size` and `free` quantities, copied without substituting configured values. |
+| Readback field     | Authentic source                                                                                          |
+| ------------------ | --------------------------------------------------------------------------------------------------------- |
+| `observed_at`      | UTC ISO timestamp captured by the operator/readback tool when it received the authenticated API response. |
+| `node_uid`         | The bound Node UID, also matched to the LVMNode's Node owner reference.                                   |
+| `lvmnode_uid`      | `LVMNode.metadata.uid`.                                                                                   |
+| `resource_version` | `LVMNode.metadata.resourceVersion` from that response.                                                    |
+| `vg_uuid`          | The dedicated `pgcf` entry's `uuid`.                                                                      |
+| `size`, `free`     | That same entry's measured `size` and `free` quantities, copied without substituting configured values.   |
 
 All three observations must bind the same approved Node, LVMNode and VG UUID and unchanged total.
 Their capture times must be strictly ordered inside the approved proof window; their resource

@@ -144,6 +144,108 @@ beforeEach(async () => {
 
 afterEach(() => db.close());
 
+it("preserves existing capacity authority while making new thresholds and warnings opt in", () => {
+  const directory = new URL("../../../apps/api/migrations/", import.meta.url);
+  for (const file of readdirSync(directory)
+    .sort()
+    .filter(
+      (name) =>
+        name.endsWith(".sql") &&
+        name > "0001_init.sql" &&
+        name < "0038_generic_capacity_policy.sql",
+    ))
+    db.exec(readFileSync(new URL(file, directory), "utf8"));
+  run(
+    "INSERT INTO regions(id,provider,provider_region,gateway_url,backup_bucket,backup_endpoint_url,agent_key_hash,created_at,updated_at) SELECT 'us-test',provider,provider_region,gateway_url,backup_bucket,backup_endpoint_url,?,created_at,updated_at FROM regions WHERE id='eu-1'",
+    "b".repeat(64),
+  );
+  const profile = JSON.stringify({
+    id: "retained-authority",
+    trigger: "ram_76_percent",
+  });
+  run(
+    "INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,autoscale_enabled,placement_mode,standing_cost_profile,standing_cost_profile_hash,maximum_database_memory_mib,postgres_memory_request_mib) VALUES('eu-1',3,1,'{}',0,'actual_ram',?,?,4096,128)",
+    profile,
+    "a".repeat(64),
+  );
+  run(
+    "INSERT INTO node_region_policies(region_id,max_nodes) VALUES('us-test',5)",
+  );
+  const actual = db
+      .prepare("SELECT * FROM node_region_policies WHERE region_id='eu-1'")
+      .get(),
+    reserved = db
+      .prepare("SELECT * FROM node_region_policies WHERE region_id='us-test'")
+      .get();
+  db.exec(
+    readFileSync(
+      new URL("0038_generic_capacity_policy.sql", directory),
+      "utf8",
+    ),
+  );
+  expect(
+    db
+      .prepare("SELECT * FROM node_region_policies WHERE region_id='eu-1'")
+      .get(),
+  ).toEqual({
+    ...actual,
+    ram_expansion_threshold_ppm: 760000,
+    ram_warning_threshold_ppm: null,
+    cap_warning_enabled: 0,
+  });
+  expect(
+    db
+      .prepare("SELECT * FROM node_region_policies WHERE region_id='us-test'")
+      .get(),
+  ).toEqual({
+    ...reserved,
+    ram_expansion_threshold_ppm: null,
+    ram_warning_threshold_ppm: null,
+    cap_warning_enabled: 0,
+  });
+  run("DELETE FROM node_region_policies WHERE region_id='us-test'");
+  run(
+    "INSERT INTO node_region_policies(region_id,placement_mode) VALUES('us-test','actual_ram')",
+  );
+  expect(
+    db
+      .prepare(
+        "SELECT max_nodes,purchases_enabled,autoscale_enabled,ram_expansion_threshold_ppm,ram_warning_threshold_ppm,cap_warning_enabled FROM node_region_policies WHERE region_id='us-test'",
+      )
+      .get(),
+  ).toEqual({
+    max_nodes: null,
+    purchases_enabled: 0,
+    autoscale_enabled: 0,
+    ram_expansion_threshold_ppm: null,
+    ram_warning_threshold_ppm: null,
+    cap_warning_enabled: 0,
+  });
+  expect(() =>
+    run(
+      "UPDATE node_region_policies SET ram_expansion_threshold_ppm=0 WHERE region_id='us-test'",
+    ),
+  ).toThrow(/CHECK/);
+  expect(() =>
+    run(
+      "UPDATE node_region_policies SET ram_warning_threshold_ppm=1000001 WHERE region_id='us-test'",
+    ),
+  ).toThrow(/CHECK/);
+  expect(() =>
+    run(
+      "UPDATE node_region_policies SET ram_expansion_threshold_ppm=750000.5 WHERE region_id='us-test'",
+    ),
+  ).toThrow(/CHECK/);
+  expect(() =>
+    run(
+      "UPDATE node_region_policies SET cap_warning_enabled=2 WHERE region_id='us-test'",
+    ),
+  ).toThrow(/CHECK/);
+  run(
+    "UPDATE node_region_policies SET ram_expansion_threshold_ppm=1,ram_warning_threshold_ppm=1000000,cap_warning_enabled=1 WHERE region_id='us-test'",
+  );
+});
+
 it("preserves legacy policy and approval bytes when adding explicit uncapped and unknown-cost values", () => {
   const directory = new URL("../../../apps/api/migrations/", import.meta.url);
   for (const file of readdirSync(directory)

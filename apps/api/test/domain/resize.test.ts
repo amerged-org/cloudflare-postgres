@@ -14,7 +14,19 @@ import { databaseResizeStatement } from "../../src/domain/databases.ts";
 import type { DatabaseRow, SizeRow } from "../../src/domain/rows.ts";
 
 const classes: string[] = [];
+const historySQL = (query: string) =>
+  query.replace(
+    /\boperations(?:_[a-z_]+)?\b/g,
+    (name) => "resize_history_" + name,
+  );
+const history = {
+  prepare: (query: string) => env.DB.prepare(historySQL(query)),
+};
 afterEach(async () => {
+  await env.DB.prepare("DROP TABLE IF EXISTS resize_history_operations").run();
+  await env.DB.prepare(
+    "DROP TABLE IF EXISTS resize_history_operations_resize",
+  ).run();
   await cleanupFixtures();
   for (const id of classes.splice(0))
     await env.DB.prepare("DELETE FROM size_classes WHERE id=?").bind(id).run();
@@ -143,33 +155,37 @@ describe("manual in-place resize on real Workers D1", () => {
     const initial = migrations.find((migration) =>
       migration.name.startsWith("0001"),
     )!;
-    await env.DB.prepare("DROP TABLE operations").run();
     for (const query of initial.queries.filter((query) =>
       /CREATE TABLE operations\s*\(|CREATE INDEX operations_/.test(query),
     ))
-      await env.DB.prepare(query).run();
+      await history.prepare(query).run();
     for (const row of before) {
       const columns = Object.keys(row);
-      await env.DB.prepare(
-        `INSERT INTO operations(${columns.join(",")}) VALUES(${columns.map(() => "?").join(",")})`,
-      )
+      await history
+        .prepare(
+          `INSERT INTO operations(${columns.join(",")}) VALUES(${columns.map(() => "?").join(",")})`,
+        )
         .bind(...Object.values(row))
         .run();
     }
     const oldIndexes = (
-      await env.DB.prepare(
-        "SELECT name,sql FROM sqlite_master WHERE type='index' AND tbl_name='operations' AND sql IS NOT NULL ORDER BY name",
-      ).all()
+      await history
+        .prepare(
+          "SELECT name,sql FROM sqlite_master WHERE type='index' AND tbl_name='operations' AND sql IS NOT NULL ORDER BY name",
+        )
+        .all()
     ).results;
     const oldKeys = (
-      await env.DB.prepare("PRAGMA foreign_key_list(operations)").all()
+      await history.prepare("PRAGMA foreign_key_list(operations)").all()
     ).results;
     const migration = migrations.find((value) =>
       value.name.startsWith("0006"),
     )!;
-    await env.DB.batch(migration.queries.map((query) => env.DB.prepare(query)));
+    await env.DB.batch(
+      migration.queries.map((query) => history.prepare(query)),
+    );
     expect(
-      (await env.DB.prepare("SELECT * FROM operations ORDER BY id").all())
+      (await history.prepare("SELECT * FROM operations ORDER BY id").all())
         .results,
     ).toEqual(before);
     for (const index of oldIndexes)
@@ -181,7 +197,7 @@ describe("manual in-place resize on real Workers D1", () => {
           .first(),
       ).toEqual(index);
     expect(
-      (await env.DB.prepare("PRAGMA foreign_key_list(operations)").all())
+      (await history.prepare("PRAGMA foreign_key_list(operations)").all())
         .results,
     ).toEqual(oldKeys);
     expect(

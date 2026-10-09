@@ -88,6 +88,18 @@ async function digest(value: unknown): Promise<string> {
     ),
   );
 }
+/** Keep installed 76%-RAM and non-RAM profile hashes readable; other thresholds bind fresh authority. */
+async function standingAuthorityHash(
+  profile: StandingNodeCostProfile,
+  thresholdPpm: number | null,
+): Promise<string> {
+  return digest(
+    thresholdPpm === 760_000 ||
+      (thresholdPpm === null && profile.trigger === undefined)
+      ? profile
+      : { profile, ram_expansion_threshold_ppm: thresholdPpm },
+  );
+}
 const json = (value: string | null): unknown =>
   value === null ? null : JSON.parse(value);
 async function view(row: AdditionRow): Promise<NodeAddition> {
@@ -141,12 +153,39 @@ export async function configureNodeRegionPolicy(
   value: unknown,
 ): Promise<void> {
   const policy = NodeRegionPolicy.parse(value);
+  const previous = await db
+    .prepare(
+      "SELECT ram_expansion_threshold_ppm,autoscale_enabled FROM node_region_policies WHERE region_id=?",
+    )
+    .bind(policy.region_id)
+    .first<{
+      ram_expansion_threshold_ppm: number | null;
+      autoscale_enabled: number;
+    }>();
+  const threshold =
+    policy.ram_expansion_threshold_ppm === undefined
+      ? (previous?.ram_expansion_threshold_ppm ?? null)
+      : policy.ram_expansion_threshold_ppm;
+  const autoscale =
+    policy.autoscale_enabled ?? previous?.autoscale_enabled === 1;
+  if (
+    autoscale &&
+    policy.purchases_enabled &&
+    policy.order !== null &&
+    threshold === null
+  )
+    throw new NodeStateError(
+      "configuration_required",
+      "Automatic paid orders require an explicit RAM expansion threshold",
+    );
   // Assigned databases may change request geometry only after confirmed manual
   // suspension; the next resume still needs a fresh full-peak startup grant.
   const result = await db
     .prepare(
-      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,compute_pool_json,thin_storage_json)
-    SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,? FROM regions r WHERE r.id=? AND r.provider='contabo'
+      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,compute_pool_json,thin_storage_json,ram_expansion_threshold_ppm,ram_warning_threshold_ppm,cap_warning_enabled)
+    SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,?,?,?,COALESCE(?,0) FROM regions r WHERE r.id=? AND r.provider='contabo'
+      AND (?=1 OR (SELECT ram_expansion_threshold_ppm FROM node_region_policies WHERE region_id=r.id) IS ?)
+      AND (?=1 OR COALESCE((SELECT autoscale_enabled FROM node_region_policies WHERE region_id=r.id),0)=?)
       AND ((COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id),'reserved')=?
         AND (?='reserved' OR (SELECT postgres_memory_request_mib FROM node_region_policies WHERE region_id=r.id) IS ?))
         OR (NOT EXISTS(SELECT 1 FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
@@ -163,12 +202,15 @@ export async function configureNodeRegionPolicy(
         LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
         WHERE d.region_id=r.id AND d.observed_state<>'deleted' AND (d.node_id IS NULL OR n.lost_at IS NULL)
           AND (s.memory_mib<256 OR s.memory_mib%256<>0 OR s.memory_mib>? OR s.memory_mib<?)))
-    ON CONFLICT(region_id) DO UPDATE SET max_nodes=excluded.max_nodes,purchases_enabled=excluded.purchases_enabled,order_config=excluded.order_config,
+    ON CONFLICT(region_id) DO UPDATE SET max_nodes=CASE WHEN ?=1 THEN excluded.max_nodes ELSE node_region_policies.max_nodes END,purchases_enabled=excluded.purchases_enabled,order_config=excluded.order_config,
       placement_mode=excluded.placement_mode,maximum_database_memory_mib=excluded.maximum_database_memory_mib,postgres_memory_request_mib=excluded.postgres_memory_request_mib,standing_cost_profile=excluded.standing_cost_profile,standing_cost_profile_hash=excluded.standing_cost_profile_hash,
-      autoscale_enabled=COALESCE(?,node_region_policies.autoscale_enabled),adopt_instance_ids=COALESCE(?,node_region_policies.adopt_instance_ids),compute_pool_json=CASE WHEN ?=1 THEN excluded.compute_pool_json ELSE node_region_policies.compute_pool_json END,thin_storage_json=CASE WHEN ?=1 THEN excluded.thin_storage_json ELSE node_region_policies.thin_storage_json END`,
+      autoscale_enabled=COALESCE(?,node_region_policies.autoscale_enabled),adopt_instance_ids=COALESCE(?,node_region_policies.adopt_instance_ids),compute_pool_json=CASE WHEN ?=1 THEN excluded.compute_pool_json ELSE node_region_policies.compute_pool_json END,thin_storage_json=CASE WHEN ?=1 THEN excluded.thin_storage_json ELSE node_region_policies.thin_storage_json END,
+      ram_expansion_threshold_ppm=excluded.ram_expansion_threshold_ppm,
+      ram_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.ram_warning_threshold_ppm ELSE node_region_policies.ram_warning_threshold_ppm END,
+      cap_warning_enabled=CASE WHEN ?=1 THEN excluded.cap_warning_enabled ELSE node_region_policies.cap_warning_enabled END`,
     )
     .bind(
-      policy.max_nodes,
+      policy.max_nodes ?? null,
       policy.purchases_enabled ? 1 : 0,
       policy.order === null ? null : canonical(policy.order),
       policy.placement_mode,
@@ -179,7 +221,7 @@ export async function configureNodeRegionPolicy(
         : canonical(policy.standing_cost_profile),
       policy.standing_cost_profile === null
         ? null
-        : await digest(policy.standing_cost_profile),
+        : await standingAuthorityHash(policy.standing_cost_profile, threshold),
       policy.autoscale_enabled === undefined
         ? null
         : Number(policy.autoscale_enabled),
@@ -188,13 +230,23 @@ export async function configureNodeRegionPolicy(
         : JSON.stringify(policy.adopt_instance_ids),
       policy.compute_pool == null ? null : canonical(policy.compute_pool),
       policy.thin_storage == null ? null : canonical(policy.thin_storage),
+      threshold,
+      policy.ram_warning_threshold_ppm ?? null,
+      policy.cap_warning_enabled === undefined
+        ? null
+        : Number(policy.cap_warning_enabled),
       policy.region_id,
+      Number(policy.ram_expansion_threshold_ppm !== undefined),
+      previous?.ram_expansion_threshold_ppm ?? null,
+      Number(policy.autoscale_enabled !== undefined),
+      previous?.autoscale_enabled ?? 0,
       policy.placement_mode,
       policy.placement_mode,
       policy.postgres_memory_request_mib,
       policy.placement_mode,
       policy.maximum_database_memory_mib,
       policy.postgres_memory_request_mib,
+      Number(policy.max_nodes !== undefined),
       policy.autoscale_enabled === undefined
         ? null
         : Number(policy.autoscale_enabled),
@@ -203,6 +255,8 @@ export async function configureNodeRegionPolicy(
         : JSON.stringify(policy.adopt_instance_ids),
       Number(policy.compute_pool !== undefined),
       Number(policy.thin_storage !== undefined),
+      Number(policy.ram_warning_threshold_ppm !== undefined),
+      Number(policy.cap_warning_enabled !== undefined),
     )
     .run();
   if (result.meta.changes !== 1) {
@@ -235,7 +289,7 @@ export async function nodeRegionOccupiedSlots(
   if (!row)
     throw new NodeStateError(
       "configuration_required",
-      "Region node cap has not been configured",
+      "Region capacity policy has not been configured",
     );
   return row.occupied;
 }
@@ -297,6 +351,11 @@ export async function assertNodeRecoveryAuthority(
       "Recovery requires the exact lost predecessor and exclusive instance authority",
     );
 }
+function automaticCapacityOrderKey(key: string): boolean {
+  return ["capacity-ram-", "capacity-order-", "capacity-headroom-"].some(
+    (prefix) => key.startsWith(prefix),
+  );
+}
 export async function reserveNodeAddition(
   db: D1Database,
   input: {
@@ -332,7 +391,7 @@ export async function reserveNodeAddition(
   if (!policy)
     throw new NodeStateError(
       "configuration_required",
-      "Region node cap has not been configured",
+      "Region capacity policy has not been configured",
     );
   if (
     request.mode === "order" &&
@@ -381,11 +440,11 @@ export async function reserveNodeAddition(
       SELECT ?,?,p.region_id,?,?,?,?,'reserved',?,?,? FROM node_region_policies p JOIN regions r ON r.id=p.region_id AND r.provider='contabo'
       WHERE p.region_id=? AND (p.max_nodes IS NULL OR ${slotCount}<p.max_nodes
         OR (?='recover' AND ${slotCount}<=p.max_nodes)) AND (?<>'order' OR p.order_config=?)
-      AND (?<>'order' OR ? NOT LIKE 'capacity-ram-%' OR COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'')<>'ram_76_percent'
+      AND (?<>'order' OR ?=0
         OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("p.region_id", "?")}))
       AND ${authority}
       AND (? IS NULL OR NOT EXISTS(SELECT 1 FROM node_additions WHERE slot_held=1 AND status<>'ready' AND (requested_instance_id=? OR provider_instance_id=?)))
-      AND ((?=0 AND (?<>'order' OR COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'')<>'ram_76_percent'))
+      AND ((?=0 AND (?<>'order' OR COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'') NOT IN('ram_76_percent','regional_actual_ram')))
         OR NOT EXISTS(SELECT 1 FROM node_additions active WHERE active.region_id=p.region_id AND active.slot_held=1 AND active.status NOT IN('ready','cancelled')))
       ON CONFLICT(region_id,request_key) DO NOTHING`,
       )
@@ -404,13 +463,16 @@ export async function reserveNodeAddition(
         request.mode,
         request.mode === "order" ? canonical(request.order) : null,
         request.mode,
-        input.request_key,
+        Number(automaticCapacityOrderKey(input.request_key)),
         input.request_key,
         ...authorityBindings,
         provider,
         provider,
         provider,
-        Number(input.exclusive_region_addition === true),
+        Number(
+          input.exclusive_region_addition === true ||
+            automaticCapacityOrderKey(input.request_key),
+        ),
         request.mode,
       )
       .run();
@@ -498,23 +560,21 @@ export async function approveNodePurchase(
     );
   return changed(db, addition, "approval_json=?", [canonical(approval)]);
 }
-/** Derive an exact short-lived approval under the current owner profile and optional ceilings. */
+/** Derive or refresh the same exact intent under the current profile and RAM threshold. */
 export async function approveStandingNodePurchase(
   db: D1Database,
   operationId: string,
 ): Promise<NodeAddition> {
   const addition = await readNodeAddition(db, operationId);
   if (
-    (addition.approval !== null &&
-      (!addition.approval.standing_profile_id ||
-        Date.parse(addition.approval.expires_at) > Date.now())) ||
+    (addition.approval !== null && !addition.approval.standing_profile_id) ||
     addition.status !== "reserved" ||
     addition.intent.request.mode !== "order"
   )
     return addition;
   const row = await db
     .prepare(
-      "SELECT purchases_enabled,order_config,standing_cost_profile,standing_cost_profile_hash FROM node_region_policies WHERE region_id=?",
+      "SELECT purchases_enabled,order_config,standing_cost_profile,standing_cost_profile_hash,ram_expansion_threshold_ppm FROM node_region_policies WHERE region_id=?",
     )
     .bind(addition.intent.request.region_id)
     .first<{
@@ -522,6 +582,7 @@ export async function approveStandingNodePurchase(
       order_config: string | null;
       standing_cost_profile: string | null;
       standing_cost_profile_hash: string | null;
+      ram_expansion_threshold_ppm: number | null;
     }>();
   if (!row?.standing_cost_profile || !row.purchases_enabled) return addition;
   const profile = StandingNodeCostProfile.parse(
@@ -534,12 +595,34 @@ export async function approveStandingNodePurchase(
     (profile.expires_at !== null && Date.parse(profile.expires_at) <= nowMs) ||
     canonical(profile.order) !== canonical(addition.intent.request.order) ||
     row.order_config !== canonical(profile.order) ||
-    row.standing_cost_profile_hash !== (await digest(profile))
+    row.standing_cost_profile_hash !==
+      (await standingAuthorityHash(profile, row.ram_expansion_threshold_ppm))
   )
     throw new NodeStateError(
       "approval_required",
       "Standing profile is expired or differs from the configured order",
     );
+  const ledger = await db
+    .prepare(
+      "SELECT profile_id,profile_hash FROM node_standing_approvals WHERE operation_id=?",
+    )
+    .bind(operationId)
+    .first<{ profile_id: string; profile_hash: string }>();
+  if (
+    addition.approval !== null &&
+    (addition.approval.standing_profile_id !== profile.id ||
+      ledger?.profile_id !== profile.id)
+  )
+    throw new NodeStateError(
+      "approval_required",
+      "The original standing profile identity changed",
+    );
+  if (
+    addition.approval !== null &&
+    ledger?.profile_hash === row.standing_cost_profile_hash &&
+    Date.parse(addition.approval.expires_at) > nowMs
+  )
+    return addition;
   const units = (amount: string | null) =>
     amount === null ? null : Number(BigInt(amount.replace(".", "")));
   const approval = CostedNodeApproval.parse({
@@ -560,56 +643,22 @@ export async function approveStandingNodePurchase(
     location: profile.order.location,
   });
   const encoded = canonical(approval);
-  if (addition.approval !== null) {
-    const updated = await db
-      .prepare(
-        `UPDATE node_additions SET approval_json=?,revision=revision+1,updated_at=?
-      WHERE operation_id=? AND revision=? AND status='reserved' AND slot_held=1 AND dispatch_request_id IS NULL AND approval_json=?
-        AND EXISTS(SELECT 1 FROM node_standing_approvals a JOIN node_region_policies p ON p.region_id=a.region_id
-          WHERE a.operation_id=node_additions.operation_id AND a.profile_id=? AND a.profile_hash=? AND a.profile_hash=p.standing_cost_profile_hash
-            AND p.purchases_enabled=1 AND p.order_config=?
-            AND (json_extract(p.standing_cost_profile,'$.expires_at') IS NULL OR json_extract(p.standing_cost_profile,'$.expires_at')>?)
-            AND (COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'')<>'ram_76_percent'
-              OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("node_additions.region_id", "node_additions.request_key")})))`,
-      )
-      .bind(
-        encoded,
-        now,
-        operationId,
-        addition.revision,
-        canonical(addition.approval),
-        profile.id,
-        row.standing_cost_profile_hash,
-        canonical(profile.order),
-        now,
-      )
-      .run();
-    const current = await readNodeAddition(db, operationId);
-    if (
-      updated.meta.changes === 1 ||
-      (current.approval !== null &&
-        Date.parse(current.approval.expires_at) > nowMs)
-    )
-      return current;
-    throw new NodeStateError(
-      "approval_required",
-      "The original standing authority changed before approval refresh",
-    );
-  }
   const results = await db.batch([
     db
       .prepare(
         `UPDATE node_additions SET approval_json=?,revision=revision+1,updated_at=?
-      WHERE operation_id=? AND revision=? AND status='reserved' AND slot_held=1 AND dispatch_request_id IS NULL AND approval_json IS NULL
+      WHERE operation_id=? AND revision=? AND status='reserved' AND slot_held=1 AND dispatch_request_id IS NULL AND approval_json IS ?
+        AND (approval_json IS NULL OR EXISTS(SELECT 1 FROM node_standing_approvals a
+          WHERE a.operation_id=node_additions.operation_id AND a.profile_id=? AND a.profile_hash=?))
         AND EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=node_additions.region_id AND p.purchases_enabled=1
           AND p.order_config=? AND p.standing_cost_profile_hash=?
           AND (json_extract(p.standing_cost_profile,'$.expires_at') IS NULL OR json_extract(p.standing_cost_profile,'$.expires_at')>?)
-          AND (? IS NULL OR (SELECT count(*) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=?)<?)
-          AND (? IS NULL OR (NOT EXISTS(SELECT 1 FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=? AND monthly_units IS NULL)
-            AND COALESCE((SELECT SUM(monthly_units) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=?),0)+?<=?))
-          AND (? IS NULL OR (NOT EXISTS(SELECT 1 FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=? AND setup_units IS NULL)
-            AND COALESCE((SELECT SUM(setup_units) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=?),0)+?<=?))
-          AND (COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'')<>'ram_76_percent'
+          AND (? IS NULL OR (SELECT count(*)+1 FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=? AND operation_id<>node_additions.operation_id)<=?)
+          AND (? IS NULL OR (NOT EXISTS(SELECT 1 FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=? AND operation_id<>node_additions.operation_id AND monthly_units IS NULL)
+            AND COALESCE((SELECT SUM(monthly_units) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=? AND operation_id<>node_additions.operation_id),0)+?<=?))
+          AND (? IS NULL OR (NOT EXISTS(SELECT 1 FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=? AND operation_id<>node_additions.operation_id AND setup_units IS NULL)
+            AND COALESCE((SELECT SUM(setup_units) FROM node_standing_approvals WHERE region_id=p.region_id AND profile_id=? AND operation_id<>node_additions.operation_id),0)+?<=?))
+          AND ((COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'') NOT IN('ram_76_percent','regional_actual_ram') AND (node_additions.request_key NOT LIKE 'capacity-ram-%' AND node_additions.request_key NOT LIKE 'capacity-order-%' AND node_additions.request_key NOT LIKE 'capacity-headroom-%'))
             OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("node_additions.region_id", "node_additions.request_key")})))`,
       )
       .bind(
@@ -617,6 +666,9 @@ export async function approveStandingNodePurchase(
         now,
         operationId,
         addition.revision,
+        addition.approval === null ? null : canonical(addition.approval),
+        profile.id,
+        ledger?.profile_hash ?? null,
         canonical(profile.order),
         row.standing_cost_profile_hash,
         now,
@@ -637,7 +689,9 @@ export async function approveStandingNodePurchase(
     db
       .prepare(
         `INSERT INTO node_standing_approvals(operation_id,region_id,profile_id,profile_hash,monthly_units,setup_units,created_at)
-      SELECT operation_id,region_id,?,?,?,?,? FROM node_additions WHERE changes()=1 AND operation_id=? AND approval_json=? AND revision=?`,
+      SELECT operation_id,region_id,?,?,?,?,? FROM node_additions WHERE changes()=1 AND operation_id=? AND approval_json=? AND revision=?
+      ON CONFLICT(operation_id) DO UPDATE SET profile_hash=excluded.profile_hash,monthly_units=excluded.monthly_units,setup_units=excluded.setup_units
+      WHERE node_standing_approvals.profile_id=excluded.profile_id`,
       )
       .bind(
         profile.id,
@@ -651,11 +705,22 @@ export async function approveStandingNodePurchase(
       ),
   ]);
   const current = await readNodeAddition(db, operationId);
-  if (results[0]!.meta.changes === 1 || current.approval !== null)
+  if (results[0]!.meta.changes === 1) return current;
+  if (
+    current.approval !== null &&
+    Date.parse(current.approval.expires_at) > nowMs &&
+    (await db
+      .prepare(
+        `SELECT 1 FROM node_standing_approvals a JOIN node_region_policies p ON p.region_id=a.region_id
+        WHERE a.operation_id=? AND a.profile_hash=p.standing_cost_profile_hash AND a.profile_hash=?`,
+      )
+      .bind(operationId, row.standing_cost_profile_hash)
+      .first())
+  )
     return current;
   throw new NodeStateError(
     "approval_required",
-    "Standing order count or monetary caps are exhausted, or owner configuration changed",
+    "Standing order count or monetary caps are exhausted, or current purchase authority is unavailable",
   );
 }
 export async function claimNodeDispatch(
@@ -689,12 +754,13 @@ export async function claimNodeDispatch(
       `UPDATE node_additions SET status='dispatching',dispatch_request_id=?,revision=revision+1,updated_at=?
     WHERE operation_id=? AND revision=? AND status='reserved' AND slot_held=1 AND dispatch_request_id IS NULL AND approval_json IS NOT NULL
       AND json_extract(approval_json,'$.intent_hash')=intent_hash AND json_extract(approval_json,'$.expires_at')>?
-      AND EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=node_additions.region_id AND p.purchases_enabled=1 AND p.order_config=? AND (p.max_nodes IS NULL OR ${slotCount}<=p.max_nodes))
+      AND EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=node_additions.region_id AND p.purchases_enabled=1 AND p.order_config=? AND (p.max_nodes IS NULL OR ${slotCount}<=p.max_nodes)
+        AND ((node_additions.request_key NOT LIKE 'capacity-ram-%' AND node_additions.request_key NOT LIKE 'capacity-order-%' AND node_additions.request_key NOT LIKE 'capacity-headroom-%') OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("node_additions.region_id", "node_additions.request_key")})))
       AND (NOT EXISTS(SELECT 1 FROM node_standing_approvals WHERE operation_id=node_additions.operation_id)
         OR EXISTS(SELECT 1 FROM node_standing_approvals a JOIN node_region_policies p ON p.region_id=a.region_id
           WHERE a.operation_id=node_additions.operation_id AND a.profile_hash=p.standing_cost_profile_hash
             AND (json_extract(p.standing_cost_profile,'$.expires_at') IS NULL OR json_extract(p.standing_cost_profile,'$.expires_at')>?)
-            AND (COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'')<>'ram_76_percent'
+            AND ((COALESCE(json_extract(p.standing_cost_profile,'$.trigger'),'') NOT IN('ram_76_percent','regional_actual_ram') AND (node_additions.request_key NOT LIKE 'capacity-ram-%' AND node_additions.request_key NOT LIKE 'capacity-order-%' AND node_additions.request_key NOT LIKE 'capacity-headroom-%'))
               OR (p.autoscale_enabled=1 AND ${regionalRamExpansionSql("node_additions.region_id", "node_additions.request_key")}))))`,
     )
     .bind(

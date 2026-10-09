@@ -2,16 +2,27 @@
 
 Status (2026-10-09, corrected): **Overall product goal NOT achieved. The EU/US database lifecycle and RAM-trigger tests passed; uniform fleet configuration, autonomous rollout, patch management and the approved fast-start architecture remain incomplete.**
 
+Latest owner correction (2026-10-09): remove the fixed three-VPS ceiling and this installation's
+personal email setup. PGCF must expose the regional RAM expansion threshold and automatic-purchase
+on/off setting through its authenticated Cloudflare management API. Operators configure and enable
+their own provider/profile and optional email delivery;76% remains this installation's selected
+threshold, not a fixed software rule. Optional Resend-backed notifications may remain available
+when the operator supplies credentials, sender, recipient and warning policy. Fresh installations
+send no email and do not purchase automatically. Both live node ceilings and the personal
+capacity-mail credentials/recipient have now been removed. The configurable thresholds and
+opt-in warning policies are implemented locally and still await the consolidated release.
+
 The corrected API and both regional runtimes now run source `6978033`, accepted by CI
-`37851000610`. Both live regional policies have `max_nodes:3`, counting retained control and lost
-allocations. Both regions now use the same actual-RAM policy, with a128MiB PostgreSQL request and
+`37851000610`. Both live regional policies now have `max_nodes:null`; this latest update preserves
+every other policy field. Both regions use the same actual-RAM policy, with a128MiB PostgreSQL request and
 4096MiB maximum. The controlled EU transition completed in135s through confirmed suspension and
 fresh startup admission; all3 retained databases returned Ready with unchanged storage and
 application table hashes. The exact V159 standing authority is recorded in both regions.
 Automatic expansion remains off until the current approved installation templates
 and full release are ready; the missing EU installation profile is a configuration gap, not
-missing owner permission. The notification receiver is deployed from source `f08b9cc0`, full CI `37860011792`; the actual75%
-warning, provider-confirmed delivery and identical-event replay are accepted. Matching Regional images do not close the
+missing owner permission. The notification receiver is deployed from source `f08b9cc0`, full CI `37860011792`; its earlier75%
+warning/delivery/dedupe tests remain historical evidence. Personal capacity credentials and recipient
+are removed; shared Resend credentials remain. Matching Regional images do not close the
 remaining Kubernetes, Talos schematic, resource-policy, patch or fast-start gates.
 
 The earlier broad completion claim is withdrawn. The owner now requires all three retained
@@ -80,12 +91,12 @@ fresh available RAM returned within the recorded baseline tolerance. Both trials
 maximum lifetime. Actual timestamp drift can leave a validly unknown window; do not relax the
 ten-consecutive-minute rule to manufacture an expansion decision.
 
-Autonomous purchases remain disabled in the current live installation. The owner's latest
-2026-10-08 instruction selects76% regional-RAM-triggered V159 additions with a small ceiling of3
-managed VPS per region (existing control and lost allocations count),75% RAM warning and cap
-notification. Monetary/order ceilings and standing expiry need not be added; this latest decision
-supersedes the temporary uncapped-node instruction and the older numeric-spend-cap request. Existing live test caps EU3/US1 are historical configuration,
-not the owner's intended policy. Actual allocatable CPU is3000m, with platform reservations EU350m
+Autonomous purchases remain disabled in the current live installation. The2026-10-08 three-node
+ceiling and personal warning setup were implemented and tested, then superseded by the owner's
+2026-10-09 generic-configuration decision above. Preserve the V159 monthly/no-add-on standing
+selection while removing the fixed ceiling; make the actual RAM threshold and auto-purchase switch
+operator-configurable. Historical cap/mail measurements below remain evidence of those tests,
+not the current product requirement. Actual allocatable CPU is3000m, with platform reservations EU350m
 and US1510m. The smallest configured database requires250m PostgreSQL plus100m Barman, so CPU
 ceilings in the current rejected allocation model are7 EU/4 US minimum-class databases on
 otherwise empty nodes. That model debits7700m and110GiB for22 US assignments against1490m/95GiB;
@@ -2359,8 +2370,21 @@ same16 independently reviewed public/test values. Exact rule+file+value exceptio
 those values; changed values, other paths and unrelated token rules still block. Image scanning
 and the independent real-credential scan are unchanged.
 
+The complete source review of386 changed paths identified conditional gateway lock-order and
+retained thin-verifier findings, plus a reproduced wake-order defect with unresolved physical
+security impact. Source corrections now preserve consistent routing lock order, validate protection
+before wake, suppress stale protected startup grants and require verifier custody throughout
+retained regional patch authority. Ordinary regression suites pass; the two refused dynamic
+security validations were not retried or claimed successful. Independent correction review also
+closed gateway-first/native command and Docker input omissions. All849 API cases now pass after
+isolating historical migration fixtures;301 Native cases plus the final37-case deployment slice,
+21 Power cases and31 ordinary Gateway cases pass. The pinned builder's four actual Rust notices
+were read independently, and the qualifier's incorrect old paths were corrected with a red-to-green
+regression. These remain local source checks pending the single final CI and live rollout.
+
 | Date       | Phase                     | Result and measured limits                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------- | ------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| 2026-10-09 | Generic capacity correction — live removal and source | Removed the fixed cap through the existing API: EU/US max_nodes null in2.331s, every other policy field unchanged, autoscaleoff, provider0/purchases0. Revoked only the PGCF capacity sender token and the adopter's capacity receiver secret/recipient in7.968s; other settings/binding metadata and both shared Resend secret names remain. The inactive service binding is queued for removal with the next qualified API configuration. Configurable RAM threshold, optional warnings and generic purchase profiles are implemented but not deployed. Full shared Native suite301/301 passes; fullAPI run838/848 exposed two historical migration fixture conflicts and one postjoin fixture/authority mismatch, collected for one repair batch before CI. |
 | 2026-10-09 | Live regional warning, delivery, dedupe and small ceiling | Both live regional max_nodes values are3. Exact OMH sourcef08b9cc0 passes all13 CI37860011792 jobs, applies only Dev schema179 and the existing Mail Gateway; ingress, minute schedule and previous secrets are preserved. PGCF697 activates one private Fetcher binding/secret in15.554s with all previous Native/bindings/3nodes/3retained databases/custody unchanged. Actual US1 RAM warning fired at77.2919%; later10 fresh consecutive samples,00:02:07–00:11:10Z, average80.0101% on the same physical NodeUID. Resend confirms delivered; actual identical service-binding replay200 retains one receipt/messageID and unchanged attempt/acceptance times. The3968MiB load had4096MiB limit/960s deadline; exact owned Namespace is absent, NodeReady unchanged, available RAM5,812,072,448B versus5,631,000,576B before. Subsequent00:35:41–00:37:42Z API tail197events/0Contabo attempts. First rejected tail collection is excluded. Purchases0, autoscaleoff until full release/templates pass, no customer migration. Cap-notice live mail awaits a genuine third allocation; no false threshold/recipient is synthesized. |
 | 2026-10-09 | Uniform live RAM authority and preserved EU data | Both regional policies now use actual_ram,128MiB PostgreSQL request,4096MiB maximum and max_nodes3. Exact V159/one-month/no-add-on ram76 standing authority is recorded; monetary/order/expiry fields are null under the owner decision. Controlled EU suspend→policy→fresh-peak resume completed in135s; all3 retained databases are Ready, generation+2, same storage generations/roles/custody/application-table hashes, including2 original committed rows. Cloudflare SQL after transition894/899/820ms, TLS1.3, nonsuperuser, PostgreSQL18.6. Autoscaling stays off for the unaccepted template/full-release gate; Contabo0, purchases0, EU resets0. |
 | 2026-10-09 | Actual256MiB entry-class SQL, R2 and physical deletion | One disposable US1 database used a CF-owned resource-profile revision with PostgreSQL256MiB/250m,1GiB logical disk and the unchanged Barman resource limits. Cloudflare first read10675ms after idle, TLS1.3/nonsuperuser/PostgreSQL18.6;2000 committed rows and50 queries over20000 generated rows each (p50123ms,p95203ms). R2 reports1 base backup/5 WAL objects/7,137,282bytes. Supported deletion succeeded and returned1,073,741,824 physical bytes; current VG free103,075,020,800bytes, thick allocation0. Automatic60s idle removed the Pod before cgroup peak measurement, so backup peak and lower scheduling requests are not qualified. This validates256MiB functionality on source697, not the unshipped Rust/thin fast-start release. Contabo0, purchases0. |

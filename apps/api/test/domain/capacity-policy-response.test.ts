@@ -7,6 +7,165 @@ import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 afterEach(cleanupFixtures);
 
+it("requires an effective RAM threshold for automatic paid orders while preserving adoption and manual orders", async () => {
+  const f = await fixture();
+  const order = {
+    product_id: "operator-product",
+    provider_region: "test",
+    image_id: crypto.randomUUID(),
+    term_months: 1,
+    location: "Test",
+  };
+  const policy = { region_id: f.region, order, purchases_enabled: true };
+  await expect(
+    configureNodeRegionPolicy(env.DB, { ...policy, autoscale_enabled: true }),
+  ).rejects.toMatchObject({ code: "configuration_required" });
+  await configureNodeRegionPolicy(env.DB, {
+    ...policy,
+    autoscale_enabled: false,
+  });
+  await configureNodeRegionPolicy(env.DB, {
+    ...policy,
+    purchases_enabled: false,
+    autoscale_enabled: true,
+    adopt_instance_ids: ["123"],
+  });
+  await expect(configureNodeRegionPolicy(env.DB, policy)).rejects.toMatchObject(
+    {
+      code: "configuration_required",
+    },
+  );
+  await configureNodeRegionPolicy(env.DB, {
+    ...policy,
+    ram_expansion_threshold_ppm: 830001,
+  });
+  await configureNodeRegionPolicy(env.DB, policy);
+  const path = `/v1/regions/${f.region}/capacity-policy`;
+  expect(await (await request(path, f.admin)).json()).toMatchObject({
+    purchases_enabled: true,
+    autoscale_enabled: true,
+    ram_expansion_threshold_ppm: 830001,
+  });
+  await expect(
+    configureNodeRegionPolicy(env.DB, {
+      ...policy,
+      ram_expansion_threshold_ppm: null,
+    }),
+  ).rejects.toMatchObject({ code: "configuration_required" });
+  const manual = await request(path, f.admin, "PUT", {
+    ...policy,
+    ram_expansion_threshold_ppm: null,
+  });
+  expect(manual.status).toBe(200);
+  expect(await manual.json()).toMatchObject({
+    purchases_enabled: true,
+    autoscale_enabled: false,
+    ram_expansion_threshold_ppm: null,
+  });
+});
+
+it("fences omitted autoscale state so concurrent settings cannot enable thresholdless paid orders", async () => {
+  const f = await fixture();
+  const order = {
+    product_id: "operator-product",
+    provider_region: "test",
+    image_id: crypto.randomUUID(),
+    term_months: 1,
+    location: "Test",
+  };
+  await configureNodeRegionPolicy(env.DB, { region_id: f.region, order });
+  const database = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) => {
+          const statement = target.prepare(sql);
+          if (!sql.startsWith("SELECT ram_expansion_threshold_ppm"))
+            return statement;
+          return {
+            bind(...values: unknown[]) {
+              const bound = statement.bind(...values);
+              return {
+                async first() {
+                  const result = await bound.first();
+                  await configureNodeRegionPolicy(env.DB, {
+                    region_id: f.region,
+                    order,
+                    autoscale_enabled: true,
+                    purchases_enabled: false,
+                  });
+                  return result;
+                },
+              };
+            },
+          } as D1PreparedStatement;
+        };
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  await expect(
+    configureNodeRegionPolicy(database, {
+      region_id: f.region,
+      order,
+      purchases_enabled: true,
+    }),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(
+    await env.DB.prepare(
+      "SELECT purchases_enabled,autoscale_enabled,ram_expansion_threshold_ppm FROM node_region_policies WHERE region_id=?",
+    )
+      .bind(f.region)
+      .first(),
+  ).toEqual({
+    purchases_enabled: 0,
+    autoscale_enabled: 1,
+    ram_expansion_threshold_ppm: null,
+  });
+});
+
+it("keeps fresh purchasing and warnings off and preserves omitted optional capacity settings", async () => {
+  const f = await fixture();
+  const path = `/v1/regions/${f.region}/capacity-policy`;
+  const created = await request(path, f.admin, "PUT", { region_id: f.region });
+  expect(created.status).toBe(200);
+  expect(await created.json()).toMatchObject({
+    max_nodes: null,
+    purchases_enabled: false,
+    autoscale_enabled: false,
+    ram_expansion_threshold_ppm: null,
+    ram_warning_threshold_ppm: null,
+    cap_warning_enabled: false,
+  });
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: 4,
+    ram_expansion_threshold_ppm: 830001,
+    ram_warning_threshold_ppm: 790001,
+    cap_warning_enabled: true,
+  });
+  await configureNodeRegionPolicy(env.DB, { region_id: f.region });
+  expect(await (await request(path, f.admin)).json()).toMatchObject({
+    max_nodes: 4,
+    ram_expansion_threshold_ppm: 830001,
+    ram_warning_threshold_ppm: 790001,
+    cap_warning_enabled: true,
+  });
+  const removed = await request(path, f.admin, "PUT", {
+    region_id: f.region,
+    max_nodes: null,
+    ram_expansion_threshold_ppm: null,
+    ram_warning_threshold_ppm: null,
+    cap_warning_enabled: false,
+  });
+  expect(removed.status).toBe(200);
+  expect(await removed.json()).toMatchObject({
+    max_nodes: null,
+    ram_expansion_threshold_ppm: null,
+    ram_warning_threshold_ppm: null,
+    cap_warning_enabled: false,
+  });
+});
+
 it("returns the exact public capacity policy from PUT and GET after persisting installation settings", async () => {
   const f = await fixture();
   const policy = {
@@ -18,6 +177,9 @@ it("returns the exact public capacity policy from PUT and GET after persisting i
     maximum_database_memory_mib: null,
     postgres_memory_request_mib: null,
     standing_cost_profile: null,
+    ram_expansion_threshold_ppm: null,
+    ram_warning_threshold_ppm: null,
+    cap_warning_enabled: false,
     autoscale_enabled: false,
     adopt_instance_ids: [
       String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!),
@@ -119,5 +281,8 @@ it("maps stored order JSON and enabled booleans without exposing persistence col
     maximum_database_memory_mib: null,
     postgres_memory_request_mib: null,
     standing_cost_profile: null,
+    ram_expansion_threshold_ppm: null,
+    ram_warning_threshold_ppm: null,
+    cap_warning_enabled: false,
   });
 });

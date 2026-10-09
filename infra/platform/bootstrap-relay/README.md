@@ -12,6 +12,13 @@ cluster membership changes. Verify the actual IPv4 and IPv6 source addresses bef
 The dedicated namespace permits host networking; both containers remain nonroot, read-only,
 without Linux capabilities or an attached Kubernetes service-account token.
 
+This directory retains the TypeScript transport. A release selecting `native-bootstrap-relay`
+uses [`../bootstrap-relay-native`](../bootstrap-relay-native), which reuses the same node selection,
+public key configuration and tunnel Secret. Its image runs `/pgcf-native-bootstrap-relay` without
+Node arguments. Readiness and liveness use the actual HTTP identity endpoint on host loopback;
+the fleet patch loads this overlay from the selected immutable source commit and verifies the
+observed executable, probe shape and image digest. Source preparation does not activate the relay.
+
 Provide these values through an ignored private overlay or Flux substitution:
 
 - `PGCF_BOOTSTRAP_RELAY_NODE_NAME`: the actual existing Kubernetes hostname.

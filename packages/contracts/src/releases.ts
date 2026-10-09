@@ -143,6 +143,12 @@ export const FleetReleaseSpec = z
         });
     }
     if (spec.thin_storage_qualification) {
+      if (!thinStorageReleaseGuardPinned(spec))
+        context.addIssue({
+          code: "custom",
+          message:
+            "Thin storage requires the pinned verifier and native gateway on every role",
+        });
       const q = spec.thin_storage_qualification;
       for (const [name, reference] of [
         ["openebs-lvm", q.driver_image],
@@ -260,6 +266,27 @@ export const FleetReleaseSpec = z
         });
   });
 export type FleetReleaseSpec = z.infer<typeof FleetReleaseSpec>;
+/** Thin qualification and retained requalification share the same mandatory runtime boundary. */
+export function thinStorageReleaseGuardPinned(spec: FleetReleaseSpec): boolean {
+  return Boolean(
+    spec.storage_authority_keys_sha256 &&
+    ["native-gateway", "pgcf-sandbox-controller", "openebs-lvm"].every((name) =>
+      spec.components.some(
+        (c) =>
+          c.name === name &&
+          c.kind === "image" &&
+          c.reference.endsWith("@sha256:" + c.sha256),
+      ),
+    ) &&
+    Object.values(spec.roles).every(
+      (role) =>
+        role.host_configuration_required &&
+        role.talos_extensions.includes("pgcf-sandbox-controller") &&
+        role.components.includes("native-gateway") &&
+        role.components.includes("openebs-lvm"),
+    ),
+  );
+}
 export const FleetRelease = z.strictObject({
   id: FleetReleaseId,
   spec: FleetReleaseSpec,

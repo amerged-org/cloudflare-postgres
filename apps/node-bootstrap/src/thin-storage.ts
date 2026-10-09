@@ -2,6 +2,8 @@
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createHash } from "node:crypto";
+import { canonicalStorageAuthorityKeys } from "@pgcf/contracts/storage-write-authority";
 import {
   NodeThinStorageInput,
   NodeThinStorageReport,
@@ -13,6 +15,7 @@ import {
   thinVolumeAttributesClassObject,
   thinStorageClass,
   STORAGE_PROTECTION_LEDGER_KEY,
+  DatabaseId,
 } from "@pgcf/contracts";
 import { readHostConfiguration } from "./fleet-host-configuration.ts";
 import {
@@ -86,6 +89,47 @@ function ready(value: ObjectValue) {
   return items(object(value.status).conditions).some(
     (c) => c.type === "Ready" && c.status === "True",
   );
+}
+/** A byte-equal settings file cannot qualify thin writes unless its actual guard trust is present. */
+export function assertThinStorageHostSettings(
+  input: NodeThinStorageInput,
+): void {
+  try {
+    const settings = object(
+        JSON.parse(input.host_configuration.files[0].content),
+      ),
+      cf = object(settings.cloudflare),
+      trust = object(cf.storage_authority),
+      keys = object(trust.keys);
+    const legacy = DatabaseId.array()
+      .max(2000)
+      .parse(trust.legacy_database_ids);
+    const canonicalKeys = canonicalStorageAuthorityKeys(
+      keys as Record<string, string>,
+    );
+    if (
+      input.host_configuration.status.node_uid !== input.lease.node_uid ||
+      input.host_configuration.status.cluster_uid !== input.lease.cluster_uid ||
+      input.host_configuration.status.release_id !== input.lease.release_id ||
+      input.host_configuration.status.material_revision !==
+        input.lease.material_revision ||
+      createHash("sha256").update(canonicalKeys).digest("hex") !==
+        trust.sha256 ||
+      cf.node_id !== input.lease.node_id ||
+      cf.node_uid !== input.lease.node_uid ||
+      cf.region_id !== input.lease.region_id ||
+      cf.material_revision !== input.lease.material_revision ||
+      cf.agent_key_file !== input.host_configuration.files[1].path ||
+      cf.api_url !== new URL(input.callback.url).origin ||
+      new Set(legacy).size !== legacy.length ||
+      input.lease.databases.some(
+        (db) => db.storage !== null && legacy.includes(db.id),
+      )
+    )
+      throw Error("changed");
+  } catch {
+    throw new BootstrapError("thin_storage_host_guard_unqualified");
+  }
 }
 
 /** Readiness and deletion intent never prove a writer has stopped. */
@@ -665,6 +709,7 @@ export async function runThinStorage(
         text(nodeInfo.kernelVersion) !== lease.kernel_version)
     )
       throw new BootstrapError("thin_storage_talos_identity_changed");
+    assertThinStorageHostSettings(input);
     const [hostReadback, extensionRaw, serviceRaw] = await Promise.all([
       readHostConfiguration(
         { talos: (args) => talos(args) },

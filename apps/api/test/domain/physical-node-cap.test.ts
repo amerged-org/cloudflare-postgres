@@ -118,3 +118,19 @@ it("refuses a previously queued first dispatch when three allocated VPS remain t
       .first("dispatch_request_id"),
   ).toBeNull();
 });
+
+it("removes a selected cap without a sentinel while preserving tracked physical allocations", async () => {
+  const f = await setup();
+  expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(3);
+  await configureNodeRegionPolicy(env.DB, { ...f.policy, max_nodes: null });
+  const addition = await f.reserve();
+  expect(addition.status).toBe("reserved");
+  expect(await nodeRegionOccupiedSlots(env.DB, f.region)).toBe(4);
+  expect(
+    await env.DB.prepare(
+      "SELECT max_nodes FROM node_region_policies WHERE region_id=?",
+    )
+      .bind(f.region)
+      .first("max_nodes"),
+  ).toBeNull();
+});

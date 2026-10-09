@@ -8,6 +8,7 @@ import {
   NodeMarkLost,
   NodeLoss,
   NodeRegionPolicy,
+  CostedNodeApproval,
 } from "../src/nodes.ts";
 
 it("requires an exact node UID and retains the loss identity", () => {
@@ -37,19 +38,20 @@ it("requires an exact node UID and retains the loss identity", () => {
   expect(NodeLoss.parse(record)).toEqual(record);
 });
 
-it("allows explicit uncapped RAM-trigger authority only for the approved exact monthly V159 order", () => {
+it("accepts generic RAM authority for an exact operator-selected order and preserves legacy triggers", () => {
   const order = {
-    product_id: "V159",
+    product_id: "operator-selected-product",
     provider_region: "EU",
     image_id: crypto.randomUUID(),
-    term_months: 1,
+    term_months: 12,
     location: "European Union",
+    add_ons: [{ id: "123", quantity: 1 }],
   };
   const profile = {
     id: "owner-ram-expansion",
-    trigger: "ram_76_percent",
+    trigger: "regional_actual_ram",
     order,
-    owner_reference: "owner-authorized-regional-76-percent",
+    owner_reference: "owner-authorized-regional-expansion",
     approved_at: new Date().toISOString(),
     expires_at: null,
     currency: null,
@@ -67,9 +69,16 @@ it("allows explicit uncapped RAM-trigger authority only for the approved exact m
     placement_mode: "actual_ram",
     maximum_database_memory_mib: 4096,
     postgres_memory_request_mib: 128,
+    ram_expansion_threshold_ppm: 810000,
     standing_cost_profile: profile,
   };
   expect(NodeRegionPolicy.parse(policy).max_nodes).toBeNull();
+  expect(
+    NodeRegionPolicy.parse({
+      ...policy,
+      standing_cost_profile: { ...profile, trigger: "ram_76_percent" },
+    }).standing_cost_profile?.trigger,
+  ).toBe("ram_76_percent");
   expect(
     NodeRegionPolicy.safeParse({
       ...policy,
@@ -82,12 +91,115 @@ it("allows explicit uncapped RAM-trigger authority only for the approved exact m
       standing_cost_profile: { ...profile, max_total_monthly_amount: "1.0000" },
     }).success,
   ).toBe(false);
-  const wrong = { ...order, product_id: "V155" };
+  expect(
+    NodeRegionPolicy.parse({
+      ...policy,
+      placement_mode: "reserved",
+    }).placement_mode,
+  ).toBe("reserved");
   expect(
     NodeRegionPolicy.safeParse({
       ...policy,
-      order: wrong,
-      standing_cost_profile: { ...profile, order: wrong },
+      order: { ...order, product_id: "another-product" },
+    }).success,
+  ).toBe(false);
+});
+
+it("leaves omitted capacity and warning fields unset and accepts an explicitly uncapped disabled policy", () => {
+  const fresh = NodeRegionPolicy.parse({ region_id: "eu-test" });
+  expect(fresh.purchases_enabled).toBe(false);
+  expect(fresh).not.toHaveProperty("max_nodes");
+  expect(fresh).not.toHaveProperty("ram_expansion_threshold_ppm");
+  expect(fresh).not.toHaveProperty("ram_warning_threshold_ppm");
+  expect(fresh).not.toHaveProperty("cap_warning_enabled");
+  expect(
+    NodeRegionPolicy.parse({
+      region_id: "eu-test",
+      max_nodes: null,
+      ram_expansion_threshold_ppm: null,
+      ram_warning_threshold_ppm: null,
+      cap_warning_enabled: false,
+    }),
+  ).toMatchObject({
+    max_nodes: null,
+    purchases_enabled: false,
+    ram_expansion_threshold_ppm: null,
+    ram_warning_threshold_ppm: null,
+    cap_warning_enabled: false,
+  });
+});
+
+it("bounds configured RAM thresholds to integer parts per million and requires an explicit warning boolean", () => {
+  expect(
+    NodeRegionPolicy.parse({
+      region_id: "eu-test",
+      ram_expansion_threshold_ppm: 1,
+      ram_warning_threshold_ppm: 1_000_000,
+      cap_warning_enabled: true,
+    }),
+  ).toMatchObject({
+    ram_expansion_threshold_ppm: 1,
+    ram_warning_threshold_ppm: 1_000_000,
+    cap_warning_enabled: true,
+  });
+  expect(
+    NodeRegionPolicy.safeParse({
+      region_id: "eu-test",
+      ram_expansion_threshold_ppm: 0,
+    }).success,
+  ).toBe(false);
+  expect(
+    NodeRegionPolicy.safeParse({
+      region_id: "eu-test",
+      ram_warning_threshold_ppm: 1_000_001,
+    }).success,
+  ).toBe(false);
+  expect(
+    NodeRegionPolicy.safeParse({
+      region_id: "eu-test",
+      ram_expansion_threshold_ppm: 750000.5,
+    }).success,
+  ).toBe(false);
+  expect(
+    NodeRegionPolicy.safeParse({
+      region_id: "eu-test",
+      cap_warning_enabled: "true",
+    }).success,
+  ).toBe(false);
+});
+
+it("allows unknown cost only for finite derived RAM authority with either supported trigger", () => {
+  const approval = {
+    intent_hash: "a".repeat(64),
+    owner_reference: "approved-exact-order",
+    approved_at: "2026-10-09T00:00:00.000Z",
+    expires_at: "2026-10-09T00:05:00.000Z",
+    monthly_amount: null,
+    setup_amount: null,
+    currency: null,
+    term_months: 12,
+    location: "European Union",
+    standing_profile_id: "owner-ram-expansion",
+    trigger: "regional_actual_ram",
+  };
+  expect(CostedNodeApproval.parse(approval)).toEqual(approval);
+  expect(
+    CostedNodeApproval.parse({ ...approval, trigger: "ram_76_percent" })
+      .trigger,
+  ).toBe("ram_76_percent");
+  expect(
+    CostedNodeApproval.safeParse({
+      ...approval,
+      standing_profile_id: undefined,
+    }).success,
+  ).toBe(false);
+  expect(
+    CostedNodeApproval.safeParse({ ...approval, trigger: undefined }).success,
+  ).toBe(false);
+  expect(
+    CostedNodeApproval.safeParse({
+      ...approval,
+      expires_at: approval.approved_at,
     }).success,
   ).toBe(false);
 });

@@ -261,6 +261,9 @@ export async function getCapacityPolicy(
     .first<{
       region_id: string;
       max_nodes: number | null;
+      ram_expansion_threshold_ppm: number | null;
+      ram_warning_threshold_ppm: number | null;
+      cap_warning_enabled: number;
       purchases_enabled: number;
       order_config: string | null;
       autoscale_enabled: number;
@@ -278,6 +281,9 @@ export async function getCapacityPolicy(
     NodeCapacityPolicy.parse({
       region_id: row.region_id,
       max_nodes: row.max_nodes,
+      ram_expansion_threshold_ppm: row.ram_expansion_threshold_ppm,
+      ram_warning_threshold_ppm: row.ram_warning_threshold_ppm,
+      cap_warning_enabled: Boolean(row.cap_warning_enabled),
       purchases_enabled: Boolean(row.purchases_enabled),
       autoscale_enabled: Boolean(row.autoscale_enabled),
       order: row.order_config === null ? null : JSON.parse(row.order_config),
@@ -313,6 +319,9 @@ export async function setCapacityPolicy(
   await configureNodeRegionPolicy(c.env.DB, {
     region_id: id,
     max_nodes: policy.max_nodes,
+    ram_expansion_threshold_ppm: policy.ram_expansion_threshold_ppm,
+    ram_warning_threshold_ppm: policy.ram_warning_threshold_ppm,
+    cap_warning_enabled: policy.cap_warning_enabled,
     purchases_enabled: policy.purchases_enabled,
     order: policy.order,
     placement_mode: policy.placement_mode,

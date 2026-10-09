@@ -16,6 +16,11 @@ interface AlertRow {
   delivered_at: string | null;
   last_attempt_at: string | null;
 }
+interface AlertCondition {
+  kind: InfraAlertKind;
+  active: boolean | null;
+  snapshot: { sql: string; bindings: (string | number | null)[] };
+}
 const retryMs = 60_000;
 
 /** Known provider assignments, including the control role; reserved unpaid intents are not allocations. */
@@ -97,10 +102,14 @@ export async function runInfrastructureAlerts(
   fetcher: typeof fetch = fetch,
 ): Promise<{ delivered: number; pending: number }> {
   const policy = await env.DB.prepare(
-    "SELECT max_nodes FROM node_region_policies WHERE region_id=?",
+    "SELECT max_nodes,ram_warning_threshold_ppm,cap_warning_enabled FROM node_region_policies WHERE region_id=?",
   )
     .bind(regionId)
-    .first<{ max_nodes: number | null }>();
+    .first<{
+      max_nodes: number | null;
+      ram_warning_threshold_ppm: number | null;
+      cap_warning_enabled: number;
+    }>();
   if (!policy) return { delivered: 0, pending: 0 };
   const window = await env.DB.prepare(regionalRamWindowSql("?"))
     .bind(regionId)
@@ -118,39 +127,60 @@ export async function runInfrastructureAlerts(
             BigInt(window.capacity_memory_bytes),
         );
   const timestamp = new Date(now).toISOString();
-  const conditions: [InfraAlertKind, boolean | null][] = [
-    [
-      "regional_ram_warning",
-      window === null
-        ? null
-        : BigInt(window.working_set_bytes) * 100n >=
-          BigInt(window.capacity_memory_bytes) * 75n,
-    ],
-    [
-      "regional_node_cap_reached",
-      policy.max_nodes !== null && allocated >= policy.max_nodes,
-    ],
+  const capConfigured =
+    policy.cap_warning_enabled === 1 && policy.max_nodes !== null;
+  const ramSnapshot: AlertCondition["snapshot"] = {
+    sql: "EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=? AND p.ram_warning_threshold_ppm IS ?)",
+    bindings: [regionId, policy.ram_warning_threshold_ppm],
+  };
+  if (policy.ram_warning_threshold_ppm !== null && window !== null) {
+    ramSnapshot.sql += ` AND EXISTS(SELECT 1 FROM (${regionalRamWindowSql("?")}) measured
+      WHERE measured.minute=? AND measured.working_set_bytes=? AND measured.capacity_memory_bytes=?)`;
+    ramSnapshot.bindings.push(
+      regionId,
+      window.minute,
+      window.working_set_bytes,
+      window.capacity_memory_bytes,
+    );
+  }
+  const conditions: AlertCondition[] = [
+    {
+      kind: "regional_ram_warning",
+      active:
+        policy.ram_warning_threshold_ppm === null
+          ? false
+          : window === null
+            ? null
+            : BigInt(window.working_set_bytes) * 1_000_000n >=
+              BigInt(window.capacity_memory_bytes) *
+                BigInt(policy.ram_warning_threshold_ppm),
+      snapshot: ramSnapshot,
+    },
+    {
+      kind: "regional_node_cap_reached",
+      active:
+        policy.cap_warning_enabled === 1 &&
+        policy.max_nodes !== null &&
+        allocated >= policy.max_nodes,
+      snapshot: {
+        sql: `EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=?
+          AND p.cap_warning_enabled=? AND p.max_nodes IS ?${
+            capConfigured
+              ? ` AND ${regionalNodeCountSql("p.region_id", true)}=?`
+              : ""
+          })`,
+        bindings: [
+          regionId,
+          policy.cap_warning_enabled,
+          policy.max_nodes,
+          ...(capConfigured ? [allocated] : []),
+        ],
+      },
+    },
   ];
-  for (const [kind, active] of conditions) {
-    // Unknown RAM never clears an existing episode or creates a new measured warning.
+  for (const { kind, active, snapshot } of conditions) {
+    // Unknown RAM retains an enabled episode; explicitly disabling its policy clears it.
     if (active === null) continue;
-    const snapshot =
-      kind === "regional_ram_warning"
-        ? {
-            sql: `EXISTS(SELECT 1 FROM (${regionalRamWindowSql("?")}) measured
-          WHERE measured.minute=? AND measured.working_set_bytes=? AND measured.capacity_memory_bytes=?)`,
-            bindings: [
-              regionId,
-              window!.minute,
-              window!.working_set_bytes,
-              window!.capacity_memory_bytes,
-            ],
-          }
-        : {
-            sql: `EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=? AND p.max_nodes IS ?
-          AND ${regionalNodeCountSql("p.region_id", true)}=?)`,
-            bindings: [regionId, policy.max_nodes, allocated],
-          };
     if (!active) {
       await env.DB.prepare(
         `UPDATE infrastructure_alerts SET active=0 WHERE region_id=? AND kind=? AND active=1 AND ${snapshot.sql}`,
@@ -192,10 +222,12 @@ export async function runInfrastructureAlerts(
   if (!destination) return { delivered: 0, pending: pending.results.length };
   let delivered = 0;
   for (const row of pending.results) {
+    const condition = conditions.find(({ kind }) => kind === row.kind);
+    if (condition?.active !== true) continue;
     const claim = await env.DB.prepare(
       `UPDATE infrastructure_alerts SET last_attempt_at=?
       WHERE region_id=? AND kind=? AND event_id=? AND active=1 AND delivered_at IS NULL
-        AND (last_attempt_at IS NULL OR last_attempt_at<=?)`,
+        AND (last_attempt_at IS NULL OR last_attempt_at<=?) AND ${condition.snapshot.sql}`,
     )
       .bind(
         timestamp,
@@ -203,6 +235,7 @@ export async function runInfrastructureAlerts(
         row.kind,
         row.event_id,
         new Date(now - retryMs).toISOString(),
+        ...condition.snapshot.bindings,
       )
       .run();
     if (claim.meta.changes !== 1) continue;

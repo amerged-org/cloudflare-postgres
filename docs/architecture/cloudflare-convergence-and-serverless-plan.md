@@ -1,6 +1,6 @@
 # Unified Cloudflare control, fleet releases and serverless capacity
 
-Status: **implementation and full live acceptance remain open**. Owner direction: 2026-10-08.
+Status: **implementation and full live acceptance remain open**. Owner direction: 2026-10-09.
 
 This is the corrective implementation plan for the complete PGCF product, not another declaration
 of completion. [PLAN.md](../../PLAN.md) remains the canonical scope/status record. The prior
@@ -26,15 +26,16 @@ is out of scope; configuration, status and operation control are exposed through
 OMH selects entitlements and consumes PGCF; it must not implement a second placement, resource,
 backup, patch or VPS-provisioning controller.
 
-Ordinary expansion uses at least76% actual regional physical RAM over ten fresh consecutive
+Ordinary expansion uses an operator-configured actual regional physical RAM threshold over ten fresh consecutive
 aligned minutes. Every eligible customer node must retain its own physical Node UID throughout
 that window; sum actual working-set bytes against physical capacity rather than averaging unlike
 node percentages. Existing suitable nodes remain eligible while another node is provisioned.
-There is no81% placement stop. The owner's latest2026-10-08 instruction adds a small hard ceiling:
-maximum3 managed VPS per region, including retained control and lost allocated servers. Warn the
-operator at75% regional RAM and when the configured node ceiling is reached; do not buy beyond it.
-No additional monetary or lifetime order-count ceiling is required. The authority remains limited
-to V159, one month, no storage add-on and the76% regional RAM purchase cause.
+There is no81% placement stop. The latest owner decision removes the fixed three-server ceiling
+and the personal notification setup. The authenticated Cloudflare management API exposes the
+RAM threshold and automatic-purchase on/off setting per region. The operator must configure and
+enable purchases explicitly;76% is this installation's selected value, not an immutable product
+rule. Optional email requires operator-provided delivery credentials and recipient settings.
+Public defaults contain no recipient, provider secret or automatically enabled purchase authority.
 
 The CPU and disk models must support many small or hibernated databases. A logical customer limit
 is not a permanently consumed allocation. Actual live work, simultaneous starts, persistent data
@@ -222,12 +223,19 @@ partition sizing first; existing-node conversion must have its own proven safe p
 
 ### Expansion and standing purchases
 
-The owner's latest instruction is explicit: when a zone reaches the76% rule, buy one matching
-V159/4vCPU/8GiB/150GiB NVMe/one-month/no-storage-add-on VPS in that region. This operator installation
-now has `max_nodes:3` in each retained region, including the control role. Monetary/order-count
-ceilings and standing expiry may remain null under the explicit RAM-trigger authority. Persist
-this exact conditional policy; do not substitute huge sentinel values or request permission again.
-Generic adopters can select their own supported ceilings.
+PGCF is generic open-source software. Each operator configures the per-region RAM threshold,
+automatic-purchase switch, provider credentials and purchase profile through the management API
+and protected secret configuration. Fresh installations keep automatic purchasing off. Validate
+the threshold and persist it in Cloudflare; every capacity decision, reservation and first
+dispatch uses the current configured value. A policy change invalidates stale purchase authority;
+it does not create a second order or discard an uncertain provider result.
+
+For this installation, the standing selection remains V159/4vCPU/8GiB/150GiB NVMe, one month,
+no storage add-on, with76% selected. The owner removes the three-VPS ceiling and its cap notices.
+Remove that active limit without substituting a huge sentinel value. Existing optional generic
+limits may remain operator-configurable, but none is mandatory or silently imposed. Enabling
+automatic purchasing is explicit; a fresh adopter receives no inferred authority from this
+installation's permission. The already granted owner authority does not need another approval.
 
 The region must have ten fresh consecutive aligned minutes for every Ready, schedulable eligible
 customer node, with each node's physical UID and capacity stable. The regional ratio uses summed
@@ -239,17 +247,20 @@ timestamp alone does not hide RAM use of an otherwise eligible customer node.
 Keep one active regional addition and a window-bound idempotency key. Re-evaluate current regional
 pressure before the first purchase attempt; a queued operation can continue across minutes while
 its current region/order/authority and fresh pressure remain valid. Do not abandon its identity
-merely because the sample minute changed. CPU/storage shortage below76% waits or alerts; it is not
+merely because the sample minute changed. CPU/storage shortage below the configured RAM threshold waits or alerts; it is not
 another automatic purchase cause. Existing placement retains hard RAM/CPU/storage/startup checks.
 
-At75%, create one generic infrastructure warning per active fresh-window episode. Unknown RAM
-must not rearm it. At3 known allocated managed VPS, notify the operator and prevent another
-purchase. Hard occupancy also includes unpaid reservations; the notice reports known allocations.
-Lost VPS remain in the paid-fleet count until supported decommission reconciliation; recovery on
-the same provider instance does not buy another VPS. Use a bounded authenticated generic webhook
-or Cloudflare service binding with persistent event-ID dedupe. The adopter's existing mail service
-owns recipient and provider credentials; PGCF has no hardcoded email address or mail vendor.
-Callback acceptance and actual email delivery are distinct observations.
+Email is optional and off until the operator configures it. Remove this installation's personal
+notification binding and sender token; preserve other adopter mail functions and shared Resend
+credentials. A configured Resend delivery integration may remain supported, with explicit sender,
+recipient and warning policy rather than a mandatory75% owner email. Keep the generic authenticated
+webhook/service-binding transport, bounded requests and persistent event-ID dedupe. Missing mail
+configuration must neither send email nor block capacity decisions. Document the minimal opt-in
+setup alongside other API features; callback acceptance and provider delivery remain distinct.
+
+If an operator elects to configure a separate optional allocation limit, count retained control,
+lost allocations and unpaid reservations correctly. Same-provider recovery never counts as a
+new VPS. Removing the owner-specific ceiling does not remove identity or duplicate-order checks.
 
 Retain provider request identity, OAuth reuse and uncertain-order reconciliation. Once a provider
 write is recorded or uncertain, resolve its result through reads even if RAM later falls or a
@@ -337,7 +348,7 @@ Pool policy defines ready target, maximum idle CPU/RAM, compatibility/release, m
 refill behavior. These resources count as shared platform use, not permanent per-customer slots.
 Used tenant runtimes are destroyed before clean replenishment. Concurrent claims, interruption,
 wrong-tenant binding and pool exhaustion are explicit acceptance cases. Pool misses use a bounded
-ordinary start path with honest latency/miss reporting; refill alone never bypasses the76% VPS
+ordinary start path with honest latency/miss reporting; refill alone never bypasses the configured VPS
 purchase policy.
 
 Resolve the local PGDATA/CNPG late-binding prerequisite first: prestarted slots must be eligible
@@ -394,7 +405,7 @@ If a path misses its target or late binding is not solved, the gate stays open.
 | C. Shared runtime and credential baseline | B | Accepted shared Regional fix, declared components, coordinated authority rotation | All3 nodes on the approved compatible release; retired keys rejected; no reinstall |
 | D. CPU/RAM capacity model | B,C | Separate request/limit, no sleeping CPU debit, atomic wake admission, real256/4096 profiles | Hibernation frees compute accounting; simultaneous wake/create cannot exceed actual safe headroom |
 | E. Usage-driven disk | B,C | Qualified thin profile, measured pool state, logical quota/growth and supported old-volume transition | Empty quotas do not preallocate full disk; quota/full-pool/reclaim/restore tests preserve other data |
-| F. Headless completion and purchase activation | B,C,D,E | Supported region/restore-secret setup, postjoin fix, exact76% cause, installed owner-authorized threshold-only policy | One normal authorized addition reaches Ready without operator execution; interruption buys exactly once |
+| F. Headless completion and purchase activation | B,C,D,E | Supported region/restore-secret setup, postjoin fix, configurable RAM threshold and explicit auto-purchase switch, operator-owned credentials/profile | One authorized threshold-driven addition reaches Ready without operator execution; interruption buys exactly once; disabled purchasing buys nothing |
 | G. Programmed patch lifecycle | B,C | Candidate promotion, rollout, drift repair and supported recovery | Install releaseR, upgrade retained nodes toR+1, interrupt/resume, prove runtime convergence and DB lifecycle |
 | H. Rust and shared prestarted compute | B,D,E integration contract; gateway work may proceed with E–G | Late binding, real shared pool, native components, targeted controller, routing snapshots; warm reclaim additional | Multi-database pool-hit first-read target, exclusive assignment, isolation/refill/restart/miss evidence; separate warm/reclaim/cold results |
 | I. Density, operations and migration handover | D–H | Representative tenant workload, explicit expansion policy, customer/operator runbooks | Actual resource/latency/backup limits established; all required gates below pass |
@@ -413,7 +424,8 @@ without a specific reason. Documentation is not a reason to rerun an installer.
 | Central customer control | Assign256MiB, change to a selected256MiB step and4096MiB ceiling through the PGCF management API; both regions report matching applied revision/Pod/SQL limits after interruption/resume |
 | Compute overbooking | Confirmed cold-sleep removes CPU debit; warm idle reports real use; concurrent starts reacquire bounded CPU/RAM headroom; noisy neighbor cannot consume an entire host |
 | Disk overbooking | Logical quotas are not fully preallocated; real block use and pool metadata drive admission; quota/growth/full-pool/trim/delete/restore behavior is proved |
-|76% expansion | Ten actual fresh aligned regional minutes, each member retaining its own UID→one approved V159 order; suitable old nodes still place DBs; no81% cutoff or hidden below-threshold static-allocation purchase |
+| Configurable expansion | API changes to the RAM threshold and auto-purchase switch are reflected at reservation/dispatch; this installation's76% over ten fresh aligned minutes triggers one approved V159 order, without a fixed three-node ceiling; suitable old nodes still place DBs; disabled or below-threshold purchasing orders nothing |
+| Optional email | Fresh/unconfigured installations send no email; operator-configured delivery credentials and recipient enable deduplicated notifications; the removed personal setup is absent |
 | Headless Ready | Purchase, image, network, K8s/platform/secret configuration, storage, proof and admission complete with the laptop disconnected; interrupted uncertain actions are resolved |
 | Patch management | A second release upgrades all retained roles through supported procedures; data/UIDs/configuration remain valid; controlled interruption/recovery and bounded skew are observed |
 | Backup/recovery | SQL/TLS/roles/R2 base/WAL/PITR/restore/deletion with actual physical reclaim pass on the corrected release/storage model, not merely the old thick baseline |
@@ -435,8 +447,9 @@ whether to implement the pool or silently substitute per-database warm retention
 
 - Confirm whether256MiB names the PostgreSQL limit (current contract and this plan's baseline) or
   the entire per-database PostgreSQL/backup envelope. Show both values in PGCF in either case.
-- Encode the owner's V159 permission and latest small ceiling:3 managed VPS per region,75% RAM
-  warning and cap notice. Monetary/order-count ceilings remain optional; do not erase the hard node cap.
+- Preserve this installation's V159 permission and chosen76% threshold, remove the fixed three-node
+  ceiling and personal email setup, and expose threshold/purchase controls through the API. Generic
+  users must configure their own provider and optional email credentials before activation.
 - Define storage quota offerings separately from physical allocation and a supported stable-ID or
   explicit rebind procedure for converting existing thick volumes. No silent customer-ID switch.
 - Define measured CPU baseline/burst and backup concurrency profiles; no arbitrary fixed per-tenant

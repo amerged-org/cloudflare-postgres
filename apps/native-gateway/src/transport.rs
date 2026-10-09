@@ -228,9 +228,14 @@ pub async fn serve_socket(
     }
     let path = head.path.split('?').next().unwrap_or("");
     if head.method == "GET" && (path == "/healthz" || path == "/readyz") {
-        let ready = gateway.fences.read().await.synchronized()
-            && gateway.targets.read().await.synchronized()
-            && !gateway.draining.load(Ordering::Acquire);
+        let ready = {
+            // Global order whenever both are held: fences, then targets.
+            let state = gateway.fences.read().await;
+            let physical = gateway.targets.read().await;
+            state.synchronized()
+                && physical.synchronized()
+                && !gateway.draining.load(Ordering::Acquire)
+        };
         return control::reply_text(
             &mut socket,
             if path == "/readyz" && !ready {
@@ -665,11 +670,12 @@ async fn forward_if_running(
     postgres: &mut TlsStream<TcpStream>,
     bytes: &[u8],
 ) -> Result<bool, Failure> {
+    // Match startup/health ordering while retaining both guards through the bounded write.
+    let state = gateway.fences.read().await;
     let physical = gateway.targets.read().await;
     if !physical.permits(database, target, control::now()) {
         return Err("physical write authority or writer changed".into());
     }
-    let state = gateway.fences.read().await;
     if !state.synchronized() {
         return Err("power authority unavailable".into());
     }
@@ -698,6 +704,7 @@ async fn forward_if_running(
         return Err("physical write authority expired before frontend enqueue".into());
     }
     timeout(budget, postgres.write_all(bytes)).await??;
+    drop(physical);
     drop(state);
     Ok(true)
 }

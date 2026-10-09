@@ -56,6 +56,7 @@ const nativeInputs = new Set([
   "infra/talos/publish-storage-capacity.ts",
   "infra/platform/base/values/cilium.yaml",
   "infra/platform/image-manifest.ts",
+  "infra/storage/sources.lock.json",
   "infra/talos/sandbox/runtime-admission.ts",
   "scripts/e2e/src/node-network-native.ts",
   "scripts/e2e/src/node-network-packets.ts",

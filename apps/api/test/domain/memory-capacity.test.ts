@@ -18,18 +18,18 @@ const samples = (percent: number): MemorySample[] =>
   }));
 
 it("requires ten measured minutes and expands at exactly 76 percent without closing placement", () => {
-  expect(memoryCapacityWindow(uid, samples(75), now)).toMatchObject({
+  expect(memoryCapacityWindow(uid, samples(75), now, 760_000)).toMatchObject({
     complete: true,
     expand: false,
     utilization_ppm: 750000,
   });
-  expect(memoryCapacityWindow(uid, samples(76), now)).toMatchObject({
+  expect(memoryCapacityWindow(uid, samples(76), now, 760_000)).toMatchObject({
     complete: true,
     expand: true,
     admissible: true,
     utilization_ppm: 760000,
   });
-  expect(memoryCapacityWindow(uid, samples(81), now)).toMatchObject({
+  expect(memoryCapacityWindow(uid, samples(81), now, 760_000)).toMatchObject({
     complete: true,
     expand: true,
     admissible: true,
@@ -37,7 +37,7 @@ it("requires ten measured minutes and expands at exactly 76 percent without clos
   });
   const mixed = samples(75);
   mixed[0]!.working_set_bytes = 8500;
-  expect(memoryCapacityWindow(uid, mixed, now)).toMatchObject({
+  expect(memoryCapacityWindow(uid, mixed, now, 760_000)).toMatchObject({
     complete: true,
     expand: true,
     utilization_ppm: 760000,
@@ -68,9 +68,19 @@ it("refuses changed physical capacity and current memory pressure without fabric
   expect(memoryCapacityWindow(uid, changed, now).complete).toBe(false);
   const pressure = samples(80);
   pressure[0]!.memory_pressure = true;
-  expect(memoryCapacityWindow(uid, pressure, now)).toMatchObject({
+  expect(memoryCapacityWindow(uid, pressure, now, 760_000)).toMatchObject({
     complete: true,
     admissible: false,
     expand: true,
   });
+});
+
+it("uses configured ppm and does not expand without an operator threshold", () => {
+  expect(memoryCapacityWindow(uid, samples(90), now).expand).toBe(false);
+  expect(memoryCapacityWindow(uid, samples(83), now, 830_001).expand).toBe(
+    false,
+  );
+  expect(memoryCapacityWindow(uid, samples(83), now, 830_000).expand).toBe(
+    true,
+  );
 });

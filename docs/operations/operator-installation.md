@@ -233,74 +233,74 @@ import, adoption, registration or disk-write intent. EU1 is already admitted and
 or adoption. The sequence below is the procedure for future authorized additions, not an
 instruction to reinstall either existing customer node.
 
-The corrected API/Regional source6978033 is deployed in both regions after CI37851000610;
-both live policies now have max_nodes3. Keep autoscaling disabled until the selected full release
-and installation templates are accepted. The actual EU installation profile is still missing;
-this is configuration work, not a missing purchase approval. The owner's2026-10-08 instruction authorizes V159
-regional76%-RAM expansion, with the latest small ceiling of3 managed VPS per region and75%/cap notices. Individual
-manually costed orders remain a separate explicit path. The retained
-EU and US policies both use actual RAM with a128 MiB request and4096 MiB maximum. The controlled
-EU transition completed in135s: all3 databases were confirmed manually hibernated before changing
-policy and resumed through fresh full-peak admission. Their storage generations, roles, custody
-and application table hashes are unchanged. Both regions record the exact V159 standing authority;
-only template/release acceptance keeps automatic expansion disabled. Use the guarded
-`PUT /v1/regions/{id}/capacity-policy` with `region_id`, `max_nodes`, `purchases_enabled`, `order`,
-`placement_mode`, `maximum_database_memory_mib`, `postgres_memory_request_mib`,
-`standing_cost_profile`, `autoscale_enabled` and `adopt_instance_ids`. For this operator policy use
-`max_nodes:3` and explicit `standing_cost_profile.trigger:"ram_76_percent"`; do not use huge
-sentinel counts. Finite caps remain supported for adopters that select them. Use `placement_mode:"actual_ram"`, 256 MiB assignment steps, maximum 4096 MiB and the reviewed
-128 MiB PostgreSQL request for this installation. Changing mode or the PostgreSQL request requires
-an empty assigned live cohort or a completely confirmed manually suspended/hibernated cohort
-at its current observed generation, with owned succeeded suspend operations and no unsettled
-startups. Preserve database, volume, role and credential identities; resume through fresh
-full-peak startup admission after the policy change. Idle sleep and partially stopped cohorts
-do not qualify. Configured limits must cover existing databases. Cost/node-cap updates do not
-reset database state.
+The accepted API/Regional source6978033 runs in both regions after CI37851000610. The latest
+owner change removed both live node ceilings (`max_nodes:null`) and the personal capacity-mail
+credentials/recipient. Existing order, RAM placement and automatic-purchase flags are unchanged;
+autoscaling remains disabled until the common release and installation templates are accepted.
+The missing EU installation profile is configuration work, not a missing owner permission.
+Historical warning/delivery tests remain in PLAN.md; they do not imply that mail is still enabled.
 
-The exact regional `order` contains `product_id`, `provider_region`, `image_id`, `term_months` and
-`location`. Use the confirmed V159 offer with `term_months:1` and omit `add_ons`. Its standing
-profile must bind that exact order and explicit `id`, `owner_reference`, `approved_at`, `expires_at`,
-`currency`, `monthly_amount`, `setup_amount`, `max_orders`, `max_total_monthly_amount` and
-`max_total_setup_amount`. For the explicit RAM-trigger policy set standing expiry, order-count and
-monetary ceilings to `null`. Unknown currency/monthly/setup prices are also `null`, never zero or
-an invented provider quote. The trigger is limited to V159, one month and no add-ons. Derivative
-purchase authorizations remain short-lived and bound to the exact intent/current policy.
+### Operator-configured capacity and optional notifications
 
-The owner-warning integration is live in Dev. The API uses one authenticated service binding;
-recipient and provider credentials remain solely in the adopter's private Mail Gateway secrets.
-The actual warning event at77.2919% RAM was provider-confirmed delivered. Ten consecutive fresh
-US1 samples later averaged80.0101%; identical live replay returned200 with the same single
-provider receipt. Test load is removed and NodeReady is unchanged. A subsequent197-event
-two-minute API window recorded zero Contabo attempts. Callback acceptance alone still does not
-prove delivery; retain the provider's exact message-status readback. Do not lower the node cap
-or fabricate a third allocation merely to send a cap-notice test. Autoscaling remains off for
-the full installation/release acceptance gate, not missing purchase permission.
+Deploy the matching API and additive0038 migration before using the new policy fields. Management
+is API-only and requires an administrator key; an integrator's project key does not control
+infrastructure purchases. Read `GET /v1/regions/{id}/capacity-policy`, then PUT the intended complete
+policy to the same route. Existing fields retain their documented full-replacement semantics;
+omitting newly added settings or `max_nodes` preserves stored values for existing callers.
+Explicit `null` removes an optional value. No large sentinel count represents an absent limit.
 
-The76% gate is regional actual physical RAM across ten aligned fresh consecutive minutes for every
-Ready, schedulable eligible customer Node UID. Every member keeps its own UID and capacity across
-the window. Sum working-set bytes against physical bytes; a new/missing/unaligned spare makes the
-window unknown rather than allowing an old hot source to buy repeatedly. Keep one regional addition
-in flight. The original queued intent may resume in later minutes only against fresh current
-pressure. After a provider write becomes uncertain, resolve it through reads even if RAM or
-purchasing settings later change; never repost it. Disabling autoscale atomically revokes first
-purchase authority, without preventing reconciliation of an existing write.
+| Setting | Meaning |
+| --- | --- |
+| `ram_expansion_threshold_ppm` | Required actual-RAM threshold for automatic paid expansion;760000 means76%. Fresh policy is null/unconfigured. |
+| `autoscale_enabled` | Enables automatic capacity selection, including configured adoption; false by default. |
+| `purchases_enabled` | Permits purchase authorization/first dispatch; false by default. Automatic buying requires both switches and a complete configured order/authority. |
+| `max_nodes` | Optional managed-allocation ceiling; null removes it. No fixed three-node limit is imposed. |
+| `ram_warning_threshold_ppm` | Optional mail/webhook warning threshold; null disables this warning. |
+| `cap_warning_enabled` | Opt-in notice for an operator-selected finite cap; false by default. |
 
-Infrastructure notifications use `INFRASTRUCTURE_ALERT_WEBHOOK` (optional service Fetcher) or
-`INFRASTRUCTURE_ALERT_WEBHOOK_URL`, authenticated with the private
-`INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN`. A configured Fetcher takes precedence; do not try a second
-endpoint after an uncertain response. Event IDs are stable across retries, which carry the same
-`Idempotency-Key`. The receiver must persist event-ID/payload dedupe independently of short
-provider idempotency windows. Keep mail credentials and recipient in the adopter service.
+The configured RAM threshold applies to automatic new paid orders in both placement modes.
+Retain ten fresh aligned consecutive minutes for every eligible customer node, each with stable
+physical Node UID and capacity. Sum actual working-set bytes against physical bytes. Unknown or
+unaligned capacity is not zero; an empty newly admitted spare must prevent repeated expansion
+from an old hot node. Keep one active regional addition and revalidate current policy and pressure
+before first dispatch. Policy changes invalidate stale undispatched approval while retaining the
+same intent and ledger charge. Once a provider write is recorded or uncertain, reconcile its
+saved request identity through reads, even if the threshold or purchase switches subsequently
+change. Never repeat an uncertain order. Adoption of already allocated nodes and explicit manual
+costed orders remain distinct paths.
 
-The75% RAM warning uses the same complete regional ten-minute window as expansion, with one
-notice per active episode. Unknown measurements do not clear/rearm it. Cap notice counts known
-allocated managed VPS, including control and lost machines; purchase occupancy additionally
-includes unpaid reserved slots. A lost paid server is not free budget. At3 occupied slots no
-fourth order is permitted. Status in `GET /v1/operational-health` records callback acceptance;
-verify provider acceptance/delivery separately before reporting successful notification.
-The generic notification source is deployed; the recipient callback and actual mail acceptance
-are not yet active or accepted. Configure the cap before enabling the callback so an older
-historical lower-cap episode cannot be delivered as the current policy.
+Operators configure an exact `order` (`product_id`, `provider_region`, `image_id`, `term_months`,
+`location`, and any explicitly selected add-ons) and their own standing authority. New generic RAM
+profiles use `trigger:"regional_actual_ram"`; old serialized `ram_76_percent` authorities remain
+readable. Profiles bind the exact order, owner reference, approval time and optional monetary,
+order-count and expiry limits. Unknown prices stay null, never zero or an invented provider quote.
+This installation's owner selects V159, one month, no add-on and760000PPM; those are installation
+settings, not fixed product requirements. Provider credentials are protected operator secrets.
+Fresh adopters receive neither these credentials nor this owner's purchase authority.
+
+The retained EU/US placement settings remain actual RAM,256MiB assignment steps, maximum4096MiB
+and the reviewed128MiB PostgreSQL request. Changing placement mode or the PostgreSQL request
+requires an empty live cohort or complete current-generation manual suspension with no unsettled
+starts. Preserve database/volume/role/custody identities and resume through fresh full-peak startup
+admission. Threshold, optional-cap and notification changes do not reset databases. If an operator
+selects a finite cap, count control nodes, lost paid allocations and unpaid reservations; recovery
+on the same provider allocation does not consume another slot.
+
+Email is opt-in. Configure a warning policy plus `INFRASTRUCTURE_ALERT_WEBHOOK` (service Fetcher)
+or `INFRASTRUCTURE_ALERT_WEBHOOK_URL`, authenticated with the private
+`INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN`. A Fetcher takes precedence; never try a second destination
+after an uncertain response. The adopter's receiver owns its explicit sender, recipient and mail
+provider key, for example Resend. PGCF has no hardcoded recipient or mandatory mail vendor.
+Missing delivery configuration sends nothing and does not block capacity decisions.
+
+Warning events use stable IDs and stored payloads; receivers must retain event/payload dedupe
+beyond provider idempotency windows. Explicitly disabling a warning deactivates pending episodes
+even when RAM is unknown; delivery also checks current policy. Reconnecting a mail transport must
+not deliver an obsolete personal warning. Unknown measurements alone do not rearm an enabled
+warning. Operational health records callback acceptance; provider acceptance and actual delivery
+are separate evidence. The prior personal integration has been disabled by removing only its
+capacity-specific credentials/recipient. Shared Resend keys and unrelated adopter mail continue
+unchanged; the inactive PGCF service binding is removed in the next qualified API configuration.
 
 The retained control server's UID-guarded new-database placement flag is already disabled;
 preserve Kubernetes/platform operation and existing data. The flag excludes new placement;

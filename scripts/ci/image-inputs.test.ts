@@ -20,6 +20,13 @@ const selected = (value: Partial<ImageInputs> = {}): ImageInputs => ({
   ...value,
 });
 
+test("the storage source lock invalidates both the storage and Native images", () => {
+  assert.deepEqual(
+    selectImageInputs(["infra/storage/sources.lock.json"], "push"),
+    selected({ storage: true, node_bootstrap: true }),
+  );
+});
+
 test("management-only changes skip images while exact Native and Regional build inputs select their image", () => {
   assert.deepEqual(
     selectImageInputs(["infra/talos/sandbox/runtime-admission.ts"], "push"),

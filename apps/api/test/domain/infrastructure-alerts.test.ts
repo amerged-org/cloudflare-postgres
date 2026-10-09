@@ -16,7 +16,12 @@ import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
 const capacity = 8 * 1024 ** 3;
 afterEach(cleanupFixtures);
-async function setup() {
+async function setup(
+  warnings: {
+    ram_warning_threshold_ppm?: number | null;
+    cap_warning_enabled?: boolean;
+  } = { ram_warning_threshold_ppm: 750000, cap_warning_enabled: true },
+) {
   const f = await fixture(8192, 40),
     uid = crypto.randomUUID(),
     provider = String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!);
@@ -40,6 +45,7 @@ async function setup() {
     placement_mode: "actual_ram",
     maximum_database_memory_mib: 4096,
     postgres_memory_request_mib: 128,
+    ...warnings,
   });
   return { ...f, uid, provider, order };
 }
@@ -82,7 +88,192 @@ function configured() {
   };
 }
 
-it("durably warns once at the actual 75-percent ten-minute boundary and exposes callback status through admin health", async () => {
+it("creates no warning by default even with configured delivery and a reached finite cap", async () => {
+  const f = await setup({});
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: 1,
+  });
+  await sample(f, 90);
+  let sent = 0;
+  const receiver: typeof fetch = async () => {
+    sent++;
+    return new Response(null, { status: 204 });
+  };
+  expect(
+    await runInfrastructureAlerts(configured(), f.region, Date.now(), receiver),
+  ).toEqual({ delivered: 0, pending: 0 });
+  expect(sent).toBe(0);
+  expect(await infrastructureAlertStatus(env.DB, f.region)).toEqual([]);
+});
+
+it("uses the configured RAM warning threshold", async () => {
+  const f = await setup({ ram_warning_threshold_ppm: 830001 }),
+    at = Date.now();
+  await sample(f, 83, at);
+  expect(await runInfrastructureAlerts(env, f.region, at)).toEqual({
+    delivered: 0,
+    pending: 0,
+  });
+  await sample(f, 84, at + 1);
+  expect(await runInfrastructureAlerts(env, f.region, at + 1)).toEqual({
+    delivered: 0,
+    pending: 1,
+  });
+});
+
+it("deactivates pending warnings when disabled even when current RAM is unknown", async () => {
+  const f = await setup(),
+    at = Date.now();
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: 1,
+  });
+  await sample(f, 75, at);
+  expect(await runInfrastructureAlerts(env, f.region, at)).toEqual({
+    delivered: 0,
+    pending: 2,
+  });
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    ram_warning_threshold_ppm: null,
+    cap_warning_enabled: false,
+  });
+  const observedAt = new Date(at + 1).toISOString();
+  await recordNodeMemoryObservation(
+    env.DB,
+    f.region,
+    {
+      node_id: f.node,
+      node_uid: f.uid,
+      provider_instance_id: f.provider,
+      memory: null,
+    },
+    observedAt,
+    at + 1,
+  );
+  let sent = 0;
+  const receiver: typeof fetch = async () => {
+    sent++;
+    return new Response(null, { status: 204 });
+  };
+  expect(
+    await runInfrastructureAlerts(configured(), f.region, at + 1, receiver),
+  ).toEqual({ delivered: 0, pending: 0 });
+  expect(sent).toBe(0);
+  expect(await infrastructureAlertStatus(env.DB, f.region)).toMatchObject([
+    { active: false, delivered_at: null, last_attempt_at: null },
+    { active: false, delivered_at: null, last_attempt_at: null },
+  ]);
+});
+
+it("rechecks warning policy after reading pending delivery", async () => {
+  const f = await setup(),
+    at = Date.now();
+  await sample(f, 75, at);
+  await runInfrastructureAlerts(env, f.region, at);
+  let captured!: () => void, resume!: () => void;
+  const read = new Promise<void>((resolve) => {
+    captured = resolve;
+  });
+  const release = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+  const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
+    new Proxy(statement, {
+      get(target, key) {
+        if (key === "bind")
+          return (...values: unknown[]) => wrap(target.bind(...values));
+        if (key === "all")
+          return async () => {
+            const value = await target.all();
+            captured();
+            await release;
+            return value;
+          };
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+  const paused = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) =>
+          sql.startsWith(
+            "SELECT * FROM infrastructure_alerts WHERE region_id=? AND active=1",
+          )
+            ? wrap(target.prepare(sql))
+            : target.prepare(sql);
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  let sent = 0;
+  const receiver: typeof fetch = async () => {
+    sent++;
+    return new Response(null, { status: 204 });
+  };
+  const delivery = runInfrastructureAlerts(
+    { ...configured(), DB: paused },
+    f.region,
+    at,
+    receiver,
+  );
+  await read;
+  try {
+    await configureNodeRegionPolicy(env.DB, {
+      region_id: f.region,
+      ram_warning_threshold_ppm: 900000,
+    });
+  } finally {
+    resume();
+    await delivery;
+  }
+  expect(sent).toBe(0);
+  expect(await infrastructureAlertStatus(env.DB, f.region)).toMatchObject([
+    { delivered_at: null, last_attempt_at: null },
+  ]);
+});
+
+it("retains an enabled pending RAM warning without delivering until measurements are current", async () => {
+  const f = await setup(),
+    at = Date.now();
+  await sample(f, 75, at);
+  await runInfrastructureAlerts(env, f.region, at);
+  const before = (await infrastructureAlertStatus(env.DB, f.region))[0]!;
+  const observedAt = new Date(at + 1).toISOString();
+  await recordNodeMemoryObservation(
+    env.DB,
+    f.region,
+    {
+      node_id: f.node,
+      node_uid: f.uid,
+      provider_instance_id: f.provider,
+      memory: null,
+    },
+    observedAt,
+    at + 1,
+  );
+  const received: unknown[] = [];
+  const receiver: typeof fetch = async (_input, init) => {
+    received.push(JSON.parse(String(init?.body)));
+    return new Response(null, { status: 204 });
+  };
+  expect(
+    await runInfrastructureAlerts(configured(), f.region, at + 1, receiver),
+  ).toEqual({ delivered: 0, pending: 1 });
+  expect(received).toEqual([]);
+  expect((await infrastructureAlertStatus(env.DB, f.region))[0]).toEqual(
+    before,
+  );
+  await sample(f, 75, at + 2);
+  expect(
+    await runInfrastructureAlerts(configured(), f.region, at + 2, receiver),
+  ).toEqual({ delivered: 1, pending: 0 });
+  expect(received).toMatchObject([{ event_id: before.event_id }]);
+});
+
+it("durably warns once at the configured ten-minute boundary and exposes callback status through admin health", async () => {
   const f = await setup(),
     at = Date.now();
   const delivered: {
@@ -246,6 +437,15 @@ it("counts control and provider-assigned VPS for the cap notice, excluding an un
   ]);
   await runInfrastructureAlerts(configured(), f.region, Date.now(), receiver);
   expect(events).toHaveLength(1);
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: null,
+  });
+  await runInfrastructureAlerts(configured(), f.region, Date.now(), receiver);
+  expect(events).toHaveLength(1);
+  expect(await infrastructureAlertStatus(env.DB, f.region)).toMatchObject([
+    { kind: "regional_node_cap_reached", active: false },
+  ]);
 });
 
 it("supports an authenticated generic service binding without resolving an external URL", async () => {

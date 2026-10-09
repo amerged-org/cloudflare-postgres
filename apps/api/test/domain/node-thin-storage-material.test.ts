@@ -21,6 +21,7 @@ import {
   joinBundleReference,
 } from "../../src/crypto/bootstrap-credentials.ts";
 import sources from "../../../../infra/storage/sources.lock.json" with { type: "json" };
+import { installationHash } from "../../src/domain/node-installation.ts";
 const releases: string[] = [];
 afterEach(async () => {
   await cleanupFixtures();
@@ -28,6 +29,62 @@ afterEach(async () => {
     await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
       .bind(id)
       .run();
+});
+it("retained thin nodes reject successor release verifier omission without replacing custody or consuming a physical lease", async () => {
+  const f = await thinExecutionFixture(releases);
+  const before = await env.DB.prepare(
+    "SELECT revision,sha256,ciphertext FROM node_host_configurations WHERE node_id=?",
+  )
+    .bind(f.node)
+    .first();
+  const spec = structuredClone(f.qualified.spec);
+  delete spec.storage_authority_keys_sha256;
+  delete spec.thin_storage_qualification;
+  const successor = `unqualified-${crypto.randomUUID()}`;
+  releases.push(successor);
+  const policy = JSON.parse(
+    (await env.DB.prepare(
+      "SELECT policy_json FROM node_compute_pool_policies WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first<string>("policy_json"))!,
+  );
+  policy.profile.release_id = successor;
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO fleet_releases VALUES(?,?,?,?)").bind(
+      successor,
+      JSON.stringify(spec),
+      await installationHash(spec),
+      new Date().toISOString(),
+    ),
+    env.DB.prepare(
+      "UPDATE fleet_node_releases SET release_id=?,revision=revision+1 WHERE node_id=?",
+    ).bind(successor, f.node),
+    env.DB.prepare(
+      "UPDATE fleet_region_releases SET release_id=?,revision=revision+1 WHERE region_id=?",
+    ).bind(successor, f.region),
+    env.DB.prepare(
+      "UPDATE node_compute_pool_policies SET release_id=?,policy_json=?,revision=revision+1 WHERE node_id=?",
+    ).bind(successor, JSON.stringify(policy), f.node),
+  ]);
+  await expect(
+    ensureNodeHostConfiguration(f.local, { node_id: f.node, node_uid: f.uid }),
+  ).rejects.toThrow();
+  await expect(reserveThinStorageLease(f.local, f.node)).rejects.toThrow();
+  expect(
+    await env.DB.prepare(
+      "SELECT revision,sha256,ciphertext FROM node_host_configurations WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first(),
+  ).toEqual(before);
+  expect(
+    await env.DB.prepare(
+      "SELECT lease_revision FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first("lease_revision"),
+  ).toBe(0);
 });
 it("grows an existing measured pool for a queued first logical-quota startup without ordering a node", async () => {
   const f = await thinExecutionFixture(releases),

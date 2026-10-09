@@ -16,6 +16,7 @@ import {
   readFleetPatch,
   recordFleetPatchCheckpoint,
   assertFleetPatchAuthority,
+  fleetPatchAuthoritySql,
 } from "../../src/domain/fleet-patches.ts";
 import {
   storeRegionJoinBundle,
@@ -24,6 +25,7 @@ import {
 import { installationHash } from "../../src/domain/node-installation.ts";
 import { createApp } from "../../src/app.ts";
 import type { Env } from "../../src/env.ts";
+import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -32,6 +34,136 @@ afterEach(async () => {
     await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
       .bind(id)
       .run();
+});
+it("public successor assignment cannot skip retained thin trust by disabling the host configuration flag", async () => {
+  const f = await thinExecutionFixture(releases),
+    successor = `unguarded-${crypto.randomUUID()}`;
+  const spec = structuredClone(f.qualified.spec);
+  delete spec.thin_storage_qualification;
+  delete spec.storage_authority_keys_sha256;
+  for (const role of Object.values(spec.roles))
+    role.host_configuration_required = false;
+  // The physical fixture has no full software inventory; public status represents that as unknown.
+  await env.DB.prepare(
+    "UPDATE fleet_node_release_observations SET facts_json=json_set(facts_json,'$.components',json('[]')) WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  releases.push(successor);
+  expect(
+    (
+      await request(
+        `/v1/fleet/releases/${successor}`,
+        f.admin,
+        "PUT",
+        spec,
+        crypto.randomUUID(),
+      )
+    ).status,
+  ).toBe(200);
+  expect(
+    (
+      await request(
+        `/v1/regions/${f.region}/release`,
+        f.admin,
+        "PUT",
+        { expected_revision: 1, release_id: successor },
+        crypto.randomUUID(),
+      )
+    ).status,
+  ).toBe(200);
+  const assigned = await request(
+    `/v1/nodes/${f.node}/release`,
+    f.admin,
+    "PUT",
+    {
+      expected_revision: 1,
+      release_id: successor,
+      node_uid: f.uid,
+      role: "customer",
+    },
+    crypto.randomUUID(),
+  );
+  expect(assigned.status).toBe(200);
+  const before = await env.DB.prepare(
+    "SELECT revision,sha256,ciphertext FROM node_host_configurations WHERE node_id=?",
+  )
+    .bind(f.node)
+    .first();
+  const patches = await env.DB.prepare(
+    "SELECT COUNT(*) n FROM fleet_patch_operations WHERE node_id=?",
+  )
+    .bind(f.node)
+    .first("n");
+  const result = await request(
+    `/v1/nodes/${f.node}/patches`,
+    f.admin,
+    "POST",
+    {
+      node_uid: f.uid,
+      assignment_revision: 2,
+      release_id: successor,
+      address: "192.0.2.18",
+      maintenance_acknowledged: true,
+    },
+    crypto.randomUUID(),
+  );
+  expect(result.status).toBe(409);
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) n FROM fleet_patch_operations WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first("n"),
+  ).toBe(patches);
+  expect(
+    await env.DB.prepare(
+      "SELECT revision,sha256,ciphertext FROM node_host_configurations WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first(),
+  ).toEqual(before);
+  // A queued patch from the former implementation must fail current authority too.
+  const legacy = newOperationId(),
+    at = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE nodes SET database_placement_closed_at=? WHERE id=?",
+    ).bind(at, f.node),
+    env.DB.prepare(
+      `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at) VALUES(?,?,?,?,?,?,?,2,2,1,'192.0.2.18',?,0,'preflight','pending',?,?,?)`,
+    ).bind(
+      legacy,
+      f.node,
+      f.region,
+      f.uid,
+      f.authority.cluster_uid,
+      successor,
+      await installationHash(spec),
+      JSON.stringify([
+        {
+          node_id: f.node,
+          node_uid: f.uid,
+          k8s_node_name: f.nodeName,
+          assignment_revision: 2,
+          previous_placement_closed_at: null,
+        },
+      ]),
+      at,
+      at,
+      new Date(Date.now() + 60000).toISOString(),
+    ),
+  ]);
+  expect(
+    await env.DB.prepare(
+      `SELECT 1 valid FROM fleet_patch_operations WHERE operation_id=? AND ${fleetPatchAuthoritySql}`,
+    )
+      .bind(legacy)
+      .first("valid"),
+  ).toBe(1);
+  await expect(
+    assertFleetPatchAuthority(f.local, await readFleetPatch(f.local, legacy)),
+  ).rejects.toThrow("Fleet patch identity or authority changed");
 });
 async function setup(hostRequired = false) {
   const f = await fixture(),

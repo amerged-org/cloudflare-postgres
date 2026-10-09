@@ -10,6 +10,8 @@
 !infra/platform/base/
 !infra/platform/base/values/
 !infra/platform/base/values/cilium.yaml
+!infra/storage/
+!infra/storage/sources.lock.json
 !infra/talos/
 !infra/talos/publish-storage-capacity.ts
 !infra/talos/sandbox/

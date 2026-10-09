@@ -9,6 +9,7 @@ import { FleetPatchFacts } from "@pgcf/contracts/fleet-patches";
 import { thinVolumeProfile } from "../../src/domain/node-thin-storage-selection.ts";
 import { ComputePoolObservation } from "@pgcf/contracts/compute-pool";
 import { FleetReleaseSpec } from "@pgcf/contracts/releases";
+import { storageAuthorityPublicKeys } from "../../src/domain/storage-authority.ts";
 import type { NodeJoinBundle } from "@pgcf/contracts/node-bootstrap";
 import generated from "../../../../packages/contracts/native/compute-pool.generated.json" with { type: "json" };
 import {
@@ -25,6 +26,7 @@ import {
 export async function standingPostjoinFixture(
   region: string,
   materialOverride?: NodeJoinBundle,
+  storageKeysSha256?: string,
 ) {
   const id = "postjoin-" + crypto.randomUUID(),
     digest = "d".repeat(64),
@@ -34,6 +36,7 @@ export async function standingPostjoinFixture(
       "edge",
       "node-bootstrap",
       "regional",
+      "native-gateway",
       "postgres",
       "barman",
       "cloudflared",
@@ -99,6 +102,8 @@ export async function standingPostjoinFixture(
       version: 1,
       versions_lock_sha256: "c".repeat(64),
       configuration_schema_revision: 1,
+      storage_authority_keys_sha256:
+        storageKeysSha256 ?? (await storageAuthorityPublicKeys(env)).sha256,
       components: names.map((name) => ({
         name,
         kind: ["api", "edge"].includes(name) ? "worker_bundle" : "image",
