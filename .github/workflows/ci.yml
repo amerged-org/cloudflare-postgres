@@ -415,6 +415,20 @@ jobs:
             echo "Image digest: \`$IMAGE@$digest\`"
             echo "Tags: \`sha-${GITHUB_SHA::12}\`, \`latest\`"
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Copy the qualified NodeBootstrap manifest to public runtime storage
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          image_id=$(cat "$RUNNER_TEMP/pgcf-bootstrap-image-gate/image.id")
+          digest=$(node --input-type=module -e 'import {readFileSync} from "node:fs"; console.log(JSON.parse(readFileSync(process.argv[1], "utf8")).digest)' "$RUNNER_TEMP/pgcf-bootstrap-image-gate/registry-sha.json")
+          public_image="ghcr.io/amerged-org/pgcf-regional:node-bootstrap-sha-${GITHUB_SHA::12}"
+          docker buildx imagetools create --prefer-index=false --tag "$public_image" "$IMAGE@$digest"
+          node scripts/ci/image-qualification.ts --profile node-bootstrap registry "$public_image" \
+            "$image_id" "$GITHUB_SHA" "https://github.com/$GITHUB_REPOSITORY" \
+            "$RUNNER_TEMP/pgcf-bootstrap-image-gate/qualification.json" "$RUNNER_TEMP/pgcf-bootstrap-image-gate/public-bootstrap-sha.json"
+          node --input-type=module -e 'import {readFileSync} from "node:fs"; import {assertEquivalentRegistryReadbacks} from "./scripts/ci/registry.ts"; const read=p=>JSON.parse(readFileSync(p,"utf8")); assertEquivalentRegistryReadbacks(read(process.argv[1]),read(process.argv[2]));' \
+            "$RUNNER_TEMP/pgcf-bootstrap-image-gate/registry-sha.json" "$RUNNER_TEMP/pgcf-bootstrap-image-gate/public-bootstrap-sha.json"
+          echo "Public NodeBootstrap digest: $public_image@$digest" >> "$GITHUB_STEP_SUMMARY"
       - name: Remove image qualification files
         if: always()
         run: rm -rf "$RUNNER_TEMP/pgcf-bootstrap-image-gate"

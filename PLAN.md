@@ -11,8 +11,8 @@ The live API baseline remains 6978033; no newer API release has been deployed. T
 lifecycle, measured RAM trigger and 135-second EU policy transition are valid partial evidence.
 They do not establish uniform releases, unattended purchases, thin storage, key rotation or fast start.
 
-The complete CI preflight requires an available native Ubuntu/AMD64 runner. The retained Talos
-fleet is not repurposed into a privileged CI host; no new push or CI run has been made.
+The owner approved native Ubuntu/AMD64 validation on a GitHub review branch. Main publication
+and Dev delivery follow successful validation; the retained Talos fleet remains a database fleet.
 Existing later-gate implementation remains unchanged while gate 1 is completed.
 
 R1 uses official Image Factory Talos 1.14.2, Kubernetes 1.36.5 and the pinned platform on all three

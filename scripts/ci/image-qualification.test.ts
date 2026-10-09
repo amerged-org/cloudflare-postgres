@@ -274,6 +274,45 @@ test("the single CI workflow qualifies all three image profiles before independe
   );
 });
 
+test("NodeBootstrap publication mirrors the exact qualified digest to the existing public package", async () => {
+  const workflow = await readFile(".github/workflows/ci.yml", "utf8");
+  const bootstrap = workflow
+    .split("\n  node_bootstrap_image:\n")[1]!
+    .split("\n  postgres_image:\n")[0]!;
+  const step =
+    "- name: Copy the qualified NodeBootstrap manifest to public runtime storage";
+  const mirror = bootstrap.split(step)[1]?.split("      - name:")[0];
+  assert.ok(
+    mirror,
+    "the qualified bootstrap image needs an accessible public pull path",
+  );
+  assert.ok(
+    bootstrap.indexOf("--profile node-bootstrap registry") <
+      bootstrap.indexOf(step),
+  );
+  assert.match(
+    mirror,
+    /public_image="ghcr\.io\/amerged-org\/pgcf-regional:node-bootstrap-sha-\$\{GITHUB_SHA::12\}"/,
+  );
+  assert.match(
+    mirror,
+    /imagetools create --prefer-index=false --tag "\$public_image" "\$IMAGE@\$digest"/,
+  );
+  assert.match(mirror, /--profile node-bootstrap registry "\$public_image"/);
+  assert.match(
+    mirror,
+    /"\$image_id" "\$GITHUB_SHA" "https:\/\/github\.com\/\$GITHUB_REPOSITORY"/,
+  );
+  assert.match(mirror, /pgcf-bootstrap-image-gate\/qualification\.json/);
+  assert.match(mirror, /assertEquivalentRegistryReadbacks/);
+  assert.match(
+    mirror,
+    /registry-sha\.json" "\$RUNNER_TEMP\/pgcf-bootstrap-image-gate\/public-bootstrap-sha\.json"/,
+  );
+  assert.match(mirror, /Public NodeBootstrap digest: \$public_image@\$digest/);
+  assert.doesNotMatch(mirror, /buildx build|--label|promote|:latest/);
+});
+
 test("Dockerfile profiles bind every FROM and the exact pinned stage topology", () => {
   const regional = `FROM ${nodeBase} AS build\nFROM ${nodeBase}\n`,
     bootstrap = `FROM ${nodeBase} AS build\nFROM ${nodeBase} AS clients\nFROM ${nodeBase}\n`;
