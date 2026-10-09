@@ -920,13 +920,17 @@ it("recovers one quiesced physical LV in an8GiB pool while keeping both real5GiB
       .first(),
   ).toEqual({ generation: 2, observed_power: "awake" });
   expect(authority.physical.thin_pool!.data_total_bytes).toBe(8 * gib);
+  const againAt = Date.now();
   const again = await accepted(
     f,
     {
       ...authority,
       revision: 3,
-      observed_at: new Date().toISOString(),
-      expires_at: new Date(Date.now() + 30000).toISOString(),
+      observed_at: new Date(againAt).toISOString(),
+      captured_at: new Date(againAt).toISOString(),
+      expires_at: new Date(
+        againAt + f.profile.guard_seconds * 1000,
+      ).toISOString(),
       volumes: authority.volumes.map((v) => ({ ...v, generation: 2 })),
     },
     true,
