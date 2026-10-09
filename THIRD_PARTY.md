@@ -111,6 +111,13 @@ Rust standard-library and libc notices when distributing a static native executa
 attribute their code to the project's Apache license alone. No upstream source is vendored here.
 The primitive is not yet installed on customer servers or integrated with containerd/CNPG.
 
+CI host checks use the build-only [Protocol Buffers31.1 compiler](https://github.com/protocolbuffers/protobuf/releases/tag/v31.1)
+under [BSD-3-Clause](https://github.com/protocolbuffers/protobuf/blob/v31.1/LICENSE), matching the
+31.1 compiler used by the pinned Alpine build recipes. The Linux archive and executable SHA256
+are recorded in `nativeRuntime.protoc` in versions.lock.json. They were pinned from the official
+release download and checked against its published asset size; that historical asset has no
+vendor-published digest. The compiler is not shipped in PGCF runtime images.
+
 The native sandbox-controller adapter uses unchanged Apache-2.0 protobuf definitions from
 [containerd 2.3.6](https://github.com/containerd/containerd/tree/v2.3.6/api),
 [Kubernetes CRI API 0.36.5](https://github.com/kubernetes/cri-api/tree/v0.36.5) and

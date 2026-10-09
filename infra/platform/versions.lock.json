@@ -255,7 +255,20 @@
   "nativeRuntime": {
     "rustVersion": "1.99.0",
     "testBuilderImage": "docker.io/library/rust:1.99.0-alpine3.24@sha256:0cce0a5e0e8ba67b455257a3a02a1d99005f382748789d6464460028810f1627",
-    "verificationScope": "Prepared namespace primitive only; no CRI, CNPG, database readiness or first-read acceptance."
+    "verificationScope": "Prepared namespace primitive only; no CRI, CNPG, database readiness or first-read acceptance.",
+    "protoc": {
+      "version": "31.1",
+      "license": "BSD-3-Clause",
+      "archives": [
+        {
+          "os": "linux",
+          "architecture": "amd64",
+          "url": "https://github.com/protocolbuffers/protobuf/releases/download/v31.1/protoc-31.1-linux-x86_64.zip",
+          "sha256": "96553041f1a91ea0efee963cb16f462f5985b4d65365f3907414c360044d8065",
+          "binarySha256": "caaf8517e57c57d34a7d6f0544172d9051abf58556aa35c70d3fb0d824b8cfbb"
+        }
+      ]
+    }
   },
   "talosBoot": {
     "imager": "ghcr.io/siderolabs/imager@sha256:89d1b1e2be167632745abf7f6834220a255a0182714f3d91670ecad55a3c41ff",

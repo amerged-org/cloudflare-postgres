@@ -87,6 +87,21 @@ jobs:
             appendFileSync(process.env.GITHUB_ENV, `${tool.environmentVariable}=${executable}\n`);
           }
           JS
+      - name: Install the pinned Protobuf compiler for host Rust checks
+        run: |
+          PGCF_PROTOC_DIR="$RUNNER_TEMP/pgcf-protoc"
+          PGCF_PROTOC_URL=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.protoc.archives.find(v => v.os === "linux" && v.architecture === "amd64").url')
+          PGCF_PROTOC_SHA=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.protoc.archives.find(v => v.os === "linux" && v.architecture === "amd64").sha256')
+          PGCF_PROTOC_BINARY_SHA=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.protoc.archives.find(v => v.os === "linux" && v.architecture === "amd64").binarySha256')
+          PGCF_PROTOC_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.protoc.version')
+          mkdir -m 700 "$PGCF_PROTOC_DIR"
+          curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' \
+            --connect-timeout 15 --max-time 120 --output "$PGCF_PROTOC_DIR/compiler.zip" "$PGCF_PROTOC_URL"
+          printf '%s  %s\n' "$PGCF_PROTOC_SHA" "$PGCF_PROTOC_DIR/compiler.zip" | sha256sum --check --status
+          unzip -q "$PGCF_PROTOC_DIR/compiler.zip" -d "$PGCF_PROTOC_DIR"
+          printf '%s  %s\n' "$PGCF_PROTOC_BINARY_SHA" "$PGCF_PROTOC_DIR/bin/protoc" | sha256sum --check --status
+          test "$("$PGCF_PROTOC_DIR/bin/protoc" --version)" = "libprotoc $PGCF_PROTOC_VERSION"
+          printf 'PROTOC=%s\nPROTOC_INCLUDE=%s\n' "$PGCF_PROTOC_DIR/bin/protoc" "$PGCF_PROTOC_DIR/include" >> "$GITHUB_ENV"
       - name: Select affected image inputs
         id: image_inputs
         env:

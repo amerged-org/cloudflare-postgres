@@ -124,7 +124,7 @@ mod tests {
         assert!(transition(&next, &settings).is_err());
     }
     #[tokio::test]
-    async fn authenticated_file_refresh_keeps_controller_and_guard_instance_alive() {
+    async fn root_custody_refresh_preserves_instances_and_nonroot_file_is_rejected() {
         use std::{
             fs,
             io::Write,
@@ -181,6 +181,23 @@ mod tests {
         file.write_all(&serde_json::to_vec(&settings).unwrap())
             .unwrap();
         drop(file);
+        let current_uid = unsafe { libc::geteuid() };
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(metadata.uid(), current_uid);
+        assert_eq!(metadata.mode() & 0o777, 0o600);
+        if current_uid != 0 {
+            let denied = read(&path)
+                .err()
+                .expect("nonroot-owned configuration must fail custody validation");
+            assert_eq!(denied.code(), tonic::Code::FailedPrecondition);
+            assert_eq!(
+                denied.message(),
+                "sealed_runtime_configuration_transition_invalid"
+            );
+            fs::remove_dir_all(directory).unwrap();
+            return;
+        }
+        assert!(read(&path).is_ok());
         let controller = SandboxController::prepare(settings.clone()).await.unwrap();
         let original_guard = controller.storage_guard().unwrap();
         let (sender, mut updates) = watch::channel(client);
