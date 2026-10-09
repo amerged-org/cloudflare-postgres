@@ -21,7 +21,6 @@ RUN rustc --version | grep -F "rustc ${RUST_VERSION} " \
  && cargo fmt --all -- --check \
  && cargo test --workspace --locked \
  && cargo clippy --workspace --all-targets --locked -- -D warnings \
- && cargo build --workspace --release --locked \
  && find target/debug/deps -maxdepth 1 -type f -name 'kernel_assignment-*' -perm -111 \
     -exec cp '{}' /usr/local/bin/pgcf-slot-kernel-test ';' \
  && test -x /usr/local/bin/pgcf-slot-kernel-test
