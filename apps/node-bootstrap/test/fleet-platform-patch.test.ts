@@ -706,3 +706,144 @@ test("OpenEBS readiness requires both the spec-selected actual image and its hos
     false,
   );
 });
+
+import {
+  readFleetFluxIdentities,
+  reconcileFleetFlux,
+} from "../src/fleet-platform-patch.ts";
+test("retained Flux upgrades create absent qualified objects, resolve a lost create reply and retain their actual UID", async () => {
+  const { input } = patchFixture();
+  const expected = [
+    {
+      apiVersion: "v1",
+      kind: "ResourceQuota",
+      metadata: { name: "critical-pods", namespace: "flux-system" },
+      spec: { hard: { pods: "1000" } },
+    },
+    {
+      apiVersion: "apiextensions.k8s.io/v1",
+      kind: "CustomResourceDefinition",
+      metadata: { name: "artifactgenerators.source.extensions.fluxcd.io" },
+      spec: {
+        group: "source.extensions.fluxcd.io",
+        names: { kind: "ArtifactGenerator", plural: "artifactgenerators" },
+        scope: "Namespaced",
+        versions: [{ name: "v1beta1", served: true, storage: true }],
+      },
+    },
+  ];
+  const assets = { lock: {}, flux: expected, flux_deprecated: [], relay: {} },
+    present = new Map<string, Record<string, unknown>>(),
+    committed: Record<string, string> = {};
+  let creates = 0;
+  const commands = {
+    authorize: async () => {},
+    kube: async (args: string[], stdin?: string) => {
+      if (args[0] === "get") {
+        assert.ok(args.includes("--ignore-not-found"));
+        const value = present.get(args[2]!);
+        return value ? JSON.stringify(value) : "";
+      }
+      assert.equal(args[0], "create");
+      creates++;
+      assert.equal(Object.keys(committed).length, creates - 1);
+      const value = JSON.parse(stdin!) as Record<string, unknown>,
+        metadata = value.metadata as Record<string, unknown>;
+      assert.equal(
+        (metadata.annotations as Record<string, unknown>)[
+          "pgcf.io/fleet-patch-operation"
+        ],
+        input.status.operation_id,
+      );
+      metadata.uid = randomUUID();
+      metadata.resourceVersion = "1";
+      present.set(String(metadata.name), value);
+      // The API committed the fixed-name creation but the command reply was lost.
+      if (creates === 1) throw Error("lost_create_reply");
+      return JSON.stringify(value);
+    },
+  };
+  assert.deepEqual(await readFleetFluxIdentities(assets, commands), {});
+  await reconcileFleetFlux(input, assets, {}, commands, async (bindings) => {
+    Object.assign(committed, bindings);
+  });
+  const bindings = await readFleetFluxIdentities(assets, commands, {
+    operation_id: input.status.operation_id,
+    bound_uids: {},
+  });
+  assert.equal(Object.keys(bindings).length, 2);
+  assert.equal(creates, 2);
+  const recovered: Record<string, string> = {};
+  await reconcileFleetFlux(input, assets, {}, commands, async (current) => {
+    Object.assign(recovered, current);
+  });
+  assert.deepEqual(recovered, bindings);
+  assert.equal(creates, 2);
+  await reconcileFleetFlux(input, assets, bindings, commands);
+  assert.equal(creates, 2);
+  const quota = present.get("critical-pods")!;
+  (quota.metadata as Record<string, unknown>).uid = randomUUID();
+  await assert.rejects(
+    readFleetFluxIdentities(assets, commands, {
+      operation_id: input.status.operation_id,
+      bound_uids: bindings,
+    }),
+    /patch_platform_identity_changed/,
+  );
+  present.delete("critical-pods");
+  await assert.rejects(
+    readFleetFluxIdentities(assets, commands, {
+      operation_id: input.status.operation_id,
+      bound_uids: bindings,
+    }),
+    /patch_platform_identity_changed/,
+  );
+  assert.equal(creates, 2);
+});
+
+test("a denied Flux read or an unowned fixed-name collision cannot authorize creation", async () => {
+  const { input } = patchFixture(),
+    quota = {
+      apiVersion: "v1",
+      kind: "ResourceQuota",
+      metadata: { name: "critical-pods", namespace: "flux-system" },
+      spec: { hard: { pods: "1000" } },
+    },
+    assets = { lock: {}, flux: [quota], flux_deprecated: [], relay: {} };
+  let writes = 0,
+    denial: string | undefined = "Forbidden";
+  const commands = {
+    authorize: async () => {},
+    kube: async (args: string[]) => {
+      if (args[0] !== "get") writes++;
+      if (denial) throw Error(denial);
+      return JSON.stringify({
+        ...quota,
+        metadata: { ...quota.metadata, uid: randomUUID() },
+      });
+    },
+  };
+  await assert.rejects(readFleetFluxIdentities(assets, commands), /Forbidden/);
+  await assert.rejects(
+    reconcileFleetFlux(input, assets, {}, commands, async () => {}),
+    /Forbidden/,
+  );
+  denial = "transport_failed";
+  await assert.rejects(
+    reconcileFleetFlux(input, assets, {}, commands, async () => {}),
+    /transport_failed/,
+  );
+  denial = undefined;
+  await assert.rejects(
+    readFleetFluxIdentities(assets, commands, {
+      operation_id: input.status.operation_id,
+      bound_uids: {},
+    }),
+    /patch_platform_identity_unbound/,
+  );
+  await assert.rejects(
+    reconcileFleetFlux(input, assets, {}, commands, async () => {}),
+    /patch_platform_identity_unbound/,
+  );
+  assert.equal(writes, 0);
+});

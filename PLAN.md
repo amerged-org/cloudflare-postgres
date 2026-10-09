@@ -2,13 +2,13 @@
 
 **Status, 2026-10-09: overall goal open; none of the 13 final acceptance gates is closed.**
 
-**Current work: execution gate 1 — reproduce the single CI on native Linux/AMD64, obtain green CI,
-then deliver the current generic capacity and optional-email configuration.**
+**Current work: execution gate 2 — R1 fleet preflight and supported upgrades. Immediate US
+cluster-authority rotation passed live; Cloudflare custody revision 2 is active. Execution gate 1 passed live.**
 The [corrective plan, §10](docs/architecture/cloudflare-convergence-and-serverless-plan.md#10-execution-order-and-release-gates)
 defines the owner's ordered work packages; its §11 defines the 13 acceptance rows in [Status](#11-status).
 
-The live API baseline remains 6978033; no newer API release has been deployed. The EU/US database
-lifecycle, measured RAM trigger and 135-second EU policy transition are valid partial evidence.
+The live API is 3b6baeb after successful native review and main CI (37972707745); D1 is at 0038.
+The EU/US database lifecycle, measured RAM trigger and 135-second EU policy transition are valid partial evidence.
 They do not establish uniform releases, unattended purchases, thin storage, key rotation or fast start.
 
 The owner approved native Ubuntu/AMD64 validation on a GitHub review branch. Main publication
@@ -182,7 +182,7 @@ not claims of measured throughput.
   dialing, enforces replay/fence rules, bounded buffering and deadlines, and never replays SQL.
   Unknown identities use bounded decoy authentication; unauthenticated traffic is not activity
   that may keep a database awake.
-- Rotate exposed EU authority through supported operations; prove new access works and old access
+- Rotate exposed EU and US authority through supported operations; prove new access works and old access
   fails while preserving data, cluster identity and required archive decryption.
 - Never print or commit secrets, .env files, kubeconfigs, Talos configurations or private evidence.
   No machine credentials belong in a public image or schematic.
@@ -199,8 +199,8 @@ The 13 final acceptance rows in section 11 remain the completion criteria.
 
 | Order | Work package | Required result before advancing |
 | --- | --- | --- |
-| 1 — current | CI parity and current delivery | Reproduce the single CI on native Linux/AMD64 with Node 24.21, the same Docker version and Rust targets; fix the collected clock/inspect/package-pin failures; green CI, then deliver the current no-ceiling, configurable threshold/purchase switch and generic optional-email behavior |
-| 2 | R1: uniform retained fleet | Official Image Factory Talos 1.14.2, Kubernetes 1.36.5 and pinned platform on all three servers through supported upgrades; preserve data/identities and prove actual common release |
+| 1 — passed live | CI parity and current delivery | Reproduce the single CI on native Linux/AMD64 with Node 24.21, the same Docker version and Rust targets; fix the collected clock/inspect/package-pin failures; green CI, then deliver the current no-ceiling, configurable threshold/purchase switch and generic optional-email behavior |
+| 2 — current | R1: uniform retained fleet | Official Image Factory Talos 1.14.2, Kubernetes 1.36.5 and pinned platform on all three servers through supported upgrades; preserve data/identities and prove actual common release |
 | 3 | R2: extension and patch management | The same baseline plus the sandbox extension; supported Talos upgrade with deliberate interruption and resume, exact final runtime/configuration and preserved data on retained roles |
 | 4 | Thin storage, then lifecycle | Qualify the physical storage model and its safety bounds; repeat SQL/TLS/roles, R2 base/WAL, PITR/restore and physical deletion on that model |
 | 5 | Configurable expansion and headless Ready | The configured threshold triggers one already-authorized V159 purchase through Ready with no operator; resolve the postjoin 409, preserve exactly-once purchase and continued safe placement |
@@ -332,12 +332,12 @@ point or infer 22-project density from nominal host RAM or permanent class-reser
 | Central customer control | Open — partial live evidence | Shared actual-RAM policy: 128 MiB PostgreSQL request, 4096 MiB maximum. EU transition 135 s preserved all 3 database hashes; complete profile-change/interruption acceptance in both regions remains open. | 2026-10-09 |
 | Compute overbooking | Open | A 256 MiB PostgreSQL trial worked; backup peak, cold-sleep CPU release and concurrent startup/neighbor bounds are not accepted on the corrected model. | 2026-10-09 |
 | Disk overbooking | Open | Thick storage is the accepted baseline. Last measured VG total was 103,075,020,800 B per node; no complete live thin-profile quota/full-pool/startup/reclaim acceptance. | 2026-10-09 |
-| Configurable expansion | Open — trigger measured, purchase path incomplete | Historical 10-minute RAM average 79.9062%; stored trigger and continued placement passed with purchasing disabled. Both live max_nodes values are null; no unattended threshold-to-V159-to-Ready run. | 2026-10-09 |
+| Configurable expansion | Open — gate 1 configuration passed live; purchase path incomplete | API 3b6baeb / D1 0038: threshold/switch/remove-cap trial 124.523 s; fresh defaults 103.865 s and 1 real Cron, 0 purchases/mail. Both policies restored (760000 PPM, max_nodes null). All 3 retained SQL/TLS/table hashes and 9 relay connections passed, 0 Contabo calls. Historical 10-minute RAM mean 79.9062%; unattended V159-to-Ready remains open. | 2026-10-09 |
 | Optional email | Open — partial historical evidence | A configured warning delivered once at 77.2919% RAM with dedupe. Personal setup was removed; generic clean-install/opt-in behavior still needs acceptance of the current release. | 2026-10-09 |
 | Headless Ready | Open | US1 reached Ready in 198.356 s through the operator fallback; the programmed 1 GiB storage trial took 753.081 s. Automatic postjoin 409 and laptop-independent completion remain unresolved. | 2026-10-08 |
 | Patch management | Open — R2 pending | No live all-role sandbox-extension upgrade with controlled interruption/resume is accepted. Source implementation and local checks are not that measurement. | 2026-10-09 |
 | Backup/recovery | Open — thick-baseline regression evidence only | EU/US SQL used PostgreSQL 18.6, TLS 1.3 and nonsuperuser roles; 4 R2 base/WAL checks and 4 × 5 GiB deletions reclaimed 20 GiB. EU restore 108,618 ms; EU-to-US restore 87,988 ms. Repeat on the corrected model. | 2026-10-08 |
 | Shared-pool fast start | Open | Local-only proof prepared 2 unassigned holders; 4.954/2.455 ms were runtime assignment observations, not SQL latency. US1 CNPG late binding and subsecond pool-hit first reads remain unproved. | 2026-10-09 |
 | Capacity and economics | Open | No representative 22-project US workload measurement; no accepted node-count or cost conclusion from nominal RAM or class sums. | 2026-10-09 |
-| Security | Open | Official Talos 1.14.2 and Kubernetes 1.36.5 SBOM signatures were verified. Real EU key rotation/new-key success/old-key rejection and complete release security acceptance remain open. | 2026-10-09 |
+| Security | Open — US rotation passed; EU rotation pending | US custody revision 2 active: 22 configuration phases, 20 controller renewals, 7/7 old/new access pairs (154.466 s), all 19 Secrets preserved and encrypted under the new canonical key2 after 38 guarded writes. First configuration write to custody activation 4258.061 s; 1 same-disk reboot and 1 supported kubelet recovery; 0 Contabo calls, purchases, reinstalls or EU writes. Node/Cluster/filesystem/VG identities preserved; VG 103,075,020,800 B. EU revision 1 retirement and complete release security acceptance remain mandatory before customer data. | 2026-10-09 |
 | Operational ownership | Open — relay access measured | Historical 30-minute window: 390 proof/transport requests, 0 provider attempts. Current CF preview verified the retained US Cluster/Node UIDs through 3 mTLS relay connections with 0 provider calls and 0 cluster writes. Permanent operator delivery and routine operation without private scripts remain open. | 2026-10-09 |

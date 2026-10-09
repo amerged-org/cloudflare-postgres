@@ -526,3 +526,32 @@ test("a current-custody host-only finalization skips every OS and Kubernetes wri
   assert.equal(r.current.state, "pending");
   assert.equal(r.writes.length, 0);
 });
+
+test("Flux records a new resource UID while dispatched without replacing prior identity", () => {
+  const { input, facts } = patchFixture(),
+    prior = { "Namespace//flux-system": randomUUID() };
+  input.status.stage = "flux";
+  input.status.state = "dispatched";
+  input.status.observed = { ...facts, platform_resource_uids: prior };
+  const next = {
+    expected_revision: input.status.revision,
+    stage: "flux" as const,
+    state: "dispatched" as const,
+    facts: {
+      ...facts,
+      platform_resource_uids: {
+        ...prior,
+        "ResourceQuota/flux-system/critical-pods": randomUUID(),
+      },
+    },
+    error_code: null,
+  };
+  assert.equal(fleetPatchCheckpointAllowed(input, next), true);
+  next.facts.platform_resource_uids["Namespace//flux-system"] = randomUUID();
+  assert.equal(fleetPatchCheckpointAllowed(input, next), false);
+  input.status.stage = "talos";
+  assert.equal(
+    fleetPatchCheckpointAllowed(input, { ...next, stage: "talos" }),
+    false,
+  );
+});

@@ -1200,3 +1200,102 @@ it("a metadata-only material transition creates one current-custody host-only fi
       .database_placement_closed_at,
   ).toBe(row.created_at);
 });
+
+it("a host-free material transition retains closure until one current-custody runtime final pass", async () => {
+  const f = await setup(),
+    now = new Date().toISOString();
+  const { loadRegionJoinBundle } =
+    await import("../../src/crypto/bootstrap-credentials.ts");
+  const { continueFleetPatchRegion, restoreFleetPatchPlacements } =
+    await import("../../src/domain/fleet-patches.ts");
+  const oldFacts = {
+      ...f.facts,
+      talos_version: "v1.14.1",
+      kubelet_version: "v1.36.5",
+      kubernetes_version: "v1.36.5",
+    },
+    receipt = {
+      method: "deploymentreceipt",
+      installer: `registry.example/talos@sha256:${"a".repeat(64)}`,
+      node_uid: f.nodeUid,
+      cluster_uid: f.clusterUid,
+      system_uuid: f.facts.system_uuid,
+      pre_reboot_boot_id: crypto.randomUUID(),
+      completed_at: now,
+      source: "cli_exit_0",
+    };
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE fleet_patch_operations SET stage='complete',state='confirmed',observed_json=?,talos_upgrade_receipt_json=? WHERE operation_id=?",
+    ).bind(JSON.stringify(oldFacts), JSON.stringify(receipt), f.op),
+    env.DB.prepare(
+      "INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at) SELECT ?,?,1,agent_key_hash,?,?,? FROM regions WHERE id=?",
+    ).bind(
+      f.node,
+      f.nodeUid,
+      JSON.stringify({ boot_id: oldFacts.boot_id, components: [] }),
+      now,
+      now,
+      f.region,
+    ),
+  ]);
+  const old = await loadRegionJoinBundle(
+    env.DB,
+    env.CREDENTIAL_KEYS,
+    joinBundleReference(f.region, 1),
+  );
+  await storeRegionJoinBundle(
+    env.DB,
+    env.CREDENTIAL_KEYS,
+    joinBundleReference(f.region, 2),
+    {
+      ...old,
+      talos_version: "1.14.1",
+      kubernetes_version: "1.36.5",
+      talos_admin_config: "new-current-talos-authority",
+      kubeconfig: "new-current-kubernetes-authority",
+    },
+  );
+  await env.DB.prepare(
+    "UPDATE regions SET bootstrap_material_revision=2 WHERE id=?",
+  )
+    .bind(f.region)
+    .run();
+  expect(await restoreFleetPatchPlacements(f.runtime, f.op)).toBe(false);
+  let dispatched = 0;
+  const runtime = {
+    ...f.runtime,
+    PATCH_NODE: {
+      create: async () => {
+        dispatched++;
+        return {};
+      },
+    },
+  } as unknown as Env;
+  const next = await continueFleetPatchRegion(runtime, f.op);
+  expect(next).not.toBeNull();
+  expect(next!.stage).toBe("runtime_admission");
+  const input = await fleetPatchInput(runtime, next!.operation_id);
+  expect(
+    (await readFleetPatch(runtime, next!.operation_id)).material_revision,
+  ).toBe(2);
+  expect(input.host_configuration_only).toBe(false);
+  expect(input.host_configuration).toBeUndefined();
+  expect(input.talos_admin_config).toBe("new-current-talos-authority");
+  expect(input.kubeconfig).toBe("new-current-kubernetes-authority");
+  expect((await continueFleetPatchRegion(runtime, f.op))!.operation_id).toBe(
+    next!.operation_id,
+  );
+  expect(dispatched).toBe(2);
+  expect(await restoreFleetPatchPlacements(runtime, f.op)).toBe(false);
+  expect((await readFleetPatch(runtime, f.op)).stage).toBe("complete");
+  expect((await readFleetPatch(runtime, f.op)).material_revision).toBe(1);
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='complete',state='confirmed' WHERE operation_id=?",
+  )
+    .bind(next!.operation_id)
+    .run();
+  expect(await restoreFleetPatchPlacements(runtime, next!.operation_id)).toBe(
+    true,
+  );
+});

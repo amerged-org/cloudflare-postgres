@@ -727,28 +727,61 @@ function argsFor(value: Record<string, unknown>) {
 export async function readFleetFluxIdentities(
   assets: FleetPlatformAssets,
   commands: Pick<FleetPlatformCommands, "kube">,
+  authority?: {
+    operation_id: string;
+    bound_uids: Record<string, string>;
+  },
 ): Promise<Record<string, string>> {
   const result: Record<string, string> = {};
   for (let offset = 0; offset < assets.flux.length; offset += 8) {
     const reads = await Promise.allSettled(
       assets.flux.slice(offset, offset + 8).map(async (value) => {
-        const text = await commands.kube([
-          "get",
-          ...argsFor(value),
-          "--output=jsonpath={.metadata.uid}",
-        ]);
-        if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(text))
+        const key = resourceKey(value),
+          expectedUid = authority?.bound_uids[key],
+          text = await commands.kube([
+            "get",
+            ...argsFor(value),
+            "--ignore-not-found",
+            "--output=json",
+          ]);
+        if (!text.trim()) {
+          if (expectedUid)
+            throw new BootstrapError("patch_platform_identity_changed");
+          return null;
+        }
+        const actual = object(JSON.parse(text)),
+          metadata = object(actual.metadata),
+          uid = metadata.uid;
+        if (
+          typeof uid !== "string" ||
+          !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(uid) ||
+          metadata.deletionTimestamp ||
+          resourceKey(actual) !== key
+        )
           throw new BootstrapError("patch_flux_identity_missing");
-        return [resourceKey(value), text] as const;
+        if (expectedUid && uid !== expectedUid)
+          throw new BootstrapError("patch_platform_identity_changed");
+        if (authority && !expectedUid) {
+          if (
+            object(metadata.annotations ?? {})[
+              "pgcf.io/fleet-patch-operation"
+            ] !== authority.operation_id
+          )
+            throw new BootstrapError("patch_platform_identity_unbound");
+          assertOwnedResource(value, actual);
+        }
+        return [key, uid] as const;
       }),
     );
     const failed = reads.find((v) => v.status === "rejected");
     if (failed?.status === "rejected") throw failed.reason;
     for (const value of reads)
-      if (value.status === "fulfilled") result[value.value[0]] = value.value[1];
+      if (value.status === "fulfilled" && value.value)
+        result[value.value[0]] = value.value[1];
   }
   return result;
 }
+
 function merge(current: unknown, wanted: unknown): unknown {
   if (!wanted || typeof wanted !== "object" || Array.isArray(wanted))
     return structuredClone(wanted);
@@ -771,12 +804,56 @@ async function reconcileDeclaredResource(
   expected: Record<string, unknown>,
   uid: string | undefined,
   commands: FleetPlatformCommands,
+  creationOperation?: string,
 ) {
-  if (!uid) throw new BootstrapError("patch_platform_identity_unbound");
   const target = argsFor(expected),
-    actual = object(
-      JSON.parse(await commands.kube(["get", ...target, "--output=json"])),
-    );
+    read = () =>
+      commands.kube(["get", ...target, "--ignore-not-found", "--output=json"]);
+  if (!uid) {
+    if (!creationOperation)
+      throw new BootstrapError("patch_platform_identity_unbound");
+    const before = await read();
+    if (!before.trim()) {
+      const metadata = object(expected.metadata),
+        created = {
+          ...expected,
+          metadata: {
+            ...metadata,
+            annotations: {
+              ...object(metadata.annotations ?? {}),
+              "pgcf.io/fleet-patch-operation": creationOperation,
+            },
+          },
+        };
+      await commands.authorize();
+      // A fixed-name create cannot replace an existing object. Resolve its reply by GET.
+      await commands
+        .kube(
+          ["create", "--filename=/dev/stdin", "--output=json"],
+          JSON.stringify(created),
+        )
+        .catch(() => undefined);
+    }
+    const after = await read();
+    if (!after.trim())
+      throw new BootstrapError("patch_platform_creation_unconfirmed");
+    const actual = object(JSON.parse(after)),
+      metadata = object(actual.metadata);
+    if (
+      resourceKey(actual) !== resourceKey(expected) ||
+      typeof metadata.uid !== "string" ||
+      !/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(metadata.uid) ||
+      metadata.deletionTimestamp ||
+      object(metadata.annotations ?? {})["pgcf.io/fleet-patch-operation"] !==
+        creationOperation
+    )
+      throw new BootstrapError("patch_platform_identity_unbound");
+    assertOwnedResource(expected, actual);
+    return metadata.uid;
+  }
+  const text = await read();
+  if (!text.trim()) throw new BootstrapError("patch_platform_identity_changed");
+  const actual = object(JSON.parse(text));
   if (
     object(actual.metadata).uid !== uid ||
     object(actual.metadata).deletionTimestamp
@@ -932,14 +1009,24 @@ export async function reconcileFleetFlux(
   assets: FleetPlatformAssets,
   baseline: Record<string, string>,
   commands: FleetPlatformCommands,
+  onCreated?: (bindings: Record<string, string>) => Promise<void>,
 ) {
   await pruneDeprecatedFlux(input, assets, baseline, commands);
-  for (const value of assets.flux)
-    await reconcileDeclaredResource(
+  for (const value of assets.flux) {
+    const key = resourceKey(value);
+    if (!baseline[key] && !onCreated)
+      throw new BootstrapError("patch_platform_identity_unbound");
+    const createdUid = await reconcileDeclaredResource(
       value,
-      baseline[resourceKey(value)],
+      baseline[key],
       commands,
+      input.status.operation_id,
     );
+    if (!baseline[key] && createdUid) {
+      await onCreated!({ [key]: createdUid });
+      baseline[key] = createdUid;
+    }
+  }
 }
 export function fleetPlatformSourceObjects(
   input: FleetPatchInput,

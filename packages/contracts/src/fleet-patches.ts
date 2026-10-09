@@ -438,6 +438,25 @@ export function fleetPatchCheckpointAllowed(
     return true;
   if (current.stage === "host_ready" || current.stage === "complete")
     return false;
+  if (
+    current.stage === "flux" &&
+    next.stage === "flux" &&
+    current.state === "dispatched" &&
+    next.state === "dispatched"
+  ) {
+    const prior = [
+        ...Object.entries(current.baseline?.platform_resource_uids ?? {}),
+        ...Object.entries(current.observed?.platform_resource_uids ?? {}),
+      ],
+      updated = facts.platform_resource_uids ?? {};
+    return (
+      healthy &&
+      prior.every(([key, uid]) => updated[key] === uid) &&
+      Object.keys(updated).some(
+        (key) => !prior.some(([bound]) => bound === key),
+      )
+    );
+  }
   if (next.stage === "host_ready")
     return (
       current.stage === "runtime_admission" &&

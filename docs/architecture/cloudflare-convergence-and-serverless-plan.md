@@ -418,14 +418,15 @@ If a path misses its target or late binding is not solved, the gate stays open.
 
 ## 10. Execution order and release gates
 
-Current execution gate: **1**. Close each gate live before beginning the next large package.
+Current execution gate: **2**. Gate 1 passed live; the US authority rotation is also accepted.
+Close each gate live before beginning the next large package.
 These eight execution packages organize work; the thirteen rows in section11 remain the final
 acceptance checklist. Existing later-gate source is retained unchanged, not discarded.
 
 | Order | Work package | Required closure |
 | --- | --- | --- |
-| 1 — current | CI parity and current delivery | Reproduce CI on native Linux/AMD64 with Node24.21, the same Docker version and Rust targets. Fix collected wall-clock, inspect-capability and architecture-pin failures; obtain green CI and deliver no-ceiling, configurable threshold/purchase-switch and generic optional-email behavior. |
-| 2 | R1: uniform retained fleet | Official Image Factory Talos1.14.2, Kubernetes1.36.5 and pinned platform on all three servers, using supported upgrades without reinstallation. Prove actual common release and preserved data/identities. |
+| 1 — passed live | CI parity and current delivery | Reproduce CI on native Linux/AMD64 with Node24.21, the same Docker version and Rust targets. Fix collected wall-clock, inspect-capability and architecture-pin failures; obtain green CI and deliver no-ceiling, configurable threshold/purchase-switch and generic optional-email behavior. |
+| 2 — current | R1: uniform retained fleet | Official Image Factory Talos1.14.2, Kubernetes1.36.5 and pinned platform on all three servers, using supported upgrades without reinstallation. Prove actual common release and preserved data/identities. |
 | 3 | R2: extension and patch management | The same baseline plus the sandbox extension. Interrupt/resume its supported Talos upgrade; prove all retained roles, exact final configuration/runtime and preserved data. |
 | 4 | Thin storage, then backup/recovery lifecycle | Qualify actual physical storage and startup bounds, then repeat SQL/TLS/roles, R2 base/WAL, PITR/restore and physical deletion on the new model. |
 | 5 | Configurable expansion and Headless Ready | One real threshold-driven, already-authorized V159 purchase reaches Ready with no operator. Resolve postjoin409, prove exactly-once purchase, current-policy dispatch and continued eligible placement. |

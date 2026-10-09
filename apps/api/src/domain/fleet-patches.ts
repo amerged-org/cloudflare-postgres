@@ -383,6 +383,7 @@ export async function fleetPatchInput(
     status: status(row),
     host_configuration_only:
       !!row.finalization_of &&
+      !!spec.roles[selected.role].host_configuration_required &&
       (await readFleetPatch(env, row.finalization_of)).material_revision !==
         row.material_revision,
     regional_hosts_ready: await regionalFleetHostsReady(env, row, spec),
@@ -665,7 +666,7 @@ export async function continueFleetPatchRegion(
     if (next) return next;
   }
   const stale = await env.DB.prepare(
-    `SELECT p.operation_id FROM fleet_patch_operations p JOIN regions r ON r.id=p.region_id JOIN nodes n ON n.id=p.node_id JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_releases s ON s.id=a.release_id WHERE p.region_id=? AND p.release_id=? AND p.spec_sha256=? AND p.region_revision=? AND p.stage='complete' AND p.state='confirmed' AND p.material_revision<r.bootstrap_material_revision AND p.node_uid=n.node_uid AND a.node_uid=n.node_uid AND a.revision=p.assignment_revision AND a.release_id=p.release_id AND n.lost_at IS NULL AND json_extract(s.spec_json,'$.roles.'||a.role||'.host_configuration_required')=1 AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations f WHERE f.node_id=p.node_id AND f.node_uid=p.node_uid AND f.release_id=p.release_id AND f.assignment_revision=p.assignment_revision AND f.material_revision=r.bootstrap_material_revision) ORDER BY p.updated_at DESC LIMIT 1`,
+    `SELECT p.operation_id FROM fleet_patch_operations p JOIN regions r ON r.id=p.region_id JOIN nodes n ON n.id=p.node_id JOIN fleet_node_releases a ON a.node_id=n.id WHERE p.region_id=? AND p.release_id=? AND p.spec_sha256=? AND p.region_revision=? AND p.stage='complete' AND p.state='confirmed' AND p.material_revision<r.bootstrap_material_revision AND p.node_uid=n.node_uid AND a.node_uid=n.node_uid AND a.revision=p.assignment_revision AND a.release_id=p.release_id AND n.lost_at IS NULL AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations f WHERE f.node_id=p.node_id AND f.node_uid=p.node_uid AND f.release_id=p.release_id AND f.assignment_revision=p.assignment_revision AND f.material_revision=r.bootstrap_material_revision) ORDER BY p.updated_at DESC LIMIT 1`,
   )
     .bind(row.region_id, row.release_id, row.spec_sha256, row.region_revision)
     .first<{ operation_id: string }>();
@@ -867,7 +868,8 @@ async function prepareFleetPatchInsert(
     finalization?.observed_json ?? null,
     finalization?.talos_upgrade_receipt_json ?? null,
     finalization
-      ? finalization.material_revision !== ref.revision
+      ? finalization.material_revision !== ref.revision &&
+        selectedSpec.roles[selected.role].host_configuration_required
         ? "host_config"
         : "runtime_admission"
       : "preflight",

@@ -83,6 +83,11 @@ Flux's active controller composition comes from `lock.flux.components`. Shared p
 CRDs/RBAC remain. Removal of accidental optional controllers requires their original admitted
 bootstrap owner, baseline UID and exact verified vendor spec. Conditional UID/resource-version
 DeleteOptions and fresh reads resolve outcomes; a replacement resource is never deleted.
+An upgrade may introduce a fixed vendor resource absent from the retained cluster. Only a real
+NotFound observation permits its fixed-name creation from the qualified artifact. The operation
+records the returned/read-back UID before another creation; lost replies are resolved against
+the same operation-owned spec. A denied or failed read never means absence, and a recorded UID
+may not disappear or change.
 
 Flux/Helm acceptance uses current Ready conditions and immutable source/applied revisions. Chart
 versions allow the vendor's OCI build suffix, while current Helm history must carry the full
@@ -127,6 +132,9 @@ never restarts a controller around active thin writers.
 A confirmed configuration waiting for a kernel module never triggers another identical apply.
 Final Ready and operation-owned placement reopening wait for every current-material host/pool and
 selected storage qualification. The previous completed operations remain immutable.
+Roles without protected host settings use a distinct current-custody runtime/database final pass
+after a material revision changes. It cannot enter OS or Kubernetes write stages; placement stays
+closed until that pass completes with fresh identities and release observations.
 
 ## Identity, interruption and remaining acceptance
 

@@ -447,15 +447,43 @@ export async function runFleetPatch(
           facts.legacy_storage_bindings ??
             current.baseline?.legacy_storage_bindings,
         );
-        const identities = current.baseline?.platform_resource_uids ?? {
-          ...platformState.uids,
-          ...(await readFleetFluxIdentities(assets, { kube })),
+        const identities = {
+          ...current.observed?.platform_resource_uids,
+          ...current.baseline?.platform_resource_uids,
         };
+        const fluxKeys = new Set(
+          assets.flux.map((value) => {
+            const metadata = object(value.metadata);
+            return `${value.kind}/${metadata.namespace ?? ""}/${metadata.name}`;
+          }),
+        );
+        const fluxIdentities =
+          !current.baseline ||
+          ["flux", "release_verify"].includes(current.stage)
+            ? await readFleetFluxIdentities(
+                assets,
+                { kube },
+                current.baseline
+                  ? {
+                      operation_id: current.operation_id,
+                      bound_uids: identities,
+                    }
+                  : undefined,
+              )
+            : {};
         for (const [key, uid] of Object.entries(platformState.uids))
           if (identities[key] && identities[key] !== uid)
             throw new BootstrapError("patch_platform_identity_changed");
-        facts.platform_resource_uids = platformState.uids;
-        if (!current.baseline) facts.platform_resource_uids = identities;
+        facts.platform_resource_uids = {
+          ...identities,
+          ...Object.fromEntries(
+            Object.entries(platformState.uids).filter(
+              ([key]) =>
+                !current.baseline || !fluxKeys.has(key) || identities[key],
+            ),
+          ),
+          ...fluxIdentities,
+        };
         const receipt = current.talos_upgrade_receipt,
           postReboot =
             receipt &&
@@ -914,9 +942,29 @@ export async function runFleetPatch(
           await checkpoint(stage, "dispatched", facts);
         await authorize();
         const commands = { kube, authorize },
-          baseline = current.baseline.platform_resource_uids;
+          baseline = {
+            ...(stage === "flux"
+              ? current.observed?.platform_resource_uids
+              : facts.platform_resource_uids),
+            ...current.baseline.platform_resource_uids,
+          };
         if (stage === "flux")
-          await reconcileFleetFlux(input, assets, baseline, commands);
+          await reconcileFleetFlux(
+            input,
+            assets,
+            baseline,
+            commands,
+            async (bindings) => {
+              const after = await fresh();
+              if (
+                Object.entries(bindings).some(
+                  ([key, uid]) => after.platform_resource_uids?.[key] !== uid,
+                )
+              )
+                throw new BootstrapError("patch_platform_identity_changed");
+              await checkpoint("flux", "dispatched", after);
+            },
+          );
         else if (stage === "platform")
           await reconcileFleetPlatformSource(
             input,
