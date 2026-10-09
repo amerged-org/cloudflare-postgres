@@ -14,6 +14,10 @@ runtime unchanged. The controller waits for its protected configuration and agen
 
 ## CI order
 
+Whole-OS qualification and initrd expansion require **Node.js 24.21.0 or a later 24.x release**.
+Earlier 24.x decoders can silently accept truncated Zstd frames. Other major versions are
+unqualified and fail with `boot_node_runtime_unsupported` before Docker or image processing.
+
 Extend the existing single CI workflow. The pure producer/template checks are:
 
 ```sh

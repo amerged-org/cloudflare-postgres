@@ -14,6 +14,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { randomBytes } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { zstdCompressSync } from "node:zlib";
 import {
@@ -291,6 +292,53 @@ test("initrd expansion consumes both actual Zstd frames and keeps one aggregate 
         join(directory, "invalid.zstd"),
         join(directory, "invalid.cpio"),
       ),
+    );
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test("streamed initrd frames stop their input at frame EOF before the next source chunk", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-streamed-initrd-"));
+  try {
+    // Incompressible frames force multiple filesystem reads; tiny compressed fixtures hide
+    // the half-open decoder receiving a later chunk from the middle of the second frame.
+    const base = randomBytes(160 * 1024 + 17),
+      extension = randomBytes(192 * 1024 + 29),
+      first = zstdCompressSync(base),
+      second = zstdCompressSync(extension),
+      input = join(directory, "initrd.zstd"),
+      output = join(directory, "initrd.cpio");
+    assert.ok(first.length > 2 * 65536 && first.length % 65536 !== 0);
+    assert.ok(second.length > 2 * 65536);
+    await writeFile(input, Buffer.concat([first, second]), { mode: 0o600 });
+    await expandBootInitrd(input, output);
+    assert.deepEqual(await readFile(output), Buffer.concat([base, extension]));
+    await assert.rejects(expandBootInitrd(input, output));
+    assert.deepEqual(await readFile(output), Buffer.concat([base, extension]));
+    await assert.rejects(
+      expandBootInitrd(
+        input,
+        join(directory, "bounded.cpio"),
+        base.length + extension.length - 1,
+      ),
+      /boot_initrd_expansion_limit/,
+    );
+    await writeFile(input, Buffer.concat([first, second.subarray(0, -1)]), {
+      mode: 0o600,
+    });
+    await assert.rejects(
+      expandBootInitrd(input, join(directory, "truncated.cpio")),
+    );
+    await writeFile(
+      input,
+      Buffer.concat([first, second, Buffer.from("invalid tail")]),
+      { mode: 0o600 },
+    );
+    await assert.rejects(
+      expandBootInitrd(input, join(directory, "invalid.cpio")),
+    );
+    await assert.rejects(
+      expandBootInitrd(directory, join(directory, "unreadable.cpio")),
     );
   } finally {
     await rm(directory, { recursive: true, force: true });

@@ -12,7 +12,7 @@ import {
   cp,
 } from "node:fs/promises";
 import { join, resolve } from "node:path";
-import { pipeline } from "node:stream/promises";
+import { finished, pipeline } from "node:stream/promises";
 import { createZstdDecompress } from "node:zlib";
 import { pathToFileURL } from "node:url";
 import {
@@ -46,6 +46,10 @@ import reviewed from "../../../scripts/ci/reviewed-findings.json" with { type: "
 import { classifyReviewedTalosBoot } from "../../../scripts/ci/reviewed-findings.ts";
 function check(v: unknown, code: string): asserts v {
   if (!v) throw Error(code);
+}
+function checkBootNodeRuntime() {
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  check(major === 24 && minor! >= 21, "boot_node_runtime_unsupported");
 }
 const digest = (b: Buffer | string) =>
   createHash("sha256").update(b).digest("hex");
@@ -531,6 +535,7 @@ export async function expandBootInitrd(
   output: string,
   limit = 2 * 1024 ** 3,
 ) {
+  checkBootNodeRuntime();
   check(
     Number.isSafeInteger(limit) && limit > 0 && limit <= 2 * 1024 ** 3,
     "boot_initrd_expansion_limit",
@@ -548,14 +553,52 @@ export async function expandBootInitrd(
   let consumed = 0;
   while (consumed < inputSize) {
     // Node ends at the first frame; Talos appends the system-extension CPIO in another frame.
-    const decoder = createZstdDecompress();
-    await pipeline(
-      bounded(createReadStream(input, { start: consumed }).pipe(decoder)),
-      createWriteStream(output, {
-        mode: 0o600,
-        flags: consumed === 0 ? "wx" : "a",
-      }),
-    );
+    const source = createReadStream(input, { start: consumed }),
+      decoder = createZstdDecompress();
+    async function feedFrame() {
+      try {
+        for await (const chunk of source) {
+          const before = decoder.bytesWritten;
+          await new Promise<void>((resolve, reject) => {
+            decoder.write(chunk, (error) =>
+              error ? reject(error) : resolve(),
+            );
+          });
+          // Native Zstd stops within this chunk at frame EOF. A later chunk may
+          // start inside the next frame, so never feed it to this decoder.
+          if (decoder.bytesWritten - before < chunk.length) return;
+        }
+        decoder.end();
+      } catch (error) {
+        decoder.destroy(
+          error instanceof Error
+            ? error
+            : Error("boot_initrd_decompression_failed"),
+        );
+        throw error;
+      }
+    }
+    try {
+      // Install error/teardown ownership before input starts flowing.
+      const expansion = pipeline(
+        decoder,
+        bounded,
+        createWriteStream(output, {
+          mode: 0o600,
+          flags: consumed === 0 ? "wx" : "a",
+        }),
+      );
+      await Promise.all([expansion, feedFrame()]);
+    } finally {
+      source.destroy();
+      decoder.destroy();
+      // Deliberate first-frame termination closes an incomplete source; wait for
+      // both streams to release their resources on success and on decode failure.
+      await Promise.allSettled([
+        finished(source, { cleanup: true }),
+        finished(decoder, { cleanup: true }),
+      ]);
+    }
     check(
       Number.isSafeInteger(decoder.bytesWritten) &&
         decoder.bytesWritten > 0 &&
@@ -760,6 +803,7 @@ export async function qualifyBootImages(
   directoryInput: string,
   sourceCommit: string,
 ) {
+  checkBootNodeRuntime();
   const directory = resolve(directoryInput);
   check(/^[a-f0-9]{40}$/.test(sourceCommit), "boot_source_revision_invalid");
   const binding = await context(directory, sourceCommit),
