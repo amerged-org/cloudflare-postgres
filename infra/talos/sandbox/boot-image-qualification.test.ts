@@ -1,10 +1,20 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtemp, open, rm, writeFile, readFile } from "node:fs/promises";
+import {
+  mkdtemp,
+  mkdir,
+  open,
+  rm,
+  writeFile,
+  readFile,
+  readdir,
+  stat,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { zstdCompressSync } from "node:zlib";
 import {
   crc32,
@@ -17,7 +27,130 @@ import {
   validateBootFacts,
   inspectBootBaseImage,
   expandBootInitrd,
+  runBootTool,
 } from "./boot-image-qualification.ts";
+import { sandboxImagePlan, bindSandboxImageProfiles } from "./images.ts";
+
+const failurePrefix =
+  "Whole OS qualification failed; installer/raw publication is not authorized.";
+function runFailureCli(directory: string, path: string, source: string) {
+  const result = spawnSync(
+    process.execPath,
+    [
+      fileURLToPath(new URL("./boot-image-qualification.ts", import.meta.url)),
+      directory,
+      source,
+    ],
+    {
+      env: { ...process.env, PATH: path },
+      encoding: "utf8",
+      timeout: 30000,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  assert.equal(result.status, 1);
+  assert.equal(result.stdout, "");
+  assert.ok(result.stderr.startsWith(failurePrefix));
+  return {
+    stderr: result.stderr,
+    diagnostic: JSON.parse(result.stderr.slice(failurePrefix.length).trim()),
+  };
+}
+test("the real CLI preserves the existing safe failure stage and code without launching Docker", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-boot-cli-test-"));
+  try {
+    const source = "d".repeat(40),
+      extension = `ghcr.io/example/sandbox@sha256:${"a".repeat(64)}`,
+      recipe = `ghcr.io/example/recipe@sha256:${"b".repeat(64)}`,
+      plan = sandboxImagePlan({
+        sourceCommit: source,
+        architecture: "amd64",
+        sandboxExtension: extension,
+        otherExtensions: [],
+      }),
+      profiles = bindSandboxImageProfiles(plan, recipe),
+      context = join(directory, "recipe-context"),
+      emptyPath = join(directory, "no-programs");
+    await mkdir(context);
+    await mkdir(emptyPath);
+    for (const [name, value] of [
+      ["plan.json", plan],
+      ["installer.profile.json", profiles.installer],
+      ["raw.profile.json", profiles.raw],
+    ] as const)
+      await writeFile(join(context, name), JSON.stringify(value), {
+        mode: 0o600,
+      });
+    // Fixture metadata only reaches the command boundary. An empty PATH proves no Docker/tool action can execute.
+    for (const [name, profile, reference] of [
+      ["extension-gate", "sandbox-extension", extension],
+      ["recipe-gate", "talos-recipe", recipe],
+    ] as const) {
+      const gate = join(directory, name);
+      await mkdir(gate);
+      await writeFile(
+        join(gate, "qualification.json"),
+        JSON.stringify({
+          version: 2,
+          profile,
+          revision: source,
+          unresolved: 0,
+          opaqueExpectedBytes: 1,
+          opaqueDetectorBytes: 1,
+          configDigest: `sha256:${"c".repeat(64)}`,
+          recipeSha256: plan.recipeSha256,
+        }),
+        { mode: 0o600 },
+      );
+      await writeFile(
+        join(gate, "registry.json"),
+        JSON.stringify({
+          configDigest: `sha256:${"c".repeat(64)}`,
+          digest: reference.split("@")[1],
+        }),
+        { mode: 0o600 },
+      );
+    }
+    const result = runFailureCli(directory, emptyPath, source),
+      work = (await readdir(directory)).find((name) =>
+        name.startsWith("whole-os-gate-"),
+      )!;
+    assert.deepEqual(result.diagnostic, {
+      passed: false,
+      stage: "boot_tool_build",
+      code: "boot_docker_command_failed",
+    });
+    assert.deepEqual(
+      result.diagnostic,
+      JSON.parse(
+        await readFile(join(directory, work, "failure.private.json"), "utf8"),
+      ),
+    );
+    assert.ok(!result.stderr.includes(directory));
+    assert.ok(!result.stderr.includes(extension));
+    assert.ok(!result.stderr.includes(source));
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+test("the real CLI masks unknown preflight errors and private-looking paths", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-boot-cli-test-"));
+  try {
+    const marker = "private-candidate-input-never-log",
+      missing = join(directory, marker),
+      result = runFailureCli(missing, directory, "d".repeat(40));
+    assert.deepEqual(result.diagnostic, {
+      passed: false,
+      stage: "boot_gate_failed",
+      code: "boot_gate_failed",
+    });
+    assert.ok(!result.stderr.includes(marker));
+    assert.ok(!result.stderr.includes(directory));
+    assert.doesNotMatch(result.stderr, /ENOENT|recipe-context|stack|at file:/);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
 test(
   "actual loaded base inspection preserves AMD64 image ID and diffID binding",
   { skip: !process.env.PGCF_TEST_BOOT_BASE_IMAGE },
@@ -361,3 +494,150 @@ test("actual SquashFS pseudo xattr encodings are decoded before scanning without
     /escape_invalid/,
   );
 });
+
+test(
+  "boot helper returns private success and failure files to a nonroot Linux owner",
+  { skip: !process.env.PGCF_TEST_BOOT_TOOL_IMAGE },
+  () => {
+    const image = process.env.PGCF_TEST_BOOT_TOOL_IMAGE!;
+    assert.match(image, /^sha256:[a-f0-9]{64}$/);
+    const suffix = `${process.pid}-${Date.now()}`,
+      input = `pgcf-boot-owner-input-${suffix}`,
+      output = `pgcf-boot-owner-output-${suffix}`;
+    const docker = (args: string[], stdin?: string) =>
+      spawnSync("docker", args, {
+        input: stdin,
+        encoding: "utf8",
+        timeout: 45000,
+        maxBuffer: 1024 * 1024,
+      });
+    const run = [
+      "run",
+      "--rm",
+      "--network",
+      "none",
+      "--cpus",
+      "1",
+      "--memory",
+      "512m",
+      "--pids-limit",
+      "64",
+      "--security-opt",
+      "no-new-privileges",
+    ];
+    try {
+      for (const name of [input, output])
+        assert.equal(docker(["volume", "create", name]).status, 0);
+      const setup = docker([
+        ...run,
+        "--cap-drop",
+        "ALL",
+        "--cap-add",
+        "CHOWN",
+        "--cap-add",
+        "FOWNER",
+        "--cap-add",
+        "DAC_OVERRIDE",
+        "--mount",
+        `type=volume,src=${input},dst=/input`,
+        "--mount",
+        `type=volume,src=${output},dst=/output`,
+        "--mount",
+        `type=bind,src=${fileURLToPath(new URL("./boot-inspect-worker.ts", import.meta.url))},dst=/source.ts,readonly`,
+        "--entrypoint",
+        "/bin/sh",
+        image,
+        "-ec",
+        "mkdir /tmp/tiny; printf public-fixture > /tmp/tiny/marker; mksquashfs /tmp/tiny /input/tiny.squashfs -noappend -quiet -processors 1; cp /source.ts /input/worker.ts; chmod 755 /input; chmod 644 /input/*; chown 1001:1001 /output; chmod 700 /output",
+      ]);
+      assert.equal(setup.status, 0, setup.stderr);
+      const helper = (mode: string) =>
+        docker(
+          [
+            ...run,
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--cap-add",
+            "DAC_OVERRIDE",
+            "--cap-add",
+            "CHOWN",
+            "--tmpfs",
+            "/work:rw,nosuid,nodev,size=16m",
+            "--mount",
+            `type=volume,src=${input},dst=/input,readonly`,
+            "--mount",
+            `type=volume,src=${output},dst=/output`,
+            "-i",
+            "--entrypoint",
+            "node",
+            image,
+            "/input/worker.ts",
+          ],
+          JSON.stringify({
+            mode,
+            path: "/input/tiny.squashfs",
+            prefix: "synthetic",
+            output_uid: 1001,
+            output_gid: 1001,
+          }),
+        );
+      const completed = helper("squashfs");
+      assert.equal(completed.status, 0, completed.stderr);
+      const failed = helper("invalid");
+      assert.equal(failed.status, 1);
+      const reader = docker([
+        ...run,
+        "--user",
+        "1001:1001",
+        "--cap-drop",
+        "ALL",
+        "--read-only",
+        "--mount",
+        `type=volume,src=${output},dst=/output,readonly`,
+        "--entrypoint",
+        "node",
+        image,
+        "-e",
+        "const fs=require('fs'),a=require('assert/strict');const d=fs.statSync('/output');a.equal(d.uid,1001);a.equal(d.mode&511,448);for(const name of fs.readdirSync('/output')){const f='/output/'+name,s=fs.statSync(f);a.equal(s.uid,1001);a.equal(s.gid,1001);a.equal(s.mode&511,384);fs.readFileSync(f)}a.equal(JSON.parse(fs.readFileSync('/output/files.json')).files.length,1);a.equal(JSON.parse(fs.readFileSync('/output/failure.private.json')).code,'boot_tool_mode_invalid');",
+      ]);
+      assert.equal(reader.status, 0, reader.stderr);
+    } finally {
+      for (const name of [input, output])
+        assert.equal(docker(["volume", "rm", name]).status, 0);
+    }
+  },
+);
+
+test(
+  "boot helper failure reaches its caller as a bounded code with private host-readable output",
+  { skip: !process.env.PGCF_TEST_BOOT_TOOL_IMAGE },
+  async () => {
+    const directory = await mkdtemp(join(tmpdir(), "pgcf-boot-tool-failure-")),
+      input = join(directory, "public-fixture"),
+      output = join(directory, "output");
+    try {
+      await writeFile(input, "public fixture", { mode: 0o600 });
+      await assert.rejects(
+        runBootTool(
+          process.env.PGCF_TEST_BOOT_TOOL_IMAGE!,
+          { mode: "invalid" },
+          input,
+          output,
+          30000,
+        ),
+        /^Error: boot_tool_mode_invalid$/,
+      );
+      const failure = join(output, "failure.private.json"),
+        info = await stat(failure);
+      assert.equal(info.uid, process.getuid!());
+      assert.equal(info.mode & 0o777, 0o600);
+      assert.deepEqual(JSON.parse(await readFile(failure, "utf8")), {
+        failed: true,
+        code: "boot_tool_mode_invalid",
+      });
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
+  },
+);

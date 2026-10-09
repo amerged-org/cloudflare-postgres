@@ -262,11 +262,24 @@ export async function runBootTool(
   privileged = false,
 ) {
   await mkdir(output, { recursive: true, mode: 0o700 });
+  const owner = await stat(output);
+  check(
+    owner.isDirectory() &&
+      (owner.mode & 0o077) === 0 &&
+      owner.uid === process.getuid?.() &&
+      [owner.uid, owner.gid].every(
+        (value) =>
+          Number.isSafeInteger(value) && value >= 0 && value < 0xffffffff,
+      ),
+    "boot_output_owner_invalid",
+  );
   const session = randomUUID(),
     name = "pgcf-boot-" + session,
     inputPath = "/input/" + session;
   const payload = {
     ...job,
+    output_uid: owner.uid,
+    output_gid: owner.gid,
     ...(job.mode === "filesystems" || job.mode === "boot"
       ? { raw: inputPath }
       : { path: inputPath }),
@@ -297,9 +310,11 @@ export async function runBootTool(
           : [
               "--cap-drop",
               "ALL",
-              ...(job.mode === "squashfs"
-                ? ["--cap-add", "DAC_READ_SEARCH"]
-                : []),
+              // Only /output and the disposable /work tmpfs are writable.
+              "--cap-add",
+              "DAC_OVERRIDE",
+              "--cap-add",
+              "CHOWN",
             ]),
         "--tmpfs",
         "/work:rw,nosuid,nodev,size=2g",
@@ -314,7 +329,19 @@ export async function runBootTool(
       timeout,
       JSON.stringify(payload),
     );
-    check(run.code === 0, "boot_tool_execution_failed");
+    if (run.code !== 0) {
+      const failure = await json(
+        join(output, "failure.private.json"),
+        4096,
+      ).catch(() => null);
+      throw Error(
+        failure?.failed === true &&
+          typeof failure.code === "string" &&
+          /^boot_[a-z_]{1,120}$/.test(failure.code)
+          ? failure.code
+          : "boot_tool_execution_failed",
+      );
+    }
   } finally {
     await command(
       ["rm", "--force", name],
@@ -1032,19 +1059,22 @@ export async function qualifyBootImages(
     );
     return result;
   } catch (error) {
+    const failure = {
+      passed: false,
+      stage,
+      code:
+        error instanceof Error && /^boot_[a-z_]+$/.test(error.message)
+          ? error.message
+          : "boot_gate_failed",
+    };
     await writeFile(
       join(work, "failure.private.json"),
-      JSON.stringify({
-        passed: false,
-        stage,
-        code:
-          error instanceof Error && /^boot_[a-z_]+$/.test(error.message)
-            ? error.message
-            : "boot_gate_failed",
-      }),
+      JSON.stringify(failure),
       { mode: 0o600 },
     );
-    throw Error("whole_os_qualification_failed:" + stage);
+    throw Error(
+      `whole_os_qualification_failed:${failure.stage}:${failure.code}`,
+    );
   }
 }
 if (
@@ -1058,9 +1088,20 @@ if (
     );
   qualifyBootImages(directory, source)
     .then((r) => console.log(JSON.stringify(r)))
-    .catch(() => {
+    .catch((error: unknown) => {
+      const failure =
+        error instanceof Error
+          ? /^whole_os_qualification_failed:(boot_[a-z_]+):(boot_[a-z_]+)$/.exec(
+              error.message,
+            )
+          : null;
       console.error(
         "Whole OS qualification failed; installer/raw publication is not authorized.",
+        JSON.stringify({
+          passed: false,
+          stage: failure?.[1] ?? "boot_gate_failed",
+          code: failure?.[2] ?? "boot_gate_failed",
+        }),
       );
       process.exitCode = 1;
     });

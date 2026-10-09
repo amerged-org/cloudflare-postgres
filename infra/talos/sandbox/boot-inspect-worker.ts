@@ -2,7 +2,7 @@
 // Runs only in the bounded disposable inspection container; no credentials or Docker socket.
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { createReadStream, createWriteStream } from "node:fs";
+import { constants, createReadStream, createWriteStream } from "node:fs";
 import {
   mkdir,
   readdir,
@@ -13,9 +13,31 @@ import {
 } from "node:fs/promises";
 import { join } from "node:path";
 import { pipeline } from "node:stream/promises";
+process.umask(0o077);
 const fail = (code: string): never => {
   throw Error(code);
 };
+let outputOwner: { uid: number; gid: number } | undefined;
+/** Linux containers must return private files to the owner of the mounted output. */
+async function returnOutputOwnership() {
+  if (!outputOwner) return;
+  const names = await readdir("/output");
+  if (names.length > 200010) fail("boot_output_entry_limit");
+  for (const name of names) {
+    const file = await open(
+      join("/output", name),
+      constants.O_RDONLY | constants.O_NOFOLLOW,
+    );
+    try {
+      const info = await file.stat();
+      if (!info.isFile()) fail("boot_output_file_invalid");
+      if ((info.mode & 0o777) !== 0o600) await file.chmod(0o600);
+      await file.chown(outputOwner.uid, outputOwner.gid);
+    } finally {
+      await file.close();
+    }
+  }
+}
 async function run(program: string, args: string[], timeout = 30000) {
   return new Promise<{ code: number; stdout: string }>((resolve, reject) => {
     const child = spawn(program, args, { stdio: ["ignore", "pipe", "ignore"] });
@@ -349,28 +371,44 @@ async function boot(job: { raw: string; timeout_ms: number }) {
   }
 }
 async function main() {
+  const output = await lstat("/output");
+  if (
+    !output.isDirectory() ||
+    ![output.uid, output.gid].every(
+      (value) =>
+        Number.isSafeInteger(value) && value >= 0 && value < 0xffffffff,
+    )
+  )
+    fail("boot_output_owner_invalid");
+  outputOwner = { uid: output.uid, gid: output.gid };
+  if ((output.mode & 0o077) !== 0) fail("boot_output_owner_invalid");
   let raw = "";
   for await (const chunk of process.stdin) {
     raw += chunk;
     if (raw.length > 1024 ** 2) fail("boot_job_size_invalid");
   }
   const job = JSON.parse(raw) as Record<string, unknown>;
+  if (job.output_uid !== outputOwner.uid || job.output_gid !== outputOwner.gid)
+    fail("boot_output_owner_invalid");
   if (job.mode === "filesystems") await filesystems(job as never);
   else if (job.mode === "squashfs") await squashfs(job as never);
   else if (job.mode === "boot") await boot(job as never);
   else fail("boot_tool_mode_invalid");
 }
-main().catch(async (error: unknown) => {
-  await writeFile(
-    "/output/failure.private.json",
-    JSON.stringify({
-      failed: true,
-      code:
-        error instanceof Error && /^boot_[a-z_]+$/.test(error.message)
-          ? error.message
-          : "boot_tool_failed",
-    }),
-    { mode: 0o600 },
-  ).catch(() => {});
-  process.exitCode = 1;
-});
+main()
+  .then(returnOutputOwnership)
+  .catch(async (error: unknown) => {
+    await writeFile(
+      "/output/failure.private.json",
+      JSON.stringify({
+        failed: true,
+        code:
+          error instanceof Error && /^boot_[a-z_]+$/.test(error.message)
+            ? error.message
+            : "boot_tool_failed",
+      }),
+      { mode: 0o600 },
+    ).catch(() => {});
+    await returnOutputOwnership().catch(() => {});
+    process.exitCode = 1;
+  });
