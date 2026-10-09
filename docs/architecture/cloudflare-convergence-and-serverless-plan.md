@@ -1,16 +1,19 @@
 # Unified Cloudflare control, fleet releases and serverless capacity
 
-Status: **implementation and full live acceptance remain open**. Owner direction: 2026-10-09.
+Status: **all 13 final acceptance gates remain open**. Owner direction: 2026-10-09, 17:00.
 
-This is the corrective implementation plan for the complete PGCF product, not another declaration
-of completion. [PLAN.md](../../PLAN.md) remains the canonical scope/status record. The prior
-operator-assisted US admission and database lifecycle results remain valid, but do not prove
-automatic installation, uniform configuration, fleet patching or the approved fast-start design.
+[PLAN.md](../../PLAN.md) is the canonical scope and status record. Historical operator-assisted
+US admission, database lifecycle and RAM measurements remain partial evidence.
 
-This plan supersedes the earlier deferral of EU alignment, permanent sleeping CPU reservations,
-blanket logical-volume reservations, and the reservation-preserving clauses in the Rust proposal.
-It specifies work; it does not report that this work is already deployed. No VPS purchase,
-reinstallation, live policy change or customer migration is performed by writing this plan.
+The owner's execution order in section10 supersedes earlier dependencies and permission to
+develop large work packages in parallel. Current work is gate1: native Linux/AMD64 CI parity,
+green CI and delivery of the current generic policy configuration. Existing later-gate code
+remains unchanged; this sequencing decision does not discard it.
+
+R1 is the official Image Factory Talos1.14.2 / Kubernetes1.36.5 fleet release without a custom
+OS image. R2 adds the sandbox extension and proves interrupted upgrade/resume. Upstream bytes
+use digest and official signature/SBOM verification; scan/review first-party builds only.
+This document authorizes no reinstallation or customer migration and records no new live result.
 
 ## 1. Required outcome
 
@@ -48,23 +51,27 @@ is an additional mode and cannot substitute for that pool. The subsequent Neon c
 
 ## 2. What is proved, what is not
 
-Evidence base: source commit8af3ab5; retained EU/US inventories from October7/8; actual D1 policy
-and size-class reads; accepted Regional115 release; existing live SQL/backup/recovery receipts.
-Inventory dates matter: refresh the full fleet observation once before implementation; do not
-describe a historical inventory as a continuously enforced current release.
+The reported live API/Regional baseline remains6978033; no subsequent API deployment is claimed.
+EU's actual-RAM transition took135s and preserved all3 retained database hashes. The live node
+ceilings and personal notification setup were removed; generic controls still need current-release
+delivery and acceptance.
 
-Proved: US1 Ready through an operator fallback; normal Cloudflare SQL/TLS and nonsuperuser roles
-in EU and US; R2 base/WAL checks; healthy-source cross-region restore; four5GiB test-volume deletions
-with20GiB physical reclamation; an actual79.9062% ten-minute RAM window and continued eligible
-placement. The expansion decision in that test was disabled. Existing EU data was preserved.
+Historical live evidence includes operator-assisted US1 Ready in198.356s, EU/US SQL/TLS and
+nonsuperuser roles, four R2 base/WAL checks, healthy-source EU-to-US restore in87,988ms,
+four5GiB volume deletions reclaiming20GiB, and ten fresh minute samples averaging79.9062% RAM.
+The expansion decision was disabled. These results do not close any complete gate in section11
+or replace retesting after the storage/runtime changes.
 
-Not proved: autonomous threshold-to-purchase-to-Ready completion; identical fleet software/policy;
-central profile changes converging across assigned databases; no-static-allocation density;
-programmed day-two patching; the Rust/shared-prestarted-compute-pool design and additional warm
-reclaim; safe first customer migration after
-credential rotation. None of these can be inferred from the successful database lifecycle tests.
+Uniform releases, unattended purchase-to-Ready, thin storage, EU rotation, CNPG-compatible
+shared compute and representative density remain unaccepted. Local builds, unit tests,
+artifact checks and isolated mechanisms remain distinct from live Dev acceptance.
+The refused local privileged preflight is unvalidated and is not retried.
 
 ## 3. Observed fleet differences
+
+This inventory records October7/8 observations, with the Regional/RAM rows updated for the
+reported6978033 convergence. Refresh the required facts once for the current live gate; this
+table is not a continuously enforced release observation.
 
 | Layer | EU control/relay and EU1 | US1 | Required correction |
 | --- | --- | --- | --- |
@@ -74,9 +81,9 @@ credential rotation. None of these can be inferred from the successful database 
 | Flux source/kustomize | 1.9.5/1.9.5 | 1.9.6/1.9.6 | Same approved component versions/digests |
 | Flux helm | 1.6.4 | 1.6.5 | Same approved version/digest |
 | Flux component set | No image-automation/image-reflector/source-watcher in retained inventory | Those three additional controllers installed | Declare a justified common/role-specific set; remove accidental extras |
-| Regional runtime | Source901b3228, digest eeaa6a… | Source11555215, digest1886a6… | Converge the accepted fix before enabling equivalent policy in EU |
-| Checked-in Regional baseline | Git pins14191e… | Neither live regional runtime matches that pin | Eliminate the third baseline and independent overlay drift |
-| RAM policy | reserved | actual_ram, request128MiB, maximum4096MiB | Same centrally declared customer policy and supported conversion |
+| Regional runtime | Reported source6978033 | Reported source6978033 | Preserve this accepted baseline while qualifying R1; complete release convergence remains open |
+| Release/configuration baseline | Individual component convergence is recorded | Individual component convergence is recorded | R1 must bind the checked-in release and all actual shared components/role parameters |
+| RAM policy | actual_ram, request128MiB, maximum4096MiB | Same reported policy | Preserve the accepted135s EU conversion; prove full profile changes through the API |
 | Customer-node platform CPU requests | EU1 worker350m; control1110m | Combined control/platform/customer node1510m | Explain role cost, measure actual consumption, remove unnecessary footprint |
 | PostgreSQL | SQL18.6; retained configured/runtime evidence | SQL18.6; configured pin matches, separate runtime imageID was not retained | Record actual imageID for each workload; missing evidence is not proof of different bytes |
 
@@ -91,11 +98,15 @@ keys, certificates and customer data must remain distinct. Copying entire initia
 cluster credentials to obtain byte equality would violate isolation and destroy identity.
 
 The current topology explains some overhead: EU1 is a worker behind the retained EU control node;
-US1 also hosts its regional control plane. It does not justify different RAM rules or an older
-Regional implementation. Three existing servers also do not constitute replicated HA: one local
+US1 also hosts its regional control plane. It does not justify divergent customer policy or future
+runtime drift. Three existing servers also do not constitute replicated HA: one local
 database volume and a single regional control-plane node can experience maintenance downtime.
 
 ## 4. Findings and consequences
+
+These identifiers retain the original audit's corrective scope, not a claim that every defect
+is unchanged in source or Dev. Source fixes and partial operational corrections do not close the
+associated live gate; current status is the13-row table in PLAN.md.
 
 | ID | Priority | Proven problem / gap | Why it fails the intended product | Primary source |
 | --- | --- | --- | --- | --- |
@@ -271,41 +282,48 @@ ceiling. Demonstrate threshold→one purchase→approved release→Ready without
 
 ## 7. Common release and patch management for all three servers
 
-Complete the existing versions.lock into one approved release contract. Generate component
-references/templates from it rather than maintaining second constants and private permanent
-overrides. Include Talos artifacts/schematics/extensions, Kubernetes, exact Flux component set,
-platform chart and workload digests, PostgreSQL/extensions/Barman, API/Edge/Native/Regional artifacts
-and configuration schema compatibility. Component artifacts may have different source commits,
-but the release explicitly selects one compatible set for the whole fleet.
+Use one immutable release contract for Talos artifacts/schematics/extensions, Kubernetes,
+Flux/platform charts and workload digests, PostgreSQL/Barman, first-party runtime artifacts and
+configuration schema compatibility. Roles, regions, networking and credentials remain explicit
+parameters; initialized disks and cluster credentials are never copied to make servers identical.
 
-Cloudflare stores desired release, actual observed release/configuration hash, role and rollout
-state. New nodes install that approved release directly. Existing nodes use supported in-place
-Talos/Kubernetes/Flux/CNPG/first-party upgrades. Bootstrap version metadata is synchronized only
-after actual runtime readback; changing metadata alone never counts as patching a server.
+**R1:** official Image Factory Talos1.14.2, Kubernetes1.36.5 and the pinned platform on all three
+retained servers. Use supported in-place upgrades, preserve databases/volumes/identities and
+observe actual versions and imageIDs. R1 contains no custom OS image and does not depend on
+the composed boot-image qualification chain. It closes Uniform3-server release only after the
+complete three-server runtime/configuration readback succeeds.
 
-Program the lifecycle in the existing Workflows/control mechanisms: detect candidate update;
-assemble pinned release and changelog/security evidence; qualify in the single CI; canary;
-promote; upgrade one affected node/region at a time; check actual versions and database health;
-finish or stop with an explicit reason. An interrupted operation resumes from observed state.
-Resolve unknown writes; do not blindly rerun installation, patch or reboot commands.
+**R2:** the same baseline plus the first-party sandbox extension, delivered through a supported
+Talos upgrade. Deliberately interrupt and resume the programmed operation, resolve any uncertain
+write through the same intent, and prove final runtime/configuration and data preservation.
+This closes the Patch management row and establishes the extension baseline for later pool work.
+It does not by itself qualify thin storage or shared-pool fast start.
 
-Converge the shared Regional startup-memory fix to EU before changing EU resource geometry.
-Then align Kubernetes/Flux and declared role composition through supported maintenance. Current
-EU policy conversion requires a fully suspended/hibernated cohort; either use a controlled window
-with verified resumes or implement a supported per-database revision transition. Never bypass
-that guard through direct D1 edits. No existing EU node is reinstalled.
+For upstream Talos and other upstream images, verify immutable digest and official
+signature/SBOM provenance. Scan and review only first-party extension, recipe and binary bytes.
+Delete upstream finding lists and code used solely for vendor-byte scanning; do not recreate
+that dependency under another name. Track actual advisories separately from secret scanning.
+Reuse already qualified immutable first-party artifacts when their inputs have not changed.
+Existing Talos/Kubernetes SBOM verification does not assert that every platform image is signed
+or that an empty image-SBOM file constitutes dependency evidence.
 
-Patch policy includes normal maintenance windows and a separate critical-security urgency rule,
-candidate rejection and observed-deadline alerts. Select patch targets from supported upstream
-compatibility information rather than “latest” tags. Track SBOM/dependencies and actual advisories;
-Gitleaks/integrity checks do not establish that an image has no known vulnerabilities.
+Cloudflare owns desired/observed release and rollout state. Existing Workflows and PatchNode
+perform serial upgrades and drift correction with checkpoints and bounded readback. New nodes
+install the selected release directly. Synchronize bootstrap version metadata only after actual
+runtime acceptance; metadata updates never count as OS upgrades. Terminal AddNode jobs remain
+terminal.
 
-Each release declares rollback boundaries: restoring a previous container can be supported;
-PostgreSQL major/catalog changes, CRD migrations and Kubernetes changes are not generically undone
-by changing Git. Use a qualified rollback or forward-fix/restore path. Single-node control/data
-topology entails visible maintenance interruption; do not promise zero downtime without replicas.
+Patch policy retains maintenance windows, critical-security urgency, candidate rejection,
+observed-deadline reporting and explicit rollback boundaries. A container rollback does not
+automatically undo PostgreSQL catalogs, Kubernetes compatibility changes or CRD migrations.
+The retained single-node control/data topology can have visible maintenance downtime.
 
 ## 8. Close the headless installation and operations gaps
+
+Execute these requirements only at their corresponding gate in section10. Operational access
+uses the existing Cloudflare relay; stop adding changing laptop addresses to the Contabo firewall.
+Remove temporary operator exceptions once the relay supports the required checks. Necessary
+provider lifecycle actions remain distinct from routine relay transport and observation.
 
 1. Resolve the actual postjoin409 predicate from retained request/report/state evidence. Reproduce
    that predicate before correcting it; do not assert it was a timeout solely because sessions
@@ -333,9 +351,11 @@ topology entails visible maintenance interruption; do not promise zero downtime 
 
 ## 9. Fast start and Rust: implement the approved plan
 
-Keep [the approved architecture](rust-runtime-and-cold-starts.md) and its single-CI migration order.
-Update its obsolete reservation clauses to the resource model in this document. Rust is the chosen
-runtime; measurements validate it. Do not substitute a token Node polling tweak for this scope.
+Keep [the approved architecture](rust-runtime-and-cold-starts.md); section10 governs when this
+work starts. At gate7, first prove the actual CNPG/local-volume late-binding boundary on US1,
+then extend the remaining gateway/controller/pool integration. Earlier gates do not authorize
+more large Rust/pool/reclaimer packages. Existing implementation remains unchanged in the meantime.
+Rust is the chosen runtime; measurements validate it.
 
 The **shared pool of prestarted, unassigned compute is mandatory**, following Neon's documented
 [compute-pool approach](https://neon.com/blog/cold-starts-just-got-hot). Cloudflare configures and
@@ -398,36 +418,45 @@ If a path misses its target or late binding is not solved, the gate stays open.
 
 ## 10. Execution order and release gates
 
-| Work package | Depends on | Concrete output | Gate |
-| --- | --- | --- | --- |
-| A. Correct scope and freeze facts | None | This plan, corrected status, fresh fleet/config inventory | Every difference classified as intended role parameter, defect or missing evidence |
-| B. Central configuration/release contracts | A | Revisioned profiles/assignments, release selection and desired/observed status through the existing CF management API | One API change converges on both customer regions, with data preserved and queryable failure |
-| C. Shared runtime and credential baseline | B | Accepted shared Regional fix, declared components, coordinated authority rotation | All3 nodes on the approved compatible release; retired keys rejected; no reinstall |
-| D. CPU/RAM capacity model | B,C | Separate request/limit, no sleeping CPU debit, atomic wake admission, real256/4096 profiles | Hibernation frees compute accounting; simultaneous wake/create cannot exceed actual safe headroom |
-| E. Usage-driven disk | B,C | Qualified thin profile, measured pool state, logical quota/growth and supported old-volume transition | Empty quotas do not preallocate full disk; quota/full-pool/reclaim/restore tests preserve other data |
-| F. Headless completion and purchase activation | B,C,D,E | Supported region/restore-secret setup, postjoin fix, configurable RAM threshold and explicit auto-purchase switch, operator-owned credentials/profile | One authorized threshold-driven addition reaches Ready without operator execution; interruption buys exactly once; disabled purchasing buys nothing |
-| G. Programmed patch lifecycle | B,C | Candidate promotion, rollout, drift repair and supported recovery | Install releaseR, upgrade retained nodes toR+1, interrupt/resume, prove runtime convergence and DB lifecycle |
-| H. Rust and shared prestarted compute | B,D,E integration contract; gateway work may proceed with E–G | Late binding, real shared pool, native components, targeted controller, routing snapshots; warm reclaim additional | Multi-database pool-hit first-read target, exclusive assignment, isolation/refill/restart/miss evidence; separate warm/reclaim/cold results |
-| I. Density, operations and migration handover | D–H | Representative tenant workload, explicit expansion policy, customer/operator runbooks | Actual resource/latency/backup limits established; all required gates below pass |
+Current execution gate: **1**. Close each gate live before beginning the next large package.
+These eight execution packages organize work; the thirteen rows in section11 remain the final
+acceptance checklist. Existing later-gate source is retained unchanged, not discarded.
 
-Use one implementation owner per touched subsystem; independent reviews consume concrete changes,
-not repeated unbounded audit loops. Gather related observed failures before releasing a batch.
-Bug fixes get a failing reproduction, then affected tests. One existing CI run per final code stand;
-qualify changed artifacts once and reuse immutable evidence. No unchanged image rebuild/deployment
-without a specific reason. Documentation is not a reason to rerun an installer.
+| Order | Work package | Required closure |
+| --- | --- | --- |
+| 1 — current | CI parity and current delivery | Reproduce CI on native Linux/AMD64 with Node24.21, the same Docker version and Rust targets. Fix collected wall-clock, inspect-capability and architecture-pin failures; obtain green CI and deliver no-ceiling, configurable threshold/purchase-switch and generic optional-email behavior. |
+| 2 | R1: uniform retained fleet | Official Image Factory Talos1.14.2, Kubernetes1.36.5 and pinned platform on all three servers, using supported upgrades without reinstallation. Prove actual common release and preserved data/identities. |
+| 3 | R2: extension and patch management | The same baseline plus the sandbox extension. Interrupt/resume its supported Talos upgrade; prove all retained roles, exact final configuration/runtime and preserved data. |
+| 4 | Thin storage, then backup/recovery lifecycle | Qualify actual physical storage and startup bounds, then repeat SQL/TLS/roles, R2 base/WAL, PITR/restore and physical deletion on the new model. |
+| 5 | Configurable expansion and Headless Ready | One real threshold-driven, already-authorized V159 purchase reaches Ready with no operator. Resolve postjoin409, prove exactly-once purchase, current-policy dispatch and continued eligible placement. |
+| 6 | Real EU key rotation | New authority works, retired authority is rejected and retained data/custody/archive recovery survive the coordinated operation. |
+| 7 | Rust runtime and shared pool | First obtain the real US1 CNPG late-binding proof; then finish Rust gateway/controller/Edge/relay and shared-pool integration, isolation, interruption and first-read acceptance. |
+| 8 | Density and operational ownership | Measure22 representative US projects and their actual workload/backup mix; complete ordinary operation without private scripts, an AI agent or laptop access. |
+
+Before a push, reproduce the actual CI toolchain on native Linux/AMD64, not an emulated Mac with
+different Node/Docker versions. Collect and fix related clock, inspect and package-pin failures
+once. The goal is a green next push, not repeated discovery of another environment difference.
+
+Use one implementation owner per subsystem, one reviewable commit per package/fix batch and
+one independent review per batch. Use the existing single CI; retain valid immutable artifact
+qualification instead of rebuilding unchanged images. No documentation change authorizes
+another installer run, and no refused local validation is retried.
+
+Owner-facing progress reports occur when a live gate closes: one line naming the gate, measured
+result and next gate. PLAN.md Status contains the13 gate rows; per-fix narratives belong in Git.
 
 ## 11. Final acceptance: every row must have direct evidence
 
 | Gate | Required live evidence |
 | --- | --- |
-| Uniform3-server release | Actual shared component versions/imageIDs and config schema match one approved release; role differences explicitly rendered; no unknown persistent override |
+| Uniform3-server release | R1: official Image Factory Talos1.14.2, Kubernetes1.36.5 and pinned platform on all three retained servers; actual shared versions/imageIDs/schema match, role differences are explicit and no unknown override remains |
 | Central customer control | Assign256MiB, change to a selected256MiB step and4096MiB ceiling through the PGCF management API; both regions report matching applied revision/Pod/SQL limits after interruption/resume |
 | Compute overbooking | Confirmed cold-sleep removes CPU debit; warm idle reports real use; concurrent starts reacquire bounded CPU/RAM headroom; noisy neighbor cannot consume an entire host |
 | Disk overbooking | Logical quotas are not fully preallocated; real block use and pool metadata drive admission; quota/growth/full-pool/trim/delete/restore behavior is proved |
 | Configurable expansion | API changes to the RAM threshold and auto-purchase switch are reflected at reservation/dispatch; this installation's76% over ten fresh aligned minutes triggers one approved V159 order, without a fixed three-node ceiling; suitable old nodes still place DBs; disabled or below-threshold purchasing orders nothing |
 | Optional email | Fresh/unconfigured installations send no email; operator-configured delivery credentials and recipient enable deduplicated notifications; the removed personal setup is absent |
 | Headless Ready | Purchase, image, network, K8s/platform/secret configuration, storage, proof and admission complete with the laptop disconnected; interrupted uncertain actions are resolved |
-| Patch management | A second release upgrades all retained roles through supported procedures; data/UIDs/configuration remain valid; controlled interruption/recovery and bounded skew are observed |
+| Patch management | R2 adds the sandbox extension to the R1 baseline through a supported Talos upgrade; all retained roles preserve data/UIDs/configuration, with controlled interruption/resume and bounded skew |
 | Backup/recovery | SQL/TLS/roles/R2 base/WAL/PITR/restore/deletion with actual physical reclaim pass on the corrected release/storage model, not merely the old thick baseline |
 | Shared-pool fast start | Native Rust components/full Rust-Wasm Edge selected and deployed; actual unassigned slots ready before requests, at least two hibernated DBs assigned safely; subsecond pool-hit first read, refill/isolation/restart/miss metrics; warm-only/reclaim/pre-pulled images cannot substitute |
 | Capacity and economics | Representative22-project US workload with realistic sleeping/active/backup mix measured; derive required nodes from real limits, not8GiB division or old permanent CPU sums |
@@ -447,8 +476,8 @@ whether to implement the pool or silently substitute per-database warm retention
 
 - Confirm whether256MiB names the PostgreSQL limit (current contract and this plan's baseline) or
   the entire per-database PostgreSQL/backup envelope. Show both values in PGCF in either case.
-- Preserve this installation's V159 permission and chosen76% threshold, remove the fixed three-node
-  ceiling and personal email setup, and expose threshold/purchase controls through the API. Generic
+- Preserve this installation's V159 permission, chosen76% threshold, removed node ceiling and
+  removed personal email setup; deliver generic threshold/purchase controls at gate1. Generic
   users must configure their own provider and optional email credentials before activation.
 - Define storage quota offerings separately from physical allocation and a supported stable-ID or
   explicit rebind procedure for converting existing thick volumes. No silent customer-ID switch.
