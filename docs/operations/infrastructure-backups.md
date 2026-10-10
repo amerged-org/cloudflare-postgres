@@ -14,6 +14,13 @@ NodeBootstrap image. The existing minute Cron dispatches at most one persisted r
 per UTC calendar day. Fresh installations have backups disabled and no email
 addresses configured.
 
+Set the operator-configurable `containers[].max_instances` to at least two when
+a backup must run alongside a node patch or installation. The example uses two.
+These operations share the existing NodeBootstrap application; a limit of one
+rejects the second container before native capture starts. Size this limit for
+the maintenance concurrency your installation allows, and keep it in the saved
+deployment configuration so a later publication does not restore an older limit.
+
 Set the private Worker secret `INFRASTRUCTURE_BACKUP_CF_TOKEN` to an operator-owned
 Cloudflare API token with D1 export permission for the actual control database.
 The token stays in the management Worker. The container receives only the temporary

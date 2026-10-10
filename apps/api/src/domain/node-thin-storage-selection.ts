@@ -238,7 +238,10 @@ export async function configureNodeThinStorage(
       !current.authority.data_accounting_complete ||
       !spec.roles[source.role].host_configuration_required ||
       !sandbox ||
-      !spec.roles[source.role].components.includes(sandbox.name) ||
+      // The protected host service runs inside this Talos extension, not a Kubernetes Pod.
+      !spec.roles[source.role].talos_extensions.includes(
+        "pgcf-sandbox-controller",
+      ) ||
       !(await env.DB.prepare(`SELECT 1 WHERE ${hostActivationSql}`)
         .bind(...hostBindings)
         .first())

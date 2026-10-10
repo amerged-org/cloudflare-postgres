@@ -16,9 +16,13 @@ import { NodeThinStorageState } from "@pgcf/contracts/node-thin-storage";
 import { createApp } from "../../src/app.ts";
 import type { Env } from "../../src/env.ts";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
-import { configureNodeThinStorage } from "../../src/domain/node-thin-storage-selection.ts";
+import {
+  configureNodeThinStorage,
+  thinVolumeProfile,
+} from "../../src/domain/node-thin-storage-selection.ts";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import { storageAuthorityPublicKeys } from "../../src/domain/storage-authority.ts";
+import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import {
   installationHash,
   canonicalInstallation,
@@ -270,6 +274,138 @@ it("pins physical identity, current release driver and storage public keys and r
       .bind(f.node)
       .first("count"),
   ).toBe(0);
+});
+it("activates qualified native storage through the proved Talos host service without requiring a sandbox-controller Pod", async () => {
+  const f = await thinExecutionFixture(releaseIds),
+    spec = structuredClone(f.qualified.spec),
+    sandbox = spec.components.find((c) => c.name === "sandbox-controller")!;
+  spec.components = spec.components.filter((c) => c.name !== "regional");
+  spec.components.push({
+    name: "native-controller",
+    kind: "image",
+    version: "1.0.0",
+    reference: `registry.example/native-controller@sha256:${"f".repeat(64)}`,
+    sha256: "f".repeat(64),
+  });
+  for (const role of Object.values(spec.roles))
+    role.components = role.components.map((name) =>
+      name === "regional" ? "native-controller" : name,
+    );
+  const release = `native-thin-${crypto.randomUUID()}`,
+    approved = FleetReleaseSpec.parse(spec),
+    specSha = await installationHash(approved),
+    profileSha = await installationHash(thinVolumeProfile(f.profile)),
+    pool = JSON.parse(
+      (await env.DB.prepare(
+        "SELECT policy_json FROM node_compute_pool_policies WHERE node_id=?",
+      )
+        .bind(f.node)
+        .first<string>("policy_json"))!,
+    );
+  pool.profile.image = sandbox.reference;
+  pool.profile.release_id = release;
+  const runtimeSha = await installationHash(pool.profile),
+    receipt = {
+      ...f.qualified.qualification,
+      release_id: release,
+      spec_sha256: specSha,
+    },
+    authority = {
+      ...f.authority,
+      profile_sha256: profileSha,
+      storage_class: thinStorageClass(profileSha),
+    };
+  releaseIds.push(release);
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+    ).bind(release, canonicalInstallation(approved), specSha, f.qualified.at),
+    env.DB.prepare(
+      "UPDATE fleet_region_releases SET release_id=? WHERE region_id=?",
+    ).bind(release, f.region),
+    env.DB.prepare(
+      "UPDATE fleet_node_releases SET release_id=? WHERE node_id=?",
+    ).bind(release, f.node),
+    env.DB.prepare(
+      "UPDATE node_compute_pool_policies SET release_id=?,policy_json=? WHERE node_id=?",
+    ).bind(release, JSON.stringify(pool), f.node),
+    env.DB.prepare(
+      "UPDATE node_host_configurations SET release_id=?,profile_sha256=? WHERE node_id=?",
+    ).bind(release, runtimeSha, f.node),
+    env.DB.prepare(
+      "UPDATE fleet_patch_operations SET release_id=?,spec_sha256=?,observed_json=json_set(observed_json,'$.runtime_admission_sha256',?) WHERE node_id=?",
+    ).bind(release, specSha, runtimeSha, f.node),
+    env.DB.prepare(
+      "UPDATE node_thin_storage SET profile_sha256=?,profile_json=?,qualification_json=?,authority_json=?,allow_new_databases=0 WHERE node_id=?",
+    ).bind(
+      profileSha,
+      canonicalInstallation(f.profile),
+      JSON.stringify(receipt),
+      JSON.stringify(authority),
+      f.node,
+    ),
+  ]);
+  const select = () =>
+    configureNodeThinStorage(f.local, f.node, {
+      expected_revision: 1,
+      node_uid: f.uid,
+      address: "192.0.2.18",
+      volume_group_uuid: authority.volume_group_uuid,
+      profile: f.profile,
+      allow_new_databases: true,
+    });
+  const missingExtension = structuredClone(approved);
+  missingExtension.roles.customer.talos_extensions = ["schematic"];
+  const missingRelease = `missing-ext-${crypto.randomUUID()}`;
+  releaseIds.push(missingRelease);
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+    ).bind(
+      missingRelease,
+      canonicalInstallation(missingExtension),
+      await installationHash(missingExtension),
+      f.qualified.at,
+    ),
+    env.DB.prepare(
+      "UPDATE fleet_node_releases SET release_id=? WHERE node_id=?",
+    ).bind(missingRelease, f.node),
+  ]);
+  await expect(select()).rejects.toBeDefined();
+  await env.DB.prepare(
+    "UPDATE fleet_node_releases SET release_id=? WHERE node_id=?",
+  )
+    .bind(release, f.node)
+    .run();
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET qualification_json=json_set(qualification_json,'$.software.host_extension_image',?) WHERE node_id=?",
+  )
+    .bind(`registry.example/other@sha256:${"c".repeat(64)}`, f.node)
+    .run();
+  await expect(select()).rejects.toMatchObject({ code: "conflict" });
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET qualification_json=? WHERE node_id=?",
+  )
+    .bind(JSON.stringify(receipt), f.node)
+    .run();
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET observed_json=json_remove(observed_json,'$.runtime_admission_sha256') WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  await expect(select()).rejects.toMatchObject({ code: "conflict" });
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET observed_json=json_set(observed_json,'$.runtime_admission_sha256',?) WHERE node_id=?",
+  )
+    .bind(runtimeSha, f.node)
+    .run();
+  expect(approved.roles.customer.components).not.toContain(
+    "sandbox-controller",
+  );
+  expect(await select()).toMatchObject({
+    revision: 2,
+    allow_new_databases: true,
+  });
 });
 it("preserves an uncertain dispatched pool write and only clears an expired known-negative pending action", async () => {
   const f = await setup();
