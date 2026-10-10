@@ -196,6 +196,19 @@ test("management-only changes skip images while exact Native and Regional build 
     selected({ regional: true }),
   );
 });
+test("controller schema changes rebuild its consuming native runtime only", () => {
+  assert.deepEqual(
+    selectImageInputs(
+      ["packages/contracts/native/controller.generated.json"],
+      "push",
+    ),
+    selected({
+      regional: true,
+      node_bootstrap: true,
+      native_controller: true,
+    }),
+  );
+});
 test("actual storage and native inputs select only their affected runtime artifacts", () => {
   assert.deepEqual(
     selectImageInputs(["apps/native-gateway/src/budget.rs"], "push"),

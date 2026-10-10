@@ -1081,6 +1081,47 @@
                       ],
                       "additionalProperties": false
                     },
+                    "talos_raw_image": {
+                      "type": "object",
+                      "properties": {
+                        "url": {
+                          "type": "string",
+                          "maxLength": 2048,
+                          "format": "uri"
+                        },
+                        "sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        },
+                        "format": {
+                          "type": "string",
+                          "enum": ["raw.xz", "raw"]
+                        },
+                        "bytes": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "raw_sha256": {
+                          "type": "string",
+                          "pattern": "^[0-9a-f]{64}$"
+                        },
+                        "raw_bytes": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 9007199254740991
+                        }
+                      },
+                      "required": [
+                        "url",
+                        "sha256",
+                        "format",
+                        "bytes",
+                        "raw_sha256",
+                        "raw_bytes"
+                      ],
+                      "additionalProperties": false
+                    },
                     "components": {
                       "minItems": 1,
                       "maxItems": 128,

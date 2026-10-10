@@ -267,7 +267,8 @@ export function selectImageInputs(
         "infra/platform/versions.lock.json",
       ].includes(path) ||
       rustInputs(path, "packages/native-protocol") ||
-      nativeSchemaInputs.has(path)
+      (nativeSchemaInputs.has(path) &&
+        path !== "packages/contracts/native/controller.generated.json")
     ) {
       result.rust_gateway = true;
       result.native_controller = true;
@@ -275,6 +276,9 @@ export function selectImageInputs(
       result.native_reclaimer = true;
       result.sandbox_controller = true;
     }
+    // The reclaimer uses only pure controller helpers, never this runtime schema.
+    if (path === "packages/contracts/native/controller.generated.json")
+      result.native_controller = true;
     if (path === ".dockerignore") result.storage = true;
     if (rustInputs(path, "apps/native-gateway")) result.rust_gateway = true;
     if (
