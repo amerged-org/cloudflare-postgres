@@ -8,7 +8,7 @@ import { afterEach, expect, it } from "vitest";
 import { ComputePoolPolicy } from "@pgcf/contracts/compute-pool";
 import { FleetReleaseSpec } from "@pgcf/contracts/releases";
 import generatedPool from "../../../../packages/contracts/native/compute-pool.generated.json" with { type: "json" };
-import { newNodeId } from "@pgcf/contracts";
+import { newNodeId, newOperationId } from "@pgcf/contracts";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
 import { createApp } from "../../src/app.ts";
 import type { Env } from "../../src/env.ts";
@@ -26,6 +26,7 @@ import {
 import { installationHash } from "../../src/domain/node-installation.ts";
 import {
   advanceFleetRollout,
+  readFleetRollout,
   readFleetRolloutIntent,
   writeFleetRolloutIntent,
 } from "../../src/domain/fleet-rollouts.ts";
@@ -221,6 +222,144 @@ async function setup() {
   }
   return { ...f, release, spec, input, runtime, started, send, us, control };
 }
+it("a completed fleet can select its next release without reopening confirmed host-ready history or bypassing unknown writes", async () => {
+  const f = await setup(),
+    first = await f.send(),
+    { rollout_id } = (await first.json()) as { rollout_id: string },
+    nextRelease = `next-${crypto.randomUUID()}`,
+    now = new Date().toISOString(),
+    next = structuredClone(f.input);
+  expect(first.status).toBe(202);
+  releases.push(nextRelease);
+  await env.DB.prepare(
+    "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+  )
+    .bind(
+      nextRelease,
+      JSON.stringify(f.spec),
+      await installationHash(f.spec),
+      now,
+    )
+    .run();
+  next.release_id = nextRelease;
+  for (const region of next.regions) {
+    region.expected_revision = 1;
+    for (const node of region.nodes) node.expected_revision = 1;
+  }
+  expect((await f.send(next, "next-before-complete")).status).toBe(409);
+
+  const old = (await env.DB.prepare(
+    "SELECT operation_id FROM fleet_patch_operations WHERE node_id=?",
+  )
+    .bind(f.us)
+    .first<{ operation_id: string }>())!;
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='complete',state='confirmed' WHERE operation_id=?",
+  )
+    .bind(old.operation_id)
+    .run();
+  const historical = newOperationId();
+  const copy = async (
+    id: string,
+    region: (typeof f.input.regions)[number],
+    node: (typeof f.input.regions)[number]["nodes"][number],
+    stage: "complete" | "host_ready",
+    created: string,
+    parent: string | null = null,
+  ) =>
+    env.DB.prepare(
+      `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at,finalization_of)
+       SELECT ?,?,?,?, ?,release_id,spec_sha256,assignment_revision,region_revision,material_revision,?,?,revision,?,'confirmed',?,?,deadline_at,? FROM fleet_patch_operations WHERE operation_id=?`,
+    )
+      .bind(
+        id,
+        node.node_id,
+        region.region_id,
+        node.node_uid,
+        region.cluster_uid,
+        node.address,
+        JSON.stringify(region.nodes),
+        stage,
+        created,
+        created,
+        parent,
+        old.operation_id,
+      )
+      .run();
+  const eu = f.input.regions[1]!;
+  await copy(
+    historical,
+    eu,
+    eu.nodes[0]!,
+    "host_ready",
+    new Date(Date.now() - 2000).toISOString(),
+  );
+  await copy(newOperationId(), eu, eu.nodes[0]!, "complete", now, historical);
+  await copy(newOperationId(), eu, eu.nodes[1]!, "complete", now);
+  for (const region of f.input.regions)
+    for (const node of region.nodes)
+      await env.DB.prepare(
+        "INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at) SELECT ?,?,1,agent_key_hash,?,?,? FROM regions WHERE id=?",
+      )
+        .bind(
+          node.node_id,
+          node.node_uid,
+          JSON.stringify({
+            configuration_schema_revision: f.spec.configuration_schema_revision,
+            talos_version: f.spec.roles.customer.talos_version,
+            talos_installer: f.spec.roles.customer.talos_installer,
+            talos_schematic_sha256:
+              f.spec.roles.customer.talos_schematic_sha256,
+            kubernetes_version: f.spec.roles.customer.kubernetes_version,
+            components: f.spec.components
+              .filter((component) =>
+                f.spec.roles.customer.components.includes(component.name),
+              )
+              .map(({ name, version, sha256 }) => ({ name, version, sha256 })),
+          }),
+          now,
+          now,
+          region.region_id,
+        )
+        .run();
+  expect((await readFleetRollout(f.runtime, rollout_id)).state).toBe(
+    "complete",
+  );
+
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET state='dispatched' WHERE operation_id=?",
+  )
+    .bind(historical)
+    .run();
+  expect((await f.send(next, "next-unconfirmed-host")).status).toBe(409);
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='talos' WHERE operation_id=?",
+  )
+    .bind(historical)
+    .run();
+  expect((await f.send(next, "next-unknown-write")).status).toBe(409);
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='host_ready',state='confirmed' WHERE operation_id=?",
+  )
+    .bind(historical)
+    .run();
+
+  expect((await f.send(next, "next-completed-fleet")).status).toBe(202);
+  expect(
+    await env.DB.prepare(
+      "SELECT stage,state FROM fleet_patch_operations WHERE operation_id=?",
+    )
+      .bind(historical)
+      .first(),
+  ).toEqual({ stage: "host_ready", state: "confirmed" });
+  expect(
+    await env.DB.prepare(
+      "SELECT release_id,revision FROM fleet_node_releases WHERE node_id=?",
+    )
+      .bind(f.us)
+      .first(),
+  ).toEqual({ release_id: nextRelease, revision: 2 });
+});
 it("one fleet request assigns all physical members but dispatches only the first region, and replay reuses the operation", async () => {
   const f = await setup(),
     first = await f.send();

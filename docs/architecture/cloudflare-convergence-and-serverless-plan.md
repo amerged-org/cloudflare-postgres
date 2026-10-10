@@ -29,6 +29,8 @@ Reuse US1 and existing code.
 | Oct 10 | US Golden runtime accepted by the same operation | H6 confirmed Golden762c655d…/bootc74415e8…: Talos1.14.2, Kubernetes1.36.5, NodeReady, loaded/running sandbox extension, healthy etcd/trustd; physical/cluster/volume identities preserved. Readback3.628 s; programmed runtime verification139.457 s. Fresh RAM3,687,542,784/8,308,830,208 B (44.381%), pressure0. Bounded operator recovery was required; final release acceptance remains open. |
 | Oct 10 | Admission freshness correction delivered | db7644e/CI38076538637 passed; API7cc2cdfc… at100%, modulec5edf272…, Bootstrap48/c06e529c…/max2. Publication333.586 s, one mirror/one publication, zero Contabo calls. The same H6 created its three admission objects; EU hold and retained databases preserved. |
 | Oct 10 | Actual normalized admission readbacks checked | Two targeted server-side dry-runs returned US/EU admission and Node-label JSON; zero writes/provider calls/grants. The only old-target difference was Binding matchResources.matchPolicy absent→Equivalent. Declaring that default makes all semantic comparisons pass; Policy Exact and wrong-binding rejection remain. Failing-first runtime9/9 and image-selection14/14 tests passed. Only Bootstrap needs rebuilding; Golden/sandbox bytes unchanged. |
+| Oct 10 | Binding-default final CI and delivery passed | 4cc3d3d/CI38080065517 passed: check23m54s, Bootstrap2m8s; other image jobs skipped. Publication250.682s: API7e9b6652… at100%, unchanged modulec5edf272…, Bootstrap49/a0e3f1ea…/max2. One mirror/publication, zero Contabo/DB/resume/EU-server actions. Same H6/revision28 and EU hold retained for the live runner. |
+| Oct 10 | R1→R2 compatibility batch prepared | A completed multi-node fleet's immutable confirmed host_ready history incorrectly caused409 on the next release. Failing-first D1 regression now passes202; affected suite14/14, types/lint/format passed. Both precheck/CAS exclude only confirmed host_ready; previous-fleet completion and unknown-write rejection remain. Three native workload descriptors added to the private candidate. Final publication bindings and live R2 acceptance remain open. |
 
 ## Open
 
@@ -42,7 +44,7 @@ Reuse US1 and existing code.
 | Backup alarms | The daily D1/etcd R2 run passed full independent verification. Optional sender/recipient configuration remains unset; a real notification test remains open. |
 | Routing template authority | Live retirement and b793273 API delivery passed. The immutable US profile keeps historical custody; current composition derives the live route authority from Cloudflare. R2 native gateway acceptance remains open. |
 | US post-reboot host-file correction | Talos1.14.2 requires existing files for overwrite. Our two new /var files were declared overwrite, blocking WriteUserFiles before etcd/trustd registration. The failing regression and32 affected tests now pass with create; unrelated configuration and identity/write guards remain. The supported no-reboot US repair was accepted once and changed only those two operations (full configuration a67c450c… →3adc946d…). The paused boot task did not rerun after apply; one identity-bound corrective reboot was accepted once. Fresh boot68a54885-4527-40f0-a31f-e1d011ea8fa5 retains the repaired configuration and both files exactly match the declared bytes. Ten direct authenticated reads passed in1.603 s: etcd/trustd healthy, Kubernetes1.36.5 responds, Node/Cluster/DMI unchanged. Node readiness/platform acceptance remains open. Source b5c050c passed CI38068917261; only Bootstrap rebuilt. Talos reverted the failed Golden boot to its retained slot. A single supported rollback was accepted to select the already written Golden slot, preserving the same H6 operation/installer receipt; no EU change, new installation or provider action. |
-| Admission default correction | Fresh-report correction is delivered and worked. RuntimeClass and Policy readbacks match; Kubernetes defaults Binding matchPolicy to Equivalent. Explicit declaration and strict altered-value rejection passed the real normalized readback and focused regression tests. One coordinated Bootstrap-only delivery remains before resuming H6. |
+| Admission default correction | Fresh-report and explicit Binding Equivalent corrections are delivered. Real normalized readback and strict altered-value regression passed; the live runner must complete the same H6 and US six-check acceptance before releasing EU. |
 | Management transport latency | Reproduced TLS setup failure is closed by the measured b793273 correction. Existing US patch passed preflight; host convergence remains open. No further timeout increases. |
 | Thin-storage admission correction | Source 66aedf passed CI38067216773 and nine focused tests. It requires the actual pgcf-sandbox-controller Talos extension instead of a nonexistent Pod. It joins the observed host-file correction below in one delivery; existing images are reused except the changed Bootstrap executor. |
 
@@ -97,8 +99,9 @@ EU test databases may be deleted/recreated if obstructive. Checks 4–5 share a 
 ## Execution
 
 Owner target: October10–11; October10 19:45 coaching supersedes the earlier order.
-US1 is accepted **with three operator interventions**: two-file configuration repair, corrective
-reboot and supported return to the written Golden slot. EU must demonstrate zero interventions.
+US1 required **three operator interventions**: two-file configuration repair, corrective
+reboot and supported return to the written Golden slot. Its six-check acceptance is still open;
+record it as accepted with interventions only after those checks pass. EU must demonstrate zero interventions.
 
 Before any EU write: finish US's six checks; render all three actual role projections and run
 server-side dry-run; perform one isolated AMD64 Golden boot scenario for the rendered EU customer

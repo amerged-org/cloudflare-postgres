@@ -64,6 +64,9 @@ admission and its own database runtime, then completes without another OS instal
 original host-ready operation is never reopened. Only all-member final acceptance restores owned
 placement closures and synchronizes version metadata. A future owned profile update uses UID and
 exact previous owned fields; unrelated scheduling and controller status are preserved.
+After the entire preceding fleet rollout is complete, its confirmed `host_ready` history does
+not block selection of a new release. Unconfirmed records and uncertain writes remain blockers;
+starting a new release cannot bypass an incomplete preceding fleet rollout.
 
 Talos is upgraded through the official no-reboot lifecycle command using the exact qualified
 installer digest. Positive CLI completion is persisted before a separately fenced reboot.
