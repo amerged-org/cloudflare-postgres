@@ -502,7 +502,9 @@ target from R2 while keeping the EU source healthy. Compare SQL data and committ
 verify target backup/WAL and retain the EU Node, volume, role and encrypted custody identities.
 Earlier loss, deletion and decommissioning kits are withheld; any later loss drill needs a
 separately reviewed scope that preserves or recovers the same customer EU1. Keep unchanged prior
-proofs and record new measured results in `PLAN.md`. Approximately nine-second cold starts are accepted for v1.
+proofs and record new measured results in `PLAN.md`. The historical approximately nine-second wake is the fallback baseline. The current ULTRA
+scope additionally requires a genuine shared-pool first SQL below one second; its acceptance
+remains open in the canonical plan.
 Do not migrate Neon or call the product finished until EU and US plus recovery have passed.
 Record measured installation/rollout time and actual Contabo calls by lifecycle phase, including
 zero calls throughout repeated transport grants, Kubernetes/Talos reads and proof cleanup after
@@ -665,7 +667,9 @@ never expose a VPS database port.
 Dev cold connections measured p95 **9.160 s**, maximum **9.708 s**. The adopter’s **5 s**
 connect timeout can fail before wake. Its **10 s** query/statement defaults are separate from
 the end-to-end request deadline; budget wake plus work explicitly.
-Before cutover, verify one policy: an approved always-warm size class
+The approved shared-pool runtime must pass its separate below-one-second first-read gate before
+customer readiness. Pool misses still need an explicit timeout policy. Before cutover, verify
+one fallback policy: an approved always-warm size class
 (`sleep_after_seconds:null`); prewake with `POST /v1/databases/{id}/resume`, operation/readiness
 polling and `SELECT 1` immediately before traffic; or bounded connection/request deadlines
 covering measured wake plus query/network margin. SQL statement timeouts are separate and do

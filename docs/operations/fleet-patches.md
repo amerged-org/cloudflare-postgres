@@ -26,7 +26,9 @@ gateway-first patch can bind its retained storage and prove real SQL before cont
    permanent per-node Pod requirement.
 2. If the role requires the sandbox extension, assign its compatible compute-pool policy. The
    patch seals the two fixed0600 host files in current Cloudflare custody before OS activation.
-   No private machine configuration or agent key belongs in the image or a ConfigMap.
+   The two managed paths under `/var` use Talos `op:create`, which creates missing files and
+   updates existing contents. `overwrite` requires a preexisting file and can pause boot before
+   etcd/trustd start. No private machine configuration or agent key belongs in the image or a ConfigMap.
 3. Start one canary using `POST /v1/nodes/{id}/patches`, an administrator key and
    `Idempotency-Key`. Supply current `node_uid`, `assignment_revision`, `release_id`, approved
    IPv4 `address` and `maintenance_acknowledged:true`.
@@ -159,9 +161,10 @@ physical deletion acceptance remain live gates. A source/unit-test pass is not l
 Cloudflare policy configuration, the administrator candidate catalog and bounded official-feed
 discovery are implemented in source. No configured policy means no work. Current candidates
 honestly remain `awaiting_ci` with `qualification_channel_unavailable`; discovery cannot execute
-patches or fabricate CI/canary receipts. The actual CI qualification channel, full canary/soak
-promotion, security-alert integration, exposed-key rotation and complete Dev fleet acceptance
-remain open. These source APIs are not automatic patch completion. Advance regions only after the
+patches or fabricate CI/canary receipts. The automatic discovery-to-CI qualification channel, security-alert integration and complete
+Dev fleet acceptance remain open. Use the canonical ULTRA acceptance scope; long soak series
+are not a prerequisite. Scoped route retirement is verified; prepared EU authority follows
+the selected supported patch window. These source APIs are not automatic patch completion. Advance regions only after the
 canary's required gates pass, including an actual thin-database material-revision transition.
 
 ## One-request fleet convergence

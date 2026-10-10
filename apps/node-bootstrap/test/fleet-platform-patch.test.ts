@@ -1,7 +1,77 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { parseAllDocuments } from "yaml";
 import { fleetResourcePatch } from "../src/fleet-platform-patch.ts";
+
+function renderedGatewayEnvironment(
+  directory: "regional" | "regional-native",
+  substitute: Record<string, string>,
+) {
+  const kubectl = process.env.PGCF_TEST_KUBECTL;
+  assert.ok(
+    kubectl,
+    "PGCF_TEST_KUBECTL must select the verified native client",
+  );
+  const build = spawnSync(
+    kubectl,
+    [
+      "kustomize",
+      fileURLToPath(
+        new URL(`../../../infra/platform/${directory}/`, import.meta.url),
+      ),
+    ],
+    { encoding: "utf8", timeout: 15_000 },
+  );
+  assert.equal(build.status, 0, "the real Kustomize build must succeed");
+  // Flux substitutes these plain variables after Kustomize has serialized YAML.
+  let output = build.stdout.replace(
+    /\$\{(PGCF_STORAGE_AUTHORITY_KEYS|PGCF_STORAGE_AUTHORITY_KEYS_SHA256|PGCF_GATEWAY_LEGACY_BINDINGS_JSON)\}/g,
+    (variable, name: string) => substitute[name] ?? variable,
+  );
+  const flux = process.env.PGCF_TEST_FLUX;
+  if (flux) {
+    const variables = new Set(
+      [...build.stdout.matchAll(/\$\{([A-Z_][A-Z0-9_]*)\}/g)].map(
+        (match) => match[1]!,
+      ),
+    );
+    const rendered = spawnSync(flux, ["envsubst", "--strict"], {
+      input: build.stdout,
+      encoding: "utf8",
+      timeout: 15_000,
+      env: Object.fromEntries(
+        [...variables].map((name) => [
+          name,
+          substitute[name] ?? "unconfigured",
+        ]),
+      ),
+    });
+    assert.equal(rendered.status, 0, "the real Flux substitution must succeed");
+    output = rendered.stdout;
+  }
+  const documents = parseAllDocuments(output);
+  assert.ok(documents.every((document) => document.errors.length === 0));
+  const gateway = documents
+    .map((document) => document.toJSON())
+    .find(
+      (value) =>
+        value.kind === "Deployment" && value.metadata.name === "pgcf-gateway",
+    );
+  const container = gateway.spec.template.spec.containers.find(
+    (value: { name: string }) => value.name === "gateway",
+  );
+  return Object.fromEntries(
+    container.env
+      .filter((value: { name: string }) => value.name in substitute)
+      .map((value: { name: string; value: unknown }) => [
+        value.name,
+        value.value,
+      ]),
+  ) as Record<string, unknown>;
+}
 
 function applyTests(
   value: Record<string, unknown>,
@@ -232,11 +302,20 @@ test("disabled storage authority supplies both empty Regional substitutions with
       };
     }
   ).postBuild;
-  assert.equal(build.substitute.PGCF_STORAGE_AUTHORITY_KEYS, "");
-  assert.equal(build.substitute.PGCF_STORAGE_AUTHORITY_KEYS_SHA256, "");
+  assert.equal(
+    build.substitute.PGCF_STORAGE_AUTHORITY_KEYS,
+    JSON.stringify(""),
+  );
+  assert.equal(
+    build.substitute.PGCF_STORAGE_AUTHORITY_KEYS_SHA256,
+    JSON.stringify(""),
+  );
   assert.equal(build.substitute.RETAINED, "unchanged");
   assert.deepEqual(build.substituteFrom, refs);
   assert.equal(writes, 1);
+  const environment = renderedGatewayEnvironment("regional", build.substitute);
+  assert.equal(environment.PGCF_STORAGE_AUTHORITY_KEYS, "");
+  assert.equal(environment.PGCF_STORAGE_AUTHORITY_KEYS_SHA256, "");
 });
 
 test("separate native controller/gateway pins reconcile through distinct logical images and prove actual selected runtime digests", async () => {
@@ -492,8 +571,14 @@ test("separate native controller/gateway pins reconcile through distinct logical
   const substitute = (
     regional.spec as { postBuild: { substitute: Record<string, string> } }
   ).postBuild.substitute;
-  assert.equal(substitute.PGCF_STORAGE_AUTHORITY_KEYS, keyText);
+  assert.equal(substitute.PGCF_STORAGE_AUTHORITY_KEYS, JSON.stringify(keyText));
   assert.equal(substitute.PGCF_STORAGE_AUTHORITY_KEYS_SHA256, sha256);
+  const environment = renderedGatewayEnvironment("regional-native", substitute);
+  assert.equal(typeof environment.PGCF_STORAGE_AUTHORITY_KEYS, "string");
+  assert.equal(environment.PGCF_STORAGE_AUTHORITY_KEYS, keyText);
+  assert.equal(typeof environment.PGCF_GATEWAY_LEGACY_BINDINGS_JSON, "string");
+  assert.equal(environment.PGCF_GATEWAY_LEGACY_BINDINGS_JSON, "[]");
+  assert.equal(environment.PGCF_STORAGE_AUTHORITY_KEYS_SHA256, sha256);
   assert.equal(
     fleetPlatformReadback(input, state, assets, []).regional_ready,
     true,

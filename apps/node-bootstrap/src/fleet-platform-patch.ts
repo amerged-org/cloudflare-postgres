@@ -1424,12 +1424,14 @@ export async function reconcileFleetRegional(
             ...(legacyBindings === undefined
               ? {}
               : {
-                  PGCF_GATEWAY_LEGACY_BINDINGS_JSON: canonical(legacyBindings),
+                  PGCF_GATEWAY_LEGACY_BINDINGS_JSON: JSON.stringify(
+                    canonical(legacyBindings),
+                  ),
                 }),
             ...(input.storage_authority
               ? {
-                  PGCF_STORAGE_AUTHORITY_KEYS: canonical(
-                    input.storage_authority.keys,
+                  PGCF_STORAGE_AUTHORITY_KEYS: JSON.stringify(
+                    canonical(input.storage_authority.keys),
                   ),
                   PGCF_STORAGE_AUTHORITY_KEYS_SHA256:
                     input.storage_authority.sha256,
@@ -1437,8 +1439,8 @@ export async function reconcileFleetRegional(
               : !runtime.native_gateway &&
                   !input.spec.storage_authority_keys_sha256
                 ? {
-                    PGCF_STORAGE_AUTHORITY_KEYS: "",
-                    PGCF_STORAGE_AUTHORITY_KEYS_SHA256: "",
+                    PGCF_STORAGE_AUTHORITY_KEYS: JSON.stringify(""),
+                    PGCF_STORAGE_AUTHORITY_KEYS_SHA256: JSON.stringify(""),
                   }
                 : {}),
           },
