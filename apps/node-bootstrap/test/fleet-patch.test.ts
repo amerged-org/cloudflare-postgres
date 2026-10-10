@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { parse } from "yaml";
+import { parse, stringify } from "yaml";
 import { test } from "node:test";
 import {
   FleetPatchCheckpoint,
@@ -27,6 +27,7 @@ function runtime(
   const writes: Command[] = [],
     checkpoints: FleetPatchCheckpoint[] = [];
   let lifecycleLogs = "";
+  let machineConfiguration: string | undefined;
   const resource = (type: string, id: string, spec: unknown) =>
     JSON.stringify({ metadata: { type, id }, spec });
   const node = () => ({
@@ -62,6 +63,9 @@ function runtime(
     },
     set lifecycleLogs(value: string) {
       lifecycleLogs = value;
+    },
+    set machineConfiguration(value: string) {
+      machineConfiguration = value;
     },
     turn: () =>
       runFleetPatch(
@@ -110,6 +114,15 @@ function runtime(
           },
           run: async (command) => {
             const args = command.args;
+            if (
+              args.includes("apply-config") &&
+              machineConfiguration !== undefined
+            ) {
+              writes.push(command);
+              assert.equal(current.state, "dispatched");
+              machineConfiguration = command.stdin;
+              return { exit_code: 0, stdout: "" };
+            }
             if (
               failedLateRead &&
               current.state === "dispatched" &&
@@ -179,6 +192,13 @@ function runtime(
                     },
                   ],
                 });
+            } else if (args.includes("machineconfig")) {
+              assert.ok(machineConfiguration);
+              stdout = resource(
+                "MachineConfigs.config.talos.dev",
+                args.includes("persistent") ? "persistent" : "v1alpha1",
+                machineConfiguration,
+              );
             } else if (args.includes("logs")) stdout = lifecycleLogs;
             else if (args.includes("version"))
               stdout = JSON.stringify({
@@ -576,4 +596,52 @@ test("the existing callback accepts a bounded status larger than 32 KiB without 
   assert.equal(f.current.stage, "preflight");
   assert.equal(f.current.state, "confirmed");
   assert.equal(f.writes.length, 0);
+});
+
+test("checkpoint echoes compare the JSON wire facts when pre-boot image evidence is undefined", async () => {
+  const r = runtime(),
+    pins = {
+      kubelet: `registry.example/kubelet:v1.36.5@sha256:${"1".repeat(64)}`,
+      apiServer: `registry.example/kube-apiserver:v1.36.5@sha256:${"2".repeat(64)}`,
+      controllerManager: `registry.example/kube-controller-manager:v1.36.5@sha256:${"3".repeat(64)}`,
+      scheduler: `registry.example/kube-scheduler:v1.36.5@sha256:${"4".repeat(64)}`,
+    };
+  r.fixture.input.spec.roles.customer.kubernetes_images = pins;
+  r.current.spec_sha256 = digest(canonical(r.fixture.input.spec));
+  r.current.stage = "kubernetes_images";
+  r.facts = {
+    ...r.fixture.facts,
+    kubernetes_version: "v1.36.5",
+    kubelet_version: "v1.36.5",
+    cluster_nodes: [
+      {
+        node_uid: r.fixture.facts.node_uid,
+        kubelet_version: "v1.36.5",
+        node_ready: true,
+      },
+    ],
+  };
+  r.machineConfiguration = [
+    { version: "v1alpha1", machine: { type: "controlplane" } },
+    { apiVersion: "v1alpha1", kind: "KubeProxyConfig", disabled: true },
+    ...Object.entries({
+      kubelet: "KubeletConfig",
+      apiServer: "KubeAPIServerConfig",
+      controllerManager: "KubeControllerManagerConfig",
+      scheduler: "KubeSchedulerConfig",
+    }).map(([key, kind]) => ({
+      apiVersion: "v1alpha1",
+      kind,
+      image: pins[key as keyof typeof pins].split("@")[0],
+    })),
+  ]
+    .map((value) => stringify(value))
+    .join("---\n");
+  await r.turn();
+  assert.equal(r.current.stage, "kubernetes_images");
+  assert.equal(r.current.state, "confirmed");
+  assert.equal(r.writes.length, 1);
+  assert.ok(r.writes[0]!.args.includes("apply-config"));
+  assert.equal(Object.hasOwn(r.current.observed!, "kubernetes_images"), false);
+  assert.deepEqual(r.current.observed!.kubernetes_image_configuration, pins);
 });

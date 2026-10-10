@@ -591,15 +591,21 @@ export async function runFleetPatch(
       receipt?: FleetTalosUpgradeReceipt,
       postgresProgress?: ReturnType<typeof FleetPostgresPatchProgress.parse>,
     ) => {
-      const value = FleetPatchCheckpoint.parse({
-        expected_revision: current.revision,
-        stage,
-        state,
-        facts,
-        error_code,
-        ...(receipt ? { talos_upgrade_receipt: receipt } : {}),
-        ...(postgresProgress ? { postgres_progress: postgresProgress } : {}),
-      });
+      const value = FleetPatchCheckpoint.parse(
+        JSON.parse(
+          JSON.stringify({
+            expected_revision: current.revision,
+            stage,
+            state,
+            facts,
+            error_code,
+            ...(receipt ? { talos_upgrade_receipt: receipt } : {}),
+            ...(postgresProgress
+              ? { postgres_progress: postgresProgress }
+              : {}),
+          }),
+        ),
+      );
       if (!fleetPatchCheckpointAllowed({ ...input, status: current }, value))
         throw new BootstrapError("patch_checkpoint_invalid");
       let raw: unknown;
@@ -620,7 +626,8 @@ export async function runFleetPatch(
         result.state !== state ||
         canonical(result.observed) !== canonical(value.facts) ||
         (receipt &&
-          canonical(result.talos_upgrade_receipt) !== canonical(receipt))
+          canonical(result.talos_upgrade_receipt) !==
+            canonical(value.talos_upgrade_receipt))
       )
         throw new BootstrapError("patch_checkpoint_unconfirmed");
       current = result;
