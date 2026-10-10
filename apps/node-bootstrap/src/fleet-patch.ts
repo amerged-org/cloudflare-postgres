@@ -19,6 +19,7 @@ import {
   FleetPostgresPatchProgress,
   retainedTalosInstallationMatches,
   fleetPatchTalosRebootObserved,
+  FLEET_PATCH_PROOF_MAX_AGE_MS,
 } from "@pgcf/contracts/fleet-patches";
 import { CONFIGURATION_SCHEMA_REVISION } from "@pgcf/contracts";
 import { canonicalStorageAuthorityKeys } from "@pgcf/contracts/storage-write-authority";
@@ -183,7 +184,7 @@ export async function runFleetPatch(
     signal = AbortSignal.any([
       abort.signal,
       ...(options.signal ? [options.signal] : []),
-      AbortSignal.timeout(600_000),
+      AbortSignal.timeout(FLEET_PATCH_PROOF_MAX_AGE_MS),
     ]),
     directory = await mkdtemp(join(tmpdir(), "pgcf-patch-"));
   await chmod(directory, 0o700);
@@ -271,7 +272,7 @@ export async function runFleetPatch(
     const command = async (
       executable: string,
       args: string[],
-      timeout_ms = 30_000,
+      timeout_ms = 60_000,
       stdin?: string,
     ) => {
       signal.throwIfAborted();
@@ -326,7 +327,7 @@ export async function runFleetPatch(
     const talos = (args: string[], timeout?: number, stdin?: string) =>
       talosAt(args, input.address, timeout, stdin);
     const hostCommands = {
-      talos: (args: string[], stdin?: string) => talos(args, 30_000, stdin),
+      talos: (args: string[], stdin?: string) => talos(args, 60_000, stdin),
     };
     let controlNode: ObjectValue | undefined;
     let kubeInput = 0;
@@ -356,10 +357,10 @@ export async function runFleetPatch(
         [
           "--kubeconfig",
           join(directory, "kubeconfig"),
-          "--request-timeout=30s",
+          "--request-timeout=60s",
           ...nativeArgs,
         ],
-        30_000,
+        60_000,
         nativeStdin,
       );
     };
@@ -722,6 +723,14 @@ export async function runFleetPatch(
       receipt?: FleetTalosUpgradeReceipt,
       postgresProgress?: ReturnType<typeof FleetPostgresPatchProgress.parse>,
     ) => {
+      if (
+        Date.parse(facts.observed_at) <
+          Date.now() - FLEET_PATCH_PROOF_MAX_AGE_MS ||
+        Date.parse(facts.observed_at) > Date.now() + 5000 ||
+        facts.node_uid !== current.node_uid ||
+        facts.cluster_uid !== current.cluster_uid
+      )
+        throw new BootstrapError("patch_input_stale");
       const value = FleetPatchCheckpoint.parse(
         JSON.parse(
           JSON.stringify({

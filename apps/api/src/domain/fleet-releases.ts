@@ -687,10 +687,14 @@ export async function readDesiredFleetRelease(
     after.desired_release_id !== selected.id
   )
     return conflict("Region release changed during desired-state read");
+  // Provisioning-only artifacts are outside the runtime agent's inventory wire view.
+  // Keep the assigned full-spec hash and the complete immutable DB/admin/AddNode record.
+  const { talos_raw_image: provisioningImage, ...runtimeSpec } = selected.spec;
+  void provisioningImage;
   return FleetDesiredRelease.parse({
     region_id: regionId,
     region_revision: state.revision,
-    release: selected,
+    release: { ...selected, spec: runtimeSpec },
     nodes: nodes.results,
   });
 }

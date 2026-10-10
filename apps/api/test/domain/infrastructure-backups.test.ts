@@ -135,9 +135,10 @@ it("polls a real D1 export's at_bookmark and stops on the provider's error witho
   const bodies: Record<string, unknown>[] = [];
   const exportURL = "https://export.example.com/control.sql";
   expect(
-    await exportControlD1(binding, run, async (_input, init) => {
+    await exportControlD1(binding, run, async (input, init) => {
       bodies.push(JSON.parse(init!.body as string));
-      expect(init!.redirect).toBe("error");
+      expect(new Request(input, init).redirect).toBe("manual");
+      expect(init!.redirect).toBe("manual");
       expect(init!.signal).toBeInstanceOf(AbortSignal);
       return Response.json({
         success: true,
@@ -179,6 +180,17 @@ it("polls a real D1 export's at_bookmark and stops on the provider's error witho
     }),
   ).rejects.toThrow("infrastructure_backup_d1_export_failed");
   expect(failedCalls).toBe(1);
+  let redirects = 0;
+  await expect(
+    exportControlD1(binding, run, async () => {
+      redirects++;
+      return new Response("not-json", {
+        status: 302,
+        headers: { location: "https://untrusted.example.test/export" },
+      });
+    }),
+  ).rejects.toThrow("infrastructure_backup_d1_export_failed");
+  expect(redirects).toBe(1);
 });
 it("polls the same export while D1 queries are locked and rechecks authority after completion", async () => {
   const f = await fixture(),

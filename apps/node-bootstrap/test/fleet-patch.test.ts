@@ -317,6 +317,35 @@ test("an uncertain Talos upgrade is sent once and unchanged boot/version never a
   assert.equal(r.current.state, "dispatched");
   assert.equal(r.writes.length, 1);
 });
+test("a bounded Cloudflare management read can use measured transport headroom without starting a write", async () => {
+  const r = runtime();
+  let checked = 0;
+  r.kubeProbe = (command) => {
+    if (command.args.includes("get")) {
+      // The observed compound Flux GET exceeded the former 30 s outer timer
+      // after sequential authorized WebSocket setup.
+      const measuredReadMs = 35_000;
+      const requestSeconds = Number(
+        command.args
+          .find((arg) => arg.startsWith("--request-timeout="))
+          ?.slice("--request-timeout=".length, -1),
+      );
+      if (
+        command.timeout_ms <= measuredReadMs ||
+        requestSeconds * 1000 <= measuredReadMs
+      )
+        throw new Error("command_timeout");
+      assert.ok(command.timeout_ms <= 60_000);
+      checked++;
+    }
+    return undefined;
+  };
+  await r.turn();
+  assert.ok(checked > 0);
+  assert.equal(r.current.state, "confirmed");
+  assert.equal(r.writes.length, 0);
+});
+
 test("sealed configurations use the current authorized bridge rather than an obsolete bootstrap proxy", async () => {
   const r = runtime(true);
   await r.turn();
@@ -1102,12 +1131,34 @@ test("Flux CAS patches pass private real files to the pinned native kubectl and 
       });
     if (
       command.args.some((value) =>
-        value.startsWith("gitrepositories.source.toolkit"),
+        [
+          "gitrepositories",
+          "kustomizations",
+          "helmreleases",
+          "ocirepositories",
+          "helmcharts",
+        ].some((kind) => value.startsWith(kind + ".")),
       )
     )
       return Promise.resolve({
         exit_code: 0,
-        stdout: JSON.stringify({ items: sources }),
+        stdout: JSON.stringify({
+          items: sources.filter((value) => {
+            const kinds: Record<string, string> = {
+              gitrepositories: "GitRepository",
+              kustomizations: "Kustomization",
+              helmreleases: "HelmRelease",
+              ocirepositories: "OCIRepository",
+              helmcharts: "HelmChart",
+            };
+            return (
+              value.kind ===
+              kinds[
+                command.args[command.args.indexOf("get") + 1]!.split(".")[0]!
+              ]
+            );
+          }),
+        }),
       });
     if (command.args.includes("pods"))
       return Promise.resolve({
@@ -1252,4 +1303,40 @@ test("fleet apply gives the actual pinned native client a private configuration 
   await assert.rejects(stat(appliedFile), { code: "ENOENT" });
   await r.turn();
   assert.equal(r.writes.length, 1, "an uncertain outcome never replays apply");
+});
+
+test("the measured 178-second checkpoint collection preserves the configured witness and its original time", async (t) => {
+  const originalNow = Date.now();
+  t.mock.method(Date, "now", () => originalNow + 178_000);
+  const { r, pins } = pinnedKubernetesRuntime();
+  await r.turn();
+  assert.equal(r.current.state, "confirmed");
+  assert.deepEqual(r.current.observed!.kubernetes_image_configuration, pins);
+  assert.equal(
+    r.current.observed!.kubernetes_configuration_boot_id,
+    r.fixture.facts.boot_id,
+  );
+  assert.ok(Date.parse(r.current.observed!.observed_at) < Date.now() - 170_000);
+  assert.equal(
+    r.current.observed!.kubernetes_configuration_observed_at,
+    r.current.observed!.observed_at,
+  );
+});
+
+test("a checkpoint collection older than600 seconds cannot dispatch a native write", async (t) => {
+  const originalNow = Date.now();
+  t.mock.method(Date, "now", () => originalNow + 601_000);
+  const { r } = pinnedKubernetesRuntime();
+  await assert.rejects(r.turn(), /patch_input_stale/);
+  assert.equal(r.writes.length, 0);
+  assert.equal(r.checkpoints.length, 0);
+});
+
+test("future-dated checkpoint facts cannot dispatch a native write", async (t) => {
+  const originalNow = Date.now();
+  t.mock.method(Date, "now", () => originalNow - 10_000);
+  const { r } = pinnedKubernetesRuntime();
+  await assert.rejects(r.turn(), /patch_input_stale/);
+  assert.equal(r.writes.length, 0);
+  assert.equal(r.checkpoints.length, 0);
 });

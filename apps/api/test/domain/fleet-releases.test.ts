@@ -2,6 +2,8 @@
 import { env } from "cloudflare:workers";
 import lock from "../../../../infra/platform/versions.lock.json" with { type: "json" };
 import { afterEach, expect, it, vi } from "vitest";
+import { FleetReleaseSpec } from "@pgcf/contracts/releases";
+import { z } from "zod";
 import { FleetNodeReleaseObservation } from "@pgcf/contracts/releases";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
@@ -966,4 +968,49 @@ it("an ordinary report cannot claim a target component hash while reporting a co
   ).json()) as { state: string; mismatches: string[] };
   expect(status.state).toBe("pending");
   expect(status.mismatches).toContain("unobserved/components/regional");
+});
+it("the agent inventory view remains parseable by the deployed strict legacy release schema while the approved raw image stays immutable", async () => {
+  const f = await setup(),
+    spec = FleetReleaseSpec.parse(f.value);
+  spec.talos_raw_image = {
+    url: `https://artifacts.example/raw/${"e".repeat(64)}`,
+    sha256: "e".repeat(64),
+    format: "raw.xz",
+    bytes: 104857600,
+    raw_sha256: "f".repeat(64),
+    raw_bytes: 4294967296,
+  };
+  const approved = await request(
+    `/v1/fleet/releases/${f.id}`,
+    f.admin,
+    "PUT",
+    spec,
+  );
+  expect(approved.status).toBe(200);
+  const full = (await approved.json()) as {
+    spec: unknown;
+    spec_sha256: string;
+  };
+  expect((await f.assignRegion()).status).toBe(200);
+  expect((await f.assignNode()).status).toBe(200);
+  const { readDesiredFleetRelease } =
+      await import("../../src/domain/fleet-releases.ts"),
+    desired = (await readDesiredFleetRelease(env.DB, f.region))!;
+  const { talos_raw_image: unused, ...legacyShape } = FleetReleaseSpec.shape;
+  void unused;
+  const legacy = z.strictObject(legacyShape);
+  expect(legacy.safeParse(spec).success).toBe(false);
+  expect(legacy.safeParse(desired.release.spec).success).toBe(true);
+  expect(desired.release.spec_sha256).toBe(full.spec_sha256);
+  expect(desired.nodes[0]!.node_uid).toBe(f.uid);
+  expect(desired.nodes[0]!.revision).toBe(1);
+  const read = await (
+    await request(`/v1/fleet/releases/${f.id}`, f.admin)
+  ).json();
+  expect(read).toEqual(full);
+  const { readSelectedNodeGoldenImage } =
+    await import("../../src/domain/node-golden-image.ts");
+  expect((await readSelectedNodeGoldenImage(env, f.region))!.raw).toEqual(
+    spec.talos_raw_image,
+  );
 });

@@ -16,16 +16,23 @@ Reuse US1 and existing code.
 | Oct 10 | CLI stdin class fixed; gateway watch correction built | CI 38031252627: code check + Regional/Bootstrap passed; installer publication failed. Gateway not deployed. |
 | Oct 10 | Golden installer + matching raw published to R2 | Five original objects, 396,907,240 B fully read back; raw 245,551,396 B compressed. Public digest retrieval awaits API delivery/release approval. |
 | Oct 9–10 | Rust artifacts built | Five native images qualified by CI 37972707745; live runtime/pool acceptance pending. |
+| Oct 10 | Final integrated CI and API delivery | CI 38048525921 passed at source 5c3b03b. API module SHA d5a76c6e… is deployed at 100%; container 44/D1 0040. Three hosts and four database records preserved. Bootstrap mirror: 18 layers, 163,193,295 compressed bytes fully verified. |
+| Oct 10 | Public Golden distribution verified | Two original installer layers and 245,551,396 raw-image bytes verified through the Cloudflare API's public digest endpoints. Common release r1-ultra-5c3b03b approved. |
+| Oct 10 | One fleet intent persisted | op_f9shyukodjb1b8vs54gr selects US1/customer → EU1/customer → EU/control_relay. US patch op_h6j47nsw7pz6wljscpdr is pending in preflight at revision 0; no host write has started. EU authority changes wait for the required accepted snapshot. Zero Contabo calls in these actions. |
+| Oct 10 | Complete US preflight readback | All 59 reads and semantic checks passed in 218.640 s. The initial runtime measurement was then 178.383 s old, exceeding the API's 60 s freshness gate. The batch preserves original timestamps and gives checkpoint proofs a bounded 600 s window, exceeding twice the measured collection time; transport authorization and identity checks remain unchanged. |
+| Oct 10 | Observed-error correction batch verified locally | API 898/898 tests (104.78 s), Bootstrap 378/378, contracts 195/195 and image-input selection 14/14 passed. Independent source review clear; all nine native generators unchanged. Final CI/publication pending. |
 
 ## Open
 
 | Work | Missing customer-readiness result |
 | --- | --- |
-| Golden R1 | R2 bytes verified; public installer/raw retrieval and common release approval pending. |
-| Automatic convergence | One-request coordinator implemented with serial continuation, fresh RAM and prepared rotation; live rollout pending. |
-| Functional baseline | RAM/OCI/backup fixes and rotation integrated; final CI/delivery and three-node acceptance pending. |
+| Golden R1 | Public immutable delivery and release approval passed; actual host convergence remains open. |
+| Automatic convergence | Existing fleet intent retained. Batch corrections cover legacy agent schema projection, historical Talos STATE provenance, command budgets, parallel Flux reads and checkpoint freshness; reviewed delivery and live completion pending. |
+| Functional baseline | Integrated API delivered; three-node live convergence and functional acceptance pending. |
 | Operations/capacity | Daily R2 backups/alerts, thin storage, sleeping CPU release, startup bounds, restore and measured density. |
 | R2/handover | Rust/shared pool, subsecond first SQL/refill, automatic R1→R2, migration instructions. |
+| First daily backup | Run 1ebb9c1e-e353-4c31-b394-863d825a9440 failed in 86.476 s before export/native capture. Workerd rejects redirect:error; the three Worker-side sites are being corrected together. No accepted D1/etcd artifact yet. |
+| Routing credential retirement | A historical route master was accidentally printed during private inspection. Identity-bound reads confirm its derived key remains active in both gateways; the US encrypted installation profile also retains it. Owner exception to the no-further-key-rotation instruction is pending. No key changed. |
 
 ## Delivery architecture
 

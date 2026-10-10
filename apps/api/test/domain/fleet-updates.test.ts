@@ -540,6 +540,36 @@ it("bounds and pins official feeds; malformed advisories remain unknown and unsa
   });
   expect(seen).toEqual(["https://www.postgresql.org/versions.rss"]);
 });
+it("uses Worker-supported manual redirects and refuses a redirected official feed", async () => {
+  const now = Date.parse("2026-10-09T12:00:00.000Z"),
+    seen: string[] = [];
+  await readFleetUpdateFeed("talos", now, async (input, init) => {
+    expect(init?.redirect).toBe("manual");
+    expect(new Request(input, init).redirect).toBe("manual");
+    seen.push(String(input));
+    return Response.json(
+      String(input).includes("security-advisories") ? [] : [release("1.14.2")],
+    );
+  });
+  expect(seen).toHaveLength(2);
+  const redirectedRequests: string[] = [];
+  await expect(
+    readFleetUpdateFeed("talos", now, async (input, init) => {
+      expect(new Request(input, init).redirect).toBe("manual");
+      redirectedRequests.push(String(input));
+      return new Response("redirected", {
+        status: 302,
+        headers: { location: "https://untrusted.example.test/releases" },
+      });
+    }),
+  ).rejects.toThrow("upstream_unavailable");
+  expect(redirectedRequests).toHaveLength(2);
+  expect(
+    redirectedRequests.every((url) =>
+      url.startsWith("https://api.github.com/"),
+    ),
+  ).toBe(true);
+});
 it("enforces the five-second deadline even when an upstream body never finishes", async () => {
   vi.useFakeTimers();
   try {

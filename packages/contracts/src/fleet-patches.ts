@@ -16,6 +16,8 @@ import {
 } from "./releases.ts";
 
 const Hash = z.string().regex(/^[0-9a-f]{64}$/);
+/** One bounded Native turn may collect a checkpoint proof; original observation times stay intact. */
+export const FLEET_PATCH_PROOF_MAX_AGE_MS = 600_000;
 export const FleetPatchRequest = z.strictObject({
   node_uid: z.uuid(),
   assignment_revision: z.number().int().positive(),

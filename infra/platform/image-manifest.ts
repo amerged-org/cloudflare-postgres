@@ -204,7 +204,7 @@ async function runtimeIndex(
           tokenURL.searchParams.set("service", service);
           tokenURL.searchParams.set("scope", scope);
           const tokenResponse = await request(tokenURL.href, {
-            redirect: "error",
+            redirect: "manual",
             signal,
           });
           if (!tokenResponse.ok) {

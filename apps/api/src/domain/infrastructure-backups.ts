@@ -528,9 +528,13 @@ export async function exportControlD1(
         dump_options: { no_schema: false, no_data: false, tables: [] },
         ...(bookmark ? { current_bookmark: bookmark } : {}),
       }),
-      redirect: "error",
+      redirect: "manual",
       signal: AbortSignal.timeout(10000),
     });
+    if (response.status !== 200) {
+      await response.body?.cancel();
+      throw new Error("infrastructure_backup_d1_export_failed");
+    }
     const result = (await response.json()) as {
       success?: boolean;
       result?: {

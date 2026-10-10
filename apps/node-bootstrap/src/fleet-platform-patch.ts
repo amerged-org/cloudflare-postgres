@@ -327,13 +327,17 @@ export async function readFleetPlatformState(
       "-o",
       "json",
     ]),
-    commands.kube([
-      "get",
-      "gitrepositories.source.toolkit.fluxcd.io,kustomizations.kustomize.toolkit.fluxcd.io,helmreleases.helm.toolkit.fluxcd.io,ocirepositories.source.toolkit.fluxcd.io,helmcharts.source.toolkit.fluxcd.io",
-      "--all-namespaces",
-      "-o",
-      "json",
-    ]),
+    // kubectl serializes a multi-kind GET across fresh relay connections. Read
+    // these independent kinds concurrently within the same bounded session.
+    ...[
+      "gitrepositories.source.toolkit.fluxcd.io",
+      "kustomizations.kustomize.toolkit.fluxcd.io",
+      "helmreleases.helm.toolkit.fluxcd.io",
+      "ocirepositories.source.toolkit.fluxcd.io",
+      "helmcharts.source.toolkit.fluxcd.io",
+    ].map((kind) =>
+      commands.kube(["get", kind, "--all-namespaces", "-o", "json"]),
+    ),
     commands.kube(["get", "pods", "--all-namespaces", "-o", "json"]),
   ]);
   const failed = reads.find((v) => v.status === "rejected");
@@ -345,7 +349,7 @@ export async function readFleetPlatformState(
     uids: Record<string, string> = {};
   for (const value of [
     ...objects(data[0]!.items),
-    ...objects(data[1]!.items),
+    ...data.slice(1, -1).flatMap((value) => objects(value.items)),
   ]) {
     const metadata = object(value.metadata),
       key = resourceKey(value);
@@ -358,7 +362,7 @@ export async function readFleetPlatformState(
   }
   const state: FleetPlatformState = {
     resources,
-    pods: objects(data[2]!.items),
+    pods: objects(data.at(-1)!.items),
     uids,
   };
   if (!input) return state;

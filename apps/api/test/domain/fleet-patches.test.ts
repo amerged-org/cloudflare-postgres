@@ -8,6 +8,7 @@ import { afterEach, expect, it } from "vitest";
 import { newOperationId } from "@pgcf/contracts";
 import {
   FleetPatchStatus,
+  retainedTalosInstallationMatches,
   type FleetPatchFacts,
 } from "@pgcf/contracts/fleet-patches";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
@@ -940,6 +941,90 @@ it("reuses an exact prior installed-image receipt after metadata-only custody re
   expect((await readFleetPatch(f.runtime, f.op)).material_revision).toBe(2);
 });
 
+it("retains proved historical boot configuration for a different next installer without treating the target as installed", async () => {
+  const f = await setup(),
+    current = await fleetPatchInput(f.runtime, f.op),
+    oldId = newOperationId(),
+    oldRelease = `historical-${crypto.randomUUID()}`,
+    oldInstaller = `registry.example/old-talos@sha256:${"e".repeat(64)}`,
+    oldSpec = structuredClone(current.spec),
+    now = new Date().toISOString(),
+    priorBoot = crypto.randomUUID();
+  releases.push(oldRelease);
+  for (const role of Object.values(oldSpec.roles))
+    role.talos_installer = oldInstaller;
+  const receipt = {
+    method: "deploymentreceipt" as const,
+    installer: oldInstaller,
+    node_uid: f.nodeUid,
+    cluster_uid: f.clusterUid,
+    system_uuid: f.facts.system_uuid,
+    pre_reboot_boot_id: priorBoot,
+    completed_at: now,
+    source: "cli_exit_0" as const,
+  };
+  const observed: FleetPatchFacts = {
+    ...f.facts,
+    talos_version: "1.14.1",
+    kubernetes_version: "1.36.5",
+    kubelet_version: "1.36.5",
+    observed_at: now,
+    release_facts: {
+      components: [],
+      kubernetes_image_provenance: {
+        method: "pinned_configuration_boot",
+        configuration_boot_id: priorBoot,
+        configuration_observed_at: now,
+        observed_at: now,
+        kubelet_version: "1.36.5",
+        control_plane: false,
+        images: {
+          kubelet: {
+            configuration: `registry.example/kubelet@sha256:${"d".repeat(64)}`,
+            runtime_sha256: "d".repeat(64),
+          },
+        },
+      },
+    },
+  };
+  await env.DB.prepare(
+    "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+  )
+    .bind(
+      oldRelease,
+      JSON.stringify(oldSpec),
+      await installationHash(oldSpec),
+      now,
+    )
+    .run();
+  await env.DB.prepare(
+    `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,baseline_json,observed_json,talos_upgrade_receipt_json,created_at,updated_at,deadline_at) SELECT ?,node_id,region_id,node_uid,cluster_uid,?,?,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,0,'complete','confirmed',?,?,?,created_at,?,deadline_at FROM fleet_patch_operations WHERE operation_id=?`,
+  )
+    .bind(
+      oldId,
+      oldRelease,
+      await installationHash(oldSpec),
+      JSON.stringify(observed),
+      JSON.stringify(observed),
+      JSON.stringify(receipt),
+      now,
+      f.op,
+    )
+    .run();
+  await env.DB.prepare(
+    "INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at) SELECT ?,?,1,agent_key_hash,'{\"components\":[]}',?,? FROM regions WHERE id=?",
+  )
+    .bind(f.node, f.nodeUid, now, now, f.region)
+    .run();
+  const input = await fleetPatchInput(f.runtime, f.op);
+  expect(input.retained_talos_installation?.receipt).toEqual(receipt);
+  expect(
+    input.retained_talos_installation?.kubernetes_image_provenance,
+  ).toEqual(observed.release_facts!.kubernetes_image_provenance);
+  expect(retainedTalosInstallationMatches(input, observed)).toBe(false);
+  expect(input.status.talos_upgrade_receipt).toBeNull();
+});
+
 it("keeps a host-qualified control operation terminal while a worker and idempotent control finalization finish the same release", async () => {
   const f = await setup(),
     worker = `nod_${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
@@ -1533,4 +1618,76 @@ it("verified activation creates a current-custody host-only finalization from an
     original.material_revision,
   );
   expect((await readFleetPatch(runtime, f.op)).stage).toBe("host_ready");
+});
+
+it("accepts the measured 178-second checkpoint proof without changing its timestamps or stage facts", async () => {
+  const f = await setup(),
+    observedAt = new Date(Date.now() - 178000).toISOString(),
+    facts = {
+      ...f.facts,
+      observed_at: observedAt,
+      platform_resource_uids: { "Namespace//flux-system": crypto.randomUUID() },
+    };
+  const result = await recordFleetPatchCheckpoint(f.runtime, f.op, {
+    expected_revision: 0,
+    stage: "preflight",
+    state: "confirmed",
+    facts,
+    error_code: null,
+  });
+  expect(result.observed).toEqual(facts);
+  expect(result.baseline).toEqual(facts);
+  expect(result.observed!.observed_at).toBe(observedAt);
+});
+
+it("rejects checkpoint proof older than the bounded 600-second collection window", async () => {
+  const f = await setup();
+  await expect(
+    recordFleetPatchCheckpoint(f.runtime, f.op, {
+      expected_revision: 0,
+      stage: "preflight",
+      state: "confirmed",
+      facts: {
+        ...f.facts,
+        observed_at: new Date(Date.now() - 601000).toISOString(),
+      },
+      error_code: null,
+    }),
+  ).rejects.toThrow("Fleet patch identity or authority changed");
+  expect((await readFleetPatch(f.runtime, f.op)).revision).toBe(0);
+});
+
+it("rejects future-dated checkpoint proof within the collection budget", async () => {
+  const f = await setup();
+  await expect(
+    recordFleetPatchCheckpoint(f.runtime, f.op, {
+      expected_revision: 0,
+      stage: "preflight",
+      state: "confirmed",
+      facts: {
+        ...f.facts,
+        observed_at: new Date(Date.now() + 10000).toISOString(),
+      },
+      error_code: null,
+    }),
+  ).rejects.toThrow("Fleet patch identity or authority changed");
+  expect((await readFleetPatch(f.runtime, f.op)).revision).toBe(0);
+});
+
+it("the longer collection window cannot authorize another physical Node UID", async () => {
+  const f = await setup();
+  await expect(
+    recordFleetPatchCheckpoint(f.runtime, f.op, {
+      expected_revision: 0,
+      stage: "preflight",
+      state: "confirmed",
+      facts: {
+        ...f.facts,
+        node_uid: crypto.randomUUID(),
+        observed_at: new Date(Date.now() - 178000).toISOString(),
+      },
+      error_code: null,
+    }),
+  ).rejects.toThrow("Fleet patch identity or authority changed");
+  expect((await readFleetPatch(f.runtime, f.op)).revision).toBe(0);
 });

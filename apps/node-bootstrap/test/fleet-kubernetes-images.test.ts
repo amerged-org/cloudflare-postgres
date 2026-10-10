@@ -541,6 +541,7 @@ test("runtime index resolution supports a scoped anonymous GHCR challenge", asyn
     const url = new URL(String(input));
     if (url.hostname === "ghcr.io" && url.pathname === "/token") {
       tokenRequests++;
+      assert.equal(init?.redirect, "manual");
       assert.equal(url.searchParams.get("service"), "ghcr.io");
       assert.equal(
         url.searchParams.get("scope"),
@@ -583,6 +584,40 @@ test("runtime index resolution supports a scoped anonymous GHCR challenge", asyn
   );
   assert.equal(images?.apiServer?.runtime_sha256, apiServerManifestDigest);
   assert.equal(tokenRequests, 1);
+});
+test("a registry token redirect is refused without following its location", async () => {
+  const seen: string[] = [];
+  const normalized = await normalizeRuntimeImageManifest(
+    `ghcr.io/example/kube-apiserver@sha256:${apiServerManifestDigest}`,
+    apiServerManifestDigest,
+    apiServerRuntimeDigest,
+    {
+      request: async (input, init) => {
+        const url = new URL(String(input));
+        seen.push(url.href);
+        if (url.pathname === "/token") {
+          assert.equal(init?.redirect, "manual");
+          return new Response("redirect", {
+            status: 302,
+            headers: { location: "https://untrusted.example.test/token" },
+          });
+        }
+        return new Response(null, {
+          status: 401,
+          headers: {
+            "www-authenticate":
+              'Bearer realm="https://ghcr.io/token",service="ghcr.io",scope="repository:example/kube-apiserver:pull"',
+          },
+        });
+      },
+    },
+  );
+  assert.equal(normalized, undefined);
+  assert.equal(seen.length, 2);
+  assert.equal(
+    seen.some((url) => url.includes("untrusted.example.test")),
+    false,
+  );
 });
 test("a different request implementation cannot reuse another reader's immutable index cache", async () => {
   const f = indexRuntimeFixture();

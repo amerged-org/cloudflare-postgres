@@ -16,6 +16,7 @@ import {
   FleetTalosUpgradeReceipt,
   FleetPatchFacts,
   retainedTalosInstallationMatches,
+  FLEET_PATCH_PROOF_MAX_AGE_MS,
 } from "@pgcf/contracts/fleet-patches";
 import {
   FleetReleaseSpec,
@@ -324,19 +325,20 @@ export async function fleetPatchInput(
         JSON.parse(prior.talos_upgrade_receipt_json),
       ),
       observed = FleetPatchFacts.parse(JSON.parse(prior.observed_json));
-    if (receipt.installer === spec.roles[selected.role].talos_installer)
-      retainedTalos = {
-        receipt,
-        boot_id: observed.boot_id,
-        talos_version: observed.talos_version,
-        talos_schematic_sha256: observed.talos_schematic_sha256,
-        ...(observed.release_facts?.kubernetes_image_provenance
-          ? {
-              kubernetes_image_provenance:
-                observed.release_facts.kubernetes_image_provenance,
-            }
-          : {}),
-      };
+    // Historical proof authorizes reading boot-loaded STATE before a different image is
+    // installed. The executor separately requires exact target-installer equality to skip it.
+    retainedTalos = {
+      receipt,
+      boot_id: observed.boot_id,
+      talos_version: observed.talos_version,
+      talos_schematic_sha256: observed.talos_schematic_sha256,
+      ...(observed.release_facts?.kubernetes_image_provenance
+        ? {
+            kubernetes_image_provenance:
+              observed.release_facts.kubernetes_image_provenance,
+          }
+        : {}),
+    };
   }
   const hostConfiguration =
     row.host_configuration_revision && row.host_configuration_sha256
@@ -1258,7 +1260,8 @@ export async function recordFleetPatchCheckpoint(
   if (
     input.facts.node_uid !== row.node_uid ||
     input.facts.cluster_uid !== row.cluster_uid ||
-    Date.parse(input.facts.observed_at) < Date.now() - 60_000 ||
+    Date.parse(input.facts.observed_at) <
+      Date.now() - FLEET_PATCH_PROOF_MAX_AGE_MS ||
     Date.parse(input.facts.observed_at) > Date.now() + 5000 ||
     (row.baseline_json &&
       JSON.parse(row.baseline_json).system_uuid !== input.facts.system_uuid)

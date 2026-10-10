@@ -112,7 +112,7 @@ async function readOfficial(
     return await Promise.race([
       (async () => {
         const response = await request(url, {
-          redirect: "error",
+          redirect: "manual",
           signal: abort.signal,
           headers: {
             Accept: "application/vnd.github+json",

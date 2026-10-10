@@ -1282,7 +1282,18 @@ function platformIndexFixture() {
         return JSON.stringify({ items: workloads });
       if (args[1] === "pods") return JSON.stringify({ items: pods });
       if (args[1] === "nodes") return JSON.stringify({ items: nodes });
-      return JSON.stringify({ items: flux });
+      const kinds: Record<string, string> = {
+        gitrepositories: "GitRepository",
+        kustomizations: "Kustomization",
+        helmreleases: "HelmRelease",
+        ocirepositories: "OCIRepository",
+        helmcharts: "HelmChart",
+      };
+      return JSON.stringify({
+        items: flux.filter(
+          (value) => value.kind === kinds[args[1]!.split(".")[0]!],
+        ),
+      });
     },
   };
   return {
@@ -1421,4 +1432,49 @@ test("platform aliases reject tampered metadata, another AMD64 child and a non-A
     ).components.length,
     0,
   );
+});
+
+test("Flux kind readbacks run concurrently without a serialized multi-kind kubectl transport", async () => {
+  const kinds = new Map([
+    ["gitrepositories.source.toolkit.fluxcd.io", "GitRepository"],
+    ["kustomizations.kustomize.toolkit.fluxcd.io", "Kustomization"],
+    ["helmreleases.helm.toolkit.fluxcd.io", "HelmRelease"],
+    ["ocirepositories.source.toolkit.fluxcd.io", "OCIRepository"],
+    ["helmcharts.source.toolkit.fluxcd.io", "HelmChart"],
+  ]);
+  let active = 0,
+    peak = 0;
+  const seen: string[] = [];
+  const state = await readFleetPlatformState({
+    kube: async (args) => {
+      const resource = args[1]!;
+      seen.push(resource);
+      if (resource.includes("gitrepositories") && resource.includes(","))
+        throw new Error("compound_flux_read_serializes_transports");
+      active++;
+      peak = Math.max(peak, active);
+      await Promise.resolve();
+      active--;
+      return JSON.stringify({
+        items: kinds.has(resource)
+          ? [
+              {
+                kind: kinds.get(resource),
+                metadata: {
+                  name: "fixture",
+                  namespace: "flux-system",
+                  uid: randomUUID(),
+                },
+              },
+            ]
+          : [],
+      });
+    },
+  });
+  assert.deepEqual(
+    seen.filter((resource) => kinds.has(resource)),
+    [...kinds.keys()],
+  );
+  assert.ok(peak >= kinds.size);
+  assert.equal(state.resources.size, kinds.size);
 });
