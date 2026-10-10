@@ -184,7 +184,7 @@ export async function collectFleetPatchRuntime(
     (current.baseline && current.baseline.system_uuid !== observed.system_uuid)
   )
     throw new BootstrapError("patch_live_identity_changed");
-  return { facts: observed, controlNode };
+  return { facts: observed, controlNode, nodes: clusterNodes };
 }
 
 /** Talos ExtensionStatus describes loaded metadata; it does not expose an OCI imageID. */

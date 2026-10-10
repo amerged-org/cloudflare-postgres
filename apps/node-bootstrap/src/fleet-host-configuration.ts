@@ -92,26 +92,73 @@ export function mergeHostConfiguration(
 }
 export async function readMachineConfiguration(
   commands: HostConfigurationCommands,
+  boot?: {
+    boot_id: string;
+    configuration_boot_id: string;
+    configuration_sha256?: string;
+  },
 ) {
-  const [active, persistent] = await Promise.all([
-    commands.talos(["get", "machineconfig", "v1alpha1", "--output=json"]),
-    commands.talos(["get", "machineconfig", "persistent", "--output=json"]),
-  ]);
-  const a = machineConfigurationDocuments(active, "v1alpha1"),
-    p = machineConfigurationDocuments(persistent, "persistent");
-  if (canonical(a.values) !== canonical(p.values))
+  const resources = jsonRecords(
+    await commands.talos(["get", "machineconfig", "--output=json"]),
+  );
+  const selected = (id: string) =>
+    resources.filter((value) => object(value.metadata).id === id);
+  const activeRows = selected("v1alpha1"),
+    persistentRows = selected("persistent");
+  if (activeRows.length !== 1 || persistentRows.length > 1)
+    throw new BootstrapError("patch_host_configuration_resource_invalid");
+  const active = JSON.stringify(activeRows[0]),
+    persistent = persistentRows[0]
+      ? JSON.stringify(persistentRows[0])
+      : undefined,
+    a = machineConfigurationDocuments(active, "v1alpha1"),
+    sha256 = digest(canonical(a.values));
+  if (
+    persistent &&
+    canonical(a.values) !==
+      canonical(machineConfigurationDocuments(persistent, "persistent").values)
+  )
     throw new BootstrapError(
       "patch_host_configuration_active_persistent_diverged",
     );
-  return { active, persistent, sha256: digest(canonical(a.values)) };
+  // Talos omits PersistentID when a boot loads its already persisted STATE configuration.
+  // The caller must bind that absence to the previous proved configuration and changed boot.
+  if (
+    !persistent &&
+    (!boot ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(boot.boot_id) ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(
+        boot.configuration_boot_id,
+      ) ||
+      boot.boot_id === boot.configuration_boot_id ||
+      (boot.configuration_sha256 !== undefined &&
+        boot.configuration_sha256 !== sha256))
+  )
+    throw new BootstrapError("patch_host_configuration_persistence_unproved");
+  return {
+    active,
+    persistent,
+    sha256,
+    ...(!persistent && boot
+      ? {
+          state_loaded: {
+            boot_id: boot.boot_id,
+            configuration_boot_id: boot.configuration_boot_id,
+            configuration_sha256: sha256,
+          },
+        }
+      : {}),
+  };
 }
 export async function readHostConfiguration(
   commands: HostConfigurationCommands,
   input: NodeHostConfigurationPrivate,
   configuration?: Awaited<ReturnType<typeof readMachineConfiguration>>,
   requireThinPool = false,
+  boot?: Parameters<typeof readMachineConfiguration>[1],
 ) {
-  const value = configuration ?? (await readMachineConfiguration(commands));
+  const value =
+    configuration ?? (await readMachineConfiguration(commands, boot));
   const moduleConfigured = (raw: string, id: string) => {
     const modules = machineConfigurationDocuments(raw, id).values.filter(
       (value) =>
@@ -125,9 +172,13 @@ export async function readHostConfiguration(
   const configured =
     (!requireThinPool ||
       (moduleConfigured(value.active, "v1alpha1") &&
-        moduleConfigured(value.persistent, "persistent"))) &&
+        (value.persistent
+          ? moduleConfigured(value.persistent, "persistent")
+          : !!value.state_loaded))) &&
     hostConfigurationMatches(value.active, "v1alpha1", input) &&
-    hostConfigurationMatches(value.persistent, "persistent", input);
+    (value.persistent
+      ? hostConfigurationMatches(value.persistent, "persistent", input)
+      : !!value.state_loaded);
   return {
     ...value,
     thin_pool_required: requireThinPool,
@@ -146,6 +197,7 @@ export async function applyHostConfiguration(
     input,
     undefined,
     expected.thin_pool_required,
+    expected.state_loaded,
   );
   if (latest.sha256 !== expected.sha256)
     throw new BootstrapError("patch_host_configuration_changed_before_write");

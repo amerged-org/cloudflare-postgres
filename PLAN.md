@@ -1,14 +1,16 @@
 # cloudflare-postgres — Plan
 
-**Status, 2026-10-09: overall goal open; none of the 13 final acceptance gates is closed.**
+**Status, 2026-10-10: overall goal open; none of the 13 final acceptance gates is closed.**
 
 **Current work: execution gate 2 — R1 fleet preflight and supported upgrades. Immediate US
 cluster-authority rotation passed live; Cloudflare custody revision 2 is active. Execution gate 1 passed live.**
 The [corrective plan, §10](docs/architecture/cloudflare-convergence-and-serverless-plan.md#10-execution-order-and-release-gates)
 defines the owner's ordered work packages; its §11 defines the 13 acceptance rows in [Status](#11-status).
 
-The live API is 71362c8 after successful main CI (38012058196); D1 remains at 0038.
-The qualified Bootstrap image d9c752de is fully mirrored in Cloudflare; no migration was rerun.
+The live API is edcabc36 after successful main CI (38015987192); D1 remains at 0038.
+The qualified Bootstrap image 3bfbf60b is fully mirrored in Cloudflare; no migration was rerun.
+US1 has booted official Talos 1.14.2 through its original patch operation; final release admission
+awaits the collected post-boot reader corrections. EU rotation is next, before either EU upgrade.
 The EU/US database lifecycle, measured RAM trigger and 135-second EU policy transition are valid partial evidence.
 They do not establish uniform releases, unattended purchases, thin storage, key rotation or fast start.
 
@@ -329,7 +331,7 @@ point or infer 22-project density from nominal host RAM or permanent class-reser
 
 | Gate | Stand | Messwert | Datum |
 | --- | --- | --- | --- |
-| Uniform3-server release | Open — R1 pending | Retained Talos 1.14.1; Kubernetes EU 1.36.3 / US 1.36.5. No accepted all-three-server R1 on official Talos 1.14.2 / Kubernetes 1.36.5. | 2026-10-09 |
+| Uniform3-server release | Open — US upgraded; R1 admission pending | US1 live readback at 02:57:41 UTC: official Talos 1.14.2, Kubernetes/kubelet 1.36.5, new boot ID, retained Node/Cluster/DMI identities and Node Ready; 6 direct reads and 6 grants passed, 0 Contabo calls. EU remains Talos 1.14.1 / Kubernetes 1.36.3. The same US patch is paused at revision 19 for the collected state-loaded configuration and OCI-index reader corrections; no repeated reboot. | 2026-10-10 |
 | Central customer control | Open — partial live evidence | Shared actual-RAM policy: 128 MiB PostgreSQL request, 4096 MiB maximum. EU transition 135 s preserved all 3 database hashes; complete profile-change/interruption acceptance in both regions remains open. | 2026-10-09 |
 | Compute overbooking | Open | A 256 MiB PostgreSQL trial worked; backup peak, cold-sleep CPU release and concurrent startup/neighbor bounds are not accepted on the corrected model. | 2026-10-09 |
 | Disk overbooking | Open | Thick storage is the accepted baseline. Last measured VG total was 103,075,020,800 B per node; no complete live thin-profile quota/full-pool/startup/reclaim acceptance. | 2026-10-09 |

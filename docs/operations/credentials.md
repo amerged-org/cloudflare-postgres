@@ -113,6 +113,12 @@ the Kubernetes API/aggregator CAs, service-account signer, discovery secret and 
 encryption key may live outside the legacy `machine`/`cluster` document. Emit field names and
 validation booleans only. A missing legacy field does not establish absence of the credential.
 
+After a boot that loads configuration only from STATE, Talos intentionally omits the separate
+`machineconfig/persistent` runtime resource ([pinned acquisition controller](https://github.com/siderolabs/talos/blob/v1.14.2/internal/app/machined/pkg/controllers/config/acquire.go)).
+List the resources and use the actual active configuration with the verified prior configuration
+and changed-boot witness. Keep rejecting unproved absence or changed configuration. Do not
+reapply configuration merely to recreate that runtime resource.
+
 The October5 disclosure affected EU authority. A subsequent October9 diagnostic exposed the
 US machine configuration as well; treat both prior authority sets as compromised. Earlier
 fingerprint differences do not protect a later disclosure. Read the current accepted rotation
@@ -186,6 +192,11 @@ replay never rotates keys again or overwrites historical ciphertext. A staged pa
 not reserve a maintenance window: keep other mutation admission closed through the physical
 rotation. Refresh material-bound host/proof receipts before resuming bootstrap or new thin/warm
 authority. Retain every old ciphertext/decryption key needed by historical custody and snapshots.
+
+For an occupied cluster, coordinate an exclusive operator window and check pending database
+operations before changing authority. Placement closure alone does not freeze every database
+mutation; PGCF currently has no complete region-wide maintenance lock. Keep adopter/admin
+mutation clients stopped during this window and measure retained database availability separately.
 
 Pinned Talos1.14.1 and1.14.2 have identical relevant CA rotator/configuration source. Each stock
 `rotate-ca` invocation generates fresh keys, so a dry run does not select the later live keys and

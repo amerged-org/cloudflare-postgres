@@ -324,7 +324,9 @@ export async function runFleetPatch(
       );
     let assets: FleetPlatformAssets | undefined,
       platformState: FleetPlatformState | undefined,
-      platformReadback: ReturnType<typeof fleetPlatformReadback> | undefined;
+      platformReadback: ReturnType<typeof fleetPlatformReadback> | undefined,
+      machineConfiguration:
+        Awaited<ReturnType<typeof readMachineConfiguration>> | undefined;
     const authorize = async () => {
       const next = FleetPatchStatus.parse(
         await call({
@@ -357,10 +359,79 @@ export async function runFleetPatch(
         !!input.spec.roles[input.role].kubernetes_images &&
         (FLEET_PATCH_STAGES as readonly string[]).indexOf(current.stage) >=
           FLEET_PATCH_STAGES.indexOf("kubernetes_images");
-      const machineConfiguration =
+      const priorConfiguration = current.observed,
+        receipt = current.talos_upgrade_receipt,
+        retainedConfiguration = input.retained_talos_installation,
+        retainedConfigurationProof =
+          retainedConfiguration?.kubernetes_image_provenance,
+        retainedStateBoot =
+          retainedConfiguration &&
+          retainedConfiguration.boot_id === facts.boot_id &&
+          retainedConfiguration.receipt.node_uid === facts.node_uid &&
+          retainedConfiguration.receipt.cluster_uid === facts.cluster_uid &&
+          retainedConfiguration.receipt.system_uuid === facts.system_uuid &&
+          retainedConfiguration.receipt.pre_reboot_boot_id !== facts.boot_id &&
+          retainedConfiguration.talos_version.replace(/^v/, "") ===
+            facts.talos_version.replace(/^v/, "") &&
+          retainedConfiguration.talos_schematic_sha256 ===
+            facts.talos_schematic_sha256 &&
+          retainedConfigurationProof?.method === "pinned_configuration_boot" &&
+          retainedConfigurationProof.configuration_boot_id &&
+          retainedConfigurationProof.configuration_observed_at &&
+          retainedConfigurationProof.control_plane ===
+            facts.kubernetes_control_plane &&
+          retainedConfigurationProof.kubelet_version.replace(/^v/, "") ===
+            facts.kubelet_version.replace(/^v/, "")
+            ? {
+                boot_id: facts.boot_id,
+                configuration_boot_id:
+                  retainedConfigurationProof.configuration_boot_id,
+              }
+            : undefined,
+        stateBoot =
+          receipt &&
+          receipt.node_uid === facts.node_uid &&
+          receipt.cluster_uid === facts.cluster_uid &&
+          receipt.system_uuid === facts.system_uuid &&
+          facts.boot_id !== receipt.pre_reboot_boot_id &&
+          fleetPatchRuntimeMatches(input, facts).talos &&
+          priorConfiguration?.kubernetes_configuration_boot_id ===
+            receipt.pre_reboot_boot_id &&
+          priorConfiguration.kubernetes_configuration_observed_at &&
+          priorConfiguration.kubernetes_image_configuration
+            ? {
+                boot_id: facts.boot_id,
+                configuration_boot_id:
+                  priorConfiguration.kubernetes_configuration_boot_id,
+              }
+            : retainedStateBoot,
+        provedConfiguration =
+          retainedStateBoot &&
+          stateBoot === retainedStateBoot &&
+          retainedConfigurationProof
+            ? Object.fromEntries(
+                Object.entries(retainedConfigurationProof.images).map(
+                  ([name, image]) => [name, image.configuration],
+                ),
+              )
+            : priorConfiguration?.kubernetes_image_configuration;
+      machineConfiguration =
         input.host_configuration || observeImages
-          ? await readMachineConfiguration(hostCommands)
+          ? await readMachineConfiguration(hostCommands, stateBoot)
           : undefined;
+      if (
+        machineConfiguration?.state_loaded &&
+        canonical(
+          kubernetesConfigurationImages(
+            machineConfiguration.active,
+            "v1alpha1",
+            facts.kubernetes_control_plane,
+          ),
+        ) !== canonical(provedConfiguration)
+      )
+        throw new BootstrapError(
+          "patch_host_configuration_persistence_unproved",
+        );
       if (observeImages) {
         facts.kubernetes_image_configuration = kubernetesConfigurationImages(
           machineConfiguration!.active,
@@ -407,7 +478,7 @@ export async function runFleetPatch(
         facts.kubernetes_images = await observeKubernetesImages(
           input,
           facts.kubernetes_control_plane,
-          { ...hostCommands, kube },
+          { ...hostCommands, kube, request, signal },
           machineConfiguration,
           facts.kubernetes_configuration_boot_id
             ? {
@@ -455,7 +526,11 @@ export async function runFleetPatch(
       }
       if (input.spec.platform_source_commit) {
         assets ??= await readFleetPlatformAssets(input, signal, request);
-        platformState = await readFleetPlatformState({ kube });
+        platformState = await readFleetPlatformState(
+          { kube, request, signal },
+          input,
+          { nodes: observed.nodes, boot_id: facts.boot_id },
+        );
         platformReadback = fleetPlatformReadback(
           input,
           platformState,
@@ -500,11 +575,10 @@ export async function runFleetPatch(
           ),
           ...fluxIdentities,
         };
-        const receipt = current.talos_upgrade_receipt,
-          postReboot =
-            receipt &&
-            facts.boot_id !== receipt.pre_reboot_boot_id &&
-            fleetPatchRuntimeMatches(input, facts).talos;
+        const postReboot =
+          receipt &&
+          facts.boot_id !== receipt.pre_reboot_boot_id &&
+          fleetPatchRuntimeMatches(input, facts).talos;
         const extensionFacts = [];
         if (input.spec.roles[input.role].talos_extensions.length) {
           const loaded = readFleetTalosExtensions(
@@ -723,6 +797,7 @@ export async function runFleetPatch(
           host,
           undefined,
           !!input.spec.thin_storage_qualification,
+          machineConfiguration?.state_loaded,
         );
         await checkpoint("host_config", "dispatched", facts);
         const latest = await latePreflight(facts);
@@ -910,7 +985,10 @@ export async function runFleetPatch(
       if (fleetPatchKubernetesConfigurationMatches(input, facts))
         await checkpoint("kubernetes_images", "confirmed", configured(facts));
       else if (current.state === "pending") {
-        const before = await readMachineConfiguration(hostCommands);
+        const before = await readMachineConfiguration(
+          hostCommands,
+          machineConfiguration?.state_loaded,
+        );
         await checkpoint("kubernetes_images", "dispatched", facts);
         const latest = await latePreflight(facts);
         if (!latest) return current;

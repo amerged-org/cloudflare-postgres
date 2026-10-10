@@ -981,3 +981,307 @@ test("release image observations ignore terminal rollout Pods but still require 
     false,
   );
 });
+
+import { readFileSync } from "node:fs";
+import { readFleetPlatformState } from "../src/fleet-platform-patch.ts";
+
+// Actual immutable Cilium/Flux index bytes; the expected AMD64 pins come from the lock.
+const platformIndexBodies = [
+  '{\n  "schemaVersion": 2,\n  "mediaType": "application/vnd.oci.image.index.v1+json",\n  "manifests": [\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:9d308e3f7f05972b0b0604c40d2b0f08fa2f6a55084fef1e1aaadb469e430639",\n      "size": 1247,\n      "platform": {\n        "architecture": "amd64",\n        "os": "linux"\n      }\n    },\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:02dd062a1f48a6ef52f50e7396117f9e7c82fbe9e6408dcaebe212257414bbeb",\n      "size": 1247,\n      "platform": {\n        "architecture": "arm64",\n        "os": "linux"\n      }\n    }\n  ]\n}',
+  '{\n  "schemaVersion": 2,\n  "mediaType": "application/vnd.oci.image.index.v1+json",\n  "manifests": [\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:d10ea2ebeb475de80a6d3caf792578b1eaaa0366c55442d20d7e5f6f78fad3ec",\n      "size": 865,\n      "platform": {\n        "architecture": "amd64",\n        "os": "linux"\n      }\n    },\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:abda1053b630d5258b04dbd5090029e4c7f68cb1ab6ba26d46764912f81ddcec",\n      "size": 865,\n      "platform": {\n        "architecture": "arm",\n        "os": "linux",\n        "variant": "v7"\n      }\n    },\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:5f2e5cd101b7b5e22afa9d555ba58afb54c5bbc099ac814deb993ee2e982592f",\n      "size": 865,\n      "platform": {\n        "architecture": "arm64",\n        "os": "linux"\n      }\n    },\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:20057b4589fdd01b3d09ed33a75c51fd40e3d2f99007ddc0b3f10f0ad762cf4a",\n      "size": 1110,\n      "annotations": {\n        "vnd.docker.reference.digest": "sha256:d10ea2ebeb475de80a6d3caf792578b1eaaa0366c55442d20d7e5f6f78fad3ec",\n        "vnd.docker.reference.type": "attestation-manifest"\n      },\n      "platform": {\n        "architecture": "unknown",\n        "os": "unknown"\n      }\n    },\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:3e698ddbfe73c13c2478b36513ca2907d62bb0ccd1c5a886ec73df5205badb90",\n      "size": 1110,\n      "annotations": {\n        "vnd.docker.reference.digest": "sha256:abda1053b630d5258b04dbd5090029e4c7f68cb1ab6ba26d46764912f81ddcec",\n        "vnd.docker.reference.type": "attestation-manifest"\n      },\n      "platform": {\n        "architecture": "unknown",\n        "os": "unknown"\n      }\n    },\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:de87d42abc0237190ef5f33b7a56141736fd6104dd67bd5fd722718e67c606b0",\n      "size": 1110,\n      "annotations": {\n        "vnd.docker.reference.digest": "sha256:5f2e5cd101b7b5e22afa9d555ba58afb54c5bbc099ac814deb993ee2e982592f",\n        "vnd.docker.reference.type": "attestation-manifest"\n      },\n      "platform": {\n        "architecture": "unknown",\n        "os": "unknown"\n      }\n    }\n  ]\n}',
+];
+function platformIndexFixture() {
+  const { input } = patchFixture();
+  const lock = JSON.parse(
+    readFileSync(
+      new URL("../../../infra/platform/versions.lock.json", import.meta.url),
+      "utf8",
+    ),
+  );
+  const cilium = lock.charts.find(
+    (value: { name: string }) => value.name === "cilium",
+  );
+  const references = [
+    cilium.renderedImages.find((value: string) =>
+      value.startsWith("quay.io/cilium/cilium:"),
+    ),
+    lock.flux.images["source-controller"],
+  ];
+  const names = ["image/cilium/cilium", "flux-source"];
+  input.spec.platform_source_commit = "f".repeat(40);
+  const pins = references.map((reference: string, index: number) => ({
+    name: names[index]!,
+    kind: "image" as const,
+    version: reference.split("@")[0]!.split(":").at(-1)!,
+    reference,
+    sha256: reference.split("@sha256:")[1]!,
+    workload: {
+      namespace: index === 0 ? "kube-system" : "flux-system",
+      selector: { app: names[index]! },
+      scope: "cluster" as const,
+    },
+  }));
+  input.spec.components = [
+    ...input.spec.components.filter((v) => !names.includes(v.name)),
+    ...pins,
+  ];
+  input.spec.roles.customer.components = names;
+  const resource = (
+    kind: string,
+    name: string,
+    spec: object,
+    status: object,
+  ) => ({
+    kind,
+    metadata: {
+      uid: randomUUID(),
+      name,
+      namespace: "flux-system",
+      generation: 1,
+    },
+    spec,
+    status: {
+      observedGeneration: 1,
+      conditions: [{ type: "Ready", status: "True", observedGeneration: 1 }],
+      ...status,
+    },
+  });
+  const commit = input.spec.platform_source_commit;
+  const flux = [
+    resource(
+      "GitRepository",
+      "pgcf-platform",
+      { ref: { commit } },
+      { artifact: { revision: `sha1:${commit}` } },
+    ),
+    resource(
+      "Kustomization",
+      "pgcf-platform",
+      {},
+      { lastAppliedRevision: `sha1:${commit}` },
+    ),
+    resource(
+      "Kustomization",
+      "pgcf-regional",
+      { path: "./infra/platform/regional" },
+      { lastAppliedRevision: `sha1:${commit}` },
+    ),
+  ];
+  const workloads = pins.map((pin, index) => {
+    const value = resource(
+      "Deployment",
+      "workload-" + index,
+      { replicas: 1, selector: { matchLabels: pin.workload.selector } },
+      {
+        replicas: 1,
+        updatedReplicas: 1,
+        readyReplicas: 1,
+        availableReplicas: 1,
+      },
+    );
+    value.metadata.namespace = pin.workload.namespace;
+    return value;
+  });
+  const pods = pins.map((pin, index) => ({
+    kind: "Pod",
+    metadata: {
+      uid: randomUUID(),
+      namespace: pin.workload.namespace,
+      labels: pin.workload.selector,
+      ownerReferences: [
+        { controller: true, uid: workloads[index]!.metadata.uid },
+      ],
+    },
+    spec: {
+      nodeName: input.k8s_node_name,
+      containers: [{ name: "main", image: pin.reference }],
+    },
+    status: {
+      phase: "Running",
+      containerStatuses: [
+        {
+          name: "main",
+          ready: true,
+          imageID:
+            pin.reference.split("@")[0] +
+            "@sha256:" +
+            createHash("sha256")
+              .update(platformIndexBodies[index]!)
+              .digest("hex"),
+          state: { running: { startedAt: new Date().toISOString() } },
+        },
+      ],
+    },
+  }));
+  const bootID = randomUUID();
+  const nodes = [
+    {
+      kind: "Node",
+      metadata: { name: input.k8s_node_name, uid: input.status.node_uid },
+      status: {
+        nodeInfo: { architecture: "amd64", operatingSystem: "linux", bootID },
+      },
+    },
+  ];
+  const request = async (url: string | URL | Request) => {
+    const address = String(url);
+    if (address.startsWith("https://ghcr.io/token?"))
+      return new Response(JSON.stringify({ token: "unit-test-only" }));
+    const index = address.includes("quay.io") ? 0 : 1;
+    return new Response(platformIndexBodies[index]!, {
+      headers: {
+        "docker-content-digest":
+          "sha256:" +
+          createHash("sha256")
+            .update(platformIndexBodies[index]!)
+            .digest("hex"),
+      },
+    });
+  };
+  const commands = {
+    request: request as typeof fetch,
+    kube: async (args: string[]) => {
+      if (args[1] === "deployments.apps,daemonsets.apps")
+        return JSON.stringify({ items: workloads });
+      if (args[1] === "pods") return JSON.stringify({ items: pods });
+      if (args[1] === "nodes") return JSON.stringify({ items: nodes });
+      return JSON.stringify({ items: flux });
+    },
+  };
+  return {
+    input,
+    pins,
+    pods,
+    nodes,
+    bootID,
+    commands,
+    assets: { lock: {}, flux: [], flux_deprecated: [], relay: {} },
+  };
+}
+
+test("platform runtime parent indexes prove the locked AMD64 child without rewriting raw Pods", async () => {
+  const fixture = platformIndexFixture();
+  const state = await readFleetPlatformState(fixture.commands, fixture.input);
+  const seen = fleetPlatformReadback(
+    fixture.input,
+    state,
+    fixture.assets,
+  ).components;
+  for (const pin of fixture.pins)
+    assert.ok(
+      seen.some(
+        (value) => value.name === pin.name && value.sha256 === pin.sha256,
+      ),
+    );
+  assert.deepEqual(state.pods, fixture.pods);
+  (
+    state.nodes![0]!.status as { nodeInfo: { bootID: string } }
+  ).nodeInfo.bootID = randomUUID();
+  assert.equal(
+    fleetPlatformReadback(fixture.input, state, fixture.assets).components
+      .length,
+    0,
+  );
+});
+
+test("platform aliases retain immutable configuration pins and exact member identity", async () => {
+  const fixture = platformIndexFixture();
+  fixture.pods[0]!.spec.containers[0]!.image =
+    fixture.pins[0]!.reference.split("@")[0] +
+    "@sha256:" +
+    createHash("sha256").update(platformIndexBodies[0]!).digest("hex");
+  fixture.pods[1]!.spec.containers[0]!.image =
+    fixture.pins[1]!.reference.split("@")[0]!;
+  const state = await readFleetPlatformState(fixture.commands, fixture.input, {
+    nodes: fixture.nodes,
+    boot_id: fixture.bootID,
+  });
+  const seen = fleetPlatformReadback(
+    fixture.input,
+    state,
+    fixture.assets,
+  ).components;
+  assert.ok(seen.some((value) => value.name === fixture.pins[0]!.name));
+  assert.equal(
+    seen.some((value) => value.name === fixture.pins[1]!.name),
+    false,
+  );
+  fixture.pods[0]!.metadata.uid = randomUUID();
+  state.pods = fixture.pods;
+  assert.equal(
+    fleetPlatformReadback(fixture.input, state, fixture.assets).components
+      .length,
+    0,
+  );
+
+  const changedMember = platformIndexFixture();
+  changedMember.nodes[0]!.metadata.uid = randomUUID();
+  await assert.rejects(
+    readFleetPlatformState(changedMember.commands, changedMember.input),
+    /patch_platform_identity_invalid/,
+  );
+  const changedBoot = platformIndexFixture();
+  await assert.rejects(
+    readFleetPlatformState(changedBoot.commands, changedBoot.input, {
+      nodes: changedBoot.nodes,
+      boot_id: randomUUID(),
+    }),
+    /patch_platform_identity_invalid/,
+  );
+});
+
+test("platform aliases reject tampered metadata, another AMD64 child and a non-AMD64 member", async () => {
+  const tampered = platformIndexFixture();
+  const originalRequest = tampered.commands.request;
+  tampered.commands.request = (async (...args: Parameters<typeof fetch>) => {
+    const response = await originalRequest(...args);
+    if (String(args[0]).includes("/token?")) return response;
+    return new Response((await response.text()) + " ", {
+      headers: response.headers,
+    });
+  }) as typeof fetch;
+  const invalid = await readFleetPlatformState(
+    tampered.commands,
+    tampered.input,
+  );
+  assert.equal(
+    fleetPlatformReadback(tampered.input, invalid, tampered.assets).components
+      .length,
+    0,
+  );
+
+  const wrongChild = platformIndexFixture();
+  wrongChild.pins[0]!.sha256 = "a".repeat(64);
+  wrongChild.pins[0]!.reference =
+    wrongChild.pins[0]!.reference.split("@")[0] +
+    "@sha256:" +
+    wrongChild.pins[0]!.sha256;
+  wrongChild.pods[0]!.spec.containers[0]!.image = wrongChild.pins[0]!.reference;
+  const mismatched = await readFleetPlatformState(
+    wrongChild.commands,
+    wrongChild.input,
+  );
+  assert.equal(
+    fleetPlatformReadback(
+      wrongChild.input,
+      mismatched,
+      wrongChild.assets,
+    ).components.some((value) => value.name === wrongChild.pins[0]!.name),
+    false,
+  );
+
+  const wrongArchitecture = platformIndexFixture();
+  wrongArchitecture.nodes[0]!.status.nodeInfo.architecture = "arm64";
+  const incompatible = await readFleetPlatformState(
+    wrongArchitecture.commands,
+    wrongArchitecture.input,
+  );
+  assert.equal(
+    fleetPlatformReadback(
+      wrongArchitecture.input,
+      incompatible,
+      wrongArchitecture.assets,
+    ).components.length,
+    0,
+  );
+});

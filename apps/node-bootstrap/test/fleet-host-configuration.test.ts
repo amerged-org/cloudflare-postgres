@@ -5,6 +5,7 @@ import { parseAllDocuments, stringify } from "yaml";
 import {
   mergeHostConfiguration,
   readHostConfiguration,
+  readMachineConfiguration,
   applyHostConfiguration,
   hostConfigurationMatches,
 } from "../src/fleet-host-configuration.ts";
@@ -63,6 +64,103 @@ const raw = (values: unknown[], id = "v1alpha1") =>
     metadata: { type: "MachineConfigs.config.talos.dev", id },
     spec: values.map((v) => stringify(v)).join("---\n"),
   });
+const configList = (values: unknown[]) =>
+  [raw(values), raw(values, "persistent")].join("\n");
+test("a state-loaded changed boot has only the real active resource; unwitnessed absence and divergent resources remain blocked", async () => {
+  const boot = { boot_id: randomUUID(), configuration_boot_id: randomUUID() };
+  const commands = {
+    talos: async (args: string[]) => {
+      assert.deepEqual(args, ["get", "machineconfig", "--output=json"]);
+      return raw(source);
+    },
+  };
+  const observed = await readMachineConfiguration(commands, boot);
+  assert.equal(observed.active, raw(source));
+  assert.equal(observed.persistent, undefined);
+  assert.equal(observed.state_loaded?.boot_id, boot.boot_id);
+  assert.equal(
+    observed.state_loaded?.configuration_boot_id,
+    boot.configuration_boot_id,
+  );
+  await assert.rejects(
+    readMachineConfiguration(commands),
+    /persistence_unproved/,
+  );
+  await assert.rejects(
+    readMachineConfiguration(commands, {
+      ...boot,
+      configuration_boot_id: boot.boot_id,
+    }),
+    /persistence_unproved/,
+  );
+  await assert.rejects(
+    readMachineConfiguration(
+      {
+        talos: async () =>
+          [
+            raw(source),
+            raw(
+              [...source, { kind: "changed", apiVersion: "v1alpha1" }],
+              "persistent",
+            ),
+          ].join("\n"),
+      },
+      boot,
+    ),
+    /active_persistent_diverged/,
+  );
+  await assert.rejects(
+    readMachineConfiguration(
+      {
+        talos: async () => {
+          throw Error("transport_failure");
+        },
+      },
+      boot,
+    ),
+    /transport_failure/,
+  );
+  await assert.rejects(
+    readMachineConfiguration(commands, {
+      ...boot,
+      configuration_sha256: "f".repeat(64),
+    }),
+    /persistence_unproved/,
+  );
+});
+test("a proved STATE boot remains bound to the full configuration before a later host-file write", async () => {
+  let changed = false,
+    writes = 0;
+  const commands = {
+    talos: async (args: string[]) => {
+      if (args[0] === "apply-config") {
+        writes++;
+        throw Error("lost_reply");
+      }
+      return raw(
+        changed
+          ? [...source, { apiVersion: "v1alpha1", kind: "changed" }]
+          : source,
+      );
+    },
+  };
+  const boot = { boot_id: randomUUID(), configuration_boot_id: randomUUID() };
+  const before = await readHostConfiguration(
+    commands,
+    host,
+    undefined,
+    false,
+    boot,
+  );
+  await applyHostConfiguration(commands, host, before);
+  assert.equal(writes, 1);
+  changed = true;
+  await assert.rejects(
+    applyHostConfiguration(commands, host, before),
+    /persistence_unproved/,
+  );
+  assert.equal(writes, 1);
+});
 test("fixed host files preserve all unrelated multidoc configuration and are proved from active and persistent resources", async () => {
   const merged = mergeHostConfiguration(raw(source), host),
     values = parseAllDocuments(merged).map((v) => v.toJSON());
@@ -73,7 +171,7 @@ test("fixed host files preserve all unrelated multidoc configuration and are pro
   assert.equal(values[0].machine.files.length, 3);
   assert.equal(hostConfigurationMatches(raw(values), "v1alpha1", host), true);
   const observed = await readHostConfiguration(
-    { talos: async (args) => raw(values, args[2]!) },
+    { talos: async () => configList(values) },
     host,
   );
   assert.equal(observed.matches, true);
@@ -91,11 +189,10 @@ test("changed full configuration before dispatch refuses the only supported appl
         writes++;
         throw Error("lost_reply");
       }
-      return raw(
+      return configList(
         changed
           ? [...source, { kind: "changed", apiVersion: "v1alpha1" }]
           : source,
-        args[2]!,
       );
     },
   };
@@ -140,7 +237,7 @@ test("a selected thin release appends only the missing dm_thin_pool config and r
         ? loaded
           ? "dm_thin_pool 123 0 - Live 0x0\n"
           : ""
-        : raw(values, args[2]!);
+        : configList(values);
     },
   };
   const pending = await readHostConfiguration(commands, host, undefined, true);

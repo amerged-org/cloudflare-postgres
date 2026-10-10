@@ -20,6 +20,7 @@ import {
   type CommandRunner,
 } from "../src/bootstrap.ts";
 import { patchFixture } from "./fleet-patch.fixture.ts";
+import { NodeHostConfigurationPrivate } from "@pgcf/contracts/node-host-configuration";
 
 function runtime(
   checkConfig = false,
@@ -35,6 +36,7 @@ function runtime(
     checkpoints: FleetPatchCheckpoint[] = [];
   let lifecycleLogs = "";
   let machineConfiguration: string | undefined;
+  let stateLoadedConfiguration = false;
   let applyProbe: CommandRunner | undefined;
   const resource = (type: string, id: string, spec: unknown) =>
     JSON.stringify({ metadata: { type, id }, spec });
@@ -74,6 +76,9 @@ function runtime(
     },
     set machineConfiguration(value: string) {
       machineConfiguration = value;
+    },
+    set stateLoadedConfiguration(value: boolean) {
+      stateLoadedConfiguration = value;
     },
     set applyProbe(value: CommandRunner) {
       applyProbe = value;
@@ -210,11 +215,22 @@ function runtime(
                 });
             } else if (args.includes("machineconfig")) {
               assert.ok(machineConfiguration);
-              stdout = resource(
-                "MachineConfigs.config.talos.dev",
-                args.includes("persistent") ? "persistent" : "v1alpha1",
-                machineConfiguration,
-              );
+              const ids = args.includes("v1alpha1")
+                ? ["v1alpha1"]
+                : args.includes("persistent")
+                  ? ["persistent"]
+                  : stateLoadedConfiguration
+                    ? ["v1alpha1"]
+                    : ["v1alpha1", "persistent"];
+              stdout = ids
+                .map((id) =>
+                  resource(
+                    "MachineConfigs.config.talos.dev",
+                    id,
+                    machineConfiguration,
+                  ),
+                )
+                .join("\n");
             } else if (args.includes("logs")) stdout = lifecycleLogs;
             else if (args.includes("version"))
               stdout = JSON.stringify({
@@ -655,6 +671,120 @@ function pinnedKubernetesRuntime() {
     .join("---\n");
   return { r, pins };
 }
+test("a later host-required preflight uses retained installed boot/configuration proof without accepting a new target as already installed", async () => {
+  const { r, pins } = pinnedKubernetesRuntime(),
+    priorBoot = randomUUID(),
+    boot = randomUUID(),
+    facts = {
+      ...r.fixture.facts,
+      boot_id: boot,
+      talos_version: "v1.14.1",
+      kubelet_version: "v1.36.5",
+      kubernetes_version: "v1.36.5",
+    };
+  const oldInstaller = r.fixture.input.spec.roles.customer.talos_installer;
+  r.fixture.input.spec.roles.customer.host_configuration_required = true;
+  r.fixture.input.spec.roles.customer.talos_version = "1.14.2";
+  r.fixture.input.spec.roles.control_relay.talos_version = "1.14.2";
+  r.fixture.input.spec.roles.customer.talos_installer = `registry.example/new-target@sha256:${"e".repeat(64)}`;
+  const files = NodeHostConfigurationPrivate.shape.files.parse([
+    {
+      path: "/var/lib/pgcf-sandbox/settings.json",
+      permissions: 384,
+      content: "test-only-settings",
+    },
+    {
+      path: "/var/lib/pgcf-sandbox/agent-key",
+      permissions: 384,
+      content: "test-only-key",
+    },
+  ]);
+  r.fixture.input.host_configuration = NodeHostConfigurationPrivate.parse({
+    files,
+    status: {
+      version: 1,
+      node_id: r.current.node_id,
+      node_uid: facts.node_uid,
+      region_id: r.current.region_id,
+      cluster_uid: facts.cluster_uid,
+      material_revision: 1,
+      revision: 1,
+      release_id: r.current.release_id,
+      pool_policy_revision: 1,
+      profile_sha256: "f".repeat(64),
+      sha256: digest(canonical(files)),
+      created_at: new Date().toISOString(),
+    },
+  });
+  r.fixture.input.retained_talos_installation = {
+    receipt: {
+      method: "deploymentreceipt",
+      installer: oldInstaller,
+      node_uid: facts.node_uid,
+      cluster_uid: facts.cluster_uid,
+      system_uuid: facts.system_uuid,
+      pre_reboot_boot_id: priorBoot,
+      completed_at: new Date().toISOString(),
+      source: "cli_exit_0",
+    },
+    boot_id: boot,
+    talos_version: "v1.14.1",
+    talos_schematic_sha256: facts.talos_schematic_sha256,
+    kubernetes_image_provenance: {
+      method: "pinned_configuration_boot",
+      configuration_boot_id: priorBoot,
+      configuration_observed_at: new Date().toISOString(),
+      observed_at: new Date().toISOString(),
+      kubelet_version: "v1.36.5",
+      control_plane: true,
+      images: Object.fromEntries(
+        Object.entries(pins).map(([name, configuration]) => [
+          name,
+          { configuration, runtime_sha256: configuration.slice(-64) },
+        ]),
+      ) as NonNullable<FleetPatchFacts["kubernetes_images"]>,
+    },
+  };
+  r.current = {
+    ...r.current,
+    stage: "preflight",
+    host_configuration_revision: 1,
+    host_configuration_sha256: r.fixture.input.host_configuration.status.sha256,
+    spec_sha256: digest(canonical(r.fixture.input.spec)),
+  };
+  r.facts = facts;
+  r.machineConfiguration = [
+    { version: "v1alpha1", machine: { type: "controlplane" } },
+    ...Object.entries({
+      kubelet: "KubeletConfig",
+      apiServer: "KubeAPIServerConfig",
+      controllerManager: "KubeControllerManagerConfig",
+      scheduler: "KubeSchedulerConfig",
+    }).map(([name, kind]) => ({
+      apiVersion: "v1alpha1",
+      kind,
+      image: pins[name as keyof typeof pins],
+    })),
+  ]
+    .map((value) => stringify(value))
+    .join("---\n");
+  r.stateLoadedConfiguration = true;
+  await r.turn();
+  assert.equal(r.current.stage, "preflight");
+  assert.equal(r.current.state, "confirmed");
+  assert.equal(r.current.talos_upgrade_receipt, null);
+  assert.equal(r.writes.length, 0);
+  r.current = { ...r.current, state: "pending" };
+  r.fixture.input.retained_talos_installation.kubernetes_image_provenance!.images.kubelet.configuration = `registry.example/unproved@sha256:${"a".repeat(64)}`;
+  await assert.rejects(r.turn(), /persistence_unproved/);
+  assert.equal(r.writes.length, 0);
+  r.fixture.input.retained_talos_installation.kubernetes_image_provenance!.images.kubelet.configuration =
+    pins.kubelet;
+  r.current = { ...r.current, stage: "host_config" };
+  await r.turn();
+  assert.equal(r.current.state, "confirmed");
+  assert.equal(r.writes.length, 1);
+});
 test("checkpoint echoes compare the JSON wire facts when pre-boot image evidence is undefined", async () => {
   const { r, pins } = pinnedKubernetesRuntime();
   await r.turn();

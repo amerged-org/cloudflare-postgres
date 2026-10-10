@@ -16,6 +16,7 @@ import {
   selectFluxObjects,
 } from "./platform.ts";
 import { inspectionResponseBody } from "./inspection-proxy-command.ts";
+import { normalizeRuntimeImageManifest } from "./fleet-kubernetes-images.ts";
 import type { LegacyStorageBinding } from "@pgcf/contracts/storage-write-authority";
 import type { FleetPatchInput } from "@pgcf/contracts/fleet-patches";
 import {
@@ -295,10 +296,28 @@ export interface FleetPlatformState {
   resources: Map<string, Record<string, unknown>>;
   pods: Record<string, unknown>[];
   uids: Record<string, string>;
+  nodes?: Record<string, unknown>[];
+  runtime_manifests?: Map<
+    string,
+    {
+      configured: string;
+      reported: string;
+      manifest: string;
+      owner_uid: string;
+      node_uid: string;
+      node_name: string;
+      boot_id: string;
+    }
+  >;
 }
 /** All reads are also callable from the direct acceptance runner; this does not acquire grants or mutate. */
 export async function readFleetPlatformState(
-  commands: Pick<FleetPlatformCommands, "kube">,
+  commands: Pick<FleetPlatformCommands, "kube"> & {
+    request?: typeof fetch;
+    signal?: AbortSignal;
+  },
+  input?: FleetPatchInput,
+  observation?: { nodes: Record<string, unknown>[]; boot_id: string },
 ): Promise<FleetPlatformState> {
   const reads = await Promise.allSettled([
     commands.kube([
@@ -337,7 +356,133 @@ export async function readFleetPlatformState(
     resources.set(key, value);
     uids[key] = metadata.uid;
   }
-  return { resources, pods: objects(data[2]!.items), uids };
+  const state: FleetPlatformState = {
+    resources,
+    pods: objects(data[2]!.items),
+    uids,
+  };
+  if (!input) return state;
+  const wanted = new Set(input.spec.roles[input.role].components);
+  const candidates = input.spec.components
+    .filter((pin) => wanted.has(pin.name) && pin.kind === "image")
+    .flatMap((pin) =>
+      state.pods.flatMap((pod) => {
+        const metadata = object(pod.metadata),
+          spec = object(pod.spec),
+          statuses = objects(object(pod.status).containerStatuses ?? []);
+        if (
+          metadata.deletionTimestamp ||
+          ["Succeeded", "Failed"].includes(String(object(pod.status).phase)) ||
+          !metadata.uid ||
+          (pin.workload &&
+            (metadata.namespace !== pin.workload.namespace ||
+              Object.entries(pin.workload.selector).some(
+                ([key, value]) => object(metadata.labels)[key] !== value,
+              ))) ||
+          (pin.workload?.scope !== "cluster" &&
+            spec.nodeName !== input.k8s_node_name)
+        )
+          return [];
+        return objects(spec.containers).flatMap((container) => {
+          const status = statuses.find(
+              (value) => value.name === container.name,
+            ),
+            configured = imageDigest(container.image),
+            reported = imageDigest(status?.imageID);
+          return typeof container.image === "string" &&
+            imageRepository(container.image) ===
+              imageRepository(pin.reference) &&
+            configured &&
+            reported &&
+            status?.ready === true &&
+            object(object(status.state).running).startedAt &&
+            (configured !== pin.sha256 || reported !== pin.sha256)
+            ? [{ pin, pod, container, status, configured, reported }]
+            : [];
+        });
+      }),
+    );
+  if (!candidates.length) return state;
+  const nodes =
+    observation?.nodes ??
+    objects(
+      object(JSON.parse(await commands.kube(["get", "nodes", "-o", "json"])))
+        .items,
+    );
+  if (
+    nodes.length !== input.cluster_nodes.length ||
+    input.cluster_nodes.some(
+      (member) =>
+        nodes.filter(
+          (node) =>
+            object(node.metadata).name === member.k8s_node_name &&
+            object(node.metadata).uid === member.node_uid &&
+            !object(node.metadata).deletionTimestamp,
+        ).length !== 1,
+    ) ||
+    (observation &&
+      object(
+        object(
+          nodes.find(
+            (node) => object(node.metadata).uid === input.status.node_uid,
+          )?.status ?? {},
+        ).nodeInfo ?? {},
+      ).bootID !== observation.boot_id)
+  )
+    throw new BootstrapError("patch_platform_identity_invalid");
+  state.nodes = nodes;
+  state.runtime_manifests = new Map();
+  for (const {
+    pin,
+    pod,
+    container,
+    status,
+    configured,
+    reported,
+  } of candidates) {
+    const metadata = object(pod.metadata),
+      owners = objects(metadata.ownerReferences ?? []),
+      owner = owners.filter((value) => value.controller === true),
+      node = nodes.find(
+        (value) => object(value.metadata).name === object(pod.spec).nodeName,
+      );
+    if (!node || owner.length !== 1 || typeof owner[0]!.uid !== "string")
+      continue;
+    const info = object(object(node.status).nodeInfo);
+    if (
+      info.architecture !== "amd64" ||
+      info.operatingSystem !== "linux" ||
+      typeof info.bootID !== "string"
+    )
+      continue;
+    const configuredManifest = await normalizeRuntimeImageManifest(
+      pin.reference,
+      pin.sha256,
+      configured,
+      commands,
+    );
+    if (configuredManifest !== pin.sha256) continue;
+    const runtimeManifest = await normalizeRuntimeImageManifest(
+      pin.reference,
+      pin.sha256,
+      reported,
+      commands,
+    );
+    if (runtimeManifest !== pin.sha256) continue;
+    state.runtime_manifests.set(
+      `${metadata.uid}/${container.name}/${pin.sha256}`,
+      {
+        configured: String(container.image),
+        reported: String(status.imageID),
+        manifest: runtimeManifest,
+        owner_uid: String(owner[0]!.uid),
+        node_uid: String(object(node.metadata).uid),
+        node_name: String(object(node.metadata).name),
+        boot_id: info.bootID,
+      },
+    );
+  }
+  return state;
 }
 function required(
   state: FleetPlatformState,
@@ -443,12 +588,38 @@ function pinnedPods(
           imageRepository(String(v.image)) === imageRepository(pin.reference),
       )
       .every((container) => {
-        const status = statuses.find((v) => v.name === container.name);
+        const status = statuses.find((v) => v.name === container.name),
+          alias = state.runtime_manifests?.get(
+            `${metadata.uid}/${container.name}/${pin.sha256}`,
+          ),
+          node = state.nodes?.find(
+            (value) =>
+              object(value.metadata).name === object(pod.spec).nodeName,
+          ),
+          info = node ? object(object(node.status).nodeInfo) : undefined,
+          normalized =
+            !!alias &&
+            alias.configured === container.image &&
+            alias.reported === status?.imageID &&
+            alias.manifest === pin.sha256 &&
+            alias.owner_uid ===
+              owners.find((v) => v.controller === true)?.uid &&
+            alias.node_name === object(pod.spec).nodeName &&
+            alias.node_uid === object(node?.metadata ?? {}).uid &&
+            input.cluster_nodes.some(
+              (member) =>
+                member.node_uid === alias.node_uid &&
+                member.k8s_node_name === alias.node_name,
+            ) &&
+            info?.architecture === "amd64" &&
+            info.operatingSystem === "linux" &&
+            alias.boot_id === info.bootID;
         return (
           status?.ready === true &&
           !!object(object(status.state).running).startedAt &&
-          imageDigest(status.imageID) === pin.sha256 &&
-          imageDigest(container.image) === pin.sha256
+          ((imageDigest(status.imageID) === pin.sha256 &&
+            imageDigest(container.image) === pin.sha256) ||
+            normalized)
         );
       });
   });
