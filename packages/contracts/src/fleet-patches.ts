@@ -375,6 +375,12 @@ export function fleetPatchTalosRebootObserved(
         ? facts.kubernetes_configuration_boot_id
         : receipt.pre_reboot_boot_id) &&
     fleetPatchKubernetesImagesMatch(input, facts) &&
+    (!target.host_configuration_required ||
+      (!!input.host_configuration &&
+        facts.host_configuration_sha256 ===
+          input.host_configuration.status.sha256 &&
+        facts.host_configuration_sha256 ===
+          input.status.host_configuration_sha256)) &&
     (!authority ||
       (authority.phase === "etcd-ca" &&
         authority.state === "confirmed" &&
@@ -452,13 +458,14 @@ export function fleetPatchCheckpointAllowed(
     current.state === "dispatched" &&
     next.state === "pending" &&
     next.stage === current.stage &&
-    [
+    ([
       "host_config",
       "talos",
       "talos_reboot",
       "kubernetes",
       "kubernetes_images",
-    ].includes(current.stage) &&
+    ].includes(current.stage) ||
+      (current.stage === "host_service" && input.host_configuration_only)) &&
     next.error_code === "patch_write_not_attempted"
   )
     return true;
@@ -519,6 +526,15 @@ export function fleetPatchCheckpointAllowed(
   ) {
     if (!healthy) return false;
     if (current.stage === "host_config") return !!input.host_configuration;
+    if (current.stage === "host_service")
+      return (
+        input.host_configuration_only &&
+        !!input.host_configuration &&
+        current.host_configuration_sha256 ===
+          input.host_configuration.status.sha256 &&
+        matches.talos &&
+        matches.kubernetes
+      );
     if (current.stage === "talos")
       return (
         supportedFleetPatchVersion(
@@ -589,7 +605,16 @@ export function fleetPatchCheckpointAllowed(
     if (current.stage === "host_service")
       return (
         !input.host_configuration_only ||
-        (facts.sandbox_service_running === true &&
+        ((current.state === "pending" ||
+          (current.state === "dispatched" &&
+            !!current.observed &&
+            facts.boot_id !== current.observed.boot_id)) &&
+          healthy &&
+          matches.talos &&
+          matches.kubernetes &&
+          facts.sandbox_service_running === true &&
+          facts.host_configuration_sha256 ===
+            current.host_configuration_sha256 &&
           facts.host_configuration_sha256 ===
             input.host_configuration?.status.sha256 &&
           fleetPatchHostServiceObserved(input))
@@ -686,13 +711,16 @@ export function fleetPatchWritePreflightAllowed(
   const current = input.status;
   if (
     current.state !== "dispatched" ||
-    ![
-      "host_config",
-      "talos",
-      "talos_reboot",
-      "kubernetes",
-      "kubernetes_images",
-    ].includes(current.stage)
+    !(
+      [
+        "host_config",
+        "talos",
+        "talos_reboot",
+        "kubernetes",
+        "kubernetes_images",
+      ].includes(current.stage) ||
+      (current.stage === "host_service" && input.host_configuration_only)
+    )
   )
     return false;
   if (

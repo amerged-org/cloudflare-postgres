@@ -371,9 +371,10 @@ export async function runFleetPatch(
       machineConfiguration:
         Awaited<ReturnType<typeof readMachineConfiguration>> | undefined;
     let observedBootId: string | undefined;
-    const authorize = async () => {
+    const authorize = async (refreshHostPool = false) => {
       const refreshPool =
-          ["runtime_admission", "release_verify"].includes(current.stage) &&
+          (refreshHostPool ||
+            ["runtime_admission", "release_verify"].includes(current.stage)) &&
           input.compute_pool,
         response = await call({
           kind: "status",
@@ -386,7 +387,7 @@ export async function runFleetPatch(
           ? refreshRuntimeAdmissionObservation(
               admissionInput,
               response,
-              observedBootId!,
+              refreshHostPool ? current.observed!.boot_id : observedBootId!,
             )
           : FleetPatchStatus.parse(response);
       if (refreshPool)
@@ -444,8 +445,46 @@ export async function runFleetPatch(
                   retainedConfigurationProof.configuration_boot_id,
               }
             : undefined,
+        activationBoot =
+          current.state === "dispatched" &&
+          (current.stage === "talos_reboot" ||
+            (input.host_configuration_only &&
+              current.stage === "host_service")) &&
+          priorConfiguration &&
+          priorConfiguration.node_uid === facts.node_uid &&
+          priorConfiguration.cluster_uid === facts.cluster_uid &&
+          priorConfiguration.system_uuid === facts.system_uuid &&
+          priorConfiguration.boot_id !== facts.boot_id &&
+          fleetPatchRuntimeMatches(input, facts).talos &&
+          fleetPatchRuntimeMatches(input, facts).kubernetes
+            ? {
+                boot_id: facts.boot_id,
+                configuration_boot_id: priorConfiguration.boot_id,
+              }
+            : undefined,
+        observedStateBoot =
+          priorConfiguration &&
+          priorConfiguration.node_uid === facts.node_uid &&
+          priorConfiguration.cluster_uid === facts.cluster_uid &&
+          priorConfiguration.system_uuid === facts.system_uuid &&
+          priorConfiguration.boot_id === facts.boot_id &&
+          priorConfiguration.kubernetes_configuration_boot_id &&
+          priorConfiguration.kubernetes_configuration_boot_id !==
+            facts.boot_id &&
+          priorConfiguration.kubernetes_configuration_observed_at &&
+          priorConfiguration.kubernetes_image_configuration &&
+          fleetPatchRuntimeMatches(input, facts).talos &&
+          fleetPatchRuntimeMatches(input, facts).kubernetes
+            ? {
+                boot_id: facts.boot_id,
+                configuration_boot_id:
+                  priorConfiguration.kubernetes_configuration_boot_id,
+              }
+            : undefined,
         stateBoot =
-          receipt &&
+          activationBoot ??
+          observedStateBoot ??
+          (receipt &&
           receipt.node_uid === facts.node_uid &&
           receipt.cluster_uid === facts.cluster_uid &&
           receipt.system_uuid === facts.system_uuid &&
@@ -460,7 +499,7 @@ export async function runFleetPatch(
                 configuration_boot_id:
                   priorConfiguration.kubernetes_configuration_boot_id,
               }
-            : retainedStateBoot,
+            : retainedStateBoot),
         provedConfiguration =
           retainedStateBoot &&
           stateBoot === retainedStateBoot &&
@@ -488,6 +527,20 @@ export async function runFleetPatch(
         throw new BootstrapError(
           "patch_host_configuration_persistence_unproved",
         );
+      if (
+        !observeImages &&
+        input.host_configuration_only &&
+        machineConfiguration
+      ) {
+        facts.kubernetes_image_configuration = kubernetesConfigurationImages(
+          machineConfiguration.active,
+          "v1alpha1",
+          facts.kubernetes_control_plane,
+        );
+        facts.kubernetes_configuration_boot_id =
+          stateBoot?.configuration_boot_id ?? facts.boot_id;
+        facts.kubernetes_configuration_observed_at = new Date().toISOString();
+      }
       if (observeImages) {
         facts.kubernetes_image_configuration = kubernetesConfigurationImages(
           machineConfiguration!.active,
@@ -575,6 +628,8 @@ export async function runFleetPatch(
           input.host_configuration,
           machineConfiguration,
           !!input.spec.thin_storage_qualification,
+          undefined,
+          !["preflight", "host_config"].includes(current.stage),
         );
         if (host.matches)
           facts.host_configuration_sha256 =
@@ -883,12 +938,44 @@ export async function runFleetPatch(
           await checkpoint("host_config", "confirmed", after);
       }
     } else if (current.stage === "host_service") {
-      if (
-        !input.host_configuration_only ||
-        (facts.sandbox_service_running === true &&
-          fleetPatchHostServiceObserved(input))
-      )
+      if (!input.host_configuration_only)
         await checkpoint("host_service", "confirmed", facts);
+      else if (
+        facts.sandbox_service_running === true &&
+        facts.host_configuration_sha256 ===
+          input.host_configuration?.status.sha256 &&
+        (current.state === "pending" ||
+          (current.state === "dispatched" &&
+            facts.boot_id !== current.observed?.boot_id))
+      ) {
+        await authorize(true);
+        if (fleetPatchHostServiceObserved(input))
+          await checkpoint("host_service", "confirmed", facts);
+      } else if (
+        current.state === "pending" &&
+        facts.host_configuration_sha256 !==
+          input.host_configuration?.status.sha256
+      ) {
+        const host = input.host_configuration!;
+        const declared = await readHostConfiguration(
+          hostCommands,
+          host,
+          machineConfiguration,
+          !!input.spec.thin_storage_qualification,
+        );
+        if (!declared.configured)
+          throw new BootstrapError(
+            "patch_host_configuration_changed_before_write",
+          );
+        await checkpoint("host_service", "dispatched", facts);
+        const latest = await latePreflight(facts);
+        if (!latest) return current;
+        await authorize();
+        await talos(
+          ["reboot", "--wait=false", "--progress=plain"],
+          60_000,
+        ).catch(() => undefined);
+      }
     } else if (current.stage === "talos") {
       if (
         current.state === "pending" &&

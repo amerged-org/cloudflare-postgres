@@ -44,6 +44,7 @@ function runtime(
     ((command: Command) => ReturnType<CommandRunner> | undefined) | undefined;
   let assetRequest: typeof fetch | undefined;
   let servingCertificate: string | undefined;
+  let physicalHostFiles: Map<string, string> | undefined;
   const resource = (type: string, id: string, spec: unknown) =>
     JSON.stringify({ metadata: { type, id }, spec });
   const node = () => ({
@@ -97,6 +98,9 @@ function runtime(
     },
     set servingCertificate(value: string) {
       servingCertificate = value;
+    },
+    set physicalHostFiles(value: Map<string, string>) {
+      physicalHostFiles = value;
     },
     turn: () =>
       runFleetPatch(
@@ -259,7 +263,12 @@ function runtime(
                 )
                 .join("\n");
             } else if (args.includes("logs")) stdout = lifecycleLogs;
-            else if (args.includes("version"))
+            else if (physicalHostFiles && args.includes("read")) {
+              const at = args.indexOf("read");
+              const value = physicalHostFiles.get(args[at + 1]!);
+              if (value === undefined) return { exit_code: 1, stdout: "" };
+              stdout = value;
+            } else if (args.includes("version"))
               stdout = JSON.stringify({
                 version: { tag: facts.talos_version },
               });
@@ -804,6 +813,134 @@ test("a current-custody host-only finalization skips every OS and Kubernetes wri
   assert.equal(r.current.stage, "runtime_admission");
   assert.equal(r.current.state, "pending");
   assert.equal(r.writes.length, 0);
+});
+
+test("host-only file activation dispatches one normal reboot and resolves an unknown result without repeating it", async () => {
+  const { r, pins } = pinnedKubernetesRuntime(),
+    files = NodeHostConfigurationPrivate.shape.files.parse([
+      {
+        path: "/var/lib/pgcf-sandbox/settings.json",
+        permissions: 384,
+        content: "new-settings",
+      },
+      {
+        path: "/var/lib/pgcf-sandbox/agent-key",
+        permissions: 384,
+        content: "retained-key",
+      },
+    ]),
+    target = r.fixture.input.spec.roles.customer,
+    facts = {
+      ...r.fixture.facts,
+      talos_version: "v" + target.talos_version,
+      kubernetes_version: "v" + target.kubernetes_version,
+      kubelet_version: "v" + target.kubernetes_version,
+      cluster_nodes: [
+        {
+          node_uid: r.current.node_uid,
+          kubelet_version: "v" + target.kubernetes_version,
+          node_ready: true,
+        },
+      ],
+    };
+  target.host_configuration_required = true;
+  r.fixture.input.host_configuration_only = true;
+  r.fixture.input.host_configuration = NodeHostConfigurationPrivate.parse({
+    files,
+    status: {
+      version: 1,
+      node_id: r.current.node_id,
+      node_uid: facts.node_uid,
+      region_id: r.current.region_id,
+      cluster_uid: facts.cluster_uid,
+      material_revision: 3,
+      revision: 2,
+      release_id: r.current.release_id,
+      pool_policy_revision: 1,
+      profile_sha256: "f".repeat(64),
+      sha256: digest(canonical(files)),
+      created_at: new Date().toISOString(),
+    },
+  });
+  const host = r.fixture.input.host_configuration;
+  r.current = {
+    ...r.current,
+    stage: "host_service",
+    state: "pending",
+    baseline: facts,
+    observed: { ...facts, host_configuration_sha256: host.status.sha256 },
+    host_configuration_revision: host.status.revision,
+    host_configuration_sha256: host.status.sha256,
+    spec_sha256: digest(canonical(r.fixture.input.spec)),
+  };
+  r.facts = facts;
+  r.machineConfiguration = [
+    {
+      version: "v1alpha1",
+      machine: {
+        type: "controlplane",
+        files: files.map((file) => ({ ...file, op: "create" })),
+      },
+    },
+    ...Object.entries({
+      kubelet: "KubeletConfig",
+      apiServer: "KubeAPIServerConfig",
+      controllerManager: "KubeControllerManagerConfig",
+      scheduler: "KubeSchedulerConfig",
+    }).map(([name, kind]) => ({
+      apiVersion: "v1alpha1",
+      kind,
+      image: pins[name as keyof typeof pins],
+    })),
+  ]
+    .map((value) => stringify(value))
+    .join("---\n");
+  r.physicalHostFiles = new Map(
+    files.map((file) => [
+      file.path,
+      file.path.endsWith("settings.json") ? "old-settings" : file.content,
+    ]),
+  );
+  await r.turn();
+  assert.equal(r.current.state, "dispatched");
+  assert.equal(r.current.observed?.boot_id, facts.boot_id);
+  assert.equal(r.current.observed?.host_configuration_sha256, undefined);
+  assert.equal(r.writes.length, 1);
+  assert.ok(r.writes[0]!.args.includes("reboot"));
+  assert.ok(!r.writes[0]!.args.includes("upgrade"));
+  await r.turn();
+  assert.equal(r.writes.length, 1);
+  assert.equal(r.current.state, "dispatched");
+  r.facts = { ...facts, boot_id: randomUUID() };
+  r.stateLoadedConfiguration = true;
+  r.physicalHostFiles = new Map(files.map((file) => [file.path, file.content]));
+  await r.turn();
+  assert.equal(r.writes.length, 1);
+  assert.equal(
+    r.current.state,
+    "dispatched",
+    "fresh service/pool evidence is still required",
+  );
+  const activatedBoot = randomUUID();
+  r.facts = { ...facts, boot_id: activatedBoot };
+  r.current = {
+    ...r.current,
+    state: "confirmed",
+    observed: {
+      ...facts,
+      boot_id: activatedBoot,
+      kubernetes_control_plane: true,
+      kubernetes_image_configuration: pins,
+      kubernetes_configuration_boot_id: facts.boot_id,
+      kubernetes_configuration_observed_at: new Date().toISOString(),
+      host_configuration_sha256: host.status.sha256,
+      sandbox_service_running: true,
+    },
+  };
+  await r.turn();
+  assert.equal(r.current.stage, "runtime_admission");
+  assert.equal(r.current.state, "pending");
+  assert.equal(r.writes.length, 1);
 });
 
 test("Flux records a new resource UID while dispatched without replacing prior identity", () => {

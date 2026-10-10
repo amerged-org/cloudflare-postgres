@@ -92,6 +92,30 @@ test("new fixed /var files use boot-safe create; a declaration requiring nonexis
     "persistent configuration must recreate the two fixed files after a reboot",
   );
 });
+test("a persisted new declaration cannot prove unchanged old physical host files", async () => {
+  const declared = parseAllDocuments(
+    mergeHostConfiguration(raw(source), host),
+  ).map((document) => document.toJSON());
+  const commands = {
+    talos: async (args: string[]) => {
+      if (args[0] === "get") return configList(declared);
+      assert.equal(args[0], "read");
+      return args[1] === host.files[0]!.path
+        ? '{"version":0}\n'
+        : host.files[1]!.content;
+    },
+  };
+  const observed = await readHostConfiguration(
+    commands,
+    host,
+    undefined,
+    false,
+    undefined,
+    true,
+  );
+  assert.equal(observed.configured, true);
+  assert.equal(observed.matches, false);
+});
 test("a state-loaded changed boot has only the real active resource; unwitnessed absence and divergent resources remain blocked", async () => {
   const boot = { boot_id: randomUUID(), configuration_boot_id: randomUUID() };
   const commands = {

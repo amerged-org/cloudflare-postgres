@@ -714,6 +714,10 @@ export async function runThinStorage(
       readHostConfiguration(
         { talos: (args) => talos(args) },
         input.host_configuration,
+        undefined,
+        false,
+        undefined,
+        true,
       ),
       talos(["get", "extensionstatuses", "--output=json"]),
       talos(["get", "services", "--output=json"]),

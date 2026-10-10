@@ -134,8 +134,14 @@ Kubernetes version metadata. Metadata synchronization never counts as an OS upgr
 idempotent when the observed target versions are already current. Because protected sandbox
 settings bind the material revision, an actual revision advance starts one current-custody
 host-config-only final pass for each affected member. This path cannot enter an OS or Kubernetes
-write stage. It applies the fixed files without reboot. The protected host watcher consumes only the supported
-material-only change in the same process while retaining storage deadlines and writer fences.
+write stage. Talos no-reboot configuration application persists the file declarations; it does
+not write these qualified0600 `/var` files. The existing host-service stage confirms unchanged,
+already consumed files without a write. Otherwise it dispatches one normal fenced Talos reboot
+and requires a changed boot, both exact physical files and a fresh current-material pool report
+before completion. A lost reboot response is resolved by readback, never blindly repeated.
+The reboot interrupts node services and Pods while retaining the OS image, keys and data volumes.
+Full patches use their already planned OS reboot for file activation. The protected host watcher
+accepts only the supported material-only change while retaining storage deadlines and writer fences.
 The read-only host-service stage waits for fresh current-revision/profile pool observations; it
 never restarts a controller around active thin writers.
 A confirmed configuration waiting for a kernel module never triggers another identical apply.

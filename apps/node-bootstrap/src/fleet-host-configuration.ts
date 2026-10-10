@@ -158,6 +158,7 @@ export async function readHostConfiguration(
   configuration?: Awaited<ReturnType<typeof readMachineConfiguration>>,
   requireThinPool = false,
   boot?: Parameters<typeof readMachineConfiguration>[1],
+  requireMaterializedFiles = false,
 ) {
   const value =
     configuration ?? (await readMachineConfiguration(commands, boot));
@@ -181,11 +182,21 @@ export async function readHostConfiguration(
     (value.persistent
       ? hostConfigurationMatches(value.persistent, "persistent", input)
       : !!value.state_loaded);
+  const materialized =
+    !requireMaterializedFiles ||
+    (
+      await Promise.allSettled(
+        input.files.map(
+          async (file) =>
+            (await commands.talos(["read", file.path])) === file.content,
+        ),
+      )
+    ).every((result) => result.status === "fulfilled" && result.value);
   return {
     ...value,
     thin_pool_required: requireThinPool,
     configured,
-    matches: moduleLoaded && configured,
+    matches: moduleLoaded && configured && materialized,
   };
 }
 /** Supported ApplyConfiguration has no revision CAS. The serialized assignment plus fresh full-config equality precedes its single attempt. */
