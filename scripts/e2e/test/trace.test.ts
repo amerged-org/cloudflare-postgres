@@ -422,12 +422,16 @@ test("trace rejects malformed expiry text before ownership and still deletes the
   }
 });
 
-test("trace event timeout never replays its trigger and always terminates and deletes", async () => {
+test("trace event timeout never replays its trigger and always terminates and deletes", async (context) => {
+  context.mock.timers.enable({
+    apis: ["Date", "setTimeout"],
+    now: Date.UTC(2030, 0, 1),
+  });
   const value = fixture();
   const socket = installSocket();
   let calls = 0;
   try {
-    await assert.rejects(
+    const rejected = assert.rejects(
       capture(
         value.client,
         worker,
@@ -440,6 +444,10 @@ test("trace event timeout never replays its trigger and always terminates and de
       ),
       { message: "trace_event_missing" },
     );
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(calls, 1);
+    context.mock.timers.tick(1);
+    await rejected;
     assert.equal(calls, 1);
     assert.equal(socket.sockets[0]!.terminated, 1);
     assert.equal(value.deletes.length, 1);
