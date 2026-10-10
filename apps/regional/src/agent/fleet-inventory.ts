@@ -6,7 +6,6 @@ import {
   fleetFluxReady,
 } from "@pgcf/contracts/releases";
 import { CONFIGURATION_SCHEMA_REVISION } from "@pgcf/contracts";
-import { normalizeRuntimeImageManifest } from "../../../../infra/platform/image-manifest.ts";
 import { record, string, type Kubernetes, type Resource } from "./types.ts";
 
 export const FLEET_INVENTORY_INTERVAL_MS = 60_000;
@@ -54,14 +53,16 @@ function ready(node: Resource): boolean {
     )
   );
 }
-/** Kube-only inventory deliberately leaves Talos artifact/schematic and configuration revision unknown. */
+/** Kube-only inventory reports raw OCI IDs; the API verifies aliases against qualified deployment provenance. */
 export async function collectFleetInventory(
   k8s: Pick<Kubernetes, "read" | "list">,
   desired: FleetDesiredRelease,
   now: () => number = Date.now,
   signal?: AbortSignal,
-  request: typeof fetch = fetch,
+  _request: typeof fetch = fetch,
 ): Promise<FleetNodeReleaseObservation[]> {
+  // Keep the existing operator-call signature; inventory never invokes this request hook.
+  void _request;
   const started = now();
   const stop = () => signal?.aborted || now() - started >= 20_000;
   if (stop()) return [];
@@ -248,24 +249,9 @@ export async function collectFleetInventory(
               : ((await k8s.read("Node", undefined, name)) ?? undefined);
           if (carrier) carriers.set(name, carrier);
         }
-        const info = record(record(carrier?.status).nodeInfo);
-        const normalized =
-          carrier?.metadata.uid &&
-          !carrier.metadata.deletionTimestamp &&
-          ready(carrier) &&
-          info.operatingSystem === "linux" &&
-          info.architecture === "amd64" &&
-          validBootId(bootId) &&
-          validBootId(info.bootID)
-            ? await normalizeRuntimeImageManifest(
-                component.reference,
-                component.sha256,
-                reported,
-                { request, signal },
-              )
-            : undefined;
-        if (normalized) canonicalDigests.add(normalized);
-        else qualified = false;
+        // Registry requests are outside this Pod's API-only egress and inventory budget.
+        // Preserve the stable carrier and raw digest for existing Worker-side verification.
+        qualified = false;
       }
       const runtimeDigest =
         runtimeDigests.size === 1 ? [...runtimeDigests][0]! : undefined;
@@ -400,23 +386,7 @@ export async function collectFleetInventory(
             current.imageID === oldStatus.imageID &&
             current.restartCount === oldStatus.restartCount
           ) {
-            const expected =
-              desired.release.spec.roles[assignment.role].kubernetes_images?.[
-                name
-              ];
-            const normalized =
-              expected &&
-              validBootId(bootId) &&
-              information.operatingSystem === "linux" &&
-              information.architecture === "amd64"
-                ? await normalizeRuntimeImageManifest(
-                    expected,
-                    expected.slice(-64),
-                    sha,
-                    { request, signal },
-                  )
-                : undefined;
-            staticImages[name] = normalized ?? sha;
+            staticImages[name] = sha;
           }
         }
       const afterNamespace = await k8s.read(

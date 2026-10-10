@@ -460,7 +460,56 @@ test("coalesces inventory outside reconciliation and respects its minimum interv
 // Exact public OCI index reported by the post-Talos-upgrade US Cilium Pod.
 const ciliumIndex =
   '{\n  "schemaVersion": 2,\n  "mediaType": "application/vnd.oci.image.index.v1+json",\n  "manifests": [\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:9d308e3f7f05972b0b0604c40d2b0f08fa2f6a55084fef1e1aaadb469e430639",\n      "size": 1247,\n      "platform": {\n        "architecture": "amd64",\n        "os": "linux"\n      }\n    },\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:02dd062a1f48a6ef52f50e7396117f9e7c82fbe9e6408dcaebe212257414bbeb",\n      "size": 1247,\n      "platform": {\n        "architecture": "arm64",\n        "os": "linux"\n      }\n    }\n  ]\n}';
-test("fresh Linux/AMD64 inventory resolves the actual OCI parent imageID to the release child instead of reporting unknown", async () => {
+test("API-only inventory reports stable raw OCI IDs without letting blocked registry metadata consume its 20-second budget", async () => {
+  const f = inventoryFixture(),
+    pin = f.desired.release.spec.components.find((v) => v.name === "cilium")!,
+    reference = lock.charts
+      .find((v) => v.name === "cilium")!
+      .renderedImages.find((v) => v.startsWith("quay.io/cilium/cilium:"))!,
+    reported = createHash("sha256").update(ciliumIndex).digest("hex");
+  Object.assign(pin, {
+    reference,
+    sha256: reference.slice(-64),
+    version: lock.charts.find((v) => v.name === "cilium")!.appVersion,
+    workload: {
+      namespace: "pgcf-system",
+      selector: { app: "pgcf-agent" },
+      scope: "node",
+    },
+  });
+  Object.assign(record(record(f.node.status).nodeInfo), {
+    operatingSystem: "linux",
+    architecture: "amd64",
+  });
+  (record(f.pod.spec).containers as Record<string, unknown>[])[0]!.image =
+    reference;
+  (
+    record(f.pod.status).containerStatuses as Record<string, unknown>[]
+  )[0]!.imageID = `containerd://sha256:${reported}`;
+  let now = Date.now(),
+    metadataReads = 0;
+  const blocked: typeof fetch = async () => {
+    metadataReads++;
+    now += 20_001;
+    throw new TypeError("fetch failed", {
+      cause: Object.assign(new Error("connect timeout"), { code: "ETIMEDOUT" }),
+    });
+  };
+  const reports = await collectFleetInventory(
+    f.k8s,
+    f.desired,
+    () => now,
+    undefined,
+    blocked,
+  );
+  assert.equal(reports.length, 1);
+  assert.deepEqual(reports[0]!.facts.components, [
+    { name: "cilium", runtime_image_sha256: reported },
+  ]);
+  assert.equal(metadataReads, 0);
+  assert.equal(f.k8s.mutations, 0);
+});
+test("stable inventory delegates actual OCI parent imageIDs to the API without claiming the selected child locally", async () => {
   const f = inventoryFixture(),
     pin = f.desired.release.spec.components.find((v) => v.name === "cilium")!;
   const reference = lock.charts
@@ -488,18 +537,19 @@ test("fresh Linux/AMD64 inventory resolves the actual OCI parent imageID to the 
   containers[0]!.image = reference;
   const reported = createHash("sha256").update(ciliumIndex).digest("hex");
   statuses[0]!.imageID = `containerd://sha256:${reported}`;
-  const request: typeof fetch = async () =>
-    new Response(ciliumIndex, {
+  let metadataReads = 0;
+  const request: typeof fetch = async () => {
+    metadataReads++;
+    return new Response(ciliumIndex, {
       headers: { "docker-content-digest": `sha256:${reported}` },
     });
+  };
   const observation = (
     await collectFleetInventory(f.k8s, f.desired, Date.now, undefined, request)
   )[0]!;
   assert.deepEqual(observation.facts.components, [
     {
       name: "cilium",
-      version: pin.version,
-      sha256: pin.sha256,
       runtime_image_sha256: reported,
     },
   ]);
@@ -516,12 +566,13 @@ test("fresh Linux/AMD64 inventory resolves the actual OCI parent imageID to the 
     )[0]!.facts.components,
     [{ name: "cilium", runtime_image_sha256: reported }],
   );
+  assert.equal(metadataReads, 0);
 });
 
 const apiServerIndex =
   '{\n   "schemaVersion": 2,\n   "mediaType": "application/vnd.docker.distribution.manifest.list.v2+json",\n   "manifests": [\n      {\n         "mediaType": "application/vnd.docker.distribution.manifest.v2+json",\n         "size": 3444,\n         "digest": "sha256:78487f7b4b1a588d9630f758f6677895eabe00d93c4cbbea3d6b06e5f476a371",\n         "platform": {\n            "architecture": "amd64",\n            "os": "linux"\n         }\n      },\n      {\n         "mediaType": "application/vnd.docker.distribution.manifest.v2+json",\n         "size": 3444,\n         "digest": "sha256:fd2aeee57db21e3e988ae7845dd549f8fdc036a3de985dc70aad4a69ad8ceb5a",\n         "platform": {\n            "architecture": "arm64",\n            "os": "linux"\n         }\n      },\n      {\n         "mediaType": "application/vnd.docker.distribution.manifest.v2+json",\n         "size": 3444,\n         "digest": "sha256:a932de6bf497f09570130c750b97eee9c5e3306a32ad598f31933074a12258d2",\n         "platform": {\n            "architecture": "ppc64le",\n            "os": "linux"\n         }\n      },\n      {\n         "mediaType": "application/vnd.docker.distribution.manifest.v2+json",\n         "size": 3444,\n         "digest": "sha256:c7c14e0cee7edf77296ca3df0b9379a4e2159d87050372e1cf055b26160180e2",\n         "platform": {\n            "architecture": "s390x",\n            "os": "linux"\n         }\n      }\n   ]\n}';
 
-test("actual static-Pod parent IDs are canonical only while the freshly checked Node boot remains unchanged", async () => {
+test("actual static-Pod parent IDs remain raw and are reported only while the freshly checked Node boot remains unchanged", async () => {
   const f = staticInventoryFixture(),
     reference = lock.target.kubernetesImages.apiServer;
   Object.assign(f.desired.release.spec.roles.control_relay, {
@@ -539,10 +590,13 @@ test("actual static-Pod parent IDs are canonical only while the freshly checked 
   containers[0]!.image = reference;
   const reported = createHash("sha256").update(apiServerIndex).digest("hex");
   statuses[0]!.imageID = `containerd://sha256:${reported}`;
-  const request: typeof fetch = async () =>
-    new Response(apiServerIndex, {
+  let metadataReads = 0;
+  const request: typeof fetch = async () => {
+    metadataReads++;
+    return new Response(apiServerIndex, {
       headers: { "docker-content-digest": `sha256:${reported}` },
     });
+  };
   assert.deepEqual(
     (
       await collectFleetInventory(
@@ -553,7 +607,7 @@ test("actual static-Pod parent IDs are canonical only while the freshly checked 
         request,
       )
     )[0]!.facts.kubernetes_static_images,
-    { apiServer: reference.slice(-64) },
+    { apiServer: reported },
   );
   const original = f.k8s.read.bind(f.k8s);
   f.k8s.read = async (...args) => {
@@ -566,6 +620,7 @@ test("actual static-Pod parent IDs are canonical only while the freshly checked 
     await collectFleetInventory(f.k8s, f.desired, Date.now, undefined, request),
     [],
   );
+  assert.equal(metadataReads, 0);
 });
 
 test("missing or invalid boot identity keeps workload and static OCI aliases raw and unqualified", async () => {
