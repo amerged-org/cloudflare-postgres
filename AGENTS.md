@@ -28,4 +28,5 @@ Rust is an owner-approved architecture choice; measurements validate its impleme
 First-party code is Apache-2.0; upstream components keep their own licenses.
 Pin upstream versions and digests; record licenses and notices in THIRD_PARTY.md.
 The repository is public: never print or commit secrets, .env* files, kubeconfigs or Talos configs.
+Never content-search private files or bypass the private-file search exclusions. Load a known required credential file only in memory, and output only explicitly selected nonsecret metadata.
 New paid resources and production writes need the owner's explicit, costed go.

@@ -1,0 +1,5 @@
+# Private local state must stay outside default searches, including hidden-file searches.
+.local/
+*.private.*
+.env*
+.dev.vars*

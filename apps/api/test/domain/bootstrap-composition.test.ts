@@ -10,7 +10,16 @@ import {
 } from "../../src/crypto/bootstrap-credentials.ts";
 import { afterEach, describe, expect, it } from "vitest";
 import { composeConfiguredNodeBootstrap } from "../../src/domain/bootstrap-composition.ts";
-import { recordNodeInstallationInspection } from "../../src/domain/node-installation.ts";
+import {
+  recordNodeInstallationInspection,
+  readNodeInstallationProfile,
+} from "../../src/domain/node-installation.ts";
+import {
+  deriveRegionKeyring,
+  parseRouteKeyring,
+  serializeRouteKeyring,
+} from "@pgcf/contracts/route-token";
+import { bytesToBase64url } from "@pgcf/contracts";
 import {
   readBootstrapJob,
   bootstrapJobInput,
@@ -43,6 +52,46 @@ async function setup(worker = false) {
   return f;
 }
 describe("provider-bound bootstrap composition", () => {
+  it("derives current route authority rather than reinstalling a retired profile key", async () => {
+    const f = await setup(),
+      id = f.addition.intent.operation_id,
+      original = await readNodeInstallationProfile(
+        f.bindings,
+        f.fixture.region,
+      ),
+      master = JSON.stringify({
+        active: "replacement",
+        keys: {
+          replacement: bytesToBase64url(
+            crypto.getRandomValues(new Uint8Array(32)),
+          ),
+        },
+      }),
+      bindings = { ...f.bindings, ROUTE_MASTER_KEYS: master };
+    await recordNodeInstallationInspection(bindings, id, 0, f.inspection);
+    await composeConfiguredNodeBootstrap(bindings, id, {
+      provider: f.provider,
+    });
+    const input = await bootstrapJobInput(
+      bindings,
+      await readBootstrapJob(env.DB, id),
+    );
+    expect(input.platform!.route_keyring).toBe(
+      serializeRouteKeyring(
+        await deriveRegionKeyring(parseRouteKeyring(master), f.fixture.region),
+      ),
+    );
+    expect(input.platform).toEqual({
+      ...original!.profile.first_region!.platform,
+      route_keyring: input.platform!.route_keyring,
+    });
+    expect(
+      await readNodeInstallationProfile(bindings, f.fixture.region),
+    ).toEqual(original);
+    expect(input.platform!.route_keyring).not.toBe(
+      original!.profile.first_region!.platform.route_keyring,
+    );
+  });
   it("seals the selected common initial disk and postjoin release under the same immutable region target", async () => {
     const f = await setup(true),
       id = f.addition.intent.operation_id,

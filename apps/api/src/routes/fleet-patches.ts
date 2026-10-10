@@ -16,6 +16,10 @@ import {
 import { ApiError, type ApiApp } from "../app.ts";
 import {
   authenticateFleetPatch,
+  authenticateFleetPatchContext,
+  authenticateFleetPatchRow,
+  assertFleetPatchAuthority,
+  assertFleetPatchCurrent,
   createFleetPatch,
   fleetPatchInput,
   getFleetPatch,
@@ -97,12 +101,35 @@ export function registerFleetPatches(app: ApiApp) {
       resumeFleetPatch(c, OperationId.parse(c.req.param("operation_id"))),
   );
   app.post("/internal/v1/fleet-patches/:operation_id", async (c) => {
-    const id = OperationId.parse(c.req.param("operation_id"));
-    await authenticateFleetPatch(c, id);
+    const id = OperationId.parse(c.req.param("operation_id")),
+      authenticated = await authenticateFleetPatchRow(c, id);
     const raw = (await c.req.json()) as {
       kind?: unknown;
       expected_compute_pool_revision?: unknown;
     };
+    if (raw.kind === "transport") {
+      const verified = await authenticateFleetPatchContext(
+        c,
+        id,
+        authenticated,
+      );
+      return c.json(
+        await issueFleetPatchTransport(
+          c.env,
+          id,
+          z
+            .enum(["talos_api", "kubernetes_api"])
+            .parse((raw as { capability?: unknown }).capability),
+          z
+            .enum(["node", "control"])
+            .default("node")
+            .parse((raw as { target?: unknown }).target),
+          verified,
+        ),
+        200,
+      );
+    }
+    await assertFleetPatchAuthority(c.env, authenticated);
     if (raw.kind === "postgres_rollout") {
       const row = await authenticateFleetPatch(c, id);
       if (row.stage !== "postgres")
@@ -157,26 +184,12 @@ export function registerFleetPatches(app: ApiApp) {
         200,
       );
     }
-    if (raw.kind === "transport")
-      return c.json(
-        await issueFleetPatchTransport(
-          c.env,
-          id,
-          z
-            .enum(["talos_api", "kubernetes_api"])
-            .parse((raw as { capability?: unknown }).capability),
-          z
-            .enum(["node", "control"])
-            .default("node")
-            .parse((raw as { target?: unknown }).target),
-        ),
-        200,
-      );
     throw new ApiError("invalid_request", "Unsupported fleet patch action");
   });
   app.get("/internal/v1/fleet-patches/:operation_id/relay", async (c) => {
     const id = OperationId.parse(c.req.param("operation_id")),
-      row = await authenticateFleetPatch(c, id),
+      verified = await authenticateFleetPatchContext(c, id),
+      row = verified.row,
       token = c.req.header(BOOTSTRAP_RELAY_HEADER);
     if (
       c.req.header("Upgrade")?.toLowerCase() !== "websocket" ||
@@ -201,7 +214,7 @@ export function registerFleetPatches(app: ApiApp) {
     } catch {
       throw new ApiError("unauthorized", "Invalid fleet patch transport grant");
     }
-    const input = await fleetPatchInput(c.env, id),
+    const input = verified.input,
       clusterAddress = new URL(input.cluster_endpoint).hostname,
       addresses =
         claims.capability === "talos_api"
@@ -220,10 +233,33 @@ export function registerFleetPatches(app: ApiApp) {
     )
       throw new ApiError("forbidden", "Fleet patch transport scope changed");
     // The regional relay verifies the signature, expiry, nonce, target and relay epoch.
-    return c.env.BOOTSTRAP_RELAY_SERVICE.fetch(
+    await assertFleetPatchCurrent(
+      c.env,
+      row,
+      false,
+      input.compute_pool?.revision,
+    );
+    const response = await c.env.BOOTSTRAP_RELAY_SERVICE.fetch(
       new Request(new URL(BOOTSTRAP_RELAY_PATH, c.env.BOOTSTRAP_RELAY_URL), {
         headers: { Upgrade: "websocket", [BOOTSTRAP_RELAY_HEADER]: token },
       }),
     );
+    try {
+      await assertFleetPatchCurrent(
+        c.env,
+        row,
+        false,
+        input.compute_pool?.revision,
+      );
+    } catch (error) {
+      try {
+        response.webSocket?.accept();
+        response.webSocket?.close(1008, "authority_changed");
+      } catch {
+        /* The upstream may already have closed. */
+      }
+      throw error;
+    }
+    return response;
   });
 }

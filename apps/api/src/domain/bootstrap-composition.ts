@@ -5,6 +5,11 @@ import {
   type NodePostjoinRelease,
 } from "@pgcf/contracts/node-bootstrap";
 import { NodeInstallationInspection } from "@pgcf/contracts/node-installation";
+import {
+  deriveRegionKeyring,
+  parseRouteKeyring,
+  serializeRouteKeyring,
+} from "@pgcf/contracts/route-token";
 import { z } from "zod";
 import { readSelectedNodeGoldenImage } from "./node-golden-image.ts";
 import { ApiError } from "../app.ts";
@@ -241,7 +246,18 @@ export async function composeConfiguredNodeBootstrap(
   if (!join && !installed.profile.first_region)
     return refuse("An empty region requires its protected platform profile");
   const first = installed.profile.first_region,
-    platform = role === "controlplane" ? first!.platform : undefined;
+    platform =
+      role === "controlplane"
+        ? {
+            ...first!.platform,
+            route_keyring: serializeRouteKeyring(
+              await deriveRegionKeyring(
+                parseRouteKeyring(env.ROUTE_MASTER_KEYS),
+                installed.profile.region_id,
+              ),
+            ),
+          }
+        : undefined;
   const spec = NodeBootstrapSpec.parse({
     version: 1,
     ...(options.postjoinRelease

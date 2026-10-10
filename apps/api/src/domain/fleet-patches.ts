@@ -168,10 +168,12 @@ async function retainedThinPatchRequiresHost(
     return closed();
   return true;
 }
-export async function assertFleetPatchAuthority(
+/** Fresh metadata fencing for a request whose private input has already been verified. */
+export async function assertFleetPatchCurrent(
   env: Env,
   row: PatchRow,
   allowExpired = false,
+  poolRevision?: number,
 ) {
   if (
     row.state === "halted" ||
@@ -179,14 +181,41 @@ export async function assertFleetPatchAuthority(
     (!allowExpired && Date.parse(row.deadline_at) <= Date.now())
   )
     return closed();
-  if (
-    !(await env.DB.prepare(
-      `SELECT 1 valid FROM fleet_patch_operations WHERE operation_id=? AND revision=? AND ${authoritySql}`,
-    )
-      .bind(row.operation_id, row.revision)
-      .first())
+  const valid = await env.DB.prepare(
+    `SELECT 1 valid FROM fleet_patch_operations WHERE operation_id=? AND revision=? AND node_id=? AND region_id=? AND node_uid=? AND cluster_uid=? AND release_id=? AND spec_sha256=? AND assignment_revision=? AND region_revision=? AND material_revision=? AND address=? AND cluster_nodes_json=? AND stage=? AND state=? AND deadline_at=? AND host_configuration_revision IS ? AND host_configuration_sha256 IS ? AND ${authoritySql}
+    AND (? IS NULL OR EXISTS(SELECT 1 FROM node_compute_pool_policies p WHERE p.node_id=fleet_patch_operations.node_id AND p.node_uid=fleet_patch_operations.node_uid AND p.release_id=fleet_patch_operations.release_id AND p.revision=?))`,
   )
-    return closed();
+    .bind(
+      row.operation_id,
+      row.revision,
+      row.node_id,
+      row.region_id,
+      row.node_uid,
+      row.cluster_uid,
+      row.release_id,
+      row.spec_sha256,
+      row.assignment_revision,
+      row.region_revision,
+      row.material_revision,
+      row.address,
+      row.cluster_nodes_json,
+      row.stage,
+      row.state,
+      row.deadline_at,
+      row.host_configuration_revision,
+      row.host_configuration_sha256,
+      poolRevision ?? null,
+      poolRevision ?? null,
+    )
+    .first();
+  if (!valid) return closed();
+}
+export async function assertFleetPatchAuthority(
+  env: Env,
+  row: PatchRow,
+  allowExpired = false,
+) {
+  await assertFleetPatchCurrent(env, row, allowExpired);
   if (await retainedThinPatchRequiresHost(env, row.region_id, row.release_id)) {
     if (!row.host_configuration_revision || !row.host_configuration_sha256)
       return closed();
@@ -264,19 +293,44 @@ async function patchBearer(env: Env, row: PatchRow) {
     ),
   );
 }
-export async function authenticateFleetPatch(c: ApiContext, id: string) {
+/** Authenticate before parsing a callback body; no private-input reconstruction here. */
+export async function authenticateFleetPatchRow(c: ApiContext, id: string) {
   const row = await readFleetPatch(c.env, id);
   if (!timingSafeEqual(bearer(c), await patchBearer(c.env, row)))
     throw new ApiError("unauthorized", "Fleet patch credentials required");
+  await assertFleetPatchCurrent(c.env, row);
+  return row;
+}
+export async function authenticateFleetPatch(c: ApiContext, id: string) {
+  const row = await authenticateFleetPatchRow(c, id);
   await assertFleetPatchAuthority(c.env, row);
   return row;
+}
+/** One request owns one full private-input validation; later checks use fresh fenced metadata. */
+export async function authenticateFleetPatchContext(
+  c: ApiContext,
+  id: string,
+  authenticatedRow?: PatchRow,
+) {
+  const row = authenticatedRow ?? (await authenticateFleetPatchRow(c, id));
+  if (row.operation_id !== id) return closed();
+  const input = await fleetPatchInput(c.env, id, row);
+  return { row, input };
 }
 export async function fleetPatchInput(
   env: Env,
   id: string,
+  verifiedRow?: PatchRow,
 ): Promise<FleetPatchInput> {
-  const row = await readFleetPatch(env, id);
-  await assertFleetPatchAuthority(env, row);
+  const row = verifiedRow ?? (await readFleetPatch(env, id));
+  if (row.operation_id !== id) return closed();
+  await assertFleetPatchCurrent(env, row);
+  if (
+    (await retainedThinPatchRequiresHost(env, row.region_id, row.release_id)) &&
+    (!row.host_configuration_revision || !row.host_configuration_sha256)
+  )
+    return closed();
+  if (row.bootstrap_operation_id) await assertBootstrapFleetParent(env, row);
   const selected = await env.DB.prepare(
     "SELECT a.role,n.k8s_node_name,s.spec_json FROM fleet_node_releases a JOIN nodes n ON n.id=a.node_id JOIN fleet_releases s ON s.id=a.release_id WHERE a.node_id=?",
   )
@@ -376,6 +430,13 @@ export async function fleetPatchInput(
         policy: JSON.parse(poolRow.policy_json),
       })
     : undefined;
+  if (
+    hostConfiguration &&
+    (!computePool ||
+      (await installationHash(computePool.policy.profile)) !==
+        hostConfiguration.status.profile_sha256)
+  )
+    return closed();
   const observation = computePool
     ? await env.DB.prepare(
         "SELECT observation_json FROM node_compute_pool_observations WHERE node_id=? AND node_uid=? AND policy_revision=? AND material_revision=?",
@@ -396,7 +457,7 @@ export async function fleetPatchInput(
     env.NODE_BOOTSTRAP_CALLBACK_URL,
   );
   if (url.protocol !== "https:") return closed();
-  await assertFleetPatchAuthority(env, row);
+  await assertFleetPatchCurrent(env, row, false, computePool?.revision);
   return FleetPatchInput.parse({
     status: status(row),
     host_configuration_only:
@@ -1488,9 +1549,10 @@ export async function issueFleetPatchTransport(
   id: string,
   capability: "talos_api" | "kubernetes_api",
   target: "node" | "control" = "node",
+  verified?: Awaited<ReturnType<typeof authenticateFleetPatchContext>>,
 ) {
-  const input = await fleetPatchInput(env, id),
-    row = await readFleetPatch(env, id),
+  const row = verified?.row ?? (await readFleetPatch(env, id)),
+    input = verified?.input ?? (await fleetPatchInput(env, id, row)),
     service = env.BOOTSTRAP_RELAY_SERVICE;
   if (!service) return closed();
   if (
@@ -1544,7 +1606,7 @@ export async function issueFleetPatchTransport(
     capability,
     address,
   });
-  await assertFleetPatchAuthority(env, row);
+  await assertFleetPatchCurrent(env, row, false, input.compute_pool?.revision);
   return {
     websocket_url: input.callback.url.replace(/^https:/, "wss:") + "/relay",
     token,
