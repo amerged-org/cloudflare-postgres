@@ -145,6 +145,11 @@ function fixture() {
       }
       if (args[0] === "apply") {
         const value = JSON.parse(stdin!) as Record<string, unknown>;
+        if (value.kind === "MutatingAdmissionPolicyBinding") {
+          const spec = value.spec as Record<string, unknown>,
+            match = spec.matchResources as Record<string, unknown>;
+          match.matchPolicy ??= "Equivalent";
+        }
         if (args.includes("--dry-run=server")) return JSON.stringify(value);
         (value.metadata as Record<string, unknown>).uid =
           "uid-" + String(objects.size);
@@ -410,4 +415,24 @@ test("an omitted CNPG readyReplicas is zero readiness and cannot activate shared
     /patch_runtime_admission_conflict/,
   );
   assert.equal(f.writes(), 0);
+});
+
+test("the Kubernetes binding default is declared explicitly and survives strict owned readback", async () => {
+  const f = fixture();
+  await applyRuntimeAdmission(f.commands, f.input);
+  assert.equal(
+    (await readRuntimeAdmission(f.commands, f.input)).confirmed,
+    true,
+  );
+  const binding = f.objects.get(
+    "MutatingAdmissionPolicyBinding/pgcf-cnpg-prestarted",
+  )!;
+  const match = (binding.spec as { matchResources: { matchPolicy: string } })
+    .matchResources;
+  assert.equal(match.matchPolicy, "Equivalent");
+  match.matchPolicy = "Exact";
+  await assert.rejects(
+    readRuntimeAdmission(f.commands, f.input),
+    /patch_runtime_admission_conflict/,
+  );
 });

@@ -27,6 +27,12 @@ Provide these values through an ignored private overlay or Flux substitution:
 - `PGCF_BOOTSTRAP_RELAY_ALLOWED_TARGET_REGIONS`: an explicit JSON array of allowed region IDs.
 - Secret `pgcf-bootstrap-tunnel`, key `token`: the dedicated outbound tunnel's credential.
 
+For Flux post-build substitution, encode the two JSON values as JSON string literals, for
+example `JSON.stringify(JSON.stringify(publicKeys))`. Kustomize can normalize a placeholder
+inside a YAML block scalar; block syntax alone does not keep the substituted map or list a
+string. Verify the final ConfigMap data contains the original JSON strings. The retained-node
+patch preserves the existing typed ConfigMap and updates the relay Deployment.
+
 Configure the dedicated tunnel's private HTTP origin as `http://127.0.0.1:8082` and connect it
 through the API Worker's `BOOTSTRAP_RELAY_SERVICE` VPC binding. Do not add a public hostname for
 the relay. The API gives native jobs an authenticated WebSocket route on its own origin, then

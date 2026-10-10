@@ -108,6 +108,7 @@ export function sandboxRuntimeAdmission(input: {
         spec: {
           policyName,
           matchResources: {
+            matchPolicy: "Equivalent",
             namespaceSelector: match.namespaceSelector,
             objectSelector: match.objectSelector,
           },

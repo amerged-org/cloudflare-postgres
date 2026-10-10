@@ -314,6 +314,7 @@ export function selectImageInputs(
       rustInputs(path, "apps/sandbox-controller") ||
       rustInputs(path, "apps/node-runtime") ||
       (path.startsWith("infra/talos/sandbox/") &&
+        path !== "infra/talos/sandbox/runtime-admission.ts" &&
         !path.endsWith(".md") &&
         !path.includes(".test.") &&
         !path.endsWith("/tsconfig.json"))

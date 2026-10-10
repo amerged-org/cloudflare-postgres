@@ -163,7 +163,7 @@ test("the storage source lock invalidates both the storage and Native images", (
 test("management-only changes skip images while exact Native and Regional build inputs select their image", () => {
   assert.deepEqual(
     selectImageInputs(["infra/talos/sandbox/runtime-admission.ts"], "push"),
-    selected({ node_bootstrap: true, sandbox_controller: true }),
+    selected({ node_bootstrap: true }),
   );
   assert.deepEqual(
     selectImageInputs(["infra/platform/image-manifest.ts"], "push"),
