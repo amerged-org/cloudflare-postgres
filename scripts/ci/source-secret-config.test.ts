@@ -99,8 +99,12 @@ test("source exceptions require the exact reviewed file and exact value while pr
   const mutation = await scan("changed", [[paths[1]!, altered]]);
   assert.equal(mutation.exit, 99);
   assert.ok(mutation.findings.some((f) => f.RuleID === "generic-api-key"));
+  // The default detector allows digit-free strings; use one stable, varied key.
+  const unreviewedKey = createHash("sha256")
+    .update("source-config-unreviewed-key-fixture")
+    .digest("hex");
   const unrelated = Buffer.from(
-    `\napi_key = "${randomBytes(32).toString("base64url")}"\ngithub_token = "${String.fromCharCode(103, 104, 112, 95) + randomBytes(18).toString("hex")}"\n`,
+    `\napi_key = "${unreviewedKey}"\ngithub_token = "${String.fromCharCode(103, 104, 112, 95) + randomBytes(18).toString("hex")}"\n`,
   );
   const other = await scan("unrelated", [
     [paths[1]!, Buffer.concat([changed, unrelated])],
