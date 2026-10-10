@@ -12,6 +12,7 @@ import { canonical, digest } from "../src/bootstrap.ts";
 import {
   readRuntimeAdmission,
   applyRuntimeAdmission,
+  refreshRuntimeAdmissionObservation,
   type RuntimeAdmissionInput,
 } from "../src/fleet-runtime-admission.ts";
 function fixture() {
@@ -278,6 +279,79 @@ test("stale observations, wrong operator and unrelated fixed-object ownership fa
   });
   await assert.rejects(applyRuntimeAdmission(owned.commands, owned.input));
   assert.equal(owned.writes(), 0);
+});
+
+test("actuation refreshes the authenticated pool observation before its first read and preserves the old report", async () => {
+  const f = fixture(),
+    stale = {
+      ...f.input.compute_pool_observation,
+      observed_at: new Date(Date.now() - 139_457).toISOString(),
+    },
+    fresh = structuredClone(f.input.compute_pool_observation),
+    facts = patchFixture().facts;
+  f.input.compute_pool_observation = stale;
+  const originalTimestamp = stale.observed_at;
+  let authorizations = 0;
+  f.commands.authorize = async () => {
+    authorizations++;
+    refreshRuntimeAdmissionObservation(
+      f.input,
+      {
+        ...f.input.status,
+        observed: facts,
+        compute_pool_observation: fresh,
+      },
+      facts.boot_id,
+    );
+  };
+  await applyRuntimeAdmission(f.commands, f.input);
+  assert.ok(authorizations > 0);
+  assert.equal(f.objects.size, 3);
+  assert.equal(
+    (await readRuntimeAdmission(f.commands, f.input)).confirmed,
+    true,
+  );
+  assert.equal(stale.observed_at, originalTimestamp);
+  assert.equal(f.input.compute_pool_observation.observed_at, fresh.observed_at);
+});
+
+test("a fresh callback cannot replace the selected boot or pool-policy authority", async () => {
+  const f = fixture(),
+    original = f.input.compute_pool_observation,
+    report = structuredClone(f.input.compute_pool_observation),
+    facts = patchFixture().facts;
+  f.commands.authorize = async () => {
+    refreshRuntimeAdmissionObservation(
+      f.input,
+      {
+        ...f.input.status,
+        observed: { ...facts, boot_id: "00000000-0000-4000-8000-000000000001" },
+        compute_pool_observation: report,
+      },
+      facts.boot_id,
+    );
+  };
+  await assert.rejects(
+    applyRuntimeAdmission(f.commands, f.input),
+    /patch_runtime_admission_conflict/,
+  );
+  assert.equal(f.writes(), 0);
+  assert.equal(f.input.compute_pool_observation, original);
+  report.policy_revision++;
+  assert.throws(
+    () =>
+      refreshRuntimeAdmissionObservation(
+        f.input,
+        {
+          ...f.input.status,
+          observed: facts,
+          compute_pool_observation: report,
+        },
+        facts.boot_id,
+      ),
+    /patch_runtime_admission_conflict/,
+  );
+  assert.equal(f.writes(), 0);
 });
 
 test("a qualified profile transition updates only the existing owned RuntimeClass fields and preserves its UID and unrelated scheduling", async () => {

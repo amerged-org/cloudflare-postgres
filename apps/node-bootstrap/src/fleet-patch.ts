@@ -79,6 +79,7 @@ import {
 import {
   readRuntimeAdmission,
   applyRuntimeAdmission,
+  refreshRuntimeAdmissionObservation,
   type RuntimeAdmissionInput,
 } from "./fleet-runtime-admission.ts";
 import { refreshKubeletTrust } from "./kubelet-trust.ts";
@@ -369,16 +370,28 @@ export async function runFleetPatch(
       platformReadback: ReturnType<typeof fleetPlatformReadback> | undefined,
       machineConfiguration:
         Awaited<ReturnType<typeof readMachineConfiguration>> | undefined;
+    let observedBootId: string | undefined;
     const authorize = async () => {
-      const next = FleetPatchStatus.parse(
-        await call({
+      const refreshPool =
+          ["runtime_admission", "release_verify"].includes(current.stage) &&
+          input.compute_pool,
+        response = await call({
           kind: "status",
-          ...(["runtime_admission", "release_verify"].includes(current.stage) &&
-          input.compute_pool
-            ? { expected_compute_pool_revision: input.compute_pool.revision }
+          ...(refreshPool
+            ? { expected_compute_pool_revision: refreshPool.revision }
             : {}),
         }),
-      );
+        admissionInput = { ...input, status: current } as RuntimeAdmissionInput,
+        next = refreshPool
+          ? refreshRuntimeAdmissionObservation(
+              admissionInput,
+              response,
+              observedBootId!,
+            )
+          : FleetPatchStatus.parse(response);
+      if (refreshPool)
+        input.compute_pool_observation =
+          admissionInput.compute_pool_observation;
       if (
         next.operation_id !== current.operation_id ||
         next.revision !== current.revision ||
@@ -395,6 +408,7 @@ export async function runFleetPatch(
       });
       controlNode = observed.controlNode;
       const facts = observed.facts;
+      observedBootId = facts.boot_id;
       facts.kubernetes_control_plane =
         object(observed.controlNode.metadata).uid === facts.node_uid;
       const observeImages =
@@ -1157,11 +1171,21 @@ export async function runFleetPatch(
       else {
         if (!input.compute_pool || !input.compute_pool_observation)
           return current;
+        await authorize();
         const runtimeInput = {
           ...input,
+          status: current,
           compute_pool: input.compute_pool,
           compute_pool_observation: input.compute_pool_observation,
         } as RuntimeAdmissionInput;
+        const admissionCommands = {
+          kube,
+          authorize: async () => {
+            await authorize();
+            runtimeInput.compute_pool_observation =
+              input.compute_pool_observation!;
+          },
+        };
         const loaded = facts.release_facts?.components.some(
           (component) =>
             component.name === "pgcf-sandbox-controller" &&
@@ -1171,7 +1195,7 @@ export async function runFleetPatch(
         );
         if (!loaded) return current;
         const state = await readRuntimeAdmission(
-          { kube, authorize },
+          admissionCommands,
           runtimeInput,
         );
         if (state.confirmed)
@@ -1186,8 +1210,7 @@ export async function runFleetPatch(
               ...facts,
               runtime_admission_policy_revision: input.compute_pool.revision,
             });
-          await authorize();
-          await applyRuntimeAdmission({ kube, authorize }, runtimeInput);
+          await applyRuntimeAdmission(admissionCommands, runtimeInput);
         }
       }
     } else if (current.stage === "postgres") {
@@ -1218,10 +1241,12 @@ export async function runFleetPatch(
       if (target.host_configuration_required) {
         if (!input.compute_pool || !input.compute_pool_observation)
           throw new BootstrapError("patch_runtime_admission_unobserved");
+        await authorize();
         const state = await readRuntimeAdmission(
           { kube, authorize },
           {
             ...input,
+            status: current,
             compute_pool: input.compute_pool,
             compute_pool_observation: input.compute_pool_observation,
           },

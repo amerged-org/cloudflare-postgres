@@ -24,6 +24,8 @@ Reuse US1 and existing code.
 | Oct 10 | Scoped route authority retired | All four current gateway Pods reject freshly signed old tokens with HTTP/WS 401 and accept new WebSockets with 101. Edge and API use only route-20261010; modules, bindings and other secrets preserved. Current private custody updated. All three EU databases still pass SQL/TLS 1.3/app-role checks in 590–767 ms; two marker rows and their hash unchanged. |
 | Oct 10 | Management latency correction delivered and measured | b793273/CI 38063853988/API 2e9e762a at 100%; all images and Bootstrap version 45 reused. All ten targeted reads passed in 20.414 s under backup load. Grant authorization 2.8–4.6 s versus 14–16 s; Talos 9.9–11.0 s, machine configuration 6.9 s. Same US patch confirmed preflight/revision 1 at 16:03:47 UTC. |
 | Oct 10 | Same daily backup independently verified | Run 1ebb9c1e-e353-4c31-b394-863d825a9440 completed at 15:59:56 UTC; successful Workflow 232.720 s. R2 ciphertext: D1 316,307,388 B; EU etcd 28,471,850 B; US etcd 32,530,986 B. All hashes/GCM identities verified; D1 integrity OK, zero FK violations, 56 tables/410,685 rows; etcd 982/821 keys. Temporary plaintext removed. No new run ID/object keys or Contabo calls. |
+| Oct 10 | Isolated Golden EU-role boot passed | Corrected lab attempt2 passed in125.696 s:control etcd/trustd/kubelet healthy; customer kubelet healthy (worker has no etcd/trustd). Both authenticated Talos1.14.2/Golden762c…/sandbox3b6…, one boot each, no fallback. Same target/raw hashes; one empty local bootstrap. First604.937 s attempt had a lab /24-versus-real-/23 routing error. Lab time/cache/identity overrides explicit; no production network/data/pool claim. All VM/config/ISO/overlay resources removed. |
+| Oct 10 | All-role manifest validation passed | Actual R1 program targets passed strict server-side dry-run:US91 objects/6 categories; EU customer/control94 each/7. Logical279 role documents,21 final CLI invocations; HTTP count unmeasured. Identical EU platform20 validated once with the actual Kustomize field manager. Retained relay six-string data hash acbebad3… unchanged; zero resource/provider writes. |
 | Oct 10 | US Golden runtime accepted by the same operation | H6 confirmed Golden762c655d…/bootc74415e8…: Talos1.14.2, Kubernetes1.36.5, NodeReady, loaded/running sandbox extension, healthy etcd/trustd; physical/cluster/volume identities preserved. Readback3.628 s; programmed runtime verification139.457 s. Fresh RAM3,687,542,784/8,308,830,208 B (44.381%), pressure0. Bounded operator recovery was required; final release acceptance remains open. |
 
 ## Open
@@ -38,7 +40,7 @@ Reuse US1 and existing code.
 | Backup alarms | The daily D1/etcd R2 run passed full independent verification. Optional sender/recipient configuration remains unset; a real notification test remains open. |
 | Routing template authority | Live retirement and b793273 API delivery passed. The immutable US profile keeps historical custody; current composition derives the live route authority from Cloudflare. R2 native gateway acceptance remains open. |
 | US post-reboot host-file correction | Talos1.14.2 requires existing files for overwrite. Our two new /var files were declared overwrite, blocking WriteUserFiles before etcd/trustd registration. The failing regression and32 affected tests now pass with create; unrelated configuration and identity/write guards remain. The supported no-reboot US repair was accepted once and changed only those two operations (full configuration a67c450c… →3adc946d…). The paused boot task did not rerun after apply; one identity-bound corrective reboot was accepted once. Fresh boot68a54885-4527-40f0-a31f-e1d011ea8fa5 retains the repaired configuration and both files exactly match the declared bytes. Ten direct authenticated reads passed in1.603 s: etcd/trustd healthy, Kubernetes1.36.5 responds, Node/Cluster/DMI unchanged. Node readiness/platform acceptance remains open. Source b5c050c passed CI38068917261; only Bootstrap rebuilt. Talos reverted the failed Golden boot to its retained slot. A single supported rollback was accepted to select the already written Golden slot, preserving the same H6 operation/installer receipt; no EU change, new installation or provider action. |
-| Regional JSON rendering correction | Flux post-build substitution turned bare JSON into YAML maps/lists and empty values into null. Four producer substitutions now use quoted string literals; Deployment values and verification hashes stay canonical. Failing-first real Kustomize/Flux2.9.6 reproduction and17 affected tests pass; types/lint/format/review clear. Same H6 remains regional/dispatched25; Bootstrap-only delivery pending. The reported key map contains public verifiers, not signing secrets. |
+| Admission report refresh | Regional convergence passed in75.438 s at H6/revision26. Admission had no objects or profile conflict: its frozen pool report exceeded120 s during the139.457 s collector. Existing status action now returns the actual fresh report when its existing revision flag is supplied; Native verifies unchanged authority/UID/boot/material/profile and replaces only that report. Original timestamps/120 s gate retained. Failing-first API22/Native33 tests plus types/lint/format/review passed; coordinated delivery pending. |
 | Management transport latency | Reproduced TLS setup failure is closed by the measured b793273 correction. Existing US patch passed preflight; host convergence remains open. No further timeout increases. |
 | Thin-storage admission correction | Source 66aedf passed CI38067216773 and nine focused tests. It requires the actual pgcf-sandbox-controller Talos extension instead of a nonexistent Pod. It joins the observed host-file correction below in one delivery; existing images are reused except the changed Bootstrap executor. |
 
@@ -92,17 +94,27 @@ EU test databases may be deleted/recreated if obstructive. Checks 4–5 share a 
 
 ## Execution
 
-Owner target: October 10–11.
+Owner target: October10–11; October10 19:45 coaching supersedes the earlier order.
+US1 is accepted **with three operator interventions**: two-file configuration repair, corrective
+reboot and supported return to the written Golden slot. EU must demonstrate zero interventions.
+
+Before any EU write: finish US's six checks; render all three actual role projections and run
+server-side dry-run; perform one isolated AMD64 Golden boot scenario for the rendered EU customer
+and control configurations; retain current configs/hashes, the accepted R2 snapshot and direct
+control Talos access. F9's existing EU rotation checkpoint is held at snapshot/halted with
+operator_hold_us_acceptance; only explicit release after these gates may continue EU.
+Sunday12:00 target: genuine shared-pool sleeping-DB first SQL plus refill, or an exact observed
+blocker. Capacity/thin density and the common R2 rollout/handover follow. No additional test series.
 
 | Step | Owner / timing | Finished when |
 | --- | --- | --- |
 | 1 — done | Integrator, Saturday, ≤1 hour | Concise plan replaces contradictions; Done/Open evidence checked. |
 | 2 | Image owner, Saturday | R1 installer/raw image retrievable by immutable reference; manifest published. |
 | 3 | Patch owner + parallel node readers, Saturday | Full three-node read-only preflight; all fixes in one reviewed batch, one CI/delivery; preflight passes. |
-| 4 | Integrator, Saturday | One API request completes US1→EU1→control and EU key activation; six checks pass without intervention. |
+| 4 | Integrator, Saturday | Same F9 completes US1, then gated EU1→control and prepared EU authority. US counts three physical operator actions; EU six-check acceptance requires zero interventions. |
 | 5 | Operations owner, Sunday | API enables daily backups; D1 + both etcd artifacts verified in R2; owner configures sender/recipient, test alarm received. |
-| 6 | Capacity owner, Sunday | Thin DB, one backup/restore/delete; sleeping CPU released; DBs/node and fit for 22 projects measured. |
-| 7 | Rust/pool owner from Saturday, integrate Sunday | Automatic R2 on all three; sleeping DB's genuine pool-hit first SQL <1 s; pool refills. |
+| 6 | Capacity owner, Sunday after pool | Thin DB, one backup/restore/delete; sleeping CPU released; DBs/node and fit for22 projects measured. |
+| 7 | Rust/pool owner, Sunday12:00 milestone | Sleeping DB's genuine pool-hit first SQL <1 s and refill, or concrete blocker; same programmed R2 rollout then converges all three. |
 | 8 | Integrator, Sunday | Handover: API, WS/TCP adapter, timeouts, restore/new DB ID, capacity and recovery. Neon migration separate. |
 
 One integrator combines image/patch, Rust/pool and operations/capacity owners. Read all nodes

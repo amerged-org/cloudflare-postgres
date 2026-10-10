@@ -170,7 +170,16 @@ export function registerFleetPatches(app: ApiApp) {
           "conflict",
           "Regional hosts are not qualified for runtime activation",
         );
-      return c.json(current.status, 200);
+      return c.json(
+        raw.expected_compute_pool_revision !== undefined
+          ? {
+              ...current.status,
+              compute_pool_observation:
+                current.compute_pool_observation ?? null,
+            }
+          : current.status,
+        200,
+      );
     }
     if (raw.kind === "checkpoint") {
       const value = { ...raw };

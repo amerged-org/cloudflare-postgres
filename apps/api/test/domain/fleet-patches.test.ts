@@ -330,6 +330,173 @@ it("uses current sealed custody without reopening a bootstrap job or touching pr
     (await request(`/v1/fleet/patches/${f.op}`, f.integrator)).status,
   ).toBe(403);
 });
+async function runtimeAdmissionStatusFixture() {
+  const f = await setup(true),
+    now = new Date().toISOString(),
+    policy = {
+      ...generatedPool.lease.policy,
+      profile: { ...generatedPool.lease.policy.profile, release_id: f.id },
+    };
+  await env.DB.prepare(
+    "INSERT INTO node_compute_pool_policies VALUES(?,?,1,?,?,?)",
+  )
+    .bind(f.node, f.nodeUid, f.id, JSON.stringify(policy), now)
+    .run();
+  await importRegionAgentKey(env.DB, env, f.region, f.agent);
+  const { ensureNodeHostConfiguration } =
+    await import("../../src/domain/node-host-configuration.ts");
+  const host = await ensureNodeHostConfiguration(f.runtime, {
+    node_id: f.node,
+    node_uid: f.nodeUid,
+  });
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='runtime_admission',state='dispatched',host_configuration_revision=?,host_configuration_sha256=? WHERE operation_id=?",
+  )
+    .bind(host.revision, host.sha256, f.op)
+    .run();
+  const original = await fleetPatchInput(f.runtime, f.op);
+  const call = async (body: unknown, bearer = original.callback.bearer) => {
+    const context = createExecutionContext(),
+      response = await createApp().fetch(
+        new Request(original.callback.url, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${bearer}`,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify(body),
+        }),
+        f.runtime,
+        context,
+      );
+    await waitOnExecutionContext(context);
+    return response;
+  };
+  return { ...f, policy, original, call };
+}
+it("the policy-fenced status callback returns the current pool report without restamping it", async () => {
+  const f = await runtimeAdmissionStatusFixture(),
+    observedAt = new Date(Date.now() - 7000).toISOString(),
+    observation = {
+      node_id: f.node,
+      node_uid: f.nodeUid,
+      policy_revision: 1,
+      material_revision: 1,
+      observed_at: observedAt,
+      profile: f.policy.profile,
+      idle_memory_current_bytes: null,
+      idle_cpu_usage_usec: null,
+      slots: [],
+    };
+  expect(f.original.compute_pool_observation).toBeUndefined();
+  // The controller reports after the executor's original private input was captured.
+  await env.DB.prepare(
+    "INSERT INTO node_compute_pool_observations VALUES(?,?,1,1,?,?,?)",
+  )
+    .bind(
+      f.node,
+      f.nodeUid,
+      JSON.stringify(observation),
+      observedAt,
+      new Date().toISOString(),
+    )
+    .run();
+  const response = await f.call({
+    kind: "status",
+    expected_compute_pool_revision: 1,
+  });
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({
+    ...f.original.status,
+    compute_pool_observation: observation,
+  });
+  const compatible = await f.call({ kind: "status" });
+  expect(compatible.status).toBe(200);
+  expect(FleetPatchStatus.parse(await compatible.json())).toEqual(
+    f.original.status,
+  );
+});
+it("the policy-fenced status callback preserves an absent report and rejects a changed pool policy", async () => {
+  const f = await runtimeAdmissionStatusFixture(),
+    body = { kind: "status", expected_compute_pool_revision: 1 };
+  const missing = await f.call(body);
+  expect(missing.status).toBe(200);
+  expect(await missing.json()).toEqual({
+    ...f.original.status,
+    compute_pool_observation: null,
+  });
+  await env.DB.prepare(
+    "UPDATE node_compute_pool_policies SET revision=2 WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  const response = await f.call(body);
+  expect(response.status).toBe(409);
+  expect(await response.json()).toMatchObject({
+    error: {
+      code: "conflict",
+      message: "Compute pool policy changed before fleet actuation",
+    },
+  });
+  expect((await readFleetPatch(env, f.op)).revision).toBe(0);
+});
+it("the status callback still rejects invalid credentials before exposing a pool report", async () => {
+  const f = await runtimeAdmissionStatusFixture(),
+    response = await f.call(
+      { kind: "status", expected_compute_pool_revision: 1 },
+      "invalid-callback-bearer",
+    );
+  expect(response.status).toBe(401);
+  expect(await response.json()).toMatchObject({
+    error: { code: "unauthorized" },
+  });
+});
+it("the policy-fenced status callback retains the regional host qualification gate", async () => {
+  const f = await runtimeAdmissionStatusFixture(),
+    worker = `nod_${crypto.randomUUID().replaceAll("-", "").slice(0, 20)}`,
+    workerUid = crypto.randomUUID();
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,created_at,updated_at,node_uid,database_placement_closed_at) SELECT ?,region_id,'unqualified-worker',1,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,created_at,updated_at,?,database_placement_closed_at FROM nodes WHERE id=?",
+    ).bind(worker, workerUid, f.node),
+    env.DB.prepare(
+      "INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) SELECT ?,?,release_id,'customer',1,updated_at FROM fleet_node_releases WHERE node_id=?",
+    ).bind(worker, workerUid, f.node),
+    env.DB.prepare(
+      "UPDATE fleet_patch_operations SET cluster_nodes_json=? WHERE operation_id=?",
+    ).bind(
+      JSON.stringify([
+        {
+          node_id: f.node,
+          node_uid: f.nodeUid,
+          k8s_node_name: f.nodeName,
+          assignment_revision: 1,
+        },
+        {
+          node_id: worker,
+          node_uid: workerUid,
+          k8s_node_name: "unqualified-worker",
+          assignment_revision: 1,
+        },
+      ]),
+      f.op,
+    ),
+  ]);
+  expect((await fleetPatchInput(f.runtime, f.op)).regional_hosts_ready).toBe(
+    false,
+  );
+  const response = await f.call({
+    kind: "status",
+    expected_compute_pool_revision: 1,
+  });
+  expect(response.status).toBe(409);
+  expect(await response.json()).toMatchObject({
+    error: {
+      code: "conflict",
+      message: "Regional hosts are not qualified for runtime activation",
+    },
+  });
+});
 it("rejects stale transitions, changed UID/material/release authority and never clears a dispatched uncertainty", async () => {
   const f = await setup();
   let current = await recordFleetPatchCheckpoint(f.runtime, f.op, {

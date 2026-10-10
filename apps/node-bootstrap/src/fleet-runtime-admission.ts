@@ -6,7 +6,10 @@ import {
   ComputePoolPolicyState,
   ComputePoolObservation,
 } from "@pgcf/contracts/compute-pool";
-import type { FleetPatchInput } from "@pgcf/contracts/fleet-patches";
+import {
+  FleetPatchStatus,
+  type FleetPatchInput,
+} from "@pgcf/contracts/fleet-patches";
 import { sandboxRuntimeAdmission } from "../../../infra/talos/sandbox/runtime-admission.ts";
 import { quantity, assertWorkloadReady } from "./platform.ts";
 import { BootstrapError, canonical, digest } from "./bootstrap.ts";
@@ -88,6 +91,37 @@ function verified(input: RuntimeAdmissionInput) {
       perSlotMemoryMiB: state.policy.per_slot_memory_mib,
     }),
   };
+}
+/** Refresh only the live report; the selected policy, profile and write authority remain fixed. */
+export function refreshRuntimeAdmissionObservation(
+  input: RuntimeAdmissionInput,
+  response: unknown,
+  bootId: string,
+) {
+  const { compute_pool_observation, ...rawStatus } = object(response),
+    status = FleetPatchStatus.parse(rawStatus);
+  if (
+    status.operation_id !== input.status.operation_id ||
+    status.revision !== input.status.revision ||
+    status.node_id !== input.status.node_id ||
+    status.region_id !== input.status.region_id ||
+    status.node_uid !== input.status.node_uid ||
+    status.cluster_uid !== input.status.cluster_uid ||
+    status.spec_sha256 !== input.status.spec_sha256 ||
+    status.assignment_revision !== input.status.assignment_revision ||
+    status.release_id !== input.status.release_id ||
+    status.host_configuration_revision !==
+      input.status.host_configuration_revision ||
+    status.host_configuration_sha256 !==
+      input.status.host_configuration_sha256 ||
+    status.observed?.boot_id !== bootId ||
+    !compute_pool_observation
+  )
+    return fail();
+  const observation = ComputePoolObservation.parse(compute_pool_observation);
+  verified({ ...input, status, compute_pool_observation: observation });
+  input.compute_pool_observation = observation;
+  return status;
 }
 async function read(
   commands: RuntimeAdmissionCommands,
@@ -252,6 +286,7 @@ export async function applyRuntimeAdmission(
   commands: RuntimeAdmissionCommands,
   input: RuntimeAdmissionInput,
 ) {
+  await commands.authorize();
   let current = await read(commands, input);
   for (let index = 0; index < resources.length; index++) {
     if (current.present[index]) continue;

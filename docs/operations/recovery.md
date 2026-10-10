@@ -5,16 +5,37 @@ from R2; the last recoverable commit depends on the WAL that actually reached R2
 synchronous replica or zero-loss promise. Record both recovery duration and the last restored
 commit in `PLAN.md` after each real drill.
 
-The current operator topology retains the EU control/relay server and already-admitted customer
-EU1 (formerly EU2), and adds one US1 using the same V159 / Cloud VPS Plus 4 model: 4 vCPU, 8 GiB
-RAM and 150 GiB NVMe, with a one-month term. US1 is provider Running but still needs installation
-and admission. Current completion first restores from the healthy EU1 source into a separate
-US1 target. Do not reset, re-adopt, fence, delete or decommission EU1 for this drill; the earlier
-loss and deletion kits are withheld. The incident procedures below apply to an actual loss or
-a separately reviewed drill that preserves or recovers the same customer EU1.
-US1's profile, binding and reported inspection are already retained; its original authorized job
-is still `created`, with installation and Ready acceptance outstanding. Continue the same
-Cloudflare addition/Workflow and seals rather than ordering, re-adopting or resetting that VPS.
+## Talos patch recovery
+
+Before patching, retain each node's complete current machine configuration and canonical hash,
+an accepted R2 etcd snapshot with its metadata and decryption key, and a working direct Talos
+mTLS configuration. Verify the direct node identity independently of the bootstrap relay.
+
+Talos upgrades use an A/B boot scheme that retains the previous kernel and OS image. A failed
+boot can fall back to that image. If the Talos API remains reachable, the supported manual
+rollback changes the boot reference and reboots the selected node:
+
+```sh
+talosctl --talosconfig <working-direct-config> --endpoints <node-ip> --nodes <node-ip> rollback
+```
+
+Run recovery only in the approved operator window. An OS rollback does not downgrade Kubernetes
+or prove that the earlier machine configuration has been restored. Recheck direct identity,
+configuration and database availability before resuming the existing fleet operation. Do not
+reinstall, reset or restore etcd merely because a patch has stalled. The procedure's availability
+does not attest that a retained node currently has a usable alternate boot slot; record actual
+slot observations separately. See the pinned [Talos upgrade and rollback procedure](https://docs.siderolabs.com/talos/v1.14/configure-your-talos-cluster/lifecycle-management/upgrading-talos).
+
+The operator topology retains three physical servers: EU control/relay, customer EU1 and
+customer US1. The customer model is V159 / Cloud VPS Plus4:4 vCPU,8 GB RAM,150 GB NVMe,
+one-month term. US1 runs Golden Talos1.14.2/Kubernetes1.36.5; final regional/database acceptance
+remains open in the canonical ULTRA plan. Preserve the existing US AddNode and fleet operations;
+never order a replacement or reinstall an EU node to resume a stalled rollout.
+
+Recovery drills use separate targets while preserving the healthy source and its committed data.
+Do not reset, re-adopt, fence, delete or decommission EU1 for an acceptance drill. The incident
+procedures below apply to an actual loss or a separately reviewed drill that preserves or
+recovers the same customer EU1.
 
 ## Restore or PITR
 
