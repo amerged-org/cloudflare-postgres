@@ -858,7 +858,8 @@ it("Worker ingestion canonicalizes fresh TS or Rust OCI aliases while preserving
   await f.seed();
   const rawCilium =
       "2939231d0d3e3ebddcd80fffa168b7ddcc78fdf0dc864d1c8c126ff523c54f01",
-    rawKubernetesIndexDigest = "4b3e69973a1d58d3c1f670d3477a9b9f14a03a271823113e8e0c9a333eb84f48";
+    rawKubernetesIndexDigest =
+      "4b3e69973a1d58d3c1f670d3477a9b9f14a03a271823113e8e0c9a333eb84f48";
   const fetcher = vi
     .spyOn(globalThis, "fetch")
     .mockImplementation(async (url) => {
@@ -911,7 +912,9 @@ it("Worker ingestion canonicalizes fresh TS or Rust OCI aliases while preserving
   expect((await f.observe(changed)).status).toBe(200);
   const changedFacts = JSON.parse((await f.stored()).facts_json);
   expect(changedFacts.components).toEqual(changed.facts.components);
-  expect(changedFacts.kubernetes_static_images).toEqual({ apiServer: rawKubernetesIndexDigest });
+  expect(changedFacts.kubernetes_static_images).toEqual({
+    apiServer: rawKubernetesIndexDigest,
+  });
   expect(changedFacts).not.toHaveProperty("kubernetes_image_provenance");
   expect(fetcher).toHaveBeenCalledTimes(2);
   await f.seed();
@@ -933,7 +936,9 @@ it("Worker ingestion canonicalizes fresh TS or Rust OCI aliases while preserving
   expect(rejectedFacts.components).toEqual([
     { name: "cilium", runtime_image_sha256: rawCilium },
   ]);
-  expect(rejectedFacts.kubernetes_static_images).toEqual({ apiServer: rawKubernetesIndexDigest });
+  expect(rejectedFacts.kubernetes_static_images).toEqual({
+    apiServer: rawKubernetesIndexDigest,
+  });
 });
 
 it("an ordinary report cannot claim a target component hash while reporting a contradictory unproved runtime", async () => {
