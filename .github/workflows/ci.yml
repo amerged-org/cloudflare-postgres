@@ -171,10 +171,46 @@ jobs:
         run: |
           pnpm test
           node --test infra/talos/publish-storage-capacity.test.ts
-          node --test infra/platform/release-candidate.test.ts
+          node --test infra/platform/*.test.ts
           node --test infra/talos/sandbox/*.test.ts
           node --test scripts/ci/*.test.ts
+          node --test scripts/operations/publish-talos-installer.test.mjs
+          node --test scripts/operations/publish-talos-installer.test.mjs
           node packages/contracts/native/generate-compute-pool.ts --check
+      - name: Bind the already-tested Rust Edge artifact
+        run: |
+          node --input-type=module <<'JS'
+          import { createHash } from 'node:crypto';
+          import { readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
+          import { join } from 'node:path';
+          const root = 'apps/edge-rust/build';
+          for (const name of ['index.js', 'index_bg.wasm', 'worker/shim.mjs']) {
+            if (!statSync(join(root, name)).isFile()) throw new Error('Missing tested Rust Edge artifact');
+          }
+          const files = directory => readdirSync(directory).sort().flatMap(name => {
+            const file = join(directory, name);
+            return statSync(file).isDirectory() ? files(file) : [file];
+          });
+          const sha256 = file => createHash('sha256').update(readFileSync(file)).digest('hex');
+          const inputs = ['infra/platform/versions.lock.json', 'Cargo.lock'];
+          writeFileSync(join(root, 'artifact.json'), JSON.stringify({
+            source_commit: process.env.GITHUB_SHA,
+            run_id: process.env.GITHUB_RUN_ID,
+            run_attempt: process.env.GITHUB_RUN_ATTEMPT,
+            inputs: inputs.map(path => ({ path, sha256: sha256(path) })),
+            files: files(root).map(path => ({ path: path.slice(root.length + 1), sha256: sha256(path) })),
+          }, null, 2) + '\n');
+          writeFileSync(join(root, 'checksums.sha256'), files(root).map(path =>
+            `${sha256(path)}  ${path.slice(root.length + 1)}\n`).join(''));
+          JS
+      - name: Retain the already-tested Rust Edge bytes
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: pgcf-rust-edge-${{ github.sha }}-${{ github.run_attempt }}
+          path: apps/edge-rust/build/
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: false
       - name: Check the native prepared runtime against the actual Linux kernel
         run: |
           PGCF_RUST_BUILDER=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.testBuilderImage')
@@ -685,11 +721,12 @@ jobs:
 
   native_runtime_images:
     needs: check
-    if: (needs.check.outputs.rust_gateway_image == 'true' || needs.check.outputs.native_controller_image == 'true' || needs.check.outputs.rust_bootstrap_relay_image == 'true' || needs.check.outputs.native_reclaimer_image == 'true' || needs.check.outputs.sandbox_controller_image == 'true') && github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
+    if: (needs.check.outputs.rust_gateway_image == 'true' || needs.check.outputs.native_controller_image == 'true' || needs.check.outputs.rust_bootstrap_relay_image == 'true' || needs.check.outputs.native_reclaimer_image == 'true' || needs.check.outputs.sandbox_controller_image == 'true' || vars.PGCF_TALOS_INSTALLER_RELEASE != '') && github.ref == 'refs/heads/main' && !inputs.external_probe && !inputs.node_network_probe && (github.event_name == 'workflow_dispatch' || github.event_name == 'push')
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     permissions:
       contents: read
+      actions: read
       packages: write
     outputs:
       extension_ref: ${{ steps.native_artifacts.outputs.extension_ref }}
@@ -761,6 +798,14 @@ jobs:
           if [ "$PGCF_BUILD_SANDBOX" = true ]; then
             bash infra/talos/sandbox/ci-artifacts.sh "$RUNNER_TEMP/pgcf-native-image-gate/sandbox-controller/qualification.json"
           fi
+      - name: Publish an explicitly selected preassembled Talos installer
+        if: vars.PGCF_TALOS_INSTALLER_RELEASE != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PGCF_TALOS_INSTALLER_RELEASE: ${{ vars.PGCF_TALOS_INSTALLER_RELEASE }}
+        run: |
+          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          node scripts/operations/publish-talos-installer.mjs "$PGCF_TALOS_INSTALLER_RELEASE" "$RUNNER_TEMP/pgcf-preassembled-installer"
       - name: Retain exact native qualification and publication receipts
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
@@ -773,6 +818,8 @@ jobs:
             ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/extension-gate/registry.json
             ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/recipe-gate/qualification.json
             ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/recipe-gate/registry.json
+            ${{ runner.temp }}/pgcf-preassembled-installer/publication.json
+            ${{ runner.temp }}/pgcf-preassembled-installer/registry.json
           if-no-files-found: warn
           retention-days: 90
           overwrite: false

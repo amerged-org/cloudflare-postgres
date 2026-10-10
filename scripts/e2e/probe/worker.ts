@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
-import { Client, Pool, parseIntoClientConfig } from "@neondatabase/serverless";
+import {
+  Client,
+  Pool,
+  parseIntoClientConfig,
+  type PoolClient,
+} from "@neondatabase/serverless";
 import { isDatabaseId, isRoleName } from "@pgcf/contracts";
 import { connect } from "cloudflare:sockets";
 import { credentialOccurrences } from "../src/audit.ts";
-import { workerScanUnsupported } from "../src/transport.ts";
+import { safeProbeError, workerScanUnsupported } from "../src/transport.ts";
 import { runActive } from "../src/run-expiry.ts";
 import { isTraceMarker } from "../src/trace-marker.ts";
 
@@ -143,6 +148,7 @@ function routedPool(
   uri: string,
   admitted: ReturnType<typeof connectionIdentity>,
   marker?: string,
+  timeoutMs?: number,
 ): Pool {
   const target = connectionIdentity(uri);
   const query = new URLSearchParams({
@@ -154,9 +160,9 @@ function routedPool(
   const db = new Pool({
     connectionString: uri,
     max: 1,
-    connectionTimeoutMillis: 10_000,
+    connectionTimeoutMillis: timeoutMs ?? 10_000,
     idleTimeoutMillis: 1000,
-    query_timeout: 15_000,
+    query_timeout: timeoutMs ?? 15_000,
   });
   // Pool constructs clients before it emits connect, so configure their streams here.
   db.Client = class extends Client {
@@ -179,6 +185,52 @@ function routedPool(
     }
   };
   return db;
+}
+
+async function readOnlyProbe(uri: string, marker?: string): Promise<unknown> {
+  const target = connectionIdentity(uri);
+  const db = routedPool(uri, target, marker, 5000);
+  const started = performance.now();
+  let phase = "connect";
+  let client: PoolClient | undefined;
+  try {
+    client = await db.connect();
+    const connected = performance.now();
+    phase = "query";
+    const { rows } = await client.query(
+      "SELECT 1 AS probe,s.ssl,s.version AS tls_version,current_user,current_database(),r.rolsuper,current_setting('server_version') AS server_version FROM pg_stat_ssl s JOIN pg_roles r ON r.rolname=current_user WHERE s.pid=pg_backend_pid()",
+    );
+    phase = "validate";
+    const row = rows[0];
+    if (
+      rows.length !== 1 ||
+      row.probe !== 1 ||
+      row.ssl !== true ||
+      !["TLSv1.2", "TLSv1.3"].includes(row.tls_version) ||
+      row.current_user !== "app" ||
+      row.current_database !== target.database ||
+      row.rolsuper !== false
+    )
+      return { pass: false, phase, code: "probe_identity_or_tls_failed" };
+    return {
+      pass: true,
+      database_id: target.database,
+      connect_ms: Math.round(connected - started),
+      elapsed_ms: Math.round(performance.now() - started),
+      tls_version: row.tls_version,
+      postgres_version: row.server_version,
+    };
+  } catch (error: unknown) {
+    return {
+      pass: false,
+      phase,
+      elapsed_ms: Math.round(performance.now() - started),
+      ...safeProbeError(error),
+    };
+  } finally {
+    client?.release(true);
+    await db.end();
+  }
 }
 
 export function startupMismatchRejection(error: unknown): {
@@ -383,12 +435,15 @@ export default {
           "/metadata",
           "/integrator-trace",
           "/exercise",
+          "/read-only",
           "/startup-database-mismatch",
           "/startup-user-mismatch",
         ].includes(path)
       )
         return response({ code: "not_found" }, 404);
       const uri = await connection(env, marker);
+      if (path === "/read-only")
+        return response(await readOnlyProbe(uri, marker));
       if (path === "/canary-audit") {
         const input = (await request.json()) as {
           d1: string;

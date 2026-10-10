@@ -7,16 +7,24 @@ cluster-authority rotation passed live; Cloudflare custody revision 2 is active.
 The [corrective plan, §10](docs/architecture/cloudflare-convergence-and-serverless-plan.md#10-execution-order-and-release-gates)
 defines the owner's ordered work packages; its §11 defines the 13 acceptance rows in [Status](#11-status).
 
-The live API is edcabc36 after successful main CI (38015987192); D1 remains at 0038.
-The qualified Bootstrap image 3bfbf60b is fully mirrored in Cloudflare; no migration was rerun.
-US1 has booted official Talos 1.14.2 through its original patch operation; final release admission
-awaits the collected post-boot reader corrections. EU rotation is next, before either EU upgrade.
+The live API is 9e8214b5 after successful main CI (38022247223); D1 remains at 0038.
+The qualified Bootstrap image 63b476c1 is fully mirrored in Cloudflare; no migration was rerun.
+US1 has booted official Talos 1.14.2 through its original patch operation. Regional services and
+PostgreSQL reconciliation are confirmed; final admission awaits the collected API correction batch.
+Owner decision, October 10: no further key rotations; preserve EU revision 1 and US revision 2
+and verify their actual access while completing fleet and database acceptance.
+Customer-data readiness includes the native Rust runtime and shared prestarted compute pool;
+the owner explicitly rejected deferring them until after migration. It also requires actual-use
+CPU/thin-storage acceptance, daily encrypted etcd/D1 backups in R2, configurable failure alerts
+and an explanation of the observed EU SQL failures. Complete automatic purchasing can follow
+customer migration; its existing implementation and standing model authorization remain intact.
 The EU/US database lifecycle, measured RAM trigger and 135-second EU policy transition are valid partial evidence.
-They do not establish uniform releases, unattended purchases, thin storage, key rotation or fast start.
+They do not establish uniform releases, unattended purchases, thin storage or fast start.
 
 The owner approved native Ubuntu/AMD64 validation on a GitHub review branch. Main publication
 and Dev delivery follow successful validation; the retained Talos fleet remains a database fleet.
-Existing later-gate implementation remains unchanged while gate 1 is completed.
+Independent code fixes and read-only preparation may run in parallel. Retained-server mutations
+remain serial, with the current US patch completed before either EU upgrade.
 
 R1 uses official Image Factory Talos 1.14.2, Kubernetes 1.36.5 and the pinned platform on all three
 retained servers, through supported upgrades without reinstallation. R2 adds the sandbox extension
@@ -185,8 +193,9 @@ not claims of measured throughput.
   dialing, enforces replay/fence rules, bounded buffering and deadlines, and never replays SQL.
   Unknown identities use bounded decoy authentication; unauthenticated traffic is not activity
   that may keep a database awake.
-- Rotate exposed EU and US authority through supported operations; prove new access works and old access
-  fails while preserving data, cluster identity and required archive decryption.
+- Preserve and verify the current EU/US authority and archive decryption material. The owner stopped
+  further cluster-authority rotation on October 10. Historical disclosures remain documented;
+  they are not evidence that current EU authority was retired.
 - Never print or commit secrets, .env files, kubeconfigs, Talos configurations or private evidence.
   No machine credentials belong in a public image or schematic.
 - Verify upstream artifacts by immutable digest and official signature/SBOM provenance. Scan and
@@ -207,7 +216,7 @@ The 13 final acceptance rows in section 11 remain the completion criteria.
 | 3 | R2: extension and patch management | The same baseline plus the sandbox extension; supported Talos upgrade with deliberate interruption and resume, exact final runtime/configuration and preserved data on retained roles |
 | 4 | Thin storage, then lifecycle | Qualify the physical storage model and its safety bounds; repeat SQL/TLS/roles, R2 base/WAL, PITR/restore and physical deletion on that model |
 | 5 | Configurable expansion and headless Ready | The configured threshold triggers one already-authorized V159 purchase through Ready with no operator; resolve the postjoin 409, preserve exactly-once purchase and continued safe placement |
-| 6 | EU key rotation | Execute the real coordinated rotation; new authority succeeds, retired authority is rejected and data/custody remain intact |
+| 6 | Verify current credentials | Preserve EU custody revision 1 and US revision 2; prove actual Talos/Kubernetes and database access, with no further key rotation |
 | 7 | Rust and shared pool | First prove CNPG/local-volume late binding on US1; then complete the Rust gateway/controller/Edge/relay and shared prestarted pool integration and live latency/isolation gates |
 | 8 | Density and operations | Measure the representative 22-project US workload; complete ordinary policy, recovery and lifecycle operations without private scripts, an AI agent or laptop access |
 
@@ -331,7 +340,7 @@ point or infer 22-project density from nominal host RAM or permanent class-reser
 
 | Gate | Stand | Messwert | Datum |
 | --- | --- | --- | --- |
-| Uniform3-server release | Open — US upgraded; R1 admission pending | US1 live readback at 02:57:41 UTC: official Talos 1.14.2, Kubernetes/kubelet 1.36.5, new boot ID, retained Node/Cluster/DMI identities and Node Ready; 6 direct reads and 6 grants passed, 0 Contabo calls. EU remains Talos 1.14.1 / Kubernetes 1.36.3. The same US patch is paused at revision 19 for the collected state-loaded configuration and OCI-index reader corrections; no repeated reboot. | 2026-10-10 |
+| Uniform3-server release | Open — US upgraded; final admission pending | US1: Talos 1.14.2 and Kubernetes/kubelet 1.36.5 with retained Node/Cluster/DMI/disk identities. Same operation confirmed Flux 25, platform 28, regional services 31, runtime admission 33 and PostgreSQL reconciliation 36; release verification 37 remains pending. A 57-read local preview reports no API release mismatches; a newer ordinary inventory report prevents its final CAS. EU remains Talos 1.14.1 / Kubernetes 1.36.3. No repeated reboot, reinstall, purchase or Contabo call. | 2026-10-10 |
 | Central customer control | Open — partial live evidence | Shared actual-RAM policy: 128 MiB PostgreSQL request, 4096 MiB maximum. EU transition 135 s preserved all 3 database hashes; complete profile-change/interruption acceptance in both regions remains open. | 2026-10-09 |
 | Compute overbooking | Open | A 256 MiB PostgreSQL trial worked; backup peak, cold-sleep CPU release and concurrent startup/neighbor bounds are not accepted on the corrected model. | 2026-10-09 |
 | Disk overbooking | Open | Thick storage is the accepted baseline. Last measured VG total was 103,075,020,800 B per node; no complete live thin-profile quota/full-pool/startup/reclaim acceptance. | 2026-10-09 |
@@ -342,5 +351,5 @@ point or infer 22-project density from nominal host RAM or permanent class-reser
 | Backup/recovery | Open — thick-baseline regression evidence only | EU/US SQL used PostgreSQL 18.6, TLS 1.3 and nonsuperuser roles; 4 R2 base/WAL checks and 4 × 5 GiB deletions reclaimed 20 GiB. EU restore 108,618 ms; EU-to-US restore 87,988 ms. Repeat on the corrected model. | 2026-10-08 |
 | Shared-pool fast start | Open | Local-only proof prepared 2 unassigned holders; 4.954/2.455 ms were runtime assignment observations, not SQL latency. US1 CNPG late binding and subsecond pool-hit first reads remain unproved. | 2026-10-09 |
 | Capacity and economics | Open | No representative 22-project US workload measurement; no accepted node-count or cost conclusion from nominal RAM or class sums. | 2026-10-09 |
-| Security | Open — US rotation passed; EU rotation pending | US custody revision 2 active: 22 configuration phases, 20 controller renewals, 7/7 old/new access pairs (154.466 s), all 19 Secrets preserved and encrypted under the new canonical key2 after 38 guarded writes. First configuration write to custody activation 4258.061 s; 1 same-disk reboot and 1 supported kubelet recovery; 0 Contabo calls, purchases, reinstalls or EU writes. Node/Cluster/filesystem/VG identities preserved; VG 103,075,020,800 B. EU revision 1 retirement and complete release security acceptance remain mandatory before customer data. | 2026-10-09 |
-| Operational ownership | Open — relay access measured | Historical 30-minute window: 390 proof/transport requests, 0 provider attempts. Current CF preview verified the retained US Cluster/Node UIDs through 3 mTLS relay connections with 0 provider calls and 0 cluster writes. Permanent operator delivery and routine operation without private scripts remain open. | 2026-10-09 |
+| Security | Open — existing access passed; complete release review pending | Current EU custody revision 1 access passed on both retained nodes in 33.103 s through 32 Cloudflare connections, with exact Node/Cluster/DMI/boot identities and 0 writes/provider/rotation calls. US revision 2 passes current operator access; historical 7/7 retired/new pairs passed in 154.466 s, preserving all 19 Secrets after 38 guarded rewrites. The owner stopped further rotations on October 10. Prior disclosures remain recorded; exact release/permission/public-history security acceptance remains open. | 2026-10-10 |
+| Operational ownership | Open — SQL availability correction prepared | Five-hour EU series: 66/10,797 failed reads (0.6113%): 33 correlate with laptop Wi-Fi loss, 7 explicit gateway draining, 4 gateway startup errors, 5 client deadlines, 3 Tunnel origin refusals and 14 unclassified fast errors. Regional Pods were replaced at 23:46 UTC; OS/data remained intact. Normal watch renewal has a failing-first regression; delivery and paired Cloudflare/client acceptance remain pending. Separate 361-second Edge capture: 206 accepted admissions, 56–211 ms, 0 provider calls. Daily etcd/D1 R2 backups and routine operation without private scripts remain open. | 2026-10-10 |

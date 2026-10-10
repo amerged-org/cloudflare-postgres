@@ -1280,7 +1280,16 @@ export function fleetPlatformSourceObjects(
           oldSpec.postRenderers === undefined
             ? []
             : objects(oldSpec.postRenderers),
-        cgroup = openEbsCgroupPostRenderers();
+        cgroup = openEbsCgroupPostRenderers(),
+        obsoleteCgroup = cgroup.map((value) => {
+          const prior = structuredClone(value),
+            patch = prior.kustomize.patches[0]!,
+            body = object(JSON.parse(patch.patch));
+          Object.assign(patch.target, { namespace: "openebs" });
+          object(body.metadata).namespace = "openebs";
+          patch.patch = JSON.stringify(body);
+          return prior;
+        });
       if (
         old.kind !== "HelmRelease" ||
         object(old.metadata).name !== "openebs" ||
@@ -1292,7 +1301,12 @@ export function fleetPlatformSourceObjects(
         spec: {
           ...oldSpec,
           postRenderers: [
-            ...renderers,
+            ...renderers.filter(
+              (value) =>
+                !obsoleteCgroup.some(
+                  (prior) => canonical(prior) === canonical(value),
+                ),
+            ),
             ...cgroup.filter(
               (value) =>
                 !renderers.some(
@@ -1416,7 +1430,13 @@ export async function reconcileFleetRegional(
                   PGCF_STORAGE_AUTHORITY_KEYS_SHA256:
                     input.storage_authority.sha256,
                 }
-              : {}),
+              : !runtime.native_gateway &&
+                  !input.spec.storage_authority_keys_sha256
+                ? {
+                    PGCF_STORAGE_AUTHORITY_KEYS: "",
+                    PGCF_STORAGE_AUTHORITY_KEYS_SHA256: "",
+                  }
+                : {}),
           },
         },
       },

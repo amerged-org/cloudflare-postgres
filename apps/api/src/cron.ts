@@ -7,6 +7,8 @@ import { runUsageCron, type UsageCronResult } from "./domain/usage-cron.ts";
 import { cleanupRetainedArchives } from "./domain/retained-archives.ts";
 import { runFleetUpdates } from "./domain/fleet-updates.ts";
 import { purgeIdempotency } from "./middleware/idempotency.ts";
+import { runInfrastructureBackupCron } from "./domain/infrastructure-backups.ts";
+import { runInfrastructureHealthAlerts } from "./domain/infrastructure-alerts.ts";
 import { runNodeCapacityCron } from "./domain/node-capacity.ts";
 import { runResourceProfileRollouts } from "./domain/resource-profiles.ts";
 
@@ -151,5 +153,7 @@ export async function runCron(
   await runNodeCapacityCron(env);
   await cleanupRetainedArchives(env, now);
   await runFleetUpdates(env, now);
+  await runInfrastructureBackupCron(env, now);
+  await runInfrastructureHealthAlerts(env, now);
   return { failed: result.meta.changes + recovered, purged, hinted, usage };
 }

@@ -50,13 +50,21 @@ They select the Talos version and immutable imager/base-installer references fro
 `infra/platform/versions.lock.json` and keep private machine configuration outside the recipe.
 Generating these profiles does not run the imager or qualify an OS image.
 
+An operator may stage a verified preassembled installer as a repository release containing
+`installer-amd64.transport.tar` and `installer-binding.json`, then select its tag with the optional
+`PGCF_TALOS_INSTALLER_RELEASE` Actions variable. The existing CI uses its scoped package writer to
+run `scripts/operations/publish-talos-installer.mjs`, verify the exact source CI, archive, upstream
+identity and registry layers, and retain the publication receipt. It neither rebuilds native
+images nor deploys a node. The default empty variable performs no publication; clear the variable
+after delivery. An existing matching immutable tag is verified without another push.
+
 ## R2 transport and retained-node requirements
 
 `publish-artifacts.ts` retains the content-addressed transport and publication identity
 checks for separately qualified R2 artifacts. It verifies config identity, upstream Talos
 labels, diffIDs and compressed layers; a qualified report must bind the exact source, recipe
-and raw artifact. It cannot create that qualification. No current CI step invokes installer
-or raw-image publication. Publication-state receipts still resolve an uncertain remote write
+and raw artifact. It cannot create that qualification. The opt-in CI step publishes an already
+assembled installer; raw-image publication remains separate. Publication-state receipts resolve an uncertain remote write
 through exact tag/asset reads before another mutation is considered.
 
 The R2 upgrade must establish actual Talos/kernel/containerd/runc versions, loaded extension

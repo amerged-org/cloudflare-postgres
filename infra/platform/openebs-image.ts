@@ -60,14 +60,12 @@ export function openEbsCgroupPostRenderers() {
               version: "v1",
               kind: "DaemonSet",
               name: "openebs-lvm-localpv-node",
-              namespace: "openebs",
             },
             patch: JSON.stringify({
               apiVersion: "apps/v1",
               kind: "DaemonSet",
               metadata: {
                 name: "openebs-lvm-localpv-node",
-                namespace: "openebs",
               },
               spec: {
                 template: {

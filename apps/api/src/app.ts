@@ -18,6 +18,7 @@ import { registerFleetUpdates } from "./routes/fleet-updates.ts";
 import { registerResourceProfiles } from "./routes/resource-profiles.ts";
 import { registerRegionArchiveSources } from "./routes/region-archive-sources.ts";
 import { registerNodes } from "./routes/nodes.ts";
+import { registerInfrastructureBackups } from "./routes/infrastructure-backups.ts";
 import { registerNodeOperator } from "./routes/node-operator.ts";
 import { authenticateThinStorage } from "./domain/node-thin-storage-execution.ts";
 import { RECLAIM_LIMITS } from "@pgcf/contracts/reclaim";
@@ -396,6 +397,7 @@ export function createApp(): ApiApp {
   registerCosts(app);
   registerNodes(app);
   registerNodeOperator(app);
+  registerInfrastructureBackups(app);
   registerComputePool(app);
   registerNodeThinStorage(app);
   registerReclaim(app);

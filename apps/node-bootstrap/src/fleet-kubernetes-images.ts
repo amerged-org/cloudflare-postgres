@@ -114,13 +114,25 @@ async function runtimeIndex(
           ...(commands.signal ? [commands.signal] : []),
           AbortSignal.timeout(15_000),
         ]),
-        repositoryName = imageRepository.slice(separator + 1);
+        repositoryName = imageRepository.slice(separator + 1),
+        imageHost = imageRepository.slice(0, separator),
+        registryHost =
+          imageHost === "docker.io" ? "registry-1.docker.io" : imageHost;
       let url = new URL(
-          `https://${imageRepository.slice(0, separator)}/v2/${repositoryName}/manifests/sha256:${sha256}`,
+          `https://${registryHost}/v2/${repositoryName}/manifests/sha256:${sha256}`,
         ),
         redirects = 0,
         pullToken: string | undefined;
       const originalHost = url.hostname;
+      const authentication =
+        !url.port && originalHost === "ghcr.io"
+          ? { realm: "https://ghcr.io/token", service: "ghcr.io" }
+          : !url.port && originalHost === "registry-1.docker.io"
+            ? {
+                realm: "https://auth.docker.io/token",
+                service: "registry.docker.io",
+              }
+            : undefined;
       for (let attempt = 0; attempt < 6; attempt++) {
         signal.throwIfAborted();
         const headers = new Headers({
@@ -132,7 +144,8 @@ async function runtimeIndex(
         )?.[1];
         if (
           pullToken &&
-          url.hostname === "ghcr.io" &&
+          url.hostname === originalHost &&
+          !url.port &&
           requestedRepository === repositoryName
         )
           headers.set("authorization", `Bearer ${pullToken}`);
@@ -163,8 +176,9 @@ async function runtimeIndex(
         }
         if (
           response.status === 401 &&
-          originalHost === "ghcr.io" &&
-          url.hostname === "ghcr.io" &&
+          authentication &&
+          url.hostname === originalHost &&
+          !url.port &&
           requestedRepository === repositoryName &&
           !pullToken
         ) {
@@ -175,8 +189,8 @@ async function runtimeIndex(
             scope = challenge.match(/\bscope="([^"]+)"/)?.[1];
           if (
             !/^Bearer /i.test(challenge) ||
-            realm !== "https://ghcr.io/token" ||
-            service !== "ghcr.io" ||
+            realm !== authentication.realm ||
+            service !== authentication.service ||
             scope !== `repository:${repositoryName}:pull`
           )
             throw new BootstrapError(

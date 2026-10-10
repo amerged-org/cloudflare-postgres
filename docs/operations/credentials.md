@@ -124,6 +124,10 @@ US machine configuration as well; treat both prior authority sets as compromised
 fingerprint differences do not protect a later disclosure. Read the current accepted rotation
 results in PLAN.md Status. Disposable laboratory keys must never become fleet custody.
 
+For the current owner installation, the October10 decision stops additional cluster-authority
+rotations. Keep EU custody revision1 and US revision2 and verify their actual access. The prior
+disclosure record remains; the procedures below apply only to a separately requested rotation.
+
 The pinned [Talos CA command](https://github.com/siderolabs/talos/blob/v1.14.2/cmd/talosctl/cmd/talos/rotate-ca.go)
 supports separate Talos and Kubernetes API CA rotation. For Talos only, explicitly set
 `--talos=true --kubernetes=false`; both default to true. Start with `--dry-run=true` and an explicit
@@ -159,9 +163,9 @@ configuration acknowledgement alone.
 Coordinate any Talos/Kubernetes change with the encrypted region seed and join bundle before
 allowing another node to bootstrap. Inspect each installation's active revision; replacing
 live trust alone leaves retained bootstrap custody stale. The version-template synchronization
-endpoint preserves keys and cannot rotate them. Stage and verify complete matching seed/join
-custody through a separately reviewed rotation before permitting customer data or further
-bootstrap; do not overwrite historical revision 1. Preserve the original ciphertext and all
+endpoint preserves keys and cannot rotate them. For a separately requested rotation, stage and
+verify complete matching seed/join custody before allowing another bootstrap; do not overwrite
+historical revision1. Preserve the original ciphertext and all
 referenced credential-encryption keys, the region's cluster identity, existing Node/storage UIDs
 and the independent PGCF agent, R2 and Worker secrets.
 

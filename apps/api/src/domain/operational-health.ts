@@ -133,7 +133,7 @@ export function diskHealth(
 export const OperationalRegionHealth = z.strictObject({
   id: RegionId,
   /** delivered_at records callback acceptance, not downstream email delivery. */
-  infrastructure_alerts: z.array(InfraAlertStatus).max(2).optional(),
+  infrastructure_alerts: z.array(InfraAlertStatus).max(5).optional(),
   created_at: Timestamp,
   agent: HeartbeatHealth,
 });

@@ -176,7 +176,69 @@ import {
   type FleetPlatformState,
 } from "../src/fleet-platform-patch.ts";
 import { FleetPatchInput } from "@pgcf/contracts/fleet-patches";
+import { openEbsCgroupPostRenderers } from "../../../infra/platform/openebs-image.ts";
 import { randomUUID, createHash } from "node:crypto";
+test("disabled storage authority supplies both empty Regional substitutions without replacing operator configuration", async () => {
+  const { input } = patchFixture();
+  input.spec.roles.customer.host_configuration_required = false;
+  const key = "Kustomization/flux-system/pgcf-regional",
+    uid = randomUUID(),
+    refs = [{ kind: "ConfigMap", name: "pgcf-regional-vars", optional: false }];
+  const regional: Record<string, unknown> = {
+    apiVersion: "kustomize.toolkit.fluxcd.io/v1",
+    kind: "Kustomization",
+    metadata: { name: "pgcf-regional", namespace: "flux-system", uid },
+    spec: {
+      path: "./infra/platform/regional",
+      sourceRef: { name: "pgcf-platform" },
+      postBuild: {
+        substituteFrom: refs,
+        substitute: { RETAINED: "unchanged" },
+      },
+    },
+  };
+  const state: FleetPlatformState = {
+    resources: new Map([[key, regional]]),
+    pods: [],
+    uids: { [key]: uid },
+  };
+  let writes = 0;
+  await reconcileFleetRegional(
+    input,
+    state,
+    { lock: {}, flux: [], flux_deprecated: [], relay: {} },
+    state.uids,
+    {
+      authorize: async () => {},
+      kube: async (args, stdin) => {
+        if (args[0] === "get") return JSON.stringify(regional);
+        writes++;
+        const patch = JSON.parse(stdin!);
+        applyTests(regional, patch);
+        regional.spec = patch.find(
+          (p: { op: string; path: string }) =>
+            p.op === "replace" && p.path === "/spec",
+        ).value;
+        return JSON.stringify(regional);
+      },
+    },
+    [],
+  );
+  const build = (
+    regional.spec as {
+      postBuild: {
+        substituteFrom: unknown[];
+        substitute: Record<string, string>;
+      };
+    }
+  ).postBuild;
+  assert.equal(build.substitute.PGCF_STORAGE_AUTHORITY_KEYS, "");
+  assert.equal(build.substitute.PGCF_STORAGE_AUTHORITY_KEYS_SHA256, "");
+  assert.equal(build.substitute.RETAINED, "unchanged");
+  assert.deepEqual(build.substituteFrom, refs);
+  assert.equal(writes, 1);
+});
+
 test("separate native controller/gateway pins reconcile through distinct logical images and prove actual selected runtime digests", async () => {
   const fixture = patchFixture(),
     commit = "f".repeat(40),
@@ -427,6 +489,11 @@ test("separate native controller/gateway pins reconcile through distinct logical
     `sha256:${gateway.sha256}`,
   );
   assert.equal(images.find((v) => v.name === "unrelated")?.newName, "retained");
+  const substitute = (
+    regional.spec as { postBuild: { substitute: Record<string, string> } }
+  ).postBuild.substitute;
+  assert.equal(substitute.PGCF_STORAGE_AUTHORITY_KEYS, keyText);
+  assert.equal(substitute.PGCF_STORAGE_AUTHORITY_KEYS_SHA256, sha256);
   assert.equal(
     fleetPlatformReadback(input, state, assets, []).regional_ready,
     true,
@@ -539,6 +606,76 @@ test("the approved OpenEBS image reaches the platform without a post-build lock 
     selected.spec.postRenderers[0].kustomize.patches[0].target.name,
     "openebs-lvm-localpv-node",
   );
+});
+
+test("OpenEBS replaces its obsolete namespace-targeted cgroup renderer while preserving unrelated renderers", () => {
+  const { input } = patchFixture();
+  input.spec.platform_source_commit = "a".repeat(40);
+  const expected = openEbsCgroupPostRenderers(),
+    obsolete = structuredClone(expected);
+  const oldPatch = obsolete[0]!.kustomize.patches[0]!;
+  Object.assign(oldPatch.target, { namespace: "openebs" });
+  const oldBody = JSON.parse(oldPatch.patch);
+  oldBody.metadata.namespace = "openebs";
+  oldPatch.patch = JSON.stringify(oldBody);
+  const unrelated = {
+      kustomize: { images: [{ name: "retained", newTag: "keep" }] },
+    },
+    target = {
+      group: "helm.toolkit.fluxcd.io",
+      version: "v2",
+      kind: "HelmRelease",
+      name: "openebs",
+      namespace: "flux-system",
+    };
+  const prior = {
+    apiVersion: "helm.toolkit.fluxcd.io/v2",
+    kind: "HelmRelease",
+    metadata: { name: "openebs", namespace: "flux-system" },
+    spec: { postRenderers: [unrelated, ...obsolete], values: { KEEP: "yes" } },
+  };
+  const resources = new Map<string, Record<string, unknown>>([
+    [
+      "GitRepository/flux-system/pgcf-platform",
+      {
+        apiVersion: "source.toolkit.fluxcd.io/v1",
+        kind: "GitRepository",
+        metadata: { name: "pgcf-platform", namespace: "flux-system" },
+        spec: {
+          url: "https://github.com/amerged-org/cloudflare-postgres",
+          ref: { branch: "main" },
+        },
+      },
+    ],
+    [
+      "Kustomization/flux-system/pgcf-platform",
+      {
+        apiVersion: "kustomize.toolkit.fluxcd.io/v1",
+        kind: "Kustomization",
+        metadata: { name: "pgcf-platform", namespace: "flux-system" },
+        spec: {
+          path: "./infra/platform",
+          sourceRef: { name: "pgcf-platform" },
+          patches: [{ target, patch: JSON.stringify(prior) }],
+        },
+      },
+    ],
+  ]);
+  const values = fleetPlatformSourceObjects(
+    input,
+    { resources, pods: [], uids: {} },
+    {
+      lock: { charts: [{ name: "openebs", enabledEngine: {} }] },
+      flux: [],
+      flux_deprecated: [],
+      relay: {},
+    },
+  );
+  const patch = (values[1]!.spec as { patches: { patch: string }[] })
+    .patches[0]!;
+  const actual = JSON.parse(patch.patch);
+  assert.deepEqual(actual.spec.postRenderers, [unrelated, ...expected]);
+  assert.equal(actual.spec.values.KEEP, "yes");
 });
 
 test("OpenEBS selection keeps legacy locked pins and refuses malformed approved image authority", () => {

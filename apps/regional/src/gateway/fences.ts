@@ -83,7 +83,11 @@ export class GatewayFenceStore {
     Partial<
       Pick<Gateway, "beginRetirement" | "retirementStatus" | "forgetRetirement">
     >;
-  ready = false;
+  private synchronized = false;
+  private observedAt = 0;
+  get ready(): boolean {
+    return this.synchronized && performance.now() - this.observedAt < 70_000;
+  }
   epoch = 0;
   constructor(
     gateway: Pick<Gateway, "beginQuiesce" | "releaseQuiesce"> &
@@ -100,11 +104,15 @@ export class GatewayFenceStore {
     return this.records.get(database)?.intent;
   }
   disconnect(): void {
-    this.ready = false;
+    this.synchronized = false;
     this.epoch++;
   }
   connected(): void {
-    this.ready = true;
+    this.synchronized = true;
+    this.observe();
+  }
+  observe(): void {
+    this.observedAt = performance.now();
   }
   private validate(record: FenceRecord): void {
     const old = this.records.get(record.intent.database);
@@ -164,7 +172,6 @@ export class GatewayFenceStore {
     return record;
   }
   load(values: unknown[]): void {
-    this.disconnect();
     try {
       if (values.length > MAX_GATEWAY_FENCES)
         throw new Error("gateway fence capacity exhausted");
@@ -182,6 +189,7 @@ export class GatewayFenceStore {
       for (const [database, record] of this.records)
         if (!unique.has(database)) this.removeRecord(record);
       for (const record of parsed) this.apply(record);
+      this.observedAt = performance.now();
     } catch (error) {
       this.disconnect();
       throw error;
@@ -258,6 +266,7 @@ export class GatewayFenceStore {
       )
         throw new Error("gateway fence capacity exhausted");
       this.apply(record);
+      this.observedAt = performance.now();
     } catch (error) {
       this.disconnect();
       throw error;
@@ -358,6 +367,7 @@ async function readWatch(
     response.destroy();
     throw new Error("fence watch unavailable");
   }
+  const started = performance.now();
   store.connected();
   let pending = Buffer.alloc(0);
   for await (const chunk of response) {
@@ -380,14 +390,17 @@ async function readWatch(
       if (event.type === "ADDED" || event.type === "MODIFIED")
         store.update(event.object);
       else if (event.type === "DELETED") store.remove(event.object);
-      else if (event.type === "BOOKMARK")
+      else if (event.type === "BOOKMARK") {
         resourceVersion(object(object(event.object).metadata).resourceVersion);
-      else throw new Error("fence watch lost authority");
+        store.observe();
+      } else throw new Error("fence watch lost authority");
     }
     if (pending.length > MAX_FENCE_EVENT_BYTES)
       throw new Error("fence event overflow");
   }
   if (pending.length !== 0) throw new Error("incomplete fence event");
+  if (performance.now() - started < 50_000)
+    throw new Error("fence watch ended early");
 }
 
 export function watchGatewayFences(
@@ -397,7 +410,6 @@ export function watchGatewayFences(
   const stopped = new AbortController();
   const run = (async () => {
     while (!stopped.signal.aborted) {
-      store.disconnect();
       let failed = false;
       const cycle = new AbortController();
       const abort = () => cycle.abort();
@@ -420,11 +432,11 @@ export function watchGatewayFences(
           watch: "true",
           resourceVersion: list.version,
           allowWatchBookmarks: "true",
-          timeoutSeconds: "30",
+          timeoutSeconds: "55",
         });
         const response = await request(
           watchQuery,
-          AbortSignal.any([cycle.signal, AbortSignal.timeout(45000)]),
+          AbortSignal.any([cycle.signal, AbortSignal.timeout(65000)]),
         );
         if (stopped.signal.aborted) {
           response.destroy();
@@ -437,7 +449,7 @@ export function watchGatewayFences(
       } finally {
         cycle.abort();
         stopped.signal.removeEventListener("abort", abort);
-        store.disconnect();
+        if (stopped.signal.aborted) store.disconnect();
       }
       if (failed && !stopped.signal.aborted) {
         try {

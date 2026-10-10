@@ -287,15 +287,22 @@ Configure either an `INFRASTRUCTURE_ALERT_WEBHOOK` service binding or an HTTPS
 `INFRASTRUCTURE_ALERT_WEBHOOK_URL`, plus your own `INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN` secret.
 The adopter's receiving service verifies the bearer token and durably deduplicates the
 `event_id` / `Idempotency-Key` together with the exact request body before acknowledging it.
-That service owns its delivery credentials, sender and recipient; it may use Resend or another
-mail provider. PGCF supplies no default recipient or mail-provider credentials.
+That service may use any mail provider. Alternatively, import `RESEND_API_KEY` as a private
+Worker secret and configure `notification_sender` and `notification_recipient` through
+`PUT /v1/infrastructure-backups/config`. The sender must belong to your verified Resend domain.
+PGCF supplies no default recipient, sender or mail-provider credentials; a configured webhook
+takes precedence over direct email.
 
 PGCF retries an unacknowledged event with its original ID and body, at least 60 seconds apart,
 with a five-second callback deadline. A successful callback records acceptance by the receiving
-service; provider-confirmed email delivery belongs to that service. Inspect event status through
+service or Resend API; final inbox delivery is observed in the operator's mail account. Inspect
+event status through
 `GET /v1/operational-health?scope=regions`. Disabling a warning deactivates its pending episode;
 current warning policy and measurements are checked before delivery. Missing delivery
-configuration does not block capacity decisions.
+configuration does not block capacity decisions. Daily encrypted D1 and regional etcd backups,
+full R2 readback, failure/staleness alarms and offline key custody are described in the
+[infrastructure backup runbook](docs/operations/infrastructure-backups.md). Capture is disabled
+by default until the operator supplies its actual D1 identity, export secret and Workflow binding.
 
 ## Development checks
 

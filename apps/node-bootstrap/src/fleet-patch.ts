@@ -310,18 +310,40 @@ export async function runFleetPatch(
       talos: (args: string[], stdin?: string) => talos(args, 30_000, stdin),
     };
     let controlNode: ObjectValue | undefined;
-    const kube = (args: string[], stdin?: string) =>
-      command(
+    let kubeInput = 0;
+    const kube = async (args: string[], stdin?: string) => {
+      let nativeArgs = args;
+      let nativeStdin = stdin;
+      if (
+        stdin !== undefined &&
+        args.some((arg) =>
+          ["--patch-file=/dev/stdin", "--filename=/dev/stdin"].includes(arg),
+        )
+      ) {
+        // Linux cannot reopen the command's piped socket as a filename.
+        const inputPath = join(directory, `kubectl-input-${++kubeInput}.json`);
+        await writeFile(inputPath, stdin, { mode: 0o600, flag: "wx" });
+        nativeArgs = args.map((arg) =>
+          arg === "--patch-file=/dev/stdin"
+            ? `--patch-file=${inputPath}`
+            : arg === "--filename=/dev/stdin"
+              ? `--filename=${inputPath}`
+              : arg,
+        );
+        nativeStdin = undefined;
+      }
+      return command(
         "kubectl",
         [
           "--kubeconfig",
           join(directory, "kubeconfig"),
           "--request-timeout=30s",
-          ...args,
+          ...nativeArgs,
         ],
         30_000,
-        stdin,
+        nativeStdin,
       );
+    };
     let assets: FleetPlatformAssets | undefined,
       platformState: FleetPlatformState | undefined,
       platformReadback: ReturnType<typeof fleetPlatformReadback> | undefined,

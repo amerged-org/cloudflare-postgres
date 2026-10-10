@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import { DurableObject } from "cloudflare:workers";
 import { OperationId } from "@pgcf/contracts";
+import {
+  InfrastructureBackupInput,
+  InfrastructureBackupPreparedArtifact,
+} from "@pgcf/contracts/infrastructure-backups";
 import { z } from "zod";
 import type { Env } from "./env.ts";
 import { ApiError } from "./app.ts";
@@ -192,6 +196,119 @@ async function statusIdentifierHash(value: string) {
 }
 
 export class NodeBootstrap extends DurableObject<Env> {
+  async #backupPort(runId: string) {
+    z.uuid().parse(runId);
+    if (
+      !this.ctx.id.equals(
+        this.env.NODE_BOOTSTRAP.idFromName(`infrastructure-backup:${runId}`),
+      )
+    )
+      throw new Error("infrastructure_backup_container_identity_mismatch");
+    const container = this.ctx.container;
+    if (!container)
+      throw new Error("infrastructure_backup_container_unavailable");
+    const bearer = await this.ctx.blockConcurrencyWhile(async () => {
+      const previous = await this.ctx.storage.get<string>("backupServerBearer");
+      if (previous) return previous;
+      const value = crypto.randomUUID() + crypto.randomUUID();
+      await this.ctx.storage.put("backupServerBearer", value);
+      return value;
+    });
+    if (!container.running)
+      container.start({
+        enableInternet: true,
+        env: { PORT: "8080", PGCF_BOOTSTRAP_SERVER_BEARER: bearer },
+      });
+    await container.setInactivityTimeout(10 * 60 * 1000);
+    await this.ctx.storage.setAlarm(Date.now() + 2 * 60 * 60 * 1000);
+    await this.#waitForPort(container);
+    return { port: container.getTcpPort(8080), bearer };
+  }
+  async prepareInfrastructureBackup(value: InfrastructureBackupInput) {
+    const input = InfrastructureBackupInput.parse(value),
+      { port, bearer } = await this.#backupPort(input.run_id);
+    const response = await port.fetch(
+      new Request("http://localhost:8080/v1/infrastructure-backups", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bearer}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(input),
+        signal: AbortSignal.timeout(30 * 60 * 1000),
+      }),
+    );
+    if (!response.ok) {
+      const raw = (await inspectionStatusBody(
+        response,
+        AbortSignal.timeout(5000),
+      ).catch(() => null)) as { error_code?: unknown } | null;
+      throw new Error(
+        typeof raw?.error_code === "string" &&
+          /^infrastructure_backup_[a-z0-9_]{1,90}$/.test(raw.error_code)
+          ? raw.error_code
+          : "infrastructure_backup_prepare_failed",
+      );
+    }
+    return z
+      .array(InfrastructureBackupPreparedArtifact)
+      .max(65)
+      .parse(await response.json());
+  }
+  async infrastructureBackupStream(runId: string, artifactId: string) {
+    const { port, bearer } = await this.#backupPort(runId);
+    const response = await port.fetch(
+      new Request(
+        `http://localhost:8080/v1/infrastructure-backups/${encodeURIComponent(artifactId)}`,
+        {
+          headers: { authorization: `Bearer ${bearer}` },
+          signal: AbortSignal.timeout(10 * 60 * 1000),
+        },
+      ),
+    );
+    if (!response.ok || !response.body)
+      throw new Error("infrastructure_backup_stream_failed");
+    return response.body;
+  }
+  async verifyInfrastructureBackup(
+    runId: string,
+    artifactId: string,
+    stream: ReadableStream<Uint8Array>,
+  ) {
+    const { port, bearer } = await this.#backupPort(runId);
+    const response = await port.fetch(
+      new Request(
+        `http://localhost:8080/v1/infrastructure-backups/${encodeURIComponent(artifactId)}/verify`,
+        {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${bearer}`,
+            "content-type": "application/octet-stream",
+          },
+          body: stream,
+          signal: AbortSignal.timeout(10 * 60 * 1000),
+        },
+      ),
+    );
+    if (!response.ok) throw new Error("infrastructure_backup_readback_failed");
+    return InfrastructureBackupPreparedArtifact.pick({
+      plaintext_sha256: true,
+      plaintext_bytes: true,
+      encrypted_sha256: true,
+      encrypted_bytes: true,
+    }).parse(await response.json());
+  }
+  async closeInfrastructureBackup(runId: string) {
+    z.uuid().parse(runId);
+    if (
+      !this.ctx.id.equals(
+        this.env.NODE_BOOTSTRAP.idFromName(`infrastructure-backup:${runId}`),
+      )
+    )
+      throw new Error("infrastructure_backup_container_identity_mismatch");
+    await this.ctx.container?.destroy();
+    await this.ctx.storage.deleteAlarm();
+  }
   async thinStorage(nodeId: string) {
     NodeId.parse(nodeId);
     if (

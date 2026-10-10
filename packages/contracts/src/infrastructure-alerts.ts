@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
 import { Timestamp } from "./api.ts";
-import { RegionId } from "./ids.ts";
+import { RegionId, NodeId } from "./ids.ts";
 
 export const InfraAlertKind = z.enum([
   "regional_ram_warning",
   "regional_node_cap_reached",
+  "regional_node_stale",
+  "infrastructure_backup_failed",
+  "infrastructure_backup_stale",
 ]);
 export type InfraAlertKind = z.infer<typeof InfraAlertKind>;
 
@@ -28,6 +31,18 @@ export const InfraAlert = z.strictObject({
     .positive()
     .max(Number.MAX_SAFE_INTEGER)
     .nullable(),
+  backup_artifacts: z
+    .array(
+      z.strictObject({
+        kind: z.enum(["d1", "etcd"]),
+        status: z.enum(["unknown", "stale", "failing"]),
+        last_completed_at: Timestamp.nullable(),
+        error_code: z.string().max(128).nullable(),
+      }),
+    )
+    .max(2)
+    .optional(),
+  node_ids: z.array(NodeId).max(64).optional(),
 });
 export type InfraAlert = z.infer<typeof InfraAlert>;
 

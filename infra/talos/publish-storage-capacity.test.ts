@@ -481,3 +481,38 @@ test("Native proof work refuses stale completion, future completion and a histor
   const tooLong = nativeWindowFixture(1_801_001, 1000);
   assert.throws(() => capacityPlan(tooLong.config, tooLong.name, tooLong.node, tooLong.lvm, now), /stale_storage_proof/);
 });
+
+import { mkdtemp, chmod, writeFile, readFile, rm, access } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+test("the default native publisher gives kubectl a private real patch file and cleans it up", async () => {
+  const client = process.env.PGCF_TEST_KUBECTL;
+  assert.ok(client, "the verified pinned kubectl is required");
+  const f = fixture(), directory = await mkdtemp(join(tmpdir(), "pgcf-publisher-file-test-"));
+  await chmod(directory, 0o700);
+  const originalPath = process.env.PATH, original = process.env.PGCF_PAYLOAD_FILE_TEST;
+  const source = join(directory, "source.json"), report = join(directory, "report.json"), updated = join(directory, "updated.json");
+  await writeFile(source, JSON.stringify(f.node), { mode: 0o600 });
+  await writeFile(join(directory, "kubectl"), `#!${process.execPath}\nconst fs=require('node:fs'),cp=require('node:child_process'),path=require('node:path');const d=JSON.parse(process.env.PGCF_PAYLOAD_FILE_TEST),a=process.argv.slice(2);if(a.includes('patch')){const file=a.find(v=>v.startsWith('--patch-file=')).slice(13);if(file==='/dev/stdin')throw Error('fileflag_reopens_socket');fs.writeFileSync(d.report,JSON.stringify({file,fileMode:fs.statSync(file).mode&511,directoryMode:fs.statSync(path.dirname(file)).mode&511}));const r=cp.spawnSync(d.client,['patch','--local=true','--filename',d.source,'--type=json','--patch-file='+file,'--dry-run=client','--output=json'],{encoding:'utf8'});if(r.status!==0)process.exit(1);fs.writeFileSync(d.updated,r.stdout);process.stdout.write(r.stdout);}else{const p=a[a.indexOf('--raw')+1];const value=p==='/api/v1/namespaces/kube-system'?{metadata:{uid:d.config.clusterUid}}:p==='/api/v1/namespaces/openebs'?{metadata:{uid:d.config.storageNamespaceUid}}:p.startsWith('/api/v1/nodes/')?JSON.parse(fs.readFileSync(d.source,'utf8')):d.lvm;console.log(JSON.stringify(value));}\n`, { mode: 0o700 });
+  process.env.PATH = directory + ":" + originalPath;
+  process.env.PGCF_PAYLOAD_FILE_TEST = JSON.stringify({ client, source, report, updated, config: f.config, lvm: f.lvm });
+  try {
+    const result = await run(["--apply"], {
+      PGCF_STORAGE_EXPECTED_CLUSTER_UID: f.config.clusterUid,
+      PGCF_STORAGE_EXPECTED_NAMESPACE_UID: f.config.storageNamespaceUid,
+      PGCF_STORAGE_KUBE_CONTEXT: f.config.context,
+      PGCF_STORAGE_PROOF_NOT_BEFORE: new Date(f.config.proofNotBefore).toISOString(),
+      PGCF_STORAGE_PROOF_COMPLETED_AT: new Date(f.config.proofCompletedAt).toISOString(),
+      PGCF_STORAGE_BINDINGS_JSON: JSON.stringify(f.config.bindings),
+    }, undefined, () => now);
+    assert.equal(result.status, "published");
+    const actual = JSON.parse(await readFile(report, "utf8"));
+    assert.equal(actual.fileMode, 0o600); assert.equal(actual.directoryMode, 0o700);
+    await assert.rejects(access(actual.file));
+  } finally {
+    process.env.PATH = originalPath;
+    if (original === undefined) delete process.env.PGCF_PAYLOAD_FILE_TEST;
+    else process.env.PGCF_PAYLOAD_FILE_TEST = original;
+    await rm(directory, { recursive: true, force: true });
+  }
+});

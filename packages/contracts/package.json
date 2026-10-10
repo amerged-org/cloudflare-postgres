@@ -29,7 +29,8 @@
     "./client": "./src/client.ts",
     "./reclaim": "./src/reclaim.ts",
     "./fleet-updates": "./src/fleet-updates.ts",
-    "./region-material-rotation": "./src/region-material-rotation.ts"
+    "./region-material-rotation": "./src/region-material-rotation.ts",
+    "./infrastructure-backups": "./src/infrastructure-backups.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

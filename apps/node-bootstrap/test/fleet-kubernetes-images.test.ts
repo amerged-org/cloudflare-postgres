@@ -652,3 +652,75 @@ test("anonymous GHCR proof rejects a different repository scope and invalid toke
     undefined,
   );
 });
+
+// Public Docker Hub index bytes from the observed OpenEBS runtime.
+const openEbsRuntimeIndex =
+  '{\n  "schemaVersion": 2,\n  "mediaType": "application/vnd.oci.image.index.v1+json",\n  "manifests": [\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:ae4b9e0b57c64e35fc8f742496420bc8f9d3aadd990e1a0e19b4083fafdd6639",\n      "size": 1250,\n      "platform": {\n        "architecture": "amd64",\n        "os": "linux"\n      }\n    },\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:bc49182f9cde4a70b282b1500f7505707afbd37ff069d6f6fec61e66cab093f4",\n      "size": 1250,\n      "platform": {\n        "architecture": "arm64",\n        "os": "linux"\n      }\n    },\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:01c950c61b43f62aac3f4925363ed642ece4c525a34103852c69393c88d3b130",\n      "size": 1112,\n      "annotations": {\n        "vnd.docker.reference.digest": "sha256:ae4b9e0b57c64e35fc8f742496420bc8f9d3aadd990e1a0e19b4083fafdd6639",\n        "vnd.docker.reference.type": "attestation-manifest"\n      },\n      "platform": {\n        "architecture": "unknown",\n        "os": "unknown"\n      }\n    },\n    {\n      "mediaType": "application/vnd.oci.image.manifest.v1+json",\n      "digest": "sha256:0e6d4db73f324713a077d950c303fd7241fcd55678204040e4cfe31148267258",\n      "size": 1112,\n      "annotations": {\n        "vnd.docker.reference.digest": "sha256:bc49182f9cde4a70b282b1500f7505707afbd37ff069d6f6fec61e66cab093f4",\n        "vnd.docker.reference.type": "attestation-manifest"\n      },\n      "platform": {\n        "architecture": "unknown",\n        "os": "unknown"\n      }\n    }\n  ]\n}';
+
+test("Docker Hub logical image names resolve through the canonical registry and exact anonymous pull challenge", async () => {
+  const runtime =
+      "41f73aba7f31eee4a033053d9c2f203e007a838c14823f3fd472c50651a98999",
+    manifest =
+      "ae4b9e0b57c64e35fc8f742496420bc8f9d3aadd990e1a0e19b4083fafdd6639";
+  assert.equal(
+    createHash("sha256").update(openEbsRuntimeIndex).digest("hex"),
+    runtime,
+  );
+  const hosts: string[] = [];
+  const request = (async (
+    input: string | URL | Request,
+    init?: RequestInit,
+  ) => {
+    const url = new URL(String(input));
+    hosts.push(url.hostname);
+    if (url.hostname === "docker.io")
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://www.docker.com/" },
+      });
+    if (url.hostname === "www.docker.com")
+      return new Response("<html>Docker</html>");
+    if (url.hostname === "auth.docker.io") {
+      assert.equal(url.pathname, "/token");
+      assert.equal(url.searchParams.get("service"), "registry.docker.io");
+      assert.equal(
+        url.searchParams.get("scope"),
+        "repository:openebs/lvm-driver:pull",
+      );
+      assert.equal(new Headers(init?.headers).has("authorization"), false);
+      return new Response(JSON.stringify({ token: "test-only-docker-token" }));
+    }
+    assert.equal(url.hostname, "registry-1.docker.io");
+    assert.equal(
+      url.pathname,
+      `/v2/openebs/lvm-driver/manifests/sha256:${runtime}`,
+    );
+    const authorization = new Headers(init?.headers).get("authorization");
+    if (!authorization)
+      return new Response(null, {
+        status: 401,
+        headers: {
+          "www-authenticate":
+            'Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:openebs/lvm-driver:pull"',
+        },
+      });
+    assert.equal(authorization, "Bearer test-only-docker-token");
+    return new Response(openEbsRuntimeIndex, {
+      headers: { "docker-content-digest": `sha256:${runtime}` },
+    });
+  }) as typeof fetch;
+  assert.equal(
+    await normalizeRuntimeImageManifest(
+      `docker.io/openebs/lvm-driver:1.10.1@sha256:${manifest}`,
+      manifest,
+      runtime,
+      { request },
+    ),
+    manifest,
+  );
+  assert.deepEqual(hosts, [
+    "registry-1.docker.io",
+    "auth.docker.io",
+    "registry-1.docker.io",
+  ]);
+});

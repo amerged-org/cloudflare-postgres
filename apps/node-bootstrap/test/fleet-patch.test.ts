@@ -38,6 +38,9 @@ function runtime(
   let machineConfiguration: string | undefined;
   let stateLoadedConfiguration = false;
   let applyProbe: CommandRunner | undefined;
+  let kubeProbe:
+    ((command: Command) => ReturnType<CommandRunner> | undefined) | undefined;
+  let assetRequest: typeof fetch | undefined;
   const resource = (type: string, id: string, spec: unknown) =>
     JSON.stringify({ metadata: { type, id }, spec });
   const node = () => ({
@@ -83,6 +86,12 @@ function runtime(
     set applyProbe(value: CommandRunner) {
       applyProbe = value;
     },
+    set kubeProbe(value: NonNullable<typeof kubeProbe>) {
+      kubeProbe = value;
+    },
+    set assetRequest(value: typeof fetch) {
+      assetRequest = value;
+    },
     turn: () =>
       runFleetPatch(
         { ...fixture.input, status: current },
@@ -92,6 +101,8 @@ function runtime(
             close: async () => {},
           }),
           request: async (_url, options) => {
+            if (assetRequest && String(_url) !== fixture.input.callback.url)
+              return assetRequest(_url, options);
             const body = JSON.parse(String(options?.body));
             if (body.kind === "status") return Response.json(current);
             if (body.kind !== "checkpoint")
@@ -130,6 +141,10 @@ function runtime(
           },
           run: async (command) => {
             const args = command.args;
+            if (command.executable === "kubectl" && kubeProbe) {
+              const result = kubeProbe(command);
+              if (result) return result;
+            }
             if (
               args.includes("apply-config") &&
               machineConfiguration !== undefined
@@ -794,6 +809,187 @@ test("checkpoint echoes compare the JSON wire facts when pre-boot image evidence
   assert.ok(r.writes[0]!.args.includes("apply-config"));
   assert.equal(Object.hasOwn(r.current.observed!, "kubernetes_images"), false);
   assert.deepEqual(r.current.observed!.kubernetes_image_configuration, pins);
+});
+
+test("Flux CAS patches pass private real files to the pinned native kubectl and clean up every payload", async () => {
+  const client = process.env.PGCF_TEST_KUBECTL;
+  assert.ok(client, "PGCF_TEST_KUBECTL must select the verified native client");
+  const r = runtime();
+  const deployments = [
+    "helm-controller",
+    "kustomize-controller",
+    "notification-controller",
+    "source-controller",
+  ].map((name) => ({
+    apiVersion: "apps/v1",
+    kind: "Deployment",
+    metadata: { name, namespace: "flux-system" },
+    spec: {
+      replicas: 1,
+      selector: { matchLabels: { app: name } },
+      template: {
+        metadata: { labels: { app: name } },
+        spec: {
+          containers: [
+            {
+              name: "manager",
+              image: `registry.example/flux-${name.split("-")[0]}:old`,
+            },
+          ],
+        },
+      },
+    },
+  }));
+  const text = deployments.map((value) => stringify(value)).join("---\n"),
+    relay = stringify({
+      kind: "Deployment",
+      metadata: { name: "pgcf-bootstrap-relay" },
+    }),
+    lock = JSON.stringify({
+      target: {
+        talosVersion: r.fixture.input.spec.roles.customer.talos_version,
+        kubernetesVersion:
+          r.fixture.input.spec.roles.customer.kubernetes_version,
+      },
+      flux: {
+        installManifestURL:
+          "https://github.com/fluxcd/flux2/releases/download/v2.8.0/install.yaml",
+        installManifestSha256: digest(text),
+      },
+    });
+  r.fixture.input.spec.platform_source_commit = "e".repeat(40);
+  r.fixture.input.spec.versions_lock_sha256 = digest(lock);
+  const current = new Map(
+    deployments.map((value) => [
+      value.metadata.name,
+      {
+        ...structuredClone(value),
+        metadata: { ...value.metadata, uid: randomUUID() },
+      },
+    ]),
+  );
+  const sources = [
+    {
+      apiVersion: "source.toolkit.fluxcd.io/v1",
+      kind: "GitRepository",
+      metadata: {
+        name: "pgcf-platform",
+        namespace: "flux-system",
+        uid: randomUUID(),
+      },
+      spec: { ref: { commit: "a".repeat(40) } },
+      status: { artifact: { revision: `main@sha1:${"a".repeat(40)}` } },
+    },
+    ...["pgcf-platform", "pgcf-regional"].map((name) => ({
+      apiVersion: "kustomize.toolkit.fluxcd.io/v1",
+      kind: "Kustomization",
+      metadata: { name, namespace: "flux-system", uid: randomUUID() },
+      spec: { path: "./infra/platform" },
+      status: {},
+    })),
+  ];
+  r.current = {
+    ...r.current,
+    stage: "flux",
+    baseline: {
+      ...r.fixture.facts,
+      platform_resource_uids: Object.fromEntries(
+        [...current.values(), ...sources].map((value) => [
+          `${value.kind}/flux-system/${value.metadata.name}`,
+          value.metadata.uid,
+        ]),
+      ),
+    },
+    spec_sha256: digest(canonical(r.fixture.input.spec)),
+  };
+  r.assetRequest = async (url) =>
+    new Response(
+      String(url).endsWith("versions.lock.json")
+        ? lock
+        : String(url).endsWith("relay.yaml")
+          ? relay
+          : text,
+    );
+  const paths: string[] = [];
+  r.kubeProbe = (command) => {
+    if (command.args.includes("deployments.apps,daemonsets.apps"))
+      return Promise.resolve({
+        exit_code: 0,
+        stdout: JSON.stringify({ items: [...current.values()] }),
+      });
+    if (
+      command.args.some((value) =>
+        value.startsWith("gitrepositories.source.toolkit"),
+      )
+    )
+      return Promise.resolve({
+        exit_code: 0,
+        stdout: JSON.stringify({ items: sources }),
+      });
+    if (command.args.includes("pods"))
+      return Promise.resolve({
+        exit_code: 0,
+        stdout: JSON.stringify({ items: [] }),
+      });
+    if (!command.args.includes("Deployment")) return undefined;
+    const name = command.args[command.args.indexOf("Deployment") + 1]!;
+    if (command.args.includes("get"))
+      return Promise.resolve({
+        exit_code: 0,
+        stdout: JSON.stringify(current.get(name)),
+      });
+    return (async () => {
+      assert.ok(command.args.includes("patch"));
+      const file = command.args
+        .find((value) => value.startsWith("--patch-file="))!
+        .slice("--patch-file=".length);
+      assert.notEqual(file, "/dev/stdin");
+      assert.equal(command.stdin, undefined);
+      assert.equal((await stat(file)).mode & 0o777, 0o600);
+      assert.equal((await stat(dirname(file))).mode & 0o777, 0o700);
+      paths.push(file);
+      const patch = JSON.parse(await readFile(file, "utf8"));
+      assert.deepEqual(patch[0], {
+        op: "test",
+        path: "/metadata/uid",
+        value: current.get(name)!.metadata.uid,
+      });
+      const source = join(
+        dirname(file),
+        `native-kubectl-source-${paths.length}.json`,
+      );
+      await writeFile(source, JSON.stringify(current.get(name)), {
+        mode: 0o600,
+        flag: "wx",
+      });
+      const result = spawnSync(
+        client,
+        [
+          "patch",
+          "--local=true",
+          "--filename",
+          source,
+          "--type=json",
+          `--patch-file=${file}`,
+          "--dry-run=client",
+          "--output=json",
+        ],
+        {
+          encoding: "utf8",
+          timeout: 15000,
+          env: { PATH: process.env.PATH, LANG: "C" },
+        },
+      );
+      assert.equal(result.status, 0, result.stderr);
+      current.set(name, JSON.parse(result.stdout));
+      return { exit_code: 0, stdout: result.stdout };
+    })();
+  };
+  await r.turn();
+  assert.equal(paths.length, 4);
+  assert.equal(new Set(paths).size, 4);
+  for (const path of paths)
+    await assert.rejects(stat(path), { code: "ENOENT" });
 });
 
 test("fleet apply gives the actual pinned native client a private configuration file and retains uncertain outcomes", async () => {

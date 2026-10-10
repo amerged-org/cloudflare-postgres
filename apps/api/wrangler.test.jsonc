@@ -47,6 +47,11 @@
   ],
   "workflows": [
     {
+      "binding": "INFRASTRUCTURE_BACKUP",
+      "name": "pgcf-infrastructure-backup",
+      "class_name": "InfrastructureBackup",
+    },
+    {
       "binding": "PATCH_NODE",
       "name": "pgcf-patch-node",
       "class_name": "PatchNode",

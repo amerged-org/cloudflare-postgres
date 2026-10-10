@@ -16,6 +16,7 @@ Add machinery only for an observed problem, never for a hypothetical one.
 Delete unused code, files and branches; no parked, held or frozen work. Git history is the archive.
 No mocks, stubs or hardcoded data in product code; acceptance only from real Dev systems.
 Test the logic you write; write the failing test first for bug fixes; no test matrices; one CI workflow.
+At native CLI boundaries, materialize filename-flag payloads as real 0600 files in 0700 temporary directories and clean them up; never reopen stdin through /dev/stdin or /proc/self/fd, or assume Talos accepts --file=-. Preserve explicitly supported kubectl --filename=- direct-stream input. Never log payload contents.
 Record phase results and measured numbers in PLAN.md Status; no per-change evidence documents.
 Repository documentation is written in English; discussion with the owner may be in German.
 Docs live in PLAN.md, README.md, THIRD_PARTY.md, infra READMEs, docs/operations runbooks and docs/architecture proposals.

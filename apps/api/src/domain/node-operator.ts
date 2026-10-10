@@ -30,7 +30,7 @@ const closed = (): never => {
 };
 
 /** Uses only retained schema0030 node/region/custody records. */
-async function current(
+export async function currentOperatorAuthority(
   env: Env,
   nodeId: string,
   expectedUid: string,
@@ -118,19 +118,33 @@ export async function operatorKubernetes(
       "invalid_request",
       "A Kubernetes operator WebSocket is required",
     );
-  const service = c.env.BOOTSTRAP_RELAY_SERVICE;
+  return operatorKubernetesRelay(c.env, nodeId, nodeUid, async () => {
+    c.set("auth", undefined);
+    await requireScope(c, "admin");
+  });
+}
+
+/** The caller supplies a fresh, scoped authorization check; mTLS and live identities remain unchanged. */
+export async function operatorKubernetesRelay(
+  env: Env,
+  nodeId: string,
+  nodeUid: string,
+  authorize: () => Promise<void>,
+): Promise<Response> {
+  await authorize();
+  const service = env.BOOTSTRAP_RELAY_SERVICE;
   if (!service) throw new ApiError("conflict", "Operator relay unavailable");
-  const before = await current(c.env, nodeId, nodeUid);
+  const before = await currentOperatorAuthority(env, nodeId, nodeUid);
   const checkCurrent = async () => {
-    const after = await current(
-      c.env,
+    const after = await currentOperatorAuthority(
+      env,
       nodeId,
       nodeUid,
       before.binding.material_revision,
     );
     if (JSON.stringify(after) !== JSON.stringify(before)) return closed();
   };
-  const endpoint = new URL(c.env.BOOTSTRAP_RELAY_URL);
+  const endpoint = new URL(env.BOOTSTRAP_RELAY_URL);
   if (
     !["https:", "http:"].includes(endpoint.protocol) ||
     endpoint.pathname !== BOOTSTRAP_RELAY_PATH ||
@@ -150,17 +164,16 @@ export async function operatorKubernetes(
   if (identityResponse.status !== 200) return closed();
   const identity = await readBootstrapRelayIdentity(identityResponse, signal);
   if (
-    identity.region !== c.env.BOOTSTRAP_RELAY_ISSUER_REGION ||
+    identity.region !== env.BOOTSTRAP_RELAY_ISSUER_REGION ||
     identity.issuer_region !== identity.region ||
     !identity.allowed_target_regions.includes(before.region) ||
     !identity.capabilities.includes("kubernetes_api")
   )
     return closed();
   await checkCurrent();
-  c.set("auth", undefined);
-  await requireScope(c, "admin");
+  await authorize();
   const key = await bootstrapTransportSigningKey(
-    c.env.BOOTSTRAP_RELAY_SIGNING_KEYS,
+    env.BOOTSTRAP_RELAY_SIGNING_KEYS,
   );
   // The existing relay operation field correlates this administrator request; no provisioning job is created.
   const token = await signBootstrapRelay({
@@ -188,8 +201,7 @@ export async function operatorKubernetes(
   }
   try {
     await checkCurrent();
-    c.set("auth", undefined);
-    await requireScope(c, "admin");
+    await authorize();
   } catch (error) {
     try {
       upstream.webSocket.accept();

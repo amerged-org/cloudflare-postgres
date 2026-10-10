@@ -4,6 +4,11 @@ import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createRequire } from "node:module";
+
+const { parse: parseYaml } = createRequire(
+  new URL("../../apps/node-bootstrap/package.json", import.meta.url),
+)("yaml") as { parse(source: string): unknown };
 
 export interface ImageInputs {
   regional: boolean;
@@ -47,7 +52,6 @@ const sharedNodeInputs = new Set([
 const sharedQualificationInputs = new Set([
   "package.json",
   "pnpm-lock.yaml",
-  ".github/workflows/ci.yml",
   "scripts/ci/image-qualification.ts",
   "scripts/ci/scanner.ts",
   "scripts/ci/registry.ts",
@@ -81,9 +85,106 @@ function validPath(path: string): boolean {
       .some((part) => part === "" || part === "." || part === "..")
   );
 }
+const nativeSchemaInputs = new Set(
+  [
+    "protocol",
+    "controller",
+    "power",
+    "measurements",
+    "bootstrap",
+    "reclaim",
+    "compute-pool",
+  ].map((name) => `packages/contracts/native/${name}.generated.json`),
+);
+function rustInputs(path: string, directory: string): boolean {
+  return (
+    path === `${directory}/Dockerfile` ||
+    path === `${directory}/Cargo.toml` ||
+    path === `${directory}/build.rs` ||
+    (path.startsWith(`${directory}/src/`) && path.endsWith(".rs")) ||
+    (path.startsWith(`${directory}/proto/`) && !path.endsWith(".md"))
+  );
+}
+function canonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonical);
+  if (value && typeof value === "object")
+    return Object.fromEntries(
+      Object.entries(value)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, item]) => [key, canonical(item)]),
+    );
+  return value;
+}
+function workflowInputs(change: {
+  before: string;
+  after: string;
+}): ImageInputs {
+  if (
+    change.before.length > 2 * 1024 * 1024 ||
+    change.after.length > 2 * 1024 * 1024
+  )
+    return all();
+  const project = (raw: string) => {
+    const workflow = metadataObject(parseYaml(raw)),
+      jobs = metadataObject(workflow.jobs);
+    return Object.fromEntries(
+      Object.keys(imageJobs).map((name) => {
+        const job = metadataObject(jobs[name]);
+        if (!Array.isArray(job.steps) || job.steps.length > 500)
+          throw Error("Image workflow steps unavailable");
+        const steps = job.steps
+          .map(metadataObject)
+          .filter((step) => {
+            // Receipt retention and the separately verified installer delivery do not build these images.
+            if (
+              typeof step.uses === "string" &&
+              step.uses.startsWith("actions/upload-artifact@")
+            )
+              return false;
+            return !(
+              typeof step.run === "string" &&
+              /^printf '%s' "\$GH_TOKEN" \| docker login ghcr\.io --username "\$GITHUB_ACTOR" --password-stdin\nnode scripts\/operations\/publish-talos-installer\.mjs "\$PGCF_TALOS_INSTALLER_RELEASE" "\$RUNNER_TEMP\/[a-zA-Z0-9_/-]+"\s*$/.test(
+                step.run,
+              )
+            );
+          })
+          .map((step) =>
+            Object.fromEntries(
+              Object.entries(step).filter(([key]) => key !== "name"),
+            ),
+          );
+        return [
+          name,
+          canonical({
+            global_env: workflow.env,
+            global_defaults: workflow.defaults,
+            runner: job["runs-on"],
+            container: job.container,
+            services: job.services,
+            defaults: job.defaults,
+            env: job.env,
+            steps,
+          }),
+        ];
+      }),
+    );
+  };
+  try {
+    const before = project(change.before),
+      after = project(change.after),
+      result = selectImageInputs([], "push");
+    for (const [job, flags] of Object.entries(imageJobs))
+      if (JSON.stringify(before[job]) !== JSON.stringify(after[job]))
+        for (const flag of flags) result[flag] = true;
+    return result;
+  } catch {
+    return all();
+  }
+}
 export function selectImageInputs(
   paths: readonly string[] | null,
   eventName: string,
+  workflowChange?: { before: string; after: string },
 ): ImageInputs {
   if (
     eventName !== "push" ||
@@ -104,6 +205,11 @@ export function selectImageInputs(
     sandbox_controller: false,
   };
   for (const path of paths) {
+    if (path === ".github/workflows/ci.yml") {
+      const affected = workflowChange ? workflowInputs(workflowChange) : all();
+      for (const flag of Object.keys(affected) as (keyof ImageInputs)[])
+        result[flag] ||= affected[flag];
+    }
     if (sharedQualificationInputs.has(path)) return all();
     if (sharedNodeInputs.has(path) || path.startsWith("packages/contracts/")) {
       result.regional = true;
@@ -122,7 +228,15 @@ export function selectImageInputs(
     )
       result.node_bootstrap = true;
     if (postgresInputs.has(path)) result.postgres = true;
-    if (path.startsWith("infra/storage/")) result.storage = true;
+    if (
+      [
+        "infra/storage/Dockerfile",
+        "infra/storage/.dockerignore",
+        "infra/storage/sources.lock.json",
+        "infra/storage/image.test.mjs",
+      ].includes(path)
+    )
+      result.storage = true;
     if (
       [
         "Cargo.toml",
@@ -132,8 +246,8 @@ export function selectImageInputs(
         ".dockerignore",
         "infra/platform/versions.lock.json",
       ].includes(path) ||
-      path.startsWith("packages/native-protocol/") ||
-      path.startsWith("packages/contracts/native/")
+      rustInputs(path, "packages/native-protocol") ||
+      nativeSchemaInputs.has(path)
     ) {
       result.rust_gateway = true;
       result.native_controller = true;
@@ -142,37 +256,43 @@ export function selectImageInputs(
       result.sandbox_controller = true;
     }
     if (path === ".dockerignore") result.storage = true;
-    if (path.startsWith("apps/native-gateway/")) result.rust_gateway = true;
+    if (rustInputs(path, "apps/native-gateway")) result.rust_gateway = true;
     if (
       path === "apps/native-gateway/Cargo.toml" ||
       path === "apps/native-gateway/build.rs" ||
       (path.startsWith("apps/native-gateway/src/") &&
+        path.endsWith(".rs") &&
         path !== "apps/native-gateway/src/main.rs")
     )
       result.rust_bootstrap_relay = true;
-    if (path.startsWith("apps/native-bootstrap-relay/"))
+    if (rustInputs(path, "apps/native-bootstrap-relay"))
       result.rust_bootstrap_relay = true;
-    if (path.startsWith("apps/native-reclaimer/"))
+    if (rustInputs(path, "apps/native-reclaimer"))
       result.native_reclaimer = true;
-    if (path.startsWith("apps/native-controller/"))
+    if (rustInputs(path, "apps/native-controller"))
       result.native_controller = true;
     if (
       path === "apps/native-controller/Cargo.toml" ||
       path === "apps/native-controller/build.rs" ||
       (path.startsWith("apps/native-controller/src/") &&
+        path.endsWith(".rs") &&
         path !== "apps/native-controller/src/main.rs")
     )
       result.native_reclaimer = true;
     if (path === "apps/native-gateway/license-bundle.sh") {
+      result.rust_gateway = true;
       result.native_controller = true;
       result.rust_bootstrap_relay = true;
       result.native_reclaimer = true;
       result.sandbox_controller = true;
     }
     if (
-      path.startsWith("apps/sandbox-controller/") ||
-      path.startsWith("apps/node-runtime/") ||
-      path.startsWith("infra/talos/sandbox/")
+      rustInputs(path, "apps/sandbox-controller") ||
+      rustInputs(path, "apps/node-runtime") ||
+      (path.startsWith("infra/talos/sandbox/") &&
+        !path.endsWith(".md") &&
+        !path.includes(".test.") &&
+        !path.endsWith("/tsconfig.json"))
     )
       result.sandbox_controller = true;
   }
@@ -228,10 +348,22 @@ export function changedImageInputs(input: {
     );
     const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
     if (text !== "" && !text.endsWith("\0")) return all();
-    return selectImageInputs(
-      text === "" ? [] : text.slice(0, -1).split("\0"),
-      input.eventName,
-    );
+    const paths = text === "" ? [] : text.slice(0, -1).split("\0");
+    const workflowChange = paths.includes(".github/workflows/ci.yml")
+      ? {
+          before: execFileSync(
+            "git",
+            ["show", `${input.before}:.github/workflows/ci.yml`],
+            options,
+          ).toString("utf8"),
+          after: execFileSync(
+            "git",
+            ["show", `${input.head}:.github/workflows/ci.yml`],
+            options,
+          ).toString("utf8"),
+        }
+      : undefined;
+    return selectImageInputs(paths, input.eventName, workflowChange);
   } catch {
     return all();
   }

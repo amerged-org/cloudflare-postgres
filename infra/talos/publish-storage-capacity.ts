@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { spawn } from "node:child_process";
-import { resolve } from "node:path";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
 
@@ -413,19 +415,29 @@ class KubectlClient implements ClusterClient {
   get(path: string, context: string): Promise<unknown> {
     return this.command(["get", "--raw", path], context);
   }
-  patchNode(name: string, patch: Patch, context: string): Promise<unknown> {
-    return this.command(
+  async patchNode(name: string, patch: Patch, context: string): Promise<unknown> {
+    const directory = await mkdtemp(join(tmpdir(), "pgcf-storage-patch-"));
+    await chmod(directory, 0o700);
+    const filename = join(directory, "patch.json");
+    try {
+      await writeFile(filename, JSON.stringify(patch), {
+        mode: 0o600,
+        flag: "wx",
+      });
+      return await this.command(
       [
         "patch",
         "node",
         name,
         "--type=json",
-        "--patch-file=/dev/stdin",
+        `--patch-file=${filename}`,
         "--output=json",
       ],
       context,
-      JSON.stringify(patch),
-    );
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   }
 }
 

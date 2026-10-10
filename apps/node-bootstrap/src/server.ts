@@ -14,6 +14,16 @@ import { runNodeProof } from "./node-proof-runner.ts";
 import { runThinStorage } from "./thin-storage.ts";
 import { runFleetPatch } from "./fleet-patch.ts";
 import {
+  InfrastructureBackupInput,
+  InfrastructureBackupPreparedArtifact,
+} from "@pgcf/contracts/infrastructure-backups";
+import {
+  prepareDailyBackup,
+  openPreparedArtifact,
+  verifyArtifactReadback,
+} from "./infrastructure-backup.ts";
+import { pipeline } from "node:stream/promises";
+import {
   BootstrapError,
   BootstrapJob,
   validateInput,
@@ -58,6 +68,9 @@ export function createBootstrapServer(
   let installationRegistration = false;
   let patchRunning = false;
   let patchRegistered = false;
+  let backupRunning = false;
+  let backup: Awaited<ReturnType<typeof prepareDailyBackup>> | undefined;
+  let backupInput: InfrastructureBackupInput | undefined;
   const inspections = new Map<
     string,
     {
@@ -92,6 +105,77 @@ export function createBootstrapServer(
         return;
       }
       const path = request.url ?? "";
+      if (request.method === "POST" && path === "/v1/infrastructure-backups") {
+        if (
+          backupRunning ||
+          patchRegistered ||
+          installationRegistration ||
+          jobs.size ||
+          inspections.size ||
+          proofs.size
+        )
+          throw new BootstrapError("container_busy");
+        const input = InfrastructureBackupInput.parse(await body(request));
+        if (
+          backupInput &&
+          JSON.stringify(backupInput) !== JSON.stringify(input)
+        )
+          throw new BootstrapError("infrastructure_backup_input_changed");
+        backupRunning = true;
+        try {
+          if (!backup) {
+            backupInput = input;
+            backup = await prepareDailyBackup(input, {
+              request: options.request,
+            });
+          }
+          server.requestTimeout = 10 * 60 * 1000;
+          reply(
+            response,
+            200,
+            backup.artifacts.map((artifact) =>
+              InfrastructureBackupPreparedArtifact.strip().parse(artifact),
+            ),
+          );
+        } finally {
+          backupRunning = false;
+        }
+        return;
+      }
+      const backupArtifact =
+        /^\/v1\/infrastructure-backups\/([a-z0-9._-]{1,128})(\/verify)?$/.exec(
+          path,
+        );
+      if (backupArtifact && backup && backupInput) {
+        const artifact = backup.artifacts.find(
+          (value) => value.id === backupArtifact[1],
+        );
+        if (!artifact)
+          throw new BootstrapError("infrastructure_backup_artifact_unknown");
+        if (request.method === "GET" && !backupArtifact[2]) {
+          response.writeHead(200, {
+            "content-type": "application/octet-stream",
+            "content-length": artifact.encrypted_bytes,
+            "cache-control": "no-store",
+          });
+          await pipeline(openPreparedArtifact(artifact), response);
+          return;
+        }
+        if (request.method === "POST" && backupArtifact[2]) {
+          reply(
+            response,
+            200,
+            await verifyArtifactReadback(
+              request,
+              backupInput.encryption.key,
+              artifact,
+            ),
+          );
+          return;
+        }
+      }
+      if (backupInput)
+        throw new BootstrapError("infrastructure_backup_container_only");
       if (request.method === "POST" && path === "/v1/thin-storage") {
         if (
           patchRunning ||
@@ -391,7 +475,12 @@ export function createBootstrapServer(
     };
     void handle().catch((error: unknown) => {
       const code =
-        error instanceof BootstrapError ? error.code : "request_invalid";
+        error instanceof BootstrapError
+          ? error.code
+          : error instanceof Error &&
+              /^infrastructure_backup_[a-z0-9_]{1,90}$/.test(error.message)
+            ? error.message
+            : "request_invalid";
       const responseCode =
         request.url === "/v1/patches" &&
         !code.startsWith("patch_") &&
@@ -420,6 +509,7 @@ export function createBootstrapServer(
   server.headersTimeout = 15_000;
   server.maxHeadersCount = 32;
   const stop = () => {
+    void backup?.close();
     for (const entry of jobs.values()) entry.job.abort.abort();
     for (const entry of inspections.values()) entry.abort.abort();
     for (const entry of proofs.values()) entry.abort.abort();

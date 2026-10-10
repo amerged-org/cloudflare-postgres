@@ -7,6 +7,7 @@ import { neonConfig } from "@neondatabase/serverless";
 import { WebSocket, WebSocketServer } from "ws";
 import { once } from "node:events";
 import { StartupReader, encodeErrorResponse } from "@pgcf/contracts/pg-wire";
+import { safeProbeError } from "../src/transport.ts";
 
 const sockets = registerHooks({
   resolve(specifier, context, nextResolve) {
@@ -126,6 +127,7 @@ test("probe expires before any handler or authentication can cause side effects"
     for (const path of [
       "/metadata",
       "/exercise",
+      "/read-only",
       "/refusal",
       "/scan",
       "/canary-audit",
@@ -142,6 +144,32 @@ test("probe expires before any handler or authentication can cause side effects"
   } finally {
     globalThis.fetch = original;
   }
+});
+
+test("read-only probe diagnostics retain standardized codes without exception credentials", () => {
+  const secret = randomBytes(32).toString("base64url");
+  const failure = Object.assign(new Error(`postgres://app:${secret}@host/db`), {
+    name: "DatabaseError",
+    code: "08006",
+    detail: secret,
+    cause: { password: secret },
+  });
+  assert.deepEqual(safeProbeError(failure), {
+    error_class: "DatabaseError",
+    sqlstate: "08006",
+    errno: null,
+  });
+  const unexpected = safeProbeError({
+    name: secret,
+    code: secret,
+    message: secret,
+  });
+  assert.deepEqual(unexpected, {
+    error_class: "unknown",
+    sqlstate: null,
+    errno: null,
+  });
+  assert.equal(JSON.stringify(unexpected).includes(secret), false);
 });
 
 test("probe rejects missing, invalid and overlong run expiry", async () => {

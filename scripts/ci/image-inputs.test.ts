@@ -25,6 +25,79 @@ const selected = (value: Partial<ImageInputs> = {}): ImageInputs => ({
   ...value,
 });
 
+test("workflow retention, test globs, installer delivery and documentation do not rebuild unchanged native artifacts", async () => {
+  const before = await readFile(
+    new URL("../../.github/workflows/ci.yml", import.meta.url),
+    "utf8",
+  );
+  const after = before
+    .replace("retention-days: 90", "retention-days: 91")
+    .replace(
+      "node --test infra/platform/*.test.ts",
+      "node --test infra/platform/release-candidate.test.ts",
+    )
+    .replace(
+      'node scripts/operations/publish-talos-installer.mjs "$PGCF_TALOS_INSTALLER_RELEASE" "$RUNNER_TEMP/pgcf-preassembled-installer"',
+      'node scripts/operations/publish-talos-installer.mjs "$PGCF_TALOS_INSTALLER_RELEASE" "$RUNNER_TEMP/pgcf-preassembled-installer-next"',
+    );
+  assert.notEqual(before, after);
+  assert.deepEqual(
+    selectImageInputs(
+      [
+        ".github/workflows/ci.yml",
+        "infra/talos/sandbox/README.md",
+        "infra/storage/README.md",
+        "apps/native-controller/README.md",
+        "apps/node-runtime/tests/kernel_assignment.rs",
+        "packages/native-protocol/tests/conformance.rs",
+        "packages/contracts/native/generate.ts",
+        "scripts/operations/publish-talos-installer.mjs",
+        "packages/contracts/src/infrastructure-backups.ts",
+      ],
+      "push",
+      { before, after },
+    ),
+    selected({ regional: true, node_bootstrap: true }),
+  );
+});
+
+test("workflow build recipes and consumed native schema bytes still invalidate the affected immutable profiles", async () => {
+  const before = await readFile(
+    new URL("../../.github/workflows/ci.yml", import.meta.url),
+    "utf8",
+  );
+  const after = before.replace(
+    '--build-arg SOURCE_COMMIT="$GITHUB_SHA"',
+    '--build-arg SOURCE_COMMIT="changed-source"',
+  );
+  assert.notEqual(before, after);
+  const native = selected({
+    rust_gateway: true,
+    native_controller: true,
+    rust_bootstrap_relay: true,
+    native_reclaimer: true,
+    sandbox_controller: true,
+  });
+  assert.deepEqual(
+    selectImageInputs([".github/workflows/ci.yml"], "push", { before, after }),
+    native,
+  );
+  assert.deepEqual(
+    selectImageInputs(
+      ["packages/contracts/native/protocol.generated.json"],
+      "push",
+    ),
+    { ...native, regional: true, node_bootstrap: true },
+  );
+  assert.deepEqual(
+    selectImageInputs([".github/workflows/ci.yml"], "push", {
+      before,
+      after: "jobs: [broken",
+    }),
+    selectImageInputs(null, "push"),
+  );
+});
+
 test("the storage source lock invalidates both the storage and Native images", () => {
   assert.deepEqual(
     selectImageInputs(["infra/storage/sources.lock.json"], "push"),
@@ -298,6 +371,31 @@ async function failedPushHistory(
   const head = commit();
   return { cwd, qualified, failed, head, git, commit };
 }
+
+test("the committed Git comparison supplies workflow bytes instead of rebuilding for its filename", async () => {
+  const history = await failedPushHistory("docs/change.md");
+  try {
+    const source = await readFile(
+      new URL("../../.github/workflows/ci.yml", import.meta.url),
+      "utf8",
+    );
+    const path = join(history.cwd, ".github/workflows/ci.yml");
+    await mkdir(dirname(path), { recursive: true });
+    await writeFile(path, source);
+    const before = history.commit();
+    await writeFile(
+      path,
+      source.replace("retention-days: 90", "retention-days: 91"),
+    );
+    const head = history.commit();
+    assert.deepEqual(
+      changedImageInputs({ eventName: "push", before, head, cwd: history.cwd }),
+      selected(),
+    );
+  } finally {
+    await rm(history.cwd, { recursive: true, force: true });
+  }
+});
 
 const workflow = { id: 7, path: ".github/workflows/ci.yml" };
 function successfulRun(head: string, number = 1) {

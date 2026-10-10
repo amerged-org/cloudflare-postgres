@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 import { spawn } from "node:child_process";
 import { isIP } from "node:net";
+import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   HarnessError,
   assertOwned,
@@ -1359,27 +1362,38 @@ export class Kubernetes {
       },
     };
     await this.guard();
-    await command(
-      "kubectl",
-      [
-        "--kubeconfig",
-        this.configPath,
-        "--context",
-        this.context,
-        "--request-timeout=30s",
-        "patch",
-        "deployment",
-        deploymentName,
-        "--namespace",
-        namespace,
-        "--type=strategic",
-        "--patch-file=/dev/stdin",
-      ],
-      {
-        timeoutMs: requestTimeout(this.deadline),
-        input: JSON.stringify(patch),
-      },
-    );
+    const directory = await mkdtemp(join(tmpdir(), "pgcf-agent-patch-"));
+    await chmod(directory, 0o700);
+    const filename = join(directory, "patch.json");
+    try {
+      await writeFile(filename, JSON.stringify(patch), {
+        mode: 0o600,
+        flag: "wx",
+      });
+      await command(
+        "kubectl",
+
+        [
+          "--kubeconfig",
+          this.configPath,
+          "--context",
+          this.context,
+          "--request-timeout=30s",
+          "patch",
+          "deployment",
+          deploymentName,
+          "--namespace",
+          namespace,
+          "--type=strategic",
+          `--patch-file=${filename}`,
+        ],
+        {
+          timeoutMs: requestTimeout(this.deadline),
+        },
+      );
+    } finally {
+      await rm(directory, { recursive: true, force: true });
+    }
   }
   async applyPolicy(
     policy: Record<string, unknown>,

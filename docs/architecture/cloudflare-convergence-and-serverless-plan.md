@@ -51,10 +51,11 @@ is an additional mode and cannot substitute for that pool. The subsequent Neon c
 
 ## 2. What is proved, what is not
 
-The live API is71362c8 after successful main CI38012058196; D1 remains at0038. Execution gate1
+The live API is9e8214b5 after successful main CI38022247223; D1 remains at0038. Execution gate1
 passed live configuration/defaults and retained SQL checks. The fixed node ceilings and personal
 notification setup are removed. US custody revision2 is active after live authority rotation;
-EU rotation remains required before customer data. Measured results are recorded in PLAN.md Status.
+The owner stopped further key rotations on October10: retain EU revision1/US revision2 and
+verify their actual access. Earlier disclosures remain recorded. Measured results are in PLAN.md Status.
 
 Historical live evidence includes operator-assisted US1 Ready in198.356s, EU/US SQL/TLS and
 nonsuperuser roles, four R2 base/WAL checks, healthy-source EU-to-US restore in87,988ms,
@@ -62,7 +63,7 @@ four5GiB volume deletions reclaiming20GiB, and ten fresh minute samples averagin
 The expansion decision was disabled. These results do not close any complete gate in section11
 or replace retesting after the storage/runtime changes.
 
-Uniform releases, unattended purchase-to-Ready, thin storage, EU rotation, CNPG-compatible
+Uniform releases, unattended purchase-to-Ready, thin storage, current-authority access, CNPG-compatible
 shared compute and representative density remain unaccepted. Local builds, unit tests,
 artifact checks and isolated mechanisms remain distinct from live Dev acceptance.
 The refused local privileged preflight is unvalidated and is not retried.
@@ -133,7 +134,7 @@ associated live gate; current status is the13-row table in PLAN.md.
 | F21 | P0 | Fleet patching is only specified; bootstrap-material endpoint changes version metadata | Publishing an image does not upgrade existing servers or prevent drift | PLAN patch section; region-material-revisions.ts |
 | F22 | P0 | Rust runtime, target cache, complete Actor snapshot and warm reclaim are unimplemented | The approved fast-start architecture is absent, not merely untuned | rust-runtime-and-cold-starts.md; current TS apps |
 | F23 | P1 | Current wake waits behind full-region reconcile/inventory; timing names mix connect and first read | Latency comparison is misleading and the hot path includes unrelated work | agent/loop.ts; e2e/probe/worker.ts |
-| F24 | P0 | Exposed revision1 authority remains; coordinated rotation is incomplete | No customer data should be admitted while known retired authority still works | operations/credentials.md |
+| F24 | Owner scope change | Historical authority disclosures; US rotated, EU revision1 retained | October10 decision stops further rotations; verify existing access and retain the exposure record | operations/credentials.md |
 | F25 | P1 | Qualified layers/Gitleaks are presented too broadly as security/patch assurance | No full CVE/SBOM/signature/history/permission assurance follows from a green build | ci.yml; versions.lock verificationScope |
 | F26 | P1 | Some chart workload references remain tags; OpenEBS follows a current HTTP chart index | An immutable-looking release does not pin every shipped byte | versions.lock.json; platform README |
 | F27 | P1 | Node observations lack desired/actual complete release and customer-policy drift | Operators cannot see that nominally Ready nodes are different | contracts/agent.ts; operational-health.ts |
@@ -345,9 +346,9 @@ provider lifecycle actions remain distinct from routine relay transport and obse
 6. Remove required behavior from private one-off helpers by putting the minimal reusable operation
    into existing product paths. Keep secrets and raw evidence private. Delete obsolete helper-driven
    implementation alternatives; Git remains the archive. Do not check in a second orchestrator.
-7. Complete coordinated exposed-key rotation and prove both new authority works and old authority
-   is rejected, including bootstrap custody and recovery. Do not remove decryption material still
-   referenced by retained archives. Public repository/security review is a separate evidence gate.
+7. Verify current authority, bootstrap custody and recovery without further key rotation, following
+   the owner's October10 decision. Retain decryption material referenced by archives and the
+   historical disclosure record. Public repository/security review remains a separate evidence gate.
 
 ## 9. Fast start and Rust: implement the approved plan
 
@@ -419,7 +420,13 @@ If a path misses its target or late binding is not solved, the gate stays open.
 ## 10. Execution order and release gates
 
 Current execution gate: **2**. Gate 1 passed live; the US authority rotation is also accepted.
-Close each gate live before beginning the next large package.
+Owner correction, October10: customer-data readiness still requires Rust and the shared
+prestarted compute pool, actual-use CPU and thin storage, repeated database backup/recovery,
+daily encrypted etcd/D1 backups in R2 and operator-configured failure alerts. Explain the
+observed66/10,797 EU SQL probe failures before accepting customer operation. Complete automatic
+purchasing may follow migration; it is not claimed accepted by the customer-readiness subset.
+Independent implementation fixes and read-only preparation run in parallel; fleet mutations
+remain serial and US1 must finish its current patch before an EU upgrade.
 These eight execution packages organize work; the thirteen rows in section11 remain the final
 acceptance checklist. Existing later-gate source is retained unchanged, not discarded.
 
@@ -430,7 +437,7 @@ acceptance checklist. Existing later-gate source is retained unchanged, not disc
 | 3 | R2: extension and patch management | The same baseline plus the sandbox extension. Interrupt/resume its supported Talos upgrade; prove all retained roles, exact final configuration/runtime and preserved data. |
 | 4 | Thin storage, then backup/recovery lifecycle | Qualify actual physical storage and startup bounds, then repeat SQL/TLS/roles, R2 base/WAL, PITR/restore and physical deletion on the new model. |
 | 5 | Configurable expansion and Headless Ready | One real threshold-driven, already-authorized V159 purchase reaches Ready with no operator. Resolve postjoin409, prove exactly-once purchase, current-policy dispatch and continued eligible placement. |
-| 6 | Real EU key rotation | New authority works, retired authority is rejected and retained data/custody/archive recovery survive the coordinated operation. |
+| 6 | Verify current credentials | Preserve EU revision1/US revision2; actual Talos/Kubernetes/database access works, with no further authority rotation. |
 | 7 | Rust runtime and shared pool | First obtain the real US1 CNPG late-binding proof; then finish Rust gateway/controller/Edge/relay and shared-pool integration, isolation, interruption and first-read acceptance. |
 | 8 | Density and operational ownership | Measure22 representative US projects and their actual workload/backup mix; complete ordinary operation without private scripts, an AI agent or laptop access. |
 
@@ -461,7 +468,7 @@ result and next gate. PLAN.md Status contains the13 gate rows; per-fix narrative
 | Backup/recovery | SQL/TLS/roles/R2 base/WAL/PITR/restore/deletion with actual physical reclaim pass on the corrected release/storage model, not merely the old thick baseline |
 | Shared-pool fast start | Native Rust components/full Rust-Wasm Edge selected and deployed; actual unassigned slots ready before requests, at least two hibernated DBs assigned safely; subsecond pool-hit first read, refill/isolation/restart/miss metrics; warm-only/reclaim/pre-pulled images cannot substitute |
 | Capacity and economics | Representative22-project US workload with realistic sleeping/active/backup mix measured; derive required nodes from real limits, not8GiB division or old permanent CPU sums |
-| Security | Coordinated exposed-key rotation accepted; exact release vulnerability/provenance/secret/permission review; public repository/history exposure separately assessed |
+| Security | Existing authority/custody access verified under the October10 no-further-rotation decision; exact release vulnerability/provenance/secret/permission review; public repository/history exposure separately assessed |
 | Operational ownership | Operator can change policy, inspect drift/failure and resume supported operations through PGCF; no private script/AI agent needed for normal operation |
 
 The prior database tests remain useful regression evidence, but changing storage, runtime or

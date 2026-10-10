@@ -19,6 +19,7 @@ import {
 } from "@pgcf/contracts/fleet-patches";
 import {
   FleetReleaseSpec,
+  FleetReleaseFacts,
   thinStorageReleaseGuardPinned,
 } from "@pgcf/contracts/releases";
 import {
@@ -1195,8 +1196,92 @@ export async function recordFleetPatchCheckpoint(
           JSON.stringify(input.talos_upgrade_receipt)))
   )
     return closed();
+  let observationFence = "1=1",
+    observationBindings: unknown[] = [],
+    inventoryObservedAt = input.facts.observed_at;
+  if (input.stage === "complete") {
+    const previous = await env.DB.prepare(
+      `SELECT o.node_uid,o.assignment_revision,o.agent_key_hash,o.facts_json,o.observed_at,r.agent_key_hash current_key
+      FROM fleet_node_release_observations o JOIN nodes n ON n.id=o.node_id JOIN regions r ON r.id=n.region_id WHERE o.node_id=?`,
+    )
+      .bind(row.node_id)
+      .first<{
+        node_uid: string;
+        assignment_revision: number;
+        agent_key_hash: string;
+        facts_json: string;
+        observed_at: string;
+        current_key: string;
+      }>();
+    if (previous) {
+      if (
+        Date.parse(previous.observed_at) > Date.parse(input.facts.observed_at)
+      ) {
+        const actual = FleetReleaseFacts.safeParse(
+            JSON.parse(previous.facts_json),
+          ),
+          facts = input.facts.release_facts!,
+          version = (value: string | undefined) => value?.replace(/^v/, "");
+        if (
+          !actual.success ||
+          previous.node_uid !== row.node_uid ||
+          previous.assignment_revision !== row.assignment_revision ||
+          previous.agent_key_hash !== previous.current_key ||
+          actual.data.boot_id !== facts.boot_id ||
+          version(actual.data.talos_version) !== version(facts.talos_version) ||
+          version(actual.data.kubernetes_version) !==
+            version(facts.kubernetes_version) ||
+          (
+            [
+              "talos_installer",
+              "talos_schematic_sha256",
+              "platform_source_commit",
+              "configuration_schema_revision",
+              "kubernetes_control_plane",
+            ] as const
+          ).some(
+            (key) =>
+              actual.data[key] !== undefined && actual.data[key] !== facts[key],
+          ) ||
+          (actual.data.kubelet_version !== undefined &&
+            version(actual.data.kubelet_version) !==
+              version(facts.kubelet_version)) ||
+          actual.data.components.some((component) => {
+            const proof = facts.components.find(
+              (value) => value.name === component.name,
+            );
+            return (
+              !proof ||
+              (component.version !== undefined &&
+                component.version !== proof.version) ||
+              (component.sha256 !== undefined &&
+                component.sha256 !== proof.sha256)
+            );
+          })
+        )
+          return closed();
+        // The inventory remains monotonic; the independently qualified provenance keeps its original times.
+        inventoryObservedAt = previous.observed_at;
+      }
+      // Fence the exact prior row, as agent observation merges do. A concurrent identity/report wins.
+      observationFence = `EXISTS(SELECT 1 FROM fleet_node_release_observations o JOIN nodes n ON n.id=o.node_id JOIN regions r ON r.id=n.region_id WHERE o.node_id=? AND o.node_uid=? AND o.assignment_revision=? AND o.agent_key_hash=? AND o.observed_at=? AND o.facts_json=? AND r.agent_key_hash=?)`;
+      observationBindings = [
+        row.node_id,
+        previous.node_uid,
+        previous.assignment_revision,
+        previous.agent_key_hash,
+        previous.observed_at,
+        previous.facts_json,
+        previous.current_key,
+      ];
+    } else {
+      observationFence =
+        "NOT EXISTS(SELECT 1 FROM fleet_node_release_observations o WHERE o.node_id=?)";
+      observationBindings = [row.node_id];
+    }
+  }
   const update = env.DB.prepare(
-    `UPDATE fleet_patch_operations SET revision=revision+1,stage=?,state=?,baseline_json=COALESCE(baseline_json,?),observed_json=?,talos_upgrade_receipt_json=COALESCE(talos_upgrade_receipt_json,?),postgres_progress_json=COALESCE(?,postgres_progress_json),error_code=?,updated_at=? WHERE operation_id=? AND revision=? AND ${authoritySql} AND julianday(deadline_at)>julianday('now') AND (?<>'complete' OR NOT EXISTS(SELECT 1 FROM fleet_node_release_observations o WHERE o.node_id=fleet_patch_operations.node_id AND o.observed_at>?))`,
+    `UPDATE fleet_patch_operations SET revision=revision+1,stage=?,state=?,baseline_json=COALESCE(baseline_json,?),observed_json=?,talos_upgrade_receipt_json=COALESCE(talos_upgrade_receipt_json,?),postgres_progress_json=COALESCE(?,postgres_progress_json),error_code=?,updated_at=? WHERE operation_id=? AND revision=? AND ${authoritySql} AND julianday(deadline_at)>julianday('now') AND (${observationFence})`,
   ).bind(
     input.stage,
     input.state,
@@ -1210,8 +1295,7 @@ export async function recordFleetPatchCheckpoint(
     new Date().toISOString(),
     id,
     row.revision,
-    input.stage,
-    input.facts.observed_at,
+    ...observationBindings,
   );
   const updates = [update];
   if (["complete", "host_ready"].includes(input.stage)) {
@@ -1222,7 +1306,7 @@ export async function recordFleetPatchCheckpoint(
       ON CONFLICT(node_id) DO UPDATE SET node_uid=excluded.node_uid,assignment_revision=excluded.assignment_revision,agent_key_hash=excluded.agent_key_hash,facts_json=excluded.facts_json,observed_at=excluded.observed_at,received_at=excluded.received_at WHERE excluded.observed_at>=fleet_node_release_observations.observed_at`,
       ).bind(
         JSON.stringify(input.facts.release_facts),
-        input.facts.observed_at,
+        inventoryObservedAt,
         new Date().toISOString(),
         id,
         row.revision + 1,

@@ -219,6 +219,87 @@ test("complete snapshot gates startup; watch loss blocks admission and recovery 
   assert.equal(store.ready, false);
 });
 
+test("normal fence watch renewal preserves unchanged authority without admitting stale observations", async (t) => {
+  let clock = 0;
+  t.mock.method(performance, "now", () => clock);
+  const postgres = await postgresServer();
+  const { gateway, port } = await gatewayFor(postgres.port, {
+    fenceSynchronization: {
+      get ready() {
+        return store?.ready ?? false;
+      },
+      get epoch() {
+        return store?.epoch ?? 0;
+      },
+    },
+  });
+  const store = new GatewayFenceStore(gateway);
+  const api = await source();
+  const watcher = watchGatewayFences(store, api.fetch);
+  t.after(async () => {
+    await watcher.stop();
+    await gateway.drain();
+    await postgres.close();
+    await api.close();
+  });
+  const map = resource();
+  api.unblock([map]);
+  await until(() => store.ready);
+  const epoch = store.epoch;
+  clock = 55_000;
+  api.block();
+  api.watchers[0]!.end();
+  await until(() => api.listCalls() === 2);
+  assert.equal(store.ready, true);
+  assert.equal(store.epoch, epoch);
+  const other = newDatabaseId();
+  const duringRenewal = await open(port, await token({ db: other }));
+  duringRenewal.terminate();
+  assert.equal(await rejection(port, await token()), 503);
+  api.unblock([map]);
+  await until(() => api.watchers.length === 2);
+  assert.equal(store.ready, true);
+  assert.equal(store.epoch, epoch);
+  const running = resource(
+    database,
+    newOperationId(),
+    2,
+    "running",
+    map.metadata.uid,
+  );
+  clock += 55_000;
+  api.unblock([running]);
+  api.watchers[1]!.end();
+  await until(() => api.watchers.length === 3);
+  assert.equal(store.get(database)?.mode, "running");
+  const afterChange = await open(port, await token());
+  afterChange.terminate();
+  clock += 70_000;
+  assert.equal(store.ready, false);
+  assert.equal(await rejection(port, await token()), 503);
+});
+
+test("a clean fence watch EOF before its expected lifetime remains an authority loss", async (t) => {
+  const postgres = await postgresServer();
+  const { gateway } = await gatewayFor(postgres.port);
+  const store = new GatewayFenceStore(gateway);
+  const api = await source();
+  const watcher = watchGatewayFences(store, api.fetch);
+  t.after(async () => {
+    await watcher.stop();
+    await gateway.drain();
+    await postgres.close();
+    await api.close();
+  });
+  api.unblock([]);
+  await until(() => store.ready);
+  const epoch = store.epoch;
+  api.block();
+  api.watchers[0]!.end();
+  await until(() => !store.ready);
+  assert(store.epoch > epoch);
+});
+
 test("monotonic retained running records reject stale operations, rollback and disappearance", async (t) => {
   const postgres = await postgresServer();
   const { gateway } = await gatewayFor(postgres.port);
@@ -630,6 +711,8 @@ test("an asynchronous quiescence-drain failure disconnects the fence observer wi
   store.connected();
   assert.equal(store.ready, true);
   await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(store.ready, false);
+  store.observe();
   assert.equal(store.ready, false);
   assert.equal(store.get(database)?.mode, "quiesce");
 });

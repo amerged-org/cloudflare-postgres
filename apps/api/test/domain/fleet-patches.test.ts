@@ -561,7 +561,7 @@ it("creation is replayable during maintenance and persists only one separate pat
   expect(scheduled.size).toBe(1);
 });
 it("full release completion restores only owned placement closures and preserves operator exclusions", async () => {
-  const complete = async (previous: string | null) => {
+  const complete = async (previous: string | null, newerInventory = false) => {
     const f = await setup(),
       row = await readFleetPatch(env, f.op),
       members = JSON.parse(row.cluster_nodes_json),
@@ -634,17 +634,103 @@ it("full release completion restores only owned placement closures and preserves
             })),
         },
       };
+    let inventoryTime: string | undefined;
+    const checkpoint = {
+      expected_revision: 0,
+      stage: "complete" as const,
+      state: "confirmed" as const,
+      facts,
+      error_code: null,
+    };
+    if (newerInventory) {
+      facts.observed_at = new Date(Date.now() - 1000).toISOString();
+      inventoryTime = new Date().toISOString();
+      Object.assign(facts.release_facts, {
+        kubernetes_control_plane: false,
+        kubelet_version: "1.36.5",
+        kubernetes_image_provenance: {
+          method: "pinned_configuration_boot",
+          observed_at: facts.observed_at,
+          configuration_boot_id: receipt.pre_reboot_boot_id,
+          configuration_observed_at: facts.observed_at,
+          control_plane: false,
+          kubelet_version: "1.36.5",
+          images: {
+            kubelet: {
+              configuration: `registry.example/kubelet@sha256:${"d".repeat(64)}`,
+              runtime_sha256: "d".repeat(64),
+            },
+          },
+        },
+      });
+      const ordinary = {
+        boot_id: boot,
+        talos_version: "1.14.1",
+        kubernetes_version: "1.36.5",
+        components: [
+          { name: "regional", runtime_image_sha256: "e".repeat(64) },
+        ],
+      };
+      await env.DB.prepare(
+        "INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at) SELECT ?,?,1,agent_key_hash,?,?,? FROM regions WHERE id=?",
+      )
+        .bind(
+          f.node,
+          f.nodeUid,
+          JSON.stringify(ordinary),
+          inventoryTime,
+          inventoryTime,
+          f.region,
+        )
+        .run();
+      await env.DB.prepare(
+        "UPDATE fleet_node_release_observations SET facts_json=json_set(facts_json,'$.boot_id',?) WHERE node_id=?",
+      )
+        .bind(crypto.randomUUID(), f.node)
+        .run();
+      await expect(
+        recordFleetPatchCheckpoint(f.runtime, f.op, checkpoint),
+      ).rejects.toThrow("Fleet patch identity or authority changed");
+      await env.DB.prepare(
+        "UPDATE fleet_node_release_observations SET facts_json=?,node_uid=? WHERE node_id=?",
+      )
+        .bind(JSON.stringify(ordinary), crypto.randomUUID(), f.node)
+        .run();
+      await expect(
+        recordFleetPatchCheckpoint(f.runtime, f.op, checkpoint),
+      ).rejects.toThrow("Fleet patch identity or authority changed");
+      await env.DB.prepare(
+        "UPDATE fleet_node_release_observations SET node_uid=?,agent_key_hash='changed-authority' WHERE node_id=?",
+      )
+        .bind(f.nodeUid, f.node)
+        .run();
+      await expect(
+        recordFleetPatchCheckpoint(f.runtime, f.op, checkpoint),
+      ).rejects.toThrow("Fleet patch identity or authority changed");
+      await env.DB.prepare(
+        "UPDATE fleet_node_release_observations SET agent_key_hash=(SELECT agent_key_hash FROM regions WHERE id=?) WHERE node_id=?",
+      )
+        .bind(f.region, f.node)
+        .run();
+    }
     expect(
-      (
-        await recordFleetPatchCheckpoint(f.runtime, f.op, {
-          expected_revision: 0,
-          stage: "complete",
-          state: "confirmed",
-          facts,
-          error_code: null,
-        })
-      ).stage,
+      (await recordFleetPatchCheckpoint(f.runtime, f.op, checkpoint)).stage,
     ).toBe("complete");
+    if (inventoryTime) {
+      const observation = await env.DB.prepare(
+        "SELECT facts_json,observed_at FROM fleet_node_release_observations WHERE node_id=?",
+      )
+        .bind(f.node)
+        .first<{ facts_json: string; observed_at: string }>();
+      expect(observation!.observed_at).toBe(inventoryTime);
+      expect(JSON.parse(observation!.facts_json).talos_provenance).toEqual(
+        facts.release_facts.talos_provenance,
+      );
+      expect(
+        JSON.parse(observation!.facts_json).kubernetes_image_provenance
+          .observed_at,
+      ).toBe(facts.observed_at);
+    }
     expect(
       await env.DB.prepare(
         "SELECT database_placement_closed_at,database_placement_enabled FROM nodes WHERE id=?",
@@ -667,6 +753,7 @@ it("full release completion restores only owned placement closures and preserves
   };
   await complete(null);
   await complete("2024-01-01T00:00:00.000Z");
+  await complete(null, true);
 });
 
 it("synchronizes retained seed/join version metadata only after every current member has qualified release facts", async () => {
