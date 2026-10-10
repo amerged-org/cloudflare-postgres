@@ -66,6 +66,32 @@ const raw = (values: unknown[], id = "v1alpha1") =>
   });
 const configList = (values: unknown[]) =>
   [raw(values), raw(values, "persistent")].join("\n");
+test("new fixed /var files use boot-safe create; a declaration requiring nonexistent files is not configured", () => {
+  // Talos1.14.2 WriteUserFiles checks existence for overwrite before writing.
+  // create permits both first boot and updating an existing /var file.
+  const values = parseAllDocuments(
+    mergeHostConfiguration(raw(source), host),
+  ).map((value) => value.toJSON());
+  const fixed = values[0].machine.files.filter((file: { path: string }) =>
+    host.files.some((expected) => expected.path === file.path),
+  );
+  assert.equal(fixed.length, 2);
+  assert.ok(fixed.every((file: { op: string }) => file.op === "create"));
+  assert.deepEqual(values[0].machine.network, source[0]!.machine!.network);
+  assert.deepEqual(values[0].cluster, source[0]!.cluster);
+  assert.deepEqual(values[0].machine.files[0], source[0]!.machine!.files[0]);
+  assert.deepEqual(values[1], source[1]);
+  assert.equal(hostConfigurationMatches(raw(values), "v1alpha1", host), true);
+  const overwrite = structuredClone(values);
+  for (const file of overwrite[0].machine.files)
+    if (host.files.some((expected) => expected.path === file.path))
+      file.op = "overwrite";
+  assert.equal(
+    hostConfigurationMatches(raw(overwrite), "v1alpha1", host),
+    false,
+    "persistent configuration must recreate the two fixed files after a reboot",
+  );
+});
 test("a state-loaded changed boot has only the real active resource; unwitnessed absence and divergent resources remain blocked", async () => {
   const boot = { boot_id: randomUUID(), configuration_boot_id: randomUUID() };
   const commands = {

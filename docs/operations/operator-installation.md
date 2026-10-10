@@ -607,38 +607,33 @@ shared-pool fast-start acceptance before customer migration. Preserve EU1 and al
 databases; the earlier EU-upgrade deferral does not override this approved corrective scope.
 Neither alignment nor template selection authorizes an EU reinstall or a customer cutover.
 
-Before customer data, resolve the October 5 revision-1 credential exposure through
-[the credential procedure](credentials.md). Secure encrypted D1/etcd/configuration backups and SQL
-markers; rehearse targeted rotation, prove replacement access and rejection of retired trust,
-and preserve Node/Cluster/storage identities. API CA rotation alone does not cover etcd,
-bootstrap/trustd, discovery, aggregator, service-account or Secret-at-rest material. Coordinate
-live trust with Cloudflare seed/join custody; the version-template API changes metadata only.
-Retire affected historical active signers and rescue/SSH bootstrap authority after replacement
-verification. Retain required archive-verification/decryption material privately, including
-referenced `CREDENTIAL_KEYS` IDs and old decrypt keys until rewriting/retention permits removal.
-Do not reinstall nodes, overwrite revision 1 or claim rotation is complete.
+The US cluster uses custody revision 2; replacement access and retired-access rejection were
+verified. Prepared EU revision-2 authority is activated in the existing supported patch window,
+after the accepted etcd snapshot. The scoped route signer was separately replaced on October10:
+current Edge/API custody and all four gateway Pods reject its predecessor. Do not repeat key
+rotations or reinstall nodes. Retain historical archive-decryption material privately until
+retention permits its removal. Check the canonical plan for live fleet completion.
 
-Inventory source region, roles/grants/extensions, sequences, pools, timeouts and sizing. The
-actual capacity snapshot has **3,000 millicores allocatable** on each customer node. US platform
-reservations consume **1,510**, leaving **1,490** for database reservations. The smallest enabled
-size class requests **250 PostgreSQL + 100 Barman = 350 millicores**: at most **four** such databases
-by configured CPU arithmetic on an otherwise empty US node. The 22-US cohort needs at least
-**7,700**, exceeding the **1,490** available database CPU. At the configured **5 GiB** minimum,
-22 volumes need **110 GiB**, exceeding measured **95 GiB** node storage.
+Inventory source region, roles/grants/extensions, sequences, pools, timeouts and sizing. Resource
+classes are configured through the management API in 256 MiB PostgreSQL increments, with an
+operator maximum of4 GiB. A limit is not a permanent physical reservation. Actual-RAM placement,
+sleeping CPU release and thin physical storage must be measured together with hard startup and
+backup-peak admission. Customer placement excludes the control/relay host.
 
-EU1 reserves **350** platform millicores: `(3,000-350)/350` admits at most **seven** minimum-class
-databases if otherwise empty. Its current **1,024 MiB / 500-millicore** database reserves **600**
-including Barman, leaving CPU room for at most five additional minimum-class databases before
-other checks. The snapshot’s original US demand reserved 600 millicores; all trial databases are now deleted.
-Refresh actual placement reservations before the separate customer cutover.
-These are configuration ceilings, not a demonstrated workload density.
+The October8 static-reservation snapshot allowed four minimum-class databases on US1 and seven
+on EU1, and allocated5 GiB physical volumes upfront. Those were ceilings of the old configuration,
+not measured customer density or limits of an8 GiB server. They do not establish whether the22
+US projects fit the replacement resource model. Refresh physical inventory and measure the new
+model before customer cutover; record the result in the canonical plan.
 
 Ten real consecutive US minute samples from18:43:01 to18:52:04 UTC averaged **79.9062%** under
 an operation-owned3968MiB allocation. Cloudflare persisted that average and its expansion trigger.
 Existing eligible placement and full CPU/storage/PostgreSQL plus512MiB Barman startup checks
 still passed. At that historical test the dry capacity decision was `disabled` and made no provider
-call. Since October9 both live caps are3 and the exact V159 standing authority is recorded; the
-full installation-template/release gate still keeps autoscaling disabled.
+call. The current generic API exposes the operator-configured threshold and purchase switch; a fresh
+installation buys nothing until configured. There is no fixed three-node cap. The agreed model
+is V159 with a one-month term and no storage add-on. The installation/release acceptance gate
+still prevents automatic expansion until the target is qualified.
 The first trial correctly rejected a missing18:37 sample; actual kubelet timestamps crossed
 18:36:59 to18:38:00. Its load was removed and physical available RAM recovered before the
 independent second trial. Never synthesize samples or weaken consecutive-minute validation.

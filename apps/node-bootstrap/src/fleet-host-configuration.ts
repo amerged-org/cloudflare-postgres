@@ -52,7 +52,7 @@ export function hostConfigurationMatches(
     return (
       found?.content === expected.content &&
       found.permissions === expected.permissions &&
-      found.op === "overwrite"
+      found.op === "create"
     );
   });
 }
@@ -69,7 +69,9 @@ export function mergeHostConfiguration(
       (file) =>
         !paths.has(String(file.path) as (typeof input.files)[number]["path"]),
     ),
-    ...input.files.map((file) => ({ ...file, op: "overwrite" })),
+    // Talos WriteUserFiles permits create for new or existing /var files.
+    // overwrite requires an existing file and blocks boot before system services otherwise.
+    ...input.files.map((file) => ({ ...file, op: "create" })),
   ];
   if (requireThinPool) {
     const modules = parsed.values.filter(

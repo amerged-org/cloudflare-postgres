@@ -24,7 +24,7 @@ Reuse US1 and existing code.
 | Oct 10 | Scoped route authority retired | All four current gateway Pods reject freshly signed old tokens with HTTP/WS 401 and accept new WebSockets with 101. Edge and API use only route-20261010; modules, bindings and other secrets preserved. Current private custody updated. All three EU databases still pass SQL/TLS 1.3/app-role checks in 590–767 ms; two marker rows and their hash unchanged. |
 | Oct 10 | Management latency correction delivered and measured | b793273/CI 38063853988/API 2e9e762a at 100%; all images and Bootstrap version 45 reused. All ten targeted reads passed in 20.414 s under backup load. Grant authorization 2.8–4.6 s versus 14–16 s; Talos 9.9–11.0 s, machine configuration 6.9 s. Same US patch confirmed preflight/revision 1 at 16:03:47 UTC. |
 | Oct 10 | Same daily backup independently verified | Run 1ebb9c1e-e353-4c31-b394-863d825a9440 completed at 15:59:56 UTC; successful Workflow 232.720 s. R2 ciphertext: D1 316,307,388 B; EU etcd 28,471,850 B; US etcd 32,530,986 B. All hashes/GCM identities verified; D1 integrity OK, zero FK violations, 56 tables/410,685 rows; etcd 982/821 keys. Temporary plaintext removed. No new run ID/object keys or Contabo calls. |
-| Oct 10 | US same-operation progress | op_h6j47nsw7pz6wljscpdr reached kubernetes/confirmed, revision 8, at 16:13:46 UTC. A lost Container connection during host configuration resolved through automatic readback while the original execution continued; no write replay. Talos installer receipt and complete node acceptance remain open. |
+| Oct 10 | US same-operation progress | op_h6j47nsw7pz6wljscpdr reached talos_reboot/dispatched, revision 15, at 16:23:55 UTC after the Talos installer command returned exit 0 at 16:20:10. A fresh authenticated read proved boot ID 0405bada-5574-4337-8621-af528868a6c6, changed from the previous boot; core Talos services run. Post-reboot Kubernetes acceptance remains open. Lost connections resolve through readback, without replaying installation or reboot. |
 
 ## Open
 
@@ -35,10 +35,11 @@ Reuse US1 and existing code.
 | Functional baseline | Integrated API delivered; three-node live convergence and functional acceptance pending. |
 | Operations/capacity | Daily R2 backups/alerts, thin storage, sleeping CPU release, startup bounds, restore and measured density. |
 | R2/handover | Rust/shared pool, subsecond first SQL/refill, automatic R1→R2, migration instructions. |
-| First daily backup | Run 1ebb9c1e-e353-4c31-b394-863d825a9440 failed in 86.476 s before export/native capture. Workerd rejects redirect:error; the three Worker-side sites are being corrected together. No accepted D1/etcd artifact yet. |
-| Routing template authority | Live route key retirement passed. The immutable US profile keeps historical custody; b793273 composition derives current route authority from Cloudflare instead of reusing its obsolete ring. CI 38063853988 passed; API-only publication pending. |
+| Backup alarms | The daily D1/etcd R2 run passed full independent verification. Optional sender/recipient configuration remains unset; a real notification test remains open. |
+| Routing template authority | Live retirement and b793273 API delivery passed. The immutable US profile keeps historical custody; current composition derives the live route authority from Cloudflare. R2 native gateway acceptance remains open. |
+| US post-reboot host-file correction | Talos1.14.2 requires existing files for overwrite. Our two new /var files were declared overwrite, blocking WriteUserFiles before etcd/trustd registration. The failing regression and32 affected tests now pass with create; unrelated configuration and identity/write guards remain. A single no-reboot US repair changes only those two operations. No EU change, installation replay or provider action. |
 | Management transport latency | Reproduced TLS setup failure is closed by the measured b793273 correction. Existing US patch passed preflight; host convergence remains open. No further timeout increases. |
-| Backup executor capacity | Same run failed before native dispatch because the existing application allowed only one running container. Its configurable concurrency is now two, with the same image/version/namespace. Same UUID/object keys recovered after confirmed terminal failure; accepted D1/etcd archives remain open. |
+| Thin-storage admission correction | Source 66aedf passed CI38067216773 and nine focused tests. It requires the actual pgcf-sandbox-controller Talos extension instead of a nonexistent Pod. It joins the observed host-file correction below in one delivery; existing images are reused except the changed Bootstrap executor. |
 
 ## Delivery architecture
 
