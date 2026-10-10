@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
-import { readFile } from "node:fs/promises";
-import { parse, stringify } from "yaml";
+import { spawnSync } from "node:child_process";
+import { readFile, stat, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { parse, parseAllDocuments, stringify } from "yaml";
 import { test } from "node:test";
 import {
   FleetPatchCheckpoint,
@@ -11,7 +13,12 @@ import {
   fleetPatchCheckpointAllowed,
 } from "@pgcf/contracts/fleet-patches";
 import { runFleetPatch, validateFleetPatchInput } from "../src/fleet-patch.ts";
-import { canonical, digest, type Command } from "../src/bootstrap.ts";
+import {
+  canonical,
+  digest,
+  type Command,
+  type CommandRunner,
+} from "../src/bootstrap.ts";
 import { patchFixture } from "./fleet-patch.fixture.ts";
 
 function runtime(
@@ -28,6 +35,7 @@ function runtime(
     checkpoints: FleetPatchCheckpoint[] = [];
   let lifecycleLogs = "";
   let machineConfiguration: string | undefined;
+  let applyProbe: CommandRunner | undefined;
   const resource = (type: string, id: string, spec: unknown) =>
     JSON.stringify({ metadata: { type, id }, spec });
   const node = () => ({
@@ -66,6 +74,9 @@ function runtime(
     },
     set machineConfiguration(value: string) {
       machineConfiguration = value;
+    },
+    set applyProbe(value: CommandRunner) {
+      applyProbe = value;
     },
     turn: () =>
       runFleetPatch(
@@ -120,7 +131,12 @@ function runtime(
             ) {
               writes.push(command);
               assert.equal(current.state, "dispatched");
-              machineConfiguration = command.stdin;
+              if (applyProbe) return applyProbe(command);
+              const file = args.find((arg) => arg.startsWith("--file="));
+              machineConfiguration =
+                file && file !== "--file=-"
+                  ? await readFile(file.slice("--file=".length), "utf8")
+                  : command.stdin;
               return { exit_code: 0, stdout: "" };
             }
             if (
@@ -598,7 +614,7 @@ test("the existing callback accepts a bounded status larger than 32 KiB without 
   assert.equal(f.writes.length, 0);
 });
 
-test("checkpoint echoes compare the JSON wire facts when pre-boot image evidence is undefined", async () => {
+function pinnedKubernetesRuntime() {
   const r = runtime(),
     pins = {
       kubelet: `registry.example/kubelet:v1.36.5@sha256:${"1".repeat(64)}`,
@@ -637,6 +653,10 @@ test("checkpoint echoes compare the JSON wire facts when pre-boot image evidence
   ]
     .map((value) => stringify(value))
     .join("---\n");
+  return { r, pins };
+}
+test("checkpoint echoes compare the JSON wire facts when pre-boot image evidence is undefined", async () => {
+  const { r, pins } = pinnedKubernetesRuntime();
   await r.turn();
   assert.equal(r.current.stage, "kubernetes_images");
   assert.equal(r.current.state, "confirmed");
@@ -644,4 +664,83 @@ test("checkpoint echoes compare the JSON wire facts when pre-boot image evidence
   assert.ok(r.writes[0]!.args.includes("apply-config"));
   assert.equal(Object.hasOwn(r.current.observed!, "kubernetes_images"), false);
   assert.deepEqual(r.current.observed!.kubernetes_image_configuration, pins);
+});
+
+test("fleet apply gives the actual pinned native client a private configuration file and retains uncertain outcomes", async () => {
+  const client = process.env.PGCF_TEST_TALOSCTL;
+  assert.ok(
+    client,
+    "PGCF_TEST_TALOSCTL must select the verified native client",
+  );
+  const { r, pins } = pinnedKubernetesRuntime();
+  let appliedFile: string | undefined;
+  let nativeDiagnostic: string | undefined;
+  let observed:
+    | {
+        exit: number | null;
+        signal: NodeJS.Signals | null;
+        error: Error | undefined;
+        configDirectory: string;
+        stdin: string | undefined;
+        mode: number;
+        directoryMode: number;
+        imageReferences: string[];
+      }
+    | undefined;
+  r.applyProbe = async (command) => {
+    const config = command.args[command.args.indexOf("--talosconfig") + 1]!;
+    const invalidConfig = join(dirname(config), "native-test-invalid-config");
+    await writeFile(invalidConfig, "[unclosed\n", { mode: 0o600, flag: "wx" });
+    const args = command.args.map((arg) =>
+      arg === config ? invalidConfig : arg,
+    );
+    const result = spawnSync(client, args, {
+      cwd: dirname(config),
+      input: command.stdin,
+      encoding: "utf8",
+      timeout: 15_000,
+      env: { PATH: process.env.PATH, LANG: "C" },
+    });
+    nativeDiagnostic = result.stderr;
+    const file = args.find((arg) => arg.startsWith("--file="))!;
+    appliedFile = file.slice("--file=".length);
+    observed = {
+      exit: result.status,
+      signal: result.signal,
+      error: result.error,
+      configDirectory: dirname(config),
+      stdin: command.stdin,
+      mode: (await stat(appliedFile)).mode & 0o777,
+      directoryMode: (await stat(dirname(appliedFile))).mode & 0o777,
+      imageReferences: parseAllDocuments(await readFile(appliedFile, "utf8"))
+        .map((doc) => doc.toJSON())
+        .filter((doc) => typeof doc.image === "string")
+        .map((doc) => doc.image),
+    };
+    return { exit_code: result.status ?? 255, stdout: result.stdout };
+  };
+  await r.turn();
+  // Invalid local custody stops the real vendor command before its client or RPC.
+  // Reaching that parser proves the existing apply configuration was read first.
+  assert.match(
+    nativeDiagnostic ?? "",
+    /failed to open config file.*go-yaml load error/,
+  );
+  assert.ok(observed);
+  assert.equal(observed.exit, 1);
+  assert.equal(observed.signal, null);
+  assert.equal(observed.error, undefined);
+  assert.equal(observed.stdin, undefined);
+  assert.equal(observed.mode, 0o600);
+  assert.equal(observed.directoryMode, 0o700);
+  assert.deepEqual(observed.imageReferences, Object.values(pins));
+  assert.equal(r.writes.length, 1);
+  assert.equal(r.current.state, "dispatched");
+  assert.equal(r.current.error_code, null);
+  assert.notDeepEqual(r.current.observed!.kubernetes_image_configuration, pins);
+  assert.ok(appliedFile);
+  assert.equal(dirname(appliedFile), observed.configDirectory);
+  await assert.rejects(stat(appliedFile), { code: "ENOENT" });
+  await r.turn();
+  assert.equal(r.writes.length, 1, "an uncertain outcome never replays apply");
 });

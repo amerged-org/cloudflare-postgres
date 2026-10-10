@@ -7,8 +7,8 @@ cluster-authority rotation passed live; Cloudflare custody revision 2 is active.
 The [corrective plan, §10](docs/architecture/cloudflare-convergence-and-serverless-plan.md#10-execution-order-and-release-gates)
 defines the owner's ordered work packages; its §11 defines the 13 acceptance rows in [Status](#11-status).
 
-The live API is 4fc24d3 after successful main CI (38007839468); D1 remains at 0038.
-The qualified Bootstrap image 4feabe38 is fully mirrored in Cloudflare; no migration was rerun.
+The live API is 71362c8 after successful main CI (38012058196); D1 remains at 0038.
+The qualified Bootstrap image d9c752de is fully mirrored in Cloudflare; no migration was rerun.
 The EU/US database lifecycle, measured RAM trigger and 135-second EU policy transition are valid partial evidence.
 They do not establish uniform releases, unattended purchases, thin storage, key rotation or fast start.
 

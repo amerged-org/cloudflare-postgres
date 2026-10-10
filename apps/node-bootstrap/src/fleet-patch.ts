@@ -268,13 +268,28 @@ export async function runFleetPatch(
         throw new BootstrapError("patch_command_failed");
       return result.stdout;
     };
-    const talosAt = (
+    const talosAt = async (
       args: string[],
       address: string,
       timeout?: number,
       stdin?: string,
-    ) =>
-      command(
+    ) => {
+      let nativeArgs = args;
+      let nativeStdin = stdin;
+      if (
+        args[0] === "apply-config" &&
+        args.includes("--file=-") &&
+        stdin !== undefined
+      ) {
+        // Talos reads a real filename; its apply command has no '-' stdin convention.
+        const configPath = join(directory, "machineconfig-apply.yaml");
+        await writeFile(configPath, stdin, { mode: 0o600, flag: "wx" });
+        nativeArgs = args.map((arg) =>
+          arg === "--file=-" ? `--file=${configPath}` : arg,
+        );
+        nativeStdin = undefined;
+      }
+      return command(
         "talosctl",
         [
           "--talosconfig",
@@ -283,11 +298,12 @@ export async function runFleetPatch(
           address,
           "--endpoints",
           address,
-          ...args,
+          ...nativeArgs,
         ],
         timeout,
-        stdin,
+        nativeStdin,
       );
+    };
     const talos = (args: string[], timeout?: number, stdin?: string) =>
       talosAt(args, input.address, timeout, stdin);
     const hostCommands = {
