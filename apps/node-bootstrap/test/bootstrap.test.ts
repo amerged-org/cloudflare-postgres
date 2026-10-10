@@ -1637,3 +1637,28 @@ test("restart blocks a changed cluster UID before reusing sealed join custody", 
     /cluster_uid_mismatch/,
   );
 });
+
+test("command capture accepts the observed 649643-byte inventory while retaining a finite combined output bound", async () => {
+  const result = await runCommand({
+    executable: process.execPath,
+    args: ["-e", "process.stdout.write(Buffer.alloc(649643, 120))"],
+    signal: AbortSignal.timeout(5000),
+    timeout_ms: 5000,
+    env: {},
+  });
+  assert.equal(result.exit_code, 0);
+  assert.equal(Buffer.byteLength(result.stdout), 649643);
+  await assert.rejects(
+    runCommand({
+      executable: process.execPath,
+      args: [
+        "-e",
+        "process.stdout.write(Buffer.alloc(8388608, 120)); process.stderr.write('x')",
+      ],
+      signal: AbortSignal.timeout(5000),
+      timeout_ms: 5000,
+      env: {},
+    }),
+    /command_output_limit/,
+  );
+});

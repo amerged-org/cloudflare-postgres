@@ -51,7 +51,7 @@ is an additional mode and cannot substitute for that pool. The subsequent Neon c
 
 ## 2. What is proved, what is not
 
-The live API is0cbf616 after successful main CI37998729329; D1 remains at0038. Execution gate1
+The live API isdb130cb after successful main CI38002576199; D1 remains at0038. Execution gate1
 passed live configuration/defaults and retained SQL checks. The fixed node ceilings and personal
 notification setup are removed. US custody revision2 is active after live authority rotation;
 EU rotation remains required before customer data. Measured results are recorded in PLAN.md Status.

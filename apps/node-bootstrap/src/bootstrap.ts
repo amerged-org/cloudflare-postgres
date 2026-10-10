@@ -79,7 +79,7 @@ export function bootstrapStorageDocuments(spec: NodeBootstrapSpec) {
   ];
 }
 const MAX_COMMAND_MS = 540_000;
-const OUTPUT_LIMIT = 512 * 1024;
+const OUTPUT_LIMIT = 8 * 1024 * 1024;
 const RECORD = "\n__PGCF_RECORD__\n";
 const GI = 1024 ** 3;
 const STAGES: NodeBootstrapStage[] = [

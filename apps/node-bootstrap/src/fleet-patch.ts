@@ -187,7 +187,7 @@ export async function runFleetPatch(
       throw new BootstrapError("patch_authority_refused");
     }
     return JSON.parse(
-      await inspectionResponseBody(response, 32_768, bounded),
+      await inspectionResponseBody(response, 128 * 1024, bounded),
     ) as unknown;
   };
   try {

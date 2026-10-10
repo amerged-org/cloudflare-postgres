@@ -555,3 +555,25 @@ test("Flux records a new resource UID while dispatched without replacing prior i
     false,
   );
 });
+
+test("the existing callback accepts a bounded status larger than 32 KiB without changing patch authority", async () => {
+  const f = runtime(),
+    facts = {
+      ...f.fixture.facts,
+      platform_resource_uids: Object.fromEntries(
+        Array.from({ length: 200 }, (_, i) => [
+          `Deployment/flux-system/retained-resource-${i}`,
+          randomUUID(),
+        ]),
+      ),
+    };
+  f.current = { ...f.current, baseline: facts, observed: facts };
+  const bytes = Buffer.byteLength(JSON.stringify(f.current));
+  assert.ok(bytes > 32 * 1024 && bytes < 128 * 1024);
+  const before = f.current.operation_id;
+  await f.turn();
+  assert.equal(f.current.operation_id, before);
+  assert.equal(f.current.stage, "preflight");
+  assert.equal(f.current.state, "confirmed");
+  assert.equal(f.writes.length, 0);
+});

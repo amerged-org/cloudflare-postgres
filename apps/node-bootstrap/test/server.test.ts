@@ -311,3 +311,42 @@ test(
     }
   },
 );
+
+test("patch failures preserve the safe executor code without exposing private exception messages", async () => {
+  const { BootstrapError } = await import("../src/bootstrap.ts");
+  const bearer = randomBytes(32).toString("base64url"),
+    secret = randomBytes(32).toString("base64url");
+  let error: Error = new BootstrapError("command_output_limit");
+  const runtime = createBootstrapServer(bearer, {
+    patch: async () => {
+      throw error;
+    },
+  });
+  runtime.server.listen(0, LOOPBACK);
+  await once(runtime.server, "listening");
+  const address = runtime.server.address();
+  assert.ok(address && typeof address !== "string");
+  const call = () =>
+    fetch(`http://${LOOPBACK}:${address.port}/v1/patches`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${bearer}`,
+        "content-type": "application/json",
+      },
+      body: "{}",
+    });
+  try {
+    const bounded = await call();
+    assert.equal(bounded.status, 400);
+    assert.deepEqual(await bounded.json(), {
+      error_code: "patch_command_output_limit",
+    });
+    error = new Error(secret);
+    const unexpected = await call();
+    assert.deepEqual(await unexpected.json(), {
+      error_code: "patch_request_invalid",
+    });
+  } finally {
+    await runtime.stop();
+  }
+});

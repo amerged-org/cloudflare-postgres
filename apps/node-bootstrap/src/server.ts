@@ -392,6 +392,12 @@ export function createBootstrapServer(
     void handle().catch((error: unknown) => {
       const code =
         error instanceof BootstrapError ? error.code : "request_invalid";
+      const responseCode =
+        request.url === "/v1/patches" &&
+        !code.startsWith("patch_") &&
+        /^[a-z0-9_]{1,80}$/.test(code)
+          ? `patch_${code}`
+          : code;
       if (response.headersSent) {
         response.destroy();
         return;
@@ -406,7 +412,7 @@ export function createBootstrapServer(
               code === "proof_identity_conflict"
             ? 409
             : 400,
-        { error_code: code },
+        { error_code: responseCode },
       );
     });
   });
