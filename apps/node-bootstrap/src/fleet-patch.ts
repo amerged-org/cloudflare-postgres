@@ -402,6 +402,21 @@ export async function runFleetPatch(
       )
         throw new BootstrapError("patch_input_stale");
     };
+    const refreshServingPin = () =>
+      refreshKubeletTrust(
+        { ...input, status: current },
+        {
+          authorize: async () => {
+            await authorize();
+            return current.cluster_uid;
+          },
+          talos: async (args) => ({ exit_code: 0, stdout: await talos(args) }),
+          kube: async (args, _permitFailure, stdin) => ({
+            exit_code: 0,
+            stdout: await kube(args, stdin),
+          }),
+        },
+      );
     const fresh = async (): Promise<FleetPatchFacts> => {
       const observed = await collectFleetPatchRuntime(input, current, {
         kube,
@@ -888,6 +903,7 @@ export async function runFleetPatch(
       target = input.spec.roles[input.role];
     if (current.state === "confirmed") {
       if (input.host_configuration_only && current.stage === "host_service") {
+        await refreshServingPin();
         await checkpoint("runtime_admission", "pending", facts);
         return current;
       }
@@ -949,8 +965,10 @@ export async function runFleetPatch(
             facts.boot_id !== current.observed?.boot_id))
       ) {
         await authorize(true);
-        if (fleetPatchHostServiceObserved(input))
+        if (fleetPatchHostServiceObserved(input)) {
+          await refreshServingPin();
           await checkpoint("host_service", "confirmed", facts);
+        }
       } else if (
         current.state === "pending" &&
         facts.host_configuration_sha256 !==
@@ -1171,20 +1189,7 @@ export async function runFleetPatch(
       facts.node_ready &&
       facts.databases_ready
     ) {
-      await refreshKubeletTrust(
-        { ...input, status: current },
-        {
-          authorize: async () => {
-            await authorize();
-            return current.cluster_uid;
-          },
-          talos: async (args) => ({ exit_code: 0, stdout: await talos(args) }),
-          kube: async (args, _permitFailure, stdin) => ({
-            exit_code: 0,
-            stdout: await kube(args, stdin),
-          }),
-        },
-      );
+      await refreshServingPin();
       await checkpoint("runtime_verified", "confirmed", facts);
     } else if (["flux", "platform", "regional"].includes(current.stage)) {
       if (

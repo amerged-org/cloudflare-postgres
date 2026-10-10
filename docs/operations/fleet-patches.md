@@ -142,6 +142,10 @@ before completion. A lost reboot response is resolved by readback, never blindly
 The reboot interrupts node services and Pods while retaining the OS image, keys and data volumes.
 Full patches use their already planned OS reboot for file activation. The protected host watcher
 accepts only the supported material-only change while retaining storage deadlines and writer fences.
+The host-only completion also refreshes the existing public Kubelet serving-certificate pin through
+authenticated Talos and conditional Kubernetes readback before admission. This does not generate
+keys or relax TLS. A stale pin yields unknown RAM and blocks placement. Completed patch operations
+remain immutable; a diagnosed operator pin recovery uses the same identity-bound helper separately.
 The read-only host-service stage waits for fresh current-revision/profile pool observations; it
 never restarts a controller around active thin writers.
 A confirmed configuration waiting for a kernel module never triggers another identical apply.

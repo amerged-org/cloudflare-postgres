@@ -75,6 +75,9 @@ function runtime(
     set current(value) {
       current = value;
     },
+    get facts() {
+      return facts;
+    },
     set facts(value: FleetPatchFacts) {
       facts = value;
     },
@@ -456,15 +459,7 @@ test("a modified desired spec and off-origin callback are rejected before access
     /patch_endpoint_invalid/,
   );
 });
-test("runtime verification refreshes the current serving pin before acceptance without claiming platform convergence", async () => {
-  const r = runtime();
-  r.current = { ...r.current, stage: "verify", baseline: r.fixture.facts };
-  r.facts = {
-    ...r.fixture.facts,
-    talos_version: "v1.14.1",
-    kubernetes_version: "v1.36.5",
-    kubelet_version: "v1.36.5",
-  };
+async function servingPinFixture(r: ReturnType<typeof runtime>) {
   const directory = await mkdtemp(join(tmpdir(), "pgcf-patch-pin-test-"));
   const certificate = join(directory, "public.fixture.pem");
   try {
@@ -495,7 +490,8 @@ test("runtime verification refreshes the current serving pin before acceptance w
     r.fixture.input.initial_bootstrap_input_sha256 =
       digest("initial-bootstrap");
     const namespaceUid = randomUUID();
-    let pinWrites = 0;
+    let pinWrites = 0,
+      replacementStage = r.current.stage;
     let map = {
       apiVersion: "v1",
       kind: "ConfigMap",
@@ -526,6 +522,11 @@ test("runtime verification refreshes the current serving pin before acceptance w
     r.kubeProbe = (command) => {
       const args = command.args;
       if (args.includes("replace")) {
+        assert.equal(
+          r.current.stage,
+          replacementStage,
+          "the pin refresh precedes stage acceptance",
+        );
         pinWrites++;
         const updated = JSON.parse(command.stdin!) as typeof map;
         assert.equal(updated.metadata.uid, map.metadata.uid);
@@ -576,8 +577,8 @@ test("runtime verification refreshes the current serving pin before acceptance w
             },
             status: {
               nodeInfo: {
-                systemUUID: r.fixture.facts.system_uuid,
-                bootID: r.fixture.facts.boot_id,
+                systemUUID: r.facts.system_uuid,
+                bootID: r.facts.boot_id,
                 kubeletVersion: "v1.36.5",
               },
               addresses: [
@@ -589,13 +590,62 @@ test("runtime verification refreshes the current serving pin before acceptance w
         });
       return undefined;
     };
+    return {
+      writes: () => pinWrites,
+      current: () => map,
+      pem,
+      retire: () => {
+        replacementStage = r.current.stage;
+        map.data.certificate_pem = "retired-public-fixture";
+        map.data.certificate_sha256 = digest(map.data.certificate_pem);
+      },
+      close: () => rm(directory, { recursive: true, force: true }),
+    };
+  } catch (error) {
+    await rm(directory, { recursive: true, force: true });
+    throw error;
+  }
+}
+test("runtime verification and a host-only confirmed successor refresh the serving pin before acceptance", async () => {
+  const r = runtime();
+  r.current = { ...r.current, stage: "verify", baseline: r.fixture.facts };
+  const facts = {
+    ...r.fixture.facts,
+    talos_version: "v1.14.1",
+    kubernetes_version: "v1.36.5",
+    kubelet_version: "v1.36.5",
+  };
+  r.facts = facts;
+  const pin = await servingPinFixture(r);
+  try {
     await r.turn();
     assert.equal(r.current.stage, "runtime_verified");
     assert.equal(r.writes.length, 0);
-    assert.equal(pinWrites, 1);
-    assert.equal(map.data.certificate_pem, pem);
+    assert.equal(pin.writes(), 1);
+    assert.equal(pin.current().data.certificate_pem, pin.pem);
+
+    const boot = randomUUID();
+    r.fixture.input.host_configuration_only = true;
+    r.facts = { ...facts, boot_id: boot };
+    r.current = {
+      ...r.current,
+      stage: "host_service",
+      state: "confirmed",
+      observed: { ...facts, boot_id: boot },
+    };
+    pin.retire();
+    await r.turn();
+    assert.equal(
+      pin.writes(),
+      2,
+      "a host-only successor cannot bypass the current serving pin",
+    );
+    assert.equal(pin.current().data.certificate_pem, pin.pem);
+    assert.equal(r.current.stage, "runtime_admission");
+    assert.equal(r.current.state, "pending");
+    assert.equal(r.writes.length, 0);
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    await pin.close();
   }
 });
 test("cluster upgrade confirmation rejects a second member that still runs the old kubelet", () => {
@@ -809,10 +859,16 @@ test("a current-custody host-only finalization skips every OS and Kubernetes wri
     state: "confirmed",
     baseline: r.fixture.facts,
   };
-  await r.turn();
-  assert.equal(r.current.stage, "runtime_admission");
-  assert.equal(r.current.state, "pending");
-  assert.equal(r.writes.length, 0);
+  const pin = await servingPinFixture(r);
+  try {
+    await r.turn();
+    assert.equal(r.current.stage, "runtime_admission");
+    assert.equal(r.current.state, "pending");
+    assert.equal(r.writes.length, 0);
+    assert.equal(pin.writes(), 1);
+  } finally {
+    await pin.close();
+  }
 });
 
 test("host-only file activation dispatches one normal reboot and resolves an unknown result without repeating it", async () => {
@@ -937,10 +993,16 @@ test("host-only file activation dispatches one normal reboot and resolves an unk
       sandbox_service_running: true,
     },
   };
-  await r.turn();
-  assert.equal(r.current.stage, "runtime_admission");
-  assert.equal(r.current.state, "pending");
-  assert.equal(r.writes.length, 1);
+  const pin = await servingPinFixture(r);
+  try {
+    await r.turn();
+    assert.equal(r.current.stage, "runtime_admission");
+    assert.equal(r.current.state, "pending");
+    assert.equal(r.writes.length, 1);
+    assert.equal(pin.writes(), 1);
+  } finally {
+    await pin.close();
+  }
 });
 
 test("Flux records a new resource UID while dispatched without replacing prior identity", () => {
