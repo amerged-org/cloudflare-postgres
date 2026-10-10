@@ -102,6 +102,12 @@ tooling, separate from the product runtime.
 
 ## Native Rust runtime primitive
 
+**Installer publication tooling:** CI uses [Skopeo1.13.3](https://github.com/containers/skopeo/tree/v1.13.3),
+licensed [Apache-2.0](https://github.com/containers/skopeo/blob/v1.13.3/LICENSE), through the Ubuntu
+`1.13.3+ds1-2ubuntu0.24.04.3` package pinned in the installer-publication step. It transfers inspected
+OCI bytes with `--preserve-digests`; it is neither included in a PGCF runtime image nor installed on
+database nodes. Ubuntu's package dependencies retain their own licenses and notices.
+
 The first-party prepared namespace holder is Apache-2.0. Its only direct crate dependency is
 [libc0.2.190](https://crates.io/crates/libc/0.2.190), licensed `MIT OR Apache-2.0`; Cargo.lock binds
 archive checksum `ce5d3ddc6d3fa000eb1536d85e147bfe31aacaba692ed6a876f95cb7c855be78`.

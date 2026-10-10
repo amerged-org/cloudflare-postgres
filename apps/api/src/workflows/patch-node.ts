@@ -17,6 +17,8 @@ import {
   refreshFleetPatchRegionStorage,
 } from "../domain/fleet-patches.ts";
 
+import { continueFleetRolloutForRegion } from "../domain/fleet-rollouts.ts";
+
 export class PatchNode extends WorkflowEntrypoint<
   Env,
   { operation_id: string }
@@ -33,6 +35,11 @@ export class PatchNode extends WorkflowEntrypoint<
           `patch-next-host-${cycle}`,
           { retries: { limit: 2, delay: "15 seconds" }, timeout: "60 seconds" },
           () => continueFleetPatchRegion(this.env, id),
+        );
+        await step.do(
+          `patch-fleet-next-host-${cycle}`,
+          { retries: { limit: 2, delay: "15 seconds" }, timeout: "60 seconds" },
+          () => continueFleetRolloutForRegion(this.env, row.region_id),
         );
         return {
           operation_id: id,
@@ -117,6 +124,11 @@ export class PatchNode extends WorkflowEntrypoint<
           await step.sleep(`patch-storage-readback-${cycle}`, "15 seconds");
           continue;
         }
+        await step.do(
+          `patch-fleet-next-region-${cycle}`,
+          { retries: { limit: 2, delay: "15 seconds" }, timeout: "60 seconds" },
+          () => continueFleetRolloutForRegion(this.env, row.region_id),
+        );
         return {
           operation_id: id,
           stage: row.stage,

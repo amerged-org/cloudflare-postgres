@@ -18,6 +18,7 @@ COPY apps/regional/tsconfig.json apps/regional/tsconfig.json
 COPY apps/regional/src apps/regional/src
 COPY infra/platform/versions.lock.json infra/platform/versions.lock.json
 COPY infra/platform/openebs-image.ts infra/platform/openebs-image.ts
+COPY infra/platform/image-manifest.ts infra/platform/image-manifest.ts
 RUN pnpm --filter @pgcf/regional build \
  && test -f apps/regional/dist/agent/main.mjs && test -f apps/regional/dist/gateway/main.mjs && test -f apps/regional/dist/bootstrap-relay-main.mjs \
  && mkdir -p /licenses/zod \

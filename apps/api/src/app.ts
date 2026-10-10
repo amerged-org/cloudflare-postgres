@@ -13,6 +13,10 @@ import { registerCosts } from "./routes/costs.ts";
 import { registerOperationalHealth } from "./routes/health.ts";
 import { registerRegionConfiguration } from "./routes/region-configuration.ts";
 import { registerFleetReleases } from "./routes/fleet-releases.ts";
+import { registerFleetImages } from "./routes/fleet-images.ts";
+import { registerFleetRollouts } from "./routes/fleet-rollouts.ts";
+import { registerFleetRegionAuthority } from "./routes/fleet-region-authority.ts";
+import { authorizeFleetRegionRotation } from "./domain/fleet-region-authority.ts";
 import { registerFleetPatches } from "./routes/fleet-patches.ts";
 import { registerFleetUpdates } from "./routes/fleet-updates.ts";
 import { registerResourceProfiles } from "./routes/resource-profiles.ts";
@@ -85,6 +89,8 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/regions/:id/release",
   "/v1/nodes/:id/release",
   "/v1/nodes/:id/patches",
+  "/v1/fleet/rollouts",
+  "/v1/fleet/rollouts/:id",
   "/v1/fleet/patches/:operation_id",
   "/v1/fleet/patches/:operation_id/resume",
   "/internal/v1/fleet-patches/:operation_id",
@@ -326,7 +332,19 @@ export function createApp(): ApiApp {
       /^\/agent\/v1\/nodes\/(nod_[a-z0-9]{20})\/reclaim-observations$/.exec(
         path,
       );
-    if (reclaim && c.req.method === "POST") {
+    const authorityRotation =
+      /^\/internal\/v1\/fleet-rollouts\/(op_[a-z0-9]{20})\/regions\/([a-z0-9][a-z0-9_-]{0,63})\/rotation$/.exec(
+        path,
+      );
+    if (authorityRotation && c.req.method === "POST") {
+      await authorizeFleetRegionRotation(
+        c.env,
+        authorityRotation[1]!,
+        authorityRotation[2]!,
+        c.req.header("authorization") ?? null,
+      );
+      maximum = 512 * 1024;
+    } else if (reclaim && c.req.method === "POST") {
       await authenticateReclaimRequest(c, reclaim[1]!);
       maximum = RECLAIM_LIMITS.max_envelope_bytes;
     } else if (thinStorage && c.req.method === "POST") {
@@ -407,7 +425,10 @@ export function createApp(): ApiApp {
   registerOperationalHealth(app);
   registerRegionConfiguration(app);
   registerFleetReleases(app);
+  registerFleetImages(app);
   registerFleetPatches(app);
+  registerFleetRollouts(app);
+  registerFleetRegionAuthority(app);
   registerFleetUpdates(app);
   registerResourceProfiles(app);
   registerRegionArchiveSources(app);

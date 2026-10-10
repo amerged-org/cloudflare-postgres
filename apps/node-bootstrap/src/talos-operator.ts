@@ -19,6 +19,7 @@ import {
 import { parse } from "yaml";
 import { startCapabilityProxy } from "./proxy-command.ts";
 import { nativeTalosConfig, nativeKubeconfig } from "./bootstrap.ts";
+import { normalizeRuntimeImageManifest } from "../../../infra/platform/image-manifest.ts";
 
 const operatorRequire = createOperatorRequire(import.meta.url);
 const { WebSocket, createWebSocketStream } = operatorRequire(
@@ -62,7 +63,12 @@ interface KubernetesResource {
     conditions?: { type?: string; status?: string }[];
     addresses?: { type?: string; address?: string }[];
     phase?: string;
-    nodeInfo: { systemUUID: string; bootID: string };
+    nodeInfo: {
+      systemUUID: string;
+      bootID: string;
+      architecture?: string;
+      operatingSystem?: string;
+    };
     containerStatuses?: {
       name?: string;
       ready?: boolean;
@@ -218,8 +224,82 @@ export function selectCiliumPod(
     uid: pod.metadata.uid,
     ownerUid: daemonSet.metadata.uid,
     image: expectedImage,
-    imageID: expectedImageID,
+    imageID: pod.status.containerStatuses!.find(
+      (v) => v.name === "cilium-agent",
+    )!.imageID!,
   };
+}
+
+export async function selectVerifiedCiliumPod(
+  pods: unknown,
+  daemonSet: unknown,
+  node: ReturnType<typeof verifyNode>,
+  expectedImage: string,
+  expectedImageID: string,
+  options: {
+    architecture: string;
+    operatingSystem: string;
+    request?: typeof fetch;
+    signal?: AbortSignal;
+  },
+) {
+  must(
+    options.architecture === "amd64" && options.operatingSystem === "linux",
+    "operator_cilium_architecture_mismatch",
+  );
+  const template = (daemonSet as KubernetesResource)?.spec?.template?.spec,
+    actualImage = template?.containers?.find(
+      (v) => v.name === "cilium-agent",
+    )?.image,
+    expectedDigest = imageDigest(expectedImage),
+    actualDigest = imageDigest(actualImage),
+    runtimeDigest = imageDigest(expectedImageID),
+    repository = (value: string) => {
+      const raw = value.split("@")[0]!,
+        colon = raw.lastIndexOf(":"),
+        slash = raw.lastIndexOf("/");
+      return colon > slash ? raw.slice(0, colon) : raw;
+    };
+  must(
+    expectedDigest &&
+      actualImage &&
+      actualDigest &&
+      runtimeDigest &&
+      repository(actualImage) === repository(expectedImage) &&
+      repository(expectedImageID) === repository(expectedImage),
+    "operator_cilium_image_identity_mismatch",
+  );
+  const [configured, runtime] = await Promise.all([
+    normalizeRuntimeImageManifest(
+      expectedImage,
+      expectedDigest,
+      actualDigest,
+      options,
+    ),
+    normalizeRuntimeImageManifest(
+      expectedImage,
+      expectedDigest,
+      runtimeDigest,
+      options,
+    ),
+  ]);
+  must(
+    configured === expectedDigest && runtime === expectedDigest,
+    "operator_cilium_image_manifest_mismatch",
+  );
+  // Semantic authorization does not rewrite the captured Pod, template or runtime identity.
+  const selected = selectCiliumPod(
+    pods,
+    daemonSet,
+    node,
+    actualImage,
+    expectedImageID,
+  );
+  must(
+    repository(selected.imageID) === repository(expectedImage),
+    "operator_cilium_image_identity_mismatch",
+  );
+  return selected;
 }
 
 export function assertSameCarrier(before: unknown, after: unknown) {
@@ -550,12 +630,20 @@ export async function openTalosOperator(options: TalosOperatorOptions) {
         );
       return {
         physical,
-        pod: selectCiliumPod(
+        pod: await selectVerifiedCiliumPod(
           pods,
           daemon,
           physical,
           options.ciliumImage,
           options.ciliumImageID,
+          {
+            architecture:
+              (node as KubernetesResource).status.nodeInfo.architecture ?? "",
+            operatingSystem:
+              (node as KubernetesResource).status.nodeInfo.operatingSystem ??
+              "",
+            signal: abort.signal,
+          },
         ),
       };
     };

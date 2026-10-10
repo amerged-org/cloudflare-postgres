@@ -1,10 +1,11 @@
 # Sandbox extension and public recipe
 
-Release R1 uses official Talos1.14.2 from Image Factory, Kubernetes1.36.5 and the pinned
-platform through supported in-place upgrades. The current CI gate produces first-party
-artifacts without building, booting or publishing a custom installer or raw OS image.
-R2 adds the sandbox extension through a separately accepted Talos upgrade with controlled
-interruption and resume. These source artifacts do not establish either live release gate.
+The [ULTRA plan](../../../docs/architecture/cloudflare-convergence-and-serverless-plan.md)
+defines golden R1: Talos1.14.2, the sandbox extension, thin-pool module and base kernel arguments,
+with Kubernetes1.36.5/platform/PGCF pins in its release manifest. Reuse the composed installer;
+build the matching raw image and publish both immutable artifacts. Runtime/pool integration
+ships as R2 through the same automatic fleet patch workflow. Built artifacts alone do not prove
+live fleet or pool acceptance.
 
 Use immutable digest and signature/SBOM verification for upstream Talos and other upstream
 images. Secret scanning covers our extension, public recipe and binaries. The upstream
@@ -45,7 +46,7 @@ qualification report from the same source revision. Its complete execution is:
 
 The recipe hash describes PGCF's canonical public recipe. Its projected `schematic` metadata
 uses the `PGCF imager` flavor; it does not assert that Image Factory hosts that recipe hash.
-`images.ts` and `build-plan.ts bind` retain the pure recipe/profile construction used by R2.
+`images.ts` and `build-plan.ts bind` retain the pure recipe/profile construction used by golden releases.
 They select the Talos version and immutable imager/base-installer references from
 `infra/platform/versions.lock.json` and keep private machine configuration outside the recipe.
 Generating these profiles does not run the imager or qualify an OS image.
@@ -57,17 +58,49 @@ run `scripts/operations/publish-talos-installer.mjs`, verify the exact source CI
 identity and registry layers, and retain the publication receipt. It neither rebuilds native
 images nor deploys a node. The default empty variable performs no publication; clear the variable
 after delivery. An existing matching immutable tag is verified without another push.
+The installer transfer uses Skopeo `--preserve-digests` directly from the inspected OCI archive;
+it never loads the archive into Docker, which may recompress layers. Publication uses a separate
+`-oci` tag and preserves the original manifest, config and compressed layers. A failure retains
+its safe stage in `failure.json`; scoped registry credentials are removed and never uploaded.
 
-## R2 transport and retained-node requirements
+## Cloudflare image distribution
+
+The existing management Worker serves approved release images from the existing EU R2 archive
+bucket. Installer references use `<api-host>/pgcf-talos-installer@sha256:<manifest-hash>`;
+the matching disk image uses `https://<api-host>/fleet-images/v1/raw/sha256:<compressed-hash>`.
+Only original manifest/config/layer bytes and the matching raw artifact belong under
+`fleet-images/v1/sha256/<hash>`. Configuration, credentials and tenant backups are excluded.
+
+`node scripts/operations/publish-fleet-images.mjs stage <artifact-qualification.json>
+<installer-amd64.transport.tar> <nocloud-amd64.raw.xz> <new-directory> <api-origin>` checks
+source/recipe qualification and original archive/raw hashes, extracts the original OCI objects
+into a protected directory and writes `objects.json`. Staging performs no remote writes.
+`upload <objects.json> <existing-bucket> <r2-endpoint> <region> <new-receipt>` verifies the source
+CI producer and uses the installed AWS CLI with `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`;
+`GITHUB_REPOSITORY` selects the source repository. Supply these credentials privately.
+The uploader performs conditional immutable PUTs, disables SDK retries and resolves uncertain
+outcomes with HEAD and complete SHA-256 readback. Conflicting objects stop publication;
+shared blobs retain their first owning-manifest metadata. It creates no bucket or server.
+
+Approve the manifest/raw references in the fleet release before anonymous HTTP readback.
+Use `verifyPublicFleetImages` from `scripts/operations/publish-fleet-images.mjs` to fetch only
+same-origin digest paths without registry credentials or redirects. It materializes the original
+OCI archive, reuses the installer transport verifier, checks actual gzip diffIDs, and verifies
+the raw response length and compressed SHA-256. The shared runtime registry qualifier remains
+unchanged. R2 upload success alone is not public
+readback or live-node acceptance. Both artifacts share one recipe; per-node boot networking and
+sealed machine configuration are supplied outside the immutable image.
+
+## Golden-image transport and retained-node requirements
 
 `publish-artifacts.ts` retains the content-addressed transport and publication identity
-checks for separately qualified R2 artifacts. It verifies config identity, upstream Talos
+checks for qualified release artifacts. It verifies config identity, upstream Talos
 labels, diffIDs and compressed layers; a qualified report must bind the exact source, recipe
 and raw artifact. It cannot create that qualification. The opt-in CI step publishes an already
 assembled installer; raw-image publication remains separate. Publication-state receipts resolve an uncertain remote write
 through exact tag/asset reads before another mutation is considered.
 
-The R2 upgrade must establish actual Talos/kernel/containerd/runc versions, loaded extension
+The golden-image upgrade must establish actual Talos/kernel/containerd/runc versions, loaded extension
 and recipe identity, first-party binary hashes and working CRI. A host service waiting for
 protected files is not a ready pool. Database readiness and authenticated SQL remain separate
 live acceptance gates.

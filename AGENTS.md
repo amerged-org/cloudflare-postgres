@@ -1,13 +1,13 @@
 # cloudflare-postgres
 Open-source, Neon-style serverless PostgreSQL: Cloudflare control plane, real PostgreSQL on Contabo VPS.
-Read PLAN.md first; it is the canonical scope, architecture, phases and status.
+Read PLAN.md first; it links to the canonical ULTRA scope, delivery architecture and Done/Open status.
 Cloudflare is the control plane: Workers, D1, Durable Objects, Workflows, R2, Secrets, Containers.
 Only PostgreSQL data lives on VPS; regional components execute desired state and report observations.
 All database traffic enters through Cloudflare (edge Worker, Tunnel); VPS expose no PostgreSQL port.
 Run unmodified PostgreSQL with CloudNativePG on Talos Linux and Kubernetes with local LVM volumes.
 Back up every database to R2 with Barman Cloud: base backups, WAL archiving, point-in-time recovery.
 Databases sleep when idle and wake on connect; never lose committed data or replay uncertain writes.
-Cloudflare places databases, tracks capacity and adds Contabo VPS through their API within spend caps.
+Cloudflare places databases, tracks capacity and adds Contabo VPS through their API under the operator-configured purchase policy.
 Report usage and infrastructure cost as metrics; prices, credits and wallets belong to integrators.
 No budget enforcement, compute autoscaling or branching in v1; integrators call suspend and resume.
 Keep APIs and defaults generic; adopter adapters live in adopter repositories (e.g. ohmyho.st).
@@ -17,7 +17,7 @@ Delete unused code, files and branches; no parked, held or frozen work. Git hist
 No mocks, stubs or hardcoded data in product code; acceptance only from real Dev systems.
 Test the logic you write; write the failing test first for bug fixes; no test matrices; one CI workflow.
 At native CLI boundaries, materialize filename-flag payloads as real 0600 files in 0700 temporary directories and clean them up; never reopen stdin through /dev/stdin or /proc/self/fd, or assume Talos accepts --file=-. Preserve explicitly supported kubectl --filename=- direct-stream input. Never log payload contents.
-Record phase results and measured numbers in PLAN.md Status; no per-change evidence documents.
+Record completed steps and measured numbers in the ULTRA plan linked by PLAN.md; no per-change evidence documents.
 Repository documentation is written in English; discussion with the owner may be in German.
 Docs live in PLAN.md, README.md, THIRD_PARTY.md, infra READMEs, docs/operations runbooks and docs/architecture proposals.
 Approved runtime target: native Rust for the regional gateway, controller, bootstrap relay and node reclaimer; Rust/Wasm for the Edge Worker.

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { readSelectedNodeGoldenImage } from "../../src/domain/node-golden-image.ts";
 import { env } from "cloudflare:workers";
 import {
   joinBundleReference,
@@ -42,10 +43,29 @@ async function setup(worker = false) {
   return f;
 }
 describe("provider-bound bootstrap composition", () => {
-  it("seals the selected common postjoin release while retaining the original Factory installation image", async () => {
+  it("seals the selected common initial disk and postjoin release under the same immutable region target", async () => {
     const f = await setup(true),
       id = f.addition.intent.operation_id,
-      selected = await standingPostjoinFixture(f.fixture.region);
+      selected = await standingPostjoinFixture(
+        f.fixture.region,
+        undefined,
+        undefined,
+        {
+          url: `https://artifacts.example/raw/${f.inspection.image.compressed_sha256}`,
+          sha256: f.inspection.image.compressed_sha256,
+          format: "raw.xz",
+          bytes: f.inspection.image.compressed_bytes,
+          raw_sha256: f.inspection.image.raw_sha256,
+          raw_bytes: f.inspection.image.raw_bytes,
+        },
+      );
+    const golden = (await readSelectedNodeGoldenImage(env, f.fixture.region))!;
+    f.inspection.image = {
+      ...f.inspection.image,
+      schematic_id: golden.schematic_id,
+      installer_digest: golden.installer.split("@").at(-1)!,
+      golden_image: golden,
+    };
     releases.push(selected.id);
     const expected = (await readNodePostjoinRelease(env, f.fixture.region))
       .reference;

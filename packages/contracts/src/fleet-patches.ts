@@ -7,6 +7,7 @@ import {
 } from "./compute-pool.ts";
 import { LegacyStorageBindings } from "./storage-write-authority.ts";
 import { NodeHostConfigurationPrivate } from "./node-host-configuration.ts";
+import { FleetRegionMaterialRotationInput } from "./region-material-rotation.ts";
 import {
   FleetReleaseId,
   FleetReleaseSpec,
@@ -199,6 +200,7 @@ export const FleetPatchInput = z.strictObject({
     .string()
     .min(1)
     .max(256 * 1024),
+  authority_rotation: FleetRegionMaterialRotationInput.optional(),
   storage_authority: z
     .strictObject({
       keys: z.record(z.string(), z.string().regex(/^[A-Za-z0-9_-]{43}$/)),
@@ -354,6 +356,28 @@ export function retainedTalosInstallationMatches(
     version(facts.talos_version) === version(role.talos_version) &&
     retained.talos_schematic_sha256 === facts.talos_schematic_sha256 &&
     facts.talos_schematic_sha256 === role.talos_schematic_sha256
+  );
+}
+export function fleetPatchTalosRebootObserved(
+  input: FleetPatchInput,
+  facts: FleetPatchFacts,
+): boolean {
+  const target = input.spec.roles[input.role],
+    receipt = input.status.talos_upgrade_receipt,
+    authority = input.authority_rotation?.checkpoint;
+  return (
+    fleetPatchRuntimeMatches(input, facts).talos &&
+    !!receipt &&
+    facts.boot_id !==
+      (target.kubernetes_images
+        ? facts.kubernetes_configuration_boot_id
+        : receipt.pre_reboot_boot_id) &&
+    fleetPatchKubernetesImagesMatch(input, facts) &&
+    (!authority ||
+      (authority.phase === "etcd-ca" &&
+        authority.state === "confirmed" &&
+        !!authority.prior_boot_id &&
+        facts.boot_id !== authority.prior_boot_id))
   );
 }
 export function fleetPatchKubernetesConfigurationMatches(
@@ -583,15 +607,7 @@ export function fleetPatchCheckpointAllowed(
       );
     }
     if (current.stage === "talos_reboot")
-      return (
-        !!current.talos_upgrade_receipt &&
-        matches.talos &&
-        facts.boot_id !==
-          (input.spec.roles[input.role].kubernetes_images
-            ? facts.kubernetes_configuration_boot_id
-            : current.talos_upgrade_receipt.pre_reboot_boot_id) &&
-        fleetPatchKubernetesImagesMatch(input, facts)
-      );
+      return fleetPatchTalosRebootObserved(input, facts);
     if (current.stage === "kubernetes_images")
       return (
         supportedFleetPatchVersion(

@@ -1,5 +1,9 @@
 # Retained-node fleet patches
 
+These per-node endpoints are existing building blocks. The one-request fleet coordinator is
+implemented; its live acceptance remains open in the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md#open).
+Manual orchestration of these endpoints does not establish automatic fleet acceptance.
+
 The management API provides an assignment-bound `PatchNode` Workflow and a separate Native
 container identity. A terminal admitted AddNode job stays terminal. Patches use authenticated
 Talos/Kubernetes transport without Contabo, Rescue, disk reinstallation or SSH.
@@ -149,7 +153,7 @@ write cannot infer it from an unchanged boot/version or missing response.
 Before delivery, run the same read-only parsers against the actual retained fleet and collect all
 deviations together. Deliver the API/Native changes with `PATCH_NODE` configured, then prove the
 canary and interruption/recovery through this path. Record actual elapsed time, provider calls,
-versions and release digests in `PLAN.md` Status. SQL/TLS/roles, R2 base/WAL backup, restore and
+versions and release digests in the ULTRA plan. SQL/TLS/roles, R2 base/WAL backup, restore and
 physical deletion acceptance remain live gates. A source/unit-test pass is not live acceptance.
 
 Cloudflare policy configuration, the administrator candidate catalog and bounded official-feed
@@ -159,3 +163,49 @@ patches or fabricate CI/canary receipts. The actual CI qualification channel, fu
 promotion, security-alert integration, exposed-key rotation and complete Dev fleet acceptance
 remain open. These source APIs are not automatic patch completion. Advance regions only after the
 canary's required gates pass, including an actual thin-database material-revision transition.
+
+## One-request fleet convergence
+
+After approving the immutable release, send `POST /v1/fleet/rollouts` with an administrator
+credential and an `Idempotency-Key`. The request contains `release_id`,
+`maintenance_acknowledged: true`, and an ordered `regions` array. Each region specifies
+`region_id`, the current release-assignment `expected_revision`, `cluster_uid`, current
+`material_revision`, and every live physical member in the desired maintenance order.
+Each member specifies `node_id`, `node_uid`, current node-assignment `expected_revision`,
+`role`, and its management IPv4 `address`. Read revisions from the existing region/node
+release endpoints; a missing assignment has revision zero. Select US first, then the EU
+customer member before the EU control/relay member. Required Kubernetes control-plane
+updates remain part of the existing PatchNode dependency handling.
+
+For a release that requires protected host configuration, each member must already have
+its release-pinned compute policy, or include `compute_pool: { expected_revision, policy }`
+in this request. The policy uses the existing compute-pool schema and exact approved
+sandbox-controller image. Assignment and policy selection commit atomically; PatchNode
+creates protected host files from current encrypted custody. A prepared authority
+replacement is selected with the region's `staged_material_revision` (current + 1).
+Staging alone does not authorize live key activation: the fleet waits for the programmed
+rotation and its verified custody handoff.
+
+The response is `202` with `rollout_id`, member release observations and existing patch
+states. Read `GET /v1/fleet/rollouts/{rollout_id}` for progress. Region desired assignments
+hold this ordering metadata; `fleet_patch_operations` remains the sole mutation journal.
+Terminal PatchNode turns and the existing Cron continue untouched hosts and later regions.
+The next region waits for predecessor convergence and regional finalization. A current
+component is skipped; an interrupted patch resumes its original operation and dispatch
+state. A halted write or changed Node/Cluster UID remains blocked. Repeating the original
+request with the same idempotency key reads and resumes its committed intent rather than
+creating another patch. This endpoint does not purchase a server or reinstall a node.
+
+Example with a reviewed JSON request saved locally:
+
+```sh
+curl --fail-with-body --request POST "$PGCF_API_URL/v1/fleet/rollouts" \
+  --header "Authorization: Bearer $PGCF_ADMIN_KEY" \
+  --header "Content-Type: application/json" \
+  --header "Idempotency-Key: $PGCF_ROLLOUT_KEY" \
+  --data-binary @fleet-rollout.json
+```
+
+The API's `complete` state proves current software convergence. Customer readiness also
+requires the six live node checks in the ULTRA plan; an assignment or unit-test result does
+not replace SQL, archive and physical deletion acceptance.

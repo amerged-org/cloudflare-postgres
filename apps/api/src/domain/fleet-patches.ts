@@ -31,6 +31,10 @@ import {
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { requireScope, bearer } from "../middleware/auth.ts";
+import {
+  effectiveFleetRegionJoin,
+  fleetPatchPreparedAuthority,
+} from "./fleet-region-authority.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import {
   loadCurrentRegionMaterialReference,
@@ -111,6 +115,12 @@ export async function readFleetPatch(env: Env, id: string) {
     .first<PatchRow>();
   if (!row) throw new ApiError("not_found", "Fleet patch not found");
   return row;
+}
+export async function readFleetPatchStatus(
+  env: Env,
+  id: string,
+): Promise<FleetPatchStatus> {
+  return status(await readFleetPatch(env, id));
 }
 const baseFleetPatchAuthoritySql = `EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id
   JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id
@@ -282,7 +292,12 @@ export async function fleetPatchInput(
     "join_bundle",
   );
   if (ref.revision !== row.material_revision) return closed();
-  const bundle = await loadRegionJoinBundle(env.DB, env.CREDENTIAL_KEYS, ref);
+  const bundle = await effectiveFleetRegionJoin(
+    env,
+    row.region_id,
+    ref.revision,
+    await loadRegionJoinBundle(env.DB, env.CREDENTIAL_KEYS, ref),
+  );
   if (bundle.kube_system_uid !== row.cluster_uid) return closed();
   const spec = FleetReleaseSpec.parse(JSON.parse(selected.spec_json));
   const storageAuthority = spec.storage_authority_keys_sha256
@@ -410,6 +425,9 @@ export async function fleetPatchInput(
       ? { initial_bootstrap_input_sha256: bootstrapOwner.input_hash }
       : {}),
     ...(retainedTalos ? { retained_talos_installation: retainedTalos } : {}),
+    ...(await fleetPatchPreparedAuthority(env, row.region_id, row.node_id).then(
+      (value) => (value ? { authority_rotation: value } : {}),
+    )),
     callback: { url: url.href, bearer: await patchBearer(env, row) },
   });
 }
@@ -524,6 +542,59 @@ async function regionalFleetHostsReady(
   }
   return true;
 }
+/** A completed programmed rotation may refresh immutable pre-activation host receipts without another OS write. */
+async function verifiedRotationHostRefresh(
+  env: Env,
+  row: PatchRow,
+  currentMaterial: number,
+): Promise<boolean> {
+  const state = await env.DB.prepare(
+    "SELECT f.rollout_json,r.bootstrap_material_revision,r.bootstrap_material_provenance_sha256 FROM fleet_region_releases f JOIN regions r ON r.id=f.region_id WHERE f.region_id=?",
+  )
+    .bind(row.region_id)
+    .first<{
+      rollout_json: string | null;
+      bootstrap_material_revision: number;
+      bootstrap_material_provenance_sha256: string | null;
+    }>();
+  if (!state?.rollout_json) return false;
+  const { FleetRolloutIntent } = await import("@pgcf/contracts/fleet-rollouts");
+  const parsed = FleetRolloutIntent.safeParse(JSON.parse(state.rollout_json));
+  if (!parsed.success) return false;
+  const intent = parsed.data,
+    region = intent.regions.find(
+      (region) => region.region_id === row.region_id,
+    ),
+    node = region?.nodes.find((node) => node.node_id === row.node_id),
+    proof = region?.rotation?.verified;
+  if (
+    !region ||
+    !node ||
+    !proof ||
+    proof.source !== "trusted_native" ||
+    intent.release_id !== row.release_id ||
+    region.revision !== row.region_revision ||
+    region.cluster_uid !== row.cluster_uid ||
+    region.material_revision !== row.material_revision ||
+    region.staged_material_revision !== currentMaterial ||
+    region.current_material_revision !== currentMaterial ||
+    state.bootstrap_material_revision !== currentMaterial ||
+    region.rotation?.phase !== "complete" ||
+    region.rotation.state !== "confirmed" ||
+    node.node_uid !== row.node_uid ||
+    node.assignment_revision !== row.assignment_revision ||
+    (await installationHash(proof)) !==
+      state.bootstrap_material_provenance_sha256
+  )
+    return false;
+  const { fleetRolloutAuthoritySql } = await import("./fleet-rollouts.ts"),
+    authority = fleetRolloutAuthoritySql(intent);
+  return Boolean(
+    await env.DB.prepare(`SELECT 1 valid WHERE ${authority.sql}`)
+      .bind(...authority.bindings)
+      .first(),
+  );
+}
 /** A host_ready operation remains immutable. Its one finalization reloads current custody and revalidates identities. */
 export async function ensureFleetPatchFinalization(
   env: Env,
@@ -542,6 +613,18 @@ export async function ensureFleetPatchFinalization(
     .bind(hostOperationId)
     .first<PatchRow>();
   if (existing) {
+    const currentMaterial = await env.DB.prepare(
+      "SELECT bootstrap_material_revision revision FROM regions WHERE id=?",
+    )
+      .bind(source.region_id)
+      .first<{ revision: number }>();
+    if (
+      existing.stage === "host_ready" ||
+      (existing.stage === "complete" &&
+        currentMaterial &&
+        existing.material_revision < currentMaterial.revision)
+    )
+      return ensureFleetPatchFinalization(env, existing.operation_id);
     if (existing.stage !== "complete") {
       await assertFleetPatchAuthority(env, existing, true);
       if (Date.parse(existing.deadline_at) <= Date.now()) {
@@ -566,9 +649,10 @@ export async function ensureFleetPatchFinalization(
     .bind(source.region_id)
     .first<{ revision: number }>();
   const refresh =
-    source.stage === "complete" &&
     revision &&
-    revision.revision > source.material_revision;
+    revision.revision > source.material_revision &&
+    (source.stage === "complete" ||
+      (await verifiedRotationHostRefresh(env, source, revision.revision)));
   if (refresh) {
     const current = await env.DB.prepare(
       `SELECT 1 valid FROM nodes n JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id JOIN fleet_node_release_observations o ON o.node_id=n.id JOIN regions r ON r.id=n.region_id WHERE n.id=? AND n.node_uid=? AND n.lost_at IS NULL AND a.node_uid=n.node_uid AND a.release_id=? AND a.revision=? AND f.release_id=a.release_id AND f.revision=? AND o.node_uid=n.node_uid AND o.assignment_revision=a.revision AND o.agent_key_hash=r.agent_key_hash AND json_extract(o.facts_json,'$.boot_id')=? AND julianday(o.observed_at)>=julianday('now','-180 seconds')`,
@@ -657,8 +741,20 @@ export async function continueFleetPatchRegion(
     await startFleetPatch(env, active.operation_id);
     return status(active);
   }
+  const priorMaterial = await env.DB.prepare(
+    `SELECT h.operation_id FROM fleet_patch_operations h JOIN regions r ON r.id=h.region_id JOIN nodes n ON n.id=h.node_id JOIN fleet_node_releases a ON a.node_id=n.id WHERE h.region_id=? AND h.release_id=? AND h.spec_sha256=? AND h.region_revision=? AND h.stage IN('host_ready','complete') AND h.state='confirmed' AND h.material_revision<r.bootstrap_material_revision AND h.node_uid=n.node_uid AND n.lost_at IS NULL AND a.node_uid=n.node_uid AND a.release_id=h.release_id AND a.revision=h.assignment_revision AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations f WHERE f.node_id=h.node_id AND f.node_uid=h.node_uid AND f.release_id=h.release_id AND f.assignment_revision=h.assignment_revision AND f.region_revision=h.region_revision AND f.material_revision=r.bootstrap_material_revision) ORDER BY h.updated_at DESC,h.rowid DESC LIMIT 1`,
+  )
+    .bind(row.region_id, row.release_id, row.spec_sha256, row.region_revision)
+    .first<{ operation_id: string }>();
+  if (priorMaterial) {
+    const refresh = await ensureFleetPatchFinalization(
+      env,
+      priorMaterial.operation_id,
+    );
+    if (refresh) return refresh;
+  }
   const pending = await env.DB.prepare(
-    `SELECT h.operation_id FROM fleet_patch_operations h WHERE h.region_id=? AND h.release_id=? AND h.spec_sha256=? AND h.region_revision=? AND h.stage='host_ready' AND h.state='confirmed' AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations f WHERE f.finalization_of=h.operation_id AND f.stage='complete') ORDER BY h.created_at LIMIT 1`,
+    `SELECT h.operation_id FROM fleet_patch_operations h JOIN regions r ON r.id=h.region_id WHERE h.region_id=? AND h.release_id=? AND h.spec_sha256=? AND h.region_revision=? AND h.material_revision=r.bootstrap_material_revision AND h.stage='host_ready' AND h.state='confirmed' AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations f WHERE f.node_id=h.node_id AND f.node_uid=h.node_uid AND f.release_id=h.release_id AND f.assignment_revision=h.assignment_revision AND f.region_revision=h.region_revision AND f.material_revision=r.bootstrap_material_revision AND f.stage='complete' AND f.state='confirmed') ORDER BY h.created_at LIMIT 1`,
   )
     .bind(row.region_id, row.release_id, row.spec_sha256, row.region_revision)
     .first<{ operation_id: string }>();
@@ -810,7 +906,12 @@ async function prepareFleetPatchInsert(
       selected.region_id,
       "join_bundle",
     ),
-    bundle = await loadRegionJoinBundle(env.DB, env.CREDENTIAL_KEYS, ref);
+    bundle = await effectiveFleetRegionJoin(
+      env,
+      selected.region_id,
+      ref.revision,
+      await loadRegionJoinBundle(env.DB, env.CREDENTIAL_KEYS, ref),
+    );
   const clusterNodes = await env.DB.prepare(
     `SELECT n.id node_id,n.node_uid,n.k8s_node_name,a.revision assignment_revision,n.database_placement_closed_at previous_placement_closed_at FROM nodes n JOIN fleet_node_releases a ON a.node_id=n.id WHERE n.region_id=? AND n.lost_at IS NULL AND a.node_uid=n.node_uid AND a.release_id=? ORDER BY n.id`,
   )
@@ -952,6 +1053,63 @@ export async function createFleetPatch(
       return output(creation.id);
     },
   });
+}
+/** Fleet desired-state reconciliation reuses the exact persisted patch, including an uncertain dispatch. */
+export async function ensureRetainedFleetPatch(
+  env: Env,
+  nodeId: string,
+  input: FleetPatchRequest,
+): Promise<FleetPatchStatus> {
+  const read = () =>
+    env.DB.prepare(
+      "SELECT * FROM fleet_patch_operations WHERE node_id=? AND node_uid=? AND release_id=? AND assignment_revision=? AND bootstrap_operation_id IS NULL ORDER BY created_at DESC,rowid DESC LIMIT 1",
+    )
+      .bind(nodeId, input.node_uid, input.release_id, input.assignment_revision)
+      .first<PatchRow>();
+  const existing = await read();
+  if (existing) {
+    if (
+      !["complete", "host_ready"].includes(existing.stage) &&
+      existing.state !== "halted"
+    ) {
+      await assertFleetPatchAuthority(env, existing, true);
+      if (Date.parse(existing.deadline_at) <= Date.now()) {
+        const changed = await env.DB.prepare(
+          `UPDATE fleet_patch_operations SET deadline_at=?,updated_at=? WHERE operation_id=? AND revision=? AND ${authoritySql}`,
+        )
+          .bind(
+            new Date(Date.now() + 3600000).toISOString(),
+            new Date().toISOString(),
+            existing.operation_id,
+            existing.revision,
+          )
+          .run();
+        if (changed.meta.changes !== 1) return closed();
+      }
+      await startFleetPatch(env, existing.operation_id);
+    }
+    return status(await readFleetPatch(env, existing.operation_id));
+  }
+  const creation = await prepareFleetPatchInsert(env, nodeId, input);
+  try {
+    const result = await env.DB.batch([
+      creation.insert,
+      creation.closePlacements,
+    ]);
+    if (
+      result[0]!.meta.changes !== 1 ||
+      result[1]!.meta.changes !== creation.count
+    )
+      return closed();
+  } catch (error) {
+    // A committed row is the only authority to recover a lost D1 response; never insert blindly again.
+    const committed = await read();
+    if (!committed) throw error;
+    await startFleetPatch(env, committed.operation_id);
+    return status(await readFleetPatch(env, committed.operation_id));
+  }
+  await startFleetPatch(env, creation.id);
+  return status(await readFleetPatch(env, creation.id));
 }
 /** Future AddNode only. This never reopens an admitted job and never closes existing capacity. */
 export async function ensureBootstrapFleetPatch(
@@ -1398,6 +1556,14 @@ export async function synchronizeFleetPatchRegionMaterial(
 ): Promise<"synchronized" | "waiting_members"> {
   const row = await readFleetPatch(env, id);
   if (row.stage !== "complete" || row.state !== "confirmed") return closed();
+  // A staged replacement owns current+1. Version-only synchronization must not occupy that
+  // immutable envelope or publish old keys while the programmed rotation is still running.
+  const rotating = await env.DB.prepare(
+    `SELECT 1 pending FROM fleet_region_releases f JOIN regions r ON r.id=f.region_id,json_each(f.rollout_json,'$.regions') target WHERE f.region_id=? AND json_extract(target.value,'$.region_id')=f.region_id AND json_extract(target.value,'$.staged_material_revision') IS NOT NULL AND COALESCE(json_extract(target.value,'$.rotation.phase')='complete' AND json_extract(target.value,'$.rotation.state')='confirmed' AND r.bootstrap_material_revision>=json_extract(target.value,'$.staged_material_revision'),0)=0 LIMIT 1`,
+  )
+    .bind(row.region_id)
+    .first();
+  if (rotating) return "waiting_members";
   const unfinished = await env.DB.prepare(
     `SELECT 1 missing FROM nodes n JOIN fleet_node_releases a ON a.node_id=n.id WHERE n.region_id=? AND n.lost_at IS NULL AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.node_id=n.id AND p.node_uid=n.node_uid AND p.release_id=? AND p.spec_sha256=? AND p.assignment_revision=a.revision AND p.region_revision=? AND p.stage='complete' AND p.state='confirmed') LIMIT 1`,
   )

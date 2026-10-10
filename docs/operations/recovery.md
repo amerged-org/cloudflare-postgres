@@ -275,7 +275,7 @@ deleted report cannot supply that proof. Database deletion and the configured R2
 retention remain separate operations. Thin physical allocation metrics stay null until a real
 measurement exists; neither a logical quota nor zero stands in for an unknown measurement.
 
-See PLAN.md Status for the selected source, qualified images and completed live checks. Local
+See the ULTRA plan for the selected source, qualified images and completed live checks. Local
 D1 and Workerd tests alone do not activate this feature or establish live storage acceptance.
 
 

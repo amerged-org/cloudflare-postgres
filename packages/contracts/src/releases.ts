@@ -107,6 +107,39 @@ export const ThinStorageQualification = z.strictObject({
   }),
 });
 export type ThinStorageQualification = z.infer<typeof ThinStorageQualification>;
+/** Immutable initial disk bytes; this is an install artifact, never a running component inventory item. */
+export const FleetTalosRawImage = z
+  .strictObject({
+    url: z
+      .url({ protocol: /^https$/ })
+      .max(2048)
+      .refine((value) => {
+        const url = new URL(value);
+        return !url.username && !url.password && !url.search && !url.hash;
+      }),
+    sha256: Sha256,
+    format: z.enum(["raw.xz", "raw"]),
+    bytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    raw_sha256: Sha256,
+    raw_bytes: z
+      .number()
+      .int()
+      .positive()
+      .max(Number.MAX_SAFE_INTEGER)
+      .refine((value) => value % 512 === 0),
+  })
+  .superRefine((image, context) => {
+    if (
+      image.format === "raw" &&
+      (image.sha256 !== image.raw_sha256 || image.bytes !== image.raw_bytes)
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "An uncompressed disk must pin identical transport and raw bytes",
+      });
+  });
+export type FleetTalosRawImage = z.infer<typeof FleetTalosRawImage>;
 export const FleetReleaseSpec = z
   .strictObject({
     version: z.literal(1),
@@ -118,6 +151,7 @@ export const FleetReleaseSpec = z
       .optional(),
     storage_authority_keys_sha256: Sha256.optional(),
     thin_storage_qualification: ThinStorageQualification.optional(),
+    talos_raw_image: FleetTalosRawImage.optional(),
     components: z.array(FleetReleaseComponent).min(1).max(128),
     roles: z.strictObject({ control_relay: Role, customer: Role }),
   })

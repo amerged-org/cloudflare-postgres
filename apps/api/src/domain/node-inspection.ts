@@ -15,6 +15,7 @@ import {
   signBootstrapRelay,
 } from "@pgcf/contracts/bootstrap-relay";
 import { z } from "zod";
+import { readSelectedNodeGoldenImage } from "./node-golden-image.ts";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
 import {
@@ -217,6 +218,9 @@ export async function prepareNodeInspectionInput(
         : {}),
     },
     dns: profile.profile.dns,
+    golden_image:
+      (await readSelectedNodeGoldenImage(env, binding.row.region_id)) ??
+      undefined,
     peer_ipv4: [
       ...new Set([
         ...plan.data.relay.addresses.ipv4,
@@ -283,6 +287,13 @@ export async function assertNodeInspectionInputCurrent(
     )
       .bind(operationId)
       .first())
+  )
+    return deny();
+  if (
+    (await installationHash(value.golden_image ?? null)) !==
+    (await installationHash(
+      await readSelectedNodeGoldenImage(env, value.region_id),
+    ))
   )
     return deny();
   const binding = await loadNodeInstallationBinding(env, operationId),

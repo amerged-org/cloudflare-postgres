@@ -13,6 +13,8 @@ import { NodeProofExecutionInput } from "@pgcf/contracts/node-proof";
 import { runNodeProof } from "./node-proof-runner.ts";
 import { runThinStorage } from "./thin-storage.ts";
 import { runFleetPatch } from "./fleet-patch.ts";
+import { runRegionAuthorityRotation } from "./region-authority-rotation.ts";
+import { FleetRegionMaterialRotationInput } from "@pgcf/contracts/region-material-rotation";
 import {
   InfrastructureBackupInput,
   InfrastructureBackupPreparedArtifact,
@@ -69,6 +71,7 @@ export function createBootstrapServer(
   let patchRunning = false;
   let patchRegistered = false;
   let backupRunning = false;
+  let rotationRunning = false;
   let backup: Awaited<ReturnType<typeof prepareDailyBackup>> | undefined;
   let backupInput: InfrastructureBackupInput | undefined;
   const inspections = new Map<
@@ -105,6 +108,32 @@ export function createBootstrapServer(
         return;
       }
       const path = request.url ?? "";
+      if (
+        request.method === "POST" &&
+        path === "/v1/region-authority-rotations"
+      ) {
+        if (
+          rotationRunning ||
+          backupRunning ||
+          patchRegistered ||
+          installationRegistration ||
+          jobs.size ||
+          inspections.size ||
+          proofs.size
+        )
+          throw new BootstrapError("container_busy");
+        const input = FleetRegionMaterialRotationInput.parse(
+          await body(request),
+        );
+        rotationRunning = true;
+        void runRegionAuthorityRotation(input)
+          .catch(() => undefined)
+          .finally(() => {
+            rotationRunning = false;
+          });
+        reply(response, 202, { running: true });
+        return;
+      }
       if (request.method === "POST" && path === "/v1/infrastructure-backups") {
         if (
           backupRunning ||

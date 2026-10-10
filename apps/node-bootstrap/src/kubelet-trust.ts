@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { X509Certificate } from "node:crypto";
 import type { NodeBootstrapInput } from "@pgcf/contracts/node-bootstrap";
+import type { FleetPatchInput } from "@pgcf/contracts/fleet-patches";
 import { BootstrapError, canonical, digest } from "./bootstrap.ts";
 
 type Json = Record<string, unknown>;
@@ -93,11 +94,21 @@ interface Binding {
   node_uid: string;
   cluster_uid: string;
   namespace_uid: string;
+  system_uuid?: string;
+  boot_id?: string;
 }
 
+type TrustInput = Pick<NodeBootstrapInput, "input_hash"> & {
+  spec: Pick<
+    NodeBootstrapInput["spec"],
+    "hostname" | "node_id" | "region_id" | "provider_instance_id"
+  > & { hardware: Pick<NodeBootstrapInput["spec"]["hardware"], "ipv4"> };
+};
+
 export async function publishKubeletTrust(
-  input: NodeBootstrapInput,
+  input: TrustInput,
   commands: KubeletTrustCommands,
+  refresh?: Pick<Binding, "node_uid" | "cluster_uid">,
 ) {
   const read = async (
     kind: "node" | "namespace" | "configmap",
@@ -153,10 +164,27 @@ export async function publishKubeletTrust(
       "Namespace",
       "pgcf-system",
     );
+    const physical = refresh ? record(record(node.status).nodeInfo) : null,
+      systemUuid = String(physical?.systemUUID).toLowerCase(),
+      bootId = String(physical?.bootID).toLowerCase();
+    if (
+      refresh &&
+      (nodeMetadata.uid !== refresh.node_uid ||
+        cluster_uid !== refresh.cluster_uid ||
+        !UID.test(systemUuid) ||
+        !UID.test(bootId))
+    )
+      throw new BootstrapError("kubelet_trust_identity_changed");
     return {
       node_uid: String(nodeMetadata.uid),
       cluster_uid,
       namespace_uid: String(namespace.uid),
+      ...(physical
+        ? {
+            system_uuid: systemUuid,
+            boot_id: bootId,
+          }
+        : {}),
     };
   };
   const first = await binding();
@@ -213,7 +241,48 @@ export async function publishKubeletTrust(
   await confirmBinding();
   const previous = await read("configmap", name, "pgcf-system", true);
   if (previous) {
-    confirmMap(previous);
+    if (
+      !refresh ||
+      canonical(record(previous.data)) === canonical(expected.data)
+    )
+      confirmMap(previous);
+    else {
+      const previousMetadata = metadata(
+          previous,
+          "ConfigMap",
+          name,
+          "pgcf-system",
+        ),
+        prior = record(previous.data),
+        previousPem = prior.certificate_pem;
+      // The previous public pin must still belong to this exact Node/cluster.
+      // Only certificate bytes change; the existing UID/resourceVersion fence the PUT.
+      if (
+        typeof previousPem !== "string" ||
+        Buffer.byteLength(previousPem, "utf8") > 16 * 1024 ||
+        /PRIVATE KEY/.test(previousPem) ||
+        prior.certificate_sha256 !== digest(previousPem)
+      )
+        throw new BootstrapError("kubelet_trust_map_mismatch");
+      confirmMap({ ...previous, data: { ...prior, ...certificate } });
+      const updated = structuredClone(previous);
+      updated.data = expected.data;
+      await confirmBinding();
+      try {
+        await commands.kube(
+          ["replace", "--filename=-", "--output=json"],
+          true,
+          JSON.stringify(updated),
+        );
+      } catch {
+        /* Resolve this single conditional replacement through authenticated readback. */
+      }
+      await confirmBinding();
+      const observed = await read("configmap", name, "pgcf-system", true);
+      if (!observed || record(observed.metadata).uid !== previousMetadata.uid)
+        throw new BootstrapError("kubelet_trust_refresh_unconfirmed");
+      confirmMap(observed);
+    }
     await confirmBinding();
     return;
   }
@@ -233,4 +302,68 @@ export async function publishKubeletTrust(
   if (!observed) throw new BootstrapError("kubelet_trust_create_unconfirmed");
   confirmMap(observed);
   await confirmBinding();
+}
+
+/** Supported patch/authority replacement boundary; consumers never trust a new TLS leaf themselves. */
+export async function refreshKubeletTrust(
+  input: Pick<
+    FleetPatchInput,
+    "k8s_node_name" | "address" | "initial_bootstrap_input_sha256"
+  > & {
+    status: Pick<
+      FleetPatchInput["status"],
+      "node_id" | "region_id" | "node_uid" | "cluster_uid"
+    >;
+  },
+  commands: KubeletTrustCommands,
+) {
+  const result = await commands.kube([
+    "get",
+    "node",
+    input.k8s_node_name,
+    "--output=json",
+  ]);
+  const node = record(JSON.parse(result.stdout)),
+    nodeMetadata = metadata(node, "Node", input.k8s_node_name);
+  if (nodeMetadata.uid !== input.status.node_uid)
+    throw new BootstrapError("kubelet_trust_identity_changed");
+  let owner = input.initial_bootstrap_input_sha256;
+  if (!owner) {
+    const current = await commands.kube([
+      "--namespace",
+      "pgcf-system",
+      "get",
+      "configmap",
+      `kubelet-${input.status.node_uid}`,
+      "--output=json",
+    ]);
+    const map = record(JSON.parse(current.stdout));
+    metadata(
+      map,
+      "ConfigMap",
+      `kubelet-${input.status.node_uid}`,
+      "pgcf-system",
+    );
+    owner = String(
+      record(record(map.metadata).annotations)["pgcf.io/bootstrap-input"],
+    );
+  }
+  if (!/^[a-f0-9]{64}$/.test(owner))
+    throw new BootstrapError("kubelet_trust_map_mismatch");
+  await publishKubeletTrust(
+    {
+      input_hash: owner,
+      spec: {
+        hostname: input.k8s_node_name,
+        node_id: input.status.node_id,
+        region_id: input.status.region_id,
+        provider_instance_id: String(
+          record(nodeMetadata.labels)["pgcf.io/provider-instance-id"],
+        ),
+        hardware: { ipv4: input.address },
+      },
+    },
+    commands,
+    { node_uid: input.status.node_uid, cluster_uid: input.status.cluster_uid },
+  );
 }

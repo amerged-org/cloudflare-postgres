@@ -106,7 +106,7 @@ This installation's selected standing policy remains V159, one month, no storage
 76% expansion threshold. Updating its live configuration and completing autonomous rollout
 remain acceptance work. Monetary and lifetime order-count ceilings are optional under explicit
 operator authority. The real RAM-threshold window and load cleanup passed.
-See [PLAN.md](PLAN.md#11-status) for measured results and remaining work.
+See [ULTRA status](docs/architecture/cloudflare-convergence-and-serverless-plan.md#done) for measured results and remaining work.
 
 ## Architecture
 
@@ -251,7 +251,7 @@ during upstream startup). The packaged CLI includes the first-party and bundled-
 - A Contabo account with API credentials. The lab uses Cloud VPS with 4 vCPU and 8 GiB.
 
 The current target is the operator deployment on existing accounts and three VPS in total.
-Public-release installation polish follows separately; see [PLAN.md](PLAN.md#7-phases).
+Public-release installation polish follows separately; see [ULTRA execution plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#execution).
 
 The API reference is generated at `/v1/openapi.json` from the shared contracts. Operator runbooks
 cover [installation](docs/operations/operator-installation.md), [recovery](docs/operations/recovery.md)

@@ -223,5 +223,5 @@ CI=true pnpm --filter @pgcf/e2e accept --run-id "$PGCF_E2E_RUN_ID" --cleanup-onl
 ```
 
 Keep the ledger until cleanup succeeds. Record actual E6 results and remaining gaps in
-[PLAN.md Status](../../PLAN.md#11-status) only after verification; a signed report or successful
+[ULTRA status](../architecture/cloudflare-convergence-and-serverless-plan.md#done) only after verification; a signed report or successful
 workflow by itself does not complete Phase 1 acceptance.

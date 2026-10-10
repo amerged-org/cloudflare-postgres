@@ -31,6 +31,7 @@ import { NodeStorageTrial } from "@pgcf/contracts/node-bootstrap";
 import { BootstrapError } from "./bootstrap-error.ts";
 export { BootstrapError } from "./bootstrap-error.ts";
 
+import { GOLDEN_GRUB_NETWORK_PYTHON } from "./golden-boot-network.ts";
 import { TALOS_VERSION, KUBERNETES_VERSION } from "./platform-artifacts.ts";
 export { TALOS_VERSION, KUBERNETES_VERSION } from "./platform-artifacts.ts";
 export const CHUNK_BYTES = 16 * 1024 ** 2;
@@ -676,7 +677,10 @@ export function bootstrapSchematic(spec: BootstrapNetworkSpec) {
   return { customization: { extraKernelArgs } };
 }
 export function imageURL(spec: NodeBootstrapSpec) {
-  return `https://factory.talos.dev/image/${spec.image.schematic_id}/v${TALOS_VERSION}/nocloud-amd64.raw.xz`;
+  return (
+    spec.image.golden_image?.raw.url ??
+    `https://factory.talos.dev/image/${spec.image.schematic_id}/v${TALOS_VERSION}/nocloud-amd64.raw.xz`
+  );
 }
 
 interface Partition {
@@ -985,6 +989,11 @@ export class BootstrapJob {
     }
   }
   private async verifySchematic() {
+    if (this.input.spec.image.golden_image) {
+      if (this.input.spec.image.golden_image.talos_version !== TALOS_VERSION)
+        throw new BootstrapError("schematic_identity_mismatch");
+      return;
+    }
     const response = await this.request(
       "https://factory.talos.dev/schematics",
       {
@@ -1016,6 +1025,8 @@ export class BootstrapJob {
   private imageDecompressScript() {
     const compressed = shellQuote(this.remotePath("image.raw.xz"));
     const partial = shellQuote(this.remotePath("image.raw.partial"));
+    if (this.input.spec.image.golden_image?.raw.format === "raw")
+      return `dd if=${compressed} of=${partial} bs=1M status=none`;
     return [
       "if command -v xz >/dev/null 2>&1; then",
       `xz --decompress --stdout --single-stream ${compressed} > ${partial}`,
@@ -1146,7 +1157,10 @@ export class BootstrapJob {
       written_bytes: spec.image.raw_bytes,
     });
   }
-  private async verifyPartitions(expected: Partition[]) {
+  private async verifyPartitions(
+    expected: Partition[],
+    bootNetworkConfigured = false,
+  ) {
     const raw = shellQuote(this.remotePath("image.raw"));
     const disk = shellQuote(this.input.spec.hardware.install_disk);
     if (
@@ -1157,6 +1171,7 @@ export class BootstrapJob {
       throw new BootstrapError("disk_partition_mismatch");
     }
     for (const partition of expected) {
+      if (bootNetworkConfigured && partition.name === "BOOT") continue;
       await this.ssh(
         `cmp --bytes=${partition.size * 512} --ignore-initial=${partition.start * 512}:${partition.start * 512} ${raw} ${disk}`,
       );
@@ -1164,6 +1179,63 @@ export class BootstrapJob {
     const validation = await this.ssh(`sgdisk --verify ${disk}`);
     if (!validation.stdout.includes("No problems found."))
       throw new BootstrapError("disk_gpt_invalid");
+  }
+  private async configureGoldenBootNetwork(expected: Partition[]) {
+    const golden = this.input.spec.image.golden_image;
+    if (!golden) return;
+    const boot = expected.filter((partition) => partition.name === "BOOT");
+    if (boot.length !== 1) throw new BootstrapError("disk_partition_mismatch");
+    const offset = boot[0]!.start * 512,
+      size = boot[0]!.size * 512;
+    const mountRoot = `/run/pgcf-boot-network/${this.input.spec.operation_id}-${this.input.input_hash}`;
+    const reference = `${mountRoot}/reference`,
+      live = `${mountRoot}/live`;
+    const args = bootstrapSchematic(this.input.spec).customization
+      .extraKernelArgs;
+    const raw = shellQuote(this.remotePath("image.raw")),
+      disk = shellQuote(this.input.spec.hardware.install_disk);
+    // The shared bytes are already verified. The hardware-specific network file is separate configuration.
+    await this.authority.read(this.abort.signal);
+    const result = await this.ssh(`${this.guardScript()}
+for network_tool in mount umount mountpoint losetup python3; do command -v "$network_tool" >/dev/null; done
+test ! -L /run/pgcf-boot-network
+mkdir -p -- /run/pgcf-boot-network
+test "$(readlink -f /run/pgcf-boot-network)" = /run/pgcf-boot-network
+test ! -L ${shellQuote(mountRoot)}
+mkdir -p -- ${shellQuote(mountRoot)}
+network_unmount_owned() {
+  local network_dir="$1" network_backing="$2" network_loop
+  if mountpoint --quiet "$network_dir"; then
+    network_loop="$(findmnt --noheadings --raw --target "$network_dir" --output SOURCE)"
+    losetup --json --list --output NAME,BACK-FILE,OFFSET,SIZELIMIT "$network_loop" | python3 -c 'import json,os,sys; loops=json.load(sys.stdin)["loopdevices"]; assert len(loops)==1; loop=loops[0]; assert loop["name"]==sys.argv[1] and os.path.realpath(loop["back-file"])==os.path.realpath(sys.argv[2]) and int(loop["offset"])==int(sys.argv[3]) and int(loop["sizelimit"])==int(sys.argv[4])' "$network_loop" "$network_backing" ${offset} ${size}
+    umount -- "$network_dir"
+  fi
+}
+for network_dir in ${shellQuote(reference)} ${shellQuote(live)}; do
+  test ! -L "$network_dir"
+  mkdir -p -- "$network_dir"
+  test "$(readlink -f "$network_dir")" = "$network_dir"
+done
+# An interrupted owned mount is resolved by its exact backing file/range, never by its path alone.
+network_unmount_owned ${shellQuote(reference)} ${raw}
+network_unmount_owned ${shellQuote(live)} ${disk}
+network_cleanup() {
+  local network_failed=0
+  if mountpoint --quiet ${shellQuote(live)}; then umount -- ${shellQuote(live)} || network_failed=1; fi
+  if mountpoint --quiet ${shellQuote(reference)}; then umount -- ${shellQuote(reference)} || network_failed=1; fi
+  test "$network_failed" -eq 0
+}
+trap network_cleanup EXIT
+mount -t xfs -o loop,ro,norecovery,nouuid,offset=${offset},sizelimit=${size} ${raw} ${shellQuote(reference)}
+mount -t xfs -o loop,nouuid,offset=${offset},sizelimit=${size} ${disk} ${shellQuote(live)}
+python3 - ${shellQuote(reference)} ${shellQuote(live)} ${shellQuote(JSON.stringify(args))} ${shellQuote(golden.talos_version)} <<'PGCF_GOLDEN_NETWORK_PY'
+${GOLDEN_GRUB_NETWORK_PYTHON}
+PGCF_GOLDEN_NETWORK_PY
+network_cleanup
+trap - EXIT
+rmdir -- ${shellQuote(live)} ${shellQuote(reference)} ${shellQuote(mountRoot)}`);
+    if (!/^[a-f0-9]{64}\s*$/.test(result.stdout))
+      throw new BootstrapError("disk_readback_failed");
   }
   private async talos(
     args: string[],
@@ -1346,7 +1418,8 @@ export class BootstrapJob {
       "--install-disk",
       hardware.install_disk,
       "--install-image",
-      `factory.talos.dev/metal-installer/${spec.image.schematic_id}@${spec.image.installer_digest}`,
+      spec.image.golden_image?.installer ??
+        `factory.talos.dev/metal-installer/${spec.image.schematic_id}@${spec.image.installer_digest}`,
       "--with-secrets",
       join(this.directory, "machine-secrets"),
       "--config-patch",
@@ -2013,7 +2086,12 @@ export class BootstrapJob {
         if (position() < at("gpt_relocated")) {
           await this.verifyPartitions(expected);
           authority = await this.checkpoint("gpt_relocated");
-        } else await this.verifyPartitions(expected);
+        } else
+          await this.verifyPartitions(
+            expected,
+            !!this.input.spec.image.golden_image,
+          );
+        await this.configureGoldenBootNetwork(expected);
         authority = await this.checkpoint("rescue_reboot_intent");
         await this.ssh("reboot", true);
       }

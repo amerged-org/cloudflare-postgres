@@ -2,7 +2,8 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
-import { readFile, stat, writeFile } from "node:fs/promises";
+import { mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { parse, parseAllDocuments, stringify } from "yaml";
 import { test } from "node:test";
@@ -11,6 +12,7 @@ import {
   FleetPatchStatus,
   type FleetPatchFacts,
   fleetPatchCheckpointAllowed,
+  fleetPatchTalosRebootObserved,
 } from "@pgcf/contracts/fleet-patches";
 import { runFleetPatch, validateFleetPatchInput } from "../src/fleet-patch.ts";
 import {
@@ -41,6 +43,7 @@ function runtime(
   let kubeProbe:
     ((command: Command) => ReturnType<CommandRunner> | undefined) | undefined;
   let assetRequest: typeof fetch | undefined;
+  let servingCertificate: string | undefined;
   const resource = (type: string, id: string, spec: unknown) =>
     JSON.stringify({ metadata: { type, id }, spec });
   const node = () => ({
@@ -91,6 +94,9 @@ function runtime(
     },
     set assetRequest(value: typeof fetch) {
       assetRequest = value;
+    },
+    set servingCertificate(value: string) {
+      servingCertificate = value;
     },
     turn: () =>
       runFleetPatch(
@@ -145,6 +151,12 @@ function runtime(
               const result = kubeProbe(command);
               if (result) return result;
             }
+            if (
+              servingCertificate &&
+              command.executable === "talosctl" &&
+              args.includes("/var/lib/kubelet/pki/kubelet.crt")
+            )
+              return { exit_code: 0, stdout: servingCertificate };
             if (
               args.includes("apply-config") &&
               machineConfiguration !== undefined
@@ -406,7 +418,7 @@ test("a modified desired spec and off-origin callback are rejected before access
     /patch_endpoint_invalid/,
   );
 });
-test("runtime verification is conditional and does not claim platform component convergence", async () => {
+test("runtime verification refreshes the current serving pin before acceptance without claiming platform convergence", async () => {
   const r = runtime();
   r.current = { ...r.current, stage: "verify", baseline: r.fixture.facts };
   r.facts = {
@@ -415,9 +427,138 @@ test("runtime verification is conditional and does not claim platform component 
     kubernetes_version: "v1.36.5",
     kubelet_version: "v1.36.5",
   };
-  await r.turn();
-  assert.equal(r.current.stage, "runtime_verified");
-  assert.equal(r.writes.length, 0);
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-patch-pin-test-"));
+  const certificate = join(directory, "public.fixture.pem");
+  try {
+    const generated = spawnSync(
+      "openssl",
+      [
+        "req",
+        "-x509",
+        "-newkey",
+        "ed25519",
+        "-nodes",
+        "-keyout",
+        join(directory, "generated-fixture-material"),
+        "-out",
+        certificate,
+        "-subj",
+        "/CN=test-node",
+        "-addext",
+        "subjectAltName=DNS:test-node",
+        "-days",
+        "2",
+      ],
+      { timeout: 15_000 },
+    );
+    assert.equal(generated.status, 0);
+    const pem = await readFile(certificate, "utf8");
+    r.servingCertificate = pem;
+    r.fixture.input.initial_bootstrap_input_sha256 =
+      digest("initial-bootstrap");
+    const namespaceUid = randomUUID();
+    let pinWrites = 0;
+    let map = {
+      apiVersion: "v1",
+      kind: "ConfigMap",
+      metadata: {
+        name: `kubelet-${r.fixture.facts.node_uid}`,
+        namespace: "pgcf-system",
+        uid: randomUUID(),
+        resourceVersion: "3",
+        labels: {
+          "pgcf.io/kubelet-node-uid": r.fixture.facts.node_uid,
+          "pgcf.io/kubelet-cluster-uid": r.fixture.facts.cluster_uid,
+          "pgcf.io/node-id": r.fixture.input.status.node_id,
+          "pgcf.io/region": r.fixture.input.status.region_id,
+        },
+        annotations: {
+          "pgcf.io/bootstrap-input":
+            r.fixture.input.initial_bootstrap_input_sha256,
+        },
+      },
+      data: {
+        node_name: "test-node",
+        node_uid: r.fixture.facts.node_uid,
+        cluster_uid: r.fixture.facts.cluster_uid,
+        certificate_pem: "retired-public-fixture",
+        certificate_sha256: digest("retired-public-fixture"),
+      },
+    };
+    r.kubeProbe = (command) => {
+      const args = command.args;
+      if (args.includes("replace")) {
+        pinWrites++;
+        const updated = JSON.parse(command.stdin!) as typeof map;
+        assert.equal(updated.metadata.uid, map.metadata.uid);
+        assert.equal(
+          updated.metadata.resourceVersion,
+          map.metadata.resourceVersion,
+        );
+        map = updated;
+        map.metadata.resourceVersion = "4";
+        return Promise.resolve({ exit_code: 0, stdout: JSON.stringify(map) });
+      }
+      if (args.includes("configmap"))
+        return Promise.resolve({ exit_code: 0, stdout: JSON.stringify(map) });
+      if (args.includes("namespace")) {
+        const name = args[args.indexOf("namespace") + 1];
+        return Promise.resolve({
+          exit_code: 0,
+          stdout: JSON.stringify({
+            apiVersion: "v1",
+            kind: "Namespace",
+            metadata: {
+              name,
+              uid:
+                name === "kube-system"
+                  ? r.fixture.facts.cluster_uid
+                  : namespaceUid,
+              resourceVersion: "1",
+            },
+          }),
+        });
+      }
+      if (args.includes("node"))
+        return Promise.resolve({
+          exit_code: 0,
+          stdout: JSON.stringify({
+            apiVersion: "v1",
+            kind: "Node",
+            metadata: {
+              name: "test-node",
+              uid: r.fixture.facts.node_uid,
+              resourceVersion: "12",
+              labels: {
+                "pgcf.io/node-id": r.fixture.input.status.node_id,
+                "pgcf.io/region": r.fixture.input.status.region_id,
+                "pgcf.io/provider-instance-id": "provider-fixture",
+                "node-role.kubernetes.io/control-plane": "",
+              },
+            },
+            status: {
+              nodeInfo: {
+                systemUUID: r.fixture.facts.system_uuid,
+                bootID: r.fixture.facts.boot_id,
+                kubeletVersion: "v1.36.5",
+              },
+              addresses: [
+                { type: "InternalIP", address: r.fixture.input.address },
+              ],
+              conditions: [{ type: "Ready", status: "True" }],
+            },
+          }),
+        });
+      return undefined;
+    };
+    await r.turn();
+    assert.equal(r.current.stage, "runtime_verified");
+    assert.equal(r.writes.length, 0);
+    assert.equal(pinWrites, 1);
+    assert.equal(map.data.certificate_pem, pem);
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 test("cluster upgrade confirmation rejects a second member that still runs the old kubelet", () => {
   const { input, facts } = patchFixture(),
@@ -512,6 +653,48 @@ test("the qualified Native rebinds a previous exact deployment receipt only on t
   assert.equal(r.current.stage, "talos_reboot");
   assert.equal(r.current.state, "confirmed");
   assert.equal(r.writes.length, 0);
+});
+test("a retained current image cannot satisfy the separate prepared-authority reboot until that dispatch's boot changes", () => {
+  const { input, facts: original } = patchFixture(),
+    facts = { ...original, talos_version: "v1.14.1" },
+    receipt = {
+      method: "deploymentreceipt" as const,
+      installer: input.spec.roles.customer.talos_installer,
+      node_uid: facts.node_uid,
+      cluster_uid: facts.cluster_uid,
+      system_uuid: facts.system_uuid,
+      pre_reboot_boot_id: randomUUID(),
+      completed_at: new Date().toISOString(),
+      source: "cli_exit_0" as const,
+    };
+  input.status = {
+    ...input.status,
+    stage: "talos_reboot",
+    state: "pending",
+    talos_upgrade_receipt: receipt,
+  };
+  assert.equal(fleetPatchTalosRebootObserved(input, facts), true);
+  input.authority_rotation = {
+    checkpoint: {
+      revision: 15,
+      phase: "discovery-secret",
+      node_index: 0,
+      state: "confirmed",
+    },
+  } as NonNullable<typeof input.authority_rotation>;
+  assert.equal(fleetPatchTalosRebootObserved(input, facts), false);
+  input.authority_rotation.checkpoint = {
+    revision: 16,
+    phase: "etcd-ca",
+    node_index: 0,
+    state: "confirmed",
+    prior_boot_id: facts.boot_id,
+  };
+  assert.equal(fleetPatchTalosRebootObserved(input, facts), false);
+  assert.equal(
+    fleetPatchTalosRebootObserved(input, { ...facts, boot_id: randomUUID() }),
+    true,
+  );
 });
 
 test("deployment-pinned storage authority keys cannot be replaced in private patch input", () => {

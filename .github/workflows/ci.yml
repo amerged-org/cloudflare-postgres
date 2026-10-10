@@ -174,8 +174,7 @@ jobs:
           node --test infra/platform/*.test.ts
           node --test infra/talos/sandbox/*.test.ts
           node --test scripts/ci/*.test.ts
-          node --test scripts/operations/publish-talos-installer.test.mjs
-          node --test scripts/operations/publish-talos-installer.test.mjs
+          node --test scripts/operations/publish-talos-installer.test.mjs scripts/operations/publish-fleet-images.test.mjs
           node packages/contracts/native/generate-compute-pool.ts --check
       - name: Bind the already-tested Rust Edge artifact
         run: |
@@ -208,6 +207,7 @@ jobs:
         with:
           name: pgcf-rust-edge-${{ github.sha }}-${{ github.run_attempt }}
           path: apps/edge-rust/build/
+          include-hidden-files: true
           if-no-files-found: error
           retention-days: 90
           overwrite: false
@@ -803,8 +803,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           PGCF_TALOS_INSTALLER_RELEASE: ${{ vars.PGCF_TALOS_INSTALLER_RELEASE }}
+          PGCF_SKOPEO_VERSION: 1.13.3+ds1-2ubuntu0.24.04.3
         run: |
-          printf '%s' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          sudo apt-get update --quiet
+          sudo apt-get install --yes --no-install-recommends "skopeo=$PGCF_SKOPEO_VERSION"
+          PGCF_TEST_SKOPEO=1 node --test --test-name-pattern='actual OCI archive' scripts/operations/publish-talos-installer.test.mjs
           node scripts/operations/publish-talos-installer.mjs "$PGCF_TALOS_INSTALLER_RELEASE" "$RUNNER_TEMP/pgcf-preassembled-installer"
       - name: Retain exact native qualification and publication receipts
         if: always()
@@ -820,6 +823,8 @@ jobs:
             ${{ runner.temp }}/pgcf-talos-boot-${{ github.sha }}/recipe-gate/registry.json
             ${{ runner.temp }}/pgcf-preassembled-installer/publication.json
             ${{ runner.temp }}/pgcf-preassembled-installer/registry.json
+            ${{ runner.temp }}/pgcf-preassembled-installer/failure.json
+            ${{ runner.temp }}/pgcf-preassembled-installer/archive-copy.log
           if-no-files-found: warn
           retention-days: 90
           overwrite: false

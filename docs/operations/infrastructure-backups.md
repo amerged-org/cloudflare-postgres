@@ -56,6 +56,11 @@ Talos, boot and Cilium carrier identities before and after capture.
 
 ## Capture and acceptance
 
+Cloudflare [documents query unavailability during D1 export](https://developers.cloudflare.com/api/resources/d1/subresources/database/methods/export/).
+The exporter polls that same provider job within its authorized deadline without querying the
+locked database, then rechecks current run/configuration authority before using the export URL.
+Control-plane requests may wait during this export window; record its actual duration.
+
 One Workflow captures D1 and one etcd snapshot per existing regional cluster in a
 private NodeBootstrap container. Files are streamed and hashed; the complete run's
 private payload workspace is bounded to 1 GiB. Encryption uses a purpose-derived
@@ -87,7 +92,7 @@ new nodes do not trigger a stale-node alarm.
 Before accepting customer data, enable this configuration and verify a real daily
 run contains D1 and every expected regional etcd artifact with `status: complete`.
 Record the real artifact byte counts, full readback results, duration and recovery
-proof in `PLAN.md`; targeted tests alone are not live backup acceptance.
+proof in the ULTRA plan; targeted tests alone are not live backup acceptance.
 
 ## Optional email or webhook delivery
 

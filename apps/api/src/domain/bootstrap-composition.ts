@@ -6,6 +6,7 @@ import {
 } from "@pgcf/contracts/node-bootstrap";
 import { NodeInstallationInspection } from "@pgcf/contracts/node-installation";
 import { z } from "zod";
+import { readSelectedNodeGoldenImage } from "./node-golden-image.ts";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import {
@@ -203,6 +204,15 @@ export async function composeConfiguredNodeBootstrap(
   ]
     .filter((address) => address !== hardware.ipv4)
     .sort();
+  const golden = await readSelectedNodeGoldenImage(
+    env,
+    installed.profile.region_id,
+  );
+  if (
+    (await installationHash(observation.image.golden_image ?? null)) !==
+    (await installationHash(golden))
+  )
+    return refuse("Initial disk no longer matches the selected golden release");
   const requiredRam =
     observation.image.compressed_bytes +
     observation.image.raw_bytes +

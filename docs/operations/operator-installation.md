@@ -1,29 +1,23 @@
 # Existing-account installation
 
-Current scope (2026-10-09): the overall product goal remains open. Follow the ordered
-[execution gates](../architecture/cloudflare-convergence-and-serverless-plan.md#10-execution-order-and-release-gates)
-and record measured acceptance in [PLAN.md Status](../../PLAN.md#11-status). Preserve existing
-nodes, data and custody through supported upgrades.
+Current scope (2026-10-10): follow the canonical [ULTRA delivery plan](../architecture/cloudflare-convergence-and-serverless-plan.md)
+and record measured completion there. Keep the existing EU control/relay, customer EU1 and US1
+servers. The three EU databases are owner-declared disposable test data and may be deleted and
+recreated if they obstruct; this does not authorize resetting EU hosts or repurposing control.
 
-This guide completes the operator's existing Cloudflare/Contabo installation. Preserve the first
-EU control/relay node and its imported credentials. Retain the already-admitted second EU node as
-customer EU1 (formerly EU2), with its installation, Node identity, data and custody unchanged.
-Exactly one new US1 control-plane/customer node was purchased through the API for one month.
-Both customer nodes use V159 / Cloud VPS Plus 4: 4 vCPU, 8 GiB RAM and 150 GiB NVMe. Provider
-Running is not installation or admission. No new EU worker, EU1 re-adoption, reset or
-decommissioning is part of this completion. Public
-distribution and installation in a foreign Cloudflare account are separate release work.
+The two customer servers use V159 / Cloud VPS Plus 4, 4 vCPU, 8 GiB RAM and 150 GiB NVMe.
+US1's Talos 1.14.2/Kubernetes 1.36.5 is the starting baseline. Golden R1 includes the sandbox
+extension, thin-pool kernel module and common release pins. Activate prepared EU replacement
+credentials in its patch window; retain US custody revision2. Rust and shared-pool work proceeds
+in parallel and ships as R2 through the same automatic target-release workflow.
 
-Complete the native Linux/AMD64 CI preflight and deliver the reviewed generic configuration first.
-R1 then converges all three retained servers on official Image Factory Talos 1.14.2,
-Kubernetes 1.36.5 and the pinned platform through data-preserving upgrades. R2 adds the sandbox
-extension and proves interrupted upgrade/resume. Continue the remaining gates in their documented
-order; later implementations stay unchanged until their gate begins.
-
-Retain US1's existing Ready operation. Prove fully unattended threshold-to-V159-to-Ready on the
-next authorized threshold-driven purchase at its execution gate. Use the Cloudflare relay for
-fleet management, including operator checks; remove temporary laptop firewall sources once the
-permanent relay entry is verified. Do not reopen the historical US1 fallback or reinstall EU nodes.
+New nodes use the golden raw image through AddNode; existing nodes use supported Talos/Kubernetes
+upgrades followed by Flux platform/PGCF convergence. One target-release API call must drive the
+whole selected fleet serially without laptop helpers or operator steps. Current per-node APIs
+are building blocks, not proof that fleet automation exists. Use the six functional checks in the
+ULTRA plan. Retain US1's terminal original AddNode operation; do not reopen it to test patches.
+Use Contabo only at provider lifecycle boundaries. A future real expansion uses the configured
+threshold/purchase policy and the same golden release; no additional test server is required now.
 
 ## Reviewed deployment inputs
 
@@ -74,7 +68,7 @@ and preserve the existing Worker name, hostname, DatabaseActor binding, rate-lim
 namespaces, regional VPC/service bindings and `ROUTE_MASTER_KEYS` secret. The example
 intentionally has no custom build command: delivery uses the qualified artifact instead
 of compiling again. Do not activate the replacement until the selected bytes pass Dev
-database acceptance. Record the actual Worker version and result in PLAN.md Status.
+database acceptance. Record the actual Worker version and result in the ULTRA plan.
 
 Successful upgrades return the unopened upstream WebSocket directly to Cloudflare.
 PostgreSQL bytes are not relayed through a TypeScript or Wasm application loop. Only
@@ -106,6 +100,17 @@ The operator retains Kubernetes mTLS credentials and CA validation client-side, 
 reads `/api/v1/namespaces/kube-system` and `/api/v1/nodes/{node_name}` through the tunnel before
 any write. Their actual UIDs must match the expected cluster and Node UIDs. Missing or different
 identities stop the operation. This endpoint does not reopen terminal AddNode jobs.
+
+For bounded Talos reads, use `scripts/operations/talos-via-kubernetes.mjs` with the administrator
+key supplied by `--api-key-env`, private `--kubeconfig`/`--talosconfig`, the expected Node ID/UID
+and literal address, the current Cilium spec image and running image-ID pins, pinned native
+`--kubectl`/`--talosctl` paths, and a new private `--output-dir`. Put the Talos command after `--`.
+The helper checks actual cluster, Node, DMI and carrier identities before and after forwarding
+through an existing host-network Cilium Pod; Talos mTLS retains the real-IP endpoint. It supports
+`get`, `read`, `version`, `image list` and `etcd snapshot <basename>` into the private output directory.
+All `upgrade-k8s` commands are refused because even `--dry-run` can write machine configuration.
+Target/context/configuration and insecure overrides are refused; processes and sockets are cleaned
+on completion or timeout. The helper creates no Pod or provisioning job.
 
 Select and seal the provider-verified proof source association once per installation in
 Cloudflare. Reuse that association across proof renewals with fresh expiring claims. Each grant

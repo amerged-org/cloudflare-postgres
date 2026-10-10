@@ -29,6 +29,9 @@ import {
   type EncryptedBootstrapCredential,
 } from "../crypto/bootstrap-credentials.ts";
 import { installationHash } from "./node-installation.ts";
+import { FleetRolloutIntent } from "@pgcf/contracts/fleet-rollouts";
+import { FleetReleaseSpec } from "@pgcf/contracts/releases";
+import { fleetRolloutAuthoritySql } from "./fleet-rollouts.ts";
 
 const refuse = (): never => {
   throw new ApiError(
@@ -168,11 +171,14 @@ async function matchingRotation(
 function matchingTopology(
   base: { seed: RegionSeed; join: RegionJoinBundle },
   observed: RotationTopology,
+  versions: { talos_version: string; kubernetes_version: string } = base.seed,
 ) {
+  const equalVersion = (a: string, b: string) =>
+    a.replace(/^v/, "") === b.replace(/^v/, "");
   if (
     base.join.kube_system_uid !== observed.kube_system_uid ||
-    base.seed.talos_version !== observed.talos_version ||
-    base.seed.kubernetes_version !== observed.kubernetes_version
+    !equalVersion(versions.talos_version, observed.talos_version) ||
+    !equalVersion(versions.kubernetes_version, observed.kubernetes_version)
   )
     return refuse();
 }
@@ -394,6 +400,107 @@ export async function activateRegionBootstrapRotation(
       return read();
     },
   });
+}
+/** The existing fleet intent supplies native evidence and target versions; prepared ciphertext stays immutable. */
+export async function activateNativeRegionBootstrapRotation(
+  env: Env,
+  regionId: string,
+  rolloutId: string,
+  input: RegionMaterialRotationActivate,
+) {
+  const value = RegionMaterialRotationActivate.parse(input),
+    row = await env.DB.prepare(
+      "SELECT r.rollout_json,f.spec_json FROM fleet_region_releases r JOIN fleet_releases f ON f.id=r.release_id WHERE r.region_id=?",
+    )
+      .bind(regionId)
+      .first<{ rollout_json: string | null; spec_json: string }>();
+  if (!row?.rollout_json) return refuse();
+  const intent = FleetRolloutIntent.parse(JSON.parse(row.rollout_json)),
+    region = intent.regions.find((r) => r.region_id === regionId),
+    spec = FleetReleaseSpec.parse(JSON.parse(row.spec_json));
+  if (
+    intent.rollout_id !== rolloutId ||
+    !region ||
+    region.material_revision !== value.expected_revision ||
+    region.staged_material_revision !== value.expected_revision + 1 ||
+    region.rotation?.phase !== "verify" ||
+    region.rotation.state !== "confirmed" ||
+    value.verified.source !== "trusted_native" ||
+    (await installationHash(region.rotation.verified)) !==
+      value.verification_sha256 ||
+    (await installationHash(value.verified)) !== value.verification_sha256 ||
+    value.verified.seed_sha256 !== value.seed_sha256 ||
+    value.verified.join_sha256 !== value.join_sha256
+  )
+    return refuse();
+  const stored = await stagedRotation(env, regionId, value);
+  matchingTopology(stored, value.verified, spec.roles.control_relay);
+  const hosts = await env.DB.prepare(
+    `SELECT n.id,n.node_uid,n.k8s_node_name,n.provider_instance_id,p.stage,p.state
+     FROM nodes n JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid
+     JOIN fleet_patch_operations p ON p.node_id=n.id AND p.node_uid=n.node_uid AND p.release_id=a.release_id AND p.assignment_revision=a.revision
+     WHERE n.region_id=? AND n.lost_at IS NULL AND a.release_id=? ORDER BY p.created_at DESC`,
+  )
+    .bind(regionId, intent.release_id)
+    .all<{
+      id: string;
+      node_uid: string;
+      k8s_node_name: string;
+      provider_instance_id: string;
+      stage: string;
+      state: string;
+    }>();
+  for (const member of region.nodes) {
+    const host = hosts.results.find((h) => h.id === member.node_id);
+    if (
+      !host ||
+      host.node_uid !== member.node_uid ||
+      !["complete", "host_ready"].includes(host.stage) ||
+      host.state !== "confirmed" ||
+      !value.verified.nodes.some(
+        (n) =>
+          n.node_id === host.id &&
+          n.node_uid === host.node_uid &&
+          n.k8s_node_name === host.k8s_node_name &&
+          n.provider_instance_id === host.provider_instance_id,
+      )
+    )
+      return refuse();
+  }
+  if (stored.before.revision === value.expected_revision + 1) {
+    if (stored.before.provenance !== value.verification_sha256) return refuse();
+    return readRegionBootstrapMaterial(env, regionId);
+  }
+  const guard = rotationAuthority(regionId, stored.before, value.verified, [
+    ...stored.oldRows,
+    ...stored.rows,
+  ]);
+  const fleet = fleetRolloutAuthoritySql(intent);
+  await env.DB.prepare(
+    `UPDATE regions SET bootstrap_material_revision=?,bootstrap_material_provenance_sha256=?,updated_at=? WHERE ${guard.sql} AND ${fleet.sql}
+     AND NOT EXISTS(SELECT 1 FROM json_each(?) member WHERE NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.node_id=json_extract(member.value,'$.node_id') AND p.node_uid=json_extract(member.value,'$.node_uid') AND p.release_id=? AND p.assignment_revision=json_extract(member.value,'$.assignment_revision') AND p.region_revision=? AND p.cluster_uid=? AND p.stage IN('complete','host_ready') AND p.state='confirmed'))`,
+  )
+    .bind(
+      value.expected_revision + 1,
+      value.verification_sha256,
+      new Date().toISOString(),
+      ...guard.bindings,
+      ...fleet.bindings,
+      JSON.stringify(region.nodes),
+      intent.release_id,
+      region.revision,
+      region.cluster_uid,
+    )
+    .run();
+  const current = await readRegionBootstrapMaterial(env, regionId);
+  if (
+    current.revision !== value.expected_revision + 1 ||
+    current.provenance_sha256 !== value.verification_sha256 ||
+    current.seed_sha256 !== value.seed_sha256 ||
+    current.join_sha256 !== value.join_sha256
+  )
+    return refuse();
+  return current;
 }
 async function envelopes(db: D1Database, regionId: string, revision: number) {
   const rows = await db

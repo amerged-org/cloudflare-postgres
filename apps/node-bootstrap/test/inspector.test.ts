@@ -746,3 +746,50 @@ test("actual Python decoder verifies XZ integrity and byte hashes within measure
     await rm(directory, { recursive: true, force: true });
   }
 });
+test("a selected golden inspection reads its immutable installer and disk without an Image Factory request", async () => {
+  const value = await input(),
+    state = officialImageScenario(value),
+    manifest = JSON.stringify({
+      schemaVersion: 2,
+      mediaType: "application/vnd.oci.image.manifest.v1+json",
+      config: { digest: `sha256:${"a".repeat(64)}`, size: 1024 },
+      layers: [],
+    });
+  const installerDigest = `sha256:${digest(manifest)}`;
+  value.golden_image = {
+    release_id: "golden-fixture",
+    spec_sha256: "b".repeat(64),
+    region_revision: 1,
+    talos_version: "1.14.2",
+    schematic_id: "c".repeat(64),
+    installer: `artifacts.example/pgcf-talos-installer:v1@${installerDigest}`,
+    raw: {
+      url: "https://artifacts.example/v1/fleet/images/raw.raw.xz",
+      sha256:
+        "16759f5f97cc2370833130a8e962ea6b8648aa9383861e38a0c92c6ea2582037",
+      format: "raw.xz",
+      bytes: 232141432,
+      raw_sha256:
+        "b915cdcdb1a6de6e8754a287c688083187eaab45d775917384a727df125d1064",
+      raw_bytes: 4453302272,
+    },
+  };
+  const report = await inspectNode(value, {
+    run: state.run,
+    request: async (url) => {
+      assert.equal(
+        String(url),
+        `https://artifacts.example/v2/pgcf-talos-installer/manifests/${installerDigest}`,
+      );
+      return new Response(manifest, {
+        headers: { "docker-content-digest": installerDigest },
+      });
+    },
+  });
+  assert.deepEqual(report.image.golden_image, value.golden_image);
+  const imageCommand = state.commands.find((command) =>
+    command.stdin?.includes("__PGCF_INSPECTION_IMAGE__"),
+  )!;
+  assert.ok(imageCommand.stdin!.includes(value.golden_image.raw.url));
+  assert.ok(!imageCommand.stdin!.includes("factory.talos.dev"));
+});

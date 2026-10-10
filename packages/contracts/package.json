@@ -30,7 +30,8 @@
     "./reclaim": "./src/reclaim.ts",
     "./fleet-updates": "./src/fleet-updates.ts",
     "./region-material-rotation": "./src/region-material-rotation.ts",
-    "./infrastructure-backups": "./src/infrastructure-backups.ts"
+    "./infrastructure-backups": "./src/infrastructure-backups.ts",
+    "./fleet-rollouts": "./src/fleet-rollouts.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit",

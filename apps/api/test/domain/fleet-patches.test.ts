@@ -20,11 +20,18 @@ import {
 } from "../../src/domain/fleet-patches.ts";
 import {
   storeRegionJoinBundle,
+  importRegionAgentKey,
   joinBundleReference,
 } from "../../src/crypto/bootstrap-credentials.ts";
 import { installationHash } from "../../src/domain/node-installation.ts";
 import { createApp } from "../../src/app.ts";
 import type { Env } from "../../src/env.ts";
+import generatedPool from "../../../../packages/contracts/native/compute-pool.generated.json" with { type: "json" };
+import {
+  RegionMaterialRotationAuthority,
+  RegionMaterialRotationVerification,
+} from "@pgcf/contracts/region-material-rotation";
+import { FleetRolloutIntent } from "@pgcf/contracts/fleet-rollouts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 
 const releases: string[] = [];
@@ -1385,4 +1392,145 @@ it("a host-free material transition retains closure until one current-custody ru
   expect(await restoreFleetPatchPlacements(runtime, next!.operation_id)).toBe(
     true,
   );
+});
+it("verified activation creates a current-custody host-only finalization from an immutable host-ready receipt", async () => {
+  const f = await setup(true),
+    now = new Date().toISOString(),
+    original = await readFleetPatch(f.runtime, f.op),
+    rollout = newOperationId(),
+    nodeName = (await env.DB.prepare(
+      "SELECT k8s_node_name FROM nodes WHERE id=?",
+    )
+      .bind(f.node)
+      .first("k8s_node_name")) as string;
+  const { loadRegionJoinBundle } =
+    await import("../../src/crypto/bootstrap-credentials.ts");
+  const old = await loadRegionJoinBundle(
+    env.DB,
+    env.CREDENTIAL_KEYS,
+    joinBundleReference(f.region, 1),
+  );
+  await storeRegionJoinBundle(
+    env.DB,
+    env.CREDENTIAL_KEYS,
+    joinBundleReference(f.region, 2),
+    {
+      ...old,
+      talos_admin_config: "current-rotated-talos-config",
+      kubeconfig: "current-rotated-kubeconfig",
+    },
+  );
+  await importRegionAgentKey(env.DB, env, f.region, f.agent);
+  const proof = RegionMaterialRotationVerification.parse({
+    source: "trusted_native",
+    talos_version: "1.14.1",
+    kubernetes_version: "1.36.5",
+    observed_at: now,
+    kube_system_uid: f.clusterUid,
+    nodes: [
+      {
+        node_id: f.node,
+        node_uid: f.nodeUid,
+        k8s_node_name: nodeName,
+        provider_instance_id: "123456",
+      },
+    ],
+    seed_sha256: "a".repeat(64),
+    join_sha256: "b".repeat(64),
+    transcript_sha256: "c".repeat(64),
+    retired_authorities: RegionMaterialRotationAuthority.options.map(
+      (authority) => ({
+        authority,
+        prior_sha256: "1".repeat(64),
+        replacement_sha256: "2".repeat(64),
+        new_access_sha256: "3".repeat(64),
+        retired_access_sha256: "4".repeat(64),
+        result: ["discovery_secret", "secret_at_rest_key"].includes(authority)
+          ? "retired_from_live_configuration"
+          : "rejected",
+      }),
+    ),
+  });
+  const intent = FleetRolloutIntent.parse({
+    rollout_id: rollout,
+    release_id: f.id,
+    maintenance_acknowledged: true,
+    created_at: now,
+    regions: [
+      {
+        region_id: f.region,
+        expected_revision: 0,
+        revision: 1,
+        cluster_uid: f.clusterUid,
+        material_revision: 1,
+        current_material_revision: 2,
+        staged_material_revision: 2,
+        rotation: {
+          revision: 1,
+          phase: "complete",
+          state: "confirmed",
+          node_index: 0,
+          verified: proof,
+        },
+        nodes: [
+          {
+            node_id: f.node,
+            node_uid: f.nodeUid,
+            expected_revision: 0,
+            assignment_revision: 1,
+            role: "customer",
+            address: "192.0.2.18",
+          },
+        ],
+      },
+    ],
+  });
+  const policy = {
+    ...generatedPool.lease.policy,
+    profile: { ...generatedPool.lease.policy.profile, release_id: f.id },
+  };
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE regions SET bootstrap_material_revision=2,bootstrap_material_provenance_sha256=? WHERE id=?",
+    ).bind(await installationHash(proof), f.region),
+    env.DB.prepare(
+      "UPDATE fleet_region_releases SET rollout_json=? WHERE region_id=?",
+    ).bind(JSON.stringify(intent), f.region),
+    env.DB.prepare(
+      "UPDATE fleet_patch_operations SET stage='host_ready',state='confirmed',observed_json=? WHERE operation_id=?",
+    ).bind(JSON.stringify(f.facts), f.op),
+    env.DB.prepare(
+      "INSERT INTO node_compute_pool_policies(node_id,node_uid,revision,release_id,policy_json,updated_at) VALUES(?,?,1,?,?,?)",
+    ).bind(f.node, f.nodeUid, f.id, JSON.stringify(policy), now),
+    env.DB.prepare(
+      "INSERT INTO fleet_node_release_observations(node_id,node_uid,assignment_revision,agent_key_hash,facts_json,observed_at,received_at) SELECT ?,?,1,agent_key_hash,?,?,? FROM regions WHERE id=?",
+    ).bind(
+      f.node,
+      f.nodeUid,
+      JSON.stringify({ boot_id: f.facts.boot_id, components: [] }),
+      now,
+      now,
+      f.region,
+    ),
+  ]);
+  const { continueFleetPatchRegion } =
+    await import("../../src/domain/fleet-patches.ts");
+  const runtime = {
+    ...f.runtime,
+    PATCH_NODE: { create: async () => ({}) },
+  } as unknown as Env;
+  const next = await continueFleetPatchRegion(runtime, f.op);
+  expect(next!.finalization_of).toBe(f.op);
+  expect(next!.stage).toBe("host_config");
+  expect(
+    (await readFleetPatch(runtime, next!.operation_id)).material_revision,
+  ).toBe(2);
+  const input = await fleetPatchInput(runtime, next!.operation_id);
+  expect(input.host_configuration_only).toBe(true);
+  expect(input.host_configuration!.status.material_revision).toBe(2);
+  expect(input.talos_admin_config).toBe("current-rotated-talos-config");
+  expect((await readFleetPatch(runtime, f.op)).material_revision).toBe(
+    original.material_revision,
+  );
+  expect((await readFleetPatch(runtime, f.op)).stage).toBe("host_ready");
 });

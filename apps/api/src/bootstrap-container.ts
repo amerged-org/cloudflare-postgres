@@ -27,6 +27,7 @@ import {
 } from "./domain/node-thin-storage-execution.ts";
 import { NodeId } from "@pgcf/contracts";
 import { FleetPatchStatus } from "@pgcf/contracts/fleet-patches";
+import { FleetRegionMaterialRotationInput } from "@pgcf/contracts/region-material-rotation";
 import {
   prepareNodeInspectionInput,
   assertNodeInspectionInputCurrent,
@@ -196,6 +197,53 @@ async function statusIdentifierHash(value: string) {
 }
 
 export class NodeBootstrap extends DurableObject<Env> {
+  async rotateRegionAuthority(value: FleetRegionMaterialRotationInput) {
+    const input = FleetRegionMaterialRotationInput.parse(value);
+    if (
+      !this.ctx.id.equals(
+        this.env.NODE_BOOTSTRAP.idFromName(
+          `fleet-rotation:${input.rollout_id}:${input.region_id}`,
+        ),
+      )
+    )
+      throw new Error("rotation_container_identity_mismatch");
+    const container = this.ctx.container;
+    if (!container) throw new Error("rotation_container_unavailable");
+    const bearer = await this.ctx.blockConcurrencyWhile(async () => {
+      const existing = await this.ctx.storage.get<string>(
+        "rotationServerBearer",
+      );
+      if (existing) return existing;
+      const token = crypto.randomUUID() + crypto.randomUUID();
+      await this.ctx.storage.put("rotationServerBearer", token);
+      return token;
+    });
+    if (!container.running)
+      container.start({
+        enableInternet: true,
+        env: { PORT: "8080", PGCF_BOOTSTRAP_SERVER_BEARER: bearer },
+      });
+    await container.setInactivityTimeout(660_000);
+    await this.ctx.storage.setAlarm(Date.now() + 660_000);
+    await this.#waitForPort(container);
+    const response = await container.getTcpPort(8080).fetch(
+      new Request("http://localhost:8080/v1/region-authority-rotations", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bearer}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify(input),
+        signal: AbortSignal.timeout(30_000),
+      }),
+    );
+    if (!response.ok) {
+      const result = (await response.json()) as { error_code?: string };
+      if (result.error_code === "container_busy") return { running: true };
+      throw new Error("rotation_native_dispatch_failed");
+    }
+    return { running: true };
+  }
   async #backupPort(runId: string) {
     z.uuid().parse(runId);
     if (

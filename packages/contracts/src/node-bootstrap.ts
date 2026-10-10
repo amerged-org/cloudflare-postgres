@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
-import { FleetReleaseId } from "./releases.ts";
+import { FleetReleaseId, FleetTalosRawImage } from "./releases.ts";
 import { NodeId, OperationId, RegionId } from "./ids.ts";
 import { parseRouteKeyring } from "./route-token.ts";
 import { NodeStorageTrial } from "./node-storage.ts";
@@ -105,6 +105,19 @@ export const NodePostjoinRelease = z.strictObject({
   storage_template_sha256: z.string().regex(/^[a-f0-9]{64}$/),
 });
 export type NodePostjoinRelease = z.infer<typeof NodePostjoinRelease>;
+export const NodeGoldenImage = z.strictObject({
+  release_id: FleetReleaseId,
+  spec_sha256: Digest,
+  region_revision: z.number().int().positive(),
+  talos_version: z.string().regex(/^1\.14\.(?:0|[1-9]\d*)$/),
+  schematic_id: Digest,
+  installer: z
+    .string()
+    .max(512)
+    .regex(/^[^\s@]+@sha256:[a-f0-9]{64}$/),
+  raw: FleetTalosRawImage,
+});
+export type NodeGoldenImage = z.infer<typeof NodeGoldenImage>;
 export const NodeBootstrapSpec = z
   .strictObject({
     version: z.literal(1),
@@ -144,6 +157,7 @@ export const NodeBootstrapSpec = z
       raw_sha256: Digest,
       raw_bytes: PositiveBytes.refine((value) => value % 512 === 0),
       installer_digest: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+      golden_image: NodeGoldenImage.optional(),
     }),
     storage: z.strictObject({
       ephemeral_gib: z.number().int().min(4).max(1024),
@@ -203,6 +217,21 @@ export const NodeBootstrapSpec = z
         message: "volumes do not fit target disk",
       });
     }
+    const golden = value.image.golden_image;
+    if (
+      golden &&
+      (golden.schematic_id !== value.image.schematic_id ||
+        golden.installer.split("@").at(-1) !== value.image.installer_digest ||
+        golden.raw.sha256 !== value.image.compressed_sha256 ||
+        golden.raw.bytes !== value.image.compressed_bytes ||
+        golden.raw.raw_sha256 !== value.image.raw_sha256 ||
+        golden.raw.raw_bytes !== value.image.raw_bytes)
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "Initial disk measurements differ from the selected golden release",
+      });
     if (
       value.hardware.rescue_ram_min_bytes <
       value.image.compressed_bytes + value.image.raw_bytes + 512 * 1024 ** 2

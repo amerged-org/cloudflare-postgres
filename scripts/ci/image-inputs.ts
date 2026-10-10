@@ -47,6 +47,7 @@ const sharedNodeInputs = new Set([
   "scripts/e2e/package.json",
   "infra/platform/versions.lock.json",
   "infra/platform/openebs-image.ts",
+  "infra/platform/image-manifest.ts",
 ]);
 // These also govern qualification of PostgreSQL, despite not entering its image filesystem.
 const sharedQualificationInputs = new Set([
@@ -63,7 +64,6 @@ const nativeInputs = new Set([
   "apps/node-bootstrap/tsconfig.json",
   "infra/talos/publish-storage-capacity.ts",
   "infra/platform/base/values/cilium.yaml",
-  "infra/platform/image-manifest.ts",
   "infra/storage/sources.lock.json",
   "infra/talos/sandbox/runtime-admission.ts",
   "scripts/e2e/src/node-network-native.ts",
@@ -115,6 +115,31 @@ function canonical(value: unknown): unknown {
     );
   return value;
 }
+function installerDeliveryOnly(step: Record<string, unknown>): boolean {
+  if (
+    step.if !== "vars.PGCF_TALOS_INSTALLER_RELEASE != ''" ||
+    typeof step.run !== "string" ||
+    Object.keys(step).some((key) => !["name", "if", "env", "run"].includes(key))
+  )
+    return false;
+  const env = metadataObject(step.env);
+  if (
+    env.GH_TOKEN !== "${{ github.token }}" ||
+    env.PGCF_TALOS_INSTALLER_RELEASE !==
+      "${{ vars.PGCF_TALOS_INSTALLER_RELEASE }}"
+  )
+    return false;
+  const legacy =
+    /^printf '%s' "\$GH_TOKEN" \| docker login ghcr\.io --username "\$GITHUB_ACTOR" --password-stdin\nnode scripts\/operations\/publish-talos-installer\.mjs "\$PGCF_TALOS_INSTALLER_RELEASE" "\$RUNNER_TEMP\/[a-zA-Z0-9_/-]+"\s*$/;
+  if (Object.keys(env).length === 2 && legacy.test(step.run)) return true;
+  const skopeo =
+    /^sudo apt-get update --quiet\nsudo apt-get install --yes --no-install-recommends "skopeo=\$PGCF_SKOPEO_VERSION"\nPGCF_TEST_SKOPEO=1 node --test --test-name-pattern='actual OCI archive' scripts\/operations\/publish-talos-installer\.test\.mjs\nnode scripts\/operations\/publish-talos-installer\.mjs "\$PGCF_TALOS_INSTALLER_RELEASE" "\$RUNNER_TEMP\/[a-zA-Z0-9_/-]+"\s*$/;
+  return (
+    Object.keys(env).length === 3 &&
+    env.PGCF_SKOPEO_VERSION === "1.13.3+ds1-2ubuntu0.24.04.3" &&
+    skopeo.test(step.run)
+  );
+}
 function workflowInputs(change: {
   before: string;
   after: string;
@@ -141,12 +166,7 @@ function workflowInputs(change: {
               step.uses.startsWith("actions/upload-artifact@")
             )
               return false;
-            return !(
-              typeof step.run === "string" &&
-              /^printf '%s' "\$GH_TOKEN" \| docker login ghcr\.io --username "\$GITHUB_ACTOR" --password-stdin\nnode scripts\/operations\/publish-talos-installer\.mjs "\$PGCF_TALOS_INSTALLER_RELEASE" "\$RUNNER_TEMP\/[a-zA-Z0-9_/-]+"\s*$/.test(
-                step.run,
-              )
-            );
+            return !installerDeliveryOnly(step);
           })
           .map((step) =>
             Object.fromEntries(

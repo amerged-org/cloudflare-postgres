@@ -122,11 +122,13 @@ reapply configuration merely to recreate that runtime resource.
 The October5 disclosure affected EU authority. A subsequent October9 diagnostic exposed the
 US machine configuration as well; treat both prior authority sets as compromised. Earlier
 fingerprint differences do not protect a later disclosure. Read the current accepted rotation
-results in PLAN.md Status. Disposable laboratory keys must never become fleet custody.
+results in the [ULTRA plan](../architecture/cloudflare-convergence-and-serverless-plan.md#done). Disposable laboratory keys must never become fleet custody.
 
-For the current owner installation, the October10 decision stops additional cluster-authority
-rotations. Keep EU custody revision1 and US revision2 and verify their actual access. The prior
-disclosure record remains; the procedures below apply only to a separately requested rotation.
+The latest October10 owner decision authorizes activation of the prepared EU replacement
+authority during the automatic EU patch window, combining required restarts with the upgrade.
+This supersedes the earlier rotation pause. Verify replacement access and rejection of retired
+authority through the existing procedure; retain US custody revision2. The prior disclosure
+record remains. Planning this change does not mean it has been activated.
 
 The pinned [Talos CA command](https://github.com/siderolabs/talos/blob/v1.14.2/cmd/talosctl/cmd/talos/rotate-ca.go)
 supports separate Talos and Kubernetes API CA rotation. For Talos only, explicitly set

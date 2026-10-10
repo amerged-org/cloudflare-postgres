@@ -61,6 +61,61 @@ test("workflow retention, test globs, installer delivery and documentation do no
   );
 });
 
+test("exact Skopeo installer publication run and env do not rebuild native artifacts", async () => {
+  const after = await readFile(
+    new URL("../../.github/workflows/ci.yml", import.meta.url),
+    "utf8",
+  );
+  const skopeo = [
+    "          sudo apt-get update --quiet",
+    '          sudo apt-get install --yes --no-install-recommends "skopeo=$PGCF_SKOPEO_VERSION"',
+    "          PGCF_TEST_SKOPEO=1 node --test --test-name-pattern='actual OCI archive' scripts/operations/publish-talos-installer.test.mjs",
+    '          node scripts/operations/publish-talos-installer.mjs "$PGCF_TALOS_INSTALLER_RELEASE" "$RUNNER_TEMP/pgcf-preassembled-installer"',
+  ].join("\n");
+  const before = after
+    .replace("          PGCF_SKOPEO_VERSION: 1.13.3+ds1-2ubuntu0.24.04.3\n", "")
+    .replace(
+      skopeo,
+      [
+        '          printf \'%s\' "$GH_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin',
+        '          node scripts/operations/publish-talos-installer.mjs "$PGCF_TALOS_INSTALLER_RELEASE" "$RUNNER_TEMP/pgcf-preassembled-installer"',
+      ].join("\n"),
+    );
+  assert.notEqual(before, after);
+  assert.deepEqual(
+    selectImageInputs([".github/workflows/ci.yml"], "push", { before, after }),
+    selected(),
+  );
+  const native = selected({
+    rust_gateway: true,
+    native_controller: true,
+    rust_bootstrap_relay: true,
+    native_reclaimer: true,
+    sandbox_controller: true,
+  });
+  assert.deepEqual(
+    selectImageInputs([".github/workflows/ci.yml"], "push", {
+      before: after,
+      after: after.replace(
+        skopeo,
+        skopeo +
+          "\n          docker buildx build --file apps/native-gateway/Dockerfile .",
+      ),
+    }),
+    native,
+  );
+  assert.deepEqual(
+    selectImageInputs([".github/workflows/ci.yml"], "push", {
+      before: after,
+      after: after.replace(
+        "          PGCF_SKOPEO_VERSION: 1.13.3+ds1-2ubuntu0.24.04.3\n",
+        "          PGCF_SKOPEO_VERSION: 1.13.3+ds1-2ubuntu0.24.04.3\n          EXTRA_BUILD_INPUT: changed\n",
+      ),
+    }),
+    native,
+  );
+});
+
 test("workflow build recipes and consumed native schema bytes still invalidate the affected immutable profiles", async () => {
   const before = await readFile(
     new URL("../../.github/workflows/ci.yml", import.meta.url),
@@ -112,7 +167,7 @@ test("management-only changes skip images while exact Native and Regional build 
   );
   assert.deepEqual(
     selectImageInputs(["infra/platform/image-manifest.ts"], "push"),
-    selected({ node_bootstrap: true }),
+    selected({ node_bootstrap: true, regional: true }),
   );
   assert.deepEqual(
     selectImageInputs(

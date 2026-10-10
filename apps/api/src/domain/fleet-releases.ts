@@ -15,6 +15,7 @@ import type { ApiContext } from "../env.ts";
 import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { agentRegion } from "./agent-auth.ts";
+import { normalizeRuntimeImageManifest } from "../../../../infra/platform/image-manifest.ts";
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -523,14 +524,73 @@ export async function observeFleetNodeRelease(
             name as keyof typeof role.kubernetes_images
           ] && value.runtime_sha256 === value.configuration.slice(-64),
     );
+  // Raw imageIDs may name the immutable OCI parent. Only fresh same-boot reports
+  // may map that parent to the release's unique Linux/AMD64 manifest.
+  const currentFacts = structuredClone(input.facts);
+  const deadline = new AbortController(),
+    timer = preserveKube
+      ? setTimeout(() => deadline.abort(), 20_000)
+      : undefined;
+  const signal = deadline.signal;
+  try {
+    for (const actual of currentFacts.components) {
+      const pin = selected.spec.components.find(
+        (component) =>
+          component.name === actual.name && component.kind === "image",
+      );
+      if (!pin || !actual.runtime_image_sha256) continue;
+      const normalized =
+        actual.runtime_image_sha256 === pin.sha256
+          ? pin.sha256
+          : preserveKube
+            ? await normalizeRuntimeImageManifest(
+                pin.reference,
+                pin.sha256,
+                actual.runtime_image_sha256,
+                { signal },
+              )
+            : undefined;
+      if (normalized) {
+        actual.version ??= pin.version;
+        actual.sha256 ??= normalized;
+      } else if (actual.sha256 === pin.sha256) {
+        // An unproved contradictory runtime cannot retain a claimed target pin.
+        delete actual.sha256;
+        if (actual.version === pin.version) delete actual.version;
+      }
+    }
+    if (preserveKube) {
+      for (const name of [
+        "apiServer",
+        "controllerManager",
+        "scheduler",
+      ] as const) {
+        const reported = currentFacts.kubernetes_static_images?.[name],
+          expected = role.kubernetes_images?.[name];
+        if (!reported || !expected) continue;
+        const normalized = await normalizeRuntimeImageManifest(
+          expected,
+          expected.slice(-64),
+          reported,
+          { signal },
+        );
+        if (normalized)
+          currentFacts.kubernetes_static_images![name] = normalized;
+      }
+      if (Date.parse(input.observed_at) < Date.now() - 180_000)
+        return conflict("Fleet observation is not fresh");
+    }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
   const facts = preserve
     ? {
-        ...input.facts,
+        ...currentFacts,
         talos_installer: old!.talos_installer,
         talos_schematic_sha256: old!.talos_schematic_sha256,
         talos_provenance: receipt,
         components: [
-          ...input.facts.components,
+          ...currentFacts.components,
           ...old!.components.filter(
             (component) =>
               role.talos_extensions.includes(component.name) &&
@@ -544,7 +604,7 @@ export async function observeFleetNodeRelease(
         ],
         ...(preserveKube ? { kubernetes_image_provenance: kubeProof } : {}),
       }
-    : input.facts;
+    : currentFacts;
   // Fence the exact prior observation. A concurrent Native receipt must win over
   // a partial merge prepared before that receipt was committed.
   const previous =

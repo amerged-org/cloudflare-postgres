@@ -61,6 +61,22 @@ Invoke `talosctl bootstrap` exactly once against one control-plane node after re
 
 The CNI is intentionally absent at bootstrap. Install the pinned Cilium release promptly using the [platform baseline](../platform/README.md), then confirm Cilium, CoreDNS, Node Ready, one disposable Pod DNS check and Talos health. Flux subsequently owns platform releases; the regional agent owns per-database namespaces and CNPG resources. Talos lifecycle jobs own host and Kubernetes upgrades. Flux does not patch the guest OS.
 
-Before joining another node in Phase 3, apply the exact peer-address allowlist for Talos, Kubernetes, kubelet, control-plane etcd and CNI traffic described in [PLAN.md section 6](../../PLAN.md#6-security-and-isolation). The platform baseline requests Cilium WireGuard encryption for inter-node Pod traffic. Verify the encryption peers and traffic before admitting the new node for customer database placement; no cluster port may become world reachable. The checked-in configuration does not prove that encryption is deployed or that this two-node acceptance has passed.
+Before joining another node, apply the exact peer-address allowlist for Talos, Kubernetes, kubelet, control-plane etcd and CNI traffic. The [ULTRA delivery plan](../../docs/architecture/cloudflare-convergence-and-serverless-plan.md#delivery-architecture) retains restricted management access and Cloudflare-only database ingress. The platform baseline requests Cilium WireGuard encryption for inter-node Pod traffic. Verify the encryption peers and traffic before admitting the new node for customer database placement; no cluster port may become world reachable. The checked-in configuration does not prove that encryption is deployed or that this two-node acceptance has passed.
 
 Sources: [Talos NoCloud](https://docs.siderolabs.com/talos/v1.14/platform-specific-installations/cloud-platforms/nocloud), [network kernel arguments](https://docs.siderolabs.com/talos/v1.14/reference/kernel), [raw volumes](https://docs.siderolabs.com/talos/v1.14/reference/configuration/block/rawvolumeconfig), [LVM groups](https://docs.siderolabs.com/talos/v1.14/reference/configuration/storage/lvmvolumegroupconfig), [control-plane scheduling](https://docs.siderolabs.com/talos/v1.14/deploy-and-manage-workloads/workloads-on-controlplane), [Contabo rescue](https://help.contabo.com/en/support/solutions/articles/103000295053-how-do-i-boot-a-rescue-system-for-my-server-).
+
+A selected fleet release binds its initial disk in `talos_raw_image` (`url`, compressed
+`sha256`/`bytes`, `format`, and `raw_sha256`/`raw_bytes`). AddNode inspection, composition
+and disk installation preserve that exact approved release identity and its customer-role
+installer. A selected release without this artifact is rejected; Image Factory fallback
+is available only before a region selects a release.
+
+The common raw image contains no node addresses or keys. For the qualified NoCloud/GRUB
+layout, after full raw/GPT verification the provisioner configures only the default A boot
+entry with its existing fresh hardware network arguments. It compares the live kernel and
+initramfs with the immutable reference, preserves the Reset entry, writes the one known
+GRUB file atomically and reads it back. A committed file is skipped after interruption;
+unexpected file content stops execution. GPT and the other partitions remain verified.
+The transient mounts are outside the image staging filesystem and are checked against
+exact backing-file offsets before cleanup. Cluster custody is generated or selected through
+the existing sealed configuration flow after boot, outside the image.

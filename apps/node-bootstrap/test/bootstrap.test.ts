@@ -25,6 +25,7 @@ import {
   assertAuthority,
   canonical,
   inputHash,
+  imageURL,
   jsonRecords,
   networkKernelArg,
   partitions,
@@ -1661,4 +1662,35 @@ test("command capture accepts the observed 649643-byte inventory while retaining
     }),
     /command_output_limit/,
   );
+});
+test("a selected golden release installs its pinned common raw disk without creating a per-node Factory schematic", async () => {
+  const input = fixture(),
+    image = input.spec.image;
+  image.golden_image = {
+    release_id: "golden-fixture",
+    spec_sha256: "e".repeat(64),
+    region_revision: 1,
+    talos_version: TALOS_VERSION,
+    schematic_id: image.schematic_id,
+    installer: `registry.example/installer@${image.installer_digest}`,
+    raw: {
+      url: `https://artifacts.example/v1/sha256/${image.compressed_sha256}`,
+      sha256: image.compressed_sha256,
+      format: "raw.xz",
+      bytes: image.compressed_bytes,
+      raw_sha256: image.raw_sha256,
+      raw_bytes: image.raw_bytes,
+    },
+  };
+  input.input_hash = inputHash(input.spec);
+  assert.equal(imageURL(input.spec), image.golden_image.raw.url);
+  const job = new BootstrapJob(input, {
+    request: async () => {
+      throw new Error("Golden disk must not invoke Image Factory");
+    },
+  });
+  await Reflect.get(job, "verifySchematic").call(job);
+  const different = structuredClone(input.spec);
+  different.image.raw_sha256 = "1".repeat(64);
+  assert.equal(NodeBootstrapSpec.safeParse(different).success, false);
 });

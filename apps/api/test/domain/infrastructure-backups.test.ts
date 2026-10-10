@@ -5,6 +5,7 @@ import type { Env } from "../../src/env.ts";
 import {
   authorizeBackupOperator,
   configureInfrastructureBackups,
+  exportControlD1,
   finishInfrastructureBackup,
   initializeInfrastructureBackup,
   prepareInfrastructureBackupInput,
@@ -113,6 +114,138 @@ it("uses actual local Workflow missing-instance semantics and one persisted dail
     day: new Date(at).toISOString().slice(0, 10),
     status: "pending",
   });
+});
+it("polls a real D1 export's at_bookmark and stops on the provider's error without restarting", async () => {
+  const f = await fixture(),
+    at = Date.now(),
+    run = crypto.randomUUID(),
+    binding = enabled(),
+    c = await configureInfrastructureBackups(binding, config(f.region), at);
+  await env.DB.prepare(
+    "INSERT INTO infrastructure_backup_runs(id,day,config_revision,status,created_at,expires_at) VALUES(?,?,?,'running',?,?)",
+  )
+    .bind(
+      run,
+      new Date(at).toISOString().slice(0, 10),
+      c.revision,
+      new Date(at).toISOString(),
+      new Date(at + 3600000).toISOString(),
+    )
+    .run();
+  const bodies: Record<string, unknown>[] = [];
+  const exportURL = "https://export.example.com/control.sql";
+  expect(
+    await exportControlD1(binding, run, async (_input, init) => {
+      bodies.push(JSON.parse(init!.body as string));
+      expect(init!.redirect).toBe("error");
+      expect(init!.signal).toBeInstanceOf(AbortSignal);
+      return Response.json({
+        success: true,
+        result:
+          bodies.length === 1
+            ? { success: true, status: "active", at_bookmark: "same-export" }
+            : {
+                success: true,
+                status: "complete",
+                at_bookmark: "same-export",
+                result: { filename: "control.sql", signed_url: exportURL },
+              },
+      });
+    }),
+  ).toBe(exportURL);
+  expect(bodies).toEqual([
+    {
+      output_format: "polling",
+      dump_options: { no_schema: false, no_data: false, tables: [] },
+    },
+    {
+      output_format: "polling",
+      dump_options: { no_schema: false, no_data: false, tables: [] },
+      current_bookmark: "same-export",
+    },
+  ]);
+  let failedCalls = 0;
+  await expect(
+    exportControlD1(binding, run, async () => {
+      failedCalls++;
+      return Response.json({
+        success: true,
+        result: {
+          status: "error",
+          at_bookmark: "failed-export",
+          error: "private-provider-error",
+        },
+      });
+    }),
+  ).rejects.toThrow("infrastructure_backup_d1_export_failed");
+  expect(failedCalls).toBe(1);
+});
+it("polls the same export while D1 queries are locked and rechecks authority after completion", async () => {
+  const f = await fixture(),
+    at = Date.now(),
+    run = crypto.randomUUID(),
+    binding = enabled();
+  const c = await configureInfrastructureBackups(binding, config(f.region), at);
+  await env.DB.prepare(
+    "INSERT INTO infrastructure_backup_runs(id,day,config_revision,status,created_at,expires_at) VALUES(?,?,?,'running',?,?)",
+  )
+    .bind(
+      run,
+      new Date(at).toISOString().slice(0, 10),
+      c.revision,
+      new Date(at).toISOString(),
+      new Date(at + 3600000).toISOString(),
+    )
+    .run();
+  let locked = false,
+    calls = 0;
+  const guarded = {
+    ...binding,
+    DB: new Proxy(binding.DB, {
+      get(target, key) {
+        if (key === "prepare")
+          return (query: string) => {
+            if (locked) throw Error("documented_d1_export_lock");
+            return target.prepare(query);
+          };
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+  };
+  const url = "https://export.example.com/control.sql";
+  expect(
+    await exportControlD1(guarded, run, async (_input, init) => {
+      calls++;
+      if (calls === 1) {
+        locked = true;
+        return Response.json({
+          success: true,
+          result: { status: "active", at_bookmark: "one-export" },
+        });
+      }
+      expect(JSON.parse(init!.body as string).current_bookmark).toBe(
+        "one-export",
+      );
+      locked = false;
+      return Response.json({
+        success: true,
+        result: { status: "complete", result: { signed_url: url } },
+      });
+    }),
+  ).toBe(url);
+  expect(calls).toBe(2);
+  await expect(
+    exportControlD1(binding, run, async () => {
+      await env.DB.prepare(
+        "UPDATE infrastructure_backup_config SET enabled=0,revision=revision+1 WHERE singleton=1",
+      ).run();
+      return Response.json({
+        success: true,
+        result: { status: "complete", result: { signed_url: url } },
+      });
+    }),
+  ).rejects.toThrow();
 });
 it("first failed run is failing without an older success; stale grace expires and optional email is generic and deduplicated", async () => {
   const f = await fixture(),
@@ -387,6 +520,7 @@ it("binds one fresh control snapshot source and revokes its daily capability on 
           {
             name: "image/cilium/cilium",
             reference: "quay.io/cilium/cilium:v1.20.2@sha256:" + "a".repeat(64),
+            sha256: "a".repeat(64),
           },
         ],
       }),
@@ -405,7 +539,7 @@ it("binds one fresh control snapshot source and revokes its daily capability on 
       JSON.stringify({
         kubernetes_control_plane: true,
         components: [
-          { name: "image/cilium/cilium", runtime_image_sha256: "b".repeat(64) },
+          { name: "image/cilium/cilium", runtime_image_sha256: "a".repeat(64) },
         ],
       }),
       new Date(now).toISOString(),
@@ -431,6 +565,12 @@ it("binds one fresh control snapshot source and revokes its daily capability on 
     source = input.artifacts.find((value) => value.kind === "etcd")!;
   expect(source.node_id).toBe(f.node);
   expect(source.cluster_uid).toBe(cluster);
+  expect(source.source!.cilium_image).toBe(
+    "quay.io/cilium/cilium:v1.20.2@sha256:" + "a".repeat(64),
+  );
+  expect(source.source!.cilium_image_id).toBe(
+    "quay.io/cilium/cilium:v1.20.2@sha256:" + "a".repeat(64),
+  );
   expect(
     (
       await authorizeBackupOperator(

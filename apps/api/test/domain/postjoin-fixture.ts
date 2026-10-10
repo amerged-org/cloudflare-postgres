@@ -8,7 +8,10 @@ import {
 import { FleetPatchFacts } from "@pgcf/contracts/fleet-patches";
 import { thinVolumeProfile } from "../../src/domain/node-thin-storage-selection.ts";
 import { ComputePoolObservation } from "@pgcf/contracts/compute-pool";
-import { FleetReleaseSpec } from "@pgcf/contracts/releases";
+import {
+  FleetReleaseSpec,
+  type FleetTalosRawImage,
+} from "@pgcf/contracts/releases";
 import { storageAuthorityPublicKeys } from "../../src/domain/storage-authority.ts";
 import type { NodeJoinBundle } from "@pgcf/contracts/node-bootstrap";
 import generated from "../../../../packages/contracts/native/compute-pool.generated.json" with { type: "json" };
@@ -27,6 +30,7 @@ export async function standingPostjoinFixture(
   region: string,
   materialOverride?: NodeJoinBundle,
   storageKeysSha256?: string,
+  rawImage?: FleetTalosRawImage,
 ) {
   const id = "postjoin-" + crypto.randomUUID(),
     digest = "d".repeat(64),
@@ -80,7 +84,7 @@ export async function standingPostjoinFixture(
     },
     role = {
       host_configuration_required: true,
-      talos_version: "1.14.1",
+      talos_version: rawImage ? "1.14.2" : "1.14.1",
       talos_installer: `registry.example/talos@sha256:${digest}`,
       talos_schematic_sha256: recipe,
       talos_extensions: ["pgcf-sandbox-controller", "schematic"],
@@ -102,6 +106,7 @@ export async function standingPostjoinFixture(
       version: 1,
       versions_lock_sha256: "c".repeat(64),
       configuration_schema_revision: 1,
+      ...(rawImage ? { talos_raw_image: rawImage } : {}),
       storage_authority_keys_sha256:
         storageKeysSha256 ?? (await storageAuthorityPublicKeys(env)).sha256,
       components: names.map((name) => ({
@@ -144,7 +149,7 @@ export async function standingPostjoinFixture(
       now,
     ),
     env.DB.prepare(
-      "INSERT INTO fleet_region_releases VALUES(?,?,1,?) ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,revision=1,updated_at=excluded.updated_at",
+      "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES(?,?,1,?) ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,revision=1,updated_at=excluded.updated_at",
     ).bind(region, id, now),
     env.DB.prepare(
       "UPDATE node_region_policies SET compute_pool_json=?,thin_storage_json=? WHERE region_id=?",
@@ -163,7 +168,7 @@ export async function standingPostjoinFixture(
       version: 1 as const,
       cluster_name: old?.cluster_name ?? "test-common",
       cluster_endpoint: old?.cluster_endpoint ?? "https://127.0.0.1:6443/",
-      talos_version: "1.14.1",
+      talos_version: rawImage ? "1.14.2" : "1.14.1",
       kubernetes_version: "1.36.5",
       talos_machine_secrets_yaml:
         old?.talos_machine_secrets_yaml ?? "test-material",

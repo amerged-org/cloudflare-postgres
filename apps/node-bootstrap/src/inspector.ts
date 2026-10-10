@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createPrivateKey, randomUUID } from "node:crypto";
+import { imageRepository } from "../../../infra/platform/image-manifest.ts";
 import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -563,20 +564,37 @@ class Inspector {
     throw new BootstrapError("inspection_registry_redirect_invalid");
   }
   private async imageIdentity() {
-    const schematic = bootstrapSchematic({
-      hardware: { ...this.input.expected_network, dns: this.input.dns },
-      peer_ipv4: this.input.peer_ipv4,
-    });
-    const result = await this.response("https://factory.talos.dev/schematics", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(schematic),
-    });
-    const id = object(JSON.parse(result.body)).id;
-    if (typeof id !== "string" || !/^[a-f0-9]{64}$/.test(id))
-      throw new BootstrapError("inspection_schematic_invalid");
+    const golden = this.input.golden_image;
+    let id: string, url: string;
+    if (golden) {
+      id = golden.schematic_id;
+      const repository = imageRepository(golden.installer),
+        pinned = golden.installer.split("@").at(-1);
+      const path = repository!.indexOf("/");
+      if (path < 1)
+        throw new BootstrapError("inspection_installer_manifest_invalid");
+      url = `https://${repository!.slice(0, path)}/v2/${repository!.slice(path + 1)}/manifests/${pinned}`;
+    } else {
+      const schematic = bootstrapSchematic({
+        hardware: { ...this.input.expected_network, dns: this.input.dns },
+        peer_ipv4: this.input.peer_ipv4,
+      });
+      const result = await this.response(
+        "https://factory.talos.dev/schematics",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(schematic),
+        },
+      );
+      const actual = object(JSON.parse(result.body)).id;
+      if (typeof actual !== "string" || !/^[a-f0-9]{64}$/.test(actual))
+        throw new BootstrapError("inspection_schematic_invalid");
+      id = actual;
+      url = `https://factory.talos.dev/v2/metal-installer/${id}/manifests/v${TALOS_VERSION}`;
+    }
     const manifest = await this.response(
-      `https://factory.talos.dev/v2/metal-installer/${id}/manifests/v${TALOS_VERSION}`,
+      url,
       {
         headers: {
           accept:
@@ -588,7 +606,8 @@ class Inspector {
     const installer_digest = `sha256:${digest(manifest.body)}`;
     if (
       manifest.response.headers.get("docker-content-digest") !==
-      installer_digest
+        installer_digest ||
+      (golden && golden.installer.split("@").at(-1) !== installer_digest)
     )
       throw new BootstrapError("inspection_installer_digest_mismatch");
     const parsed = object(JSON.parse(manifest.body));
@@ -614,7 +633,11 @@ class Inspector {
       )
     )
       throw new BootstrapError("inspection_installer_architecture_invalid");
-    return { schematic_id: id, installer_digest };
+    return {
+      schematic_id: id,
+      installer_digest,
+      ...(golden ? { golden_image: golden } : {}),
+    };
   }
   private async prepareScratch(available: number) {
     this.scratchOwned = true;
@@ -654,13 +677,16 @@ printf '%s\\n' "$inspection_free"`);
     const path = this.remotePath(),
       compressed = shellQuote(`${path}/image.raw.xz`),
       raw = shellQuote(`${path}/image.raw`);
-    const url = `https://factory.talos.dev/image/${id}/v${TALOS_VERSION}/nocloud-amd64.raw.xz`;
+    const golden = this.input.golden_image;
+    const url =
+      golden?.raw.url ??
+      `https://factory.talos.dev/image/${id}/v${TALOS_VERSION}/nocloud-amd64.raw.xz`;
     const stdout = await this.ssh(`# __PGCF_INSPECTION_IMAGE__\n${rootGuard}
 test "$(findmnt --noheadings --raw --target ${shellQuote(path)} --output TARGET,SOURCE,FSTYPE)" = ${shellQuote(`${path} ${this.scratchSource()} tmpfs`)}
 test "$(cat ${shellQuote(`${path}/identity`)})" = ${shellQuote(this.scratchIdentity())}
 test ! -e ${compressed} && test ! -L ${compressed} && test ! -e ${raw} && test ! -L ${raw}
-curl --disable --silent --show-error --fail --location --max-redirs 3 --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 480 --retry 0 --max-filesize ${bytes} --output ${compressed} ${shellQuote(url)}
-python3 - ${compressed} ${raw} ${bytes} ${diskBytes} <<'PGCF_INSPECTION_IMAGE_PY'
+curl --disable --silent --show-error --fail --location --max-redirs 3 --proto '=https' --proto-redir '=https' --tlsv1.2 --connect-timeout 15 --max-time 480 --retry 0 --max-filesize ${golden?.raw.bytes ?? bytes} --output ${compressed} ${shellQuote(url)}
+python3 - ${compressed} ${raw} ${bytes} ${diskBytes} ${shellQuote(golden?.raw.format ?? "raw.xz")} <<'PGCF_INSPECTION_IMAGE_PY'
 import hashlib, json, lzma, os, sys
 compressed, raw = sys.argv[1:3]
 compressed_bytes = os.stat(compressed).st_size
@@ -672,20 +698,31 @@ with open(compressed, 'rb') as source:
     while chunk := source.read(1024 * 1024):
         compressed_hash.update(chunk)
 raw_hash, written = hashlib.sha256(), 0
-decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=256 * 1024 * 1024)
+image_format = sys.argv[5] if len(sys.argv) > 5 else 'raw.xz'
 with open(compressed, 'rb') as source, open(raw, 'xb') as target:
-    while not decoder.eof:
-        data = source.read(1024 * 1024) if decoder.needs_input else b''
-        if decoder.needs_input and not data:
-            raise RuntimeError('inspection_image_truncated')
-        chunk = decoder.decompress(data, max_length=1024 * 1024)
-        written += len(chunk)
-        if written > maximum:
-            raise RuntimeError('inspection_image_size_invalid')
-        target.write(chunk)
-        raw_hash.update(chunk)
-    if decoder.unused_data or source.read(1):
-        raise RuntimeError('inspection_image_trailing_bytes')
+    if image_format == 'raw':
+        while chunk := source.read(1024 * 1024):
+            written += len(chunk)
+            if written > maximum:
+                raise RuntimeError('inspection_image_size_invalid')
+            target.write(chunk)
+            raw_hash.update(chunk)
+    elif image_format == 'raw.xz':
+        decoder = lzma.LZMADecompressor(format=lzma.FORMAT_XZ, memlimit=256 * 1024 * 1024)
+        while not decoder.eof:
+            data = source.read(1024 * 1024) if decoder.needs_input else b''
+            if decoder.needs_input and not data:
+                raise RuntimeError('inspection_image_truncated')
+            chunk = decoder.decompress(data, max_length=1024 * 1024)
+            written += len(chunk)
+            if written > maximum:
+                raise RuntimeError('inspection_image_size_invalid')
+            target.write(chunk)
+            raw_hash.update(chunk)
+        if decoder.unused_data or source.read(1):
+            raise RuntimeError('inspection_image_trailing_bytes')
+    else:
+        raise RuntimeError('inspection_image_size_invalid')
 if written <= 0 or written % 512:
     raise RuntimeError('inspection_image_size_invalid')
 print(json.dumps({'compressed_sha256': compressed_hash.hexdigest(), 'compressed_bytes': compressed_bytes, 'raw_sha256': raw_hash.hexdigest(), 'raw_bytes': written}))
@@ -701,6 +738,14 @@ PGCF_INSPECTION_IMAGE_PY`);
       !/^[a-f0-9]{64}$/.test(measured.compressed_sha256) ||
       typeof measured.raw_sha256 !== "string" ||
       !/^[a-f0-9]{64}$/.test(measured.raw_sha256)
+    )
+      throw new BootstrapError("inspection_image_size_invalid");
+    if (
+      golden &&
+      (measured.compressed_sha256 !== golden.raw.sha256 ||
+        compressed_bytes !== golden.raw.bytes ||
+        measured.raw_sha256 !== golden.raw.raw_sha256 ||
+        raw_bytes !== golden.raw.raw_bytes)
     )
       throw new BootstrapError("inspection_image_size_invalid");
     const layout = partitions(await this.ssh(`sfdisk --json ${raw}`));

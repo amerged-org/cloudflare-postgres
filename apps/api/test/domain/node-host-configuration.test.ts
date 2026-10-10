@@ -79,11 +79,9 @@ async function configured(
       "a".repeat(64),
       now,
     ),
-    env.DB.prepare("INSERT INTO fleet_region_releases VALUES(?,?,1,?)").bind(
-      f.region,
-      id,
-      now,
-    ),
+    env.DB.prepare(
+      "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES(?,?,1,?)",
+    ).bind(f.region, id, now),
     env.DB.prepare(
       "INSERT INTO fleet_node_releases VALUES(?,?,?,'customer',1,?)",
     ).bind(f.node, uid, id, now),

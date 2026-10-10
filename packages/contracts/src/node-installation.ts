@@ -6,6 +6,7 @@ import {
   NodeBootstrapSpec,
   NodePlatformConfiguration,
   NodePlatformSpec,
+  NodeGoldenImage,
   NodeIpv6Network,
 } from "./node-bootstrap.ts";
 
@@ -206,6 +207,7 @@ export const NodeInspectionInput = z
       ipv6: true,
     }),
     dns: NodeBootstrapSpec.shape.hardware.shape.dns,
+    golden_image: NodeGoldenImage.optional(),
     peer_ipv4: NodeBootstrapSpec.shape.peer_ipv4.unwrap(),
     rescue: NodeBootstrapInput.shape.rescue,
     callback: NodeBootstrapInput.shape.callback,

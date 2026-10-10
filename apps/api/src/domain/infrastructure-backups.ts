@@ -24,6 +24,7 @@ import {
   loadCurrentRegionMaterialReference,
   loadRegionJoinBundle,
 } from "../crypto/bootstrap-credentials.ts";
+import { normalizeRuntimeImageManifest } from "../../../../infra/platform/image-manifest.ts";
 
 export const INFRASTRUCTURE_BACKUP_MAX_AGE_MS = 36 * 60 * 60 * 1000;
 const MAX_RUN_MS = 2 * 60 * 60 * 1000;
@@ -337,7 +338,7 @@ async function snapshotSource(
         components: { name: string; runtime_image_sha256?: string }[];
       },
       spec = JSON.parse(node.spec_json) as {
-        components: { name: string; reference: string }[];
+        components: { name: string; reference: string; sha256: string }[];
       };
     if (
       facts.kubernetes_control_plane !== true &&
@@ -348,8 +349,15 @@ async function snapshotSource(
       live = facts.components.find((c) => c.name === "image/cilium/cilium");
     if (
       !pin ||
+      !/^[a-f0-9]{64}$/.test(pin.sha256) ||
       !live?.runtime_image_sha256 ||
-      !/^[a-f0-9]{64}$/.test(live.runtime_image_sha256)
+      !/^[a-f0-9]{64}$/.test(live.runtime_image_sha256) ||
+      (await normalizeRuntimeImageManifest(
+        pin.reference,
+        pin.sha256,
+        live.runtime_image_sha256,
+        {},
+      )) !== pin.sha256
     )
       continue;
     const authority = await currentOperatorAuthority(
@@ -499,13 +507,16 @@ export async function exportControlD1(
   id: string,
   fetcher: typeof fetch = fetch,
 ) {
-  const { config } = await assertBackupRun(env, id);
+  const { config, row } = await assertBackupRun(env, id);
   if (!env.INFRASTRUCTURE_BACKUP_CF_TOKEN)
     throw new Error("infrastructure_backup_export_secret_missing");
   const url = `https://api.cloudflare.com/client/v4/accounts/${config.d1_account_id}/d1/database/${config.d1_database_id}/export`;
   let bookmark: string | undefined;
   for (let poll = 0; poll < 120; poll++) {
-    await assertBackupRun(env, id);
+    // D1 itself may reject queries while its export is running. Poll the same provider job
+    // under the already-authorized deadline, then recheck current authority before returning.
+    if (Date.now() >= Date.parse(row.expires_at))
+      throw new Error("infrastructure_backup_d1_export_timeout");
     const response = await fetcher(url, {
       method: "POST",
       headers: {
@@ -523,22 +534,30 @@ export async function exportControlD1(
     const result = (await response.json()) as {
       success?: boolean;
       result?: {
+        success?: boolean;
         status?: string;
-        current_bookmark?: string;
+        at_bookmark?: string;
         result?: { signed_url?: string };
         signed_url?: string;
       };
     };
-    if (!response.ok || !result.success || !result.result)
+    if (
+      !response.ok ||
+      !result.success ||
+      !result.result ||
+      result.result.success === false ||
+      result.result.status === "error"
+    )
       throw new Error("infrastructure_backup_d1_export_failed");
     if (result.result.status === "complete") {
       const signed =
         result.result.result?.signed_url ?? result.result.signed_url;
       if (!signed || new URL(signed).protocol !== "https:")
         throw new Error("infrastructure_backup_d1_export_invalid");
+      await assertBackupRun(env, id);
       return signed;
     }
-    bookmark = result.result.current_bookmark;
+    bookmark = result.result.at_bookmark;
     if (!bookmark) throw new Error("infrastructure_backup_d1_export_invalid");
     await new Promise((resolve) => setTimeout(resolve, 1000));
   }

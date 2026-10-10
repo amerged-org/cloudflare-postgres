@@ -10,7 +10,7 @@ The owner also explicitly requires Neon's **shared pool of prestarted, unassigne
 Per-database warm reclaim is an additional mode; it cannot substitute for that pool or satisfy
 its acceptance. The earlier database-bound-only interpretation is withdrawn.
 
-[PLAN.md](../../PLAN.md) remains the canonical scope, roadmap and phase-status record. This document describes the approved architecture and its migration boundaries. It does not claim that the Rust components, routing caches, Actor snapshots or warm-reclaim runtime already exist. Completed Dev results and measured limits belong in PLAN.md Status, not in separate per-change evidence documents.
+The [ULTRA plan](cloudflare-convergence-and-serverless-plan.md) is the canonical delivery sequence and Done/Open status, linked from [PLAN.md](../../PLAN.md). This document describes the approved architecture and its migration boundaries. It does not claim that the Rust components, routing caches, Actor snapshots or warm-reclaim runtime already exist. Completed results belong in the ULTRA Done/Open tables. Its October10 six-check node acceptance and R2 pool result supersede older long measurement series.
 
 ## 1. Decision and purpose
 
@@ -184,18 +184,14 @@ warm retention. No pool state may be reported ready from these findings.
 
 ### Required pool acceptance
 
-Start real unassigned slots before requests, then take at least two different hibernated databases
-with no running per-database compute and assign them distinct slots from the shared inventory.
-Preserve their committed data and isolation. Prove refill, assignment after a configuration change,
-concurrent claims, controller restart, expired/uncertain claim, mixed-release rejection, exhaustion
-fallback and clean destruction after use. The data path must never point to a previous tenant.
-
-Measure twenty independent five-minute-idle pool-hit activations through normal Cloudflare SQL,
-with connect_ms and first_read_ms from the same initial timestamp, plus separate30/120-minute
-idle soaks. Show slot creation/readiness timestamps preceding the request, actual per-database
-compute absence before assignment, slot/volume identities, resource use, hit/miss rate and refill
-time. The subsecond first-read target applies to this path. A same-Pod warm/reclaim result cannot
-replace it. Implementation and these real checks are required to complete the workstream.
+Use the R2 completion step in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#execution).
+A real unassigned slot must exist before demand. Connect normally through Cloudflare to a sleeping
+database with no running tenant compute and measure connection through the first validated SQL
+result from the same start time. A pool hit must finish below one second, preserve committed data,
+bind the correct CNPG/volume/tenant identities and trigger refill. Label a miss as a miss.
+Existing exclusive-claim, isolation, exhaustion and uncertain-outcome behavior remains part of the
+implementation and focused regression tests. Fixed twenty-wake series and 30/120-minute idle soaks
+are no longer prerequisites. A same-Pod warm/reclaim result cannot replace this shared-pool result.
 
 ## 5. Runtime states and idle policy
 
@@ -365,7 +361,7 @@ Report actual runtime activation separately from time between the user's applica
 
 ## 14. Migration and deployment
 
-Implement the approved architecture in this order:
+Implement these dependent runtime pieces within the parallel Rust/pool workstream. Fleet delivery uses R1/R2 from the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#delivery-architecture):
 
 0. **Shared pool/storage integration:** prove and implement the prestarted unassigned-runtime
    boundary and data/CNPG late binding from section4. Resolve incompatibilities explicitly; the
@@ -374,8 +370,8 @@ Implement the approved architecture in this order:
 2. **Rust controller and bootstrap relay:** replace the full regional Node server implementation; implement shared-slot preparation, exclusive assignment, refill, retirement and observations alongside targeted desired-state execution; preserve persisted progress.
 3. **Warm routing and fingerprints:** publish identity-bound direct targets, separate configuration and activity/power revisions, and implement same-runtime attestations.
 4. **Rust/Wasm Edge and Actor snapshots:** preserve real VPC HTTP/unopened-WebSocket forwarding and add the mutation barrier plus versioned route snapshots/tokens.
-5. **Shared-pool Dev acceptance:** execute the section4 multi-database, isolation, refill, restart, exhaustion and subsecond pool-hit first-read checks.
-6. **Additional warm-reclaim acceptance:** configure an approved resource/node policy and measure its separate same-runtime behavior; it cannot close the pool gate.
+5. **Shared-pool Dev acceptance:** run the R2 shared-pool acceptance in section4 through the ordinary Cloudflare path.
+6. **Optional later warm reclaim:** evaluate separately after the required shared-pool result; it is not an additional customer-readiness gate.
 7. **Later independent work:** proxy SCRAM, process/VM snapshot research and optional native CLI stream handling.
 
 The controller handoff retains a single reconciler per region. Use the existing `Recreate` ownership model, stop the previous process and confirm termination on a reachable node before starting its replacement. Do not force-delete an uncertain old Pod and allow two executors during a partition. Resume from current Cloudflare desired state and the existing storage/power/fence records; preserve credential Secret UIDs and versions when unchanged.
@@ -386,38 +382,18 @@ After each native replacement is accepted in Dev, remove its unused TypeScript s
 
 ## 15. Acceptance and measurements
 
-All acceptance uses real harness-owned Dev systems through the normal Cloudflare-to-gateway-to-PostgreSQL path. No product mocks, synthetic product data, new paid resources or production deployment is authorized by this document.
+The [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#node-acceptance) defines the six
+functional node checks. Its R2 step additionally requires a real shared-pool first SQL result below
+one second and refill after assignment. Run these through the normal Cloudflare path on Dev.
+Focused regression tests cover changed authentication, TLS, fencing, claims, isolation and
+uncertain-write behavior. Reuse valid unchanged results; do not introduce a second live test matrix.
 
-### Compatibility and safety
-
-- Preserve negative authentication, unknown hints and startup database/user mismatch rejection before PostgreSQL dial; verify routing-token and TLS interoperability.
-- Run real commit/rollback, prepared statements, transactions, cancellation and binary COPY integrity; verify slow readers, bounded buffers, close/drain and no replay of uncertain writes.
-- Rotate roles and CA/target state, replace the primary Pod, and prove stale route/fingerprint/attestation rejection, unchanged-storage protection and fresh checks for a new runtime.
-- Restart gateway, controller and reclaimer; break/recover watches and desired-state hints; preserve fence, storage, Secrets, progress, usage gaps and one-reconciler behavior.
-- Exercise Actor mutations, interrupted guarded D1 commits and interrupted snapshot publication; prove no stale snapshot reopens admission, explicit suspension stays blocked and partial observations do not clear unrelated inventory/orphan state.
-- Re-prove real CNPG hibernation/wake, quiescence, closed-WAL/R2 acknowledgement and backup behavior. Ten concurrent connections coalesce to one activation/reclaim revocation as appropriate.
-
-### Comparable timings
-
-Use the same pinned driver/client settings, source region, database class and endpoint for comparable samples. Record `connect_ms` from immediately before `Client.connect()` to successful connection and `first_read_ms` from that same start through the complete validated marker result. Record an established-session read separately. Label the physical precondition: always warm, warm idle with reclaim, or truly hibernated.
-
-Record p50/p95/max, all sample outcomes and the exact versions/digests. Twenty samples use the existing nearest-rank percentile definition; they are bounded Dev acceptance, not a production p99 or latency guarantee.
-
-The mandatory shared-pool series is specified in section4. Pool hits, pool misses, already-warm
-and warm-reclaim activations have separate labels and results.
-
-For the additional warm-reclaim series, run **twenty independent cycles with five minutes of idle time before each first connection/read**. Each cycle proves the intended idle/reclaim state, same Pod/container/process and Cluster/PVC/storage identities, committed-marker preservation, rollback absence and actual memory/swap observations. Close the client and independently re-establish the next idle cycle. Compare with twenty always-warm fresh connections using the same connect/first-read definitions.
-
-Add separate **30-minute and 120-minute idle soaks**, followed by the same first connection/read and safety checks. These longer soaks expose pages brought back by probes, Barman, background activity and kernel behavior; they are not a concurrency/class/language matrix. Keep true Pod-cold samples separate and independently prove removed/replaced Pods.
-
-Measure resident memory and swap/zswap before reclaim, after idle and after the first query; page-in activity, CPU, gateway/controller memory, relevant throttling, backup/WAL progress and the effect of an in-progress reclaim call. Report explicit unknowns rather than equating missing telemetry with zero consumption.
-
-### Attribution and outcome
-
-Correlate client, Edge/Actor, controller, Kubernetes/PostgreSQL and gateway stages by database, operation, revision and Pod identity. Use local monotonic durations and retain explicit gaps between different clocks. Distinguish configuration work, runtime verification, publication, network/TLS/authentication and memory page-in; do not add phase percentiles or compare different timer endpoints.
-
-The first successful read below one second after assigning a shared prestarted compute remains
-the required pool-hit target. Already-warm/reclaim measurements are additional evidence. If a run misses it, retain the chosen Rust architecture, record the measured result and identify the remaining constraint. Do not relabel Pod-cold activation, omitted query time or a preload-only result as a successful warm-path measurement. Completed outcomes are recorded in PLAN.md Status.
+Record the physical starting state and selected release. Measure `connect_ms` and `first_read_ms`
+from the same instant before connection; the latter includes the complete validated marker query.
+Label pool hits, misses and already-warm connections separately. Retain observed failures and
+unknowns. A slot-assignment duration alone is not SQL latency. No fixed repeated-cycle count,
+long laptop monitor or mandatory idle-soak series remains. If the target is missed, document the
+actual limiting stage and fix that observed class. Record completion in the ULTRA plan.
 
 ## 16. Later research boundaries
 

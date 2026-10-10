@@ -6,9 +6,16 @@ import {
   fleetFluxReady,
 } from "@pgcf/contracts/releases";
 import { CONFIGURATION_SCHEMA_REVISION } from "@pgcf/contracts";
+import { normalizeRuntimeImageManifest } from "../../../../infra/platform/image-manifest.ts";
 import { record, string, type Kubernetes, type Resource } from "./types.ts";
 
 export const FLEET_INVENTORY_INTERVAL_MS = 60_000;
+function validBootId(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(value)
+  );
+}
 function digest(imageId: unknown): string | undefined {
   if (typeof imageId !== "string") return undefined;
   return /(?:@sha256:|^sha256:|^[a-z][a-z0-9+.-]*:\/\/sha256:)([0-9a-f]{64})$/.exec(
@@ -53,6 +60,7 @@ export async function collectFleetInventory(
   desired: FleetDesiredRelease,
   now: () => number = Date.now,
   signal?: AbortSignal,
+  request: typeof fetch = fetch,
 ): Promise<FleetNodeReleaseObservation[]> {
   const started = now();
   const stop = () => signal?.aborted || now() - started >= 20_000;
@@ -222,8 +230,46 @@ export async function collectFleetInventory(
       const runtimeDigests = new Set(
         candidates.map(({ status }) => digest(status?.imageID)!),
       );
-      if (runtimeDigests.size !== 1) continue;
-      const runtimeDigest = [...runtimeDigests][0]!;
+      const carriers = new Map<string, Resource>();
+      const canonicalDigests = new Set<string>();
+      let qualified = validBootId(bootId);
+      for (const { pod, status } of candidates) {
+        const reported = digest(status?.imageID)!;
+        if (reported === component.sha256) {
+          canonicalDigests.add(reported);
+          continue;
+        }
+        const name = string(record(pod.spec).nodeName);
+        let carrier = name ? carriers.get(name) : undefined;
+        if (name && !carrier) {
+          carrier =
+            name === assignment.k8s_node_name
+              ? node
+              : ((await k8s.read("Node", undefined, name)) ?? undefined);
+          if (carrier) carriers.set(name, carrier);
+        }
+        const info = record(record(carrier?.status).nodeInfo);
+        const normalized =
+          carrier?.metadata.uid &&
+          !carrier.metadata.deletionTimestamp &&
+          ready(carrier) &&
+          info.operatingSystem === "linux" &&
+          info.architecture === "amd64" &&
+          validBootId(bootId) &&
+          validBootId(info.bootID)
+            ? await normalizeRuntimeImageManifest(
+                component.reference,
+                component.sha256,
+                reported,
+                { request, signal },
+              )
+            : undefined;
+        if (normalized) canonicalDigests.add(normalized);
+        else qualified = false;
+      }
+      const runtimeDigest =
+        runtimeDigests.size === 1 ? [...runtimeDigests][0]! : undefined;
+      if (!qualified && !runtimeDigest) continue;
       let stable = true;
       for (const { pod, container, status } of candidates) {
         if (stop()) return result;
@@ -249,6 +295,12 @@ export async function collectFleetInventory(
           (ownership.scope !== "cluster" &&
             record(fresh.spec).nodeName !== assignment.k8s_node_name) ||
           record(fresh.spec).nodeName !== record(pod.spec).nodeName ||
+          !Array.isArray(record(fresh.spec).containers) ||
+          !(record(fresh.spec).containers as unknown[]).some(
+            (value) =>
+              record(value).name === container.name &&
+              record(value).image === container.image,
+          ) ||
           freshStatus?.ready !== true ||
           freshStatus.imageID !== status?.imageID ||
           freshStatus.restartCount !== status?.restartCount
@@ -256,6 +308,21 @@ export async function collectFleetInventory(
           stable = false;
           break;
         }
+      }
+      for (const [name, carrier] of carriers) {
+        const fresh = await k8s.read("Node", undefined, name);
+        if (
+          !fresh ||
+          fresh.metadata.uid !== carrier.metadata.uid ||
+          fresh.metadata.deletionTimestamp ||
+          !ready(fresh) ||
+          ["bootID", "architecture", "operatingSystem"].some(
+            (key) =>
+              record(record(fresh.status).nodeInfo)[key] !==
+              record(record(carrier.status).nodeInfo)[key],
+          )
+        )
+          stable = false;
       }
       const afterNamespace = await k8s.read(
         "Namespace",
@@ -271,8 +338,10 @@ export async function collectFleetInventory(
       if (stable)
         components.push({
           name: component.name,
-          runtime_image_sha256: runtimeDigest,
-          ...(runtimeDigest === component.sha256
+          ...(runtimeDigest ? { runtime_image_sha256: runtimeDigest } : {}),
+          ...(qualified &&
+          canonicalDigests.size === 1 &&
+          canonicalDigests.has(component.sha256)
             ? { version: component.version, sha256: component.sha256 }
             : {}),
         });
@@ -330,8 +399,25 @@ export async function collectFleetInventory(
             sha &&
             current.imageID === oldStatus.imageID &&
             current.restartCount === oldStatus.restartCount
-          )
-            staticImages[name] = sha;
+          ) {
+            const expected =
+              desired.release.spec.roles[assignment.role].kubernetes_images?.[
+                name
+              ];
+            const normalized =
+              expected &&
+              validBootId(bootId) &&
+              information.operatingSystem === "linux" &&
+              information.architecture === "amd64"
+                ? await normalizeRuntimeImageManifest(
+                    expected,
+                    expected.slice(-64),
+                    sha,
+                    { request, signal },
+                  )
+                : undefined;
+            staticImages[name] = normalized ?? sha;
+          }
         }
       const afterNamespace = await k8s.read(
         "Namespace",
@@ -364,6 +450,8 @@ export async function collectFleetInventory(
         "machineID",
         "containerRuntimeVersion",
         "kernelVersion",
+        "architecture",
+        "operatingSystem",
       ].some(
         (key) =>
           record(record(after.status).nodeInfo)[key] !== information[key],
@@ -380,10 +468,7 @@ export async function collectFleetInventory(
         facts: {
           configuration_schema_revision: CONFIGURATION_SCHEMA_REVISION,
           ...(platformCommit ? { platform_source_commit: platformCommit } : {}),
-          ...(bootId &&
-          /^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(bootId)
-            ? { boot_id: bootId }
-            : {}),
+          ...(validBootId(bootId) ? { boot_id: bootId } : {}),
           ...(kubeVersion
             ? { kubernetes_version: kubeVersion, kubelet_version: kubeVersion }
             : {}),

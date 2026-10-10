@@ -18,6 +18,7 @@ import {
   canonicalInstallation,
 } from "./node-installation.ts";
 import { sandboxHostFiles } from "../../../../infra/talos/sandbox/configuration.ts";
+import { effectiveFleetRegionJoin } from "./fleet-region-authority.ts";
 import { ApiError } from "../app.ts";
 import type { Env } from "../env.ts";
 import { readBootstrapJob, admissionAuthority } from "./bootstrap-jobs.ts";
@@ -100,7 +101,12 @@ async function authority(
       "join_bundle",
     );
   if (ref.revision !== source.material_revision) return closed();
-  const material = await loadRegionJoinBundle(env.DB, env.CREDENTIAL_KEYS, ref);
+  const material = await effectiveFleetRegionJoin(
+    env,
+    source.region_id,
+    ref.revision,
+    await loadRegionJoinBundle(env.DB, env.CREDENTIAL_KEYS, ref),
+  );
   const pinned = (
       JSON.parse(source.spec_json) as { storage_authority_keys_sha256?: string }
     ).storage_authority_keys_sha256,

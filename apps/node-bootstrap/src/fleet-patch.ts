@@ -18,6 +18,7 @@ import {
   FLEET_PATCH_STAGES,
   FleetPostgresPatchProgress,
   retainedTalosInstallationMatches,
+  fleetPatchTalosRebootObserved,
 } from "@pgcf/contracts/fleet-patches";
 import { CONFIGURATION_SCHEMA_REVISION } from "@pgcf/contracts";
 import { canonicalStorageAuthorityKeys } from "@pgcf/contracts/storage-write-authority";
@@ -61,6 +62,7 @@ import {
 } from "./fleet-platform-patch.ts";
 
 import { readFleetLegacyStorage } from "./fleet-legacy-storage.ts";
+import { applyPreparedEtcdAuthority } from "./region-authority-rotation.ts";
 import {
   readHostConfiguration,
   readMachineConfiguration,
@@ -78,6 +80,7 @@ import {
   applyRuntimeAdmission,
   type RuntimeAdmissionInput,
 } from "./fleet-runtime-admission.ts";
+import { refreshKubeletTrust } from "./kubelet-trust.ts";
 
 export function validateFleetPatchInput(raw: unknown) {
   const input = FleetPatchInput.parse(raw),
@@ -143,6 +146,22 @@ export function validateFleetPatchInput(raw: unknown) {
     throw new BootstrapError("patch_compute_pool_binding_invalid");
   if (input.spec.roles[input.role].host_configuration_required && !host)
     throw new BootstrapError("patch_host_configuration_missing");
+  if (
+    input.authority_rotation &&
+    (input.authority_rotation.region_id !== input.status.region_id ||
+      input.authority_rotation.cluster_uid !== input.status.cluster_uid ||
+      !host ||
+      input.authority_rotation.current_revision !==
+        host.status.material_revision ||
+      !input.authority_rotation.nodes.some(
+        (node) =>
+          node.node_id === input.status.node_id &&
+          node.node_uid === input.status.node_uid &&
+          node.address === input.address &&
+          node.role === "controlplane",
+      ))
+  )
+    throw new BootstrapError("patch_authority_rotation_identity_mismatch");
   return input;
 }
 export interface FleetPatchOptions {
@@ -900,20 +919,19 @@ export async function runFleetPatch(
           await checkpoint("talos", "confirmed", await fresh(), null, receipt);
       }
     } else if (current.stage === "talos_reboot") {
-      if (
-        matches.talos &&
-        current.talos_upgrade_receipt &&
-        facts.boot_id !==
-          (target.kubernetes_images
-            ? facts.kubernetes_configuration_boot_id
-            : current.talos_upgrade_receipt.pre_reboot_boot_id) &&
-        fleetPatchKubernetesImagesMatch(input, facts)
-      )
+      if (fleetPatchTalosRebootObserved({ ...input, status: current }, facts))
         await checkpoint("talos_reboot", "confirmed", facts);
       else if (current.state === "pending") {
         await checkpoint("talos_reboot", "dispatched", facts);
         const latest = await latePreflight(facts);
         if (!latest) return current;
+        if (input.authority_rotation)
+          await applyPreparedEtcdAuthority(input.authority_rotation, {
+            talos,
+            run,
+            request,
+            signal,
+          });
         await talos(
           ["reboot", "--wait=false", "--progress=plain"],
           60_000,
@@ -1042,9 +1060,23 @@ export async function runFleetPatch(
       fleetPatchKubernetesImagesMatch(input, facts) &&
       facts.node_ready &&
       facts.databases_ready
-    )
+    ) {
+      await refreshKubeletTrust(
+        { ...input, status: current },
+        {
+          authorize: async () => {
+            await authorize();
+            return current.cluster_uid;
+          },
+          talos: async (args) => ({ exit_code: 0, stdout: await talos(args) }),
+          kube: async (args, _permitFailure, stdin) => ({
+            exit_code: 0,
+            stdout: await kube(args, stdin),
+          }),
+        },
+      );
       await checkpoint("runtime_verified", "confirmed", facts);
-    else if (["flux", "platform", "regional"].includes(current.stage)) {
+    } else if (["flux", "platform", "regional"].includes(current.stage)) {
       if (
         !assets ||
         !platformState ||
