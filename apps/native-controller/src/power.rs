@@ -1596,7 +1596,7 @@ impl PowerCoordinator {
             let protected = self.storage_protection_for_running(db, &intent).await?;
             if map.is_none()
                 && db["creation"]["ever_ready"] == false
-                && db["creation"]["generation"] == db["generation"]
+                && number(&db["creation"], "generation") <= number(db, "generation")
                 && !protected
             {
                 return Ok(PrepareRunning::Proceed);
@@ -3463,6 +3463,33 @@ mod tls_tests {
                 .unwrap()
                 .is_none()
         );
+    }
+    #[tokio::test]
+    async fn original_creation_can_start_after_queued_release_generations() {
+        let mut db = database();
+        db["generation"] = 3.into();
+        db["desired_state"] = "running".into();
+        db["creation"]["generation"] = 1.into();
+        db["creation"]["status"] = "running".into();
+        db["creation"]["ever_ready"] = false.into();
+        db["power"] = json!({"operation":db["creation"]["operation_id"],"revision":3,"mode":"running","reason":null});
+        assert!(database_valid(&db));
+        let server = Server::new(&db, false).await;
+        server.objects.lock().unwrap().clear();
+        let coordinator = PowerCoordinator::with_clock(
+            server.k8s.clone(),
+            "eu-test".into(),
+            1,
+            Arc::new(|| 100_000),
+        )
+        .unwrap();
+        assert!(matches!(
+            coordinator.prepare_running(&db).await.unwrap(),
+            PrepareRunning::Proceed
+        ));
+        assert_eq!(server.marker_writes.load(Ordering::SeqCst), 0);
+        assert_eq!(server.cluster_writes.load(Ordering::SeqCst), 0);
+        assert!(server.objects.lock().unwrap().is_empty());
     }
     #[tokio::test]
     async fn protected_running_generation_is_rejected_before_any_wake_write() {

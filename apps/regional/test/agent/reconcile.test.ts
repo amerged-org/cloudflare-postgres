@@ -966,10 +966,18 @@ test("a failed CREATE cannot initialize missing storage", async () => {
   assert.equal(k8s.actions.length, 0);
 });
 
-test("a later configuration revision cannot authorize first namespace creation", async () => {
+test("the original never-ready running CREATE authorizes generation-three PostgreSQL settings without changing its operation or archive", async () => {
   const { db, ctx } = fixture();
-  db.generation = 2;
-  db.roles[0]!.revision = 2;
+  db.generation = 3;
+  db.creation!.status = "running";
+  db.postgres = {
+    release_id: "queued-release-three",
+    image: ctx.postgresImage,
+    version: "18.6",
+    configuration_schema_revision: 1,
+  };
+  const creation = structuredClone(db.creation),
+    archive = structuredClone(db.archive);
   const k8s = new MemoryKubernetes();
   assert.equal(
     (
@@ -981,9 +989,23 @@ test("a later configuration revision cannot authorize first namespace creation",
         authenticate,
       ).reconcile(db, ctx)
     )?.state,
-    "error",
+    "ready",
   );
-  assert.equal(k8s.actions.length, 0);
+  assert.deepEqual(db.creation, creation);
+  assert.deepEqual(db.archive, archive);
+  assert.equal(db.creation!.generation, 1);
+  assert.equal(db.creation!.ever_ready, false);
+  assert.equal(db.storage_generation ?? 1, 1);
+  assert.equal(
+    k8s.actions.filter(
+      (action) => action === `create:Namespace:pgcf-db-${db.id}`,
+    ).length,
+    1,
+  );
+  assert.equal(
+    k8s.actions.filter((action) => action === "create:Cluster:database").length,
+    1,
+  );
 });
 
 test("a missing namespace after ready requires recovery instead of recreating empty storage", async () => {

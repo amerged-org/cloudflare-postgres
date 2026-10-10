@@ -732,11 +732,7 @@ export class Reconciler {
     if (!namespace) {
       if (storage?.namespaceUid)
         return recoveryRequired(db, "database namespace is missing");
-      if (
-        !pendingCreation(db) ||
-        db.generation !==
-          (db.creation?.generation ?? (db.recovery ? 1 : undefined))
-      )
+      if (!pendingCreation(db))
         return recoveryRequired(
           db,
           "missing namespace has no initial CREATE authority",

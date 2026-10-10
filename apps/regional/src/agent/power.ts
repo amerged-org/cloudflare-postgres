@@ -1289,7 +1289,7 @@ export class PowerCoordinator {
         if (
           !map &&
           db.creation?.ever_ready === false &&
-          db.creation.generation === db.generation
+          db.creation.generation <= db.generation
         )
           return undefined;
         const physical = await this.anchor(step, db),

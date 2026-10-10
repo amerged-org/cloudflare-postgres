@@ -303,6 +303,28 @@ const clusterFor = (state: Awaited<ReturnType<typeof readyFixture>>) =>
     state.k8s.key("Cluster", `pgcf-db-${state.db.id}`, "database"),
   )!;
 
+test("a never-ready original CREATE can prepare a later desired generation without inventing wake storage history", async () => {
+  const { db } = fixture();
+  db.creation!.status = "running";
+  const target = running(db, 3),
+    k8s = new MemoryKubernetes(),
+    power = new PowerCoordinator({
+      k8s,
+      signal: new AbortController().signal,
+      region: "eu-test",
+    }),
+    creation = structuredClone(target.creation),
+    archive = structuredClone(target.archive);
+  assert.equal(await power.prepareRunning(target), undefined);
+  assert.deepEqual(target.creation, creation);
+  assert.deepEqual(target.archive, archive);
+  assert.equal(target.creation!.generation, 1);
+  assert.equal(k8s.actions.length, 0);
+  target.creation = { ...target.creation!, ever_ready: true };
+  assert.equal((await power.prepareRunning(target))?.state, "error");
+  assert.equal(k8s.actions.length, 0);
+});
+
 test("prepared transactions refuse sleep without annotation and retain the original refusal after restart", async () => {
   const state = await readyFixture(),
     target = suspended(state.db);
