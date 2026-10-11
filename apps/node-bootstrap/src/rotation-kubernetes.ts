@@ -56,7 +56,13 @@ function list(value: ObjectValue): ObjectValue[] {
     text(object(value.metadata).continue)
   )
     return fail("rotation_kubernetes_inventory_incomplete");
-  return value.items.map(object);
+  // kube-apiserver omits TypeMeta on list items; the list kind names their kind.
+  const listKind = text(value.kind),
+    kind = listKind.endsWith("List") ? listKind.slice(0, -4) : "";
+  return value.items.map((raw) => {
+    const item = object(raw);
+    return item.kind === undefined && kind ? { ...item, kind } : item;
+  });
 }
 function item(
   value: ObjectValue,

@@ -3,6 +3,19 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { rewriteRotationSecrets } from "../src/rotation-kubernetes.ts";
 
+/** kube-apiserver omits TypeMeta on list items and names the list kind instead. */
+const apiList = (kind: string, items: object[]) => ({
+  kind: `${kind}List`,
+  apiVersion: "v1",
+  metadata: {},
+  items: items.map((item) =>
+    Object.fromEntries(
+      Object.entries(item).filter(
+        ([key]) => key !== "kind" && key !== "apiVersion",
+      ),
+    ),
+  ),
+});
 const secret = () => ({
   apiVersion: "v1",
   kind: "Secret",
@@ -32,9 +45,7 @@ test("a lost Secret replacement response is reconciled without a second write", 
         throw Error("response_lost");
       }
       return JSON.stringify(
-        args[2] === "/api/v1/secrets"
-          ? { items: [actual], metadata: {} }
-          : actual,
+        args[2] === "/api/v1/secrets" ? apiList("Secret", [actual]) : actual,
       );
     },
   };
@@ -64,9 +75,7 @@ test("an uncommitted uncertain Secret replacement remains unresolved and never r
         throw Error("response_lost");
       }
       return JSON.stringify(
-        args[2] === "/api/v1/secrets"
-          ? { items: [actual], metadata: {} }
-          : actual,
+        args[2] === "/api/v1/secrets" ? apiList("Secret", [actual]) : actual,
       );
     },
   };
@@ -98,9 +107,7 @@ test("replacement preserves Secret data and rejects a changed physical object", 
         actual.metadata.resourceVersion = "2";
       }
       return JSON.stringify(
-        args[2] === "/api/v1/secrets"
-          ? { items: [actual], metadata: {} }
-          : actual,
+        args[2] === "/api/v1/secrets" ? apiList("Secret", [actual]) : actual,
       );
     },
   };
@@ -273,12 +280,12 @@ test("CNPG token consumers delete their exact instance Pods once and resolve a l
           metadata: { name: "default", namespace: "default", uid: accountUid },
         });
       if (route === "/apis/apps/v1/replicasets")
-        return JSON.stringify({ items: [], metadata: {} });
+        return JSON.stringify(apiList("ReplicaSet", []));
       if (
         route === "/api/v1/pods" ||
         route === "/api/v1/namespaces/example/pods"
       )
-        return JSON.stringify({ items: [pod], metadata: {} });
+        return JSON.stringify(apiList("Pod", [pod]));
       return JSON.stringify(cluster);
     },
   };
@@ -383,12 +390,12 @@ test("a resumed CNPG consumer step deletes a still-live initial instance Pod aga
           metadata: { name: "default", namespace: "default", uid: accountUid },
         });
       if (route === "/apis/apps/v1/replicasets")
-        return JSON.stringify({ items: [], metadata: {} });
+        return JSON.stringify(apiList("ReplicaSet", []));
       if (
         route === "/api/v1/pods" ||
         route === "/api/v1/namespaces/example/pods"
       )
-        return JSON.stringify({ items: [pod], metadata: {} });
+        return JSON.stringify(apiList("Pod", [pod]));
       return JSON.stringify(cluster);
     },
   };
@@ -445,7 +452,7 @@ test("bootstrap-token retirement uses UID/RV preconditions and reconciles a lost
         all = all.slice(1);
         throw Error("reply_lost");
       }
-      return JSON.stringify({ items: all, metadata: {} });
+      return JSON.stringify(apiList("Secret", all));
     },
   };
   const input = { old_token: oldToken, new_token: newToken };
@@ -478,9 +485,7 @@ test("a pre-write authority failure leaves Secret rewrite pending and permits th
         actual.metadata.resourceVersion = "2";
       }
       return JSON.stringify(
-        args[2] === "/api/v1/secrets"
-          ? { items: [actual], metadata: {} }
-          : actual,
+        args[2] === "/api/v1/secrets" ? apiList("Secret", [actual]) : actual,
       );
     },
   };
