@@ -68,7 +68,7 @@ async function setup() {
     "api",
     "edge",
     "node-bootstrap",
-    "regional",
+    "native-controller",
     "postgres",
     "barman",
     "cloudflared",
@@ -279,18 +279,6 @@ it("activates qualified native storage through the proved Talos host service wit
   const f = await thinExecutionFixture(releaseIds),
     spec = structuredClone(f.qualified.spec),
     sandbox = spec.components.find((c) => c.name === "sandbox-controller")!;
-  spec.components = spec.components.filter((c) => c.name !== "regional");
-  spec.components.push({
-    name: "native-controller",
-    kind: "image",
-    version: "1.0.0",
-    reference: `registry.example/native-controller@sha256:${"f".repeat(64)}`,
-    sha256: "f".repeat(64),
-  });
-  for (const role of Object.values(spec.roles))
-    role.components = role.components.map((name) =>
-      name === "regional" ? "native-controller" : name,
-    );
   const release = `native-thin-${crypto.randomUUID()}`,
     approved = FleetReleaseSpec.parse(spec),
     specSha = await installationHash(approved),

@@ -43,7 +43,7 @@ export async function installThinQualifiedFixture(
     "api",
     "edge",
     "node-bootstrap",
-    "regional",
+    "native-controller",
     "native-gateway",
     "postgres",
     "barman",
