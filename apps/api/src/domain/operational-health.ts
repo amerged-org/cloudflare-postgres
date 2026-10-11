@@ -5,6 +5,7 @@ import {
   NodeId,
   RegionId,
   Timestamp,
+  InfraAlertKind,
   InfraAlertStatus,
 } from "@pgcf/contracts";
 import { UsageSample } from "@pgcf/contracts/usage";
@@ -133,7 +134,10 @@ export function diskHealth(
 export const OperationalRegionHealth = z.strictObject({
   id: RegionId,
   /** delivered_at records callback acceptance, not downstream email delivery. */
-  infrastructure_alerts: z.array(InfraAlertStatus).max(5).optional(),
+  infrastructure_alerts: z
+    .array(InfraAlertStatus)
+    .max(InfraAlertKind.options.length)
+    .optional(),
   created_at: Timestamp,
   agent: HeartbeatHealth,
 });

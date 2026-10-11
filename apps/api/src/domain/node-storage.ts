@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { NodeStorageSample, type NodeObservation } from "@pgcf/contracts";
 
-const freshnessMs = 120_000;
+export const NODE_STORAGE_SAMPLE_MAX_AGE_MS = 120_000;
 /** Fresh physical measurements never authorize thin provisioning or remove thick reservations. */
 export async function recordNodeStorageObservation(
   db: D1Database,
@@ -24,7 +24,7 @@ export async function recordNodeStorageObservation(
     at = Date.parse(sample.observed_at);
   if (
     !Number.isSafeInteger(receivedAt) ||
-    at < receivedAt - freshnessMs ||
+    at < receivedAt - NODE_STORAGE_SAMPLE_MAX_AGE_MS ||
     at > receivedAt + 5000
   )
     return false;
@@ -63,7 +63,7 @@ export async function readNodeStorageObservation(
     .bind(
       nodeId,
       regionId,
-      new Date(now - freshnessMs).toISOString(),
+      new Date(now - NODE_STORAGE_SAMPLE_MAX_AGE_MS).toISOString(),
       new Date(now + 5000).toISOString(),
     )
     .first<{

@@ -1,24 +1,42 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { InfraAlert, newNodeId } from "@pgcf/contracts";
+import {
+  InfraAlert,
+  newNodeId,
+  type InfraAlertKind,
+  type NodePhysicalStorage,
+} from "@pgcf/contracts";
 import { afterEach, expect, it } from "vitest";
 import {
   allocatedRegionalNodes,
   infrastructureAlertStatus,
   runInfrastructureAlerts,
 } from "../../src/domain/infrastructure-alerts.ts";
+import { configureInfrastructureBackups } from "../../src/domain/infrastructure-backups.ts";
 import {
   configureNodeRegionPolicy,
+  markNodeLost,
   reserveNodeAddition,
 } from "../../src/domain/node-state.ts";
 import { recordNodeMemoryObservation } from "../../src/domain/memory-capacity.ts";
+import { recordNodeStorageObservation } from "../../src/domain/node-storage.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
-const capacity = 8 * 1024 ** 3;
-afterEach(cleanupFixtures);
+const capacity = 8 * 1024 ** 3,
+  terabyte = 1_000_000_000_000,
+  core = 1_000_000_000;
+afterEach(async () => {
+  await env.DB.prepare(
+    "UPDATE infrastructure_backup_config SET notification_recipient=NULL,notification_sender=NULL WHERE singleton=1",
+  ).run();
+  await cleanupFixtures();
+});
 async function setup(
   warnings: {
     ram_warning_threshold_ppm?: number | null;
+    node_ram_warning_threshold_ppm?: number | null;
+    node_cpu_warning_threshold_ppm?: number | null;
+    node_storage_warning_threshold_ppm?: number | null;
     cap_warning_enabled?: boolean;
   } = { ram_warning_threshold_ppm: 750000, cap_warning_enabled: true },
 ) {
@@ -49,14 +67,17 @@ async function setup(
   });
   return { ...f, uid, provider, order };
 }
+/** Ten minute samples, oldest first; `cpu` holds nanocores on 2000 millicores, null as an older reporter. */
 async function sample(
   f: Awaited<ReturnType<typeof setup>>,
   percent: number,
   at = Date.now(),
+  cpu?: (number | null)[],
 ) {
   for (let i = 9; i >= 0; i--) {
     const time = at - i * 60000,
-      observed_at = new Date(time).toISOString();
+      observed_at = new Date(time).toISOString(),
+      usage = cpu?.[9 - i] ?? null;
     expect(
       await recordNodeMemoryObservation(
         env.DB,
@@ -72,6 +93,9 @@ async function sample(
             working_set_bytes: Math.floor((capacity * percent) / 100),
             available_bytes: capacity - Math.floor((capacity * percent) / 100),
             memory_pressure: false,
+            ...(usage === null
+              ? {}
+              : { cpu_usage_nano_cores: usage, capacity_cpu_millicores: 2000 }),
           },
         },
         observed_at,
@@ -79,6 +103,81 @@ async function sample(
       ),
     ).toBe(true);
   }
+}
+type Member = { node: string; uid: string; provider: string; name: string };
+function member(f: Awaited<ReturnType<typeof setup>>): Member {
+  return { node: f.node, uid: f.uid, provider: f.provider, name: f.nodeName };
+}
+async function addMember(f: Awaited<ReturnType<typeof setup>>) {
+  const now = new Date().toISOString(),
+    added: Member = {
+      node: newNodeId(),
+      uid: crypto.randomUUID(),
+      provider: String(1 + crypto.getRandomValues(new Uint32Array(1))[0]!),
+      name: `${f.nodeName}-second`,
+    };
+  await env.DB.prepare(
+    "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid,provider_instance_id) VALUES(?,?,?,1,8192,2000,40,128,100,?,?,?,?,?)",
+  )
+    .bind(
+      added.node,
+      f.region,
+      added.name,
+      now,
+      now,
+      now,
+      added.uid,
+      added.provider,
+    )
+    .run();
+  return added;
+}
+function volumeGroup(used: number): NodePhysicalStorage {
+  return {
+    volume_group_uuid: "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+    total_bytes: terabyte,
+    free_bytes: terabyte - used,
+    thick_allocated_bytes: used,
+    thin_pool: null,
+  };
+}
+async function storage(
+  f: Awaited<ReturnType<typeof setup>>,
+  node: Member,
+  physical: NodePhysicalStorage,
+  at: number,
+) {
+  const observed_at = new Date(at).toISOString();
+  expect(
+    await recordNodeStorageObservation(
+      env.DB,
+      f.region,
+      {
+        node_id: node.node,
+        node_uid: node.uid,
+        provider_instance_id: node.provider,
+        name: node.name,
+        ready: true,
+        allocatable_memory_mib: 8192,
+        allocatable_cpu_millicores: 2000,
+        storage_gib_total: 40,
+        platform_reserved_memory_mib: 128,
+      },
+      { node_uid: node.uid, observed_at, physical },
+      at,
+    ),
+  ).toBe(true);
+}
+async function payload(
+  f: Awaited<ReturnType<typeof setup>>,
+  kind: InfraAlertKind,
+) {
+  const stored = await env.DB.prepare(
+    "SELECT payload FROM infrastructure_alerts WHERE region_id=? AND kind=?",
+  )
+    .bind(f.region, kind)
+    .first<string>("payload");
+  return InfraAlert.parse(JSON.parse(stored!));
 }
 function configured() {
   return {
@@ -575,4 +674,303 @@ it("does not wait for a streaming receiver body's unbounded cancellation", async
   } finally {
     if (timer !== undefined) clearTimeout(timer);
   }
+});
+
+it("emails one node storage warning at the exact configured boundary under concurrent runs", async () => {
+  const f = await setup({ node_storage_warning_threshold_ppm: 850000 }),
+    at = Date.now(),
+    mail = { ...env, RESEND_API_KEY: "test-private-resend-key" };
+  await configureInfrastructureBackups(env, {
+    enabled: false,
+    d1_account_id: null,
+    d1_database_id: null,
+    d1_region_id: null,
+    notification_recipient: "operator@example.com",
+    notification_sender: "alerts@example.com",
+  });
+  const sent: {
+    url: string;
+    key: string | null;
+    body: { from: string; to: string[]; subject: string; text: string };
+  }[] = [];
+  const resend: typeof fetch = async (input, init) => {
+    sent.push({
+      url: String(input),
+      key: new Headers(init?.headers).get("Idempotency-Key"),
+      body: JSON.parse(String(init?.body)),
+    });
+    return new Response(null, { status: 200 });
+  };
+  await storage(f, member(f), volumeGroup(850_000_000_000 - 1), at);
+  expect(await runInfrastructureAlerts(mail, f.region, at, resend)).toEqual({
+    delivered: 0,
+    pending: 0,
+  });
+  await storage(f, member(f), volumeGroup(850_000_000_000), at + 1);
+  await Promise.all([
+    runInfrastructureAlerts(mail, f.region, at + 1, resend),
+    runInfrastructureAlerts(mail, f.region, at + 1, resend),
+  ]);
+  await runInfrastructureAlerts(mail, f.region, at + 2, resend);
+  expect(sent).toHaveLength(1);
+  const event = InfraAlert.parse(JSON.parse(sent[0]!.body.text));
+  expect(sent[0]).toMatchObject({
+    url: "https://api.resend.com/emails",
+    key: event.event_id,
+    body: {
+      from: "alerts@example.com",
+      to: ["operator@example.com"],
+      subject: `PGCF infrastructure: regional_node_storage_warning (${f.region})`,
+    },
+  });
+  expect(event).toMatchObject({
+    kind: "regional_node_storage_warning",
+    region_id: f.region,
+    regional_ram_utilization_ppm: null,
+    node_ids: [f.node],
+    threshold_ppm: 850000,
+    utilization_ppm: 850000,
+  });
+});
+
+it("measures a thin node by pool fill instead of its intentionally allocated volume group", async () => {
+  const f = await setup({ node_storage_warning_threshold_ppm: 900000 }),
+    at = Date.now();
+  const thin = (dataUsed: number): NodePhysicalStorage => ({
+    ...volumeGroup(980_000_000_000),
+    thick_allocated_bytes: 70_000_000_000,
+    thin_pool: {
+      name: "pgcf_thinpool",
+      data_total_bytes: 900_000_000_000,
+      data_used_bytes_upper_bound: dataUsed,
+      metadata_total_bytes: 10_000_000_000,
+      metadata_used_bytes_upper_bound: 1_000_000_000,
+    },
+  });
+  await storage(f, member(f), thin(90_000_000_000), at);
+  expect(await runInfrastructureAlerts(env, f.region, at)).toEqual({
+    delivered: 0,
+    pending: 0,
+  });
+  await storage(f, member(f), thin(810_000_000_000), at + 1);
+  const events: unknown[] = [];
+  await runInfrastructureAlerts(
+    configured(),
+    f.region,
+    at + 1,
+    async (_input, init) => {
+      events.push(JSON.parse(String(init?.body)));
+      return new Response(null, { status: 204 });
+    },
+  );
+  expect(events).toMatchObject([
+    {
+      kind: "regional_node_storage_warning",
+      node_ids: [f.node],
+      utilization_ppm: 900000,
+    },
+  ]);
+});
+
+it("keeps a node warning while a named node is unknown and clears once every named node is known below or lost", async () => {
+  const f = await setup({ node_storage_warning_threshold_ppm: 800000 }),
+    first = member(f),
+    second = await addMember(f),
+    at = Date.now(),
+    later = at + 121_000,
+    events: InfraAlert[] = [];
+  const receiver: typeof fetch = async (_input, init) => {
+    events.push(InfraAlert.parse(JSON.parse(String(init?.body))));
+    return new Response(null, { status: 204 });
+  };
+  const episode = async () =>
+    (await infrastructureAlertStatus(env.DB, f.region))[0]!;
+  await storage(f, first, volumeGroup(900_000_000_000), at);
+  await storage(f, second, volumeGroup(100_000_000_000), at);
+  expect(await runInfrastructureAlerts(env, f.region, at)).toEqual({
+    delivered: 0,
+    pending: 1,
+  });
+  const armed = await episode();
+  expect(await payload(f, "regional_node_storage_warning")).toMatchObject({
+    node_ids: [first.node],
+    utilization_ppm: 900000,
+  });
+  // The named node's sample expires while the other node stays fresh and below.
+  await storage(f, second, volumeGroup(100_000_000_000), later);
+  expect(
+    await runInfrastructureAlerts(configured(), f.region, later, receiver),
+  ).toEqual({ delivered: 0, pending: 1 });
+  expect(await episode()).toEqual(armed);
+  await storage(f, first, volumeGroup(800_000_000_000 - 1), later + 1);
+  await runInfrastructureAlerts(configured(), f.region, later + 1, receiver);
+  expect(await episode()).toMatchObject({ active: false });
+  await storage(f, second, volumeGroup(800_000_000_000), later + 2);
+  await runInfrastructureAlerts(configured(), f.region, later + 2, receiver);
+  expect(events).toMatchObject([
+    { node_ids: [second.node], utilization_ppm: 800000 },
+  ]);
+  expect(events[0]!.event_id).not.toBe(armed.event_id);
+  await markNodeLost(env.DB, second.node, {
+    expected_node_uid: second.uid,
+    reason: "confirmed provider loss",
+  });
+  await runInfrastructureAlerts(configured(), f.region, later + 3, receiver);
+  expect(await episode()).toMatchObject({ active: false });
+});
+
+it("cannot arm or clear a node warning from a superseded concurrent read", async () => {
+  const f = await setup({ node_storage_warning_threshold_ppm: 800000 }),
+    at = Date.now();
+  // The older run pauses after its node read while a newer measurement is recorded and evaluated.
+  const race = async (older: number, newer: number, offset: number) => {
+    await storage(f, member(f), volumeGroup(older), at + offset);
+    let captured!: () => void, resume!: () => void;
+    const read = new Promise<void>((resolve) => {
+      captured = resolve;
+    });
+    const release = new Promise<void>((resolve) => {
+      resume = resolve;
+    });
+    const paused = new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "prepare")
+          return (sql: string) => {
+            const statement = target.prepare(sql);
+            if (!sql.startsWith("SELECT id,utilization_ppm FROM"))
+              return statement;
+            return {
+              bind: (...values: unknown[]) => ({
+                all: async () => {
+                  const value = await statement.bind(...values).all();
+                  captured();
+                  await release;
+                  return value;
+                },
+              }),
+            } as unknown as D1PreparedStatement;
+          };
+        const value: unknown = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const run = runInfrastructureAlerts(
+      { ...env, DB: paused },
+      f.region,
+      at + offset,
+    );
+    await read;
+    try {
+      await storage(f, member(f), volumeGroup(newer), at + offset + 1);
+      await runInfrastructureAlerts(env, f.region, at + offset + 1);
+    } finally {
+      resume();
+      await run;
+    }
+  };
+  await race(900_000_000_000, 700_000_000_000, 0);
+  expect(await infrastructureAlertStatus(env.DB, f.region)).toEqual([]);
+  await race(700_000_000_000, 900_000_000_000, 2);
+  expect(await infrastructureAlertStatus(env.DB, f.region)).toMatchObject([
+    { kind: "regional_node_storage_warning", active: true },
+  ]);
+});
+
+it("warns from each node's own RAM window, including a node closed to placement, until disabled", async () => {
+  const f = await setup({ node_ram_warning_threshold_ppm: 750000 }),
+    at = Date.now();
+  await env.DB.prepare(
+    "UPDATE nodes SET database_placement_enabled=0 WHERE id=?",
+  )
+    .bind(f.node)
+    .run();
+  await sample(f, 74, at);
+  expect(await runInfrastructureAlerts(env, f.region, at)).toEqual({
+    delivered: 0,
+    pending: 0,
+  });
+  await sample(f, 75, at + 1);
+  expect(await runInfrastructureAlerts(env, f.region, at + 1)).toEqual({
+    delivered: 0,
+    pending: 1,
+  });
+  expect(await payload(f, "regional_node_ram_warning")).toMatchObject({
+    node_ids: [f.node],
+    threshold_ppm: 750000,
+    utilization_ppm: 750000,
+  });
+  const observedAt = new Date(at + 2).toISOString();
+  await recordNodeMemoryObservation(
+    env.DB,
+    f.region,
+    {
+      node_id: f.node,
+      node_uid: f.uid,
+      provider_instance_id: f.provider,
+      memory: null,
+    },
+    observedAt,
+    at + 2,
+  );
+  await runInfrastructureAlerts(env, f.region, at + 2);
+  expect(await infrastructureAlertStatus(env.DB, f.region)).toMatchObject([
+    { kind: "regional_node_ram_warning", active: true },
+  ]);
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    node_ram_warning_threshold_ppm: null,
+  });
+  let sent = 0;
+  expect(
+    await runInfrastructureAlerts(configured(), f.region, at + 2, async () => {
+      sent++;
+      return new Response(null, { status: 204 });
+    }),
+  ).toEqual({ delivered: 0, pending: 0 });
+  expect(sent).toBe(0);
+  expect(await infrastructureAlertStatus(env.DB, f.region)).toMatchObject([
+    {
+      kind: "regional_node_ram_warning",
+      active: false,
+      delivered_at: null,
+      last_attempt_at: null,
+    },
+  ]);
+});
+
+it("warns from a complete ten-minute CPU window and treats missing CPU data as unknown", async () => {
+  const f = await setup({ node_cpu_warning_threshold_ppm: 500000 }),
+    at = Date.now(),
+    idle = Array<number>(9).fill(0),
+    half = Array<number>(9).fill(core);
+  await sample(f, 50, at, [2 * core, 2 * core, null, ...half.slice(2)]);
+  expect(await runInfrastructureAlerts(env, f.region, at)).toEqual({
+    delivered: 0,
+    pending: 0,
+  });
+  await sample(f, 50, at + 1, [...half, core - 10]);
+  expect(await runInfrastructureAlerts(env, f.region, at + 1)).toEqual({
+    delivered: 0,
+    pending: 0,
+  });
+  await sample(f, 50, at + 2, [...half, core]);
+  expect(await runInfrastructureAlerts(env, f.region, at + 2)).toEqual({
+    delivered: 0,
+    pending: 1,
+  });
+  expect(await payload(f, "regional_node_cpu_warning")).toMatchObject({
+    node_ids: [f.node],
+    threshold_ppm: 500000,
+    utilization_ppm: 500000,
+  });
+  await sample(f, 50, at + 3, [...idle, null]);
+  await runInfrastructureAlerts(env, f.region, at + 3);
+  expect(await infrastructureAlertStatus(env.DB, f.region)).toMatchObject([
+    { kind: "regional_node_cpu_warning", active: true },
+  ]);
+  await sample(f, 50, at + 4, [...idle, 0]);
+  await runInfrastructureAlerts(env, f.region, at + 4);
+  expect(await infrastructureAlertStatus(env.DB, f.region)).toMatchObject([
+    { kind: "regional_node_cpu_warning", active: false },
+  ]);
 });

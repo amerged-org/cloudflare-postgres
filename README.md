@@ -283,6 +283,25 @@ RAM warnings. A cap notice additionally requires both a finite `max_nodes` and
 `cap_warning_enabled: true`; set the flag to `false` to disable it. RAM warnings use the same
 fresh, complete ten-minute regional measurements as capacity decisions.
 
+Per-node warnings use the same route and scale: `node_ram_warning_threshold_ppm`,
+`node_cpu_warning_threshold_ppm` and `node_storage_warning_threshold_ppm` each take an integer
+from `1` to `1000000` parts per million (`900000` means 90%). `null` disables a warning; omitting
+a field keeps its stored value. A warning fires when any single node reaches its threshold,
+including a control node closed to database placement:
+
+- RAM uses the node's own fresh, complete ten-minute working-set window.
+- CPU averages kubelet CPU usage over the same ten consecutive minutes against the node's CPU
+  capacity. Only regional reporters that send the optional CPU fields with their node memory
+  samples supply it (the native controller); without them CPU stays unknown and never warns.
+- Storage uses the node's fresh LVM sample: the fuller of thin-pool data and metadata when a thin
+  pool exists, otherwise volume-group allocation.
+
+Each region keeps one episode per kind (`regional_node_ram_warning`, `regional_node_cpu_warning`,
+`regional_node_storage_warning`). Its event lists up to 64 exceeding nodes, highest first, with
+`threshold_ppm` and the highest `utilization_ppm`. Another node crossing during an active episode
+sends nothing new. The episode clears only after every listed node is fresh and below the
+threshold, or lost; a missing measurement keeps it.
+
 Configure either an `INFRASTRUCTURE_ALERT_WEBHOOK` service binding or an HTTPS
 `INFRASTRUCTURE_ALERT_WEBHOOK_URL`, plus your own `INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN` secret.
 The adopter's receiving service verifies the bearer token and durably deduplicates the

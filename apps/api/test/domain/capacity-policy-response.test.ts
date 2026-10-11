@@ -134,6 +134,9 @@ it("keeps fresh purchasing and warnings off and preserves omitted optional capac
     autoscale_enabled: false,
     ram_expansion_threshold_ppm: null,
     ram_warning_threshold_ppm: null,
+    node_ram_warning_threshold_ppm: null,
+    node_cpu_warning_threshold_ppm: null,
+    node_storage_warning_threshold_ppm: null,
     cap_warning_enabled: false,
   });
   await configureNodeRegionPolicy(env.DB, {
@@ -141,6 +144,9 @@ it("keeps fresh purchasing and warnings off and preserves omitted optional capac
     max_nodes: 4,
     ram_expansion_threshold_ppm: 830001,
     ram_warning_threshold_ppm: 790001,
+    node_ram_warning_threshold_ppm: 900001,
+    node_cpu_warning_threshold_ppm: 850001,
+    node_storage_warning_threshold_ppm: 800001,
     cap_warning_enabled: true,
   });
   await configureNodeRegionPolicy(env.DB, { region_id: f.region });
@@ -148,6 +154,9 @@ it("keeps fresh purchasing and warnings off and preserves omitted optional capac
     max_nodes: 4,
     ram_expansion_threshold_ppm: 830001,
     ram_warning_threshold_ppm: 790001,
+    node_ram_warning_threshold_ppm: 900001,
+    node_cpu_warning_threshold_ppm: 850001,
+    node_storage_warning_threshold_ppm: 800001,
     cap_warning_enabled: true,
   });
   const removed = await request(path, f.admin, "PUT", {
@@ -155,6 +164,9 @@ it("keeps fresh purchasing and warnings off and preserves omitted optional capac
     max_nodes: null,
     ram_expansion_threshold_ppm: null,
     ram_warning_threshold_ppm: null,
+    node_ram_warning_threshold_ppm: null,
+    node_cpu_warning_threshold_ppm: null,
+    node_storage_warning_threshold_ppm: null,
     cap_warning_enabled: false,
   });
   expect(removed.status).toBe(200);
@@ -162,6 +174,9 @@ it("keeps fresh purchasing and warnings off and preserves omitted optional capac
     max_nodes: null,
     ram_expansion_threshold_ppm: null,
     ram_warning_threshold_ppm: null,
+    node_ram_warning_threshold_ppm: null,
+    node_cpu_warning_threshold_ppm: null,
+    node_storage_warning_threshold_ppm: null,
     cap_warning_enabled: false,
   });
 });
@@ -179,6 +194,9 @@ it("returns the exact public capacity policy from PUT and GET after persisting i
     standing_cost_profile: null,
     ram_expansion_threshold_ppm: null,
     ram_warning_threshold_ppm: null,
+    node_ram_warning_threshold_ppm: 900000,
+    node_cpu_warning_threshold_ppm: 850000,
+    node_storage_warning_threshold_ppm: 800000,
     cap_warning_enabled: false,
     autoscale_enabled: false,
     adopt_instance_ids: [
@@ -283,6 +301,9 @@ it("maps stored order JSON and enabled booleans without exposing persistence col
     standing_cost_profile: null,
     ram_expansion_threshold_ppm: null,
     ram_warning_threshold_ppm: null,
+    node_ram_warning_threshold_ppm: null,
+    node_cpu_warning_threshold_ppm: null,
+    node_storage_warning_threshold_ppm: null,
     cap_warning_enabled: false,
   });
 });

@@ -10,8 +10,12 @@ import {
 } from "./infrastructure-backups.ts";
 import { heartbeatHealth } from "./operational-health.ts";
 import type { Env } from "../env.ts";
-import { regionalRamWindowSql } from "./memory-capacity.ts";
+import {
+  MEMORY_SAMPLE_MAX_AGE_MS,
+  regionalRamWindowSql,
+} from "./memory-capacity.ts";
 import { regionalNodeCountSql } from "./node-capacity-count.ts";
+import { NODE_STORAGE_SAMPLE_MAX_AGE_MS } from "./node-storage.ts";
 
 interface AlertRow {
   kind: InfraAlertKind;
@@ -25,8 +29,118 @@ interface AlertCondition {
   kind: InfraAlertKind;
   active: boolean | null;
   snapshot: { sql: string; bindings: (string | number | null)[] };
+  /** Payload fields that replace the regional RAM and cap values. */
+  detail?: Pick<
+    InfraAlert,
+    | "regional_ram_utilization_ppm"
+    | "node_ids"
+    | "threshold_ppm"
+    | "utilization_ppm"
+  >;
 }
 const retryMs = 60_000;
+
+/** floor(used * 1000000 / total) in SQLite int64 for byte counts up to Number.MAX_SAFE_INTEGER. */
+function ppmSql(used: string, total: string): string {
+  return `((${used})*1000/(${total}))*1000+((((${used})*1000)%(${total}))*1000)/(${total})`;
+}
+const physical = (path: string) => `json_extract(o.physical_json,'$.${path}')`;
+/**
+ * Each node's latest fresh utilization in parts per million; a node without one is unknown and absent.
+ * Ingest rejects future-dated samples, so only age bounds freshness and a delayed run still sees newer data.
+ */
+const nodeUtilization = {
+  // The node's own ten-minute window maintained at ingest, including nodes closed to placement.
+  regional_node_ram_warning: {
+    column: "node_ram_warning_threshold_ppm",
+    maxAgeMs: MEMORY_SAMPLE_MAX_AGE_MS,
+    sql: `SELECT n.id,n.memory_utilization_ppm utilization_ppm FROM nodes n
+      WHERE n.region_id=? AND n.node_uid IS NOT NULL AND n.lost_at IS NULL AND n.memory_window_valid=1
+        AND n.memory_utilization_ppm IS NOT NULL AND julianday(n.memory_window_observed_at)>=julianday(?)`,
+  },
+  // The same ten consecutive minutes as RAM; every sample needs CPU data and one unchanged capacity.
+  regional_node_cpu_warning: {
+    column: "node_cpu_warning_threshold_ppm",
+    maxAgeMs: MEMORY_SAMPLE_MAX_AGE_MS,
+    sql: `SELECT n.id,MIN(1000000,SUM(m.cpu_usage_nano_cores)/(10*MAX(m.capacity_cpu_millicores))) utilization_ppm
+      FROM nodes n JOIN node_memory_samples latest ON latest.node_id=n.id AND latest.node_uid=n.node_uid
+        AND latest.minute=(SELECT MAX(minute) FROM node_memory_samples WHERE node_id=n.id AND node_uid=n.node_uid)
+      JOIN node_memory_samples m ON m.node_id=n.id AND m.node_uid=n.node_uid
+        AND m.minute BETWEEN latest.minute-9 AND latest.minute
+      WHERE n.region_id=? AND n.lost_at IS NULL AND julianday(latest.observed_at)>=julianday(?)
+      GROUP BY n.id HAVING COUNT(*)=10 AND COUNT(m.cpu_usage_nano_cores)=10
+        AND MIN(m.capacity_cpu_millicores)=MAX(m.capacity_cpu_millicores)`,
+  },
+  // A thin pool consumes its volume group by design, so pool data or metadata fill governs it.
+  regional_node_storage_warning: {
+    column: "node_storage_warning_threshold_ppm",
+    maxAgeMs: NODE_STORAGE_SAMPLE_MAX_AGE_MS,
+    sql: `SELECT n.id,CASE WHEN json_type(o.physical_json,'$.thin_pool')='object' THEN MAX(
+          ${ppmSql(physical("thin_pool.data_used_bytes_upper_bound"), physical("thin_pool.data_total_bytes"))},
+          ${ppmSql(physical("thin_pool.metadata_used_bytes_upper_bound"), physical("thin_pool.metadata_total_bytes"))})
+        ELSE ${ppmSql(`${physical("total_bytes")}-${physical("free_bytes")}`, physical("total_bytes"))} END utilization_ppm
+      FROM node_storage_observations o JOIN nodes n ON n.id=o.node_id AND n.node_uid=o.node_uid
+      WHERE n.region_id=? AND n.ready=1 AND n.lost_at IS NULL AND o.physical_json IS NOT NULL
+        AND julianday(o.observed_at)>=julianday(?)`,
+  },
+} as const;
+type NodeWarningKind = keyof typeof nodeUtilization;
+
+/** Any fresh node at or above the threshold keeps one regional episode; snapshots re-evaluate current D1 state. */
+async function nodeWarning(
+  db: D1Database,
+  regionId: string,
+  kind: NodeWarningKind,
+  thresholds: Record<
+    (typeof nodeUtilization)[NodeWarningKind]["column"],
+    number | null
+  >,
+  now: number,
+): Promise<AlertCondition> {
+  const measured = nodeUtilization[kind],
+    threshold = thresholds[measured.column],
+    policy = {
+      sql: `EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=? AND p.${measured.column} IS ?)`,
+      bindings: [regionId, threshold],
+    };
+  if (threshold === null) return { kind, active: false, snapshot: policy };
+  const fresh = [regionId, new Date(now - measured.maxAgeMs).toISOString()],
+    exceeded = `EXISTS(SELECT 1 FROM (${measured.sql}) measured WHERE measured.utilization_ppm>=?)`;
+  const exceeding = await db
+    .prepare(
+      `SELECT id,utilization_ppm FROM (${measured.sql}) measured WHERE utilization_ppm>=?
+      ORDER BY utilization_ppm DESC,id LIMIT 64`,
+    )
+    .bind(...fresh, threshold)
+    .all<{ id: string; utilization_ppm: number }>();
+  if (exceeding.results.length)
+    return {
+      kind,
+      active: true,
+      snapshot: {
+        sql: `${policy.sql} AND ${exceeded}`,
+        bindings: [...policy.bindings, ...fresh, threshold],
+      },
+      detail: {
+        regional_ram_utilization_ppm: null,
+        node_ids: exceeding.results.map((node) => node.id),
+        threshold_ppm: threshold,
+        utilization_ppm: exceeding.results[0]!.utilization_ppm,
+      },
+    };
+  // Only the clearing update uses this snapshot: every node the episode names must be fresh and
+  // below the threshold, or lost; otherwise the episode is retained as unknown.
+  return {
+    kind,
+    active: false,
+    snapshot: {
+      sql: `${policy.sql} AND NOT ${exceeded} AND NOT EXISTS(SELECT 1 FROM json_each(infrastructure_alerts.payload,'$.node_ids') named
+        JOIN nodes named_node ON named_node.id=named.value AND named_node.lost_at IS NULL
+        WHERE named.value NOT IN(SELECT id FROM (${measured.sql})))`,
+      bindings: [...policy.bindings, ...fresh, threshold, ...fresh],
+    },
+  };
+}
 
 /** Known provider assignments, including the control role; reserved unpaid intents are not allocations. */
 export async function allocatedRegionalNodes(
@@ -107,13 +221,16 @@ export async function runInfrastructureAlerts(
   fetcher: typeof fetch = fetch,
 ): Promise<{ delivered: number; pending: number }> {
   const policy = await env.DB.prepare(
-    "SELECT max_nodes,ram_warning_threshold_ppm,cap_warning_enabled FROM node_region_policies WHERE region_id=?",
+    "SELECT max_nodes,ram_warning_threshold_ppm,cap_warning_enabled,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm FROM node_region_policies WHERE region_id=?",
   )
     .bind(regionId)
     .first<{
       max_nodes: number | null;
       ram_warning_threshold_ppm: number | null;
       cap_warning_enabled: number;
+      node_ram_warning_threshold_ppm: number | null;
+      node_cpu_warning_threshold_ppm: number | null;
+      node_storage_warning_threshold_ppm: number | null;
     }>();
   if (!policy) return { delivered: 0, pending: 0 };
   const window = await env.DB.prepare(regionalRamWindowSql("?"))
@@ -183,8 +300,10 @@ export async function runInfrastructureAlerts(
       },
     },
   ];
-  for (const { kind, active, snapshot } of conditions) {
-    // Unknown RAM retains an enabled episode; explicitly disabling its policy clears it.
+  for (const kind of Object.keys(nodeUtilization) as NodeWarningKind[])
+    conditions.push(await nodeWarning(env.DB, regionId, kind, policy, now));
+  for (const { kind, active, snapshot, detail } of conditions) {
+    // Unknown measurements retain an enabled episode; explicitly disabling its policy clears it.
     if (active === null) continue;
     if (!active) {
       await env.DB.prepare(
@@ -203,6 +322,7 @@ export async function runInfrastructureAlerts(
       regional_ram_utilization_ppm: utilization,
       allocated_nodes: allocated,
       max_nodes: policy.max_nodes,
+      ...detail,
     });
     await env.DB.prepare(
       `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload)

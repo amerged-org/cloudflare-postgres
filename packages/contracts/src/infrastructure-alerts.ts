@@ -9,21 +9,20 @@ export const InfraAlertKind = z.enum([
   "regional_node_stale",
   "infrastructure_backup_failed",
   "infrastructure_backup_stale",
+  "regional_node_ram_warning",
+  "regional_node_cpu_warning",
+  "regional_node_storage_warning",
 ]);
 export type InfraAlertKind = z.infer<typeof InfraAlertKind>;
 
+const Ppm = z.number().int().min(0).max(1_000_000);
 export const InfraAlert = z.strictObject({
   version: z.literal(1),
   event_id: z.uuid(),
   kind: InfraAlertKind,
   region_id: RegionId,
   occurred_at: Timestamp,
-  regional_ram_utilization_ppm: z
-    .number()
-    .int()
-    .min(0)
-    .max(1_000_000)
-    .nullable(),
+  regional_ram_utilization_ppm: Ppm.nullable(),
   allocated_nodes: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
   max_nodes: z
     .number()
@@ -43,6 +42,9 @@ export const InfraAlert = z.strictObject({
     .max(2)
     .optional(),
   node_ids: z.array(NodeId).max(64).optional(),
+  /** Per-node warnings: the configured threshold and the highest utilization among node_ids. */
+  threshold_ppm: Ppm.nullable().optional(),
+  utilization_ppm: Ppm.nullable().optional(),
 });
 export type InfraAlert = z.infer<typeof InfraAlert>;
 
