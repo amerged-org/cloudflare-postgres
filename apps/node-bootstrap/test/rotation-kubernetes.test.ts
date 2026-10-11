@@ -303,7 +303,7 @@ test("CNPG token consumers delete their exact instance Pods once and resolve a l
       {
         apiVersion: "v1",
         kind: "DeleteOptions",
-        preconditions: { uid: oldPod, resourceVersion: "7" },
+        preconditions: { uid: oldPod },
         propagationPolicy: "Background",
       },
     ],
@@ -312,6 +312,103 @@ test("CNPG token consumers delete their exact instance Pods once and resolve a l
   assert.equal(result.controllers_renewed, 1);
   assert.equal(cluster.metadata.annotations, undefined);
   assert.deepEqual(cluster.spec, { instances: 1 });
+});
+
+test("a resumed CNPG consumer step deletes a still-live initial instance Pod again by its UID", async () => {
+  const target = signer(),
+    now = 1700000000000;
+  let saved: unknown,
+    attempts = 0;
+  const cluster = {
+    apiVersion: "postgresql.cnpg.io/v1",
+    kind: "Cluster",
+    metadata: {
+      name: "database",
+      namespace: "example",
+      uid: controllerUid,
+      resourceVersion: "1",
+    },
+    spec: { instances: 1 },
+  };
+  const pod = {
+    kind: "Pod",
+    metadata: {
+      namespace: "example",
+      name: "database-1",
+      uid: oldPod,
+      resourceVersion: "7",
+      ownerReferences: [
+        {
+          kind: "Cluster",
+          name: "database",
+          uid: controllerUid,
+          controller: true,
+        },
+      ],
+    },
+    spec: {
+      volumes: [
+        {
+          projected: { sources: [{ serviceAccountToken: { path: "token" } }] },
+        },
+      ],
+    },
+    status: {
+      phase: "Running",
+      conditions: [{ type: "Ready", status: "True" }],
+    },
+  };
+  const commands = {
+    now: () => now,
+    async authorize() {},
+    async checkpoint(value: unknown) {
+      saved = structuredClone(value);
+    },
+    async kube(args: string[], payload?: string) {
+      if (args[0] === "create")
+        return JSON.stringify({ status: { token: jwt(target, now) } });
+      if (args[0] === "delete") {
+        attempts++;
+        assert.deepEqual(JSON.parse(payload!).preconditions, { uid: oldPod });
+        // The first delete never reaches the API server; the instance Pod stays live.
+        if (attempts === 1) throw Error("relay_unavailable");
+        pod.metadata.uid = newPod;
+        pod.metadata.resourceVersion = "9";
+        return "{}";
+      }
+      const route = args[2];
+      if (route?.endsWith("/serviceaccounts/default"))
+        return JSON.stringify({
+          kind: "ServiceAccount",
+          metadata: { name: "default", namespace: "default", uid: accountUid },
+        });
+      if (route === "/apis/apps/v1/replicasets")
+        return JSON.stringify({ items: [], metadata: {} });
+      if (
+        route === "/api/v1/pods" ||
+        route === "/api/v1/namespaces/example/pods"
+      )
+        return JSON.stringify({ items: [pod], metadata: {} });
+      return JSON.stringify(cluster);
+    },
+  };
+  const input = {
+    issuer_private_key: target.private,
+    issuer_url: issuer,
+    annotation_value: "rotation",
+  };
+  await assert.rejects(
+    renewRotationConsumers(input, commands),
+    /relay_unavailable/,
+  );
+  // A status update changed the Pod's resourceVersion; only its UID identifies it.
+  pod.metadata.resourceVersion = "8";
+  const result = await renewRotationConsumers(
+    { ...input, cursor: saved },
+    commands,
+  );
+  assert.equal(attempts, 2);
+  assert.equal(result.controllers_renewed, 1);
 });
 test("bootstrap-token retirement uses UID/RV preconditions and reconciles a lost delete response", async () => {
   const oldToken = "abcdef.abcdefghijklmnop",

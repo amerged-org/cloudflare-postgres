@@ -434,15 +434,16 @@ export async function renewRotationConsumers(
       // CNPG restarts a primary in place for a restart annotation, keeping the Pod and its
       // projected token; only deleting the exact instance Pods makes CNPG recreate them.
       const pods = await instancePods(commands, expected);
-      if (index === cursor.index && cursor.state === "dispatched") {
-        if (pods.length) return fail("rotation_consumer_write_unresolved");
-      } else if (pods.length) {
+      if (pods.length) {
         await commands.authorize();
-        cursor = await save(commands, {
-          ...cursor,
-          index,
-          state: "dispatched",
-        });
+        if (index !== cursor.index || cursor.state !== "dispatched")
+          cursor = await save(commands, {
+            ...cursor,
+            index,
+            state: "dispatched",
+          });
+        // A UID precondition makes the delete idempotent: a resumed step can only remove an
+        // initial instance Pod that this step owns, and a status update cannot refuse it.
         for (const pod of pods)
           await commands.kube(
             [
@@ -454,15 +455,12 @@ export async function renewRotationConsumers(
             JSON.stringify({
               apiVersion: "v1",
               kind: "DeleteOptions",
-              preconditions: {
-                uid: text(metadata(pod).uid),
-                resourceVersion: text(metadata(pod).resourceVersion),
-              },
+              preconditions: { uid: text(metadata(pod).uid) },
               propagationPolicy: "Background",
             }),
           );
         if ((await instancePods(commands, expected)).length)
-          return fail("rotation_consumer_write_unresolved");
+          return fail("rotation_consumer_rollout_pending");
       }
     } else if (index === cursor.index && cursor.state === "dispatched") {
       if (object(annotation)[RESTART] !== cursor.restart_at)
