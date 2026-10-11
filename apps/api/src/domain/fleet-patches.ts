@@ -38,6 +38,7 @@ import {
 } from "./fleet-region-authority.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import {
+  joinBundleReference,
   loadCurrentRegionMaterialReference,
   loadRegionJoinBundle,
 } from "../crypto/bootstrap-credentials.ts";
@@ -53,7 +54,10 @@ import {
   ComputePoolPolicyState,
   ComputePoolObservation,
 } from "@pgcf/contracts/compute-pool";
-import { NodeBootstrapAdmissionBinding } from "@pgcf/contracts/node-bootstrap";
+import {
+  NodeBootstrapAdmissionBinding,
+  NodeBootstrapTransportBatch,
+} from "@pgcf/contracts/node-bootstrap";
 import { retainedThickStorageAssignments } from "./storage-capacity.ts";
 import { installationHash } from "./node-installation.ts";
 import { storageAuthorityPublicKeys } from "./storage-authority.ts";
@@ -168,7 +172,7 @@ async function retainedThinPatchRequiresHost(
     return closed();
   return true;
 }
-/** Fresh metadata fencing for a request whose private input has already been verified. */
+/** Fresh metadata fence: state, deadline, assignment, release, material and host custody identity. */
 export async function assertFleetPatchCurrent(
   env: Env,
   row: PatchRow,
@@ -306,26 +310,43 @@ export async function authenticateFleetPatch(c: ApiContext, id: string) {
   await assertFleetPatchAuthority(c.env, row);
   return row;
 }
-/** One request owns one full private-input validation; later checks use fresh fenced metadata. */
-export async function authenticateFleetPatchContext(
-  c: ApiContext,
-  id: string,
-  authenticatedRow?: PatchRow,
-) {
-  const row = authenticatedRow ?? (await authenticateFleetPatchRow(c, id));
-  if (row.operation_id !== id) return closed();
-  const fence: { poolRevision?: number } = {};
-  const input = await fleetPatchInput(c.env, id, row, fence);
-  return { row, input, poolRevision: fence.poolRevision };
+/** Transport-only authority for a bearer-authenticated, fenced row. A grant reaches only these two
+ *  targets; status and dispatch checkpoints re-prove the full private input before every write. */
+export async function fleetPatchTransportTargets(
+  env: Env,
+  row: PatchRow,
+): Promise<{ node: string; cluster: string }> {
+  if (
+    (await retainedThinPatchRequiresHost(env, row.region_id, row.release_id)) &&
+    (!row.host_configuration_revision || !row.host_configuration_sha256)
+  )
+    return closed();
+  // The fence binds current region material to row.material_revision; staged rotation material
+  // keeps this cluster endpoint (effectiveFleetRegionJoin).
+  const bundle = await loadRegionJoinBundle(
+    env.DB,
+    env.CREDENTIAL_KEYS,
+    joinBundleReference(row.region_id, row.material_revision),
+  );
+  if (bundle.kube_system_uid !== row.cluster_uid) return closed();
+  return {
+    node: row.address,
+    cluster: new URL(bundle.cluster_endpoint).hostname,
+  };
+}
+function fleetPatchCallbackUrl(env: Env, id: string) {
+  const url = new URL(
+    `/internal/v1/fleet-patches/${id}`,
+    env.NODE_BOOTSTRAP_CALLBACK_URL,
+  );
+  if (url.protocol !== "https:") return closed();
+  return url.href;
 }
 export async function fleetPatchInput(
   env: Env,
   id: string,
-  verifiedRow?: PatchRow,
-  fence?: { poolRevision?: number },
 ): Promise<FleetPatchInput> {
-  const row = verifiedRow ?? (await readFleetPatch(env, id));
-  if (row.operation_id !== id) return closed();
+  const row = await readFleetPatch(env, id);
   await assertFleetPatchCurrent(env, row);
   if (
     (await retainedThinPatchRequiresHost(env, row.region_id, row.release_id)) &&
@@ -472,13 +493,8 @@ export async function fleetPatchInput(
   const poolObservation = observation
     ? ComputePoolObservation.parse(JSON.parse(observation.observation_json))
     : undefined;
-  const url = new URL(
-    `/internal/v1/fleet-patches/${id}`,
-    env.NODE_BOOTSTRAP_CALLBACK_URL,
-  );
-  if (url.protocol !== "https:") return closed();
+  const callback = fleetPatchCallbackUrl(env, id);
   await assertFleetPatchCurrent(env, row, false, storedPool?.revision);
-  if (fence) fence.poolRevision = storedPool?.revision;
   return FleetPatchInput.parse({
     status: status(row),
     host_configuration_only:
@@ -512,7 +528,7 @@ export async function fleetPatchInput(
     ...(await fleetPatchPreparedAuthority(env, row.region_id, row.node_id).then(
       (value) => (value ? { authority_rotation: value } : {}),
     )),
-    callback: { url: url.href, bearer: await patchBearer(env, row) },
+    callback: { url: callback, bearer: await patchBearer(env, row) },
   });
 }
 /** Host receipts and physical identity qualify every runtime; enabled pools also need fresh slot observations. */
@@ -1595,24 +1611,23 @@ export async function recordFleetPatchCheckpoint(
     await restoreFleetPatchPlacements(env, id);
   return status(await readFleetPatch(env, id));
 }
+/** Signs `count` single-use grants for one target after one authority check and one relay identity. */
 export async function issueFleetPatchTransport(
   env: Env,
-  id: string,
+  row: PatchRow,
   capability: "talos_api" | "kubernetes_api",
-  target: "node" | "control" = "node",
-  verified?: Awaited<ReturnType<typeof authenticateFleetPatchContext>>,
-) {
-  const fence: { poolRevision?: number } = {};
-  const row = verified?.row ?? (await readFleetPatch(env, id)),
-    input = verified?.input ?? (await fleetPatchInput(env, id, row, fence)),
-    poolRevision = verified ? verified.poolRevision : fence.poolRevision,
-    service = env.BOOTSTRAP_RELAY_SERVICE;
+  target: "node" | "control",
+  count: number,
+): Promise<NodeBootstrapTransportBatch> {
+  const service = env.BOOTSTRAP_RELAY_SERVICE;
   if (!service) return closed();
   if (
     target === "control" &&
     (capability !== "talos_api" || row.stage !== "kubernetes")
   )
     return closed();
+  const targets = await fleetPatchTransportTargets(env, row),
+    callback = fleetPatchCallbackUrl(env, row.operation_id);
   const endpoint = new URL(env.BOOTSTRAP_RELAY_URL);
   if (
     !["https:", "http:"].includes(endpoint.protocol) ||
@@ -1640,31 +1655,34 @@ export async function issueFleetPatchTransport(
   )
     return closed();
   const address =
-    capability === "talos_api"
-      ? target === "control"
-        ? new URL(input.cluster_endpoint).hostname
-        : input.address
-      : new URL(input.cluster_endpoint).hostname;
+    capability === "talos_api" && target === "node"
+      ? targets.node
+      : targets.cluster;
   const key = await bootstrapTransportSigningKey(
     env.BOOTSTRAP_RELAY_SIGNING_KEYS,
   );
-  const token = await signBootstrapRelay({
-    ...key,
-    operation: id,
-    node: row.node_id,
-    region: row.region_id,
-    issuer_region: identity.region,
-    relay_epoch: identity.relay_epoch,
-    revision: row.assignment_revision,
-    capability,
-    address,
-  });
-  await assertFleetPatchCurrent(env, row, false, poolRevision);
-  return {
-    websocket_url: input.callback.url.replace(/^https:/, "wss:") + "/relay",
-    token,
+  // Each grant draws its own nonce and keeps the default TTL; the relay admits each token once.
+  const tokens = await Promise.all(
+    Array.from({ length: count }, () =>
+      signBootstrapRelay({
+        ...key,
+        operation: row.operation_id,
+        node: row.node_id,
+        region: row.region_id,
+        issuer_region: identity.region,
+        relay_epoch: identity.relay_epoch,
+        revision: row.assignment_revision,
+        capability,
+        address,
+      }),
+    ),
+  );
+  await assertFleetPatchCurrent(env, row);
+  return NodeBootstrapTransportBatch.parse({
+    websocket_url: callback.replace(/^https:/, "wss:") + "/relay",
     expectedTarget: { ip: address, port: BOOTSTRAP_PORTS[capability] },
-  };
+    tokens,
+  });
 }
 
 /** The final regional member's qualified readbacks synchronize metadata; this never patches an OS. */

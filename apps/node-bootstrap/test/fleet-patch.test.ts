@@ -377,6 +377,37 @@ test("a bounded Cloudflare management read can use measured transport headroom w
   assert.equal(r.writes.length, 0);
 });
 
+test("patch transports request one batch per target and refuse a foreign-target grant before opening", async () => {
+  const fixture = patchFixture(),
+    bodies: unknown[] = [];
+  await assert.rejects(
+    runFleetPatch(fixture.input, {
+      proxy: async (_capabilityFor, open) => {
+        await assert.rejects(
+          open("talos_api", `${fixture.input.address}:50000`),
+          /patch_transport_mismatch/,
+        );
+        throw new Error("transport_inspected");
+      },
+      request: async (_url, options) => {
+        bodies.push(JSON.parse(String(options?.body)));
+        return Response.json({
+          websocket_url:
+            fixture.input.callback.url.replace(/^https:/, "wss:") + "/relay",
+          expectedTarget: { ip: "192.0.2.99", port: 50000 },
+          tokens: ["a".repeat(32), "b".repeat(32)],
+        });
+      },
+      run: async () => {
+        throw new Error("unexpected_command");
+      },
+    }),
+    /transport_inspected/,
+  );
+  assert.deepEqual(bodies, [
+    { kind: "transport", capability: "talos_api", target: "node", count: 8 },
+  ]);
+});
 test("sealed configurations use the current authorized bridge rather than an obsolete bootstrap proxy", async () => {
   const r = runtime(true);
   await r.turn();

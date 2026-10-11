@@ -24,7 +24,6 @@ import {
 import { CONFIGURATION_SCHEMA_REVISION } from "@pgcf/contracts";
 import { thinStorageReleaseGuardPinned } from "@pgcf/contracts/releases";
 import { canonicalStorageAuthorityKeys } from "@pgcf/contracts/storage-write-authority";
-import { NodeBootstrapTransport } from "@pgcf/contracts/node-bootstrap";
 import {
   BootstrapError,
   canonical,
@@ -35,7 +34,9 @@ import {
   type CommandRunner,
 } from "./bootstrap.ts";
 import {
-  connectRelayTransport,
+  openPooledRelay,
+  relayGrantPool,
+  relayGrants,
   startCapabilityProxy,
 } from "./proxy-command.ts";
 import { inspectionResponseBody } from "./inspection-proxy-command.ts";
@@ -167,6 +168,8 @@ export function validateFleetPatchInput(raw: unknown) {
     throw new BootstrapError("patch_authority_rotation_identity_mismatch");
   return input;
 }
+type PatchTransportKey =
+  `${"talos_api" | "kubernetes_api"}:${"node" | "control"}`;
 export interface FleetPatchOptions {
   run?: CommandRunner;
   request?: typeof fetch;
@@ -217,6 +220,34 @@ export async function runFleetPatch(
   };
   try {
     const clusterAddress = new URL(input.cluster_endpoint).hostname;
+    // One batch serves several connections; every grant still opens exactly one relay stream.
+    const grants = relayGrantPool<PatchTransportKey>(async (key, count) => {
+      const [capability, target] = key.split(":") as [
+          "talos_api" | "kubernetes_api",
+          "node" | "control",
+        ],
+        batch = relayGrants(
+          await call({ kind: "transport", capability, target, count }),
+        ),
+        expected =
+          capability === "talos_api"
+            ? {
+                ip: target === "control" ? clusterAddress : input.address,
+                port: 50000,
+              }
+            : { ip: clusterAddress, port: 6443 };
+      if (
+        batch.some(
+          (transport) =>
+            transport.expectedTarget.ip !== expected.ip ||
+            transport.expectedTarget.port !== expected.port ||
+            transport.websocket_url !==
+              input.callback.url.replace(/^https:/, "wss:") + "/relay",
+        )
+      )
+        throw new BootstrapError("patch_transport_mismatch");
+      return batch;
+    }, signal);
     proxy = await (options.proxy ?? startCapabilityProxy)(
       (authority) =>
         authority === `${input.address}:50000` ||
@@ -233,24 +264,12 @@ export async function runFleetPatch(
           clusterAddress !== input.address
             ? "control"
             : "node";
-        const transport = NodeBootstrapTransport.parse(
-            await call({ kind: "transport", capability, target }),
-          ),
-          expected =
-            capability === "talos_api"
-              ? {
-                  ip: target === "control" ? clusterAddress : input.address,
-                  port: 50000,
-                }
-              : { ip: clusterAddress, port: 6443 };
-        if (
-          transport.expectedTarget.ip !== expected.ip ||
-          transport.expectedTarget.port !== expected.port ||
-          transport.websocket_url !==
-            input.callback.url.replace(/^https:/, "wss:") + "/relay"
-        )
-          throw new BootstrapError("patch_transport_mismatch");
-        return connectRelayTransport(transport, input.callback.bearer, signal);
+        return openPooledRelay(
+          grants,
+          `${capability}:${target}`,
+          input.callback.bearer,
+          signal,
+        );
       },
       signal,
     );

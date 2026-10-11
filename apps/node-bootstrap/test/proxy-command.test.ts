@@ -9,11 +9,141 @@ import { runInNewContext } from "node:vm";
 import ts from "typescript";
 import { test } from "node:test";
 import {
+  RELAY_GRANT_BATCH_MAX,
+  type NodeBootstrapTransport,
+} from "@pgcf/contracts/node-bootstrap";
+import {
+  RELAY_GRANT_LOW_WATER,
+  RELAY_GRANT_USABLE_MS,
   capabilityTarget,
   openCapability,
+  relayGrantPool,
+  relayGrants,
   startNativeProxy,
 } from "../src/proxy-command.ts";
 import { fixture } from "./fixture.ts";
+
+const relayUrl =
+  "wss://api.invalid/internal/v1/fleet-patches/op_aaaaaaaaaaaaaaaaaaaa/relay";
+const grantBatch = (label: string) =>
+  relayGrants({
+    websocket_url: relayUrl,
+    expectedTarget: { ip: "192.0.2.18", port: 6443 },
+    tokens: Array.from({ length: RELAY_GRANT_BATCH_MAX }, (_, index) =>
+      `${label}-${index}-`.padEnd(32, "x"),
+    ),
+  });
+function deferredGrants() {
+  const requests: {
+    count: number;
+    resolve: (grants: NodeBootstrapTransport[]) => void;
+  }[] = [];
+  return {
+    requests,
+    request: (_key: "kubernetes_api", count: number) =>
+      new Promise<NodeBootstrapTransport[]>((resolve) =>
+        requests.push({ count, resolve }),
+      ),
+  };
+}
+const turn = () => new Promise((resolve) => setImmediate(resolve));
+
+test("pooled relay grants expire at fifteen seconds local age and a fresh batch replaces them", async () => {
+  let clock = 1000;
+  const requested: number[] = [];
+  const pool = relayGrantPool(
+    async (_key: "kubernetes_api", count) => {
+      requested.push(count);
+      return grantBatch(`batch${requested.length}`);
+    },
+    new AbortController().signal,
+    () => clock,
+  );
+  assert.ok((await pool.take("kubernetes_api")).token.startsWith("batch1-0-"));
+  clock += RELAY_GRANT_USABLE_MS - 1;
+  assert.ok((await pool.take("kubernetes_api")).token.startsWith("batch1-1-"));
+  clock += 1;
+  assert.ok((await pool.take("kubernetes_api")).token.startsWith("batch2-0-"));
+  assert.deepEqual(requested, [RELAY_GRANT_BATCH_MAX, RELAY_GRANT_BATCH_MAX]);
+});
+
+test("concurrent connections share one in-flight batch and refill once at four remaining grants", async () => {
+  const { requests, request } = deferredGrants(),
+    pool = relayGrantPool(request, new AbortController().signal),
+    waiting = Array.from({ length: 3 }, () => pool.take("kubernetes_api"));
+  await turn();
+  assert.equal(requests.length, 1);
+  requests[0]!.resolve(grantBatch("first"));
+  const taken = await Promise.all(waiting);
+  assert.equal(requests.length, 1);
+  taken.push(await pool.take("kubernetes_api"));
+  assert.equal(requests.length, 2);
+  for (let index = 0; index < RELAY_GRANT_LOW_WATER; index++)
+    taken.push(await pool.take("kubernetes_api"));
+  const ninth = pool.take("kubernetes_api");
+  await turn();
+  assert.equal(requests.length, 2);
+  requests[1]!.resolve(grantBatch("second"));
+  taken.push(await ninth);
+  assert.equal(requests.length, 2);
+  assert.deepEqual(
+    requests.map((value) => value.count),
+    [RELAY_GRANT_BATCH_MAX, RELAY_GRANT_BATCH_MAX],
+  );
+  assert.equal(new Set(taken.map((grant) => grant.token)).size, 9);
+  assert.ok(taken[8]!.token.startsWith("second-0-"));
+});
+
+test("clearing the pool drops pooled grants and discards a batch requested before the refusal", async () => {
+  const { requests, request } = deferredGrants(),
+    pool = relayGrantPool(request, new AbortController().signal),
+    first = pool.take("kubernetes_api");
+  await turn();
+  requests[0]!.resolve(grantBatch("old"));
+  await first;
+  for (let index = 0; index < 3; index++) await pool.take("kubernetes_api");
+  assert.equal(requests.length, 2);
+  pool.clear();
+  const fresh = pool.take("kubernetes_api");
+  await turn();
+  assert.equal(requests.length, 3);
+  requests[1]!.resolve(grantBatch("stale"));
+  requests[2]!.resolve(grantBatch("new"));
+  const grants = [await fresh];
+  for (let index = 1; index < RELAY_GRANT_BATCH_MAX; index++)
+    grants.push(await pool.take("kubernetes_api"));
+  assert.ok(grants.every((grant) => grant.token.startsWith("new-")));
+});
+
+test("an older API's single grant is a batch of one and duplicate batch tokens are refused", async () => {
+  const single = {
+    websocket_url: relayUrl,
+    token: "legacy".padEnd(32, "x"),
+    expectedTarget: { ip: "192.0.2.18", port: 6443 as const },
+  };
+  assert.deepEqual(relayGrants(single), [single]);
+  assert.throws(() =>
+    relayGrants({
+      websocket_url: relayUrl,
+      expectedTarget: single.expectedTarget,
+      tokens: [single.token, single.token],
+    }),
+  );
+  let requested = 0;
+  const pool = relayGrantPool<"kubernetes_api">(
+    async () =>
+      relayGrants({
+        ...single,
+        token: `legacy-${++requested}-`.padEnd(32, "x"),
+      }),
+    new AbortController().signal,
+  );
+  const first = await pool.take("kubernetes_api");
+  await turn();
+  const second = await pool.take("kubernetes_api");
+  assert.notEqual(first.token, second.token);
+  assert.equal(requested, 3);
+});
 
 test("relay capability refuses a callback target that differs from immutable provider identity", async () => {
   const input = fixture();

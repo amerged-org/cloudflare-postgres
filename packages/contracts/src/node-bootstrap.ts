@@ -606,6 +606,25 @@ export const NodeBootstrapTransport = z.strictObject({
   }),
 });
 export type NodeBootstrapTransport = z.infer<typeof NodeBootstrapTransport>;
+/** One transport callback mints at most this many single-use grants for one capability target. */
+export const RELAY_GRANT_BATCH_MAX = 8;
+export const RelayGrantCount = z
+  .number()
+  .int()
+  .min(1)
+  .max(RELAY_GRANT_BATCH_MAX);
+export const NodeBootstrapTransportBatch = z.strictObject({
+  websocket_url: NodeBootstrapTransport.shape.websocket_url,
+  expectedTarget: NodeBootstrapTransport.shape.expectedTarget,
+  tokens: z
+    .array(NodeBootstrapTransport.shape.token)
+    .min(1)
+    .max(RELAY_GRANT_BATCH_MAX)
+    .refine((tokens) => new Set(tokens).size === tokens.length),
+});
+export type NodeBootstrapTransportBatch = z.infer<
+  typeof NodeBootstrapTransportBatch
+>;
 
 export const NodeBootstrapStatus = z.strictObject({
   operation_id: OperationId,

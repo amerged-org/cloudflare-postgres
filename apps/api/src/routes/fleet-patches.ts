@@ -13,15 +13,19 @@ import {
   BOOTSTRAP_RELAY_TOKEN_MAX_LENGTH,
   bootstrapRelayClaimsSchema,
 } from "@pgcf/contracts/bootstrap-relay";
+import {
+  RELAY_GRANT_BATCH_MAX,
+  RelayGrantCount,
+} from "@pgcf/contracts/node-bootstrap";
 import { ApiError, type ApiApp } from "../app.ts";
 import {
   authenticateFleetPatch,
-  authenticateFleetPatchContext,
   authenticateFleetPatchRow,
   assertFleetPatchAuthority,
   assertFleetPatchCurrent,
   createFleetPatch,
   fleetPatchInput,
+  fleetPatchTransportTargets,
   getFleetPatch,
   issueFleetPatchTransport,
   recordFleetPatchCheckpoint,
@@ -108,24 +112,36 @@ export function registerFleetPatches(app: ApiApp) {
       expected_compute_pool_revision?: unknown;
     };
     if (raw.kind === "transport") {
-      const verified = await authenticateFleetPatchContext(
-        c,
-        id,
+      const body = raw as {
+          capability?: unknown;
+          target?: unknown;
+          count?: unknown;
+        },
+        count =
+          body.count === undefined
+            ? undefined
+            : RelayGrantCount.safeParse(body.count);
+      if (count && !count.success)
+        throw new ApiError(
+          "invalid_request",
+          `Transport grant count must be 1-${RELAY_GRANT_BATCH_MAX}`,
+        );
+      const batch = await issueFleetPatchTransport(
+        c.env,
         authenticated,
+        z.enum(["talos_api", "kubernetes_api"]).parse(body.capability),
+        z.enum(["node", "control"]).default("node").parse(body.target),
+        count?.data ?? 1,
       );
+      // An executor without `count` predates batches and strictly parses exactly one grant.
       return c.json(
-        await issueFleetPatchTransport(
-          c.env,
-          id,
-          z
-            .enum(["talos_api", "kubernetes_api"])
-            .parse((raw as { capability?: unknown }).capability),
-          z
-            .enum(["node", "control"])
-            .default("node")
-            .parse((raw as { target?: unknown }).target),
-          verified,
-        ),
+        count
+          ? batch
+          : {
+              websocket_url: batch.websocket_url,
+              token: batch.tokens[0],
+              expectedTarget: batch.expectedTarget,
+            },
         200,
       );
     }
@@ -197,8 +213,7 @@ export function registerFleetPatches(app: ApiApp) {
   });
   app.get("/internal/v1/fleet-patches/:operation_id/relay", async (c) => {
     const id = OperationId.parse(c.req.param("operation_id")),
-      verified = await authenticateFleetPatchContext(c, id),
-      row = verified.row,
+      row = await authenticateFleetPatchRow(c, id),
       token = c.req.header(BOOTSTRAP_RELAY_HEADER);
     if (
       c.req.header("Upgrade")?.toLowerCase() !== "websocket" ||
@@ -223,15 +238,14 @@ export function registerFleetPatches(app: ApiApp) {
     } catch {
       throw new ApiError("unauthorized", "Invalid fleet patch transport grant");
     }
-    const input = verified.input,
-      clusterAddress = new URL(input.cluster_endpoint).hostname,
+    const targets = await fleetPatchTransportTargets(c.env, row),
       addresses =
         claims.capability === "talos_api"
           ? [
-              input.address,
-              ...(row.stage === "kubernetes" ? [clusterAddress] : []),
+              targets.node,
+              ...(row.stage === "kubernetes" ? [targets.cluster] : []),
             ]
-          : [clusterAddress];
+          : [targets.cluster];
     if (
       claims.operation !== id ||
       claims.node !== row.node_id ||
@@ -242,14 +256,14 @@ export function registerFleetPatches(app: ApiApp) {
     )
       throw new ApiError("forbidden", "Fleet patch transport scope changed");
     // The regional relay verifies the signature, expiry, nonce, target and relay epoch.
-    await assertFleetPatchCurrent(c.env, row, false, verified.poolRevision);
+    await assertFleetPatchCurrent(c.env, row);
     const response = await c.env.BOOTSTRAP_RELAY_SERVICE.fetch(
       new Request(new URL(BOOTSTRAP_RELAY_PATH, c.env.BOOTSTRAP_RELAY_URL), {
         headers: { Upgrade: "websocket", [BOOTSTRAP_RELAY_HEADER]: token },
       }),
     );
     try {
-      await assertFleetPatchCurrent(c.env, row, false, verified.poolRevision);
+      await assertFleetPatchCurrent(c.env, row);
     } catch (error) {
       try {
         response.webSocket?.accept();

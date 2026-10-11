@@ -11,6 +11,8 @@ import {
   BootstrapCapability,
   NodeBootstrapInput,
   NodeBootstrapTransport,
+  NodeBootstrapTransportBatch,
+  RELAY_GRANT_BATCH_MAX,
   type NodeBootstrapCallback,
 } from "@pgcf/contracts/node-bootstrap";
 
@@ -134,6 +136,98 @@ export async function connectRelayTransport(
     socket.terminate();
   });
   return stream;
+}
+
+/** Local age limit for offering a pooled grant; the relay admits it for 29-30 s after signing. */
+export const RELAY_GRANT_USABLE_MS = 15_000;
+/** A background batch is requested once a take leaves at most this many usable grants. */
+export const RELAY_GRANT_LOW_WATER = 4;
+
+/** Accepts a batch, or an older API's single strict grant (version skew). */
+export function relayGrants(raw: unknown): NodeBootstrapTransport[] {
+  const batch = NodeBootstrapTransportBatch.safeParse(raw);
+  return batch.success
+    ? batch.data.tokens.map((token) => ({
+        websocket_url: batch.data.websocket_url,
+        token,
+        expectedTarget: batch.data.expectedTarget,
+      }))
+    : [NodeBootstrapTransport.parse(raw)];
+}
+
+export interface RelayGrantPool<Key extends string> {
+  take(key: Key): Promise<NodeBootstrapTransport>;
+  clear(): void;
+}
+
+/** Hands each single-use grant to exactly one connection. Concurrent takers share one in-flight
+ *  request per key; unused grants expire unpresented and never reach the relay. */
+export function relayGrantPool<Key extends string>(
+  request: (key: Key, count: number) => Promise<NodeBootstrapTransport[]>,
+  signal: AbortSignal,
+  now: () => number = () => performance.now(),
+): RelayGrantPool<Key> {
+  interface Entry {
+    grants: { transport: NodeBootstrapTransport; received: number }[];
+    refill?: Promise<void>;
+  }
+  let entries = new Map<Key, Entry>();
+  const entry = (key: Key) => {
+    let value = entries.get(key);
+    if (!value) entries.set(key, (value = { grants: [] }));
+    return value;
+  };
+  const refill = (key: Key, value: Entry) =>
+    (value.refill ??= request(key, RELAY_GRANT_BATCH_MAX)
+      .then((grants) => {
+        // A cleared pool never offers grants requested before the refusal.
+        if (entries.get(key) !== value) return;
+        const received = now();
+        value.grants.push(
+          ...grants.map((transport) => ({ transport, received })),
+        );
+      })
+      .finally(() => {
+        value.refill = undefined;
+      }));
+  return {
+    async take(key) {
+      for (;;) {
+        signal.throwIfAborted();
+        const value = entry(key),
+          oldest = now() - RELAY_GRANT_USABLE_MS;
+        value.grants = value.grants.filter((grant) => grant.received > oldest);
+        const grant = value.grants.shift();
+        if (grant) {
+          if (value.grants.length <= RELAY_GRANT_LOW_WATER)
+            refill(key, value).catch(() => {});
+          return grant.transport;
+        }
+        await refill(key, value);
+      }
+    },
+    clear() {
+      entries = new Map();
+    },
+  };
+}
+
+/** The CONNECT is answered only after this resolves, so a refused upgrade forwarded no client byte
+ *  and one fresh grant may retry it. Failures after the stream opened are never retried. */
+export async function openPooledRelay<Key extends string>(
+  pool: RelayGrantPool<Key>,
+  key: Key,
+  bearer: string,
+  signal: AbortSignal,
+): Promise<Duplex> {
+  const grant = await pool.take(key);
+  try {
+    return await connectRelayTransport(grant, bearer, signal);
+  } catch {
+    // A relay restart (new epoch), revoked authority or overload: no pooled grant survives.
+    pool.clear();
+    return connectRelayTransport(await pool.take(key), bearer, signal);
+  }
 }
 
 export async function startNativeProxy(

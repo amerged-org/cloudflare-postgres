@@ -20,7 +20,14 @@ import {
 } from "@pgcf/contracts/bootstrap-relay";
 import { createBootstrapRelay } from "../../regional/src/bootstrap-relay.ts";
 import { inputHash } from "../src/bootstrap.ts";
-import { LOOPBACK, openCapability } from "../src/proxy-command.ts";
+import {
+  LOOPBACK,
+  openCapability,
+  openPooledRelay,
+  relayGrantPool,
+  relayGrants,
+  startCapabilityProxy,
+} from "../src/proxy-command.ts";
 import { fixture } from "./fixture.ts";
 
 async function localRelay(t: TestContext) {
@@ -59,7 +66,9 @@ async function localRelay(t: TestContext) {
   ])) as { privateKey: BootstrapCryptoKey; publicKey: BootstrapCryptoKey };
   const keys = new Map([["current", pair.publicKey]]);
   const sockets = new Set<Socket>();
+  let backendConnections = 0;
   const backend = net.createServer((socket) => {
+    backendConnections++;
     sockets.add(socket);
     socket.on("error", () => {});
     socket.once("close", () => sockets.delete(socket));
@@ -151,6 +160,7 @@ async function localRelay(t: TestContext) {
     websocket_url,
     token,
     upgrades: () => upgrades,
+    backendConnections: () => backendConnections,
     restart: async () => {
       const previous = relay.identity.relay_epoch;
       await relay.close();
@@ -158,6 +168,79 @@ async function localRelay(t: TestContext) {
       return previous;
     },
   };
+}
+
+/** Presents a token once more; a relay that admits it fails the caller. */
+function refusalStatus(
+  relay: Awaited<ReturnType<typeof localRelay>>,
+  token: string,
+): Promise<number> {
+  return new Promise<number>((resolve, reject) => {
+    const client = new WebSocket(relay.websocket_url, {
+      headers: {
+        [BOOTSTRAP_RELAY_HEADER]: token,
+        authorization: `Bearer ${relay.config.callback.bearer}`,
+      },
+    });
+    client.on("error", () => {});
+    client.once("open", () => {
+      client.terminate();
+      reject(new Error("refused relay grant admitted"));
+    });
+    client.once("unexpected-response", (request, response) => {
+      const status = response.statusCode!;
+      response.destroy();
+      request.destroy();
+      client.terminate();
+      resolve(status);
+    });
+  });
+}
+
+/** Batched callback: the real relay signs each token for its current epoch. */
+function relayBatches(relay: Awaited<ReturnType<typeof localRelay>>) {
+  const issued: string[][] = [];
+  return {
+    issued,
+    request: async (_key: "kubernetes_api", count: number) => {
+      const tokens = await Promise.all(
+        Array.from({ length: count }, () => relay.token()),
+      );
+      issued.push(tokens);
+      return relayGrants({
+        websocket_url: relay.websocket_url,
+        expectedTarget: { ip: LOOPBACK, port: 6443 },
+        tokens,
+      });
+    },
+  };
+}
+
+/** CONNECT with the payload in its head: the proxy forwards it only into an opened relay stream. */
+async function tunnel(proxy: string, payload: Buffer) {
+  const socket = net.connect(Number(new URL(proxy).port), LOOPBACK),
+    established = Buffer.from("HTTP/1.1 200 Connection Established\r\n\r\n");
+  socket.setTimeout(10_000, () => socket.destroy(new Error("tunnel_timeout")));
+  await once(socket, "connect");
+  socket.write(
+    Buffer.concat([
+      Buffer.from(
+        `CONNECT ${LOOPBACK}:6443 HTTP/1.1\r\nHost: ${LOOPBACK}:6443\r\n\r\n`,
+      ),
+      payload,
+    ]),
+  );
+  let received = Buffer.alloc(0);
+  try {
+    for await (const chunk of socket as AsyncIterable<Buffer>) {
+      received = Buffer.concat([received, chunk]);
+      if (received.length >= established.length + payload.length) break;
+    }
+  } finally {
+    socket.destroy();
+  }
+  assert.deepEqual(received.subarray(0, established.length), established);
+  return received.subarray(established.length);
 }
 
 test("native capability bridges bytes through an authenticated TLS API front and the real raw-token relay", async (t) => {
@@ -191,27 +274,7 @@ test("a relay restart rejects its old audience while the immutable job requests 
   const originalHash = relay.config.input_hash;
   const oldToken = await relay.token();
   await relay.restart();
-  const rejected = await new Promise<number>((resolve, reject) => {
-    const client = new WebSocket(relay.websocket_url, {
-      headers: {
-        [BOOTSTRAP_RELAY_HEADER]: oldToken,
-        authorization: `Bearer ${relay.config.callback.bearer}`,
-      },
-    });
-    client.on("error", () => {});
-    client.once("open", () => {
-      client.terminate();
-      reject(new Error("old relay audience admitted"));
-    });
-    client.once("unexpected-response", (request, response) => {
-      const status = response.statusCode!;
-      response.destroy();
-      request.destroy();
-      client.terminate();
-      resolve(status);
-    });
-  });
-  assert.equal(rejected, 401);
+  assert.equal(await refusalStatus(relay, oldToken), 401);
   const abort = new AbortController();
   const bridge = await openCapability(
     relay.config,
@@ -281,4 +344,68 @@ test("native capability rejects a different WebSocket origin or operation path b
     /transport_endpoint_mismatch/,
   );
   assert.equal(relay.upgrades(), 0);
+});
+
+test("one batched callback opens eight relay streams and each grant is admitted once", async (t) => {
+  const relay = await localRelay(t),
+    abort = new AbortController(),
+    batches = relayBatches(relay),
+    pool = relayGrantPool(batches.request, abort.signal);
+  t.after(() => abort.abort());
+  const streams = await Promise.all(
+    Array.from({ length: 8 }, () =>
+      openPooledRelay(
+        pool,
+        "kubernetes_api",
+        relay.config.callback.bearer,
+        abort.signal,
+      ),
+    ),
+  );
+  try {
+    for (const stream of streams) {
+      const expected = randomBytes(256),
+        response = once(stream, "data");
+      stream.write(expected);
+      assert.deepEqual((await response)[0], expected);
+    }
+  } finally {
+    for (const stream of streams) stream.destroy();
+  }
+  assert.equal(relay.upgrades(), 8);
+  assert.equal(relay.backendConnections(), 8);
+  assert.equal(batches.issued[0]!.length, 8);
+  for (const token of batches.issued[0]!)
+    assert.equal(await refusalStatus(relay, token), 401);
+});
+
+test("a relay restart refuses a pooled grant and the unanswered CONNECT retries once with a fresh batch", async (t) => {
+  const relay = await localRelay(t),
+    abort = new AbortController(),
+    batches = relayBatches(relay),
+    pool = relayGrantPool(batches.request, abort.signal),
+    proxy = await startCapabilityProxy(
+      (authority) =>
+        authority === `${LOOPBACK}:6443` ? "kubernetes_api" : undefined,
+      () =>
+        openPooledRelay(
+          pool,
+          "kubernetes_api",
+          relay.config.callback.bearer,
+          abort.signal,
+        ),
+      abort.signal,
+    );
+  t.after(async () => {
+    abort.abort();
+    await proxy.close();
+  });
+  const first = randomBytes(64);
+  assert.deepEqual(await tunnel(proxy.url, first), first);
+  await relay.restart();
+  const second = randomBytes(64);
+  assert.deepEqual(await tunnel(proxy.url, second), second);
+  assert.equal(batches.issued.length, 2);
+  assert.equal(relay.upgrades(), 3);
+  assert.equal(relay.backendConnections(), 2);
 });
