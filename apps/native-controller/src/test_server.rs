@@ -73,6 +73,14 @@ fn collection(path: &str) -> bool {
     };
     rest.len() == 1 || (rest.len() == 3 && rest[0] == "namespaces")
 }
+/// kube-apiserver omits TypeMeta on items of built-in lists; custom resources keep theirs.
+fn builtin(path: &str) -> bool {
+    path.starts_with("/api/")
+        || path
+            .strip_prefix("/apis/")
+            .and_then(|rest| rest.split('/').next())
+            .is_some_and(|group| !group.contains('.') || group.ends_with(".k8s.io"))
+}
 fn listed(key: &str, path: &str) -> bool {
     let Some((parent, _)) = key.rsplit_once('/') else {
         return false;
@@ -106,7 +114,15 @@ fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u
                     .objects
                     .iter()
                     .filter(|(key, _)| listed(key, path))
-                    .map(|(_, value)| value.clone())
+                    .map(|(_, value)| {
+                        let mut value = value.clone();
+                        if builtin(path) {
+                            let object = value.as_object_mut().unwrap();
+                            object.remove("kind");
+                            object.remove("apiVersion");
+                        }
+                        value
+                    })
                     .collect();
                 return reply(
                     200,

@@ -497,6 +497,11 @@ impl Kubernetes {
         selector: Option<&str>,
     ) -> Result<Vec<Value>, Error> {
         let path = collection(kind, namespace)?;
+        let prefix = resource(kind)?.0;
+        let api_version = prefix
+            .strip_prefix("/apis/")
+            .or_else(|| prefix.strip_prefix("/api/"))
+            .ok_or("Kubernetes API version unknown")?;
         let mut result = vec![];
         let mut cursor = String::new();
         let mut version = None;
@@ -528,13 +533,20 @@ impl Kubernetes {
             let items = value["items"]
                 .as_array()
                 .ok_or("Kubernetes collection invalid")?;
+            // kube-apiserver omits TypeMeta on built-in list items; a stated identity must match.
             if items.iter().any(|v| {
-                text(v, "kind") != kind
+                (!v["kind"].is_null() && text(v, "kind") != kind)
+                    || (!v["apiVersion"].is_null() && text(v, "apiVersion") != api_version)
                     || namespace.is_some_and(|ns| text(&v["metadata"], "namespace") != ns)
             }) {
                 return Err("Kubernetes inventory identity changed".into());
             }
-            result.extend(items.iter().cloned());
+            result.extend(items.iter().map(|item| {
+                let mut item = item.clone();
+                item["kind"] = kind.into();
+                item["apiVersion"] = api_version.into();
+                item
+            }));
             if result.len() > 10000 {
                 return Err("Kubernetes inventory exceeds bound".into());
             }
@@ -717,6 +729,37 @@ mod tests {
             "/apis/node.k8s.io/v1/runtimeclasses/pgcf-prestarted"
         );
         assert!(named("MutatingAdmissionPolicy", Some("kube-system"), "policy").is_err());
+    }
+}
+#[cfg(test)]
+mod list_tests {
+    use crate::test_server::{Server, uid};
+    use serde_json::json;
+    #[tokio::test]
+    async fn built_in_list_items_without_type_meta_keep_the_requested_identity() {
+        let server = Server::start().await;
+        server.put(
+            json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"customer","uid":uid(1)}}),
+        );
+        server.put(json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"driver","namespace":"openebs","uid":uid(2)}}));
+        let nodes = server.k8s.list("Node", None, None).await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["kind"], "Node");
+        assert_eq!(nodes[0]["apiVersion"], "v1");
+        let pods = server.k8s.list("Pod", None, None).await.unwrap();
+        assert_eq!(pods[0]["kind"], "Pod");
+        assert_eq!(pods[0]["metadata"]["uid"], uid(2));
+        server.state.lock().unwrap().objects.insert(
+            "/apis/local.openebs.io/v1alpha1/namespaces/openebs/lvmvolumes/changed".into(),
+            json!({"apiVersion":"local.openebs.io/v1alpha1","kind":"LVMNode","metadata":{"name":"changed","namespace":"openebs","uid":uid(3)}}),
+        );
+        assert!(
+            server
+                .k8s
+                .list("LVMVolume", Some("openebs"), None)
+                .await
+                .is_err()
+        );
     }
 }
 #[cfg(test)]
