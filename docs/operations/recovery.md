@@ -258,11 +258,12 @@ Administrators read or CAS-select a profile with `GET`/`PUT /v1/nodes/{id}/stora
 PUT includes `expected_revision`, the physical `node_uid`, literal management `address`,
 `volume_group_uuid`, the complete finite `profile` and `allow_new_databases:false`.
 `Idempotency-Key` protects repeated requests. Selection records desired policy and supplies no
-qualification; only a Native report changes its `status`. An active or uncertain Native pool
-action blocks reselection. The approved release must pin the exact driver, the storage verifier,
-the `pgcf-sandbox-controller` host extension and the `native-gateway` and `native-controller`
-images on every role. Only the native controller writes the gateway's write-authority ledger,
-protection marker and reclamation proof.
+qualification; only a Native report changes its `status`. An active Native lease blocks
+reselection, and an uncertain dispatched pool action blocks any change to it. The approved
+release must pin the exact driver, the storage verifier, the `pgcf-sandbox-controller` host
+extension and the `native-gateway` and `native-controller` images on every role. Only the
+native controller writes the gateway's write-authority ledger, protection marker and
+reclamation proof.
 The regional capacity policy accepts an optional `thin_storage` standing template: omission
 preserves it, explicit null clears it. Future purchases seal that template before ordering;
 customer placement still waits for the actual joined node's qualified physical report.
@@ -275,9 +276,14 @@ admission, which is recorded only while that policy is set. Once the node's curr
 has completed with its host configuration, a successful PUT starts the Native executor. Its one
 lease initializes a missing `pgcf_thinpool` from free volume-group extents only, leaves thick
 volumes untouched and never repeats an uncertain dispatched action. The response waits for that
-first Native run and reports the resulting `status` and `error_code`. Without that completed
-patch the PUT records only the selection; select again after the patch completes. No API removes
-a selection, and a selected node never takes new thick placements.
+first Native run and reports the resulting `status` and `error_code`. A failed run leaves the
+node `blocked` with its `error_code`; after the lease expires, repeat the PUT with the current
+`expected_revision` to start one new run. While a dispatched action is uncertain, only the
+identical selection is accepted: it keeps the revision and the action, and the new run only reads
+the action back. Only the pool that action created or grew, at its target size, confirms it;
+otherwise the node is blocked again and the write is not repeated. Without that completed patch
+the PUT records only the selection; select again after the patch completes. No API removes a
+selection, and a selected node never takes new thick placements.
 
 A release that carries the receipt requires current thin write authority from every member that
 takes databases and from every member that already has a selection. Until then that member stays
