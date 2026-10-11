@@ -45,12 +45,19 @@ type ProbeResult = {
   error?: string;
   reply_sha256?: string;
   reply?: ObjectValue;
-  range?: ReturnType<typeof decodeEncryptedSecretRange>;
+  /** One raw KV/Range page; only readEncryptedSecretRange decodes it and only hashes leave. */
+  message?: Buffer;
 };
 const CAP = 4 * 1024 * 1024,
   PREFIX = Buffer.from("/registry/secrets/"),
   CIPHER = Buffer.from("k8s:enc:secretbox:v1:"),
-  LIMIT = 256;
+  // etcd refuses writes above its 1.5 MiB --max-request-bytes default, so eight
+  // maximum-size Secrets with keys and framing stay near 12 MiB: the 16 MiB page
+  // cap never cuts a valid page. 4096 Secrets (512 pages) bound the whole range
+  // and still fit ~680 databases at ~6 Secrets each.
+  PAGE = 8,
+  PAGE_CAP = 16 * 1024 * 1024,
+  MAX_SECRETS = 4096;
 const CERT_RPC = "/securityapi.SecurityService/Certificate",
   STATUS_RPC = "/etcdserverpb.Maintenance/Status",
   RANGE_RPC = "/etcdserverpb.KV/Range";
@@ -271,12 +278,13 @@ export function isExplicitRetirementRefusal(
     )
   );
 }
-function varint(value: number) {
+function varint(value: number | bigint) {
   const bytes: number[] = [];
+  let rest = BigInt(value);
   do {
-    bytes.push((value & 127) | (value > 127 ? 128 : 0));
-    value >>>= 7;
-  } while (value);
+    bytes.push(Number(rest & 127n) | (rest > 127n ? 128 : 0));
+    rest >>= 7n;
+  } while (rest);
   return Buffer.from(bytes);
 }
 interface Field {
@@ -323,19 +331,42 @@ function* protobufFields(message: Buffer): Generator<Field> {
     yield { field, wire, value };
   }
 }
-/** Decode only the fixed /registry/secrets/ bounded range; expose hashes, never ciphertext. */
-export function decodeEncryptedSecretRange(
+/** Decode one page of the fixed /registry/secrets/ range; raw keys and ciphertext stay here. */
+function decodeSecretPage(
   message: Buffer,
   expectedName: string,
+  start: Buffer,
 ) {
   const entries: { key_sha256: string; value_sha256: string }[] = [],
-    seen = new Set<string>();
-  let more = false,
+    expected = Buffer.from(CIPHER.toString() + expectedName + ":");
+  let revision = 0n,
+    more = false,
     count = 0n,
+    next = start,
+    sawHeader = false,
     sawMore = false,
     sawCount = false;
   for (const item of protobufFields(message)) {
-    if (item.field === 3) {
+    if (item.field === 1) {
+      must(
+        !sawHeader && item.wire === 2 && Buffer.isBuffer(item.value),
+        "range_invalid",
+      );
+      sawHeader = true;
+      // ResponseHeader.revision (field 3) is int64.
+      for (const field of protobufFields(item.value))
+        if (field.field === 3) {
+          must(
+            !revision &&
+              field.wire === 0 &&
+              typeof field.value === "bigint" &&
+              field.value > 0n &&
+              field.value < 1n << 63n,
+            "range_invalid",
+          );
+          revision = field.value;
+        }
+    } else if (item.field === 3) {
       must(
         !sawMore &&
           item.wire === 0 &&
@@ -347,19 +378,15 @@ export function decodeEncryptedSecretRange(
       more = item.value === 1n;
     } else if (item.field === 4) {
       must(
-        !sawCount &&
-          item.wire === 0 &&
-          typeof item.value === "bigint" &&
-          item.value <= BigInt(LIMIT),
+        !sawCount && item.wire === 0 && typeof item.value === "bigint",
         "range_invalid",
       );
+      must(item.value <= BigInt(MAX_SECRETS), "range_limit");
       sawCount = true;
       count = item.value;
     } else if (item.field === 2) {
       must(
-        item.wire === 2 &&
-          Buffer.isBuffer(item.value) &&
-          entries.length < LIMIT,
+        item.wire === 2 && Buffer.isBuffer(item.value) && entries.length < PAGE,
         "range_invalid",
       );
       let key: Buffer | undefined, value: Buffer | undefined;
@@ -379,49 +406,96 @@ export function decodeEncryptedSecretRange(
           value = field.value;
         }
       }
+      // Keys ascend strictly from the page start, so none repeats within or across pages.
       must(
         key &&
           value &&
           key.length > PREFIX.length &&
-          key.subarray(0, PREFIX.length).equals(PREFIX),
+          key.subarray(0, PREFIX.length).equals(PREFIX) &&
+          Buffer.compare(key, next) >= 0,
         "range_invalid",
       );
-      const id = hash(key);
-      must(!seen.has(id), "range_invalid");
-      seen.add(id);
-      const expected = Buffer.from(CIPHER.toString() + expectedName + ":");
+      next = Buffer.concat([key, Buffer.from([0])]);
       must(
         value.subarray(0, expected.length).equals(expected) &&
           value.length - expected.length >= 40,
         "ciphertext_key_differs",
       );
-      entries.push({ key_sha256: id, value_sha256: hash(value) });
+      entries.push({ key_sha256: hash(key), value_sha256: hash(value) });
     }
   }
-  must(!more, "range_truncated");
+  must(revision, "range_invalid");
+  must(!more || entries.length === PAGE, "range_truncated");
+  // RangeResponse.count counts every key from the page start to the range end.
   must(
-    sawCount && count === BigInt(entries.length) && entries.length > 0,
+    sawCount &&
+      (more
+        ? count > BigInt(PAGE)
+        : count === BigInt(entries.length) && count > 0n),
     "range_count_invalid",
   );
-  return {
-    count: entries.length,
-    allCiphertextUsesExpectedKey: true as const,
-    entries,
-  };
+  return { revision, count, more, entries, next };
 }
-function rangeRequest() {
+function rangeRequest(start: Buffer, revision?: bigint) {
   const end = Buffer.from(PREFIX);
   end[end.length - 1]!++;
   return Buffer.concat([
     Buffer.from([10]),
-    varint(PREFIX.length),
-    PREFIX,
+    varint(start.length),
+    start,
     Buffer.from([18]),
     varint(end.length),
     end,
     Buffer.from([24]),
-    varint(LIMIT),
+    varint(PAGE),
+    // RangeRequest.revision (field 4) pins every later page to the first page's snapshot.
+    ...(revision ? [Buffer.from([32]), varint(revision)] : []),
   ]);
+}
+/**
+ * Read every Secret under /registry/secrets/ as one etcd snapshot in bounded pages,
+ * all pinned to the first page's revision; expose hashes, never ciphertext or key names.
+ */
+export async function readEncryptedSecretRange(
+  transport: Pick<
+    Parameters<typeof grpc>[0],
+    "port" | "address" | "ca" | "cert" | "key" | "signal"
+  >,
+  expectedName: string,
+) {
+  const name = text(expectedName),
+    entries: { key_sha256: string; value_sha256: string }[] = [];
+  let start: Buffer = PREFIX,
+    first: { revision: bigint; count: bigint } | undefined;
+  for (let pages = 0; pages < MAX_SECRETS / PAGE; pages++) {
+    const result = await grpc({
+      ...transport,
+      method: RANGE_RPC,
+      request: rangeRequest(start, first?.revision),
+    });
+    must(
+      result.ok && result.grpc_status === 0 && result.message,
+      "encrypted_range_verdict",
+    );
+    const page = decodeSecretPage(result.message, name, start);
+    first ??= page;
+    // etcd reports its current revision in every header; at the pinned revision the
+    // remaining count shrinks by exactly the keys already read.
+    must(
+      page.revision >= first.revision &&
+        page.count === first.count - BigInt(entries.length),
+      "range_snapshot_differs",
+    );
+    entries.push(...page.entries);
+    if (!page.more)
+      return {
+        count: entries.length,
+        allCiphertextUsesExpectedKey: true as const,
+        entries,
+      };
+    start = page.next;
+  }
+  fail("range_limit");
 }
 function certificateResponse(message: Buffer) {
   const fields = new Map<number, Buffer>();
@@ -465,7 +539,7 @@ async function grpc(options: {
   method: typeof CERT_RPC | typeof STATUS_RPC | typeof RANGE_RPC;
   token?: string;
   csr?: Buffer;
-  expectedKeyName?: string;
+  request?: Buffer;
   signal?: AbortSignal;
 }): Promise<ProbeResult> {
   const signal = boundedSignal(
@@ -572,7 +646,7 @@ async function grpc(options: {
         stream.on("trailers", capture);
         stream.on("data", (chunk: Buffer) => {
           bytes += chunk.length;
-          if (bytes > CAP + 5) {
+          if (bytes > (options.method === RANGE_RPC ? PAGE_CAP : CAP) + 5) {
             finish({ ok: false, error: "response_limit" });
             stream!.destroy();
           } else chunks.push(chunk);
@@ -604,12 +678,7 @@ async function grpc(options: {
               ok: true,
               grpc_status: 0,
               ...(options.method === RANGE_RPC
-                ? {
-                    range: decodeEncryptedSecretRange(
-                      raw.subarray(5),
-                      text(options.expectedKeyName),
-                    ),
-                  }
+                ? { message: raw.subarray(5) }
                 : options.method === CERT_RPC
                   ? { reply: certificateResponse(raw.subarray(5)) }
                   : {}),
@@ -620,7 +689,7 @@ async function grpc(options: {
         });
         const body =
             options.method === RANGE_RPC
-              ? rangeRequest()
+              ? options.request!
               : options.method === CERT_RPC
                 ? Buffer.concat([
                     Buffer.from([10]),
@@ -1126,21 +1195,16 @@ export async function verifyRotationSecretCiphertexts(options: {
       2379,
       options.signal,
     );
-    const result = await grpc({
-      port: transport.port,
-      address: options.session.carrier.physical.address,
-      ca,
-      cert,
-      key: clientKey.export({ type: "pkcs8", format: "pem" }).toString(),
-      method: RANGE_RPC,
-      expectedKeyName: options.expected_key_name,
-      signal: options.signal,
-    });
-    must(
-      result.ok &&
-        result.grpc_status === 0 &&
-        result.range?.allCiphertextUsesExpectedKey,
-      "encrypted_range_verdict",
+    const range = await readEncryptedSecretRange(
+      {
+        port: transport.port,
+        address: options.session.carrier.physical.address,
+        ca,
+        cert,
+        key: clientKey.export({ type: "pkcs8", format: "pem" }).toString(),
+        signal: options.signal,
+      },
+      options.expected_key_name,
     );
     await options.session.verify();
     const finalRows = parseMachineRows(
@@ -1153,12 +1217,12 @@ export async function verifyRotationSecretCiphertexts(options: {
       "configuration_changed_during_probes",
     );
     return {
-      secret_count: result.range.count,
+      secret_count: range.count,
       encrypted_range_sha256: hashValue({
         node_uid: binding.node_uid,
         cluster_uid: binding.cluster_uid,
         active_configuration_sha256: active.sha256,
-        range: result.range,
+        range,
       }),
       allCiphertextUsesExpectedKey: true as const,
       new_key_name: options.expected_key_name,
@@ -1728,19 +1792,10 @@ export async function verifyRegionAuthorityRetirement(
         "etcd_verdict",
       );
       record("etcd_ca", current, prior);
-      const range = await grpc({
-        ...common,
-        ...leaves["new-etcd"]!,
-        method: RANGE_RPC,
-        expectedKeyName: secretbox(options.newDocuments).name,
-      });
-      must(
-        range.ok &&
-          range.grpc_status === 0 &&
-          range.range?.allCiphertextUsesExpectedKey,
-        "encrypted_range_verdict",
+      transcript.encrypted_range = await readEncryptedSecretRange(
+        { ...common, ...leaves["new-etcd"]! },
+        secretbox(options.newDocuments).name,
       );
-      transcript.encrypted_range = range.range;
     } finally {
       await etcdForward.close();
     }
