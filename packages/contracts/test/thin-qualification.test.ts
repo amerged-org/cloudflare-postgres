@@ -4,6 +4,7 @@ import { ThinStorageProfile } from "../src/database-storage.ts";
 import { ThinStorageQualification } from "../src/releases.ts";
 import {
   ThinQualificationRequest,
+  ThinQualificationResumeMarker,
   thinQualificationGatePass,
   thinQualificationPassed,
   thinQualificationReceiptMaterial,
@@ -262,6 +263,13 @@ describe("thin storage qualification producer contract", () => {
         { ...value, uncommitted_rows: 1 },
         profile,
       ),
+    ).toBe(false);
+    // The run never resumes a changed identity, so it records no such refusal.
+    expect(
+      ThinQualificationResumeMarker.safeParse({
+        ...value,
+        changed_identity_refused: true,
+      }).success,
     ).toBe(false);
   });
 

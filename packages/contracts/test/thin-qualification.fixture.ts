@@ -257,7 +257,6 @@ export function thinQualificationFixture(
       long_statement_active: true,
       suspended: true,
       resume_target_verified: true,
-      changed_identity_refused: true,
       restart_ready_milliseconds: 3_900,
       marker_present: true,
       uncommitted_rows: 0,

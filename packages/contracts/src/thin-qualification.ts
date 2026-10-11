@@ -300,7 +300,6 @@ export const ThinQualificationResumeMarker = z.strictObject({
   long_statement_active: z.boolean(),
   suspended: z.boolean(),
   resume_target_verified: z.boolean(),
-  changed_identity_refused: z.boolean(),
   restart_ready_milliseconds: Count,
   marker_present: z.boolean(),
   uncommitted_rows: Count,
@@ -577,7 +576,6 @@ export function thinQualificationGatePass<G extends ThinQualificationGate>(
         e.long_statement_active &&
         e.suspended &&
         e.resume_target_verified &&
-        e.changed_identity_refused &&
         e.lv_uuid_after === e.lv_uuid_before &&
         e.pool_uuid_after === e.pool_uuid_before &&
         e.marker_present &&

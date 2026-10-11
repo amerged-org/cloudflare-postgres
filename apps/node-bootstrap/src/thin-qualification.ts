@@ -2568,12 +2568,8 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
           lv_uuid: volume.lv_uuid,
           pool_device: String(pool.device),
         };
-        const verified = resumeTargetMatches(info, table, expected),
-          changed = !resumeTargetMatches(info, table, {
-            ...expected,
-            lv_uuid: `${expected.lv_uuid.slice(0, -1)}${expected.lv_uuid.endsWith("0") ? "1" : "0"}`,
-          });
-        if (!verified) return { verified, changed, exit_code: 255 };
+        const verified = resumeTargetMatches(info, table, expected);
+        if (!verified) return { verified, exit_code: 255 };
         const result = await this.timed([
           "dmsetup",
           "resume",
@@ -2582,7 +2578,7 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
           "--uuid",
           lvDm,
         ]);
-        return { verified, changed, exit_code: result.exit_code };
+        return { verified, exit_code: result.exit_code };
       },
     );
     if (resumed.exit_code !== 0) fail("resume_failed");
@@ -2637,7 +2633,6 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
         long_statement_active: Boolean(long.active),
         suspended: suspended.state === "SUSPENDED",
         resume_target_verified: Boolean(resumed.verified),
-        changed_identity_refused: Boolean(resumed.changed),
         restart_ready_milliseconds: Number(restart.ready_milliseconds),
         marker_present: Boolean(verify.marker_present),
         uncommitted_rows: Number(verify.uncommitted),

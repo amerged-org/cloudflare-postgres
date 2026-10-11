@@ -366,14 +366,14 @@ boot at the next reboot a fleet patch orchestrates: the R2b `talos_reboot` or `h
 | `data_full` | Commits a marker and acknowledged inserts, fills the pool with direct writes, probes an unmapped thin LV, grows the pool with the product `lvextend`, restarts PostgreSQL on the same PVC | Pool `out_of_data_space` with `error_if_no_space` at 100%; fill and probe end with ENOSPC/EIO, the probe within `drain_seconds`; same pool and LV UUIDs; `rw` after growth to `min(maximum, initial + growth)`; marker and every acknowledged commit present after crash recovery |
 | `metadata_full` | A separate pool below the profile metadata floor is exhausted, deactivated, checked (`thin_check`), repaired (`lvconvert --repair`) and reactivated; then the profile pool at its maximum is filled across `maximum_volumes` thin LVs | Scratch pool `ro`/`fail` with no new chunks after exhaustion; data verifies after repair or activation is refused; maximum pool full with metadata use at most `metadata_bytes - metadata_reserve_bytes` |
 | `noflush_quiescence` | `dmsetup suspend --noflush --nolockfs` of a buffered writer's LV, then resume as drain; the same suspension on a full pool | Dirty pages present; suspended state; no new sectors or chunks while suspended; drain at most max(startup reserve, quota) within `drain_seconds`; clean `e2fsck`; suspension confirmed on a full pool |
-| `resume_marker` | Commits a marker, starts a long uncommitted INSERT, suspends the exact LV, kills the Pod, verifies the thin table identity, resumes and restarts on the same PVC | Marker present, uncommitted rows absent, same LV and pool; a changed LV identity is refused |
+| `resume_marker` | Commits a marker, starts a long uncommitted INSERT, suspends the exact LV, kills the Pod, verifies the thin table identity, resumes and restarts on the same PVC | Marker present, uncommitted rows absent, same LV and pool; the resume target's DM UUID and thin-pool device are verified before resume |
 | `startup_bound` | Cold start on a fresh PVC (mkfs, initdb, bulk load), Pod `io.max`, direct-write rates at the VAC limits, one product-equivalent Native readback | Mapped growth at most max(startup reserve, quota); every ext4 group `ITABLE_ZEROED`; finite `io.max` at most the profile; measured rates within 10% of the limits; readback turn under `guard_seconds / 2` |
 | `trim_delete_recreate` | Writes a raw volume, deletes its PVC/PV/LV, deletes the last thin LV, re-initializes the pool with the product command if the driver removed it, recreates a volume of the same size | LV gone from `lvs -a` and DM; pool usage back to baseline; re-initialized pool has a new UUID; recreated LV reads back only zeros |
 | `retained_thick_preservation` | Compares the retained thick LVs, PVs/PVCs, LVMVolumes and CNPG `Ready`/`ContinuousArchiving` with the setup baseline | All identical and no thin-profile database on the node |
 
 `trim_delete_recreate` qualifies extent return on LV and PVC deletion. The thin class has no
-in-filesystem discard. A resume through the Cloudflare host guard, including refusal of an expired
-token, is verified after activation by the six live checks.
+in-filesystem discard. A resume through the Cloudflare host guard, including refusal of a changed LV
+identity and of an expired token, is verified after activation by the six live checks.
 
 **Failure and cleanup**
 - A failed gate or executor error records its code and moves straight to cleanup.
