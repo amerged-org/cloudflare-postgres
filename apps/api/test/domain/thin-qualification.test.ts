@@ -67,13 +67,13 @@ const profile = ThinStorageProfile.parse({
   maximum_volumes: 128,
   maximum_quota_gib: 7,
 });
-/** A release pinning the thin guard, native gateway, driver, host extension and PostgreSQL. */
+/** A release pinning the thin guard, native controller and gateway, driver, host extension and PostgreSQL. */
 function guardedSpec(keys: string, driverImage = profile.driver_image) {
   const names = [
     "api",
     "edge",
     "node-bootstrap",
-    "regional",
+    "native-controller",
     "native-gateway",
     "postgres",
     "barman",
