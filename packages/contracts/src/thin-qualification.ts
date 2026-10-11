@@ -259,13 +259,6 @@ export const ThinQualificationMetadataFull = z.strictObject({
     written_bytes: Count,
     status: ThinPoolStatus,
   }),
-  reboot: z.strictObject({
-    boot_id_before: z.uuid(),
-    boot_id_after: z.uuid(),
-    pool_active: z.boolean(),
-    volume_active: z.boolean(),
-    marker_present: z.boolean(),
-  }),
 });
 export type ThinQualificationMetadataFull = z.infer<
   typeof ThinQualificationMetadataFull
@@ -530,8 +523,7 @@ export function thinQualificationGatePass<G extends ThinQualificationGate>(
     case "metadata_full": {
       const e = ThinQualificationMetadataFull.parse(raw),
         s = e.scratch,
-        m = e.maximum,
-        r = e.reboot;
+        m = e.maximum;
       const repaired =
         (s.activation_exit_code === 0 &&
           s.marker_sha256_after === s.marker_sha256) ||
@@ -554,11 +546,7 @@ export function thinQualificationGatePass<G extends ThinQualificationGate>(
         m.status.used_metadata_blocks !== null &&
         m.status.used_metadata_blocks *
           THIN_QUALIFICATION_LIMITS.metadata_block_bytes <=
-          p.metadata_bytes - p.metadata_reserve_bytes &&
-        r.boot_id_after !== r.boot_id_before &&
-        r.pool_active &&
-        r.volume_active &&
-        r.marker_present
+          p.metadata_bytes - p.metadata_reserve_bytes
       );
     }
     case "noflush_quiescence": {

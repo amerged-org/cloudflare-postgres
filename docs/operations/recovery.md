@@ -358,13 +358,13 @@ scratch object, LV, the pool and a pool metadata spare that did not exist before
 3. `GET /v1/thin-qualifications/{id}` returns status, step, the measured evidence per gate and the
    decision Cloudflare computed from it.
 
-The run reboots the node once (`metadata_full`). Retained thick databases on the node restart. Run
-it only when that disruption is acceptable.
+The run never reboots the node. The six live checks verify pool and thin volume activation after a
+boot at the next reboot a fleet patch orchestrates: the R2b `talos_reboot` or `host_service` stage.
 
 | Gate | What the run does | Pass criterion (computed by code) |
 | --- | --- | --- |
 | `data_full` | Commits a marker and acknowledged inserts, fills the pool with direct writes, probes an unmapped thin LV, grows the pool with the product `lvextend`, restarts PostgreSQL on the same PVC | Pool `out_of_data_space` with `error_if_no_space` at 100%; fill and probe end with ENOSPC/EIO, the probe within `drain_seconds`; same pool and LV UUIDs; `rw` after growth to `min(maximum, initial + growth)`; marker and every acknowledged commit present after crash recovery |
-| `metadata_full` | A separate pool below the profile metadata floor is exhausted, deactivated, checked (`thin_check`), repaired (`lvconvert --repair`) and reactivated; then a node reboot; then the profile pool at its maximum is filled across `maximum_volumes` thin LVs | Scratch pool `ro`/`fail` with no new chunks after exhaustion; data verifies after repair or activation is refused; maximum pool full with metadata use at most `metadata_bytes - metadata_reserve_bytes`; after a new boot the pool and thin LV are active and the marker is present |
+| `metadata_full` | A separate pool below the profile metadata floor is exhausted, deactivated, checked (`thin_check`), repaired (`lvconvert --repair`) and reactivated; then the profile pool at its maximum is filled across `maximum_volumes` thin LVs | Scratch pool `ro`/`fail` with no new chunks after exhaustion; data verifies after repair or activation is refused; maximum pool full with metadata use at most `metadata_bytes - metadata_reserve_bytes` |
 | `noflush_quiescence` | `dmsetup suspend --noflush --nolockfs` of a buffered writer's LV, then resume as drain; the same suspension on a full pool | Dirty pages present; suspended state; no new sectors or chunks while suspended; drain at most max(startup reserve, quota) within `drain_seconds`; clean `e2fsck`; suspension confirmed on a full pool |
 | `resume_marker` | Commits a marker, starts a long uncommitted INSERT, suspends the exact LV, kills the Pod, verifies the thin table identity, resumes and restarts on the same PVC | Marker present, uncommitted rows absent, same LV and pool; a changed LV identity is refused |
 | `startup_bound` | Cold start on a fresh PVC (mkfs, initdb, bulk load), Pod `io.max`, direct-write rates at the VAC limits, one product-equivalent Native readback | Mapped growth at most max(startup reserve, quota); every ext4 group `ITABLE_ZEROED`; finite `io.max` at most the profile; measured rates within 10% of the limits; readback turn under `guard_seconds / 2` |

@@ -631,12 +631,6 @@ class Qualifier {
     if (this.remaining() < milliseconds + 20_000) throw new Yield();
     await delay(milliseconds, undefined, { signal: this.session.signal });
   }
-  private expectedBoot(): string | null {
-    const reboot = this.journal.entry("metadata_full:reboot");
-    if (reboot?.state === "confirmed")
-      return String(object(reboot.facts).boot_id_after);
-    return this.run.setup?.identity.boot_id ?? null;
-  }
   private async lease() {
     const current = object(await this.session.call({ kind: "status" }));
     if (
@@ -651,37 +645,22 @@ class Qualifier {
       fail("lease_changed");
   }
   async connect() {
-    const rebooting =
-      this.journal.entry("metadata_full:reboot")?.state === "dispatched";
-    try {
-      this.node = await verifyThinNode(
-        this.session,
-        {
-          node_id: this.run.node_id,
-          region_id: this.run.region_id,
-          node_uid: this.run.node_uid,
-          cluster_uid: this.run.cluster_uid,
-          name: this.run.name,
-          provider_instance_id: this.run.provider_instance_id,
-          driver_image: this.profile.driver_image,
-          host_extension_version: this.input.host_extension.version,
-          boot_id: rebooting ? null : this.expectedBoot(),
-          kernel_version: this.run.setup?.identity.kernel_version ?? null,
-        },
-        () => this.lease(),
-      );
-    } catch (error) {
-      // A dispatched reboot makes the node, Talos and driver temporarily unavailable.
-      if (
-        rebooting &&
-        !(
-          error instanceof BootstrapError &&
-          error.code === "thin_qualification_lease_changed"
-        )
-      )
-        throw new Yield();
-      throw error;
-    }
+    this.node = await verifyThinNode(
+      this.session,
+      {
+        node_id: this.run.node_id,
+        region_id: this.run.region_id,
+        node_uid: this.run.node_uid,
+        cluster_uid: this.run.cluster_uid,
+        name: this.run.name,
+        provider_instance_id: this.run.provider_instance_id,
+        driver_image: this.profile.driver_image,
+        host_extension_version: this.input.host_extension.version,
+        boot_id: this.run.setup?.identity.boot_id ?? null,
+        kernel_version: this.run.setup?.identity.kernel_version ?? null,
+      },
+      () => this.lease(),
+    );
     if (!thinDriverDeviceView(this.node.daemonSet))
       fail("driver_device_view_missing");
   }
@@ -2088,32 +2067,6 @@ printf 'pgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$rc" "$start" "$end"`,
       },
     );
     await this.removeScratchPool("metadata_full:scratch-remove");
-    // A real boot: who activates the pool is observed as its state after the node returns.
-    const reboot = await this.reboot("metadata_full:reboot");
-    const rebooted = await this.journal.observe(
-      "metadata_full:after-reboot",
-      async () => {
-        const lvm = await this.lvm(),
-          pool = lvm.volumes.find((lv) => lv.name === POOL),
-          volume = this.journal.entry("data_full:pg-a:volume")?.facts as
-            VolumeFacts | undefined,
-          lv = lvm.volumes.find((value) => value.lv_uuid === volume?.lv_uuid);
-        return {
-          pool_active: pool?.attr[4] === "a",
-          volume_active: lv?.attr[4] === "a",
-        };
-      },
-    );
-    await this.restartPostgres("metadata_full", "pg-a");
-    const durable = await this.journal.observe(
-      "metadata_full:durable",
-      async () => {
-        const [markers] = await this.sql("pg-a", [
-          `SELECT count(*) FROM q WHERE v='${MARKER}'`,
-        ]);
-        return { marker_present: markers === "1" };
-      },
-    );
     await this.releaseWorkload("data_full", "pg-a");
     // (a) Grow to the profile maximum and fill it across maximum_volumes raw thin LVs.
     const poolUuid = this.setup.pool.pool_uuid;
@@ -2256,13 +2209,6 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
           written_bytes: Number(fill.written_bytes),
           status: ThinPoolStatus.parse(maximum.status),
         },
-        reboot: {
-          boot_id_before: String(reboot.boot_id_before),
-          boot_id_after: String(reboot.boot_id_after),
-          pool_active: Boolean(rebooted.pool_active),
-          volume_active: Boolean(rebooted.volume_active),
-          marker_present: Boolean(durable.marker_present),
-        },
       },
     };
   }
@@ -2316,28 +2262,6 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
       return { removed: true };
     });
   }
-  /** Talos reboot dispatched once; the next turns confirm a new boot of the same node. */
-  private async reboot(key: string) {
-    const entry = this.journal.entry(key);
-    if (entry?.state === "confirmed") return object(entry.facts);
-    if (!entry) {
-      const nonce = newOperationId();
-      await this.journal.put(key, "dispatched", nonce, {
-        boot_id_before: this.node.boot,
-      });
-      await this.node.authorize();
-      await this.session
-        .talos(["reboot", "--wait=false", "--progress=plain"], 60_000)
-        .catch(() => undefined);
-      throw new Yield();
-    }
-    const before = String(object(entry.facts).boot_id_before);
-    if (this.node.boot === before) throw new Yield();
-    const facts = { boot_id_before: before, boot_id_after: this.node.boot };
-    await this.journal.put(key, "confirmed", entry.nonce, facts);
-    return facts;
-  }
-
   private async noflush(): Promise<ThinQualificationReport> {
     const poolUuid = this.setup.pool.pool_uuid,
       quota = this.profile.maximum_quota_gib * GIB;
@@ -2719,7 +2643,7 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
             provider_instance_id: this.run.provider_instance_id,
             driver_image: this.profile.driver_image,
             host_extension_version: this.input.host_extension.version,
-            boot_id: this.expectedBoot(),
+            boot_id: this.setup.identity.boot_id,
             kernel_version: this.setup.identity.kernel_version,
           },
           () => this.lease(),

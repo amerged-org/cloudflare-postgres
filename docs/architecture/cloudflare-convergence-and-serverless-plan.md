@@ -116,7 +116,8 @@ Six checks per node:
 3. Fresh actual RAM and inventory in Cloudflare.
 4. Real SQL through `db.ohmyho.st`, correct roles/TLS, deletion and physical storage reclamation.
 5. R2 base backup, archived WAL and real restore into a separate target.
-6. Existing databases and committed markers preserved.
+6. Existing databases and committed markers preserved; after a reboot, thin pools and volumes are
+   active again.
 
 US intervention accounting retains three historical OS actions, one later operator configuration
 apply, public-pin/inventory repairs, one create retry and qualified consumer cycles. A programmed

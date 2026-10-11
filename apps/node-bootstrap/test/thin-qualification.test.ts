@@ -19,7 +19,14 @@ import {
   thinDriverDeviceView,
 } from "../src/thin-qualification.ts";
 import { storageDeleteRequest } from "../src/storage-capacity.ts";
+import {
+  lvm,
+  profile,
+  thinQualificationRun,
+} from "./thin-qualification.fixture.ts";
 
+const GIB = 1024 ** 3,
+  MIB = 1024 ** 2;
 const vg = "Rq3Vb8-xYzA-1bCd-2eFg-3hIj-4kLm-5nOpQr",
   pool = "Tp7Kq2-AbCd-EfGh-IjKl-MnOp-QrSt-UvWxYz",
   volume = "Lv9Zx1-QwEr-TyUi-OpAs-DfGh-JkLz-XcVbNm";
@@ -469,4 +476,66 @@ test("scratch class removal is allowed only for qualification classes and may fo
     0,
   );
   assert.equal(JSON.parse(pod.stdin).gracePeriodSeconds, 0);
+});
+
+/** The journaled scratch-pool half of metadata_full, measured in earlier turns. */
+function scratchMeasured(run: ReturnType<typeof thinQualificationRun>) {
+  run.confirm("metadata_full:scratch-pool", {
+    pool_uuid: lvm("Sp"),
+    data_bytes: 12 * GIB,
+    metadata_bytes: 4 * MIB,
+    volume_uuid: lvm("Sv"),
+    minor: 40,
+  });
+  run.confirm("metadata_full:marker", { sha256: "4".repeat(64) });
+  run.confirm("metadata_full:exhaust", {
+    exit_code: 1,
+    error: "eio",
+    written_bytes: 5_301_600_256,
+    milliseconds: 9_800,
+  });
+  run.confirm("metadata_full:exhausted", {
+    status: {
+      mode: "ro",
+      used_data_blocks: 80_896,
+      total_data_blocks: 196_608,
+      used_metadata_blocks: 1024,
+      total_metadata_blocks: 1024,
+      error_if_no_space: true,
+      needs_check: false,
+    },
+  });
+  run.confirm("metadata_full:probe", {
+    exit_code: 1,
+    error: "eio",
+    written_bytes: 0,
+    milliseconds: 10,
+    before: 80_896,
+    after: 80_896,
+  });
+  run.confirm("metadata_full:deactivate", { inactive: true });
+  run.confirm("metadata_full:check", { exit_code: 0 });
+  run.confirm("metadata_full:repair", { exit_code: 0 });
+  run.confirm("metadata_full:activate", { exit_code: 0 });
+  run.confirm("metadata_full:verify", { sha256: "4".repeat(64) });
+  run.confirm("metadata_full:scratch-remove", { removed: true });
+}
+
+test("metadata_full grows and fills the profile pool without rebooting the node outside a fleet patch", async () => {
+  const run = thinQualificationRun("metadata_full");
+  scratchMeasured(run);
+  run.workload("data_full", "pg-a", "Pa");
+  run.world.lv("pgcf_thinpool")!.size = 2 * GIB;
+  assert.deepEqual(await run.turn(), { kind: "report" });
+  assert.deepEqual(
+    run.world.log.filter((line) => line.startsWith("talosctl")),
+    [],
+  );
+  assert.equal(run.entry("metadata_full:reboot"), undefined);
+  const report = run.calls[0]!.report as {
+    evidence: Record<string, { pool_uuid: string; data_bytes: number }>;
+  };
+  assert.deepEqual(Object.keys(report.evidence).sort(), ["maximum", "scratch"]);
+  assert.equal(report.evidence.maximum!.pool_uuid, run.setup.pool.pool_uuid);
+  assert.equal(report.evidence.maximum!.data_bytes, profile.maximum_data_bytes);
 });

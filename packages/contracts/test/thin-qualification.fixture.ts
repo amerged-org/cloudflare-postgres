@@ -214,13 +214,6 @@ export function thinQualificationFixture(
           ),
         ),
       },
-      reboot: {
-        boot_id_before: "51111111-1111-4111-8111-111111111111",
-        boot_id_after: "52111111-1111-4111-8111-111111111111",
-        pool_active: true,
-        volume_active: true,
-        marker_present: true,
-      },
     },
     noflush_quiescence: {
       writer: {
