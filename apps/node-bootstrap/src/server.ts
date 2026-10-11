@@ -12,6 +12,7 @@ import { runInspection } from "./inspector.ts";
 import { NodeProofExecutionInput } from "@pgcf/contracts/node-proof";
 import { runNodeProof } from "./node-proof-runner.ts";
 import { runThinStorage } from "./thin-storage.ts";
+import { runThinQualification } from "./thin-qualification.ts";
 import { runFleetPatch } from "./fleet-patch.ts";
 import { runRegionAuthorityRotation } from "./region-authority-rotation.ts";
 import { FleetRegionMaterialRotationInput } from "@pgcf/contracts/region-material-rotation";
@@ -63,6 +64,7 @@ export function createBootstrapServer(
     proof?: typeof runNodeProof;
     patch?: typeof runFleetPatch;
     thinStorage?: typeof runThinStorage;
+    thinQualification?: typeof runThinQualification;
   } = {},
 ) {
   if (bearer.length < 32) throw new BootstrapError("server_bearer_required");
@@ -224,6 +226,31 @@ export function createBootstrapServer(
               run: options.run,
               request: options.request,
             }),
+          );
+        } finally {
+          patchRunning = false;
+        }
+        return;
+      }
+      if (request.method === "POST" && path === "/v1/thin-qualification") {
+        if (
+          patchRunning ||
+          installationRegistration ||
+          [...jobs.values()].some((v) => v.running) ||
+          [...inspections.values()].some((v) => v.running) ||
+          [...proofs.values()].some((v) => v.running)
+        )
+          throw new BootstrapError("container_busy");
+        patchRunning = true;
+        patchRegistered = true;
+        try {
+          reply(
+            response,
+            200,
+            await (options.thinQualification ?? runThinQualification)(
+              await body(request),
+              { run: options.run, request: options.request },
+            ),
           );
         } finally {
           patchRunning = false;

@@ -26,6 +26,11 @@ import {
   readThinStorageLeaseRow,
 } from "./domain/node-thin-storage-execution.ts";
 import { NodeId } from "@pgcf/contracts";
+import {
+  failThinQualificationTurn,
+  prepareThinQualificationTurn,
+  releaseThinQualificationTurn,
+} from "./domain/thin-qualification.ts";
 import { FleetPatchStatus } from "@pgcf/contracts/fleet-patches";
 import { FleetRegionMaterialRotationInput } from "@pgcf/contracts/region-material-rotation";
 import {
@@ -426,6 +431,72 @@ export class NodeBootstrap extends DurableObject<Env> {
       ),
     );
     return result;
+  }
+  /** One bounded scratch qualification turn in this run's own container. */
+  async thinQualification(runId: string, step: string) {
+    OperationId.parse(runId);
+    if (
+      !this.ctx.id.equals(
+        this.env.NODE_BOOTSTRAP.idFromName(`thin-qualification:${runId}`),
+      )
+    )
+      throw new Error("thin_qualification_container_identity_mismatch");
+    const container = this.ctx.container;
+    if (!container) throw new Error("thin_qualification_container_unavailable");
+    const input = await prepareThinQualificationTurn(this.env, runId, step);
+    if (!input) return { waiting: true };
+    const lease = input.run.lease.operation_id;
+    const serverBearer = await this.ctx.blockConcurrencyWhile(async () => {
+      const existing = await this.ctx.storage.get<string>(
+        "thinQualificationServerBearer",
+      );
+      if (existing) return existing;
+      const value = crypto.randomUUID() + crypto.randomUUID();
+      await this.ctx.storage.put("thinQualificationServerBearer", value);
+      return value;
+    });
+    if (!container.running)
+      container.start({
+        enableInternet: true,
+        env: { PORT: "8080", PGCF_BOOTSTRAP_SERVER_BEARER: serverBearer },
+      });
+    await container.setInactivityTimeout(660_000);
+    await this.ctx.storage.setAlarm(Date.now() + 720_000);
+    await this.#waitForPort(container);
+    let response: Response;
+    try {
+      response = await container.getTcpPort(8080).fetch(
+        new Request("http://localhost:8080/v1/thin-qualification", {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${serverBearer}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(input),
+          signal: AbortSignal.timeout(630_000),
+        }),
+      );
+    } catch {
+      // An unanswered executor may still be inside its turn; its lease expires on its own.
+      return { waiting: true };
+    }
+    if (!response.ok) {
+      const raw = (await response.json().catch(() => null)) as {
+        error_code?: unknown;
+      } | null;
+      if (raw?.error_code === "container_busy") {
+        await releaseThinQualificationTurn(this.env, runId);
+        return { waiting: true };
+      }
+      const code =
+        typeof raw?.error_code === "string" &&
+        /^thin_(?:qualification|storage)_[a-z0-9_]{1,80}$/.test(raw.error_code)
+          ? raw.error_code
+          : "thin_qualification_executor_unconfirmed";
+      await failThinQualificationTurn(this.env, runId, lease, code);
+      return { failed: code };
+    }
+    return (await response.json()) as unknown;
   }
   async patch(operationId: string) {
     OperationId.parse(operationId);

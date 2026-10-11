@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// Controlled D1 metadata for authority logic tests; this is never a live qualification receipt.
+// Controlled D1 metadata for authority logic tests; its receipt comes from a fixture completed run.
 import { newOperationId, type ThinStorageProfile } from "@pgcf/contracts";
 import {
   FleetReleaseSpec,
@@ -8,6 +8,7 @@ import {
 import { installationHash } from "../../src/domain/node-installation.ts";
 import { env } from "cloudflare:workers";
 import { storageAuthorityPublicKeys } from "../../src/domain/storage-authority.ts";
+import { insertCompletedThinQualification } from "./thin-qualification-fixture.ts";
 export async function installThinQualifiedFixture(
   db: D1Database,
   nodeId: string,
@@ -106,33 +107,31 @@ export async function installThinQualifiedFixture(
           ].includes(name),
       ),
   };
-  const qualification = {
-    profile_sha256: fullProfileSha,
-    driver_image: profile.driver_image,
+  const base = FleetReleaseSpec.parse({
+    version: 1,
+    versions_lock_sha256: "f".repeat(64),
+    configuration_schema_revision: 1,
+    storage_authority_keys_sha256:
+      options.storageKeysSha256 ??
+      (await storageAuthorityPublicKeys(env)).sha256,
+    components,
+    roles: { control_relay: role, customer: structuredClone(role) },
+  });
+  const qualification = await insertCompletedThinQualification(db, {
+    node_id: nodeId,
+    region_id: row.region_id,
+    node_uid: row.node_uid,
+    release_id: releaseId,
+    spec: base,
+    profile,
     host_extension_image: hostImage,
     kernel_version: "6.18.51",
-    receipt_sha256: "e".repeat(64),
-    qualified_at: at,
-    gates: {
-      data_full: true,
-      metadata_full: true,
-      noflush_quiescence: true,
-      resume_marker: true,
-      startup_bound: true,
-      trim_delete_recreate: true,
-      retained_thick_preservation: true,
-    },
-  };
+  });
+  if (qualification.profile_sha256 !== fullProfileSha)
+    throw new Error("Qualified fixture profile changed");
   const spec = FleetReleaseSpec.parse({
-      version: 1,
-      versions_lock_sha256: "f".repeat(64),
-      configuration_schema_revision: 1,
-      storage_authority_keys_sha256:
-        options.storageKeysSha256 ??
-        (await storageAuthorityPublicKeys(env)).sha256,
+      ...base,
       thin_storage_qualification: qualification,
-      components,
-      roles: { control_relay: role, customer: structuredClone(role) },
     }),
     specSha = await installationHash(spec);
   const profileRevision =

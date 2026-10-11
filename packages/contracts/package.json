@@ -26,6 +26,7 @@
     "./storage-write-authority": "./src/storage-write-authority.ts",
     "./database-storage": "./src/database-storage.ts",
     "./node-thin-storage": "./src/node-thin-storage.ts",
+    "./thin-qualification": "./src/thin-qualification.ts",
     "./client": "./src/client.ts",
     "./reclaim": "./src/reclaim.ts",
     "./fleet-updates": "./src/fleet-updates.ts",

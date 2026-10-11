@@ -1,0 +1,604 @@
+// SPDX-License-Identifier: Apache-2.0
+import { env } from "cloudflare:workers";
+import {
+  createExecutionContext,
+  waitOnExecutionContext,
+} from "cloudflare:test";
+import { afterEach, expect, it } from "vitest";
+import { ThinStorageProfile, newOperationId } from "@pgcf/contracts";
+import {
+  FleetReleaseSpec,
+  type FleetReleaseComponent,
+} from "@pgcf/contracts/releases";
+import {
+  thinQualificationGatePass,
+  thinQualificationReceiptMaterial,
+  thinStorageQualificationFromRun,
+  type ThinQualificationGates,
+  type ThinQualificationRun,
+} from "@pgcf/contracts/thin-qualification";
+import { createApp } from "../../src/app.ts";
+import type { Env } from "../../src/env.ts";
+import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+import { insertCompletedThinQualification } from "./thin-qualification-fixture.ts";
+import { thinQualificationFixture } from "../../../../packages/contracts/test/thin-qualification.fixture.ts";
+import {
+  canonicalInstallation,
+  installationHash,
+} from "../../src/domain/node-installation.ts";
+import { storageAuthorityPublicKeys } from "../../src/domain/storage-authority.ts";
+import {
+  joinBundleReference,
+  storeRegionJoinBundle,
+} from "../../src/crypto/bootstrap-credentials.ts";
+import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
+import {
+  completeThinQualification,
+  failThinQualificationTurn,
+  prepareThinQualificationTurn,
+  recordThinQualificationCheckpoint,
+  recordThinQualificationReport,
+} from "../../src/domain/thin-qualification.ts";
+
+const releases: string[] = [];
+afterEach(async () => {
+  await cleanupFixtures();
+  for (const id of releases.splice(0).reverse())
+    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
+      .bind(id)
+      .run();
+});
+const hostImage = `ghcr.io/amerged-org/pgcf-regional:sandbox-extension-sha-${"c".repeat(40)}@sha256:${"c".repeat(64)}`;
+const profile = ThinStorageProfile.parse({
+  version: 1,
+  driver_image: `ghcr.io/amerged-org/pgcf-regional:lvm-thin-sha-${"a".repeat(40)}@sha256:${"b".repeat(64)}`,
+  initial_data_bytes: 1024 ** 3,
+  growth_bytes: 1024 ** 3,
+  maximum_data_bytes: 8 * 1024 ** 3,
+  metadata_bytes: 128 * 1024 ** 2,
+  vg_reserve_bytes: 512 * 1024 ** 2,
+  data_reserve_bytes: 256 * 1024 ** 2,
+  metadata_reserve_bytes: 32 * 1024 ** 2,
+  startup_reserve_bytes: 128 * 1024 ** 2,
+  write_bytes_per_second: 1024 ** 2,
+  write_iops_per_second: 100,
+  guard_seconds: 10,
+  drain_seconds: 10,
+  maximum_volumes: 128,
+  maximum_quota_gib: 7,
+});
+/** A release pinning the thin guard, native gateway, driver, host extension and PostgreSQL. */
+function guardedSpec(keys: string, driverImage = profile.driver_image) {
+  const names = [
+    "api",
+    "edge",
+    "node-bootstrap",
+    "regional",
+    "native-gateway",
+    "postgres",
+    "barman",
+    "cloudflared",
+    "cilium",
+    "flux-source",
+    "flux-kustomize",
+    "flux-helm",
+    "flux-notification",
+    "cert-manager",
+    "cloudnative-pg",
+    "openebs-lvm",
+    "pgcf-sandbox-controller",
+    "schematic",
+  ];
+  const components: FleetReleaseComponent[] = names.map((name) => ({
+    name,
+    kind: ["api", "edge"].includes(name) ? "worker_bundle" : "image",
+    version: name === "schematic" ? "d".repeat(64) : "1.0.0",
+    reference:
+      name === "openebs-lvm"
+        ? driverImage
+        : name === "pgcf-sandbox-controller"
+          ? hostImage
+          : `registry.example/${name}@sha256:${"d".repeat(64)}`,
+    sha256:
+      name === "openebs-lvm"
+        ? driverImage.split("@sha256:")[1]!
+        : name === "pgcf-sandbox-controller"
+          ? "c".repeat(64)
+          : "d".repeat(64),
+  }));
+  const role = {
+    host_configuration_required: true,
+    talos_version: "1.14.1",
+    talos_installer: `registry.example/talos@sha256:${"d".repeat(64)}`,
+    talos_schematic_sha256: "d".repeat(64),
+    talos_extensions: ["pgcf-sandbox-controller", "schematic"],
+    kubernetes_version: "1.36.5",
+    components: names.filter(
+      (name) =>
+        ![
+          "api",
+          "edge",
+          "node-bootstrap",
+          "postgres",
+          "barman",
+          "pgcf-sandbox-controller",
+          "schematic",
+        ].includes(name),
+    ),
+  };
+  return FleetReleaseSpec.parse({
+    version: 1,
+    versions_lock_sha256: "f".repeat(64),
+    configuration_schema_revision: 1,
+    storage_authority_keys_sha256: keys,
+    components,
+    roles: { control_relay: role, customer: structuredClone(role) },
+  });
+}
+/** A current placement node assigned to a guard-pinned release with sealed region material. */
+async function qualificationSetup() {
+  const f = await fixture(),
+    at = new Date().toISOString(),
+    uid = (await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
+      .bind(f.node)
+      .first<string>("node_uid"))!,
+    release = `qualified-base-${crypto.randomUUID()}`,
+    spec = guardedSpec((await storageAuthorityPublicKeys(env)).sha256),
+    specSha = await installationHash(spec),
+    clusterUid = crypto.randomUUID();
+  releases.push(release);
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: 2,
+    purchases_enabled: false,
+    order: null,
+    placement_mode: "actual_ram",
+    maximum_database_memory_mib: 4096,
+    postgres_memory_request_mib: 128,
+  });
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE nodes SET provider_instance_id='qualification-instance' WHERE id=?",
+    ).bind(f.node),
+    env.DB.prepare(
+      "UPDATE regions SET bootstrap_material_revision=1 WHERE id=?",
+    ).bind(f.region),
+    env.DB.prepare(
+      "UPDATE node_region_policies SET compute_pool_json='{}' WHERE region_id=?",
+    ).bind(f.region),
+    env.DB.prepare(
+      "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+    ).bind(release, canonicalInstallation(spec), specSha, at),
+    env.DB.prepare(
+      "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES(?,?,1,?)",
+    ).bind(f.region, release, at),
+    env.DB.prepare(
+      "INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) VALUES(?,?,?,'customer',1,?)",
+    ).bind(f.node, uid, release, at),
+  ]);
+  await storeRegionJoinBundle(
+    env.DB,
+    env.CREDENTIAL_KEYS,
+    joinBundleReference(f.region, 1),
+    {
+      version: 1,
+      cluster_name: "qualification-fixture",
+      cluster_endpoint: "https://192.0.2.18:6443/",
+      talos_version: "1.14.1",
+      kubernetes_version: "1.36.5",
+      talos_machine_secrets_yaml: "test-only-machine",
+      talos_admin_config: "test-only-admin",
+      kube_system_uid: clusterUid,
+      kubeconfig: "test-only-kube",
+    },
+  );
+  const created: string[] = [];
+  const workflows = {
+    async create(options: { id: string }) {
+      created.push(options.id);
+      return {};
+    },
+  } as unknown as Env["THIN_QUALIFICATION"];
+  const start = async (
+    body: unknown,
+    idempotency: string | undefined = crypto.randomUUID(),
+  ) => {
+    const context = createExecutionContext(),
+      headers = new Headers({
+        Authorization: `Bearer ${f.admin}`,
+        "Content-Type": "application/json",
+      });
+    if (idempotency) headers.set("Idempotency-Key", idempotency);
+    const response = await createApp().fetch(
+      new Request(
+        `https://api.invalid/v1/nodes/${f.node}/thin-qualifications`,
+        { method: "POST", headers, body: JSON.stringify(body) },
+      ),
+      { ...env, THIN_QUALIFICATION: workflows },
+      context,
+    );
+    await waitOnExecutionContext(context);
+    return response;
+  };
+  return { ...f, uid, release, spec, specSha, clusterUid, created, start };
+}
+async function insertRunning(
+  f: Awaited<ReturnType<typeof qualificationSetup>>,
+  step: ThinQualificationRun["step"],
+  setup: unknown = null,
+) {
+  const id = newOperationId(),
+    at = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO thin_storage_qualification_runs(id,node_id,region_id,node_uid,cluster_uid,address,release_id,spec_sha256,assignment_revision,region_revision,material_revision,profile_json,profile_sha256,driver_image,host_extension_image,postgres_image,kernel_version,setup_json,step,status,lease_id,lease_revision,lease_expires_at,created_at,updated_at)
+    VALUES(?,?,?,?,?,'192.0.2.18',?,?,1,1,1,?,?,?,?,?,?,?,?,'running',?,1,?,?,?)`,
+  )
+    .bind(
+      id,
+      f.node,
+      f.region,
+      f.uid,
+      f.clusterUid,
+      f.release,
+      f.specSha,
+      canonicalInstallation(profile),
+      await installationHash(profile),
+      profile.driver_image,
+      hostImage,
+      `registry.example/postgres@sha256:${"d".repeat(64)}`,
+      setup ? "6.18.51-talos" : null,
+      setup ? JSON.stringify(setup) : null,
+      step,
+      newOperationId(),
+      new Date(Date.now() + 600_000).toISOString(),
+      at,
+      at,
+    )
+    .run();
+  return id;
+}
+async function renewLease(id: string) {
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET lease_id=?,lease_revision=lease_revision+1,lease_expires_at=? WHERE id=?",
+  )
+    .bind(newOperationId(), new Date(Date.now() + 600_000).toISOString(), id)
+    .run();
+}
+async function run(id: string) {
+  return (await env.DB.prepare(
+    "SELECT * FROM thin_storage_qualification_runs WHERE id=?",
+  )
+    .bind(id)
+    .first())!;
+}
+
+it("release approval refuses hand-typed thin gate flags and accepts only a completed run's exact receipt", async () => {
+  const f = await qualificationSetup(),
+    id = `thin-receipt-${crypto.randomUUID()}`;
+  releases.push(id);
+  const fabricated = {
+    ...f.spec,
+    thin_storage_qualification: {
+      profile_sha256: await installationHash(profile),
+      driver_image: profile.driver_image,
+      host_extension_image: hostImage,
+      kernel_version: "6.18.51-talos",
+      receipt_sha256: "e".repeat(64),
+      qualified_at: new Date().toISOString(),
+      gates: {
+        data_full: true,
+        metadata_full: true,
+        noflush_quiescence: true,
+        resume_marker: true,
+        startup_bound: true,
+        trim_delete_recreate: true,
+        retained_thick_preservation: true,
+      },
+    },
+  };
+  expect(
+    (await request(`/v1/fleet/releases/${id}`, f.admin, "PUT", fabricated))
+      .status,
+  ).toBe(409);
+  const qualification = await insertCompletedThinQualification(env.DB, {
+    node_id: f.node,
+    region_id: f.region,
+    node_uid: f.uid,
+    release_id: id,
+    spec: f.spec,
+    profile,
+    host_extension_image: hostImage,
+    kernel_version: "6.18.51-talos",
+  });
+  releases.push(`${id}-base`);
+  const changed = `thin-receipt-${crypto.randomUUID()}`;
+  releases.push(changed);
+  expect(
+    (
+      await request(`/v1/fleet/releases/${changed}`, f.admin, "PUT", {
+        ...f.spec,
+        thin_storage_qualification: {
+          ...qualification,
+          kernel_version: "6.18.54-talos",
+        },
+      })
+    ).status,
+  ).toBe(409);
+  const approved = await request(`/v1/fleet/releases/${id}`, f.admin, "PUT", {
+    ...f.spec,
+    thin_storage_qualification: qualification,
+  });
+  expect(approved.status).toBe(200);
+  expect(
+    ((await approved.json()) as { spec: FleetReleaseSpec }).spec
+      .thin_storage_qualification,
+  ).toEqual(qualification);
+});
+
+it("starts one scratch run only on a fresh placement node of a guard-pinned release with the region pool on", async () => {
+  const f = await qualificationSetup(),
+    body = { node_uid: f.uid, address: "192.0.2.18", profile };
+  expect((await f.start(body, "")).status).toBe(400);
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET compute_pool_json=NULL WHERE region_id=?",
+  )
+    .bind(f.region)
+    .run();
+  expect((await f.start(body)).status).toBe(409);
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET compute_pool_json='{}' WHERE region_id=?",
+  )
+    .bind(f.region)
+    .run();
+  // Placement-disabled control nodes never qualify thin storage.
+  await env.DB.prepare(
+    "UPDATE nodes SET database_placement_enabled=0 WHERE id=?",
+  )
+    .bind(f.node)
+    .run();
+  expect((await f.start(body)).status).toBe(409);
+  await env.DB.prepare(
+    "UPDATE nodes SET database_placement_enabled=1,last_observed_at=? WHERE id=?",
+  )
+    .bind(new Date(Date.now() - 600_000).toISOString(), f.node)
+    .run();
+  expect((await f.start(body)).status).toBe(409);
+  await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
+    .bind(new Date().toISOString(), f.node)
+    .run();
+  expect(
+    (
+      await f.start({
+        ...body,
+        profile: {
+          ...profile,
+          driver_image: `registry.example/other@sha256:${"9".repeat(64)}`,
+        },
+      })
+    ).status,
+  ).toBe(409);
+  const started = await f.start(body);
+  expect(started.status).toBe(202);
+  const value = (await started.json()) as ThinQualificationRun;
+  expect(value).toMatchObject({
+    node_id: f.node,
+    node_uid: f.uid,
+    release_id: f.release,
+    status: "running",
+    step: "setup",
+    profile_sha256: await installationHash(profile),
+    driver_image: profile.driver_image,
+    host_extension_image: hostImage,
+    qualification: null,
+  });
+  expect(f.created).toEqual([value.id]);
+  expect((await f.start(body)).status).toBe(409);
+  // Thin selection waits until the scratch pool and namespace are gone.
+  await expect(
+    env.DB.prepare(
+      `INSERT INTO node_thin_storage(node_id,node_uid,cluster_uid,address,volume_group_uuid,profile_revision,profile_sha256,profile_json,material_revision,status,created_at,updated_at)
+      VALUES(?,?,?,'192.0.2.18','abcdef-abcd-abcd-abcd-abcd-abcd-abcdef',1,?,'{}',1,'selected',?,?)`,
+    )
+      .bind(
+        f.node,
+        f.uid,
+        f.clusterUid,
+        "a".repeat(64),
+        new Date().toISOString(),
+        new Date().toISOString(),
+      )
+      .run(),
+  ).rejects.toThrow("thin_storage_qualification_running");
+  expect(
+    (await request(`/v1/thin-qualifications/${value.id}`, f.integrator)).status,
+  ).toBe(403);
+});
+
+it("journals each dispatched write once and refuses rewritten, stale or unleased checkpoints", async () => {
+  const f = await qualificationSetup(),
+    id = await insertRunning(f, "setup"),
+    nonce = newOperationId(),
+    entry = {
+      key: "setup:pool",
+      state: "dispatched" as const,
+      nonce,
+      at: new Date().toISOString(),
+      facts: null,
+    };
+  expect(
+    await recordThinQualificationCheckpoint(env, id, {
+      expected_revision: 0,
+      entry,
+    }),
+  ).toEqual({ revision: 1 });
+  // An uncertain write cannot be dispatched again under a new nonce.
+  await expect(
+    recordThinQualificationCheckpoint(env, id, {
+      expected_revision: 1,
+      entry: { ...entry, nonce: newOperationId() },
+    }),
+  ).rejects.toThrow("cannot be rewritten");
+  await expect(
+    recordThinQualificationCheckpoint(env, id, {
+      expected_revision: 1,
+      entry: { ...entry, state: "confirmed", nonce: newOperationId() },
+    }),
+  ).rejects.toThrow("cannot be rewritten");
+  await expect(
+    recordThinQualificationCheckpoint(env, id, {
+      expected_revision: 0,
+      entry: { ...entry, key: "setup:namespace" },
+    }),
+  ).rejects.toThrow("lease or identity changed");
+  expect(
+    await recordThinQualificationCheckpoint(env, id, {
+      expected_revision: 1,
+      entry: { ...entry, state: "confirmed", facts: { pool_uuid: "x" } },
+    }),
+  ).toEqual({ revision: 2 });
+  await expect(
+    recordThinQualificationCheckpoint(env, id, {
+      expected_revision: 2,
+      entry: { ...entry, state: "confirmed", facts: { pool_uuid: "y" } },
+    }),
+  ).rejects.toThrow("cannot be rewritten");
+  // An active lease is never shared with a second turn.
+  expect(await prepareThinQualificationTurn(env, id, "setup")).toBeNull();
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET lease_expires_at=? WHERE id=?",
+  )
+    .bind(new Date(Date.now() - 1000).toISOString(), id)
+    .run();
+  await expect(
+    recordThinQualificationCheckpoint(env, id, {
+      expected_revision: 2,
+      entry: { ...entry, key: "setup:quota" },
+    }),
+  ).rejects.toThrow("lease or identity changed");
+  // A failed gate turn ends the measurements; a failed cleanup turn keeps converging.
+  await renewLease(id);
+  const leased = await run(id);
+  await failThinQualificationTurn(
+    env,
+    id,
+    String(leased.lease_id),
+    "thin_qualification_write_unconfirmed",
+  );
+  expect(await run(id)).toMatchObject({
+    step: "cleanup",
+    error_code: "thin_qualification_write_unconfirmed",
+    lease_id: null,
+  });
+  await renewLease(id);
+  await failThinQualificationTurn(
+    env,
+    id,
+    String((await run(id)).lease_id),
+    "thin_storage_command_failed",
+  );
+  expect(await run(id)).toMatchObject({
+    step: "cleanup",
+    error_code: "thin_qualification_write_unconfirmed",
+  });
+});
+
+it("decides every gate from its evidence and seals the receipt only after verified cleanup", async () => {
+  const f = await qualificationSetup(),
+    sample = thinQualificationFixture(profile, {
+      node_uid: f.uid,
+      cluster_uid: f.clusterUid,
+      host_extension_image: hostImage,
+      kernel_version: "6.18.51-talos",
+      at: new Date().toISOString(),
+    });
+  // A failing measurement closes the run even when the executor would call it a pass.
+  const failing = await insertRunning(f, "data_full", sample.setup);
+  expect(
+    await recordThinQualificationReport(env, failing, {
+      step: "data_full",
+      evidence: {
+        ...sample.evidence.data_full,
+        probe: { ...sample.evidence.data_full.probe, milliseconds: 10_001 },
+      },
+    }),
+  ).toMatchObject({ step: "cleanup" });
+  const failed = await run(failing);
+  expect(failed.error_code).toBe("thin_qualification_data_full_failed");
+  expect(
+    (JSON.parse(String(failed.gates_json)) as ThinQualificationGates).data_full
+      ?.pass,
+  ).toBe(false);
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET status='failed',step='complete',lease_id=NULL,lease_expires_at=NULL,completed_at=? WHERE id=?",
+  )
+    .bind(new Date().toISOString(), failing)
+    .run();
+  // A complete passing run, step by step, through the same report path.
+  const id = await insertRunning(f, "setup");
+  expect(
+    await recordThinQualificationReport(env, id, {
+      step: "setup",
+      setup: sample.setup,
+    }),
+  ).toMatchObject({ step: "data_full" });
+  for (const gate of [
+    "data_full",
+    "metadata_full",
+    "noflush_quiescence",
+    "resume_marker",
+    "startup_bound",
+    "trim_delete_recreate",
+  ] as const) {
+    await renewLease(id);
+    await recordThinQualificationReport(env, id, {
+      step: gate,
+      evidence: sample.evidence[gate],
+    } as never);
+  }
+  await renewLease(id);
+  // Cloudflare, not the executor, supplies the node's thin placement count.
+  expect(
+    await recordThinQualificationReport(env, id, {
+      step: "retained_thick_preservation",
+      evidence: {
+        baseline: sample.evidence.retained_thick_preservation.baseline,
+        after: sample.evidence.retained_thick_preservation.after,
+      },
+    }),
+  ).toMatchObject({ step: "cleanup" });
+  expect(await completeThinQualification(env, id)).toMatchObject({
+    status: "running",
+  });
+  await renewLease(id);
+  await recordThinQualificationReport(env, id, {
+    step: "cleanup",
+    cleanup: sample.cleanup,
+  });
+  expect(await completeThinQualification(env, id)).toMatchObject({
+    status: "completed",
+  });
+  const response = await request(`/v1/thin-qualifications/${id}`, f.admin);
+  expect(response.status).toBe(200);
+  const value = (await response.json()) as ThinQualificationRun;
+  for (const [gate, decided] of Object.entries(value.gates))
+    expect(
+      decided &&
+        thinQualificationGatePass(
+          gate as never,
+          decided.evidence as never,
+          profile,
+        ),
+    ).toBe(true);
+  expect(value.receipt_sha256).toBe(
+    await installationHash(thinQualificationReceiptMaterial(value)),
+  );
+  expect(value.qualification).toEqual(thinStorageQualificationFromRun(value));
+  // Produced evidence is immutable.
+  await expect(
+    env.DB.prepare(
+      "UPDATE thin_storage_qualification_runs SET kernel_version='6.18.54-talos' WHERE id=?",
+    )
+      .bind(id)
+      .run(),
+  ).rejects.toThrow("thin_storage_qualification_terminal");
+});

@@ -321,6 +321,79 @@ measurement exists; neither a logical quota nor zero stands in for an unknown me
 See the ULTRA plan for the selected source, qualified images and completed live checks. Local
 D1 and Workerd tests alone do not activate this feature or establish live storage acceptance.
 
+### Thin storage qualification run
+
+A release's `thin_storage_qualification` receipt comes only from a completed qualification run.
+`PUT /v1/fleet/releases/{id}` refuses a receipt unless a completed run has the same `receipt_sha256`,
+`profile_sha256`, `driver_image`, `host_extension_image`, `kernel_version` and `qualified_at`.
+Hand-typed gate flags are never accepted.
+
+The run is scratch-first. It creates `pgcf_thinpool` from free extents with the product `lvcreate`
+command and the exact profile geometry. All gates run in the fenced namespace `pgcf-thin-q-<run>`
+(deny-all NetworkPolicy, ResourceQuota, restricted Pod security) on the scratch StorageClass and VAC
+`pgcf-thin-q-<run>`. These carry the product class parameters. Afterwards the run removes every
+scratch object, LV, the pool and a pool metadata spare that did not exist before. It never writes a
+`node_thin_storage` row, and thin selection on that node is refused until the run ends.
+
+**Preconditions**
+- The node is ready, has fresh observations and allows database placement. Never use the control
+  node.
+- The region compute pool is on (`compute_pool` in `PUT /v1/regions/{id}/capacity-policy`). Thin
+  storage depends on its runtime admission fact.
+- The assigned region release pins `native-gateway`, `pgcf-sandbox-controller`, `postgres` and the
+  thin-tools `openebs-lvm` image. The storage authority keys equal the current signer keys.
+  `dm_thin_pool` is live.
+- The VG has only the retained linear LVs. Free extents cover the profile maximum, twice its metadata
+  and its VG reserve, plus 12 GiB for the metadata scratch pool.
+- The profile can grow (`initial_data_bytes` < `maximum_data_bytes`) and has at most 256 volumes.
+- One NodeBootstrap container slot is free. Run it outside a fleet patch or rollout.
+
+**Start and observe**
+1. `POST /v1/nodes/{id}/thin-qualifications` with an `Idempotency-Key` and
+   `{ "node_uid", "address", "profile" }`. `address` is the node's literal Talos address. `profile`
+   is the complete finite profile the release will carry.
+2. A Workflow drives one durable step per gate through the bootstrap container and relay. Every
+   mutating action is checkpointed in D1 before dispatch. An interrupted write is resolved by readback
+   or ends the run; it is never repeated.
+3. `GET /v1/thin-qualifications/{id}` returns status, step, the measured evidence per gate and the
+   decision Cloudflare computed from it.
+
+The run reboots the node once (`metadata_full`). Retained thick databases on the node restart. Run
+it only when that disruption is acceptable.
+
+| Gate | What the run does | Pass criterion (computed by code) |
+| --- | --- | --- |
+| `data_full` | Commits a marker and acknowledged inserts, fills the pool with direct writes, probes an unmapped thin LV, grows the pool with the product `lvextend`, restarts PostgreSQL on the same PVC | Pool `out_of_data_space` with `error_if_no_space` at 100%; fill and probe end with ENOSPC/EIO, the probe within `drain_seconds`; same pool and LV UUIDs; `rw` after growth to `min(maximum, initial + growth)`; marker and every acknowledged commit present after crash recovery |
+| `metadata_full` | A separate pool below the profile metadata floor is exhausted, deactivated, checked (`thin_check`), repaired (`lvconvert --repair`) and reactivated; then a node reboot; then the profile pool at its maximum is filled across `maximum_volumes` thin LVs | Scratch pool `ro`/`fail` with no new chunks after exhaustion; data verifies after repair or activation is refused; maximum pool full with metadata use at most `metadata_bytes - metadata_reserve_bytes`; after a new boot the pool and thin LV are active and the marker is present |
+| `noflush_quiescence` | `dmsetup suspend --noflush --nolockfs` of a buffered writer's LV, then resume as drain; the same suspension on a full pool | Dirty pages present; suspended state; no new sectors or chunks while suspended; drain at most max(startup reserve, quota) within `drain_seconds`; clean `e2fsck`; suspension confirmed on a full pool |
+| `resume_marker` | Commits a marker, starts a long uncommitted INSERT, suspends the exact LV, kills the Pod, verifies the thin table identity, resumes and restarts on the same PVC | Marker present, uncommitted rows absent, same LV and pool; a changed LV identity is refused |
+| `startup_bound` | Cold start on a fresh PVC (mkfs, initdb, bulk load), Pod `io.max`, direct-write rates at the VAC limits, one product-equivalent Native readback | Mapped growth at most max(startup reserve, quota); every ext4 group `ITABLE_ZEROED`; finite `io.max` at most the profile; measured rates within 10% of the limits; readback turn under `guard_seconds / 2` |
+| `trim_delete_recreate` | Writes a raw volume, deletes its PVC/PV/LV, deletes the last thin LV, re-initializes the pool with the product command if the driver removed it, recreates a volume of the same size | LV gone from `lvs -a` and DM; pool usage back to baseline; re-initialized pool has a new UUID; recreated LV reads back only zeros |
+| `retained_thick_preservation` | Compares the retained thick LVs, PVs/PVCs, LVMVolumes and CNPG `Ready`/`ContinuousArchiving` with the setup baseline | All identical and no thin-profile database on the node |
+
+`trim_delete_recreate` qualifies extent return on LV and PVC deletion. The thin class has no
+in-filesystem discard. A resume through the Cloudflare host guard, including refusal of an expired
+token, is verified after activation by the six live checks.
+
+**Failure and cleanup**
+- A failed gate or executor error records its code and moves straight to cleanup.
+- Cleanup resumes any suspended scratch LV and removes everything the run created. It reports
+  absence, the LV inventory and VG free space against the baseline.
+- If cleanup cannot be verified, the run fails with `thin_qualification_cleanup_incomplete`. Remove
+  the remaining objects by hand. They are: namespace `pgcf-thin-q-<run>`, the StorageClass and VAC of
+  the same name, LVs tagged `pgcf.thin-q.<run id>` or named `pgcf_thin_q_<run>*`, and a
+  `pgcf_thinpool` whose `pgcf.action.<nonce>` tag matches the run journal.
+
+**Receipt into a release (R2b)**
+1. Copy `qualification` from the completed run.
+2. Approve a copy of the qualified release spec with that object as `thin_storage_qualification`
+   under a new release id. Releases are immutable.
+3. Set the region `thin_storage` template to the byte-identical profile.
+4. Select the profile on the node with `allow_new_databases:false`. Roll out the new release as a
+   successor, then activate placement.
+5. `kernel_version` is the exact `nodeInfo.kernelVersion`. `profile_sha256` is the full-profile hash,
+   not the class hash. Each new Talos kernel, driver or host extension needs a new run.
+
 
 ## Optional warm reclaim
 

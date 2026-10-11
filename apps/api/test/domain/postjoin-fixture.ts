@@ -3,6 +3,7 @@ import { env } from "cloudflare:workers";
 import {
   NodeThinStorageAuthority,
   thinStorageClass,
+  newNodeId,
   newOperationId,
 } from "@pgcf/contracts";
 import { FleetPatchFacts } from "@pgcf/contracts/fleet-patches";
@@ -19,6 +20,7 @@ import {
   canonicalInstallation,
   installationHash,
 } from "../../src/domain/node-installation.ts";
+import { insertCompletedThinQualification } from "./thin-qualification-fixture.ts";
 import {
   joinBundleReference,
   regionSeedReference,
@@ -102,7 +104,7 @@ export async function standingPostjoinFixture(
             ].includes(name),
         ),
     },
-    spec = FleetReleaseSpec.parse({
+    base = FleetReleaseSpec.parse({
       version: 1,
       versions_lock_sha256: "c".repeat(64),
       configuration_schema_revision: 1,
@@ -122,23 +124,32 @@ export async function standingPostjoinFixture(
         sha256: digest,
       })),
       roles: { control_relay: role, customer: role },
-      thin_storage_qualification: {
-        profile_sha256: await installationHash(storage),
-        driver_image: storage.driver_image,
-        host_extension_image: `registry.example/pgcf-sandbox-controller@sha256:${digest}`,
-        kernel_version: "6.18.51",
-        receipt_sha256: "e".repeat(64),
-        qualified_at: new Date().toISOString(),
-        gates: {
-          data_full: true,
-          metadata_full: true,
-          noflush_quiescence: true,
-          resume_marker: true,
-          startup_bound: true,
-          trim_delete_recreate: true,
-          retained_thick_preservation: true,
+    }),
+    // A receipt binds software and profile; a new region can use one qualified on any node.
+    qualifier = (await env.DB.prepare(
+      "SELECT id,node_uid FROM nodes WHERE region_id=? ORDER BY id LIMIT 1",
+    )
+      .bind(region)
+      .first<{ id: string; node_uid: string | null }>()) ?? {
+      id: newNodeId(),
+      node_uid: null,
+    };
+  // The region template's receipt comes from an earlier completed scratch qualification run.
+  const spec = FleetReleaseSpec.parse({
+      ...base,
+      thin_storage_qualification: await insertCompletedThinQualification(
+        env.DB,
+        {
+          node_id: qualifier.id,
+          region_id: region,
+          node_uid: qualifier.node_uid ?? crypto.randomUUID(),
+          release_id: id,
+          spec: base,
+          profile: storage,
+          host_extension_image: `registry.example/pgcf-sandbox-controller@sha256:${digest}`,
+          kernel_version: "6.18.51",
         },
-      },
+      ),
     }),
     now = new Date().toISOString();
   await env.DB.batch([

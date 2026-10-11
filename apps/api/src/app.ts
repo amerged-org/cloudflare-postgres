@@ -29,6 +29,8 @@ import { RECLAIM_LIMITS } from "@pgcf/contracts/reclaim";
 import { authenticateReclaimRequest } from "./domain/warm-reclaim.ts";
 import { registerReclaim } from "./routes/reclaim.ts";
 import { registerNodeThinStorage } from "./routes/node-thin-storage.ts";
+import { registerThinQualification } from "./routes/thin-qualification.ts";
+import { authenticateThinQualification } from "./domain/thin-qualification.ts";
 import { registerComputePool } from "./routes/compute-pool.ts";
 import { registerNodeHostConfiguration } from "./routes/node-host-configuration.ts";
 import { registerNodeInstallation } from "./routes/node-installation.ts";
@@ -69,6 +71,10 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/agent/v1/nodes/:id/storage-guard",
   "/internal/v1/node-thin-storage/:id",
   "/internal/v1/node-thin-storage/:id/relay",
+  "/v1/nodes/:id/thin-qualifications",
+  "/v1/thin-qualifications/:id",
+  "/internal/v1/thin-qualifications/:id",
+  "/internal/v1/thin-qualifications/:id/relay",
   "/v1/costs/node-facts",
   "/healthz",
   "/v1/openapi.json",
@@ -328,6 +334,8 @@ export function createApp(): ApiApp {
       );
     const thinStorage =
       /^\/internal\/v1\/node-thin-storage\/(nod_[a-z0-9]{20})$/.exec(path);
+    const thinQualification =
+      /^\/internal\/v1\/thin-qualifications\/(op_[a-z0-9]{20})$/.exec(path);
     const reclaim =
       /^\/agent\/v1\/nodes\/(nod_[a-z0-9]{20})\/reclaim-observations$/.exec(
         path,
@@ -350,6 +358,9 @@ export function createApp(): ApiApp {
     } else if (thinStorage && c.req.method === "POST") {
       await authenticateThinStorage(c, thinStorage[1]!);
       maximum = 2 * 1024 * 1024;
+    } else if (thinQualification && c.req.method === "POST") {
+      await authenticateThinQualification(c, thinQualification[1]!);
+      maximum = 512 * 1024;
     } else if (proof && c.req.method === "POST") {
       await authenticateNodeProofRequest(c, proof[1]!);
       maximum = 512 * 1024;
@@ -418,6 +429,7 @@ export function createApp(): ApiApp {
   registerInfrastructureBackups(app);
   registerComputePool(app);
   registerNodeThinStorage(app);
+  registerThinQualification(app);
   registerReclaim(app);
   registerNodeHostConfiguration(app);
   registerNodeInstallation(app);

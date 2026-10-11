@@ -57,6 +57,11 @@
       "class_name": "PatchNode",
     },
     { "binding": "ADD_NODE", "name": "pgcf-add-node", "class_name": "AddNode" },
+    {
+      "binding": "THIN_QUALIFICATION",
+      "name": "pgcf-thin-qualification",
+      "class_name": "ThinQualification",
+    },
   ],
   "triggers": { "crons": ["* * * * *"] },
 }
