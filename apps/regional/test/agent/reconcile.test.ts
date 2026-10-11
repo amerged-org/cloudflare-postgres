@@ -22,7 +22,7 @@ import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 
 const signal = () => new AbortController().signal;
 
-test("a same-generation runtime switch recreates only the primary through one resolved CNPG restart before publishing ready", async () => {
+test("a same-generation runtime switch deletes only the exact primary once and resolves a lost reply before publishing ready", async () => {
   const { db, ctx } = fixture(),
     k8s = new MemoryKubernetes();
   await new Reconciler(
@@ -56,26 +56,33 @@ test("a same-generation runtime switch recreates only the primary through one re
       claim.metadata.uid,
       record(fence.data).state,
     ],
-    marker = `pgcf-runtime/${db.generation}/standard`;
-  let restarts = 0,
-    probes = 0,
+    deleted = [
+      "Pod",
+      namespace,
+      "database-1",
+      pod.metadata.uid,
+      pod.metadata.resourceVersion,
+    ],
+    deletes: unknown[][] = [];
+  let probes = 0,
     loseResponse = true;
-  const patch = k8s.patch.bind(k8s);
-  k8s.patch = async (...args) => {
-    await patch(...args);
-    if (
-      args[0] === "Cluster" &&
-      args[3].some(
-        (op) =>
-          record(record(op).value)["kubectl.kubernetes.io/restartedAt"] ===
-          marker,
-      )
-    ) {
-      restarts++;
-      if (loseResponse) {
-        loseResponse = false;
-        throw new Error("restart_reply_lost");
-      }
+  // CNPG restarts a primary in place for a restart annotation; only a deletion replaces the Pod.
+  k8s.delete = async (
+    kind: string,
+    namespace: string | undefined,
+    name: string,
+    uid: string,
+    resourceVersion?: string,
+  ) => {
+    deletes.push([kind, namespace, name, uid, resourceVersion]);
+    const current = k8s.resources.get(k8s.key(kind, namespace, name))!;
+    assert.equal(current.metadata.uid, uid);
+    assert.equal(current.metadata.resourceVersion, resourceVersion);
+    current.metadata.deletionTimestamp = new Date().toISOString();
+    current.metadata.resourceVersion = String(++k8s.revision);
+    if (loseResponse) {
+      loseResponse = false;
+      throw new Error("delete_reply_lost");
     }
   };
   const request: typeof fetch = async (...args) => {
@@ -99,28 +106,40 @@ test("a same-generation runtime switch recreates only the primary through one re
     "kept",
   );
   assert.equal(
-    cluster.metadata.annotations!["kubectl.kubernetes.io/restartedAt"],
-    marker,
+    cluster.metadata.annotations!["pgcf.io/runtime-switch"],
+    `${db.generation}/standard/${deleted[3]}`,
   );
-  assert.equal((await reconciler.reconcile(db, ctx))?.state, "provisioning");
-  pod.metadata.deletionTimestamp = new Date().toISOString();
+  assert.deepEqual(deletes, [deleted]);
   assert.equal((await reconciler.reconcile(db, ctx))?.state, "provisioning");
   k8s.resources.delete(k8s.key("Pod", namespace, "database-1"));
   assert.equal((await reconciler.reconcile(db, ctx))?.state, "provisioning");
-  assert.equal(restarts, 1);
-  assert.equal(probes, 0);
+  // A replacement that still came up on the other runtime is never deleted in a loop.
   const replacement = structuredClone(pod);
   replacement.metadata.uid = randomUUID();
   replacement.metadata.resourceVersion = String(++k8s.revision);
   delete replacement.metadata.deletionTimestamp;
-  replacement.metadata.annotations = {
-    "kubectl.kubernetes.io/restartedAt": marker,
-  };
-  delete record(replacement.spec).runtimeClassName;
   record(replacement.status).podIP = "127.0.0.2";
   k8s.resources.set(k8s.key("Pod", namespace, "database-1"), replacement);
+  assert.equal((await reconciler.reconcile(db, ctx))?.state, "provisioning");
+  assert.deepEqual(deletes, [deleted]);
+  assert.equal(probes, 0);
+  replacement.metadata.uid = randomUUID();
+  delete record(replacement.spec).runtimeClassName;
   assert.equal((await reconciler.reconcile(db, ctx))?.state, "ready");
-  assert.equal(restarts, 1);
+  assert.deepEqual(deletes, [deleted]);
+  assert.equal(
+    cluster.metadata.annotations!["kubectl.kubernetes.io/restartedAt"],
+    undefined,
+  );
+  // The completed switch is cleared, so a later flip at this generation switches once more.
+  assert.equal(
+    cluster.metadata.annotations!["pgcf.io/runtime-switch"],
+    undefined,
+  );
+  assert.equal(
+    cluster.metadata.annotations!["other.example/annotation"],
+    "kept",
+  );
   assert.deepEqual(
     [
       ns.metadata.uid,
@@ -129,10 +148,6 @@ test("a same-generation runtime switch recreates only the primary through one re
       record(fence.data).state,
     ],
     identities,
-  );
-  assert.equal(
-    k8s.actions.some((action) => action.startsWith("delete:")),
-    false,
   );
 });
 

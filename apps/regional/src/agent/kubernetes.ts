@@ -567,11 +567,13 @@ export function kubernetesFromConfig(
             uid,
             ...(resourceVersion === undefined ? {} : { resourceVersion }),
           },
-          propagationPolicy: "Foreground",
+          // A Pod owns nothing to wait for; its graceful termination governs its removal.
+          propagationPolicy: kind === "Pod" ? "Background" : "Foreground",
         },
       };
       try {
         if (kind === "Namespace") await core.deleteNamespace(args, options);
+        else if (kind === "Pod") await core.deleteNamespacedPod(args, options);
         else if (kind === "ConfigMap")
           await core.deleteNamespacedConfigMap(args, options);
         else if (kind === "Secret")

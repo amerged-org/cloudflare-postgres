@@ -204,6 +204,14 @@ test("real Kustomize composition selects all three native entrypoints and exact 
         },
       ],
     );
+    // The only Pod write is the runtime switch's exact primary deletion.
+    assert.deepEqual(
+      (agentRole.rules as Json[])
+        .filter((rule) => (rule.resources as string[]).includes("pods"))
+        .flatMap((rule) => rule.verbs as string[])
+        .sort(),
+      ["delete", "get", "list", "watch"],
+    );
     const legacy = patchFixture().input,
       oldRegional = await render(
         directory,

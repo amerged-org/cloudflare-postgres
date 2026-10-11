@@ -353,6 +353,21 @@ async function issuerLoaded(
     ),
   };
 }
+/** The still-live initial instance Pods of a CNPG Cluster consumer, read in its namespace. */
+async function instancePods(
+  commands: RotationKubernetesCommands,
+  expected: Cursor["items"][number],
+) {
+  return list(
+    await get(
+      commands,
+      `/api/v1/namespaces/${pathName(expected.namespace)}/pods`,
+    ),
+  ).filter(
+    (pod) =>
+      live(pod) && expected.initial_pod_uids!.includes(text(metadata(pod).uid)),
+  );
+}
 /** Renew actual token consumers after the API demonstrably signs tokens with the replacement key. */
 export async function renewRotationConsumers(
   input: {
@@ -412,11 +427,44 @@ export async function renewRotationConsumers(
       specDigest(current, kind) !== expected.sha256
     )
       return fail("rotation_token_consumer_owner_changed");
-    const annotation =
-      kind === "Cluster"
-        ? metadata(current).annotations
-        : object(object(object(current.spec).template).metadata).annotations;
-    if (index === cursor.index && cursor.state === "dispatched") {
+    const annotation = object(
+      object(object(current.spec).template).metadata,
+    ).annotations;
+    if (kind === "Cluster") {
+      // CNPG restarts a primary in place for a restart annotation, keeping the Pod and its
+      // projected token; only deleting the exact instance Pods makes CNPG recreate them.
+      const pods = await instancePods(commands, expected);
+      if (index === cursor.index && cursor.state === "dispatched") {
+        if (pods.length) return fail("rotation_consumer_write_unresolved");
+      } else if (pods.length) {
+        await commands.authorize();
+        cursor = await save(commands, {
+          ...cursor,
+          index,
+          state: "dispatched",
+        });
+        for (const pod of pods)
+          await commands.kube(
+            [
+              "delete",
+              "--raw",
+              `/api/v1/namespaces/${pathName(expected.namespace)}/pods/${pathName(text(metadata(pod).name))}`,
+              "--filename=-",
+            ],
+            JSON.stringify({
+              apiVersion: "v1",
+              kind: "DeleteOptions",
+              preconditions: {
+                uid: text(metadata(pod).uid),
+                resourceVersion: text(metadata(pod).resourceVersion),
+              },
+              propagationPolicy: "Background",
+            }),
+          );
+        if ((await instancePods(commands, expected)).length)
+          return fail("rotation_consumer_write_unresolved");
+      }
+    } else if (index === cursor.index && cursor.state === "dispatched") {
       if (object(annotation)[RESTART] !== cursor.restart_at)
         return fail("rotation_consumer_write_unresolved");
     } else {
@@ -428,7 +476,7 @@ export async function renewRotationConsumers(
           value: metadata(current).resourceVersion,
         },
       ];
-      const base = kind === "Cluster" ? "/metadata" : "/spec/template/metadata";
+      const base = "/spec/template/metadata";
       if (annotation === undefined)
         ops.push({ op: "add", path: `${base}/annotations`, value: {} });
       ops.push({
@@ -449,13 +497,9 @@ export async function renewRotationConsumers(
         JSON.stringify(ops),
       ]);
       current = await get(commands, route);
-      const after =
-        kind === "Cluster"
-          ? object(metadata(current).annotations)
-          : object(
-              object(object(object(current.spec).template).metadata)
-                .annotations,
-            );
+      const after = object(
+        object(object(object(current.spec).template).metadata).annotations,
+      );
       if (
         metadata(current).uid !== expected.uid ||
         specDigest(current, kind) !== expected.sha256 ||

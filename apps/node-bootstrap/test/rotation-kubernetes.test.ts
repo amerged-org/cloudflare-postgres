@@ -191,12 +191,12 @@ test("consumer renewal waits for the actual replacement signer and never patches
   );
   assert.equal(patches, 0);
 });
-test("CNPG token consumers use its supported restart annotation with a timestamp and resume lost responses", async () => {
+test("CNPG token consumers delete their exact instance Pods once and resolve a lost reply by re-reading", async () => {
   const target = signer(),
     now = 1700000000000;
   let saved: unknown,
-    patches = 0,
-    restarted = false;
+    patches = 0;
+  const deletes: unknown[] = [];
   const cluster = {
     apiVersion: "postgresql.cnpg.io/v1",
     kind: "Cluster",
@@ -209,30 +209,61 @@ test("CNPG token consumers use its supported restart annotation with a timestamp
     },
     spec: { instances: 1 },
   };
+  const pod = {
+    kind: "Pod",
+    metadata: {
+      namespace: "example",
+      name: "database-1",
+      uid: oldPod,
+      resourceVersion: "7",
+      ownerReferences: [
+        {
+          kind: "Cluster",
+          name: "database",
+          uid: controllerUid,
+          controller: true,
+        },
+      ],
+    },
+    spec: {
+      volumes: [
+        {
+          projected: {
+            sources: [{ serviceAccountToken: { path: "token" } }],
+          },
+        },
+      ],
+    },
+    status: {
+      phase: "Running",
+      conditions: [{ type: "Ready", status: "True" }],
+    },
+  };
   const commands = {
     now: () => now,
     async authorize() {},
     async checkpoint(value: unknown) {
       saved = structuredClone(value);
     },
-    async kube(args: string[]) {
+    async kube(args: string[], payload?: string) {
       if (args[0] === "create")
         return JSON.stringify({ status: { token: jwt(target, now) } });
+      // CNPG restarts a primary in place for a restart annotation: the Pod and its token remain.
       if (args[0] === "patch") {
         patches++;
-        const ops = JSON.parse(args.at(-1)!);
-        assert.ok(
-          cluster.metadata.annotations ||
-            ops.some(
-              (op: { op: string; path: string }) =>
-                op.op === "add" && op.path === "/metadata/annotations",
-            ),
-        );
-        cluster.metadata.annotations ??= {};
-        cluster.metadata.annotations["kubectl.kubernetes.io/restartedAt"] =
-          ops.at(-1).value;
+        cluster.metadata.annotations = {
+          ...cluster.metadata.annotations,
+          "kubectl.kubernetes.io/restartedAt": JSON.parse(args.at(-1)!).at(-1)
+            .value,
+        };
         cluster.metadata.resourceVersion = "2";
-        restarted = true;
+        return "{}";
+      }
+      // Only a deletion makes CNPG recreate the instance on its volume.
+      if (args[0] === "delete") {
+        deletes.push([args, JSON.parse(payload!)]);
+        pod.metadata.uid = newPod;
+        pod.metadata.resourceVersion = "8";
         throw Error("reply_lost");
       }
       const route = args[2];
@@ -243,41 +274,11 @@ test("CNPG token consumers use its supported restart annotation with a timestamp
         });
       if (route === "/apis/apps/v1/replicasets")
         return JSON.stringify({ items: [], metadata: {} });
-      if (route === "/api/v1/pods")
-        return JSON.stringify({
-          items: [
-            {
-              kind: "Pod",
-              metadata: {
-                namespace: "example",
-                name: "database-1",
-                uid: restarted ? newPod : oldPod,
-                ownerReferences: [
-                  {
-                    kind: "Cluster",
-                    name: "database",
-                    uid: controllerUid,
-                    controller: true,
-                  },
-                ],
-              },
-              spec: {
-                volumes: [
-                  {
-                    projected: {
-                      sources: [{ serviceAccountToken: { path: "token" } }],
-                    },
-                  },
-                ],
-              },
-              status: {
-                phase: "Running",
-                conditions: [{ type: "Ready", status: "True" }],
-              },
-            },
-          ],
-          metadata: {},
-        });
+      if (
+        route === "/api/v1/pods" ||
+        route === "/api/v1/namespaces/example/pods"
+      )
+        return JSON.stringify({ items: [pod], metadata: {} });
       return JSON.stringify(cluster);
     },
   };
@@ -286,17 +287,30 @@ test("CNPG token consumers use its supported restart annotation with a timestamp
     issuer_url: issuer,
     annotation_value: "rotation",
   };
-  await assert.rejects(renewRotationConsumers(input, commands));
+  await assert.rejects(renewRotationConsumers(input, commands), /reply_lost/);
   const result = await renewRotationConsumers(
     { ...input, cursor: saved },
     commands,
   );
-  assert.equal(patches, 1);
+  assert.deepEqual(deletes, [
+    [
+      [
+        "delete",
+        "--raw",
+        "/api/v1/namespaces/example/pods/database-1",
+        "--filename=-",
+      ],
+      {
+        apiVersion: "v1",
+        kind: "DeleteOptions",
+        preconditions: { uid: oldPod, resourceVersion: "7" },
+        propagationPolicy: "Background",
+      },
+    ],
+  ]);
+  assert.equal(patches, 0);
   assert.equal(result.controllers_renewed, 1);
-  assert.equal(
-    cluster.metadata.annotations!["kubectl.kubernetes.io/restartedAt"],
-    new Date(now).toISOString(),
-  );
+  assert.equal(cluster.metadata.annotations, undefined);
   assert.deepEqual(cluster.spec, { instances: 1 });
 });
 test("bootstrap-token retirement uses UID/RV preconditions and reconciles a lost delete response", async () => {
