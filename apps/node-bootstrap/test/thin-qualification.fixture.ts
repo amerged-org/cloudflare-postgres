@@ -100,7 +100,7 @@ export class ThinWorld {
   namespaceUid: string | null = null;
   classes = new Map<string, string>();
   poolMode: "rw" | "out_of_data_space" = "rw";
-  /** Every write, exec and Talos call in order; reads are not recorded. */
+  /** Writes, Pod execs and Talos calls other than identity reads, in order. */
   log: string[] = [];
   /** Simulated relay latency of one driver command, applied to the mocked clock. */
   cost: (args: string[]) => number = () => 0;
@@ -205,7 +205,6 @@ export class ThinWorld {
       );
     this.log.push(`talosctl ${args.join(" ")}`);
     if (args[0] === "dmesg") return ok("");
-    if (args[0] === "reboot") return ok("");
     throw new Error(`unexpected_talosctl_${args[0]}`);
   }
 
@@ -995,10 +994,11 @@ export function thinQualificationRun(
       });
       confirm(`${step}:${name}:release`, { released: true });
     },
-    /** One bounded executor turn; `lease` is the remaining Cloudflare lease in milliseconds. */
-    async turn(lease_ms = 3_600_000) {
+    /** One bounded executor turn under a fresh one-hour lease. */
+    async turn() {
       const now = Date.now();
-      world.cancelAt = now + Math.min(570_000, lease_ms - 30_000) + 20_000;
+      // The relay session ends 20 s after the 570 s turn deadline.
+      world.cancelAt = now + 590_000;
       const input = ThinQualificationInput.parse({
         run: {
           ...ids,
@@ -1012,7 +1012,7 @@ export function thinQualificationRun(
           lease: {
             ...lease,
             issued_at: new Date(now).toISOString(),
-            expires_at: new Date(now + lease_ms).toISOString(),
+            expires_at: new Date(now + 3_600_000).toISOString(),
           },
           journal: { revision, entries: structuredClone(entries) },
         },

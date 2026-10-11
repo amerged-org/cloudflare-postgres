@@ -629,8 +629,7 @@ describe(
         size: 2 * profile.maximum_data_bytes,
       });
       assert.deepEqual(await run.turn(), { kind: "report" });
-      const lv = run.world.lvs.find((value) => value.uuid === fill.lv_uuid);
-      assert.equal(lv, undefined);
+      assert.ok(!run.world.lvs.some((value) => value.uuid === fill.lv_uuid));
       assert.ok(run.world.log.includes("exec fill-full /bin/bash"));
       const evidence = (
         run.calls[0]!.report as {
