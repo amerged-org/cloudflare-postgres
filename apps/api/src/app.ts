@@ -449,6 +449,23 @@ export function createApp(): ApiApp {
   app.doc31("/v1/openapi.json", {
     openapi: "3.1.0",
     info: { title: "PGCF API", version },
+    tags: [
+      {
+        name: "Nodes",
+        description:
+          "Node additions and per-region capacity policies. Infrastructure alert thresholds are part of GET/PUT /v1/regions/{id}/capacity-policy.",
+      },
+      {
+        name: "Infrastructure",
+        description:
+          "Daily infrastructure backups and infrastructure alert delivery by email through Resend or by an authenticated webhook (see PUT /v1/infrastructure-backups/config).",
+      },
+      {
+        name: "Health",
+        description:
+          "Measured health with explicit unknown states and the status of infrastructure alert episodes (GET /v1/operational-health?scope=regions).",
+      },
+    ],
   });
   app.notFound((c) => apiError(c, "not_found", "Route not found"));
   return app;

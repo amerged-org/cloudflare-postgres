@@ -55,11 +55,53 @@ describe("API harness in the Workers runtime", () => {
     expect(response.status).toBe(200);
     const document = await response.json<{
       openapi: string;
-      paths: Record<string, unknown>;
+      paths: Record<
+        string,
+        Record<
+          string,
+          {
+            summary?: string;
+            description?: string;
+            requestBody?: {
+              content: Record<
+                string,
+                {
+                  schema: {
+                    properties: Record<string, { description?: string }>;
+                  };
+                }
+              >;
+            };
+          }
+        >
+      >;
     }>();
     expect(document.openapi).toBe("3.1.0");
     expect(document.paths["/healthz"]).toBeDefined();
     expect(response.headers.get("X-Request-Id")).toBeTruthy();
+    const config = document.paths["/v1/infrastructure-backups/config"]?.put;
+    expect({
+      limits: document.paths["/v1/regions/{id}/capacity-policy"]?.put,
+      email: config,
+      sender:
+        config?.requestBody?.content["application/json"]?.schema.properties
+          .notification_sender,
+      status: document.paths["/v1/operational-health"]?.get,
+    }).toMatchObject({
+      limits: {
+        summary: expect.any(String),
+        description: expect.stringContaining("ppm"),
+      },
+      email: {
+        summary: expect.any(String),
+        description: expect.stringContaining("RESEND_API_KEY"),
+      },
+      sender: { description: expect.stringContaining("verified") },
+      status: {
+        summary: expect.any(String),
+        description: expect.stringContaining("infrastructure_alerts"),
+      },
+    });
   });
 
   it("returns the shared error envelope for an unknown route", async () => {

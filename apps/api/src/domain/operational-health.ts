@@ -14,19 +14,37 @@ import { NODE_OBSERVATION_MAX_AGE_MS } from "./placement.ts";
 export const BASE_BACKUP_MAX_AGE_MS = 36 * 60 * 60 * 1000;
 export const DISK_WARNING_FRACTION = 0.9;
 const HealthClock = z.strictObject({
-  observed_at: Timestamp.nullable(),
-  age_seconds: z.number().nonnegative().nullable(),
+  observed_at: Timestamp.nullable().describe(
+    "Time of the measurement; null when unknown.",
+  ),
+  age_seconds: z
+    .number()
+    .nonnegative()
+    .nullable()
+    .describe("Seconds since observed_at; null when unknown."),
 });
 export const HeartbeatHealth = HealthClock.safeExtend({
-  status: z.enum(["ok", "stale", "unknown", "lost"]),
+  status: z
+    .enum(["ok", "stale", "unknown", "lost"])
+    .describe(
+      "ok: observed within the last 180 s; stale: older; unknown: no valid observation; lost: node marked lost.",
+    ),
 });
 export const BackupHealth = HealthClock.safeExtend({
-  status: z.enum(["ok", "stale", "failing", "unknown"]),
+  status: z
+    .enum(["ok", "stale", "failing", "unknown"])
+    .describe(
+      "ok: last completed base backup at most 36 h old; stale: older; failing: the agent reports failing or the last failure is newer than the last completion; unknown: no agent report within 180 s, an unknown report, or no completed backup.",
+    ),
   last_completed_at: Timestamp.nullable(),
   last_failed_at: Timestamp.nullable(),
 });
 export const DiskHealth = HealthClock.safeExtend({
-  status: z.enum(["ok", "warning", "unknown"]),
+  status: z
+    .enum(["ok", "warning", "unknown"])
+    .describe(
+      "warning: at least 90 % of the allocated storage is used; unknown: no agent usage sample within 180 s.",
+    ),
   storage_used_bytes: z.number().int().nonnegative().nullable(),
   storage_allocated_bytes: z.number().int().positive().nullable(),
   used_fraction: z.number().nonnegative().nullable(),
@@ -133,13 +151,17 @@ export function diskHealth(
 }
 export const OperationalRegionHealth = z.strictObject({
   id: RegionId,
-  /** delivered_at records callback acceptance, not downstream email delivery. */
   infrastructure_alerts: z
     .array(InfraAlertStatus)
     .max(InfraAlertKind.options.length)
-    .optional(),
+    .optional()
+    .describe(
+      "Alert episodes of this region, one entry per kind ever recorded, active or cleared; omitted when none.",
+    ),
   created_at: Timestamp,
-  agent: HeartbeatHealth,
+  agent: HeartbeatHealth.describe(
+    "Regional agent heartbeat from its last accepted observation report.",
+  ),
 });
 export const OperationalNodeHealth = z.strictObject({
   id: NodeId,

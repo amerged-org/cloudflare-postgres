@@ -12,7 +12,12 @@ import {
 } from "../domain/operational-health.ts";
 
 export const OperationalHealthQuery = ListQuery.safeExtend({
-  scope: z.enum(["regions", "nodes", "databases"]).default("databases"),
+  scope: z
+    .enum(["regions", "nodes", "databases"])
+    .default("databases")
+    .describe(
+      "regions: regional agent heartbeat and infrastructure alert status; nodes: node heartbeats; databases: base backup and disk health.",
+    ),
 });
 const OperationalHealthResponse = z.discriminatedUnion("scope", [
   listEnvelope(OperationalRegionHealth).safeExtend({
@@ -31,6 +36,11 @@ export function registerOperationalHealth(app: ApiApp): void {
       path: "/v1/operational-health",
       tags: ["Health"],
       security: [{ bearerAuth: [] }],
+      summary: "Read operational health and infrastructure alert status",
+      description: [
+        "Lists measured health with explicit unknown states; a missing measurement is unknown, never ok. Heartbeats older than 180 s are stale; backup and disk reports older than 180 s are unknown.",
+        "With scope=regions each region carries infrastructure_alerts: one entry per alert kind ever recorded for it, active or cleared. The minute cron keeps one episode per region and kind. regional_ram_warning, regional_node_cap_reached and the three per-node warnings follow the thresholds of PUT /v1/regions/{id}/capacity-policy and are evaluated for the first four regions with a policy, in region ID order; regional_node_stale, infrastructure_backup_failed and infrastructure_backup_stale (see GET /v1/infrastructure-backups) are evaluated for every region. A new episode gets a new event_id and is delivered at least once through the alert webhook or email of PUT /v1/infrastructure-backups/config; delivered_at and last_attempt_at show its delivery.",
+      ].join("\n\n"),
       request: { query: OperationalHealthQuery },
       responses: {
         200: {

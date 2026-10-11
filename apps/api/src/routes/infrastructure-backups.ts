@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createRoute, z } from "@hono/zod-openapi";
+import { ErrorBody, InfraAlertKind } from "@pgcf/contracts";
 import {
   InfrastructureBackupConfig,
   InfrastructureBackupConfigInput,
@@ -16,6 +17,14 @@ import {
   readInfrastructureBackupConfig,
 } from "../domain/infrastructure-backups.ts";
 import { operatorKubernetesRelay } from "../domain/node-operator.ts";
+const error = (description: string) => ({
+  description,
+  content: { "application/json": { schema: ErrorBody } },
+});
+const admin = {
+  401: error("Invalid credentials"),
+  403: error("Administrator scope required"),
+};
 export function registerInfrastructureBackups(app: ApiApp) {
   app.openapi(
     createRoute({
@@ -23,6 +32,9 @@ export function registerInfrastructureBackups(app: ApiApp) {
       path: "/v1/infrastructure-backups/config",
       tags: ["Infrastructure"],
       security: [{ bearerAuth: [] }],
+      summary: "Read infrastructure backup and alert email settings",
+      description:
+        "Returns the singleton settings of daily infrastructure backups and of alert email delivery. Fresh installations have backups disabled and every identifier and address null. Secrets are never returned, and whether RESEND_API_KEY or an alert webhook is configured is not visible here; last_attempt_at and delivered_at in GET /v1/operational-health?scope=regions show delivery.",
       responses: {
         200: {
           description:
@@ -31,6 +43,7 @@ export function registerInfrastructureBackups(app: ApiApp) {
             "application/json": { schema: InfrastructureBackupConfig },
           },
         },
+        ...admin,
       },
     }),
     async (c) => {
@@ -44,6 +57,15 @@ export function registerInfrastructureBackups(app: ApiApp) {
       path: "/v1/infrastructure-backups/config",
       tags: ["Infrastructure"],
       security: [{ bearerAuth: [] }],
+      summary: "Configure infrastructure backups and alert email",
+      description: [
+        "Replaces the singleton settings; send all six fields, null clears an identifier or address. The alert email addresses work independently of enabled.",
+        `Alert email: when the Worker secret RESEND_API_KEY and both notification_recipient and notification_sender are set and no valid alert webhook is configured, every new episode of any alert kind (${InfraAlertKind.options.join(", ")}) is sent through the Resend API with subject "PGCF infrastructure: <kind> (<region_id>)" and the event JSON as plain-text body. A cleared episode sends nothing.`,
+        "Event JSON: version (1), event_id, kind, region_id, occurred_at (episode start), regional_ram_utilization_ppm, allocated_nodes and max_nodes. Backup kinds add backup_artifacts (kind, status, last_completed_at, error_code); regional_node_stale and the per-node warnings add node_ids (at most 64; per-node warnings highest first), and the per-node warnings add threshold_ppm and the highest utilization_ppm.",
+        "Delivery: the minute cron sends with a 5 s deadline and event_id as Idempotency-Key; a 2xx response sets delivered_at. Any other outcome is retried with the same event_id and body at least 60 s after last_attempt_at while the episode stays active; capacity policy warnings only while that minute's evaluation still confirms them. Resend deduplicates the Idempotency-Key within its own retention window. Status: GET /v1/operational-health?scope=regions.",
+        "Webhook alternative: set the Worker secret INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN (16 to 512 characters of A-Z a-z 0-9 . _ ~ -) with the service binding INFRASTRUCTURE_ALERT_WEBHOOK (requests go through it) or INFRASTRUCTURE_ALERT_WEBHOOK_URL (https without credentials, query or fragment, at most 2048 characters). A valid webhook takes precedence and email is then not sent. PGCF POSTs the event JSON with Authorization: Bearer <token> and Idempotency-Key: <event_id>, follows no redirects and treats any 2xx as acknowledged; the receiver must verify the token and durably deduplicate event_id. Without either destination, episodes are only recorded.",
+        "Every successful PUT increments revision, so a backup run in progress fails. 400: invalid body, or enabled without d1_account_id, d1_database_id and d1_region_id. 404: d1_region_id does not exist. 409: enabled without the INFRASTRUCTURE_BACKUP Workflow binding or the INFRASTRUCTURE_BACKUP_CF_TOKEN secret.",
+      ].join("\n\n"),
       request: {
         body: {
           required: true,
@@ -60,6 +82,10 @@ export function registerInfrastructureBackups(app: ApiApp) {
             "application/json": { schema: InfrastructureBackupConfig },
           },
         },
+        400: error("Invalid configuration"),
+        ...admin,
+        404: error("Backup region not found"),
+        409: error("Backup Workflow binding or D1 export secret missing"),
       },
     }),
     async (c) => {
@@ -76,18 +102,26 @@ export function registerInfrastructureBackups(app: ApiApp) {
       path: "/v1/infrastructure-backups",
       tags: ["Infrastructure"],
       security: [{ bearerAuth: [] }],
+      summary: "Read the latest infrastructure backup run and backup freshness",
+      description:
+        "Returns the most recent daily run with per-artifact receipts and the freshness of every expected backup: the D1 export in d1_region_id and one etcd snapshot per region with a current cluster and a node that is not lost. While enabled, the minute cron starts at most one run per UTC day; a run fails after two hours. Health status failing raises infrastructure_backup_failed and stale raises infrastructure_backup_stale for that region. No credentials, signed URLs or keys are returned.",
       responses: {
         200: {
           description: "Latest safe backup receipts and current freshness",
           content: {
             "application/json": {
               schema: z.object({
-                latest: InfrastructureBackupRunStatus.nullable(),
-                health: z.array(InfrastructureBackupHealth),
+                latest: InfrastructureBackupRunStatus.nullable().describe(
+                  "Run of the latest UTC day; null before the first run.",
+                ),
+                health: z
+                  .array(InfrastructureBackupHealth)
+                  .describe("Freshness of every expected backup."),
               }),
             },
           },
         },
+        ...admin,
       },
     }),
     async (c) => {

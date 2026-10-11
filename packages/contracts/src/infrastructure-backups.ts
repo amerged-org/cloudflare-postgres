@@ -18,15 +18,29 @@ const HttpsUrl = z
   });
 const Email = z.email().max(320);
 const ConfigFields = {
-  enabled: z.boolean(),
+  enabled: z
+    .boolean()
+    .describe(
+      "Daily encrypted capture of the control D1 database and each regional etcd into R2. Enabling needs the D1 identity, the INFRASTRUCTURE_BACKUP Workflow binding and the INFRASTRUCTURE_BACKUP_CF_TOKEN secret.",
+    ),
   d1_account_id: z
     .string()
     .regex(/^[a-f0-9]{32}$/)
-    .nullable(),
-  d1_database_id: z.uuid().nullable(),
-  d1_region_id: RegionId.nullable(),
-  notification_recipient: Email.nullable(),
-  notification_sender: Email.nullable(),
+    .nullable()
+    .describe("Cloudflare account ID of the control D1 database."),
+  d1_database_id: z
+    .uuid()
+    .nullable()
+    .describe("ID of the control D1 database to export."),
+  d1_region_id: RegionId.nullable().describe(
+    "Existing region whose R2 archive bucket stores the D1 export.",
+  ),
+  notification_recipient: Email.nullable().describe(
+    "Address that receives infrastructure alert emails. Email is sent only when the Worker secret RESEND_API_KEY and both addresses are set and no valid alert webhook is configured; null disables email.",
+  ),
+  notification_sender: Email.nullable().describe(
+    "From address of alert emails. It must belong to a domain verified in the Resend account of RESEND_API_KEY; a rejected send stays undelivered and is retried. null disables email.",
+  ),
 };
 export const InfrastructureBackupConfigInput = z
   .strictObject(ConfigFields)
@@ -43,9 +57,19 @@ export const InfrastructureBackupConfigInput = z
   });
 export const InfrastructureBackupConfig = z.strictObject({
   ...ConfigFields,
-  revision: z.number().int().nonnegative(),
-  enabled_at: Timestamp.nullable(),
-  updated_at: Timestamp.nullable(),
+  revision: z
+    .number()
+    .int()
+    .nonnegative()
+    .describe(
+      "Incremented by every successful PUT; a backup run still in progress under an older revision fails.",
+    ),
+  enabled_at: Timestamp.nullable().describe(
+    "When backups were last enabled; null while disabled. Freshness counts from here until a backup completes.",
+  ),
+  updated_at: Timestamp.nullable().describe(
+    "Time of the last PUT; null before the first one.",
+  ),
 });
 export type InfrastructureBackupConfig = z.infer<
   typeof InfrastructureBackupConfig
@@ -173,11 +197,24 @@ export type InfrastructureBackupPreparedArtifact = z.infer<
 >;
 export const InfrastructureBackupArtifactStatus =
   InfrastructureBackupArtifactIdentity.safeExtend({
-    status: z.enum(["pending", "prepared", "complete", "failed"]),
+    status: z
+      .enum(["pending", "prepared", "complete", "failed"])
+      .describe(
+        "pending, then prepared (encrypted and hashed), then complete (stored in R2 and fully read back); failed otherwise.",
+      ),
     completed_at: Timestamp.nullable(),
     error_code: z.string().max(128).nullable(),
-    object_key: z.string().max(1024),
-    kid: z.string().max(64).nullable(),
+    object_key: z
+      .string()
+      .max(1024)
+      .describe(
+        "Key in the region's R2 archive bucket: infrastructure/v1/<day>/<run>/<artifact>.pgcfenc.",
+      ),
+    kid: z
+      .string()
+      .max(64)
+      .nullable()
+      .describe("Credential key version the encryption key is derived from."),
     plaintext_sha256: Sha256.nullable(),
     plaintext_bytes: z.number().int().nonnegative().nullable(),
     encrypted_sha256: Sha256.nullable(),
@@ -185,18 +222,39 @@ export const InfrastructureBackupArtifactStatus =
   });
 export const InfrastructureBackupRunStatus = z.strictObject({
   id: z.uuid(),
-  day: z.iso.date(),
-  status: z.enum(["pending", "running", "complete", "failed"]),
+  day: z.iso.date().describe("UTC day; at most one run per day."),
+  status: z
+    .enum(["pending", "running", "complete", "failed"])
+    .describe(
+      "pending: recorded, capture not started; running: artifacts fixed, capture in progress; complete: every artifact complete; failed: see error_code, for example infrastructure_backup_deadline after two hours.",
+    ),
   created_at: Timestamp,
   completed_at: Timestamp.nullable(),
   error_code: z.string().max(128).nullable(),
-  artifacts: z.array(InfrastructureBackupArtifactStatus).max(65),
+  artifacts: z
+    .array(InfrastructureBackupArtifactStatus)
+    .max(65)
+    .describe(
+      "d1-control plus one etcd-<region> per captured regional cluster.",
+    ),
 });
 export const InfrastructureBackupHealth = z.strictObject({
   kind: InfrastructureBackupKind,
   region_id: RegionId,
-  status: z.enum(["disabled", "ok", "unknown", "stale", "failing"]),
-  last_completed_at: Timestamp.nullable(),
-  last_failed_at: Timestamp.nullable(),
-  error_code: z.string().max(128).nullable(),
+  status: z
+    .enum(["disabled", "ok", "unknown", "stale", "failing"])
+    .describe(
+      "disabled: backups are off. unknown: the expected source cannot be identified, or nothing completed yet within 36 h of enabling. failing: the latest failed run ended at or after the last completed backup (or the enabling). stale: no completed backup for more than 36 h, counted from enabling when none exists. ok otherwise. failing raises infrastructure_backup_failed and stale raises infrastructure_backup_stale for the region.",
+    ),
+  last_completed_at: Timestamp.nullable().describe(
+    "Latest completed backup of this kind, region and source.",
+  ),
+  last_failed_at: Timestamp.nullable().describe(
+    "End of the latest failed run of any artifact.",
+  ),
+  error_code: z
+    .string()
+    .max(128)
+    .nullable()
+    .describe("Error code of the latest failed run of any artifact."),
 });

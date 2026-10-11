@@ -76,8 +76,19 @@ export async function getNodeStorage(
 }
 
 export const NodeCapacityPolicy = NodeRegionPolicy.safeExtend({
-  autoscale_enabled: z.boolean().default(false),
-  adopt_instance_ids: z.array(ProviderInstanceId).max(100).default([]),
+  autoscale_enabled: z
+    .boolean()
+    .default(false)
+    .describe(
+      "Lets the minute capacity cron add a node when capacity is needed: it adopts the first unused adopt_instance_ids entry, otherwise reserves an addition of `order` once regional RAM reaches ram_expansion_threshold_ppm. Dispatching an order still needs purchases_enabled and a cost approval. GET /v1/regions/{id}/capacity-decision previews the next step.",
+    ),
+  adopt_instance_ids: z
+    .array(ProviderInstanceId)
+    .max(100)
+    .default([])
+    .describe(
+      "Provider instance IDs that autoscale may adopt, in list order; instances already registered or held by an addition are skipped.",
+    ),
 });
 export const NodePurchaseApproval = z.strictObject({
   expected_revision: z.number().int().positive(),

@@ -143,22 +143,72 @@ export const StandingNodeCostProfile = z
       });
   });
 export type StandingNodeCostProfile = z.infer<typeof StandingNodeCostProfile>;
+const PPM = "Integer parts per million: 1000000 = 100 %, 800000 = 80 %.";
+const KEEP = "Omitted on PUT: keeps the stored value.";
+const WARNING = `${PPM} null disables the warning and clears its episode. ${KEEP}`;
 export const NodeRegionPolicy = z
   .strictObject({
     region_id: RegionId,
-    max_nodes: z.number().int().min(1).max(10000).nullable().optional(),
-    purchases_enabled: z.boolean().default(false),
+    max_nodes: z
+      .number()
+      .int()
+      .min(1)
+      .max(10000)
+      .nullable()
+      .optional()
+      .describe(
+        `Regional node ceiling; null means none. Counts the region's nodes (lost ones included) and held node additions, once per provider instance. New additions are refused at the ceiling; recovering a lost node on its own allocation is exempt. ${KEEP}`,
+      ),
+    purchases_enabled: z
+      .boolean()
+      .default(false)
+      .describe(
+        "Permits paid provider orders: an order addition is dispatched only while this is true and its order equals `order`. Requires `order`.",
+      ),
     autoscale_enabled: z.boolean().optional(),
-    ram_expansion_threshold_ppm: ThresholdPpm.nullable().optional(),
-    ram_warning_threshold_ppm: ThresholdPpm.nullable().optional(),
-    /** Per-node warnings: any fresh node at or above the threshold warns; null disables. */
-    node_ram_warning_threshold_ppm: ThresholdPpm.nullable().optional(),
-    node_cpu_warning_threshold_ppm: ThresholdPpm.nullable().optional(),
-    node_storage_warning_threshold_ppm: ThresholdPpm.nullable().optional(),
-    cap_warning_enabled: z.boolean().optional(),
+    ram_expansion_threshold_ppm: ThresholdPpm.nullable()
+      .optional()
+      .describe(
+        `Regional RAM utilization that permits an automatic order, measured like ram_warning_threshold_ppm. Required when autoscale_enabled, purchases_enabled and order are all set (409 otherwise); null means no RAM-triggered orders. ${PPM} ${KEEP}`,
+      ),
+    ram_warning_threshold_ppm: ThresholdPpm.nullable()
+      .optional()
+      .describe(
+        `Regional RAM warning (alert regional_ram_warning) when regional RAM utilization reaches it: the ten-minute average of kubelet working-set bytes of every ready, schedulable, placement-enabled, non-lost node against their summed memory capacity. Each such node needs ten consecutive one-minute samples with unchanged capacity, the newest at most 90 s old and in the same minute as the others, and an observation at most 180 s old; otherwise utilization is unknown and an episode neither starts nor clears. ${WARNING}`,
+      ),
+    node_ram_warning_threshold_ppm: ThresholdPpm.nullable()
+      .optional()
+      .describe(
+        `Per-node RAM warning (alert regional_node_ram_warning) when any non-lost node, including one closed to database placement, reaches it: the node's own ten-minute working-set average against its memory capacity, from ten consecutive one-minute samples with unchanged capacity, the newest at most 90 s old. ${WARNING}`,
+      ),
+    node_cpu_warning_threshold_ppm: ThresholdPpm.nullable()
+      .optional()
+      .describe(
+        `Per-node CPU warning (alert regional_node_cpu_warning) when any non-lost node reaches it: kubelet Summary node.cpu.usageNanoCores averaged over the node's ten latest consecutive one-minute samples (newest at most 90 s old, all with CPU data and the same capacity) against its status.capacity.cpu. Only reporters that add these optional fields to node memory samples supply CPU (the native regional controller); otherwise CPU is unknown and never warns. ${WARNING}`,
+      ),
+    node_storage_warning_threshold_ppm: ThresholdPpm.nullable()
+      .optional()
+      .describe(
+        `Per-node storage warning (alert regional_node_storage_warning) when any ready, non-lost node's latest LVM sample (at most 120 s old) reaches it: the fuller of thin-pool data and metadata when a thin pool exists, otherwise (total - free) / total of the volume group. ${WARNING}`,
+      ),
+    cap_warning_enabled: z
+      .boolean()
+      .optional()
+      .describe(
+        `Node cap notice (alert regional_node_cap_reached) while the region's provider allocations reach max_nodes: nodes (lost ones included) and held additions already bound to a provider instance; unpaid reservations do not count. Needs a non-null max_nodes; false disables the notice and clears its episode. ${KEEP}`,
+      ),
     adopt_instance_ids: z.array(ProviderInstanceId).max(100).optional(),
-    order: NodeOrderConfiguration.nullable().default(null),
-    placement_mode: z.enum(["reserved", "actual_ram"]).default("reserved"),
+    order: NodeOrderConfiguration.nullable()
+      .default(null)
+      .describe(
+        "Exact provider order (product, provider region, image, term, location, optional add-ons) for every order addition; manual order requests must equal it. null means no orders.",
+      ),
+    placement_mode: z
+      .enum(["reserved", "actual_ram"])
+      .default("reserved")
+      .describe(
+        "reserved: admit databases against reserved size-class memory. actual_ram: admit them against fresh measured node memory, for size classes from postgres_memory_request_mib to maximum_database_memory_mib in 256 MiB steps. A change needs an empty or manually suspended assigned cohort and no unsettled start (409 otherwise).",
+      ),
     maximum_database_memory_mib: z
       .number()
       .int()
@@ -166,17 +216,35 @@ export const NodeRegionPolicy = z
       .max(1048576)
       .multipleOf(256)
       .nullable()
-      .default(null),
+      .default(null)
+      .describe(
+        "actual_ram: largest size-class memory placed in this region (MiB).",
+      ),
     postgres_memory_request_mib: z
       .number()
       .int()
       .positive()
       .max(1048576)
       .nullable()
-      .default(null),
-    standing_cost_profile: StandingNodeCostProfile.nullable().default(null),
-    compute_pool: ComputePoolPolicy.nullable().optional(),
-    thin_storage: ThinStorageProfile.nullable().optional(),
+      .default(null)
+      .describe(
+        "actual_ram: Kubernetes memory request of each PostgreSQL container (MiB); smaller size classes are not placed. A change under actual_ram has the same precondition as placement_mode.",
+      ),
+    standing_cost_profile: StandingNodeCostProfile.nullable()
+      .default(null)
+      .describe(
+        "Standing owner approval for order additions of exactly `order`, bounded by its expiry, order count and total monthly and setup amounts; unknown prices stay null. With trigger regional_actual_ram it approves only automatic orders while regional RAM is at or above ram_expansion_threshold_ppm; without a trigger it also approves manual order additions and needs expiry and finite limits. null: every order waits for POST /v1/nodes/additions/{id}/approve.",
+      ),
+    compute_pool: ComputePoolPolicy.nullable()
+      .optional()
+      .describe(
+        "Optional prestarted compute pool of idle runtime slots on the region's nodes; non-null switches the pool runtime on. Returned only when set; omitted on PUT keeps it, null removes it.",
+      ),
+    thin_storage: ThinStorageProfile.nullable()
+      .optional()
+      .describe(
+        "Optional thin-provisioned LVM storage profile for the region's nodes. Returned only when set; omitted on PUT keeps it, null removes it.",
+      ),
   })
   .superRefine((policy, context) => {
     if (policy.purchases_enabled && policy.order === null)
