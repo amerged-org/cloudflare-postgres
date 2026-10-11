@@ -2233,13 +2233,17 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
       },
     };
   }
-  /** Remove owned raw thin LVs by exact name; each must carry this run's tag. */
+  /**
+   * Remove owned raw thin LVs by exact name; each must carry this run's tag. One relayed
+   * lvremove per LV can outlast the turn, so the removal continues from fresh reads next turn.
+   */
   private async removeTagged(key: string, names: string[]) {
     return await this.journal.converge(key, async () => {
       const wanted = new Set(names);
       for (const lv of (await this.lvm()).volumes) {
         if (!wanted.has(lv.name)) continue;
         if (!lv.tags.includes(this.tag)) fail("scratch_volume_not_owned");
+        this.room(60_000);
         await this.node.driverExec(
           ["lvremove", "--yes", `pgcf/${lv.name}`],
           true,

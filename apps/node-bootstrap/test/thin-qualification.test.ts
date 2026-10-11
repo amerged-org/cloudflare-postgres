@@ -815,3 +815,60 @@ describe(
     });
   },
 );
+
+test("metadata_full removes its raw volumes across turns instead of outrunning the relay session", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const run = thinQualificationRun("metadata_full");
+  scratchMeasured(run);
+  run.workload("data_full", "pg-a", "Pa", { pod: false });
+  run.confirm("metadata_full:pg-a:stop", { stopped: true });
+  const pool = run.world.lv("pgcf_thinpool")!;
+  pool.size = profile.maximum_data_bytes;
+  run.confirm("metadata_full:grow", {
+    pool_uuid: pool.uuid,
+    data_bytes: pool.size,
+  });
+  const prefix = `pgcf_thin_q_${run.ids.id.slice(3)}_v`;
+  const raw = Array.from({ length: profile.maximum_volumes }, (_, index) =>
+    run.world.addLv({
+      name: `${prefix}${index}`,
+      uuid: lvm(`Rv${index}`),
+      segtype: "thin",
+      pool: "pgcf_thinpool",
+      size: profile.maximum_data_bytes / profile.maximum_volumes,
+      tags: [run.world.tag],
+    }),
+  );
+  run.confirm("metadata_full:volumes", {
+    minors: raw.map((lv) => lv.minor),
+  });
+  run.confirm("metadata_full:maximum-fill", {
+    exit_code: 1,
+    error: "enospc",
+    written_bytes: profile.maximum_data_bytes,
+    milliseconds: 60_000,
+  });
+  run.confirm("metadata_full:maximum", {
+    data_bytes: profile.maximum_data_bytes,
+    metadata_bytes: profile.metadata_bytes,
+    status: {
+      mode: "out_of_data_space",
+      used_data_blocks: profile.maximum_data_bytes / 65536,
+      total_data_blocks: profile.maximum_data_bytes / 65536,
+      used_metadata_blocks: 3_000,
+      total_metadata_blocks: profile.metadata_bytes / 4096,
+      error_if_no_space: true,
+      needs_check: false,
+    },
+  });
+  // Each relayed lvremove takes about 5 s; all of them do not fit one session.
+  run.world.cost = (args) => (args[0] === "lvremove" ? 5_000 : 0);
+  run.world.elapse = (milliseconds) => t.mock.timers.tick(milliseconds);
+  const left = () =>
+    run.world.lvs.filter((lv) => lv.name.startsWith(prefix)).length;
+  assert.deepEqual(await run.turn(), { kind: "release" });
+  assert.ok(left() > 0 && left() < raw.length);
+  assert.equal(run.entry("metadata_full:volumes-remove")?.state, "dispatched");
+  assert.deepEqual(await run.turn(), { kind: "report" });
+  assert.equal(left(), 0);
+});
