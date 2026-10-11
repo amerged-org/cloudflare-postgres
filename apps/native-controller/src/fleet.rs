@@ -4,7 +4,7 @@ use crate::{
     Error,
     api::{ControlApi, timestamp},
     contracts::{constant, integer, schema_valid, text},
-    kubernetes::Kubernetes,
+    kubernetes::{Kubernetes, terminal_pod},
 };
 use serde_json::{Value, json};
 use std::{
@@ -98,8 +98,7 @@ pub fn chart(pin: &Value, release: &Value, source: &Value, artifact: &Value) -> 
 }
 /// Succeeded or Failed Pods are history; only a live Pod can prove what currently runs.
 fn active(pod: &Value) -> bool {
-    pod["metadata"]["deletionTimestamp"].is_null()
-        && !matches!(text(&pod["status"], "phase"), "Succeeded" | "Failed")
+    pod["metadata"]["deletionTimestamp"].is_null() && !terminal_pod(pod)
 }
 fn selected(pod: &Value, workload: &Value, node: &str) -> bool {
     pod["metadata"]["namespace"] == text(workload, "namespace")
