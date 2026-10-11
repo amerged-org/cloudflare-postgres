@@ -1,11 +1,13 @@
 # Sandbox extension and public recipe
 
 The [ULTRA plan](../../../docs/architecture/cloudflare-convergence-and-serverless-plan.md)
-defines golden R1: Talos1.14.2, the sandbox extension, thin-pool module and base kernel arguments,
-with Kubernetes1.36.5/platform/PGCF pins in its release manifest. Reuse the composed installer;
-build the matching raw image and publish both immutable artifacts. Runtime/pool integration
-ships as R2 through the same automatic fleet patch workflow. Built artifacts alone do not prove
-live fleet or pool acceptance.
+defines golden R1: Talos 1.14.2, the sandbox extension and base kernel arguments, with
+Kubernetes 1.36.5/platform/PGCF pins in its release manifest. The image adds no thin-pool module.
+`dm_thin_pool` ships with the Talos kernel; a `KernelModuleConfig` document in the machine
+configuration loads it, for new nodes from a postjoin release and for retained nodes from a
+release that pins the thin guard. Reuse the composed installer; build the matching raw image and
+publish both immutable artifacts. Runtime/pool integration ships as R2 through the same automatic
+fleet patch workflow. Built artifacts alone do not prove live fleet or pool acceptance.
 
 Use immutable digest and signature/SBOM verification for upstream Talos and other upstream
 images. Secret scanning covers our extension, public recipe and binaries. The upstream
