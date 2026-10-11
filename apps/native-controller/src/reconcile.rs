@@ -585,43 +585,16 @@ impl Reconciler {
     ) -> Result<bool, Error> {
         let ns = namespace(db);
         let pool = &context["computePool"];
-        let (mode, selection) = if pool.is_null() {
-            ("standard", format!("{}/standard", number(db, "generation")))
+        let selection = if pool.is_null() {
+            format!("{}/standard", number(db, "generation"))
         } else {
-            (
-                "pool",
-                format!(
-                    "{}/pool/{}",
-                    number(db, "generation"),
-                    text(&pool["profile"], "release_id")
-                ),
+            format!(
+                "{}/pool/{}",
+                number(db, "generation"),
+                text(&pool["profile"], "release_id")
             )
         };
-        let current = self
-            .k8s
-            .read("Namespace", None, &ns)
-            .await?
-            .ok_or("database namespace missing")?;
-        owned(&current, db, &ns, None)?;
-        if current["metadata"]["uid"] != *namespace_uid {
-            return Err("database namespace identity changed".into());
-        }
-        if text(&current["metadata"]["labels"], RUNTIME) != mode
-            && let Err(error) = self
-                .k8s
-                .patch(&current, &json!({"metadata":{"labels":{RUNTIME:mode}}}))
-                .await
-        {
-            match self.k8s.read("Namespace", None, &ns).await? {
-                Some(after)
-                    if after["metadata"]["uid"] == *namespace_uid
-                        && text(&after["metadata"]["labels"], RUNTIME) == mode =>
-                {
-                    owned(&after, db, &ns, None)?
-                }
-                _ => return Err(error),
-            }
-        }
+        self.runtime_label(db, context, namespace_uid).await?;
         let primary = text(&cluster["status"], "currentPrimary");
         if !dns_label(primary) {
             return Ok(false);
@@ -671,6 +644,50 @@ impl Reconciler {
             }
         }
         Ok(false)
+    }
+    /// Labels the database namespace with the selected runtime, which admission matches when CNPG
+    /// creates a Pod, under its UID and resourceVersion; an unknown write is read back.
+    async fn runtime_label(
+        &self,
+        db: &Value,
+        context: &Value,
+        namespace_uid: &Value,
+    ) -> Result<Value, Error> {
+        let ns = namespace(db);
+        let mode = if context["computePool"].is_null() {
+            "standard"
+        } else {
+            "pool"
+        };
+        let current = self
+            .k8s
+            .read("Namespace", None, &ns)
+            .await?
+            .ok_or("database namespace missing")?;
+        owned(&current, db, &ns, None)?;
+        if current["metadata"]["uid"] != *namespace_uid {
+            return Err("database namespace identity changed".into());
+        }
+        if text(&current["metadata"]["labels"], RUNTIME) == mode {
+            return Ok(current);
+        }
+        match self
+            .k8s
+            .patch(&current, &json!({"metadata":{"labels":{RUNTIME:mode}}}))
+            .await
+        {
+            Ok(after) => Ok(after),
+            Err(error) => match self.k8s.read("Namespace", None, &ns).await? {
+                Some(after)
+                    if after["metadata"]["uid"] == *namespace_uid
+                        && text(&after["metadata"]["labels"], RUNTIME) == mode =>
+                {
+                    owned(&after, db, &ns, None)?;
+                    Ok(after)
+                }
+                _ => Err(error),
+            },
+        }
     }
     /// Writes or clears the runtime switch record under the Cluster's UID and resourceVersion;
     /// an unknown write is read back.
@@ -732,7 +749,7 @@ impl Reconciler {
             return Err("database deletion is irreversible".into());
         }
         let ns = namespace(db);
-        let ns_current = self.k8s.read("Namespace", None, &ns).await?;
+        let mut ns_current = self.k8s.read("Namespace", None, &ns).await?;
         let fence_name = format!("storage-{}", text(db, "id"));
         let mut fence = self
             .k8s
@@ -829,16 +846,24 @@ impl Reconciler {
             }
         }
         let intent = desired_power(db)?;
+        let finalized = !db["recovery"].is_null()
+            && stored["recoveryMappedOperation"] == db["recovery"]["operation_id"];
+        let context = self.context(db, snapshot, finalized).await?;
         if intent.is_some() {
+            // CNPG creates the woken primary as soon as hibernation is released, and admission
+            // matches the namespace label at that moment, so the runtime is selected first.
+            if let Some(current) = &ns_current {
+                ns_current = Some(
+                    self.runtime_label(db, &context, &current["metadata"]["uid"])
+                        .await?,
+                );
+            }
             match self.power.prepare_running(db).await? {
                 PrepareRunning::Pending => return Ok(Some(observation(db, "provisioning", None))),
                 PrepareRunning::Observation(v) => return Ok(Some(v)),
                 PrepareRunning::Proceed => {}
             }
         }
-        let finalized = !db["recovery"].is_null()
-            && stored["recoveryMappedOperation"] == db["recovery"]["operation_id"];
-        let context = self.context(db, snapshot, finalized).await?;
         if fence.is_none() && !db["storage"].is_null() {
             stored["storage"] = db["storage"].clone();
         }
@@ -1804,6 +1829,53 @@ mod runtime_tests {
             vec![deleted(&f, uid(8), "1"), deleted(&f, uid(9), "1")]
         );
         assert_eq!(switch(&f), format!("1/pool/native-compute-test/{}", uid(9)));
+    }
+    #[tokio::test]
+    async fn a_wake_selects_the_runtime_before_it_releases_hibernation() {
+        let pooled = vector("assigned-sandbox-overhead");
+        let mut f = fixture("standard", None, pooled["ctx"]["computePool"].clone()).await;
+        // The database slept under `standard`; the pool was admitted before its wake.
+        f.db["generation"] = 2.into();
+        f.db["creation"]["ever_ready"] = true.into();
+        f.db["power"] = json!({"operation":format!("op_{}","w".repeat(20)),"revision":2,"mode":"running","reason":null});
+        let stamped = "0123456789abcdef".repeat(4);
+        admission(&f.server, &stamped);
+        f.server.edit("Node", None, text(&f.db, "node"), |node| {
+            node["metadata"]["labels"][PROFILE] = format!("r-{}", &stamped[..40]).into();
+        });
+        f.server
+            .edit("Cluster", Some(&f.ns), "database", |cluster| {
+                cluster["metadata"]["annotations"]["cnpg.io/hibernation"] = "on".into();
+            });
+        let id = text(&f.db, "id").to_string();
+        f.server
+            .edit("ConfigMap", Some(SYSTEM), &format!("storage-{id}"), |map| {
+                map["metadata"]["annotations"][VOLUME] =
+                    json!({"claimUid":uid(11),"volumeUid":uid(12),"handle":"pvc-retained"})
+                        .to_string()
+                        .into();
+            });
+        f.server.put(json!({"apiVersion":"v1","kind":"PersistentVolume","metadata":{"name":"retained-pv","uid":uid(12)},"spec":{"claimRef":{"name":"database-1","namespace":f.ns,"uid":uid(11)},"csi":{"driver":"local.csi.openebs.io","volumeHandle":"pvc-retained"},"storageClassName":"pgcf-lvm"},"status":{"phase":"Bound"}}));
+        f.server.put(json!({"apiVersion":"v1","kind":"PersistentVolumeClaim","metadata":{"name":"database-1","namespace":f.ns,"uid":uid(11)},"spec":{"volumeName":"retained-pv","storageClassName":"pgcf-lvm"},"status":{"phase":"Bound"}}));
+        f.server.put(json!({"apiVersion":"local.openebs.io/v1alpha1","kind":"LVMVolume","metadata":{"name":"pvc-retained","namespace":"openebs","uid":uid(13)}}));
+        assert_eq!(observed(&f).await, "provisioning");
+        let writes = f.server.state.lock().unwrap().writes.clone();
+        let position = |path: String, wanted: &dyn Fn(&Value) -> bool| {
+            writes
+                .iter()
+                .position(|(method, at, body)| method == "PATCH" && *at == path && wanted(body))
+                .unwrap()
+        };
+        let label = position(
+            crate::test_server::path("Namespace", None, &f.ns),
+            &|body| body["metadata"]["labels"][RUNTIME] == "pool",
+        );
+        let wake = position(
+            crate::test_server::path("Cluster", Some(&f.ns), "database"),
+            &|body| body["metadata"]["annotations"]["cnpg.io/hibernation"] == "off",
+        );
+        // Admission matches the namespace label when CNPG creates the woken primary.
+        assert!(label < wake);
     }
     #[tokio::test]
     async fn the_region_pool_follows_the_profile_that_node_bootstrap_stamped() {
