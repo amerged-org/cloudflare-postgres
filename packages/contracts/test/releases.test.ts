@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { expect, it } from "vitest";
+import { ThinStorageProfile } from "../src/database-storage.ts";
+import { thinStorageQualificationFromRun } from "../src/thin-qualification.ts";
+import { thinQualificationFixture } from "./thin-qualification.fixture.ts";
 import {
   FleetReleaseSpec,
   FleetNodeReleaseObservation,
@@ -368,25 +371,48 @@ it("qualified thin releases require a pinned verifier and native gateway while t
     role.talos_extensions.push("pgcf-sandbox-controller");
     role.components.push("native-gateway");
   }
+  // The receipt is the export of a completed qualification run, never typed gate flags.
+  const profile = ThinStorageProfile.parse({
+      version: 1,
+      driver_image: `registry.example/openebs-lvm@sha256:${"d".repeat(64)}`,
+      initial_data_bytes: 1024 ** 3,
+      growth_bytes: 1024 ** 3,
+      maximum_data_bytes: 8 * 1024 ** 3,
+      metadata_bytes: 128 * 1024 ** 2,
+      vg_reserve_bytes: 512 * 1024 ** 2,
+      data_reserve_bytes: 256 * 1024 ** 2,
+      metadata_reserve_bytes: 32 * 1024 ** 2,
+      startup_reserve_bytes: 128 * 1024 ** 2,
+      write_bytes_per_second: 1024 ** 2,
+      write_iops_per_second: 100,
+      guard_seconds: 10,
+      drain_seconds: 10,
+      maximum_volumes: 128,
+      maximum_quota_gib: 7,
+    }),
+    hostImage = `registry.example/pgcf-sandbox-controller@sha256:${"d".repeat(64)}`,
+    completed = thinQualificationFixture(profile, {
+      node_uid: "11111111-2222-4333-8444-555555555555",
+      cluster_uid: "66666666-7777-4888-8999-aaaaaaaaaaaa",
+      host_extension_image: hostImage,
+      kernel_version: "6.18.54",
+      at: "2026-10-09T00:00:00.000Z",
+    });
   const qualified = Object.assign(base, {
     storage_authority_keys_sha256: "a".repeat(64),
-    thin_storage_qualification: {
+    thin_storage_qualification: thinStorageQualificationFromRun({
+      status: "completed",
+      profile,
       profile_sha256: "b".repeat(64),
-      driver_image: `registry.example/openebs-lvm@sha256:${"d".repeat(64)}`,
-      host_extension_image: `registry.example/pgcf-sandbox-controller@sha256:${"d".repeat(64)}`,
+      driver_image: profile.driver_image,
+      host_extension_image: hostImage,
       kernel_version: "6.18.54",
       receipt_sha256: "c".repeat(64),
       qualified_at: "2026-10-09T00:00:00.000Z",
-      gates: {
-        data_full: true,
-        metadata_full: true,
-        noflush_quiescence: true,
-        resume_marker: true,
-        startup_bound: true,
-        trim_delete_recreate: true,
-        retained_thick_preservation: true,
-      },
-    },
+      setup: completed.setup,
+      gates: completed.gates,
+      cleanup: completed.cleanup,
+    }),
   });
   expect(FleetReleaseSpec.safeParse(qualified).success).toBe(true);
   const missingPin = structuredClone(qualified) as Partial<typeof qualified>;

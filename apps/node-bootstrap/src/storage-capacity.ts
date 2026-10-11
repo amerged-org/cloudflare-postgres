@@ -230,11 +230,16 @@ export function storageTrialObjects(
 export function storageDeleteRequest(
   path: string,
   metadata: { uid: string; resourceVersion: string },
+  gracePeriodSeconds?: 0,
 ) {
   if (
-    !/^\/api\/v1\/(?:namespaces|persistentvolumes)\/[a-z0-9-]+(?:\/(?:pods|persistentvolumeclaims)\/[a-z0-9-]+)?$/.test(
+    (!/^\/api\/v1\/(?:namespaces|persistentvolumes)\/[a-z0-9-]+(?:\/(?:pods|persistentvolumeclaims)\/[a-z0-9-]+)?$/.test(
       path,
-    ) ||
+    ) &&
+      // Only thin qualification scratch classes; product storage classes are never deleted.
+      !/^\/apis\/storage\.k8s\.io\/v1\/(?:storageclasses|volumeattributesclasses)\/pgcf-thin-q-[a-z0-9]{20}$/.test(
+        path,
+      )) ||
     !UID.test(metadata.uid) ||
     !/^[0-9]+$/.test(metadata.resourceVersion)
   )
@@ -246,6 +251,7 @@ export function storageDeleteRequest(
       kind: "DeleteOptions",
       preconditions: metadata,
       propagationPolicy: "Foreground",
+      ...(gracePeriodSeconds === undefined ? {} : { gracePeriodSeconds }),
     }),
   };
 }
