@@ -58,8 +58,10 @@ export const thinStorageAuthoritySql = `EXISTS(SELECT 1 FROM nodes n JOIN region
 export async function readThinStorageLeaseRow(env: Env, nodeId: string) {
   const row = await env.DB.prepare(
     `SELECT t.*,n.region_id,n.k8s_node_name,n.provider_instance_id,a.release_id,a.revision assignment_revision,f.revision region_revision,s.spec_json,s.spec_sha256,h.revision host_revision,h.sha256 host_sha256,
-    (SELECT json_extract(p.observed_json,'$.boot_id') FROM fleet_patch_operations p WHERE p.node_id=n.id AND p.node_uid=n.node_uid AND p.release_id=a.release_id AND p.assignment_revision=a.revision AND p.region_revision=f.revision AND p.material_revision=t.material_revision AND p.stage='complete' AND p.state='confirmed' AND p.error_code IS NULL AND p.host_configuration_revision=h.revision AND p.host_configuration_sha256=h.sha256 ORDER BY p.updated_at DESC LIMIT 1) boot_id
-    FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id JOIN fleet_releases s ON s.id=a.release_id LEFT JOIN node_host_configurations h ON h.node_id=n.id AND h.node_uid=n.node_uid AND h.release_id=a.release_id AND h.material_revision=t.material_revision WHERE t.node_id=? AND ${thinStorageAuthoritySql.replaceAll("node_thin_storage.", "t.")}`,
+    json_extract(p.observed_json,'$.boot_id') boot_id,json_extract(p.observed_json,'$.kubernetes_configuration_boot_id') configuration_boot_id
+    FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id JOIN fleet_releases s ON s.id=a.release_id LEFT JOIN node_host_configurations h ON h.node_id=n.id AND h.node_uid=n.node_uid AND h.release_id=a.release_id AND h.material_revision=t.material_revision
+    LEFT JOIN fleet_patch_operations p ON p.operation_id=(SELECT q.operation_id FROM fleet_patch_operations q WHERE q.node_id=n.id AND q.node_uid=n.node_uid AND q.release_id=a.release_id AND q.assignment_revision=a.revision AND q.region_revision=f.revision AND q.material_revision=t.material_revision AND q.stage='complete' AND q.state='confirmed' AND q.error_code IS NULL AND q.host_configuration_revision=h.revision AND q.host_configuration_sha256=h.sha256 ORDER BY q.updated_at DESC LIMIT 1)
+    WHERE t.node_id=? AND ${thinStorageAuthoritySql.replaceAll("node_thin_storage.", "t.")}`,
   )
     .bind(nodeId)
     .first<
@@ -75,6 +77,7 @@ export async function readThinStorageLeaseRow(env: Env, nodeId: string) {
         host_revision: number | null;
         host_sha256: string | null;
         boot_id: string | null;
+        configuration_boot_id: string | null;
       }
     >();
   if (!row) return closed();
@@ -479,6 +482,7 @@ export async function thinStorageInput(
       material_revision: row.material_revision,
       kernel_version: spec.thin_storage_qualification?.kernel_version ?? null,
       boot_id: row.boot_id,
+      configuration_boot_id: row.configuration_boot_id,
       issued_at: row.updated_at,
       expires_at: row.lease_expires_at,
       required_data_free_bytes: requiredHeadroom.data,

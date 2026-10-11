@@ -10,7 +10,10 @@ import {
   reserveThinStorageLease,
   thinStorageCallbackBearer,
   dispatchThinPoolAction,
+  prepareThinStorageLease,
+  thinStorageInput,
 } from "../../src/domain/node-thin-storage-execution.ts";
+import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { createApp } from "../../src/app.ts";
 import {
   createExecutionContext,
@@ -169,4 +172,21 @@ it("the actual D1 lease keeps an uncertain dispatched pool action and invalidate
   expect(
     (await call(await thinStorageCallbackBearer(selected, resumed!))).status,
   ).toBe(200);
+});
+it("the Native lease carries the completed patch's boot and its configuration-boot witness", async () => {
+  const f = await thinExecutionFixture(releases);
+  const input = await prepareThinStorageLease(f.local, f.node);
+  expect(input!.lease.boot_id).toBe(f.qualified.bootId);
+  expect(input!.lease.configuration_boot_id).toBeNull();
+  // A patch that completes on a STATE-loaded boot records the boot its configuration was proved in.
+  const configured = crypto.randomUUID();
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET observed_json=json_set(observed_json,'$.kubernetes_configuration_boot_id',?) WHERE node_id=?",
+  )
+    .bind(configured, f.node)
+    .run();
+  expect((await thinStorageInput(f.local, f.node)).lease).toMatchObject({
+    boot_id: f.qualified.bootId,
+    configuration_boot_id: configured,
+  });
 });

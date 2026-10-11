@@ -916,6 +916,31 @@ export async function verifyThinNode(
   };
 }
 
+/** The lease pins the completed patch's boot. After a STATE-loaded boot Talos lists no persistent
+ * configuration; that patch's proved configuration boot is then the only accepted witness. */
+export async function thinStorageHostConfiguration(
+  input: NodeThinStorageInput,
+  talos: (args: string[]) => Promise<string>,
+) {
+  assertThinStorageHostSettings(input);
+  const lease = input.lease;
+  return (
+    await readHostConfiguration(
+      { talos },
+      input.host_configuration,
+      undefined,
+      false,
+      lease.configuration_boot_id
+        ? {
+            boot_id: lease.boot_id,
+            configuration_boot_id: lease.configuration_boot_id,
+          }
+        : undefined,
+      true,
+    )
+  ).matches;
+}
+
 export async function runThinStorage(
   raw: unknown,
   options: {
@@ -988,19 +1013,8 @@ export async function runThinStorage(
           )
             throw new BootstrapError("thin_storage_lease_changed");
         },
-        async () => {
-          assertThinStorageHostSettings(input);
-          return (
-            await readHostConfiguration(
-              { talos: (args) => session.talos(args) },
-              input.host_configuration,
-              undefined,
-              false,
-              undefined,
-              true,
-            )
-          ).matches;
-        },
+        () =>
+          thinStorageHostConfiguration(input, (args) => session.talos(args)),
       );
       let facts = await readLvm();
       if (facts.vg_uuid !== lease.volume_group_uuid)
