@@ -2969,7 +2969,7 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
 
   private async retained(): Promise<ThinQualificationReport> {
     const baseline = this.setup.thick;
-    // Retained databases may still be recovering from the qualification reboot.
+    // A retained database that is waking up or falling asleep differs only briefly.
     const attempt = this.journal.keys(
       "retained_thick_preservation:after-",
     ).length;

@@ -361,6 +361,11 @@ scratch object, LV, the pool and a pool metadata spare that did not exist before
 The run never reboots the node. The six live checks verify pool and thin volume activation after a
 boot at the next reboot a fleet patch orchestrates: the R2b `talos_reboot` or `host_service` stage.
 
+Suspend the node's databases (`POST /v1/databases/{id}/suspend`) before the start and resume them
+once the run is terminal. Until then, create, restore or delete no database in the node's region.
+`retained_thick_preservation` and cleanup compare the retained thick volumes, claims and CNPG
+clusters with the setup baseline, so such a change fails the run.
+
 | Gate | What the run does | Pass criterion (computed by code) |
 | --- | --- | --- |
 | `data_full` | Commits a marker and acknowledged inserts, fills the pool with direct writes, probes an unmapped thin LV, grows the pool with the product `lvextend`, restarts PostgreSQL on the same PVC | Pool `out_of_data_space` with `error_if_no_space` at 100%; fill and probe end with ENOSPC/EIO, the probe within `drain_seconds`; same pool and LV UUIDs; `rw` after growth to `min(maximum, initial + growth)`; marker and every acknowledged commit present after crash recovery |
