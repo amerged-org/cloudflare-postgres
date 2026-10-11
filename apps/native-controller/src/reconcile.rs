@@ -16,7 +16,7 @@ use base64::{
 };
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 use std::{
     net::IpAddr,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -1300,19 +1300,17 @@ impl Reconciler {
         }
         Ok(context)
     }
-    /// The region pool applies to a database only once node-bootstrap has admitted the current
-    /// profile on this cluster: RuntimeClass, MutatingAdmissionPolicy, its binding and the label
-    /// of the database node. Until then the Pod keeps the standard runtime, so a region switch
-    /// that precedes admission can never strand a restarted primary without its RuntimeClass.
+    /// The region pool applies to a database only once node-bootstrap has admitted a compute
+    /// profile on this cluster: RuntimeClass, MutatingAdmissionPolicy and its binding stamped with
+    /// one profile hash, and the database node labelled for it. node-bootstrap stamps the node
+    /// policy profile of the release it applies, which rollouts advance without the region
+    /// template, so the template only switches the pool on. Until admission, the Pod keeps the
+    /// standard runtime, so a region switch that precedes it can never strand a recreated primary
+    /// without its RuntimeClass.
     async fn admitted_pool(&self, db: &Value, pool: &Value) -> Result<Value, Error> {
         if pool.is_null() {
             return Ok(Value::Null);
         }
-        let profile: String = Sha256::digest(serde_json::to_vec(&pool["profile"])?)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect();
-        let selector = format!("r-{}", &profile[..40]);
         let (class, policy, binding, node) = tokio::try_join!(
             self.k8s.read("RuntimeClass", None, PRESTARTED),
             self.k8s.read("MutatingAdmissionPolicy", None, ADMISSION),
@@ -1320,13 +1318,27 @@ impl Reconciler {
                 .read("MutatingAdmissionPolicyBinding", None, ADMISSION),
             self.k8s.read("Node", None, text(db, "node"))
         )?;
+        let profile = class.as_ref().map_or("", |class| {
+            text(
+                &class["metadata"]["annotations"],
+                "pgcf.io/compute-profile-sha256",
+            )
+        });
+        if profile.len() != 64
+            || !profile
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Ok(Value::Null);
+        }
+        let selector = format!("r-{}", &profile[..40]);
         let current = |object: &Option<Value>| {
             object.as_ref().is_some_and(|value| {
                 let metadata = &value["metadata"];
                 metadata["deletionTimestamp"].is_null()
                     && metadata["labels"]["pgcf.io/managed-by"] == "node-bootstrap"
                     && metadata["annotations"]["pgcf.io/runtime-admission"] == "1"
-                    && metadata["annotations"]["pgcf.io/compute-profile-sha256"] == profile.as_str()
+                    && metadata["annotations"]["pgcf.io/compute-profile-sha256"] == profile
             })
         };
         let admitted = current(&class)
@@ -1710,7 +1722,7 @@ mod runtime_tests {
                 .clone()
         };
         let node = text(&f.db, "node").to_string();
-        // TypeScript canonical profile hash of the vector pool; node-bootstrap stamps it.
+        // A profile hash that node-bootstrap stamps on the admission objects and the node.
         let current = "4f36e3c1ff2eade6a35e642c8206ac7852caab47d06f0fd8aaae71ed11dd96b4";
         let label = |f: &Fixture, value: Option<String>| {
             f.server.edit("Node", None, &node, |n| {
@@ -1743,5 +1755,33 @@ mod runtime_tests {
         assert_eq!(switch(&f), format!("1/pool/native-compute-test/{}", uid(8)));
         assert_eq!(deletes(&f), vec![deleted(&f, uid(8), "1")]);
         assert_eq!(quota(&f), pooled["manifests"][1]["spec"]["hard"]);
+    }
+    #[tokio::test]
+    async fn the_region_pool_follows_the_profile_that_node_bootstrap_stamped() {
+        // A rollout restamps admission with its release's node policy profile, while the region
+        // template that switches the pool on still names the previous release.
+        let pooled = vector("assigned-sandbox-overhead");
+        let f = fixture("standard", None, pooled["ctx"]["computePool"].clone()).await;
+        let stamped = "0123456789abcdef".repeat(4);
+        f.server.edit("Node", None, text(&f.db, "node"), |node| {
+            node["metadata"]["labels"][PROFILE] = format!("r-{}", &stamped[..40]).into();
+        });
+        admission(&f.server, &stamped);
+        f.server.edit(
+            "MutatingAdmissionPolicyBinding",
+            None,
+            ADMISSION,
+            |binding| {
+                binding["metadata"]["annotations"]["pgcf.io/compute-profile-sha256"] =
+                    "f".repeat(64).into();
+            },
+        );
+        assert_eq!(observed(&f).await, "provisioning");
+        assert_eq!(runtime(&f), "standard");
+        assert!(deletes(&f).is_empty());
+        admission(&f.server, &stamped);
+        assert_eq!(observed(&f).await, "provisioning");
+        assert_eq!(runtime(&f), "pool");
+        assert_eq!(deletes(&f), vec![deleted(&f, uid(8), "1")]);
     }
 }
