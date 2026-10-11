@@ -18,6 +18,7 @@ No mocks, stubs or hardcoded data in product code; acceptance only from real Dev
 Test the logic you write; write the failing test first for bug fixes; no test matrices; one CI workflow.
 At native CLI boundaries, materialize filename-flag payloads as real 0600 files in 0700 temporary directories and clean them up; never reopen stdin through /dev/stdin or /proc/self/fd, or assume Talos accepts --file=-. Preserve explicitly supported kubectl --filename=- direct-stream input. Never log payload contents.
 Record completed steps and measured numbers in the ULTRA plan linked by PLAN.md; no per-change evidence documents.
+Never give effort or duration estimates (weeks, days, hours or any other unit) for planned work, in plans, designs, reports or replies.
 Repository documentation is written in English; discussion with the owner may be in German.
 Docs live in PLAN.md, README.md, THIRD_PARTY.md, infra READMEs, docs/operations runbooks and docs/architecture proposals.
 Approved runtime target: native Rust for the regional gateway, controller, bootstrap relay and node reclaimer; Rust/Wasm for the Edge Worker.
