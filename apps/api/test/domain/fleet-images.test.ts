@@ -122,6 +122,8 @@ async function fixture() {
     )
     .run();
   return {
+    id,
+    spec,
     manifest,
     manifestHash,
     config,
@@ -186,6 +188,60 @@ it("serves approved OCI bytes and raw GET/HEAD anonymously with original media t
   expect(new Uint8Array(await range.arrayBuffer())).toEqual(f.raw.slice(3, 10));
 });
 
+it("authorizes a shared blob through its approved manifest when the first metadata owner was abandoned", async () => {
+  const f = await fixture(),
+    abandoned = new TextEncoder().encode(
+      JSON.stringify({
+        ...JSON.parse(new TextDecoder().decode(f.manifest)),
+        annotations: { abandoned: "true" },
+      }),
+    ),
+    abandonedHash = await hash(abandoned),
+    path = `/v2/pgcf-talos-installer/blobs/sha256:${f.configHash}`;
+  await f.put(abandonedHash, abandoned, "manifest", manifestType);
+  await f.put(f.configHash, f.config, "blob", configType, abandonedHash);
+  const accepted = await call(path);
+  expect(accepted.status).toBe(200);
+  expect(accepted.headers.get("Content-Type")).toBe(configType);
+  expect(await hash(new Uint8Array(await accepted.arrayBuffer()))).toBe(
+    f.configHash,
+  );
+  expect((await call(path, "HEAD")).status).toBe(200);
+
+  await f.put(
+    f.configHash,
+    new Uint8Array(f.config.byteLength + 1),
+    "blob",
+    configType,
+    abandonedHash,
+  );
+  expect((await call(path)).status).toBe(404);
+  await f.put(f.configHash, f.config, "blob", layerType, abandonedHash);
+  expect((await call(path)).status).toBe(404);
+  await f.put(f.configHash, f.config, "blob", configType, abandonedHash);
+  await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
+    .bind(f.id)
+    .run();
+  expect((await call(path)).status).toBe(404);
+  const unrelated = await fixture();
+  expect(unrelated.manifestHash).not.toBe(f.manifestHash);
+  expect((await call(path)).status).toBe(404);
+  const foreignId = "foreign-host-" + crypto.randomUUID();
+  releases.push(foreignId);
+  f.spec.roles.customer.talos_installer = `api.invalid.evil/pgcf-talos-installer@sha256:${f.manifestHash}`;
+  await env.DB.prepare(
+    "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+  )
+    .bind(
+      foreignId,
+      JSON.stringify(f.spec),
+      "b".repeat(64),
+      new Date().toISOString(),
+    )
+    .run();
+  expect((await call(path)).status).toBe(404);
+});
+
 it("never exposes tenant keys, tags, writes, unapproved hashes or incorrect manifest/child identities", async () => {
   const f = await fixture();
   const tenant = `eu-private/customer-${crypto.randomUUID()}/credentials`;
@@ -209,7 +265,7 @@ it("never exposes tenant keys, tags, writes, unapproved hashes or incorrect mani
   expect((await call(`/v2/other/blobs/sha256:${f.configHash}`)).status).toBe(
     404,
   );
-  await f.put(f.configHash, f.config, "blob", configType, "f".repeat(64));
+  await f.put(f.configHash, f.config, "blob", layerType, "f".repeat(64));
   expect(
     (await call(`/v2/pgcf-talos-installer/blobs/sha256:${f.configHash}`))
       .status,

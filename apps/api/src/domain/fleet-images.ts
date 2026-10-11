@@ -125,6 +125,39 @@ async function manifest(c: ApiContext, hash: string) {
   if (layers.some((value) => value === null)) return null;
   return { bytes, object, descriptors: [config, ...(layers as Descriptor[])] };
 }
+async function approvedBlob(
+  c: ApiContext,
+  digest: string,
+  object: R2Object,
+): Promise<Descriptor | undefined> {
+  const parent = object.customMetadata?.manifest_sha256;
+  if (!parent || !HASH.test(parent)) return undefined;
+  const matching = async (hash: string) =>
+    (await manifest(c, hash))?.descriptors.find(
+      (entry) =>
+        entry.digest === digest &&
+        entry.size === object.size &&
+        entry.mediaType === object.httpMetadata?.contentType,
+    );
+  const owner = await matching(parent);
+  if (owner) return owner;
+  const prefix = `${new URL(c.req.url).host}/pgcf-talos-installer@sha256:`;
+  // Current phase: inspect at most 32 newest distinct approved manifests; old owners retain the fast path.
+  const candidates = await c.env.DB.prepare(
+    `SELECT json_extract(role.value,'$.talos_installer') reference FROM fleet_releases r,json_each(r.spec_json,'$.roles') role
+     WHERE r.approved_at IS NOT NULL AND substr(json_extract(role.value,'$.talos_installer'),1,?)=?
+     GROUP BY reference ORDER BY max(r.approved_at) DESC,reference LIMIT 32`,
+  )
+    .bind(prefix.length, prefix)
+    .all<{ reference: string }>();
+  for (const { reference } of candidates.results) {
+    const hash = reference.slice(prefix.length);
+    if (hash === parent || !HASH.test(hash)) continue;
+    const entry = await matching(hash);
+    if (entry) return entry;
+  }
+  return undefined;
+}
 
 /** Public image bytes only: fixed bucket/prefix, immutable digests and approved release references. */
 export async function serveFleetImage(
@@ -151,16 +184,8 @@ export async function serveFleetImage(
   if (!object || !metadata(object, hash, kind)) return missing();
   let contentType: string;
   if (kind === "blob") {
-    const parent = object.customMetadata?.manifest_sha256;
-    if (!parent || !HASH.test(parent)) return missing();
-    const owner = await manifest(c, parent);
-    const entry = owner?.descriptors.find((value) => value.digest === digest);
-    if (
-      !entry ||
-      entry.size !== object.size ||
-      entry.mediaType !== object.httpMetadata?.contentType
-    )
-      return missing();
+    const entry = await approvedBlob(c, digest, object);
+    if (!entry) return missing();
     contentType = entry.mediaType;
   } else {
     const approved = await c.env.DB.prepare(
