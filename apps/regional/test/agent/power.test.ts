@@ -443,6 +443,55 @@ test("missing replicas and a pending replica with no address cannot produce a qu
   );
 });
 
+test("a starting gateway Pod without an address is retried rather than reported for recovery", async () => {
+  const state = await readyFixture(),
+    target = suspended(state.db);
+  let probes = 0;
+  const probe = async () => {
+    probes++;
+    return { safe: false as const, reason: "sql_busy" as const };
+  };
+  // The kubelet publishes a waiting container status before the Pod sandbox has an address.
+  const starting = state.k8s.put({
+    apiVersion: "v1",
+    kind: "Pod",
+    metadata: {
+      name: "gateway-starting",
+      namespace: "pgcf-system",
+      labels: { "app.kubernetes.io/name": "pgcf-gateway" },
+    },
+    spec: { serviceAccountName: "pgcf-gateway" },
+    status: {
+      phase: "Pending",
+      containerStatuses: [
+        {
+          name: "gateway",
+          restartCount: 0,
+          state: { waiting: { reason: "ContainerCreating" } },
+        },
+      ],
+    },
+  });
+  assert.equal(await reconciler(state).reconcile(state.db, state.ctx), null);
+  await assert.rejects(
+    new PowerCoordinator({
+      k8s: state.k8s,
+      signal: state.signal,
+      region: "eu-test",
+      replicas: 2,
+    }).gatewaySnapshot(state.signal),
+    /gateway_private_address_unavailable/,
+  );
+  assert.equal(await reconciler(state, { probe }).reconcile(target), null);
+  assert.equal(probes, 0);
+  record(starting.status).podIP = "10.20.0.3";
+  assert.equal(
+    (await reconciler(state, { probe }).reconcile(target))?.power?.refusal,
+    "busy",
+  );
+  assert.equal(probes, 1);
+});
+
 test("terminal gateway Pods left by node shutdown neither block nor receive power controls", async () => {
   const state = await readyFixture(),
     target = suspended(state.db),

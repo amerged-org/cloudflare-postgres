@@ -251,7 +251,8 @@ function owned(
   return resource;
 }
 function privateIp(value: unknown): string {
-  const ip = required(value);
+  // A starting Pod has no address yet; like any nonprivate address, that is retried, not recovery.
+  const ip = typeof value === "string" ? value : "";
   if (isIP(ip) === 4) {
     const [a, b] = ip.split(".").map(Number);
     if (
