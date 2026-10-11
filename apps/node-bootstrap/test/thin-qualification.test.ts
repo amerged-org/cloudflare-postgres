@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import test from "node:test";
+import test, { describe } from "node:test";
 import { randomUUID } from "node:crypto";
 import type { ThinQualificationJournalEntry } from "@pgcf/contracts/thin-qualification";
 import {
@@ -521,59 +521,242 @@ function scratchMeasured(run: ReturnType<typeof thinQualificationRun>) {
   run.confirm("metadata_full:scratch-remove", { removed: true });
 }
 
-test("metadata_full grows and fills the profile pool without rebooting the node outside a fleet patch", async () => {
-  const run = thinQualificationRun("metadata_full");
-  scratchMeasured(run);
-  const kept = run.workload("data_full", "pg-a", "Pa");
-  run.world.lv("pgcf_thinpool")!.size = 2 * GIB;
-  assert.deepEqual(await run.turn(), { kind: "report" });
-  // pg-a stops, but its CSI volume keeps the pool from being removed by the driver.
-  assert.ok(!run.world.pods.has("pg-a"));
-  assert.ok(run.world.lv(kept.pv_name));
-  assert.deepEqual(
-    run.world.log.filter((line) => line.startsWith("talosctl")),
-    [],
-  );
-  assert.equal(run.entry("metadata_full:reboot"), undefined);
-  const report = run.calls[0]!.report as {
-    evidence: Record<string, { pool_uuid: string; data_bytes: number }>;
-  };
-  assert.deepEqual(Object.keys(report.evidence).sort(), ["maximum", "scratch"]);
-  assert.equal(report.evidence.maximum!.pool_uuid, run.setup.pool.pool_uuid);
-  assert.equal(report.evidence.maximum!.data_bytes, profile.maximum_data_bytes);
-});
-
-test("trim releases data_full's kept volume first, so only the sentinel is the pool's last thin LV", async () => {
-  const run = thinQualificationRun("trim_delete_recreate");
-  run.world.lv("pgcf_thinpool")!.size = profile.maximum_data_bytes;
-  const kept = run.workload("data_full", "pg-a", "Pa", { pod: false });
-  const sentinel = run.workload("trim_delete_recreate", "sentinel", "Sn", {
-    size: 64 * MIB,
-  });
-  run.workload("trim_delete_recreate", "trim", "Tr", { size: 256 * MIB });
-  run.confirm("trim_delete_recreate:baseline", { used: 16 });
-  run.confirm("trim_delete_recreate:write", {
-    bytes: 256 * MIB,
-    used: 16 + 4096,
-  });
-  assert.deepEqual(await run.turn(), { kind: "report" });
-  assert.deepEqual(
-    run.world.log
-      .filter((line) => line.includes("/persistentvolumeclaims/"))
-      .map((line) => line.split("/").at(-1)),
-    ["trim", "pg-a", "sentinel", "trim-again"],
-  );
-  assert.ok(!run.world.lvs.some((lv) => lv.name === kept.pv_name));
-  const evidence = (
-    run.calls[0]!.report as {
-      evidence: {
-        last_lv_uuid: string;
-        pool_present_after_last: boolean;
-        reinitialized_pool_uuid: string | null;
+// Each turn owns its world and journal; scratch releases poll every 2 s, so turns run concurrently.
+describe(
+  "executor turns resume from the Cloudflare journal",
+  { concurrency: true },
+  () => {
+    test("metadata_full grows and fills the profile pool without rebooting the node outside a fleet patch", async () => {
+      const run = thinQualificationRun("metadata_full");
+      scratchMeasured(run);
+      const kept = run.workload("data_full", "pg-a", "Pa");
+      run.world.lv("pgcf_thinpool")!.size = 2 * GIB;
+      assert.deepEqual(await run.turn(), { kind: "report" });
+      // pg-a stops, but its CSI volume keeps the pool from being removed by the driver.
+      assert.ok(!run.world.pods.has("pg-a"));
+      assert.ok(run.world.lv(kept.pv_name));
+      assert.deepEqual(
+        run.world.log.filter((line) => line.startsWith("talosctl")),
+        [],
+      );
+      assert.equal(run.entry("metadata_full:reboot"), undefined);
+      const report = run.calls[0]!.report as {
+        evidence: Record<string, { pool_uuid: string; data_bytes: number }>;
       };
-    }
-  ).evidence;
-  assert.equal(evidence.last_lv_uuid, sentinel.lv_uuid);
-  assert.equal(evidence.pool_present_after_last, false);
-  assert.equal(evidence.reinitialized_pool_uuid, lvm("Np"));
-});
+      assert.deepEqual(Object.keys(report.evidence).sort(), [
+        "maximum",
+        "scratch",
+      ]);
+      assert.equal(
+        report.evidence.maximum!.pool_uuid,
+        run.setup.pool.pool_uuid,
+      );
+      assert.equal(
+        report.evidence.maximum!.data_bytes,
+        profile.maximum_data_bytes,
+      );
+    });
+
+    test("trim releases data_full's kept volume first, so only the sentinel is the pool's last thin LV", async () => {
+      const run = thinQualificationRun("trim_delete_recreate");
+      run.world.lv("pgcf_thinpool")!.size = profile.maximum_data_bytes;
+      const kept = run.workload("data_full", "pg-a", "Pa", { pod: false });
+      const sentinel = run.workload("trim_delete_recreate", "sentinel", "Sn", {
+        size: 64 * MIB,
+      });
+      run.workload("trim_delete_recreate", "trim", "Tr", { size: 256 * MIB });
+      run.confirm("trim_delete_recreate:baseline", { used: 16 });
+      run.confirm("trim_delete_recreate:write", {
+        bytes: 256 * MIB,
+        used: 16 + 4096,
+      });
+      assert.deepEqual(await run.turn(), { kind: "report" });
+      assert.deepEqual(
+        run.world.log
+          .filter((line) => line.includes("/persistentvolumeclaims/"))
+          .map((line) => line.split("/").at(-1)),
+        ["trim", "pg-a", "sentinel", "trim-again"],
+      );
+      assert.ok(!run.world.lvs.some((lv) => lv.name === kept.pv_name));
+      const evidence = (
+        run.calls[0]!.report as {
+          evidence: {
+            last_lv_uuid: string;
+            pool_present_after_last: boolean;
+            reinitialized_pool_uuid: string | null;
+          };
+        }
+      ).evidence;
+      assert.equal(evidence.last_lv_uuid, sentinel.lv_uuid);
+      assert.equal(evidence.pool_present_after_last, false);
+      assert.equal(evidence.reinitialized_pool_uuid, lvm("Np"));
+    });
+
+    test("a resumed noflush turn continues from its journal after the run stopped the writer Pod", async () => {
+      const run = thinQualificationRun("noflush_quiescence");
+      run.workload("data_full", "pg-a", "Pa", { pod: false });
+      run.released("noflush_quiescence", "writer", "Wr");
+      for (const [key, facts] of Object.entries({
+        "writer-pod": { uid: randomUUID() },
+        "writer-start": { started: true },
+        dirty: { bytes: 41_943_040 },
+        suspend: { exit_code: 0, milliseconds: 30 },
+        frozen: {
+          state: "SUSPENDED",
+          lv_state: "s",
+          write_sectors_first: 1_204_224,
+          write_sectors_second: 1_204_224,
+          used_first: 2_100,
+          used_second: 2_100,
+          observed_milliseconds: 3_000,
+        },
+        resume: {
+          resume_exit_code: 0,
+          resume_milliseconds: 20,
+          sync_ok: true,
+          drain_milliseconds: 9_000,
+          used_after: 2_740,
+        },
+        "writer-stop": { stopped: true },
+        fsck: { exit_code: 0 },
+      }))
+        run.confirm(`noflush_quiescence:${key}`, facts);
+      const fill = run.workload("noflush_quiescence", "fill-full", "Ff", {
+        size: 2 * profile.maximum_data_bytes,
+      });
+      assert.deepEqual(await run.turn(), { kind: "report" });
+      const lv = run.world.lvs.find((value) => value.uuid === fill.lv_uuid);
+      assert.equal(lv, undefined);
+      assert.ok(run.world.log.includes("exec fill-full /bin/bash"));
+      const evidence = (
+        run.calls[0]!.report as {
+          evidence: { writer: { lv_uuid: string }; full: { state: string } };
+        }
+      ).evidence;
+      assert.equal(
+        evidence.writer.lv_uuid,
+        run.entry("noflush_quiescence:writer:volume")!.facts!.lv_uuid,
+      );
+      assert.equal(evidence.full.state, "SUSPENDED");
+    });
+
+    test("a resumed data_full turn accepts PostgreSQL crashed on the full pool and replaces its Pod", async () => {
+      const run = thinQualificationRun("data_full");
+      const pool = run.world.lv("pgcf_thinpool")!;
+      run.confirm("data_full:pool", {
+        data_bytes: profile.initial_data_bytes,
+        device: `253:${pool.minor}`,
+      });
+      const pg = run.workload("data_full", "pg-a", "Pa");
+      run.world.pods.get("pg-a")!.phase = "Failed";
+      run.confirm("data_full:marker", { rows: ["1"] });
+      run.confirm("data_full:pre", { first: 2, last: 65, count: 64 });
+      const fill = run.workload("data_full", "fill", "Fl", {
+        size: 2 * profile.maximum_data_bytes,
+      });
+      const probe = run.world.addLv({
+        name: `pgcf_thin_q_${run.ids.id.slice(3)}_p`,
+        uuid: lvm("Pr"),
+        segtype: "thin",
+        pool: "pgcf_thinpool",
+        size: 64 * MIB,
+        tags: [run.world.tag],
+      });
+      run.confirm("data_full:probe-volume", {
+        lv_uuid: probe.uuid,
+        minor: probe.minor,
+      });
+      run.confirm("data_full:fill", {
+        exit_code: 1,
+        error: "enospc",
+        written_bytes: profile.initial_data_bytes - 64 * MIB,
+        milliseconds: 21_400,
+      });
+      run.confirm("data_full:full", {
+        status: {
+          mode: "out_of_data_space",
+          used_data_blocks: 16_384,
+          total_data_blocks: 16_384,
+          used_metadata_blocks: 1180,
+          total_metadata_blocks: 32_768,
+          error_if_no_space: true,
+          needs_check: false,
+        },
+      });
+      run.confirm("data_full:probe", {
+        exit_code: 1,
+        error: "enospc",
+        written_bytes: 0,
+        milliseconds: 20,
+      });
+      run.world.poolMode = "out_of_data_space";
+      assert.deepEqual(await run.turn(), { kind: "report" });
+      // The crashed Pod acknowledges nothing more; crash recovery keeps every earlier commit.
+      assert.deepEqual(run.entry("data_full:post")!.facts, {
+        first: null,
+        last: null,
+        count: 0,
+      });
+      assert.notEqual(
+        run.world.pods.get("pg-a")!.uid,
+        run.entry("data_full:pg-a:pod")!.facts!.uid,
+      );
+      const evidence = (
+        run.calls[0]!.report as {
+          evidence: {
+            volumes_after: string[];
+            acknowledged_commits: number;
+            acknowledged_present: number;
+            marker_present: boolean;
+          };
+        }
+      ).evidence;
+      assert.deepEqual(
+        [...evidence.volumes_after].sort(),
+        [pg.lv_uuid, fill.lv_uuid, probe.uuid].sort(),
+      );
+      assert.equal(evidence.acknowledged_commits, 64);
+      assert.equal(evidence.acknowledged_present, 64);
+      assert.equal(evidence.marker_present, true);
+    });
+
+    test("a resumed resume_marker turn resumes the exact LV after the run killed its Pod", async () => {
+      const run = thinQualificationRun("resume_marker");
+      run.workload("data_full", "pg-a", "Pa", { pod: false });
+      const volume = run.workload("resume_marker", "pg-r", "Rm", {
+        pod: false,
+      });
+      const lv = run.world.lvs.find((value) => value.uuid === volume.lv_uuid)!;
+      lv.state = "s";
+      const pool = run.world.lv("pgcf_thinpool")!;
+      run.confirm("resume_marker:marker", { rows: ["1"] });
+      run.confirm("resume_marker:pool", {
+        pool_uuid: pool.uuid,
+        device: `253:${pool.minor}`,
+      });
+      run.confirm("resume_marker:long", { active: true });
+      run.confirm("resume_marker:suspend", {
+        exit_code: 0,
+        state: "SUSPENDED",
+      });
+      run.confirm("resume_marker:kill", { killed: true });
+      assert.deepEqual(await run.turn(), { kind: "report" });
+      assert.ok(run.world.log.includes(`dmsetup resume ${run.world.dm(lv)}`));
+      const evidence = (
+        run.calls[0]!.report as {
+          evidence: {
+            lv_uuid_before: string;
+            lv_uuid_after: string;
+            resume_target_verified: boolean;
+            marker_present: boolean;
+            uncommitted_rows: number;
+          };
+        }
+      ).evidence;
+      assert.equal(evidence.lv_uuid_after, evidence.lv_uuid_before);
+      assert.equal(evidence.resume_target_verified, true);
+      assert.equal(evidence.marker_present, true);
+      assert.equal(evidence.uncommitted_rows, 0);
+    });
+  },
+);

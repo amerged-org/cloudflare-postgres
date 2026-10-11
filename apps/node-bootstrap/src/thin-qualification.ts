@@ -1032,14 +1032,22 @@ exec postgres -D "$PGDATA" -k /run/q -c listen_addresses= -c shared_buffers=32MB
       },
     };
   }
-  /** One scratch PVC on the identical profile class and one bound Pod on this node. */
+  /**
+   * One scratch PVC on the identical profile class and one bound Pod on this node. Once the
+   * `stopping` key is journaled the run itself may have stopped, crashed or replaced the Pod,
+   * so a resumed turn keeps the journaled volume and never re-checks that Pod.
+   */
   private async workload(
     step: string,
     name: string,
     kind: PodKind,
     size: number,
     attributes: boolean,
+    stopping = `${step}:${name}:release`,
   ) {
+    const volume = this.journal.entry(`${step}:${name}:volume`);
+    if (volume?.state === "confirmed" && this.journal.entry(stopping))
+      return volume.facts as VolumeFacts;
     await this.create(
       `${step}:${name}:claim`,
       "persistentvolumeclaim",
@@ -1658,14 +1666,17 @@ printf 'pgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$rc" "$start" "$end"`,
       const pool = await this.requirePool(poolUuid);
       return { data_bytes: pool.volume.size_bytes, device: pool.device };
     });
+    // PostgreSQL may crash once the fill exhausts the pool; it is replaced on the same PVC.
     const pg = await this.workload(
       "data_full",
       "pg-a",
       "postgres",
       quota,
       true,
+      "data_full:fill",
     );
-    await this.postgresReady("pg-a");
+    if (!this.journal.entry("data_full:marker"))
+      await this.postgresReady("pg-a");
     const marker = await this.journal.measure("data_full:marker", async () => ({
       rows: await this.sql("pg-a", [
         "CREATE TABLE IF NOT EXISTS q(id bigserial PRIMARY KEY, v text NOT NULL)",
@@ -2275,6 +2286,7 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
       "sleep",
       quota,
       true,
+      "noflush_quiescence:writer-stop",
     );
     const writerPod = await this.journal.observe(
       "noflush_quiescence:writer-pod",
@@ -2476,8 +2488,10 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
       "postgres",
       quota,
       true,
+      "resume_marker:kill",
     );
-    await this.postgresReady("pg-r");
+    if (!this.journal.entry("resume_marker:marker"))
+      await this.postgresReady("pg-r");
     const marker = await this.journal.measure(
       "resume_marker:marker",
       async () => ({

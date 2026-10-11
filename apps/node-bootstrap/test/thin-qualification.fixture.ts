@@ -65,6 +65,7 @@ interface Pod {
   uid: string;
   rv: number;
   created: string;
+  phase: "Running" | "Failed";
 }
 interface Claim {
   name: string;
@@ -308,7 +309,7 @@ export class ThinWorld {
         annotations: this.annotations(),
       },
       spec: { nodeName: this.ids.name },
-      status: { phase: "Running" },
+      status: { phase: pod.phase },
     };
   }
   private claimObject(claim: Claim) {
@@ -433,6 +434,7 @@ export class ThinWorld {
       uid: randomUUID(),
       rv: this.nextVersion(),
       created: new Date().toISOString(),
+      phase: "Running" as const,
     };
     this.pods.set(name, pod);
     // WaitForFirstConsumer: the first Pod binds its claim to a new thin LV in the pool.
@@ -555,7 +557,9 @@ export class ThinWorld {
       command = args.slice(args.indexOf("--") + 1);
     if (namespace === "openebs") return this.driverCommand(command);
     this.log.push(`exec ${pod} ${command[0]}`);
-    if (!this.pods.has(pod)) return { exit_code: 1, stdout: "" };
+    // kubectl cannot exec into a missing or completed Pod.
+    if (this.pods.get(pod)?.phase !== "Running")
+      return { exit_code: 1, stdout: "" };
     if (command[0] === "pg_isready") return ok("");
     if (command[0] === "psql")
       return ok(
@@ -670,6 +674,7 @@ export class ThinWorld {
         this.lv(POOL)!.size = Number(
           rest[rest.indexOf("--size") + 1]!.slice(0, -1),
         );
+        this.poolMode = "rw";
         return ok("");
       }
       case "sh": {
@@ -962,6 +967,7 @@ export function thinQualificationRun(
           uid: podUid,
           rv: world.nextVersion(),
           created: new Date().toISOString(),
+          phase: "Running",
         });
       const facts = {
         claim_uid: claim,
