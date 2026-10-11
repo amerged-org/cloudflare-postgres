@@ -9,31 +9,31 @@
   "files": [
     {
       "path": "docs/architecture/mermaider/add-node.md",
-      "sha256": "64df57d7d4e5d8a85f87414c3e51e187eeaefdc47eba56814bc7b3fe13f8c469"
+      "sha256": "52164dbcf43393d520e2a013d8099aabe803d76f3bcb4328df758c6ec388b236"
     },
     {
       "path": "docs/architecture/mermaider/add-node.mmd",
-      "sha256": "1af2dbc81bf9bc77d59fc5d0276526f2769d83c7bc1390607261944fec8788a7"
+      "sha256": "33ce0d5cb44747a521a0835384da168b4412b15ed8e0e2278dddeb43df703750"
     },
     {
       "path": "docs/architecture/mermaider/api-resources.md",
-      "sha256": "27b81b97182809a015dba77e452b0cae174491761137bf4b5472a30c4222bdf9"
+      "sha256": "393876f5b4123088136a0b12b01e1f6c773de7cb9745150c5b483062ae47f19f"
     },
     {
       "path": "docs/architecture/mermaider/api-resources.mmd",
-      "sha256": "caec1d791813f01abb875a67b6b56571fc3185c714b326c51b733f5bcf324b64"
+      "sha256": "33fa151dc6e32c6c88f19e7d669a23fe0b52368f7f4ff268f2080e9d9933aac7"
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.md",
-      "sha256": "8fefb3cd341b9954262b4687f9e0040d75cb166da6b68cfe28361ec23e32a2b0"
+      "sha256": "d28e2967e0500146e9e45c05e6aff99f0973e106e0ddd79668e9e937bedfcbe6"
     },
     {
       "path": "docs/architecture/mermaider/ci-pipeline.mmd",
-      "sha256": "cf1f11310fd7254de5caab6e462fdbaa4967fe7d5deb0cecf388a06838e938f5"
+      "sha256": "01957995b5dd5c88ec10b5d02e64a3cd193bfb58f89e0c69e629e5d62a3d9c6c"
     },
     {
       "path": "docs/architecture/mermaider/d1-core.md",
-      "sha256": "313ff45297804cfd085ef3d684314c3374cf0ceab707bdc5b673e78bc64e0a10"
+      "sha256": "1539aba7ea8ddb4a396e0ba24b01013bfaa4f500e4a84a12adacbe61b4d7542a"
     },
     {
       "path": "docs/architecture/mermaider/d1-core.mmd",
@@ -41,18 +41,18 @@
     },
     {
       "path": "docs/architecture/mermaider/edge-resources.md",
-      "sha256": "3cd2ca4e1dc609c3928d8de4f7396cea864afe15a5176097229ac9df8a1eb874"
+      "sha256": "31b437ec67e2c3e49321a89081011824f46eb42d127d089cb15e50ab111fea8c"
     },
     {
       "path": "docs/architecture/mermaider/edge-resources.mmd",
-      "sha256": "90ccae903c2523013322f53559721b4a8c568b4df0984daef28a30763c9c2cea"
+      "sha256": "964ed9eb1b351e10e317c187d1ec5e1fc2e8711610bd36e066cf898899a68c2d"
     },
     {
       "path": "docs/architecture/mermaider/index.html",
-      "sha256": "3044253f8c6629640117a0611586bb88062e27c5f12ab6d613a3a895ca3457ee"
+      "sha256": "f7ff63a22f1f18a449fe954ed95b7881df11c22f3358b1e0c0c13e9bab1edd34"
     }
   ],
-  "fingerprint": "ece6dd4c73a06e6d0441796ccb686ec0cb747f98efe5707e7d7497572621d230",
-  "toolVersion": "0.1.0",
+  "fingerprint": "c91507c2856bc82d5605d25569c0ba659697a96a426f1584687a07a4c85974d1",
+  "toolVersion": "0.1.1",
   "version": 1
 }

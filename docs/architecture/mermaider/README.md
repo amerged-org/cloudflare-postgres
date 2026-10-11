@@ -4,10 +4,12 @@ These views are maintained by [Mermaider](https://github.com/sebmer-com/mermaide
 The selection and reviewed process model live in `.mermaider/`; generated files
 carry source references and are checked against the current repository contents.
 
-Open [the diagram gallery](index.html) in a local browser to view all five diagrams,
-filter by title, inspect sources and switch to full-size views. The HTML contains
-its renderer and works offline. GitHub displays this file as source; download it
-or open the local checkout to use the gallery. No website publication is required.
+Open [the diagram gallery](index.html) in a local browser and select a view from
+the short sidebar labels. Drag or use arrow keys to move the diagram; use Fit for
+the complete overview, 100% for actual size, or the zoom controls to inspect it.
+Notes and source evidence are available below the canvas. The Seb Builds fonts
+and renderer are embedded, so the HTML works offline. GitHub displays this file
+as source; download it or open the local checkout to use the gallery.
 
 | View | What it establishes |
 | --- | --- |

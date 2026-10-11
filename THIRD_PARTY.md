@@ -225,7 +225,7 @@ are recorded in `pnpm-lock.yaml`; build and test tooling is not relicensed as fi
 
 ## Architecture documentation tooling
 
-[Mermaider](https://github.com/sebmer-com/mermaider) 0.1.0 is licensed under
+[Mermaider](https://github.com/sebmer-com/mermaider) 0.1.1 is licensed under
 [Apache-2.0](https://github.com/sebmer-com/mermaider/blob/main/LICENSE). Its immutable
 source revision is recorded in [.mermaider/tool-revision](.mermaider/tool-revision);
 the existing CI workflow reads that pin and installs the tool's locked dependency
@@ -235,7 +235,11 @@ image. Its dependencies retain the licenses and notices in their installed
 packages and upstream source. The generated offline diagram gallery embeds
 [Mermaid 11.17.2](https://github.com/mermaid-js/mermaid/tree/mermaid%4011.17.2),
 with its MIT license included in the HTML; this browser renderer is documentation
-content, not a PGCF service. No Mermaider analysis source is vendored here.
+content, not a PGCF service. The gallery also embeds unmodified Latin Modern
+regular and italic fonts from latex.css 1.14.0 under the GUST Font License 1.0
+(LPPL 1.3c or later); the full font and distribution notices are included in its
+HTML and in [Mermaider's notices](https://github.com/sebmer-com/mermaider/blob/main/THIRD_PARTY.md).
+No Mermaider analysis source is vendored here.
 
 ## Acceptance workflow actions
 

@@ -1,24 +1,24 @@
 flowchart TD
     n_98d16e133cfc["Read current node addition from D1"]
     n_05cae6515ea2["Cancelled: return"]
-    n_f6c7e8a30e85["Ready: place pending databases and notify RegionLink"]
-    n_a67701fc2401["As eligible: claim order dispatch and resolve provider identity"]
-    n_7702b1130af3["Prepare installation inputs, rescue, inspection and job"]
-    n_17ae6f100820["Before admission: prove authority/network; start or verify bootstrap"]
-    n_5c15400744d9["Configured release: confirm patch, qualify storage and refresh proof"]
-    n_0adfcd24c2f2["Validate admission receipt; admit through NodeBootstrap if needed"]
-    n_5a534632ead6["Wait; re-read D1 next cycle (never trust cached outputs as authority)"]
-    n_14a2f70a9191["After 288 cycles: waiting_for_operator"]
+    n_f6c7e8a30e85["Ready: place pending databases and<br/>notify RegionLink"]
+    n_a67701fc2401["As eligible: claim order dispatch<br/>and resolve provider identity"]
+    n_7702b1130af3["Prepare installation inputs, rescue,<br/>inspection and job"]
+    n_17ae6f100820["Before admission: prove<br/>authority/network; start or verify<br/>bootstrap"]
+    n_5c15400744d9["Configured release: confirm patch,<br/>qualify storage and refresh proof"]
+    n_0adfcd24c2f2["Validate admission receipt; admit<br/>through NodeBootstrap if needed"]
+    n_5a534632ead6["Wait; re-read D1 next cycle (never<br/>trust cached outputs as authority)"]
+    n_14a2f70a9191["After 288 cycles:<br/>waiting_for_operator"]
     n_98d16e133cfc -->|"cancelled"| n_05cae6515ea2
     n_98d16e133cfc -->|"ready"| n_f6c7e8a30e85
     n_98d16e133cfc -->|"nonterminal"| n_a67701fc2401
     n_a67701fc2401 -->|"audited or bootstrapping"| n_7702b1130af3
     n_a67701fc2401 -->|"provider work pending"| n_5a534632ead6
-    n_7702b1130af3 -->|"authorized rescue job; no admission authority"| n_17ae6f100820
-    n_7702b1130af3 -->|"admission authorized; release configured"| n_5c15400744d9
-    n_7702b1130af3 -->|"admission authorized; no postjoin release"| n_0adfcd24c2f2
+    n_7702b1130af3 -->|"authorized rescue job; no admission<br/>authority"| n_17ae6f100820
+    n_7702b1130af3 -->|"admission authorized; release<br/>configured"| n_5c15400744d9
+    n_7702b1130af3 -->|"admission authorized; no postjoin<br/>release"| n_0adfcd24c2f2
     n_7702b1130af3 -->|"inputs, inspection or job pending"| n_5a534632ead6
-    n_17ae6f100820 -->|"asynchronous progress or proof pending"| n_5a534632ead6
+    n_17ae6f100820 -->|"asynchronous progress or proof<br/>pending"| n_5a534632ead6
     n_5c15400744d9 -->|"all gates pass"| n_0adfcd24c2f2
     n_5c15400744d9 -->|"gate pending"| n_5a534632ead6
     n_0adfcd24c2f2 -->|"next cycle reads resulting status"| n_5a534632ead6

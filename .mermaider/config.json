@@ -17,7 +17,8 @@
       "output": {
         "markdown": "docs/architecture/mermaider/api-resources.md",
         "mermaid": "docs/architecture/mermaider/api-resources.mmd"
-      }
+      },
+      "navLabel": "API resources"
     },
     {
       "id": "architecture_f9bf00edc351",
@@ -25,7 +26,8 @@
       "output": {
         "markdown": "docs/architecture/mermaider/edge-resources.md",
         "mermaid": "docs/architecture/mermaider/edge-resources.mmd"
-      }
+      },
+      "navLabel": "Edge"
     },
     {
       "id": "ci_b803fcb7f17e",
@@ -33,7 +35,8 @@
       "output": {
         "markdown": "docs/architecture/mermaider/ci-pipeline.md",
         "mermaid": "docs/architecture/mermaider/ci-pipeline.mmd"
-      }
+      },
+      "navLabel": "CI pipeline"
     },
     {
       "id": "data:schema:apps/api/migrations",
@@ -53,7 +56,8 @@
       "output": {
         "markdown": "docs/architecture/mermaider/d1-core.md",
         "mermaid": "docs/architecture/mermaider/d1-core.mmd"
-      }
+      },
+      "navLabel": "Data model"
     },
     {
       "id": "pgcf-add-node",
@@ -61,7 +65,8 @@
       "output": {
         "markdown": "docs/architecture/mermaider/add-node.md",
         "mermaid": "docs/architecture/mermaider/add-node.mmd"
-      }
+      },
+      "navLabel": "Provisioning"
     }
   ],
   "hooks": {

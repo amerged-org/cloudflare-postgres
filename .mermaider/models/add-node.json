@@ -106,14 +106,14 @@
           {
             "path": "apps/api/src/domain/node-inspection.ts",
             "symbol": "ensureNodeInstallationInspection",
-            "line": 563,
+            "line": 574,
             "sha256": "624d99046bfb1ba13ec4f06496805f39b93b0358f3ff45afdd3f41639565076c"
           },
           {
             "path": "apps/api/src/domain/bootstrap-composition.ts",
             "symbol": "composeConfiguredNodeBootstrap",
-            "line": 65,
-            "sha256": "2aa222c1f70233857e0a6cca22c9e92157b81d67e9b21c7cbdda3e4826d6a2f7"
+            "line": 71,
+            "sha256": "56b527ee5778545ab012e5676f25d81c6fbc8671851baf3df38dcb1dcf7b7cd4"
           }
         ]
       },
@@ -166,7 +166,7 @@
           {
             "path": "apps/api/src/domain/fleet-patches.ts",
             "symbol": "ensureBootstrapFleetPatch",
-            "line": 954,
+            "line": 1200,
             "sha256": "a79fdae8d570f57bc5afc02efb24d471bf8feae8191655f4aae37f882ec4a664"
           },
           {

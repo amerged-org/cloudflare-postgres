@@ -105,5 +105,9 @@ erDiagram
 - [apps/api/migrations/0036_warm_reclaim.sql:1](../../../apps/api/migrations/0036_warm_reclaim.sql#L1)
 - [apps/api/migrations/0037_fleet_updates.sql:1](../../../apps/api/migrations/0037_fleet_updates.sql#L1)
 - [apps/api/migrations/0038_generic_capacity_policy.sql:1](../../../apps/api/migrations/0038_generic_capacity_policy.sql#L1)
+- [apps/api/migrations/0039_infrastructure_backups.sql:1](../../../apps/api/migrations/0039_infrastructure_backups.sql#L1)
+- [apps/api/migrations/0040_fleet_rollout_intent.sql:1](../../../apps/api/migrations/0040_fleet_rollout_intent.sql#L1)
+- [apps/api/migrations/0041_node_threshold_warnings.sql:1](../../../apps/api/migrations/0041_node_threshold_warnings.sql#L1)
+- [apps/api/migrations/0042_thin_qualification.sql:1](../../../apps/api/migrations/0042_thin_qualification.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

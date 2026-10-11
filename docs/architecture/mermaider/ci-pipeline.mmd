@@ -1,13 +1,13 @@
 flowchart LR
-    n_e34ac7a1f534["node_bootstrap_image if: needs.check.outputs.node_bootstrap_image == 'true' #38;#38; github.ref == 'refs/heads/main' #38;#38; !input…"]
-    n_ae6278aee13d["image if: needs.check.outputs.regional_image == 'true' #38;#38; github.ref == 'refs/heads/main' #38;#38; !inputs.exte…"]
-    n_3cbfbc22e3a1["native_runtime_images if: (needs.check.outputs.rust_gateway_image == 'true' || needs.check.outputs.native_controller_imag…"]
-    n_d92200072b60["external_probe if: github.event_name == 'workflow_dispatch' #38;#38; (inputs.external_probe || inputs.node_network_probe…"]
-    n_58381b3e9536["check if: github.event_name != 'workflow_dispatch' || (!inputs.external_probe #38;#38; !inputs.node_network_pro…"]
-    n_0bd87febac77["storage_image if: needs.check.outputs.storage_image == 'true' #38;#38; github.ref == 'refs/heads/main' #38;#38; !inputs.exter…"]
-    n_89a17c1e5e49["postgres_image if: needs.check.outputs.postgres_image == 'true' #38;#38; github.ref == 'refs/heads/main' #38;#38; !inputs.exte…"]
-    n_58381b3e9536 -->|"needs"| n_ae6278aee13d
-    n_58381b3e9536 -->|"needs"| n_3cbfbc22e3a1
-    n_58381b3e9536 -->|"needs"| n_0bd87febac77
-    n_58381b3e9536 -->|"needs"| n_e34ac7a1f534
-    n_58381b3e9536 -->|"needs"| n_89a17c1e5e49
+    n_e34ac7a1f534["node_bootstrap_image<br/>if:<br/>needs.check.outputs.node_bootstrap_image<br/>== 'true' #38;#38; github.ref ==<br/>'refs/heads/main' #38;#38; !input…"]
+    n_ae6278aee13d["image<br/>if:<br/>needs.check.outputs.regional_image<br/>== 'true' #38;#38; github.ref ==<br/>'refs/heads/main' #38;#38; !inputs.exte…"]
+    n_3cbfbc22e3a1["native_runtime_images<br/>if:<br/>(needs.check.outputs.rust_gateway_image<br/>== 'true' ||<br/>needs.check.outputs.native_controller_imag…"]
+    n_d92200072b60["external_probe<br/>if: github.event_name ==<br/>'workflow_dispatch' #38;#38;<br/>(inputs.external_probe ||<br/>inputs.node_network_probe…"]
+    n_58381b3e9536["check<br/>if: github.event_name !=<br/>'workflow_dispatch' ||<br/>(!inputs.external_probe #38;#38;<br/>!inputs.node_network_pro…"]
+    n_0bd87febac77["storage_image<br/>if:<br/>needs.check.outputs.storage_image ==<br/>'true' #38;#38; github.ref ==<br/>'refs/heads/main' #38;#38; !inputs.exter…"]
+    n_89a17c1e5e49["postgres_image<br/>if:<br/>needs.check.outputs.postgres_image<br/>== 'true' #38;#38; github.ref ==<br/>'refs/heads/main' #38;#38; !inputs.exte…"]
+    n_58381b3e9536 --> n_ae6278aee13d
+    n_58381b3e9536 --> n_3cbfbc22e3a1
+    n_58381b3e9536 --> n_0bd87febac77
+    n_58381b3e9536 --> n_e34ac7a1f534
+    n_58381b3e9536 --> n_89a17c1e5e49
