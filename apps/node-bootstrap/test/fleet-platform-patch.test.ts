@@ -956,7 +956,9 @@ test("retained Flux upgrades create absent qualified objects, resolve a lost cre
   ];
   const assets = { lock: {}, flux: expected, flux_deprecated: [], relay: {} },
     present = new Map<string, Record<string, unknown>>(),
-    committed: Record<string, string> = {};
+    committed: Record<string, string>[] = [],
+    order: string[] = [],
+    checkpointsAtCreate: number[] = [];
   let creates = 0;
   const commands = {
     authorize: async () => {},
@@ -968,9 +970,10 @@ test("retained Flux upgrades create absent qualified objects, resolve a lost cre
       }
       assert.equal(args[0], "create");
       creates++;
-      assert.equal(Object.keys(committed).length, creates - 1);
+      checkpointsAtCreate.push(committed.length);
       const value = JSON.parse(stdin!) as Record<string, unknown>,
         metadata = value.metadata as Record<string, unknown>;
+      order.push(String(metadata.name));
       assert.equal(
         (metadata.annotations as Record<string, unknown>)[
           "pgcf.io/fleet-patch-operation"
@@ -987,7 +990,7 @@ test("retained Flux upgrades create absent qualified objects, resolve a lost cre
   };
   assert.deepEqual(await readFleetFluxIdentities(assets, commands), {});
   await reconcileFleetFlux(input, assets, {}, commands, async (bindings) => {
-    Object.assign(committed, bindings);
+    committed.push(bindings);
   });
   const bindings = await readFleetFluxIdentities(assets, commands, {
     operation_id: input.status.operation_id,
@@ -995,6 +998,13 @@ test("retained Flux upgrades create absent qualified objects, resolve a lost cre
   });
   assert.equal(Object.keys(bindings).length, 2);
   assert.equal(creates, 2);
+  // Both creations run in asset order; one checkpoint then binds the whole pass.
+  assert.deepEqual(order, [
+    "critical-pods",
+    "artifactgenerators.source.extensions.fluxcd.io",
+  ]);
+  assert.deepEqual(checkpointsAtCreate, [0, 0]);
+  assert.deepEqual(committed, [bindings]);
   const recovered: Record<string, string> = {};
   await reconcileFleetFlux(input, assets, {}, commands, async (current) => {
     Object.assign(recovered, current);
@@ -1068,6 +1078,197 @@ test("a denied Flux read or an unowned fixed-name collision cannot authorize cre
     /patch_platform_identity_unbound/,
   );
   assert.equal(writes, 0);
+});
+
+type FluxObject = Record<string, unknown> & {
+  kind: string;
+  metadata: Record<string, unknown> & { name: string; uid?: string };
+  spec: { ports: { name: string; port: number }[] };
+};
+const fluxService = (index: number): FluxObject => ({
+  apiVersion: "v1",
+  kind: "Service",
+  metadata: { name: `flux-${index}`, namespace: "flux-system" },
+  spec: { ports: [{ name: "http", port: 9000 + index }] },
+});
+const fluxKey = (value: FluxObject) =>
+  `${value.kind}/${value.metadata.namespace ?? ""}/${value.metadata.name}`;
+const liveFlux = (value: FluxObject): FluxObject => ({
+  ...structuredClone(value),
+  metadata: { ...value.metadata, uid: randomUUID() },
+});
+/** Each GET yields once, so reads that the pass overlaps are observable. */
+function fluxCluster() {
+  const present = new Map<string, FluxObject>(),
+    events: string[] = [];
+  let active = 0,
+    peak = 0;
+  const target = (args: string[]) => {
+    const at = args.indexOf("--namespace");
+    return `${args[1]}/${at < 0 ? "" : args[at + 1]}/${args[2]}`;
+  };
+  const commands = {
+    authorize: async () => {},
+    kube: async (args: string[], stdin?: string) => {
+      if (args[0] === "get") {
+        active++;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setImmediate(resolve));
+        active--;
+        events.push(`get ${target(args)}`);
+        const value = present.get(target(args));
+        if (value) return JSON.stringify(value);
+        if (!args.includes("--ignore-not-found")) throw Error("NotFound");
+        return "";
+      }
+      if (args[0] === "create") {
+        const value = JSON.parse(stdin!) as FluxObject;
+        events.push(`create ${fluxKey(value)}`);
+        if (present.has(fluxKey(value))) throw Error("AlreadyExists");
+        value.metadata.uid = randomUUID();
+        present.set(fluxKey(value), value);
+        return JSON.stringify(value);
+      }
+      assert.equal(args[0], "patch");
+      events.push(`patch ${target(args)}`);
+      const value = present.get(target(args))!,
+        patch = JSON.parse(stdin!) as {
+          op: string;
+          path: string;
+          value: unknown;
+        }[];
+      applyTests(value, patch);
+      for (const item of patch)
+        if (item.op === "replace")
+          (value as Record<string, unknown>)[item.path.slice(1)] = item.value;
+      return JSON.stringify(value);
+    },
+  };
+  return { present, events, commands, peak: () => peak };
+}
+
+test("a Flux pass reads every asset in bounded parallel batches and writes in asset order without rereading", async () => {
+  const { input } = patchFixture(),
+    flux = Array.from({ length: 12 }, (_, index) => fluxService(index)),
+    keys = flux.map(fluxKey),
+    cluster = fluxCluster(),
+    baseline: Record<string, string> = {},
+    committed: Record<string, string>[] = [];
+  for (const [index, value] of flux.entries()) {
+    if (index === 3 || index === 9) continue; // Absent: this pass creates it.
+    const actual = liveFlux(value);
+    if (index === 6) actual.spec.ports[0]!.port = 1; // Drifted: this pass patches it.
+    cluster.present.set(keys[index]!, actual);
+    baseline[keys[index]!] = actual.metadata.uid!;
+  }
+  await reconcileFleetFlux(
+    input,
+    { lock: {}, flux, flux_deprecated: [], relay: {} },
+    baseline,
+    cluster.commands,
+    async (bindings) => {
+      committed.push(bindings);
+    },
+  );
+  assert.ok(cluster.peak() > 1, "Flux asset reads must overlap");
+  assert.ok(cluster.peak() <= 8, "Flux asset reads stay bounded");
+  // One read per asset precedes every write; each write is then confirmed by its own read.
+  assert.deepEqual(
+    cluster.events.slice(0, keys.length).sort(),
+    keys.map((key) => `get ${key}`).sort(),
+  );
+  assert.deepEqual(cluster.events.slice(keys.length), [
+    `create ${keys[3]}`,
+    `get ${keys[3]}`,
+    `patch ${keys[6]}`,
+    `get ${keys[6]}`,
+    `create ${keys[9]}`,
+    `get ${keys[9]}`,
+  ]);
+  assert.equal(cluster.present.get(keys[6]!)!.spec.ports[0]!.port, 9006);
+  assert.deepEqual(committed, [
+    {
+      [keys[3]!]: cluster.present.get(keys[3]!)!.metadata.uid,
+      [keys[9]!]: cluster.present.get(keys[9]!)!.metadata.uid,
+    },
+  ]);
+});
+
+test("a Flux pass stopped after its first create binds that annotated object on resume without creating it again", async () => {
+  const { input } = patchFixture(),
+    flux = [fluxService(0), fluxService(1)],
+    assets = { lock: {}, flux, flux_deprecated: [], relay: {} },
+    [first, second] = flux.map(fluxKey) as [string, string],
+    cluster = fluxCluster(),
+    committed: Record<string, string>[] = [];
+  let grants = 0;
+  cluster.commands.authorize = async () => {
+    // The turn's budget ends after the first creation and before the pass's checkpoint.
+    if (++grants === 2) throw Error("job_cancelled");
+  };
+  const onCreated = async (bindings: Record<string, string>) => {
+    committed.push(bindings);
+  };
+  await assert.rejects(
+    reconcileFleetFlux(input, assets, {}, cluster.commands, onCreated),
+    /job_cancelled/,
+  );
+  assert.deepEqual(committed, []);
+  const created = cluster.present.get(first)!.metadata.uid!;
+  // The next turn's identity read accepts the unbound object only by this operation's annotation.
+  assert.deepEqual(
+    await readFleetFluxIdentities(assets, cluster.commands, {
+      operation_id: input.status.operation_id,
+      bound_uids: {},
+    }),
+    { [first]: created },
+  );
+  await reconcileFleetFlux(input, assets, {}, cluster.commands, onCreated);
+  assert.deepEqual(
+    cluster.events.filter((event) => event.startsWith("create ")),
+    [`create ${first}`, `create ${second}`],
+  );
+  assert.deepEqual(committed, [
+    { [first]: created, [second]: cluster.present.get(second)!.metadata.uid },
+  ]);
+});
+
+test("prefetched Flux reads keep the identity, ownership and exact-spec refusals", async () => {
+  const { input } = patchFixture(),
+    flux = [fluxService(0), fluxService(1), fluxService(2)],
+    assets = { lock: {}, flux, flux_deprecated: [], relay: {} },
+    keys = flux.map(fluxKey),
+    cluster = fluxCluster(),
+    baseline: Record<string, string> = {};
+  for (const [index, value] of flux.slice(0, 2).entries()) {
+    const actual = liveFlux(value);
+    cluster.present.set(keys[index]!, actual);
+    baseline[keys[index]!] = actual.metadata.uid!;
+  }
+  const writes = () =>
+    cluster.events.filter((event) => !event.startsWith("get "));
+  const pass = () =>
+    reconcileFleetFlux(input, assets, baseline, cluster.commands, async () => {
+      throw Error("unexpected_binding");
+    });
+  cluster.present.set(keys[1]!, liveFlux(flux[1]!));
+  await assert.rejects(pass(), /patch_platform_identity_changed/);
+  cluster.present.delete(keys[1]!);
+  await assert.rejects(pass(), /patch_platform_identity_changed/);
+  const collision = liveFlux(flux[1]!);
+  delete baseline[keys[1]!];
+  cluster.present.set(keys[1]!, collision);
+  await assert.rejects(pass(), /patch_platform_identity_unbound/);
+  assert.deepEqual(writes(), []);
+  // A concurrent change after the prefetch fails the exact prior-spec CAS instead of being overwritten.
+  baseline[keys[1]!] = collision.metadata.uid!;
+  collision.spec.ports[0]!.port = 1;
+  cluster.commands.authorize = async () => {
+    cluster.present.get(keys[1]!)!.spec.ports[0]!.port = 2;
+  };
+  await assert.rejects(pass(), /platform_resource_mismatch/);
+  assert.equal(cluster.present.get(keys[1]!)!.spec.ports[0]!.port, 2);
+  assert.deepEqual(writes(), [`patch ${keys[1]}`]);
 });
 
 test("release image observations ignore terminal rollout Pods but still require an active Ready pinned Pod", () => {

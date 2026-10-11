@@ -2085,6 +2085,135 @@ test("Flux CAS patches pass private real files to the pinned native kubectl and 
     await assert.rejects(stat(path), { code: "ENOENT" });
 });
 
+test("a Flux turn binds all objects it creates with one fresh collection and one checkpoint", async () => {
+  const r = runtime();
+  const flux = [
+    {
+      apiVersion: "v1",
+      kind: "ResourceQuota",
+      metadata: { name: "critical-pods", namespace: "flux-system" },
+      spec: { hard: { pods: "1000" } },
+    },
+    {
+      apiVersion: "apiextensions.k8s.io/v1",
+      kind: "CustomResourceDefinition",
+      metadata: { name: "artifactgenerators.source.extensions.fluxcd.io" },
+      spec: { group: "source.extensions.fluxcd.io", scope: "Namespaced" },
+    },
+  ];
+  const text = flux.map((value) => stringify(value)).join("---\n"),
+    relay = stringify({
+      kind: "Deployment",
+      metadata: { name: "pgcf-bootstrap-relay" },
+    }),
+    lock = JSON.stringify({
+      target: {
+        talosVersion: r.fixture.input.spec.roles.customer.talos_version,
+        kubernetesVersion:
+          r.fixture.input.spec.roles.customer.kubernetes_version,
+      },
+      flux: {
+        installManifestURL:
+          "https://github.com/fluxcd/flux2/releases/download/v2.8.0/install.yaml",
+        installManifestSha256: digest(text),
+      },
+    });
+  r.fixture.input.spec.platform_source_commit = "e".repeat(40);
+  r.fixture.input.spec.versions_lock_sha256 = digest(lock);
+  const sources = [
+    ["GitRepository", "pgcf-platform"],
+    ["Kustomization", "pgcf-platform"],
+    ["Kustomization", "pgcf-regional"],
+  ].map(([kind, name]) => ({
+    kind: kind!,
+    metadata: { name: name!, namespace: "flux-system", uid: randomUUID() },
+    spec: { ref: { commit: "a".repeat(40) } },
+    status: { artifact: { revision: `main@sha1:${"a".repeat(40)}` } },
+  }));
+  r.current = {
+    ...r.current,
+    stage: "flux",
+    baseline: {
+      ...r.fixture.facts,
+      platform_resource_uids: Object.fromEntries(
+        sources.map((value) => [
+          `${value.kind}/flux-system/${value.metadata.name}`,
+          value.metadata.uid,
+        ]),
+      ),
+    },
+    spec_sha256: digest(canonical(r.fixture.input.spec)),
+  };
+  r.assetRequest = async (url) =>
+    new Response(
+      String(url).endsWith("versions.lock.json")
+        ? lock
+        : String(url).endsWith("relay.yaml")
+          ? relay
+          : text,
+    );
+  const present = new Map<string, { metadata: { uid: string } }>();
+  let collections = 0;
+  r.kubeProbe = (command) => {
+    const args = command.args,
+      reply = (stdout: string) => Promise.resolve({ exit_code: 0, stdout });
+    if (args.includes("kube-system")) collections++;
+    if (
+      args.includes("deployments.apps,daemonsets.apps") ||
+      args.includes("pods")
+    )
+      return reply(JSON.stringify({ items: [] }));
+    const kinds: Record<string, string> = {
+        gitrepositories: "GitRepository",
+        kustomizations: "Kustomization",
+        helmreleases: "HelmRelease",
+        ocirepositories: "OCIRepository",
+        helmcharts: "HelmChart",
+      },
+      kind = args.find(
+        (value) => value.includes(".") && kinds[value.split(".")[0]!],
+      );
+    if (kind)
+      return reply(
+        JSON.stringify({
+          items: sources.filter(
+            (value) => value.kind === kinds[kind.split(".")[0]!],
+          ),
+        }),
+      );
+    if (args.includes("create"))
+      return (async () => {
+        const file = args.find((value) => value.startsWith("--filename="))!,
+          value = JSON.parse(
+            await readFile(file.slice("--filename=".length), "utf8"),
+          );
+        value.metadata.uid = randomUUID();
+        present.set(value.metadata.name, value);
+        return { exit_code: 0, stdout: JSON.stringify(value) };
+      })();
+    const name = flux.find((value) => args.includes(value.metadata.name))
+      ?.metadata.name;
+    if (name === undefined) return undefined;
+    const value = present.get(name);
+    return reply(value ? JSON.stringify(value) : "");
+  };
+  await r.turn();
+  // The turn's own collection and dispatch, then one collection and checkpoint for both bindings.
+  assert.deepEqual(
+    r.checkpoints.map((value) => `${value.stage}/${value.state}`),
+    ["flux/dispatched", "flux/dispatched"],
+  );
+  assert.equal(collections, 2);
+  assert.equal(present.size, 2);
+  for (const value of flux) {
+    const key = `${value.kind}/${value.metadata.namespace ?? ""}/${value.metadata.name}`;
+    assert.equal(
+      r.current.observed!.platform_resource_uids![key],
+      present.get(value.metadata.name)!.metadata.uid,
+    );
+  }
+});
+
 test("fleet apply gives the actual pinned native client a private configuration file and retains uncertain outcomes", async () => {
   const client = process.env.PGCF_TEST_TALOSCTL;
   assert.ok(

@@ -94,10 +94,13 @@ CRDs/RBAC remain. Removal of accidental optional controllers requires their orig
 bootstrap owner, baseline UID and exact verified vendor spec. Conditional UID/resource-version
 DeleteOptions and fresh reads resolve outcomes; a replacement resource is never deleted.
 An upgrade may introduce a fixed vendor resource absent from the retained cluster. Only a real
-NotFound observation permits its fixed-name creation from the qualified artifact. The operation
-records the returned/read-back UID before another creation; lost replies are resolved against
-the same operation-owned spec. A denied or failed read never means absence, and a recorded UID
-may not disappear or change.
+NotFound observation permits its fixed-name creation from the qualified artifact. A pass reads
+all Flux objects in bounded parallel batches, then writes them sequentially in artifact order.
+Each creation carries the operation's annotation; one checkpoint after the pass records every
+returned/read-back UID. A turn that stops earlier leaves only annotated objects, which a later
+turn binds without creating them again; lost replies are resolved against the same
+operation-owned spec. A denied or failed read never means absence, and a recorded UID may not
+disappear or change.
 
 Flux/Helm acceptance uses current Ready conditions and immutable source/applied revisions. Chart
 versions allow the vendor's OCI build suffix, while current Helm history must carry the full

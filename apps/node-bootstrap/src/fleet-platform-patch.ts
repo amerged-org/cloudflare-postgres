@@ -985,6 +985,7 @@ async function reconcileDeclaredResource(
   uid: string | undefined,
   commands: FleetPlatformCommands,
   creationOperation?: string,
+  prefetched?: string,
 ) {
   const target = argsFor(expected),
     read = () =>
@@ -992,7 +993,7 @@ async function reconcileDeclaredResource(
   if (!uid) {
     if (!creationOperation)
       throw new BootstrapError("patch_platform_identity_unbound");
-    const before = await read();
+    const before = prefetched ?? (await read());
     if (!before.trim()) {
       const metadata = object(expected.metadata),
         created = {
@@ -1031,7 +1032,7 @@ async function reconcileDeclaredResource(
     assertOwnedResource(expected, actual);
     return metadata.uid;
   }
-  const text = await read();
+  const text = prefetched ?? (await read());
   if (!text.trim()) throw new BootstrapError("patch_platform_identity_changed");
   const actual = object(JSON.parse(text));
   if (
@@ -1192,7 +1193,31 @@ export async function reconcileFleetFlux(
   onCreated?: (bindings: Record<string, string>) => Promise<void>,
 ) {
   await pruneDeprecatedFlux(input, assets, baseline, commands);
-  for (const value of assets.flux) {
+  // Each kubectl call acquires its own single-use relay transport, so the reads overlap in
+  // bounded batches like readFleetFluxIdentities. Writes stay sequential in asset order
+  // (CRDs/namespaces first). A stale read cannot authorize a blind write: a fixed-name
+  // create cannot replace an object and a patch tests the read UID and prior fields.
+  const prefetched: string[] = [],
+    created: Record<string, string> = {};
+  for (let offset = 0; offset < assets.flux.length; offset += 8) {
+    const reads = await Promise.allSettled(
+      assets.flux
+        .slice(offset, offset + 8)
+        .map(async (value) =>
+          commands.kube([
+            "get",
+            ...argsFor(value),
+            "--ignore-not-found",
+            "--output=json",
+          ]),
+        ),
+    );
+    const failed = reads.find((v) => v.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
+    for (const value of reads)
+      prefetched.push((value as PromiseFulfilledResult<string>).value);
+  }
+  for (const [index, value] of assets.flux.entries()) {
     const key = resourceKey(value);
     if (!baseline[key] && !onCreated)
       throw new BootstrapError("patch_platform_identity_unbound");
@@ -1201,12 +1226,17 @@ export async function reconcileFleetFlux(
       baseline[key],
       commands,
       input.status.operation_id,
+      prefetched[index],
     );
-    if (!baseline[key] && createdUid) {
-      await onCreated!({ [key]: createdUid });
-      baseline[key] = createdUid;
-    }
+    if (!baseline[key] && createdUid) created[key] = createdUid;
   }
+  if (!Object.keys(created).length) return;
+  // One fresh collection and checkpoint bind the whole pass. A turn that stops before it is
+  // safe: each created object carries this operation's annotation, and the next turn's
+  // identity read and creation path accept an unbound object only with that annotation and
+  // the qualified spec, binding it then without a second create.
+  await onCreated!(created);
+  Object.assign(baseline, created);
 }
 export function fleetPlatformSourceObjects(
   input: FleetPatchInput,
