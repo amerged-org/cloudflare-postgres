@@ -151,6 +151,10 @@ fn named(kind: &str, namespace: Option<&str>, name: &str) -> Result<String, Erro
     }
     Ok(format!("{}/{name}", collection(kind, namespace)?))
 }
+/// Kubernetes never restarts a Succeeded or Failed Pod; a deletionTimestamp alone proves no stop.
+pub fn terminal_pod(pod: &Value) -> bool {
+    matches!(text(&pod["status"], "phase"), "Succeeded" | "Failed")
+}
 pub async fn bounded(response: reqwest::Response, maximum: usize) -> Result<Vec<u8>, Error> {
     if response
         .content_length()

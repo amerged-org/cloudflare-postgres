@@ -32,6 +32,7 @@ import { appliedGeneration, condition, DATABASE_LABEL } from "./observe.ts";
 import {
   record,
   string,
+  terminalPod,
   uid,
   type Kubernetes,
   type Log,
@@ -784,11 +785,10 @@ export class PowerCoordinator {
       expected > 64
     )
       throw new Unavailable("gateway_replica_configuration_missing");
-    const pods = await step.k8s.list(
-      "Pod",
-      NS,
-      "app.kubernetes.io/name=pgcf-gateway",
-    );
+    // Node shutdown leaves terminal Pods behind: no connections, controls or replica count.
+    const pods = (
+      await step.k8s.list("Pod", NS, "app.kubernetes.io/name=pgcf-gateway")
+    ).filter((pod) => !terminalPod(pod));
     if (pods.length < expected || pods.length > 64)
       throw new Unavailable("gateway_inventory_incomplete");
     const ids = new Set<string>();
@@ -1038,7 +1038,7 @@ export class PowerCoordinator {
                 `pgcf-db-${db.id}`,
                 "cnpg.io/cluster=database",
               )
-            ).length === 0;
+            ).every(terminalPod);
           progress = alreadyOff
             ? { ...progress!, target: intent, phase: "hibernated" }
             : {
@@ -1090,7 +1090,7 @@ export class PowerCoordinator {
               "True" ||
             condition(physical.cluster, "cnpg.io/hibernation")?.reason !==
               "Hibernated" ||
-            pods.length !== 0
+            !pods.every(terminalPod)
           )
             return null;
           const confirmed = await this.anchor(step, db);

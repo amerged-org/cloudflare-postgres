@@ -56,3 +56,9 @@ export function uid(resource: Resource): string {
   if (!resource.metadata.uid) throw new Error("resource_identity_missing");
   return resource.metadata.uid;
 }
+
+/** Kubernetes never restarts a Succeeded or Failed Pod; a deletionTimestamp alone proves no stop. */
+export function terminalPod(pod: Resource): boolean {
+  const phase = record(pod.status).phase;
+  return phase === "Succeeded" || phase === "Failed";
+}

@@ -3,7 +3,7 @@
 use crate::{
     Error,
     contracts::{constant, database_valid, generation, namespace, number, text},
-    kubernetes::Kubernetes,
+    kubernetes::{Kubernetes, terminal_pod},
     postgres,
 };
 use base64::{
@@ -773,14 +773,18 @@ impl PowerCoordinator {
         Ok(())
     }
     async fn gateways(&self) -> Result<Vec<GatewayPod>> {
-        let resources = self
+        // Node shutdown leaves terminal Pods behind: no connections, controls or replica count.
+        let resources: Vec<_> = self
             .k8s
             .list(
                 "Pod",
                 Some(SYSTEM),
                 Some("app.kubernetes.io/name=pgcf-gateway"),
             )
-            .await?;
+            .await?
+            .into_iter()
+            .filter(|pod| !terminal_pod(pod))
+            .collect();
         if resources.len() < self.replicas || resources.len() > 64 {
             return Err(Fault::Unavailable("gateway_inventory_incomplete"));
         }
@@ -1273,7 +1277,8 @@ impl PowerCoordinator {
                             Some("cnpg.io/cluster=database"),
                         )
                         .await?
-                        .is_empty();
+                        .iter()
+                        .all(terminal_pod);
                 let next = if already_off {
                     let mut prior = progress.clone().unwrap();
                     prior.target = intent.clone();
@@ -1329,7 +1334,8 @@ impl PowerCoordinator {
                             Some("cnpg.io/cluster=database"),
                         )
                         .await?
-                        .is_empty()
+                        .iter()
+                        .all(terminal_pod)
                 {
                     return Ok(None);
                 }
@@ -1519,7 +1525,8 @@ impl PowerCoordinator {
                 .k8s
                 .list("Pod", Some(&ns), Some("cnpg.io/cluster=database"))
                 .await?
-                .is_empty()
+                .iter()
+                .all(terminal_pod)
         {
             return Ok(Some(None));
         }
@@ -1576,7 +1583,8 @@ impl PowerCoordinator {
                 .k8s
                 .list("Pod", Some(&ns), Some("cnpg.io/cluster=database"))
                 .await?
-                .is_empty()
+                .iter()
+                .all(terminal_pod)
             || !self.snapshot().await?.same_identity(&snapshot)
         {
             return Ok(Some(None));
@@ -3821,5 +3829,129 @@ mod tls_tests {
         assert_eq!(state["completed"], true);
         assert!(state["physicalLvUuid"].is_null());
         assert_eq!(state["startedAt"], 100_000);
+    }
+    #[tokio::test]
+    async fn terminal_gateway_pods_neither_block_nor_receive_power_controls() {
+        let db = protected_database();
+        let server = Server::new(&db, false).await;
+        protected_objects(&server, &db);
+        // Graceful node shutdown leaves Deployment Pods behind as terminal objects without an address.
+        server
+            .objects
+            .lock()
+            .unwrap()
+            .get_mut("/api/v1/namespaces/pgcf-system/pods")
+            .unwrap()["items"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"kind":"Pod","metadata":{"name":"gateway-shutdown","namespace":SYSTEM,"uid":id(22),"labels":{"app.kubernetes.io/name":"pgcf-gateway"}},"spec":{"serviceAccountName":"pgcf-gateway"},"status":{"phase":"Succeeded","containerStatuses":[{"name":"gateway","restartCount":0,"state":{"terminated":{"exitCode":0}}}]}}));
+        let controls = Controls::new(&server, &db).await;
+        let mut coordinator = PowerCoordinator::with_clock(
+            server.k8s.clone(),
+            "eu-test".into(),
+            1,
+            Arc::new(|| 100_000),
+        )
+        .unwrap();
+        coordinator.http = controls.client.clone();
+        let result = coordinator.suspend(&db).await.unwrap().unwrap();
+        assert_eq!(result["state"], "hibernated");
+        // The control endpoint accepts only the live Pod: begin, close and status reached it alone.
+        assert_eq!(controls.calls.load(Ordering::SeqCst), 3);
+        let two = PowerCoordinator::with_clock(
+            server.k8s.clone(),
+            "eu-test".into(),
+            2,
+            Arc::new(|| 100_000),
+        )
+        .unwrap();
+        assert!(matches!(
+            two.gateways().await,
+            Err(Fault::Unavailable("gateway_inventory_incomplete"))
+        ));
+    }
+    #[tokio::test]
+    async fn a_terminal_instance_pod_is_stopped_but_a_terminating_one_blocks_a_protected_stop() {
+        let db = protected_database();
+        let server = Server::new(&db, false).await;
+        protected_objects(&server, &db);
+        let controls = Controls::new(&server, &db).await;
+        let mut coordinator = PowerCoordinator::with_clock(
+            server.k8s.clone(),
+            "eu-test".into(),
+            1,
+            Arc::new(|| 100_000),
+        )
+        .unwrap();
+        coordinator.http = controls.client.clone();
+        let ns = namespace(&db);
+        let pods_path = format!("/api/v1/namespaces/{ns}/pods");
+        server.objects.lock().unwrap().get_mut(&pods_path).unwrap()["items"] = json!([{"kind":"Pod","metadata":{"name":"database-1","namespace":ns,"uid":id(88),"deletionTimestamp":"2026-10-11T00:00:00Z","labels":{"cnpg.io/cluster":"database"}},"status":{"phase":"Running"}}]);
+        assert!(coordinator.suspend(&db).await.unwrap().is_none());
+        assert_eq!(controls.calls.load(Ordering::SeqCst), 0);
+        server.objects.lock().unwrap().get_mut(&pods_path).unwrap()["items"][0]["status"]["phase"] =
+            "Failed".into();
+        assert_eq!(
+            coordinator.suspend(&db).await.unwrap().unwrap()["state"],
+            "hibernated"
+        );
+    }
+    #[tokio::test]
+    async fn a_terminal_instance_pod_does_not_hold_a_hibernated_database_awake() {
+        let db = protected_database();
+        let server = Server::new(&db, false).await;
+        protected_objects(&server, &db);
+        let ns = namespace(&db);
+        let storage_path = format!(
+            "/api/v1/namespaces/pgcf-system/configmaps/storage-{}",
+            text(&db, "id")
+        );
+        {
+            // This database slept through the normal proof, not a physical protection stop.
+            let mut objects = server.objects.lock().unwrap();
+            objects.get_mut(&storage_path).unwrap()["data"]
+                .as_object_mut()
+                .unwrap()
+                .remove(protection_key());
+            objects
+                .get_mut(&format!("/api/v1/namespaces/{ns}/pods"))
+                .unwrap()["items"] = json!([{"kind":"Pod","metadata":{"name":"database-1","namespace":ns,"uid":id(88),"labels":{"cnpg.io/cluster":"database"}},"status":{"phase":"Failed","reason":"Terminated"}}]);
+        }
+        let controls = Controls::new(&server, &db).await;
+        let mut coordinator = PowerCoordinator::with_clock(
+            server.k8s.clone(),
+            "eu-test".into(),
+            1,
+            Arc::new(|| 100_000),
+        )
+        .unwrap();
+        coordinator.http = controls.client.clone();
+        let (anchor, _) = coordinator.anchor(&db).await.unwrap();
+        let snapshot = coordinator.snapshot().await.unwrap();
+        let prior = PowerIntent {
+            database: text(&db, "id").into(),
+            operation: text(&db["creation"], "operation_id").into(),
+            revision: 1,
+            mode: "quiesce".into(),
+        };
+        let mut p = Progress::new(prior.clone(), Phase::Hibernated, anchor, 99_000);
+        p.proof_intent = Some(prior.clone());
+        p.segment = Some("000000010000000000000001".into());
+        p.gateways = Some(snapshot.pods);
+        p.key_uid = Some(snapshot.key_uid);
+        p.key_version = Some(snapshot.key_version);
+        let name = format!("gateway-fence-{}", text(&db, "id"));
+        server.objects.lock().unwrap().insert(format!("/api/v1/namespaces/pgcf-system/configmaps/{name}"),json!({"kind":"ConfigMap","metadata":{"name":name,"namespace":SYSTEM,"uid":id(500),"resourceVersion":"1","labels":{DATABASE_LABEL:db["id"],wire("fenceLabel"):"true"}},"data":{"intent.json":serde_json::to_string(&prior).unwrap(),"power.json":serde_json::to_string(&p).unwrap()}}));
+        let result = coordinator.suspend(&db).await.unwrap().unwrap();
+        assert_eq!(result["state"], "hibernated", "{result}");
+        assert_eq!(result["power"]["revision"], 2);
+        assert!(
+            !server
+                .requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|path| path.contains("maintenance-credentials"))
+        );
     }
 }

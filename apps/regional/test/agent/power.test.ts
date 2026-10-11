@@ -443,6 +443,127 @@ test("missing replicas and a pending replica with no address cannot produce a qu
   );
 });
 
+test("terminal gateway Pods left by node shutdown neither block nor receive power controls", async () => {
+  const state = await readyFixture(),
+    target = suspended(state.db),
+    segment = randomBytes(12).toString("hex").toUpperCase();
+  const live = new Set(
+    [...state.k8s.resources.values()]
+      .filter(
+        (value) =>
+          value.kind === "Pod" && value.metadata.namespace === "pgcf-system",
+      )
+      .map((value) => value.metadata.uid),
+  );
+  // Graceful node shutdown leaves Deployment Pods behind as terminal objects without an address.
+  for (const [name, phase] of [
+    ["gateway-shutdown", "Failed"],
+    ["gateway-completed", "Succeeded"],
+  ] as const)
+    state.k8s.put({
+      apiVersion: "v1",
+      kind: "Pod",
+      metadata: {
+        name,
+        namespace: "pgcf-system",
+        labels: { "app.kubernetes.io/name": "pgcf-gateway" },
+      },
+      spec: { serviceAccountName: "pgcf-gateway" },
+      status: {
+        phase,
+        containerStatuses: [
+          {
+            name: "gateway",
+            restartCount: 0,
+            state: { terminated: { exitCode: 0 } },
+          },
+        ],
+      },
+    });
+  const recipients = new Set<string>();
+  const fetcher: typeof fetch = async (input, options) => {
+    const token = new Headers(options?.headers).get("X-PGCF-Control")!;
+    recipients.add(
+      JSON.parse(
+        Buffer.from(token.split(".")[1]!, "base64url").toString("utf8"),
+      ).pod,
+    );
+    return state.fetcher(input, options);
+  };
+  const probe = async (options: SleepProbeOptions) => {
+    await options.onClosedSegment!(segment);
+    return { safe: true as const, segment };
+  };
+  assert.equal(
+    (await reconciler(state, { fetcher }).reconcile(state.db, state.ctx))
+      ?.state,
+    "ready",
+  );
+  assert.equal(
+    await reconciler(state, { fetcher, probe }).reconcile(target),
+    null,
+  );
+  confirmedHibernation(state);
+  assert.equal(
+    (await reconciler(state, { fetcher, probe }).reconcile(target))?.state,
+    "hibernated",
+  );
+  assert.deepEqual(recipients, live);
+  const power = new PowerCoordinator({
+    k8s: state.k8s,
+    signal: state.signal,
+    region: "eu-test",
+    replicas: 2,
+  });
+  assert.deepEqual(
+    new Set(
+      (await power.gatewaySnapshot(state.signal)).pods.map((pod) => pod.uid),
+    ),
+    live,
+  );
+  state.k8s.resources.delete(state.k8s.key("Pod", "pgcf-system", "gateway-2"));
+  await assert.rejects(
+    power.gatewaySnapshot(state.signal),
+    /gateway_inventory_incomplete/,
+  );
+});
+
+test("a terminal database Pod is stopped for hibernation while a terminating one still blocks", async () => {
+  const state = await readyFixture(),
+    target = suspended(state.db),
+    segment = randomBytes(12).toString("hex").toUpperCase();
+  let probes = 0;
+  const probe = async (options: SleepProbeOptions) => {
+    probes++;
+    await options.onClosedSegment!(segment);
+    return { safe: true as const, segment };
+  };
+  assert.equal(await reconciler(state, { probe }).reconcile(target), null);
+  record(clusterFor(state).status).conditions = [
+    { type: "cnpg.io/hibernation", status: "True", reason: "Hibernated" },
+  ];
+  const pod = state.k8s.resources.get(
+    state.k8s.key("Pod", `pgcf-db-${state.db.id}`, "database-1"),
+  )!;
+  pod.metadata.deletionTimestamp = new Date().toISOString();
+  record(pod.status).phase = "Running";
+  assert.equal(await reconciler(state, { probe }).reconcile(target), null);
+  record(pod.status).phase = "Failed";
+  assert.equal(
+    (await reconciler(state, { probe }).reconcile(target))?.state,
+    "hibernated",
+  );
+  const changed = {
+    ...target,
+    generation: 3,
+    power: { ...target.power!, revision: 3 },
+  };
+  const result = await reconciler(state, { probe }).reconcile(changed);
+  assert.equal(result?.state, "hibernated");
+  assert.equal(result?.power?.revision, 3);
+  assert.equal(probes, 1);
+});
+
 test("a new gateway Pod after the switch invalidates the old proof before archive resume", async () => {
   const state = await readyFixture(),
     target = suspended(state.db),
