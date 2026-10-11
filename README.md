@@ -299,9 +299,10 @@ including a control node closed to database placement:
 
 Each region keeps one episode per kind (`regional_node_ram_warning`, `regional_node_cpu_warning`,
 `regional_node_storage_warning`). Its event lists up to 64 exceeding nodes, highest first, with
-`threshold_ppm` and the highest `utilization_ppm`. Another node crossing during an active episode
-sends nothing new. The episode clears only after every listed node is fresh and below the
-threshold, or lost; a missing measurement keeps it.
+`threshold_ppm` and the highest `utilization_ppm`. Another node crossing sends nothing new only
+while a listed node still exceeds; otherwise the crossing replaces the episode with a new event.
+The episode clears only after every listed node is fresh and below the threshold, or lost; a
+missing measurement keeps it.
 
 Configure either an `INFRASTRUCTURE_ALERT_WEBHOOK` service binding or an HTTPS
 `INFRASTRUCTURE_ALERT_WEBHOOK_URL`, plus your own `INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN` secret.

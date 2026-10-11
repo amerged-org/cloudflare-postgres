@@ -144,7 +144,7 @@ function volumeGroup(used: number): NodePhysicalStorage {
 async function storage(
   f: Awaited<ReturnType<typeof setup>>,
   node: Member,
-  physical: NodePhysicalStorage,
+  physical: NodePhysicalStorage | null,
   at: number,
 ) {
   const observed_at = new Date(at).toISOString();
@@ -185,6 +185,49 @@ function configured() {
     INFRASTRUCTURE_ALERT_WEBHOOK_URL: "https://receiver.invalid/events",
     INFRASTRUCTURE_ALERT_WEBHOOK_TOKEN: "test-alert-receiver-token",
   };
+}
+/** Pauses a run after its node read until `meanwhile` has finished, then lets it complete. */
+async function stalled(
+  run: (db: D1Database) => Promise<unknown>,
+  meanwhile: () => Promise<void>,
+) {
+  let captured!: () => void, resume!: () => void;
+  const read = new Promise<void>((resolve) => {
+    captured = resolve;
+  });
+  const release = new Promise<void>((resolve) => {
+    resume = resolve;
+  });
+  const paused = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) => {
+          const statement = target.prepare(sql);
+          if (!sql.startsWith("SELECT id,utilization_ppm FROM"))
+            return statement;
+          return {
+            bind: (...values: unknown[]) => ({
+              all: async () => {
+                const value = await statement.bind(...values).all();
+                captured();
+                await release;
+                return value;
+              },
+            }),
+          } as unknown as D1PreparedStatement;
+        };
+      const value: unknown = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  const older = run(paused);
+  await read;
+  try {
+    await meanwhile();
+  } finally {
+    resume();
+    await older;
+  }
 }
 
 it("creates no warning by default even with configured delivery and a reached finite cap", async () => {
@@ -819,60 +862,92 @@ it("keeps a node warning while a named node is unknown and clears once every nam
   expect(await episode()).toMatchObject({ active: false });
 });
 
+it("warns about another node's crossing once no listed node still exceeds, even while a listed node is unknown", async () => {
+  const f = await setup({ node_storage_warning_threshold_ppm: 850000 }),
+    first = member(f),
+    second = await addMember(f),
+    at = Date.now(),
+    events: InfraAlert[] = [];
+  const receiver: typeof fetch = async (_input, init) => {
+    events.push(InfraAlert.parse(JSON.parse(String(init?.body))));
+    return new Response(null, { status: 204 });
+  };
+  await storage(f, first, volumeGroup(900_000_000_000), at);
+  await storage(f, second, volumeGroup(100_000_000_000), at);
+  await runInfrastructureAlerts(configured(), f.region, at, receiver);
+  // The listed node keeps reporting without a measurement: it is neither stale nor lost.
+  await storage(f, first, null, at + 1);
+  await storage(f, second, volumeGroup(990_000_000_000), at + 1);
+  await runInfrastructureAlerts(configured(), f.region, at + 1, receiver);
+  expect(events).toMatchObject([
+    { node_ids: [first.node], utilization_ppm: 900000 },
+    { node_ids: [second.node], utilization_ppm: 990000 },
+  ]);
+  expect(events[1]!.event_id).not.toBe(events[0]!.event_id);
+  // While a listed node still exceeds, another node crossing sends nothing new.
+  await storage(f, first, volumeGroup(950_000_000_000), at + 2);
+  await runInfrastructureAlerts(configured(), f.region, at + 2, receiver);
+  expect(events).toHaveLength(2);
+});
+
 it("cannot arm or clear a node warning from a superseded concurrent read", async () => {
   const f = await setup({ node_storage_warning_threshold_ppm: 800000 }),
     at = Date.now();
   // The older run pauses after its node read while a newer measurement is recorded and evaluated.
   const race = async (older: number, newer: number, offset: number) => {
     await storage(f, member(f), volumeGroup(older), at + offset);
-    let captured!: () => void, resume!: () => void;
-    const read = new Promise<void>((resolve) => {
-      captured = resolve;
-    });
-    const release = new Promise<void>((resolve) => {
-      resume = resolve;
-    });
-    const paused = new Proxy(env.DB, {
-      get(target, key) {
-        if (key === "prepare")
-          return (sql: string) => {
-            const statement = target.prepare(sql);
-            if (!sql.startsWith("SELECT id,utilization_ppm FROM"))
-              return statement;
-            return {
-              bind: (...values: unknown[]) => ({
-                all: async () => {
-                  const value = await statement.bind(...values).all();
-                  captured();
-                  await release;
-                  return value;
-                },
-              }),
-            } as unknown as D1PreparedStatement;
-          };
-        const value: unknown = Reflect.get(target, key, target);
-        return typeof value === "function" ? value.bind(target) : value;
+    await stalled(
+      (db) =>
+        runInfrastructureAlerts({ ...env, DB: db }, f.region, at + offset),
+      async () => {
+        await storage(f, member(f), volumeGroup(newer), at + offset + 1);
+        await runInfrastructureAlerts(env, f.region, at + offset + 1);
       },
-    });
-    const run = runInfrastructureAlerts(
-      { ...env, DB: paused },
-      f.region,
-      at + offset,
     );
-    await read;
-    try {
-      await storage(f, member(f), volumeGroup(newer), at + offset + 1);
-      await runInfrastructureAlerts(env, f.region, at + offset + 1);
-    } finally {
-      resume();
-      await run;
-    }
   };
   await race(900_000_000_000, 700_000_000_000, 0);
   expect(await infrastructureAlertStatus(env.DB, f.region)).toEqual([]);
   await race(700_000_000_000, 900_000_000_000, 2);
   expect(await infrastructureAlertStatus(env.DB, f.region)).toMatchObject([
     { kind: "regional_node_storage_warning", active: true },
+  ]);
+});
+
+it("cannot arm or deliver a stalled read naming a node that no longer exceeds", async () => {
+  const f = await setup({ node_storage_warning_threshold_ppm: 800000 }),
+    first = member(f),
+    second = await addMember(f),
+    at = Date.now(),
+    events: InfraAlert[] = [];
+  const receiver: typeof fetch = async (_input, init) => {
+    events.push(InfraAlert.parse(JSON.parse(String(init?.body))));
+    return new Response(null, { status: 204 });
+  };
+  await storage(f, first, volumeGroup(900_000_000_000), at);
+  await storage(f, second, volumeGroup(100_000_000_000), at);
+  // Later runs warn about the second node and clear its episode while the stalled run holds its read.
+  await stalled(
+    (db) =>
+      runInfrastructureAlerts(
+        { ...configured(), DB: db },
+        f.region,
+        at,
+        receiver,
+      ),
+    async () => {
+      await storage(f, first, volumeGroup(500_000_000_000), at + 1);
+      await storage(f, second, volumeGroup(950_000_000_000), at + 1);
+      await runInfrastructureAlerts(configured(), f.region, at + 1, receiver);
+      await storage(f, second, volumeGroup(100_000_000_000), at + 2);
+      await runInfrastructureAlerts(configured(), f.region, at + 2, receiver);
+      await storage(f, second, volumeGroup(950_000_000_000), at + 3);
+    },
+  );
+  expect(events).toMatchObject([{ node_ids: [second.node] }]);
+  await runInfrastructureAlerts(configured(), f.region, at + 3, receiver);
+  expect(events).toMatchObject([
+    { node_ids: [second.node] },
+    { node_ids: [second.node], occurred_at: new Date(at + 3).toISOString() },
   ]);
 });
 
