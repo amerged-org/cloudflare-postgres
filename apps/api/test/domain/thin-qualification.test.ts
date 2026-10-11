@@ -195,34 +195,62 @@ async function qualificationSetup() {
     },
   );
   const created: string[] = [];
+  let unavailable = 0;
+  // The Workflow scheduling boundary; a transient create failure leaves no instance.
   const workflows = {
     async create(options: { id: string }) {
+      if (unavailable > 0) {
+        unavailable--;
+        throw new Error("workflow_create_unavailable");
+      }
       created.push(options.id);
       return {};
     },
+    async get() {
+      throw new Error("workflow_instance_not_found");
+    },
   } as unknown as Env["THIN_QUALIFICATION"];
-  const start = async (
-    body: unknown,
-    idempotency: string | undefined = crypto.randomUUID(),
+  const send = async (
+    path: string,
+    body?: unknown,
+    idempotency?: string,
+    binding = workflows,
+    key = f.admin,
   ) => {
     const context = createExecutionContext(),
-      headers = new Headers({
-        Authorization: `Bearer ${f.admin}`,
-        "Content-Type": "application/json",
-      });
+      headers = new Headers({ Authorization: `Bearer ${key}` });
+    if (body !== undefined) headers.set("Content-Type", "application/json");
     if (idempotency) headers.set("Idempotency-Key", idempotency);
     const response = await createApp().fetch(
-      new Request(
-        `https://api.invalid/v1/nodes/${f.node}/thin-qualifications`,
-        { method: "POST", headers, body: JSON.stringify(body) },
-      ),
-      { ...env, THIN_QUALIFICATION: workflows },
+      new Request(`https://api.invalid${path}`, {
+        method: "POST",
+        headers,
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      }),
+      { ...env, THIN_QUALIFICATION: binding },
       context,
     );
     await waitOnExecutionContext(context);
     return response;
   };
-  return { ...f, uid, release, spec, specSha, clusterUid, created, start };
+  const start = (
+    body: unknown,
+    idempotency: string | undefined = crypto.randomUUID(),
+  ) => send(`/v1/nodes/${f.node}/thin-qualifications`, body, idempotency);
+  return {
+    ...f,
+    uid,
+    release,
+    spec,
+    specSha,
+    clusterUid,
+    created,
+    start,
+    send,
+    unavailable: (count: number) => {
+      unavailable = count;
+    },
+  };
 }
 async function insertRunning(
   f: Awaited<ReturnType<typeof qualificationSetup>>,
@@ -648,3 +676,104 @@ it("waits out a turn lease an unanswered executor still holds before the next tu
     await instance.dispose();
   }
 }, 15_000);
+
+it("reports a lost Workflow start and drives the committed run again on replay", async () => {
+  const f = await qualificationSetup(),
+    body = { node_uid: f.uid, address: "192.0.2.18", profile },
+    key = crypto.randomUUID();
+  f.unavailable(1);
+  // The run is committed before its Workflow starts; a failed start is reported, not dropped.
+  expect((await f.start(body, key)).status).toBe(500);
+  expect(f.created).toEqual([]);
+  const replay = await f.start(body, key);
+  expect(replay.status).toBe(202);
+  const value = (await replay.json()) as ThinQualificationRun;
+  expect(value).toMatchObject({ status: "running", step: "setup" });
+  expect(f.created).toEqual([value.id]);
+  // A refused start names the running run, so it can be resumed or cancelled.
+  const refused = await f.start(body);
+  expect(refused.status).toBe(409);
+  expect(await refused.json()).toMatchObject({
+    error: { details: { run_id: value.id } },
+  });
+});
+
+it("resumes a running run's stopped Workflow and never reopens an ended run", async () => {
+  const f = await qualificationSetup(),
+    id = await insertRunning(f, "data_full"),
+    restarted: string[] = [];
+  const stopped = {
+    async create() {
+      throw new Error("workflow_instance_exists");
+    },
+    async get(instance: string) {
+      return {
+        status: async () => ({ status: "errored" }),
+        restart: async () => {
+          restarted.push(instance);
+        },
+      };
+    },
+  } as unknown as Env["THIN_QUALIFICATION"];
+  const path = `/v1/thin-qualifications/${id}/resume`;
+  expect(
+    (await f.send(path, undefined, undefined, stopped, f.integrator)).status,
+  ).toBe(403);
+  const resumed = await f.send(path, undefined, undefined, stopped);
+  expect(resumed.status).toBe(200);
+  expect(await resumed.json()).toMatchObject({
+    id,
+    status: "running",
+    step: "data_full",
+  });
+  expect(restarted).toEqual([id]);
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET status='failed',step='complete',error_code='thin_qualification_data_full_failed',lease_id=NULL,lease_expires_at=NULL,completed_at=? WHERE id=?",
+  )
+    .bind(new Date().toISOString(), id)
+    .run();
+  expect((await f.send(path, undefined, undefined, stopped)).status).toBe(409);
+  expect(restarted).toEqual([id]);
+});
+
+it("cancels the measurements of a running run, still runs cleanup and then fails it", async () => {
+  const f = await qualificationSetup(),
+    id = await insertRunning(f, "data_full");
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET lease_id=NULL,lease_expires_at=NULL WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  const instance = await introspectWorkflowInstance(env.THIN_QUALIFICATION, id);
+  try {
+    await instance.modify(async (m) => {
+      await m.disableSleeps();
+      await m.disableRetryDelays();
+      // A transient failure of one turn is retried instead of stopping the Workflow.
+      await m.mockStepError({ name: "setup-0" }, new Error("D1_ERROR"), 1);
+    });
+    const path = `/v1/thin-qualifications/${id}/cancel`;
+    expect((await request(path, f.integrator, "POST")).status).toBe(403);
+    // The cancel drives the run's Workflow through the real binding.
+    const cancelled = await request(path, f.admin, "POST");
+    expect(cancelled.status).toBe(200);
+    expect(await cancelled.json()).toMatchObject({
+      status: "running",
+      step: "cleanup",
+      error_code: "thin_qualification_cancelled",
+    });
+    await instance.waitForStatus("complete");
+    expect(
+      await instance.waitForStepResult({ name: "cleanup-0" }),
+    ).toMatchObject({ step: "cleanup", status: "running" });
+    expect(await run(id)).toMatchObject({
+      status: "failed",
+      step: "complete",
+      error_code: "thin_qualification_cancelled",
+      receipt_sha256: null,
+    });
+    expect((await request(path, f.admin, "POST")).status).toBe(409);
+  } finally {
+    await instance.dispose();
+  }
+});

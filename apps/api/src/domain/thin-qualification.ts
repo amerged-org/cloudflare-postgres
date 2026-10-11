@@ -175,15 +175,22 @@ export async function startThinQualification(
       "invalid_request",
       "Thin qualification requires an Idempotency-Key",
     );
+  // The Workflow follows the persisted run, so a replay also drives a run whose start was lost.
+  const output = async (id: string) => {
+    const run = await readThinQualification(c.env, id);
+    if (run.status === "running")
+      await startThinQualificationWorkflow(c.env, id);
+    return c.json(run, 202);
+  };
   return withIdempotency(c, {
-    replay: async (id) => c.json(await readThinQualification(c.env, id), 202),
+    replay: output,
     execute: async (lease) => {
       const env = c.env;
       const source = await env.DB.prepare(
         `SELECT n.region_id,a.role,a.release_id,a.revision assignment_revision,f.revision region_revision,s.spec_json,s.spec_sha256,r.bootstrap_material_revision material_revision,
         EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=n.region_id AND p.compute_pool_json IS NOT NULL) pool_enabled,
         EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=n.id) thin_selected,
-        EXISTS(SELECT 1 FROM thin_storage_qualification_runs q WHERE q.node_id=n.id AND q.status='running') running
+        (SELECT q.id FROM thin_storage_qualification_runs q WHERE q.node_id=n.id AND q.status='running') running
         FROM nodes n JOIN regions r ON r.id=n.region_id JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid
         JOIN fleet_region_releases f ON f.region_id=n.region_id AND f.release_id=a.release_id JOIN fleet_releases s ON s.id=a.release_id
         WHERE ${freshNodeSql}`,
@@ -200,7 +207,7 @@ export async function startThinQualification(
           material_revision: number;
           pool_enabled: number;
           thin_selected: number;
-          running: number;
+          running: string | null;
         }>();
       if (!source)
         return conflict(
@@ -213,7 +220,11 @@ export async function startThinQualification(
           "A node with selected thin storage cannot run a scratch qualification",
         );
       if (source.running)
-        return conflict("A thin qualification is already running on this node");
+        throw new ApiError(
+          "conflict",
+          "A thin qualification is already running on this node",
+          { run_id: source.running },
+        );
       const spec = FleetReleaseSpec.parse(JSON.parse(source.spec_json));
       if ((await installationHash(spec)) !== source.spec_sha256)
         return conflict("Approved release contents changed");
@@ -293,21 +304,47 @@ export async function startThinQualification(
       ]);
       if (results[0]!.meta.changes !== 1)
         return conflict("Thin qualification preconditions changed");
-      c.executionCtx.waitUntil(startThinQualificationWorkflow(env, id));
-      return c.json(await readThinQualification(env, id), 202);
+      return output(id);
     },
   });
 }
+/** Create, restart or resume the run's one Workflow; each turn fast-forwards to the persisted step. */
 export async function startThinQualificationWorkflow(env: Env, id: string) {
   OperationId.parse(id);
   try {
     await env.THIN_QUALIFICATION.create({ id, params: { run_id: id } });
   } catch {
-    const instance = await env.THIN_QUALIFICATION.get(id);
-    const status = await instance.status();
-    if (status.status === "errored" || status.status === "terminated")
+    const instance = await env.THIN_QUALIFICATION.get(id),
+      state = await instance.status();
+    if (["errored", "terminated", "complete"].includes(state.status))
       await instance.restart();
+    else if (state.status === "paused") await instance.resume();
   }
+}
+/** Drive a running run again after a lost start or a stopped Workflow; an ended run stays ended. */
+export async function resumeThinQualification(c: ApiContext, id: string) {
+  await requireScope(c, "admin");
+  const run = await readThinQualification(c.env, id);
+  if (run.status !== "running")
+    return conflict("Thin qualification already ended");
+  await startThinQualificationWorkflow(c.env, id);
+  return c.json(run, 200);
+}
+/** End the measurements; cleanup still runs and the run then fails without a receipt. */
+export async function cancelThinQualification(c: ApiContext, id: string) {
+  await requireScope(c, "admin");
+  OperationId.parse(id);
+  const result = await c.env.DB.prepare(
+    `UPDATE thin_storage_qualification_runs SET error_code=COALESCE(error_code,'thin_qualification_cancelled'),
+    step=CASE WHEN step IN('cleanup','complete') THEN step ELSE 'cleanup' END,updated_at=? WHERE id=? AND status='running'`,
+  )
+    .bind(new Date().toISOString(), id)
+    .run();
+  const run = await readThinQualification(c.env, id);
+  if (result.meta.changes !== 1)
+    return conflict("Thin qualification already ended");
+  await startThinQualificationWorkflow(c.env, id);
+  return c.json(run, 200);
 }
 
 async function callbackBearer(env: Pick<Env, "API_KEY_PEPPER">, row: Row) {

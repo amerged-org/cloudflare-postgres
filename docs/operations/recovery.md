@@ -357,6 +357,11 @@ scratch object, LV, the pool and a pool metadata spare that did not exist before
    or ends the run; it is never repeated.
 3. `GET /v1/thin-qualifications/{id}` returns status, step, the measured evidence per gate and the
    decision Cloudflare computed from it.
+4. A run that stops progressing, for example after a failed Workflow start (a `500` after the run was
+   committed) or a stopped instance, continues with `POST /v1/thin-qualifications/{id}/resume`. A
+   start refused because a run is already running names that run in `details.run_id`.
+5. `POST /v1/thin-qualifications/{id}/cancel` ends the measurements with
+   `thin_qualification_cancelled`. Cleanup still runs; the run then fails without a receipt.
 
 The run reboots the node once (`metadata_full`). Retained thick databases on the node restart. Run
 it only when that disruption is acceptable.

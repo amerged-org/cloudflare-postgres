@@ -43,7 +43,8 @@ export class ThinQualification extends WorkflowEntrypoint<
       for (let turn = 0; ; turn++) {
         const state = await step.do(
           `${name}-${turn}`,
-          { retries: { limit: 0, delay: "1 second" }, timeout: "12 minutes" },
+          // A retry is one more lease-fenced turn; an uncertain write stays journaled.
+          { retries: { limit: 3, delay: "15 seconds" }, timeout: "12 minutes" },
           async () => {
             try {
               await stub.thinQualification(id, name);

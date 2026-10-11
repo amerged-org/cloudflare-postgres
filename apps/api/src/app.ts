@@ -73,6 +73,8 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/internal/v1/node-thin-storage/:id/relay",
   "/v1/nodes/:id/thin-qualifications",
   "/v1/thin-qualifications/:id",
+  "/v1/thin-qualifications/:id/resume",
+  "/v1/thin-qualifications/:id/cancel",
   "/internal/v1/thin-qualifications/:id",
   "/internal/v1/thin-qualifications/:id/relay",
   "/v1/costs/node-facts",

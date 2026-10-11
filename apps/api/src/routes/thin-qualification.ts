@@ -22,11 +22,13 @@ import {
 import { ApiError, type ApiApp } from "../app.ts";
 import {
   authenticateThinQualification,
+  cancelThinQualification,
   getThinQualification,
   issueThinQualificationTransport,
   recordThinQualificationCheckpoint,
   recordThinQualificationReport,
   releaseThinQualificationTurn,
+  resumeThinQualification,
   startThinQualification,
   thinQualificationInput,
   thinQualificationStatus,
@@ -93,6 +95,36 @@ export function registerThinQualification(app: ApiApp) {
     }),
     async (c) => getThinQualification(c, OperationId.parse(c.req.param("id"))),
   );
+  for (const [action, description, handler] of [
+    [
+      "resume",
+      "Drives a running qualification again from its persisted step, for example after a lost Workflow start or a stopped instance. It never repeats an uncertain write or reopens an ended run.",
+      resumeThinQualification,
+    ],
+    [
+      "cancel",
+      "Ends the measurements of a running qualification with thin_qualification_cancelled. Cleanup still runs; the run then fails without a receipt.",
+      cancelThinQualification,
+    ],
+  ] as const)
+    app.openapi(
+      createRoute({
+        method: "post",
+        path: `/v1/thin-qualifications/{id}/${action}`,
+        tags: ["Physical storage"],
+        security: [{ bearerAuth: [] }],
+        description,
+        request: { params: z.object({ id: OperationId }) },
+        responses: {
+          200: {
+            description: "Running qualification",
+            content: { "application/json": { schema: ThinQualificationRun } },
+          },
+          ...errors,
+        },
+      }),
+      async (c) => handler(c, OperationId.parse(c.req.param("id"))),
+    );
   app.post("/internal/v1/thin-qualifications/:id", async (c) => {
     const id = OperationId.parse(c.req.param("id"));
     await authenticateThinQualification(c, id);
