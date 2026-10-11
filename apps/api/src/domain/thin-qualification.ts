@@ -681,9 +681,16 @@ export async function expireThinQualificationStep(
     )
     .run();
 }
+/** A still-held lease reports how long its turn may continue; the Workflow waits that out. */
 export async function readThinQualificationStep(env: Env, id: string) {
   const row = await readRow(env.DB, id);
-  return { step: row.step, status: row.status };
+  return {
+    step: row.step,
+    status: row.status,
+    lease_wait_ms: row.lease_expires_at
+      ? Math.max(0, Date.parse(row.lease_expires_at) - Date.now())
+      : 0,
+  };
 }
 /** Seal a finished run: a receipt only for every gate passed by code and a verified cleanup. */
 export async function completeThinQualification(env: Env, id: string) {

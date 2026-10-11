@@ -53,6 +53,9 @@ export class ThinQualification extends WorkflowEntrypoint<
             return await readThinQualificationStep(this.env, id);
           },
         );
+        // An unanswered executor may still be inside its lease; no turn or deadline starts before it ends.
+        if (state.lease_wait_ms > 0)
+          await step.sleep(`${name}-lease-${turn}`, state.lease_wait_ms + 1000);
         if (state.status !== "running" || state.step !== name) break;
         if (turn + 1 >= TURNS[name]) {
           await step.do(`${name}-deadline`, () =>

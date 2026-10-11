@@ -2,6 +2,7 @@
 import { env } from "cloudflare:workers";
 import {
   createExecutionContext,
+  introspectWorkflowInstance,
   waitOnExecutionContext,
 } from "cloudflare:test";
 import { afterEach, expect, it } from "vitest";
@@ -11,6 +12,7 @@ import {
   type FleetReleaseComponent,
 } from "@pgcf/contracts/releases";
 import {
+  THIN_QUALIFICATION_STEPS,
   thinQualificationGatePass,
   thinQualificationReceiptMaterial,
   thinStorageQualificationFromRun,
@@ -602,3 +604,47 @@ it("decides every gate from its evidence and seals the receipt only after verifi
       .run(),
   ).rejects.toThrow("thin_storage_qualification_terminal");
 });
+
+it("waits out a turn lease an unanswered executor still holds before the next turn or the step deadline", async () => {
+  const f = await qualificationSetup(),
+    id = await insertRunning(f, "cleanup"),
+    expires = Date.now() + 2500;
+  // The previous turn's executor stopped answering; its lease still runs.
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET lease_expires_at=? WHERE id=?",
+  )
+    .bind(new Date(expires).toISOString(), id)
+    .run();
+  const instance = await introspectWorkflowInstance(env.THIN_QUALIFICATION, id);
+  try {
+    // Only the fixed turn cadence is skipped; a lease wait really elapses.
+    await instance.modify((m) =>
+      m.disableSleeps(
+        [...THIN_QUALIFICATION_STEPS, "complete"].flatMap((name) =>
+          Array.from({ length: 64 }, (_, turn) => ({
+            name: `${name}-wait-${turn}`,
+          })),
+        ),
+      ),
+    );
+    // The real test DO has no container, so every turn ends before it can take a lease.
+    await env.THIN_QUALIFICATION.create({ id, params: { run_id: id } });
+    expect(await instance.waitForStepResult({ name: "setup-0" })).toMatchObject(
+      { step: "cleanup", status: "running" },
+    );
+    expect((await run(id)).step).toBe("cleanup");
+    await instance.waitForStatus("complete");
+    const ended = await run(id);
+    expect(ended).toMatchObject({
+      status: "failed",
+      step: "complete",
+      error_code: "thin_qualification_cleanup_deadline",
+    });
+    // Cleanup expired only after the held lease ended, never under it.
+    expect(Date.parse(String(ended.completed_at))).toBeGreaterThanOrEqual(
+      expires,
+    );
+  } finally {
+    await instance.dispose();
+  }
+}, 15_000);

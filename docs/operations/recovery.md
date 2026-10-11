@@ -377,12 +377,15 @@ token, is verified after activation by the six live checks.
 
 **Failure and cleanup**
 - A failed gate or executor error records its code and moves straight to cleanup.
+- A turn whose executor stops answering keeps its lease until the lease expires. The Workflow waits
+  for that lease before the next turn or a step deadline, so cleanup still gets all its turns.
 - Cleanup resumes any suspended scratch LV and removes everything the run created. It reports
   absence, the LV inventory and VG free space against the baseline.
-- If cleanup cannot be verified, the run fails with `thin_qualification_cleanup_incomplete`. Remove
-  the remaining objects by hand. They are: namespace `pgcf-thin-q-<run>`, the StorageClass and VAC of
-  the same name, LVs tagged `pgcf.thin-q.<run id>` or named `pgcf_thin_q_<run>*`, and a
-  `pgcf_thinpool` whose `pgcf.action.<nonce>` tag matches the run journal.
+- A failed run keeps its first error code. If its `cleanup` is null or unverified
+  (`thin_qualification_cleanup_incomplete`), remove the remaining objects by hand. They are:
+  namespace `pgcf-thin-q-<run>`, the StorageClass and VAC of the same name, LVs tagged
+  `pgcf.thin-q.<run id>` or named `pgcf_thin_q_<run>*`, and a `pgcf_thinpool` whose
+  `pgcf.action.<nonce>` tag matches the run journal.
 
 **Receipt into a release (R2b)**
 1. Copy `qualification` from the completed run.
