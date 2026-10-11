@@ -25,6 +25,7 @@ import {
   storeRegionJoinBundle,
   joinBundleReference,
 } from "../../src/crypto/bootstrap-credentials.ts";
+import { newNodeId } from "@pgcf/contracts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 afterEach(async () => {
   await env.DB.prepare("DELETE FROM infrastructure_backup_runs").run();
@@ -483,7 +484,7 @@ it("R2 multipart writes bounded parts and preserves a committed unique object af
   await env.ARCHIVE.delete(key);
 });
 
-it("binds one fresh control snapshot source and revokes its daily capability on a changed Node UID", async () => {
+it("binds one fresh control snapshot source, skips a region without live members and revokes its daily capability on a changed Node UID", async () => {
   const f = await fixture(),
     binding = enabled(),
     now = Date.now(),
@@ -567,8 +568,49 @@ it("binds one fresh control snapshot source and revokes its daily capability on 
       new Date(now + 3600000).toISOString(),
     ),
   ]);
+  // A cluster whose only physical member is lost has no snapshot source.
+  const retired = newNodeId();
+  await storeRegionJoinBundle(
+    env.DB,
+    env.CREDENTIAL_KEYS,
+    joinBundleReference(f.foreign, 1),
+    {
+      version: 1,
+      cluster_name: "daily-backup-retired",
+      cluster_endpoint: "https://192.0.2.41:6443",
+      kube_system_uid: crypto.randomUUID(),
+      talos_version: "1.14.1",
+      kubernetes_version: "1.36.5",
+      talos_machine_secrets_yaml: "cluster: private-test-material\n",
+      talos_admin_config: "context: private-test-material\n",
+      kubeconfig: "apiVersion: v1\ncontext: private-test-material\n",
+    },
+  );
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE regions SET bootstrap_material_revision=1 WHERE id=?",
+    ).bind(f.foreign),
+    env.DB.prepare(
+      "INSERT INTO nodes(id,region_id,k8s_node_name,node_uid,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,'retired',?,1,4096,2000,30,128,100,?,?,?)",
+    ).bind(
+      retired,
+      f.foreign,
+      crypto.randomUUID(),
+      new Date(now).toISOString(),
+      new Date(now).toISOString(),
+      new Date(now).toISOString(),
+    ),
+    env.DB.prepare(
+      "UPDATE nodes SET lost_at=?,lost_reason='test loss',ready=0,schedulable=0 WHERE id=?",
+    ).bind(new Date(now).toISOString(), retired),
+  ]);
   const artifacts = await initializeInfrastructureBackup(binding, run);
   expect(artifacts).toHaveLength(2);
+  expect(
+    (await infrastructureBackupHealth(binding, now)).filter(
+      (value) => value.region_id === f.foreign,
+    ),
+  ).toEqual([]);
   const input = await prepareInfrastructureBackupInput(
       binding,
       run,

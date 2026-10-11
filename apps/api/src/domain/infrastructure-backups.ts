@@ -260,7 +260,7 @@ export async function initializeInfrastructureBackup(env: Env, id: string) {
     },
   ];
   const clusters = await env.DB.prepare(
-    "SELECT id FROM regions WHERE EXISTS(SELECT 1 FROM region_bootstrap_credentials c WHERE c.region_id=regions.id AND c.purpose='join_bundle' AND c.revision=regions.bootstrap_material_revision) ORDER BY id",
+    "SELECT id FROM regions WHERE EXISTS(SELECT 1 FROM region_bootstrap_credentials c WHERE c.region_id=regions.id AND c.purpose='join_bundle' AND c.revision=regions.bootstrap_material_revision) AND EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=regions.id AND n.lost_at IS NULL) ORDER BY id",
   ).all<{ id: string }>();
   for (const region of clusters.results) {
     const source = await snapshotSource(env, region.id);
@@ -661,7 +661,7 @@ export async function infrastructureBackupHealth(env: Env, now = Date.now()) {
       source_id: config.d1_database_id,
     });
   const clusters = await env.DB.prepare(
-    "SELECT id FROM regions WHERE bootstrap_material_revision>0 AND EXISTS(SELECT 1 FROM region_bootstrap_credentials c WHERE c.region_id=regions.id AND c.purpose='join_bundle' AND c.revision=regions.bootstrap_material_revision)",
+    "SELECT id FROM regions WHERE bootstrap_material_revision>0 AND EXISTS(SELECT 1 FROM region_bootstrap_credentials c WHERE c.region_id=regions.id AND c.purpose='join_bundle' AND c.revision=regions.bootstrap_material_revision) AND EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=regions.id AND n.lost_at IS NULL)",
   ).all<{ id: string }>();
   for (const region of clusters.results) {
     let clusterUid: string | null = null;

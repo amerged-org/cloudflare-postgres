@@ -64,8 +64,24 @@ async function assertHeldReplacement(
   env: Env,
   previous: FleetRolloutIntent,
   input: FleetRolloutRequest,
-) {
-  await assertIntent(env, previous);
+): Promise<FleetRolloutIntent> {
+  // Only an exact lost physical identity leaves the selection; a region without survivors is not replaced.
+  const lost = await env.DB.prepare(
+    "SELECT n.id FROM json_each(?) r,json_each(r.value,'$.nodes') m JOIN nodes n ON n.id=json_extract(m.value,'$.node_id') AND n.node_uid=json_extract(m.value,'$.node_uid') WHERE n.lost_at IS NOT NULL",
+  )
+    .bind(JSON.stringify(previous.regions))
+    .all<{ id: string }>();
+  const gone = new Set(lost.results.map((row) => row.id));
+  const replaced: FleetRolloutIntent = {
+    ...previous,
+    regions: previous.regions
+      .map((region) => ({
+        ...region,
+        nodes: region.nodes.filter((node) => !gone.has(node.node_id)),
+      }))
+      .filter((region) => region.nodes.length > 0),
+  };
+  await assertIntent(env, replaced, JSON.stringify(previous));
   if (previous.release_id === input.release_id) return changed();
   const identity = (regions: FleetRolloutRequest["regions"]) =>
     JSON.stringify(
@@ -80,15 +96,15 @@ async function assertHeldReplacement(
         })),
       })),
     );
-  if (identity(previous.regions) !== identity(input.regions)) return changed();
-  for (const [index, region] of previous.regions.entries()) {
+  if (identity(replaced.regions) !== identity(input.regions)) return changed();
+  for (const [index, region] of replaced.regions.entries()) {
     const target = input.regions[index]!;
     const held =
       region.rotation?.phase === "snapshot" &&
       region.rotation.state === "halted" &&
       region.rotation.revision === 0 &&
       region.rotation.node_index === 0 &&
-      region.rotation.error_code === "operator_hold_us_acceptance" &&
+      region.rotation.error_code?.startsWith("operator_hold_") === true &&
       region.staged_material_revision === region.current_material_revision + 1;
     if (held) {
       if (
@@ -119,13 +135,14 @@ async function assertHeldReplacement(
       }
     }
   }
-  const quiet = quiescentRolloutSql(previous);
+  const quiet = quiescentRolloutSql(replaced);
   if (
     !(await env.DB.prepare(`SELECT 1 valid WHERE ${quiet.sql}`)
       .bind(...quiet.bindings)
       .first())
   )
     return changed();
+  return replaced;
 }
 /** Shared atomic authority for the existing intent, custody activation and issued capabilities. */
 export function fleetRolloutAuthoritySql(input: FleetRolloutIntent): {
@@ -249,8 +266,11 @@ async function refreshFleetRolloutQualifiedMaterial(env: Env, id: string) {
   if (JSON.stringify(updated) !== JSON.stringify(intent))
     await writeFleetRolloutIntent(env, intent, updated);
 }
-async function assertIntent(env: Env, intent: FleetRolloutIntent) {
-  const raw = JSON.stringify(intent);
+async function assertIntent(
+  env: Env,
+  intent: FleetRolloutIntent,
+  raw = JSON.stringify(intent),
+) {
   for (const region of intent.regions) {
     const row = await env.DB.prepare(
       "SELECT f.release_id,f.revision,f.rollout_json,r.bootstrap_material_revision FROM fleet_region_releases f JOIN regions r ON r.id=f.region_id WHERE f.region_id=?",
@@ -642,7 +662,9 @@ export async function createFleetRollout(
             throw error;
           })
         : undefined;
-      if (previous) await assertHeldReplacement(c.env, previous, input);
+      const replaced = previous
+        ? await assertHeldReplacement(c.env, previous, input)
+        : undefined;
       const intent: FleetRolloutIntent = {
         ...desired,
         rollout_id: newOperationId(),
@@ -734,15 +756,6 @@ export async function createFleetRollout(
           revision,
           current_material_revision: target.material_revision,
           nodes: members,
-          ...(previous?.regions.find(
-            (region) => region.region_id === target.region_id,
-          )?.rotation?.state === "halted"
-            ? {
-                rotation: previous.regions.find(
-                  (region) => region.region_id === target.region_id,
-                )!.rotation,
-              }
-            : {}),
         };
         await assertCluster(c.env, region);
         for (const node of region.nodes) {
@@ -808,8 +821,8 @@ export async function createFleetRollout(
       const guard = `NOT EXISTS(SELECT 1 FROM json_each(?) targets LEFT JOIN regions r ON r.id=json_extract(targets.value,'$.region_id') LEFT JOIN fleet_region_releases f ON f.region_id=r.id WHERE r.id IS NULL OR COALESCE(f.revision,0)<>json_extract(targets.value,'$.revision') OR f.rollout_json IS NOT json_extract(targets.value,'$.rollout_json') OR r.bootstrap_material_revision<>json_extract(targets.value,'$.material_revision') OR (SELECT count(*) FROM nodes WHERE region_id=r.id AND lost_at IS NULL)<>json_array_length(targets.value,'$.nodes')) AND NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members LEFT JOIN nodes n ON n.id=json_extract(members.value,'$.node_id') LEFT JOIN fleet_node_releases a ON a.node_id=n.id WHERE n.id IS NULL OR n.region_id<>json_extract(regions.value,'$.region_id') OR n.node_uid<>json_extract(members.value,'$.node_uid') OR n.lost_at IS NOT NULL OR n.ready<>1 OR julianday(n.last_observed_at)<julianday('now','-180 seconds') OR julianday(n.last_observed_at)>julianday('now','+5 seconds') OR n.last_observed_at IS NULL OR COALESCE(a.revision,0)<>json_extract(members.value,'$.expected_revision') OR (json_type(members.value,'$.compute_pool') IS NOT NULL AND COALESCE((SELECT revision FROM node_compute_pool_policies WHERE node_id=n.id),0)<>json_extract(members.value,'$.compute_pool.expected_revision'))) AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND p.stage<>'complete' AND NOT(p.stage='host_ready' AND p.state='confirmed') AND (p.release_id<>? OR NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members WHERE json_extract(members.value,'$.node_id')=p.node_id AND json_extract(members.value,'$.node_uid')=p.node_uid AND json_extract(members.value,'$.assignment_revision')=p.assignment_revision AND json_extract(regions.value,'$.revision')=p.region_revision)))`;
       const owner =
         "EXISTS(SELECT 1 FROM fleet_region_releases WHERE region_id=? AND rollout_json=?)";
-      const replacement = previous
-        ? quiescentRolloutSql(previous)
+      const replacement = replaced
+        ? quiescentRolloutSql(replaced)
         : { sql: "1=1", bindings: [] };
       const statements: D1PreparedStatement[] = [
         c.env.DB.prepare(

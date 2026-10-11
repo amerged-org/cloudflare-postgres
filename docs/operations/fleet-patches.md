@@ -214,12 +214,14 @@ request with the same idempotency key reads and resumes its committed intent rat
 creating another patch. This endpoint does not purchase a server or reinstall a node.
 
 A replacement of an explicitly held, quiescent rollout includes
-`expected_previous_rollout_id` identifying the current intent. It preserves the regional
-members and physical Node/Cluster UIDs; dispatched or uncertain writes block replacement.
-The old patch operations and receipts remain immutable. Existing EU hold remains in force:
-replacement selection does not authorize its authority activation or advance it before the
-US canary gates pass. The old rollout reports `blocked` with
-`identity_or_assignment_changed` after its assignments change.
+`expected_previous_rollout_id` identifying the current intent. It keeps every surviving
+regional member in order with its physical Node/Cluster UIDs. Only members marked lost with
+`POST /v1/nodes/{id}/mark-lost` leave the selection; a region without surviving members is
+omitted and keeps its old intent. Dispatched or uncertain writes in a replaced region block
+replacement. The old patch operations and receipts remain immutable. A snapshot hold whose
+error code starts with `operator_hold_` is not carried over: the successor starts the
+prepared rotation at its snapshot gate when its region is reached. The old rollout reports
+`blocked` with `identity_or_assignment_changed` after its assignments change.
 
 The existing region intent retains one `previous_intent` snapshot containing only the
 immediate predecessor's core intent. A snapshot excludes its own `previous_intent` and

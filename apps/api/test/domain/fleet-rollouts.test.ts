@@ -222,7 +222,7 @@ async function setup() {
   }
   return { ...f, release, spec, input, runtime, started, send, us, control };
 }
-it("an explicit quiescent held rollout replacement preserves its immediate predecessor, EU hold and completed receipts", async () => {
+it("an explicit quiescent held rollout replacement preserves its immediate predecessor and completed receipts without inheriting the operator hold", async () => {
   const f = await setup(),
     original = structuredClone(
       f.input,
@@ -368,7 +368,7 @@ it("an explicit quiescent held rollout replacement preserves its immediate prede
   const current = (await accepted.json()) as { rollout_id: string },
     replacement = await readFleetRolloutIntent(env.DB, current.rollout_id);
   expect(replacement.previous_intent).toEqual(held);
-  expect(replacement.regions[1]!.rotation).toEqual(held.regions[1]!.rotation);
+  expect(replacement.regions[1]!.rotation).toBeUndefined();
   expect(replacement.regions[1]!.staged_material_revision).toBe(2);
   expect(
     await env.DB.prepare(
@@ -390,6 +390,78 @@ it("an explicit quiescent held rollout replacement preserves its immediate prede
   expect(replay.status).toBe(202);
   expect(((await replay.json()) as { state: string }).state).toBe("blocked");
   expect(f.started.size).toBe(started);
+});
+it("a held successor drops only lost members and their regions, checks only replaced regions and restarts the rotation", async () => {
+  const f = await setup(),
+    original = structuredClone(
+      f.input,
+    ) as import("@pgcf/contracts/fleet-rollouts").FleetRolloutRequest;
+  original.regions[1]!.staged_material_revision = 2;
+  const { rollout_id } = (await (
+    await f.send(original as typeof f.input)
+  ).json()) as { rollout_id: string };
+  const before = await readFleetRolloutIntent(env.DB, rollout_id),
+    held = structuredClone(before);
+  held.regions[1]!.rotation = {
+    revision: 0,
+    phase: "snapshot",
+    node_index: 0,
+    state: "halted",
+    error_code: "operator_hold_eu_start",
+  };
+  await writeFleetRolloutIntent(f.runtime, before, held);
+  const nextRelease = `successor-${crypto.randomUUID()}`;
+  releases.push(nextRelease);
+  await env.DB.prepare(
+    "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+  )
+    .bind(
+      nextRelease,
+      JSON.stringify(f.spec),
+      await installationHash(f.spec),
+      new Date().toISOString(),
+    )
+    .run();
+  const eu = structuredClone(original.regions[1]!);
+  eu.expected_revision = 1;
+  eu.nodes = eu.nodes
+    .filter((node) => node.node_id === f.control)
+    .map((node) => ({ ...node, expected_revision: 1 }));
+  const next = {
+    release_id: nextRelease,
+    maintenance_acknowledged: true,
+    expected_previous_rollout_id: rollout_id,
+    regions: [eu],
+  };
+  // The unfinished US patch stays; only an exact loss may remove live members.
+  expect((await f.send(next as typeof f.input, "live-members")).status).toBe(
+    409,
+  );
+  for (const node of [f.us, f.node])
+    await env.DB.prepare(
+      "UPDATE nodes SET lost_at=?,lost_reason='test loss',ready=0,schedulable=0 WHERE id=?",
+    )
+      .bind(new Date().toISOString(), node)
+      .run();
+  const accepted = await f.send(next as typeof f.input, "lost-members");
+  expect(accepted.status).toBe(202);
+  const successor = await readFleetRolloutIntent(
+    env.DB,
+    ((await accepted.json()) as { rollout_id: string }).rollout_id,
+  );
+  expect(successor.previous_intent).toEqual(held);
+  expect(
+    successor.regions.map((region) => [
+      region.region_id,
+      region.nodes.map((node) => node.node_id),
+    ]),
+  ).toEqual([[f.region, [f.control]]]);
+  expect(successor.regions[0]!.rotation).toEqual({
+    revision: 0,
+    phase: "snapshot",
+    node_index: 0,
+    state: "pending",
+  });
 });
 it("a completed fleet can select its next release without reopening confirmed host-ready history or bypassing unknown writes", async () => {
   const f = await setup(),
