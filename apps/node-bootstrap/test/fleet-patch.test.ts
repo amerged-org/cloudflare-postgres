@@ -954,6 +954,109 @@ test("pool-off admission retains both physical host files without requiring pool
   assert.equal(r.writes.length, 0);
 });
 
+test("a thin-guard-pinned retained host loads dm_thin_pool before any qualification receipt exists", async () => {
+  const r = runtime(),
+    spec = r.fixture.input.spec,
+    keys = { test: "A".repeat(43) },
+    files = NodeHostConfigurationPrivate.shape.files.parse([
+      {
+        path: "/var/lib/pgcf-sandbox/settings.json",
+        permissions: 384,
+        content: "guarded-settings",
+      },
+      {
+        path: "/var/lib/pgcf-sandbox/agent-key",
+        permissions: 384,
+        content: "retained-key",
+      },
+    ]);
+  for (const name of [
+    "native-gateway",
+    "native-controller",
+    "pgcf-sandbox-controller",
+  ])
+    spec.components.push({
+      name,
+      kind: "image",
+      version: "1.0.0",
+      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
+      sha256: "d".repeat(64),
+    });
+  for (const role of Object.values(spec.roles)) {
+    role.host_configuration_required = true;
+    role.talos_extensions.push("pgcf-sandbox-controller");
+    role.components.push("native-gateway", "native-controller");
+  }
+  spec.storage_authority_keys_sha256 = digest(canonical(keys));
+  assert.equal(spec.thin_storage_qualification, undefined);
+  r.fixture.input.storage_authority = {
+    keys,
+    sha256: spec.storage_authority_keys_sha256,
+  };
+  r.fixture.input.retained_thick_storage = [];
+  r.fixture.input.host_configuration = NodeHostConfigurationPrivate.parse({
+    files,
+    status: {
+      version: 1,
+      node_id: r.current.node_id,
+      node_uid: r.current.node_uid,
+      region_id: r.current.region_id,
+      cluster_uid: r.current.cluster_uid,
+      material_revision: 1,
+      revision: 1,
+      release_id: r.current.release_id,
+      pool_policy_revision: 1,
+      profile_sha256: "f".repeat(64),
+      sha256: digest(canonical(files)),
+      created_at: new Date().toISOString(),
+    },
+  });
+  const host = r.fixture.input.host_configuration;
+  r.current = {
+    ...r.current,
+    stage: "host_config",
+    baseline: r.fixture.facts,
+    host_configuration_revision: host.status.revision,
+    host_configuration_sha256: host.status.sha256,
+    spec_sha256: digest(canonical(spec)),
+  };
+  r.machineConfiguration = stringify({
+    version: "v1alpha1",
+    machine: { network: { hostname: "retained" } },
+  });
+  let applied = "";
+  r.applyProbe = async (command) => {
+    const file = command.args.find((arg) => arg.startsWith("--file="))!;
+    applied = await readFile(file.slice("--file=".length), "utf8");
+    r.machineConfiguration = applied;
+    return { exit_code: 0, stdout: "" };
+  };
+  await r.turn();
+  assert.equal(r.writes.length, 1);
+  assert.ok(
+    parseAllDocuments(applied).some(
+      (document) =>
+        canonical(document.toJSON()) ===
+        canonical({
+          apiVersion: "v1alpha1",
+          kind: "KernelModuleConfig",
+          name: "dm_thin_pool",
+        }),
+    ),
+  );
+  assert.equal(r.current.state, "dispatched");
+  await r.turn();
+  assert.equal(r.writes.length, 1, "a pending module load never reapplies");
+  assert.equal(r.current.state, "dispatched");
+  r.physicalHostFiles = new Map([
+    ["/proc/modules", "dm_thin_pool 151552 0 - Live 0x0\n"],
+  ]);
+  await r.turn();
+  assert.equal(r.current.stage, "host_config");
+  assert.equal(r.current.state, "confirmed");
+  assert.equal(r.writes.length, 1);
+});
+
 test("host-only file activation dispatches one normal reboot and resolves an unknown result without repeating it", async () => {
   const { r, pins } = pinnedKubernetesRuntime(),
     files = NodeHostConfigurationPrivate.shape.files.parse([

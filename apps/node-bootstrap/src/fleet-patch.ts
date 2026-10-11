@@ -22,6 +22,7 @@ import {
   FLEET_PATCH_PROOF_MAX_AGE_MS,
 } from "@pgcf/contracts/fleet-patches";
 import { CONFIGURATION_SCHEMA_REVISION } from "@pgcf/contracts";
+import { thinStorageReleaseGuardPinned } from "@pgcf/contracts/releases";
 import { canonicalStorageAuthorityKeys } from "@pgcf/contracts/storage-write-authority";
 import { NodeBootstrapTransport } from "@pgcf/contracts/node-bootstrap";
 import {
@@ -180,6 +181,8 @@ export async function runFleetPatch(
 ): Promise<FleetPatchStatus> {
   const input = validateFleetPatchInput(raw),
     admitted = !!input.initial_bootstrap_input_sha256,
+    // The guard, not a receipt, loads dm_thin_pool: retained nodes qualify and select thin in place.
+    thinPool = thinStorageReleaseGuardPinned(input.spec),
     request = options.request ?? fetch,
     run = options.run ?? runCommand;
   const abort = new AbortController(),
@@ -667,7 +670,7 @@ export async function runFleetPatch(
           hostCommands,
           input.host_configuration,
           machineConfiguration,
-          !!input.spec.thin_storage_qualification,
+          thinPool,
           undefined,
           !["preflight", "host_config"].includes(current.stage),
           admitted,
@@ -964,7 +967,7 @@ export async function runFleetPatch(
           hostCommands,
           host,
           undefined,
-          !!input.spec.thin_storage_qualification,
+          thinPool,
           machineConfiguration?.state_loaded,
           false,
           admitted,
@@ -1015,7 +1018,7 @@ export async function runFleetPatch(
           hostCommands,
           host,
           machineConfiguration,
-          !!input.spec.thin_storage_qualification,
+          thinPool,
           undefined,
           false,
           admitted,
