@@ -70,6 +70,8 @@ interface Claim {
   name: string;
   uid: string;
   rv: number;
+  size: number;
+  bound: boolean;
 }
 interface Persistent {
   name: string;
@@ -319,7 +321,7 @@ export class ThinWorld {
         annotations: this.annotations(),
       },
       spec: {
-        volumeName: `pvc-${claim.uid}`,
+        ...(claim.bound ? { volumeName: `pvc-${claim.uid}` } : {}),
         storageClassName: this.namespace,
       },
     };
@@ -403,18 +405,59 @@ export class ThinWorld {
     return one({ items: [] });
   }
 
-  private create(manifest: Record<string, unknown>): CommandResult {
-    const meta = manifest.metadata as { name: string };
+  private create(manifest: {
+    kind: string;
+    metadata: { name: string };
+    spec: {
+      resources?: { requests: { storage: string } };
+      volumes?: { persistentVolumeClaim?: { claimName: string } }[];
+    };
+  }): CommandResult {
+    const name = manifest.metadata.name;
+    this.log.push(`create ${manifest.kind} ${name}`);
+    if (manifest.kind === "PersistentVolumeClaim") {
+      const claim = {
+        name,
+        uid: randomUUID(),
+        rv: this.nextVersion(),
+        size: Number(manifest.spec.resources!.requests.storage),
+        bound: false,
+      };
+      this.claims.set(name, claim);
+      return ok(JSON.stringify(this.claimObject(claim)));
+    }
     if (manifest.kind !== "Pod")
       throw new Error(`unexpected_create_${manifest.kind}`);
     const pod = {
-      name: meta.name,
+      name,
       uid: randomUUID(),
       rv: this.nextVersion(),
       created: new Date().toISOString(),
     };
-    this.pods.set(pod.name, pod);
-    this.log.push(`create pod ${pod.name}`);
+    this.pods.set(name, pod);
+    // WaitForFirstConsumer: the first Pod binds its claim to a new thin LV in the pool.
+    const claim = this.claims.get(
+      manifest.spec.volumes![0]!.persistentVolumeClaim!.claimName,
+    );
+    if (claim && !claim.bound) {
+      claim.bound = true;
+      const pv = `pvc-${claim.uid}`;
+      this.volumes.set(pv, {
+        name: pv,
+        uid: randomUUID(),
+        claim: { name: claim.name, uid: claim.uid },
+        policy: "Retain",
+        rv: this.nextVersion(),
+      });
+      this.addLv({
+        name: pv,
+        uuid: lvm(`N${this.minor}`),
+        segtype: "thin",
+        pool: POOL,
+        size: claim.size,
+        tags: [],
+      });
+    }
     return ok(JSON.stringify(this.podObject(pod)));
   }
 
@@ -474,7 +517,11 @@ export class ThinWorld {
   }
   private reclaim(pv: Persistent) {
     this.volumes.delete(pv.name);
-    this.lvs = this.lvs.filter((lv) => lv.name !== pv.name);
+    const lv = this.lv(pv.name)!;
+    this.lvs = this.lvs.filter((value) => value !== lv);
+    // The pinned OpenEBS LVM 1.10.1 driver removes the pool after deleting its last thin volume.
+    if (!this.lvs.some((value) => value.pool === lv.pool))
+      this.lvs = this.lvs.filter((value) => value.name !== lv.pool);
   }
 
   private patch(args: string[]): CommandResult {
@@ -603,6 +650,21 @@ export class ThinWorld {
         this.lvs = this.lvs.filter((lv) => lv.name !== name);
         return ok("");
       }
+      case "lvcreate": {
+        const value = (flag: string) => rest[rest.indexOf(flag) + 1]!;
+        this.log.push(`lvcreate ${value("--name")}`);
+        this.addLv({
+          name: value("--name"),
+          uuid: lvm("Np"),
+          segtype: "thin-pool",
+          pool: "",
+          size: Number(value("--size").slice(0, -1)),
+          metadata: Number(value("--poolmetadatasize").slice(0, -1)),
+          tags: rest.filter((_, index) => rest[index - 1] === "--addtag"),
+        });
+        this.poolMode = "rw";
+        return ok("");
+      }
       case "lvextend": {
         this.log.push(`lvextend ${rest.join(" ")}`);
         this.lv(POOL)!.size = Number(
@@ -631,6 +693,14 @@ export class ThinWorld {
             });
           this.log.push(`lvcreate ${names.length}`);
           return ok("");
+        }
+        if (script!.includes("pgcf-read=")) {
+          const lv = this.lvs.find(
+            (value) => values[0] === `/dev/dm-${value.minor}`,
+          );
+          return ok(
+            `pgcf-read=${lv ? Number(values[1]) * MIB : 0}\npgcf-nonzero=0\n`,
+          );
         }
         if (script!.includes("rounds=$2")) {
           this.poolMode = "out_of_data_space";
@@ -872,7 +942,13 @@ export function thinQualificationRun(
         size: options.size ?? profile.maximum_quota_gib * GIB,
         tags: [],
       });
-      world.claims.set(name, { name, uid: claim, rv: world.nextVersion() });
+      world.claims.set(name, {
+        name,
+        uid: claim,
+        rv: world.nextVersion(),
+        size: lv.size,
+        bound: true,
+      });
       world.volumes.set(pv, {
         name: pv,
         uid: randomUUID(),

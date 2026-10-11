@@ -524,9 +524,12 @@ function scratchMeasured(run: ReturnType<typeof thinQualificationRun>) {
 test("metadata_full grows and fills the profile pool without rebooting the node outside a fleet patch", async () => {
   const run = thinQualificationRun("metadata_full");
   scratchMeasured(run);
-  run.workload("data_full", "pg-a", "Pa");
+  const kept = run.workload("data_full", "pg-a", "Pa");
   run.world.lv("pgcf_thinpool")!.size = 2 * GIB;
   assert.deepEqual(await run.turn(), { kind: "report" });
+  // pg-a stops, but its CSI volume keeps the pool from being removed by the driver.
+  assert.ok(!run.world.pods.has("pg-a"));
+  assert.ok(run.world.lv(kept.pv_name));
   assert.deepEqual(
     run.world.log.filter((line) => line.startsWith("talosctl")),
     [],
@@ -538,4 +541,39 @@ test("metadata_full grows and fills the profile pool without rebooting the node 
   assert.deepEqual(Object.keys(report.evidence).sort(), ["maximum", "scratch"]);
   assert.equal(report.evidence.maximum!.pool_uuid, run.setup.pool.pool_uuid);
   assert.equal(report.evidence.maximum!.data_bytes, profile.maximum_data_bytes);
+});
+
+test("trim releases data_full's kept volume first, so only the sentinel is the pool's last thin LV", async () => {
+  const run = thinQualificationRun("trim_delete_recreate");
+  run.world.lv("pgcf_thinpool")!.size = profile.maximum_data_bytes;
+  const kept = run.workload("data_full", "pg-a", "Pa", { pod: false });
+  const sentinel = run.workload("trim_delete_recreate", "sentinel", "Sn", {
+    size: 64 * MIB,
+  });
+  run.workload("trim_delete_recreate", "trim", "Tr", { size: 256 * MIB });
+  run.confirm("trim_delete_recreate:baseline", { used: 16 });
+  run.confirm("trim_delete_recreate:write", {
+    bytes: 256 * MIB,
+    used: 16 + 4096,
+  });
+  assert.deepEqual(await run.turn(), { kind: "report" });
+  assert.deepEqual(
+    run.world.log
+      .filter((line) => line.includes("/persistentvolumeclaims/"))
+      .map((line) => line.split("/").at(-1)),
+    ["trim", "pg-a", "sentinel", "trim-again"],
+  );
+  assert.ok(!run.world.lvs.some((lv) => lv.name === kept.pv_name));
+  const evidence = (
+    run.calls[0]!.report as {
+      evidence: {
+        last_lv_uuid: string;
+        pool_present_after_last: boolean;
+        reinitialized_pool_uuid: string | null;
+      };
+    }
+  ).evidence;
+  assert.equal(evidence.last_lv_uuid, sentinel.lv_uuid);
+  assert.equal(evidence.pool_present_after_last, false);
+  assert.equal(evidence.reinitialized_pool_uuid, lvm("Np"));
 });

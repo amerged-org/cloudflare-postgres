@@ -2067,7 +2067,11 @@ printf 'pgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$rc" "$start" "$end"`,
       },
     );
     await this.removeScratchPool("metadata_full:scratch-remove");
-    await this.releaseWorkload("data_full", "pg-a");
+    // The driver removes the pool after its last CSI volume: pg-a's volume stays until trim.
+    await this.journal.converge("metadata_full:pg-a:stop", async () => {
+      await this.absent("pod", "pg-a", 0);
+      return { stopped: true };
+    });
     // (a) Grow to the profile maximum and fill it across maximum_volumes raw thin LVs.
     const poolUuid = this.setup.pool.pool_uuid;
     await this.growPool(
@@ -2886,6 +2890,7 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
       },
     );
     // Deleting the last thin LV lets the driver remove the pool; the product re-initializes it.
+    await this.releaseWorkload("data_full", "pg-a");
     await this.releaseWorkload("trim_delete_recreate", "sentinel");
     const last = await this.journal.observe(
       "trim_delete_recreate:last",
