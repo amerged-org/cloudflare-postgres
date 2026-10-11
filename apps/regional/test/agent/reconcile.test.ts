@@ -131,6 +131,15 @@ test("a same-generation runtime switch deletes only the exact primary once and r
     cluster.metadata.annotations!["kubectl.kubernetes.io/restartedAt"],
     undefined,
   );
+  // The completed switch is cleared, so a later flip at this generation switches once more.
+  assert.equal(
+    cluster.metadata.annotations!["pgcf.io/runtime-switch"],
+    undefined,
+  );
+  assert.equal(
+    cluster.metadata.annotations!["other.example/annotation"],
+    "kept",
+  );
   assert.deepEqual(
     [
       ns.metadata.uid,

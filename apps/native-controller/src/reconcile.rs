@@ -573,8 +573,9 @@ impl Reconciler {
     /// A runtime switch at the same generation relabels the namespace that runtime admission
     /// matches, then deletes only a primary on the other runtime, so that CNPG recreates it on its
     /// volume under the selected RuntimeClass. A CNPG restart annotation would restart the primary
-    /// in place and keep its immutable RuntimeClass. The Cluster records the exact Pod before its
-    /// deletion, one per generation, runtime and pool release; an unknown write is read back.
+    /// in place and keep its immutable RuntimeClass. Until the switch completes, the Cluster
+    /// records the exact Pod before its deletion, one per generation, runtime and pool release;
+    /// an unknown write is read back.
     async fn runtime_selected(
         &self,
         db: &Value,
@@ -637,34 +638,25 @@ impl Reconciler {
         {
             return Ok(false);
         }
+        let recorded = &cluster["metadata"]["annotations"][SWITCH];
         if text(&pod["spec"], "runtimeClassName") == runtime_class(context) {
+            // The switch is complete; without its record a later flip at this generation can
+            // switch the primary once more.
+            if !recorded.is_null() {
+                self.record_switch(db, cluster, Value::Null).await?;
+            }
             return Ok(true);
         }
         let marker = format!("{selection}/{}", text(&pod["metadata"], "uid"));
-        let recorded = text(&cluster["metadata"]["annotations"], SWITCH);
-        if recorded != marker {
+        if recorded != marker.as_str() {
             // A replacement that came up on the other runtime is not deleted again.
-            if recorded.starts_with(&format!("{selection}/")) {
+            if recorded
+                .as_str()
+                .is_some_and(|value| value.starts_with(&format!("{selection}/")))
+            {
                 return Ok(false);
             }
-            if let Err(error) = self
-                .k8s
-                .patch(
-                    cluster,
-                    &json!({"metadata":{"annotations":{SWITCH:marker}}}),
-                )
-                .await
-            {
-                match self.k8s.read("Cluster", Some(&ns), "database").await? {
-                    Some(after)
-                        if after["metadata"]["uid"] == cluster["metadata"]["uid"]
-                            && text(&after["metadata"]["annotations"], SWITCH) == marker =>
-                    {
-                        owned(&after, db, "database", Some(&ns))?
-                    }
-                    _ => return Err(error),
-                }
-            }
+            self.record_switch(db, cluster, marker.into()).await?;
         }
         // The recorded Pod still runs: its UID and resourceVersion bind exactly this deletion.
         if let Err(error) = self.k8s.delete(&pod, "Background").await {
@@ -679,6 +671,27 @@ impl Reconciler {
             }
         }
         Ok(false)
+    }
+    /// Writes or clears the runtime switch record under the Cluster's UID and resourceVersion;
+    /// an unknown write is read back.
+    async fn record_switch(&self, db: &Value, cluster: &Value, value: Value) -> Result<(), Error> {
+        let ns = namespace(db);
+        if let Err(error) = self
+            .k8s
+            .patch(cluster, &json!({"metadata":{"annotations":{SWITCH:value}}}))
+            .await
+        {
+            match self.k8s.read("Cluster", Some(&ns), "database").await? {
+                Some(after)
+                    if after["metadata"]["uid"] == cluster["metadata"]["uid"]
+                        && after["metadata"]["annotations"][SWITCH] == value =>
+                {
+                    owned(&after, db, "database", Some(&ns))?
+                }
+                _ => return Err(error),
+            }
+        }
+        Ok(())
     }
     pub async fn reconcile(
         &self,
@@ -1755,6 +1768,42 @@ mod runtime_tests {
         assert_eq!(switch(&f), format!("1/pool/native-compute-test/{}", uid(8)));
         assert_eq!(deletes(&f), vec![deleted(&f, uid(8), "1")]);
         assert_eq!(quota(&f), pooled["manifests"][1]["spec"]["hard"]);
+    }
+    #[tokio::test]
+    async fn a_runtime_flip_at_the_same_generation_switches_the_primary_once_more() {
+        let pooled = vector("assigned-sandbox-overhead");
+        let f = fixture("standard", None, pooled["ctx"]["computePool"].clone()).await;
+        let stamped = "0123456789abcdef".repeat(4);
+        let label = |value: Option<String>| {
+            f.server.edit("Node", None, text(&f.db, "node"), |node| {
+                let labels = node["metadata"]["labels"].as_object_mut().unwrap();
+                match value {
+                    Some(value) => labels.insert(PROFILE.into(), value.into()),
+                    None => labels.remove(PROFILE),
+                };
+            })
+        };
+        admission(&f.server, &stamped);
+        label(Some(format!("r-{}", &stamped[..40])));
+        assert_eq!(observed(&f).await, "provisioning");
+        assert_eq!(deletes(&f), vec![deleted(&f, uid(8), "1")]);
+        // One reconcile misses admission while CNPG recreates the primary under `standard`.
+        label(None);
+        assert_eq!(observed(&f).await, "provisioning");
+        assert_eq!(runtime(&f), "standard");
+        f.server.put(primary(&f.db, uid(9), None));
+        assert_eq!(observed(&f).await, "provisioning");
+        assert!(published(&f));
+        assert!(switch(&f).is_null());
+        // Admission returns: the primary that now runs `standard` switches once more.
+        label(Some(format!("r-{}", &stamped[..40])));
+        assert_eq!(observed(&f).await, "provisioning");
+        assert_eq!(runtime(&f), "pool");
+        assert_eq!(
+            deletes(&f),
+            vec![deleted(&f, uid(8), "1"), deleted(&f, uid(9), "1")]
+        );
+        assert_eq!(switch(&f), format!("1/pool/native-compute-test/{}", uid(9)));
     }
     #[tokio::test]
     async fn the_region_pool_follows_the_profile_that_node_bootstrap_stamped() {

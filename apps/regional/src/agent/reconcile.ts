@@ -1486,45 +1486,51 @@ export class Reconciler {
       pod.metadata.deletionTimestamp
     )
       return false;
-    if ((string(record(pod.spec).runtimeClassName) ?? "") === runtimeClass)
+    const recorded = cluster.metadata.annotations?.[annotation],
+      recordSwitch = async (value: string | undefined) => {
+        if (!cluster.metadata.resourceVersion)
+          throw new Error("database_cluster_version_missing");
+        const annotations = { ...cluster.metadata.annotations };
+        if (value === undefined) delete annotations[annotation];
+        else annotations[annotation] = value;
+        try {
+          this.signal.throwIfAborted();
+          await this.k8s.patch("Cluster", namespaceName, "database", [
+            { op: "test", path: "/metadata/uid", value: uid(cluster) },
+            {
+              op: "test",
+              path: "/metadata/resourceVersion",
+              value: cluster.metadata.resourceVersion,
+            },
+            { op: "add", path: "/metadata/annotations", value: annotations },
+          ]);
+        } catch (error) {
+          const current = await this.k8s.read(
+            "Cluster",
+            namespaceName,
+            "database",
+          );
+          if (
+            !current ||
+            uid(current) !== uid(cluster) ||
+            current.metadata.deletionTimestamp ||
+            current.metadata.annotations?.[annotation] !== value
+          )
+            throw error;
+          assertOwned(current, db.id, "database");
+        }
+      };
+    if ((string(record(pod.spec).runtimeClassName) ?? "") === runtimeClass) {
+      // The switch is complete; without its record a later flip at this generation can switch
+      // the primary once more.
+      if (recorded !== undefined) await recordSwitch(undefined);
       return true;
-    const marker = `${selection}/${pod.metadata.uid}`,
-      recorded = cluster.metadata.annotations?.[annotation];
+    }
+    const marker = `${selection}/${pod.metadata.uid}`;
     if (recorded !== marker) {
       // A replacement that came up on the other runtime is not deleted again.
       if (recorded?.startsWith(`${selection}/`)) return false;
-      if (!cluster.metadata.resourceVersion)
-        throw new Error("database_cluster_version_missing");
-      try {
-        this.signal.throwIfAborted();
-        await this.k8s.patch("Cluster", namespaceName, "database", [
-          { op: "test", path: "/metadata/uid", value: uid(cluster) },
-          {
-            op: "test",
-            path: "/metadata/resourceVersion",
-            value: cluster.metadata.resourceVersion,
-          },
-          {
-            op: "add",
-            path: "/metadata/annotations",
-            value: { ...cluster.metadata.annotations, [annotation]: marker },
-          },
-        ]);
-      } catch (error) {
-        const current = await this.k8s.read(
-          "Cluster",
-          namespaceName,
-          "database",
-        );
-        if (
-          !current ||
-          uid(current) !== uid(cluster) ||
-          current.metadata.deletionTimestamp ||
-          current.metadata.annotations?.[annotation] !== marker
-        )
-          throw error;
-        assertOwned(current, db.id, "database");
-      }
+      await recordSwitch(marker);
     }
     // The recorded Pod still runs: its UID and resourceVersion bind exactly this deletion.
     try {
