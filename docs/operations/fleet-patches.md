@@ -149,9 +149,16 @@ keys or relax TLS. A stale pin yields unknown RAM and blocks placement. Complete
 remain immutable; a diagnosed operator pin recovery uses the same identity-bound helper separately.
 The read-only host-service stage waits for fresh current-revision/profile pool observations; it
 never restarts a controller around active thin writers.
-A confirmed configuration waiting for a kernel module never triggers another identical apply.
+A release that pins the thin storage guard (storage verifier, host extension, native gateway and
+controller and `openebs-lvm` on every role) adds `dm_thin_pool` to every member's host
+configuration and requires it loaded, with or without a qualification receipt. A confirmed
+configuration waiting for a kernel module never triggers another identical apply.
 Final Ready and operation-owned placement reopening wait for every current-material host/pool and
-selected storage qualification. The previous completed operations remain immutable.
+selected storage qualification. A release that carries the receipt also requires thin write
+authority from every member that takes databases; a control/relay member with database placement
+disabled and no thin selection converges without one. Thin storage additionally requires the
+region `compute_pool` policy, because only a pool-enabled patch records the runtime admission that
+thin activation binds. The previous completed operations remain immutable.
 Roles without protected host settings use a distinct current-custody runtime/database final pass
 after a material revision changes. It cannot enter OS or Kubernetes write stages; placement stays
 closed until that pass completes with fresh identities and release observations.
