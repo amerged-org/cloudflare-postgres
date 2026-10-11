@@ -69,7 +69,9 @@ locked database, then rechecks current run/configuration authority before using 
 Control-plane requests may wait during this export window; record its actual duration.
 
 One Workflow captures D1 and one etcd snapshot per existing regional cluster in a
-private NodeBootstrap container. Files are streamed and hashed; the complete run's
+private NodeBootstrap container. A region whose nodes are all marked lost, or that
+has no node, is skipped: the run captures no etcd snapshot there and backup
+freshness expects none. Files are streamed and hashed; the complete run's
 private payload workspace is bounded to 1 GiB. Encryption uses a purpose-derived
 AES-256-GCM key from the existing active `CREDENTIAL_KEYS` version. No cluster key
 or credential key is generated or rotated. Plaintext files are removed immediately
