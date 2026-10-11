@@ -430,8 +430,8 @@ how to requalify, and decide before R2b selects EU1. A run also needs the node's
 region release, so a requalification first rolls out a receipt-less candidate release. Selected
 nodes have no thin write authority until the successor with the new receipt is rolled out; the
 decision must accept or avoid that outage. Options:
-- Qualify on the control node, which has placement disabled and no selection. This accepts one
-  control and relay reboot in `metadata_full` and needs free extents in its VG.
+- Qualify on the control node, which has placement disabled and no selection. This puts scratch
+  writes on the relay host and needs free extents in its VG.
 - Allow a run on a selected node that holds no thin volumes, using a distinct scratch pool name.
 
 

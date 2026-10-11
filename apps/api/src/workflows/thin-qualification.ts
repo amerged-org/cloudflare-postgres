@@ -13,7 +13,7 @@ import {
   readThinQualificationStep,
 } from "../domain/thin-qualification.ts";
 
-/** Bounded turns per step; a reboot or recovering retained databases need several. */
+/** Bounded turns per step; long fills and recovering retained databases need several. */
 const TURNS: Record<(typeof THIN_QUALIFICATION_STEPS)[number], number> = {
   setup: 8,
   data_full: 12,
