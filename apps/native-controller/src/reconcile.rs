@@ -28,7 +28,7 @@ const GENERATION: &str = "pgcf.io/generation";
 const ACCEPTED: &str = "pgcf.io/accepted-generation";
 const VOLUME: &str = "pgcf.io/volume-identity";
 const RUNTIME: &str = "pgcf.io/compute-runtime";
-const RESTART: &str = "kubectl.kubernetes.io/restartedAt";
+const SWITCH: &str = "pgcf.io/runtime-switch";
 const PRESTARTED: &str = "pgcf-prestarted";
 const PROFILE: &str = "pgcf.io/compute-profile";
 const ADMISSION: &str = "pgcf-cnpg-prestarted";
@@ -571,8 +571,10 @@ impl Reconciler {
         Ok(())
     }
     /// A runtime switch at the same generation relabels the namespace that runtime admission
-    /// matches, then recreates only a primary on the other runtime through one CNPG restart. The
-    /// marker is one-shot per generation, runtime and pool release; an unknown write is read back.
+    /// matches, then deletes only a primary on the other runtime, so that CNPG recreates it on its
+    /// volume under the selected RuntimeClass. A CNPG restart annotation would restart the primary
+    /// in place and keep its immutable RuntimeClass. The Cluster records the exact Pod before its
+    /// deletion, one per generation, runtime and pool release; an unknown write is read back.
     async fn runtime_selected(
         &self,
         db: &Value,
@@ -582,16 +584,13 @@ impl Reconciler {
     ) -> Result<bool, Error> {
         let ns = namespace(db);
         let pool = &context["computePool"];
-        let (mode, marker) = if pool.is_null() {
-            (
-                "standard",
-                format!("pgcf-runtime/{}/standard", number(db, "generation")),
-            )
+        let (mode, selection) = if pool.is_null() {
+            ("standard", format!("{}/standard", number(db, "generation")))
         } else {
             (
                 "pool",
                 format!(
-                    "pgcf-runtime/{}/pool/{}",
+                    "{}/pool/{}",
                     number(db, "generation"),
                     text(&pool["profile"], "release_id")
                 ),
@@ -641,23 +640,42 @@ impl Reconciler {
         if text(&pod["spec"], "runtimeClassName") == runtime_class(context) {
             return Ok(true);
         }
-        if text(&cluster["metadata"]["annotations"], RESTART) != marker
-            && let Err(error) = self
+        let marker = format!("{selection}/{}", text(&pod["metadata"], "uid"));
+        let recorded = text(&cluster["metadata"]["annotations"], SWITCH);
+        if recorded != marker {
+            // A replacement that came up on the other runtime is not deleted again.
+            if recorded.starts_with(&format!("{selection}/")) {
+                return Ok(false);
+            }
+            if let Err(error) = self
                 .k8s
                 .patch(
                     cluster,
-                    &json!({"metadata":{"annotations":{RESTART:marker}}}),
+                    &json!({"metadata":{"annotations":{SWITCH:marker}}}),
                 )
                 .await
-        {
-            match self.k8s.read("Cluster", Some(&ns), "database").await? {
-                Some(after)
-                    if after["metadata"]["uid"] == cluster["metadata"]["uid"]
-                        && text(&after["metadata"]["annotations"], RESTART) == marker =>
-                {
-                    owned(&after, db, "database", Some(&ns))?
+            {
+                match self.k8s.read("Cluster", Some(&ns), "database").await? {
+                    Some(after)
+                        if after["metadata"]["uid"] == cluster["metadata"]["uid"]
+                            && text(&after["metadata"]["annotations"], SWITCH) == marker =>
+                    {
+                        owned(&after, db, "database", Some(&ns))?
+                    }
+                    _ => return Err(error),
                 }
-                _ => return Err(error),
+            }
+        }
+        // The recorded Pod still runs: its UID and resourceVersion bind exactly this deletion.
+        if let Err(error) = self.k8s.delete(&pod, "Background").await {
+            match self.k8s.read("Pod", Some(&ns), primary).await? {
+                Some(after)
+                    if after["metadata"]["uid"] == pod["metadata"]["uid"]
+                        && after["metadata"]["deletionTimestamp"].is_null() =>
+                {
+                    return Err(error);
+                }
+                _ => {}
             }
         }
         Ok(false)
@@ -1572,17 +1590,30 @@ mod runtime_tests {
             )
             .is_some()
     }
-    fn restarts(f: &Fixture) -> usize {
-        f.server
-            .state
-            .lock()
-            .unwrap()
+    /// Every Pod deletion as (path, DeleteOptions). The API double never replaces a Pod for a
+    /// restart annotation, which CNPG applies in place to a primary without a new RuntimeClass.
+    fn deletes(f: &Fixture) -> Vec<(String, Value)> {
+        let state = f.server.state.lock().unwrap();
+        assert!(state.writes.iter().all(|(_, _, body)| {
+            body["metadata"]["annotations"]["kubectl.kubernetes.io/restartedAt"].is_null()
+        }));
+        state
             .writes
             .iter()
-            .filter(|(method, _, body)| {
-                method == "PATCH" && body["metadata"]["annotations"][RESTART].is_string()
-            })
-            .count()
+            .filter(|(method, _, _)| method == "DELETE")
+            .map(|(_, path, body)| (path.clone(), body.clone()))
+            .collect()
+    }
+    fn switch(f: &Fixture) -> Value {
+        f.server.get("Cluster", Some(&f.ns), "database").unwrap()["metadata"]["annotations"][SWITCH]
+            .clone()
+    }
+    /// The exact primary deletion that lets CNPG recreate it under the selected runtime.
+    fn deleted(f: &Fixture, pod_uid: String, version: &str) -> (String, Value) {
+        (
+            crate::test_server::path("Pod", Some(&f.ns), "database-1"),
+            json!({"apiVersion":"v1","kind":"DeleteOptions","preconditions":{"uid":pod_uid,"resourceVersion":version},"propagationPolicy":"Background"}),
+        )
     }
     fn runtime(f: &Fixture) -> Value {
         f.server.get("Namespace", None, &f.ns).unwrap()["metadata"]["labels"][RUNTIME].clone()
@@ -1609,35 +1640,34 @@ mod runtime_tests {
         assert!(primary_current(&pod, &cluster, &db, &pool));
     }
     #[tokio::test]
-    async fn a_same_generation_runtime_switch_restarts_only_the_primary_once() {
+    async fn a_same_generation_runtime_switch_deletes_only_the_primary_once() {
         let f = fixture("pool", Some("pgcf-prestarted"), Value::Null).await;
-        f.server.state.lock().unwrap().lose = Some(Box::new(|_, patch| {
-            patch["metadata"]["annotations"][RESTART].is_string()
-        }));
+        f.server.state.lock().unwrap().lose = Some(Box::new(|path, _| path.contains("/pods/")));
         assert_eq!(observed(&f).await, "provisioning");
         let ns = f.server.get("Namespace", None, &f.ns).unwrap();
         assert_eq!(ns["metadata"]["labels"][RUNTIME], "standard");
         assert_eq!(ns["metadata"]["labels"]["other.example/label"], "kept");
         let cluster = f.server.get("Cluster", Some(&f.ns), "database").unwrap();
-        assert_eq!(
-            cluster["metadata"]["annotations"][RESTART],
-            "pgcf-runtime/1/standard"
-        );
+        assert_eq!(switch(&f), format!("1/standard/{}", uid(8)));
         assert_eq!(
             cluster["metadata"]["annotations"]["other.example/annotation"],
             "kept"
         );
+        // The delete committed although its reply was lost; the read-back resolves it.
+        assert_eq!(deletes(&f), vec![deleted(&f, uid(8), "1")]);
         assert!(!published(&f));
         assert_eq!(observed(&f).await, "provisioning");
-        f.server.edit("Pod", Some(&f.ns), "database-1", |pod| {
-            pod["metadata"]["deletionTimestamp"] = "2026-10-11T00:00:00Z".into();
-        });
-        assert_eq!(observed(&f).await, "provisioning");
         assert!(!published(&f));
-        f.server.put(primary(&f.db, uid(9), None));
+        // A replacement that still came up on the other runtime is never deleted in a loop.
+        f.server
+            .put(primary(&f.db, uid(9), Some("pgcf-prestarted")));
+        assert_eq!(observed(&f).await, "provisioning");
+        assert_eq!(deletes(&f).len(), 1);
+        // Only a deletion makes CNPG recreate the primary, here without a RuntimeClass.
+        f.server.put(primary(&f.db, uid(10), None));
         assert_eq!(observed(&f).await, "provisioning");
         assert!(published(&f));
-        assert_eq!(restarts(&f), 1);
+        assert_eq!(deletes(&f).len(), 1);
         assert_eq!(
             f.server.get("Namespace", None, &f.ns).unwrap()["metadata"]["uid"],
             uid(2)
@@ -1646,6 +1676,28 @@ mod runtime_tests {
             f.server.get("Cluster", Some(&f.ns), "database").unwrap()["metadata"]["uid"],
             uid(3)
         );
+    }
+    #[tokio::test]
+    async fn a_recorded_switch_deletes_its_primary_that_still_runs() {
+        let f = fixture("pool", Some("pgcf-prestarted"), Value::Null).await;
+        // The switch was recorded, but its deletion never landed (a crash or a changed version).
+        f.server
+            .edit("Cluster", Some(&f.ns), "database", |cluster| {
+                cluster["metadata"]["annotations"][SWITCH] =
+                    format!("1/standard/{}", uid(8)).into();
+            });
+        assert_eq!(observed(&f).await, "provisioning");
+        assert_eq!(deletes(&f), vec![deleted(&f, uid(8), "1")]);
+        assert!(
+            f.server
+                .state
+                .lock()
+                .unwrap()
+                .writes
+                .iter()
+                .all(|(_, _, body)| body["metadata"]["annotations"][SWITCH].is_null())
+        );
+        assert!(!published(&f));
     }
     #[tokio::test]
     async fn the_region_pool_waits_for_runtime_admission_of_the_current_profile() {
@@ -1684,16 +1736,12 @@ mod runtime_tests {
         label(&f, None);
         assert_eq!(observed(&f).await, "provisioning");
         assert_eq!(runtime(&f), "standard");
-        assert_eq!(restarts(&f), 0);
+        assert!(deletes(&f).is_empty());
         label(&f, Some(format!("r-{}", &current[..40])));
         assert_eq!(observed(&f).await, "provisioning");
         assert_eq!(runtime(&f), "pool");
-        assert_eq!(
-            f.server.get("Cluster", Some(&f.ns), "database").unwrap()["metadata"]["annotations"]
-                [RESTART],
-            "pgcf-runtime/1/pool/native-compute-test"
-        );
-        assert_eq!(restarts(&f), 1);
+        assert_eq!(switch(&f), format!("1/pool/native-compute-test/{}", uid(8)));
+        assert_eq!(deletes(&f), vec![deleted(&f, uid(8), "1")]);
         assert_eq!(quota(&f), pooled["manifests"][1]["spec"]["hard"]);
     }
 }

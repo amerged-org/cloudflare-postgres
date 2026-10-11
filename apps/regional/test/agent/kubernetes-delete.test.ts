@@ -42,3 +42,34 @@ test("restore Secret deletion sends exact UID and revision preconditions through
     },
   ]);
 });
+
+test("primary Pod deletion sends exact UID and revision preconditions in the background", async (t) => {
+  const uid = randomUUID();
+  t.mock.method(KubeConfig.prototype, "loadFromFile", () => {});
+  const calls: unknown[] = [];
+  t.mock.method(KubeConfig.prototype, "makeApiClient", (kind: unknown) =>
+    kind === CoreV1Api
+      ? {
+          async deleteNamespacedPod(args: unknown) {
+            calls.push(args);
+            return {};
+          },
+        }
+      : {},
+  );
+  const k8s = kubernetesFromConfig(
+    new AbortController().signal,
+    "fixture.config",
+  );
+  await k8s.delete("Pod", "pgcf-db-test", "database-1", uid, "23");
+  assert.deepEqual(calls, [
+    {
+      name: "database-1",
+      namespace: "pgcf-db-test",
+      body: {
+        preconditions: { uid, resourceVersion: "23" },
+        propagationPolicy: "Background",
+      },
+    },
+  ]);
+});

@@ -1411,6 +1411,7 @@ export class Reconciler {
       : observation;
   }
 
+  /** CNPG restarts a primary in place for a restart annotation, so a runtime switch deletes the exact Pod. */
   private async runtimeSelected(
     db: DesiredDatabase,
     ctx: BuildContext,
@@ -1421,8 +1422,8 @@ export class Reconciler {
       mode = ctx.computePool != null ? "pool" : "standard",
       runtimeClass = mode === "pool" ? "pgcf-prestarted" : "",
       label = "pgcf.io/compute-runtime",
-      restart = "kubectl.kubernetes.io/restartedAt",
-      marker = `pgcf-runtime/${db.generation}/${mode}${ctx.computePool != null ? `/${ctx.computePool.profile.release_id}` : ""}`;
+      annotation = "pgcf.io/runtime-switch",
+      selection = `${db.generation}/${mode}${ctx.computePool != null ? `/${ctx.computePool.profile.release_id}` : ""}`;
     const namespace = await this.k8s.read(
       "Namespace",
       undefined,
@@ -1487,7 +1488,11 @@ export class Reconciler {
       return false;
     if ((string(record(pod.spec).runtimeClassName) ?? "") === runtimeClass)
       return true;
-    if (cluster.metadata.annotations?.[restart] !== marker) {
+    const marker = `${selection}/${pod.metadata.uid}`,
+      recorded = cluster.metadata.annotations?.[annotation];
+    if (recorded !== marker) {
+      // A replacement that came up on the other runtime is not deleted again.
+      if (recorded?.startsWith(`${selection}/`)) return false;
       if (!cluster.metadata.resourceVersion)
         throw new Error("database_cluster_version_missing");
       try {
@@ -1502,7 +1507,7 @@ export class Reconciler {
           {
             op: "add",
             path: "/metadata/annotations",
-            value: { ...cluster.metadata.annotations, [restart]: marker },
+            value: { ...cluster.metadata.annotations, [annotation]: marker },
           },
         ]);
       } catch (error) {
@@ -1515,11 +1520,29 @@ export class Reconciler {
           !current ||
           uid(current) !== uid(cluster) ||
           current.metadata.deletionTimestamp ||
-          current.metadata.annotations?.[restart] !== marker
+          current.metadata.annotations?.[annotation] !== marker
         )
           throw error;
         assertOwned(current, db.id, "database");
       }
+    }
+    // The recorded Pod still runs: its UID and resourceVersion bind exactly this deletion.
+    try {
+      this.signal.throwIfAborted();
+      await this.k8s.delete(
+        "Pod",
+        namespaceName,
+        primary,
+        pod.metadata.uid,
+        pod.metadata.resourceVersion,
+      );
+    } catch (error) {
+      const current = await this.k8s.read("Pod", namespaceName, primary);
+      if (
+        current?.metadata.uid === pod.metadata.uid &&
+        !current.metadata.deletionTimestamp
+      )
+        throw error;
     }
     return false;
   }

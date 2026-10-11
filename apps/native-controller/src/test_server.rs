@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //! In-process HTTPS Kubernetes API double for controller tests. It serves stored objects, lists
-//! and text bodies, creates by POST, applies merge patches only under the request's UID and
-//! resourceVersion preconditions, and can drop the reply of one committed write.
+//! and text bodies, creates by POST, applies merge patches and deletes only under the request's
+//! UID and resourceVersion preconditions, and can drop the reply of one committed write.
 use crate::kubernetes::{Kubernetes, named};
 use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
 use serde_json::{Value, json};
@@ -24,7 +24,8 @@ pub struct State {
     pub texts: BTreeMap<String, String>,
     /// Every accepted write as (method, path, request body).
     pub writes: Vec<(String, String, Value)>,
-    /// The first committed PATCH matching (path, body) closes the connection without a reply.
+    /// The first committed PATCH or DELETE matching (path, body) closes the connection without a
+    /// reply.
     pub lose: Option<LoseReply>,
     /// Runs once while a text body is served, e.g. to replace an object during a scrape.
     pub during_text: Option<DuringText>,
@@ -155,24 +156,57 @@ fn handle(state: &mut State, method: &str, path: &str, body: &[u8]) -> Option<(u
                 return reply(409, &json!({"reason":"Conflict"}));
             }
             merge(&mut current, &patch);
-            let version: u64 = current["metadata"]["resourceVersion"]
-                .as_str()
-                .unwrap()
-                .parse()
-                .unwrap();
-            current["metadata"]["resourceVersion"] = (version + 1).to_string().into();
+            advance(&mut current);
             state.objects.insert(path.into(), current.clone());
-            state
-                .writes
-                .push((method.into(), path.into(), patch.clone()));
-            if state.lose.as_ref().is_some_and(|lose| lose(path, &patch)) {
-                state.lose = None;
-                return None;
+            committed(state, method, path, patch, &current)
+        }
+        "DELETE" => {
+            let options: Value = serde_json::from_slice(body).unwrap();
+            let Some(mut current) = state.objects.get(path).cloned() else {
+                return reply(404, &json!({}));
+            };
+            let preconditions = &options["preconditions"];
+            if preconditions["uid"] != current["metadata"]["uid"]
+                || preconditions["resourceVersion"] != current["metadata"]["resourceVersion"]
+            {
+                return reply(409, &json!({"reason":"Conflict"}));
             }
-            reply(200, &current)
+            // A Pod terminates gracefully under its deletionTimestamp; other kinds go at once.
+            if current["kind"] == "Pod" {
+                current["metadata"]["deletionTimestamp"] = "2026-10-11T00:00:00Z".into();
+                advance(&mut current);
+                state.objects.insert(path.into(), current.clone());
+            } else {
+                state.objects.remove(path);
+            }
+            committed(state, method, path, options, &current)
         }
         _ => reply(405, &json!({})),
     }
+}
+fn advance(value: &mut Value) {
+    let version: u64 = value["metadata"]["resourceVersion"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    value["metadata"]["resourceVersion"] = (version + 1).to_string().into();
+}
+/// Records a committed write and replies, unless the reply of this write is to be lost.
+fn committed(
+    state: &mut State,
+    method: &str,
+    path: &str,
+    body: Value,
+    current: &Value,
+) -> Option<(u16, Vec<u8>)> {
+    let lose = state.lose.as_ref().is_some_and(|lose| lose(path, &body));
+    state.writes.push((method.into(), path.into(), body));
+    if lose {
+        state.lose = None;
+        return None;
+    }
+    Some((200, serde_json::to_vec(current).unwrap()))
 }
 impl Server {
     pub async fn start() -> Self {
