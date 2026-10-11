@@ -99,14 +99,18 @@ async function assertHeldReplacement(
   if (identity(replaced.regions) !== identity(input.regions)) return changed();
   for (const [index, region] of replaced.regions.entries()) {
     const target = input.regions[index]!;
-    const held =
-      region.rotation?.phase === "snapshot" &&
-      region.rotation.state === "halted" &&
-      region.rotation.revision === 0 &&
-      region.rotation.node_index === 0 &&
-      region.rotation.error_code?.startsWith("operator_hold_") === true &&
-      region.staged_material_revision === region.current_material_revision + 1;
-    if (held) {
+    // A staged rotation that never started, or an operator hold at its undispatched snapshot, issued no
+    // capability; with no patch at the previous release its staged custody carries to the successor.
+    const undispatched =
+      region.staged_material_revision ===
+        region.current_material_revision + 1 &&
+      (region.rotation === undefined ||
+        (region.rotation.phase === "snapshot" &&
+          region.rotation.state === "halted" &&
+          region.rotation.revision === 0 &&
+          region.rotation.node_index === 0 &&
+          region.rotation.error_code?.startsWith("operator_hold_") === true));
+    if (undispatched) {
       if (
         target.staged_material_revision !== region.staged_material_revision ||
         target.material_revision !== region.current_material_revision
