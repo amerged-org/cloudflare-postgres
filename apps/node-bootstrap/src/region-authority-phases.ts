@@ -4,6 +4,7 @@ import {
   createPrivateKey,
   createPublicKey,
   X509Certificate,
+  type KeyObject,
 } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import {
@@ -113,6 +114,23 @@ function privateKey(value: unknown) {
   } catch {
     fail("private_key_invalid");
   }
+}
+const ECDSA_JWS = new Map([
+  ["prime256v1", { alg: "ES256", digest: "sha256" }],
+  ["secp384r1", { alg: "ES384", digest: "sha384" }],
+  ["secp521r1", { alg: "ES512", digest: "sha512" }],
+]);
+/**
+ * The JWS algorithm kube-apiserver signs service-account tokens with for this signer key: RS256 for
+ * RSA (Talos v1.7+), ES256/ES384/ES512 by ECDSA curve (Talos v1.6 and earlier: P-256). ECDSA JWS
+ * signatures are fixed-width r||s, so callers sign and verify with dsaEncoding "ieee-p1363".
+ */
+export function serviceAccountJWS(key: KeyObject) {
+  if (key.asymmetricKeyType === "rsa")
+    return { alg: "RS256", digest: "sha256" };
+  if (key.asymmetricKeyType === "ec")
+    return ECDSA_JWS.get(key.asymmetricKeyDetails?.namedCurve ?? "");
+  return undefined;
 }
 function publicKey(value: unknown) {
   const pem = string(value);

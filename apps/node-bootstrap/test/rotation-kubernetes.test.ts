@@ -137,17 +137,16 @@ const accountUid = "658d527d-9960-4c38-af3e-f03e5d196773";
 const controllerUid = "7ae8268a-766f-4eba-aec3-c1131c479103";
 const oldPod = "a9371465-8b63-40d2-aeeb-10f7c0f46e60",
   newPod = "246f6d70-acfb-4c51-8173-e81a0a42b6e6";
+/** kube-apiserver signs service-account tokens with ES384 for an ECDSA P-384 key. */
 function signer() {
-  const pair = generateKeyPairSync("ed25519");
+  const pair = generateKeyPairSync("ec", { namedCurve: "secp384r1" });
   return {
     key: pair.privateKey,
-    private: pair.privateKey
-      .export({ type: "pkcs8", format: "pem" })
-      .toString(),
+    private: pair.privateKey.export({ type: "sec1", format: "pem" }).toString(),
   };
 }
 function jwt(key: ReturnType<typeof signer>, now: number) {
-  const header = Buffer.from(JSON.stringify({ alg: "EdDSA" })).toString(
+  const header = Buffer.from(JSON.stringify({ alg: "ES384" })).toString(
       "base64url",
     ),
     body = Buffer.from(
@@ -164,7 +163,7 @@ function jwt(key: ReturnType<typeof signer>, now: number) {
       }),
     ).toString("base64url"),
     input = `${header}.${body}`;
-  return `${input}.${sign(null, Buffer.from(input), key.key).toString("base64url")}`;
+  return `${input}.${sign("sha384", Buffer.from(input), { key: key.key, dsaEncoding: "ieee-p1363" }).toString("base64url")}`;
 }
 test("consumer renewal waits for the actual replacement signer and never patches under an old signer", async () => {
   const target = signer(),

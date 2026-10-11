@@ -5,6 +5,7 @@ import {
   type RotationKubernetesCursor as Cursor,
 } from "@pgcf/contracts/region-material-rotation";
 import { BootstrapError, canonical, digest } from "./bootstrap.ts";
+import { serviceAccountJWS } from "./region-authority-phases.ts";
 
 type ObjectValue = Record<string, unknown>;
 const object = (value: unknown): ObjectValue =>
@@ -312,28 +313,16 @@ async function issuerLoaded(
   }
   const signed = Buffer.from(`${parts[0]}.${parts[1]}`),
     signature = Buffer.from(parts[2]!, "base64url"),
-    alg =
-      publicKey.asymmetricKeyType === "rsa"
-        ? "RS256"
-        : publicKey.asymmetricKeyType === "ec"
-          ? "ES256"
-          : publicKey.asymmetricKeyType === "ed25519"
-            ? "EdDSA"
-            : null;
+    jws = serviceAccountJWS(publicKey);
   const signatureValid =
-    header.alg === alg &&
-    (alg === "RS256"
-      ? verify("RSA-SHA256", signed, publicKey, signature)
-      : alg === "ES256"
-        ? verify(
-            "sha256",
-            signed,
-            { key: publicKey, dsaEncoding: "ieee-p1363" },
-            signature,
-          )
-        : alg === "EdDSA"
-          ? verify(null, signed, publicKey, signature)
-          : false);
+    !!jws &&
+    header.alg === jws.alg &&
+    verify(
+      jws.digest,
+      signed,
+      { key: publicKey, dsaEncoding: "ieee-p1363" },
+      signature,
+    );
   const now = Math.floor((commands.now ?? Date.now)() / 1000),
     identity = object(claims["kubernetes.io"]),
     aud = Array.isArray(claims.aud) ? claims.aud : [claims.aud];

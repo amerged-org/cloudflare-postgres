@@ -29,6 +29,7 @@ import { startCapabilityProxy } from "./proxy-command.ts";
 import { stopChild, type openTalosOperator } from "./talos-operator.ts";
 import {
   parseAuthorityPEMEnvelope,
+  serviceAccountJWS,
   type AuthorityDocuments,
 } from "./region-authority-phases.ts";
 
@@ -938,17 +939,18 @@ async function httpProbe(
     tunnel?.destroy();
   }
 }
-function serviceAccountToken(
+export function serviceAccountToken(
   key: string,
   issuer: string,
   serviceAccount: ObjectValue,
 ) {
-  const signing = privateKey(key);
-  must(signing.asymmetricKeyType === "rsa", "service_account_algorithm");
+  const signing = privateKey(key),
+    jws = serviceAccountJWS(signing);
+  must(jws, "service_account_algorithm");
   const metadata = object(serviceAccount.metadata),
     issued = Math.floor(Date.now() / 1000),
     header = {
-      alg: "RS256",
+      alg: jws.alg,
       kid: createHash("sha256")
         .update(
           createPublicKey(signing).export({ type: "spki", format: "der" }),
@@ -974,7 +976,10 @@ function serviceAccountToken(
   return (
     body +
     "." +
-    sign("RSA-SHA256", Buffer.from(body), signing).toString("base64url")
+    sign(jws.digest, Buffer.from(body), {
+      key: signing,
+      dsaEncoding: "ieee-p1363",
+    }).toString("base64url")
   );
 }
 function parseMachineRows(raw: Buffer, address: string) {

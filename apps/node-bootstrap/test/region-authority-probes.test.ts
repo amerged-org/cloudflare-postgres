@@ -1,14 +1,70 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
 import test from "node:test";
+import {
+  createHash,
+  createPublicKey,
+  generateKeyPairSync,
+  verify,
+} from "node:crypto";
 import { mkdtemp, rm, stat } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   decodeEncryptedSecretRange,
   isExplicitRetirementRefusal,
+  serviceAccountToken,
   verifyTalosAdministrationPair,
 } from "../src/region-authority-probes.ts";
+function probeToken(pem: string) {
+  const issuer = "https://kubernetes.default.svc",
+    [header, payload, signature] = serviceAccountToken(pem, issuer, {
+      metadata: {
+        name: "default",
+        uid: "5b0f0c9e-1d4a-4c38-9a51-6f2b7d3e8a10",
+      },
+    }).split(".") as [string, string, string],
+    publicKey = createPublicKey(pem);
+  return {
+    header: JSON.parse(Buffer.from(header, "base64url").toString()),
+    claims: JSON.parse(Buffer.from(payload, "base64url").toString()),
+    input: Buffer.from(`${header}.${payload}`),
+    signature: Buffer.from(signature, "base64url"),
+    publicKey,
+    // kube-apiserver's key ID: base64url SHA-256 of the signer's PKIX public key.
+    kid: createHash("sha256")
+      .update(publicKey.export({ type: "spki", format: "der" }))
+      .digest("base64url"),
+  };
+}
+test("probe tokens are signed with the signer key's own JWS algorithm under kube-apiserver's key ID", () => {
+  // Talos v1.6 and earlier generate the service-account signer as a SEC1 ECDSA P-256 key.
+  const ec = probeToken(
+    generateKeyPairSync("ec", { namedCurve: "prime256v1" })
+      .privateKey.export({ type: "sec1", format: "pem" })
+      .toString(),
+  );
+  assert.deepEqual(ec.header, { alg: "ES256", kid: ec.kid });
+  assert.equal(ec.claims.sub, "system:serviceaccount:kube-system:default");
+  // JWS ES256 is the fixed-width r||s signature, not DER.
+  assert.equal(ec.signature.length, 64);
+  assert.ok(
+    verify(
+      "sha256",
+      ec.input,
+      { key: ec.publicKey, dsaEncoding: "ieee-p1363" },
+      ec.signature,
+    ),
+  );
+  // Talos v1.7 and later generate an RSA signer.
+  const rsa = probeToken(
+    generateKeyPairSync("rsa", { modulusLength: 2048 })
+      .privateKey.export({ type: "pkcs1", format: "pem" })
+      .toString(),
+  );
+  assert.deepEqual(rsa.header, { alg: "RS256", kid: rsa.kid });
+  assert.ok(verify("RSA-SHA256", rsa.input, rsa.publicKey, rsa.signature));
+});
 test("worker retirement creates its private output directory before checking client material", async (t) => {
   const root = await mkdtemp(join(tmpdir(), "pgcf-retirement-directory-")),
     output = join(root, "worker", "retirement");
