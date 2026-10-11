@@ -197,6 +197,60 @@ async function reference(
   await rm(config);
   return rows;
 }
+/** Strict validation turns Talos 1.14's `.machine.files` deprecation into an error, but the fleet host
+ * configuration writes those files. Then the full candidate must still pass normal validation and the
+ * same candidate without `.machine.files` must pass strict validation, so every other warning fails. */
+async function candidateValid(
+  run: CommandRunner,
+  file: string,
+  rows: AuthorityDocuments,
+  signal: AbortSignal,
+) {
+  const validate = async (path: string, strict: boolean) =>
+    (
+      await run({
+        executable: "/usr/local/bin/talosctl",
+        args: [
+          "validate",
+          ...(strict ? ["--strict"] : []),
+          "--mode",
+          "metal",
+          "--config",
+          path,
+        ],
+        signal,
+        timeout_ms: 30_000,
+        env: process.env,
+      })
+    ).exit_code === 0;
+  if (await validate(file, true)) return true;
+  const legacy = rows.filter(
+    (d) => d.version === "v1alpha1" && d.machine && !d.kind,
+  );
+  if (
+    legacy.length !== 1 ||
+    object(legacy[0]!.machine).files === undefined ||
+    !(await validate(file, false))
+  )
+    return false;
+  const machine = { ...object(legacy[0]!.machine) },
+    stripped = `${file}.without-files.yaml`;
+  delete machine.files;
+  await writeFile(
+    stripped,
+    rows
+      .map((d) =>
+        stringify(d === legacy[0] ? { ...d, machine } : d, { lineWidth: 0 }),
+      )
+      .join("---\n"),
+    { mode: 0o600, flag: "wx" },
+  );
+  try {
+    return await validate(stripped, true);
+  } finally {
+    await rm(stripped, { force: true });
+  }
+}
 function checkpointClient(
   input: Input,
   request: typeof fetch,
@@ -329,14 +383,7 @@ export async function applyPreparedEtcdAuthority(
         target.map((d) => stringify(d, { lineWidth: 0 })).join("---\n"),
         { mode: 0o600, flag: "wx" },
       );
-      const validation = await run({
-        executable: "/usr/local/bin/talosctl",
-        args: ["validate", "--strict", "--mode", "metal", "--config", file],
-        signal,
-        timeout_ms: 30_000,
-        env: process.env,
-      });
-      if (validation.exit_code !== 0)
+      if (!(await candidateValid(run, file, target, signal)))
         return fail("candidate_validation_failed");
       if (!unapplied)
         await progress.commit({
@@ -674,14 +721,7 @@ export async function runRegionAuthorityRotation(
           target.map((d) => stringify(d, { lineWidth: 0 })).join("---\n"),
           { mode: 0o600, flag: "wx" },
         );
-        const validation = await run({
-          executable: "/usr/local/bin/talosctl",
-          args: ["validate", "--strict", "--mode", "metal", "--config", file],
-          signal,
-          timeout_ms: 30_000,
-          env: process.env,
-        });
-        if (validation.exit_code !== 0)
+        if (!(await candidateValid(run, file, target, signal)))
           return fail("candidate_validation_failed");
       }
       await session.verify();
