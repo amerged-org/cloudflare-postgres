@@ -97,6 +97,8 @@ export const NodeThinStorageLease = z.strictObject({
   material_revision: z.number().int().positive(),
   kernel_version: z.string().max(128).nullable(),
   boot_id: z.uuid(),
+  /** The completed patch's proved configuration boot; witnesses a STATE-loaded `boot_id`. */
+  configuration_boot_id: z.uuid().nullable(),
   issued_at: z.iso.datetime(),
   expires_at: z.iso.datetime(),
   required_data_free_bytes: Bytes,

@@ -236,7 +236,7 @@ it("exposes an authenticated CAS profile API and idempotent replay without autho
     action_json: null,
   });
 });
-it("an admin selection on a retained guard-pinned node reserves exactly one initialize lease and keeps its uncertain outcome", async () => {
+it("an admin selection on a retained guard-pinned node reserves exactly one initialize lease and only reads its uncertain outcome back", async () => {
   const f = await thinExecutionFixture(releaseIds);
   // The retained installation has current host custody but has never selected thin storage.
   await env.DB.prepare("DELETE FROM node_thin_storage WHERE node_id=?")
@@ -289,24 +289,47 @@ it("an admin selection on a retained guard-pinned node reserves exactly one init
     crypto.randomUUID(),
     crypto.randomUUID(),
   );
+  // The Native run then fails after its dispatch: the DO blocks the node and the lease expires.
   await env.DB.prepare(
-    "UPDATE node_thin_storage SET lease_expires_at='2000-01-01T00:00:00.000Z' WHERE node_id=?",
+    "UPDATE node_thin_storage SET status='blocked',error_code='thin_storage_executor_unconfirmed',lease_expires_at='2000-01-01T00:00:00.000Z' WHERE node_id=?",
   )
     .bind(f.node)
     .run();
-  const uncertain = await lease();
+  const uncertain = (await lease())!;
+  const changed = {
+    ...body,
+    expected_revision: 1,
+    profile: {
+      ...f.profile,
+      maximum_quota_gib: f.profile.maximum_quota_gib + 1,
+    },
+  };
   expect(
-    (
-      await request(
-        path,
-        f.admin,
-        "PUT",
-        { ...body, expected_revision: 1 },
-        crypto.randomUUID(),
-      )
-    ).status,
+    (await request(path, f.admin, "PUT", changed, crypto.randomUUID())).status,
   ).toBe(409);
   expect(await lease()).toEqual(uncertain);
+  // The identical selection starts one new lease that only reads the same dispatched action back.
+  const retried = await request(
+    path,
+    f.admin,
+    "PUT",
+    { ...body, expected_revision: 1 },
+    crypto.randomUUID(),
+  );
+  expect(retried.status).toBe(200);
+  expect(await retried.json()).toMatchObject({
+    revision: 1,
+    status: "selected",
+    error_code: null,
+  });
+  const resumed = (await lease())!;
+  expect(resumed.lease_revision).toBe(uncertain.lease_revision + 1);
+  expect(resumed.lease_id).not.toBe(uncertain.lease_id);
+  expect(resumed.action_json).toBe(uncertain.action_json);
+  expect(JSON.parse(resumed.action_json!)).toMatchObject({
+    nonce,
+    state: "dispatched",
+  });
 });
 it("pins physical identity, current release driver and storage public keys and refuses unqualified activation", async () => {
   const f = await setup();
@@ -495,6 +518,7 @@ it("preserves an uncertain dispatched pool write and only clears an expired know
     configureNodeThinStorage(f.selected, f.node, {
       ...f.body,
       expected_revision: 1,
+      profile: { ...f.profile, maximum_quota_gib: 17 },
     }),
   ).rejects.toMatchObject({ code: "conflict" });
   expect(

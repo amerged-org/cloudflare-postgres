@@ -173,12 +173,38 @@ export async function configureNodeThinStorage(
     return conflict("Selected physical storage identity changed");
   if (old?.lease_expires_at && Date.parse(old.lease_expires_at) > Date.now())
     return conflict("Native physical operation is still active");
-  if (old?.action_json && JSON.parse(old.action_json).state !== "pending")
-    return conflict(
-      "Uncertain physical write must be resolved before profile change",
-    );
   const serialized = canonicalInstallation(body.profile),
     hash = await installationHash(thinVolumeProfile(body.profile));
+  if (old?.action_json && JSON.parse(old.action_json).state !== "pending") {
+    if (
+      old.profile_json !== serialized ||
+      old.address !== body.address ||
+      old.allow_new_databases !== Number(body.allow_new_databases) ||
+      old.material_revision !== source.material_revision ||
+      old.qualified_driver_image !== driver.reference
+    )
+      return conflict(
+        "Uncertain physical write must be resolved before profile change",
+      );
+    // Never repeat the uncertain write: the identical selection clears only the failed run's error.
+    // The next lease keeps the dispatched action, which Native confirms by readback or refuses.
+    const retried = await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE node_thin_storage SET status='selected',error_code=NULL WHERE node_id=? AND profile_revision=? AND lease_revision=? AND action_json=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now'))",
+      ).bind(nodeId, old.profile_revision, old.lease_revision, old.action_json),
+      ...(lease
+        ? [
+            lease.completeStatement(nodeId, 200, {
+              sql: "changes()=1",
+              bindings: [],
+            }),
+          ]
+        : []),
+    ]);
+    if (retried[0]!.meta.changes !== 1)
+      return conflict("Thin selection changed before admission");
+    return state(env, nodeId);
+  }
   const references = await env.DB.prepare(
     `SELECT COUNT(*) count,COALESCE(MAX(s.storage_gib),0) maximum_quota FROM databases d JOIN size_classes s ON s.id=d.size_class_id
     WHERE d.node_id=? AND d.storage_profile_json IS NOT NULL AND d.observed_state<>'deleted'`,
@@ -359,7 +385,8 @@ export async function configureNodeThinStorage(
 }
 /** A retained node has no AddNode postjoin, so its committed selection starts the Native executor.
  * One lease creates a missing pool from free extents only and never repeats an uncertain dispatched
- * action. The response reports the resulting state; a failed start never fails the selection. */
+ * action; repeating the identical selection only reads that action back. The response reports the
+ * resulting state; a failed start never fails the selection. */
 export async function selectNodeThinStorage(
   c: ApiContext,
   nodeId: string,
