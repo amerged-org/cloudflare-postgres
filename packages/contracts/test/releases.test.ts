@@ -353,9 +353,13 @@ it("requires explicit digests, complete product layers and closed role reference
   duplicate.components.push(duplicate.components[0]!);
   expect(FleetReleaseSpec.safeParse(duplicate).success).toBe(false);
 });
-it("qualified thin releases require a pinned verifier and native gateway while thick-only releases remain valid", () => {
+it("qualified thin releases require a pinned verifier, native gateway and native controller while thick-only releases remain valid", () => {
   const base = spec();
-  for (const name of ["pgcf-sandbox-controller", "native-gateway"])
+  for (const name of [
+    "pgcf-sandbox-controller",
+    "native-gateway",
+    "native-controller",
+  ])
     base.components.push({
       name,
       kind: "image",
@@ -366,7 +370,7 @@ it("qualified thin releases require a pinned verifier and native gateway while t
   for (const role of Object.values(base.roles)) {
     Object.assign(role, { host_configuration_required: true });
     role.talos_extensions.push("pgcf-sandbox-controller");
-    role.components.push("native-gateway");
+    role.components.push("native-gateway", "native-controller");
   }
   const qualified = Object.assign(base, {
     storage_authority_keys_sha256: "a".repeat(64),
@@ -389,6 +393,13 @@ it("qualified thin releases require a pinned verifier and native gateway while t
     },
   });
   expect(FleetReleaseSpec.safeParse(qualified).success).toBe(true);
+  // Only the native controller writes the gateway ledger, protection marker and reclamation proof.
+  const legacyController = structuredClone(qualified);
+  legacyController.roles.control_relay.components =
+    legacyController.roles.control_relay.components.filter(
+      (n) => n !== "native-controller",
+    );
+  expect(FleetReleaseSpec.safeParse(legacyController).success).toBe(false);
   const missingPin = structuredClone(qualified) as Partial<typeof qualified>;
   delete missingPin.storage_authority_keys_sha256;
   expect(FleetReleaseSpec.safeParse(missingPin).success).toBe(false);

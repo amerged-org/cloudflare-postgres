@@ -168,6 +168,7 @@ interface NodeReleaseRow {
   region_id: string;
   node_uid: string | null;
   lost_at: string | null;
+  database_placement_enabled: number;
   revision: number | null;
   release_id: string | null;
   role: "control_relay" | "customer" | null;
@@ -182,7 +183,7 @@ interface NodeReleaseRow {
 async function nodeRow(db: D1Database, id: string): Promise<NodeReleaseRow> {
   const row = await db
     .prepare(
-      `SELECT n.id node_id,n.region_id,n.node_uid,n.lost_at,
+      `SELECT n.id node_id,n.region_id,n.node_uid,n.lost_at,n.database_placement_enabled,
     a.revision,a.release_id,a.role,a.node_uid assigned_uid,r.agent_key_hash,
     o.agent_key_hash observed_agent_key_hash,o.node_uid observed_uid,o.assignment_revision observed_revision,o.observed_at,o.facts_json
     FROM nodes n JOIN regions r ON r.id=n.region_id LEFT JOIN fleet_node_releases a ON a.node_id=n.id
@@ -345,8 +346,11 @@ export async function readFleetNodeRelease(
     const { readCurrentNodeThinStorage } =
         await import("./node-thin-storage.ts"),
       storage = await readCurrentNodeThinStorage({ DB: db }, id);
+    // A receipt binds members that take databases; control/relay without placement stays thick.
     if (
-      (desired?.spec.thin_storage_qualification || storage) &&
+      ((desired?.spec.thin_storage_qualification &&
+        row.database_placement_enabled === 1) ||
+        storage) &&
       !storage?.authority?.write_allowed
     ) {
       state = "pending";

@@ -39,7 +39,7 @@ export async function standingPostjoinFixture(
       "api",
       "edge",
       "node-bootstrap",
-      "regional",
+      "native-controller",
       "native-gateway",
       "postgres",
       "barman",

@@ -181,7 +181,7 @@ export const FleetReleaseSpec = z
         context.addIssue({
           code: "custom",
           message:
-            "Thin storage requires the pinned verifier and native gateway on every role",
+            "Thin storage requires the pinned verifier, native gateway and native controller on every role",
         });
       const q = spec.thin_storage_qualification;
       for (const [name, reference] of [
@@ -300,11 +300,13 @@ export const FleetReleaseSpec = z
         });
   });
 export type FleetReleaseSpec = z.infer<typeof FleetReleaseSpec>;
-/** Thin qualification and retained requalification share the same mandatory runtime boundary. */
+/** Thin qualification and retained requalification share the same mandatory runtime boundary.
+ * Only the native controller writes the gateway's write-authority ledger, protection marker and reclamation proof. */
 export function thinStorageReleaseGuardPinned(spec: FleetReleaseSpec): boolean {
+  const runtime = ["native-gateway", "native-controller", "openebs-lvm"];
   return Boolean(
     spec.storage_authority_keys_sha256 &&
-    ["native-gateway", "pgcf-sandbox-controller", "openebs-lvm"].every((name) =>
+    [...runtime, "pgcf-sandbox-controller"].every((name) =>
       spec.components.some(
         (c) =>
           c.name === name &&
@@ -316,8 +318,7 @@ export function thinStorageReleaseGuardPinned(spec: FleetReleaseSpec): boolean {
       (role) =>
         role.host_configuration_required &&
         role.talos_extensions.includes("pgcf-sandbox-controller") &&
-        role.components.includes("native-gateway") &&
-        role.components.includes("openebs-lvm"),
+        runtime.every((name) => role.components.includes(name)),
     ),
   );
 }
