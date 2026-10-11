@@ -36,13 +36,14 @@ distinguishes cloudflared's selected architecture manifest from its upstream ind
 These integrity checks do not establish vulnerability clearance or live fleet convergence.
 
 The earlier platform baseline ran in the Contabo lab; live acceptance of this updated baseline
-is recorded in [PLAN.md](../../PLAN.md). The approved deployment retains the EU control/relay
-node without new customer database placement and preserves the already-admitted EU worker as
-customer EU1 (formerly EU2). One new US1 control-plane/customer node bootstraps its own regional
-platform. Both customer nodes use V159 / Cloud VPS Plus 4 with 4 vCPU, 8 GiB RAM and 150 GiB NVMe;
-US1 was purchased for one month. EU1 requires no new join, re-adoption or reinstallation. System
-and platform resources remain reserved. Verify an R2 restore into admitted US1 while retaining
-the healthy EU source; the earlier EU1 removal drill is withheld. Node loss is recovered from R2.
+is recorded in [PLAN.md](../../PLAN.md). The current deployment is EU only: it retains the EU
+control/relay node without new customer database placement and preserves the already-admitted
+EU worker as customer EU1 (formerly EU2), a V159 / Cloud VPS Plus 4 with 4 vCPU, 8 GiB RAM and
+150 GiB NVMe. EU1 requires no new join, re-adoption or reinstallation. The US region is
+cancelled. The first node of a new region bootstraps its own regional platform through AddNode
+from the [control-server configuration](../talos/README.md#control-server-configuration-per-region).
+System and platform resources remain reserved. The earlier EU1 removal drill is withheld. Node
+loss is recovered from R2.
 
 ## Ownership and prerequisites
 

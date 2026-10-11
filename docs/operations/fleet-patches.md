@@ -197,9 +197,10 @@ credential and an `Idempotency-Key`. The request contains `release_id`,
 `material_revision`, and every live physical member in the desired maintenance order.
 Each member specifies `node_id`, `node_uid`, current node-assignment `expected_revision`,
 `role`, and its management IPv4 `address`. Read revisions from the existing region/node
-release endpoints; a missing assignment has revision zero. Select US first, then the EU
-customer member before the EU control/relay member. Required Kubernetes control-plane
-updates remain part of the existing PatchNode dependency handling.
+release endpoints; a missing assignment has revision zero. Within each region, list the
+customer members before the region's control server, for example EU1 before EU control/relay.
+Required Kubernetes control-plane updates remain part of the existing PatchNode dependency
+handling.
 
 For a release that requires protected host configuration, each member must already have
 its release-pinned compute policy, or include `compute_pool: { expected_revision, policy }`

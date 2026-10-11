@@ -12,7 +12,7 @@ config:
     cpu: 500m
     memory: 512Mi
 ---
-# Allows customer databases on the initial EU/US control-plane/worker nodes.
+# Lets platform Pods run on a control-plane node; customer placement stays behind the API flag.
 apiVersion: v1alpha1
 kind: KubeNodeConfig
 taints:

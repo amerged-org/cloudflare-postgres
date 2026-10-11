@@ -26,11 +26,10 @@ reinstall, reset or restore etcd merely because a patch has stalled. The procedu
 does not attest that a retained node currently has a usable alternate boot slot; record actual
 slot observations separately. See the pinned [Talos upgrade and rollback procedure](https://docs.siderolabs.com/talos/v1.14/configure-your-talos-cluster/lifecycle-management/upgrading-talos).
 
-The operator topology retains three physical servers: EU control/relay, customer EU1 and
-customer US1. The customer model is V159 / Cloud VPS Plus4:4 vCPU,8 GB RAM,150 GB NVMe,
-one-month term. US1 runs Golden Talos1.14.2/Kubernetes1.36.5; final regional/database acceptance
-remains open in the canonical ULTRA plan. Preserve the existing US AddNode and fleet operations;
-never order a replacement or reinstall an EU node to resume a stalled rollout.
+The operator topology is EU only: EU control/relay and customer EU1. The customer model is
+V159 / Cloud VPS Plus 4: 4 vCPU, 8 GB RAM, 150 GB NVMe, one-month term. The US region is
+cancelled; US1 serves only as the R1.1 canary until it is marked lost, as listed in the canonical
+ULTRA plan. Never order a replacement or reinstall an EU node to resume a stalled rollout.
 
 Recovery drills use separate targets while preserving the healthy source and its committed data.
 Do not reset, re-adopt, fence, delete or decommission EU1 for an acceptance drill. The incident
@@ -221,15 +220,16 @@ An etcd snapshot helps recover Kubernetes configuration, but it does not recreat
 PostgreSQL volumes. Validate SQL and routing before opening traffic.
 
 The D1 export/local restore rehearsal and API full restore/PITR/deleted-source acceptance are
-recorded in `PLAN.md`. The current completion drill installs and admits US1, then restores the
-customer EU1 test source from the EU R2 archive into a separate US1 target.
+recorded in `PLAN.md`. A healthy-source cross-region restore from EU into US1 passed earlier; with
+the US region cancelled, the current completion drill restores an EU1 test database from the EU
+R2 archive into a separate target, as node check 5 in the ULTRA plan.
 Verify SQL, recovered markers, recovery duration and the last recoverable transaction. Keep EU1
 healthy throughout the restore and retain its Node, namespace, Cluster, PVC/PV, role and encrypted
-custody identities. The final topology retains the EU control/relay server, existing customer EU1
-and new US1; it requires no new EU worker or EU1 removal. The earlier destructive loss and cleanup
-kits are withheld. Install the scoped source-read credential map only after US1 is Ready; its
-credentials must not alter the EU source archive. A later separately authorized incident or
-loss drill must preserve or recover this same customer EU1.
+custody identities. The topology is the EU control/relay server and existing customer EU1; it
+requires no EU1 removal. The earlier destructive loss and cleanup kits are withheld. A
+cross-region restore into a later region installs its scoped source-read credential map only after
+that region is Ready; its credentials must not alter the source archive. A later separately
+authorized incident or loss drill must preserve or recover this same customer EU1.
 A complete regional control-plane loss drill remains outside this customer-free completion gate.
 
 ## Later adopter migration
@@ -406,7 +406,7 @@ Pod, PostgreSQL, Barman and their active CPU accounting; it does not count as a 
 `GET`/`PUT /v1/nodes/{id}/warm-reclaim-qualification` records an independently accepted isolated
 worker proof bound to the current Node UID, boot, sealed cluster/material and selected release.
 A control-plane node, missing qualification or stale/mismatched runtime proof cannot issue reclaim.
-None of the three retained nodes is implicitly qualified by deploying this source. The approved
+No retained node is implicitly qualified by deploying this source. The approved
 isolated-worker and actual encrypted-swap acceptance remain required before any live trial.
 
 The protected host publisher uses the existing regional identity to fetch

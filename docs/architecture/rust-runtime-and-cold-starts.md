@@ -3,7 +3,7 @@
 Approved: **2026-10-05**. **The target architecture is approved; implementation and live acceptance are pending.**
 
 Owner correction (2026-10-08): the [unified control/capacity/release plan](cloudflare-convergence-and-serverless-plan.md)
-now requires the actual-use resource model and uniform three-server patching as part of completion.
+now requires the actual-use resource model and uniform automatic fleet patching as part of completion.
 Earlier clauses preserving full sleeping CPU and logical disk reservations are superseded below.
 The Rust implementation and its measured first-read target remain required and unaccepted.
 The owner also explicitly requires Neon's **shared pool of prestarted, unassigned compute**.
@@ -107,8 +107,8 @@ constraint to solve, not a reason to replace the requested pool with per-databas
 
 The first implementation stage must produce a working late-binding contract between a prestarted,
 unassigned runtime and a retained database volume. With local data, candidate slots must be on
-nodes eligible to access that data; a regional pool can have node-affine subsets. No arbitrary US
-slot can use EU local storage. Do not hot-swap PGDATA beneath a running PostgreSQL process, attempt
+nodes eligible to access that data; a regional pool can have node-affine subsets. A slot in
+another region can never use EU local storage. Do not hot-swap PGDATA beneath a running PostgreSQL process, attempt
 to mutate an already running Pod's volume specification, or create an empty replacement database. Kubernetes documents the
 [Pod update restrictions](https://kubernetes.io/docs/concepts/workloads/pods/#pod-update-and-replacement);
 CNPG documents its [instance-manager ownership](https://cloudnative-pg.io/docs/devel/instance_manager/).
@@ -184,7 +184,7 @@ warm retention. No pool state may be reported ready from these findings.
 
 ### Required pool acceptance
 
-Use the R2 completion step in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#execution).
+Use the pool cold-start step after R2 in the [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#open).
 A real unassigned slot must exist before demand. Connect normally through Cloudflare to a sleeping
 database with no running tenant compute and measure connection through the first validated SQL
 result from the same start time. A pool hit must finish below one second, preserve committed data,
@@ -383,8 +383,9 @@ After each native replacement is accepted in Dev, remove its unused TypeScript s
 ## 15. Acceptance and measurements
 
 The [ULTRA plan](cloudflare-convergence-and-serverless-plan.md#node-acceptance) defines the six
-functional node checks. Its R2 step additionally requires a real shared-pool first SQL result below
-one second and refill after assignment. Run these through the normal Cloudflare path on Dev.
+functional node checks. Its pool cold-start step after R2 requires a real shared-pool first SQL
+result below one second and refill after assignment. Run these through the normal Cloudflare path
+on Dev.
 Focused regression tests cover changed authentication, TLS, fencing, claims, isolation and
 uncertain-write behavior. Reuse valid unchanged results; do not introduce a second live test matrix.
 
