@@ -43,7 +43,8 @@ export class ThinQualification extends WorkflowEntrypoint<
       for (let turn = 0; ; turn++) {
         const state = await step.do(
           `${name}-${turn}`,
-          { retries: { limit: 0, delay: "1 second" }, timeout: "12 minutes" },
+          // A retry is one more lease-fenced turn; an uncertain write stays journaled.
+          { retries: { limit: 3, delay: "15 seconds" }, timeout: "12 minutes" },
           async () => {
             try {
               await stub.thinQualification(id, name);
@@ -53,6 +54,9 @@ export class ThinQualification extends WorkflowEntrypoint<
             return await readThinQualificationStep(this.env, id);
           },
         );
+        // An unanswered executor may still be inside its lease; no turn or deadline starts before it ends.
+        if (state.lease_wait_ms > 0)
+          await step.sleep(`${name}-lease-${turn}`, state.lease_wait_ms + 1000);
         if (state.status !== "running" || state.step !== name) break;
         if (turn + 1 >= TURNS[name]) {
           await step.do(`${name}-deadline`, () =>

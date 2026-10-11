@@ -342,13 +342,19 @@ scratch object, LV, the pool and a pool metadata spare that did not exist before
 `node_thin_storage` row, and thin selection on that node is refused until the run ends.
 
 **Preconditions**
-- The node is ready, has fresh observations and allows database placement. Never use the control
-  node.
+- The node is a ready customer node with fresh observations. Never use the control node.
+- The node has no thin selection. A selected node is refused, and a selection cannot be removed.
+- Database placement on the node is disabled (`PUT /v1/nodes/{id}/database-placement`) from before
+  the start until the run ends. Thick placement does not count the scratch pool, and a new database
+  would change the retained baseline. Re-enabling placement during the run ends the measurements;
+  cleanup still runs. Re-enable placement after the run.
 - The region compute pool is on (`compute_pool` in `PUT /v1/regions/{id}/capacity-policy`). Thin
   storage depends on its runtime admission fact.
-- The assigned region release pins `native-gateway`, `pgcf-sandbox-controller`, `postgres` and the
-  thin-tools `openebs-lvm` image. The storage authority keys equal the current signer keys.
-  `dm_thin_pool` is live.
+- The assigned region release pins the thin guard: digest-pinned `native-gateway`,
+  `native-controller`, thin-tools `openebs-lvm` and `pgcf-sandbox-controller` images. Every role
+  requires host configuration, carries the `pgcf-sandbox-controller` extension and runs
+  `native-gateway`, `native-controller` and `openebs-lvm`. The release also pins `postgres`. The
+  storage authority keys equal the current signer keys. `dm_thin_pool` is live.
 - The VG has only the retained linear LVs. Free extents cover the profile maximum, twice its metadata
   and its VG reserve, plus 12 GiB for the metadata scratch pool.
 - The profile can grow (`initial_data_bytes` < `maximum_data_bytes`) and has at most 256 volumes.
@@ -363,6 +369,11 @@ scratch object, LV, the pool and a pool metadata spare that did not exist before
    or ends the run; it is never repeated.
 3. `GET /v1/thin-qualifications/{id}` returns status, step, the measured evidence per gate and the
    decision Cloudflare computed from it.
+4. A run that stops progressing, for example after a failed Workflow start (a `500` after the run was
+   committed) or a stopped instance, continues with `POST /v1/thin-qualifications/{id}/resume`. A
+   start refused because a run is already running names that run in `details.run_id`.
+5. `POST /v1/thin-qualifications/{id}/cancel` ends the measurements with
+   `thin_qualification_cancelled`. Cleanup still runs; the run then fails without a receipt.
 
 The run never reboots the node. The six live checks verify pool and thin volume activation after a
 boot at the next reboot a fleet patch orchestrates: the R2b `talos_reboot` or `host_service` stage.
@@ -388,13 +399,16 @@ identity and of an expired token, is verified after activation by the six live c
 
 **Failure and cleanup**
 - A failed gate or executor error records its code and moves straight to cleanup.
+- A turn whose executor stops answering keeps its lease until the lease expires. The Workflow waits
+  for that lease before the next turn or a step deadline, so cleanup still gets all its turns.
 - Cleanup resumes any suspended scratch LV and removes everything the run created, also after a
   reboot or a kernel, driver or host extension change. It reports absence, the LV inventory and VG
   free space against the baseline.
-- If cleanup cannot be verified, the run fails with `thin_qualification_cleanup_incomplete`. Remove
-  the remaining objects by hand. They are: namespace `pgcf-thin-q-<run>`, the StorageClass and VAC of
-  the same name, LVs tagged `pgcf.thin-q.<run id>` or named `pgcf_thin_q_<run>*`, and a
-  `pgcf_thinpool` whose `pgcf.action.<nonce>` tag matches the run journal.
+- A failed run keeps its first error code. If its `cleanup` is null or unverified
+  (`thin_qualification_cleanup_incomplete`), remove the remaining objects by hand. They are:
+  namespace `pgcf-thin-q-<run>`, the StorageClass and VAC of the same name, LVs tagged
+  `pgcf.thin-q.<run id>` or named `pgcf_thin_q_<run>*`, and a `pgcf_thinpool` whose
+  `pgcf.action.<nonce>` tag matches the run journal.
 
 **Receipt into a release (R2b)**
 1. Copy `qualification` from the completed run.
@@ -405,6 +419,20 @@ identity and of an expired token, is verified after activation by the six live c
    successor, then activate placement.
 5. `kernel_version` is the exact `nodeInfo.kernelVersion`. `profile_sha256` is the full-profile hash,
    not the class hash. Each new Talos kernel, driver or host extension needs a new run.
+
+**Requalification after R2b (open owner decision)**
+A new run needs a customer node without a thin selection. Once R2b selects EU1, EU has no such node:
+the selection cannot be removed, the control node is excluded and AddNode selects thin storage on
+every new node. A later release that changes the Talos kernel, `openebs-lvm` or
+`pgcf-sandbox-controller` then cannot obtain a receipt, and its patch leaves EU1 waiting in the
+storage stage without thin write authority. Do not roll out such a release before the owner decides
+how to requalify, and decide before R2b selects EU1. A run also needs the node's release to equal the
+region release, so a requalification first rolls out a receipt-less candidate release. Selected
+nodes have no thin write authority until the successor with the new receipt is rolled out; the
+decision must accept or avoid that outage. Options:
+- Qualify on the control node, which has placement disabled and no selection. This accepts one
+  control and relay reboot in `metadata_full` and needs free extents in its VG.
+- Allow a run on a selected node that holds no thin volumes, using a distinct scratch pool name.
 
 
 ## Optional warm reclaim

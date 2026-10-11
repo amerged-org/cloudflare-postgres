@@ -106,7 +106,8 @@ export async function configureNodeThinStorage(
     now = new Date().toISOString();
   const source = await env.DB.prepare(
     `SELECT n.region_id,n.node_uid,n.provider_instance_id,a.role,a.revision assignment_revision,a.release_id,
-    f.revision region_revision,s.spec_json,s.spec_sha256,r.bootstrap_material_revision material_revision
+    f.revision region_revision,s.spec_json,s.spec_sha256,r.bootstrap_material_revision material_revision,
+    EXISTS(SELECT 1 FROM thin_storage_qualification_runs q WHERE q.node_id=n.id AND q.status='running') qualifying
     FROM nodes n JOIN regions r ON r.id=n.region_id JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid
     JOIN fleet_region_releases f ON f.region_id=n.region_id AND f.release_id=a.release_id JOIN fleet_releases s ON s.id=a.release_id
     WHERE n.id=? AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND n.provider_instance_id IS NOT NULL
@@ -124,9 +125,15 @@ export async function configureNodeThinStorage(
       spec_json: string;
       spec_sha256: string;
       material_revision: number;
+      qualifying: number;
     }>();
   if (!source)
     return conflict("Current assigned physical node and release are required");
+  // The scratch pool and namespace stay until the run's cleanup reports.
+  if (source.qualifying)
+    return conflict(
+      "A thin qualification is running on this node; select thin storage after it ends",
+    );
   const spec = FleetReleaseSpec.parse(JSON.parse(source.spec_json));
   if ((await installationHash(spec)) !== source.spec_sha256)
     return conflict("Approved release contents changed");
@@ -344,7 +351,8 @@ export async function configureNodeThinStorage(
       )
     : env.DB.prepare(
         `INSERT INTO node_thin_storage(node_id,node_uid,cluster_uid,address,volume_group_uuid,profile_revision,profile_sha256,profile_json,allow_new_databases,material_revision,qualified_driver_image,status,created_at,updated_at)
-      SELECT ?,?,?,?,?,?,?,?,?,?,?,'selected',?,? WHERE ${referenceFence} AND ${authority} ON CONFLICT(node_id) DO NOTHING`,
+      SELECT ?,?,?,?,?,?,?,?,?,?,?,'selected',?,? WHERE ${referenceFence} AND ${authority}
+        AND NOT EXISTS(SELECT 1 FROM thin_storage_qualification_runs q WHERE q.node_id=? AND q.status='running') ON CONFLICT(node_id) DO NOTHING`,
       ).bind(
         nodeId,
         body.node_uid,
@@ -361,6 +369,7 @@ export async function configureNodeThinStorage(
         now,
         ...referenceBindings,
         ...authorityBindings,
+        nodeId,
       );
   const statements = [statement];
   if (lease)

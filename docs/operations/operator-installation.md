@@ -28,8 +28,8 @@ deployment's Cloudflare managed registry and use its returned immutable referenc
 image's source labels and notices; registry transfer does not replace qualification.
 
 Keep the private API configuration outside Git. It supplies D1, region-specific R2 bindings,
-RegionLink/DatabaseActor/NodeBootstrap Durable Objects, the AddNode Workflow, the Container and
-the fixed-source VPC relay binding. Start from `apps/api/wrangler.example.jsonc`; replace every
+RegionLink/DatabaseActor/NodeBootstrap Durable Objects, the AddNode, PatchNode, ThinQualification
+and InfrastructureBackup Workflows, the Container and the fixed-source VPC relay binding. Start from `apps/api/wrangler.example.jsonc`; replace every
 placeholder. Import secret values from private custody and preserve the existing four root
 secrets. Export D1 before applying additive migrations and rehearse them against the export.
 
