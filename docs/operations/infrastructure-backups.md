@@ -125,8 +125,9 @@ policy region each minute, including control:
 
 The email subject is `PGCF infrastructure: <kind> (<region>)` and its body is the
 event JSON, including `node_ids`, `threshold_ppm` and the highest `utilization_ppm`.
-A node crossing during an active episode adds no message. The episode clears only
-when every listed node is fresh and below the threshold, or lost.
+A node crossing during an active episode adds no message only while a listed node
+still exceeds; otherwise it replaces the episode with a new event. The episode clears
+only when every listed node is fresh and below the threshold, or lost.
 
 The existing authenticated infrastructure webhook remains supported and takes
 precedence when configured. Without a webhook or both email addresses plus the

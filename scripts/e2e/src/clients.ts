@@ -778,6 +778,12 @@ function assertGatewayEntrypoint(
   };
 }
 
+/** Node shutdown leaves Succeeded or Failed Pods behind; Kubernetes never restarts them. */
+function terminalPod(pod: Record<string, unknown>): boolean {
+  const phase = record(pod.status ?? {}).phase;
+  return phase === "Succeeded" || phase === "Failed";
+}
+
 export function gatewayLogPods(
   deployments: unknown,
   replicaSets: unknown,
@@ -845,6 +851,7 @@ export function gatewayLogPods(
     const labels = record(metadata.labels ?? {});
     return (
       !metadata.deletionTimestamp &&
+      !terminalPod(row) &&
       labels["app.kubernetes.io/name"] === "pgcf-gateway" &&
       labels["app.kubernetes.io/part-of"] === "pgcf" &&
       ownedBy(row, "ReplicaSet", sets)
@@ -1227,6 +1234,7 @@ export class Kubernetes {
         labels["app.kubernetes.io/name"] === deploymentName &&
         labels["app.kubernetes.io/part-of"] === "pgcf" &&
         !metadata.deletionTimestamp &&
+        !terminalPod(pod) &&
         Array.isArray(metadata.ownerReferences) &&
         metadata.ownerReferences
           .map(record)

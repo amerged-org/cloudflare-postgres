@@ -460,6 +460,85 @@ test("Gateway log pod selection requires namespace, Deployment ownership and the
   );
 });
 
+test("Gateway log pod selection ignores terminal Pods left by node shutdown", () => {
+  const fixture = resources();
+  const sibling = (phase?: string) => ({
+    ...fixture.pod,
+    metadata: {
+      ...fixture.pod.metadata,
+      name: `pgcf-gateway-${randomBytes(5).toString("hex")}`,
+      uid: randomUUID(),
+    },
+    status: { ...fixture.pod.status, ...(phase ? { phase } : {}) },
+  });
+  const live = sibling("Running");
+  assert.deepEqual(
+    clients.gatewayLogPods(
+      { items: [fixture.deployment] },
+      { items: [fixture.set] },
+      { items: [fixture.pod, sibling("Failed"), live, sibling("Succeeded")] },
+      fixture.namespace,
+      fixture.image,
+    ),
+    [fixture.pod.metadata.name, live.metadata.name],
+  );
+});
+
+test("Agent Pod selection ignores terminal Pods left by node shutdown", async () => {
+  const namespace = "pgcf-system",
+    deployment = {
+      metadata: { namespace, name: "pgcf-agent", uid: randomUUID() },
+    },
+    set = {
+      metadata: {
+        namespace,
+        name: `pgcf-agent-${randomBytes(5).toString("hex")}`,
+        uid: randomUUID(),
+        ownerReferences: [
+          {
+            kind: "Deployment",
+            name: "pgcf-agent",
+            uid: deployment.metadata.uid,
+            controller: true,
+          },
+        ],
+      },
+    };
+  const pod = (phase: string) => ({
+    metadata: {
+      namespace,
+      name: `${set.metadata.name}-${randomBytes(3).toString("hex")}`,
+      uid: randomUUID(),
+      labels: {
+        "app.kubernetes.io/name": "pgcf-agent",
+        "app.kubernetes.io/part-of": "pgcf",
+      },
+      ownerReferences: [
+        {
+          kind: "ReplicaSet",
+          name: set.metadata.name,
+          uid: set.metadata.uid,
+          controller: true,
+        },
+      ],
+    },
+    status: { phase },
+  });
+  const live = pod("Running");
+  const kube = new Kubernetes("test-kube-path", "test-context");
+  Object.assign(kube, {
+    read: async (resource: string) => ({
+      items:
+        resource === "deployments"
+          ? [deployment]
+          : resource === "replicasets"
+            ? [set]
+            : [pod("Failed"), live, pod("Succeeded")],
+    }),
+  });
+  assert.deepEqual(await kube.agentPod(namespace, "pgcf-agent"), live);
+});
+
 test("E3 cannot complete when the named startup mismatch proof is missing", async () => {
   let completed = false;
   const run = Object.assign(Object.create(Run.prototype) as Run, {

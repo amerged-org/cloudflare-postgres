@@ -29,6 +29,8 @@ interface AlertCondition {
   kind: InfraAlertKind;
   active: boolean | null;
   snapshot: { sql: string; bindings: (string | number | null)[] };
+  /** Lets arming replace a still active episode, evaluated against the stored row. */
+  takeover?: { sql: string; bindings: (string | number | null)[] };
   /** Payload fields that replace the regional RAM and cap values. */
   detail?: Pick<
     InfraAlert,
@@ -86,7 +88,10 @@ const nodeUtilization = {
 } as const;
 type NodeWarningKind = keyof typeof nodeUtilization;
 
-/** Any fresh node at or above the threshold keeps one regional episode; snapshots re-evaluate current D1 state. */
+/**
+ * Any fresh node at or above the threshold keeps one regional episode until none of its listed
+ * nodes still exceeds; snapshots re-evaluate current D1 state.
+ */
 async function nodeWarning(
   db: D1Database,
   regionId: string,
@@ -117,9 +122,21 @@ async function nodeWarning(
     return {
       kind,
       active: true,
+      // Arm and claim only while this read's highest node still exceeds, never from a superseded read.
       snapshot: {
-        sql: `${policy.sql} AND ${exceeded}`,
-        bindings: [...policy.bindings, ...fresh, threshold],
+        sql: `${policy.sql} AND EXISTS(SELECT 1 FROM (${measured.sql}) measured WHERE measured.id=? AND measured.utilization_ppm>=?)`,
+        bindings: [
+          ...policy.bindings,
+          ...fresh,
+          exceeding.results[0]!.id,
+          threshold,
+        ],
+      },
+      // A listed node that is unknown or below cannot mute another node's crossing.
+      takeover: {
+        sql: `NOT EXISTS(SELECT 1 FROM (${measured.sql}) measured WHERE measured.utilization_ppm>=?
+          AND measured.id IN(SELECT value FROM json_each(infrastructure_alerts.payload,'$.node_ids')))`,
+        bindings: [...fresh, threshold],
       },
       detail: {
         regional_ram_utilization_ppm: null,
@@ -302,7 +319,7 @@ export async function runInfrastructureAlerts(
   ];
   for (const kind of Object.keys(nodeUtilization) as NodeWarningKind[])
     conditions.push(await nodeWarning(env.DB, regionId, kind, policy, now));
-  for (const { kind, active, snapshot, detail } of conditions) {
+  for (const { kind, active, snapshot, takeover, detail } of conditions) {
     // Unknown measurements retain an enabled episode; explicitly disabling its policy clears it.
     if (active === null) continue;
     if (!active) {
@@ -327,7 +344,9 @@ export async function runInfrastructureAlerts(
     await env.DB.prepare(
       `INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload)
       SELECT ?,?,1,?,? WHERE ${snapshot.sql} ON CONFLICT(region_id,kind) DO UPDATE SET active=1,event_id=excluded.event_id,
-        payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0`,
+        payload=excluded.payload,delivered_at=NULL,last_attempt_at=NULL WHERE infrastructure_alerts.active=0${
+          takeover ? ` OR ${takeover.sql}` : ""
+        }`,
     )
       .bind(
         regionId,
@@ -335,6 +354,7 @@ export async function runInfrastructureAlerts(
         event.event_id,
         JSON.stringify(event),
         ...snapshot.bindings,
+        ...(takeover?.bindings ?? []),
       )
       .run();
   }
