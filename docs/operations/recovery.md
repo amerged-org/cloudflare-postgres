@@ -377,8 +377,9 @@ token, is verified after activation by the six live checks.
 
 **Failure and cleanup**
 - A failed gate or executor error records its code and moves straight to cleanup.
-- Cleanup resumes any suspended scratch LV and removes everything the run created. It reports
-  absence, the LV inventory and VG free space against the baseline.
+- Cleanup resumes any suspended scratch LV and removes everything the run created, also after a
+  reboot or a kernel, driver or host extension change. It reports absence, the LV inventory and VG
+  free space against the baseline.
 - If cleanup cannot be verified, the run fails with `thin_qualification_cleanup_incomplete`. Remove
   the remaining objects by hand. They are: namespace `pgcf-thin-q-<run>`, the StorageClass and VAC of
   the same name, LVs tagged `pgcf.thin-q.<run id>` or named `pgcf_thin_q_<run>*`, and a

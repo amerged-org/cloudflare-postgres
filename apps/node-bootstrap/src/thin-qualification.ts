@@ -645,6 +645,10 @@ class Qualifier {
       fail("lease_changed");
   }
   async connect() {
+    // Cleanup only removes owned objects and resumes owned LVs by DM UUID. A later boot,
+    // kernel, driver or host extension must not strand them; identity fences still apply.
+    const cleanup = this.run.step === "cleanup",
+      setup = cleanup ? null : this.run.setup;
     this.node = await verifyThinNode(
       this.session,
       {
@@ -654,10 +658,12 @@ class Qualifier {
         cluster_uid: this.run.cluster_uid,
         name: this.run.name,
         provider_instance_id: this.run.provider_instance_id,
-        driver_image: this.profile.driver_image,
-        host_extension_version: this.input.host_extension.version,
-        boot_id: this.run.setup?.identity.boot_id ?? null,
-        kernel_version: this.run.setup?.identity.kernel_version ?? null,
+        driver_image: cleanup ? null : this.profile.driver_image,
+        host_extension_version: cleanup
+          ? null
+          : this.input.host_extension.version,
+        boot_id: setup?.identity.boot_id ?? null,
+        kernel_version: setup?.identity.kernel_version ?? null,
       },
       () => this.lease(),
     );

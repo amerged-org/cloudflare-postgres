@@ -717,8 +717,10 @@ export interface ThinNodeScope {
   cluster_uid: string;
   name: string;
   provider_instance_id: string;
-  driver_image: string;
-  host_extension_version: string;
+  /** Expected driver image; null accepts the node's single Ready driver Pod. */
+  driver_image: string | null;
+  /** Expected host guard extension; null skips the host guard check. */
+  host_extension_version: string | null;
   /** Expected current boot; null accepts and returns the observed boot. */
   boot_id: string | null;
   kernel_version: string | null;
@@ -777,18 +779,19 @@ export async function verifyThinNode(
     talos(["read", "/sys/class/dmi/id/product_uuid"]),
     talos(["read", "/proc/modules"]),
   ]);
+  const plugin = (p: ObjectValue) =>
+    items(object(p.spec).containers).find(
+      (c) =>
+        c.name === "openebs-lvm-plugin" &&
+        (scope.driver_image === null || c.image === scope.driver_image),
+    );
   const driverPods = items(pods.items).filter(
-    (p) =>
-      object(p.spec).nodeName === scope.name &&
-      items(object(p.spec).containers).some(
-        (c) =>
-          c.name === "openebs-lvm-plugin" && c.image === scope.driver_image,
-      ) &&
-      ready(p),
+    (p) => object(p.spec).nodeName === scope.name && plugin(p) && ready(p),
   );
   if (driverPods.length !== 1)
     throw new BootstrapError("thin_storage_driver_ambiguous");
   const driver = driverPods[0]!,
+    driverImage = text(plugin(driver)!.image),
     podName = text(metadata(driver).name),
     driverUid = uid(metadata(driver).uid);
   const owners = items(metadata(driver).ownerReferences).filter(
@@ -816,22 +819,24 @@ export async function verifyThinNode(
       text(nodeInfo.kernelVersion) !== scope.kernel_version)
   )
     throw new BootstrapError("thin_storage_talos_identity_changed");
-  const [hostMatches, extensionRaw, serviceRaw] = await Promise.all([
-    hostConfiguration ? hostConfiguration() : true,
-    talos(["get", "extensionstatuses", "--output=json"]),
-    talos(["get", "services", "--output=json"]),
-  ]);
-  const service = readFleetTalosServices(serviceRaw).get(
-    "ext-pgcf-sandbox-controller",
-  );
-  if (
-    !hostMatches ||
-    readFleetTalosExtensions(extensionRaw).get("pgcf-sandbox-controller") !==
-      scope.host_extension_version ||
-    !service?.running ||
-    (!service.healthy && !service.unknown)
-  )
-    throw new BootstrapError("thin_storage_host_guard_unqualified");
+  if (scope.host_extension_version !== null) {
+    const [hostMatches, extensionRaw, serviceRaw] = await Promise.all([
+      hostConfiguration ? hostConfiguration() : true,
+      talos(["get", "extensionstatuses", "--output=json"]),
+      talos(["get", "services", "--output=json"]),
+    ]);
+    const service = readFleetTalosServices(serviceRaw).get(
+      "ext-pgcf-sandbox-controller",
+    );
+    if (
+      !hostMatches ||
+      readFleetTalosExtensions(extensionRaw).get("pgcf-sandbox-controller") !==
+        scope.host_extension_version ||
+      !service?.running ||
+      (!service.healthy && !service.unknown)
+    )
+      throw new BootstrapError("thin_storage_host_guard_unqualified");
+  }
   const driverExec = async (args: string[], permit = false, timeout = 10000) =>
     await kube(
       [
@@ -857,8 +862,7 @@ export async function verifyThinNode(
       metadata(next).deletionTimestamp ||
       object(next.spec).nodeName !== scope.name ||
       !items(object(next.spec).containers).some(
-        (c) =>
-          c.name === "openebs-lvm-plugin" && c.image === scope.driver_image,
+        (c) => c.name === "openebs-lvm-plugin" && c.image === driverImage,
       ) ||
       (await talos(["read", "/proc/sys/kernel/random/boot_id"])).trim() !== boot
     )

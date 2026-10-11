@@ -786,5 +786,32 @@ describe(
         [run.setup.logical_volumes[0]!.name],
       );
     });
+
+    test("cleanup still converges after a reboot or a kernel, driver or host extension change", async () => {
+      const changed = (step: "cleanup" | "startup_bound") => {
+        const run = thinQualificationRun(step);
+        run.workload("data_full", "pg-a", "Pa", { pod: false });
+        run.world.boot = randomUUID();
+        run.world.kernel = "6.18.60-talos";
+        run.world.driverImage = `ghcr.io/amerged-org/pgcf-regional:lvm-thin-sha-${"9".repeat(40)}@sha256:${"9".repeat(64)}`;
+        run.world.extension = "0.2.0";
+        return run;
+      };
+      // Measurements stay fenced to the setup boot, kernel, driver and extension.
+      await assert.rejects(
+        changed("startup_bound").turn(),
+        /thin_storage_driver_ambiguous/,
+      );
+      const run = changed("cleanup");
+      assert.deepEqual(await run.turn(), { kind: "report" });
+      assert.ok(
+        thinQualificationCleanupVerified(
+          (run.calls[0]!.report as { cleanup: ThinQualificationCleanup })
+            .cleanup,
+        ),
+      );
+      assert.equal(run.world.lv("pgcf_thinpool"), undefined);
+      assert.equal(run.world.namespaceUid, null);
+    });
   },
 );
