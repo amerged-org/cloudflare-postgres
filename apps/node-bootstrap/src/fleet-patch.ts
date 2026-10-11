@@ -600,10 +600,18 @@ export async function runFleetPatch(
             canonical(prior.kubernetes_image_configuration) ===
               canonical(facts.kubernetes_image_configuration)
           ) {
-            facts.kubernetes_configuration_boot_id =
-              prior.kubernetes_configuration_boot_id;
-            facts.kubernetes_configuration_observed_at =
-              prior.kubernetes_configuration_observed_at;
+            // The activation boot loaded the dispatched boot's unchanged proved configuration from
+            // STATE, so a boundary carried from an earlier boot advances to that observed boot.
+            const advanced =
+              activationBoot &&
+              machineConfiguration!.state_loaded &&
+              prior.kubernetes_configuration_boot_id !== prior.boot_id;
+            facts.kubernetes_configuration_boot_id = advanced
+              ? prior.boot_id
+              : prior.kubernetes_configuration_boot_id;
+            facts.kubernetes_configuration_observed_at = advanced
+              ? prior.observed_at
+              : prior.kubernetes_configuration_observed_at;
           } else if (
             retained &&
             retained.boot_id === facts.boot_id &&
