@@ -228,6 +228,8 @@ export async function reserveThinStorageLease(
   if (row.error_code) return null;
   if (row.lease_expires_at && Date.parse(row.lease_expires_at) > Date.now())
     return null;
+  // Never reserve a lease or pool action that current sealed host custody cannot serve.
+  if (!row.host_revision || !row.host_sha256 || !row.boot_id) return closed();
   const profile = current.profile,
     now = new Date().toISOString(),
     operation = newOperationId();

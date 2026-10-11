@@ -33,6 +33,7 @@ import {
   qualifiedThinStorageSql,
   type NodeThinStorageRow,
 } from "./node-thin-storage.ts";
+import { processNodeThinStorage } from "./node-thin-storage-execution.ts";
 
 const conflict = (message: string): never => {
   throw new ApiError("conflict", message);
@@ -356,6 +357,9 @@ export async function configureNodeThinStorage(
     return conflict("Thin selection changed before admission");
   return state(env, nodeId);
 }
+/** A retained node has no AddNode postjoin, so its committed selection starts the Native executor.
+ * One lease creates a missing pool from free extents only and never repeats an uncertain dispatched
+ * action. The response reports the resulting state; a failed start never fails the selection. */
 export async function selectNodeThinStorage(
   c: ApiContext,
   nodeId: string,
@@ -364,7 +368,10 @@ export async function selectNodeThinStorage(
   await requireScope(c, "admin");
   return withIdempotency(c, {
     replay: () => getNodeThinStorageProfile(c, nodeId),
-    execute: async (lease) =>
-      c.json(await configureNodeThinStorage(c.env, nodeId, body, lease), 200),
+    execute: async (lease) => {
+      await configureNodeThinStorage(c.env, nodeId, body, lease);
+      await processNodeThinStorage(c.env, nodeId).catch(() => undefined);
+      return getNodeThinStorageProfile(c, nodeId);
+    },
   });
 }

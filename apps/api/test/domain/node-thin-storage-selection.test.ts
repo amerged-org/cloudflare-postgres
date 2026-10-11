@@ -15,11 +15,15 @@ import { FleetReleaseSpec } from "@pgcf/contracts/releases";
 import { NodeThinStorageState } from "@pgcf/contracts/node-thin-storage";
 import { createApp } from "../../src/app.ts";
 import type { Env } from "../../src/env.ts";
-import { cleanupFixtures, fixture } from "./fixtures.ts";
+import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 import {
   configureNodeThinStorage,
   thinVolumeProfile,
 } from "../../src/domain/node-thin-storage-selection.ts";
+import {
+  dispatchThinPoolAction,
+  processNodeThinStorage,
+} from "../../src/domain/node-thin-storage-execution.ts";
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import { storageAuthorityPublicKeys } from "../../src/domain/storage-authority.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
@@ -231,6 +235,78 @@ it("exposes an authenticated CAS profile API and idempotent replay without autho
     lease_id: null,
     action_json: null,
   });
+});
+it("an admin selection on a retained guard-pinned node reserves exactly one initialize lease and keeps its uncertain outcome", async () => {
+  const f = await thinExecutionFixture(releaseIds);
+  // The retained installation has current host custody but has never selected thin storage.
+  await env.DB.prepare("DELETE FROM node_thin_storage WHERE node_id=?")
+    .bind(f.node)
+    .run();
+  const path = `/v1/nodes/${f.node}/storage-profile`,
+    key = crypto.randomUUID(),
+    body = {
+      expected_revision: 0,
+      node_uid: f.uid,
+      address: "192.0.2.18",
+      volume_group_uuid: f.authority.volume_group_uuid,
+      profile: f.profile,
+      allow_new_databases: false,
+    };
+  const lease = () =>
+    env.DB.prepare(
+      "SELECT lease_id,lease_revision,action_json FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first<{
+        lease_id: string | null;
+        lease_revision: number;
+        action_json: string | null;
+      }>();
+  // The real test DO has no Native container; the committed selection and its lease remain.
+  const selected = await request(path, f.admin, "PUT", body, key);
+  expect(selected.status).toBe(200);
+  expect(await selected.json()).toMatchObject({
+    revision: 1,
+    allow_new_databases: false,
+  });
+  const first = (await lease())!;
+  expect(first.lease_revision).toBe(1);
+  expect(JSON.parse(first.action_json!)).toMatchObject({
+    kind: "initialize",
+    state: "pending",
+    target_data_bytes: f.profile.initial_data_bytes,
+    target_metadata_bytes: f.profile.metadata_bytes,
+    expected_pool_uuid: null,
+  });
+  expect((await request(path, f.admin, "PUT", body, key)).status).toBe(200);
+  expect(await processNodeThinStorage(f.local, f.node)).toBeUndefined();
+  expect(await lease()).toEqual(first);
+  const nonce = (JSON.parse(first.action_json!) as { nonce: string }).nonce;
+  await dispatchThinPoolAction(
+    f.local,
+    f.node,
+    nonce,
+    crypto.randomUUID(),
+    crypto.randomUUID(),
+  );
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET lease_expires_at='2000-01-01T00:00:00.000Z' WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  const uncertain = await lease();
+  expect(
+    (
+      await request(
+        path,
+        f.admin,
+        "PUT",
+        { ...body, expected_revision: 1 },
+        crypto.randomUUID(),
+      )
+    ).status,
+  ).toBe(409);
+  expect(await lease()).toEqual(uncertain);
 });
 it("pins physical identity, current release driver and storage public keys and refuses unqualified activation", async () => {
   const f = await setup();
