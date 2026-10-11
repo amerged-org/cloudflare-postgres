@@ -4438,6 +4438,100 @@
       "$defs": {
         "DatabaseId": { "type": "string", "pattern": "^[a-z][a-z0-9]{19}$" }
       }
+    },
+    "NodeStorageSample": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "node_uid": {
+          "type": "string",
+          "format": "uuid",
+          "pattern": "^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}|00000000-0000-0000-0000-000000000000|ffffffff-ffff-ffff-ffff-ffffffffffff)$"
+        },
+        "observed_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "^(?:(?:\\d\\d[2468][048]|\\d\\d[13579][26]|\\d\\d0[48]|[02468][048]00|[13579][26]00)-02-29|\\d{4}-(?:(?:0[13578]|1[02])-(?:0[1-9]|[12]\\d|3[01])|(?:0[469]|11)-(?:0[1-9]|[12]\\d|30)|(?:02)-(?:0[1-9]|1\\d|2[0-8])))T(?:(?:[01]\\d|2[0-3]):[0-5]\\d:[0-5]\\d(?:\\.\\d+)?(?:Z))$"
+        },
+        "physical": {
+          "anyOf": [
+            {
+              "type": "object",
+              "properties": {
+                "volume_group_uuid": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9]{6}-(?:[A-Za-z0-9]{4}-){5}[A-Za-z0-9]{6}$"
+                },
+                "total_bytes": {
+                  "type": "integer",
+                  "exclusiveMinimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "free_bytes": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "thick_allocated_bytes": {
+                  "type": "integer",
+                  "minimum": 0,
+                  "maximum": 9007199254740991
+                },
+                "thin_pool": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "name": { "type": "string", "const": "pgcf_thinpool" },
+                        "data_total_bytes": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "data_used_bytes_upper_bound": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "metadata_total_bytes": {
+                          "type": "integer",
+                          "exclusiveMinimum": 0,
+                          "maximum": 9007199254740991
+                        },
+                        "metadata_used_bytes_upper_bound": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 9007199254740991
+                        }
+                      },
+                      "required": [
+                        "name",
+                        "data_total_bytes",
+                        "data_used_bytes_upper_bound",
+                        "metadata_total_bytes",
+                        "metadata_used_bytes_upper_bound"
+                      ],
+                      "additionalProperties": false
+                    },
+                    { "type": "null" }
+                  ]
+                }
+              },
+              "required": [
+                "volume_group_uuid",
+                "total_bytes",
+                "free_bytes",
+                "thick_allocated_bytes",
+                "thin_pool"
+              ],
+              "additionalProperties": false
+            },
+            { "type": "null" }
+          ]
+        }
+      },
+      "required": ["node_uid", "observed_at", "physical"],
+      "additionalProperties": false
     }
   },
   "constants": {
@@ -4462,6 +4556,7 @@
     ],
     "STORAGE_AUTHORITY_LEDGER_KEY": "write-authority",
     "AGENT_PROTOCOL_VERSION": 1,
-    "CONFIGURATION_SCHEMA_REVISION": 1
+    "CONFIGURATION_SCHEMA_REVISION": 1,
+    "OPENEBS_DRIVER_IMAGE": "docker.io/openebs/lvm-driver:1.10.1@sha256:ae4b9e0b57c64e35fc8f742496420bc8f9d3aadd990e1a0e19b4083fafdd6639"
   }
 }

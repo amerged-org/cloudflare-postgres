@@ -96,6 +96,22 @@ pub fn chart(pin: &Value, release: &Value, source: &Value, artifact: &Value) -> 
     }
     Some(json!({"name":pin["name"],"version":pin["version"],"sha256":pin["sha256"]}))
 }
+/// Succeeded or Failed Pods are history; only a live Pod can prove what currently runs.
+fn active(pod: &Value) -> bool {
+    pod["metadata"]["deletionTimestamp"].is_null()
+        && !matches!(text(&pod["status"], "phase"), "Succeeded" | "Failed")
+}
+fn selected(pod: &Value, workload: &Value, node: &str) -> bool {
+    pod["metadata"]["namespace"] == text(workload, "namespace")
+        && active(pod)
+        && (text(workload, "scope") == "cluster" || pod["spec"]["nodeName"] == node)
+        && controller(pod).is_some()
+        && workload["selector"].as_object().is_some_and(|selector| {
+            selector
+                .iter()
+                .all(|(key, value)| pod["metadata"]["labels"][key] == *value)
+        })
+}
 fn unchanged_node(before: &Value, after: &Value, assignment: &Value) -> bool {
     after["metadata"]["uid"] == assignment["node_uid"]
         && after["metadata"]["deletionTimestamp"].is_null()
@@ -124,7 +140,7 @@ fn static_images(pods: &[Value], node: &Value) -> Value {
             .filter(|pod| {
                 pod["metadata"]["namespace"] == "kube-system"
                     && pod["spec"]["nodeName"] == node["metadata"]["name"]
-                    && pod["metadata"]["deletionTimestamp"].is_null()
+                    && active(pod)
                     && !text(
                         &pod["metadata"]["annotations"],
                         "kubernetes.io/config.mirror",
@@ -295,7 +311,6 @@ async fn collect_inner(kube: &Kubernetes, api: &ControlApi, desired: &Value) -> 
                 && !pin["workload"].is_null()
         }) {
             let workload = &pin["workload"];
-            let scope = text(workload, "scope");
             let ns = text(workload, "namespace");
             let Some(namespace) = kube.read("Namespace", None, ns).await? else {
                 continue;
@@ -305,17 +320,7 @@ async fn collect_inner(kube: &Kubernetes, api: &ControlApi, desired: &Value) -> 
             {
                 continue;
             }
-            let selection = |pod: &Value| {
-                pod["metadata"]["namespace"] == ns
-                    && pod["metadata"]["deletionTimestamp"].is_null()
-                    && (scope == "cluster" || pod["spec"]["nodeName"] == name)
-                    && controller(pod).is_some()
-                    && workload["selector"].as_object().is_some_and(|selector| {
-                        selector
-                            .iter()
-                            .all(|(key, value)| pod["metadata"]["labels"][key] == *value)
-                    })
-            };
+            let selection = |pod: &Value| selected(pod, workload, name);
             let mut candidates = vec![];
             for pod in pods.iter().filter(|pod| selection(pod)) {
                 for container in pod["spec"]["containers"]
@@ -512,5 +517,24 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+    #[test]
+    fn terminal_old_pods_never_hide_or_prove_the_running_image() {
+        let node = json!({"metadata":{"uid":"node-uid","name":"control"}});
+        let running = json!({"metadata":{"uid":"pod","namespace":"kube-system","labels":{"app.kubernetes.io/name":"pgcf-agent"},"annotations":{"kubernetes.io/config.mirror":"hash"},"ownerReferences":[{"kind":"Node","uid":"node-uid","controller":true}]},"spec":{"nodeName":"control","containers":[{"name":"kube-apiserver"}]},"status":{"phase":"Running","containerStatuses":[{"name":"kube-apiserver","ready":true,"state":{"running":{}},"imageID":format!("containerd://sha256:{}","a".repeat(64))}]}});
+        let terminal = |phase: &str| {
+            let mut pod = running.clone();
+            pod["metadata"]["uid"] = phase.into();
+            pod["status"]["phase"] = phase.into();
+            pod["status"]["containerStatuses"][0]["imageID"] =
+                format!("containerd://sha256:{}", "f".repeat(64)).into();
+            pod
+        };
+        let pods = [terminal("Succeeded"), running.clone(), terminal("Failed")];
+        assert_eq!(static_images(&pods, &node)["apiServer"], "a".repeat(64));
+        let workload = json!({"scope":"node","namespace":"kube-system","selector":{"app.kubernetes.io/name":"pgcf-agent"}});
+        assert!(selected(&running, &workload, "control"));
+        assert!(!selected(&terminal("Succeeded"), &workload, "control"));
+        assert!(!selected(&terminal("Failed"), &workload, "control"));
     }
 }

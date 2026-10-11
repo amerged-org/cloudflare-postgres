@@ -16,7 +16,7 @@ use base64::{
 };
 use hmac::{Hmac, KeyInit, Mac};
 use serde_json::{Value, json};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use std::{
     net::IpAddr,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -27,6 +27,11 @@ const LABEL: &str = "pgcf.io/database-id";
 const GENERATION: &str = "pgcf.io/generation";
 const ACCEPTED: &str = "pgcf.io/accepted-generation";
 const VOLUME: &str = "pgcf.io/volume-identity";
+const RUNTIME: &str = "pgcf.io/compute-runtime";
+const RESTART: &str = "kubectl.kubernetes.io/restartedAt";
+const PRESTARTED: &str = "pgcf-prestarted";
+const PROFILE: &str = "pgcf.io/compute-profile";
+const ADMISSION: &str = "pgcf-cnpg-prestarted";
 pub struct Reconciler {
     pub k8s: Kubernetes,
     pub power: PowerCoordinator,
@@ -123,6 +128,31 @@ fn credential_acknowledged(db: &Value, cluster: &Value, secret: &Value) -> bool 
             && status["passwordStatus"][role_name]["resourceVersion"]
                 == secret["metadata"]["resourceVersion"]
     }
+}
+/// Pool Pods run under the pre-started RuntimeClass; standard Pods name no RuntimeClass.
+fn runtime_class(context: &Value) -> &'static str {
+    if context["computePool"].is_null() {
+        ""
+    } else {
+        PRESTARTED
+    }
+}
+fn dns_label(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 63
+        && !value.starts_with('-')
+        && !value.ends_with('-')
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+/// A ready primary is current only on its assigned node and the selected runtime.
+fn primary_current(pod: &Value, cluster: &Value, db: &Value, context: &Value) -> bool {
+    cluster_owned(pod, cluster)
+        && condition(pod, "Ready") == Some("True")
+        && pod["spec"]["nodeName"] == db["node"]
+        && pod["metadata"]["deletionTimestamp"].is_null()
+        && text(&pod["spec"], "runtimeClassName") == runtime_class(context)
 }
 fn cluster_owned(v: &Value, cluster: &Value) -> bool {
     v["metadata"]["ownerReferences"]
@@ -540,6 +570,98 @@ impl Reconciler {
         }
         Ok(())
     }
+    /// A runtime switch at the same generation relabels the namespace that runtime admission
+    /// matches, then recreates only a primary on the other runtime through one CNPG restart. The
+    /// marker is one-shot per generation, runtime and pool release; an unknown write is read back.
+    async fn runtime_selected(
+        &self,
+        db: &Value,
+        context: &Value,
+        namespace_uid: &Value,
+        cluster: &Value,
+    ) -> Result<bool, Error> {
+        let ns = namespace(db);
+        let pool = &context["computePool"];
+        let (mode, marker) = if pool.is_null() {
+            (
+                "standard",
+                format!("pgcf-runtime/{}/standard", number(db, "generation")),
+            )
+        } else {
+            (
+                "pool",
+                format!(
+                    "pgcf-runtime/{}/pool/{}",
+                    number(db, "generation"),
+                    text(&pool["profile"], "release_id")
+                ),
+            )
+        };
+        let current = self
+            .k8s
+            .read("Namespace", None, &ns)
+            .await?
+            .ok_or("database namespace missing")?;
+        owned(&current, db, &ns, None)?;
+        if current["metadata"]["uid"] != *namespace_uid {
+            return Err("database namespace identity changed".into());
+        }
+        if text(&current["metadata"]["labels"], RUNTIME) != mode
+            && let Err(error) = self
+                .k8s
+                .patch(&current, &json!({"metadata":{"labels":{RUNTIME:mode}}}))
+                .await
+        {
+            match self.k8s.read("Namespace", None, &ns).await? {
+                Some(after)
+                    if after["metadata"]["uid"] == *namespace_uid
+                        && text(&after["metadata"]["labels"], RUNTIME) == mode =>
+                {
+                    owned(&after, db, &ns, None)?
+                }
+                _ => return Err(error),
+            }
+        }
+        let primary = text(&cluster["status"], "currentPrimary");
+        if !dns_label(primary) {
+            return Ok(false);
+        }
+        let Some(pod) = self.k8s.read("Pod", Some(&ns), primary).await? else {
+            return Ok(false);
+        };
+        if text(&pod["metadata"], "uid").is_empty()
+            || text(&pod["metadata"], "resourceVersion").is_empty()
+            || !cluster_owned(&pod, cluster)
+            || pod["metadata"]["labels"]["cnpg.io/cluster"] != "database"
+            || pod["spec"]["nodeName"] != db["node"]
+            || !pod["metadata"]["deletionTimestamp"].is_null()
+        {
+            return Ok(false);
+        }
+        if text(&pod["spec"], "runtimeClassName") == runtime_class(context) {
+            return Ok(true);
+        }
+        if text(&cluster["metadata"]["annotations"], RESTART) != marker
+            && let Err(error) = self
+                .k8s
+                .patch(
+                    cluster,
+                    &json!({"metadata":{"annotations":{RESTART:marker}}}),
+                )
+                .await
+        {
+            match self.k8s.read("Cluster", Some(&ns), "database").await? {
+                Some(after)
+                    if after["metadata"]["uid"] == cluster["metadata"]["uid"]
+                        && text(&after["metadata"]["annotations"], RESTART) == marker =>
+                {
+                    owned(&after, db, "database", Some(&ns))?
+                }
+                _ => return Err(error),
+            }
+        }
+        Ok(false)
+    }
     pub async fn reconcile(
         &self,
         db: &Value,
@@ -760,6 +882,12 @@ impl Reconciler {
         if cluster["metadata"]["uid"] != stored["clusterUid"] {
             return Err("Cluster identity changed after apply".into());
         }
+        if !self
+            .runtime_selected(db, &context, &stored["namespaceUid"], &cluster)
+            .await?
+        {
+            return Ok(Some(observation(db, "provisioning", None)));
+        }
         let Some((ca, ca_secret)) = self.ca(db, &cluster).await? else {
             return Ok(Some(observation(db, "provisioning", None)));
         };
@@ -815,11 +943,7 @@ impl Reconciler {
         let Some(pod) = self.k8s.read("Pod", Some(&ns), primary).await? else {
             return Ok(Some(observation(db, "provisioning", None)));
         };
-        if !cluster_owned(&pod, &cluster)
-            || condition(&pod, "Ready") != Some("True")
-            || pod["spec"]["nodeName"] != db["node"]
-            || !pod["metadata"]["deletionTimestamp"].is_null()
-        {
+        if !primary_current(&pod, &cluster, db, &context) {
             return Ok(Some(observation(db, "provisioning", None)));
         }
         let expected_image = db["postgres"]["image"]
@@ -1141,7 +1265,10 @@ impl Reconciler {
             }
             Ok(value)
         };
-        let mut context = json!({"backup":{"bucket":snapshot.region["backup"]["bucket"],"endpointUrl":snapshot.region["backup"]["endpoint_url"],"region":"auto","credentials":{"accessKeyId":decode("AWS_ACCESS_KEY_ID")?,"secretAccessKey":decode("AWS_SECRET_ACCESS_KEY")?}},"postgresImage":self.postgres_image,"systemNamespace":SYSTEM,"cnpgNamespace":"cnpg-system","storageClass":"pgcf-lvm","gatewaySelector":{"namespace":SYSTEM,"podLabels":{"app.kubernetes.io/name":"pgcf-gateway"}},"agentSelector":{"namespace":SYSTEM,"podLabels":{"app.kubernetes.io/name":"pgcf-agent"}},"recoveryFinalized":finalized,"computePool":snapshot.region["compute_pool"]});
+        let pool = self
+            .admitted_pool(db, &snapshot.region["compute_pool"])
+            .await?;
+        let mut context = json!({"backup":{"bucket":snapshot.region["backup"]["bucket"],"endpointUrl":snapshot.region["backup"]["endpoint_url"],"region":"auto","credentials":{"accessKeyId":decode("AWS_ACCESS_KEY_ID")?,"secretAccessKey":decode("AWS_SECRET_ACCESS_KEY")?}},"postgresImage":self.postgres_image,"systemNamespace":SYSTEM,"cnpgNamespace":"cnpg-system","storageClass":"pgcf-lvm","gatewaySelector":{"namespace":SYSTEM,"podLabels":{"app.kubernetes.io/name":"pgcf-gateway"}},"agentSelector":{"namespace":SYSTEM,"podLabels":{"app.kubernetes.io/name":"pgcf-agent"}},"recoveryFinalized":finalized,"computePool":pool});
         if !db["recovery"]["source_archive"].is_null() {
             let source = snapshot.region["recovery_sources"]
                 [text(&db["recovery"]["source_archive"], "region_id")]
@@ -1154,6 +1281,51 @@ impl Reconciler {
             context["recoverySource"] = json!({"bucket":source["bucket"],"endpointUrl":source["endpoint_url"],"region":"auto","credentials":{"accessKeyId":source["access_key_id"],"secretAccessKey":source["secret_access_key"]}});
         }
         Ok(context)
+    }
+    /// The region pool applies to a database only once node-bootstrap has admitted the current
+    /// profile on this cluster: RuntimeClass, MutatingAdmissionPolicy, its binding and the label
+    /// of the database node. Until then the Pod keeps the standard runtime, so a region switch
+    /// that precedes admission can never strand a restarted primary without its RuntimeClass.
+    async fn admitted_pool(&self, db: &Value, pool: &Value) -> Result<Value, Error> {
+        if pool.is_null() {
+            return Ok(Value::Null);
+        }
+        let profile: String = Sha256::digest(serde_json::to_vec(&pool["profile"])?)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let selector = format!("r-{}", &profile[..40]);
+        let (class, policy, binding, node) = tokio::try_join!(
+            self.k8s.read("RuntimeClass", None, PRESTARTED),
+            self.k8s.read("MutatingAdmissionPolicy", None, ADMISSION),
+            self.k8s
+                .read("MutatingAdmissionPolicyBinding", None, ADMISSION),
+            self.k8s.read("Node", None, text(db, "node"))
+        )?;
+        let current = |object: &Option<Value>| {
+            object.as_ref().is_some_and(|value| {
+                let metadata = &value["metadata"];
+                metadata["deletionTimestamp"].is_null()
+                    && metadata["labels"]["pgcf.io/managed-by"] == "node-bootstrap"
+                    && metadata["annotations"]["pgcf.io/runtime-admission"] == "1"
+                    && metadata["annotations"]["pgcf.io/compute-profile-sha256"] == profile.as_str()
+            })
+        };
+        let admitted = current(&class)
+            && current(&policy)
+            && current(&binding)
+            && class.as_ref().is_some_and(|class| {
+                class["handler"] == "pgcf"
+                    && class["scheduling"]["nodeSelector"][PROFILE] == selector.as_str()
+            })
+            && binding
+                .as_ref()
+                .is_some_and(|binding| binding["spec"]["policyName"] == ADMISSION)
+            && node.as_ref().is_some_and(|node| {
+                node["metadata"]["deletionTimestamp"].is_null()
+                    && node["metadata"]["labels"][PROFILE] == selector.as_str()
+            });
+        Ok(if admitted { pool.clone() } else { Value::Null })
     }
     async fn ca(&self, db: &Value, cluster: &Value) -> Result<Option<(Vec<u8>, Value)>, Error> {
         let name = text(&cluster["status"]["certificates"], "serverCASecret");
@@ -1302,5 +1474,226 @@ mod tests {
             "resources"
         ));
         assert!(quantity(&json!("NaN")).is_none());
+    }
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use crate::test_server::{Server, uid};
+    fn vector(name: &str) -> Value {
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/controller-vectors.generated.json"
+        ))
+        .unwrap();
+        vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == name)
+            .unwrap()
+            .clone()
+    }
+    struct Fixture {
+        server: Server,
+        db: Value,
+        ns: String,
+        snapshot: DesiredSnapshot,
+        reconciler: Reconciler,
+    }
+    fn primary(db: &Value, pod_uid: String, runtime: Option<&str>) -> Value {
+        let mut pod = json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"database-1","namespace":namespace(db),"uid":pod_uid,"labels":{"cnpg.io/cluster":"database",LABEL:db["id"]},"ownerReferences":[{"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","name":"database","uid":uid(3),"controller":true}]},"spec":{"nodeName":db["node"]}});
+        if let Some(runtime) = runtime {
+            pod["spec"]["runtimeClassName"] = runtime.into();
+        }
+        pod
+    }
+    /// An established running database whose primary still needs its runtime decision.
+    async fn fixture(runtime: &str, pod_runtime: Option<&str>, pool: Value) -> Fixture {
+        let server = Server::start().await;
+        let entry = vector("entry-request-limit-split");
+        let db = entry["db"].clone();
+        let ns = namespace(&db);
+        let id = text(&db, "id").to_string();
+        let mut params = rcgen::CertificateParams::new(vec!["unit-ca".into()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = params
+            .self_signed(&rcgen::KeyPair::generate().unwrap())
+            .unwrap()
+            .pem();
+        for object in [
+            json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"kube-system","uid":uid(1)}}),
+            json!({"apiVersion":"v1","kind":"Node","metadata":{"name":db["node"],"uid":uid(4),"labels":{}}}),
+            json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"pgcf-backup-s3","namespace":SYSTEM,"uid":uid(5)},"data":{"AWS_ACCESS_KEY_ID":STANDARD.encode("unit-access"),"AWS_SECRET_ACCESS_KEY":STANDARD.encode("unit-secret")}}),
+            json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":ns,"uid":uid(2),"labels":{LABEL:id,RUNTIME:runtime,"other.example/label":"kept"},"annotations":{GENERATION:"1",ACCEPTED:"1"}}}),
+            json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("storage-{id}"),"namespace":SYSTEM,"uid":uid(6),"labels":{LABEL:id},"annotations":{GENERATION:"1"}},"data":{"state":json!({"namespaceUid":uid(2),"clusterUid":uid(3),"node":db["node"],"archivePath":db["archive"]["destination_path"]}).to_string()}}),
+            json!({"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","metadata":{"name":"database","namespace":ns,"uid":uid(3),"labels":{LABEL:id},"annotations":{GENERATION:"1","other.example/annotation":"kept"}},"spec":{},"status":{"currentPrimary":"database-1","certificates":{"serverCASecret":"database-ca"}}}),
+            json!({"apiVersion":"v1","kind":"Secret","metadata":{"name":"database-ca","namespace":ns,"uid":uid(7),"ownerReferences":[{"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","name":"database","uid":uid(3),"controller":true}]},"data":{"ca.crt":STANDARD.encode(ca)}}),
+            primary(&db, uid(8), pod_runtime),
+        ] {
+            server.put(object);
+        }
+        let snapshot = DesiredSnapshot {
+            region: json!({"id":"eu-test","backup":{"bucket":"native-controller-test","endpoint_url":"https://backup.example.invalid","region":"auto"},"compute_pool":pool}),
+            fleet_release: json!({"nodes":[{"k8s_node_name":db["node"],"role":"customer","node_uid":uid(4)}]}),
+            databases: vec![],
+        };
+        let reconciler = Reconciler::new(
+            server.k8s.clone(),
+            uid(1),
+            text(&entry["ctx"], "postgresImage").into(),
+            "eu-test".into(),
+            1,
+        )
+        .unwrap();
+        Fixture {
+            server,
+            db,
+            ns,
+            snapshot,
+            reconciler,
+        }
+    }
+    async fn observed(f: &Fixture) -> Value {
+        f.reconciler
+            .reconcile(&f.db, &f.snapshot)
+            .await
+            .unwrap()
+            .unwrap()["state"]
+            .clone()
+    }
+    /// The CA publication follows the runtime decision, so it shows that reconciliation went on.
+    fn published(f: &Fixture) -> bool {
+        f.server
+            .get(
+                "ConfigMap",
+                Some(SYSTEM),
+                &format!("ca-{}", text(&f.db, "id")),
+            )
+            .is_some()
+    }
+    fn restarts(f: &Fixture) -> usize {
+        f.server
+            .state
+            .lock()
+            .unwrap()
+            .writes
+            .iter()
+            .filter(|(method, _, body)| {
+                method == "PATCH" && body["metadata"]["annotations"][RESTART].is_string()
+            })
+            .count()
+    }
+    fn runtime(f: &Fixture) -> Value {
+        f.server.get("Namespace", None, &f.ns).unwrap()["metadata"]["labels"][RUNTIME].clone()
+    }
+    /// Exactly the owned objects node-bootstrap applies for one compute profile.
+    fn admission(server: &Server, profile: &str) {
+        let meta = |name: &str| json!({"name":name,"labels":{"pgcf.io/managed-by":"node-bootstrap"},"annotations":{"pgcf.io/compute-profile-sha256":profile,"pgcf.io/runtime-admission":"1"}});
+        server.put(json!({"apiVersion":"node.k8s.io/v1","kind":"RuntimeClass","metadata":meta("pgcf-prestarted"),"handler":"pgcf","overhead":{"podFixed":{"cpu":"50m","memory":"64Mi"}},"scheduling":{"nodeSelector":{PROFILE:format!("r-{}",&profile[..40])}}}));
+        for kind in ["MutatingAdmissionPolicy", "MutatingAdmissionPolicyBinding"] {
+            server.put(json!({"apiVersion":"admissionregistration.k8s.io/v1","kind":kind,"metadata":meta("pgcf-cnpg-prestarted"),"spec":{"policyName":"pgcf-cnpg-prestarted"}}));
+        }
+    }
+    #[test]
+    fn readiness_requires_exactly_the_selected_runtime() {
+        let cluster = json!({"apiVersion":"postgresql.cnpg.io/v1","metadata":{"uid":uid(3)}});
+        let db = json!({"node":"customer"});
+        let mut pod = json!({"metadata":{"ownerReferences":[{"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","name":"database","uid":uid(3)}]},"spec":{"nodeName":"customer"},"status":{"conditions":[{"type":"Ready","status":"True"}]}});
+        let standard = json!({"computePool":null});
+        let pool = json!({"computePool":{"version":1}});
+        assert!(primary_current(&pod, &cluster, &db, &standard));
+        assert!(!primary_current(&pod, &cluster, &db, &pool));
+        pod["spec"]["runtimeClassName"] = "pgcf-prestarted".into();
+        assert!(!primary_current(&pod, &cluster, &db, &standard));
+        assert!(primary_current(&pod, &cluster, &db, &pool));
+    }
+    #[tokio::test]
+    async fn a_same_generation_runtime_switch_restarts_only_the_primary_once() {
+        let f = fixture("pool", Some("pgcf-prestarted"), Value::Null).await;
+        f.server.state.lock().unwrap().lose = Some(Box::new(|_, patch| {
+            patch["metadata"]["annotations"][RESTART].is_string()
+        }));
+        assert_eq!(observed(&f).await, "provisioning");
+        let ns = f.server.get("Namespace", None, &f.ns).unwrap();
+        assert_eq!(ns["metadata"]["labels"][RUNTIME], "standard");
+        assert_eq!(ns["metadata"]["labels"]["other.example/label"], "kept");
+        let cluster = f.server.get("Cluster", Some(&f.ns), "database").unwrap();
+        assert_eq!(
+            cluster["metadata"]["annotations"][RESTART],
+            "pgcf-runtime/1/standard"
+        );
+        assert_eq!(
+            cluster["metadata"]["annotations"]["other.example/annotation"],
+            "kept"
+        );
+        assert!(!published(&f));
+        assert_eq!(observed(&f).await, "provisioning");
+        f.server.edit("Pod", Some(&f.ns), "database-1", |pod| {
+            pod["metadata"]["deletionTimestamp"] = "2026-10-11T00:00:00Z".into();
+        });
+        assert_eq!(observed(&f).await, "provisioning");
+        assert!(!published(&f));
+        f.server.put(primary(&f.db, uid(9), None));
+        assert_eq!(observed(&f).await, "provisioning");
+        assert!(published(&f));
+        assert_eq!(restarts(&f), 1);
+        assert_eq!(
+            f.server.get("Namespace", None, &f.ns).unwrap()["metadata"]["uid"],
+            uid(2)
+        );
+        assert_eq!(
+            f.server.get("Cluster", Some(&f.ns), "database").unwrap()["metadata"]["uid"],
+            uid(3)
+        );
+    }
+    #[tokio::test]
+    async fn the_region_pool_waits_for_runtime_admission_of_the_current_profile() {
+        let pooled = vector("assigned-sandbox-overhead");
+        let f = fixture("standard", None, pooled["ctx"]["computePool"].clone()).await;
+        let quota = |f: &Fixture| {
+            f.server
+                .get("ResourceQuota", Some(&f.ns), "database-resources")
+                .unwrap()["spec"]["hard"]
+                .clone()
+        };
+        let node = text(&f.db, "node").to_string();
+        // TypeScript canonical profile hash of the vector pool; node-bootstrap stamps it.
+        let current = "4f36e3c1ff2eade6a35e642c8206ac7852caab47d06f0fd8aaae71ed11dd96b4";
+        let label = |f: &Fixture, value: Option<String>| {
+            f.server.edit("Node", None, &node, |n| {
+                let labels = n["metadata"]["labels"].as_object_mut().unwrap();
+                match value {
+                    Some(value) => labels.insert(PROFILE.into(), value.into()),
+                    None => labels.remove(PROFILE),
+                };
+            })
+        };
+        assert_eq!(observed(&f).await, "provisioning");
+        assert!(published(&f));
+        assert_eq!(runtime(&f), "standard");
+        assert_eq!(
+            quota(&f),
+            vector("entry-request-limit-split")["manifests"][1]["spec"]["hard"]
+        );
+        admission(&f.server, &"f".repeat(64));
+        label(&f, Some(format!("r-{}", &current[..40])));
+        assert_eq!(observed(&f).await, "provisioning");
+        assert_eq!(runtime(&f), "standard");
+        admission(&f.server, current);
+        label(&f, None);
+        assert_eq!(observed(&f).await, "provisioning");
+        assert_eq!(runtime(&f), "standard");
+        assert_eq!(restarts(&f), 0);
+        label(&f, Some(format!("r-{}", &current[..40])));
+        assert_eq!(observed(&f).await, "provisioning");
+        assert_eq!(runtime(&f), "pool");
+        assert_eq!(
+            f.server.get("Cluster", Some(&f.ns), "database").unwrap()["metadata"]["annotations"]
+                [RESTART],
+            "pgcf-runtime/1/pool/native-compute-test"
+        );
+        assert_eq!(restarts(&f), 1);
+        assert_eq!(quota(&f), pooled["manifests"][1]["spec"]["hard"]);
     }
 }

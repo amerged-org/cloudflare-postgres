@@ -7,7 +7,7 @@ use crate::{
     reconcile::quantity,
 };
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 fn condition<'a>(value: &'a Value, name: &str) -> Option<&'a str> {
     value["status"]["conditions"]
         .as_array()?
@@ -77,6 +77,14 @@ fn iso_millis(t: &str) -> Option<String> {
         time.millisecond()
     ))
 }
+fn fresh(source: &Value) -> bool {
+    let now = time::OffsetDateTime::now_utc();
+    time::OffsetDateTime::parse(
+        text(source, "time"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .is_ok_and(|sampled| sampled <= now && sampled >= now - time::Duration::seconds(90))
+}
 fn memory(node: &Value, summary: &Value) -> Option<Value> {
     if condition(node, "Ready") != Some("True")
         || summary["node"]["nodeName"] != node["metadata"]["name"]
@@ -84,13 +92,7 @@ fn memory(node: &Value, summary: &Value) -> Option<Value> {
         return None;
     }
     let source = &summary["node"]["memory"];
-    let sampled = time::OffsetDateTime::parse(
-        text(source, "time"),
-        &time::format_description::well_known::Rfc3339,
-    )
-    .ok()?;
-    let now = time::OffsetDateTime::now_utc();
-    if sampled > now || sampled < now - time::Duration::seconds(90) {
+    if !fresh(source) {
         return None;
     }
     let working = integer(source, "workingSetBytes").ok()?;
@@ -115,9 +117,32 @@ fn memory(node: &Value, summary: &Value) -> Option<Value> {
         Some("False") => Some(false),
         _ => None,
     };
+    // CPU comes from the same Summary; usage is reported only beside a known node capacity.
+    let capacity_cpu = quantity(&node["status"]["capacity"]["cpu"])
+        .map(|cores| (cores * 1000.0).floor())
+        .filter(|millicores| *millicores >= 1.0 && *millicores <= 9_007_199_254_740_991.0)
+        .map(|millicores| millicores as u64);
+    let cpu = &summary["node"]["cpu"];
+    let usage = capacity_cpu
+        .filter(|_| fresh(cpu))
+        .and_then(|_| integer(cpu, "usageNanoCores").ok());
     Some(
-        json!({"node_uid":node["metadata"]["uid"],"observed_at":iso_millis(text(source,"time"))?,"working_set_bytes":working,"capacity_memory_bytes":capacity as u64,"available_bytes":available,"memory_pressure":pressure}),
+        json!({"node_uid":node["metadata"]["uid"],"observed_at":iso_millis(text(source,"time"))?,"working_set_bytes":working,"capacity_memory_bytes":capacity as u64,"available_bytes":available,"memory_pressure":pressure,"cpu_usage_nano_cores":usage,"capacity_cpu_millicores":capacity_cpu}),
     )
+}
+/// Storage scrapes run off this path; one older than two minutes no longer describes the node.
+fn fresh_storage(
+    samples: &HashMap<String, Value>,
+    uid: &str,
+    now: time::OffsetDateTime,
+) -> Option<Value> {
+    let sample = samples.get(uid)?;
+    let observed = time::OffsetDateTime::parse(
+        text(sample, "observed_at"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()?;
+    (observed >= now - time::Duration::seconds(120)).then(|| sample.clone())
 }
 fn stable_node(before: &Value, after: Option<&Value>) -> bool {
     after.is_some_and(|after| {
@@ -133,6 +158,7 @@ pub async fn collect(
     kube: &Kubernetes,
     api: &ControlApi,
     desired_ids: &HashSet<String>,
+    storage_samples: &HashMap<String, Value>,
 ) -> Result<(), Error> {
     let (nodes, pods, namespaces) = tokio::try_join!(
         kube.list("Node", None, None),
@@ -184,6 +210,11 @@ pub async fn collect(
             report["node_id"] = node_id.into();
             report["provider_instance_id"] = provider_id.into();
             report["node_uid"] = uid.into();
+            if let Some(sample) =
+                fresh_storage(storage_samples, uid, time::OffsetDateTime::now_utc())
+            {
+                report["storage"] = sample;
+            }
             let summary = kube.stats_summary(name).await.ok();
             let after = kube.read("Node", None, name).await?;
             // Do not refresh identity-bound hardware facts from a Node replaced mid-collection.
@@ -215,6 +246,7 @@ pub async fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::schema_valid;
     #[test]
     fn replaced_or_rescheduled_node_cannot_refresh_old_identity() {
         let node = json!({"metadata":{"uid":"old"},"status":{"capacity":{"memory":"8Gi"},"allocatable":{"memory":"7Gi"},"conditions":[{"type":"Ready","status":"True"}]}});
@@ -232,6 +264,63 @@ mod tests {
         let pod = json!({"spec":{"containers":[{"resources":{"requests":{"cpu":"25m","memory":"64Mi"}}}],"initContainers":[{"restartPolicy":"Always","resources":{"requests":{"cpu":"100m","memory":"128Mi"}}},{"resources":{"requests":{"cpu":"500m","memory":"256Mi"}}}],"overhead":{"cpu":"10m","memory":"16Mi"}}});
         assert_eq!(pod_request(&pod, "cpu").unwrap(), 610.0);
         assert_eq!(pod_request(&pod, "memory").unwrap(), 400.0 * 2_f64.powi(20));
+    }
+    #[test]
+    fn cpu_usage_joins_the_memory_sample_only_with_known_capacity() {
+        let mut node = json!({"metadata":{"name":"customer","uid":"f49d2ed7-b845-4ecb-9c81-20ec4b345958"},"status":{"capacity":{"memory":"8Gi","cpu":"4"},"conditions":[{"type":"Ready","status":"True"}]}});
+        let at = timestamp().unwrap();
+        let summary = json!({"node":{"nodeName":"customer","memory":{"time":at,"workingSetBytes":1024},"cpu":{"time":at,"usageNanoCores":1_250_000_000_u64}}});
+        let contract = |sample: &Value| {
+            schema_valid(
+                "ObservationRequest",
+                &json!({"observed_at":at,"nodes":[],"databases":[],"node_memory_samples":[{"node_id":"nod_customer000000000000","provider_instance_id":"203000001","node_uid":sample["node_uid"],"memory":sample}]}),
+            )
+        };
+        let sample = memory(&node, &summary).unwrap();
+        assert_eq!(sample["cpu_usage_nano_cores"], 1_250_000_000_u64);
+        assert_eq!(sample["capacity_cpu_millicores"], 4000);
+        assert!(contract(&sample));
+        let mut stale = summary.clone();
+        stale["node"]["cpu"]["time"] = "2026-01-01T00:00:00Z".into();
+        assert!(memory(&node, &stale).unwrap()["cpu_usage_nano_cores"].is_null());
+        node["status"]["capacity"]["cpu"] = "3500m".into();
+        assert_eq!(
+            memory(&node, &summary).unwrap()["capacity_cpu_millicores"],
+            3500
+        );
+        node["status"]["capacity"]
+            .as_object_mut()
+            .unwrap()
+            .remove("cpu");
+        let sample = memory(&node, &summary).unwrap();
+        assert!(sample["capacity_cpu_millicores"].is_null());
+        assert!(sample["cpu_usage_nano_cores"].is_null());
+        assert!(contract(&sample));
+    }
+    #[test]
+    fn only_a_storage_scrape_from_the_last_two_minutes_joins_its_node() {
+        let now = time::OffsetDateTime::now_utc();
+        let at = |age: i64| {
+            (now - time::Duration::seconds(age))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let samples = HashMap::from([
+            (
+                "recent".to_string(),
+                json!({"node_uid":"recent","observed_at":at(119),"physical":null}),
+            ),
+            (
+                "stale".to_string(),
+                json!({"node_uid":"stale","observed_at":at(121),"physical":null}),
+            ),
+        ]);
+        assert_eq!(
+            fresh_storage(&samples, "recent", now).unwrap()["node_uid"],
+            "recent"
+        );
+        assert!(fresh_storage(&samples, "stale", now).is_none());
+        assert!(fresh_storage(&samples, "absent", now).is_none());
     }
     #[test]
     fn missing_memory_is_unknown_and_never_a_free_sample() {

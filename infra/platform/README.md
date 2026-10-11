@@ -13,7 +13,9 @@ containing `regional` and `native-gateway` selects
 [`regional-gateway-native`](regional-gateway-native), preserving the legacy controller while
 replacing only the gateway. A release containing both `native-controller` and `native-gateway`
 selects [`regional-native`](regional-native), which reuses the gateway-first composition and
-adds the controller patch. Both reuse the same services, RBAC, network policies and resource limits. The existing fleet patch
+adds the controller patch. Both reuse the same services, RBAC, network policies and resource limits;
+`regional-native` only adds read access to the RuntimeClass and admission policy that the controller
+waits for before it selects a region's compute pool. The existing fleet patch
 sets the exact selected image digests, cluster UID, PostgreSQL image and retained storage bindings.
 Future-node postjoin activation uses that same release path before admission; the original
 Factory bootstrap input remains unchanged. A single legacy `regional_image` is never interpreted

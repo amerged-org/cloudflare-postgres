@@ -91,11 +91,22 @@ fn identifier(value: &str) -> bool {
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         })
 }
-fn collection(kind: &str, namespace: Option<&str>) -> Result<String, Error> {
-    let (prefix, plural, cluster) = match kind {
+fn resource(kind: &str) -> Result<(&'static str, &'static str, bool), Error> {
+    Ok(match kind {
         "Namespace" => ("/api/v1", "namespaces", true),
         "Node" => ("/api/v1", "nodes", true),
         "PersistentVolume" => ("/api/v1", "persistentvolumes", true),
+        "RuntimeClass" => ("/apis/node.k8s.io/v1", "runtimeclasses", true),
+        "MutatingAdmissionPolicy" => (
+            "/apis/admissionregistration.k8s.io/v1",
+            "mutatingadmissionpolicies",
+            true,
+        ),
+        "MutatingAdmissionPolicyBinding" => (
+            "/apis/admissionregistration.k8s.io/v1",
+            "mutatingadmissionpolicybindings",
+            true,
+        ),
         "Pod" => ("/api/v1", "pods", false),
         "Secret" => ("/api/v1", "secrets", false),
         "ConfigMap" => ("/api/v1", "configmaps", false),
@@ -107,6 +118,7 @@ fn collection(kind: &str, namespace: Option<&str>) -> Result<String, Error> {
         "Backup" => ("/apis/postgresql.cnpg.io/v1", "backups", false),
         "ObjectStore" => ("/apis/barmancloud.cnpg.io/v1", "objectstores", false),
         "LVMVolume" => ("/apis/local.openebs.io/v1alpha1", "lvmvolumes", false),
+        "LVMNode" => ("/apis/local.openebs.io/v1alpha1", "lvmnodes", false),
         "NetworkPolicy" => ("/apis/networking.k8s.io/v1", "networkpolicies", false),
         "CiliumNetworkPolicy" => ("/apis/cilium.io/v2", "ciliumnetworkpolicies", false),
         "DaemonSet" => ("/apis/apps/v1", "daemonsets", false),
@@ -129,7 +141,10 @@ fn collection(kind: &str, namespace: Option<&str>) -> Result<String, Error> {
         ),
         "Job" => ("/apis/batch/v1", "jobs", false),
         _ => return Err("unsupported Kubernetes resource".into()),
-    };
+    })
+}
+fn collection(kind: &str, namespace: Option<&str>) -> Result<String, Error> {
+    let (prefix, plural, cluster) = resource(kind)?;
     if cluster && namespace.is_some() {
         return Err("invalid Kubernetes namespace scope".into());
     }
@@ -142,11 +157,11 @@ fn collection(kind: &str, namespace: Option<&str>) -> Result<String, Error> {
         Ok(format!("{prefix}/{plural}"))
     }
 }
-fn named(kind: &str, namespace: Option<&str>, name: &str) -> Result<String, Error> {
+pub(crate) fn named(kind: &str, namespace: Option<&str>, name: &str) -> Result<String, Error> {
     if !identifier(name) {
         return Err("invalid Kubernetes resource name".into());
     }
-    if namespace.is_none() && !["Namespace", "Node", "PersistentVolume"].contains(&kind) {
+    if namespace.is_none() && !resource(kind)?.2 {
         return Err("namespaced Kubernetes read requires namespace".into());
     }
     Ok(format!("{}/{name}", collection(kind, namespace)?))
@@ -487,6 +502,11 @@ impl Kubernetes {
         selector: Option<&str>,
     ) -> Result<Vec<Value>, Error> {
         let path = collection(kind, namespace)?;
+        let prefix = resource(kind)?.0;
+        let api_version = prefix
+            .strip_prefix("/apis/")
+            .or_else(|| prefix.strip_prefix("/api/"))
+            .ok_or("Kubernetes API version unknown")?;
         let mut result = vec![];
         let mut cursor = String::new();
         let mut version = None;
@@ -518,13 +538,20 @@ impl Kubernetes {
             let items = value["items"]
                 .as_array()
                 .ok_or("Kubernetes collection invalid")?;
+            // kube-apiserver omits TypeMeta on built-in list items; a stated identity must match.
             if items.iter().any(|v| {
-                text(v, "kind") != kind
+                (!v["kind"].is_null() && text(v, "kind") != kind)
+                    || (!v["apiVersion"].is_null() && text(v, "apiVersion") != api_version)
                     || namespace.is_some_and(|ns| text(&v["metadata"], "namespace") != ns)
             }) {
                 return Err("Kubernetes inventory identity changed".into());
             }
-            result.extend(items.iter().cloned());
+            result.extend(items.iter().map(|item| {
+                let mut item = item.clone();
+                item["kind"] = kind.into();
+                item["apiVersion"] = api_version.into();
+                item
+            }));
             if result.len() > 10000 {
                 return Err("Kubernetes inventory exceeds bound".into());
             }
@@ -629,6 +656,29 @@ impl Kubernetes {
         .await?;
         Ok(())
     }
+    /// Authenticated API-server proxy to the read-only OpenEBS LVM exporter of one driver Pod.
+    pub async fn openebs_metrics(&self, pod: &str) -> Result<String, Error> {
+        if pod.len() > 63 || pod.contains('.') || !identifier(pod) {
+            return Err("storage exporter Pod invalid".into());
+        }
+        let token = tokio::fs::read_to_string(&self.token).await?;
+        if token.trim().is_empty() {
+            return Err("Kubernetes bearer missing".into());
+        }
+        let response = self
+            .client
+            .get(self.origin.join(&format!(
+                "/api/v1/namespaces/openebs/pods/{pod}:9500/proxy/metrics"
+            ))?)
+            .bearer_auth(token.trim())
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err("storage metrics unavailable".into());
+        }
+        Ok(String::from_utf8_lossy(&bounded(response, 2 * 1024 * 1024).await?).into_owned())
+    }
     pub async fn assert_cluster(&self, uid: &str) -> Result<(), Error> {
         let cluster = self
             .read("Namespace", None, "kube-system")
@@ -702,6 +752,42 @@ mod tests {
         assert!(named("Secret", Some("pgcf-system"), "..").is_err());
         assert!(named("Cluster", None, "database").is_err());
         assert!(collection("Deployment", Some("kube-system")).is_err());
+        assert_eq!(
+            named("RuntimeClass", None, "pgcf-prestarted").unwrap(),
+            "/apis/node.k8s.io/v1/runtimeclasses/pgcf-prestarted"
+        );
+        assert!(named("MutatingAdmissionPolicy", Some("kube-system"), "policy").is_err());
+    }
+}
+#[cfg(test)]
+mod list_tests {
+    use crate::test_server::{Server, uid};
+    use serde_json::json;
+    #[tokio::test]
+    async fn built_in_list_items_without_type_meta_keep_the_requested_identity() {
+        let server = Server::start().await;
+        server.put(
+            json!({"apiVersion":"v1","kind":"Node","metadata":{"name":"customer","uid":uid(1)}}),
+        );
+        server.put(json!({"apiVersion":"v1","kind":"Pod","metadata":{"name":"driver","namespace":"openebs","uid":uid(2)}}));
+        let nodes = server.k8s.list("Node", None, None).await.unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["kind"], "Node");
+        assert_eq!(nodes[0]["apiVersion"], "v1");
+        let pods = server.k8s.list("Pod", None, None).await.unwrap();
+        assert_eq!(pods[0]["kind"], "Pod");
+        assert_eq!(pods[0]["metadata"]["uid"], uid(2));
+        server.state.lock().unwrap().objects.insert(
+            "/apis/local.openebs.io/v1alpha1/namespaces/openebs/lvmvolumes/changed".into(),
+            json!({"apiVersion":"local.openebs.io/v1alpha1","kind":"LVMNode","metadata":{"name":"changed","namespace":"openebs","uid":uid(3)}}),
+        );
+        assert!(
+            server
+                .k8s
+                .list("LVMVolume", Some("openebs"), None)
+                .await
+                .is_err()
+        );
     }
 }
 #[cfg(test)]
