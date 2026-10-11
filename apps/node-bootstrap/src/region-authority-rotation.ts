@@ -280,19 +280,47 @@ export async function applyPreparedEtcdAuthority(
       actual = await read(),
       target = buildPhase(actual, old, next, "etcd-ca").documents,
       before = configurationHash(actual),
-      expected = configurationHash(target);
-    const prior = progress.current();
-    if (prior.phase === "etcd-ca" && prior.state === "dispatched") {
-      if (configurationHash(actual) !== prior.target_sha256)
+      expected = configurationHash(target),
+      bootId = async () =>
+        (
+          await commands.talos(
+            ["read", "/proc/sys/kernel/random/boot_id"],
+            20_000,
+          )
+        ).trim(),
+      // Once the write may be live, Kubernetes may stop answering until the reboot. The readback
+      // and the revision-fenced confirmation therefore retry within this turn.
+      settled = async <T>(attempt: () => Promise<T>) => {
+        for (let tries = 1; ; tries++)
+          try {
+            return await attempt();
+          } catch (error) {
+            if (tries === 3) throw error;
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            signal.throwIfAborted();
+          }
+      };
+    const prior = progress.current(),
+      dispatched = prior.phase === "etcd-ca" && prior.state === "dispatched",
+      // The exact dispatched pre-write configuration is still live on the dispatch boot, so the
+      // write never took effect. The identical full target converges with any late first attempt.
+      unapplied =
+        dispatched &&
+        before === prior.before_sha256 &&
+        expected === prior.target_sha256 &&
+        (await bootId()) === prior.prior_boot_id;
+    if (dispatched && !unapplied) {
+      if (before !== prior.target_sha256)
         return fail("etcd_apply_unresolved_no_replay");
     } else if (configurationEqual(actual, target)) {
       if (prior.phase !== "etcd-ca" || prior.target_sha256 !== expected)
         return fail("etcd_configuration_changed_without_intent");
     } else {
       if (
-        prior.phase !== "discovery-secret" ||
-        prior.state !== "confirmed" ||
-        prior.node_index !== input.nodes.length - 1
+        !unapplied &&
+        (prior.phase !== "discovery-secret" ||
+          prior.state !== "confirmed" ||
+          prior.node_index !== input.nodes.length - 1)
       )
         return fail("etcd_phase_order_changed");
       const file = join(directory, "etcd-candidate.yaml");
@@ -310,36 +338,34 @@ export async function applyPreparedEtcdAuthority(
       });
       if (validation.exit_code !== 0)
         return fail("candidate_validation_failed");
-      await progress.commit({
-        ...prior,
-        revision: prior.revision + 1,
-        phase: "etcd-ca",
-        node_index: 0,
-        state: "dispatched",
-        before_sha256: before,
-        target_sha256: expected,
-        prior_boot_id: (
-          await commands.talos(
-            ["read", "/proc/sys/kernel/random/boot_id"],
-            20_000,
-          )
-        ).trim(),
-      });
-      // One attempt. An error never permits replay; the exact target is read back over this retained Talos channel.
+      if (!unapplied)
+        await progress.commit({
+          ...prior,
+          revision: prior.revision + 1,
+          phase: "etcd-ca",
+          node_index: 0,
+          state: "dispatched",
+          before_sha256: before,
+          target_sha256: expected,
+          prior_boot_id: await bootId(),
+        });
+      // An error never permits a blind replay; the exact target is read back over this retained Talos channel.
       await commands
         .talos(["apply-config", "--mode=no-reboot", "--file", file], 90_000)
         .catch(() => undefined);
-      if (!configurationEqual(await read(), target))
+      if (!configurationEqual(await settled(read), target))
         return fail("etcd_apply_unresolved_no_replay");
     }
     const current = progress.current();
-    await progress.commit({
-      ...current,
-      revision: current.revision + 1,
-      phase: "etcd-ca",
-      state: "confirmed",
-      target_sha256: expected,
-    });
+    await settled(() =>
+      progress.commit({
+        ...current,
+        revision: current.revision + 1,
+        phase: "etcd-ca",
+        state: "confirmed",
+        target_sha256: expected,
+      }),
+    );
   } finally {
     await rm(directory, { recursive: true, force: true });
   }

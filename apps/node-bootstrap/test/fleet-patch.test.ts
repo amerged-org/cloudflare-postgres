@@ -23,6 +23,10 @@ import {
 } from "../src/bootstrap.ts";
 import { patchFixture } from "./fleet-patch.fixture.ts";
 import { legacyStorageFixture } from "./fleet-legacy-storage.fixture.ts";
+import {
+  rotationInputFixture,
+  testAuthority,
+} from "./region-authority.fixture.ts";
 import { NodeHostConfigurationPrivate } from "@pgcf/contracts/node-host-configuration";
 
 function runtime(
@@ -169,7 +173,7 @@ function runtime(
               const result = kubeProbe(command);
               if (result) return result;
             }
-            if (command.executable === "talosctl" && talosProbe) {
+            if (command.executable.endsWith("talosctl") && talosProbe) {
               const result = talosProbe(command);
               if (result) return result;
             }
@@ -800,6 +804,184 @@ test("a retained current image cannot satisfy the separate prepared-authority re
   );
 });
 
+test("a control reboot resumes an unconfirmed prepared etcd write and never repeats an uncertain reboot", async () => {
+  const r = runtime(),
+    input = r.fixture.input,
+    status = r.current,
+    target = { kubelet_version: "v1.36.5", kubernetes_version: "v1.36.5" },
+    files = NodeHostConfigurationPrivate.shape.files.parse([
+      {
+        path: "/var/lib/pgcf-sandbox/settings.json",
+        permissions: 384,
+        content: "control-settings",
+      },
+      {
+        path: "/var/lib/pgcf-sandbox/agent-key",
+        permissions: 384,
+        content: "control-key",
+      },
+    ]);
+  r.facts = {
+    ...r.fixture.facts,
+    ...target,
+    cluster_nodes: [
+      { ...r.fixture.facts.cluster_nodes[0]!, kubelet_version: "v1.36.5" },
+    ],
+  };
+  input.host_configuration = NodeHostConfigurationPrivate.parse({
+    files,
+    status: {
+      version: 1,
+      node_id: status.node_id,
+      node_uid: status.node_uid,
+      region_id: status.region_id,
+      cluster_uid: status.cluster_uid,
+      material_revision: 1,
+      revision: 1,
+      release_id: status.release_id,
+      pool_policy_revision: 1,
+      profile_sha256: "f".repeat(64),
+      sha256: digest(canonical(files)),
+      created_at: new Date().toISOString(),
+    },
+  });
+  const rotation = rotationInputFixture({
+    region_id: status.region_id,
+    cluster_uid: status.cluster_uid,
+    node_id: status.node_id,
+    node_uid: status.node_uid,
+    node_name: input.k8s_node_name,
+    address: input.address,
+  });
+  rotation.checkpoint = {
+    revision: 15,
+    phase: "discovery-secret",
+    node_index: 0,
+    state: "confirmed",
+  };
+  input.authority_rotation = rotation;
+  const configuration = (authority: ReturnType<typeof testAuthority>) => [
+      {
+        version: "v1alpha1",
+        machine: { type: "controlplane" },
+        cluster: { etcd: { ca: authority.encoded } },
+      },
+      { kind: "DiscoveryIdentityConfig", clusterID: "test-cluster-id" },
+      {
+        kind: "KubeClusterConfig",
+        endpoint: input.cluster_endpoint,
+        clusterName: "test",
+      },
+    ],
+    yaml = (documents: object[]) =>
+      documents.map((document) => stringify(document)).join("---\n"),
+    prior = configuration(testAuthority()),
+    replacement = configuration(testAuthority()),
+    applied: string[] = [],
+    landing = [false, true];
+  let live = yaml(prior),
+    readFailures = 0;
+  r.machineConfiguration = live;
+  r.talosProbe = (command) => {
+    const args = command.args;
+    if (args[0] === "gen") {
+      const out = args[args.indexOf("--output") + 1]!;
+      return writeFile(
+        out,
+        yaml(out.includes("prior-") ? prior : replacement),
+      ).then(() => ({ exit_code: 0, stdout: "" }));
+    }
+    if (args[0] === "validate")
+      return Promise.resolve({ exit_code: 0, stdout: "" });
+    if (args.includes("/proc/sys/kernel/random/boot_id"))
+      return Promise.resolve({ exit_code: 0, stdout: `${r.facts.boot_id}\n` });
+    if (args.includes("machineconfig") && args.includes("v1alpha1"))
+      return readFailures-- > 0
+        ? Promise.reject(new Error("temporary_relay_failure"))
+        : Promise.resolve({
+            exit_code: 0,
+            stdout: JSON.stringify({ node: input.address, spec: live }),
+          });
+    if (args.includes("apply-config"))
+      return (async () => {
+        assert.equal(r.current.state, "dispatched");
+        const text = await readFile(args[args.indexOf("--file") + 1]!, "utf8");
+        applied.push(text);
+        if (landing.shift()) live = text;
+        readFailures = 1;
+        throw new Error("command_timeout");
+      })();
+    return undefined;
+  };
+  // The rotation callback: CAS on the revision; "unreachable" never lands.
+  let failures: ("unreachable" | undefined)[] = ["unreachable"];
+  r.assetRequest = async (url, init) => {
+    assert.equal(String(url), rotation.callback.url);
+    if (failures.shift() === "unreachable") throw new Error("network_failure");
+    const body = JSON.parse(String(init?.body));
+    if (body.expected_revision !== rotation.checkpoint.revision)
+      return new Response(null, { status: 409 });
+    rotation.checkpoint = body.checkpoint;
+    return Response.json({
+      checkpoint: body.checkpoint,
+      bearer: "y".repeat(32),
+    });
+  };
+  const reboots = () =>
+      r.writes.filter((command) => command.args.includes("reboot")).length,
+    installed = r.facts;
+  r.current = {
+    ...status,
+    stage: "talos_reboot",
+    state: "pending",
+    baseline: installed,
+    observed: installed,
+    host_configuration_revision: 1,
+    host_configuration_sha256: input.host_configuration.status.sha256,
+    talos_upgrade_receipt: {
+      method: "deploymentreceipt",
+      installer: input.spec.roles.customer.talos_installer,
+      node_uid: installed.node_uid,
+      cluster_uid: installed.cluster_uid,
+      system_uuid: installed.system_uuid,
+      pre_reboot_boot_id: installed.boot_id,
+      completed_at: new Date().toISOString(),
+      source: "cli_exit_0",
+    },
+  };
+  // The etcd dispatch never commits: neither the etcd write nor the reboot was sent.
+  await assert.rejects(r.turn(), /network_failure/);
+  assert.equal(r.current.state, "dispatched");
+  assert.equal(rotation.checkpoint.phase, "discovery-secret");
+  await r.turn();
+  assert.equal(r.current.state, "pending");
+  assert.equal(r.current.error_code, "patch_write_not_attempted");
+  assert.equal(applied.length + reboots(), 0);
+  // The dispatched etcd write does not land; the readback proves the prior configuration.
+  await assert.rejects(r.turn(), /rotation_etcd_apply_unresolved_no_replay/);
+  assert.equal(rotation.checkpoint.state, "dispatched");
+  assert.equal(applied.length, 1);
+  assert.equal(reboots(), 0);
+  // Unchanged pre-write configuration on the dispatch boot: the identical target is sent again,
+  // a transient readback and confirmation recover in the same turn, and the reboot follows once.
+  failures = ["unreachable"];
+  await r.turn();
+  assert.deepEqual(applied, [applied[0], applied[0]]);
+  assert.equal(rotation.checkpoint.phase, "etcd-ca");
+  assert.equal(rotation.checkpoint.state, "confirmed");
+  assert.equal(rotation.checkpoint.prior_boot_id, installed.boot_id);
+  assert.equal(reboots(), 1);
+  // A confirmed authority may already have sent its reboot; an unchanged boot never repeats it.
+  await r.turn();
+  assert.equal(r.current.state, "dispatched");
+  assert.equal(reboots(), 1);
+  r.facts = { ...installed, talos_version: "v1.14.1", boot_id: randomUUID() };
+  await r.turn();
+  assert.equal(r.current.state, "confirmed");
+  assert.equal(applied.length, 2);
+  assert.equal(reboots(), 1);
+});
+
 test("deployment-pinned storage authority keys cannot be replaced in private patch input", () => {
   const { input } = patchFixture(),
     keys = { test: "A".repeat(43) },
@@ -978,7 +1160,9 @@ test("a host-ready member carries its preflight-bound thick storage into the fin
     ...r.fixture.facts,
     ...target,
     talos_version: "v1.14.1",
-    cluster_nodes: [{ ...r.fixture.facts.cluster_nodes[0]!, ...target }],
+    cluster_nodes: [
+      { ...r.fixture.facts.cluster_nodes[0]!, kubelet_version: "v1.36.5" },
+    ],
   };
   await r.turn();
   assert.equal(r.current.stage, "preflight");

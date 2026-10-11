@@ -1099,23 +1099,53 @@ export async function runFleetPatch(
           await checkpoint("talos", "confirmed", await fresh(), null, receipt);
       }
     } else if (current.stage === "talos_reboot") {
+      const rotation = input.authority_rotation,
+        reboot = () =>
+          talos(["reboot", "--wait=false", "--progress=plain"], 60_000).catch(
+            () => undefined,
+          );
       if (fleetPatchTalosRebootObserved({ ...input, status: current }, facts))
         await checkpoint("talos_reboot", "confirmed", facts);
       else if (current.state === "pending") {
         await checkpoint("talos_reboot", "dispatched", facts);
         const latest = await latePreflight(facts);
         if (!latest) return current;
-        if (input.authority_rotation)
-          await applyPreparedEtcdAuthority(input.authority_rotation, {
+        if (rotation)
+          await applyPreparedEtcdAuthority(rotation, {
             talos,
             run,
             request,
             signal,
           });
-        await talos(
-          ["reboot", "--wait=false", "--progress=plain"],
-          60_000,
-        ).catch(() => undefined);
+        await reboot();
+      } else if (current.state === "dispatched" && rotation) {
+        // The etcd write follows its durable dispatch and the reboot follows only its
+        // confirmation, so an unconfirmed authority has sent no reboot for this dispatch.
+        const authority = rotation.checkpoint;
+        if (
+          authority.phase === "discovery-secret" &&
+          authority.state === "confirmed" &&
+          facts.boot_id === current.observed?.boot_id
+        )
+          await checkpoint(
+            "talos_reboot",
+            "pending",
+            facts,
+            "patch_write_not_attempted",
+          );
+        else if (
+          authority.phase === "etcd-ca" &&
+          authority.state === "dispatched"
+        ) {
+          await authorize();
+          await applyPreparedEtcdAuthority(rotation, {
+            talos,
+            run,
+            request,
+            signal,
+          });
+          if (facts.boot_id === authority.prior_boot_id) await reboot();
+        }
       }
     } else if (current.stage === "kubernetes") {
       if (

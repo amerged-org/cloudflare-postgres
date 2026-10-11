@@ -5,6 +5,7 @@ import { writeFile } from "node:fs/promises";
 import { stringify } from "yaml";
 import { runRegionAuthorityRotation } from "../src/region-authority-rotation.ts";
 import type { FleetRegionMaterialRotationInput } from "@pgcf/contracts/region-material-rotation";
+import { rotationInputFixture } from "./region-authority.fixture.ts";
 import type { CommandRunner } from "../src/bootstrap.ts";
 import type { openTalosOperator } from "../src/talos-operator.ts";
 function setup() {
@@ -23,92 +24,9 @@ function setup() {
     ],
     next = structuredClone(old);
   (next[0]!.machine as { type: string; token: string }).token = "new-trustd";
-  const talos = stringify({
-      context: "test",
-      contexts: {
-        test: {
-          ca: Buffer.from("test-ca").toString("base64"),
-          crt: "test-cert",
-          key: "test-key",
-        },
-      },
-    }),
-    kube = JSON.stringify({
-      "current-context": "test",
-      contexts: [{ name: "test", context: { cluster: "test", user: "test" } }],
-      clusters: [
-        {
-          name: "test",
-          cluster: {
-            server: "https://192.0.2.1:6443",
-            "certificate-authority-data":
-              Buffer.from("test-ca").toString("base64"),
-          },
-        },
-      ],
-      users: [
-        {
-          name: "test",
-          user: {
-            "client-certificate-data": "test-cert",
-            "client-key-data": "test-key",
-          },
-        },
-      ],
-    }),
-    seed = {
-      version: 1 as const,
-      cluster_name: "test-cluster",
-      cluster_endpoint: "https://192.0.2.1:6443",
-      talos_version: "1.14.1" as const,
-      kubernetes_version: "1.36.3" as const,
-      talos_machine_secrets_yaml: "private-test-secrets",
-      talos_admin_config: talos,
-    },
-    cluster = "22222222-2222-4222-8222-222222222222",
-    node = "11111111-1111-4111-8111-111111111111",
-    input: FleetRegionMaterialRotationInput = {
-      rollout_id: "op_abcdefghijklmnopqrst",
-      region_id: "test",
-      cluster_uid: cluster,
-      current_revision: 1,
-      target_revision: 2,
-      checkpoint: {
-        revision: 1,
-        phase: "trustd-token",
-        node_index: 0,
-        state: "pending",
-      },
-      current_seed: seed,
-      target_seed: {
-        ...seed,
-        talos_machine_secrets_yaml: "replacement-test-secrets",
-      },
-      current_join: { ...seed, kube_system_uid: cluster, kubeconfig: kube },
-      target_join: {
-        ...seed,
-        talos_machine_secrets_yaml: "replacement-test-secrets",
-        kube_system_uid: cluster,
-        kubeconfig: kube,
-      },
-      callback: {
-        url: "https://api.example.test/internal/v1/fleet-rollouts/op_abcdefghijklmnopqrst/regions/test/rotation",
-        bearer: "x".repeat(32),
-        expires_at: new Date(Date.now() + 600000).toISOString(),
-      },
-      nodes: [
-        {
-          node_id: "nod_abcdefghijklmnopqrst",
-          node_uid: node,
-          node_name: "node",
-          provider_instance_id: "12345",
-          address: "192.0.2.1",
-          role: "controlplane",
-          cilium_image: "quay.io/cilium/cilium@sha256:" + "a".repeat(64),
-          cilium_image_id: "quay.io/cilium/cilium@sha256:" + "a".repeat(64),
-        },
-      ],
-    },
+  const input = rotationInputFixture(),
+    cluster = input.cluster_uid,
+    node = input.nodes[0]!.node_uid,
     captured: FleetRegionMaterialRotationInput["checkpoint"][] = [];
   let live = old,
     apply = 0,

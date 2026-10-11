@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import assert from "node:assert/strict";
-import { generateKeyPairSync, sign } from "node:crypto";
+import { generateKeyPairSync } from "node:crypto";
 import test from "node:test";
 import {
   buildPhase,
@@ -10,6 +10,7 @@ import {
   parseAuthorityPEMEnvelope,
   type AuthorityDocuments,
 } from "../src/region-authority-phases.ts";
+import { testAuthority } from "./region-authority.fixture.ts";
 
 test("one PEM envelope parser retains Talos labels and rejects mismatched envelopes", () => {
   const key = generateKeyPairSync("ed25519")
@@ -54,69 +55,6 @@ test("a prepared token phase preserves an arbitrary existing document count and 
   assert.deepEqual(actual, old);
 });
 
-// Public, throwaway test authorities constructed in memory; no custody is read or written.
-function der(tag: number, ...contents: Buffer[]) {
-  const bytes = Buffer.concat(contents),
-    length =
-      bytes.length < 128
-        ? Buffer.from([bytes.length])
-        : bytes.length < 256
-          ? Buffer.from([0x81, bytes.length])
-          : Buffer.from([0x82, bytes.length >> 8, bytes.length & 255]);
-  return Buffer.concat([Buffer.from([tag]), length, bytes]);
-}
-function testAuthority() {
-  const pair = generateKeyPairSync("ed25519"),
-    algorithm = Buffer.from("300506032b6570", "hex"),
-    name = der(
-      0x30,
-      der(
-        0x31,
-        der(
-          0x30,
-          Buffer.from("0603550403", "hex"),
-          der(0x0c, Buffer.from("test-only")),
-        ),
-      ),
-    ),
-    tbs = der(
-      0x30,
-      der(0xa0, der(0x02, Buffer.from([2]))),
-      der(0x02, Buffer.from([1])),
-      algorithm,
-      name,
-      der(
-        0x30,
-        der(0x17, Buffer.from("240101000000Z")),
-        der(0x17, Buffer.from("491231235959Z")),
-      ),
-      name,
-      pair.publicKey.export({ type: "spki", format: "der" }),
-    ),
-    bytes = der(
-      0x30,
-      tbs,
-      algorithm,
-      der(0x03, Buffer.from([0]), sign(null, tbs, pair.privateKey)),
-    ),
-    cert = `-----BEGIN CERTIFICATE-----\n${bytes
-      .toString("base64")
-      .match(/.{1,64}/g)!
-      .join("\n")}\n-----END CERTIFICATE-----\n`,
-    key = pair.privateKey.export({ type: "pkcs8", format: "pem" }).toString(),
-    publicKey = pair.publicKey
-      .export({ type: "spki", format: "pem" })
-      .toString();
-  return {
-    cert,
-    key,
-    publicKey,
-    encoded: {
-      crt: Buffer.from(cert).toString("base64"),
-      key: Buffer.from(key).toString("base64"),
-    },
-  };
-}
 function preparedDocuments(role: "controlplane" | "worker") {
   const before = testAuthority(),
     after = testAuthority();
