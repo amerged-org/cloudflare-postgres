@@ -79,7 +79,7 @@ function releaseSpec() {
   });
 }
 
-async function setup() {
+async function setup(verificationAgeMs = 0) {
   const f = await fixture(),
     now = new Date().toISOString(),
     uid = crypto.randomUUID(),
@@ -200,7 +200,7 @@ async function setup() {
           : "rejected",
       }),
     ),
-    observed_at: now,
+    observed_at: new Date(Date.now() - verificationAgeMs).toISOString(),
     kube_system_uid: cluster,
     talos_version: spec.roles.control_relay.talos_version,
     kubernetes_version: spec.roles.control_relay.kubernetes_version,
@@ -490,55 +490,71 @@ it("resolves exact native activation replay after pointer revision two without r
   });
 });
 
-it("an unfinished patch of a lost node outside the rollout does not hold the activation, a live one does", async () => {
+it("an unfinished patch of a live node in another region holds the activation, a lost one does not", async () => {
   const f = await setup(),
     now = new Date().toISOString(),
+    region = `ap-${crypto.randomUUID().slice(0, 8)}`,
     node = newNodeId(),
-    uid = crypto.randomUUID(),
-    unfinished = (id: string, nodeUid: string) =>
-      env.DB.prepare(
-        "INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,stage,state,created_at,updated_at,deadline_at) VALUES(?,?,?,?,?,?,?,1,1,1,?,?,'talos_reboot','dispatched',?,?,?)",
-      ).bind(
-        newOperationId(),
-        id,
-        f.foreign,
-        nodeUid,
-        crypto.randomUUID(),
-        f.intent.release_id,
-        "f".repeat(64),
-        "192.0.2.30",
-        "[]",
-        now,
-        now,
-        now,
-      );
+    uid = crypto.randomUUID();
   await env.DB.batch([
     env.DB.prepare(
+      "INSERT INTO regions(id,provider,provider_region,gateway_url,backup_bucket,backup_endpoint_url,agent_key_hash,created_at,updated_at) SELECT ?,provider,provider_region,gateway_url,backup_bucket,backup_endpoint_url,?,?,? FROM regions WHERE id=?",
+    ).bind(
+      region,
+      crypto.randomUUID().replaceAll("-", "").repeat(2),
+      now,
+      now,
+      f.foreign,
+    ),
+    env.DB.prepare(
       "INSERT INTO nodes(id,region_id,k8s_node_name,node_uid,provider_instance_id,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,1,4096,2000,30,128,100,?,?,?)",
-    ).bind(node, f.foreign, "retained-lost", uid, "34567", now, now, now),
-    unfinished(node, uid),
+    ).bind(node, region, "unrelated", uid, "34567", now, now, now),
+    env.DB.prepare(
+      "INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,stage,state,created_at,updated_at,deadline_at) VALUES(?,?,?,?,?,?,?,1,1,1,?,?,'talos_reboot','dispatched',?,?,?)",
+    ).bind(
+      newOperationId(),
+      node,
+      region,
+      uid,
+      crypto.randomUUID(),
+      f.intent.release_id,
+      "f".repeat(64),
+      "192.0.2.30",
+      "[]",
+      now,
+      now,
+      now,
+    ),
   ]);
-  await expect(
-    activateNativeRegionBootstrapRotation(
-      f.runtime,
-      f.region,
-      f.intent.rollout_id,
-      f.activation,
-    ),
-  ).rejects.toThrow(/authority|changed/i);
-  await env.DB.prepare(
-    "UPDATE nodes SET lost_at=?,lost_reason='operator_marked_lost' WHERE id=?",
-  )
-    .bind(now, node)
-    .run();
-  expect(
-    await activateNativeRegionBootstrapRotation(
-      f.runtime,
-      f.region,
-      f.intent.rollout_id,
-      f.activation,
-    ),
-  ).toMatchObject({ revision: 2 });
+  try {
+    await expect(
+      activateNativeRegionBootstrapRotation(
+        f.runtime,
+        f.region,
+        f.intent.rollout_id,
+        f.activation,
+      ),
+    ).rejects.toThrow(/authority|changed/i);
+    expect(await f.pointer()).toEqual({ revision: 1, provenance: null });
+    await env.DB.prepare(
+      "UPDATE nodes SET lost_at=?,lost_reason='operator_marked_lost' WHERE id=?",
+    )
+      .bind(now, node)
+      .run();
+    expect(
+      await activateNativeRegionBootstrapRotation(
+        f.runtime,
+        f.region,
+        f.intent.rollout_id,
+        f.activation,
+      ),
+    ).toMatchObject({ revision: 2 });
+  } finally {
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM nodes WHERE id=?").bind(node),
+      env.DB.prepare("DELETE FROM regions WHERE id=?").bind(region),
+    ]);
+  }
 });
 
 it("a verification older than the activation window is repeated instead of activated", async () => {
@@ -566,4 +582,27 @@ it("a verification older than the activation window is repeated instead of activ
     prior_boot_id: rotation.prior_boot_id,
   });
   expect(await f.pointer()).toEqual({ revision: 1, provenance: null });
+});
+
+it("a committed activation completes from its verification after the reuse window", async () => {
+  const f = await setup(100_000);
+  expect(
+    await activateNativeRegionBootstrapRotation(
+      f.runtime,
+      f.region,
+      f.intent.rollout_id,
+      f.activation,
+    ),
+  ).toMatchObject({ revision: 2 });
+  expect(
+    await runPreparedRegionAuthorityRotation(f.runtime, {
+      rollout_id: f.intent.rollout_id,
+      region_id: f.region,
+    }),
+  ).toBe("complete");
+  const stored = await readFleetRolloutIntent(env.DB, f.intent.rollout_id);
+  expect(stored.regions[0]).toMatchObject({
+    current_material_revision: 2,
+    rotation: { phase: "complete", state: "confirmed" },
+  });
 });

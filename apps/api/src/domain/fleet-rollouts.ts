@@ -166,6 +166,8 @@ export async function writeFleetRolloutIntent(
   env: Env,
   before: FleetRolloutIntent,
   after: FleetRolloutIntent,
+  /** An additional condition that must hold in the same atomic UPDATE. */
+  guard?: { sql: string; bindings: unknown[] },
 ) {
   const old = JSON.stringify(FleetRolloutIntent.parse(before)),
     next = JSON.stringify(FleetRolloutIntent.parse(after));
@@ -199,9 +201,16 @@ export async function writeFleetRolloutIntent(
   }
   const authority = fleetRolloutAuthoritySql(before);
   const result = await env.DB.prepare(
-    `UPDATE fleet_region_releases SET rollout_json=? WHERE rollout_json=? AND (SELECT count(*) FROM fleet_region_releases WHERE rollout_json=?)=? AND (${authority.sql})`,
+    `UPDATE fleet_region_releases SET rollout_json=? WHERE rollout_json=? AND (SELECT count(*) FROM fleet_region_releases WHERE rollout_json=?)=? AND (${authority.sql})${guard ? ` AND (${guard.sql})` : ""}`,
   )
-    .bind(next, old, old, before.regions.length, ...authority.bindings)
+    .bind(
+      next,
+      old,
+      old,
+      before.regions.length,
+      ...authority.bindings,
+      ...(guard?.bindings ?? []),
+    )
     .run();
   if (result.meta.changes !== before.regions.length) {
     const current = await readFleetRolloutIntent(env.DB, before.rollout_id);
@@ -494,7 +503,7 @@ export async function advanceFleetRollout(
       region.nodes.map((node) => readFleetNodeRelease(env.DB, node.node_id)),
     );
     const active = await env.DB.prepare(
-      "SELECT operation_id,node_id FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready') AND node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL)",
+      "SELECT operation_id,node_id FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready')",
     )
       .bind(region.region_id)
       .first<{ operation_id: string; node_id: string }>();

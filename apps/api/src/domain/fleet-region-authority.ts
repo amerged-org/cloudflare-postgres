@@ -47,11 +47,12 @@ async function saveCheckpoint(
   intent: FleetRolloutIntent,
   region: Region,
   checkpoint: FleetRegionMaterialRotationCheckpoint,
+  guard?: { sql: string; bindings: unknown[] },
 ) {
   const next = structuredClone(intent),
     target = selected(next, region.region_id);
   target.rotation = FleetRegionMaterialRotationCheckpoint.parse(checkpoint);
-  await writeFleetRolloutIntent(env, intent, next);
+  await writeFleetRolloutIntent(env, intent, next, guard);
   return target.rotation;
 }
 async function owningIntent(env: Env, regionId: string) {
@@ -372,22 +373,38 @@ export async function runPreparedRegionAuthorityRotation(
     checkpoint.state === "confirmed" &&
     checkpoint.verified
   ) {
-    // Activation accepts a verification observed at most 120 s earlier. One that aged past that
-    // window, e.g. while another operation held the fleet, is repeated; verification only reads.
+    // Activation accepts a verification observed at most 120 s earlier. While the old material is
+    // still active, one that aged past that window is repeated (verification only reads); the reset
+    // commits only if no activation landed meanwhile. A committed activation replays without a window.
+    const active = await env.DB.prepare(
+      "SELECT bootstrap_material_revision revision FROM regions WHERE id=?",
+    )
+      .bind(region.region_id)
+      .first<{ revision: number }>();
     if (
+      active?.revision === region.material_revision &&
       Date.now() - Date.parse(checkpoint.verified.observed_at) >
-      ROTATION_VERIFICATION_REUSE_MS
+        ROTATION_VERIFICATION_REUSE_MS
     ) {
-      await saveCheckpoint(env, intent, region, {
-        revision: checkpoint.revision + 1,
-        phase: "verify",
-        node_index: 0,
-        state: "pending",
-        ...(checkpoint.artifact ? { artifact: checkpoint.artifact } : {}),
-        ...(checkpoint.prior_boot_id
-          ? { prior_boot_id: checkpoint.prior_boot_id }
-          : {}),
-      });
+      await saveCheckpoint(
+        env,
+        intent,
+        region,
+        {
+          revision: checkpoint.revision + 1,
+          phase: "verify",
+          node_index: 0,
+          state: "pending",
+          ...(checkpoint.artifact ? { artifact: checkpoint.artifact } : {}),
+          ...(checkpoint.prior_boot_id
+            ? { prior_boot_id: checkpoint.prior_boot_id }
+            : {}),
+        },
+        {
+          sql: "(SELECT bootstrap_material_revision FROM regions WHERE id=?)=?",
+          bindings: [region.region_id, region.material_revision],
+        },
+      );
       return "pending";
     }
     const prepared = await preparedRegionRotationInput(
@@ -486,7 +503,7 @@ export async function runPreparedRegionAuthorityRotation(
   if (checkpoint.phase === "etcd-ca") {
     if (checkpoint.state !== "confirmed") return "hosts_ready";
     const unfinished = await env.DB.prepare(
-      "SELECT operation_id FROM fleet_patch_operations WHERE region_id=? AND release_id=? AND stage NOT IN('complete','host_ready') AND node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL) LIMIT 1",
+      "SELECT operation_id FROM fleet_patch_operations WHERE region_id=? AND release_id=? AND stage NOT IN('complete','host_ready') LIMIT 1",
     )
       .bind(region.region_id, intent.release_id)
       .first();

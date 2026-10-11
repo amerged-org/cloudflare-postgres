@@ -837,7 +837,7 @@ export async function continueFleetPatchRegion(
   )
     return closed();
   const active = await env.DB.prepare(
-    "SELECT * FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready') AND node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL)",
+    "SELECT * FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready')",
   )
     .bind(row.region_id)
     .first<PatchRow>();
@@ -964,7 +964,7 @@ export async function restoreFleetPatchPlacements(
   }
   await env.DB.prepare(
     `UPDATE nodes SET database_placement_closed_at=NULL,updated_at=? WHERE region_id=? AND EXISTS(SELECT 1 FROM fleet_patch_operations p,json_each(p.cluster_nodes_json) j WHERE p.region_id=nodes.region_id AND p.release_id=? AND p.spec_sha256=? AND p.region_revision=? AND p.bootstrap_operation_id IS NULL AND p.stage IN('host_ready','complete') AND json_extract(j.value,'$.node_id')=nodes.id AND json_extract(j.value,'$.node_uid')=nodes.node_uid AND json_extract(j.value,'$.previous_placement_closed_at') IS NULL AND nodes.database_placement_closed_at=p.created_at)
-    AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready') AND node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL))`,
+    AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready'))`,
   )
     .bind(
       new Date().toISOString(),
@@ -1069,7 +1069,7 @@ async function prepareFleetPatchInsert(
     `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,bootstrap_operation_id,bootstrap_joined_reference,host_configuration_revision,host_configuration_sha256,finalization_of,baseline_json,observed_json,talos_upgrade_receipt_json,revision,stage,state,created_at,updated_at,deadline_at)
       SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,'pending',?,?,? WHERE EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id
         WHERE n.id=? AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds') AND a.node_uid=n.node_uid AND a.revision=? AND a.release_id=? AND f.release_id=a.release_id AND f.revision=? AND r.bootstrap_material_revision=?)
-      AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready') AND node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL))
+      AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready'))
       AND NOT EXISTS(SELECT 1 FROM json_each(?) j LEFT JOIN nodes n ON n.id=json_extract(j.value,'$.node_id') LEFT JOIN fleet_node_releases a ON a.node_id=n.id
         WHERE n.id IS NULL OR a.node_id IS NULL OR n.region_id<>? OR n.node_uid<>json_extract(j.value,'$.node_uid') OR n.lost_at IS NOT NULL OR a.node_uid<>n.node_uid OR a.release_id<>? OR a.revision<>json_extract(j.value,'$.assignment_revision') OR n.database_placement_closed_at IS NOT json_extract(j.value,'$.previous_placement_closed_at'))
       AND (SELECT count(*) FROM nodes WHERE region_id=? AND lost_at IS NULL)=?
