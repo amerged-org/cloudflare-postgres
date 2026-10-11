@@ -336,8 +336,11 @@ scratch object, LV, the pool and a pool metadata spare that did not exist before
 `node_thin_storage` row, and thin selection on that node is refused until the run ends.
 
 **Preconditions**
-- The node is ready, has fresh observations and allows database placement. Never use the control
-  node.
+- The node is a ready customer node with fresh observations. Never use the control node.
+- Database placement on the node is disabled (`PUT /v1/nodes/{id}/database-placement`) from before
+  the start until the run ends. Thick placement does not count the scratch pool, and a new database
+  would change the retained baseline. Re-enabling placement during the run ends the measurements;
+  cleanup still runs. Re-enable placement after the run.
 - The region compute pool is on (`compute_pool` in `PUT /v1/regions/{id}/capacity-policy`). Thin
   storage depends on its runtime admission fact.
 - The assigned region release pins `native-gateway`, `pgcf-sandbox-controller`, `postgres` and the

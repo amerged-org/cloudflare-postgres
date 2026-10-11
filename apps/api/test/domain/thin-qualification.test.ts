@@ -137,7 +137,7 @@ function guardedSpec(keys: string, driverImage = profile.driver_image) {
     roles: { control_relay: role, customer: structuredClone(role) },
   });
 }
-/** A current placement node assigned to a guard-pinned release with sealed region material. */
+/** A current customer node with closed placement, assigned to a guard-pinned release with sealed region material. */
 async function qualificationSetup() {
   const f = await fixture(),
     at = new Date().toISOString(),
@@ -160,8 +160,8 @@ async function qualificationSetup() {
   });
   await env.DB.batch([
     env.DB.prepare(
-      "UPDATE nodes SET provider_instance_id='qualification-instance' WHERE id=?",
-    ).bind(f.node),
+      "UPDATE nodes SET provider_instance_id='qualification-instance',database_placement_enabled=0,database_placement_closed_at=? WHERE id=?",
+    ).bind(at, f.node),
     env.DB.prepare(
       "UPDATE regions SET bootstrap_material_revision=1 WHERE id=?",
     ).bind(f.region),
@@ -365,7 +365,7 @@ it("release approval refuses hand-typed thin gate flags and accepts only a compl
   ).toEqual(qualification);
 });
 
-it("starts one scratch run only on a fresh placement node of a guard-pinned release with the region pool on", async () => {
+it("starts one scratch run only on a fresh customer node with closed placement, a guard-pinned release and the region pool on", async () => {
   const f = await qualificationSetup(),
     body = { node_uid: f.uid, address: "192.0.2.18", profile };
   expect((await f.start(body, "")).status).toBe(400);
@@ -380,16 +380,31 @@ it("starts one scratch run only on a fresh placement node of a guard-pinned rele
   )
     .bind(f.region)
     .run();
-  // Placement-disabled control nodes never qualify thin storage.
+  // Thick placement does not see the scratch pool, so an open node is refused.
   await env.DB.prepare(
-    "UPDATE nodes SET database_placement_enabled=0 WHERE id=?",
+    "UPDATE nodes SET database_placement_enabled=1,database_placement_closed_at=NULL WHERE id=?",
   )
     .bind(f.node)
     .run();
   expect((await f.start(body)).status).toBe(409);
   await env.DB.prepare(
-    "UPDATE nodes SET database_placement_enabled=1,last_observed_at=? WHERE id=?",
+    "UPDATE nodes SET database_placement_enabled=0,database_placement_closed_at=? WHERE id=?",
   )
+    .bind(new Date().toISOString(), f.node)
+    .run();
+  // The control node never qualifies thin storage.
+  await env.DB.prepare(
+    "UPDATE fleet_node_releases SET role='control_relay' WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  expect((await f.start(body)).status).toBe(409);
+  await env.DB.prepare(
+    "UPDATE fleet_node_releases SET role='customer' WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
     .bind(new Date(Date.now() - 600_000).toISOString(), f.node)
     .run();
   expect((await f.start(body)).status).toBe(409);
@@ -776,4 +791,30 @@ it("cancels the measurements of a running run, still runs cleanup and then fails
   } finally {
     await instance.dispose();
   }
+});
+
+it("ends the measurements when database placement reopens during a run and still runs cleanup", async () => {
+  const f = await qualificationSetup(),
+    id = await insertRunning(f, "data_full");
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET lease_id=NULL,lease_expires_at=NULL WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  await env.DB.prepare(
+    "UPDATE nodes SET database_placement_enabled=1,database_placement_closed_at=NULL WHERE id=?",
+  )
+    .bind(f.node)
+    .run();
+  await expect(
+    prepareThinQualificationTurn(env, id, "data_full"),
+  ).rejects.toThrow("lease or identity changed");
+  expect(await run(id)).toMatchObject({
+    step: "cleanup",
+    error_code: "thin_qualification_authority_changed",
+    lease_id: null,
+  });
+  expect(await prepareThinQualificationTurn(env, id, "cleanup")).toMatchObject({
+    run: { id, step: "cleanup" },
+  });
 });

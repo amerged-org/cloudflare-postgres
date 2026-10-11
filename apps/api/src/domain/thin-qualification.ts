@@ -158,10 +158,12 @@ function pinned(spec: FleetReleaseSpec, name: string) {
     ? component
     : null;
 }
-const freshNodeSql = `n.id=? AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND n.provider_instance_id IS NOT NULL AND n.database_placement_enabled=1
+/** Thick placement does not see the scratch pool, so a run needs a customer node with closed placement. */
+const freshNodeSql = `n.id=? AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND n.provider_instance_id IS NOT NULL
+  AND n.database_placement_enabled=0 AND a.role='customer'
   AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds')`;
 
-/** Start one fenced scratch run on a current placement node of a guard-pinned release. */
+/** Start one fenced scratch run on a current customer node with closed placement and a guard-pinned release. */
 export async function startThinQualification(
   c: ApiContext,
   nodeId: string,
@@ -211,7 +213,7 @@ export async function startThinQualification(
         }>();
       if (!source)
         return conflict(
-          "Qualification requires the current ready placement node, fresh observations and its region release",
+          "Qualification requires the current ready customer node with database placement disabled, fresh observations and its region release",
         );
       if (!source.pool_enabled)
         return conflict("Thin qualification requires the region compute pool");
@@ -429,7 +431,7 @@ export async function prepareThinQualificationTurn(
     throw error;
   }
 }
-/** Private custody for the current lease; gates keep their release and material fences. */
+/** Private custody for the current lease; gates keep their release, material and closed-placement fences. */
 export async function thinQualificationInput(
   env: Env,
   id: string,
@@ -442,7 +444,7 @@ export async function thinQualificationInput(
     LEFT JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid
     LEFT JOIN fleet_region_releases f ON f.region_id=n.region_id
     WHERE n.id=? AND n.node_uid=? AND n.region_id=? AND n.lost_at IS NULL AND n.provider_instance_id IS NOT NULL
-      AND (?=1 OR (a.release_id=? AND a.revision=? AND f.release_id=a.release_id AND f.revision=? AND r.bootstrap_material_revision=?))`,
+      AND (?=1 OR (n.database_placement_enabled=0 AND a.release_id=? AND a.revision=? AND f.release_id=a.release_id AND f.revision=? AND r.bootstrap_material_revision=?))`,
   )
     .bind(
       row.node_id,
