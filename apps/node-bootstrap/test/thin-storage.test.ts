@@ -191,6 +191,16 @@ test("complete LVM and kernel inventory retains internal IDs and refuses unexpla
     /thin_storage_kernel_lv_unexplained/,
   );
 });
+test("an empty LVM pool percentage fails closed instead of reading as an unused pool", () => {
+  assert.throws(
+    () => facts([{ ...poolRow, data_percent: "" }]),
+    /thin_storage_pool_percent_invalid/,
+  );
+  assert.throws(
+    () => facts([{ ...poolRow, metadata_percent: "" }]),
+    /thin_storage_pool_percent_invalid/,
+  );
+});
 test("pool writes use bounded absolute sizes and never retry a dispatched unknown outcome", () => {
   const value = facts();
   assert.equal(thinPoolCommand(input, value, action)?.[0], "lvcreate");

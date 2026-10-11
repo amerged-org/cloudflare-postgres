@@ -79,6 +79,14 @@ const text = (value: unknown) => {
     throw new BootstrapError("thin_storage_text_invalid");
   return value.trim();
 };
+/** LVM leaves a percentage empty when it cannot report one; Number("") would read that as an unused pool. */
+const percent = (value: unknown) => {
+  const raw = text(value),
+    n = /^\d+(?:\.\d+)?$/.test(raw) ? Number(raw) : NaN;
+  if (!(n >= 0 && n <= 100))
+    throw new BootstrapError("thin_storage_pool_percent_invalid");
+  return n;
+};
 const metadata = (value: ObjectValue) => object(value.metadata);
 function lvmRows(raw: string, key: string) {
   const value = object(JSON.parse(raw));
@@ -204,18 +212,9 @@ export function thinLvmFacts(
         throw new BootstrapError("thin_storage_pool_unqualified");
       pool_uuid = uuid;
       pool_tags = text(row.lv_tags).split(",").filter(Boolean);
-      const dataPercent = Number(text(row.data_percent)),
-        metaPercent = Number(text(row.metadata_percent)),
+      const dataPercent = percent(row.data_percent),
+        metaPercent = percent(row.metadata_percent),
         meta = bytes(row.lv_metadata_size);
-      if (
-        !Number.isFinite(dataPercent) ||
-        !Number.isFinite(metaPercent) ||
-        dataPercent < 0 ||
-        dataPercent > 100 ||
-        metaPercent < 0 ||
-        metaPercent > 100
-      )
-        throw new BootstrapError("thin_storage_pool_percent_invalid");
       pool = {
         name: "pgcf_thinpool",
         data_total_bytes: size,
