@@ -345,6 +345,8 @@ export async function preparedRegionRotationInput(
   });
 }
 
+/** Below the 120 s activation guard, leaving time for the activation reads and UPDATE. */
+const ROTATION_VERIFICATION_REUSE_MS = 90_000;
 /** Reuse the accepted daily artifact; all mutation progress stays in the existing fleet intent. */
 export async function runPreparedRegionAuthorityRotation(
   env: Env,
@@ -370,6 +372,24 @@ export async function runPreparedRegionAuthorityRotation(
     checkpoint.state === "confirmed" &&
     checkpoint.verified
   ) {
+    // Activation accepts a verification observed at most 120 s earlier. One that aged past that
+    // window, e.g. while another operation held the fleet, is repeated; verification only reads.
+    if (
+      Date.now() - Date.parse(checkpoint.verified.observed_at) >
+      ROTATION_VERIFICATION_REUSE_MS
+    ) {
+      await saveCheckpoint(env, intent, region, {
+        revision: checkpoint.revision + 1,
+        phase: "verify",
+        node_index: 0,
+        state: "pending",
+        ...(checkpoint.artifact ? { artifact: checkpoint.artifact } : {}),
+        ...(checkpoint.prior_boot_id
+          ? { prior_boot_id: checkpoint.prior_boot_id }
+          : {}),
+      });
+      return "pending";
+    }
     const prepared = await preparedRegionRotationInput(
         env,
         intent.rollout_id,
@@ -466,7 +486,7 @@ export async function runPreparedRegionAuthorityRotation(
   if (checkpoint.phase === "etcd-ca") {
     if (checkpoint.state !== "confirmed") return "hosts_ready";
     const unfinished = await env.DB.prepare(
-      "SELECT operation_id FROM fleet_patch_operations WHERE region_id=? AND release_id=? AND stage NOT IN('complete','host_ready') LIMIT 1",
+      "SELECT operation_id FROM fleet_patch_operations WHERE region_id=? AND release_id=? AND stage NOT IN('complete','host_ready') AND node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL) LIMIT 1",
     )
       .bind(region.region_id, intent.release_id)
       .first();

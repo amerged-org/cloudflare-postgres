@@ -19,6 +19,7 @@ import {
 import {
   authorizeFleetRegionRotation,
   preparedRegionRotationInput,
+  runPreparedRegionAuthorityRotation,
 } from "../../src/domain/fleet-region-authority.ts";
 import { readFleetRolloutIntent } from "../../src/domain/fleet-rollouts.ts";
 import { installationHash } from "../../src/domain/node-installation.ts";
@@ -487,4 +488,82 @@ it("resolves exact native activation replay after pointer revision two without r
     revision: 2,
     provenance: f.activation.verification_sha256,
   });
+});
+
+it("an unfinished patch of a lost node outside the rollout does not hold the activation, a live one does", async () => {
+  const f = await setup(),
+    now = new Date().toISOString(),
+    node = newNodeId(),
+    uid = crypto.randomUUID(),
+    unfinished = (id: string, nodeUid: string) =>
+      env.DB.prepare(
+        "INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,stage,state,created_at,updated_at,deadline_at) VALUES(?,?,?,?,?,?,?,1,1,1,?,?,'talos_reboot','dispatched',?,?,?)",
+      ).bind(
+        newOperationId(),
+        id,
+        f.foreign,
+        nodeUid,
+        crypto.randomUUID(),
+        f.intent.release_id,
+        "f".repeat(64),
+        "192.0.2.30",
+        "[]",
+        now,
+        now,
+        now,
+      );
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO nodes(id,region_id,k8s_node_name,node_uid,provider_instance_id,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,1,4096,2000,30,128,100,?,?,?)",
+    ).bind(node, f.foreign, "retained-lost", uid, "34567", now, now, now),
+    unfinished(node, uid),
+  ]);
+  await expect(
+    activateNativeRegionBootstrapRotation(
+      f.runtime,
+      f.region,
+      f.intent.rollout_id,
+      f.activation,
+    ),
+  ).rejects.toThrow(/authority|changed/i);
+  await env.DB.prepare(
+    "UPDATE nodes SET lost_at=?,lost_reason='operator_marked_lost' WHERE id=?",
+  )
+    .bind(now, node)
+    .run();
+  expect(
+    await activateNativeRegionBootstrapRotation(
+      f.runtime,
+      f.region,
+      f.intent.rollout_id,
+      f.activation,
+    ),
+  ).toMatchObject({ revision: 2 });
+});
+
+it("a verification older than the activation window is repeated instead of activated", async () => {
+  const f = await setup(),
+    stale = structuredClone(f.intent),
+    rotation = stale.regions[0]!.rotation!;
+  rotation.verified!.observed_at = new Date(Date.now() - 200_000).toISOString();
+  await env.DB.prepare(
+    "UPDATE fleet_region_releases SET rollout_json=? WHERE region_id IN(?,?)",
+  )
+    .bind(JSON.stringify(stale), f.region, f.foreign)
+    .run();
+  expect(
+    await runPreparedRegionAuthorityRotation(f.runtime, {
+      rollout_id: f.intent.rollout_id,
+      region_id: f.region,
+    }),
+  ).toBe("pending");
+  const stored = await readFleetRolloutIntent(env.DB, f.intent.rollout_id);
+  expect(stored.regions[0]!.rotation).toEqual({
+    revision: rotation.revision + 1,
+    phase: "verify",
+    node_index: 0,
+    state: "pending",
+    prior_boot_id: rotation.prior_boot_id,
+  });
+  expect(await f.pointer()).toEqual({ revision: 1, provenance: null });
 });

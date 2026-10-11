@@ -41,7 +41,7 @@ const refuse = (): never => {
 };
 const idleSql = `NOT EXISTS(SELECT 1 FROM node_additions WHERE slot_held=1 AND status NOT IN('ready','cancelled'))
   AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs WHERE authorized=1 AND admitted=0 AND cancelled=0)
-  AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE stage NOT IN('complete','host_ready'))
+  AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE stage NOT IN('complete','host_ready') AND node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL))
   AND NOT EXISTS(SELECT 1 FROM node_thin_storage WHERE action_json IS NOT NULL)`;
 async function regionState(db: D1Database, regionId: string) {
   const row = await db

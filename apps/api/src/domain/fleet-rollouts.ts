@@ -494,7 +494,7 @@ export async function advanceFleetRollout(
       region.nodes.map((node) => readFleetNodeRelease(env.DB, node.node_id)),
     );
     const active = await env.DB.prepare(
-      "SELECT operation_id,node_id FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready')",
+      "SELECT operation_id,node_id FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready') AND node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL)",
     )
       .bind(region.region_id)
       .first<{ operation_id: string; node_id: string }>();
