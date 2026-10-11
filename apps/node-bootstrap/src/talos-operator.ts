@@ -13,8 +13,8 @@ import { URL } from "node:url";
 import { setTimeout, clearTimeout } from "node:timers";
 import { PgcfClient } from "@pgcf/contracts/client";
 import {
+  NodeOperatorKubernetesBinding,
   parseNodeOperatorKubernetesBinding,
-  type NodeOperatorKubernetesBinding,
 } from "@pgcf/contracts/node-operator";
 import { parse } from "yaml";
 import { startCapabilityProxy } from "./proxy-command.ts";
@@ -309,6 +309,17 @@ export function assertSameCarrier(before: unknown, after: unknown) {
   );
 }
 
+/** Field order is not identity: both bindings are compared in the contract's canonical shape. */
+export function assertExpectedOperatorBinding(
+  expected: NodeOperatorKubernetesBinding,
+  actual: NodeOperatorKubernetesBinding,
+) {
+  assertSameCarrier(
+    NodeOperatorKubernetesBinding.parse(expected),
+    NodeOperatorKubernetesBinding.parse(actual),
+  );
+}
+
 export function validateTalosCommand(args: string[], outputDir: string) {
   must(
     Array.isArray(args) &&
@@ -552,7 +563,10 @@ export async function openTalosOperator(options: TalosOperatorOptions) {
                   "operator_binding_changed",
                 );
                 if (options.expectedBinding)
-                  assertSameCarrier(options.expectedBinding, actual);
+                  assertExpectedOperatorBinding(
+                    options.expectedBinding,
+                    actual,
+                  );
                 if (binding) assertSameCarrier(binding, actual);
               } catch {
                 socket.terminate();

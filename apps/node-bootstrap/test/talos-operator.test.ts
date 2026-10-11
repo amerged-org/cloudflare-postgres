@@ -9,6 +9,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import {
+  assertExpectedOperatorBinding,
   assertSameCarrier,
   selectVerifiedCiliumPod,
   snapshotFileLimit,
@@ -199,4 +200,37 @@ test("the extracted operator bundles with the actual Bootstrap banner without du
     },
   );
   assert.equal(checked.status, 0, checked.stderr);
+});
+
+test("an expected operator binding matches the relay binding regardless of field order", () => {
+  // The relay header parser returns the contract's field order; callers may list the same fields differently.
+  const relay = {
+    node_uid: "67ef56c1-4833-44b5-9588-3d44a047e1cd",
+    cluster_uid: "f5c56639-3b8e-4c08-9b1f-1c24d1d3b681",
+    node_name: "pgcf-node-fmeay0m2p7xb1c8wxac7",
+    material_revision: 1,
+  };
+  const expected = {
+    node_uid: relay.node_uid,
+    node_name: relay.node_name,
+    cluster_uid: relay.cluster_uid,
+    material_revision: relay.material_revision,
+  };
+  assert.doesNotThrow(() => assertExpectedOperatorBinding(expected, relay));
+  assert.throws(
+    () =>
+      assertExpectedOperatorBinding(
+        { ...expected, material_revision: 2 },
+        relay,
+      ),
+    /operator_carrier_changed/,
+  );
+  assert.throws(
+    () =>
+      assertExpectedOperatorBinding(expected, {
+        ...relay,
+        node_name: "pgcf-node-other",
+      }),
+    /operator_carrier_changed/,
+  );
 });
