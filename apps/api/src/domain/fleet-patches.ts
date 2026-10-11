@@ -961,6 +961,17 @@ export async function restoreFleetPatchPlacements(
     .run();
   return true;
 }
+/** A final pass starts from the source's last facts and keeps verifying retained thick storage
+ * against the bound set; a source that ended at host_ready may carry that set only in its baseline. */
+function finalizationBaseline(source: PatchRow) {
+  const observed = source.observed_json && JSON.parse(source.observed_json),
+    bound =
+      source.baseline_json &&
+      JSON.parse(source.baseline_json).legacy_storage_bindings;
+  return observed && !observed.legacy_storage_bindings && bound
+    ? JSON.stringify({ ...observed, legacy_storage_bindings: bound })
+    : source.observed_json;
+}
 async function prepareFleetPatchInsert(
   env: Env,
   nodeId: string,
@@ -1065,7 +1076,7 @@ async function prepareFleetPatchInsert(
     host?.revision ?? null,
     host?.sha256 ?? null,
     finalization?.operation_id ?? null,
-    finalization?.observed_json ?? null,
+    finalization ? finalizationBaseline(finalization) : null,
     finalization?.observed_json ?? null,
     finalization?.talos_upgrade_receipt_json ?? null,
     finalization

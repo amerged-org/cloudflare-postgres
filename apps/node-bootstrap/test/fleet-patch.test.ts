@@ -22,6 +22,7 @@ import {
   type CommandRunner,
 } from "../src/bootstrap.ts";
 import { patchFixture } from "./fleet-patch.fixture.ts";
+import { legacyStorageFixture } from "./fleet-legacy-storage.fixture.ts";
 import { NodeHostConfigurationPrivate } from "@pgcf/contracts/node-host-configuration";
 
 function runtime(
@@ -961,6 +962,55 @@ test("pool-off admission retains both physical host files without requiring pool
   );
   assert.equal(r.current.observed?.runtime_admission_sha256, undefined);
   assert.equal(r.writes.length, 0);
+});
+
+test("a host-ready member carries its preflight-bound thick storage into the final pass's release verification", async () => {
+  const r = runtime(),
+    legacy = legacyStorageFixture(r.fixture.input),
+    target = { kubelet_version: "v1.36.5", kubernetes_version: "v1.36.5" };
+  r.kubeProbe = (command) => {
+    const args = command.args.slice(command.args.indexOf("get"));
+    return legacy.reads(args)
+      ? legacy.kube(args).then((stdout) => ({ exit_code: 0, stdout }))
+      : undefined;
+  };
+  r.facts = {
+    ...r.fixture.facts,
+    ...target,
+    talos_version: "v1.14.1",
+    cluster_nodes: [{ ...r.fixture.facts.cluster_nodes[0]!, ...target }],
+  };
+  await r.turn();
+  assert.equal(r.current.stage, "preflight");
+  assert.deepEqual(r.current.baseline?.legacy_storage_bindings, [
+    legacy.expected,
+  ]);
+  // Another member is not host-qualified yet, so this pass ends at host_ready.
+  r.current = { ...r.current, stage: "runtime_admission", state: "pending" };
+  await r.turn();
+  assert.equal(r.current.stage, "host_ready");
+  // The final pass starts from the host_ready facts, as the API seeds it.
+  r.fixture.input.regional_hosts_ready = true;
+  r.current = {
+    ...r.current,
+    finalization_of: "op_hostreadysourcepass0",
+    revision: 0,
+    stage: "release_verify",
+    state: "pending",
+    baseline: r.current.observed,
+  };
+  // The unchanged bound storage passes; only the platform readback this harness omits remains.
+  await assert.rejects(r.turn(), /patch_release_unobserved/);
+  r.current = {
+    ...r.current,
+    baseline: {
+      ...r.current.baseline!,
+      legacy_storage_bindings: [
+        { ...legacy.expected, storage_uid: randomUUID() },
+      ],
+    },
+  };
+  await assert.rejects(r.turn(), /patch_legacy_storage_baseline_changed/);
 });
 
 test("a thin-guard-pinned retained host loads dm_thin_pool before any qualification receipt exists", async () => {

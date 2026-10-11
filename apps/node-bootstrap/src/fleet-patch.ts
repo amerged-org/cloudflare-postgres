@@ -668,7 +668,10 @@ export async function runFleetPatch(
             )
               throw new BootstrapError("patch_legacy_storage_baseline_changed");
         facts.legacy_storage_bindings = bindings;
-      }
+      } else if (current.baseline?.legacy_storage_bindings)
+        // Every checkpoint keeps the bound set: a host_ready checkpoint becomes its final pass's baseline.
+        facts.legacy_storage_bindings =
+          current.baseline.legacy_storage_bindings;
 
       if (
         input.host_configuration &&
@@ -698,8 +701,7 @@ export async function runFleetPatch(
           input,
           platformState,
           assets,
-          facts.legacy_storage_bindings ??
-            current.baseline?.legacy_storage_bindings,
+          facts.legacy_storage_bindings,
         );
         const identities = {
           ...current.observed?.platform_resource_uids,

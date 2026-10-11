@@ -1549,11 +1549,27 @@ it("keeps a host-qualified control operation terminal while a worker and idempot
       queued_pending: 0,
       errors: [],
     };
+  // Preflight bound retained thick storage; a deployed executor's host_ready facts omit it.
+  const claimUid = crypto.randomUUID(),
+    bound = [
+      {
+        database_id: `d${"b".repeat(19)}`,
+        storage_uid: crypto.randomUUID(),
+        namespace_uid: crypto.randomUUID(),
+        cluster_uid: crypto.randomUUID(),
+        physical_generation: 1,
+        volume_identity: {
+          handle: `pvc-${claimUid}`,
+          claimUid,
+          volumeUid: crypto.randomUUID(),
+        },
+      },
+    ];
   await env.DB.prepare(
     "UPDATE fleet_patch_operations SET stage='regional',state='confirmed',baseline_json=?,talos_upgrade_receipt_json=? WHERE operation_id=?",
   )
     .bind(
-      JSON.stringify(controlFacts),
+      JSON.stringify({ ...controlFacts, legacy_storage_bindings: bound }),
       JSON.stringify(receiptFor(controlFacts)),
       f.op,
     )
@@ -1626,6 +1642,12 @@ it("keeps a host-qualified control operation terminal while a worker and idempot
   const final = await ensureFleetPatchFinalization(patchEnv, f.op);
   expect(final!.stage).toBe("runtime_admission");
   expect(final!.operation_id).not.toBe(f.op);
+  // The final pass verifies retained storage against the source pass's bound set.
+  expect(final!.baseline).toEqual({
+    ...controlFacts,
+    legacy_storage_bindings: bound,
+  });
+  expect(final!.observed).toEqual(controlFacts);
   expect(
     (await ensureFleetPatchFinalization(patchEnv, f.op))!.operation_id,
   ).toBe(final!.operation_id);
