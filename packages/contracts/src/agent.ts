@@ -455,6 +455,22 @@ export const NodeMemorySample = z
     capacity_memory_bytes: MemoryBytes.positive(),
     available_bytes: MemoryBytes.nullable(),
     memory_pressure: z.boolean().nullable(),
+    /** Kubelet Summary `node.cpu.usageNanoCores` from the same sample; absent from older reporters. */
+    cpu_usage_nano_cores: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(Number.MAX_SAFE_INTEGER)
+      .nullable()
+      .optional(),
+    /** Node `status.capacity.cpu` in millicores, paired with the CPU usage gauge. */
+    capacity_cpu_millicores: z
+      .number()
+      .int()
+      .positive()
+      .max(Number.MAX_SAFE_INTEGER)
+      .nullable()
+      .optional(),
   })
   .refine(
     (value) =>
@@ -462,6 +478,12 @@ export const NodeMemorySample = z
       (value.available_bytes === null ||
         value.available_bytes <= value.capacity_memory_bytes),
     { message: "Node memory gauges cannot exceed physical capacity" },
+  )
+  .refine(
+    (value) =>
+      (value.cpu_usage_nano_cores ?? null) === null ||
+      (value.capacity_cpu_millicores ?? null) !== null,
+    { message: "Node CPU usage requires the node CPU capacity" },
   );
 export type NodeMemorySample = z.infer<typeof NodeMemorySample>;
 

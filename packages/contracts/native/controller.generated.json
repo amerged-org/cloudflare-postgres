@@ -2547,7 +2547,27 @@
                           { "type": "null" }
                         ]
                       },
-                      "memory_pressure": { "type": ["boolean", "null"] }
+                      "memory_pressure": { "type": ["boolean", "null"] },
+                      "cpu_usage_nano_cores": {
+                        "anyOf": [
+                          {
+                            "type": "integer",
+                            "minimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          { "type": "null" }
+                        ]
+                      },
+                      "capacity_cpu_millicores": {
+                        "anyOf": [
+                          {
+                            "type": "integer",
+                            "exclusiveMinimum": 0,
+                            "maximum": 9007199254740991
+                          },
+                          { "type": "null" }
+                        ]
+                      }
                     },
                     "required": [
                       "node_uid",
