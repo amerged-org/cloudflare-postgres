@@ -27,7 +27,16 @@ export async function cleanupFixtures(): Promise<void> {
     const [region, foreign] = fixture.regions;
     const databaseScope =
       "database_id IN(SELECT id FROM databases WHERE project_id IN(?,?))";
+    // Fixture qualification runs keep their own "-base" release; it goes with the runs.
+    const qualified = await env.DB.prepare(
+      "SELECT DISTINCT release_id FROM thin_storage_qualification_runs WHERE region_id IN(?,?) AND release_id LIKE '%-base'",
+    )
+      .bind(region, foreign)
+      .all<{ release_id: string }>();
     await env.DB.batch([
+      env.DB.prepare(
+        "DELETE FROM thin_storage_qualification_runs WHERE region_id IN(?,?)",
+      ).bind(region, foreign),
       env.DB.prepare(
         "UPDATE databases SET storage_protected_operation=NULL WHERE project_id IN(?,?)",
       ).bind(project, other),
@@ -91,6 +100,12 @@ export async function cleanupFixtures(): Promise<void> {
       ),
       env.DB.prepare("DELETE FROM size_classes WHERE id=?").bind(fixture.size),
     ]);
+    for (const { release_id } of qualified.results)
+      await env.DB.prepare(
+        `DELETE FROM fleet_releases WHERE id=? AND NOT EXISTS(SELECT 1 FROM thin_storage_qualification_runs WHERE release_id=?)`,
+      )
+        .bind(release_id, release_id)
+        .run();
   }
 }
 

@@ -16,6 +16,7 @@ import { requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
 import { agentRegion } from "./agent-auth.ts";
 import { normalizeRuntimeImageManifest } from "../../../../infra/platform/image-manifest.ts";
+import { assertThinQualificationReceipt } from "./thin-qualification.ts";
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -72,6 +73,12 @@ export async function approveFleetRelease(
   const spec = FleetReleaseSpec.parse(raw),
     specJson = canonical(spec),
     hash = await sha256(specJson);
+  // Gate flags are never typed by hand: only a completed qualification run's receipt is accepted.
+  if (spec.thin_storage_qualification)
+    await assertThinQualificationReceipt(
+      c.env.DB,
+      spec.thin_storage_qualification,
+    );
   const read = async () => {
     const current = await release(c.env.DB, id);
     if (current.spec_sha256 !== hash || canonical(current.spec) !== specJson)

@@ -85,6 +85,11 @@
       "class_name": "PatchNode",
     },
     { "binding": "ADD_NODE", "name": "pgcf-add-node", "class_name": "AddNode" },
+    {
+      "binding": "THIN_QUALIFICATION",
+      "name": "pgcf-thin-qualification",
+      "class_name": "ThinQualification",
+    },
   ],
   "triggers": { "crons": ["* * * * *"] },
   // Optional private secrets: INFRASTRUCTURE_BACKUP_CF_TOKEN (D1 export), RESEND_API_KEY (email).

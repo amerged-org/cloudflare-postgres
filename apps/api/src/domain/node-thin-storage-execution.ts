@@ -730,14 +730,20 @@ export async function recordThinStorageReport(
   };
 }
 
-export async function issueThinStorageTransport(
+/** One relay grant for a Native executor lease; callers fence their own lease around it. */
+export async function signNativeRelayCapability(
   env: Env,
-  nodeId: string,
-  capability: "talos_api" | "kubernetes_api",
+  scope: {
+    operation: string;
+    node: string;
+    region: string;
+    revision: number;
+    capability: "talos_api" | "kubernetes_api";
+    address: string;
+    callback: string;
+  },
 ) {
-  const input = await thinStorageInput(env, nodeId),
-    row = await readThinStorageLeaseRow(env, nodeId),
-    service = env.BOOTSTRAP_RELAY_SERVICE;
+  const service = env.BOOTSTRAP_RELAY_SERVICE;
   if (!service) return closed();
   const endpoint = new URL(env.BOOTSTRAP_RELAY_URL);
   if (
@@ -761,34 +767,54 @@ export async function issueThinStorageTransport(
   if (
     identity.region !== env.BOOTSTRAP_RELAY_ISSUER_REGION ||
     identity.issuer_region !== identity.region ||
-    !identity.allowed_target_regions.includes(row.region_id) ||
-    !identity.capabilities.includes(capability)
+    !identity.allowed_target_regions.includes(scope.region) ||
+    !identity.capabilities.includes(scope.capability)
   )
     return closed();
-  const address =
-    capability === "talos_api"
-      ? row.address
-      : new URL(input.cluster_endpoint).hostname;
   const key = await bootstrapTransportSigningKey(
     env.BOOTSTRAP_RELAY_SIGNING_KEYS,
   );
   const token = await signBootstrapRelay({
     ...key,
+    operation: scope.operation,
+    node: scope.node,
+    region: scope.region,
+    issuer_region: identity.region,
+    relay_epoch: identity.relay_epoch,
+    revision: scope.revision,
+    capability: scope.capability,
+    address: scope.address,
+  });
+  return {
+    websocket_url: scope.callback.replace(/^https:/, "wss:") + "/relay",
+    token,
+    expectedTarget: {
+      ip: scope.address,
+      port: BOOTSTRAP_PORTS[scope.capability],
+    },
+  };
+}
+export async function issueThinStorageTransport(
+  env: Env,
+  nodeId: string,
+  capability: "talos_api" | "kubernetes_api",
+) {
+  const input = await thinStorageInput(env, nodeId),
+    row = await readThinStorageLeaseRow(env, nodeId);
+  const transport = await signNativeRelayCapability(env, {
     operation: input.lease.operation_id,
     node: nodeId,
     region: row.region_id,
-    issuer_region: identity.region,
-    relay_epoch: identity.relay_epoch,
     revision: row.lease_revision,
     capability,
-    address,
+    address:
+      capability === "talos_api"
+        ? row.address
+        : new URL(input.cluster_endpoint).hostname,
+    callback: input.callback.url,
   });
   await thinStorageInput(env, nodeId);
-  return {
-    websocket_url: input.callback.url.replace(/^https:/, "wss:") + "/relay",
-    token,
-    expectedTarget: { ip: address, port: BOOTSTRAP_PORTS[capability] },
-  };
+  return transport;
 }
 
 export async function processNodeThinStorage(env: Env, nodeId: string) {

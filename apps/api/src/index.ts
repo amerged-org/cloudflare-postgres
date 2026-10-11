@@ -8,6 +8,7 @@ export { NodeBootstrap } from "./bootstrap-container.ts";
 export { AddNode } from "./workflows/add-node.ts";
 export { InfrastructureBackup } from "./workflows/infrastructure-backup.ts";
 export { PatchNode } from "./workflows/patch-node.ts";
+export { ThinQualification } from "./workflows/thin-qualification.ts";
 
 const app = createApp();
 
