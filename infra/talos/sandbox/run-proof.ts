@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { spawn } from "node:child_process";
-import { randomUUID } from "node:crypto";
-import { mkdtemp, chmod, open, readFile } from "node:fs/promises";
+import { createHash, randomUUID } from "node:crypto";
+import { createReadStream } from "node:fs";
+import { mkdtemp, chmod, open, readFile, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -32,26 +33,89 @@ export function proofDockerArguments(
     image,
   ];
 }
-async function invoke(args: string[], log: string, timeout: number) {
+export async function invokeProofDocker(
+  args: string[],
+  log: string,
+  timeout: number,
+  spawnProcess: typeof spawn = spawn,
+) {
   const file = await open(log, "w", 0o600);
+  const started = performance.now();
   try {
-    return await new Promise<number>((resolve, reject) => {
-      const child = spawn("docker", args, {
+    return await new Promise<{
+      exit_code: number | null;
+      signal: NodeJS.Signals | null;
+      timed_out: boolean;
+      elapsed_ms: number;
+    }>((resolve, reject) => {
+      const child = spawnProcess("docker", args, {
         stdio: ["ignore", file.fd, file.fd],
       });
-      const timer = setTimeout(() => child.kill("SIGKILL"), timeout);
+      let timedOut = false;
+      const timer = setTimeout(() => {
+        timedOut = true;
+        child.kill("SIGKILL");
+      }, timeout);
       child.once("error", (error) => {
         clearTimeout(timer);
         reject(error);
       });
-      child.once("exit", (code) => {
+      child.once("close", (exit_code, signal) => {
         clearTimeout(timer);
-        resolve(code ?? 137);
+        resolve({
+          exit_code,
+          signal,
+          timed_out: timedOut,
+          elapsed_ms: Math.round(performance.now() - started),
+        });
       });
     });
   } finally {
     await file.close();
   }
+}
+export async function sandboxProofFailure(
+  invocation: Awaited<ReturnType<typeof invokeProofDocker>>,
+  log: string,
+  container: {
+    exit_code: number;
+    oom_killed: boolean;
+    status: string;
+  } | null,
+) {
+  const hash = createHash("sha256"),
+    chunks: Buffer[] = [];
+  let bytes = 0;
+  for await (const chunk of createReadStream(log)) {
+    hash.update(chunk);
+    bytes += chunk.length;
+    if (bytes <= 8 * 1024 ** 2) chunks.push(chunk);
+    else chunks.length = 0;
+  }
+  const text = bytes <= 8 * 1024 ** 2 ? Buffer.concat(chunks).toString("utf8") : "",
+    classes = [
+      ["prepared sandbox omitted CRI resolver source", "missing_CRI_resolver"],
+      ["prepared sandbox omitted CRI hostname source", "missing_CRI_hostname"],
+      ["CRI_DNS_config_required", "CRI_DNS_config_required"],
+      ["Read-only file system (os error 30)", "errno_EROFS"],
+      ["Permission denied (os error 13)", "errno_EACCES"],
+      ["Operation not permitted (os error 1)", "errno_EPERM"],
+      ["No such file or directory (os error 2)", "errno_ENOENT"],
+      ["Cannot allocate memory (os error 12)", "errno_ENOMEM"],
+      ["Resource temporarily unavailable (os error 11)", "errno_EAGAIN"],
+      ["No space left on device (os error 28)", "errno_ENOSPC"],
+    ];
+  return {
+    version: 1,
+    invocation,
+    container,
+    error_class: classes.find(([needle]) => text.includes(needle!))?.[1] ?? "unknown",
+    runtime_log: {
+      bytes,
+      sha256: hash.digest("hex"),
+    },
+    raw_output_included: false,
+  };
 }
 export async function runSandboxProof() {
   const lock = JSON.parse(
@@ -71,11 +135,11 @@ export async function runSandboxProof() {
   let stage = "proof_native_platform";
   try {
     if (
-      (await invoke(
+      (await invokeProofDocker(
         ["info", "--format", "{{.Architecture}}"],
         join(directory, "platform.private.log"),
         30000,
-      )) !== 0
+      )).exit_code !== 0
     )
       throw Error(stage);
     const host = (
@@ -97,7 +161,7 @@ export async function runSandboxProof() {
             runc: "d10ecae898361832a059be2089bab92d158aec54661b18ed7346ed79628b46b0",
           };
     stage = "proof_build";
-    let exit = await invoke(
+    let exit = await invokeProofDocker(
       [
         "build",
         "--platform",
@@ -125,14 +189,57 @@ export async function runSandboxProof() {
       join(directory, "build.private.log"),
       900000,
     );
-    if (exit !== 0) throw Error(stage);
+    if (exit.exit_code !== 0) throw Error(stage);
     stage = "proof_runtime";
-    exit = await invoke(
+    exit = await invokeProofDocker(
       proofDockerArguments(image, name, architecture),
       join(directory, "runtime.private.log"),
       150000,
     );
-    if (exit !== 0) throw Error(stage);
+    if (exit.exit_code !== 0) {
+      const inspectLog = join(directory, "inspect.private.log"),
+        inspection = await invokeProofDocker(
+          [
+            "inspect",
+            "--format",
+            '{"exit_code":{{.State.ExitCode}},"oom_killed":{{.State.OOMKilled}},"status":"{{.State.Status}}"}',
+            name,
+          ],
+          inspectLog,
+          30000,
+        ).catch(() => null);
+      let container = null;
+      if (inspection?.exit_code === 0) {
+        const state = await readFile(inspectLog, "utf8")
+          .then((value) => JSON.parse(value))
+          .catch(() => null);
+        if (
+          state &&
+          Number.isInteger(state.exit_code) &&
+          typeof state.oom_killed === "boolean" &&
+          /^(created|running|paused|restarting|removing|exited|dead)$/.test(state.status)
+        )
+          container = {
+            exit_code: state.exit_code,
+            oom_killed: state.oom_killed,
+            status: state.status,
+          };
+      }
+      await writeFile(
+        join(process.env.RUNNER_TEMP ?? directory, "pgcf-sandbox-proof-failure.safe.json"),
+        JSON.stringify(
+          await sandboxProofFailure(
+            exit,
+            join(directory, "runtime.private.log"),
+            container,
+          ),
+          null,
+          2,
+        ) + "\n",
+        { mode: 0o600, flag: "wx" },
+      );
+      throw Error(stage);
+    }
     const lines = (
         await readFile(join(directory, "runtime.private.log"), "utf8")
       )
@@ -198,12 +305,12 @@ export async function runSandboxProof() {
   } catch {
     throw Error(stage);
   } finally {
-    await invoke(
+    await invokeProofDocker(
       ["rm", "-f", name],
       join(directory, "cleanup-container.private.log"),
       30000,
     );
-    await invoke(
+    await invokeProofDocker(
       ["image", "rm", "-f", image],
       join(directory, "cleanup-image.private.log"),
       30000,

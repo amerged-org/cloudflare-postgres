@@ -229,6 +229,15 @@ jobs:
             "$PGCF_SLOT_TEST_IMAGE"
       - name: Check the shared sandbox against ordinary containerd and isolated CRI namespaces
         run: node infra/talos/sandbox/run-proof.ts
+      - name: Retain safe sandbox failure metadata
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: pgcf-sandbox-proof-failure-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/pgcf-sandbox-proof-failure.safe.json
+          if-no-files-found: ignore
+          retention-days: 90
+          overwrite: false
       - name: Render the Kubernetes manifests
         run: |
           test -x "$PGCF_TEST_KUBECTL"
