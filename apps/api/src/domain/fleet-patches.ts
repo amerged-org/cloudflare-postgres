@@ -363,11 +363,27 @@ export async function fleetPatchInput(
     storageAuthority.sha256 !== spec.storage_authority_keys_sha256
   )
     return closed();
-  const bootstrapOwner = await env.DB.prepare(
-    "SELECT input_hash FROM node_bootstrap_jobs WHERE node_id=? AND region_id=? AND admitted=1 AND cancelled=0 ORDER BY created_at DESC LIMIT 1",
-  )
-    .bind(row.node_id, row.region_id)
-    .first<{ input_hash: string }>();
+  const bootstrapOwner =
+    row.bootstrap_operation_id === null
+      ? await env.DB.prepare(
+          `SELECT j.input_hash FROM node_bootstrap_jobs j
+          JOIN node_additions a ON a.operation_id=j.operation_id AND a.node_id=j.node_id AND a.region_id=j.region_id
+          JOIN nodes n ON n.id=j.node_id AND n.region_id=j.region_id AND n.provider_instance_id=a.provider_instance_id
+          WHERE j.node_id=? AND j.region_id=? AND n.node_uid=? AND j.admitted=1 AND j.cancelled=0
+          AND json_extract(j.checkpoint_json,'$.stage')='quarantine_released'
+          AND json_extract(j.checkpoint_json,'$.status')='released'
+          AND json_extract(j.checkpoint_json,'$.admission_receipt.operation_id')=j.operation_id
+          AND json_extract(j.checkpoint_json,'$.admission_receipt.node_id')=j.node_id
+          AND json_extract(j.checkpoint_json,'$.admission_receipt.region_id')=j.region_id
+          AND json_extract(j.checkpoint_json,'$.admission_receipt.input_hash')=j.input_hash
+          AND json_extract(j.checkpoint_json,'$.admission_receipt.node_uid')=n.node_uid
+          AND json_extract(j.checkpoint_json,'$.admission_receipt.kube_system_uid')=?
+          AND json_extract(j.checkpoint_json,'$.admission_receipt.quarantine_removed')=1
+          ORDER BY j.created_at DESC LIMIT 1`,
+        )
+          .bind(row.node_id, row.region_id, row.node_uid, row.cluster_uid)
+          .first<{ input_hash: string }>()
+      : null;
   const prior = await env.DB.prepare(
     `SELECT p.talos_upgrade_receipt_json,p.observed_json FROM fleet_patch_operations p JOIN fleet_node_release_observations o ON o.node_id=p.node_id JOIN regions r ON r.id=p.region_id WHERE p.node_id=? AND p.node_uid=? AND p.cluster_uid=? AND p.stage IN('complete','host_ready') AND p.talos_upgrade_receipt_json IS NOT NULL AND o.node_uid=p.node_uid AND o.agent_key_hash=r.agent_key_hash ORDER BY p.updated_at DESC LIMIT 1`,
   )

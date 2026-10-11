@@ -92,6 +92,98 @@ test("new fixed /var files use boot-safe create; a declaration requiring nonexis
     "persistent configuration must recreate the two fixed files after a reboot",
   );
 });
+test("admitted host configuration removes only persisted bootstrap quarantine even when host files already match", async () => {
+  const declared = parseAllDocuments(
+    mergeHostConfiguration(raw(source), host),
+  ).map((document) => document.toJSON());
+  const node = {
+    apiVersion: "v1alpha1",
+    kind: "KubeNodeConfig",
+    labels: { retained: "label" },
+    taints: {
+      "pgcf.io/quarantine": "bootstrap:NoSchedule",
+      "customer.example/retained": "owned:NoSchedule",
+    },
+  };
+  let current = [...declared, node],
+    writes = 0;
+  const commands = {
+    talos: async (args: string[], stdin?: string) => {
+      if (args[0] === "apply-config") {
+        writes++;
+        assert.ok(args.includes("--mode=no-reboot"));
+        current = parseAllDocuments(stdin!).map((document) =>
+          document.toJSON(),
+        );
+        throw Error("lost_apply_response");
+      }
+      return configList(current);
+    },
+  };
+  const before = await readHostConfiguration(
+    commands,
+    host,
+    undefined,
+    false,
+    undefined,
+    false,
+    true,
+  );
+  assert.equal(
+    before.configured,
+    false,
+    "matching host files cannot skip persisted quarantine",
+  );
+  await applyHostConfiguration(commands, host, before, true);
+  const after = await readHostConfiguration(
+    commands,
+    host,
+    undefined,
+    false,
+    undefined,
+    false,
+    true,
+  );
+  assert.equal(after.configured, true);
+  assert.deepEqual(current.slice(0, -1), declared);
+  assert.deepEqual(current.at(-1), {
+    ...node,
+    taints: { "customer.example/retained": "owned:NoSchedule" },
+  });
+  await applyHostConfiguration(commands, host, after, true);
+  assert.equal(writes, 1);
+  const held = [...declared, node];
+  assert.deepEqual(
+    parseAllDocuments(mergeHostConfiguration(raw(held), host)).map((document) =>
+      document.toJSON(),
+    ),
+    held,
+    "pre-admission input preserves quarantine",
+  );
+  assert.throws(
+    () =>
+      mergeHostConfiguration(
+        raw([
+          ...declared,
+          {
+            ...node,
+            taints: {
+              ...node.taints,
+              "pgcf.io/quarantine": "foreign:NoSchedule",
+            },
+          },
+        ]),
+        host,
+        false,
+        true,
+      ),
+    /quarantine_taint_mismatch/,
+  );
+  assert.throws(
+    () => mergeHostConfiguration(raw([...held, node]), host, false, true),
+    /configuration_resource_invalid/,
+  );
+});
 test("a persisted new declaration cannot prove unchanged old physical host files", async () => {
   const declared = parseAllDocuments(
     mergeHostConfiguration(raw(source), host),

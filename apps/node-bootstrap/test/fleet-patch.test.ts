@@ -45,6 +45,7 @@ function runtime(
   let assetRequest: typeof fetch | undefined;
   let servingCertificate: string | undefined;
   let physicalHostFiles: Map<string, string> | undefined;
+  let nodeTaints: Record<string, unknown>[] = [];
   const resource = (type: string, id: string, spec: unknown) =>
     JSON.stringify({ metadata: { type, id }, spec });
   const node = () => ({
@@ -53,6 +54,7 @@ function runtime(
       uid: facts.node_uid,
       labels: { "node-role.kubernetes.io/control-plane": "" },
     },
+    spec: { taints: nodeTaints },
     status: {
       nodeInfo: {
         systemUUID: facts.system_uuid,
@@ -104,6 +106,9 @@ function runtime(
     },
     set physicalHostFiles(value: Map<string, string>) {
       physicalHostFiles = value;
+    },
+    set nodeTaints(value: Record<string, unknown>[]) {
+      nodeTaints = value;
     },
     turn: () =>
       runFleetPatch(
@@ -861,6 +866,17 @@ test("a current-custody host-only finalization skips every OS and Kubernetes wri
   };
   const pin = await servingPinFixture(r);
   try {
+    r.nodeTaints = [
+      { key: "pgcf.io/quarantine", value: "bootstrap", effect: "NoSchedule" },
+    ];
+    await r.turn();
+    assert.equal(
+      r.current.stage,
+      "host_service",
+      "vendor taint removal must be observed before runtime admission",
+    );
+    assert.equal(pin.writes(), 0);
+    r.nodeTaints = [];
     await r.turn();
     assert.equal(r.current.stage, "runtime_admission");
     assert.equal(r.current.state, "pending");

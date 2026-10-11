@@ -49,7 +49,7 @@ const RegionTarget = z
       });
   });
 /** The array order is the maintenance order, both between clusters and between hosts. */
-export const FleetRolloutRequest = z
+const FleetRolloutRequestCore = z
   .strictObject({
     release_id: FleetReleaseId,
     maintenance_acknowledged: z.literal(true),
@@ -71,8 +71,11 @@ export const FleetRolloutRequest = z
         message: "Select at most 100 distinct nodes per request",
       });
   });
+export const FleetRolloutRequest = FleetRolloutRequestCore.safeExtend({
+  expected_previous_rollout_id: OperationId.optional(),
+});
 export type FleetRolloutRequest = z.infer<typeof FleetRolloutRequest>;
-export const FleetRolloutIntent = FleetRolloutRequest.safeExtend({
+const FleetRolloutIntentCore = FleetRolloutRequestCore.safeExtend({
   rollout_id: OperationId,
   created_at: z.iso.datetime(),
   regions: z
@@ -89,6 +92,9 @@ export const FleetRolloutIntent = FleetRolloutRequest.safeExtend({
     )
     .min(1)
     .max(10),
+});
+export const FleetRolloutIntent = FleetRolloutIntentCore.safeExtend({
+  previous_intent: FleetRolloutIntentCore.strip().optional(),
 });
 export type FleetRolloutIntent = z.infer<typeof FleetRolloutIntent>;
 export const FleetRolloutStatus = z.strictObject({

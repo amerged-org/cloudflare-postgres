@@ -30,7 +30,7 @@ export function registerFleetRollouts(app: ApiApp) {
       tags: ["Fleet patches"],
       security: [{ bearerAuth: [] }],
       description:
-        "Atomically selects an approved release for ordered region/physical-node members and starts serial Cloudflare convergence. Existing patches and uncertain writes are resumed from the same journal; fresh identities and acknowledged maintenance are required. No server is bought or reinstalled.",
+        "Atomically selects an approved release for ordered region/physical-node members and starts serial Cloudflare convergence. An explicit expected_previous_rollout_id may replace a quiescent held intent while preserving physical identities and immutable patch receipts; dispatched or uncertain writes block replacement. Only the immediate predecessor intent is retained. Fresh identities and acknowledged maintenance are required. No server is bought or reinstalled.",
       request: {
         headers: z.object({ "Idempotency-Key": IdempotencyKey }),
         body: { required: true, content: json(FleetRolloutRequest) },

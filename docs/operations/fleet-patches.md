@@ -66,7 +66,8 @@ placement closures and synchronizes version metadata. A future owned profile upd
 exact previous owned fields; unrelated scheduling and controller status are preserved.
 After the entire preceding fleet rollout is complete, its confirmed `host_ready` history does
 not block selection of a new release. Unconfirmed records and uncertain writes remain blockers;
-starting a new release cannot bypass an incomplete preceding fleet rollout.
+normal selection of a new release requires the preceding fleet rollout to be complete. The
+explicit held replacement described below requires a quiescent predecessor.
 
 Talos is upgraded through the official no-reboot lifecycle command using the exact qualified
 installer digest. Positive CLI completion is persisted before a separately fenced reboot.
@@ -211,6 +212,19 @@ component is skipped; an interrupted patch resumes its original operation and di
 state. A halted write or changed Node/Cluster UID remains blocked. Repeating the original
 request with the same idempotency key reads and resumes its committed intent rather than
 creating another patch. This endpoint does not purchase a server or reinstall a node.
+
+A replacement of an explicitly held, quiescent rollout includes
+`expected_previous_rollout_id` identifying the current intent. It preserves the regional
+members and physical Node/Cluster UIDs; dispatched or uncertain writes block replacement.
+The old patch operations and receipts remain immutable. Existing EU hold remains in force:
+replacement selection does not authorize its authority activation or advance it before the
+US canary gates pass. The old rollout reports `blocked` with
+`identity_or_assignment_changed` after its assignments change.
+
+The existing region intent retains one `previous_intent` snapshot containing only the
+immediate predecessor's core intent. A snapshot excludes its own `previous_intent` and
+request-only predecessor reference; deeper references are not retained. This is part of the
+same desired-state selection, with no new mutation journal or history chain.
 
 Example with a reviewed JSON request saved locally:
 

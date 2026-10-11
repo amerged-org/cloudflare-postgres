@@ -1213,7 +1213,9 @@ impl controller_server::Controller for SandboxController {
             (slot, "on_demand")
         };
         // A failed or uncertain claim is consumed, killed and never reinserted.
-        let assignment = slot.assign(&input.netns_path, &config.hostname);
+        let assignment = slot
+            .assign(&input.netns_path, &config.hostname)
+            .and_then(|()| crate::sandbox_files::create(&input.sandbox_id, &config));
         if assignment.is_err() {
             let _ = slot.stop().await;
             let _: Result<(), _> = transport::shim_call(
@@ -1248,8 +1250,9 @@ impl controller_server::Controller for SandboxController {
         assignment?;
         if let Err(error) = save_owner(&id, pool.assigned.get(&id).unwrap()) {
             let entry = pool.assigned.get_mut(&id).unwrap();
+            entry.slot.stop().await?;
+            crate::sandbox_files::cleanup(&id)?;
             entry.created = false;
-            let _ = entry.slot.stop().await;
             return Err(error);
         }
         Ok(Response::new(ControllerCreateResponse { sandbox_id: id }))
@@ -1457,6 +1460,9 @@ impl controller_server::Controller for SandboxController {
         let mut pool = self.pool.lock().await;
         let mut retired = None;
         if let Some(assigned) = pool.assigned.get_mut(&input.sandbox_id) {
+            if assigned.created {
+                crate::sandbox_files::cleanup(&input.sandbox_id)?;
+            }
             if assigned.protective_storage_authority.is_some() {
                 assigned.started = false;
                 save_owner_mode(&input.sandbox_id, assigned, true)?;

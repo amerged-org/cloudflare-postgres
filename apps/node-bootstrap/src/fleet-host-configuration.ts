@@ -41,25 +41,54 @@ function files(machine: Json): Json[] {
     throw new BootstrapError("patch_host_configuration_duplicate_path");
   return rows;
 }
+function quarantineTaints(values: Json[]): Json | undefined {
+  const nodes = values.filter((value) => value.kind === "KubeNodeConfig");
+  if (
+    nodes.length > 1 ||
+    (nodes.length === 1 && nodes[0]!.apiVersion !== "v1alpha1")
+  )
+    throw new BootstrapError("patch_host_configuration_resource_invalid");
+  const value = nodes[0]?.taints;
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    throw new BootstrapError("patch_host_configuration_resource_invalid");
+  const taints = value as Json;
+  if (
+    Object.hasOwn(taints, "pgcf.io/quarantine") &&
+    taints["pgcf.io/quarantine"] !== "bootstrap:NoSchedule"
+  )
+    throw new BootstrapError("quarantine_taint_mismatch");
+  return taints;
+}
 export function hostConfigurationMatches(
   raw: string,
   id: string,
   input: NodeHostConfigurationPrivate,
+  admitted = false,
 ) {
-  const actual = files(machineConfigurationDocuments(raw, id).machine);
-  return input.files.every((expected) => {
-    const found = actual.find((value) => value.path === expected.path);
-    return (
-      found?.content === expected.content &&
-      found.permissions === expected.permissions &&
-      found.op === "create"
-    );
-  });
+  const parsed = machineConfigurationDocuments(raw, id),
+    actual = files(parsed.machine);
+  return (
+    (!admitted ||
+      !Object.hasOwn(
+        quarantineTaints(parsed.values) ?? {},
+        "pgcf.io/quarantine",
+      )) &&
+    input.files.every((expected) => {
+      const found = actual.find((value) => value.path === expected.path);
+      return (
+        found?.content === expected.content &&
+        found.permissions === expected.permissions &&
+        found.op === "create"
+      );
+    })
+  );
 }
 export function mergeHostConfiguration(
   raw: string,
   input: NodeHostConfigurationPrivate,
   requireThinPool = false,
+  admitted = false,
 ) {
   const parsed = machineConfigurationDocuments(raw, "v1alpha1"),
     current = files(parsed.machine),
@@ -73,6 +102,10 @@ export function mergeHostConfiguration(
     // overwrite requires an existing file and blocks boot before system services otherwise.
     ...input.files.map((file) => ({ ...file, op: "create" })),
   ];
+  if (admitted) {
+    const taints = quarantineTaints(parsed.values);
+    if (taints) delete taints["pgcf.io/quarantine"];
+  }
   if (requireThinPool) {
     const modules = parsed.values.filter(
       (value) =>
@@ -159,6 +192,7 @@ export async function readHostConfiguration(
   requireThinPool = false,
   boot?: Parameters<typeof readMachineConfiguration>[1],
   requireMaterializedFiles = false,
+  admitted = false,
 ) {
   const value =
     configuration ?? (await readMachineConfiguration(commands, boot));
@@ -178,9 +212,14 @@ export async function readHostConfiguration(
         (value.persistent
           ? moduleConfigured(value.persistent, "persistent")
           : !!value.state_loaded))) &&
-    hostConfigurationMatches(value.active, "v1alpha1", input) &&
+    hostConfigurationMatches(value.active, "v1alpha1", input, admitted) &&
     (value.persistent
-      ? hostConfigurationMatches(value.persistent, "persistent", input)
+      ? hostConfigurationMatches(
+          value.persistent,
+          "persistent",
+          input,
+          admitted,
+        )
       : !!value.state_loaded);
   const materialized =
     !requireMaterializedFiles ||
@@ -204,6 +243,7 @@ export async function applyHostConfiguration(
   commands: HostConfigurationCommands,
   input: NodeHostConfigurationPrivate,
   expected: Awaited<ReturnType<typeof readHostConfiguration>>,
+  admitted = false,
 ) {
   const latest = await readHostConfiguration(
     commands,
@@ -211,6 +251,8 @@ export async function applyHostConfiguration(
     undefined,
     expected.thin_pool_required,
     expected.state_loaded,
+    false,
+    admitted,
   );
   if (latest.sha256 !== expected.sha256)
     throw new BootstrapError("patch_host_configuration_changed_before_write");
@@ -218,7 +260,12 @@ export async function applyHostConfiguration(
   await commands
     .talos(
       ["apply-config", "--mode=no-reboot", "--file=-"],
-      mergeHostConfiguration(latest.active, input, expected.thin_pool_required),
+      mergeHostConfiguration(
+        latest.active,
+        input,
+        expected.thin_pool_required,
+        admitted,
+      ),
     )
     .catch(() => undefined);
 }

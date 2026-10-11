@@ -38,12 +38,94 @@ export async function readFleetRolloutIntent(
 ): Promise<FleetRolloutIntent> {
   const row = await db
     .prepare(
-      "SELECT rollout_json FROM fleet_region_releases WHERE json_extract(rollout_json,'$.rollout_id')=? LIMIT 1",
+      "SELECT rollout_json FROM fleet_region_releases WHERE json_extract(rollout_json,'$.rollout_id')=? OR json_extract(rollout_json,'$.previous_intent.rollout_id')=? LIMIT 1",
     )
-    .bind(id)
+    .bind(id, id)
     .first<{ rollout_json: string }>();
   if (!row) throw new ApiError("not_found", "Fleet rollout not found");
-  return FleetRolloutIntent.parse(JSON.parse(row.rollout_json));
+  const intent = FleetRolloutIntent.parse(JSON.parse(row.rollout_json));
+  return intent.rollout_id === id
+    ? intent
+    : FleetRolloutIntent.parse(intent.previous_intent);
+}
+
+function quiescentRolloutSql(intent: FleetRolloutIntent) {
+  const regions = JSON.stringify(intent.regions);
+  return {
+    sql: `NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND NOT(p.state='confirmed' AND p.stage IN('complete','host_ready')))
+      AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs j WHERE j.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND j.admitted=0 AND j.cancelled=0)
+      AND NOT EXISTS(SELECT 1 FROM node_additions a WHERE a.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND (a.status NOT IN('ready','failed','cancelled') OR a.failure_code='provider_unknown'))
+      AND NOT EXISTS(SELECT 1 FROM node_provider_mutations m JOIN node_additions a ON a.operation_id=m.operation_id WHERE a.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND m.state IN('dispatching','unknown'))
+      AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations p JOIN json_each(?) r ON p.region_id=json_extract(r.value,'$.region_id') WHERE json_extract(r.value,'$.rotation.phase')='snapshot' AND json_extract(r.value,'$.rotation.state')='halted' AND p.release_id=? AND p.region_revision=json_extract(r.value,'$.revision'))`,
+    bindings: [regions, regions, regions, regions, regions, intent.release_id],
+  };
+}
+async function assertHeldReplacement(
+  env: Env,
+  previous: FleetRolloutIntent,
+  input: FleetRolloutRequest,
+) {
+  await assertIntent(env, previous);
+  if (previous.release_id === input.release_id) return changed();
+  const identity = (regions: FleetRolloutRequest["regions"]) =>
+    JSON.stringify(
+      regions.map((region) => ({
+        region_id: region.region_id,
+        cluster_uid: region.cluster_uid,
+        nodes: region.nodes.map(({ node_id, node_uid, role, address }) => ({
+          node_id,
+          node_uid,
+          role,
+          address,
+        })),
+      })),
+    );
+  if (identity(previous.regions) !== identity(input.regions)) return changed();
+  for (const [index, region] of previous.regions.entries()) {
+    const target = input.regions[index]!;
+    const held =
+      region.rotation?.phase === "snapshot" &&
+      region.rotation.state === "halted" &&
+      region.rotation.revision === 0 &&
+      region.rotation.node_index === 0 &&
+      region.rotation.error_code === "operator_hold_us_acceptance" &&
+      region.staged_material_revision === region.current_material_revision + 1;
+    if (held) {
+      if (
+        target.staged_material_revision !== region.staged_material_revision ||
+        target.material_revision !== region.current_material_revision
+      )
+        return changed();
+      const wrote = await env.DB.prepare(
+        "SELECT 1 present FROM fleet_patch_operations WHERE region_id=? AND release_id=? AND region_revision=? LIMIT 1",
+      )
+        .bind(region.region_id, previous.release_id, region.revision)
+        .first();
+      if (wrote) return changed();
+    } else {
+      if (
+        target.staged_material_revision !== undefined ||
+        (region.staged_material_revision !== undefined &&
+          (region.current_material_revision !==
+            region.staged_material_revision ||
+            region.rotation?.phase !== "complete" ||
+            region.rotation.state !== "confirmed"))
+      )
+        return changed();
+      for (const node of region.nodes) {
+        const patch = await latestPatch(env, previous, node);
+        if (patch?.stage !== "complete" || patch.state !== "confirmed")
+          return changed();
+      }
+    }
+  }
+  const quiet = quiescentRolloutSql(previous);
+  if (
+    !(await env.DB.prepare(`SELECT 1 valid WHERE ${quiet.sql}`)
+      .bind(...quiet.bindings)
+      .first())
+  )
+    return changed();
 }
 /** Shared atomic authority for the existing intent, custody activation and issued capabilities. */
 export function fleetRolloutAuthoritySql(input: FleetRolloutIntent): {
@@ -351,6 +433,13 @@ export async function advanceFleetRollout(
 ): Promise<FleetRolloutStatus> {
   // Resolve an acknowledged verification/uncertain custody activation before ordinary material checks.
   const initial = await readFleetRolloutIntent(env.DB, id);
+  const current = fleetRolloutAuthoritySql(initial);
+  if (
+    !(await env.DB.prepare(`SELECT 1 valid WHERE ${current.sql}`)
+      .bind(...current.bindings)
+      .first())
+  )
+    return changed();
   for (const region of initial.regions) {
     if (
       region.staged_material_revision &&
@@ -542,11 +631,24 @@ export async function createFleetRollout(
         .first<{ spec_json: string }>();
       if (!selected) throw new ApiError("not_found", "Fleet release not found");
       const spec = FleetReleaseSpec.parse(JSON.parse(selected.spec_json));
+      const { expected_previous_rollout_id, ...desired } = input;
+      const previous = expected_previous_rollout_id
+        ? await readFleetRolloutIntent(
+            c.env.DB,
+            expected_previous_rollout_id,
+          ).catch((error: unknown) => {
+            if (error instanceof ApiError && error.code === "not_found")
+              return changed();
+            throw error;
+          })
+        : undefined;
+      if (previous) await assertHeldReplacement(c.env, previous, input);
       const intent: FleetRolloutIntent = {
-        ...input,
+        ...desired,
         rollout_id: newOperationId(),
         created_at: new Date().toISOString(),
         regions: [],
+        ...(previous ? { previous_intent: previous } : {}),
       };
       const snapshot: unknown[] = [];
       for (const target of input.regions) {
@@ -567,8 +669,11 @@ export async function createFleetRollout(
           row.bootstrap_material_revision !== target.material_revision
         )
           return changed();
+        if (previous && row.rollout_json !== JSON.stringify(previous))
+          return changed();
         if (
           row.rollout_json &&
+          !previous &&
           (
             await readFleetRollout(
               c.env,
@@ -629,6 +734,15 @@ export async function createFleetRollout(
           revision,
           current_material_revision: target.material_revision,
           nodes: members,
+          ...(previous?.regions.find(
+            (region) => region.region_id === target.region_id,
+          )?.rotation?.state === "halted"
+            ? {
+                rotation: previous.regions.find(
+                  (region) => region.region_id === target.region_id,
+                )!.rotation,
+              }
+            : {}),
         };
         await assertCluster(c.env, region);
         for (const node of region.nodes) {
@@ -694,9 +808,12 @@ export async function createFleetRollout(
       const guard = `NOT EXISTS(SELECT 1 FROM json_each(?) targets LEFT JOIN regions r ON r.id=json_extract(targets.value,'$.region_id') LEFT JOIN fleet_region_releases f ON f.region_id=r.id WHERE r.id IS NULL OR COALESCE(f.revision,0)<>json_extract(targets.value,'$.revision') OR f.rollout_json IS NOT json_extract(targets.value,'$.rollout_json') OR r.bootstrap_material_revision<>json_extract(targets.value,'$.material_revision') OR (SELECT count(*) FROM nodes WHERE region_id=r.id AND lost_at IS NULL)<>json_array_length(targets.value,'$.nodes')) AND NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members LEFT JOIN nodes n ON n.id=json_extract(members.value,'$.node_id') LEFT JOIN fleet_node_releases a ON a.node_id=n.id WHERE n.id IS NULL OR n.region_id<>json_extract(regions.value,'$.region_id') OR n.node_uid<>json_extract(members.value,'$.node_uid') OR n.lost_at IS NOT NULL OR n.ready<>1 OR julianday(n.last_observed_at)<julianday('now','-180 seconds') OR julianday(n.last_observed_at)>julianday('now','+5 seconds') OR n.last_observed_at IS NULL OR COALESCE(a.revision,0)<>json_extract(members.value,'$.expected_revision') OR (json_type(members.value,'$.compute_pool') IS NOT NULL AND COALESCE((SELECT revision FROM node_compute_pool_policies WHERE node_id=n.id),0)<>json_extract(members.value,'$.compute_pool.expected_revision'))) AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND p.stage<>'complete' AND NOT(p.stage='host_ready' AND p.state='confirmed') AND (p.release_id<>? OR NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members WHERE json_extract(members.value,'$.node_id')=p.node_id AND json_extract(members.value,'$.node_uid')=p.node_uid AND json_extract(members.value,'$.assignment_revision')=p.assignment_revision AND json_extract(regions.value,'$.revision')=p.region_revision)))`;
       const owner =
         "EXISTS(SELECT 1 FROM fleet_region_releases WHERE region_id=? AND rollout_json=?)";
+      const replacement = previous
+        ? quiescentRolloutSql(previous)
+        : { sql: "1=1", bindings: [] };
       const statements: D1PreparedStatement[] = [
         c.env.DB.prepare(
-          `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at,rollout_json) SELECT ?,?,?,?,? WHERE ${guard} ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,revision=excluded.revision,updated_at=excluded.updated_at,rollout_json=excluded.rollout_json`,
+          `INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at,rollout_json) SELECT ?,?,?,?,? WHERE ${guard} AND (${replacement.sql}) ON CONFLICT(region_id) DO UPDATE SET release_id=excluded.release_id,revision=excluded.revision,updated_at=excluded.updated_at,rollout_json=excluded.rollout_json`,
         ).bind(
           anchor.region_id,
           intent.release_id,
@@ -708,6 +825,7 @@ export async function createFleetRollout(
           JSON.stringify(intent.regions),
           intent.release_id,
           JSON.stringify(intent.regions),
+          ...replacement.bindings,
         ),
       ];
       for (const region of intent.regions) {

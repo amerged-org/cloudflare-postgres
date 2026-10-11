@@ -222,6 +222,175 @@ async function setup() {
   }
   return { ...f, release, spec, input, runtime, started, send, us, control };
 }
+it("an explicit quiescent held rollout replacement preserves its immediate predecessor, EU hold and completed receipts", async () => {
+  const f = await setup(),
+    original = structuredClone(
+      f.input,
+    ) as import("@pgcf/contracts/fleet-rollouts").FleetRolloutRequest;
+  original.regions[1]!.staged_material_revision = 2;
+  const response = await f.send(original as typeof f.input),
+    { rollout_id } = (await response.json()) as { rollout_id: string };
+  expect(response.status).toBe(202);
+  const before = await readFleetRolloutIntent(env.DB, rollout_id),
+    held = structuredClone(before);
+  held.regions[1]!.rotation = {
+    revision: 0,
+    phase: "snapshot",
+    node_index: 0,
+    state: "halted",
+    error_code: "operator_hold_us_acceptance",
+  };
+  await writeFleetRolloutIntent(f.runtime, before, held);
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='complete',state='confirmed' WHERE node_id=?",
+  )
+    .bind(f.us)
+    .run();
+  const oldPatch = await env.DB.prepare(
+      "SELECT * FROM fleet_patch_operations WHERE node_id=?",
+    )
+      .bind(f.us)
+      .first(),
+    nextRelease = `replacement-${crypto.randomUUID()}`,
+    nextSpec = structuredClone(f.spec);
+  for (const role of Object.values(nextSpec.roles)) {
+    role.talos_installer = `registry.example/new-golden@sha256:${"e".repeat(64)}`;
+    role.talos_schematic_sha256 = "f".repeat(64);
+  }
+  releases.push(nextRelease);
+  await env.DB.prepare(
+    "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+  )
+    .bind(
+      nextRelease,
+      JSON.stringify(nextSpec),
+      await installationHash(nextSpec),
+      new Date().toISOString(),
+    )
+    .run();
+  const next = structuredClone(original);
+  next.release_id = nextRelease;
+  next.expected_previous_rollout_id = rollout_id;
+  for (const region of next.regions) {
+    region.expected_revision = 1;
+    for (const node of region.nodes) node.expected_revision = 1;
+  }
+  const assignments = () =>
+      env.DB.prepare(
+        "SELECT node_id,node_uid,release_id,role,revision FROM fleet_node_releases ORDER BY node_id",
+      )
+        .all()
+        .then((value) => value.results),
+    saved = await assignments();
+  expect(
+    (
+      await f.send(
+        {
+          ...next,
+          expected_previous_rollout_id: newOperationId(),
+        } as typeof f.input,
+        "wrong-held-intent",
+      )
+    ).status,
+  ).toBe(409);
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='talos',state='dispatched' WHERE node_id=?",
+  )
+    .bind(f.us)
+    .run();
+  expect(
+    (await f.send(next as typeof f.input, "unknown-held-write")).status,
+  ).toBe(409);
+  expect(await assignments()).toEqual(saved);
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='complete',state='confirmed' WHERE node_id=?",
+  )
+    .bind(f.us)
+    .run();
+  const providerOperation = newOperationId(),
+    providerTime = new Date().toISOString();
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO node_additions(operation_id,node_id,region_id,request_key,request_hash,intent_hash,intent_json,status,created_at,updated_at) VALUES(?,?,?,?,?,?,'{}','ready',?,?)",
+    ).bind(
+      providerOperation,
+      f.us,
+      f.foreign,
+      crypto.randomUUID(),
+      "a".repeat(64),
+      "b".repeat(64),
+      providerTime,
+      providerTime,
+    ),
+    env.DB.prepare(
+      "INSERT INTO node_provider_mutations(operation_id,mutation,request_id,revision,state,created_at,updated_at) VALUES(?,'restart',?,1,'unknown',?,?)",
+    ).bind(providerOperation, crypto.randomUUID(), providerTime, providerTime),
+  ]);
+  expect(
+    (await f.send(next as typeof f.input, "unknown-provider-write")).status,
+  ).toBe(409);
+  expect(await assignments()).toEqual(saved);
+  await env.DB.prepare(
+    "UPDATE node_provider_mutations SET state='accepted' WHERE operation_id=?",
+  )
+    .bind(providerOperation)
+    .run();
+  const changedHold = structuredClone(held);
+  changedHold.regions[1]!.rotation!.state = "pending";
+  let raced = false;
+  f.runtime.DB = {
+    prepare: env.DB.prepare.bind(env.DB),
+    batch: async (statements: D1PreparedStatement[]) => {
+      if (!raced) {
+        raced = true;
+        await env.DB.prepare(
+          "UPDATE fleet_region_releases SET rollout_json=? WHERE rollout_json=?",
+        )
+          .bind(JSON.stringify(changedHold), JSON.stringify(held))
+          .run();
+      }
+      return env.DB.batch(statements);
+    },
+  } as D1Database;
+  expect(
+    (await f.send(next as typeof f.input, "changed-hold-before-cas")).status,
+  ).toBe(409);
+  expect(raced).toBe(true);
+  expect(await assignments()).toEqual(saved);
+  f.runtime.DB = env.DB;
+  await env.DB.prepare(
+    "UPDATE fleet_region_releases SET rollout_json=? WHERE rollout_json=?",
+  )
+    .bind(JSON.stringify(held), JSON.stringify(changedHold))
+    .run();
+  const accepted = await f.send(next as typeof f.input, "replace-held-intent");
+  expect(accepted.status).toBe(202);
+  const current = (await accepted.json()) as { rollout_id: string },
+    replacement = await readFleetRolloutIntent(env.DB, current.rollout_id);
+  expect(replacement.previous_intent).toEqual(held);
+  expect(replacement.regions[1]!.rotation).toEqual(held.regions[1]!.rotation);
+  expect(replacement.regions[1]!.staged_material_revision).toBe(2);
+  expect(
+    await env.DB.prepare(
+      "SELECT * FROM fleet_patch_operations WHERE operation_id=?",
+    )
+      .bind(oldPatch!.operation_id)
+      .first(),
+  ).toEqual(oldPatch);
+  expect((await readFleetRollout(f.runtime, rollout_id)).state).toBe("blocked");
+  expect((await readFleetRollout(f.runtime, rollout_id)).reason).toBe(
+    "identity_or_assignment_changed",
+  );
+  const started = f.started.size;
+  await expect(advanceFleetRollout(f.runtime, rollout_id)).rejects.toThrow(
+    /identity|authority/i,
+  );
+  expect(f.started.size).toBe(started);
+  const replay = await f.send(original as typeof f.input);
+  expect(replay.status).toBe(202);
+  expect(((await replay.json()) as { state: string }).state).toBe("blocked");
+  expect(f.started.size).toBe(started);
+});
 it("a completed fleet can select its next release without reopening confirmed host-ready history or bypassing unknown writes", async () => {
   const f = await setup(),
     first = await f.send(),

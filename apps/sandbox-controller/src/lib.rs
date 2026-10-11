@@ -62,6 +62,8 @@ pub mod policy;
 #[cfg(target_os = "linux")]
 pub mod reclaim_inventory;
 #[cfg(target_os = "linux")]
+mod sandbox_files;
+#[cfg(target_os = "linux")]
 pub mod slot;
 #[cfg(target_os = "linux")]
 pub mod storage;

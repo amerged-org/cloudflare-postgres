@@ -179,6 +179,7 @@ export async function runFleetPatch(
   options: FleetPatchOptions = {},
 ): Promise<FleetPatchStatus> {
   const input = validateFleetPatchInput(raw),
+    admitted = !!input.initial_bootstrap_input_sha256,
     request = options.request ?? fetch,
     run = options.run ?? runCommand;
   const abort = new AbortController(),
@@ -370,7 +371,8 @@ export async function runFleetPatch(
       platformReadback: ReturnType<typeof fleetPlatformReadback> | undefined,
       machineConfiguration:
         Awaited<ReturnType<typeof readMachineConfiguration>> | undefined;
-    let observedBootId: string | undefined;
+    let observedBootId: string | undefined,
+      quarantineRemoved = true;
     const authorize = async (refreshHostPool = false) => {
       const refreshPool =
           (refreshHostPool ||
@@ -424,6 +426,29 @@ export async function runFleetPatch(
       });
       controlNode = observed.controlNode;
       const facts = observed.facts;
+      if (admitted) {
+        const node = observed.nodes.find(
+          (value) =>
+            object(value.metadata).uid === current.node_uid &&
+            object(value.metadata).name === input.k8s_node_name,
+        );
+        if (!node) throw new BootstrapError("patch_cluster_membership_changed");
+        const taints = object(node.spec ?? {}).taints;
+        if (taints !== undefined && !Array.isArray(taints))
+          throw new BootstrapError("quarantine_taint_mismatch");
+        const quarantine = ((taints ?? []) as unknown[])
+          .map(object)
+          .filter((value) => value.key === "pgcf.io/quarantine");
+        if (
+          quarantine.length > 1 ||
+          quarantine.some(
+            (value) =>
+              value.value !== "bootstrap" || value.effect !== "NoSchedule",
+          )
+        )
+          throw new BootstrapError("quarantine_taint_mismatch");
+        quarantineRemoved = quarantine.length === 0;
+      }
       observedBootId = facts.boot_id;
       facts.kubernetes_control_plane =
         object(observed.controlNode.metadata).uid === facts.node_uid;
@@ -645,6 +670,7 @@ export async function runFleetPatch(
           !!input.spec.thin_storage_qualification,
           undefined,
           !["preflight", "host_config"].includes(current.stage),
+          admitted,
         );
         if (host.matches)
           facts.host_configuration_sha256 =
@@ -901,8 +927,15 @@ export async function runFleetPatch(
     const facts = await fresh(),
       matches = fleetPatchRuntimeMatches(input, facts),
       target = input.spec.roles[input.role];
+    if (
+      admitted &&
+      !quarantineRemoved &&
+      ["verify", "runtime_admission", "release_verify"].includes(current.stage)
+    )
+      return current;
     if (current.state === "confirmed") {
       if (input.host_configuration_only && current.stage === "host_service") {
+        if (!quarantineRemoved) return current;
         await refreshServingPin();
         await checkpoint("runtime_admission", "pending", facts);
         return current;
@@ -933,13 +966,15 @@ export async function runFleetPatch(
           undefined,
           !!input.spec.thin_storage_qualification,
           machineConfiguration?.state_loaded,
+          false,
+          admitted,
         );
         await checkpoint("host_config", "dispatched", facts);
         const latest = await latePreflight(facts);
         if (!latest) return current;
         await authorize();
         try {
-          await applyHostConfiguration(hostCommands, host, before);
+          await applyHostConfiguration(hostCommands, host, before, admitted);
         } catch {
           await checkpoint(
             "host_config",
@@ -957,6 +992,7 @@ export async function runFleetPatch(
       if (!input.host_configuration_only)
         await checkpoint("host_service", "confirmed", facts);
       else if (
+        quarantineRemoved &&
         facts.sandbox_service_running === true &&
         facts.host_configuration_sha256 ===
           input.host_configuration?.status.sha256 &&
@@ -980,6 +1016,9 @@ export async function runFleetPatch(
           host,
           machineConfiguration,
           !!input.spec.thin_storage_qualification,
+          undefined,
+          false,
+          admitted,
         );
         if (!declared.configured)
           throw new BootstrapError(

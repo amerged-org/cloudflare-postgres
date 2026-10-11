@@ -330,6 +330,121 @@ it("uses current sealed custody without reopening a bootstrap job or touching pr
     (await request(`/v1/fleet/patches/${f.op}`, f.integrator)).status,
   ).toBe(403);
 });
+it("exposes the initial bootstrap hash only for the same admitted released Node and provider", async () => {
+  const f = await setup(),
+    operation = newOperationId(),
+    inputHash = "e".repeat(64),
+    provider = "retained-provider",
+    now = new Date().toISOString(),
+    receipt = {
+      version: 1,
+      operation_id: operation,
+      node_id: f.node,
+      region_id: f.region,
+      input_hash: inputHash,
+      checkpoint_revision: 1,
+      node_uid: f.nodeUid,
+      kube_system_uid: f.clusterUid,
+      previous_resource_version: "41",
+      resource_version: "42",
+      quarantine_removed: true,
+    },
+    checkpoint = {
+      stage: "quarantine_released",
+      status: "released",
+      downloaded_bytes: 1,
+      written_bytes: 1,
+      write_intent_offset: null,
+      destructive_intent: true,
+      sealed_ref: null,
+      pre_reboot_boot_id: null,
+      release_node_uid: f.nodeUid,
+      release_resource_version: "41",
+      admission_receipt: receipt,
+      error_code: null,
+    };
+  expect(
+    (await fleetPatchInput(f.runtime, f.op)).initial_bootstrap_input_sha256,
+  ).toBeUndefined();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE nodes SET provider_instance_id=? WHERE id=?").bind(
+      provider,
+      f.node,
+    ),
+    env.DB.prepare(
+      `INSERT INTO node_additions(operation_id,node_id,region_id,request_key,request_hash,intent_hash,intent_json,status,provider_instance_id,created_at,updated_at) VALUES(?,?,?,?,?,?,'{}','ready',?,?,?)`,
+    ).bind(
+      operation,
+      f.node,
+      f.region,
+      crypto.randomUUID(),
+      "a".repeat(64),
+      "b".repeat(64),
+      provider,
+      now,
+      now,
+    ),
+    env.DB.prepare(
+      `INSERT INTO node_bootstrap_jobs(operation_id,node_id,region_id,input_hash,inventory_revision,sealed_revision,input_ciphertext,input_iv,input_kid,callback_hash,revision,checkpoint_json,authorized,admitted,cancelled,admission_authorized,admission_expires_at,created_at,updated_at) VALUES(?,?,?,?,1,1,'retained-ciphertext','abcdefghijklmnop','retained-kid',?,2,?,0,1,0,0,?,?,?)`,
+    ).bind(
+      operation,
+      f.node,
+      f.region,
+      inputHash,
+      "c".repeat(64),
+      JSON.stringify(checkpoint),
+      new Date(Date.now() - 60000).toISOString(),
+      now,
+      now,
+    ),
+  ]);
+  const history = await env.DB.prepare(
+    "SELECT checkpoint_json,revision,authorized,admitted,admission_authorized,admission_expires_at FROM node_bootstrap_jobs WHERE operation_id=?",
+  )
+    .bind(operation)
+    .first();
+  expect(
+    (await fleetPatchInput(f.runtime, f.op)).initial_bootstrap_input_sha256,
+  ).toBe(inputHash);
+  expect(
+    await env.DB.prepare(
+      "SELECT checkpoint_json,revision,authorized,admitted,admission_authorized,admission_expires_at FROM node_bootstrap_jobs WHERE operation_id=?",
+    )
+      .bind(operation)
+      .first(),
+  ).toEqual(history);
+  await env.DB.prepare(
+    "UPDATE node_bootstrap_jobs SET checkpoint_json=json_set(checkpoint_json,'$.admission_receipt.node_uid',?) WHERE operation_id=?",
+  )
+    .bind(crypto.randomUUID(), operation)
+    .run();
+  expect(
+    (await fleetPatchInput(f.runtime, f.op)).initial_bootstrap_input_sha256,
+  ).toBeUndefined();
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET checkpoint_json=? WHERE operation_id=?",
+    ).bind(JSON.stringify(checkpoint), operation),
+    env.DB.prepare(
+      "UPDATE nodes SET provider_instance_id='replacement-provider' WHERE id=?",
+    ).bind(f.node),
+  ]);
+  expect(
+    (await fleetPatchInput(f.runtime, f.op)).initial_bootstrap_input_sha256,
+  ).toBeUndefined();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE nodes SET provider_instance_id=? WHERE id=?").bind(
+      provider,
+      f.node,
+    ),
+    env.DB.prepare(
+      "UPDATE node_bootstrap_jobs SET admitted=0,authorized=1,admission_authorized=1 WHERE operation_id=?",
+    ).bind(operation),
+  ]);
+  expect(
+    (await fleetPatchInput(f.runtime, f.op)).initial_bootstrap_input_sha256,
+  ).toBeUndefined();
+});
 async function runtimeAdmissionStatusFixture() {
   const f = await setup(true),
     now = new Date().toISOString(),

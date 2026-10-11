@@ -86,6 +86,14 @@ fn pod_config(name: &str) -> cri::PodSandboxConfig {
             attempt: 0,
         }),
         hostname: name.into(),
+        dns_config: Some(cri::DnsConfig {
+            servers: vec!["192.0.2.53".into(), "2001:db8::53".into()],
+            searches: vec![
+                "pgcf-proof.svc.cluster.local".into(),
+                "svc.cluster.local".into(),
+            ],
+            options: vec!["ndots:5".into(), "timeout:2".into()],
+        }),
         linux: Some(cri::LinuxPodSandboxConfig {
             security_context: Some(cri::LinuxSandboxSecurityContext {
                 namespace_options: Some(cri::NamespaceOption {
@@ -476,7 +484,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let daemon_socket = base.join("containerd.sock");
     let controller_socket = base.join("controller.sock");
     let config = format!(
-        "version=3\nroot=\"/run/pgcf-proof/containerd-root\"\nstate=\"/run/pgcf-proof/containerd-state\"\ndisabled_plugins=[\"io.containerd.cri.v1.images\",\"io.containerd.cri.v1.runtime\"]\n[grpc]\naddress=\"{}\"\n[proxy_plugins.pgcf]\ntype=\"sandbox\"\naddress=\"{}\"\n",
+        "version=3\nroot=\"/var/lib/containerd\"\nstate=\"/run/pgcf-proof/containerd-state\"\ndisabled_plugins=[\"io.containerd.cri.v1.images\",\"io.containerd.cri.v1.runtime\"]\n[grpc]\naddress=\"{}\"\n[proxy_plugins.pgcf]\ntype=\"sandbox\"\naddress=\"{}\"\n",
         daemon_socket.display(),
         controller_socket.display()
     );
@@ -609,6 +617,93 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut tasks = tasks::tasks_client::TasksClient::new(daemon_channel.clone());
     let mut evidence = Vec::new();
     let mut storage_stop_ms = 0.0;
+    // A refused pre-existing source never becomes owned merely because the failed sandbox is tracked.
+    let refused = "foreign-source";
+    let refused_directory =
+        PathBuf::from("/var/lib/containerd/io.containerd.grpc.v1.cri/sandboxes").join(refused);
+    fs::create_dir_all(&refused_directory)?;
+    fs::write(refused_directory.join("hostname"), b"foreign-preserved\n")?;
+    cmd(
+        "nsenter",
+        &[
+            &format!("--mount=/proc/{cri_host_pid}/ns/mnt"),
+            &format!("--pid=/proc/{cri_host_pid}/ns/pid"),
+            "--",
+            "ip",
+            "netns",
+            "add",
+            refused,
+        ],
+    );
+    let refused_subject = Sandbox {
+        sandbox_id: refused.into(),
+        runtime: Some(Runtime {
+            name: "io.containerd.runc.v2".into(),
+            options: None,
+        }),
+        sandboxer: "pgcf".into(),
+        ..Default::default()
+    };
+    store
+        .create(namespaced(
+            sandbox::StoreCreateRequest {
+                sandbox: Some(refused_subject.clone()),
+            },
+            NS,
+        )?)
+        .await?;
+    let rejected = runtime
+        .create(namespaced(
+            sandbox::ControllerCreateRequest {
+                sandbox_id: refused.into(),
+                netns_path: format!("/run/netns/{refused}"),
+                options: Some(prost_types::Any {
+                    type_url: "runtime.v1.PodSandboxConfig".into(),
+                    value: pod_config(refused).encode_to_vec(),
+                }),
+                sandbox: Some(refused_subject),
+                sandboxer: "pgcf".into(),
+                ..Default::default()
+            },
+            NS,
+        )?)
+        .await
+        .unwrap_err();
+    assert_eq!(rejected.code(), tonic::Code::FailedPrecondition);
+    runtime
+        .shutdown(namespaced(
+            sandbox::ControllerShutdownRequest {
+                sandbox_id: refused.into(),
+                sandboxer: "pgcf".into(),
+            },
+            NS,
+        )?)
+        .await?;
+    assert_eq!(
+        fs::read(refused_directory.join("hostname"))?,
+        b"foreign-preserved\n"
+    );
+    assert!(!refused_directory.join("resolv.conf").exists());
+    store
+        .delete(namespaced(
+            sandbox::StoreDeleteRequest {
+                sandbox_id: refused.into(),
+            },
+            NS,
+        )?)
+        .await?;
+    cmd(
+        "nsenter",
+        &[
+            &format!("--mount=/proc/{cri_host_pid}/ns/mnt"),
+            &format!("--pid=/proc/{cri_host_pid}/ns/pid"),
+            "--",
+            "ip",
+            "netns",
+            "delete",
+            refused,
+        ],
+    );
     for name in ["tenant-a", "tenant-b", "tenant-c"] {
         if name == "tenant-c" {
             lease.policy.target_slots = 0;
@@ -707,6 +802,27 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await?
             .into_inner();
         let assignment_ms = started.elapsed().as_secs_f64() * 1000.;
+        // Exercise the exact received CRI DNS/hostname options against the real owned daemon root.
+        // The fixture creates OCI tasks directly; Dev separately verifies CRI's automatic bind list.
+        let sandbox_files =
+            PathBuf::from("/var/lib/containerd/io.containerd.grpc.v1.cri/sandboxes").join(name);
+        let resolver = sandbox_files.join("resolv.conf");
+        let hostname = sandbox_files.join("hostname");
+        assert_eq!(
+            fs::read_to_string(&resolver).expect("prepared sandbox omitted CRI resolver source"),
+            "search pgcf-proof.svc.cluster.local svc.cluster.local\nnameserver 192.0.2.53\nnameserver 2001:db8::53\noptions ndots:5 timeout:2\n"
+        );
+        assert_eq!(
+            fs::read_to_string(&hostname).expect("prepared sandbox omitted CRI hostname source"),
+            format!("{name}\n")
+        );
+        for path in [&resolver, &hostname] {
+            assert_eq!(fs::metadata(path)?.permissions().mode() & 0o777, 0o644);
+        }
+        fs::write(
+            sandbox_files.join("unrelated-preserved"),
+            b"not-owned-by-file-setup",
+        )?;
         // The daemon's public wrapper omits these fields in 2.3.6. Its CRI
         // in-memory client uses this actual remote controller endpoint directly.
         let status = direct_runtime
@@ -795,6 +911,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error>> {
             format!("/pgcf-proof-{name}")
         };
         let mut spec = json!({"ociVersion":"1.2.1","root":{"path":rootfs,"readonly":true},"process":{"terminal":false,"user":{"uid":0,"gid":0},"args":["/bin/busybox","sh","-c","test -f /data/marker && /bin/busybox cat /data/marker && /bin/busybox sleep 60"],"env":["PATH=/bin"],"cwd":"/","capabilities":{"bounding":[],"effective":[],"permitted":[],"inheritable":[],"ambient":[]},"noNewPrivileges":true,"rlimits":[{"type":"RLIMIT_NOFILE","soft":1024,"hard":1024}]},"mounts":[{"destination":"/proc","type":"proc","source":"proc"},{"destination":"/dev","type":"tmpfs","source":"tmpfs"},{"destination":"/data","type":"bind","source":data,"options":["rbind","ro","nosuid","nodev"]}],"linux":{"cgroupsPath":cg,"resources":{"memory":{"limit":33554432},"pids":{"limit":16}},"namespaces":[{"type":"pid"},{"type":"mount"},{"type":"network","path":format!("/proc/{}/ns/net",assigned.pid)},{"type":"ipc","path":format!("/proc/{}/ns/ipc",assigned.pid)},{"type":"uts","path":format!("/proc/{}/ns/uts",assigned.pid)}]}});
+        spec["mounts"].as_array_mut().unwrap().extend([
+            json!({"destination":"/etc/resolv.conf","type":"bind","source":resolver,"options":["rbind","ro","nosuid","nodev"]}),
+            json!({"destination":"/etc/hostname","type":"bind","source":hostname,"options":["rbind","ro","nosuid","nodev"]}),
+        ]);
         if sql {
             use std::os::unix::ffi::OsStrExt;
             let directory = std::ffi::CString::new(data.as_os_str().as_bytes())?;
@@ -1244,6 +1364,15 @@ wait "$server"
                 NS,
             )?)
             .await?;
+        assert!(!resolver.exists() && !hostname.exists());
+        assert_eq!(
+            fs::read(sandbox_files.join("unrelated-preserved"))?,
+            b"not-owned-by-file-setup"
+        );
+        assert_eq!(
+            fs::read_to_string(data.join("marker"))?,
+            format!("committed-{name}")
+        );
         if sql {
             let owner_path = settings
                 .state
