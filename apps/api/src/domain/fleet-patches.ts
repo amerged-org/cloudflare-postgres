@@ -857,7 +857,8 @@ export async function continueFleetPatchRegion(
     .first<{ operation_id: string }>();
   return stale ? ensureFleetPatchFinalization(env, stale.operation_id) : null;
 }
-/** After current-material host completion, refresh only already-selected physical storage; no pool/class creation. */
+/** After current-material host completion, refresh only already-selected physical storage; no pool/class creation.
+ * A receipt additionally binds every unselected member that takes databases. */
 export async function refreshFleetPatchRegionStorage(
   env: Env,
   id: string,
@@ -872,16 +873,24 @@ export async function refreshFleetPatchRegionStorage(
   if (!selected) return closed();
   const spec = FleetReleaseSpec.parse(JSON.parse(selected.spec_json)),
     members = await env.DB.prepare(
-      "SELECT n.id,EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=n.id) selected FROM nodes n WHERE n.region_id=? AND n.lost_at IS NULL",
+      "SELECT n.id,n.database_placement_enabled,EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=n.id) selected FROM nodes n WHERE n.region_id=? AND n.lost_at IS NULL",
     )
       .bind(row.region_id)
-      .all<{ id: string; selected: number }>();
+      .all<{
+        id: string;
+        database_placement_enabled: number;
+        selected: number;
+      }>();
   const { refreshNodeThinStorageMaterial } =
     await import("./node-thin-storage-material.ts");
   let qualified = true;
   for (const member of members.results) {
     if (!member.selected) {
-      if (spec.thin_storage_qualification) qualified = false;
+      if (
+        spec.thin_storage_qualification &&
+        member.database_placement_enabled === 1
+      )
+        qualified = false;
       continue;
     }
     const current = await refreshNodeThinStorageMaterial(env, member.id);
@@ -923,14 +932,16 @@ export async function restoreFleetPatchPlacements(
     return false;
   const { readCurrentNodeThinStorage } = await import("./node-thin-storage.ts");
   const storageMembers = await env.DB.prepare(
-    "SELECT id FROM nodes WHERE region_id=? AND lost_at IS NULL",
+    "SELECT id,database_placement_enabled FROM nodes WHERE region_id=? AND lost_at IS NULL",
   )
     .bind(row.region_id)
-    .all<{ id: string }>();
+    .all<{ id: string; database_placement_enabled: number }>();
   for (const member of storageMembers.results) {
     const storage = await readCurrentNodeThinStorage(env, member.id);
     if (
-      (spec.thin_storage_qualification || storage) &&
+      ((spec.thin_storage_qualification &&
+        member.database_placement_enabled === 1) ||
+        storage) &&
       !storage?.authority?.write_allowed
     )
       return false;

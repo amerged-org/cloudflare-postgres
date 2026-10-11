@@ -18,7 +18,11 @@ import {
   recordFleetPatchCheckpoint,
   assertFleetPatchAuthority,
   fleetPatchAuthoritySql,
+  refreshFleetPatchRegionStorage,
+  restoreFleetPatchPlacements,
 } from "../../src/domain/fleet-patches.ts";
+import { readFleetNodeRelease } from "../../src/domain/fleet-releases.ts";
+import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import {
   storeRegionJoinBundle,
   importRegionAgentKey,
@@ -34,6 +38,7 @@ import {
 } from "@pgcf/contracts/region-material-rotation";
 import { FleetRolloutIntent } from "@pgcf/contracts/fleet-rollouts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
+import { standingPostjoinFixture } from "./postjoin-fixture.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -2113,4 +2118,48 @@ it("the longer collection window cannot authorize another physical Node UID", as
     }),
   ).rejects.toThrow("Fleet patch identity or authority changed");
   expect((await readFleetPatch(f.runtime, f.op)).revision).toBe(0);
+});
+
+it("a qualified release needs thin write authority only from database members and already selected nodes", async () => {
+  const f = await fixture();
+  await configureNodeRegionPolicy(env.DB, {
+    region_id: f.region,
+    max_nodes: 2,
+    purchases_enabled: false,
+    order: null,
+  });
+  releases.push((await standingPostjoinFixture(f.region)).id);
+  const op = (await env.DB.prepare(
+    "SELECT operation_id FROM fleet_patch_operations WHERE node_id=?",
+  )
+    .bind(f.node)
+    .first<string>("operation_id"))!;
+  // A control/relay member without placement keeps an existing selection bound to its authority.
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE nodes SET database_placement_enabled=0 WHERE id=?",
+    ).bind(f.node),
+    env.DB.prepare(
+      "UPDATE node_thin_storage SET status='blocked' WHERE node_id=?",
+    ).bind(f.node),
+  ]);
+  expect((await readFleetNodeRelease(env.DB, f.node)).state).toBe("pending");
+  expect(await restoreFleetPatchPlacements(env, op)).toBe(false);
+  await env.DB.prepare("DELETE FROM node_thin_storage WHERE node_id=?")
+    .bind(f.node)
+    .run();
+  expect((await readFleetNodeRelease(env.DB, f.node)).state).toBe("converged");
+  expect(await refreshFleetPatchRegionStorage(env, op)).toBe(true);
+  expect(await restoreFleetPatchPlacements(env, op)).toBe(true);
+  await env.DB.prepare(
+    "UPDATE nodes SET database_placement_enabled=1 WHERE id=?",
+  )
+    .bind(f.node)
+    .run();
+  expect(await readFleetNodeRelease(env.DB, f.node)).toMatchObject({
+    state: "pending",
+    mismatches: ["unobserved/current_material_storage"],
+  });
+  expect(await refreshFleetPatchRegionStorage(env, op)).toBe(false);
+  expect(await restoreFleetPatchPlacements(env, op)).toBe(false);
 });
