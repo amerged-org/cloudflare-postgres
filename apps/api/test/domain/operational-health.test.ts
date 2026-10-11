@@ -186,3 +186,44 @@ it("exposes bounded administrator health from real D1 samples and preserves miss
     new Set([...firstPage.data, ...nextPage.data].map((row) => row.id)),
   ).toEqual(new Set([created.database.id, second.database.id]));
 });
+
+it("reports every infrastructure alert kind of a region", async () => {
+  const f = await fixture(),
+    occurred_at = new Date().toISOString(),
+    kinds = [
+      "infrastructure_backup_failed",
+      "infrastructure_backup_stale",
+      "regional_node_cap_reached",
+      "regional_node_cpu_warning",
+      "regional_node_ram_warning",
+      "regional_node_stale",
+      "regional_node_storage_warning",
+      "regional_ram_warning",
+    ];
+  await env.DB.batch(
+    kinds.map((kind) =>
+      env.DB.prepare(
+        "INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES(?,?,1,?,?)",
+      ).bind(
+        f.region,
+        kind,
+        crypto.randomUUID(),
+        JSON.stringify({ kind, occurred_at }),
+      ),
+    ),
+  );
+  const response = await healthRequest(
+    "/v1/operational-health?scope=regions",
+    f.admin,
+  );
+  expect(response.status).toBe(200);
+  const regions = await response.json<{
+    data: { id: string; infrastructure_alerts?: { kind: string }[] }[];
+  }>();
+  expect(
+    regions.data
+      .find((row) => row.id === f.region)
+      ?.infrastructure_alerts?.map((alert) => alert.kind)
+      .sort(),
+  ).toEqual(kinds);
+});

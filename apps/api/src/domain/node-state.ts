@@ -182,8 +182,8 @@ export async function configureNodeRegionPolicy(
   // suspension; the next resume still needs a fresh full-peak startup grant.
   const result = await db
     .prepare(
-      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,compute_pool_json,thin_storage_json,ram_expansion_threshold_ppm,ram_warning_threshold_ppm,cap_warning_enabled)
-    SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,?,?,?,COALESCE(?,0) FROM regions r WHERE r.id=? AND r.provider='contabo'
+      `INSERT INTO node_region_policies(region_id,max_nodes,purchases_enabled,order_config,placement_mode,maximum_database_memory_mib,postgres_memory_request_mib,standing_cost_profile,standing_cost_profile_hash,autoscale_enabled,adopt_instance_ids,compute_pool_json,thin_storage_json,ram_expansion_threshold_ppm,ram_warning_threshold_ppm,node_ram_warning_threshold_ppm,node_cpu_warning_threshold_ppm,node_storage_warning_threshold_ppm,cap_warning_enabled)
+    SELECT r.id,?,?,?,?,?,?,?,?,COALESCE(?,0),COALESCE(?,'[]'),?,?,?,?,?,?,?,COALESCE(?,0) FROM regions r WHERE r.id=? AND r.provider='contabo'
       AND (?=1 OR (SELECT ram_expansion_threshold_ppm FROM node_region_policies WHERE region_id=r.id) IS ?)
       AND (?=1 OR COALESCE((SELECT autoscale_enabled FROM node_region_policies WHERE region_id=r.id),0)=?)
       AND ((COALESCE((SELECT placement_mode FROM node_region_policies WHERE region_id=r.id),'reserved')=?
@@ -207,6 +207,9 @@ export async function configureNodeRegionPolicy(
       autoscale_enabled=COALESCE(?,node_region_policies.autoscale_enabled),adopt_instance_ids=COALESCE(?,node_region_policies.adopt_instance_ids),compute_pool_json=CASE WHEN ?=1 THEN excluded.compute_pool_json ELSE node_region_policies.compute_pool_json END,thin_storage_json=CASE WHEN ?=1 THEN excluded.thin_storage_json ELSE node_region_policies.thin_storage_json END,
       ram_expansion_threshold_ppm=excluded.ram_expansion_threshold_ppm,
       ram_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.ram_warning_threshold_ppm ELSE node_region_policies.ram_warning_threshold_ppm END,
+      node_ram_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.node_ram_warning_threshold_ppm ELSE node_region_policies.node_ram_warning_threshold_ppm END,
+      node_cpu_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.node_cpu_warning_threshold_ppm ELSE node_region_policies.node_cpu_warning_threshold_ppm END,
+      node_storage_warning_threshold_ppm=CASE WHEN ?=1 THEN excluded.node_storage_warning_threshold_ppm ELSE node_region_policies.node_storage_warning_threshold_ppm END,
       cap_warning_enabled=CASE WHEN ?=1 THEN excluded.cap_warning_enabled ELSE node_region_policies.cap_warning_enabled END`,
     )
     .bind(
@@ -232,6 +235,9 @@ export async function configureNodeRegionPolicy(
       policy.thin_storage == null ? null : canonical(policy.thin_storage),
       threshold,
       policy.ram_warning_threshold_ppm ?? null,
+      policy.node_ram_warning_threshold_ppm ?? null,
+      policy.node_cpu_warning_threshold_ppm ?? null,
+      policy.node_storage_warning_threshold_ppm ?? null,
       policy.cap_warning_enabled === undefined
         ? null
         : Number(policy.cap_warning_enabled),
@@ -256,6 +262,9 @@ export async function configureNodeRegionPolicy(
       Number(policy.compute_pool !== undefined),
       Number(policy.thin_storage !== undefined),
       Number(policy.ram_warning_threshold_ppm !== undefined),
+      Number(policy.node_ram_warning_threshold_ppm !== undefined),
+      Number(policy.node_cpu_warning_threshold_ppm !== undefined),
+      Number(policy.node_storage_warning_threshold_ppm !== undefined),
       Number(policy.cap_warning_enabled !== undefined),
     )
     .run();

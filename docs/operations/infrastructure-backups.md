@@ -110,6 +110,24 @@ recipient, sender or API key is included in the repository. Recipient and sender
 also be configured while daily backups are disabled; this enables delivery of node
 and separately configured regional capacity alarms.
 
+Per-node threshold warnings use the same delivery. Set `node_ram_warning_threshold_ppm`,
+`node_cpu_warning_threshold_ppm` or `node_storage_warning_threshold_ppm` through
+`PUT /v1/regions/{id}/capacity-policy` to an integer from 1 to 1000000 parts per
+million (`850000` means 85%); `null` disables one. The cron checks every node of a
+policy region each minute, including control:
+
+- RAM uses the node's own fresh ten-minute window.
+- CPU averages kubelet CPU usage over the same ten minutes against node CPU capacity.
+  Only reporters that send the optional CPU sample fields supply it (the native
+  controller shipped with R2); otherwise CPU stays unknown and sends nothing.
+- Storage uses the fresh LVM sample: thin-pool data or metadata fill, otherwise
+  volume-group allocation.
+
+The email subject is `PGCF infrastructure: <kind> (<region>)` and its body is the
+event JSON, including `node_ids`, `threshold_ppm` and the highest `utilization_ppm`.
+A node crossing during an active episode adds no message. The episode clears only
+when every listed node is fresh and below the threshold, or lost.
+
 The existing authenticated infrastructure webhook remains supported and takes
 precedence when configured. Without a webhook or both email addresses plus the
 Resend secret, alarms remain visible through the API and no notification is sent.

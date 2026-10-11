@@ -93,7 +93,7 @@ export const NodeAdditionIntent = z
   });
 export type NodeAdditionIntent = z.infer<typeof NodeAdditionIntent>;
 const NodePurchaseTrigger = z.enum(["regional_actual_ram", "ram_76_percent"]);
-const RamThresholdPpm = z.number().int().min(1).max(1_000_000);
+const ThresholdPpm = z.number().int().min(1).max(1_000_000);
 /** Owner infrastructure authority; null ceilings require the explicit approved RAM trigger. */
 export const StandingNodeCostProfile = z
   .strictObject({
@@ -149,8 +149,12 @@ export const NodeRegionPolicy = z
     max_nodes: z.number().int().min(1).max(10000).nullable().optional(),
     purchases_enabled: z.boolean().default(false),
     autoscale_enabled: z.boolean().optional(),
-    ram_expansion_threshold_ppm: RamThresholdPpm.nullable().optional(),
-    ram_warning_threshold_ppm: RamThresholdPpm.nullable().optional(),
+    ram_expansion_threshold_ppm: ThresholdPpm.nullable().optional(),
+    ram_warning_threshold_ppm: ThresholdPpm.nullable().optional(),
+    /** Per-node warnings: any fresh node at or above the threshold warns; null disables. */
+    node_ram_warning_threshold_ppm: ThresholdPpm.nullable().optional(),
+    node_cpu_warning_threshold_ppm: ThresholdPpm.nullable().optional(),
+    node_storage_warning_threshold_ppm: ThresholdPpm.nullable().optional(),
     cap_warning_enabled: z.boolean().optional(),
     adopt_instance_ids: z.array(ProviderInstanceId).max(100).optional(),
     order: NodeOrderConfiguration.nullable().default(null),

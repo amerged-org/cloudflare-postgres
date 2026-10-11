@@ -109,10 +109,11 @@ export async function recordNodeMemoryObservation(
     throw new Error("invalid_node_memory_sample");
   const result = await db
     .prepare(
-      `INSERT INTO node_memory_samples(node_id,node_uid,minute,observed_at,working_set_bytes,capacity_memory_bytes,available_bytes,memory_pressure)
-     SELECT id,node_uid,?,?,?,?,?,? FROM nodes WHERE id=? AND region_id=? AND provider_instance_id=? AND node_uid=? AND lost_at IS NULL
+      `INSERT INTO node_memory_samples(node_id,node_uid,minute,observed_at,working_set_bytes,capacity_memory_bytes,available_bytes,memory_pressure,cpu_usage_nano_cores,capacity_cpu_millicores)
+     SELECT id,node_uid,?,?,?,?,?,?,?,? FROM nodes WHERE id=? AND region_id=? AND provider_instance_id=? AND node_uid=? AND lost_at IS NULL
      ON CONFLICT(node_id,node_uid,minute) DO UPDATE SET observed_at=excluded.observed_at,working_set_bytes=excluded.working_set_bytes,
-       capacity_memory_bytes=excluded.capacity_memory_bytes,available_bytes=excluded.available_bytes,memory_pressure=excluded.memory_pressure
+       capacity_memory_bytes=excluded.capacity_memory_bytes,available_bytes=excluded.available_bytes,memory_pressure=excluded.memory_pressure,
+       cpu_usage_nano_cores=excluded.cpu_usage_nano_cores,capacity_cpu_millicores=excluded.capacity_cpu_millicores
      WHERE excluded.observed_at>node_memory_samples.observed_at`,
     )
     .bind(
@@ -122,6 +123,8 @@ export async function recordNodeMemoryObservation(
       sample?.capacity_memory_bytes ?? null,
       sample?.available_bytes ?? null,
       sample?.memory_pressure == null ? null : Number(sample.memory_pressure),
+      sample?.cpu_usage_nano_cores ?? null,
+      sample?.capacity_cpu_millicores ?? null,
       observation.node_id,
       regionId,
       observation.provider_instance_id,

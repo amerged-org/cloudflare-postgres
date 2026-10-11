@@ -168,6 +168,39 @@ it("bounds configured RAM thresholds to integer parts per million and requires a
   ).toBe(false);
 });
 
+it("keeps per-node warning thresholds opt in and bounded to integer parts per million", () => {
+  const fresh = NodeRegionPolicy.parse({ region_id: "eu-test" });
+  expect(fresh).not.toHaveProperty("node_ram_warning_threshold_ppm");
+  expect(fresh).not.toHaveProperty("node_cpu_warning_threshold_ppm");
+  expect(fresh).not.toHaveProperty("node_storage_warning_threshold_ppm");
+  const thresholds = {
+    node_ram_warning_threshold_ppm: 1,
+    node_cpu_warning_threshold_ppm: null,
+    node_storage_warning_threshold_ppm: 1_000_000,
+  };
+  expect(
+    NodeRegionPolicy.parse({ region_id: "eu-test", ...thresholds }),
+  ).toMatchObject(thresholds);
+  expect(
+    NodeRegionPolicy.safeParse({
+      region_id: "eu-test",
+      node_ram_warning_threshold_ppm: 0,
+    }).success,
+  ).toBe(false);
+  expect(
+    NodeRegionPolicy.safeParse({
+      region_id: "eu-test",
+      node_cpu_warning_threshold_ppm: 1_000_001,
+    }).success,
+  ).toBe(false);
+  expect(
+    NodeRegionPolicy.safeParse({
+      region_id: "eu-test",
+      node_storage_warning_threshold_ppm: 850000.5,
+    }).success,
+  ).toBe(false);
+});
+
 it("allows unknown cost only for finite derived RAM authority with either supported trigger", () => {
   const approval = {
     intent_hash: "a".repeat(64),

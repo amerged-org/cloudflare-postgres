@@ -259,7 +259,7 @@ Historical warning/delivery tests remain in PLAN.md; they do not imply that mail
 
 ### Operator-configured capacity and optional notifications
 
-Deploy the matching API and additive0038 migration before using the new policy fields. Management
+Deploy the matching API and additive 0038/0041 migrations before using these policy fields. Management
 is API-only and requires an administrator key; an integrator's project key does not control
 infrastructure purchases. Read `GET /v1/regions/{id}/capacity-policy`, then PUT the intended complete
 policy to the same route. Existing fields retain their documented full-replacement semantics;
@@ -273,6 +273,9 @@ Explicit `null` removes an optional value. No large sentinel count represents an
 | `purchases_enabled` | Permits purchase authorization/first dispatch; false by default. Automatic buying requires both switches and a complete configured order/authority. |
 | `max_nodes` | Optional managed-allocation ceiling; null removes it. No fixed three-node limit is imposed. |
 | `ram_warning_threshold_ppm` | Optional mail/webhook warning threshold; null disables this warning. |
+| `node_ram_warning_threshold_ppm` | Optional warning when any node's own ten-minute RAM window reaches it, control included; null disables it. |
+| `node_cpu_warning_threshold_ppm` | Optional warning when any node's ten-minute average CPU usage reaches it against node CPU capacity; null disables it. Needs a reporter that sends the CPU sample fields: the native controller shipped with R2. Otherwise CPU stays unknown. |
+| `node_storage_warning_threshold_ppm` | Optional warning when any node's fresh LVM sample reaches it: thin-pool data or metadata fill, otherwise volume-group allocation; null disables it. |
 | `cap_warning_enabled` | Opt-in notice for an operator-selected finite cap; false by default. |
 
 The configured RAM threshold applies to automatic new paid orders in both placement modes.

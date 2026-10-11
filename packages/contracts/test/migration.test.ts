@@ -246,6 +246,94 @@ it("preserves existing capacity authority while making new thresholds and warnin
   );
 });
 
+it("adds opt-in per-node warning thresholds and CPU samples while preserving policies and alert episodes", () => {
+  const directory = new URL("../../../apps/api/migrations/", import.meta.url);
+  for (const file of readdirSync(directory)
+    .sort()
+    .filter(
+      (name) =>
+        name.endsWith(".sql") &&
+        name > "0001_init.sql" &&
+        name < "0041_node_threshold_warnings.sql",
+    ))
+    db.exec(readFileSync(new URL(file, directory), "utf8"));
+  run(
+    "INSERT INTO node_region_policies(region_id,max_nodes,ram_warning_threshold_ppm,cap_warning_enabled) VALUES('eu-1',3,800000,1)",
+  );
+  run(
+    "INSERT INTO node_memory_samples(node_id,node_uid,minute,observed_at,working_set_bytes,capacity_memory_bytes,available_bytes,memory_pressure) VALUES(?,?,?,?,1024,4096,2048,0)",
+    nodeId,
+    crypto.randomUUID(),
+    Math.floor(Date.parse(NOW) / 60000),
+    NOW,
+  );
+  const alert = (kind: string) =>
+    run(
+      "INSERT INTO infrastructure_alerts(region_id,kind,active,event_id,payload) VALUES('eu-1',?,1,?,?)",
+      kind,
+      crypto.randomUUID(),
+      JSON.stringify({ kind, occurred_at: NOW }),
+    );
+  alert("regional_node_stale");
+  run(
+    "UPDATE infrastructure_alerts SET delivered_at=?,last_attempt_at=?",
+    NOW,
+    NOW,
+  );
+  const policy = db.prepare("SELECT * FROM node_region_policies").get(),
+    sample = db.prepare("SELECT * FROM node_memory_samples").get(),
+    episodes = db.prepare("SELECT * FROM infrastructure_alerts").all();
+  db.exec(
+    readFileSync(
+      new URL("0041_node_threshold_warnings.sql", directory),
+      "utf8",
+    ),
+  );
+  expect(db.prepare("SELECT * FROM node_region_policies").get()).toEqual({
+    ...policy,
+    node_ram_warning_threshold_ppm: null,
+    node_cpu_warning_threshold_ppm: null,
+    node_storage_warning_threshold_ppm: null,
+  });
+  expect(db.prepare("SELECT * FROM node_memory_samples").get()).toEqual({
+    ...sample,
+    cpu_usage_nano_cores: null,
+    capacity_cpu_millicores: null,
+  });
+  expect(db.prepare("SELECT * FROM infrastructure_alerts").all()).toEqual(
+    episodes,
+  );
+  expect(() =>
+    run("UPDATE node_region_policies SET node_ram_warning_threshold_ppm=0"),
+  ).toThrow(/CHECK/);
+  expect(() =>
+    run(
+      "UPDATE node_region_policies SET node_cpu_warning_threshold_ppm=1000001",
+    ),
+  ).toThrow(/CHECK/);
+  expect(() =>
+    run(
+      "UPDATE node_region_policies SET node_storage_warning_threshold_ppm=850000.5",
+    ),
+  ).toThrow(/CHECK/);
+  run(
+    "UPDATE node_region_policies SET node_ram_warning_threshold_ppm=1,node_cpu_warning_threshold_ppm=1000000,node_storage_warning_threshold_ppm=850000",
+  );
+  expect(() =>
+    run("UPDATE node_memory_samples SET cpu_usage_nano_cores=1000000000"),
+  ).toThrow(/CHECK/);
+  expect(() =>
+    run("UPDATE node_memory_samples SET capacity_cpu_millicores=0"),
+  ).toThrow(/CHECK/);
+  run(
+    "UPDATE node_memory_samples SET capacity_cpu_millicores=2000,cpu_usage_nano_cores=1000000000",
+  );
+  alert("regional_node_ram_warning");
+  alert("regional_node_cpu_warning");
+  alert("regional_node_storage_warning");
+  expect(() => alert("regional_node_disk_warning")).toThrow(/CHECK/);
+});
+
 it("preserves legacy policy and approval bytes when adding explicit uncapped and unknown-cost values", () => {
   const directory = new URL("../../../apps/api/migrations/", import.meta.url);
   for (const file of readdirSync(directory)
