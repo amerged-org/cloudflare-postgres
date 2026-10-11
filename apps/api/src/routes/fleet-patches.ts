@@ -242,24 +242,14 @@ export function registerFleetPatches(app: ApiApp) {
     )
       throw new ApiError("forbidden", "Fleet patch transport scope changed");
     // The regional relay verifies the signature, expiry, nonce, target and relay epoch.
-    await assertFleetPatchCurrent(
-      c.env,
-      row,
-      false,
-      input.compute_pool?.revision,
-    );
+    await assertFleetPatchCurrent(c.env, row, false, verified.poolRevision);
     const response = await c.env.BOOTSTRAP_RELAY_SERVICE.fetch(
       new Request(new URL(BOOTSTRAP_RELAY_PATH, c.env.BOOTSTRAP_RELAY_URL), {
         headers: { Upgrade: "websocket", [BOOTSTRAP_RELAY_HEADER]: token },
       }),
     );
     try {
-      await assertFleetPatchCurrent(
-        c.env,
-        row,
-        false,
-        input.compute_pool?.revision,
-      );
+      await assertFleetPatchCurrent(c.env, row, false, verified.poolRevision);
     } catch (error) {
       try {
         response.webSocket?.accept();

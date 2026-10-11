@@ -265,7 +265,8 @@ export function buildDatabaseManifests(
         name: namespace,
         labels: {
           ...labels,
-          "pgcf.io/compute-runtime": ctx.computePool != null ? "pool" : "standard",
+          "pgcf.io/compute-runtime":
+            ctx.computePool != null ? "pool" : "standard",
           "pod-security.kubernetes.io/enforce": "restricted",
           "pod-security.kubernetes.io/enforce-version": "latest",
         },

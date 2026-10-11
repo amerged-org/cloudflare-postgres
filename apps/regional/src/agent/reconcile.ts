@@ -1423,7 +1423,11 @@ export class Reconciler {
       label = "pgcf.io/compute-runtime",
       restart = "kubectl.kubernetes.io/restartedAt",
       marker = `pgcf-runtime/${db.generation}/${mode}${ctx.computePool != null ? `/${ctx.computePool.profile.release_id}` : ""}`;
-    const namespace = await this.k8s.read("Namespace", undefined, namespaceName);
+    const namespace = await this.k8s.read(
+      "Namespace",
+      undefined,
+      namespaceName,
+    );
     if (!namespace) throw new Error("database_namespace_missing");
     assertOwned(namespace, db.id, namespaceName);
     if (uid(namespace) !== namespaceUid || namespace.metadata.deletionTimestamp)
@@ -1435,21 +1439,51 @@ export class Reconciler {
         this.signal.throwIfAborted();
         await this.k8s.patch("Namespace", undefined, namespaceName, [
           { op: "test", path: "/metadata/uid", value: namespaceUid },
-          { op: "test", path: "/metadata/resourceVersion", value: namespace.metadata.resourceVersion },
-          { op: "add", path: "/metadata/labels", value: { ...namespace.metadata.labels, [label]: mode } },
+          {
+            op: "test",
+            path: "/metadata/resourceVersion",
+            value: namespace.metadata.resourceVersion,
+          },
+          {
+            op: "add",
+            path: "/metadata/labels",
+            value: { ...namespace.metadata.labels, [label]: mode },
+          },
         ]);
       } catch (error) {
-        const current = await this.k8s.read("Namespace", undefined, namespaceName);
-        if (!current || uid(current) !== namespaceUid || current.metadata.deletionTimestamp || current.metadata.labels?.[label] !== mode)
+        const current = await this.k8s.read(
+          "Namespace",
+          undefined,
+          namespaceName,
+        );
+        if (
+          !current ||
+          uid(current) !== namespaceUid ||
+          current.metadata.deletionTimestamp ||
+          current.metadata.labels?.[label] !== mode
+        )
           throw error;
         assertOwned(current, db.id, namespaceName);
       }
     }
     const primary = string(record(cluster.status).currentPrimary);
-    if (!primary || !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(primary) || primary.length > 63)
+    if (
+      !primary ||
+      !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(primary) ||
+      primary.length > 63
+    )
       return false;
     const pod = await this.k8s.read("Pod", namespaceName, primary);
-    if (!pod || !pod.metadata.uid || !pod.metadata.resourceVersion || !ownedByCluster(pod, cluster) || pod.metadata.namespace !== namespaceName || pod.metadata.labels?.["cnpg.io/cluster"] !== "database" || record(pod.spec).nodeName !== db.node || pod.metadata.deletionTimestamp)
+    if (
+      !pod ||
+      !pod.metadata.uid ||
+      !pod.metadata.resourceVersion ||
+      !ownedByCluster(pod, cluster) ||
+      pod.metadata.namespace !== namespaceName ||
+      pod.metadata.labels?.["cnpg.io/cluster"] !== "database" ||
+      record(pod.spec).nodeName !== db.node ||
+      pod.metadata.deletionTimestamp
+    )
       return false;
     if ((string(record(pod.spec).runtimeClassName) ?? "") === runtimeClass)
       return true;
@@ -1460,12 +1494,29 @@ export class Reconciler {
         this.signal.throwIfAborted();
         await this.k8s.patch("Cluster", namespaceName, "database", [
           { op: "test", path: "/metadata/uid", value: uid(cluster) },
-          { op: "test", path: "/metadata/resourceVersion", value: cluster.metadata.resourceVersion },
-          { op: "add", path: "/metadata/annotations", value: { ...cluster.metadata.annotations, [restart]: marker } },
+          {
+            op: "test",
+            path: "/metadata/resourceVersion",
+            value: cluster.metadata.resourceVersion,
+          },
+          {
+            op: "add",
+            path: "/metadata/annotations",
+            value: { ...cluster.metadata.annotations, [restart]: marker },
+          },
         ]);
       } catch (error) {
-        const current = await this.k8s.read("Cluster", namespaceName, "database");
-        if (!current || uid(current) !== uid(cluster) || current.metadata.deletionTimestamp || current.metadata.annotations?.[restart] !== marker)
+        const current = await this.k8s.read(
+          "Cluster",
+          namespaceName,
+          "database",
+        );
+        if (
+          !current ||
+          uid(current) !== uid(cluster) ||
+          current.metadata.deletionTimestamp ||
+          current.metadata.annotations?.[restart] !== marker
+        )
           throw error;
         assertOwned(current, db.id, "database");
       }
@@ -2059,8 +2110,9 @@ export class Reconciler {
       pod.metadata.namespace !== namespace ||
       pod.metadata.labels?.["cnpg.io/cluster"] !== "database" ||
       condition(pod, "Ready")?.status !== "True" ||
-      record(pod.spec).nodeName !== db.node
-      || (string(record(pod.spec).runtimeClassName) ?? "") !== (ctx.computePool != null ? "pgcf-prestarted" : "")
+      record(pod.spec).nodeName !== db.node ||
+      (string(record(pod.spec).runtimeClassName) ?? "") !==
+        (ctx.computePool != null ? "pgcf-prestarted" : "")
     )
       return false;
     const containers = record(pod.spec).containers;

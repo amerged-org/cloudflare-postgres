@@ -622,7 +622,10 @@ it("standard runtime completion requires the physical host hash and closed recei
   await env.DB.prepare(
     "UPDATE fleet_patch_operations SET observed_json=? WHERE operation_id=?",
   )
-    .bind(JSON.stringify({ ...facts, host_configuration_sha256: null }), f.op)
+    .bind(
+      JSON.stringify({ ...facts, host_configuration_sha256: undefined }),
+      f.op,
+    )
     .run();
   expect((await readFleetNodeRelease(env.DB, f.node)).state).toBe("pending");
   expect(await restoreFleetPatchPlacements(f.runtime, f.op)).toBe(false);

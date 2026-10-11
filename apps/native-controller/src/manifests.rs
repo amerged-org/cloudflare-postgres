@@ -185,8 +185,13 @@ pub fn build(db: &Value, ctx: &Value) -> Result<Vec<Value>, Error> {
             hosts.push(host);
         }
     }
+    let runtime = if ctx["computePool"].is_null() {
+        "standard"
+    } else {
+        "pool"
+    };
     let mut result = vec![
-        json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":ns,"labels":{"pgcf.io/database-id":id,"pod-security.kubernetes.io/enforce":"restricted","pod-security.kubernetes.io/enforce-version":"latest"}}}),
+        json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":ns,"labels":{"pgcf.io/database-id":id,"pgcf.io/compute-runtime":runtime,"pod-security.kubernetes.io/enforce":"restricted","pod-security.kubernetes.io/enforce-version":"latest"}}}),
         resource(
             "v1",
             "ResourceQuota",

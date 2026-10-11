@@ -314,13 +314,15 @@ export async function authenticateFleetPatchContext(
 ) {
   const row = authenticatedRow ?? (await authenticateFleetPatchRow(c, id));
   if (row.operation_id !== id) return closed();
-  const input = await fleetPatchInput(c.env, id, row);
-  return { row, input };
+  const fence: { poolRevision?: number } = {};
+  const input = await fleetPatchInput(c.env, id, row, fence);
+  return { row, input, poolRevision: fence.poolRevision };
 }
 export async function fleetPatchInput(
   env: Env,
   id: string,
   verifiedRow?: PatchRow,
+  fence?: { poolRevision?: number },
 ): Promise<FleetPatchInput> {
   const row = verifiedRow ?? (await readFleetPatch(env, id));
   if (row.operation_id !== id) return closed();
@@ -476,6 +478,7 @@ export async function fleetPatchInput(
   );
   if (url.protocol !== "https:") return closed();
   await assertFleetPatchCurrent(env, row, false, storedPool?.revision);
+  if (fence) fence.poolRevision = storedPool?.revision;
   return FleetPatchInput.parse({
     status: status(row),
     host_configuration_only:
@@ -1387,18 +1390,19 @@ export async function recordFleetPatchCheckpoint(
       if (
         pool &&
         (!observed ||
-        (input.stage === "complete" &&
-          (input.facts.runtime_admission_sha256 !== host.profile_sha256 ||
-            input.facts.runtime_admission_policy_revision !== pool.revision)) ||
-        observed.node_uid !== row.node_uid ||
-        observed.policy_revision !== pool.revision ||
-        observed.material_revision !== row.material_revision ||
-        Date.parse(observed.observed_at) < Date.now() - 120000 ||
-        Date.parse(observed.observed_at) > Date.now() + 5000 ||
-        JSON.stringify(observed.profile) !==
-          JSON.stringify(pool.policy.profile) ||
-        observed.slots.filter((slot) => slot.live && slot.sandbox_id === null)
-          .length < pool.policy.target_slots)
+          (input.stage === "complete" &&
+            (input.facts.runtime_admission_sha256 !== host.profile_sha256 ||
+              input.facts.runtime_admission_policy_revision !==
+                pool.revision)) ||
+          observed.node_uid !== row.node_uid ||
+          observed.policy_revision !== pool.revision ||
+          observed.material_revision !== row.material_revision ||
+          Date.parse(observed.observed_at) < Date.now() - 120000 ||
+          Date.parse(observed.observed_at) > Date.now() + 5000 ||
+          JSON.stringify(observed.profile) !==
+            JSON.stringify(pool.policy.profile) ||
+          observed.slots.filter((slot) => slot.live && slot.sandbox_id === null)
+            .length < pool.policy.target_slots)
       )
         return closed();
     }
@@ -1576,8 +1580,10 @@ export async function issueFleetPatchTransport(
   target: "node" | "control" = "node",
   verified?: Awaited<ReturnType<typeof authenticateFleetPatchContext>>,
 ) {
+  const fence: { poolRevision?: number } = {};
   const row = verified?.row ?? (await readFleetPatch(env, id)),
-    input = verified?.input ?? (await fleetPatchInput(env, id, row)),
+    input = verified?.input ?? (await fleetPatchInput(env, id, row, fence)),
+    poolRevision = verified ? verified.poolRevision : fence.poolRevision,
     service = env.BOOTSTRAP_RELAY_SERVICE;
   if (!service) return closed();
   if (
@@ -1631,7 +1637,7 @@ export async function issueFleetPatchTransport(
     capability,
     address,
   });
-  await assertFleetPatchCurrent(env, row, false, input.compute_pool?.revision);
+  await assertFleetPatchCurrent(env, row, false, poolRevision);
   return {
     websocket_url: input.callback.url.replace(/^https:/, "wss:") + "/relay",
     token,
