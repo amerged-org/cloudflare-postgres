@@ -118,6 +118,7 @@ fn resource(kind: &str) -> Result<(&'static str, &'static str, bool), Error> {
         "Backup" => ("/apis/postgresql.cnpg.io/v1", "backups", false),
         "ObjectStore" => ("/apis/barmancloud.cnpg.io/v1", "objectstores", false),
         "LVMVolume" => ("/apis/local.openebs.io/v1alpha1", "lvmvolumes", false),
+        "LVMNode" => ("/apis/local.openebs.io/v1alpha1", "lvmnodes", false),
         "NetworkPolicy" => ("/apis/networking.k8s.io/v1", "networkpolicies", false),
         "CiliumNetworkPolicy" => ("/apis/cilium.io/v2", "ciliumnetworkpolicies", false),
         "DaemonSet" => ("/apis/apps/v1", "daemonsets", false),
@@ -650,6 +651,29 @@ impl Kubernetes {
         )
         .await?;
         Ok(())
+    }
+    /// Authenticated API-server proxy to the read-only OpenEBS LVM exporter of one driver Pod.
+    pub async fn openebs_metrics(&self, pod: &str) -> Result<String, Error> {
+        if pod.len() > 63 || pod.contains('.') || !identifier(pod) {
+            return Err("storage exporter Pod invalid".into());
+        }
+        let token = tokio::fs::read_to_string(&self.token).await?;
+        if token.trim().is_empty() {
+            return Err("Kubernetes bearer missing".into());
+        }
+        let response = self
+            .client
+            .get(self.origin.join(&format!(
+                "/api/v1/namespaces/openebs/pods/{pod}:9500/proxy/metrics"
+            ))?)
+            .bearer_auth(token.trim())
+            .timeout(Duration::from_secs(5))
+            .send()
+            .await?;
+        if response.status() != StatusCode::OK {
+            return Err("storage metrics unavailable".into());
+        }
+        Ok(String::from_utf8_lossy(&bounded(response, 2 * 1024 * 1024).await?).into_owned())
     }
     pub async fn assert_cluster(&self, uid: &str) -> Result<(), Error> {
         let cluster = self

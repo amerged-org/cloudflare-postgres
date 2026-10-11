@@ -353,8 +353,11 @@ async fn run() -> Result<(), Error> {
     let mut latest_snapshot: Option<(Instant, Arc<DesiredSnapshot>)> = None;
     let mut inventories: JoinSet<Result<(), Error>> = JoinSet::new();
     let mut metering: JoinSet<Result<(), Error>> = JoinSet::new();
+    let mut storage: HashMap<String, Value> = HashMap::new();
+    let mut storage_sampling: JoinSet<Result<HashMap<String, Value>, Error>> = JoinSet::new();
     let mut meter_interval = tokio::time::interval(Duration::from_millis(250));
     let mut node_interval = tokio::time::interval(Duration::from_secs(60));
+    let mut storage_interval = tokio::time::interval(Duration::from_secs(60));
     let mut pull_ids = HashSet::new();
     let mut full = tokio::time::interval(Duration::from_secs(60));
     let mut cadence = tokio::time::interval(Duration::from_millis(50));
@@ -381,10 +384,11 @@ async fn run() -> Result<(), Error> {
                     let databases: Vec<_> = cells.values()
                         .filter(|cell| text(&cell.db, "desired_state") != "deleted")
                         .map(|cell| cell.db.clone()).collect();
+                    let storage = storage.clone();
                     inventories.spawn_local(async move {
                         kube.assert_cluster(&controller.cluster_uid).await?;
                         tokio::time::timeout(Duration::from_secs(45), async {
-                            pgcf_native_controller::inventory::collect(&kube, &api, &ids).await?;
+                            pgcf_native_controller::inventory::collect(&kube, &api, &ids, &storage).await?;
                             let mut work = futures_util::stream::iter(databases.iter()
                                 .map(|db| controller.health.refresh(&kube, db))).buffer_unordered(4);
                             while let Some(result) = work.next().await { result?; }
@@ -397,6 +401,24 @@ async fn run() -> Result<(), Error> {
             result = inventories.join_next(), if !inventories.is_empty() => {
                 if !matches!(result, Some(Ok(Ok(())))) {
                     eprintln!("{{\"event\":\"node_inventory_unknown\"}}");
+                }
+            },
+            _ = storage_interval.tick() => {
+                // The exporter runs vgs/lvs per scrape; keep this slow read off reconcile and wake.
+                if control_healthy && have_full_snapshot && storage_sampling.is_empty() {
+                    let kube = kube.clone();
+                    let fleet=latest_snapshot.as_ref().map(|(_,snapshot)|snapshot.fleet_release.clone()).unwrap_or(Value::Null);
+                    storage_sampling.spawn_local(async move {
+                        tokio::time::timeout(Duration::from_secs(45), pgcf_native_controller::node_storage::samples(&kube, &fleet))
+                            .await
+                            .map_err(|_| "node storage sampling deadline exceeded")?
+                    });
+                }
+            },
+            result = storage_sampling.join_next(), if !storage_sampling.is_empty() => {
+                match result {
+                    Some(Ok(Ok(samples))) => storage = samples,
+                    _ => eprintln!("{{\"event\":\"node_storage_sample_failed\"}}"),
                 }
             },
             _ = full.tick() => {
@@ -599,6 +621,7 @@ async fn run() -> Result<(), Error> {
         }
     }
     inventories.abort_all();
+    storage_sampling.abort_all();
     metering.abort_all();
     pulls.abort_all();
     jobs.abort_all();

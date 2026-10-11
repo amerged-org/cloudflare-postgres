@@ -38,7 +38,11 @@ import {
   AgentUsageRequest,
   NodeThinStorageAuthority,
   ComputePoolPolicy,
+  NodeStorageSample,
 } from "../src/index.ts";
+import lock from "../../../infra/platform/versions.lock.json" with { type: "json" };
+import { openEbsDriverImage } from "../../../infra/platform/openebs-image.ts";
+import { physicalStorageMetrics } from "../../../apps/regional/src/agent/node-storage.ts";
 import {
   ARCHIVE_IDENTITY_QUERY,
   ARCHIVE_QUERY,
@@ -70,6 +74,7 @@ const schemas = Object.fromEntries(
     FleetReleaseFacts,
     FleetNodeReleaseObservation,
     DatabaseRuntimeAttestation,
+    NodeStorageSample,
   }).map(([name, source]) => [name, z.toJSONSchema(source)]),
 );
 const ctx: BuildContext = {
@@ -376,6 +381,108 @@ const fleetVectors = [
   ready: fleetFluxReady(v.release),
   observed: fleetChartObservation(v.pin, v.release, v.source, v.chart),
 }));
+// OpenEBS LocalPV LVM exporter scrapes; the native sampler must derive the same physical facts.
+const vg = "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef";
+const volumeGroup = (free = 7000) =>
+  [
+    `lvm_vg_total_size_bytes{name="pgcf"} 1e4`,
+    `lvm_vg_free_size_bytes{name="pgcf"} ${free}`,
+    `lvm_vg_permission{name="pgcf"} 0`,
+    `lvm_vg_missing_pv_count{name="pgcf"} 0`,
+    `lvm_vg_pv_count{name="pgcf"} 1`,
+  ].join("\n") + "\n";
+const volume = (
+  name: string,
+  segtype: string,
+  size: number | string,
+  pool = "",
+  gauges: Record<string, number | string> = {},
+) =>
+  Object.entries({
+    lvm_lv_total_size_bytes: size,
+    lvm_lv_health_status: 0,
+    lvm_lv_permission: 1,
+    ...gauges,
+  })
+    .map(
+      ([metric, value]) =>
+        `${metric}{active_status="active",device="dm-0",dm_path="/dev/mapper/pgcf-${name}",host="driver",name="${name}",path="/dev/pgcf/${name}",pool="${pool}",segtype="${segtype}",vg="pgcf"} ${value}\n`,
+    )
+    .join("");
+const thinPool = (gauges: Record<string, number | string> = {}) =>
+  volume("pgcf_thinpool", "thin-pool", 4000, "", {
+    lvm_lv_mda_total_size_bytes: 10,
+    lvm_lv_used_percent: 25,
+    lvm_lv_mda_used_percent: 20,
+    lvm_lv_when_full: 0,
+    ...gauges,
+  });
+const thick =
+  volumeGroup() +
+  volume("pvc-a", "linear", 3000, "", { lvm_lv_used_percent: 0 });
+const storageVectors = [
+  {
+    name: "thick-volume-group",
+    metrics: `# HELP go_goroutines Number of goroutines.\n# TYPE go_goroutines gauge\ngo_goroutines 12\n${thick}`,
+  },
+  {
+    name: "duplicate-volume-group-gauge",
+    metrics: thick + 'lvm_vg_total_size_bytes{name="pgcf"} 10000\n',
+  },
+  {
+    name: "read-only-volume-group",
+    metrics: thick.replace(
+      'lvm_vg_permission{name="pgcf"} 0',
+      'lvm_vg_permission{name="pgcf"} 1',
+    ),
+  },
+  {
+    name: "thin-pool-upper-bounds",
+    metrics:
+      volumeGroup(5990) +
+      thinPool() +
+      volume("pvc-thin", "thin", 2000, "pgcf_thinpool"),
+  },
+  {
+    name: "rounded-percent-charges-next-hundredth",
+    metrics: volumeGroup(5990) + thinPool({ lvm_lv_used_percent: 33.33 }),
+  },
+  {
+    name: "missing-thin-metadata-gauge",
+    metrics:
+      volumeGroup(5990) +
+      thinPool().replace(/^lvm_lv_mda_used_percent\{.*\n/m, ""),
+  },
+  {
+    name: "non-finite-percent",
+    metrics: volumeGroup(5990) + thinPool({ lvm_lv_used_percent: "NaN" }),
+  },
+  {
+    name: "thin-volume-without-pool",
+    metrics: volumeGroup() + volume("pvc-thin", "thin", 2000, "pgcf_thinpool"),
+  },
+  {
+    name: "unhealthy-volume",
+    metrics:
+      volumeGroup() +
+      volume("pvc-a", "linear", 3000, "", { lvm_lv_health_status: 1 }),
+  },
+  {
+    name: "escaped-labels-trailing-comma-and-crlf",
+    metrics: (
+      thick.replace('{name="pgcf"} 1e4', '{name="pgcf",} 1.0e4') +
+      'lvm_lv_total_size_bytes{host="a\\"b\\\\c\\nd",name="other",vg="other"} 5\n'
+    ).replaceAll("\n", "\r\n"),
+  },
+  {
+    name: "allocation-exceeds-volume-group",
+    metrics: volumeGroup(12000),
+  },
+].map((v) => ({
+  ...v,
+  volume_group_uuid: vg,
+  physical: physicalStorageMetrics(v.metrics, vg),
+}));
 const files = {
   "controller.generated.json": {
     version: 1,
@@ -393,10 +500,12 @@ const files = {
       STORAGE_AUTHORITY_LEDGER_KEY,
       AGENT_PROTOCOL_VERSION,
       CONFIGURATION_SCHEMA_REVISION,
+      OPENEBS_DRIVER_IMAGE: openEbsDriverImage(lock),
     },
   },
   "controller-vectors.generated.json": vectors,
   "fleet-vectors.generated.json": fleetVectors,
+  "node-storage-vectors.generated.json": storageVectors,
 };
 for (const [name, data] of Object.entries(files)) {
   const contents = await format(JSON.stringify(data), { parser: "json" }),

@@ -7,7 +7,7 @@ use crate::{
     reconcile::quantity,
 };
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 fn condition<'a>(value: &'a Value, name: &str) -> Option<&'a str> {
     value["status"]["conditions"]
         .as_array()?
@@ -130,6 +130,20 @@ fn memory(node: &Value, summary: &Value) -> Option<Value> {
         json!({"node_uid":node["metadata"]["uid"],"observed_at":iso_millis(text(source,"time"))?,"working_set_bytes":working,"capacity_memory_bytes":capacity as u64,"available_bytes":available,"memory_pressure":pressure,"cpu_usage_nano_cores":usage,"capacity_cpu_millicores":capacity_cpu}),
     )
 }
+/// Storage scrapes run off this path; one older than two minutes no longer describes the node.
+fn fresh_storage(
+    samples: &HashMap<String, Value>,
+    uid: &str,
+    now: time::OffsetDateTime,
+) -> Option<Value> {
+    let sample = samples.get(uid)?;
+    let observed = time::OffsetDateTime::parse(
+        text(sample, "observed_at"),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()?;
+    (observed >= now - time::Duration::seconds(120)).then(|| sample.clone())
+}
 fn stable_node(before: &Value, after: Option<&Value>) -> bool {
     after.is_some_and(|after| {
         after["metadata"]["uid"] == before["metadata"]["uid"]
@@ -144,6 +158,7 @@ pub async fn collect(
     kube: &Kubernetes,
     api: &ControlApi,
     desired_ids: &HashSet<String>,
+    storage_samples: &HashMap<String, Value>,
 ) -> Result<(), Error> {
     let (nodes, pods, namespaces) = tokio::try_join!(
         kube.list("Node", None, None),
@@ -195,6 +210,11 @@ pub async fn collect(
             report["node_id"] = node_id.into();
             report["provider_instance_id"] = provider_id.into();
             report["node_uid"] = uid.into();
+            if let Some(sample) =
+                fresh_storage(storage_samples, uid, time::OffsetDateTime::now_utc())
+            {
+                report["storage"] = sample;
+            }
             let summary = kube.stats_summary(name).await.ok();
             let after = kube.read("Node", None, name).await?;
             // Do not refresh identity-bound hardware facts from a Node replaced mid-collection.
@@ -276,6 +296,31 @@ mod tests {
         assert!(sample["capacity_cpu_millicores"].is_null());
         assert!(sample["cpu_usage_nano_cores"].is_null());
         assert!(contract(&sample));
+    }
+    #[test]
+    fn only_a_storage_scrape_from_the_last_two_minutes_joins_its_node() {
+        let now = time::OffsetDateTime::now_utc();
+        let at = |age: i64| {
+            (now - time::Duration::seconds(age))
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap()
+        };
+        let samples = HashMap::from([
+            (
+                "recent".to_string(),
+                json!({"node_uid":"recent","observed_at":at(119),"physical":null}),
+            ),
+            (
+                "stale".to_string(),
+                json!({"node_uid":"stale","observed_at":at(121),"physical":null}),
+            ),
+        ]);
+        assert_eq!(
+            fresh_storage(&samples, "recent", now).unwrap()["node_uid"],
+            "recent"
+        );
+        assert!(fresh_storage(&samples, "stale", now).is_none());
+        assert!(fresh_storage(&samples, "absent", now).is_none());
     }
     #[test]
     fn missing_memory_is_unknown_and_never_a_free_sample() {
