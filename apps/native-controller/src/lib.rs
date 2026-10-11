@@ -10,4 +10,6 @@ pub mod measurements;
 pub mod postgres;
 pub mod power;
 pub mod reconcile;
+#[cfg(test)]
+mod test_server;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;

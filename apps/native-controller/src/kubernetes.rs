@@ -91,11 +91,22 @@ fn identifier(value: &str) -> bool {
                     .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
         })
 }
-fn collection(kind: &str, namespace: Option<&str>) -> Result<String, Error> {
-    let (prefix, plural, cluster) = match kind {
+fn resource(kind: &str) -> Result<(&'static str, &'static str, bool), Error> {
+    Ok(match kind {
         "Namespace" => ("/api/v1", "namespaces", true),
         "Node" => ("/api/v1", "nodes", true),
         "PersistentVolume" => ("/api/v1", "persistentvolumes", true),
+        "RuntimeClass" => ("/apis/node.k8s.io/v1", "runtimeclasses", true),
+        "MutatingAdmissionPolicy" => (
+            "/apis/admissionregistration.k8s.io/v1",
+            "mutatingadmissionpolicies",
+            true,
+        ),
+        "MutatingAdmissionPolicyBinding" => (
+            "/apis/admissionregistration.k8s.io/v1",
+            "mutatingadmissionpolicybindings",
+            true,
+        ),
         "Pod" => ("/api/v1", "pods", false),
         "Secret" => ("/api/v1", "secrets", false),
         "ConfigMap" => ("/api/v1", "configmaps", false),
@@ -129,7 +140,10 @@ fn collection(kind: &str, namespace: Option<&str>) -> Result<String, Error> {
         ),
         "Job" => ("/apis/batch/v1", "jobs", false),
         _ => return Err("unsupported Kubernetes resource".into()),
-    };
+    })
+}
+fn collection(kind: &str, namespace: Option<&str>) -> Result<String, Error> {
+    let (prefix, plural, cluster) = resource(kind)?;
     if cluster && namespace.is_some() {
         return Err("invalid Kubernetes namespace scope".into());
     }
@@ -142,11 +156,11 @@ fn collection(kind: &str, namespace: Option<&str>) -> Result<String, Error> {
         Ok(format!("{prefix}/{plural}"))
     }
 }
-fn named(kind: &str, namespace: Option<&str>, name: &str) -> Result<String, Error> {
+pub(crate) fn named(kind: &str, namespace: Option<&str>, name: &str) -> Result<String, Error> {
     if !identifier(name) {
         return Err("invalid Kubernetes resource name".into());
     }
-    if namespace.is_none() && !["Namespace", "Node", "PersistentVolume"].contains(&kind) {
+    if namespace.is_none() && !resource(kind)?.2 {
         return Err("namespaced Kubernetes read requires namespace".into());
     }
     Ok(format!("{}/{name}", collection(kind, namespace)?))
@@ -698,6 +712,11 @@ mod tests {
         assert!(named("Secret", Some("pgcf-system"), "..").is_err());
         assert!(named("Cluster", None, "database").is_err());
         assert!(collection("Deployment", Some("kube-system")).is_err());
+        assert_eq!(
+            named("RuntimeClass", None, "pgcf-prestarted").unwrap(),
+            "/apis/node.k8s.io/v1/runtimeclasses/pgcf-prestarted"
+        );
+        assert!(named("MutatingAdmissionPolicy", Some("kube-system"), "policy").is_err());
     }
 }
 #[cfg(test)]

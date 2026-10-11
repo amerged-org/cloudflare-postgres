@@ -1,0 +1,16 @@
+# The native controller selects a region's compute pool only after it reads node-bootstrap's
+# runtime admission for the current profile. It reads these exact objects and never writes them.
+- op: add
+  path: /rules/-
+  value:
+    apiGroups: [node.k8s.io]
+    resources: [runtimeclasses]
+    resourceNames: [pgcf-prestarted]
+    verbs: [get]
+- op: add
+  path: /rules/-
+  value:
+    apiGroups: [admissionregistration.k8s.io]
+    resources: [mutatingadmissionpolicies, mutatingadmissionpolicybindings]
+    resourceNames: [pgcf-cnpg-prestarted]
+    verbs: [get]

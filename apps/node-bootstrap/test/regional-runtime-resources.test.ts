@@ -174,6 +174,36 @@ test("real Kustomize composition selects all three native entrypoints and exact 
       object(config.data).PGCF_POSTGRES_IMAGE,
       "${PGCF_POSTGRES_IMAGE}",
     );
+    // The native controller selects the region pool only after reading the exact admission objects.
+    const agentRole = native.find(
+      (value) =>
+        value.kind === "ClusterRole" &&
+        object(value.metadata).name === "pgcf-agent",
+    )!;
+    assert.deepEqual(
+      (agentRole.rules as Json[]).filter((rule) =>
+        (rule.apiGroups as string[]).some((group) =>
+          ["node.k8s.io", "admissionregistration.k8s.io"].includes(group),
+        ),
+      ),
+      [
+        {
+          apiGroups: ["node.k8s.io"],
+          resources: ["runtimeclasses"],
+          resourceNames: ["pgcf-prestarted"],
+          verbs: ["get"],
+        },
+        {
+          apiGroups: ["admissionregistration.k8s.io"],
+          resources: [
+            "mutatingadmissionpolicies",
+            "mutatingadmissionpolicybindings",
+          ],
+          resourceNames: ["pgcf-cnpg-prestarted"],
+          verbs: ["get"],
+        },
+      ],
+    );
     const legacy = patchFixture().input,
       oldRegional = await render(
         directory,
