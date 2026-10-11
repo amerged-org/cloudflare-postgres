@@ -214,13 +214,6 @@ export function thinQualificationFixture(
           ),
         ),
       },
-      reboot: {
-        boot_id_before: "51111111-1111-4111-8111-111111111111",
-        boot_id_after: "52111111-1111-4111-8111-111111111111",
-        pool_active: true,
-        volume_active: true,
-        marker_present: true,
-      },
     },
     noflush_quiescence: {
       writer: {
@@ -264,7 +257,6 @@ export function thinQualificationFixture(
       long_statement_active: true,
       suspended: true,
       resume_target_verified: true,
-      changed_identity_refused: true,
       restart_ready_milliseconds: 3_900,
       marker_present: true,
       uncommitted_rows: 0,
