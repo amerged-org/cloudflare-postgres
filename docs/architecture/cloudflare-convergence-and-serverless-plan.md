@@ -89,8 +89,8 @@ One row per step, in dependency order. A step moves to Done only with its measur
 | EU rotation | Open | Prepared EU authority (material revision 2) is active and retired authority is rejected. |
 | EU1 | Open | EU1 is patched first, passes the six checks and needs zero operator interventions. |
 | Control | Open | Control/relay is patched last, passes the six checks, the relay is reachable and no intervention was needed. |
-| Notifier | Open | RAM, CPU and storage warning thresholds are delivered; one real alarm arrives after the owner sets recipient and sender through the API. |
-| R2 | Open | Native gateway, native controller and the EU pool switch (relay keeps its pin) roll out EU1 then control; six checks pass. Needs Rust runtime-switch parity and node storage samples first. |
+| Notifier | Open | RAM, CPU and storage warning thresholds are delivered; one real alarm arrives after the owner sets recipient and sender through the API. CPU values arrive only from R2's native controller. |
+| R2 | Open | Native gateway, native controller and the EU pool switch (relay keeps its pin) roll out EU1 then control; six checks pass. R2 pins the thin guard, so each node's host configuration stage also waits until `dm_thin_pool` is loaded. |
 | Pool cold-start test | Open | A sleeping database's pool-hit first SQL is measured from one start (<1 s target, unproven), data is preserved and refill is observed; a miss is labelled a miss. |
 | Thin qualification | Open | A scratch-first run on EU1 passes the seven [gates](#thin-storage-qualification-gates) and yields the receipt. |
 | R2b | Open | An R2 successor carries the receipt; EU `thin_storage` template and EU1 thin selection are active; thin create, backup, restore and delete pass; density and sleeping CPU release are measured. |
@@ -134,31 +134,38 @@ new workload density still requires measurement.
 A receipt (`thin_storage_qualification` in an approved fleet release) states that all seven gates
 passed for one complete thin profile hash, `openebs-lvm` driver image, `pgcf-sandbox-controller`
 host extension image and exact `nodeInfo.kernelVersion` string. Activation compares exactly these
-values, so a change to any of them needs a new run. No receipt producer exists yet; gate flags
-typed into a release are not a qualification.
+values, so a change to any of them needs a new run. The receipt comes only from a completed
+`POST /v1/nodes/{id}/thin-qualifications` run (ThinQualification Workflow): release approval
+refuses any other receipt, and gate flags typed into a release are not a qualification. The
+producer has not run live yet.
 
 The run is scratch-first on EU1 after R2: it creates `pgcf_thinpool` with the product command and
 the exact profile geometry from free extents, uses a fenced deny-all namespace with a quota, scratch
 volumes and a PostgreSQL Pod from the release's `postgres` pin, then deletes its volumes and pool.
-It creates no node thin selection, because a selection cannot be undone. Every gate records node,
-boot and system UUIDs, VG/pool/LV UUIDs, `lvs`/`dmsetup` state before and after, timings and the
-pass value computed by code. Preconditions: R2 accepted with the EU pool switch on, and
-`dm_thin_pool` loaded on EU1; retained nodes currently load it only from a receipt-bearing release.
-Today a receipt-bearing release also requires thin write authority on every live member, control
-included, so R2b needs that scope narrowed to placement-enabled members or a thin pool on control.
+It creates no node thin selection, because a selection cannot be undone. It records the node
+identity at setup and the measured evidence of every gate; Cloudflare computes each pass decision
+from that evidence. Preconditions: R2 accepted with the EU pool switch on. The run needs a release
+that pins the thin guard, as R2 does; such a release configures and requires `dm_thin_pool` on
+every role, so R2's own patch loads the module on EU1 and control without a receipt. A
+receipt-bearing release requires thin write authority only from members that take databases or
+already have a selection, so control/relay converges without a pool.
 
-| Gate | Proves | Pass criterion |
-| --- | --- | --- |
-| `data_full` | A full data pool fails writes fast and recovers by growth without losing commits. | After a committed marker and a fill to 100% data, writes fail with EIO and no task stays in D state beyond `drain_seconds`; after growth with the product `lvextend`, pool and LV UUIDs are unchanged, writes resume, the marker is present and crash recovery keeps every acknowledged commit. |
-| `metadata_full` | Metadata never runs out before data, and metadata exhaustion fails closed. | At 100% data with random 4 KiB writes across `maximum_volumes` volumes, metadata use stays within its size minus `metadata_reserve_bytes`. A deliberately undersized scratch pool accepts no writes after exhaustion and, after `thin_check` and `lvconvert --repair`, either verifies its data or refuses activation. |
-| `noflush_quiescence` | A noflush suspend freezes writers, also on a full pool, and resume drains within budget. | With an active writer and dirty pages, `dmsetup suspend --noflush` is confirmed, also when full; no new chunks are allocated while suspended; resume drains at most the host drain budget within `drain_seconds`; the filesystem is clean. |
-| `resume_marker` | Resuming the exact volume keeps committed data and drops uncommitted work. | After suspend, a killed writer and resume, PostgreSQL restarts on the same PVC with the marker present, the uncommitted statement absent and the same LV and pool; a changed LV UUID or expired token is refused. |
-| `startup_bound` | A cold start (initdb plus bulk load) stays inside the profile's startup and IO bounds. | Pool data growth is at most the larger of `startup_reserve_bytes` and the quota; the Pod's `io.max` is finite and within the profile; no lazy-init writes occur; each executor run finishes within half of `guard_seconds`. |
-| `trim_delete_recreate` | Deleting a volume returns its extents, and a recreated volume starts clean. | After PVC and PV deletion the LV is absent from `lvs -a` and device-mapper, pool usage returns to its baseline, and a recreated LV of the same size has a new UUID, no residual data and initializes without `thin_storage_retained_pool_missing`. |
-| `retained_thick_preservation` | Thin work and its reboots leave retained thick databases untouched. | Before and after every step and reboot, thick LV UUIDs, sizes and linear segment types, PV/PVC IDs, SQL markers and WAL archive status are identical; `thick_allocated_bytes` is unchanged; no thick database gains a storage profile. |
+The [qualification runbook](../operations/recovery.md#thin-storage-qualification-run) is the single
+definition of the complete preconditions, the procedure and the pass criteria computed by code.
 
-The thin class sets no filesystem `discard` option, so deletes inside a running filesystem are
-measured but not claimed as reclaimed extents; requiring them is an open owner decision.
+| Gate | Proves |
+| --- | --- |
+| `data_full` | A full data pool fails writes fast and recovers by growth without losing commits. |
+| `metadata_full` | Metadata never runs out before data, and metadata exhaustion fails closed. |
+| `noflush_quiescence` | A noflush suspend freezes writers, also on a full pool, and resume drains within budget. |
+| `resume_marker` | Resuming the exact volume keeps committed data and drops uncommitted work. |
+| `startup_bound` | A cold start (initdb plus bulk load) stays inside the profile's startup and IO bounds. |
+| `trim_delete_recreate` | Deleting a volume returns its extents, and a recreated volume starts clean. |
+| `retained_thick_preservation` | Thin work leaves retained thick volumes and databases with the same identities, readiness and WAL archiving. |
+
+The thin class sets no filesystem `discard` option, so the run qualifies extent return only on
+volume deletion, not for deletes inside a running filesystem; requiring them is an open owner
+decision.
 
 Keep Done to one row per completed step, at most one measurement line and roughly 15 lines.
 Record only final customer-readiness results here; detailed hashes, bytes and intermediate
