@@ -127,8 +127,12 @@ results in the [ULTRA plan](../architecture/cloudflare-convergence-and-serverles
 The latest October10 owner decision authorizes activation of the prepared EU replacement
 authority during the automatic EU patch window, combining required restarts with the upgrade.
 This supersedes the earlier rotation pause. Verify replacement access and rejection of retired
-authority through the existing procedure; retain US custody revision2. The prior disclosure
-record remains. Planning this change does not mean it has been activated.
+authority through the existing procedure. The prior disclosure record remains. Planning this
+change does not mean it has been activated.
+
+The cancelled US region receives no further rotation. Keep its encrypted custody and every
+`CREDENTIAL_KEYS` ID it references as a dormant record. Revoke its R2, Tunnel and source-read
+tokens in the Cloudflare US cleanup listed in the ULTRA plan, after US1 is marked lost.
 
 The pinned [Talos CA command](https://github.com/siderolabs/talos/blob/v1.14.2/cmd/talosctl/cmd/talos/rotate-ca.go)
 supports separate Talos and Kubernetes API CA rotation. For Talos only, explicitly set

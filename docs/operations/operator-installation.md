@@ -1,23 +1,24 @@
 # Existing-account installation
 
-Current scope (2026-10-10): follow the canonical [ULTRA delivery plan](../architecture/cloudflare-convergence-and-serverless-plan.md)
-and record measured completion there. Keep the existing EU control/relay, customer EU1 and US1
-servers. The three EU databases are owner-declared disposable test data and may be deleted and
+Current scope (2026-10-11): follow the canonical [ULTRA delivery plan](../architecture/cloudflare-convergence-and-serverless-plan.md)
+and record measured completion there. Keep the existing EU control/relay and customer EU1
+servers. The US region is cancelled; US1 serves only as the R1.1 canary until it is marked lost.
+The three EU databases are owner-declared disposable test data and may be deleted and
 recreated if they obstruct; this does not authorize resetting EU hosts or repurposing control.
 
-The two customer servers use V159 / Cloud VPS Plus 4, 4 vCPU, 8 GiB RAM and 150 GiB NVMe.
-US1's Talos 1.14.2/Kubernetes 1.36.5 is the starting baseline. Golden R1 includes the sandbox
-extension, thin-pool kernel module and common release pins. Activate prepared EU replacement
-credentials in its patch window; retain US custody revision2. Rust and shared-pool work proceeds
+EU1 uses V159 / Cloud VPS Plus 4, 4 vCPU, 8 GiB RAM and 150 GiB NVMe. Talos 1.14.2/Kubernetes
+1.36.5 is the release baseline. Golden R1 includes the sandbox extension and common release pins;
+`dm_thin_pool` is loaded through Talos machine configuration, not the image recipe. Activate
+prepared EU replacement credentials in its patch window. Rust and shared-pool work proceeds
 in parallel and ships as R2 through the same automatic target-release workflow.
 
 New nodes use the golden raw image through AddNode; existing nodes use supported Talos/Kubernetes
 upgrades followed by Flux platform/PGCF convergence. One target-release API call must drive the
 whole selected fleet serially without laptop helpers or operator steps. Current per-node APIs
 are building blocks, not proof that fleet automation exists. Use the six functional checks in the
-ULTRA plan. Retain US1's terminal original AddNode operation; do not reopen it to test patches.
-Use Contabo only at provider lifecycle boundaries. A future real expansion uses the configured
-threshold/purchase policy and the same golden release; no additional test server is required now.
+ULTRA plan. Use Contabo only at provider lifecycle boundaries. A future real expansion uses the
+configured threshold/purchase policy and the same golden release; a new region starts with its
+[control server](#control-server-of-a-new-region).
 
 ## Reviewed deployment inputs
 
@@ -43,10 +44,11 @@ exact plain YAML once under the existing persisted mutation claim. Confirm the a
 host presents that retained key through strict SSH verification before any installation writes;
 the provider honoring cloud-init remains a live installation check.
 
-The EU archive uses the EU-jurisdiction binding and EU S3 endpoint. US has a separate bucket and
-the account's general S3 endpoint. Choose a North America location hint when creating that bucket;
-the hint does not guarantee jurisdiction. `ARCHIVE_BINDINGS` must map each exact region ID to its
-actual Worker binding and bucket. A mismatching or missing binding fails closed.
+The EU archive uses the EU-jurisdiction binding and EU S3 endpoint. Every other region has a
+separate bucket on the account's general S3 endpoint. Choose that region's location hint when
+creating its bucket; the hint does not guarantee jurisdiction. `ARCHIVE_BINDINGS` must map each
+exact region ID to its actual Worker binding and bucket. A mismatching or missing binding fails
+closed.
 
 ## Rust/Wasm Edge artifact
 
@@ -243,17 +245,18 @@ requires exact before/after rule and attachment identity checks, one recorded mu
 GET-only resolution of an uncertain result. Keep these lifecycle calls separate from the zero
 provider-call requirement for routine transport.
 
-US1's original purchase, profile, inspection, complete installation and admitted job are retained.
-Preserve sealed inputs, credentials, proof-source association and journals; they record completed
-work. Resolve uncertain control responses through observation. Do not repeat purchase, profile
-import, adoption, registration or disk-write intent. EU1 is already admitted and needs no bootstrap
-or adoption. The sequence below is the procedure for future authorized additions, not an
-instruction to reinstall either existing customer node.
+Completed AddNode jobs retain their original purchase, profile, inspection, installation and
+admission records. Preserve sealed inputs, credentials, proof-source association and journals;
+they record completed work. Resolve uncertain control responses through observation. Do not
+repeat purchase, profile import, adoption, registration or disk-write intent. EU1 is already
+admitted and needs no bootstrap or adoption. The sequence below is the procedure for future
+authorized additions, not an instruction to reinstall an existing node.
 
-The accepted API/Regional source6978033 runs in both regions after CI37851000610. The latest
-owner change removed both live node ceilings (`max_nodes:null`) and the personal capacity-mail
-credentials/recipient. Existing order, RAM placement and automatic-purchase flags are unchanged;
-autoscaling remains disabled until the common release and installation templates are accepted.
+The recorded EU Regional source is 6978033 (CI 37851000610) until the EU fleet patch. An owner
+change removed the live node ceilings (`max_nodes:null`) and the personal capacity-mail
+credentials/recipient. Per the owner's 2026-10-11 decision, automatic EU purchases stay enabled
+and US purchases are off; every addition still waits for a thin-qualified release (see the
+[new-region runbook](#control-server-of-a-new-region), step 4).
 The missing EU installation profile is configuration work, not a missing owner permission.
 Historical warning/delivery tests remain in PLAN.md; they do not imply that mail is still enabled.
 
@@ -295,7 +298,7 @@ This installation's owner selects V159, one month, no add-on and760000PPM; those
 settings, not fixed product requirements. Provider credentials are protected operator secrets.
 Fresh adopters receive neither these credentials nor this owner's purchase authority.
 
-The retained EU/US placement settings remain actual RAM,256MiB assignment steps, maximum4096MiB
+The retained EU placement settings remain actual RAM,256MiB assignment steps, maximum4096MiB
 and the reviewed128MiB PostgreSQL request. Changing placement mode or the PostgreSQL request
 requires an empty live cohort or complete current-generation manual suspension with no unsettled
 starts. Preserve database/volume/role/custody identities and resume through fresh full-peak startup
@@ -400,11 +403,76 @@ as 300 GB SSD. On 2026-10-06, the owner-authorized API test submitted
 `addOns.extraStorage.nvme: [{ "sizeTB": 0.15, "quantity": 1 }]`. One POST returned201 and its
 original-request CREATED audit matched. Final allocation was **8 vCPU, 24,576 MiB RAM and
 614,400 MiB SSD (600 GiB)**, so this payload does **not** select the included 150 GB NVMe
-variant. No installer or disk write ran. Do not use it for US or standing regional expansion.
+variant. No installer or disk write ran. Do not use it for standing regional expansion.
 The V155 free-NVMe selector remains unverified. The current owner-approved V159 offer supplies
-150 GiB NVMe without a storage add-on; its one US purchase and actual allocation are verified.
+150 GiB NVMe without a storage add-on; its one purchase (US1) and actual allocation are verified.
 Use only that confirmed offer and its reviewed costs for the current installation profile and
-standing policy. Do not repeat the V155 test or order another EU worker.
+standing policy. Do not repeat the V155 test; EU additions follow the configured purchase policy.
+
+## Control server of a new region
+
+Use this sequence for every new region, for example US or Oceania. It installs the region's
+control server from the selected Golden release through AddNode; customer workers then join
+through the same path. The parameters are listed in the
+[control-server configuration](../../infra/talos/README.md#control-server-configuration-per-region)
+and the model in the [ULTRA delivery architecture](../architecture/cloudflare-convergence-and-serverless-plan.md#delivery-architecture).
+Every call needs an administrator key; send each mutation with its own persistent
+`Idempotency-Key`. A new region needs no code change and no relay of its own.
+
+1. **Region.** `POST /v1/regions` with a new `id`, `provider:"contabo"`, the exact Contabo
+   `provider_region`, `gateway_url` `http://pgcf-gateway.pgcf-system.svc.cluster.local:8080/pg`,
+   the Edge VPC binding name `gateway_binding`, `backup_bucket` and `backup_endpoint_url`. Write
+   the returned agent key and route keyring directly to private custody; a replay never returns
+   them again. Do not reuse the cancelled US region ID: its write-once profile and revision-1
+   custody belong to the old cluster.
+2. **Cloudflare prerequisites.** In the private deployment configuration, create the region's
+   R2 bucket, bind it as `ARCHIVE_<NAME>` and add its `ARCHIVE_BINDINGS` entry; create a
+   bucket-scoped R2 S3 write credential; create the regional Tunnel and the Edge VPC service
+   binding named by `gateway_binding`. Keep `BOOTSTRAP_OPERATOR_SOURCES` at the current operator
+   CIDRs, add the provider instance to `BOOTSTRAP_FIREWALL_BINDINGS` or let AddNode allocate an
+   owned firewall, and add the region ID to `PGCF_BOOTSTRAP_RELAY_ALLOWED_TARGET_REGIONS` in the
+   EU relay configuration. Deploy the changed Worker configuration between fleet patches and
+   compare binding and secret names, never values.
+3. **Installation profile.** `PUT /v1/regions/{id}/installation-profile` once with `version:1`,
+   `region_id`, `provider_product_id`, `relay_issuer_region_id` set to the relay's issuer region,
+   `dns`, `storage`, `rescue_client_private_key` and
+   `first_region:{cluster_name,reviewed_commit,regional_image,platform}`. Its `platform` holds
+   `version:1`, `region_id`, `api_host`, the issued `agent_key`, `route_keyring`, `tunnel_token`
+   and `backup_s3`. The profile is write-once and its agent key must match the issued key.
+4. **Release and templates.** Select the fleet's current approved release with
+   `PUT /v1/regions/{id}/release`. Read `GET /v1/regions/{id}/capacity-policy`, then PUT the
+   complete policy with a release-pinned `compute_pool` template, a `thin_storage` template
+   byte-identical to the release's qualified profile and purchases off unless the owner approved
+   a costed order. A non-null `compute_pool` also switches the region's pool runtime on. AddNode
+   refuses before any provider order until these match a release with a thin qualification
+   receipt, so no region can add a node before R2b.
+5. **Control server.** `POST /v1/nodes/additions` with
+   `{"region_id":"<region>","mode":"adopt","provider_instance_id":"<instance>"}` for an allocated
+   VPS, or `mode:"order"` with the configured `order` and the owner's costed approval. The
+   region's first live node becomes its Talos control plane, installs Cilium, Flux, the platform
+   and regional services from `first_region`, and seals the region seed and join bundle. Its
+   outside network proof scans from a Ready, uncancelled node of another Contabo region (EU1 for
+   a non-EU region); the relay host never serves as source or target. Follow
+   `GET /v1/nodes/additions/{operation-id}` and the read-only inspection and proof views above.
+   Only admission releases the quarantine taint.
+6. **Placement off.** When `GET /v1/nodes` lists the node with its UID, send
+   `PUT /v1/nodes/{id}/database-placement` with `expected_node_uid` and
+   `database_placement_enabled:false`. Create no database in the region before this; customer
+   databases belong on its workers.
+7. **Fleet role.** Assign `control_relay` through `PUT /v1/nodes/{id}/release`
+   (`expected_revision`, `release_id`, `node_uid`, `role`) or as its member role in the next
+   `POST /v1/fleet/rollouts`. When that role requires host configuration, the node also needs a
+   release-pinned compute-pool policy with `target_slots:0`.
+8. **Firewall and operator sources.** AddNode writes every member's provider firewall from
+   `BOOTSTRAP_OPERATOR_SOURCES`, the relay addresses and the exact region peers; PostgreSQL stays
+   closed. Each later addition rewrites all members' rules, so change operator access only through
+   `BOOTSTRAP_OPERATOR_SOURCES`.
+9. **Material rotation.** Replace cluster authority only through
+   [staged custody](credentials.md#stage-and-activate-replacement-cluster-custody) and a fleet
+   rollout's `staged_material_revision`.
+10. **Acceptance and workers.** Run the ULTRA node acceptance checks, then add identical customer
+    workers through AddNode; they join with the region's custody and take customer placement
+    after admission.
 
 ## Legacy manual evidence and recovery path
 
@@ -413,8 +481,8 @@ That same node is now retained customer EU1. Do not rerun its adoption, rescue o
 This historical procedure remains a reference for separately authorized recovery; it does not
 authorize a loss drill or removal of EU1 during the current completion.
 
-1. Configure `/v1/regions/{id}/capacity-policy` with the explicit node maximum. EU lists the second
-   existing provider instance in `adopt_instance_ids`; US may order only its configured approved
+1. Configure `/v1/regions/{id}/capacity-policy` with the explicit node maximum. A region lists
+   existing provider instances in `adopt_instance_ids` or orders only its configured approved
    offer. Purchases require the specific location, term, setup amount and monthly total.
 2. Create actual database demand that exhausts measured headroom, then trigger/read
    `/v1/regions/{id}/capacity-decision`. Save the immutable node addition and operation IDs.
@@ -429,7 +497,7 @@ authorize a loss drill or removal of EU1 during the current completion.
    `spec.platform` and private `platform`: reviewed source commit, immutable regional image,
    canonical configuration hash, exact region, existing issued agent key, regional routing
    keyring, Tunnel token and scoped R2 credentials. These values are sealed, not returned in status.
-   EU workers use the retained join bundle and do not install a second platform.
+   Workers use the region's retained join bundle and do not install a second platform.
 5. Let the Workflow verify exact owned firewall rules, assignment and current readback before
    requesting the provider's RAM rescue. RAM rescue supplies the retained host key and route
    configuration so authenticated rescue access and actual network measurements can be collected.
@@ -438,8 +506,9 @@ authorize a loss drill or removal of EU1 during the current completion.
    destructive checkpoints enforce that separate verified preparation. The node stays quarantined.
    Native checkpoints record an intent before disk writes or platform mutations; resume reads exact
    owned state and does not blindly reinstall.
-6. For US, the native flow installs Cilium, Flux, the five platform releases and regional services,
-   and verifies the LVM/CSI registration. Retain the issued regional identity on retries.
+6. For a region's first node, the native flow installs Cilium, Flux, the five platform releases
+   and regional services, and verifies the LVM/CSI registration. Retain the issued regional
+   identity on retries.
 7. Generate actual preparation/post-join artifacts with
    `scripts/e2e/src/node-network-proof.ts` (`access`, `scan`, `prepare`, `verify`). Private inputs
    use `PGCF_NETWORK_CONFIG_JSON`, `PGCF_NETWORK_SIGNING_JWK` and `PGCF_NETWORK_OUTPUT`.
@@ -497,28 +566,31 @@ completion remains fresh within300 seconds and publication binds the current exa
 state. Only the internal Native caller selects this rule. The manual publisher's original
 300-second start-age and duration checks remain unchanged; there is no new CLI/environment option.
 
-For acceptance of a future authorized node, complete installation and admission, then restore an EU1 test database into a separate US
-target from R2 while keeping the EU source healthy. Compare SQL data and committed markers,
-verify target backup/WAL and retain the EU Node, volume, role and encrypted custody identities.
+For acceptance of a future authorized node, complete installation and admission, then restore a
+test database from R2 into a separate target in that node's region while keeping the source
+healthy. Compare SQL data and committed markers, verify target backup/WAL and retain the source
+Node, volume, role and encrypted custody identities.
 Earlier loss, deletion and decommissioning kits are withheld; any later loss drill needs a
 separately reviewed scope that preserves or recovers the same customer EU1. Keep unchanged prior
 proofs and record new measured results in `PLAN.md`. The historical approximately nine-second wake is the fallback baseline. The current ULTRA
 scope additionally requires a genuine shared-pool first SQL below one second; its acceptance
 remains open in the canonical plan.
-Do not migrate Neon or call the product finished until EU and US plus recovery have passed.
+Do not migrate Neon or call the product finished until the open ULTRA steps, including recovery,
+have passed.
 Record measured installation/rollout time and actual Contabo calls by lifecycle phase, including
 zero calls throughout repeated transport grants, Kubernetes/Talos reads and proof cleanup after
 source selection. Local tests, a configured image or provider Running do not establish this live
 acceptance. Use the normal Cloudflare SQL endpoint to verify actual placement, roles/TLS, committed
 markers, R2 base backup/WAL and deletion through confirmed physical storage reclamation.
 
-## Accepted EU/US checks and observed software
+## Accepted checks and observed software
 
-The owner-authorized US operator postjoin/admission completed at16:50:20 UTC in198.356 seconds.
-The programmed1GiB storage trial wrote, read and physically reclaimed its volume in753.081 seconds.
-Automatic postjoin admission remains unproved: a report returned HTTP409 before pause, and its
-session renewed without admission. The next genuine, separately authorized node purchase must
-prove that path; the operator result does not substitute for automatic acceptance.
+US1's installation used the owner-authorized operator postjoin/admission fallback, which completed
+at 16:50:20 UTC in 198.356 seconds; its programmed 1 GiB storage trial wrote, read and physically
+reclaimed its volume in 753.081 seconds. Automatic postjoin admission remains unproved: a report
+returned HTTP 409 before pause, and its session renewed without admission. The next genuine,
+separately authorized node addition must prove that path; the operator result does not
+substitute for automatic acceptance.
 
 EU1 and US1 passed real SQL through `db.ohmyho.st`, TLS1.3 and nonsuperuser application roles.
 EU trial SQL took2187ms. A separate EU restore took108618ms; a healthy-source EU-to-US restore
@@ -527,67 +599,60 @@ on US. All four databases passed R2 base-backup and exact committed-WAL checks, 
 its5GiB physical volume after deletion (20GiB total). The earlier empty timeout trial was deleted
 separately without an allocation. All three existing EU databases and encrypted custody remain.
 
-The original US region configuration omitted `/pg` from its gateway URL. Gateway WebSocket
-upgrade requires this path; a healthy Tunnel and correct service binding alone are insufficient.
 Region registration must use `http://pgcf-gateway.pgcf-system.svc.cluster.local:8080/pg` with the
-configured private VPC binding. The observed URL was corrected once with exact configuration
-comparison before/after; no runtime or database reset was needed.
+configured private VPC binding. Gateway WebSocket upgrade requires this path; a healthy Tunnel
+and correct service binding alone are insufficient. Correct a wrong URL once with exact
+configuration comparison before and after; no runtime or database reset is needed.
 
-Actual inventory differs as follows. The original inventory is from October7/8, supplemented by
-the October9 common Regional delivery and fresh read-only Talos/Kubernetes checks on all3 nodes.
-The remaining OS/cluster differences still require the supported programmed patch path.
+The recorded EU inventory is from October 7/8, supplemented by the October 9 common Regional
+delivery and fresh read-only Talos/Kubernetes checks. The supported programmed patch path closes
+its remaining OS/cluster differences from the selected release.
 
-| Component | EU | US |
-| --- | --- | --- |
-| Talos / kernel / containerd | 1.14.1 / 6.18.51-talos / 2.3.5 | Same |
-| Kubernetes API and kubelet | 1.36.3 | 1.36.5 |
-| Flux source / kustomize / helm / notification | 1.9.5 / 1.9.5 / 1.6.4 / 1.9.4 | 1.9.6 / 1.9.6 / 1.6.5 / 1.9.4 |
-| Additional Flux controllers | Absent from inventory | image-automation1.2.5, image-reflector1.2.5, source-watcher2.2.4 |
-| Cilium / CNPG operator / Barman plugin | 1.20.2 / 1.30.1 / 0.15.1 | Same |
-| CNPG / Barman Helm charts | 0.29.1 / 0.8.1 | Same |
-| cert-manager / OpenEBS / LVM driver | 1.21.2 / 4.6.1 / 1.10.1 | Same |
-| cloudflared | 2026.10.0 | Same |
-| PostgreSQL, actual SQL | 18.6 (Debian18.6-1.pgdg13+2), server180006 | Same |
-| Regional runtime source | 6978033, CI37851000610 | Same |
+| Component | EU |
+| --- | --- |
+| Talos / kernel / containerd | 1.14.1 / 6.18.51-talos / 2.3.5 |
+| Kubernetes API and kubelet | 1.36.3 |
+| Flux source / kustomize / helm / notification | 1.9.5 / 1.9.5 / 1.6.4 / 1.9.4 |
+| Additional Flux controllers | Absent from inventory |
+| Cilium / CNPG operator / Barman plugin | 1.20.2 / 1.30.1 / 0.15.1 |
+| CNPG / Barman Helm charts | 0.29.1 / 0.8.1 |
+| cert-manager / OpenEBS / LVM driver | 1.21.2 / 4.6.1 / 1.10.1 |
+| cloudflared | 2026.10.0 |
+| PostgreSQL, actual SQL | 18.6 (Debian18.6-1.pgdg13+2), server180006 |
+| Regional runtime source | 6978033, CI37851000610 |
 
 The following are actual workload `imageID` digests, not Helm chart or release-content digests.
-Kubernetes component versions are 1.36.3 in EU and 1.36.5 in US; the repositories are
-`registry.k8s.io/<component>`.
+Kubernetes component versions are 1.36.3; the repositories are `registry.k8s.io/<component>`.
 
-| Kubernetes component | EU actual imageID digest | US actual imageID digest |
-| --- | --- | --- |
-| kube-apiserver | `sha256:b4bc06c81fd76f81174e6c19ddacf477acdf1583e7a5846ebbd513493aef6e43` | `sha256:4b3e69973a1d58d3c1f670d3477a9b9f14a03a271823113e8e0c9a333eb84f48` |
-| kube-controller-manager | `sha256:ed56454bf514916079a227f5765b64524fde52106dfcc52978b28634765b78b8` | `sha256:2d717af134451db77ea053c3426bc82edc0e55415eb36e1260313c636ebe9a4d` |
-| kube-scheduler | `sha256:128fc07d278d64c4f2cce416ed0a9f37b23a30cdde6f97873d18c9c78e259df4` | `sha256:3804f66442962cefbe11fcd5330d5e7a797bfb3dc8535c322d005637b404a85f` |
+| Kubernetes component | EU actual imageID digest |
+| --- | --- |
+| kube-apiserver | `sha256:b4bc06c81fd76f81174e6c19ddacf477acdf1583e7a5846ebbd513493aef6e43` |
+| kube-controller-manager | `sha256:ed56454bf514916079a227f5765b64524fde52106dfcc52978b28634765b78b8` |
+| kube-scheduler | `sha256:128fc07d278d64c4f2cce416ed0a9f37b23a30cdde6f97873d18c9c78e259df4` |
 
-Flux repositories are `ghcr.io/fluxcd/<controller>`. An absent entry means the controller was
-not present in the retained EU inventory, rather than a failed version observation.
+Flux repositories are `ghcr.io/fluxcd/<controller>`.
 
-| Flux controller | EU version and actual imageID digest | US version and actual imageID digest |
-| --- | --- | --- |
-| source-controller | 1.9.5 / `sha256:6f20d232d596a758c923d2861f23511718fc303b8a2e36a1434a7c736b9f4268` | 1.9.6 / `sha256:6a6693172589f8ff26123a231d5fa6ceb194a6efb4dc647cdf057c959f76a2e3` |
-| kustomize-controller | 1.9.5 / `sha256:a3a955eb2bc432c2eaa94d2d3714e3beae7fdf17586fd23aadf71ab597ac3339` | 1.9.6 / `sha256:2ebeaa341da77d52b6abbbba5efcee0450d47f8b42f0e6f33b08f9020262d606` |
-| helm-controller | 1.6.4 / `sha256:8ff15409e46d354338045f483d58ca9cb35dffa2f87e4addd1f5eba1e6a9175f` | 1.6.5 / `sha256:0d52fff5c4d476277b8fcb6beb9041e269adb5db943fe69f5a806ea0c92b1511` |
-| notification-controller | 1.9.4 / `sha256:840f318265ee26f0d2c48a158bf7896b22aa4e998e320a18646309f0e40b15da` | 1.9.4 / `sha256:840f318265ee26f0d2c48a158bf7896b22aa4e998e320a18646309f0e40b15da` |
-| image-automation-controller | Absent from inventory | 1.2.5 / `sha256:e1a2720d3951694609c39635886d5dcb15b7dffe0b8248461c6693539c522a28` |
-| image-reflector-controller | Absent from inventory | 1.2.5 / `sha256:c83ce5c06fed9ebb308cd5165bd144ee934c720f6b47e0da2180869092063c82` |
-| source-watcher | Absent from inventory | 2.2.4 / `sha256:86743f5a4cd4ea76b9722eb86222d56e8253e776daa0565ecb186ec68ad1d835` |
+| Flux controller | EU version and actual imageID digest |
+| --- | --- |
+| source-controller | 1.9.5 / `sha256:6f20d232d596a758c923d2861f23511718fc303b8a2e36a1434a7c736b9f4268` |
+| kustomize-controller | 1.9.5 / `sha256:a3a955eb2bc432c2eaa94d2d3714e3beae7fdf17586fd23aadf71ab597ac3339` |
+| helm-controller | 1.6.4 / `sha256:8ff15409e46d354338045f483d58ca9cb35dffa2f87e4addd1f5eba1e6a9175f` |
+| notification-controller | 1.9.4 / `sha256:840f318265ee26f0d2c48a158bf7896b22aa4e998e320a18646309f0e40b15da` |
 
-Talos runtime versions match, but the installer configuration does not prove a shared immutable
-image. The retained EU control configuration names `v1.14.1` by tag without a digest. Customer
-EU1 records installer digest `sha256:d1d2fbf374cd886fdd3b2f19d3bc9e82dcefa9caeb73275810b0f71060cc986e`;
-US1 records `sha256:cd4cb83e5f27cd356956cac01ed6f0c5ed2ec4343d3f46e4efa72706ed92d288`.
+The installer configuration does not prove a shared immutable image. The retained EU control
+configuration names `v1.14.1` by tag without a digest. Customer EU1 records installer digest
+`sha256:d1d2fbf374cd886fdd3b2f19d3bc9e82dcefa9caeb73275810b0f71060cc986e`.
 These are configured installer identities, distinct from the running Talos version. No EU
 reinstallation, upgrade or template activation was performed to align them.
 
-Both actual Regional digests are now
+At this audit the actual EU Regional digest was
 `sha256:ee08af77e5d3adf875bc9bb4ef7fbc2d54fe0434d2af185cc6508c61d48571da`.
 The common correction passed CI qualification of all10 layers and anonymous registry readback of89,798,172
 compressed bytes. The configured PostgreSQL image pin is
 `sha256:5495f355719f24bd56219bc46825ecfa8771515a110ceca6e4d83331868bf115`; actual SQL confirms
-18.6 in both regions. A US PostgreSQL runtime imageID was not separately retained in this audit.
+18.6.
 
-Shared actual controller imageIDs: CNPG `sha256:923c267ec29636db3bee20f993d0ec4973fa22998e1adad37da79e4d32b5bc07`,
+Actual EU controller imageIDs: CNPG `sha256:923c267ec29636db3bee20f993d0ec4973fa22998e1adad37da79e4d32b5bc07`,
 Barman `sha256:c75acad19a36e8176cfe2885761ff1b836c6ef977d7257e298c99a28b5c302ef`,
 Cilium `sha256:2939231d0d3e3ebddcd80fffa168b7ddcc78fdf0dc864d1c8c126ff523c54f01`,
 cert-manager `sha256:70f532fd9cfde0b09d55687200942399d89838bc2d5d5b45152eb799a15912b8`,
@@ -609,8 +674,7 @@ shared-pool fast-start acceptance before customer migration. Preserve EU1 and al
 databases; the earlier EU-upgrade deferral does not override this approved corrective scope.
 Neither alignment nor template selection authorizes an EU reinstall or a customer cutover.
 
-The US cluster uses custody revision 2; replacement access and retired-access rejection were
-verified. Prepared EU revision-2 authority is activated in the existing supported patch window,
+Prepared EU revision-2 authority is activated in the existing supported patch window,
 after the accepted etcd snapshot. The scoped route signer was separately replaced on October10:
 current Edge/API custody and all four gateway Pods reject its predecessor. Do not repeat key
 rotations or reinstall nodes. Retain historical archive-decryption material privately until
@@ -624,8 +688,8 @@ backup-peak admission. Customer placement excludes the control/relay host.
 
 The October8 static-reservation snapshot allowed four minimum-class databases on US1 and seven
 on EU1, and allocated5 GiB physical volumes upfront. Those were ceilings of the old configuration,
-not measured customer density or limits of an8 GiB server. They do not establish whether the22
-US projects fit the replacement resource model. Refresh physical inventory and measure the new
+not measured customer density or limits of an8 GiB server. They do not establish whether an
+adopter's projects fit the replacement resource model. Refresh physical inventory and measure the new
 model before customer cutover; record the result in the canonical plan.
 
 Ten real consecutive US minute samples from18:43:01 to18:52:04 UTC averaged **79.9062%** under
@@ -642,7 +706,7 @@ independent second trial. Never synthesize samples or weaken consecutive-minute 
 Both disposable loads used4096MiB limits and720-second automatic deadlines. Final second-load cleanup removed the exact Namespace/Pod and recovered4,177,731,584 bytes;
 fresh available RAM returned within the recorded baseline tolerance. Actual customer workload density remains unaccepted; RAM overbooking
 does not remove CPU, storage or startup checks. Approve sufficient regional capacity before
-committing the22-US cohort.
+committing an adopter cohort to a region.
 
 ### Connection and cold starts
 
@@ -674,7 +738,7 @@ one fallback policy: an approved always-warm size class
 polling and `SELECT 1` immediately before traffic; or bounded connection/request deadlines
 covering measured wake plus query/network margin. SQL statement timeouts are separate and do
 not fix shorter connection timeouts. Never retry uncertain writes. These are Dev measurements,
-not accepted US application latency.
+not accepted application latency.
 
 ### Create, restore and rebind
 

@@ -1,23 +1,67 @@
 # ULTRA — customer-ready PostgreSQL
 
-Canonical scope and status. Owner coaching of **11 October 2026, 03:30 Europe/Amsterdam**
-supersedes the earlier execution order. Customer migration is not yet authorized.
+Canonical scope and status. The owner decision of **11 October 2026** makes the fleet EU-only and
+supersedes the earlier execution order, including the 03:30 Europe/Amsterdam coaching of the same
+day. Customer migration is not yet authorized.
 
 ## Fixed scope
 
-Cloudflare owns configuration, placement, progress and provider actions. The retained fleet is
-EU control/relay, customer EU1 and customer US1. Preserve all three servers, existing data and
-keys; no replacement purchase or EU reinstall. Control receives no new customer databases.
+Cloudflare is the global control plane: it owns configuration, placement, progress, releases and
+provider actions for every region. The fleet is **EU control** (relay host, no customer databases)
+and **customer EU1**. Preserve both servers, existing data and keys; no EU reinstall. The US region
+is cancelled at Contabo: US1 runs until 2026-11-05 only as the R1.1 canary and is then marked lost.
+US and Oceania return later from the same region configuration. Automatic EU purchases stay
+enabled under the configured policy; US purchases are off.
 
 **R1-final is frozen:** the qualified Golden image containing the sandbox DNS/hostname fix,
 Talos 1.14.2 and Kubernetes 1.36.5. Its installer and raw image are privately distributed and
 fully verified. Further Golden changes require an observed boot or data blocker; other work
 belongs to R2. Runtime/platform references are immutable release inputs from the verified lock.
+R1.1 is the fleet release that carries these frozen bytes.
 
-**R1 uses standard PostgreSQL runtime.** A region API switch selects the pool runtime; it is off
-for R1 acceptance and EU. US1 enables it deliberately for R2 work. The shared prestarted pool,
-Rust runtime and measured first SQL below one second remain mandatory **before migration**.
-Pool tests must not block the standard-runtime fleet acceptance.
+**R1 uses standard PostgreSQL runtime.** A region API switch selects the pool runtime; it stays
+off for R1 acceptance and turns on for EU with R2. The shared prestarted pool, Rust runtime and
+measured first SQL below one second remain mandatory **before migration**. Pool tests must not
+block the standard-runtime fleet acceptance.
+
+**New nodes require thin storage**; there is no thick fallback for them. Retained thick volumes
+keep their backend and data. Thin activation needs a release-bound receipt from the
+[qualification gates](#thin-storage-qualification-gates).
+
+## Delivery architecture
+
+- **One Golden image.** New nodes, control or customer, install the selected release's Golden raw
+  image and installer through `AddNode`; retained nodes upgrade to the same installer through
+  fleet patches. Roles differ only in generated machine configuration and release role pins
+  (`control_relay`, `customer`). Network settings, keys and cluster custody stay outside the image.
+- **Cloudflare is global.** One API, D1, Durable Objects and Workflows manage every region.
+  `AddNode` installs new nodes. An approved fleet release plus one `POST /v1/fleet/rollouts`
+  request patches every listed node automatically, customer members before their region's
+  control server, without operator steps.
+- **A region is one control server plus N identical customer workers.** The control server
+  follows the documented
+  [per-region configuration](../../infra/talos/README.md#control-server-configuration-per-region):
+  Talos role `controlplane`, fleet role `control_relay`, database placement disabled, operator
+  sources and the generated provider firewall, and material rotation through Cloudflare custody.
+  Customer workers join it through `AddNode` from the Golden image and take all customer
+  databases. EU1 predates the Golden image; it converges in place and is not reinstalled.
+- **One relay for the whole fleet.** The bootstrap relay is a singleton add-on on EU control.
+  It carries Cloudflare's native transport to every region; no other control server runs it.
+  `AddNode` never targets the relay host. EU control predates the programmed installer: fleet
+  releases converge its software, and only the manual Talos recipe can rebuild it.
+- **US and Oceania later.** A new region follows the
+  [new-region runbook](../operations/operator-installation.md#control-server-of-a-new-region):
+  `POST /v1/regions` with a new region ID, the Cloudflare prerequisites, an installation profile
+  with `first_region`, then `AddNode` for the control server (a region's first node becomes its
+  control plane), placement off and role `control_relay`, then workers. The cancelled US records
+  stay dormant and are not reused.
+- **Current constraints.** `AddNode` refuses before any provider order until the region selects a
+  thin-qualified release with matching `compute_pool` and `thin_storage` templates, so every new
+  node waits for R2b. Its outside network proof scans from a Ready, uncancelled node in another
+  Contabo region; while EU is the only region, an EU addition has no automatic scan source and
+  needs the manual network-proof path. EU also lacks its write-once installation profile, which an
+  EU addition needs before it can install. The purchase itself checks neither, so an automatic EU
+  order after R2b would buy a server that waits for both.
 
 ## Done
 
@@ -27,39 +71,30 @@ Pool tests must not block the standard-runtime fleet acceptance.
 | Credential retirement | US authority and route signer checked; current US custody metadata retains the same keys. EU replacement is prepared. |
 | Daily infrastructure backup | D1 and both etcd artifacts fully verified in R2; successful run 232.7 s. Email remains operator-configured. |
 | EU read-only preparation | 279 role documents validated; isolated role boot passed in 125.7 s; direct rescue/config/snapshot custody ready. |
-| US technical release | Ready at 21:35 UTC via Cloudflare; later operator repairs are counted separately. Database acceptance remains open. |
+| US technical release | Ready at 21:35 UTC via Cloudflare; later operator repairs are counted separately. US database acceptance is no longer pursued. |
 | Corrected sandbox runtime qualification | AMD64 proof passed: pool claims 10.4/11.5 ms. These are runtime timings, not first-SQL results. |
 | Frozen R1-final image | One installer/raw composition: 11.5/28.0 s. Five private immutable objects fully read back; public eligibility remains open. |
 | Observed-error class corrections | Generation, host-file activation, Kubelet pin, persistent taint and safe held-target replacement tested; qualified/current delivery varies below. |
 
-## Open — customer readiness
+## Open
 
-- Deliver one combined region runtime switch and pending public-image authorization correction.
-- Approve R1-final immutable references, verify public bytes, then select it with one API request.
-- US1 automatic R1-final patch and all six checks, using standard runtime and the original DB/PVC.
-- EU1 then control through the same successor intent, prepared EU keys, six checks and no operator interventions.
-- Alarm delivery test after the owner configures the recipient/sender through the API.
-- Thin storage for new databases, sleeping CPU release, real backup/restore/reclamation and measured density.
-- Rust/shared pool on US1: genuine sleeping DB, prestarted claim, first SQL timing and refill; then uniform R2.
-- Concrete migration handover: client adapter, timeout policy, restore/new ID mapping, capacity and recovery.
+One row per step, in dependency order. A step moves to Done only with its measured result.
 
-Current US database resources are physically Ready, but first admission remains closed because
-the old pool runtime cannot archive WAL. Its original create operation timed out; it is not
-recreated, falsely marked Ready or repeatedly reactivated. The standard-runtime transition and
-qualified image correction must preserve its owned Namespace, Cluster, PVC, fence and archive.
-
-## Execution order
-
-1. Finish the region switch and public-image correction together. Reuse the frozen Golden bytes.
-2. Bind and approve R1-final, complete anonymous image readback, then make one target API request.
-   Replace only the quiescent held predecessor; preserve EU hold and all completed receipts.
-3. Patch US1 automatically, verify all six checks, then release only the current successor's EU hold.
-4. Before EU, close the entire restart class below as one batch. Reuse unchanged preparation;
-   repeat a check only for an actual changed input or observed failure.
-5. Patch EU1 then control with prepared EU authority. Start EU by **12:00 local / 10:00 UTC**;
-   otherwise report the exact blocking error class. Allow one or two programmed reboots per node.
-6. After fleet acceptance: alarm test, thin storage/density, US pool first SQL/refill and uniform R2.
-7. Deliver handover only after required live results pass. Neon migration is a separate task.
+| Step | Status | Finished when |
+| --- | --- | --- |
+| R1.1 US1 canary | In progress | US1's R1.1 patch completes through the programmed rollout. EU stays held at its rotation snapshot gate. |
+| Batch A/CI-green deploy | Open | One CI passes; API and NodeBootstrap deploy between patches. Successors then drop lost members and `operator_hold_` holds; backups skip regions without a live node. |
+| US1 mark-lost and Cloudflare US cleanup | Open | US test database deleted while US1 runs; US1 marked lost before the EU successor, at the latest by 2026-11-05; US Tunnel, VPC binding, firewall/rescue entries and tokens removed; `ARCHIVE_US` kept until retained US archives expire. |
+| EU hold release | Open | A successor rollout with a new release ID (same Golden bytes) and `expected_previous_rollout_id` starts the EU rotation at its snapshot gate, which needs a complete backup run at most 36 h old. |
+| EU rotation | Open | Prepared EU authority (material revision 2) is active and retired authority is rejected. |
+| EU1 | Open | EU1 is patched first, passes the six checks and needs zero operator interventions. |
+| Control | Open | Control/relay is patched last, passes the six checks, the relay is reachable and no intervention was needed. |
+| Notifier | Open | RAM, CPU and storage warning thresholds are delivered; one real alarm arrives after the owner sets recipient and sender through the API. |
+| R2 | Open | Native gateway, native controller and the EU pool switch (relay keeps its pin) roll out EU1 then control; six checks pass. Needs Rust runtime-switch parity and node storage samples first. |
+| Pool cold-start test | Open | A sleeping database's pool-hit first SQL is measured from one start (<1 s target, unproven), data is preserved and refill is observed; a miss is labelled a miss. |
+| Thin qualification | Open | A scratch-first run on EU1 passes the seven [gates](#thin-storage-qualification-gates) and yields the receipt. |
+| R2b | Open | An R2 successor carries the receipt; EU `thin_storage` template and EU1 thin selection are active; thin create, backup, restore and delete pass; density and sleeping CPU release are measured. |
+| Handover | Open | Client adapter, timeout policy, restore/new ID mapping, capacity and recovery are documented. Neon migration is a separate task. |
 
 ## Restart class — one pre-EU gate
 
@@ -72,7 +107,9 @@ qualified image correction must preserve its owned Namespace, Cluster, PVC, fenc
 | Pool slots / Pod IPs | Respect the region runtime switch, refill only enabled pools, refresh actual routes and observations. |
 | Operation deadlines | Preserve original orders/storage and uncertain writes; handle maintenance without expiring valid work. |
 
-## Six checks per node
+## Node acceptance
+
+Six checks per node:
 
 1. Selected Talos/Kubernetes release and Node Ready.
 2. Flux/Helm/platform Ready at the selected immutable revision.
@@ -86,13 +123,44 @@ apply, public-pin/inventory repairs, one create retry and qualified consumer cyc
 activation reboot is separate. Do not claim fully automatic US acceptance from those results.
 EU has no operator exception. No new server purchase is part of this corrective rollout.
 
-The installation selects actual RAM at76% over ten fresh consecutive minutes/stable physical
+The installation selects actual RAM at 76% over ten fresh consecutive minutes/stable physical
 Node UID; threshold and automatic purchasing are API configurable. Eligible nodes remain available
-during expansion under hard startup/CPU/storage/PostgreSQL/Barman bounds. There is no81% cutoff,
+during expansion under hard startup/CPU/storage/PostgreSQL/Barman bounds. There is no 81% cutoff,
 personal email default or fixed purchase cap. Historical real ten-minute RAM acceptance is reused;
 new workload density still requires measurement.
 
-Keep Done to one row per completed step, at most one measurement line and roughly15 lines.
+## Thin storage qualification gates
+
+A receipt (`thin_storage_qualification` in an approved fleet release) states that all seven gates
+passed for one complete thin profile hash, `openebs-lvm` driver image, `pgcf-sandbox-controller`
+host extension image and exact `nodeInfo.kernelVersion` string. Activation compares exactly these
+values, so a change to any of them needs a new run. No receipt producer exists yet; gate flags
+typed into a release are not a qualification.
+
+The run is scratch-first on EU1 after R2: it creates `pgcf_thinpool` with the product command and
+the exact profile geometry from free extents, uses a fenced deny-all namespace with a quota, scratch
+volumes and a PostgreSQL Pod from the release's `postgres` pin, then deletes its volumes and pool.
+It creates no node thin selection, because a selection cannot be undone. Every gate records node,
+boot and system UUIDs, VG/pool/LV UUIDs, `lvs`/`dmsetup` state before and after, timings and the
+pass value computed by code. Preconditions: R2 accepted with the EU pool switch on, and
+`dm_thin_pool` loaded on EU1; retained nodes currently load it only from a receipt-bearing release.
+Today a receipt-bearing release also requires thin write authority on every live member, control
+included, so R2b needs that scope narrowed to placement-enabled members or a thin pool on control.
+
+| Gate | Proves | Pass criterion |
+| --- | --- | --- |
+| `data_full` | A full data pool fails writes fast and recovers by growth without losing commits. | After a committed marker and a fill to 100% data, writes fail with EIO and no task stays in D state beyond `drain_seconds`; after growth with the product `lvextend`, pool and LV UUIDs are unchanged, writes resume, the marker is present and crash recovery keeps every acknowledged commit. |
+| `metadata_full` | Metadata never runs out before data, and metadata exhaustion fails closed. | At 100% data with random 4 KiB writes across `maximum_volumes` volumes, metadata use stays within its size minus `metadata_reserve_bytes`. A deliberately undersized scratch pool accepts no writes after exhaustion and, after `thin_check` and `lvconvert --repair`, either verifies its data or refuses activation. |
+| `noflush_quiescence` | A noflush suspend freezes writers, also on a full pool, and resume drains within budget. | With an active writer and dirty pages, `dmsetup suspend --noflush` is confirmed, also when full; no new chunks are allocated while suspended; resume drains at most the host drain budget within `drain_seconds`; the filesystem is clean. |
+| `resume_marker` | Resuming the exact volume keeps committed data and drops uncommitted work. | After suspend, a killed writer and resume, PostgreSQL restarts on the same PVC with the marker present, the uncommitted statement absent and the same LV and pool; a changed LV UUID or expired token is refused. |
+| `startup_bound` | A cold start (initdb plus bulk load) stays inside the profile's startup and IO bounds. | Pool data growth is at most the larger of `startup_reserve_bytes` and the quota; the Pod's `io.max` is finite and within the profile; no lazy-init writes occur; each executor run finishes within half of `guard_seconds`. |
+| `trim_delete_recreate` | Deleting a volume returns its extents, and a recreated volume starts clean. | After PVC and PV deletion the LV is absent from `lvs -a` and device-mapper, pool usage returns to its baseline, and a recreated LV of the same size has a new UUID, no residual data and initializes without `thin_storage_retained_pool_missing`. |
+| `retained_thick_preservation` | Thin work and its reboots leave retained thick databases untouched. | Before and after every step and reboot, thick LV UUIDs, sizes and linear segment types, PV/PVC IDs, SQL markers and WAL archive status are identical; `thick_allocated_bytes` is unchanged; no thick database gains a storage profile. |
+
+The thin class sets no filesystem `discard` option, so deletes inside a running filesystem are
+measured but not claimed as reclaimed extents; requiring them is an open owner decision.
+
+Keep Done to one row per completed step, at most one measurement line and roughly 15 lines.
 Record only final customer-readiness results here; detailed hashes, bytes and intermediate
 corrections remain in Git history and protected receipts. Runbooks are English and API-only.
 [Runtime design](rust-runtime-and-cold-starts.md) and [operations](../operations) supply procedures.

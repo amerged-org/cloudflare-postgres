@@ -18,14 +18,15 @@ Ownership:
 - **CNPG** owns PostgreSQL instances.
 - **Talos** owns host and Kubernetes upgrades.
 
-The approved deployment retains the existing EU control/relay VPS, excludes it from new customer
-database placement, and retains the already-admitted EU worker as customer EU1 (formerly EU2).
-Exactly one new US1 control-plane/customer VPS uses the same V159 / Cloud VPS Plus 4 model:
-4 vCPU, 8 GiB RAM and 150 GiB NVMe, purchased through the API for one month. Preserve EU1's
-installation, Node identity, data and custody; no new EU worker or EU1 reinstallation is required.
-Install and admit US1 before verifying an R2 restore with the EU source preserved. Earlier EU1
-loss, deletion and decommissioning kits are withheld. System and platform resources remain
-reserved; node loss is recovered from R2.
+Each region has one control server, configured from the
+[per-region parameters](talos/README.md#control-server-configuration-per-region) and excluded
+from customer database placement, plus identical customer workers installed from the Golden
+image through AddNode. The current deployment is EU only: the existing EU control/relay VPS and
+the already-admitted customer EU1 (formerly EU2), a V159 / Cloud VPS Plus 4 with 4 vCPU, 8 GiB
+RAM and 150 GiB NVMe. The US region is cancelled; US and Oceania return later through the same
+configuration. Preserve EU1's installation, Node identity, data and custody; EU1 is not
+reinstalled. Earlier EU1 loss, deletion and decommissioning kits are withheld. System and
+platform resources remain reserved; node loss is recovered from R2.
 
 The programmed bootstrap owns worker join and new-region platform installation. These recipes
 also document the earlier manual installation and recovery path. Software checks do not establish

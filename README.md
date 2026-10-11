@@ -2,12 +2,12 @@
 
 Open-source, Neon-style serverless PostgreSQL that runs on **your Cloudflare account** and **your
 Contabo VPS**. Cloudflare runs the whole control plane and is the only way into the databases.
-The VPS run real, unmodified PostgreSQL under CloudNativePG. The approved initial deployment
-retains the EU control/relay VPS and the already-admitted EU customer worker, now **EU1**
-(formerly EU2), and adds one US control-plane/customer VPS, **US1**. Both customer servers use
-**V159 / Cloud VPS Plus 4: 4 vCPU, 8 GiB RAM and 150 GiB NVMe**. US1 was purchased through the
-API for one month. EU1 keeps its existing installation, identity and data. System and platform
-resources remain protected; server loss is recovered from R2.
+The VPS run real, unmodified PostgreSQL under CloudNativePG. The current deployment is EU only:
+the EU control/relay VPS and the already-admitted EU customer worker **EU1** (formerly EU2), a
+**V159 / Cloud VPS Plus 4: 4 vCPU, 8 GiB RAM and 150 GiB NVMe**. EU1 keeps its existing
+installation, identity and data. The US region was cancelled on 2026-10-11; US and Oceania
+return later from the same per-region configuration. System and platform resources remain
+protected; server loss is recovered from R2.
 
 - Create, resize, suspend, restore and delete databases through a versioned API.
 - Connect through Cloudflare: PostgreSQL over WebSocket. The VPS expose no database port.
@@ -78,20 +78,19 @@ US installation reached Ready through the owner-authorized operator path; cross-
 Missing samples stay unknown. Cost attribution is deferred.
 The already-admitted second EU node is retained as customer EU1 and serves a real capacity-test
 database. One matching V159 US1 was purchased through the API; its original-request audit and
-allocated 4 vCPU, 8,192 MiB RAM and 153,600 MiB NVMe were verified. Provider Running still requires
-Talos installation, Kubernetes admission and actual customer readiness. Its Cloudflare archive, scoped
-credentials, private Tunnel, gateway service and regional identity are configured. Cross-region
-restore is implemented, delivered and accepted on the retained EU/US nodes. The original EU/US 300 GB SSD
-V155 orders were paid, then cancelled by the owner. A later V155 NVMe-selector API test also
-allocated SSD and did not run an installer. Those failed selections are historical; the current
-V159 offer supplies the required 150 GiB NVMe without a storage add-on. No new EU worker is needed,
-and EU1 is not reset, re-adopted or decommissioned. The accepted R2 restore into US1 preserved the healthy EU source; the earlier destructive loss
-and deletion kits remain outside this scope.
-US1 is admitted through the owner-authorized operator postjoin/admission path, preserving its
+allocated 4 vCPU, 8,192 MiB RAM and 153,600 MiB NVMe were verified. Cross-region restore is
+implemented, delivered and accepted: the R2 restore into US1 preserved the healthy EU source. The
+original EU/US 300 GB SSD V155 orders were paid, then cancelled by the owner. A later V155
+NVMe-selector API test also allocated SSD and did not run an installer. Those failed selections
+are historical; the current V159 offer supplies the required 150 GiB NVMe without a storage
+add-on. EU1 is not reset, re-adopted or decommissioned; the earlier destructive loss and deletion
+kits remain outside this scope.
+US1 was admitted through the owner-authorized operator postjoin/admission path, preserving its
 original purchase and installation. EU1 and US1 passed real Cloudflare SQL/TLS, application roles,
-R2 base backup/WAL, restore and deletion with physical reclamation. Automatic postjoin admission
-remains open for the next genuine authorized node purchase. Preserve both EU nodes and their
-existing data; do not re-adopt or reset US1. Neon migration remains separate and requires the
+R2 base backup/WAL, restore and deletion with physical reclamation. The US region is now
+cancelled: US1 serves only as the R1.1 canary until 2026-11-05 and is then marked lost. Automatic
+postjoin admission remains open for the next genuine authorized node addition. Preserve both EU
+nodes and their existing data. Neon migration remains separate and requires the
 [customer handover gates](docs/operations/operator-installation.md#customer-migration-handover),
 including credential rotation, adopter transport/rebinding and sufficient regional capacity.
 
@@ -130,7 +129,7 @@ bounded direct Kubernetes reads, without discovery, and refuses incomplete or fo
 The producer waits if the retained source observation is stale, while transport access remains
 refused. Real fresh observations permit new bounded authority for that same source; changed
 identities remain blocking and the freshness limit is unchanged.
-The original US node remains Ready through the owner-authorized operator path. Autonomous
+The original US node reached Ready through the owner-authorized operator path. Autonomous
 addition and the corrective common-runtime acceptance remain outstanding in PLAN.md.
 
 ```mermaid
@@ -250,8 +249,10 @@ during upstream startup). The packaged CLI includes the first-party and bundled-
   (`db.your-domain`): Workers, D1, Durable Objects, Workflows, R2, Tunnel and Containers.
 - A Contabo account with API credentials. The lab uses Cloud VPS with 4 vCPU and 8 GiB.
 
-The current target is the operator deployment on existing accounts and three VPS in total.
-Public-release installation polish follows separately; see [ULTRA execution plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#execution).
+The current target is the operator deployment on existing accounts: one EU control server and
+customer EU1. Each further region adds one control server and customer workers from the same
+[delivery architecture](docs/architecture/cloudflare-convergence-and-serverless-plan.md#delivery-architecture).
+Public-release installation polish follows separately; see [ULTRA execution plan](docs/architecture/cloudflare-convergence-and-serverless-plan.md#open).
 
 The API reference is generated at `/v1/openapi.json` from the shared contracts. Operator runbooks
 cover [installation](docs/operations/operator-installation.md), [recovery](docs/operations/recovery.md)
