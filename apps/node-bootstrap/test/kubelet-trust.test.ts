@@ -358,6 +358,117 @@ test("the fleet boundary refresh retains bootstrap ownership and refuses a chang
   );
 });
 
+// EU control's map was published by the authenticated Talos operator before programmed installation.
+async function operatorPublished() {
+  const state = await stateFixture(),
+    labels = object(object(state.node.metadata).labels);
+  delete labels["pgcf.io/region"];
+  const prior = await certificate(state.input.spec.hostname),
+    legacy = (): Json => ({
+      apiVersion: "v1",
+      kind: "ConfigMap",
+      metadata: {
+        name: `kubelet-${state.nodeUid}`,
+        namespace: "pgcf-system",
+        uid: randomUUID(),
+        resourceVersion: "7",
+        labels: {
+          "app.kubernetes.io/part-of": "pgcf",
+          "pgcf.io/kubelet-node-uid": state.nodeUid,
+        },
+        annotations: {
+          "pgcf.io/kubelet-trust-source": "authenticated-talos-operator",
+        },
+      },
+      data: {
+        node_name: state.input.spec.hostname,
+        node_uid: state.nodeUid,
+        cluster_uid: state.clusterUid,
+        certificate_pem: prior,
+        certificate_sha256: digest(prior),
+      },
+    });
+  state.setMap(legacy());
+  const subject = {
+    status: {
+      node_id: state.input.spec.node_id,
+      region_id: state.input.spec.region_id,
+      node_uid: state.nodeUid,
+      cluster_uid: state.clusterUid,
+    },
+    k8s_node_name: state.input.spec.hostname,
+    address: state.input.spec.hardware.ipv4,
+  };
+  return { state, labels, legacy, subject };
+}
+test("a retained node's operator-published map is adopted once into the owned shape and refreshed normally afterwards", async () => {
+  const { state, subject } = await operatorPublished(),
+    uid = object(state.map()!.metadata).uid;
+  await refreshKubeletTrust(subject, state.commands);
+  assert.equal(state.replaces(), 1);
+  const adopted = state.map()!,
+    owner = digest(
+      `pgcf-retained-kubelet-trust/v1\n${state.input.spec.node_id}\n${state.nodeUid}\n${state.clusterUid}`,
+    );
+  assert.equal(object(adopted.metadata).uid, uid);
+  assert.deepEqual(object(adopted.metadata).annotations, {
+    "pgcf.io/bootstrap-input": owner,
+  });
+  assert.deepEqual(object(adopted.metadata).labels, {
+    "pgcf.io/kubelet-node-uid": state.nodeUid,
+    "pgcf.io/kubelet-cluster-uid": state.clusterUid,
+    "pgcf.io/node-id": state.input.spec.node_id,
+    "pgcf.io/region": state.input.spec.region_id,
+  });
+  assert.equal(object(adopted.data).certificate_pem, state.pem);
+  await refreshKubeletTrust(subject, state.commands);
+  assert.equal(state.replaces(), 1);
+  state.setServingPem(await certificate(state.input.spec.hostname));
+  await refreshKubeletTrust(subject, state.commands);
+  assert.equal(state.replaces(), 2);
+});
+test("adoption refuses a changed operator map, a foreign region label and a bootstrap-owned Node without its region", async () => {
+  const { state, labels, legacy, subject } = await operatorPublished();
+  for (const change of [
+    (map: Json) => {
+      object(object(map.metadata).labels)["pgcf.io/extra"] = "x";
+    },
+    (map: Json) => {
+      object(object(map.metadata).annotations)["pgcf.io/kubelet-trust-source"] =
+        "other";
+    },
+    (map: Json) => {
+      object(map.data).cluster_uid = randomUUID();
+    },
+    (map: Json) => {
+      object(map.data).certificate_sha256 = digest("other");
+    },
+  ]) {
+    const map = legacy();
+    change(map);
+    state.setMap(map);
+    await assert.rejects(
+      refreshKubeletTrust(subject, state.commands),
+      /kubelet_trust_map_mismatch/,
+    );
+  }
+  assert.equal(state.replaces(), 0);
+  state.setMap(legacy());
+  labels["pgcf.io/region"] = "us-dev";
+  await assert.rejects(
+    refreshKubeletTrust(subject, state.commands),
+    /kubernetes_node_identity_mismatch/,
+  );
+  delete labels["pgcf.io/region"];
+  await assert.rejects(
+    refreshKubeletTrust(
+      { ...subject, initial_bootstrap_input_sha256: digest("bootstrap") },
+      state.commands,
+    ),
+    /kubernetes_node_identity_mismatch/,
+  );
+  assert.equal(state.replaces(), 0);
+});
 test("an uncommitted conditional replacement is resolved by readback without blind write repetition", async () => {
   const state = await stateFixture();
   await publishKubeletTrust(state.input, state.commands);

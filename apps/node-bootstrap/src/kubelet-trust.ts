@@ -8,6 +8,9 @@ type Json = Record<string, unknown>;
 const UID = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/;
 const CERTIFICATE =
   /-----BEGIN CERTIFICATE-----\r?\n[A-Za-z0-9+/=\r\n]+-----END CERTIFICATE-----/g;
+// EU control predates programmed installation: the authenticated Talos operator published its map.
+const OPERATOR_SOURCE = "pgcf.io/kubelet-trust-source",
+  OPERATOR_PUBLISHED = "authenticated-talos-operator";
 
 function record(value: unknown): Json {
   if (!value || typeof value !== "object" || Array.isArray(value))
@@ -109,6 +112,8 @@ export async function publishKubeletTrust(
   input: TrustInput,
   commands: KubeletTrustCommands,
   refresh?: Pick<Binding, "node_uid" | "cluster_uid">,
+  /** Retained node without bootstrap input; adopt replaces its operator-published map once. */
+  retained?: { adopt: boolean },
 ) {
   const read = async (
     kind: "node" | "namespace" | "configmap",
@@ -141,7 +146,9 @@ export async function publishKubeletTrust(
     const addresses = record(node.status).addresses;
     if (
       labels["pgcf.io/node-id"] !== input.spec.node_id ||
-      labels["pgcf.io/region"] !== input.spec.region_id ||
+      // A retained manual-era Node may lack the region label; a different region never matches.
+      (labels["pgcf.io/region"] !== input.spec.region_id &&
+        !(retained && labels["pgcf.io/region"] === undefined)) ||
       labels["pgcf.io/provider-instance-id"] !==
         input.spec.provider_instance_id ||
       !Array.isArray(addresses) ||
@@ -241,7 +248,58 @@ export async function publishKubeletTrust(
   await confirmBinding();
   const previous = await read("configmap", name, "pgcf-system", true);
   if (previous) {
-    if (
+    if (retained?.adopt) {
+      const previousMetadata = metadata(
+          previous,
+          "ConfigMap",
+          name,
+          "pgcf-system",
+        ),
+        prior = record(previous.data),
+        previousPem = prior.certificate_pem;
+      // Adopt only the exact operator-published shape for this Node and cluster: one conditional
+      // replacement gives it the owned labels, owner annotation and the current public leaf.
+      if (
+        canonical(previousMetadata.labels ?? {}) !==
+          canonical({
+            "app.kubernetes.io/part-of": "pgcf",
+            "pgcf.io/kubelet-node-uid": first.node_uid,
+          }) ||
+        canonical(previousMetadata.annotations ?? {}) !==
+          canonical({ [OPERATOR_SOURCE]: OPERATOR_PUBLISHED }) ||
+        canonical(Object.keys(prior).sort()) !==
+          canonical(Object.keys(expected.data).sort()) ||
+        prior.node_name !== expected.data.node_name ||
+        prior.node_uid !== first.node_uid ||
+        prior.cluster_uid !== first.cluster_uid ||
+        typeof previousPem !== "string" ||
+        Buffer.byteLength(previousPem, "utf8") > 16 * 1024 ||
+        /PRIVATE KEY/.test(previousPem) ||
+        prior.certificate_sha256 !== digest(previousPem)
+      )
+        throw new BootstrapError("kubelet_trust_map_mismatch");
+      const updated = structuredClone(previous);
+      Object.assign(record(updated.metadata), {
+        labels: expected.metadata.labels,
+        annotations: expected.metadata.annotations,
+      });
+      updated.data = expected.data;
+      await confirmBinding();
+      try {
+        await commands.kube(
+          ["replace", "--filename=-", "--output=json"],
+          true,
+          JSON.stringify(updated),
+        );
+      } catch {
+        /* Resolve this single conditional replacement through authenticated readback. */
+      }
+      await confirmBinding();
+      const observed = await read("configmap", name, "pgcf-system", true);
+      if (!observed || record(observed.metadata).uid !== previousMetadata.uid)
+        throw new BootstrapError("kubelet_trust_refresh_unconfirmed");
+      confirmMap(observed);
+    } else if (
       !refresh ||
       canonical(record(previous.data)) === canonical(expected.data)
     )
@@ -327,7 +385,8 @@ export async function refreshKubeletTrust(
     nodeMetadata = metadata(node, "Node", input.k8s_node_name);
   if (nodeMetadata.uid !== input.status.node_uid)
     throw new BootstrapError("kubelet_trust_identity_changed");
-  let owner = input.initial_bootstrap_input_sha256;
+  let owner = input.initial_bootstrap_input_sha256,
+    adopt = false;
   if (!owner) {
     const current = await commands.kube([
       "--namespace",
@@ -344,9 +403,17 @@ export async function refreshKubeletTrust(
       `kubelet-${input.status.node_uid}`,
       "pgcf-system",
     );
-    owner = String(
-      record(record(map.metadata).annotations)["pgcf.io/bootstrap-input"],
-    );
+    const annotations = record(record(map.metadata).annotations);
+    adopt =
+      annotations["pgcf.io/bootstrap-input"] === undefined &&
+      annotations[OPERATOR_SOURCE] === OPERATOR_PUBLISHED;
+    // Without a bootstrap input, the operator-published map binds once to an owner derived
+    // from the node's fixed identity; later refreshes read that owner back like any other.
+    owner = adopt
+      ? digest(
+          `pgcf-retained-kubelet-trust/v1\n${input.status.node_id}\n${input.status.node_uid}\n${input.status.cluster_uid}`,
+        )
+      : String(annotations["pgcf.io/bootstrap-input"]);
   }
   if (!/^[a-f0-9]{64}$/.test(owner))
     throw new BootstrapError("kubelet_trust_map_mismatch");
@@ -365,5 +432,6 @@ export async function refreshKubeletTrust(
     },
     commands,
     { node_uid: input.status.node_uid, cluster_uid: input.status.cluster_uid },
+    input.initial_bootstrap_input_sha256 ? undefined : { adopt },
   );
 }
