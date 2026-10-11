@@ -2,7 +2,11 @@
 import assert from "node:assert/strict";
 import test, { describe } from "node:test";
 import { randomUUID } from "node:crypto";
-import type { ThinQualificationJournalEntry } from "@pgcf/contracts/thin-qualification";
+import {
+  thinQualificationCleanupVerified,
+  type ThinQualificationCleanup,
+  type ThinQualificationJournalEntry,
+} from "@pgcf/contracts/thin-qualification";
 import {
   QualificationJournal,
   parseAcknowledged,
@@ -757,6 +761,30 @@ describe(
       assert.equal(evidence.resume_target_verified, true);
       assert.equal(evidence.marker_present, true);
       assert.equal(evidence.uncommitted_rows, 0);
+    });
+
+    test("cleanup resumes a suspended scratch LV with a mixed-case LVM UUID and removes every scratch object", async () => {
+      const run = thinQualificationRun("cleanup");
+      run.workload("data_full", "pg-a", "Pa", { pod: false });
+      // A noflush gate failed between dmsetup suspend and resume.
+      const writer = run.workload("noflush_quiescence", "writer", "Wr");
+      const lv = run.world.lvs.find((value) => value.uuid === writer.lv_uuid)!;
+      lv.state = "s";
+      assert.match(lv.uuid, /[A-Z]/);
+      assert.deepEqual(await run.turn(), { kind: "report" });
+      assert.equal(run.world.log[0], `dmsetup resume ${run.world.dm(lv)}`);
+      assert.equal(
+        run.entry(`cleanup:resume:${writer.pv_name}`)?.state,
+        "confirmed",
+      );
+      const cleanup = (
+        run.calls[0]!.report as { cleanup: ThinQualificationCleanup }
+      ).cleanup;
+      assert.ok(thinQualificationCleanupVerified(cleanup));
+      assert.deepEqual(
+        run.world.lvs.map((value) => value.name),
+        [run.setup.logical_volumes[0]!.name],
+      );
     });
   },
 );

@@ -3008,7 +3008,8 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
         (!owned.has(lv.lv_uuid) && !lv.tags.includes(this.tag))
       )
         continue;
-      await this.journal.converge(`cleanup:resume:${lv.lv_uuid}`, async () => {
+      // Owned LV names are lowercase (pvc-<uid>, pgcf_thin_q_<run>_*); LVM UUIDs are mixed-case.
+      await this.journal.converge(`cleanup:resume:${lv.name}`, async () => {
         await this.node.driverExec(
           [
             "dmsetup",
