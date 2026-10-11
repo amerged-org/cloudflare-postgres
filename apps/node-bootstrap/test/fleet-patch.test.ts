@@ -42,6 +42,8 @@ function runtime(
   let applyProbe: CommandRunner | undefined;
   let kubeProbe:
     ((command: Command) => ReturnType<CommandRunner> | undefined) | undefined;
+  let talosProbe:
+    ((command: Command) => ReturnType<CommandRunner> | undefined) | undefined;
   let assetRequest: typeof fetch | undefined;
   let servingCertificate: string | undefined;
   let physicalHostFiles: Map<string, string> | undefined;
@@ -97,6 +99,9 @@ function runtime(
     },
     set kubeProbe(value: NonNullable<typeof kubeProbe>) {
       kubeProbe = value;
+    },
+    set talosProbe(value: NonNullable<typeof talosProbe>) {
+      talosProbe = value;
     },
     set assetRequest(value: typeof fetch) {
       assetRequest = value;
@@ -161,6 +166,10 @@ function runtime(
             const args = command.args;
             if (command.executable === "kubectl" && kubeProbe) {
               const result = kubeProbe(command);
+              if (result) return result;
+            }
+            if (command.executable === "talosctl" && talosProbe) {
+              const result = talosProbe(command);
               if (result) return result;
             }
             if (
@@ -1396,6 +1405,237 @@ test("a later host-required preflight uses retained installed boot/configuration
   await r.turn();
   assert.equal(r.current.state, "confirmed");
   assert.equal(r.writes.length, 1);
+});
+test("a host-file reboot without a Talos upgrade binds the unchanged STATE-loaded images to the dispatched boot", async () => {
+  const { r, pins } = pinnedKubernetesRuntime(),
+    target = r.fixture.input.spec.roles.customer,
+    // Earlier release: images proved on configurationBoot, Talos reboot into dispatchedBoot.
+    configurationBoot = randomUUID(),
+    dispatchedBoot = randomUUID(),
+    activatedBoot = randomUUID(),
+    provedAt = new Date(Date.now() - 86_400_000).toISOString(),
+    images = Object.fromEntries(
+      Object.entries(pins).map(([name, configuration]) => [
+        name,
+        { configuration, runtime_sha256: configuration.slice(-64) },
+      ]),
+    ) as NonNullable<FleetPatchFacts["kubernetes_images"]>,
+    facts = {
+      ...r.facts,
+      boot_id: dispatchedBoot,
+      talos_version: "v" + target.talos_version,
+    },
+    receipt = {
+      method: "deploymentreceipt" as const,
+      installer: target.talos_installer,
+      node_uid: facts.node_uid,
+      cluster_uid: facts.cluster_uid,
+      system_uuid: facts.system_uuid,
+      pre_reboot_boot_id: configurationBoot,
+      completed_at: provedAt,
+      source: "cli_exit_0" as const,
+    },
+    files = NodeHostConfigurationPrivate.shape.files.parse([
+      {
+        path: "/var/lib/pgcf-sandbox/settings.json",
+        permissions: 384,
+        content: "new-profile-settings",
+      },
+      {
+        path: "/var/lib/pgcf-sandbox/agent-key",
+        permissions: 384,
+        content: "retained-key",
+      },
+    ]),
+    configuration = (kubelet: string) =>
+      [
+        {
+          version: "v1alpha1",
+          machine: {
+            type: "controlplane",
+            files: files.map((file) => ({ ...file, op: "create" })),
+          },
+        },
+        ...Object.entries({
+          kubelet: "KubeletConfig",
+          apiServer: "KubeAPIServerConfig",
+          controllerManager: "KubeControllerManagerConfig",
+          scheduler: "KubeSchedulerConfig",
+        }).map(([name, kind]) => ({
+          apiVersion: "v1alpha1",
+          kind,
+          image: { ...pins, kubelet }[name as keyof typeof pins],
+        })),
+      ]
+        .map((value) => stringify(value))
+        .join("---\n");
+  target.host_configuration_required = true;
+  r.fixture.input.host_configuration = NodeHostConfigurationPrivate.parse({
+    files,
+    status: {
+      version: 1,
+      node_id: r.current.node_id,
+      node_uid: facts.node_uid,
+      region_id: r.current.region_id,
+      cluster_uid: facts.cluster_uid,
+      material_revision: 1,
+      revision: 2,
+      release_id: r.current.release_id,
+      pool_policy_revision: 1,
+      profile_sha256: "f".repeat(64),
+      sha256: digest(canonical(files)),
+      created_at: new Date().toISOString(),
+    },
+  });
+  r.fixture.input.retained_talos_installation = {
+    receipt,
+    boot_id: dispatchedBoot,
+    talos_version: facts.talos_version,
+    talos_schematic_sha256: facts.talos_schematic_sha256,
+    kubernetes_image_provenance: {
+      method: "pinned_configuration_boot",
+      configuration_boot_id: configurationBoot,
+      configuration_observed_at: provedAt,
+      observed_at: provedAt,
+      kubelet_version: facts.kubelet_version,
+      control_plane: true,
+      images,
+    },
+  };
+  const host = r.fixture.input.host_configuration,
+    dispatched = {
+      ...facts,
+      kubernetes_control_plane: true,
+      kubernetes_image_configuration: pins,
+      kubernetes_configuration_boot_id: configurationBoot,
+      kubernetes_configuration_observed_at: provedAt,
+      kubernetes_images: images,
+    };
+  r.current = {
+    ...r.current,
+    stage: "talos_reboot",
+    state: "dispatched",
+    baseline: facts,
+    observed: dispatched,
+    talos_upgrade_receipt: receipt,
+    host_configuration_revision: host.status.revision,
+    host_configuration_sha256: host.status.sha256,
+    spec_sha256: digest(canonical(r.fixture.input.spec)),
+  };
+  // The reboot materialized the host files and loaded the unchanged configuration from STATE.
+  r.facts = { ...facts, boot_id: activatedBoot };
+  r.stateLoadedConfiguration = true;
+  r.physicalHostFiles = new Map(files.map((file) => [file.path, file.content]));
+  const resource = (type: string, id: string, spec: unknown) =>
+    JSON.stringify({ metadata: { type, id }, spec });
+  r.talosProbe = (command) =>
+    command.args.includes("kubeletstatuses")
+      ? Promise.resolve({
+          exit_code: 0,
+          stdout: resource("KubeletStatuses.kubernetes.talos.dev", "kubelet", {
+            image: pins.kubelet,
+          }),
+        })
+      : command.args.includes("services")
+        ? Promise.resolve({
+            exit_code: 0,
+            stdout: resource("Services.v1alpha1.talos.dev", "kubelet", {
+              running: true,
+              healthy: true,
+              unknown: false,
+            }),
+          })
+        : undefined;
+  r.kubeProbe = (command) =>
+    command.args.includes("pods")
+      ? Promise.resolve({
+          exit_code: 0,
+          stdout: JSON.stringify({
+            items: Object.entries({
+              apiServer: "kube-apiserver",
+              controllerManager: "kube-controller-manager",
+              scheduler: "kube-scheduler",
+            }).map(([name, component]) => ({
+              metadata: {
+                labels: { component },
+                ownerReferences: [{ kind: "Node", uid: facts.node_uid }],
+              },
+              spec: {
+                nodeName: "test-node",
+                containers: [
+                  { name: component, image: pins[name as keyof typeof pins] },
+                ],
+              },
+              status: {
+                containerStatuses: [
+                  {
+                    name: component,
+                    ready: true,
+                    imageID: `containerd://sha256:${pins[name as keyof typeof pins].slice(-64)}`,
+                    state: { running: { startedAt: new Date().toISOString() } },
+                  },
+                ],
+              },
+            })),
+          }),
+        })
+      : undefined;
+  r.machineConfiguration = configuration(
+    `registry.example/kubelet:v1.36.5@sha256:${"9".repeat(64)}`,
+  );
+  await assert.rejects(
+    r.turn(),
+    /patch_host_configuration_persistence_unproved/,
+  );
+  assert.equal(r.current.state, "dispatched");
+  r.machineConfiguration = configuration(pins.kubelet);
+  await r.turn();
+  assert.equal(r.current.stage, "talos_reboot");
+  assert.equal(r.current.state, "confirmed");
+  assert.equal(r.writes.length, 0);
+  assert.equal(
+    r.current.observed!.kubernetes_configuration_boot_id,
+    dispatchedBoot,
+  );
+  assert.equal(
+    r.current.observed!.kubernetes_configuration_observed_at,
+    dispatched.observed_at,
+  );
+  assert.deepEqual(r.current.observed!.kubernetes_images, images);
+  await r.turn();
+  assert.equal(r.current.stage, "verify");
+  assert.equal(
+    r.current.observed!.kubernetes_configuration_boot_id,
+    dispatchedBoot,
+  );
+  assert.deepEqual(r.current.observed!.kubernetes_images, images);
+  // A Talos upgrade dispatched on the boot that proved the images keeps that original witness.
+  const upgradedBoot = randomUUID();
+  r.current = {
+    ...r.current,
+    stage: "talos_reboot",
+    state: "dispatched",
+    observed: {
+      ...r.current.observed!,
+      talos_version: "v1.14.0",
+      kubernetes_configuration_boot_id: activatedBoot,
+      kubernetes_configuration_observed_at: provedAt,
+    },
+    talos_upgrade_receipt: { ...receipt, pre_reboot_boot_id: activatedBoot },
+  };
+  r.facts = { ...facts, boot_id: upgradedBoot };
+  await r.turn();
+  assert.equal(r.current.state, "confirmed");
+  assert.equal(r.current.observed!.boot_id, upgradedBoot);
+  assert.equal(
+    r.current.observed!.kubernetes_configuration_boot_id,
+    activatedBoot,
+  );
+  assert.equal(
+    r.current.observed!.kubernetes_configuration_observed_at,
+    provedAt,
+  );
+  assert.deepEqual(r.current.observed!.kubernetes_images, images);
 });
 test("checkpoint echoes compare the JSON wire facts when pre-boot image evidence is undefined", async () => {
   const { r, pins } = pinnedKubernetesRuntime();
