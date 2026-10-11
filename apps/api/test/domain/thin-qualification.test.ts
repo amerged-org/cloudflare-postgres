@@ -454,6 +454,30 @@ it("starts one scratch run only on a fresh customer node with closed placement, 
       )
       .run(),
   ).rejects.toThrow("thin_storage_qualification_running");
+  // The admin selection is refused as a conflict, not as a server fault.
+  const selection = await request(
+    `/v1/nodes/${f.node}/storage-profile`,
+    f.admin,
+    "PUT",
+    {
+      expected_revision: 0,
+      node_uid: f.uid,
+      address: "192.0.2.18",
+      volume_group_uuid: "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef",
+      profile,
+      allow_new_databases: false,
+    },
+    crypto.randomUUID(),
+  );
+  expect(selection.status).toBe(409);
+  expect(await selection.json()).toMatchObject({
+    error: { message: expect.stringContaining("qualification is running") },
+  });
+  expect(
+    await env.DB.prepare("SELECT 1 FROM node_thin_storage WHERE node_id=?")
+      .bind(f.node)
+      .first(),
+  ).toBeNull();
   expect(
     (await request(`/v1/thin-qualifications/${value.id}`, f.integrator)).status,
   ).toBe(403);
