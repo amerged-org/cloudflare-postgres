@@ -33,6 +33,7 @@ export function sandboxRuntimeAdmission(input: {
   const match = {
     matchPolicy: "Exact",
     namespaceSelector: {
+      matchLabels: { "pgcf.io/compute-runtime": "pool" },
       matchExpressions: [{ key: "pgcf.io/database-id", operator: "Exists" }],
     },
     objectSelector: {

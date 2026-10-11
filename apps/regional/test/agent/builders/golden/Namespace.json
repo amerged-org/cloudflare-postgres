@@ -6,6 +6,7 @@
       "name": "pgcf-db-$DATABASE_ID",
       "labels": {
         "pgcf.io/database-id": "$DATABASE_ID",
+        "pgcf.io/compute-runtime": "standard",
         "pod-security.kubernetes.io/enforce": "restricted",
         "pod-security.kubernetes.io/enforce-version": "latest"
       }

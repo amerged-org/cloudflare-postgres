@@ -1,0 +1,8 @@
+flowchart LR
+    n_f3ab956c59bc["Rate limiter CONNECTION_RATE_LIMITER"]
+    n_7b6a90f74db1["pgcf-edge-dev configuration template"]
+    n_3c8077e8f708["Rate limiter DATABASE_CONNECTION_RATE_LIMITER"]
+    n_02b18227568e["Durable Object DATABASE_ACTOR class_name: DatabaseActor script_name: #60;MANAGEMENT_API_WORKER#62;"]
+    n_7b6a90f74db1 -->|"declares"| n_3c8077e8f708
+    n_7b6a90f74db1 -->|"declares"| n_f3ab956c59bc
+    n_7b6a90f74db1 -->|"declares"| n_02b18227568e

@@ -61,6 +61,27 @@ jobs:
         run: node scripts/ci/toolchain.mjs check
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+      - name: Read the pinned Mermaider revision
+        id: mermaider_pin
+        run: |
+          node --input-type=module <<'JS'
+          import { appendFileSync, readFileSync } from 'node:fs';
+          const revision = readFileSync('.mermaider/tool-revision', 'utf8').trim();
+          if (!/^[a-f0-9]{40}$/.test(revision)) throw new Error('Mermaider must be pinned to an immutable commit');
+          appendFileSync(process.env.GITHUB_OUTPUT, `revision=${revision}\n`);
+          JS
+      - name: Check out pinned Mermaider tooling
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: sebmer-com/mermaider
+          ref: ${{ steps.mermaider_pin.outputs.revision }}
+          path: .local/tools/mermaider
+          persist-credentials: false
+      - name: Check source-backed architecture and process diagrams
+        run: |
+          npm --prefix .local/tools/mermaider ci --ignore-scripts
+          npm --prefix .local/tools/mermaider run build
+          node .local/tools/mermaider/dist/cli.js check --repo .
       - name: Set up the pinned Rust and Worker build tools
         run: |
           PGCF_RUST_VERSION=$(node -p 'require("./infra/platform/versions.lock.json").nativeRuntime.rustVersion')

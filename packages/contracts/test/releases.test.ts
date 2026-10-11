@@ -251,6 +251,44 @@ it("host-only activation checks physical files, running service and current mate
   ).toISOString();
   expect(fleetPatchCheckpointAllowed(input, checkpoint)).toBe(false);
 });
+it("pool-off host activation retains physical proof and confirms admission without pool observations", () => {
+  const { input, facts, checkpoint } = hostActivation();
+  const enabledPool = input.compute_pool;
+  input.spec.roles.customer.host_configuration_required = true;
+  delete input.compute_pool;
+  delete input.compute_pool_observation;
+  input.status.state = "dispatched";
+  checkpoint.facts = { ...facts, boot_id: crypto.randomUUID() };
+  expect(
+    fleetPatchCheckpointAllowed(input, {
+      ...checkpoint,
+      facts: { ...checkpoint.facts, host_configuration_sha256: "0".repeat(64) },
+    }),
+  ).toBe(false);
+  expect(
+    fleetPatchCheckpointAllowed(input, {
+      ...checkpoint,
+      facts: { ...checkpoint.facts, sandbox_service_running: false },
+    }),
+  ).toBe(false);
+  expect(fleetPatchCheckpointAllowed(input, { ...checkpoint, facts })).toBe(
+    false,
+  );
+  expect(fleetPatchCheckpointAllowed(input, checkpoint)).toBe(true);
+  input.compute_pool = enabledPool;
+  expect(fleetPatchCheckpointAllowed(input, checkpoint)).toBe(false);
+  delete input.compute_pool;
+  input.status.stage = "runtime_admission";
+  input.status.state = "pending";
+  const admission = { ...checkpoint, stage: "runtime_admission" as const };
+  expect(
+    fleetPatchCheckpointAllowed(input, {
+      ...admission,
+      facts: { ...admission.facts, host_configuration_sha256: undefined },
+    }),
+  ).toBe(false);
+  expect(fleetPatchCheckpointAllowed(input, admission)).toBe(true);
+});
 it("host-only activation clears dispatch only for the existing proven-before-attempt error", () => {
   const { input, checkpoint } = hostActivation();
   input.status.state = "dispatched";

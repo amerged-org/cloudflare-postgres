@@ -445,7 +445,7 @@ it("exposes the initial bootstrap hash only for the same admitted released Node 
     (await fleetPatchInput(f.runtime, f.op)).initial_bootstrap_input_sha256,
   ).toBeUndefined();
 });
-async function runtimeAdmissionStatusFixture() {
+async function runtimeAdmissionStatusFixture(poolEnabled = true) {
   const f = await setup(true),
     now = new Date().toISOString(),
     policy = {
@@ -456,6 +456,11 @@ async function runtimeAdmissionStatusFixture() {
     "INSERT INTO node_compute_pool_policies VALUES(?,?,1,?,?,?)",
   )
     .bind(f.node, f.nodeUid, f.id, JSON.stringify(policy), now)
+    .run();
+  await env.DB.prepare(
+    "INSERT INTO node_region_policies(region_id,compute_pool_json) VALUES(?,?)",
+  )
+    .bind(f.region, poolEnabled ? JSON.stringify(policy) : null)
     .run();
   await importRegionAgentKey(env.DB, env, f.region, f.agent);
   const { ensureNodeHostConfiguration } =
@@ -489,6 +494,139 @@ async function runtimeAdmissionStatusFixture() {
   };
   return { ...f, policy, original, call };
 }
+it("regional null keeps sealed host custody while omitting active pool policy and reports", async () => {
+  const f = await runtimeAdmissionStatusFixture(false),
+    host = f.original.host_configuration!;
+  await env.DB.prepare(
+    "INSERT INTO node_compute_pool_observations VALUES(?,?,1,1,?,?,?)",
+  )
+    .bind(
+      f.node,
+      f.nodeUid,
+      JSON.stringify({
+        node_id: f.node,
+        node_uid: f.nodeUid,
+        policy_revision: 1,
+        material_revision: 1,
+        observed_at: new Date().toISOString(),
+        profile: f.policy.profile,
+        idle_memory_current_bytes: null,
+        idle_cpu_usage_usec: null,
+        slots: [],
+      }),
+      new Date().toISOString(),
+      new Date().toISOString(),
+    )
+    .run();
+  const off = await fleetPatchInput(f.runtime, f.op);
+  expect(off.compute_pool).toBeUndefined();
+  expect(off.compute_pool_observation).toBeUndefined();
+  expect(off.host_configuration).toEqual(host);
+  expect(host.status.profile_sha256).toBe(
+    await installationHash(f.policy.profile),
+  );
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET compute_pool_json=? WHERE region_id=?",
+  )
+    .bind(JSON.stringify({ ...f.policy, target_slots: 0 }), f.region)
+    .run();
+  const on = await fleetPatchInput(f.runtime, f.op);
+  expect(on.compute_pool?.policy).toEqual(f.policy);
+  expect(on.compute_pool_observation?.policy_revision).toBe(1);
+  expect(on.host_configuration).toEqual(host);
+});
+it("standard runtime completion requires the physical host hash and closed receipt without a pool report", async () => {
+  const f = await runtimeAdmissionStatusFixture(false),
+    host = f.original.host_configuration!.status,
+    role = f.original.spec.roles.customer,
+    boot = crypto.randomUUID(),
+    facts: FleetPatchFacts = {
+      ...f.facts,
+      boot_id: boot,
+      talos_version: "1.14.1",
+      kubernetes_version: "1.36.5",
+      kubelet_version: "1.36.5",
+      cluster_nodes: [
+        { node_uid: f.nodeUid, kubelet_version: "1.36.5", node_ready: true },
+      ],
+      host_configuration_sha256: host.sha256,
+      release_facts: {
+        boot_id: boot,
+        configuration_schema_revision: 1,
+        talos_version: "1.14.1",
+        talos_installer: role.talos_installer,
+        talos_schematic_sha256: role.talos_schematic_sha256,
+        kubernetes_version: "1.36.5",
+        talos_provenance: {
+          method: "deploymentreceipt",
+          installer: role.talos_installer,
+          node_uid: f.nodeUid,
+          cluster_uid: f.clusterUid,
+          boot_id: boot,
+        },
+        components: f.original.spec.components
+          .filter((component) => role.components.includes(component.name))
+          .map(({ name, version, sha256 }) => ({ name, version, sha256 })),
+      },
+    },
+    checkpoint = {
+      expected_revision: 0,
+      stage: "complete" as const,
+      state: "confirmed" as const,
+      facts,
+      error_code: null,
+    };
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='release_verify',state='pending',baseline_json=?,talos_upgrade_receipt_json=?,postgres_progress_json=? WHERE operation_id=?",
+  )
+    .bind(
+      JSON.stringify(f.facts),
+      JSON.stringify({
+        method: "deploymentreceipt",
+        installer: role.talos_installer,
+        node_uid: f.nodeUid,
+        cluster_uid: f.clusterUid,
+        system_uuid: f.facts.system_uuid,
+        pre_reboot_boot_id: f.facts.boot_id,
+        completed_at: new Date().toISOString(),
+        source: "cli_exit_0",
+      }),
+      JSON.stringify({
+        total: 0,
+        applied: 0,
+        pending: 0,
+        deferred_cold: 0,
+        queued_unassigned: 0,
+        queued_pending: 0,
+        errors: [],
+      }),
+      f.op,
+    )
+    .run();
+  await expect(
+    recordFleetPatchCheckpoint(f.runtime, f.op, {
+      ...checkpoint,
+      facts: { ...facts, host_configuration_sha256: "0".repeat(64) },
+    }),
+  ).rejects.toThrow("authority changed");
+  expect((await readFleetPatch(env, f.op)).revision).toBe(0);
+  expect(
+    (await recordFleetPatchCheckpoint(f.runtime, f.op, checkpoint)).stage,
+  ).toBe("complete");
+  const { readFleetNodeRelease } =
+    await import("../../src/domain/fleet-releases.ts");
+  const { restoreFleetPatchPlacements } =
+    await import("../../src/domain/fleet-patches.ts");
+  expect((await readFleetNodeRelease(env.DB, f.node)).state).toBe("converged");
+  expect(await restoreFleetPatchPlacements(f.runtime, f.op)).toBe(true);
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET observed_json=? WHERE operation_id=?",
+  )
+    .bind(JSON.stringify({ ...facts, host_configuration_sha256: null }), f.op)
+    .run();
+  expect((await readFleetNodeRelease(env.DB, f.node)).state).toBe("pending");
+  expect(await restoreFleetPatchPlacements(f.runtime, f.op)).toBe(false);
+});
 it("the policy-fenced status callback returns the current pool report without restamping it", async () => {
   const f = await runtimeAdmissionStatusFixture(),
     observedAt = new Date(Date.now() - 7000).toISOString(),

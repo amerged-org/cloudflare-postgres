@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "include": [
+    "apps/api/**",
+    "apps/edge/**",
+    "packages/contracts/**",
+    ".github/workflows/**"
+  ],
+  "exclude": [],
+  "outputDir": "docs/architecture/mermaider",
+  "audience": "both",
+  "detail": "overview",
+  "diagrams": [
+    {
+      "id": "architecture_3806f8bb5e61",
+      "title": "Management API: declared Cloudflare resources (template)",
+      "output": {
+        "markdown": "docs/architecture/mermaider/api-resources.md",
+        "mermaid": "docs/architecture/mermaider/api-resources.mmd"
+      }
+    },
+    {
+      "id": "architecture_f9bf00edc351",
+      "title": "TypeScript Edge: declared Cloudflare resources (template)",
+      "output": {
+        "markdown": "docs/architecture/mermaider/edge-resources.md",
+        "mermaid": "docs/architecture/mermaider/edge-resources.mmd"
+      }
+    },
+    {
+      "id": "ci_b803fcb7f17e",
+      "title": "PGCF CI: declared jobs and dependencies",
+      "output": {
+        "markdown": "docs/architecture/mermaider/ci-pipeline.md",
+        "mermaid": "docs/architecture/mermaider/ci-pipeline.mmd"
+      }
+    },
+    {
+      "id": "data:schema:apps/api/migrations",
+      "title": "Current D1 core tables and keys (selected view)",
+      "focus": [
+        "projects",
+        "api_keys",
+        "regions",
+        "nodes",
+        "size_classes",
+        "databases",
+        "roles",
+        "operations",
+        "lifecycle_events"
+      ],
+      "attributes": "keys",
+      "output": {
+        "markdown": "docs/architecture/mermaider/d1-core.md",
+        "mermaid": "docs/architecture/mermaider/d1-core.mmd"
+      }
+    },
+    {
+      "id": "pgcf-add-node",
+      "model": ".mermaider/models/add-node.json",
+      "output": {
+        "markdown": "docs/architecture/mermaider/add-node.md",
+        "mermaid": "docs/architecture/mermaider/add-node.mmd"
+      }
+    }
+  ],
+  "hooks": {
+    "enabled": true,
+    "trigger": "changes"
+  }
+}

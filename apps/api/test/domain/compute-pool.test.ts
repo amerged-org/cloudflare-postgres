@@ -268,3 +268,44 @@ it("rejects a target above the finite idle budget and stale policy updates", asy
     ).status,
   ).toBe(409);
 });
+it("projects zero refill while the regional runtime is off without changing the stored node policy", async () => {
+  const f = await configured(),
+    path = `/v1/nodes/${f.node}/compute-pool`,
+    leasePath = `/agent/v1/nodes/${f.node}/compute-pool`;
+  expect(
+    (
+      await request(path, f.admin, "PUT", {
+        expected_revision: 0,
+        node_uid: f.uid,
+        policy: f.policy,
+      })
+    ).status,
+  ).toBe(200);
+  const off = await (await request(leasePath, f.agent)).json();
+  expect(off).toMatchObject({
+    revision: 1,
+    policy: { ...f.policy, target_slots: 0 },
+  });
+  await env.DB.prepare(
+    "INSERT INTO node_region_policies(region_id,compute_pool_json) VALUES(?,?)",
+  )
+    .bind(f.region, JSON.stringify({ ...f.policy, target_slots: 0 }))
+    .run();
+  expect(await (await request(leasePath, f.agent)).json()).toMatchObject({
+    revision: 1,
+    policy: f.policy,
+  });
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET compute_pool_json=NULL WHERE region_id=?",
+  )
+    .bind(f.region)
+    .run();
+  expect(await (await request(leasePath, f.agent)).json()).toMatchObject({
+    revision: 1,
+    policy: { ...f.policy, target_slots: 0 },
+  });
+  expect(await (await request(path, f.admin)).json()).toMatchObject({
+    revision: 1,
+    policy: f.policy,
+  });
+});

@@ -223,6 +223,20 @@ are recorded in `pnpm-lock.yaml`; build and test tooling is not relicensed as fi
 | --------------------------------------------------------------- | ---------- | ------------------------------------------------------------------------------------------------------- |
 | [neondatabase/wsproxy](https://github.com/neondatabase/wsproxy) | Apache-2.0 | Read-only reference for the WebSocket-to-PostgreSQL bridge. Not vendored, not pinned, not a dependency. |
 
+## Architecture documentation tooling
+
+[Mermaider](https://github.com/sebmer-com/mermaider) 0.1.0 is licensed under
+[Apache-2.0](https://github.com/sebmer-com/mermaider/blob/main/LICENSE). Its immutable
+source revision is recorded in [.mermaider/tool-revision](.mermaider/tool-revision);
+the existing CI workflow reads that pin and installs the tool's locked dependency
+tree. Mermaider generates and checks selected source-backed architecture, schema,
+CI and process diagrams. It is development tooling, not part of any PGCF runtime
+image. Its dependencies retain the licenses and notices in their installed
+packages and upstream source. The generated offline diagram gallery embeds
+[Mermaid 11.17.2](https://github.com/mermaid-js/mermaid/tree/mermaid%4011.17.2),
+with its MIT license included in the HTML; this browser renderer is documentation
+content, not a PGCF service. No Mermaider analysis source is vendored here.
+
 ## Acceptance workflow actions
 
 The supplemental native TCP probe uses these official actions in the existing CI workflow.

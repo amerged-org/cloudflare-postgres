@@ -887,6 +887,73 @@ test("a current-custody host-only finalization skips every OS and Kubernetes wri
   }
 });
 
+test("pool-off admission retains both physical host files without requiring pool observations", async () => {
+  const r = runtime();
+  const files = NodeHostConfigurationPrivate.shape.files.parse([
+    {
+      path: "/var/lib/pgcf-sandbox/settings.json",
+      permissions: 384,
+      content: "retained-settings",
+    },
+    {
+      path: "/var/lib/pgcf-sandbox/agent-key",
+      permissions: 384,
+      content: "retained-key",
+    },
+  ]);
+  r.fixture.input.spec.roles.customer.host_configuration_required = true;
+  r.fixture.input.regional_hosts_ready = true;
+  r.fixture.input.host_configuration = NodeHostConfigurationPrivate.parse({
+    files,
+    status: {
+      version: 1,
+      node_id: r.current.node_id,
+      node_uid: r.current.node_uid,
+      region_id: r.current.region_id,
+      cluster_uid: r.current.cluster_uid,
+      material_revision: 3,
+      revision: 2,
+      release_id: r.current.release_id,
+      pool_policy_revision: 1,
+      profile_sha256: "f".repeat(64),
+      sha256: digest(canonical(files)),
+      created_at: new Date().toISOString(),
+    },
+  });
+  const host = r.fixture.input.host_configuration;
+  r.current = {
+    ...r.current,
+    stage: "runtime_admission",
+    baseline: r.fixture.facts,
+    host_configuration_revision: host.status.revision,
+    host_configuration_sha256: host.status.sha256,
+    spec_sha256: digest(canonical(r.fixture.input.spec)),
+  };
+  r.machineConfiguration = stringify({
+    version: "v1alpha1",
+    machine: { files: files.map((file) => ({ ...file, op: "create" })) },
+  });
+  r.physicalHostFiles = new Map(
+    files.map((file) => [
+      file.path,
+      file.path.endsWith("agent-key") ? "wrong-key" : file.content,
+    ]),
+  );
+  await r.turn();
+  assert.equal(r.current.state, "pending");
+  assert.equal(r.checkpoints.length, 0);
+  r.physicalHostFiles = new Map(files.map((file) => [file.path, file.content]));
+  await r.turn();
+  assert.equal(r.current.stage, "runtime_admission");
+  assert.equal(r.current.state, "confirmed");
+  assert.equal(
+    r.current.observed?.host_configuration_sha256,
+    host.status.sha256,
+  );
+  assert.equal(r.current.observed?.runtime_admission_sha256, undefined);
+  assert.equal(r.writes.length, 0);
+});
+
 test("host-only file activation dispatches one normal reboot and resolves an unknown result without repeating it", async () => {
   const { r, pins } = pinnedKubernetesRuntime(),
     files = NodeHostConfigurationPrivate.shape.files.parse([

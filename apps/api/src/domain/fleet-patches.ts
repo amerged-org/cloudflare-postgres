@@ -332,13 +332,14 @@ export async function fleetPatchInput(
     return closed();
   if (row.bootstrap_operation_id) await assertBootstrapFleetParent(env, row);
   const selected = await env.DB.prepare(
-    "SELECT a.role,n.k8s_node_name,s.spec_json FROM fleet_node_releases a JOIN nodes n ON n.id=a.node_id JOIN fleet_releases s ON s.id=a.release_id WHERE a.node_id=?",
+    "SELECT a.role,n.k8s_node_name,s.spec_json,EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=n.region_id AND p.compute_pool_json IS NOT NULL) compute_pool_enabled FROM fleet_node_releases a JOIN nodes n ON n.id=a.node_id JOIN fleet_releases s ON s.id=a.release_id WHERE a.node_id=?",
   )
     .bind(row.node_id)
     .first<{
       role: "control_relay" | "customer";
       k8s_node_name: string;
       spec_json: string;
+      compute_pool_enabled: number;
     }>();
   if (!selected) return closed();
   const ref = await loadCurrentRegionMaterialReference(
@@ -440,7 +441,7 @@ export async function fleetPatchInput(
           updated_at: string;
         }>()
     : null;
-  const computePool = poolRow
+  const storedPool = poolRow
     ? ComputePoolPolicyState.strip().parse({
         ...poolRow,
         policy: JSON.parse(poolRow.policy_json),
@@ -448,11 +449,12 @@ export async function fleetPatchInput(
     : undefined;
   if (
     hostConfiguration &&
-    (!computePool ||
-      (await installationHash(computePool.policy.profile)) !==
+    (!storedPool ||
+      (await installationHash(storedPool.policy.profile)) !==
         hostConfiguration.status.profile_sha256)
   )
     return closed();
+  const computePool = selected.compute_pool_enabled ? storedPool : undefined;
   const observation = computePool
     ? await env.DB.prepare(
         "SELECT observation_json FROM node_compute_pool_observations WHERE node_id=? AND node_uid=? AND policy_revision=? AND material_revision=?",
@@ -473,7 +475,7 @@ export async function fleetPatchInput(
     env.NODE_BOOTSTRAP_CALLBACK_URL,
   );
   if (url.protocol !== "https:") return closed();
-  await assertFleetPatchCurrent(env, row, false, computePool?.revision);
+  await assertFleetPatchCurrent(env, row, false, storedPool?.revision);
   return FleetPatchInput.parse({
     status: status(row),
     host_configuration_only:
@@ -510,7 +512,7 @@ export async function fleetPatchInput(
     callback: { url: url.href, bearer: await patchBearer(env, row) },
   });
 }
-/** Existing host receipts plus fresh physical identity and pool observations qualify the regional activation boundary. */
+/** Host receipts and physical identity qualify every runtime; enabled pools also need fresh slot observations. */
 async function regionalFleetHostsReady(
   env: Env,
   row: PatchRow,
@@ -518,10 +520,10 @@ async function regionalFleetHostsReady(
   includeSelf = false,
 ): Promise<boolean> {
   const selectedPool = await env.DB.prepare(
-      "SELECT policy_json FROM node_compute_pool_policies WHERE node_id=? AND node_uid=? AND release_id=?",
+      "SELECT policy_json,EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=? AND p.compute_pool_json IS NOT NULL) compute_pool_enabled FROM node_compute_pool_policies WHERE node_id=? AND node_uid=? AND release_id=?",
     )
-      .bind(row.node_id, row.node_uid, row.release_id)
-      .first<{ policy_json: string }>(),
+      .bind(row.region_id, row.node_id, row.node_uid, row.release_id)
+      .first<{ policy_json: string; compute_pool_enabled: number }>(),
     targetPool = selectedPool ? JSON.parse(selectedPool.policy_json) : null;
   const members = await env.DB.prepare(
     `SELECT n.id,n.node_uid,n.ready,n.last_observed_at,a.role,a.revision,o.facts_json,o.observed_at,o.assignment_revision,o.agent_key_hash,r.agent_key_hash current_key,h.revision host_revision,h.sha256 host_sha,h.profile_sha256,p.revision pool_revision,p.policy_json,c.observation_json,
@@ -592,21 +594,25 @@ async function regionalFleetHostsReady(
         !member.host_revision ||
         !member.pool_revision ||
         !member.policy_json ||
-        !member.observation_json ||
         old.host_configuration_sha256 !== member.host_sha
       )
         return false;
-      const policy = JSON.parse(member.policy_json),
-        observed = ComputePoolObservation.parse(
-          JSON.parse(member.observation_json),
-        );
+      const policy = JSON.parse(member.policy_json);
       if (
         !targetPool ||
         (await installationHash(policy.profile)) !==
           (await installationHash(targetPool.profile)) ||
         policy.per_slot_cpu_millicores !== targetPool.per_slot_cpu_millicores ||
         policy.per_slot_memory_mib !== targetPool.per_slot_memory_mib ||
-        (await installationHash(policy.profile)) !== member.profile_sha256 ||
+        (await installationHash(policy.profile)) !== member.profile_sha256
+      )
+        return false;
+      if (!selectedPool?.compute_pool_enabled) continue;
+      if (!member.observation_json) return false;
+      const observed = ComputePoolObservation.parse(
+        JSON.parse(member.observation_json),
+      );
+      if (
         observed.node_uid !== member.node_uid ||
         observed.policy_revision !== member.pool_revision ||
         observed.material_revision !== row.material_revision ||
@@ -1373,13 +1379,16 @@ export async function recordFleetPatchCheckpoint(
         observed = selected.compute_pool_observation,
         host = selected.host_configuration?.status;
       if (
-        !pool ||
-        !observed ||
         !host ||
         input.facts.host_configuration_sha256 !== host.sha256 ||
+        (input.stage === "complete" && !selected.regional_hosts_ready)
+      )
+        return closed();
+      if (
+        pool &&
+        (!observed ||
         (input.stage === "complete" &&
-          (!selected.regional_hosts_ready ||
-            input.facts.runtime_admission_sha256 !== host.profile_sha256 ||
+          (input.facts.runtime_admission_sha256 !== host.profile_sha256 ||
             input.facts.runtime_admission_policy_revision !== pool.revision)) ||
         observed.node_uid !== row.node_uid ||
         observed.policy_revision !== pool.revision ||
@@ -1389,7 +1398,7 @@ export async function recordFleetPatchCheckpoint(
         JSON.stringify(observed.profile) !==
           JSON.stringify(pool.policy.profile) ||
         observed.slots.filter((slot) => slot.live && slot.sandbox_id === null)
-          .length < pool.policy.target_slots
+          .length < pool.policy.target_slots)
       )
         return closed();
     }

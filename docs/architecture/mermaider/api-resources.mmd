@@ -1,0 +1,24 @@
+flowchart LR
+    n_839713e89618["Cron * * * * *"]
+    n_f305dbc12c79["D1 database DB database_name: #60;D1_DATABASE_NAME#62;"]
+    n_049ba2d64372["Workflow ADD_NODE name: pgcf-add-node class_name: AddNode"]
+    n_36ffcdc5f79f["Workflow PATCH_NODE name: pgcf-patch-node class_name: PatchNode"]
+    n_71083a5197e9["R2 bucket ARCHIVE bucket_name: replace-r2-backup-bucket"]
+    n_12eaf448c6b2["R2 bucket ARCHIVE_US bucket_name: replace-r2-us-backup-bucket"]
+    n_056b63fe76be["Durable Object DATABASE_ACTOR class_name: DatabaseActor"]
+    n_926733166afd["VPC service BOOTSTRAP_RELAY_SERVICE"]
+    n_c09d9079b0a9["Container NodeBootstrap"]
+    n_d0efe52f1f47["Durable Object NODE_BOOTSTRAP class_name: NodeBootstrap"]
+    n_7a30182df25a["pgcf-api-dev configuration template"]
+    n_260ca5b8b289["Durable Object REGION_LINK class_name: RegionLink"]
+    n_7a30182df25a -->|"declares"| n_f305dbc12c79
+    n_7a30182df25a -->|"declares"| n_c09d9079b0a9
+    n_7a30182df25a -->|"declares"| n_260ca5b8b289
+    n_839713e89618 -->|"scheduled event"| n_7a30182df25a
+    n_7a30182df25a -->|"declares"| n_049ba2d64372
+    n_7a30182df25a -->|"declares"| n_d0efe52f1f47
+    n_7a30182df25a -->|"declares"| n_71083a5197e9
+    n_7a30182df25a -->|"declares"| n_926733166afd
+    n_7a30182df25a -->|"declares"| n_056b63fe76be
+    n_7a30182df25a -->|"declares"| n_12eaf448c6b2
+    n_7a30182df25a -->|"declares"| n_36ffcdc5f79f

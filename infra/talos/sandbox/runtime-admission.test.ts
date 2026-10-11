@@ -5,7 +5,7 @@ import {
   sandboxRuntimeAdmission,
   COMPUTE_PROFILE_NODE_LABEL,
 } from "./runtime-admission.ts";
-test("runtime selection targets all managed CNPG instance cohorts from the exact operator and preserves its ordinary process and volumes", () => {
+test("runtime selection targets opted-in managed CNPG instance cohorts from the exact operator and preserves its ordinary process and volumes", () => {
   const input = {
       operatorNamespace: "cnpg-system",
       operatorServiceAccount: "cloudnative-pg",
@@ -22,6 +22,8 @@ test("runtime selection targets all managed CNPG instance cohorts from the exact
   );
   assert.equal(runtime.overhead.podFixed.memory, "32Mi");
   assert.deepEqual(policy.spec.matchConstraints.namespaceSelector.matchExpressions, [{key:"pgcf.io/database-id",operator:"Exists"}]);
+  assert.deepEqual(policy.spec.matchConstraints.namespaceSelector.matchLabels, {"pgcf.io/compute-runtime":"pool"});
+  assert.deepEqual(binding.spec.matchResources.namespaceSelector, policy.spec.matchConstraints.namespaceSelector);
   assert.deepEqual(policy.spec.matchConstraints.objectSelector.matchLabels, {"cnpg.io/podRole":"instance"});
   assert.deepEqual(policy.spec.matchConstraints.objectSelector.matchExpressions, [{key:"cnpg.io/cluster",operator:"Exists"}]);
   assert.deepEqual(policy.spec.matchConstraints.resourceRules[0].operations, [

@@ -22,6 +22,61 @@ import { MAINTENANCE_ROLE } from "@pgcf/contracts/maintenance";
 
 const signal = () => new AbortController().signal;
 
+test("a same-generation runtime switch recreates only the primary through one resolved CNPG restart before publishing ready", async () => {
+  const { db, ctx } = fixture(),
+    k8s = new MemoryKubernetes();
+  await new Reconciler(k8s, signal(), Date.now, metrics, authenticate).reconcile(db, ctx);
+  const namespace = `pgcf-db-${db.id}`,
+    ns = k8s.resources.get(k8s.key("Namespace", undefined, namespace))!,
+    cluster = k8s.resources.get(k8s.key("Cluster", namespace, "database"))!,
+    pod = k8s.resources.get(k8s.key("Pod", namespace, "database-1"))!,
+    claim = k8s.resources.get(k8s.key("PersistentVolumeClaim", namespace, "database-1"))!,
+    fence = k8s.resources.get(k8s.key("ConfigMap", "pgcf-system", `storage-${db.id}`))!;
+  ns.metadata.labels = { ...ns.metadata.labels, "pgcf.io/compute-runtime": "pool", "other.example/label": "kept" };
+  ns.metadata.annotations!["other.example/annotation"] = "kept";
+  cluster.metadata.annotations!["other.example/annotation"] = "kept";
+  record(pod.spec).runtimeClassName = "pgcf-prestarted";
+  const identities = [ns.metadata.uid, cluster.metadata.uid, claim.metadata.uid, record(fence.data).state],
+    marker = `pgcf-runtime/${db.generation}/standard`;
+  let restarts = 0, probes = 0, loseResponse = true;
+  const patch = k8s.patch.bind(k8s);
+  k8s.patch = async (...args) => {
+    await patch(...args);
+    if (args[0] === "Cluster" && args[3].some((op) => record(record(op).value)["kubectl.kubernetes.io/restartedAt"] === marker)) {
+      restarts++;
+      if (loseResponse) { loseResponse = false; throw new Error("restart_reply_lost"); }
+    }
+  };
+  const request: typeof fetch = async (...args) => { probes++; return metrics(...args); },
+    auth = async () => { probes++; return true; },
+    reconciler = new Reconciler(k8s, signal(), Date.now, request, auth);
+  assert.equal((await reconciler.reconcile(db, { ...ctx, computePool: null }))?.state, "provisioning");
+  assert.equal(ns.metadata.labels["pgcf.io/compute-runtime"], "standard");
+  assert.equal(ns.metadata.labels["other.example/label"], "kept");
+  assert.equal(ns.metadata.annotations!["other.example/annotation"], "kept");
+  assert.equal(cluster.metadata.annotations!["other.example/annotation"], "kept");
+  assert.equal(cluster.metadata.annotations!["kubectl.kubernetes.io/restartedAt"], marker);
+  assert.equal((await reconciler.reconcile(db, ctx))?.state, "provisioning");
+  pod.metadata.deletionTimestamp = new Date().toISOString();
+  assert.equal((await reconciler.reconcile(db, ctx))?.state, "provisioning");
+  k8s.resources.delete(k8s.key("Pod", namespace, "database-1"));
+  assert.equal((await reconciler.reconcile(db, ctx))?.state, "provisioning");
+  assert.equal(restarts, 1);
+  assert.equal(probes, 0);
+  const replacement = structuredClone(pod);
+  replacement.metadata.uid = randomUUID();
+  replacement.metadata.resourceVersion = String(++k8s.revision);
+  delete replacement.metadata.deletionTimestamp;
+  replacement.metadata.annotations = { "kubectl.kubernetes.io/restartedAt": marker };
+  delete record(replacement.spec).runtimeClassName;
+  record(replacement.status).podIP = "127.0.0.2";
+  k8s.resources.set(k8s.key("Pod", namespace, "database-1"), replacement);
+  assert.equal((await reconciler.reconcile(db, ctx))?.state, "ready");
+  assert.equal(restarts, 1);
+  assert.deepEqual([ns.metadata.uid, cluster.metadata.uid, claim.metadata.uid, record(fence.data).state], identities);
+  assert.equal(k8s.actions.some((action) => action.startsWith("delete:")), false);
+});
+
 test("per-database PostgreSQL patches require the running primary imageID and report the actual digest", async () => {
   const { db, ctx } = fixture(),
     k8s = new MemoryKubernetes();

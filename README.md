@@ -338,6 +338,8 @@ configuration fails explicitly. Unit tests do not replace the live phase accepta
 - [PLAN.md](PLAN.md): scope, architecture, phases, decisions and status.
 - [Rust runtime and cold starts](docs/architecture/rust-runtime-and-cold-starts.md): approved
   target architecture, shared prestarted compute pool, routing and additional warm-reclaim acceptance.
+- [Source-backed diagrams](docs/architecture/mermaider/README.md): declared Cloudflare resources,
+  CI dependencies, current core D1 tables and the reviewed AddNode orchestration.
 - [AGENTS.md](AGENTS.md): contributor and coding-agent brief.
 - [THIRD_PARTY.md](THIRD_PARTY.md): upstream components and licenses.
 - [infra/](infra/README.md): Talos, platform and backup recipes.

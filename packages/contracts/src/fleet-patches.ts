@@ -617,7 +617,7 @@ export function fleetPatchCheckpointAllowed(
             current.host_configuration_sha256 &&
           facts.host_configuration_sha256 ===
             input.host_configuration?.status.sha256 &&
-          fleetPatchHostServiceObserved(input))
+          (!input.compute_pool || fleetPatchHostServiceObserved(input)))
       );
     if (current.stage === "talos") {
       const r = next.talos_upgrade_receipt;
@@ -671,10 +671,15 @@ export function fleetPatchCheckpointAllowed(
       return (
         !input.spec.roles[input.role].host_configuration_required ||
         (healthy &&
-          facts.runtime_admission_sha256 ===
-            input.host_configuration?.status.profile_sha256 &&
-          facts.runtime_admission_policy_revision ===
-            input.compute_pool?.revision)
+          (input.compute_pool
+            ? facts.runtime_admission_sha256 ===
+                input.host_configuration?.status.profile_sha256 &&
+              facts.runtime_admission_policy_revision ===
+                input.compute_pool.revision
+            : facts.host_configuration_sha256 ===
+                current.host_configuration_sha256 &&
+              facts.host_configuration_sha256 ===
+                input.host_configuration?.status.sha256))
       );
     if (current.stage === "postgres")
       return (

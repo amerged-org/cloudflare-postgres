@@ -130,6 +130,7 @@ async function currentLease(c: ApiContext, id: string) {
     now = Date.now();
   const row = await c.env.DB.prepare(
     `SELECT p.*,n.region_id,n.last_observed_at,r.bootstrap_material_revision,
+    EXISTS(SELECT 1 FROM node_region_policies policy WHERE policy.region_id=n.region_id AND policy.compute_pool_json IS NOT NULL) compute_pool_enabled,
     a.revision assignment_revision,f.revision region_revision FROM node_compute_pool_policies p
     JOIN nodes n ON n.id=p.node_id AND n.node_uid=p.node_uid JOIN regions r ON r.id=n.region_id
     JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid AND a.release_id=p.release_id
@@ -144,6 +145,7 @@ async function currentLease(c: ApiContext, id: string) {
         bootstrap_material_revision: number;
         assignment_revision: number;
         region_revision: number;
+        compute_pool_enabled: number;
       }
     >();
   if (!row)
@@ -157,7 +159,10 @@ async function currentLease(c: ApiContext, id: string) {
     node_uid: row.node_uid,
     region_id: row.region_id,
     revision: row.revision,
-    policy: JSON.parse(row.policy_json),
+    policy: {
+      ...JSON.parse(row.policy_json),
+      ...(row.compute_pool_enabled ? {} : { target_slots: 0 }),
+    },
     updated_at: row.updated_at,
     material_revision: row.bootstrap_material_revision,
     assignment_revision: row.assignment_revision,

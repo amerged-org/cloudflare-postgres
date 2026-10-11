@@ -1001,7 +1001,7 @@ export async function runFleetPatch(
             facts.boot_id !== current.observed?.boot_id))
       ) {
         await authorize(true);
-        if (fleetPatchHostServiceObserved(input)) {
+        if (!input.compute_pool || fleetPatchHostServiceObserved(input)) {
           await refreshServingPin();
           await checkpoint("host_service", "confirmed", facts);
         }
@@ -1297,11 +1297,16 @@ export async function runFleetPatch(
         await checkpoint("host_ready", "confirmed", facts);
         return current;
       }
-      if (!target.host_configuration_required)
-        await checkpoint("runtime_admission", "confirmed", facts);
-      else {
-        if (!input.compute_pool || !input.compute_pool_observation)
+      if (!target.host_configuration_required || !input.compute_pool) {
+        if (
+          target.host_configuration_required &&
+          facts.host_configuration_sha256 !==
+            input.host_configuration?.status.sha256
+        )
           return current;
+        await checkpoint("runtime_admission", "confirmed", facts);
+      } else {
+        if (!input.compute_pool_observation) return current;
         await authorize();
         const runtimeInput = {
           ...input,
@@ -1369,8 +1374,8 @@ export async function runFleetPatch(
         !facts.release_facts?.talos_provenance
       )
         throw new BootstrapError("patch_release_unobserved");
-      if (target.host_configuration_required) {
-        if (!input.compute_pool || !input.compute_pool_observation)
+      if (target.host_configuration_required && input.compute_pool) {
+        if (!input.compute_pool_observation)
           throw new BootstrapError("patch_runtime_admission_unobserved");
         await authorize();
         const state = await readRuntimeAdmission(

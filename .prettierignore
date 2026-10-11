@@ -8,3 +8,4 @@ worker-configuration.d.ts
 infra
 *.md
 apps/edge-rust/build/
+docs/architecture/mermaider/index.html

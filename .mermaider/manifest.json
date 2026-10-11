@@ -1,0 +1,58 @@
+{
+  "diagrams": [
+    "architecture_3806f8bb5e61",
+    "architecture_f9bf00edc351",
+    "ci_b803fcb7f17e",
+    "data:schema:apps/api/migrations",
+    "pgcf-add-node"
+  ],
+  "files": [
+    {
+      "path": "docs/architecture/mermaider/add-node.md",
+      "sha256": "64df57d7d4e5d8a85f87414c3e51e187eeaefdc47eba56814bc7b3fe13f8c469"
+    },
+    {
+      "path": "docs/architecture/mermaider/add-node.mmd",
+      "sha256": "1af2dbc81bf9bc77d59fc5d0276526f2769d83c7bc1390607261944fec8788a7"
+    },
+    {
+      "path": "docs/architecture/mermaider/api-resources.md",
+      "sha256": "27b81b97182809a015dba77e452b0cae174491761137bf4b5472a30c4222bdf9"
+    },
+    {
+      "path": "docs/architecture/mermaider/api-resources.mmd",
+      "sha256": "caec1d791813f01abb875a67b6b56571fc3185c714b326c51b733f5bcf324b64"
+    },
+    {
+      "path": "docs/architecture/mermaider/ci-pipeline.md",
+      "sha256": "8fefb3cd341b9954262b4687f9e0040d75cb166da6b68cfe28361ec23e32a2b0"
+    },
+    {
+      "path": "docs/architecture/mermaider/ci-pipeline.mmd",
+      "sha256": "cf1f11310fd7254de5caab6e462fdbaa4967fe7d5deb0cecf388a06838e938f5"
+    },
+    {
+      "path": "docs/architecture/mermaider/d1-core.md",
+      "sha256": "313ff45297804cfd085ef3d684314c3374cf0ceab707bdc5b673e78bc64e0a10"
+    },
+    {
+      "path": "docs/architecture/mermaider/d1-core.mmd",
+      "sha256": "ca1b859cfd1604ad31cde35cbb05381d425c62a23bb6075e3cb9c7fd29b2f534"
+    },
+    {
+      "path": "docs/architecture/mermaider/edge-resources.md",
+      "sha256": "3cd2ca4e1dc609c3928d8de4f7396cea864afe15a5176097229ac9df8a1eb874"
+    },
+    {
+      "path": "docs/architecture/mermaider/edge-resources.mmd",
+      "sha256": "90ccae903c2523013322f53559721b4a8c568b4df0984daef28a30763c9c2cea"
+    },
+    {
+      "path": "docs/architecture/mermaider/index.html",
+      "sha256": "3044253f8c6629640117a0611586bb88062e27c5f12ab6d613a3a895ca3457ee"
+    }
+  ],
+  "fingerprint": "ece6dd4c73a06e6d0441796ccb686ec0cb747f98efe5707e7d7497572621d230",
+  "toolVersion": "0.1.0",
+  "version": 1
+}
