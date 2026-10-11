@@ -9,7 +9,7 @@ day. Customer migration is not yet authorized.
 Cloudflare is the global control plane: it owns configuration, placement, progress, releases and
 provider actions for every region. The fleet is **EU control** (relay host, no customer databases)
 and **customer EU1**. Preserve both servers, existing data and keys; no EU reinstall. The US region
-is cancelled at Contabo: US1 runs until 2026-11-05 only as the R1.1 canary and is then marked lost.
+is cancelled at Contabo (contract ends 2026-11-04); US1 was marked lost on 2026-10-11 and is no longer patched.
 US and Oceania return later from the same region configuration. Automatic EU purchases stay
 enabled under the configured policy; US purchases are off.
 
@@ -75,6 +75,9 @@ keep their backend and data. Thin activation needs a release-bound receipt from 
 | Corrected sandbox runtime qualification | AMD64 proof passed: pool claims 10.4/11.5 ms. These are runtime timings, not first-SQL results. |
 | Frozen R1-final image | One installer/raw composition: 11.5/28.0 s. Five private immutable objects fully read back; public eligibility remains open. |
 | Observed-error class corrections | Generation, host-file activation, Kubelet pin, persistent taint and safe held-target replacement tested; qualified/current delivery varies below. |
+| Batch A deploy | API and NodeBootstrap from `1de03f2` deployed; successors drop lost members and `operator_hold_` holds. |
+| US1 retired | Marked lost at 12:01 UTC on 2026-10-11; one pending US test database record remains for the Cloudflare US cleanup. |
+| EU hold release | EU-only R1.2 successor `op_3ts0qw8s0tey6u7wvdkn` started the rotation; snapshot through discovery-secret confirmed, after list-kind and binding-order fixes found live. |
 
 ## Open
 
@@ -82,16 +85,13 @@ One row per step, in dependency order. A step moves to Done only with its measur
 
 | Step | Status | Finished when |
 | --- | --- | --- |
-| R1.1 US1 canary | In progress | US1's R1.1 patch completes through the programmed rollout. EU stays held at its rotation snapshot gate. |
-| Batch A/CI-green deploy | Open | One CI passes; API and NodeBootstrap deploy between patches. Successors then drop lost members and `operator_hold_` holds; backups skip regions without a live node. |
-| US1 mark-lost and Cloudflare US cleanup | Open | US test database deleted while US1 runs; US1 marked lost before the EU successor, at the latest by 2026-11-05; US Tunnel, VPC binding, firewall/rescue entries and tokens removed; `ARCHIVE_US` kept until retained US archives expire. |
+| Cloudflare US cleanup | Open | The pending US test database record is removed; US Tunnel, VPC binding, firewall/rescue entries and tokens removed; `ARCHIVE_US` kept until retained US archives expire. |
 | Terminal Pods after reboots | Fixed in code | R1.2 carries the fixed regional agent, and after its reboot EU1 databases wake, suspend and delete. Failed or Succeeded Pods left by a reboot made these power transitions fail. |
-| CNPG in-place restart | Being fixed | The pool runtime switch yields a primary Pod with the selected RuntimeClass, and the EU rotation's consumer renewal yields new database Pods. CNPG's default restart method applies `kubectl.kubernetes.io/restartedAt` inside the running Pod, but both need a new Pod. NodeBootstrap carries the fix before the EU rotation; the native controller carries it with R2. |
-| EU hold release | Open | The successor rollout of release R1.2 (new release ID, same Golden bytes) with `expected_previous_rollout_id` starts the EU rotation at its snapshot gate, which needs a complete backup run at most 36 h old. |
-| EU rotation | Open | Prepared EU authority (material revision 2) is active and retired authority is rejected. |
-| EU1 | Open | EU1 is patched first, passes the six checks and needs zero operator interventions. |
+| CNPG in-place restart | Fixed in code | The pool runtime switch yields a primary Pod with the selected RuntimeClass, and the EU rotation's consumer renewal yields new database Pods. CNPG's default restart method applies `kubectl.kubernetes.io/restartedAt` inside the running Pod, but both need a new Pod. NodeBootstrap carries the fix before the EU rotation; the native controller carries it with R2. |
+| EU rotation | In progress: node patches; encryption, verify and activation follow. The Secret ciphertext proof reads etcd in pinned pages (43 Secrets, ~3.6 MiB measured against the former single 4 MiB read). | Prepared EU authority (material revision 2) is active and retired authority is rejected. |
+| EU1 | In progress: Talos 1.14.2 reboot confirmed; the Flux stage exceeds the 600 s turn budget because every relay command needs its own 2–6.6 s single-use transport and Flux objects are read one by one. | EU1 is patched first, passes the six checks and needs zero operator interventions. |
 | Control | Open | Control/relay is patched last, passes the six checks, the relay is reachable and no intervention was needed. |
-| Notifier | Open | RAM, CPU and storage warning thresholds are delivered; one real alarm arrives after the owner sets recipient and sender through the API. CPU values arrive only from R2's native controller. |
+| Notifier | Open: the owner provides a Resend API key (Worker secret `RESEND_API_KEY`), a sender on a Resend-verified domain and a recipient. The OpenAPI document describes email, thresholds and alert status. Alerts evaluate at most four regions; a config PUT fails a running backup. | RAM, CPU and storage warning thresholds are delivered; one real alarm arrives after the owner sets recipient and sender through the API. CPU values arrive only from R2's native controller. |
 | R2 | Open | Native gateway, native controller and the EU pool switch (relay keeps its pin) roll out EU1 then control; six checks pass. R2 pins the thin guard, so each node's host configuration stage also waits until `dm_thin_pool` is loaded. Needs the CNPG in-place restart fix first. |
 | Pool cold-start test | Open | A sleeping database's pool-hit first SQL is measured from one start (<1 s target, unproven), data is preserved and refill is observed; a miss is labelled a miss. |
 | Thin qualification | Open | A scratch-first run on EU1 passes the seven [gates](#thin-storage-qualification-gates) and yields the receipt. |
