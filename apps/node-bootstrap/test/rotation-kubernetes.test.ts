@@ -60,19 +60,32 @@ test("a lost Secret replacement response is reconciled without a second write", 
   assert.equal(result.secret_count, 1);
   assert.equal(result.physical_ciphertext_verification_pending, true);
 });
-test("an uncommitted uncertain Secret replacement remains unresolved and never replays", async () => {
-  const actual = secret();
-  let saved: unknown,
-    writes = 0;
+test("a dispatched Secret replacement that never landed is re-sent once under its exact uid and resourceVersion", async () => {
+  let actual = secret(),
+    saved: unknown;
+  const sent: ReturnType<typeof secret>[] = [];
   const commands = {
     async authorize() {},
     async checkpoint(value: unknown) {
       saved = structuredClone(value);
     },
-    async kube(args: string[]) {
+    async kube(args: string[], payload?: string) {
       if (args[0] === "replace") {
-        writes++;
-        throw Error("response_lost");
+        const body = JSON.parse(payload!);
+        sent.push(body);
+        // The first attempt dies in the relay before it reaches kube-apiserver.
+        if (sent.length === 1) throw Error("relay_unavailable");
+        // kube-apiserver applies a replacement only to the exact uid and resourceVersion.
+        if (
+          body.metadata.uid !== actual.metadata.uid ||
+          body.metadata.resourceVersion !== actual.metadata.resourceVersion
+        )
+          throw Error("conflict");
+        actual = {
+          ...body,
+          metadata: { ...body.metadata, resourceVersion: "2" },
+        };
+        return JSON.stringify(actual);
       }
       return JSON.stringify(
         args[2] === "/api/v1/secrets" ? apiList("Secret", [actual]) : actual,
@@ -81,15 +94,46 @@ test("an uncommitted uncertain Secret replacement remains unresolved and never r
   };
   await assert.rejects(
     rewriteRotationSecrets({ key_name: "replacement" }, commands),
+    /relay_unavailable/,
   );
-  await assert.rejects(
-    rewriteRotationSecrets(
-      { key_name: "replacement", cursor: saved },
-      commands,
-    ),
-    /rotation_secret_write_unresolved/,
+  assert.equal((saved as { state: string }).state, "dispatched");
+  const result = await rewriteRotationSecrets(
+    { key_name: "replacement", cursor: saved },
+    commands,
+  );
+  assert.equal(sent.length, 2);
+  assert.deepEqual(sent[1], sent[0]);
+  assert.deepEqual(
+    [sent[1]!.metadata.uid, sent[1]!.metadata.resourceVersion],
+    [secret().metadata.uid, "1"],
+  );
+  assert.equal(actual.metadata.resourceVersion, "2");
+  assert.equal(result.secret_count, 1);
+});
+test("a replacement kube-apiserver skips because the Secret already uses the new write key is accepted", async () => {
+  const actual = secret();
+  let writes = 0;
+  const commands = {
+    async authorize() {},
+    async checkpoint() {},
+    async kube(args: string[]) {
+      // An identical object whose stored value is not stale is not rewritten: resourceVersion stays.
+      if (args[0] === "replace") {
+        writes++;
+        return JSON.stringify(actual);
+      }
+      return JSON.stringify(
+        args[2] === "/api/v1/secrets" ? apiList("Secret", [actual]) : actual,
+      );
+    },
+  };
+  const result = await rewriteRotationSecrets(
+    { key_name: "replacement" },
+    commands,
   );
   assert.equal(writes, 1);
+  assert.equal(result.secret_count, 1);
+  assert.equal(result.physical_ciphertext_verification_pending, true);
 });
 test("replacement preserves Secret data and rejects a changed physical object", async () => {
   let actual = secret(),

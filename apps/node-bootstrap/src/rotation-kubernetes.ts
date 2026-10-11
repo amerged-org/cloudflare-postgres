@@ -114,7 +114,12 @@ function assertSecret(value: ObjectValue, expected: Cursor["items"][number]) {
   )
     return fail("rotation_secret_identity_changed");
 }
-/** Re-encrypt current Secrets with unchanged data. A dispatched uncertain write is read-only on resume. */
+/**
+ * Re-encrypt current Secrets with unchanged data. Each replacement body carries the Secret's uid and
+ * resourceVersion, which kube-apiserver enforces as preconditions, so at most one attempt can apply.
+ * A resumed dispatched write whose resourceVersion moved has been rewritten; an unmoved one wrote
+ * nothing, so the identical body is sent again.
+ */
 export async function rewriteRotationSecrets(
   input: { key_name: string; cursor?: unknown },
   commands: RotationKubernetesCommands,
@@ -140,24 +145,31 @@ export async function rewriteRotationSecrets(
   }
   for (let index = cursor.index; index < cursor.items.length; index++) {
     const expected = cursor.items[index]!,
-      route = secretPath(expected.namespace, expected.name);
+      route = secretPath(expected.namespace, expected.name),
+      resumed = index === cursor.index && cursor.state !== "pending";
     let actual = await get(commands, route);
     assertSecret(actual, expected);
-    if (index === cursor.index && cursor.state !== "pending") {
-      if (metadata(actual).resourceVersion === expected.resource_version)
-        return fail("rotation_secret_write_unresolved");
-    } else {
+    if (
+      !resumed ||
+      metadata(actual).resourceVersion === expected.resource_version
+    ) {
       expected.resource_version = text(metadata(actual).resourceVersion);
       await commands.authorize();
-      cursor = await save(commands, { ...cursor, index, state: "dispatched" });
+      if (!resumed)
+        cursor = await save(commands, {
+          ...cursor,
+          index,
+          state: "dispatched",
+        });
       await commands.kube(
         ["replace", "--raw", route, "--filename=-"],
         JSON.stringify(actual),
       );
       actual = await get(commands, route);
       assertSecret(actual, expected);
-      if (metadata(actual).resourceVersion === expected.resource_version)
-        return fail("rotation_secret_write_unresolved");
+      // A successful replacement that leaves resourceVersion unchanged was skipped by kube-apiserver:
+      // it rewrites an identical object only when its stored value is stale, i.e. not under the
+      // current write key. The caller reads every Secret's etcd ciphertext before the phase confirms.
     }
     cursor = await save(commands, {
       ...cursor,
