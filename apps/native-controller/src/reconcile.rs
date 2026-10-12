@@ -392,22 +392,10 @@ impl Reconciler {
         {
             return Ok(None);
         }
-        let terms = pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"]
-            .as_array()
-            .ok_or("local volume affinity missing")?;
-        if terms.is_empty()
-            || !terms.iter().all(|term| {
-                term["matchExpressions"]
-                    .as_array()
-                    .is_some_and(|expressions| {
-                        expressions.iter().any(|e| {
-                            text(e, "key") == "kubernetes.io/hostname"
-                                && text(e, "operator") == "In"
-                                && e["values"] == json!([db["node"]])
-                        })
-                    })
-            })
-        {
+        if pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"].is_null() {
+            return Err("local volume affinity missing".into());
+        }
+        if !pinned_to_node(&pv, text(db, "node")) {
             return Err("local volume node affinity changed".into());
         }
         let handle = text(&pv["spec"]["csi"], "volumeHandle");
@@ -1491,9 +1479,71 @@ impl Reconciler {
     }
 }
 
+/// Every node selector term of a local PersistentVolume pins exactly this node. OpenEBS LVM LocalPV
+/// publishes both topology keys; volumes it provisioned before carry only `openebs.io/nodename`.
+fn pinned_to_node(pv: &Value, node: &str) -> bool {
+    pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"]
+        .as_array()
+        .is_some_and(|terms| {
+            !terms.is_empty()
+                && terms.iter().all(|term| {
+                    term["matchExpressions"]
+                        .as_array()
+                        .is_some_and(|expressions| {
+                            expressions.iter().any(|e| {
+                                ["kubernetes.io/hostname", "openebs.io/nodename"]
+                                    .contains(&text(e, "key"))
+                                    && text(e, "operator") == "In"
+                                    && e["values"] == json!([node])
+                            })
+                        })
+                })
+        })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_retained_volume_pinned_by_the_openebs_node_label_belongs_to_its_node() {
+        // OpenEBS LVM LocalPV 1.x provisioned R1 volumes with only `openebs.io/nodename`.
+        let pv = |terms: Value| json!({"spec":{"nodeAffinity":{"required":{"nodeSelectorTerms":terms}}}});
+        let term = |key: &str, node: &str| json!({"matchExpressions":[{"key":key,"operator":"In","values":[node]}]});
+        let node = "pgcf-node-aaaaaaaaaaaaaaaaaaaa";
+        assert!(pinned_to_node(
+            &pv(json!([term("openebs.io/nodename", node)])),
+            node
+        ));
+        assert!(pinned_to_node(
+            &pv(json!([term("kubernetes.io/hostname", node)])),
+            node
+        ));
+        assert!(pinned_to_node(
+            &pv(
+                json!([{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":[node]},{"key":"openebs.io/nodename","operator":"In","values":[node]}]}])
+            ),
+            node
+        ));
+        assert!(!pinned_to_node(
+            &pv(json!([term(
+                "openebs.io/nodename",
+                "pgcf-node-bbbbbbbbbbbbbbbbbbbb"
+            )])),
+            node
+        ));
+        assert!(!pinned_to_node(
+            &pv(json!([term("topology.kubernetes.io/zone", node)])),
+            node
+        ));
+        assert!(!pinned_to_node(
+            &pv(json!([
+                term("openebs.io/nodename", node),
+                term("openebs.io/nodename", "pgcf-node-bbbbbbbbbbbbbbbbbbbb")
+            ])),
+            node
+        ));
+        assert!(!pinned_to_node(&pv(json!([])), node));
+        assert!(!pinned_to_node(&json!({"spec":{}}), node));
+    }
     #[test]
     fn credentials_require_cnpg_ack_for_exact_secret_version() {
         let db = json!({"id":"db","generation":2,"roles":[{"name":"app","owner":true,"password":"secret"}]});
