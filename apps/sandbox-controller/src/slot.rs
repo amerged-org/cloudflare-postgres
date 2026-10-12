@@ -190,6 +190,24 @@ fn handle_live(fd: &OwnedFd) -> Result<bool, Status> {
     }
     Ok(result == 0)
 }
+/// A pidfd turns readable when its exact process exits, before it is reaped.
+async fn exited_within(fd: &OwnedFd, limit: Duration) -> bool {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let mut poll = libc::pollfd {
+            fd: fd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut poll, 1, 0) } > 0 {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
 fn observed_process(pid: u32, ticks: u64) -> Result<Option<OwnedFd>, Status> {
     if !start_ticks(pid).is_ok_and(|value| value == ticks) {
         return Ok(None);
@@ -646,22 +664,10 @@ impl Slot {
                 .wait()
                 .await
                 .map_err(|_| unavailable("holder_reap_failed"))?;
-        } else if let Some(fd) = &self.pidfd {
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
-            loop {
-                let mut poll = libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut poll, 1, 0) } > 0 {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(unavailable("holder_stop_unconfirmed"));
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+        } else if let Some(fd) = &self.pidfd
+            && !exited_within(fd, Duration::from_secs(3)).await
+        {
+            return Err(unavailable("holder_stop_unconfirmed"));
         }
         self.exited_at.get_or_insert(SystemTime::now());
         self.exit_status = 137;
@@ -675,7 +681,7 @@ impl Slot {
     }
     async fn destroy_mode(&mut self, namespace: &str, retain_owner: bool) -> Result<(), Status> {
         self.stop().await?;
-        if self
+        let shutdown: Result<(), Status> = if self
             .shim_pidfd
             .as_ref()
             .map(handle_live)
@@ -684,7 +690,7 @@ impl Slot {
             && start_ticks(self.identity.shim_pid)
                 .is_ok_and(|ticks| ticks == self.identity.shim_start_ticks)
         {
-            let _: () = transport::shim_call(
+            transport::shim_call(
                 &self.identity.task_address,
                 "Shutdown",
                 crate::containerd::task::v3::ShutdownRequest {
@@ -693,24 +699,19 @@ impl Slot {
                 },
                 namespace,
             )
-            .await?;
-        }
-        if let Some(fd) = &self.shim_pidfd {
-            let deadline = std::time::Instant::now() + Duration::from_secs(3);
-            loop {
-                let mut poll = libc::pollfd {
-                    fd: fd.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                if unsafe { libc::poll(&mut poll, 1, 0) } > 0 {
-                    break;
-                }
-                if std::time::Instant::now() >= deadline {
-                    return Err(unavailable("shim_shutdown_unconfirmed"));
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
+            .await
+        } else {
+            Ok(())
+        };
+        // The exact shim's exit, not its reply, confirms the shutdown. A shim removes its socket
+        // before it exits and may exit before it replies; one already closing after a failed
+        // claim's Shutdown cannot answer at all. A failed request stands only while it stays alive.
+        if let Some(fd) = &self.shim_pidfd
+            && !exited_within(fd, Duration::from_secs(3)).await
+        {
+            return Err(shutdown
+                .err()
+                .unwrap_or_else(|| unavailable("shim_shutdown_unconfirmed")));
         }
         if !retain_owner {
             let _ = fs::remove_file(self.directory.join("identity.json"));
@@ -740,6 +741,87 @@ impl Slot {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A real process stands in for a shim whose socket is gone, as for a closing shim.
+    fn slot_with_unreachable_shim(directory: &Path, shim: u32) -> Slot {
+        Slot {
+            identity: Identity {
+                slot: directory
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                pid: u32::MAX,
+                shim_pid: shim,
+                task_address: format!("ttrpc+unix://{}", directory.join("gone.sock").display()),
+                network_inode: 1,
+                ipc_inode: 1,
+                uts_inode: 1,
+                holder_start_ticks: 0,
+                shim_start_ticks: start_ticks(shim).unwrap(),
+            },
+            child: None,
+            pidfd: None,
+            shim_pidfd: Some(pidfd(shim).unwrap()),
+            socket: directory.join("control.sock"),
+            directory: directory.to_owned(),
+            created_at: SystemTime::now(),
+            prepared_at: std::time::Instant::now(),
+            lifetime: Duration::ZERO,
+            assigned_network: None,
+            exited_at: None,
+            exit_status: 0,
+            _log_reader: LogReader(tokio::spawn(async {})),
+            cgroup: None,
+            budget: None,
+            profile: None,
+        }
+    }
+    #[tokio::test]
+    async fn closing_shim_that_cannot_answer_shutdown_is_destroyed_once_it_exits() {
+        let base = PathBuf::from(format!("/tmp/sc-{}", std::process::id()));
+        let directory = base.join("c".repeat(32));
+        std::fs::create_dir(&base).unwrap();
+        private_directory(&directory).unwrap();
+        let mut shim = std::process::Command::new("/bin/sleep")
+            .arg("0.5")
+            .spawn()
+            .unwrap();
+        let destroyed = slot_with_unreachable_shim(&directory, shim.id())
+            .destroy("k8s.io")
+            .await;
+        shim.wait().unwrap();
+        let retained = directory.exists();
+        std::fs::remove_dir_all(base).unwrap();
+        assert!(
+            destroyed.is_ok(),
+            "the exact shim exit confirms its shutdown: {}",
+            destroyed
+                .err()
+                .map(|e| e.message().to_string())
+                .unwrap_or_default()
+        );
+        assert!(!retained);
+    }
+    #[tokio::test]
+    async fn live_shim_that_cannot_answer_shutdown_keeps_its_slot() {
+        let base = PathBuf::from(format!("/tmp/sl-{}", std::process::id()));
+        let directory = base.join("d".repeat(32));
+        std::fs::create_dir(&base).unwrap();
+        private_directory(&directory).unwrap();
+        let mut shim = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let destroyed = slot_with_unreachable_shim(&directory, shim.id())
+            .destroy("k8s.io")
+            .await;
+        shim.kill().unwrap();
+        shim.wait().unwrap();
+        let retained = directory.exists();
+        std::fs::remove_dir_all(base).unwrap();
+        assert_eq!(destroyed.unwrap_err().message(), "shim_request_failed");
+        assert!(retained);
+    }
     #[tokio::test]
     async fn exited_unreaped_shim_is_not_contacted_when_restoring_retired_ownership() {
         let base = PathBuf::from(format!("/tmp/sr-{}", std::process::id()));
