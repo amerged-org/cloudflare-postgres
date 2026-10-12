@@ -28,9 +28,12 @@ import { normalizeRuntimeImageManifest } from "../../../../infra/platform/image-
 
 export const INFRASTRUCTURE_BACKUP_MAX_AGE_MS = 36 * 60 * 60 * 1000;
 const MAX_RUN_MS = 2 * 60 * 60 * 1000;
+const RETRY_DELAY_MS = 10 * 60 * 1000;
+const MAX_DAILY_ATTEMPTS = 3;
 type RunRow = {
   id: string;
   day: string;
+  attempt: number;
   config_revision: number;
   status: string;
   created_at: string;
@@ -158,7 +161,7 @@ export async function infrastructureBackupStatus(db: D1Database, id?: string) {
     id ??
     (await db
       .prepare(
-        "SELECT id FROM infrastructure_backup_runs ORDER BY day DESC LIMIT 1",
+        "SELECT id FROM infrastructure_backup_runs ORDER BY day DESC,attempt DESC LIMIT 1",
       )
       .first<string>("id"));
   if (!selected) return null;
@@ -166,6 +169,7 @@ export async function infrastructureBackupStatus(db: D1Database, id?: string) {
   return InfrastructureBackupRunStatus.parse({
     id: row.id,
     day: row.day,
+    attempt: row.attempt,
     status: row.status,
     created_at: row.created_at,
     completed_at: row.completed_at,
@@ -187,7 +191,7 @@ export async function assertBackupRun(env: Env, id: string, now = Date.now()) {
     throw new Error("infrastructure_backup_authority_expired");
   return { row, artifacts, config };
 }
-/** Persist one UTC-day intent. Creation ambiguity resolves through the same Workflow id. */
+/** Persist one UTC-day intent per attempt. Creation ambiguity resolves through the same Workflow id. */
 export async function runInfrastructureBackupCron(env: Env, now = Date.now()) {
   const at = new Date(now).toISOString(),
     config = await readInfrastructureBackupConfig(env.DB);
@@ -201,23 +205,35 @@ export async function runInfrastructureBackupCron(env: Env, now = Date.now()) {
   ]);
   if (!config.enabled || !env.INFRASTRUCTURE_BACKUP) return;
   const day = at.slice(0, 10),
-    id = crypto.randomUUID();
-  await env.DB.prepare(
-    "INSERT INTO infrastructure_backup_runs(id,day,config_revision,status,created_at,expires_at) VALUES(?,?,?,'pending',?,?) ON CONFLICT(day) DO NOTHING",
-  )
-    .bind(
-      id,
-      day,
-      config.revision,
-      at,
-      new Date(now + MAX_RUN_MS).toISOString(),
+    latest = () =>
+      env.DB.prepare(
+        "SELECT * FROM infrastructure_backup_runs WHERE day=? ORDER BY attempt DESC LIMIT 1",
+      )
+        .bind(day)
+        .first<RunRow>();
+  const previous = await latest(),
+    attempt = !previous
+      ? 1
+      : previous.status === "failed" &&
+          previous.attempt < MAX_DAILY_ATTEMPTS &&
+          now - Date.parse(previous.completed_at!) >= RETRY_DELAY_MS
+        ? previous.attempt + 1
+        : 0;
+  // One attempt at a time across days, so a retry never competes with another capture.
+  if (attempt)
+    await env.DB.prepare(
+      "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,expires_at) SELECT ?,?,?,?,'pending',?,? WHERE NOT EXISTS(SELECT 1 FROM infrastructure_backup_runs WHERE status IN('pending','running')) ON CONFLICT(day,attempt) DO NOTHING",
     )
-    .run();
-  const run = await env.DB.prepare(
-    "SELECT * FROM infrastructure_backup_runs WHERE day=?",
-  )
-    .bind(day)
-    .first<RunRow>();
+      .bind(
+        crypto.randomUUID(),
+        day,
+        attempt,
+        config.revision,
+        at,
+        new Date(now + MAX_RUN_MS).toISOString(),
+      )
+      .run();
+  const run = attempt ? await latest() : previous;
   if (!run || run.status !== "pending") return;
   // Resolve the exact persisted instance; only the binding's known missing-instance result permits creation.
   try {
@@ -699,7 +715,7 @@ export async function infrastructureBackupHealth(env: Env, now = Date.now()) {
         )
         .first<string>("at");
       const failed = await env.DB.prepare(
-        "SELECT r.completed_at,r.error_code FROM infrastructure_backup_runs r WHERE r.status='failed' ORDER BY r.day DESC LIMIT 1",
+        "SELECT r.completed_at,r.error_code FROM infrastructure_backup_runs r WHERE r.status='failed' ORDER BY r.day DESC,r.attempt DESC LIMIT 1",
       ).first<{ completed_at: string; error_code: string }>();
       const baseline = Date.parse(completed ?? config.enabled_at ?? "");
       return InfrastructureBackupHealth.parse({

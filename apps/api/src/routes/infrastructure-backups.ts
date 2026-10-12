@@ -104,7 +104,7 @@ export function registerInfrastructureBackups(app: ApiApp) {
       security: [{ bearerAuth: [] }],
       summary: "Read the latest infrastructure backup run and backup freshness",
       description:
-        "Returns the most recent daily run with per-artifact receipts and the freshness of every expected backup: the D1 export in d1_region_id and one etcd snapshot per region with a current cluster and a node that is not lost. While enabled, the minute cron starts at most one run per UTC day; a run fails after two hours. Health status failing raises infrastructure_backup_failed and stale raises infrastructure_backup_stale for that region. No credentials, signed URLs or keys are returned.",
+        "Returns the latest attempt of the latest UTC day with per-artifact receipts and the freshness of every expected backup: the D1 export in d1_region_id and one etcd snapshot per region with a current cluster and a node that is not lost. While enabled, the minute cron starts one run per UTC day and retries a failed run on the same day: the next attempt starts at least 10 minutes after the failed attempt ended, at most 3 attempts per day, and never while another run of any day is pending or running. A run fails after two hours. Health status failing raises infrastructure_backup_failed and stale raises infrastructure_backup_stale for that region; a later complete attempt clears failing. No credentials, signed URLs or keys are returned.",
       responses: {
         200: {
           description: "Latest safe backup receipts and current freshness",
@@ -112,7 +112,7 @@ export function registerInfrastructureBackups(app: ApiApp) {
             "application/json": {
               schema: z.object({
                 latest: InfrastructureBackupRunStatus.nullable().describe(
-                  "Run of the latest UTC day; null before the first run.",
+                  "Latest attempt of the latest UTC day; null before the first run.",
                 ),
                 health: z
                   .array(InfrastructureBackupHealth)

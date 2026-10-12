@@ -222,7 +222,14 @@ export const InfrastructureBackupArtifactStatus =
   });
 export const InfrastructureBackupRunStatus = z.strictObject({
   id: z.uuid(),
-  day: z.iso.date().describe("UTC day; at most one run per day."),
+  day: z.iso.date().describe("UTC day; at most one complete run per day."),
+  attempt: z
+    .number()
+    .int()
+    .positive()
+    .describe(
+      "Attempt within the UTC day, from 1. A failed attempt is retried at least 10 minutes after it ended, at most 3 attempts per day.",
+    ),
   status: z
     .enum(["pending", "running", "complete", "failed"])
     .describe(
@@ -244,17 +251,17 @@ export const InfrastructureBackupHealth = z.strictObject({
   status: z
     .enum(["disabled", "ok", "unknown", "stale", "failing"])
     .describe(
-      "disabled: backups are off. unknown: the expected source cannot be identified, or nothing completed yet within 36 h of enabling. failing: the latest failed run ended at or after the last completed backup (or the enabling). stale: no completed backup for more than 36 h, counted from enabling when none exists. ok otherwise. failing raises infrastructure_backup_failed and stale raises infrastructure_backup_stale for the region.",
+      "disabled: backups are off. unknown: the expected source cannot be identified, or nothing completed yet within 36 h of enabling. failing: the latest failed attempt ended at or after the last completed backup (or the enabling); it stays failing while a retry runs, and a later complete attempt clears it. stale: no completed backup for more than 36 h, counted from enabling when none exists. ok otherwise. failing raises infrastructure_backup_failed and stale raises infrastructure_backup_stale for the region.",
     ),
   last_completed_at: Timestamp.nullable().describe(
     "Latest completed backup of this kind, region and source.",
   ),
   last_failed_at: Timestamp.nullable().describe(
-    "End of the latest failed run of any artifact.",
+    "End of the latest failed attempt of any artifact.",
   ),
   error_code: z
     .string()
     .max(128)
     .nullable()
-    .describe("Error code of the latest failed run of any artifact."),
+    .describe("Error code of the latest failed attempt of any artifact."),
 });
