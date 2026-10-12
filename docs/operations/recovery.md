@@ -356,7 +356,11 @@ scratch object, LV, the pool and a pool metadata spare that did not exist before
   `native-gateway`, `native-controller` and `openebs-lvm`. The release also pins `postgres`. The
   storage authority keys equal the current signer keys. `dm_thin_pool` is live.
 - The VG has only the retained linear LVs. Free extents cover the profile maximum, twice its metadata
-  and its VG reserve, plus 12 GiB for the metadata scratch pool.
+  and its VG reserve, plus 12 GiB for the metadata scratch pool. Each fill claim must exceed the pool
+  it fills by one seventh within the room the scheduler counts for a thin claim, or the run fails
+  with `thin_qualification_fill_room_insufficient`. That room is the free extents above the pool,
+  twice its metadata and the VG reserve; the full-pool fill also counts the free data of the
+  maximum pool.
 - The profile can grow (`initial_data_bytes` < `maximum_data_bytes`) and has at most 256 volumes.
 - One NodeBootstrap container slot is free. Run it outside a fleet patch or rollout.
 

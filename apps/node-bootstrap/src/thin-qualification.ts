@@ -538,6 +538,18 @@ export class QualificationJournal {
   }
 }
 
+/**
+ * A scratch fill claim no larger than the room the scheduler counts for it, whose filesystem
+ * outlasts the pool, so the pool, never the filesystem, runs out of space first. mkfs.ext4 -m0
+ * keeps more than 7/8 of a GiB-scale device: inode tables take 1/64 (one 256-byte inode per
+ * 16 KiB), the default journal at most 1/32, bitmaps and descriptors far less.
+ */
+function fillClaimBytes(ceiling: number, room: number, poolBytes: number) {
+  const size = Math.min(ceiling, room);
+  if (size - size / 8 <= poolBytes) fail("fill_room_insufficient");
+  return size;
+}
+
 interface PoolFacts extends Facts {
   pool_uuid: string;
   data_bytes: number;
@@ -1662,12 +1674,23 @@ printf 'pgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$rc" "$start" "$end"`,
   }
 
   private async dataFull(): Promise<ThinQualificationReport> {
-    const poolUuid = this.setup.pool.pool_uuid,
+    const setup = this.setup,
+      poolUuid = setup.pool.pool_uuid,
       quota = this.profile.maximum_quota_gib * GIB,
       target = Math.min(
         this.profile.maximum_data_bytes,
         this.profile.initial_data_bytes + this.profile.growth_bytes,
       );
+    // The fill stays in the VG room above the setup pool, its metadata and spare and the reserve,
+    // so the scheduler places it. Setup facts give every turn the same size before any write.
+    const fillBytes = fillClaimBytes(
+      2 * target,
+      setup.volume_group_free_bytes -
+        setup.pool.data_bytes -
+        2 * setup.pool.metadata_bytes -
+        this.profile.vg_reserve_bytes,
+      setup.pool.data_bytes,
+    );
     const before = await this.journal.observe("data_full:pool", async () => {
       const pool = await this.requirePool(poolUuid);
       return { data_bytes: pool.volume.size_bytes, device: pool.device };
@@ -1693,12 +1716,11 @@ printf 'pgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$rc" "$start" "$end"`,
     const pre = await this.journal.measure("data_full:pre", () =>
       this.acknowledge("pg-a", 64),
     );
-    // Twice the maximum pool: the pool, never the filesystem, runs out of space first.
     const fillVolume = await this.workload(
       "data_full",
       "fill",
       "sleep",
-      2 * this.profile.maximum_data_bytes,
+      fillBytes,
       false,
     );
     // An unmapped raw thin LV in the same pool measures the pool's own error latency.
@@ -2409,12 +2431,37 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
       }),
     );
     await this.releaseWorkload("noflush_quiescence", "writer");
-    // The same noflush suspension while the pool is out of data space.
+    // The same noflush suspension while the pool is out of data space. The pool is at its maximum,
+    // so the fill also needs the free pool data the scheduler counts for a thin claim; one
+    // journaled observation gives every turn the same size.
+    const room = await this.journal.observe(
+      "noflush_quiescence:fill-full:room",
+      async () => {
+        const pool = await this.requirePool(poolUuid),
+          used = pool.status.used_data_blocks;
+        return {
+          volume_group_free_bytes: pool.lvm.free_bytes,
+          pool_data_bytes: pool.volume.size_bytes,
+          // A failed pool reports no counters; all of its data counts as used.
+          pool_used_bytes:
+            used === null
+              ? pool.volume.size_bytes
+              : used * this.setup.pool.chunk_bytes,
+        };
+      },
+    );
     const fill = await this.workload(
       "noflush_quiescence",
       "fill-full",
       "sleep",
-      2 * this.profile.maximum_data_bytes,
+      fillClaimBytes(
+        2 * room.pool_data_bytes,
+        room.volume_group_free_bytes +
+          room.pool_data_bytes -
+          room.pool_used_bytes -
+          this.profile.vg_reserve_bytes,
+        room.pool_data_bytes,
+      ),
       false,
     );
     this.room(480_000);

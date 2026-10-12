@@ -21,6 +21,8 @@ const GIB = 1024 ** 3,
   MIB = 1024 ** 2;
 const POOL = "pgcf_thinpool";
 const OWNER = "pgcf.io/thin-qualification";
+/** kube-scheduler retries an unschedulable Pod at least every 5 minutes. */
+const SCHEDULER_RETRY_MS = 300_000;
 
 export const profile = ThinStorageProfile.parse({
   version: 1,
@@ -65,7 +67,8 @@ interface Pod {
   uid: string;
   rv: number;
   created: string;
-  phase: "Running" | "Failed";
+  phase: "Pending" | "Running" | "Failed";
+  claim: string;
 }
 interface Claim {
   name: string;
@@ -90,7 +93,7 @@ export class ThinWorld {
   driverImage: string = profile.driver_image;
   extension = "0.1.0";
   readonly vg = lvm("Vg");
-  readonly total = 103_075_020_800;
+  readonly total: number;
   readonly driverUid = randomUUID();
   readonly daemonSetUid = randomUUID();
   lvs: Lv[] = [];
@@ -104,14 +107,16 @@ export class ThinWorld {
   log: string[] = [];
   /** Simulated relay latency of one driver command, applied to the mocked clock. */
   cost: (args: string[]) => number = () => 0;
+  /** Advances the mocked clock for relay latency and scheduler retries. */
   elapse: (milliseconds: number) => void = () => {};
   /** The session budget: later commands are cancelled like the real relay session. */
   cancelAt = Infinity;
   private minor = 10;
   private rv = 100;
   readonly ids: QualificationIds;
-  constructor(ids: QualificationIds) {
+  constructor(ids: QualificationIds, total = 103_075_020_800) {
     this.ids = ids;
+    this.total = total;
   }
 
   get namespace() {
@@ -157,10 +162,16 @@ export class ThinWorld {
   dm(lv: Lv) {
     return `LVM-${hex(this.vg)}${hex(lv.uuid)}`;
   }
+  private usedBlocks(pool: Lv) {
+    return this.poolMode === "out_of_data_space" ? pool.size / 65536 : 16;
+  }
   private poolStatus(pool: Lv) {
-    const total = pool.size / 65536,
-      used = this.poolMode === "out_of_data_space" ? total : 16;
-    return `0 ${pool.size / 512} thin-pool 1 1180/${pool.metadata / 4096} ${used}/${total} - ${this.poolMode} discard_passdown error_if_no_space - 1024\n`;
+    return `0 ${pool.size / 512} thin-pool 1 1180/${pool.metadata / 4096} ${this.usedBlocks(pool)}/${pool.size / 65536} - ${this.poolMode} discard_passdown error_if_no_space - 1024\n`;
+  }
+  /** OpenEBS LVM 1.10.1 GetCapacity of a thinProvision class: VG free plus free data of pgcf_thinpool. */
+  private capacity() {
+    const pool = this.lv(POOL);
+    return this.free() + (pool ? pool.size - this.usedBlocks(pool) * 65536 : 0);
   }
 
   async command(command: Command): Promise<CommandResult> {
@@ -307,7 +318,7 @@ export class ThinWorld {
         creationTimestamp: pod.created,
         annotations: this.annotations(),
       },
-      spec: { nodeName: this.ids.name },
+      spec: pod.phase === "Pending" ? {} : { nodeName: this.ids.name },
       status: { phase: pod.phase },
     };
   }
@@ -372,11 +383,15 @@ export class ThinWorld {
         });
       case "daemonset":
         return one(this.daemonSet());
-      case "pod":
+      case "pod": {
         if (namespace === "openebs") return one(this.driver());
-        return one(
-          this.pods.has(name!) && this.podObject(this.pods.get(name!)!),
-        );
+        const pod = this.pods.get(name!);
+        if (pod?.phase === "Pending") {
+          this.elapse(SCHEDULER_RETRY_MS);
+          this.schedule(pod);
+        }
+        return one(pod && this.podObject(pod));
+      }
       case "persistentvolumeclaim":
         return one(
           this.claims.has(name!) && this.claimObject(this.claims.get(name!)!),
@@ -414,7 +429,6 @@ export class ThinWorld {
     };
   }): CommandResult {
     const name = manifest.metadata.name;
-    this.log.push(`create ${manifest.kind} ${name}`);
     if (manifest.kind === "PersistentVolumeClaim") {
       const claim = {
         name,
@@ -423,24 +437,37 @@ export class ThinWorld {
         size: Number(manifest.spec.resources!.requests.storage),
         bound: false,
       };
+      this.log.push(`create ${manifest.kind} ${name} ${claim.size}`);
       this.claims.set(name, claim);
       return ok(JSON.stringify(this.claimObject(claim)));
     }
+    this.log.push(`create ${manifest.kind} ${name}`);
     if (manifest.kind !== "Pod")
       throw new Error(`unexpected_create_${manifest.kind}`);
-    const pod = {
+    const pod: Pod = {
       name,
       uid: randomUUID(),
       rv: this.nextVersion(),
       created: new Date().toISOString(),
-      phase: "Running" as const,
+      phase: "Pending",
+      claim: manifest.spec.volumes![0]!.persistentVolumeClaim!.claimName,
     };
     this.pods.set(name, pod);
-    // WaitForFirstConsumer: the first Pod binds its claim to a new thin LV in the pool.
-    const claim = this.claims.get(
-      manifest.spec.volumes![0]!.persistentVolumeClaim!.claimName,
-    );
+    this.schedule(pod);
+    return ok(JSON.stringify(this.podObject(pod)));
+  }
+  /**
+   * WaitForFirstConsumer: the scheduler places a Pod whose claim is unbound only if the claim fits
+   * the reported capacity, then the claim binds to a new thin LV in the pool. A refused Pod stays
+   * Pending, as on EU1, where FailedScheduling reported "did not have enough free storage".
+   */
+  private schedule(pod: Pod) {
+    const claim = this.claims.get(pod.claim);
     if (claim && !claim.bound) {
+      if (claim.size > this.capacity()) {
+        this.log.push(`unschedulable ${pod.name} ${claim.size}`);
+        return;
+      }
       claim.bound = true;
       const pv = `pvc-${claim.uid}`;
       this.volumes.set(pv, {
@@ -459,7 +486,7 @@ export class ThinWorld {
         tags: [],
       });
     }
-    return ok(JSON.stringify(this.podObject(pod)));
+    pod.phase = "Running";
   }
 
   private delete(
@@ -571,6 +598,17 @@ export class ThinWorld {
           })
           .join("\n") + "\n",
       );
+    // On a full pool PostgreSQL PANICs at its next WAL write; restart_after_crash=off fails the Pod.
+    if (
+      command[0] === "/bin/bash" &&
+      command[2]?.includes("INSERT INTO q(v)") &&
+      this.poolMode === "out_of_data_space"
+    ) {
+      this.pods.get(pod)!.phase = "Failed";
+      return ok(
+        'psql:<stdin>:1: PANIC:  could not write to file "pg_wal/xlogtemp.88": No space left on device\npgcf-rc=2\n',
+      );
+    }
     if (command[0] === "/bin/bash" && command[2]?.includes('of="$1" bs="$2"')) {
       this.poolMode = "out_of_data_space";
       return ok(
@@ -766,6 +804,7 @@ export interface QualificationIds {
 /** One run whose journal and Cloudflare callbacks persist across executor turns. */
 export function thinQualificationRun(
   step: ThinQualificationInput["run"]["step"],
+  options: { volumeGroupBytes?: number } = {},
 ) {
   const ids: QualificationIds = {
     id: newOperationId(),
@@ -777,7 +816,7 @@ export function thinQualificationRun(
     provider_instance_id: "202610110001",
     address: "192.0.2.21",
   };
-  const world = new ThinWorld(ids);
+  const world = new ThinWorld(ids, options.volumeGroupBytes);
   const entries: ThinQualificationJournalEntry[] = [];
   const calls: { kind: string; report?: unknown }[] = [];
   const lease = { operation_id: newOperationId(), revision: 1 };
@@ -973,6 +1012,7 @@ export function thinQualificationRun(
           rv: world.nextVersion(),
           created: new Date().toISOString(),
           phase: "Running",
+          claim: name,
         });
       const facts = {
         claim_uid: claim,

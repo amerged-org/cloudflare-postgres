@@ -596,133 +596,6 @@ describe(
       assert.equal(evidence.reinitialized_pool_uuid, lvm("Np"));
     });
 
-    test("a resumed noflush turn continues from its journal after the run stopped the writer Pod", async () => {
-      const run = thinQualificationRun("noflush_quiescence");
-      run.workload("data_full", "pg-a", "Pa", { pod: false });
-      run.released("noflush_quiescence", "writer", "Wr");
-      for (const [key, facts] of Object.entries({
-        "writer-pod": { uid: randomUUID() },
-        "writer-start": { started: true },
-        dirty: { bytes: 41_943_040 },
-        suspend: { exit_code: 0, milliseconds: 30 },
-        frozen: {
-          state: "SUSPENDED",
-          lv_state: "s",
-          write_sectors_first: 1_204_224,
-          write_sectors_second: 1_204_224,
-          used_first: 2_100,
-          used_second: 2_100,
-          observed_milliseconds: 3_000,
-        },
-        resume: {
-          resume_exit_code: 0,
-          resume_milliseconds: 20,
-          sync_ok: true,
-          drain_milliseconds: 9_000,
-          used_after: 2_740,
-        },
-        "writer-stop": { stopped: true },
-        fsck: { exit_code: 0 },
-      }))
-        run.confirm(`noflush_quiescence:${key}`, facts);
-      const fill = run.workload("noflush_quiescence", "fill-full", "Ff", {
-        size: 2 * profile.maximum_data_bytes,
-      });
-      assert.deepEqual(await run.turn(), { kind: "report" });
-      assert.ok(!run.world.lvs.some((value) => value.uuid === fill.lv_uuid));
-      assert.ok(run.world.log.includes("exec fill-full /bin/bash"));
-      const evidence = (
-        run.calls[0]!.report as {
-          evidence: { writer: { lv_uuid: string }; full: { state: string } };
-        }
-      ).evidence;
-      assert.equal(
-        evidence.writer.lv_uuid,
-        run.entry("noflush_quiescence:writer:volume")!.facts!.lv_uuid,
-      );
-      assert.equal(evidence.full.state, "SUSPENDED");
-    });
-
-    test("a resumed data_full turn accepts PostgreSQL crashed on the full pool and replaces its Pod", async () => {
-      const run = thinQualificationRun("data_full");
-      const pool = run.world.lv("pgcf_thinpool")!;
-      run.confirm("data_full:pool", {
-        data_bytes: profile.initial_data_bytes,
-        device: `253:${pool.minor}`,
-      });
-      const pg = run.workload("data_full", "pg-a", "Pa");
-      run.world.pods.get("pg-a")!.phase = "Failed";
-      run.confirm("data_full:marker", { rows: ["1"] });
-      run.confirm("data_full:pre", { first: 2, last: 65, count: 64 });
-      const fill = run.workload("data_full", "fill", "Fl", {
-        size: 2 * profile.maximum_data_bytes,
-      });
-      const probe = run.world.addLv({
-        name: `pgcf_thin_q_${run.ids.id.slice(3)}_p`,
-        uuid: lvm("Pr"),
-        segtype: "thin",
-        pool: "pgcf_thinpool",
-        size: 64 * MIB,
-        tags: [run.world.tag],
-      });
-      run.confirm("data_full:probe-volume", {
-        lv_uuid: probe.uuid,
-        minor: probe.minor,
-      });
-      run.confirm("data_full:fill", {
-        exit_code: 1,
-        error: "enospc",
-        written_bytes: profile.initial_data_bytes - 64 * MIB,
-        milliseconds: 21_400,
-      });
-      run.confirm("data_full:full", {
-        status: {
-          mode: "out_of_data_space",
-          used_data_blocks: 16_384,
-          total_data_blocks: 16_384,
-          used_metadata_blocks: 1180,
-          total_metadata_blocks: 32_768,
-          error_if_no_space: true,
-          needs_check: false,
-        },
-      });
-      run.confirm("data_full:probe", {
-        exit_code: 1,
-        error: "enospc",
-        written_bytes: 0,
-        milliseconds: 20,
-      });
-      run.world.poolMode = "out_of_data_space";
-      assert.deepEqual(await run.turn(), { kind: "report" });
-      // The crashed Pod acknowledges nothing more; crash recovery keeps every earlier commit.
-      assert.deepEqual(run.entry("data_full:post")!.facts, {
-        first: null,
-        last: null,
-        count: 0,
-      });
-      assert.notEqual(
-        run.world.pods.get("pg-a")!.uid,
-        run.entry("data_full:pg-a:pod")!.facts!.uid,
-      );
-      const evidence = (
-        run.calls[0]!.report as {
-          evidence: {
-            volumes_after: string[];
-            acknowledged_commits: number;
-            acknowledged_present: number;
-            marker_present: boolean;
-          };
-        }
-      ).evidence;
-      assert.deepEqual(
-        [...evidence.volumes_after].sort(),
-        [pg.lv_uuid, fill.lv_uuid, probe.uuid].sort(),
-      );
-      assert.equal(evidence.acknowledged_commits, 64);
-      assert.equal(evidence.acknowledged_present, 64);
-      assert.equal(evidence.marker_present, true);
-    });
-
     test("a resumed resume_marker turn resumes the exact LV after the run killed its Pod", async () => {
       const run = thinQualificationRun("resume_marker");
       run.workload("data_full", "pg-a", "Pa", { pod: false });
@@ -814,6 +687,170 @@ describe(
     });
   },
 );
+
+/**
+ * EU1's 93180 MiB of free extents at setup at the fixture profile's 1/8 scale, beside the retained
+ * 5 GiB thick LV. The scheduler then counts 11391 MiB for a thin claim whatever the pool size: VG
+ * free plus free pool data.
+ */
+const EU1_SCALED = 5 * GIB + 11_648 * MIB;
+/** Claims the scheduler refused; each one would leave its Pod Pending on every turn. */
+const refused = (run: ReturnType<typeof thinQualificationRun>) =>
+  run.world.log.filter((line) => line.startsWith("unschedulable"));
+
+// A refused Pod stays Pending. The mocked clock lets that hung turn yield instead of waiting it out.
+test("data_full fills the initial pool through a claim the scheduler places on an EU1-sized volume group", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const run = thinQualificationRun("data_full", {
+    volumeGroupBytes: EU1_SCALED,
+  });
+  run.world.elapse = (milliseconds) => t.mock.timers.tick(milliseconds);
+  const pool = run.world.lv("pgcf_thinpool")!;
+  run.confirm("data_full:pool", {
+    data_bytes: profile.initial_data_bytes,
+    device: `253:${pool.minor}`,
+  });
+  const pg = run.workload("data_full", "pg-a", "Pa");
+  run.confirm("data_full:marker", { rows: ["1"] });
+  run.confirm("data_full:pre", { first: 2, last: 65, count: 64 });
+  const probe = run.world.addLv({
+    name: `pgcf_thin_q_${run.ids.id.slice(3)}_p`,
+    uuid: lvm("Pr"),
+    segtype: "thin",
+    pool: "pgcf_thinpool",
+    size: 64 * MIB,
+    tags: [run.world.tag],
+  });
+  run.confirm("data_full:probe-volume", {
+    lv_uuid: probe.uuid,
+    minor: probe.minor,
+  });
+  run.confirm("data_full:probe", {
+    exit_code: 1,
+    error: "enospc",
+    written_bytes: 0,
+    milliseconds: 20,
+  });
+  const result = await run.turn();
+  assert.deepEqual(refused(run), []);
+  // Twice the 2 GiB growth target, within the 9856 MiB of VG room above the pool, its metadata
+  // and spare and the VG reserve.
+  assert.ok(
+    run.world.log.includes(`create PersistentVolumeClaim fill ${4 * GIB}`),
+  );
+  assert.deepEqual(result, { kind: "report" });
+  // PostgreSQL crashed on the full pool and acknowledged nothing more; it is replaced on the
+  // same PVC and crash recovery keeps every earlier commit.
+  assert.deepEqual(run.entry("data_full:post")!.facts, {
+    first: null,
+    last: null,
+    count: 0,
+  });
+  assert.notEqual(
+    run.world.pods.get("pg-a")!.uid,
+    run.entry("data_full:pg-a:pod")!.facts!.uid,
+  );
+  const evidence = (
+    run.calls[0]!.report as {
+      evidence: {
+        fill: { error: string };
+        full: { mode: string };
+        volumes_after: string[];
+        acknowledged_commits: number;
+        acknowledged_present: number;
+        marker_present: boolean;
+      };
+    }
+  ).evidence;
+  assert.equal(evidence.fill.error, "enospc");
+  assert.equal(evidence.full.mode, "out_of_data_space");
+  assert.deepEqual(
+    [...evidence.volumes_after].sort(),
+    [
+      pg.lv_uuid,
+      String(run.entry("data_full:fill:volume")!.facts!.lv_uuid),
+      probe.uuid,
+    ].sort(),
+  );
+  assert.equal(evidence.acknowledged_commits, 64);
+  assert.equal(evidence.acknowledged_present, 64);
+  assert.equal(evidence.marker_present, true);
+});
+
+test("a resumed noflush turn fills the maximum pool through a claim the scheduler places on an EU1-sized volume group", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const run = thinQualificationRun("noflush_quiescence", {
+    volumeGroupBytes: EU1_SCALED,
+  });
+  run.world.elapse = (milliseconds) => t.mock.timers.tick(milliseconds);
+  // metadata_full grew the pool to its maximum; the stopped PostgreSQL volume is still in it.
+  run.world.lv("pgcf_thinpool")!.size = profile.maximum_data_bytes;
+  run.workload("data_full", "pg-a", "Pa", { pod: false });
+  run.released("noflush_quiescence", "writer", "Wr");
+  for (const [key, facts] of Object.entries({
+    "writer-pod": { uid: randomUUID() },
+    "writer-start": { started: true },
+    dirty: { bytes: 41_943_040 },
+    suspend: { exit_code: 0, milliseconds: 30 },
+    frozen: {
+      state: "SUSPENDED",
+      lv_state: "s",
+      write_sectors_first: 1_204_224,
+      write_sectors_second: 1_204_224,
+      used_first: 2_100,
+      used_second: 2_100,
+      observed_milliseconds: 3_000,
+    },
+    resume: {
+      resume_exit_code: 0,
+      resume_milliseconds: 20,
+      sync_ok: true,
+      drain_milliseconds: 9_000,
+      used_after: 2_740,
+    },
+    "writer-stop": { stopped: true },
+    fsck: { exit_code: 0 },
+  }))
+    run.confirm(`noflush_quiescence:${key}`, facts);
+  const result = await run.turn();
+  assert.deepEqual(refused(run), []);
+  // 3200 MiB VG free plus 8191 MiB free pool data, less the 512 MiB VG reserve.
+  assert.ok(
+    run.world.log.includes(
+      `create PersistentVolumeClaim fill-full ${10_879 * MIB}`,
+    ),
+  );
+  assert.deepEqual(result, { kind: "report" });
+  const fill = run.entry("noflush_quiescence:fill-full:volume")!.facts!;
+  assert.ok(!run.world.lvs.some((value) => value.uuid === fill.lv_uuid));
+  assert.ok(run.world.log.includes("exec fill-full /bin/bash"));
+  const evidence = (
+    run.calls[0]!.report as {
+      evidence: {
+        writer: { lv_uuid: string };
+        full: { pool: { mode: string }; state: string };
+      };
+    }
+  ).evidence;
+  assert.equal(
+    evidence.writer.lv_uuid,
+    run.entry("noflush_quiescence:writer:volume")!.facts!.lv_uuid,
+  );
+  assert.equal(evidence.full.pool.mode, "out_of_data_space");
+  assert.equal(evidence.full.state, "SUSPENDED");
+});
+
+test("a fill that cannot outgrow the pool within the scheduler's room fails closed before any write", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  // 2 GiB free at setup leave 256 MiB of VG room above the 1 GiB pool, its metadata and spare and
+  // the VG reserve: no fill can outgrow the pool by one seventh.
+  const run = thinQualificationRun("data_full", {
+    volumeGroupBytes: 7 * GIB,
+  });
+  run.world.elapse = (milliseconds) => t.mock.timers.tick(milliseconds);
+  await assert.rejects(run.turn(), /thin_qualification_fill_room_insufficient/);
+  assert.deepEqual(run.world.log, []);
+});
 
 test("metadata_full removes its raw volumes across turns instead of outrunning the relay session", async (t) => {
   t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
