@@ -28,7 +28,8 @@ use tokio_tungstenite::{
 
 enum Hint {
     Pull(Option<Vec<String>>),
-    Kube(String),
+    /// A watched database object changed: its database ID and the object kind.
+    Kube(String, &'static str),
 }
 struct Cell {
     db: Value,
@@ -44,6 +45,8 @@ struct Cell {
     woke: Option<String>,
     /// Consecutive not-ready results of the pending wake.
     stalled: u32,
+    /// A Pod change of the ready database awaits a fresh runtime attestation.
+    reattest: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobKind {
@@ -148,6 +151,7 @@ fn apply_snapshot(
                     authority_at: pulled_at,
                     woke: None,
                     stalled: 0,
+                    reattest: false,
                 },
             );
         }
@@ -224,15 +228,18 @@ const SLOTS: usize = 4;
 enum Class {
     /// A protective stop or a storage-authority renewal: a lapsed authority stops writes.
     Storage,
-    /// A wake or resume whose power operation is not yet observed ready.
+    /// A wake or resume whose power operation is not yet observed ready, or the
+    /// re-attestation of a ready database whose Pod changed.
     Wake,
     Routine,
 }
-/// A running power operation this controller has not yet observed ready.
+/// Readiness that routes wait for: a running power operation this controller has not yet
+/// observed ready, or a re-attestation after a Pod change of the ready database.
 fn waking(cell: &Cell) -> bool {
-    !cell.ready
-        && cell.db["power"]["mode"] == "running"
-        && cell.db["power"]["operation"].as_str() != cell.woke.as_deref()
+    cell.reattest
+        || (!cell.ready
+            && cell.db["power"]["mode"] == "running"
+            && cell.db["power"]["operation"].as_str() != cell.woke.as_deref())
 }
 fn class(cell: &Cell, clock: i128) -> Class {
     if storage_protection_due(&cell.db, &cell.snapshot, clock) || (cell.renew && cell.ready) {
@@ -252,6 +259,14 @@ fn not_ready_delay(stalled: u32) -> Duration {
         (1_u64 << (stalled - 5).min(5)).min(30)
     })
 }
+/// A Kubernetes change of the database's objects makes it due at once. A Pod change of a
+/// ready database may replace its attested primary within the revision; v3 routes to it are
+/// refused until the next ready result re-attests it, so that check is urgent.
+fn hinted(cell: &mut Cell, kind: &str, now: Instant) {
+    cell.due = now;
+    cell.hints = cell.hints.wrapping_add(1);
+    cell.reattest |= kind == "Pod" && cell.ready;
+}
 /// Records a finished reconcile of `cell`'s current generation.
 fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>) {
     if let Some(observed) = observed {
@@ -263,6 +278,7 @@ fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>) {
         }
         if cell.ready {
             cell.stalled = 0;
+            cell.reattest = false;
             cell.due = started + Duration::from_secs(60);
             return;
         }
@@ -452,7 +468,7 @@ async fn run() -> Result<(), Error> {
                     async move { kube.watch_database_ids(kind, events).await }
                 });
                 while let Some(id) = receive.recv().await {
-                    if hints.send(Hint::Kube(id)).await.is_err() {
+                    if hints.send(Hint::Kube(id, kind)).await.is_err() {
                         task.abort();
                         return;
                     }
@@ -558,10 +574,9 @@ async fn run() -> Result<(), Error> {
                         }
                     },
                     Some(Hint::Pull(Some(ids))) => pull_ids.extend(ids),
-                    Some(Hint::Kube(id)) => {
+                    Some(Hint::Kube(id, kind)) => {
                         if let Some(cell) = cells.get_mut(&id) {
-                            cell.due = Instant::now();
-                            cell.hints = cell.hints.wrapping_add(1);
+                            hinted(cell, kind, Instant::now());
                         } else { pull_ids.insert(id); }
                     },
                     None => break
@@ -599,7 +614,8 @@ async fn run() -> Result<(), Error> {
                             if kind == JobKind::Renew {
                                 if result.is_ok() && cell.hints == marker {
                                     cell.renew = false;
-                                    cell.due = started + Duration::from_secs(60);
+                                    // A pending re-attestation does not wait for the next check.
+                                    cell.due = if cell.reattest { Instant::now() } else { started + Duration::from_secs(60) };
                                 } else { cell.due = Instant::now() + Duration::from_secs(1); }
                                 continue;
                             }
@@ -753,6 +769,7 @@ mod tests {
             authority_at: due,
             woke: None,
             stalled: 0,
+            reattest: false,
         }
     }
     fn wake(id: &str, operation: &str) -> Value {
@@ -922,6 +939,41 @@ mod tests {
         // The next wake of the same database is a new power operation.
         database.db = wake("db", &operation(2));
         assert_eq!(class(&database, 0), Class::Wake);
+    }
+    #[test]
+    fn a_pod_change_of_a_ready_database_is_urgent_re_attestation() {
+        let now = Instant::now();
+        let mut cells = HashMap::from([(
+            "db".to_string(),
+            cell(json!({"id":"db","generation":1}), now, true),
+        )]);
+        let routine: HashMap<String, Class> = (0..3)
+            .map(|index| (format!("busy{index}"), Class::Routine))
+            .collect();
+        // A Cluster or volume change of a ready database stays routine work.
+        hinted(cells.get_mut("db").unwrap(), "Cluster", now);
+        assert_eq!(class(&cells["db"], 0), Class::Routine);
+        assert!(schedule(&cells, &routine, now, 0, true).is_empty());
+        // A Pod change may have replaced the attested primary within the same revision: v3
+        // routes to it are refused until re-attestation, which takes the last slot at once.
+        hinted(cells.get_mut("db").unwrap(), "Pod", now);
+        assert_eq!(class(&cells["db"], 0), Class::Wake);
+        assert_eq!(
+            schedule(&cells, &routine, now, 0, true),
+            vec![("db".to_string(), Class::Wake)]
+        );
+        // It stays urgent, backing off like a wake, until a ready result re-attests it.
+        let db = cells.get_mut("db").unwrap();
+        settle(db, now, None);
+        assert_eq!(class(db, 0), Class::Wake);
+        settle(db, now, Some(&json!({"state":"provisioning"})));
+        assert_eq!((class(db, 0), db.stalled), (Class::Wake, 2));
+        settle(db, now, Some(&json!({"state":"ready"})));
+        assert_eq!(class(db, 0), Class::Routine);
+        // A Pod change of a database that is not ready is already reconciled as due work.
+        db.ready = false;
+        hinted(db, "Pod", now);
+        assert_eq!(class(db, 0), Class::Routine);
     }
     #[test]
     fn runtime_lease_rotation_is_not_a_configuration_change() {
