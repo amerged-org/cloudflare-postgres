@@ -1238,14 +1238,30 @@ wait "$server"
                 .as_bytes(),
             );
             let token = format!("sa1.{body}.{}", URL_SAFE_NO_PAD.encode(signed.as_ref()));
+            assert_eq!(
+                controller.snapshot().await?["protective_scope_present"],
+                false
+            );
             let started = Instant::now();
             atomic(
                 &base.join("storage-lease.json"),
                 &storage_snapshot(&local, expires, None, Some(token)),
             )?;
+            // The guard refuses a lease of an older material revision. Reloading before the shared
+            // guard holds this runtime authority would leave the 90 s startup authority in force.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let before_refresh = loop {
+                let observed = controller.snapshot().await?;
+                if observed["protective_scope_present"] == true {
+                    break observed;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "real shared storage guard did not accept the runtime authority"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
             // Consume an authenticated material-only file update while the real SQL task is alive.
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            let before_refresh = controller.snapshot().await?;
             let mut next_settings = settings.clone();
             local.material_revision += 1;
             next_settings.cloudflare = Some(local.clone());
@@ -1285,8 +1301,9 @@ wait "$server"
                 2
             );
             // No new storage authority or Kubernetes API exists; the unchanged monotonic expiry must still stop SQL.
-            tokio::time::timeout(
-                Duration::from_millis(9000),
+            // The bound is the authority's 8 s lifetime plus its 1 s drain, counted from issuance.
+            tokio::time::timeout_at(
+                tokio::time::Instant::from_std(started + Duration::from_millis(9000)),
                 tasks.wait(namespaced(
                     tasks::WaitRequest {
                         container_id: task_id.clone(),
@@ -1295,7 +1312,8 @@ wait "$server"
                     NS,
                 )?),
             )
-            .await??;
+            .await
+            .map_err(|_| "actual local SQL task exceeded configured drain bound")??;
             storage_stop_ms = (started.elapsed().as_secs_f64() * 1000. - 8000.).max(0.);
             assert!(
                 storage_stop_ms < 1000.,
