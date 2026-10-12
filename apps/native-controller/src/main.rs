@@ -267,8 +267,8 @@ fn hinted(cell: &mut Cell, kind: &str, now: Instant) {
     cell.hints = cell.hints.wrapping_add(1);
     cell.reattest |= kind == "Pod" && cell.ready;
 }
-/// Records a finished reconcile of `cell`'s current generation.
-fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>) {
+/// Records a finished reconcile of `cell`'s current generation that started at hint `marker`.
+fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>, marker: u64) {
     if let Some(observed) = observed {
         let state = text(observed, "state");
         cell.ready = matches!(state, "ready" | "deleted" | "hibernated");
@@ -278,7 +278,8 @@ fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>) {
         }
         if cell.ready {
             cell.stalled = 0;
-            cell.reattest = false;
+            // A result from before the latest hint may still name a replaced Pod.
+            cell.reattest &= cell.hints != marker;
             cell.due = started + Duration::from_secs(60);
             return;
         }
@@ -620,7 +621,7 @@ async fn run() -> Result<(), Error> {
                                 continue;
                             }
                             match result {
-                                Ok(observed) => settle(cell, started, observed.as_ref()),
+                                Ok(observed) => settle(cell, started, observed.as_ref(), marker),
                                 Err(_) => {
                                     pull_ids.insert(id.clone());
                                     cell.attempt = cell.attempt.saturating_add(1);
@@ -778,6 +779,11 @@ mod tests {
     fn operation(index: usize) -> String {
         format!("op_{index:0>20}")
     }
+    /// Settles a job that started at the cell's current hint marker.
+    fn finish(cell: &mut Cell, now: Instant, observed: Option<&Value>) {
+        let marker = cell.hints;
+        settle(cell, now, observed, marker);
+    }
     #[test]
     fn delayed_target_pulls_never_downgrade_or_remove_newer_rows() {
         let mut cells = HashMap::new();
@@ -912,7 +918,7 @@ mod tests {
         let stuck = cells.get_mut("wake3").unwrap();
         let delays: Vec<_> = (0..11)
             .map(|_| {
-                settle(stuck, now, None);
+                finish(stuck, now, None);
                 stuck.due.duration_since(now).as_secs()
             })
             .collect();
@@ -924,16 +930,16 @@ mod tests {
         let now = Instant::now();
         let mut database = cell(wake("db", &operation(1)), now, false);
         assert_eq!(class(&database, 0), Class::Wake);
-        settle(&mut database, now, Some(&json!({"state":"provisioning"})));
+        finish(&mut database, now, Some(&json!({"state":"provisioning"})));
         assert_eq!(database.stalled, 1);
-        settle(&mut database, now, Some(&json!({"state":"ready"})));
+        finish(&mut database, now, Some(&json!({"state":"ready"})));
         assert!(database.ready);
         assert_eq!(database.stalled, 0);
         assert_eq!(database.due, now + Duration::from_secs(60));
         // A later configuration change or failed check of the woken database is routine work.
         database.ready = false;
         assert_eq!(class(&database, 0), Class::Routine);
-        settle(&mut database, now, None);
+        finish(&mut database, now, None);
         assert_eq!(database.stalled, 0);
         assert_eq!(database.due, now + Duration::from_secs(1));
         // The next wake of the same database is a new power operation.
@@ -964,16 +970,29 @@ mod tests {
         );
         // It stays urgent, backing off like a wake, until a ready result re-attests it.
         let db = cells.get_mut("db").unwrap();
-        settle(db, now, None);
+        finish(db, now, None);
         assert_eq!(class(db, 0), Class::Wake);
-        settle(db, now, Some(&json!({"state":"provisioning"})));
+        finish(db, now, Some(&json!({"state":"provisioning"})));
         assert_eq!((class(db, 0), db.stalled), (Class::Wake, 2));
-        settle(db, now, Some(&json!({"state":"ready"})));
+        finish(db, now, Some(&json!({"state":"ready"})));
         assert_eq!(class(db, 0), Class::Routine);
         // A Pod change of a database that is not ready is already reconciled as due work.
         db.ready = false;
         hinted(db, "Pod", now);
         assert_eq!(class(db, 0), Class::Routine);
+    }
+    #[test]
+    fn a_pod_change_during_an_in_flight_check_keeps_re_attestation_urgent() {
+        let now = Instant::now();
+        let mut db = cell(json!({"id":"db","generation":1}), now, true);
+        let started = db.hints;
+        // The Pod changes while a check that began earlier runs; its ready result may still
+        // name the replaced Pod, so it cannot complete the re-attestation.
+        hinted(&mut db, "Pod", now);
+        settle(&mut db, now, Some(&json!({"state":"ready"})), started);
+        assert_eq!(class(&db, 0), Class::Wake);
+        finish(&mut db, now, Some(&json!({"state":"ready"})));
+        assert_eq!(class(&db, 0), Class::Routine);
     }
     #[test]
     fn runtime_lease_rotation_is_not_a_configuration_change() {
