@@ -199,7 +199,7 @@ it("retries a failed UTC day ten minutes after the failed attempt ended, at most
     status: "pending",
   });
 });
-it("starts no attempt while a run of any day is pending or running", async () => {
+it("dispatches a previous day's pending attempt and starts no other while a run of any day is pending or running", async () => {
   const f = await fixture(),
     created: string[] = [],
     binding = recordingWorkflow(created),
@@ -209,9 +209,9 @@ it("starts no attempt while a run of any day is pending or running", async () =>
       config(f.region),
       Date.parse("2026-10-11T00:00:00.000Z"),
     );
-  // The previous day's last retry was queued shortly before midnight.
+  // The previous day's last retry was queued at 23:59 and its Workflow was never created.
   await env.DB.prepare(
-    "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,expires_at) VALUES(?,'2026-10-11',3,?,'pending','2026-10-11T23:55:00.000Z','2026-10-12T01:55:00.000Z')",
+    "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,expires_at) VALUES(?,'2026-10-11',3,?,'pending','2026-10-11T23:59:00.000Z','2026-10-12T01:59:00.000Z')",
   )
     .bind(previous, c.revision)
     .run();
@@ -219,6 +219,7 @@ it("starts no attempt while a run of any day is pending or running", async () =>
     binding,
     Date.parse("2026-10-12T00:00:00.000Z"),
   );
+  expect(created).toEqual([previous]);
   await env.DB.prepare(
     "UPDATE infrastructure_backup_runs SET status='running' WHERE id=?",
   )
@@ -226,9 +227,9 @@ it("starts no attempt while a run of any day is pending or running", async () =>
     .run();
   await runInfrastructureBackupCron(
     binding,
-    Date.parse("2026-10-12T01:54:00.000Z"),
+    Date.parse("2026-10-12T01:58:00.000Z"),
   );
-  expect(created).toEqual([]);
+  expect(created).toEqual([previous]);
   expect(await infrastructureBackupStatus(env.DB)).toMatchObject({
     id: previous,
     status: "running",
@@ -236,14 +237,14 @@ it("starts no attempt while a run of any day is pending or running", async () =>
   // Its deadline ends it; the new day's first attempt then starts without a retry delay.
   await runInfrastructureBackupCron(
     binding,
-    Date.parse("2026-10-12T01:55:00.000Z"),
+    Date.parse("2026-10-12T01:59:00.000Z"),
   );
   expect(await infrastructureBackupStatus(env.DB, previous)).toMatchObject({
     status: "failed",
     error_code: "infrastructure_backup_deadline",
   });
   expect(await infrastructureBackupStatus(env.DB)).toMatchObject({
-    id: created[0],
+    id: created[1],
     day: "2026-10-12",
     attempt: 1,
     status: "pending",
@@ -323,6 +324,117 @@ it("clears a failed day's health and alert once a retry completes and reports th
       }),
     ]),
   });
+});
+it("keeps each region's failed episode while a retry completes part of the backup and clears it once an attempt completes", async () => {
+  const f = await fixture(),
+    at = Date.now(),
+    day = new Date(at).toISOString().slice(0, 10),
+    minutes = (offset: number) => new Date(at + offset * 60000).toISOString(),
+    cluster = crypto.randomUUID(),
+    member = newNodeId(),
+    memberUid = crypto.randomUUID(),
+    etcd = `etcd-${f.foreign}`,
+    c = await configureInfrastructureBackups(
+      enabled(),
+      config(f.region),
+      at - 2 * 3600000,
+    );
+  // Region A holds the D1 export; region B has a current cluster with a live member.
+  await storeRegionJoinBundle(
+    env.DB,
+    env.CREDENTIAL_KEYS,
+    joinBundleReference(f.foreign, 1),
+    {
+      version: 1,
+      cluster_name: "backup-retry-test",
+      cluster_endpoint: "https://192.0.2.42:6443",
+      kube_system_uid: cluster,
+      talos_version: "1.14.1",
+      kubernetes_version: "1.36.5",
+      talos_machine_secrets_yaml: "cluster: private-test-material\n",
+      talos_admin_config: "context: private-test-material\n",
+      kubeconfig: "apiVersion: v1\ncontext: private-test-material\n",
+    },
+  );
+  await env.DB.prepare(
+    "INSERT INTO nodes(id,region_id,k8s_node_name,node_uid,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,'member',?,1,4096,2000,30,128,100,?,?,?)",
+  )
+    .bind(member, f.foreign, memberUid, minutes(0), minutes(0), minutes(0))
+    .run();
+  const attempt = (id: string, number: number, start: number) =>
+    env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,expires_at) VALUES(?,?,?,?,'running',?,?)",
+      ).bind(id, day, number, c.revision, minutes(start), minutes(start + 120)),
+      env.DB.prepare(
+        "INSERT INTO infrastructure_backup_artifacts(run_id,id,kind,day,region_id,source_id,status,object_key) VALUES(?,'d1-control','d1',?,?,?,'prepared',?)",
+      ).bind(id, day, f.region, c.d1_database_id, `test/${id}/d1`),
+      env.DB.prepare(
+        "INSERT INTO infrastructure_backup_artifacts(run_id,id,kind,day,region_id,source_id,node_id,node_uid,cluster_uid,material_revision,status,object_key) VALUES(?,?,'etcd',?,?,?,?,?,?,1,'prepared',?)",
+      ).bind(
+        id,
+        etcd,
+        day,
+        f.foreign,
+        cluster,
+        member,
+        memberUid,
+        cluster,
+        `test/${id}/etcd`,
+      ),
+    ]);
+  // Active infrastructure_backup_failed event id of region A and region B.
+  const episodes = async () => {
+    await runInfrastructureHealthAlerts(env, at);
+    return Promise.all(
+      [f.region, f.foreign].map(async (region) => {
+        const alert = (await infrastructureAlertStatus(env.DB, region)).find(
+          (value) => value.kind === "infrastructure_backup_failed",
+        );
+        return alert?.active ? alert.event_id : null;
+      }),
+    );
+  };
+  await env.DB.prepare(
+    "INSERT INTO infrastructure_backup_runs(id,day,attempt,config_revision,status,created_at,completed_at,expires_at,error_code) VALUES(?,?,1,?,'failed',?,?,?,'infrastructure_backup_execution_failed')",
+  )
+    .bind(
+      crypto.randomUUID(),
+      day,
+      c.revision,
+      minutes(-110),
+      minutes(-100),
+      minutes(10),
+    )
+    .run();
+  const failing = await episodes();
+  expect(failing).toEqual([expect.any(String), expect.any(String)]);
+  // Attempt 2 completes region A's export, then fails on region B's snapshot.
+  const second = crypto.randomUUID();
+  await attempt(second, 2, -90);
+  await env.DB.prepare(
+    "UPDATE infrastructure_backup_artifacts SET status='complete',completed_at=? WHERE run_id=? AND id='d1-control'",
+  )
+    .bind(minutes(-80), second)
+    .run();
+  expect(await episodes()).toEqual(failing);
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE infrastructure_backup_artifacts SET status='failed',error_code='infrastructure_backup_snapshot_source_unavailable' WHERE run_id=? AND status!='complete'",
+    ).bind(second),
+    env.DB.prepare(
+      "UPDATE infrastructure_backup_runs SET status='failed',completed_at=?,error_code='infrastructure_backup_snapshot_source_unavailable' WHERE id=?",
+    ).bind(minutes(-70), second),
+  ]);
+  expect(await episodes()).toEqual(failing);
+  // Attempt 3's receipts clear both episodes only once the attempt itself completes.
+  const third = crypto.randomUUID();
+  await attempt(third, 3, -60);
+  await completeBackupArtifact(env, third, "d1-control");
+  await completeBackupArtifact(env, third, etcd);
+  expect(await episodes()).toEqual(failing);
+  await finishInfrastructureBackup(env, third);
+  expect(await episodes()).toEqual([null, null]);
 });
 it("polls a real D1 export's at_bookmark and stops on the provider's error without restarting", async () => {
   const f = await fixture(),

@@ -17,6 +17,11 @@ after the failed attempt ended, at most three attempts per UTC day, and never wh
 another run is pending or running. Fresh installations have backups disabled and
 no email addresses configured.
 
+To upgrade an installation that already applied `0039`, apply migration `0043` and
+deploy the matching Worker back to back: the previous Worker's Cron inserts runs with
+`ON CONFLICT(day)`, which fails against the rebuilt runs table. Never roll the Worker
+back below commit `efb9282` unless the `0039` tables are restored.
+
 Set the operator-configurable `containers[].max_instances` high enough for a backup
 to run alongside node patches and installations. The example uses eight because a
 fleet patch keeps its container for the inactivity window after it finishes. These
@@ -55,9 +60,10 @@ Content-Type: application/json
 ```
 
 `GET /v1/infrastructure-backups/config` reads this configuration.
-`GET /v1/infrastructure-backups` returns the latest run, per-artifact hashes/byte
-counts, R2 object keys, error codes and current backup freshness. It returns no
-private client configuration, signed export URL or encryption key. Changing the
+`GET /v1/infrastructure-backups` returns the latest attempt of the latest UTC day
+with its per-artifact hashes/byte counts, R2 object keys and error codes, and current
+backup freshness. It returns no private client configuration, signed export URL or
+encryption key. Earlier attempts of that day stay in D1 only. Changing the
 configuration revision or disabling backups revokes an unfinished run's capability.
 The existing operator Kubernetes API still requires administrator authorization.
 The internal backup WebSocket instead accepts only an expiring capability bound to
@@ -96,13 +102,14 @@ failed run; it does not repeat an uncertain write or regenerate a different arch
 under the same object identity. A same-day retry or the next UTC day creates a fresh
 run with its own UUID and object keys.
 
-Backups become stale after 36 hours without a completed artifact. The first failed
-run is failing even when no earlier backup exists; it stays failing while a retry
-runs, and a later complete attempt clears it. Deadline expiry records failure at
-two hours. Backup failed/stale episodes and stale/lost node observations appear
-in the existing operational infrastructure alerts independently of database
-availability. Node alarms reuse the existing heartbeat freshness rule. Never-observed
-new nodes do not trigger a stale-node alarm.
+Backups become stale after 36 hours without an artifact of a complete attempt. The
+first failed run is failing even when no earlier backup exists; it stays failing
+while a retry runs, even after that retry completes some artifacts, and only a later
+complete attempt clears it. Deadline expiry records failure at two hours. Backup
+failed/stale episodes and stale/lost node observations appear in the existing
+operational infrastructure alerts independently of database availability. Node
+alarms reuse the existing heartbeat freshness rule. Never-observed new nodes do not
+trigger a stale-node alarm.
 
 Before accepting customer data, enable this configuration and verify a real daily
 run contains D1 and every expected regional etcd artifact with `status: complete`.

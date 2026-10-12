@@ -254,7 +254,7 @@ export const InfrastructureBackupHealth = z.strictObject({
       "disabled: backups are off. unknown: the expected source cannot be identified, or nothing completed yet within 36 h of enabling. failing: the latest failed attempt ended at or after the last completed backup (or the enabling); it stays failing while a retry runs, and a later complete attempt clears it. stale: no completed backup for more than 36 h, counted from enabling when none exists. ok otherwise. failing raises infrastructure_backup_failed and stale raises infrastructure_backup_stale for the region.",
     ),
   last_completed_at: Timestamp.nullable().describe(
-    "Latest completed backup of this kind, region and source.",
+    "Latest completed backup of this kind, region and source from a complete attempt.",
   ),
   last_failed_at: Timestamp.nullable().describe(
     "End of the latest failed attempt of any artifact.",

@@ -205,13 +205,11 @@ export async function runInfrastructureBackupCron(env: Env, now = Date.now()) {
   ]);
   if (!config.enabled || !env.INFRASTRUCTURE_BACKUP) return;
   const day = at.slice(0, 10),
-    latest = () =>
-      env.DB.prepare(
-        "SELECT * FROM infrastructure_backup_runs WHERE day=? ORDER BY attempt DESC LIMIT 1",
-      )
-        .bind(day)
-        .first<RunRow>();
-  const previous = await latest(),
+    previous = await env.DB.prepare(
+      "SELECT * FROM infrastructure_backup_runs WHERE day=? ORDER BY attempt DESC LIMIT 1",
+    )
+      .bind(day)
+      .first<RunRow>(),
     attempt = !previous
       ? 1
       : previous.status === "failed" &&
@@ -233,8 +231,11 @@ export async function runInfrastructureBackupCron(env: Env, now = Date.now()) {
         new Date(now + MAX_RUN_MS).toISOString(),
       )
       .run();
-  const run = attempt ? await latest() : previous;
-  if (!run || run.status !== "pending") return;
+  // An inserted attempt is the only pending run; otherwise dispatch one of any day whose Workflow creation was uncertain.
+  const run = await env.DB.prepare(
+    "SELECT * FROM infrastructure_backup_runs WHERE status='pending' ORDER BY day DESC,attempt DESC LIMIT 1",
+  ).first<RunRow>();
+  if (!run) return;
   // Resolve the exact persisted instance; only the binding's known missing-instance result permits creation.
   try {
     const existing = await env.INFRASTRUCTURE_BACKUP.get(run.id);
@@ -703,8 +704,9 @@ export async function infrastructureBackupHealth(env: Env, now = Date.now()) {
   }
   return Promise.all(
     expected.map(async (identity) => {
+      // Only a complete attempt counts, so a retry's own receipts neither clear nor reopen a failed episode.
       const completed = await env.DB.prepare(
-        "SELECT MAX(completed_at) at FROM infrastructure_backup_artifacts WHERE kind=? AND region_id=? AND source_id=? AND (?='d1' OR cluster_uid=?) AND status='complete'",
+        "SELECT MAX(a.completed_at) at FROM infrastructure_backup_artifacts a JOIN infrastructure_backup_runs r ON r.id=a.run_id AND r.status='complete' WHERE a.kind=? AND a.region_id=? AND a.source_id=? AND (?='d1' OR a.cluster_uid=?) AND a.status='complete'",
       )
         .bind(
           identity.kind,
