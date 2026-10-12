@@ -36,7 +36,7 @@ import { powerTransitionStatements } from "./domain/lifecycle.ts";
 import type { DatabaseRow } from "./domain/rows.ts";
 import { readDatabasePresence } from "./domain/database-actor-sync.ts";
 
-/** A committed ready observation releases wake waiters by push; this read only recovers a lost push. */
+/** A committed ready observation's push starts the wake loop's D1 read at once; this bounded read only recovers a lost push. */
 const WAKE_FALLBACK_READ_MS = 1000;
 export const DatabasePresence = z
   .strictObject({
@@ -125,6 +125,7 @@ export class DatabaseActor extends DurableObject<Env> {
     { deadline: number; resolve: (ready: boolean) => void; owner: object }
   >();
   private polling = false;
+  private pushed = false;
   private wake: { operation: string; revision: number } | undefined;
   private pollTimer: ReturnType<typeof setTimeout> | undefined;
   private interruptPoll: (() => void) | undefined;
@@ -815,8 +816,9 @@ export class DatabaseActor extends DurableObject<Env> {
     }
   }
   /**
-   * Trusted API RPC after D1 committed a ready observation. It releases only the waiters of that
-   * exact wake revision and operation; each still passes the fresh authoritative admission read.
+   * Trusted API RPC after D1 committed a ready observation of that exact wake revision and
+   * operation. It never releases waiters itself: the shared loop reads D1 at once, so a push
+   * ahead of a visible commit keeps its waiters waiting.
    */
   async observedReady(
     databaseId: string,
@@ -831,7 +833,8 @@ export class DatabaseActor extends DurableObject<Env> {
       !this.waiters.size
     )
       return false;
-    this.finishWaiters(true);
+    this.pushed = true;
+    this.interruptPoll?.();
     return true;
   }
   private finishWaiters(ready: boolean): void {
@@ -849,6 +852,7 @@ export class DatabaseActor extends DurableObject<Env> {
             waiter.resolve(false);
           }
         if (!this.waiters.size) break;
+        this.pushed = false;
         const row = await this.env.DB.prepare(
           `SELECT d.generation,d.power_operation,d.desired_state,d.observed_state,d.observed_generation,d.observed_power,p.deleted_at project_deleted_at FROM databases d JOIN projects p ON p.id=d.project_id WHERE d.id=?`,
         )
@@ -873,6 +877,8 @@ export class DatabaseActor extends DurableObject<Env> {
           this.finishWaiters(true);
           break;
         }
+        // A push that arrived during this read asks for another one at once.
+        if (this.pushed) continue;
         const delay = Math.max(
           1,
           Math.min(
