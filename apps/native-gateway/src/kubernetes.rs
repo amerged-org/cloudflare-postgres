@@ -411,6 +411,11 @@ fn client_builder() -> reqwest::ClientBuilder {
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
 }
+/// kube-apiserver omits TypeMeta on built-in list items; a stated identity must match.
+pub(crate) fn typed(value: &Value, api_version: &str, kind: &str) -> bool {
+    (value["apiVersion"].is_null() || value["apiVersion"] == api_version)
+        && (value["kind"].is_null() || value["kind"] == kind)
+}
 pub fn parse_snapshot(value: &Value) -> Result<HashMap<String, Fence>, &'static str> {
     if value["kind"] != "ConfigMapList"
         || value["apiVersion"] != "v1"
@@ -442,8 +447,7 @@ pub fn parse_snapshot(value: &Value) -> Result<HashMap<String, Fence>, &'static 
             || intent.revision == 0
             || intent.revision > 9_007_199_254_740_991
             || !["quiesce", "running", "retired"].contains(&intent.mode.as_str())
-            || item["apiVersion"] != "v1"
-            || item["kind"] != "ConfigMap"
+            || !typed(item, "v1", "ConfigMap")
             || metadata["namespace"] != wire("fenceNamespace")
             || metadata["name"] != format!("gateway-fence-{}", intent.database)
             || metadata["labels"][wire("fenceLabel")] != "true"
@@ -664,6 +668,17 @@ mod tests {
             data["retired-at"] = json!(crate::control::timestamp(crate::control::now() - 65_001));
         }
         json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"namespace":"pgcf-system","name":format!("gateway-fence-{database}"),"uid":"01234567-89ab-4def-8123-0123456789ab","resourceVersion":revision.to_string(),"labels":{"pgcf.io/gateway-fence":"true","pgcf.io/database-id":database}},"data":data})
+    }
+    #[test]
+    fn fence_list_items_without_type_meta_parse_and_a_stated_mismatch_fails() {
+        // kube-apiserver omits TypeMeta on built-in list items; watch objects carry it.
+        let mut item = object(&"a".repeat(20), "running", 1);
+        item.as_object_mut().unwrap().remove("apiVersion");
+        item.as_object_mut().unwrap().remove("kind");
+        let list = |item: &Value| json!({"apiVersion":"v1","kind":"ConfigMapList","metadata":{"resourceVersion":"7"},"items":[item]});
+        assert_eq!(parse_snapshot(&list(&item)).unwrap().len(), 1);
+        item["kind"] = "Secret".into();
+        assert!(parse_snapshot(&list(&item)).is_err());
     }
     #[tokio::test]
     async fn watch_updates_only_the_bound_database_epoch_and_requires_retirement_hold_for_deletion()

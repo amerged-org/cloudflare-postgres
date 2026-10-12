@@ -69,8 +69,7 @@ fn safe_integer(v: &Value) -> Result<u64, &'static str> {
     Ok(n as u64)
 }
 fn owned_map(v: &Value) -> Result<Option<String>, &'static str> {
-    if v["apiVersion"] != "v1"
-        || v["kind"] != "ConfigMap"
+    if !crate::kubernetes::typed(v, "v1", "ConfigMap")
         || v["metadata"]["namespace"] != wire("fenceNamespace")
     {
         return Err("invalid discovery map");
@@ -87,8 +86,7 @@ fn owned_map(v: &Value) -> Result<Option<String>, &'static str> {
     )
 }
 fn owned_slice(v: &Value) -> Result<String, &'static str> {
-    if v["apiVersion"] != "discovery.k8s.io/v1"
-        || v["kind"] != "EndpointSlice"
+    if !crate::kubernetes::typed(v, "discovery.k8s.io/v1", "EndpointSlice")
         || v["metadata"]["labels"]["kubernetes.io/service-name"] != "database-rw"
     {
         return Err("invalid writer discovery");
@@ -661,6 +659,22 @@ mod tests {
     use serde_json::json;
     fn slice(uid: &str, ip: &str) -> Value {
         json!({"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"namespace":"pgcf-db-aaaaaaaaaaaaaaaaaaaa","uid":"11111111-1111-4111-8111-111111111111","labels":{"kubernetes.io/service-name":"database-rw"}},"addressType":"IPv4","ports":[{"port":5432,"protocol":"TCP"}],"endpoints":[{"addresses":[ip],"conditions":{"ready":true},"targetRef":{"kind":"Pod","namespace":"pgcf-db-aaaaaaaaaaaaaaaaaaaa","uid":uid},"nodeName":"customer-us1"}]})
+    }
+    #[test]
+    fn list_items_without_type_meta_synchronize_and_a_stated_mismatch_fails() {
+        // kube-apiserver omits TypeMeta on built-in list items; watch objects carry it.
+        let mut state = Targets::default();
+        let mut object = slice("22222222-2222-4222-8222-222222222222", "10.0.0.7");
+        object.as_object_mut().unwrap().remove("apiVersion");
+        object.as_object_mut().unwrap().remove("kind");
+        state
+            .replace("endpointslices", &[object.clone()], None)
+            .unwrap();
+        let map = json!({"metadata":{"namespace":"pgcf-system","name":"storage-aaaaaaaaaaaaaaaaaaaa","uid":"55555555-5555-4555-8555-555555555555","labels":{"pgcf.io/database-id":"aaaaaaaaaaaaaaaaaaaa"}},"data":{}});
+        state.replace("configmaps", &[map], None).unwrap();
+        assert!(state.synchronized());
+        object["kind"] = "Service".into();
+        assert!(state.replace("endpointslices", &[object], None).is_err());
     }
     #[test]
     fn exact_ready_target_is_required_and_ambiguous_writers_are_rejected() {
