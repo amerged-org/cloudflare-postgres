@@ -530,18 +530,26 @@ export function createBootstrapServer(
       }
     };
     void handle().catch((error: unknown) => {
+      // The API records only codes with its route prefix; any other code would lose the cause.
+      const prefix =
+        request.url === "/v1/patches"
+          ? "patch_"
+          : request.url?.startsWith("/v1/infrastructure-backups")
+            ? "infrastructure_backup_"
+            : undefined;
       const code =
         error instanceof BootstrapError
           ? error.code
           : error instanceof Error &&
-              /^infrastructure_backup_[a-z0-9_]{1,90}$/.test(error.message)
+              (/^infrastructure_backup_[a-z0-9_]{1,90}$/.test(error.message) ||
+                // Backup preparation passes talos-operator's plain error codes through.
+                (prefix === "infrastructure_backup_" &&
+                  /^operator_[a-z0-9_]{1,80}$/.test(error.message)))
             ? error.message
             : "request_invalid";
       const responseCode =
-        request.url === "/v1/patches" &&
-        !code.startsWith("patch_") &&
-        /^[a-z0-9_]{1,80}$/.test(code)
-          ? `patch_${code}`
+        prefix && !code.startsWith(prefix) && /^[a-z0-9_]{1,80}$/.test(code)
+          ? `${prefix}${code}`
           : code;
       if (response.headersSent) {
         response.destroy();
