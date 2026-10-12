@@ -259,6 +259,21 @@ export function thinVolumeAttributesClassObject(
   };
 }
 
+/** A slow identity proof stays valid this long after its read started (the slow lease's issue). */
+export const THIN_INVENTORY_MAX_SECONDS = 300;
+/** The next identity proof is due this long after the last accepted one. */
+export const THIN_INVENTORY_INTERVAL_SECONDS = 60;
+/** Cloudflare's headroom sample period for a guard: guard_seconds × 200 ms (2 s at a 10 s guard). */
+export function thinStorageSamplePeriodMilliseconds(guardSeconds: number) {
+  if (
+    !Number.isSafeInteger(guardSeconds) ||
+    guardSeconds < 1 ||
+    guardSeconds > 120
+  )
+    throw new Error("invalid_thin_guard_seconds");
+  return guardSeconds * 200;
+}
+
 export const NodeThinStorageAuthority = z
   .strictObject({
     node_id: NodeId,
@@ -282,6 +297,13 @@ export const NodeThinStorageAuthority = z
     observed_at: z.iso.datetime(),
     captured_at: z.iso.datetime(),
     expires_at: z.iso.datetime(),
+    /** The identity proof behind a composed authority: its slow read's start (Cloudflare clock),
+     * its expiry and its own revision. Facts that need a read after an event use this time; a
+     * fast renewal only moves observed_at. Absent from an executor report and from an authority
+     * recorded before composition, whose observed_at and expires_at are those of its read. */
+    inventory_observed_at: z.iso.datetime().optional(),
+    inventory_expires_at: z.iso.datetime().optional(),
+    inventory_revision: z.number().int().positive().optional(),
     write_allowed: z.boolean(),
     physical: NodePhysicalStorage,
     /** Complete fresh VG inventory, including internal and unknown LVs; absence is physical evidence. */
@@ -347,8 +369,40 @@ export const NodeThinStorageAuthority = z
         code: "custom",
         message: "Host storage authority is unbounded or has no physical pool",
       });
+    const inventory = [
+      value.inventory_observed_at,
+      value.inventory_expires_at,
+      value.inventory_revision,
+    ];
+    if (inventory.every((field) => field === undefined)) return;
+    const read = Date.parse(value.inventory_observed_at ?? ""),
+      valid = Date.parse(value.inventory_expires_at ?? "");
+    if (
+      inventory.some((field) => field === undefined) ||
+      valid <= read ||
+      valid - read > THIN_INVENTORY_MAX_SECONDS * 1000 ||
+      read > start ||
+      end > valid ||
+      value.inventory_revision! > value.revision
+    )
+      context.addIssue({
+        code: "custom",
+        message: "Composed authority outlives or predates its identity proof",
+      });
   });
 export type NodeThinStorageAuthority = z.infer<typeof NodeThinStorageAuthority>;
+/** When the identity proof's read started and until when it may be used. */
+export function thinStorageInventory(authority: NodeThinStorageAuthority) {
+  return {
+    observed_at: Date.parse(
+      authority.inventory_observed_at ?? authority.observed_at,
+    ),
+    expires_at: Date.parse(
+      authority.inventory_expires_at ?? authority.expires_at,
+    ),
+    revision: authority.inventory_revision ?? authority.revision,
+  };
+}
 
 export function thinStorageAuthorityMatches(
   storage: DesiredDatabaseStorage,
@@ -378,7 +432,8 @@ export function thinStorageAuthorityMatches(
   );
 }
 
-/** A completed deletion may remove the last pool; never infer LV absence from an ordinary agent report. */
+/** A completed deletion may remove the last pool; never infer LV absence from an ordinary agent report.
+ * Absence needs an identity read that started after the deletion; a fast renewal is no such read. */
 export function thinStorageVolumeReclaimed(
   storage: DesiredDatabaseStorage,
   authority: NodeThinStorageAuthority | null | undefined,
@@ -386,17 +441,18 @@ export function thinStorageVolumeReclaimed(
   observedAfter: number,
   now = Date.now(),
 ): boolean {
+  if (!authority) return false;
+  const inventory = thinStorageInventory(authority);
   return Boolean(
-    authority &&
     authority.data_accounting_complete &&
     authority.node_uid === storage.node_uid &&
     authority.volume_group_uuid === storage.volume_group_uuid &&
     authority.profile_sha256 === storage.profile_sha256 &&
     authority.profile_revision >= storage.profile_revision &&
-    Date.parse(authority.observed_at) > observedAfter &&
-    Date.parse(authority.observed_at) >= now - 120000 &&
-    Date.parse(authority.observed_at) <= now + 5000 &&
-    Date.parse(authority.expires_at) > now &&
+    inventory.observed_at > observedAfter &&
+    inventory.observed_at >= now - 120000 &&
+    inventory.observed_at <= now + 5000 &&
+    inventory.expires_at > now &&
     !authority.physical_lvs.some((lv) => lv.lv_uuid === lvUuid) &&
     !authority.active_lv_uuids.includes(lvUuid),
   );

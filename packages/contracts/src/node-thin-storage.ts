@@ -10,6 +10,8 @@ import {
   StorageLvmUuid,
   ThinStorageProfile,
 } from "./database-storage.ts";
+import { NodePhysicalStorage } from "./node-physical-storage.ts";
+import { STORAGE_AUTHORITY_MAX_LENGTH } from "./storage-write-authority.ts";
 
 const Bytes = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const NodeName = z
@@ -81,6 +83,8 @@ export const NodeThinStorageLease = z.strictObject({
   assignment_revision: z.number().int().positive(),
   region_revision: z.number().int().positive(),
   revision: z.number().int().positive(),
+  /** Revision of the current identity proof; the report's authority claims the next one. Fast
+   * renewals advance the composed authority's revision, never this one. */
   authority_revision: z.number().int().nonnegative(),
   node_id: NodeId,
   region_id: RegionId,
@@ -190,6 +194,106 @@ export const NodeThinStorageReport = z.strictObject({
   action_applied: z.boolean(),
 });
 export type NodeThinStorageReport = z.infer<typeof NodeThinStorageReport>;
+
+/** 128 random bits Cloudflare issues, with its own clock, for exactly one sample of one node. */
+export const ThinStorageSampleNonce = z.string().regex(/^[a-f0-9]{32}$/);
+/** guard_seconds × 200 ms for guards of 1 to 120 s. */
+const SamplePeriod = z.number().int().min(200).max(24_000);
+/** One node whose controller samples the OpenEBS exporter for Cloudflare. A qualification run's
+ * node samples into the run's evidence and renews nothing. */
+export const ThinStorageSampleTarget = z.strictObject({
+  node_id: NodeId,
+  name: NodeName,
+  node_uid: z.uuid(),
+  period_milliseconds: SamplePeriod,
+  qualification_run: OperationId.nullable(),
+});
+export type ThinStorageSampleTarget = z.infer<typeof ThinStorageSampleTarget>;
+
+/** POST /agent/v1/nodes/{id}/storage-headroom: one complete exporter scrape between two identical
+ * identity reads. Cloudflare anchors any renewal at its nonce's issue, never at captured_at. */
+export const NodeStorageHeadroomSample = z
+  .strictObject({
+    /** The previous response's nonce; null only asks for a first one and renews nothing. */
+    nonce: ThinStorageSampleNonce.nullable(),
+    node_uid: z.uuid(),
+    /** Controller wall clock; audit data only. */
+    captured_at: z.iso.datetime(),
+    physical: NodePhysicalStorage,
+    /** Every LV series the exporter reported for VG pgcf (no UUIDs; internal LVs are not listed). */
+    lvs: z
+      .array(
+        z.strictObject({
+          name: z.string().regex(/^[A-Za-z0-9_.+[\]-]{1,128}$/),
+          segtype: z.string().regex(/^[a-z0-9-]{1,32}$/),
+          size_bytes: Bytes.positive(),
+        }),
+      )
+      .max(8192),
+    /** The exporter's LV count of VG pgcf; a scrape missing any LV series is not a sample. */
+    lv_count: z.number().int().nonnegative().max(8192),
+    /** Identities read around the scrape that bind it to Cloudflare's identity proof. */
+    witnesses: z.strictObject({
+      cluster_uid: z.uuid(),
+      boot_id: z.uuid(),
+      volume_group_uuid: StorageLvmUuid,
+      driver_pod_uid: z.uuid(),
+      driver_image: z.string().regex(/^[^\s]+@sha256:[a-f0-9]{64}$/),
+    }),
+    scrape_milliseconds: z.number().int().nonnegative().max(600_000),
+  })
+  .superRefine((value, context) => {
+    if (
+      value.lvs.length !== value.lv_count ||
+      new Set(value.lvs.map((lv) => lv.name)).size !== value.lvs.length ||
+      value.physical.volume_group_uuid !== value.witnesses.volume_group_uuid
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "A sample is one complete scrape of the witnessed volume group",
+      });
+  });
+export type NodeStorageHeadroomSample = z.infer<
+  typeof NodeStorageHeadroomSample
+>;
+
+/** Every answer carries the next nonce. Only an accepted product sample renews: it returns the
+ * node's composed storage_nodes entry and every current sa1 token of the node's thin databases. */
+export const NodeStorageHeadroomResponse = z
+  .strictObject({
+    accepted: z.boolean(),
+    reason: z
+      .string()
+      .regex(/^thin_storage_sample_[a-z0-9_]{1,80}$/)
+      .nullable(),
+    nonce: ThinStorageSampleNonce,
+    period_milliseconds: SamplePeriod,
+    authority: NodeThinStorageAuthority.nullable(),
+    tokens: z
+      .array(
+        z.strictObject({
+          database_id: DatabaseId,
+          token: z.string().min(1).max(STORAGE_AUTHORITY_MAX_LENGTH),
+        }),
+      )
+      .max(4096),
+  })
+  .superRefine((value, context) => {
+    if (
+      value.accepted !== (value.reason === null) ||
+      (!value.accepted &&
+        (value.authority !== null || value.tokens.length > 0)) ||
+      (value.authority === null && value.tokens.length > 0)
+    )
+      context.addIssue({
+        code: "custom",
+        message: "Only an accepted renewal carries authority or tokens",
+      });
+  });
+export type NodeStorageHeadroomResponse = z.infer<
+  typeof NodeStorageHeadroomResponse
+>;
 
 /** Current stop intent only: bounded old-writer drain, never a tenant startup grant. */
 export const HostStorageDrain = z.strictObject({

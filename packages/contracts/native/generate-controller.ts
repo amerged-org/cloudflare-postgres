@@ -17,6 +17,11 @@ import {
 } from "../src/releases.ts";
 import { STORAGE_AUTHORITY_LEDGER_KEY } from "../src/storage-write-authority.ts";
 import {
+  NodeStorageHeadroomResponse,
+  NodeStorageHeadroomSample,
+  ThinStorageSampleTarget,
+} from "../src/node-thin-storage.ts";
+import {
   gatewayControlReportSchema,
   gatewayIntentSchema,
 } from "../src/gateway-control.ts";
@@ -79,6 +84,9 @@ const schemas = Object.fromEntries(
     FleetNodeReleaseObservation,
     DatabaseRuntimeAttestation,
     NodeStorageSample,
+    NodeStorageHeadroomSample,
+    NodeStorageHeadroomResponse,
+    ThinStorageSampleTarget,
   }).map(([name, source]) => [name, z.toJSONSchema(source)]),
 );
 const ctx: BuildContext = {
