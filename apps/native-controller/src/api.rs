@@ -205,8 +205,17 @@ impl ControlApi {
                 .body(encoded);
         }
         let response = request.send().await?;
-        if !response.status().is_success() {
-            return Err(format!("Cloudflare API HTTP{}", response.status().as_u16()).into());
+        let status = response.status();
+        if !status.is_success() {
+            let code = bounded(response, 64 * 1024)
+                .await
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|body| body["error"]["code"].as_str().map(str::to_string));
+            return Err(Box::new(Refusal {
+                status: status.as_u16(),
+                code,
+            }));
         }
         Ok(serde_json::from_slice(
             &bounded(response, 2 * 1024 * 1024).await?,
@@ -302,9 +311,7 @@ impl ControlApi {
     /// Publishes one verified database observation at once, apart from inventory work.
     pub async fn observation(&self, db: Value) -> Result<(), Error> {
         let envelope = database_update(db, timestamp()?)?;
-        let result = self
-            .request("/agent/v1/observations", Some(&envelope))
-            .await?;
+        let result = self.report(&envelope).await?;
         if crate::contracts::integer(&result, "accepted")? != 1 {
             return Err("Cloudflare observation acknowledgement invalid".into());
         }
@@ -314,10 +321,56 @@ impl ControlApi {
         if !schema_valid("RegionalInventory", envelope) {
             return Err("native inventory contract invalid".into());
         }
-        self.request("/agent/v1/observations", Some(envelope))
-            .await?;
+        self.report(envelope).await?;
         Ok(())
     }
+    /// An API released before explicit coverage refuses the label as `invalid_request`; the same
+    /// facts are then sent once in the legacy shape, where omitted orphans equally keep the
+    /// recorded inventory. An API rollback therefore never needs a fleet rollback first.
+    async fn report(&self, envelope: &Value) -> Result<Value, Error> {
+        match self.request("/agent/v1/observations", Some(envelope)).await {
+            Err(error)
+                if error.downcast_ref::<Refusal>().is_some_and(|refusal| {
+                    refusal.status == 400 && refusal.code.as_deref() == Some("invalid_request")
+                }) =>
+            {
+                self.request("/agent/v1/observations", Some(&legacy_report(envelope)?))
+                    .await
+            }
+            result => result,
+        }
+    }
+}
+/// A Cloudflare API refusal with its HTTP status and error code.
+#[derive(Debug)]
+pub struct Refusal {
+    pub status: u16,
+    pub code: Option<String>,
+}
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Cloudflare API HTTP{}", self.status)
+    }
+}
+impl std::error::Error for Refusal {}
+/// The pre-coverage shape of a partial update or regional inventory.
+fn legacy_report(envelope: &Value) -> Result<Value, Error> {
+    let mut legacy = match text(envelope, "coverage") {
+        "databases" => {
+            json!({"observed_at":envelope["observed_at"],"nodes":[],"databases":envelope["databases"]})
+        }
+        "inventory" => {
+            json!({"observed_at":envelope["observed_at"],"nodes":envelope["nodes"],"databases":[],"orphans":envelope["orphans"]})
+        }
+        _ => return Err("observation coverage unknown".into()),
+    };
+    if !envelope["node_memory_samples"].is_null() {
+        legacy["node_memory_samples"] = envelope["node_memory_samples"].clone();
+    }
+    if !schema_valid("ObservationRequest", &legacy) {
+        return Err("native legacy observation contract invalid".into());
+    }
+    Ok(legacy)
 }
 #[cfg(test)]
 mod tests {
@@ -361,5 +414,99 @@ mod tests {
         let timestamp = timestamp().unwrap();
         assert_eq!(timestamp.len(), 24);
         assert!(timestamp.ends_with('Z'));
+    }
+    /// A plain-HTTP Cloudflare API double that records every observation body. With
+    /// `coverage_known` false it refuses labelled reports like an API released before coverage.
+    async fn observation_api(
+        coverage_known: bool,
+        status: u16,
+    ) -> (ControlApi, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let bodies = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = bodies.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut chunk = [0; 4096];
+                let body = loop {
+                    let read = socket.read(&mut chunk).await.unwrap();
+                    bytes.extend_from_slice(&chunk[..read]);
+                    let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let head = String::from_utf8_lossy(&bytes[..end]).to_ascii_lowercase();
+                    let length: usize = head
+                        .lines()
+                        .find_map(|line| line.strip_prefix("content-length:"))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break serde_json::from_slice::<Value>(&bytes[end + 4..end + 4 + length])
+                            .unwrap();
+                    }
+                };
+                recorded.lock().unwrap().push(body.clone());
+                let (code, reply) = if status != 200 {
+                    (
+                        status,
+                        json!({"error":{"code":"unauthorized","message":"Unauthorized","request_id":"test"}}),
+                    )
+                } else if !coverage_known && !body["coverage"].is_null() {
+                    (
+                        400,
+                        json!({"error":{"code":"invalid_request","message":"Request validation failed","request_id":"test"}}),
+                    )
+                } else {
+                    (
+                        200,
+                        json!({"accepted":body["databases"].as_array().map_or(0, Vec::len)}),
+                    )
+                };
+                let reply = reply.to_string();
+                let _ = socket
+                    .write_all(format!("HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes())
+                    .await;
+            }
+        });
+        let api = ControlApi {
+            client: crate::cluster_http(Duration::from_secs(5)).unwrap(),
+            origin: Url::parse(&format!("http://{address}/")).unwrap(),
+            region: "eu-test".into(),
+            key: AgentKey::Environment(format!("pgcf_ak_eu-test_{}", "a".repeat(43))),
+        };
+        (api, bodies)
+    }
+    #[tokio::test]
+    async fn an_api_released_before_coverage_receives_the_same_report_in_the_legacy_shape() {
+        let db = json!({"id":"a0000000000000000001","generation":3,"state":"ready","archive":{"continuous":false,"ready_wal_files":null,"health":"unknown"}});
+        let (api, bodies) = observation_api(false, 200).await;
+        api.observation(db.clone()).await.unwrap();
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0]["coverage"], "databases");
+        assert_eq!(
+            sent[1],
+            json!({"observed_at":sent[0]["observed_at"],"nodes":[],"databases":[db]})
+        );
+        let scan = json!({"coverage":"inventory","observed_at":timestamp().unwrap(),"nodes":[],"orphans":[],"node_memory_samples":[]});
+        api.inventory(&scan).await.unwrap();
+        let sent = bodies.lock().unwrap().clone();
+        assert_eq!(sent.len(), 4);
+        assert_eq!(
+            sent[3],
+            json!({"observed_at":scan["observed_at"],"nodes":[],"databases":[],"orphans":[],"node_memory_samples":[]})
+        );
+        // A current API takes the labelled report once; another refusal is never re-sent.
+        let (current, bodies) = observation_api(true, 200).await;
+        current.observation(db.clone()).await.unwrap();
+        assert_eq!(bodies.lock().unwrap().len(), 1);
+        let (refusing, bodies) = observation_api(false, 401).await;
+        assert!(refusing.observation(db).await.is_err());
+        assert_eq!(bodies.lock().unwrap().len(), 1);
     }
 }
