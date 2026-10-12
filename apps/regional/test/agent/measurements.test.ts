@@ -658,13 +658,22 @@ test("API usage validates acknowledgements and sends only authenticated bounded 
   );
   await api.usage({ samples: [sample] }, state.signal);
   assert.equal(sent, 1);
+  // A permanently refused sample is acknowledged, so the ordered outbox drains past it.
+  await new AgentApi(
+    {
+      apiUrl: `https://${["api", "example", "invalid"].join(".")}`,
+      regionId: "eu-test",
+      agentKey: token,
+    },
+    async () => Response.json({ recorded: 1, duplicates: 0, refused: 1 }),
+  ).usage({ samples: [sample, { ...sample, sequence: 2 }] }, state.signal);
   const invalid = new AgentApi(
     {
       apiUrl: `https://${["api", "example", "invalid"].join(".")}`,
       regionId: "eu-test",
       agentKey: token,
     },
-    async () => Response.json({ recorded: 0, duplicates: 0 }),
+    async () => Response.json({ recorded: 0, duplicates: 0, refused: 0 }),
   );
   await assert.rejects(
     invalid.usage({ samples: [sample] }, state.signal),

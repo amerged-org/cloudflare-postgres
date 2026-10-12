@@ -116,13 +116,20 @@ export class AgentApi {
     const reply = JSON.parse(await boundedText(response, 4096)) as {
       recorded?: unknown;
       duplicates?: unknown;
+      refused?: unknown;
     };
+    // An API released before refusals omits the count.
+    const refused = reply.refused === undefined ? 0 : reply.refused;
     if (
       !Number.isSafeInteger(reply.recorded) ||
       (reply.recorded as number) < 0 ||
       !Number.isSafeInteger(reply.duplicates) ||
       (reply.duplicates as number) < 0 ||
-      (reply.recorded as number) + (reply.duplicates as number) !==
+      !Number.isSafeInteger(refused) ||
+      (refused as number) < 0 ||
+      (reply.recorded as number) +
+        (reply.duplicates as number) +
+        (refused as number) !==
         parsed.data.samples.length
     )
       throw new Error("usage_ack_invalid");

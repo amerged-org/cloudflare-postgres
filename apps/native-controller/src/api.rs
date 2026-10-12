@@ -112,7 +112,15 @@ impl ControlApi {
         let reply = self.request("/agent/v1/usage", Some(envelope)).await?;
         let recorded = crate::contracts::integer(&reply, "recorded")?;
         let duplicates = crate::contracts::integer(&reply, "duplicates")?;
-        if recorded.checked_add(duplicates)
+        // An API released before refusals omits the count.
+        let refused = if reply["refused"].is_null() {
+            0
+        } else {
+            crate::contracts::integer(&reply, "refused")?
+        };
+        if recorded
+            .checked_add(duplicates)
+            .and_then(|sum| sum.checked_add(refused))
             != Some(envelope["samples"].as_array().map_or(0, Vec::len) as u64)
         {
             return Err("usage acknowledgement invalid".into());
@@ -415,11 +423,9 @@ mod tests {
         assert_eq!(timestamp.len(), 24);
         assert!(timestamp.ends_with('Z'));
     }
-    /// A plain-HTTP Cloudflare API double that records every observation body. With
-    /// `coverage_known` false it refuses labelled reports like an API released before coverage.
-    async fn observation_api(
-        coverage_known: bool,
-        status: u16,
+    /// A plain-HTTP Cloudflare API double that records every request body and answers with `respond`.
+    async fn api_double(
+        respond: impl Fn(&Value) -> (u16, Value) + Send + 'static,
     ) -> (ControlApi, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -451,22 +457,7 @@ mod tests {
                     }
                 };
                 recorded.lock().unwrap().push(body.clone());
-                let (code, reply) = if status != 200 {
-                    (
-                        status,
-                        json!({"error":{"code":"unauthorized","message":"Unauthorized","request_id":"test"}}),
-                    )
-                } else if !coverage_known && !body["coverage"].is_null() {
-                    (
-                        400,
-                        json!({"error":{"code":"invalid_request","message":"Request validation failed","request_id":"test"}}),
-                    )
-                } else {
-                    (
-                        200,
-                        json!({"accepted":body["databases"].as_array().map_or(0, Vec::len)}),
-                    )
-                };
+                let (code, reply) = respond(&body);
                 let reply = reply.to_string();
                 let _ = socket
                     .write_all(format!("HTTP/1.1 {code} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}", reply.len()).as_bytes())
@@ -480,6 +471,45 @@ mod tests {
             key: AgentKey::Environment(format!("pgcf_ak_eu-test_{}", "a".repeat(43))),
         };
         (api, bodies)
+    }
+    /// With `coverage_known` false the double refuses labelled reports like an API released before coverage.
+    async fn observation_api(
+        coverage_known: bool,
+        status: u16,
+    ) -> (ControlApi, std::sync::Arc<std::sync::Mutex<Vec<Value>>>) {
+        api_double(move |body| {
+            if status != 200 {
+                (
+                    status,
+                    json!({"error":{"code":"unauthorized","message":"Unauthorized","request_id":"test"}}),
+                )
+            } else if !coverage_known && !body["coverage"].is_null() {
+                (
+                    400,
+                    json!({"error":{"code":"invalid_request","message":"Request validation failed","request_id":"test"}}),
+                )
+            } else {
+                (
+                    200,
+                    json!({"accepted":body["databases"].as_array().map_or(0, Vec::len)}),
+                )
+            }
+        })
+        .await
+    }
+    #[tokio::test]
+    async fn a_refused_usage_sample_is_acknowledged_so_the_outbox_drains_past_it() {
+        let sample = |sequence: u64| json!({"database_id":"a0000000000000000001","source":"agent","producer_id":"fixture","sequence":sequence,"observed_at":timestamp().unwrap(),"storage_used_bytes":null,"storage_allocated_bytes":1});
+        let envelope = json!({"samples":[sample(1),sample(2)]});
+        let (refusing, _) =
+            api_double(|_| (200, json!({"recorded":1,"duplicates":0,"refused":1}))).await;
+        refusing.usage(&envelope).await.unwrap();
+        // An API released before refusals omits the count; its acknowledgement still covers every sample.
+        let (legacy, _) = api_double(|_| (200, json!({"recorded":1,"duplicates":1}))).await;
+        legacy.usage(&envelope).await.unwrap();
+        let (short, _) =
+            api_double(|_| (200, json!({"recorded":1,"duplicates":0,"refused":0}))).await;
+        assert!(short.usage(&envelope).await.is_err());
     }
     #[tokio::test]
     async fn an_api_released_before_coverage_receives_the_same_report_in_the_legacy_shape() {

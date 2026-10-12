@@ -55,12 +55,14 @@ export function registerAgentMetrics(app: ApiApp): void {
       },
       responses: {
         200: {
-          description: "Measured usage accepted",
+          description:
+            "Every sample is acknowledged: recorded, an identical duplicate, or refused for good because its hour is finalized, it overlaps or exceeds the hourly input bound, or its identity was reused with different measurements",
           content: {
             "application/json": {
               schema: z.strictObject({
                 recorded: z.number().int().nonnegative(),
                 duplicates: z.number().int().nonnegative(),
+                refused: z.number().int().nonnegative(),
               }),
             },
           },

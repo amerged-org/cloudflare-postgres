@@ -252,14 +252,16 @@ it("records exact nullable usage and retains duplicate/conflicting identity sema
   expect(await (await sendUsage(f, [sample])).json()).toEqual({
     recorded: 1,
     duplicates: 0,
+    refused: 0,
   });
   expect(await (await sendUsage(f, [sample])).json()).toEqual({
     recorded: 0,
     duplicates: 1,
+    refused: 0,
   });
   expect(
-    (await sendUsage(f, [{ ...sample, storage_used_bytes: 42 }])).status,
-  ).toBe(409);
+    await (await sendUsage(f, [{ ...sample, storage_used_bytes: 42 }])).json(),
+  ).toEqual({ recorded: 0, duplicates: 0, refused: 1 });
   const row = await env.DB.prepare(
     "SELECT payload FROM usage_samples WHERE database_id=?",
   )
@@ -297,6 +299,7 @@ it("agent may relay each measured variant but cannot supply principal or mismatc
   expect(await (await sendUsage(f, [sample, backup, gateway])).json()).toEqual({
     recorded: 3,
     duplicates: 0,
+    refused: 0,
   });
   expect(
     (
@@ -314,23 +317,31 @@ it("agent may relay each measured variant but cannot supply principal or mismatc
   ).toBe(400);
   expect((await sendUsage(f, [sample], f.foreignAgent)).status).toBe(404);
 });
-it("finalized usage hours remain closed to new measurements", async () => {
+it("a finalized hour refuses its late measurement without blocking the rest of the batch", async () => {
   const f = await ready(),
-    sample = storageSample(f.id),
-    hour = new Date(Math.floor(Date.now() / 3600000) * 3600000).toISOString();
+    current = storageSample(f.id),
+    previous = Math.floor(Date.now() / 3600000) * 3600000 - 3600000,
+    late = {
+      ...storageSample(f.id),
+      observed_at: new Date(previous + 1000).toISOString(),
+    };
   await env.DB.prepare(
     "INSERT INTO usage_hourly(database_id,hour,metrics,gaps,final,computed_at) VALUES(?,?,'{}','[]',1,?)",
   )
-    .bind(f.id, hour, new Date().toISOString())
+    .bind(f.id, new Date(previous).toISOString(), new Date().toISOString())
     .run();
-  expect((await sendUsage(f, [sample])).status).toBe(409);
+  expect(await (await sendUsage(f, [late, current])).json()).toEqual({
+    recorded: 1,
+    duplicates: 0,
+    refused: 1,
+  });
   expect(
     await env.DB.prepare(
-      "SELECT COUNT(*) n FROM usage_samples WHERE database_id=?",
+      "SELECT producer_id FROM usage_samples WHERE database_id=?",
     )
       .bind(f.id)
-      .first("n"),
-  ).toBe(0);
+      .all(),
+  ).toMatchObject({ results: [{ producer_id: current.producer_id }] });
 });
 it("both batch caps and the existing global body bound apply", async () => {
   const f = await ready(),
@@ -439,6 +450,7 @@ it("usage preflight and the existing recorder keep D1 work bounded for repeated 
   expect(await (await sendUsage(f, samples)).json()).toEqual({
     recorded: 2,
     duplicates: 0,
+    refused: 0,
   });
   expect(prepare.mock.calls.length).toBeLessThanOrEqual(8);
 });

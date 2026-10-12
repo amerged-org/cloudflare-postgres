@@ -122,15 +122,34 @@ export async function ingestAgentUsage(c: ApiContext, raw: unknown) {
     parsed.data.samples.map((sample) => sample.database_id),
   );
   let recorded = 0,
-    duplicates = 0;
+    duplicates = 0,
+    refused = 0;
   for (const sample of parsed.data.samples) {
-    const result = await recordUsageSample(
-      c.env.DB,
-      { region_id: region.id, source: sample.source },
-      sample,
-    );
+    let result: "recorded" | "duplicate";
+    try {
+      result = await recordUsageSample(
+        c.env.DB,
+        { region_id: region.id, source: sample.source },
+        sample,
+      );
+    } catch (error) {
+      // A conflict is final for this sample (finalized hour, overlap, input bound, reused identity).
+      // Acknowledging it lets the producer's ordered outbox drain instead of replaying it forever.
+      if (!(error instanceof ApiError) || error.code !== "conflict")
+        throw error;
+      console.warn(
+        JSON.stringify({
+          event: "usage_sample_refused",
+          database_id: sample.database_id,
+          source: sample.source,
+          reason: error.message,
+        }),
+      );
+      refused++;
+      continue;
+    }
     if (result === "recorded") recorded++;
     else duplicates++;
   }
-  return c.json({ recorded, duplicates }, 200);
+  return c.json({ recorded, duplicates, refused }, 200);
 }
