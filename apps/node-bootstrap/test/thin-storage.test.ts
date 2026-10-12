@@ -230,6 +230,35 @@ test("complete LVM and kernel inventory retains internal IDs and refuses unexpla
     /thin_storage_kernel_lv_unexplained/,
   );
 });
+test("a grown pool's hidden data LV reported once per segment is one LV; differing rows still fail closed", () => {
+  // lvs prints one row per segment when a segment field (segtype) is requested; after the
+  // product lvextend, the pool's data LV continues behind its metadata LVs in a second segment.
+  const data = {
+    vg_uuid: vg,
+    lv_name: "[pgcf_thinpool_tdata]",
+    lv_uuid: "Td0000-0000-0000-0000-0000-0000-000000",
+    lv_size: "2147483648",
+    segtype: "linear",
+    pool_lv: "",
+    lv_attr: "Twi-ao----",
+    data_percent: "",
+    metadata_percent: "",
+    lv_metadata_size: "",
+    lv_when_full: "",
+    lv_tags: "",
+  };
+  const value = facts([{ ...poolRow, lv_size: "2147483648" }, data, data]);
+  assert.deepEqual(
+    value.volumes.map((volume) => volume.name),
+    ["pgcf_thinpool", "[pgcf_thinpool_tdata]"],
+  );
+  assert.equal(value.physical.thick_allocated_bytes, 0);
+  assert.equal(value.physical.thin_pool?.data_total_bytes, 2147483648);
+  assert.throws(
+    () => facts([poolRow, data, { ...data, segtype: "striped" }]),
+    /thin_storage_lvs_changed/,
+  );
+});
 test("an empty LVM pool percentage fails closed instead of reading as an unused pool", () => {
   assert.throws(
     () => facts([{ ...poolRow, data_percent: "" }]),

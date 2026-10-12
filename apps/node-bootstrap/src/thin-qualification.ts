@@ -25,6 +25,7 @@ import {
   bytes,
   items,
   lvmRows,
+  lvmVolumes,
   lvmUid,
   metadata,
   object,
@@ -373,29 +374,31 @@ export function parseQualificationLvm(
     return raw === "" || raw === "-1" ? null : bytes(raw);
   };
   const seen = new Set<string>();
-  const volumes = lvmRows(lvs, "lv").map((row) => {
-    const lv_uuid = lvmUid(row.lv_uuid);
-    if (seen.has(lv_uuid) || row.vg_uuid !== vg)
-      fail("logical_volumes_changed");
-    seen.add(lv_uuid);
-    return {
-      name: text(row.lv_name),
-      lv_uuid,
-      size_bytes: bytes(row.lv_size),
-      segtype: text(row.segtype),
-      pool_lv: text(row.pool_lv),
-      attr: text(row.lv_attr),
-      data_percent: percent(row.data_percent),
-      metadata_percent: percent(row.metadata_percent),
-      metadata_bytes: optional(row.lv_metadata_size),
-      chunk_bytes: optional(row.chunk_size),
-      when_full: text(row.lv_when_full),
-      tags: text(row.lv_tags).split(",").filter(Boolean),
-      major: kernel(row.lv_kernel_major),
-      minor: kernel(row.lv_kernel_minor),
-      health: text(row.lv_health_status),
-    };
-  });
+  const volumes = lvmVolumes(lvs, () => fail("logical_volumes_changed")).map(
+    (row) => {
+      const lv_uuid = lvmUid(row.lv_uuid);
+      if (seen.has(lv_uuid) || row.vg_uuid !== vg)
+        fail("logical_volumes_changed");
+      seen.add(lv_uuid);
+      return {
+        name: text(row.lv_name),
+        lv_uuid,
+        size_bytes: bytes(row.lv_size),
+        segtype: text(row.segtype),
+        pool_lv: text(row.pool_lv),
+        attr: text(row.lv_attr),
+        data_percent: percent(row.data_percent),
+        metadata_percent: percent(row.metadata_percent),
+        metadata_bytes: optional(row.lv_metadata_size),
+        chunk_bytes: optional(row.chunk_size),
+        when_full: text(row.lv_when_full),
+        tags: text(row.lv_tags).split(",").filter(Boolean),
+        major: kernel(row.lv_kernel_major),
+        minor: kernel(row.lv_kernel_minor),
+        health: text(row.lv_health_status),
+      };
+    },
+  );
   const prefix = `LVM-${hex(vg)}`,
     active = new Set<string>();
   for (const raw of dm

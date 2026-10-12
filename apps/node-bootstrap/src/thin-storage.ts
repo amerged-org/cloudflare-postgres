@@ -93,6 +93,17 @@ export function lvmRows(raw: string, key: string) {
   const reports = items(value.report);
   return reports.flatMap((report) => items(report[key]));
 }
+/** `lvs` prints one row per segment once a segment field such as `segtype` is requested, so a grown
+ * pool's hidden data LV or an extended linear LV appears once per segment; those rows must agree. */
+export function lvmVolumes(raw: string, conflict: () => never) {
+  const volumes = new Map<string, ObjectValue>();
+  for (const row of lvmRows(raw, "lv")) {
+    const seen = volumes.get(text(row.lv_uuid));
+    if (!seen) volumes.set(text(row.lv_uuid), row);
+    else if (JSON.stringify(seen) !== JSON.stringify(row)) conflict();
+  }
+  return [...volumes.values()];
+}
 export function ready(value: ObjectValue) {
   return items(object(value.status).conditions).some(
     (c) => c.type === "Ready" && c.status === "True",
@@ -182,7 +193,9 @@ export function thinLvmFacts(
     total = bytes(group.vg_size),
     free = bytes(group.vg_free),
     extent = bytes(group.vg_extent_size);
-  const rows = lvmRows(lvs, "lv");
+  const rows = lvmVolumes(lvs, () => {
+    throw new BootstrapError("thin_storage_lvs_changed");
+  });
   const seen = new Set<string>();
   let thick = 0;
   let pool: NodeThinStorageAuthority["physical"]["thin_pool"] = null;

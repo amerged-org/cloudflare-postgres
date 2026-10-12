@@ -61,6 +61,8 @@ interface Lv {
   tags: string[];
   minor: number;
   state: "a" | "s";
+  /** A pool's hidden data LV gains a segment with each lvextend behind its metadata LVs. */
+  segments?: number;
 }
 interface Pod {
   name: string;
@@ -143,6 +145,43 @@ export class ThinWorld {
   }
   lv(name: string) {
     return this.lvs.find((value) => value.name === name);
+  }
+  /** `lvs --all` also lists each pool's hidden data and metadata LVs and the VG's metadata
+   * spare, one row per segment; free() already charges their extents to the pool. */
+  hiddenLvs(): Lv[] {
+    const pools = this.lvs.filter((lv) => lv.segtype === "thin-pool");
+    const hidden = (name: string, uuid: string, size: number): Lv => ({
+      name,
+      uuid,
+      segtype: "linear",
+      pool: "",
+      size,
+      metadata: 0,
+      tags: [],
+      minor: 0,
+      state: "a",
+    });
+    return [
+      ...pools.flatMap((pool) => [
+        ...Array.from({ length: pool.segments ?? 1 }, () =>
+          hidden(`[${pool.name}_tdata]`, lvm(`Td${hex(pool.uuid)}`), pool.size),
+        ),
+        hidden(
+          `[${pool.name}_tmeta]`,
+          lvm(`Tm${hex(pool.uuid)}`),
+          pool.metadata,
+        ),
+      ]),
+      ...(pools.length
+        ? [
+            hidden(
+              "[lvol0_pmspare]",
+              lvm("Ps"),
+              Math.max(...pools.map((pool) => pool.metadata)),
+            ),
+          ]
+        : []),
+    ];
   }
   addLv(
     value: Omit<Lv, "minor" | "state" | "metadata"> & { metadata?: number },
@@ -656,7 +695,7 @@ export class ThinWorld {
           JSON.stringify({
             report: [
               {
-                lv: this.lvs.map((lv) => ({
+                lv: [...this.lvs, ...this.hiddenLvs()].map((lv) => ({
                   vg_uuid: this.vg,
                   lv_name: lv.name,
                   lv_uuid: lv.uuid,
@@ -714,9 +753,9 @@ export class ThinWorld {
       }
       case "lvextend": {
         this.log.push(`lvextend ${rest.join(" ")}`);
-        this.lv(POOL)!.size = Number(
-          rest[rest.indexOf("--size") + 1]!.slice(0, -1),
-        );
+        const grown = this.lv(POOL)!;
+        grown.size = Number(rest[rest.indexOf("--size") + 1]!.slice(0, -1));
+        grown.segments = (grown.segments ?? 1) + 1;
         this.poolMode = "rw";
         return ok("");
       }
