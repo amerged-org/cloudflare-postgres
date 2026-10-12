@@ -40,6 +40,10 @@ struct Cell {
     renew: bool,
     attempt: u32,
     authority_at: Instant,
+    /// The power operation this controller last observed ready.
+    woke: Option<String>,
+    /// Consecutive not-ready results of the pending wake.
+    stalled: u32,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobKind {
@@ -60,7 +64,7 @@ struct Active {
     task: tokio::task::Id,
     abort: AbortHandle,
     kind: JobKind,
-    urgent: bool,
+    class: Class,
 }
 fn fingerprint(db: &Value, snapshot: &DesiredSnapshot) -> Result<Vec<u8>, Error> {
     let mut db = db.clone();
@@ -118,6 +122,7 @@ fn apply_snapshot(
                 cell.ready = false;
                 cell.renew = false;
                 cell.attempt = 0;
+                cell.stalled = 0;
                 cell.due = due;
                 cell.hints = cell.hints.wrapping_add(1);
             } else if cell.ready && db["storage_authority"] != cell.db["storage_authority"] {
@@ -141,6 +146,8 @@ fn apply_snapshot(
                     renew: false,
                     attempt: 0,
                     authority_at: pulled_at,
+                    woke: None,
+                    stalled: 0,
                 },
             );
         }
@@ -212,22 +219,78 @@ fn storage_protection_due(db: &Value, snapshot: &DesiredSnapshot, clock: i128) -
 }
 /// Bounded reconciliation slots shared by every database.
 const SLOTS: usize = 4;
-/// A database whose running power intent is not yet observed ready: a wake or resume.
-fn waking(cell: &Cell) -> bool {
-    !cell.ready && cell.db["power"]["mode"] == "running"
+/// Scheduling classes in priority order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Class {
+    /// A protective stop or a storage-authority renewal: a lapsed authority stops writes.
+    Storage,
+    /// A wake or resume whose power operation is not yet observed ready.
+    Wake,
+    Routine,
 }
-/// Selects due work for the free slots; `busy` maps each running job to its urgency.
-/// Protective stops come first, then wakes. Routine reconciliation never takes the last
-/// slot, so a wake does not wait behind unrelated database work.
+/// A running power operation this controller has not yet observed ready.
+fn waking(cell: &Cell) -> bool {
+    !cell.ready
+        && cell.db["power"]["mode"] == "running"
+        && cell.db["power"]["operation"].as_str() != cell.woke.as_deref()
+}
+fn class(cell: &Cell, clock: i128) -> Class {
+    if storage_protection_due(&cell.db, &cell.snapshot, clock) || (cell.renew && cell.ready) {
+        Class::Storage
+    } else if waking(cell) {
+        Class::Wake
+    } else {
+        Class::Routine
+    }
+}
+/// The first not-ready results of a pending wake retry each second; later ones back off to
+/// 30 s, so stuck wakes cannot hold the slots. A Kubernetes hint still retries at once.
+fn not_ready_delay(stalled: u32) -> Duration {
+    Duration::from_secs(if stalled <= 5 {
+        1
+    } else {
+        (1_u64 << (stalled - 5).min(5)).min(30)
+    })
+}
+/// Records a finished reconcile of `cell`'s current generation.
+fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>) {
+    if let Some(observed) = observed {
+        let state = text(observed, "state");
+        cell.ready = matches!(state, "ready" | "deleted" | "hibernated");
+        cell.attempt = 0;
+        if state == "ready" {
+            cell.woke = cell.db["power"]["operation"].as_str().map(str::to_string);
+        }
+        if cell.ready {
+            cell.stalled = 0;
+            cell.due = started + Duration::from_secs(60);
+            return;
+        }
+    }
+    cell.due = started
+        + if waking(cell) {
+            cell.stalled = cell.stalled.saturating_add(1);
+            not_ready_delay(cell.stalled)
+        } else {
+            Duration::from_secs(1)
+        };
+}
+/// Selects due work for the free slots; `busy` maps each running job to its class.
+/// Storage work comes first, then wakes, then routine reconciliation. Routine work never
+/// takes the last slot, so a wake does not wait behind unrelated database work, and wakes
+/// leave one slot to due routine work while none runs, so stuck wakes cannot starve it.
 fn schedule(
     cells: &HashMap<String, Cell>,
-    busy: &HashMap<String, bool>,
+    busy: &HashMap<String, Class>,
     now: Instant,
     clock: i128,
     control_healthy: bool,
-) -> Vec<(String, bool)> {
+) -> Vec<(String, Class)> {
     let mut free = SLOTS.saturating_sub(busy.len());
-    let mut routine = busy.values().filter(|urgent| !**urgent).count();
+    let mut routine = busy
+        .values()
+        .filter(|class| **class == Class::Routine)
+        .count();
     let mut candidates: Vec<_> = cells
         .iter()
         .filter(|(id, cell)| {
@@ -238,27 +301,31 @@ fn schedule(
                         && now.duration_since(cell.authority_at) <= Duration::from_secs(90)))
                 && !busy.contains_key(*id)
         })
-        .map(|(id, cell)| {
-            (
-                !storage_protection_due(&cell.db, &cell.snapshot, clock),
-                !waking(cell),
-                cell.due,
-                id.clone(),
-            )
-        })
+        .map(|(id, cell)| (class(cell, clock), cell.due, id.clone()))
         .collect();
     // Within each class, pending databases rotate by oldest due time; a slow first cohort
     // cannot monopolize the bounded reconciliation slots.
     candidates.sort();
+    let mut reserved = usize::from(
+        routine == 0
+            && candidates
+                .iter()
+                .any(|(class, _, _)| *class == Class::Routine),
+    );
     let mut selected = Vec::new();
-    for (unprotected, idle, _, id) in candidates {
-        let urgent = !unprotected || !idle;
-        if free == 0 || (!urgent && routine + 1 >= SLOTS) {
-            break;
+    for (class, _, id) in candidates {
+        if free == 0
+            || (class == Class::Wake && free <= reserved)
+            || (class == Class::Routine && routine + 1 >= SLOTS)
+        {
+            continue;
         }
         free -= 1;
-        routine += usize::from(!urgent);
-        selected.push((id, urgent));
+        if class == Class::Routine {
+            routine += 1;
+            reserved = 0;
+        }
+        selected.push((id, class));
     }
     selected
 }
@@ -537,13 +604,7 @@ async fn run() -> Result<(), Error> {
                                 continue;
                             }
                             match result {
-                                Ok(Some(observed)) => {
-                                    let ready = matches!(text(&observed, "state"), "ready" | "deleted" | "hibernated");
-                                    cell.ready = ready;
-                                    cell.attempt = 0;
-                                    cell.due = started + Duration::from_secs(if ready { 60 } else { 1 });
-                                },
-                                Ok(None) => cell.due = started + Duration::from_secs(1),
+                                Ok(observed) => settle(cell, started, observed.as_ref()),
                                 Err(_) => {
                                     pull_ids.insert(id.clone());
                                     cell.attempt = cell.attempt.saturating_add(1);
@@ -588,11 +649,11 @@ async fn run() -> Result<(), Error> {
             }
         }
         if active.len() < SLOTS {
-            let busy: HashMap<String, bool> = active
+            let busy: HashMap<String, Class> = active
                 .iter()
-                .map(|(id, job)| (id.clone(), job.urgent))
+                .map(|(id, job)| (id.clone(), job.class))
                 .collect();
-            for (id, urgent) in schedule(&cells, &busy, Instant::now(), clock_ms(), control_healthy)
+            for (id, class) in schedule(&cells, &busy, Instant::now(), clock_ms(), control_healthy)
             {
                 let cell = &cells[&id];
                 let db = cell.db.clone();
@@ -646,7 +707,7 @@ async fn run() -> Result<(), Error> {
                         task: abort.id(),
                         abort,
                         kind,
-                        urgent,
+                        class,
                     },
                 );
             }
@@ -678,6 +739,27 @@ mod tests {
             fleet_release: Value::Null,
             databases: rows,
         }
+    }
+    fn cell(db: Value, due: Instant, ready: bool) -> Cell {
+        Cell {
+            db,
+            snapshot: Arc::new(snapshot(vec![])),
+            fingerprint: vec![],
+            due,
+            hints: 0,
+            ready,
+            renew: false,
+            attempt: 0,
+            authority_at: due,
+            woke: None,
+            stalled: 0,
+        }
+    }
+    fn wake(id: &str, operation: &str) -> Value {
+        json!({"id":id,"generation":3,"desired_state":"running","power":{"operation":operation,"revision":3,"mode":"running","reason":null}})
+    }
+    fn operation(index: usize) -> String {
+        format!("op_{index:0>20}")
     }
     #[test]
     fn delayed_target_pulls_never_downgrade_or_remove_newer_rows() {
@@ -731,19 +813,6 @@ mod tests {
     #[test]
     fn a_pending_wake_never_waits_behind_unrelated_reconciliation() {
         let started = Instant::now();
-        let shared = Arc::new(snapshot(vec![]));
-        let cell = |db: Value, due: Instant, ready: bool| Cell {
-            db,
-            snapshot: shared.clone(),
-            fingerprint: vec![],
-            due,
-            hints: 0,
-            ready,
-            renew: false,
-            attempt: 0,
-            authority_at: started,
-        };
-        let wake = |id: &str| json!({"id":id,"generation":3,"desired_state":"running","power":{"operation":format!("op_{}","a".repeat(20)),"revision":3,"mode":"running","reason":null}});
         let mut cells = HashMap::new();
         for index in 0..6 {
             let id = format!("routine{index}");
@@ -754,30 +823,105 @@ mod tests {
         }
         cells.insert(
             "wake".into(),
-            cell(wake("wake"), started + Duration::from_millis(5), false),
+            cell(
+                wake("wake", &operation(9)),
+                started + Duration::from_millis(5),
+                false,
+            ),
         );
         let now = started + Duration::from_millis(10);
-        let routine: HashMap<String, bool> = (0..3)
-            .map(|index| (format!("busy{index}"), false))
+        let routine: HashMap<String, Class> = (0..3)
+            .map(|index| (format!("busy{index}"), Class::Routine))
             .collect();
         assert_eq!(
             schedule(&cells, &routine, now, 0, true),
-            vec![("wake".to_string(), true)]
+            vec![("wake".to_string(), Class::Wake)]
         );
         cells.remove("wake");
         assert!(schedule(&cells, &routine, now, 0, true).is_empty());
         assert_eq!(schedule(&cells, &HashMap::new(), now, 0, true).len(), 3);
         for index in 0..SLOTS {
             let id = format!("wake{index}");
-            cells.insert(id.clone(), cell(wake(&id), now, false));
+            cells.insert(id.clone(), cell(wake(&id, &operation(index)), now, false));
         }
+        cells.retain(|id, _| id.starts_with("wake"));
         let selected = schedule(&cells, &HashMap::new(), now, 0, true);
         assert_eq!(selected.len(), SLOTS);
         assert!(
             selected
                 .iter()
-                .all(|(id, urgent)| *urgent && id.starts_with("wake"))
+                .all(|(id, class)| *class == Class::Wake && id.starts_with("wake"))
         );
+    }
+    #[test]
+    fn four_stuck_wakes_never_starve_a_due_renewal_or_routine_work() {
+        let started = Instant::now();
+        let mut cells = HashMap::new();
+        for index in 0..4 {
+            let id = format!("wake{index}");
+            cells.insert(
+                id.clone(),
+                cell(wake(&id, &operation(index)), started, false),
+            );
+        }
+        let mut renew = cell(json!({"id":"renew","generation":1}), started, true);
+        renew.renew = true;
+        cells.insert("renew".into(), renew);
+        cells.insert(
+            "routine".into(),
+            cell(json!({"id":"routine","generation":1}), started, true),
+        );
+        let now = started + Duration::from_millis(10);
+        // The renewal goes first like a protective stop; one slot stays with routine work.
+        assert_eq!(
+            schedule(&cells, &HashMap::new(), now, 0, true),
+            vec![
+                ("renew".to_string(), Class::Storage),
+                ("wake0".to_string(), Class::Wake),
+                ("wake1".to_string(), Class::Wake),
+                ("routine".to_string(), Class::Routine),
+            ]
+        );
+        // Three wakes still running: the free slot goes to the due routine job, not the fourth.
+        cells.remove("renew");
+        let wakes: HashMap<String, Class> = (0..3)
+            .map(|index| (format!("wake{index}"), Class::Wake))
+            .collect();
+        assert_eq!(
+            schedule(&cells, &wakes, now, 0, true),
+            vec![("routine".to_string(), Class::Routine)]
+        );
+        // Each stuck wake backs off after its first not-ready results.
+        let stuck = cells.get_mut("wake3").unwrap();
+        let delays: Vec<_> = (0..11)
+            .map(|_| {
+                settle(stuck, now, None);
+                stuck.due.duration_since(now).as_secs()
+            })
+            .collect();
+        assert_eq!(delays, [1, 1, 1, 1, 1, 2, 4, 8, 16, 30, 30]);
+        assert_eq!(class(stuck, 0), Class::Wake);
+    }
+    #[test]
+    fn only_a_power_operation_not_yet_observed_ready_is_a_wake() {
+        let now = Instant::now();
+        let mut database = cell(wake("db", &operation(1)), now, false);
+        assert_eq!(class(&database, 0), Class::Wake);
+        settle(&mut database, now, Some(&json!({"state":"provisioning"})));
+        assert_eq!(database.stalled, 1);
+        settle(&mut database, now, Some(&json!({"state":"ready"})));
+        assert!(database.ready);
+        assert_eq!(database.stalled, 0);
+        assert_eq!(database.due, now + Duration::from_secs(60));
+        // A later configuration change or failed check of the woken database is routine work.
+        database.ready = false;
+        assert_eq!(class(&database, 0), Class::Routine);
+        settle(&mut database, now, None);
+        assert_eq!(database.stalled, 0);
+        assert_eq!(database.due, now + Duration::from_secs(1));
+        // The next wake of the same database is a new power operation.
+        database.db = wake("db", &operation(2));
+        assert_eq!(class(&database, 0), Class::Wake);
     }
     #[test]
     fn runtime_lease_rotation_is_not_a_configuration_change() {
