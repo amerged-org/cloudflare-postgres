@@ -179,6 +179,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_fences(HashMap::from([(DATABASE.into(), fence("running", 1))])).await
+    }
+    async fn with_fences(fences: HashMap<String, Fence>) -> Self {
         let identity =
             generate_simple_self_signed(vec![format!("database-rw.pgcf-db-{DATABASE}.svc")])
                 .unwrap();
@@ -212,12 +215,7 @@ impl Fixture {
                 calls: calls.clone(),
             }),
         );
-        gateway
-            .fences
-            .write()
-            .await
-            .replace(HashMap::from([(DATABASE.into(), fence("running", 1))]))
-            .unwrap();
+        gateway.fences.write().await.replace(fences).unwrap();
         {
             let mut targets = gateway.targets.write().await;
             *targets =
@@ -936,6 +934,22 @@ async fn a_route_must_match_the_storage_binding_of_its_revision() {
         assert_eq!(fixture.upgrade(&route).await.err(), Some(503));
     }
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_v3_route_needs_the_running_fence_of_its_revision() {
+    // Without the controller's running fence the gateway cannot check the admitted revision.
+    let mut fixture = Fixture::with_fences(HashMap::new()).await;
+    assert_eq!(
+        fixture.upgrade(&routed(940, 1, &cid(200))).await.err(),
+        Some(503)
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    // Its running fence of that revision admits and dials the same route.
+    fixture.intent("running", 1, true).await;
+    let client = fixture.authenticate(941).await;
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    drop(client);
     fixture.stop().await;
 }
 #[tokio::test]

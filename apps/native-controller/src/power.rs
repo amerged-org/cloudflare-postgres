@@ -1651,9 +1651,16 @@ impl PowerCoordinator {
         db: &Value,
         observation: Value,
     ) -> std::result::Result<Option<Value>, Error> {
+        // The operation that brought this database into existence: its creation or, for a
+        // restored database, which has no creation, the restore.
+        let origin = if db["creation"].is_null() {
+            &db["recovery"]
+        } else {
+            &db["creation"]
+        };
         if observation["state"] != "ready"
             || text(db, "desired_state") != "running"
-            || db["creation"].is_null()
+            || origin.is_null()
         {
             return Ok(Some(observation));
         }
@@ -1676,7 +1683,7 @@ impl PowerCoordinator {
                 database: text(db, "id").into(),
                 operation: current
                     .map(|v| v.operation)
-                    .unwrap_or_else(|| text(&db["creation"], "operation_id").into()),
+                    .unwrap_or_else(|| text(origin, "operation_id").into()),
                 revision: number(db, "generation"),
                 mode: "running".into(),
             }))
@@ -3246,7 +3253,13 @@ mod tls_tests {
                             .unwrap()["metadata"]["uid"] = id(999).into();
                     }
                     let busy = busy_copy.load(Ordering::SeqCst);
-                    let body=json!({"database":claims["database"],"operation":claims["operation"],"revision":claims["revision"],"mode":"quiesce","pod":id(20),"status":if busy{"busy"}else{"closed"},"connections":u64::from(busy),"busyConnections":u64::from(busy),"pendingDials":0}).to_string();
+                    // A release acknowledges the running intent; every other action reports quiescence.
+                    let (mode, status) = if action == "release" {
+                        ("running", "running")
+                    } else {
+                        ("quiesce", if busy { "busy" } else { "closed" })
+                    };
+                    let body=json!({"database":claims["database"],"operation":claims["operation"],"revision":claims["revision"],"mode":mode,"pod":id(20),"status":status,"connections":u64::from(busy),"busyConnections":u64::from(busy),"pendingDials":0}).to_string();
                     socket.write_all(format!("HTTP/1.1 200 OK\r\ncontent-length: {}\r\ncontent-type: application/json\r\nconnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
                     let _ = socket.shutdown().await;
                 }
@@ -3947,5 +3960,67 @@ mod tls_tests {
                 .iter()
                 .any(|path| path.contains("maintenance-credentials"))
         );
+    }
+    #[tokio::test]
+    async fn a_ready_restored_database_publishes_its_running_fence_under_the_restore() {
+        // A restore creates its database without a creation operation; v3 routes need the
+        // running fence of the admitted revision before its first sleep.
+        let restore = format!("op_{}", "r".repeat(20));
+        let source = format!("d{}", "s".repeat(19));
+        let mut db = database();
+        db["creation"] = Value::Null;
+        db["storage_generation"] = 2.into();
+        db["archive"]["destination_path"] = format!(
+            "s3://native-controller-test/eu-test/{}/g2-{restore}",
+            text(&db, "id")
+        )
+        .into();
+        db["recovery"] = json!({"operation_id":restore,"source_database_id":source,"source_archive_path":format!("s3://native-controller-test/eu-test/{source}/g1-op_{}","s".repeat(20)),"source_storage_generation":1,"backup_id":"20261012T000000","status":"running","ever_ready":false});
+        assert!(database_valid(&db));
+        let server = Server::new(&db, false).await;
+        protected_objects(&server, &db);
+        {
+            // Running PostgreSQL: no hibernation and no physical protection stop.
+            let mut objects = server.objects.lock().unwrap();
+            let cluster = objects
+                .get_mut(&format!(
+                    "/apis/postgresql.cnpg.io/v1/namespaces/{}/clusters/database",
+                    namespace(&db)
+                ))
+                .unwrap();
+            cluster["metadata"]["annotations"]
+                .as_object_mut()
+                .unwrap()
+                .remove(HIBERNATION);
+            cluster["status"] = json!({});
+        }
+        let controls = Controls::new(&server, &db).await;
+        let mut coordinator = PowerCoordinator::with_clock(
+            server.k8s.clone(),
+            "eu-test".into(),
+            1,
+            Arc::new(|| 100_000),
+        )
+        .unwrap();
+        coordinator.http = controls.client.clone();
+        let ready = json!({"id":db["id"],"generation":1,"state":"ready","archive":{"continuous":true,"ready_wal_files":0}});
+        assert_eq!(
+            coordinator
+                .publish_ready_fence(&db, ready.clone())
+                .await
+                .unwrap(),
+            Some(ready)
+        );
+        let objects = server.objects.lock().unwrap();
+        let fence = &objects[&format!(
+            "/api/v1/namespaces/pgcf-system/configmaps/gateway-fence-{}",
+            text(&db, "id")
+        )];
+        let intent: Value = serde_json::from_str(text(&fence["data"], "intent.json")).unwrap();
+        assert_eq!(
+            intent,
+            json!({"database":db["id"],"operation":restore,"revision":1,"mode":"running"})
+        );
+        assert_eq!(controls.calls.load(Ordering::SeqCst), 1);
     }
 }
