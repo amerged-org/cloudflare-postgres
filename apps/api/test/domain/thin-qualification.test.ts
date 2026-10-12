@@ -3,9 +3,10 @@ import { env } from "cloudflare:workers";
 import {
   createExecutionContext,
   introspectWorkflowInstance,
+  runInDurableObject,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { ThinStorageProfile, newOperationId } from "@pgcf/contracts";
 import {
   FleetReleaseSpec,
@@ -20,6 +21,7 @@ import {
   type ThinQualificationRun,
 } from "@pgcf/contracts/thin-qualification";
 import { createApp } from "../../src/app.ts";
+import { NodeBootstrap } from "../../src/bootstrap-container.ts";
 import type { Env } from "../../src/env.ts";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 import { insertCompletedThinQualification } from "./thin-qualification-fixture.ts";
@@ -301,6 +303,123 @@ async function run(id: string) {
     .bind(id)
     .first())!;
 }
+/** One NodeBootstrap turn against a container double; the real test DO has no container. */
+async function containerTurn(
+  id: string,
+  step: string,
+  fetch: (request: Request) => Promise<Response>,
+) {
+  const container = {
+    running: true,
+    start: vi.fn(),
+    setInactivityTimeout: async () => {},
+    getTcpPort: () => ({
+      fetch: async (request: Request) =>
+        new URL(request.url).pathname === "/"
+          ? new Response(null, { status: 401 })
+          : fetch(request),
+    }),
+  };
+  const result = await runInDurableObject(
+    env.NODE_BOOTSTRAP.get(
+      env.NODE_BOOTSTRAP.idFromName(`thin-qualification:${id}`),
+    ),
+    async (_instance, state) => {
+      Object.defineProperty(state, "container", {
+        configurable: true,
+        value: container,
+      });
+      try {
+        return await new NodeBootstrap(state, env).thinQualification(id, step);
+      } finally {
+        delete (state as { container?: unknown }).container;
+      }
+    },
+  );
+  expect(container.start).not.toHaveBeenCalled();
+  return result;
+}
+async function unleased(f: Awaited<ReturnType<typeof qualificationSetup>>) {
+  const id = await insertRunning(f, "setup");
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET lease_id=NULL,lease_expires_at=NULL WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  return id;
+}
+
+it("ends the lease of a turn a freshly started container never received instead of holding it for 11 minutes", async () => {
+  const f = await qualificationSetup(),
+    id = await unleased(f),
+    requests: string[] = [];
+  const result = await containerTurn(id, "setup", async (request) => {
+    requests.push(`${request.method} ${new URL(request.url).pathname}`);
+    // Live on Dev: the POST threw within 5 s and the executor never made a callback.
+    if (request.method === "POST") throw new Error("Network connection lost.");
+    return Response.json({ state: "idle" });
+  });
+  expect(result).toEqual({ waiting: true });
+  expect(requests).toEqual(["POST /v1/thin-qualification", "GET /v1/turn"]);
+  // The next Workflow check starts the next turn; the step and its evidence stay unchanged.
+  expect(await run(id)).toMatchObject({
+    status: "running",
+    step: "setup",
+    error_code: null,
+    lease_id: null,
+    lease_expires_at: null,
+    lease_revision: 2,
+  });
+});
+
+it("keeps the lease while the container may still run the turn and then applies the outcome it retained", async () => {
+  const f = await qualificationSetup(),
+    id = await unleased(f),
+    held: unknown[] = [];
+  let turn: Record<string, unknown> = {},
+    posts = 0;
+  const records = [
+    { state: "receiving" },
+    // An executor without the turn record proves nothing either.
+    { error_code: "route_unknown" },
+    { state: "running", error_code: null },
+    { state: "failed", error_code: "thin_qualification_write_unconfirmed" },
+  ];
+  const result = await containerTurn(id, "setup", async (request) => {
+    if (request.method === "POST") {
+      posts++;
+      const { lease } = (
+        (await request.json()) as {
+          run: { lease: { operation_id: string; revision: number } };
+        }
+      ).run;
+      turn = {
+        kind: "thin_qualification",
+        operation_id: lease.operation_id,
+        revision: lease.revision,
+      };
+      // Live run 7: the request failed early while the executor kept running its turn.
+      throw new Error("Network connection lost.");
+    }
+    held.push((await run(id)).lease_id);
+    const next = records.shift()!;
+    return Response.json(
+      "state" in next && next.state !== "receiving"
+        ? { ...next, ...turn }
+        : next,
+      { status: "state" in next ? 200 : 404 },
+    );
+  });
+  // No second turn and no release while the executor may still hold the lease.
+  expect(posts).toBe(1);
+  expect(held).toEqual(Array(4).fill(turn.operation_id));
+  expect(result).toEqual({ failed: "thin_qualification_write_unconfirmed" });
+  expect(await run(id)).toMatchObject({
+    step: "cleanup",
+    error_code: "thin_qualification_write_unconfirmed",
+    lease_id: null,
+  });
+}, 30_000);
 
 it("release approval refuses hand-typed thin gate flags and accepts only a completed run's exact receipt", async () => {
   const f = await qualificationSetup(),

@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { cleanupFixtures, fixture } from "./fixtures.ts";
+import { NodeBootstrap } from "../../src/bootstrap-container.ts";
 import {
   storeRegionJoinBundle,
   joinBundleReference,
@@ -17,6 +18,7 @@ import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import { createApp } from "../../src/app.ts";
 import {
   createExecutionContext,
+  runInDurableObject,
   waitOnExecutionContext,
 } from "cloudflare:test";
 import type { Env } from "../../src/env.ts";
@@ -172,6 +174,61 @@ it("the actual D1 lease keeps an uncertain dispatched pool action and invalidate
   expect(
     (await call(await thinStorageCallbackBearer(selected, resumed!))).status,
   ).toBe(200);
+});
+it("ends only its own lease, without blocking, when the container never received the turn", async () => {
+  const f = await thinExecutionFixture(releases),
+    input = await prepareThinStorageLease(f.local, f.node),
+    requests: string[] = [];
+  const row = () =>
+    env.DB.prepare(
+      "SELECT status,error_code,lease_id,lease_expires_at,lease_revision,action_json FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first();
+  const before = await row();
+  expect(before).toMatchObject({
+    lease_id: input!.lease.operation_id,
+    error_code: null,
+  });
+  const container = {
+    running: true,
+    start: vi.fn(),
+    setInactivityTimeout: async () => {},
+    getTcpPort: () => ({
+      fetch: async (request: Request) => {
+        const path = new URL(request.url).pathname;
+        if (path === "/") return new Response(null, { status: 401 });
+        requests.push(`${request.method} ${path}`);
+        if (request.method === "POST")
+          throw new Error("Network connection lost.");
+        return Response.json({ state: "idle" });
+      },
+    }),
+  };
+  await runInDurableObject(
+    env.NODE_BOOTSTRAP.get(
+      env.NODE_BOOTSTRAP.idFromName(`thin-storage:${f.node}`),
+    ),
+    async (_instance, state) => {
+      Object.defineProperty(state, "container", {
+        configurable: true,
+        value: container,
+      });
+      try {
+        await new NodeBootstrap(state, f.local).thinStorage(f.node);
+      } finally {
+        delete (state as { container?: unknown }).container;
+      }
+    },
+  );
+  expect(requests).toEqual(["POST /v1/thin-storage", "GET /v1/turn"]);
+  // Not blocked, and a pool action stays for the next lease, which reads a dispatched one back.
+  expect(await row()).toEqual({
+    ...before,
+    lease_id: null,
+    lease_expires_at: null,
+  });
+  expect(container.start).not.toHaveBeenCalled();
 });
 it("the Native lease carries the completed patch's boot and its configuration-boot witness", async () => {
   const f = await thinExecutionFixture(releases);

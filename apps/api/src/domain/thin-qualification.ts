@@ -686,7 +686,8 @@ export async function releaseThinQualificationTurn(env: Env, id: string) {
   if (result.meta.changes !== 1) return closed();
   return { step: row.step, status: row.status, waiting: true };
 }
-/** The executor answered with an error: it has stopped, so its lease ends now. */
+/** The executor answered with an error, or (without a code) its container provably does not run
+ * the turn: it has stopped, so exactly this lease ends now. */
 export async function failThinQualificationTurn(
   env: Env,
   id: string,

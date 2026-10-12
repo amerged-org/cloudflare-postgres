@@ -18,6 +18,7 @@ import {
 import { readNodeAddition } from "./domain/node-state.ts";
 import {
   fleetPatchInput,
+  readFleetPatchStatus,
   recordFleetPatchFailure,
 } from "./domain/fleet-patches.ts";
 import {
@@ -29,9 +30,11 @@ import { NodeId } from "@pgcf/contracts";
 import {
   failThinQualificationTurn,
   prepareThinQualificationTurn,
-  releaseThinQualificationTurn,
 } from "./domain/thin-qualification.ts";
-import { FleetPatchStatus } from "@pgcf/contracts/fleet-patches";
+import {
+  NodeExecutorTurn,
+  NodeExecutorTurnStatus,
+} from "@pgcf/contracts/node-bootstrap";
 import { FleetRegionMaterialRotationInput } from "@pgcf/contracts/region-material-rotation";
 import {
   prepareNodeInspectionInput,
@@ -190,6 +193,24 @@ async function inspectionStatusBody(response: Response, signal: AbortSignal) {
     if (abort) signal.removeEventListener("abort", abort);
     void reader.cancel().catch(() => {});
   }
+}
+
+/** A turn request only registers the turn; the container's own record then follows it. */
+const TURN_REQUEST_MS = 10_000,
+  TURN_POLL_MS = 2_000;
+/** What the container's own record proves about one exact turn. Only a record of no turn or of
+ * another turn proves it is not running; a body still arriving or no readable record proves nothing. */
+export function executorTurnObservation(raw: unknown, turn: NodeExecutorTurn) {
+  const parsed = NodeExecutorTurnStatus.safeParse(raw);
+  if (!parsed.success || parsed.data.state === "receiving")
+    return { state: "unknown" } as const;
+  const record = parsed.data;
+  return record.state === "idle" ||
+    record.kind !== turn.kind ||
+    record.operation_id !== turn.operation_id ||
+    record.revision !== turn.revision
+    ? ({ state: "absent" } as const)
+    : record;
 }
 
 async function statusIdentifierHash(value: string) {
@@ -395,25 +416,34 @@ export class NodeBootstrap extends DurableObject<Env> {
     if (current.lease.revision !== input.lease.revision)
       throw new Error("thin_storage_container_input_changed");
     // The container bearer is fixed at start. A separate current lease bearer is only inside private input.
-    const response = await container.getTcpPort(8080).fetch(
-      new Request("http://localhost:8080/v1/thin-storage", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${serverBearer}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(current),
-        signal: AbortSignal.timeout(95000),
-      }),
+    const outcome = await this.#executorTurn(
+      container,
+      serverBearer,
+      "/v1/thin-storage",
+      current,
+      {
+        kind: "thin_storage",
+        operation_id: current.lease.operation_id,
+        revision: current.lease.revision,
+      },
+      95_000,
     );
-    if (!response.ok) {
-      const raw = (await response.json().catch(() => null)) as {
-        error_code?: unknown;
-      } | null;
+    if (outcome.state === "unanswered")
+      throw new Error("thin_storage_executor_unanswered");
+    if (outcome.state === "absent") {
+      // Not running here: only this lease ends now, and the next turn reads a dispatched action back.
+      await this.env.DB.prepare(
+        "UPDATE node_thin_storage SET lease_id=NULL,lease_expires_at=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
+      )
+        .bind(nodeId, current.lease.operation_id, current.lease.revision)
+        .run();
+      return;
+    }
+    if (outcome.state === "failed") {
       const code =
-        typeof raw?.error_code === "string" &&
-        /^thin_storage_[a-z0-9_]{1,80}$/.test(raw.error_code)
-          ? raw.error_code
+        outcome.error_code &&
+        /^thin_storage_[a-z0-9_]{1,80}$/.test(outcome.error_code)
+          ? outcome.error_code
           : "thin_storage_executor_unconfirmed";
       await this.env.DB.prepare(
         "UPDATE node_thin_storage SET status='blocked',error_code=? WHERE node_id=? AND lease_id=? AND lease_revision=?",
@@ -422,7 +452,6 @@ export class NodeBootstrap extends DurableObject<Env> {
         .run();
       throw new Error(code);
     }
-    const result = await response.json();
     await this.ctx.storage.setAlarm(
       Math.max(
         Date.now() + 1000,
@@ -430,7 +459,6 @@ export class NodeBootstrap extends DurableObject<Env> {
           input.lease.profile.guard_seconds * 500,
       ),
     );
-    return result;
   }
   /** One bounded scratch qualification turn in this run's own container. */
   async thinQualification(runId: string, step: string) {
@@ -463,40 +491,37 @@ export class NodeBootstrap extends DurableObject<Env> {
     await container.setInactivityTimeout(660_000);
     await this.ctx.storage.setAlarm(Date.now() + 720_000);
     await this.#waitForPort(container);
-    let response: Response;
-    try {
-      response = await container.getTcpPort(8080).fetch(
-        new Request("http://localhost:8080/v1/thin-qualification", {
-          method: "POST",
-          headers: {
-            authorization: `Bearer ${serverBearer}`,
-            "content-type": "application/json",
-          },
-          body: JSON.stringify(input),
-          signal: AbortSignal.timeout(630_000),
-        }),
-      );
-    } catch {
-      // An unanswered executor may still be inside its turn; its lease expires on its own.
+    const outcome = await this.#executorTurn(
+      container,
+      serverBearer,
+      "/v1/thin-qualification",
+      input,
+      {
+        kind: "thin_qualification",
+        operation_id: lease,
+        revision: input.run.lease.revision,
+      },
+      630_000,
+    );
+    // An unanswered executor may still be inside its turn; its lease expires on its own.
+    if (outcome.state === "unanswered") return { waiting: true };
+    // The executor ended its lease itself with its report or release.
+    if (outcome.state === "succeeded") return { waiting: false };
+    if (outcome.state === "absent" || outcome.error_code === "container_busy") {
+      // A turn the container never took or no longer runs ends its lease now, so the Workflow's
+      // next check continues; whatever it journaled is resolved by readback, never replayed.
+      await failThinQualificationTurn(this.env, runId, lease, null);
       return { waiting: true };
     }
-    if (!response.ok) {
-      const raw = (await response.json().catch(() => null)) as {
-        error_code?: unknown;
-      } | null;
-      if (raw?.error_code === "container_busy") {
-        await releaseThinQualificationTurn(this.env, runId);
-        return { waiting: true };
-      }
-      const code =
-        typeof raw?.error_code === "string" &&
-        /^thin_(?:qualification|storage)_[a-z0-9_]{1,80}$/.test(raw.error_code)
-          ? raw.error_code
-          : "thin_qualification_executor_unconfirmed";
-      await failThinQualificationTurn(this.env, runId, lease, code);
-      return { failed: code };
-    }
-    return (await response.json()) as unknown;
+    const code =
+      outcome.error_code &&
+      /^thin_(?:qualification|storage)_[a-z0-9_]{1,80}$/.test(
+        outcome.error_code,
+      )
+        ? outcome.error_code
+        : "thin_qualification_executor_unconfirmed";
+    await failThinQualificationTurn(this.env, runId, lease, code);
+    return { failed: code };
   }
   async patch(operationId: string) {
     OperationId.parse(operationId);
@@ -523,34 +548,30 @@ export class NodeBootstrap extends DurableObject<Env> {
     const current = await fleetPatchInput(this.env, operationId);
     if (current.status.revision !== input.status.revision)
       throw new Error("patch_container_input_changed");
-    const response = await container.getTcpPort(8080).fetch(
-      new Request("http://localhost:8080/v1/patches", {
-        method: "POST",
-        headers: {
-          authorization: `Bearer ${input.callback.bearer}`,
-          "content-type": "application/json",
-        },
-        body: JSON.stringify(current),
-        signal: AbortSignal.timeout(610_000),
-      }),
+    const outcome = await this.#executorTurn(
+      container,
+      input.callback.bearer,
+      "/v1/patches",
+      current,
+      {
+        kind: "patch",
+        operation_id: current.status.operation_id,
+        revision: current.status.revision,
+      },
+      610_000,
     );
-    if (!response.ok) {
-      const raw = await inspectionStatusBody(
-        response,
-        AbortSignal.timeout(5000),
-      ).catch(() => null);
+    if (outcome.state === "unanswered")
+      throw new Error("patch_executor_unanswered");
+    if (outcome.state === "failed") {
       const code =
-        typeof raw === "object" &&
-        raw !== null &&
-        "error_code" in raw &&
-        typeof raw.error_code === "string" &&
-        /^patch_[a-z0-9_]{1,80}$/.test(raw.error_code)
-          ? raw.error_code
+        outcome.error_code && /^patch_[a-z0-9_]{1,80}$/.test(outcome.error_code)
+          ? outcome.error_code
           : "patch_executor_refused";
       await recordFleetPatchFailure(this.env, operationId, code);
       throw new Error(code);
     }
-    return FleetPatchStatus.parse(await response.json());
+    // The turn ended, or the container provably runs no such turn: its outcome is the persisted state.
+    return readFleetPatchStatus(this.env, operationId);
   }
   private proofTurn: Promise<void> = Promise.resolve();
   async #registrationAuthority(operationId: string, admission: boolean) {
@@ -594,6 +615,95 @@ export class NodeBootstrap extends DurableObject<Env> {
       }
     }
     throw new Error("bootstrap_container_port_timeout");
+  }
+  /** Register one executor turn, then follow the container's own record of it. No request is held
+   * for the turn, so a lost answer is read again; only a record of no or another turn ends the wait
+   * early. The container runs one turn at a time and refuses another while this one runs. */
+  async #executorTurn(
+    container: NonNullable<DurableObjectState["container"]>,
+    bearer: string,
+    path: string,
+    input: unknown,
+    turn: NodeExecutorTurn,
+    timeoutMs: number,
+  ): Promise<
+    | { state: "succeeded" }
+    | { state: "absent" }
+    | { state: "unanswered" }
+    | { state: "failed"; error_code: string | null }
+  > {
+    const port = container.getTcpPort(8080),
+      deadline = Date.now() + timeoutMs,
+      authorization = `Bearer ${bearer}`;
+    // Container requests are raced: an unanswered fetch did not end on its abort signal.
+    const answer = await Promise.race([
+      port
+        .fetch(
+          new Request(`http://localhost:8080${path}`, {
+            method: "POST",
+            headers: { authorization, "content-type": "application/json" },
+            body: JSON.stringify(input),
+            signal: AbortSignal.timeout(TURN_REQUEST_MS),
+          }),
+        )
+        .catch(() => null),
+      scheduler.wait(TURN_REQUEST_MS).then(() => null),
+    ]);
+    if (answer && answer.status !== 202) {
+      // An executor that answers only after its whole turn has already ended it.
+      if (answer.ok) {
+        await answer.body?.cancel();
+        return { state: "succeeded" };
+      }
+      const raw = (await inspectionStatusBody(
+        answer,
+        AbortSignal.timeout(5000),
+      ).catch(() => null)) as { error_code?: unknown } | null;
+      return {
+        state: "failed",
+        error_code: typeof raw?.error_code === "string" ? raw.error_code : null,
+      };
+    }
+    await answer?.body?.cancel();
+    for (;;) {
+      const observed = executorTurnObservation(
+        await this.#turnRecord(port, authorization),
+        turn,
+      );
+      if (observed.state === "failed")
+        return { state: "failed", error_code: observed.error_code };
+      if (observed.state === "succeeded") return { state: "succeeded" };
+      const remaining = deadline - Date.now();
+      if (observed.state === "absent" || remaining <= 0) {
+        const state = observed.state === "absent" ? "absent" : "unanswered";
+        console.warn(
+          JSON.stringify({ event: `executor_turn_${state}`, ...turn }),
+        );
+        return { state };
+      }
+      await scheduler.wait(Math.min(TURN_POLL_MS, remaining));
+    }
+  }
+  /** The container's own turn record, or null when no readable answer arrived in time. */
+  async #turnRecord(port: Fetcher, authorization: string) {
+    const signal = AbortSignal.timeout(5000);
+    try {
+      const response = await Promise.race([
+        port.fetch(
+          new Request("http://localhost:8080/v1/turn", {
+            headers: { authorization },
+            signal,
+          }),
+        ),
+        scheduler.wait(5000).then(() => null),
+      ]);
+      if (response?.status === 200)
+        return await inspectionStatusBody(response, signal);
+      await response?.body?.cancel();
+    } catch {
+      // An unreadable answer is no evidence about the turn.
+    }
+    return null;
   }
   async #register(operationId: string, admission = false) {
     OperationId.parse(operationId);

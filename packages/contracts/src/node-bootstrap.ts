@@ -633,3 +633,27 @@ export const NodeBootstrapStatus = z.strictObject({
   checkpoint: NodeBootstrapCheckpoint,
 });
 export type NodeBootstrapStatus = z.infer<typeof NodeBootstrapStatus>;
+
+/** One fenced executor turn of a bootstrap container: the thin lease (id, revision) or the fleet
+ * patch (operation id, status revision) its input carries. */
+export const NodeExecutorTurn = z.strictObject({
+  kind: z.enum(["thin_storage", "thin_qualification", "patch"]),
+  operation_id: OperationId,
+  revision: z.number().int().nonnegative(),
+});
+export type NodeExecutorTurn = z.infer<typeof NodeExecutorTurn>;
+/** The container's own record: no turn yet, a turn body still arriving, or the last accepted turn
+ * with its outcome, which stays readable until the next turn replaces it. */
+export const NodeExecutorTurnStatus = z.union([
+  z.strictObject({ state: z.literal("idle") }),
+  z.strictObject({ state: z.literal("receiving") }),
+  NodeExecutorTurn.extend({
+    state: z.enum(["running", "succeeded"]),
+    error_code: z.null(),
+  }),
+  NodeExecutorTurn.extend({
+    state: z.literal("failed"),
+    error_code: z.string().regex(/^[a-z0-9_]{1,100}$/),
+  }),
+]);
+export type NodeExecutorTurnStatus = z.infer<typeof NodeExecutorTurnStatus>;

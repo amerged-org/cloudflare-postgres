@@ -6,7 +6,12 @@ import {
   type ServerResponse,
 } from "node:http";
 import { pathToFileURL } from "node:url";
+import { z } from "zod";
 import { OperationId } from "@pgcf/contracts";
+import type {
+  NodeExecutorTurn,
+  NodeExecutorTurnStatus,
+} from "@pgcf/contracts/node-bootstrap";
 import { NodeInspectionInput } from "@pgcf/contracts/node-installation";
 import { runInspection } from "./inspector.ts";
 import { NodeProofExecutionInput } from "@pgcf/contracts/node-proof";
@@ -57,6 +62,31 @@ function reply(response: ServerResponse, status: number, value: unknown) {
   });
   response.end(JSON.stringify(value));
 }
+/** The API records only codes with its route prefix; private exception messages never leave. */
+function failureCode(error: unknown, prefix: string | undefined) {
+  const code =
+    error instanceof BootstrapError
+      ? error.code
+      : error instanceof Error &&
+          (/^infrastructure_backup_[a-z0-9_]{1,90}$/.test(error.message) ||
+            // Backup preparation passes talos-operator's plain error codes through.
+            (prefix === "infrastructure_backup_" &&
+              /^operator_[a-z0-9_]{1,80}$/.test(error.message)))
+        ? error.message
+        : "request_invalid";
+  return {
+    code,
+    prefixed:
+      prefix && !code.startsWith(prefix) && /^[a-z0-9_]{1,80}$/.test(code)
+        ? `${prefix}${code}`
+        : code,
+  };
+}
+/** Each executor input carries the fence of its turn: its thin lease or its patch status. */
+const TurnFence = z.object({
+  operation_id: OperationId,
+  revision: z.number().int().nonnegative(),
+});
 export function createBootstrapServer(
   bearer: string,
   options: BootstrapOptions & {
@@ -76,6 +106,48 @@ export function createBootstrapServer(
   let rotationRunning = false;
   let backup: Awaited<ReturnType<typeof prepareDailyBackup>> | undefined;
   let backupInput: InfrastructureBackupInput | undefined;
+  /** The last accepted executor turn; it stays readable after it ends until the next one. */
+  let turn:
+    | Exclude<NodeExecutorTurnStatus, { state: "idle" | "receiving" }>
+    | undefined;
+  const executors = new Map<
+    string,
+    {
+      kind: NodeExecutorTurn["kind"];
+      fence: (input: unknown) => z.infer<typeof TurnFence>;
+      run: (
+        input: unknown,
+        options: Pick<BootstrapOptions, "run" | "request">,
+      ) => Promise<unknown>;
+    }
+  >([
+    [
+      "/v1/thin-storage",
+      {
+        kind: "thin_storage",
+        fence: (input) => z.object({ lease: TurnFence }).parse(input).lease,
+        run: options.thinStorage ?? runThinStorage,
+      },
+    ],
+    [
+      "/v1/thin-qualification",
+      {
+        kind: "thin_qualification",
+        fence: (input) =>
+          z.object({ run: z.object({ lease: TurnFence }) }).parse(input).run
+            .lease,
+        run: options.thinQualification ?? runThinQualification,
+      },
+    ],
+    [
+      "/v1/patches",
+      {
+        kind: "patch",
+        fence: (input) => z.object({ status: TurnFence }).parse(input).status,
+        run: options.patch ?? runFleetPatch,
+      },
+    ],
+  ]);
   const inspections = new Map<
     string,
     {
@@ -207,7 +279,9 @@ export function createBootstrapServer(
       }
       if (backupInput)
         throw new BootstrapError("infrastructure_backup_container_only");
-      if (request.method === "POST" && path === "/v1/thin-storage") {
+      const executor =
+        request.method === "POST" ? executors.get(path) : undefined;
+      if (executor) {
         if (
           patchRunning ||
           installationRegistration ||
@@ -218,68 +292,50 @@ export function createBootstrapServer(
           throw new BootstrapError("container_busy");
         patchRunning = true;
         patchRegistered = true;
+        let accepted = false;
         try {
-          reply(
-            response,
-            200,
-            await (options.thinStorage ?? runThinStorage)(await body(request), {
-              run: options.run,
-              request: options.request,
-            }),
-          );
+          const input = await body(request),
+            identity = { kind: executor.kind, ...executor.fence(input) };
+          // The request only registers the turn: an answer lost in transit never loses its outcome.
+          const running = executor.run(input, {
+            run: options.run,
+            request: options.request,
+          });
+          turn = { state: "running", ...identity, error_code: null };
+          accepted = true;
+          void running
+            .then(
+              () => {
+                turn = { state: "succeeded", ...identity, error_code: null };
+              },
+              (error: unknown) => {
+                const prefix = executor.kind === "patch" ? "patch_" : undefined,
+                  code = failureCode(error, prefix).prefixed;
+                turn = {
+                  state: "failed",
+                  ...identity,
+                  error_code: /^[a-z0-9_]{1,100}$/.test(code)
+                    ? code
+                    : failureCode(null, prefix).prefixed,
+                };
+              },
+            )
+            .finally(() => {
+              patchRunning = false;
+            });
+          reply(response, 202, turn);
         } finally {
-          patchRunning = false;
+          if (!accepted) patchRunning = false;
         }
         return;
       }
-      if (request.method === "POST" && path === "/v1/thin-qualification") {
-        if (
-          patchRunning ||
-          installationRegistration ||
-          [...jobs.values()].some((v) => v.running) ||
-          [...inspections.values()].some((v) => v.running) ||
-          [...proofs.values()].some((v) => v.running)
-        )
-          throw new BootstrapError("container_busy");
-        patchRunning = true;
-        patchRegistered = true;
-        try {
-          reply(
-            response,
-            200,
-            await (options.thinQualification ?? runThinQualification)(
-              await body(request),
-              { run: options.run, request: options.request },
-            ),
-          );
-        } finally {
-          patchRunning = false;
-        }
-        return;
-      }
-      if (request.method === "POST" && path === "/v1/patches") {
-        if (
-          patchRunning ||
-          installationRegistration ||
-          [...jobs.values()].some((v) => v.running) ||
-          [...inspections.values()].some((v) => v.running) ||
-          [...proofs.values()].some((v) => v.running)
-        )
-          throw new BootstrapError("container_busy");
-        patchRunning = true;
-        patchRegistered = true;
-        try {
-          reply(
-            response,
-            200,
-            await (options.patch ?? runFleetPatch)(await body(request), {
-              run: options.run,
-              request: options.request,
-            }),
-          );
-        } finally {
-          patchRunning = false;
-        }
+      if (request.method === "GET" && path === "/v1/turn") {
+        // A body still arriving replaces the record, so the container cannot name its turn yet.
+        const status: NodeExecutorTurnStatus =
+          patchRunning && turn?.state !== "running"
+            ? { state: "receiving" }
+            : (turn ?? { state: "idle" });
+        reply(response, 200, status);
         return;
       }
       if (patchRegistered) throw new BootstrapError("patch_container_only");
@@ -530,27 +586,14 @@ export function createBootstrapServer(
       }
     };
     void handle().catch((error: unknown) => {
-      // The API records only codes with its route prefix; any other code would lose the cause.
-      const prefix =
+      const { code, prefixed: responseCode } = failureCode(
+        error,
         request.url === "/v1/patches"
           ? "patch_"
           : request.url?.startsWith("/v1/infrastructure-backups")
             ? "infrastructure_backup_"
-            : undefined;
-      const code =
-        error instanceof BootstrapError
-          ? error.code
-          : error instanceof Error &&
-              (/^infrastructure_backup_[a-z0-9_]{1,90}$/.test(error.message) ||
-                // Backup preparation passes talos-operator's plain error codes through.
-                (prefix === "infrastructure_backup_" &&
-                  /^operator_[a-z0-9_]{1,80}$/.test(error.message)))
-            ? error.message
-            : "request_invalid";
-      const responseCode =
-        prefix && !code.startsWith(prefix) && /^[a-z0-9_]{1,80}$/.test(code)
-          ? `${prefix}${code}`
-          : code;
+            : undefined,
+      );
       if (response.headersSent) {
         response.destroy();
         return;

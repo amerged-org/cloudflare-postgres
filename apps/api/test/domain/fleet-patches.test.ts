@@ -2,9 +2,10 @@
 import { env } from "cloudflare:workers";
 import {
   createExecutionContext,
+  runInDurableObject,
   waitOnExecutionContext,
 } from "cloudflare:test";
-import { afterEach, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 import { newOperationId } from "@pgcf/contracts";
 import {
   FleetPatchStatus,
@@ -16,6 +17,7 @@ import {
   continueFleetPatchRegion,
   fleetPatchInput,
   readFleetPatch,
+  readFleetPatchStatus,
   recordFleetPatchCheckpoint,
   assertFleetPatchAuthority,
   fleetPatchAuthoritySql,
@@ -31,6 +33,7 @@ import {
 } from "../../src/crypto/bootstrap-credentials.ts";
 import { installationHash } from "../../src/domain/node-installation.ts";
 import { createApp } from "../../src/app.ts";
+import { NodeBootstrap } from "../../src/bootstrap-container.ts";
 import type { Env } from "../../src/env.ts";
 import generatedPool from "../../../../packages/contracts/native/compute-pool.generated.json" with { type: "json" };
 import {
@@ -336,6 +339,58 @@ it("uses current sealed custody without reopening a bootstrap job or touching pr
     (await request(`/v1/fleet/patches/${f.op}`, f.integrator)).status,
   ).toBe(403);
 });
+it("ends a turn whose answer never arrived once the container's record shows it ended", async () => {
+  const f = await setup();
+  let turn: Record<string, unknown> | undefined;
+  const container = {
+    running: true,
+    start: vi.fn(),
+    setInactivityTimeout: async () => {},
+    getTcpPort: () => ({
+      fetch: async (request: Request) => {
+        if (new URL(request.url).pathname === "/")
+          return new Response(null, { status: 401 });
+        if (request.method === "POST") {
+          const { status } = (await request.json()) as {
+            status: { operation_id: string; revision: number };
+          };
+          turn = {
+            kind: "patch",
+            operation_id: status.operation_id,
+            revision: status.revision,
+          };
+          // Live on Dev: the turn ended after about 30 s, but its answer never arrived.
+          return new Promise<Response>(() => {});
+        }
+        return Response.json({ state: "succeeded", ...turn, error_code: null });
+      },
+    }),
+  };
+  const started = Date.now();
+  const result = await runInDurableObject(
+    env.NODE_BOOTSTRAP.get(
+      env.NODE_BOOTSTRAP.idFromName(`fleet-patch:${f.op}`),
+    ),
+    async (_instance, state) => {
+      Object.defineProperty(state, "container", {
+        configurable: true,
+        value: container,
+      });
+      try {
+        return await new NodeBootstrap(state, f.runtime).patch(f.op);
+      } finally {
+        delete (state as { container?: unknown }).container;
+      }
+    },
+  );
+  // Bounded by the turn request, far inside the 11-minute Workflow step.
+  expect(Date.now() - started).toBeLessThan(20_000);
+  expect(turn).toEqual({ kind: "patch", operation_id: f.op, revision: 0 });
+  // The turn's outcome is the persisted state; nothing records a failure.
+  expect(result).toEqual(await readFleetPatchStatus(f.runtime, f.op));
+  expect((await readFleetPatch(f.runtime, f.op)).error_code).toBeNull();
+  expect(container.start).not.toHaveBeenCalled();
+}, 30_000);
 it("exposes the initial bootstrap hash only for the same admitted released Node and provider", async () => {
   const f = await setup(),
     operation = newOperationId(),

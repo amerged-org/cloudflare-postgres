@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { once } from "node:events";
+import { request, type IncomingMessage } from "node:http";
 import { test } from "node:test";
 import { NodeBootstrapCallback } from "@pgcf/contracts/node-bootstrap";
 import { inputHash } from "../src/bootstrap.ts";
@@ -312,10 +313,106 @@ test(
   },
 );
 
-test("patch failures preserve the safe executor code without exposing private exception messages", async () => {
+test(
+  "an executor turn registers at once and the container's own record follows that exact turn",
+  { timeout: 5000 },
+  async () => {
+    const bearer = randomBytes(32).toString("base64url"),
+      secret = randomBytes(32).toString("base64url"),
+      turn = { operation_id: `op_${"a".repeat(20)}`, revision: 7 };
+    let release!: () => void, entered!: () => void, received!: () => void;
+    const held = new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+      began = new Promise<void>((resolve) => {
+        entered = resolve;
+      }),
+      receiving = new Promise<void>((resolve) => {
+        received = resolve;
+      });
+    const runtime = createBootstrapServer(bearer, {
+      thinQualification: async () => {
+        entered();
+        await held;
+        return { waiting: false };
+      },
+    });
+    runtime.server.on("request", (incoming: IncomingMessage) => {
+      if (incoming.method === "POST") received();
+    });
+    runtime.server.listen(0, LOOPBACK);
+    await once(runtime.server, "listening");
+    const address = runtime.server.address();
+    assert.ok(address && typeof address !== "string");
+    const url = `http://${LOOPBACK}:${address.port}`,
+      headers = { authorization: `Bearer ${bearer}` };
+    const record = async () => {
+      const response = await fetch(`${url}/v1/turn`, { headers });
+      assert.equal(response.status, 200);
+      return response.text();
+    };
+    try {
+      const body = JSON.stringify({
+        run: { lease: turn },
+        callback: { bearer: secret },
+      });
+      const posted = request(`${url}/v1/thin-qualification`, {
+        method: "POST",
+        headers: {
+          ...headers,
+          "content-type": "application/json",
+          "content-length": String(Buffer.byteLength(body)),
+        },
+      });
+      // A failed assertion closes the server under this request; that must not outlive the test.
+      posted.on("error", () => {});
+      posted.write(body.slice(0, 16));
+      await receiving;
+      // Until its body arrived the container cannot know which turn it is receiving.
+      assert.deepEqual(JSON.parse(await record()), { state: "receiving" });
+      posted.end(body.slice(16));
+      const [answer] = (await once(posted, "response")) as [IncomingMessage];
+      let accepted = "";
+      for await (const chunk of answer) accepted += String(chunk);
+      const running = {
+        state: "running",
+        kind: "thin_qualification",
+        ...turn,
+        error_code: null,
+      };
+      assert.equal(answer.statusCode, 202);
+      assert.deepEqual(JSON.parse(accepted), running);
+      await began;
+      assert.equal((await fetch(`${url}/v1/turn`)).status, 401);
+      assert.deepEqual(JSON.parse(await record()), running);
+      const busy = await fetch(`${url}/v1/patches`, {
+        method: "POST",
+        headers: { ...headers, "content-type": "application/json" },
+        body: JSON.stringify({ status: turn }),
+      });
+      assert.equal(busy.status, 409);
+      assert.deepEqual(await busy.json(), {
+        error_code: "patch_container_busy",
+      });
+      release();
+      await new Promise((resolve) => setImmediate(resolve));
+      // The ended turn's record stays readable, so a lost answer never loses its outcome.
+      const ended = await record();
+      assert.deepEqual(JSON.parse(ended), { ...running, state: "succeeded" });
+      assert.ok(!ended.includes(secret));
+    } finally {
+      release();
+      runtime.stop();
+      runtime.server.closeAllConnections();
+    }
+  },
+);
+
+test("a failed turn keeps only its safe executor code in the container's record", async () => {
   const { BootstrapError } = await import("../src/bootstrap.ts");
   const bearer = randomBytes(32).toString("base64url"),
-    secret = randomBytes(32).toString("base64url");
+    secret = randomBytes(32).toString("base64url"),
+    turn = { operation_id: `op_${"b".repeat(20)}`, revision: 3 };
   let error: Error = new BootstrapError("command_output_limit");
   const runtime = createBootstrapServer(bearer, {
     patch: async () => {
@@ -326,24 +423,45 @@ test("patch failures preserve the safe executor code without exposing private ex
   await once(runtime.server, "listening");
   const address = runtime.server.address();
   assert.ok(address && typeof address !== "string");
-  const call = () =>
-    fetch(`http://${LOOPBACK}:${address.port}/v1/patches`, {
+  const url = `http://${LOOPBACK}:${address.port}`,
+    headers = {
+      authorization: `Bearer ${bearer}`,
+      "content-type": "application/json",
+    };
+  const call = async (body: unknown) => {
+    const accepted = await fetch(`${url}/v1/patches`, {
       method: "POST",
-      headers: {
-        authorization: `Bearer ${bearer}`,
-        "content-type": "application/json",
-      },
+      headers,
+      body: JSON.stringify(body),
+    });
+    assert.equal(accepted.status, 202);
+    await accepted.body?.cancel();
+    await new Promise((resolve) => setImmediate(resolve));
+    return (await fetch(`${url}/v1/turn`, { headers })).text();
+  };
+  const failed = (error_code: string) => ({
+    state: "failed",
+    kind: "patch",
+    ...turn,
+    error_code,
+  });
+  try {
+    assert.deepEqual(
+      JSON.parse(await call({ status: turn })),
+      failed("patch_command_output_limit"),
+    );
+    error = new Error(secret);
+    const unexpected = await call({ status: turn });
+    assert.deepEqual(JSON.parse(unexpected), failed("patch_request_invalid"));
+    assert.ok(!unexpected.includes(secret));
+    // Input without the fence of its turn is refused before anything runs.
+    const unfenced = await fetch(`${url}/v1/patches`, {
+      method: "POST",
+      headers,
       body: "{}",
     });
-  try {
-    const bounded = await call();
-    assert.equal(bounded.status, 400);
-    assert.deepEqual(await bounded.json(), {
-      error_code: "patch_command_output_limit",
-    });
-    error = new Error(secret);
-    const unexpected = await call();
-    assert.deepEqual(await unexpected.json(), {
+    assert.equal(unfenced.status, 400);
+    assert.deepEqual(await unfenced.json(), {
       error_code: "patch_request_invalid",
     });
   } finally {
