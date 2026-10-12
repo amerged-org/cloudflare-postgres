@@ -71,6 +71,10 @@ interface Pod {
   created: string;
   phase: "Pending" | "Running" | "Failed";
   claim: string;
+  /** The container script; a PostgreSQL Pod's start is checked against its data directory. */
+  script: string;
+  /** kubelet's default fsGroupChangePolicy re-applies the group to every file on each mount. */
+  fsGroupAlways: boolean;
 }
 interface Claim {
   name: string;
@@ -78,6 +82,8 @@ interface Claim {
   rv: number;
   size: number;
   bound: boolean;
+  /** PGDATA's mode once initdb created it on this volume. */
+  pgdata?: number;
 }
 interface Persistent {
   name: string;
@@ -465,6 +471,8 @@ export class ThinWorld {
     spec: {
       resources?: { requests: { storage: string } };
       volumes?: { persistentVolumeClaim?: { claimName: string } }[];
+      securityContext?: { fsGroup?: number; fsGroupChangePolicy?: string };
+      containers?: { command?: string[] }[];
     };
   }): CommandResult {
     const name = manifest.metadata.name;
@@ -483,6 +491,7 @@ export class ThinWorld {
     this.log.push(`create ${manifest.kind} ${name}`);
     if (manifest.kind !== "Pod")
       throw new Error(`unexpected_create_${manifest.kind}`);
+    const security = manifest.spec.securityContext ?? {};
     const pod: Pod = {
       name,
       uid: randomUUID(),
@@ -490,6 +499,10 @@ export class ThinWorld {
       created: new Date().toISOString(),
       phase: "Pending",
       claim: manifest.spec.volumes![0]!.persistentVolumeClaim!.claimName,
+      script: manifest.spec.containers![0]!.command!.at(-1)!,
+      fsGroupAlways:
+        security.fsGroup !== undefined &&
+        security.fsGroupChangePolicy !== "OnRootMismatch",
     };
     this.pods.set(name, pod);
     this.schedule(pod);
@@ -524,6 +537,18 @@ export class ThinWorld {
         size: claim.size,
         tags: [],
       });
+    }
+    if (claim && pod.script.includes("exec postgres")) {
+      // The mount re-applies fsGroup (group rwx, setgid) to an existing PGDATA; initdb creates 0700.
+      if (claim.pgdata === undefined) claim.pgdata = 0o700;
+      else if (pod.fsGroupAlways) claim.pgdata = 0o2770;
+      if (/chmod 0700 "\$PGDATA"[\s\S]*exec postgres/.test(pod.script))
+        claim.pgdata = 0o700;
+      // PostgreSQL refuses any data directory mode other than 0700 or 0750 and exits.
+      if (claim.pgdata !== 0o700 && claim.pgdata !== 0o750) {
+        pod.phase = "Failed";
+        return;
+      }
     }
     pod.phase = "Running";
   }
@@ -1036,6 +1061,8 @@ export function thinQualificationRun(
         rv: world.nextVersion(),
         size: lv.size,
         bound: true,
+        // A seeded workload already ran: a PostgreSQL volume keeps initdb's 0700 PGDATA.
+        pgdata: 0o700,
       });
       world.volumes.set(pv, {
         name: pv,
@@ -1052,6 +1079,8 @@ export function thinQualificationRun(
           created: new Date().toISOString(),
           phase: "Running",
           claim: name,
+          script: "exec sleep infinity",
+          fsGroupAlways: true,
         });
       const facts = {
         claim_uid: claim,

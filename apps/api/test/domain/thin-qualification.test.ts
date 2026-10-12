@@ -716,6 +716,46 @@ it("waits out a turn lease an unanswered executor still holds before the next tu
   }
 }, 15_000);
 
+it("continues as soon as an executor releases its lease early instead of sleeping out the whole lease", async () => {
+  const f = await qualificationSetup(),
+    id = await insertRunning(f, "cleanup");
+  // The executor's RPC answered early, while its ten-minute lease still ran; it ends the turn soon.
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET lease_expires_at=? WHERE id=?",
+  )
+    .bind(new Date(Date.now() + 600_000).toISOString(), id)
+    .run();
+  const instance = await introspectWorkflowInstance(env.THIN_QUALIFICATION, id);
+  try {
+    await instance.modify((m) =>
+      m.disableSleeps(
+        [...THIN_QUALIFICATION_STEPS, "complete"].flatMap((name) =>
+          Array.from({ length: 64 }, (_, turn) => ({
+            name: `${name}-wait-${turn}`,
+          })),
+        ),
+      ),
+    );
+    await env.THIN_QUALIFICATION.create({ id, params: { run_id: id } });
+    expect(await instance.waitForStepResult({ name: "setup-0" })).toMatchObject(
+      { step: "cleanup", status: "running" },
+    );
+    await env.DB.prepare(
+      "UPDATE thin_storage_qualification_runs SET lease_id=NULL,lease_expires_at=NULL WHERE id=?",
+    )
+      .bind(id)
+      .run();
+    await instance.waitForStatus("complete");
+    expect(await run(id)).toMatchObject({
+      status: "failed",
+      step: "complete",
+      error_code: "thin_qualification_cleanup_deadline",
+    });
+  } finally {
+    await instance.dispose();
+  }
+}, 90_000);
+
 it("reports a lost Workflow start and drives the committed run again on replay", async () => {
   const f = await qualificationSetup(),
     body = { node_uid: f.uid, address: "192.0.2.18", profile },

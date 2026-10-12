@@ -93,6 +93,31 @@ export function lvmRows(raw: string, key: string) {
   const reports = items(value.report);
   return reports.flatMap((report) => items(report[key]));
 }
+const devices = (dm: string) =>
+  new Set(
+    dm
+      .split("\n")
+      .map((v) => v.trim())
+      .filter(Boolean),
+  );
+/** lvm-localpv creates and removes volumes while we read. LVM changes a device and its metadata under
+ * the VG lock that `lvs` waits for, but `dmsetup` takes none: read the device list before and after
+ * `vgs`/`lvs`, and require an LV only for a device both reads list. */
+export async function readThinLvm(
+  exec: (args: string[]) => Promise<CommandResult>,
+  lvFields = THIN_LV_FIELDS,
+) {
+  const [vgsArgs, lvsArgs, dmArgs] = thinLvmReadCommands(lvFields);
+  const before = await exec(dmArgs!);
+  const [vg, lv] = await Promise.all([exec(vgsArgs!), exec(lvsArgs!)]);
+  const after = await exec(dmArgs!);
+  return {
+    vgs: vg.stdout,
+    lvs: lv.stdout,
+    dm: after.stdout,
+    before: before.stdout,
+  };
+}
 /** `lvs` prints one row per segment once a segment field such as `segtype` is requested, so a grown
  * pool's hidden data LV or an extended linear LV appears once per segment; those rows must agree. */
 export function lvmVolumes(raw: string, conflict: () => never) {
@@ -177,6 +202,7 @@ export function thinLvmFacts(
   vgs: string,
   lvs: string,
   dm: string,
+  before = dm,
 ): ThinLvmFacts {
   const groups = lvmRows(vgs, "vg");
   if (groups.length !== 1)
@@ -255,8 +281,9 @@ export function thinLvmFacts(
     const lv = volumes.find((v) =>
       rest.startsWith(v.lv_uuid.replaceAll("-", "")),
     );
-    if (!lv) throw new BootstrapError("thin_storage_kernel_lv_unexplained");
-    active.add(lv.lv_uuid);
+    if (lv) active.add(lv.lv_uuid);
+    else if (devices(before).has(raw))
+      throw new BootstrapError("thin_storage_kernel_lv_unexplained");
   }
   return {
     vg_uuid,
@@ -908,10 +935,8 @@ export async function verifyThinNode(
   )
     throw new BootstrapError("thin_storage_driver_unqualified");
   const readLvm = async () => {
-    const [vg, lv, dm] = await Promise.all(
-      thinLvmReadCommands().map((args) => driverExec(args)),
-    );
-    return thinLvmFacts(vg!.stdout, lv!.stdout, dm!.stdout);
+    const read = await readThinLvm((args) => driverExec(args));
+    return thinLvmFacts(read.vgs, read.lvs, read.dm, read.before);
   };
   return {
     authorize,

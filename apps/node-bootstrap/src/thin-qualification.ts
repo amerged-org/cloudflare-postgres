@@ -26,13 +26,13 @@ import {
   items,
   lvmRows,
   lvmVolumes,
+  readThinLvm,
   lvmUid,
   metadata,
   object,
   openThinSession,
   text,
   thinIoLimit,
-  thinLvmReadCommands,
   thinPodCgroupPaths,
   thinPoolCommand,
   uid,
@@ -244,7 +244,7 @@ export function parseWriteOutcome(raw: string): ThinQualificationWrite {
         ? null
         : /No space left on device/.test(raw)
           ? "enospc"
-          : /Input\/output error/.test(raw)
+          : /Input\/output error|: I\/O error$/m.test(raw)
             ? "eio"
             : "other",
     written_bytes:
@@ -348,6 +348,7 @@ export function parseQualificationLvm(
   vgs: string,
   lvs: string,
   dm: string,
+  before = dm,
 ): QualificationLvm {
   const groups = lvmRows(vgs, "vg");
   if (groups.length !== 1) fail("volume_group_ambiguous");
@@ -408,8 +409,9 @@ export function parseQualificationLvm(
     if (!raw.startsWith(prefix)) continue;
     const rest = raw.slice(prefix.length),
       lv = volumes.find((value) => rest.startsWith(hex(value.lv_uuid)));
-    if (!lv) fail("kernel_volume_unexplained");
-    active.add(lv.lv_uuid);
+    if (lv) active.add(lv.lv_uuid);
+    else if (before.split("\n").some((line) => line.trim() === raw))
+      fail("kernel_volume_unexplained");
   }
   return {
     volume_group_uuid: vg,
@@ -688,12 +690,16 @@ class Qualifier {
 
   // Physical LVM and device-mapper reads through the driver container.
   private async lvm(): Promise<QualificationLvm> {
-    const [vg, lv, dm] = await Promise.all(
-      thinLvmReadCommands(QUALIFICATION_LV_FIELDS).map((args) =>
-        this.node.driverExec(args),
-      ),
+    const read = await readThinLvm(
+      (args) => this.node.driverExec(args),
+      QUALIFICATION_LV_FIELDS,
     );
-    const value = parseQualificationLvm(vg!.stdout, lv!.stdout, dm!.stdout);
+    const value = parseQualificationLvm(
+      read.vgs,
+      read.lvs,
+      read.dm,
+      read.before,
+    );
     if (this.vg !== null && value.volume_group_uuid !== this.vg)
       fail("volume_group_identity_changed");
     return value;
@@ -968,11 +974,14 @@ class Qualifier {
     };
   }
   private podManifest(name: string, kind: PodKind) {
+    // Each mount re-applies fsGroup to every file, so a restarted Pod finds PGDATA group-writable,
+    // which PostgreSQL refuses; like CNPG's instance manager, reset it to 0700 before starting.
     const script =
       kind === "postgres"
         ? `set -eu
 export PGDATA=/data/pgdata
 if [ ! -s "$PGDATA/PG_VERSION" ]; then initdb -D "$PGDATA" --username=postgres --no-locale --encoding=UTF8 --auth=trust >/work/initdb.log 2>&1; fi
+chmod 0700 "$PGDATA"
 exec postgres -D "$PGDATA" -k /run/q -c listen_addresses= -c shared_buffers=32MB -c max_connections=10 -c fsync=on -c synchronous_commit=on -c full_page_writes=on -c restart_after_crash=off`
         : "exec sleep infinity";
     return {

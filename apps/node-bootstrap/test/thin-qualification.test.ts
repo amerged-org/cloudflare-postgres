@@ -6,6 +6,7 @@ import {
   thinQualificationCleanupVerified,
   type ThinQualificationCleanup,
   type ThinQualificationJournalEntry,
+  THIN_QUALIFICATION_LIMITS,
 } from "@pgcf/contracts/thin-qualification";
 import {
   QualificationJournal,
@@ -191,6 +192,17 @@ pgcf-end=1237.40
 pgcf-rc=1
 pgcf-start=88.10
 pgcf-end=97.95
+`).error,
+    "eio",
+  );
+  // The pinned driver image is Alpine: musl's strerror(EIO) is "I/O error", not glibc's wording.
+  assert.equal(
+    parseWriteOutcome(`dd: error writing '/dev/mapper/pgcf-pgcf_thin_q_v': I/O error
+13392+0 records in
+13391+0 records out
+pgcf-rc=1
+pgcf-start=12.00
+pgcf-end=40.25
 `).error,
     "eio",
   );
@@ -486,7 +498,7 @@ test("scratch class removal is allowed only for qualification classes and may fo
 function scratchMeasured(run: ReturnType<typeof thinQualificationRun>) {
   run.confirm("metadata_full:scratch-pool", {
     pool_uuid: lvm("Sp"),
-    data_bytes: 12 * GIB,
+    data_bytes: THIN_QUALIFICATION_LIMITS.metadata_pool_data_bytes,
     metadata_bytes: 4 * MIB,
     volume_uuid: lvm("Sv"),
     minor: 40,

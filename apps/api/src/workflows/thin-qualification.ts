@@ -41,22 +41,40 @@ export class ThinQualification extends WorkflowEntrypoint<
       );
     for (const name of THIN_QUALIFICATION_STEPS) {
       for (let turn = 0; ; turn++) {
-        const state = await step.do(
+        let state = await step.do(
           `${name}-${turn}`,
           // A retry is one more lease-fenced turn; an uncertain write stays journaled.
           { retries: { limit: 3, delay: "15 seconds" }, timeout: "12 minutes" },
           async () => {
             try {
               await stub.thinQualification(id, name);
-            } catch {
-              /* The turn outcome is the persisted run state; an uncertain write stays journaled. */
+            } catch (error) {
+              // The turn outcome is the persisted run state; an uncertain write stays journaled.
+              console.warn(
+                JSON.stringify({
+                  event: "thin_qualification_turn_unanswered",
+                  run_id: id,
+                  step: name,
+                  turn,
+                  error: String(error).slice(0, 200),
+                }),
+              );
             }
             return await readThinQualificationStep(this.env, id);
           },
         );
-        // An unanswered executor may still be inside its lease; no turn or deadline starts before it ends.
-        if (state.lease_wait_ms > 0)
-          await step.sleep(`${name}-lease-${turn}`, state.lease_wait_ms + 1000);
+        // An unanswered executor may still be inside its lease; no turn or deadline starts before it
+        // ends. An executor that finished after its RPC already ended releases the lease early, so
+        // the wait is re-checked every 30 s instead of sleeping out the whole lease.
+        for (let wait = 0; state.lease_wait_ms > 0; wait++) {
+          await step.sleep(
+            `${name}-lease-${turn}-${wait}`,
+            Math.min(state.lease_wait_ms + 1000, 30_000),
+          );
+          state = await step.do(`${name}-lease-check-${turn}-${wait}`, () =>
+            readThinQualificationStep(this.env, id),
+          );
+        }
         if (state.status !== "running" || state.step !== name) break;
         if (turn + 1 >= TURNS[name]) {
           await step.do(`${name}-deadline`, () =>

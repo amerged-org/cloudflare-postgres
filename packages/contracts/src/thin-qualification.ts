@@ -55,8 +55,10 @@ export type ThinQualificationStep = z.infer<typeof ThinQualificationStep>;
 export const THIN_QUALIFICATION_LIMITS = {
   /** Raw scratch volumes created for the maximum-data metadata measurement. */
   maximum_volumes: 256,
-  /** Data of the separate scratch pool whose metadata is deliberately below the profile floor. */
-  metadata_pool_data_bytes: 12 * GIB,
+  /** Data of the separate scratch pool whose metadata is deliberately below the profile floor.
+   * Its metadata rounds up to one 4 MiB extent, which maps about 13.4 GiB of sequential writes
+   * (measured with the pinned driver); the pool must exceed that for the exhaustion to occur. */
+  metadata_pool_data_bytes: 16 * GIB,
   /** Requested metadata of that pool; LVM rounds it up to one extent. */
   metadata_pool_metadata_bytes: 2 * 1024 ** 2,
   /** Raw bytes written, deleted and recreated by trim_delete_recreate. */

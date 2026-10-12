@@ -10,6 +10,7 @@ import {
   thinQualificationReceiptMaterial,
   thinStorageQualificationFromRun,
   type ThinQualificationRun,
+  THIN_QUALIFICATION_LIMITS,
 } from "../src/thin-qualification.ts";
 import { thinQualificationFixture } from "./thin-qualification.fixture.ts";
 
@@ -61,6 +62,18 @@ function run(overrides: Partial<ThinQualificationRun> = {}) {
 }
 
 describe("thin storage qualification producer contract", () => {
+  it("the metadata scratch pool has more chunks than its rounded-up metadata can map", () => {
+    const limits = THIN_QUALIFICATION_LIMITS,
+      extent = 4 * 1024 ** 2,
+      metadata =
+        Math.ceil(limits.metadata_pool_metadata_bytes / extent) * extent;
+    // Measured with the pinned driver image: sequential 64 KiB chunks pack at most about 216
+    // mappings per 4 KiB dm-thin metadata block, so one 4 MiB extent maps about 13.5 GiB.
+    const mappable = (metadata / limits.metadata_block_bytes) * 216;
+    expect(
+      limits.metadata_pool_data_bytes / limits.chunk_bytes,
+    ).toBeGreaterThan(mappable * 1.15);
+  });
   it("bounds requests to growable profiles inside the producer's volume bound", () => {
     const request = {
       node_uid: "11111111-2222-4333-8444-555555555555",

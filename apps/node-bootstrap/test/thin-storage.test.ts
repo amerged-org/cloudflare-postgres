@@ -180,7 +180,7 @@ const action = {
   dispatched_at: null,
   deadline_at: null,
 } as NodeThinPoolAction;
-function facts(rows: Record<string, unknown>[] = [], dm = "") {
+function facts(rows: Record<string, unknown>[] = [], dm = "", before = dm) {
   return thinLvmFacts(
     JSON.stringify({
       report: [
@@ -202,6 +202,7 @@ function facts(rows: Record<string, unknown>[] = [], dm = "") {
     }),
     JSON.stringify({ report: [{ lv: rows }] }),
     dm,
+    before,
   );
 }
 const poolRow = {
@@ -257,6 +258,19 @@ test("a grown pool's hidden data LV reported once per segment is one LV; differi
   assert.throws(
     () => facts([poolRow, data, { ...data, segtype: "striped" }]),
     /thin_storage_lvs_changed/,
+  );
+});
+test("only a device present before and after the LVM read must have an LV; one lvm-localpv is creating does not", () => {
+  // dmsetup takes no VG lock: a volume activated after the first device read and committed after
+  // lvs is not unexplained yet, while a device listed by both reads without an LV still fails closed.
+  const foreign = `LVM-${vg.replaceAll("-", "")}${"d".repeat(32)}`,
+    tpool = `LVM-${vg.replaceAll("-", "")}${pool.replaceAll("-", "")}-tpool`;
+  assert.deepEqual(facts([poolRow], `${tpool}\n${foreign}`, tpool).active, [
+    pool,
+  ]);
+  assert.throws(
+    () => facts([poolRow], `${tpool}\n${foreign}`, `${tpool}\n${foreign}`),
+    /thin_storage_kernel_lv_unexplained/,
   );
 });
 test("an empty LVM pool percentage fails closed instead of reading as an unused pool", () => {
