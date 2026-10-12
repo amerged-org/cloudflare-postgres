@@ -26,6 +26,7 @@ import {
   UPSTREAM_OPTIONS,
 } from "../src/bridge.ts";
 import type { Bridge, Session } from "../src/bridge.ts";
+import { ADMISSION_DEADLINE_MS } from "../../../apps/edge/src/session-policy.ts";
 import {
   parseArgs,
   instructions,
@@ -638,4 +639,9 @@ test("active client cap refuses excess sockets before opening another upstream",
   await once(excess, "close");
   assert.equal(sample.connections(), CLIENT_LIMIT);
   sockets.forEach((socket) => socket.destroy());
+});
+
+test("the upstream handshake outlasts the edge admission deadline of a waking database", () => {
+  assert.equal(UPSTREAM_OPTIONS.handshakeTimeout, HANDSHAKE_MS);
+  assert(HANDSHAKE_MS >= ADMISSION_DEADLINE_MS + 5_000);
 });
