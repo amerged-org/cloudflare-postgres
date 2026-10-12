@@ -283,6 +283,7 @@ pub async fn serve_socket(
         drop(state);
         return control::reply(&mut socket, 503, serde_json::json!({"error":"fenced"})).await;
     }
+    let revision_current = route_revision_current(&state, &claims);
     drop(state);
     let target = match gateway
         .targets
@@ -300,6 +301,9 @@ pub async fn serve_socket(
             .await;
         }
     };
+    if !revision_current || !route_target_current(&claims, &target) {
+        return control::reply(&mut socket, 503, serde_json::json!({"error":"route_stale"})).await;
+    }
     let mut base = gateway.memory.lease(&claims.db);
     if !base.grow(SESSION_MEMORY_BYTES) {
         return control::reply(
@@ -498,6 +502,15 @@ async fn startup(
                         return Err("fence changed during startup".into());
                     }
                     drop(state);
+                    // The route was checked against this writer; a replacement is never dialled.
+                    if !gateway
+                        .targets
+                        .read()
+                        .await
+                        .permits(&database, bound, control::now())
+                    {
+                        return Err("writer changed before dial".into());
+                    }
                     gateway
                         .sessions
                         .lock()
@@ -636,6 +649,30 @@ async fn relay(
     let _ = timeout(Duration::from_millis(500), websocket.close(None)).await;
     let _ = timeout(Duration::from_millis(500), postgres.shutdown()).await;
     Ok(())
+}
+/// A v3 route names the revision Cloudflare admitted; the running fence must still be it.
+/// Temporary rollout compatibility: a v2 route names no revision and keeps the fence checks.
+fn route_revision_current(state: &FenceState, claims: &RouteClaims) -> bool {
+    claims.rev.is_none_or(|revision| {
+        state.records.get(&claims.db).is_some_and(|fence| {
+            fence.intent.mode == "running" && fence.intent.revision == revision
+        })
+    })
+}
+/// A v3 route names the verified primary Pod; the cached writer and any storage binding must
+/// be that Pod at that revision. The dial still uses the writer's address and service TLS name.
+fn route_target_current(claims: &RouteClaims, target: &TargetIdentity) -> bool {
+    match (claims.rev, claims.pod.as_deref()) {
+        (Some(revision), Some(pod)) => {
+            target.pod_uid == pod
+                && target
+                    .storage
+                    .as_ref()
+                    .is_none_or(|binding| binding.pod_uid == pod && binding.generation == revision)
+        }
+        (None, None) => true,
+        _ => false,
+    }
 }
 fn target_revision_matches(state: &FenceState, database: &str, target: &TargetIdentity) -> bool {
     target.storage.as_ref().is_none_or(|binding| {

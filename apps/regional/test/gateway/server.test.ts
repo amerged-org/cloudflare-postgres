@@ -25,11 +25,23 @@ import {
   otherCertificate,
   postgresServer,
   rejection,
+  routeToken,
   signedClaims,
   start,
   token,
   validCertificate,
 } from "./helpers.ts";
+
+test("refuses a v3 route whose Pod target this legacy gateway cannot check, before dial", async (t) => {
+  const postgres = await postgresServer();
+  const { gateway, port } = await gatewayFor(postgres.port);
+  t.after(async () => {
+    await gateway.drain();
+    await postgres.close();
+  });
+  assert.equal(await rejection(port, await routeToken()), 401);
+  assert.equal(postgres.handshakes(), 0);
+});
 
 test("rejects malformed upgrade, missing/bad token and wrong region before dial", async (t) => {
   const postgres = await postgresServer();

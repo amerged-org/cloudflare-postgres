@@ -58,11 +58,25 @@ fn token(prefix: &str, purpose: &str, claims: Value, key: &[u8]) -> String {
     let signature = hmac(key, format!("{purpose}{payload}").as_bytes());
     format!("{prefix}.{payload}.{}", URL_SAFE_NO_PAD.encode(signature))
 }
+/// The route Cloudflare admits for the fixture's running revision and published writer.
 fn route_token(id: usize) -> String {
+    routed(id, 1, &cid(200))
+}
+fn routed(id: usize, revision: u64, pod: &str) -> String {
     let now = control::now() / 1000;
     token(
         wire("routeTokenPrefix"),
         wire("routeSignatureDomain"),
+        json!({"v":3,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30,"rev":revision,"pod":pod}),
+        &[7; 32],
+    )
+}
+/// Temporary rollout compatibility: a v2 route names no revision or target.
+fn legacy_route_token(id: usize) -> String {
+    let now = control::now() / 1000;
+    token(
+        wire("legacyRouteTokenPrefix"),
+        wire("legacyRouteSignatureDomain"),
         json!({"v":2,"db":DATABASE,"user":"app","cid":cid(id),"rg":REGION,"kid":"test","iat":now,"exp":now+30}),
         &[7; 32],
     )
@@ -255,17 +269,25 @@ impl Fixture {
         }
     }
     async fn connect(&self, id: usize) -> Client {
+        self.upgrade(&route_token(id)).await.unwrap()
+    }
+    async fn upgrade(&self, route: &str) -> Result<Client, u16> {
         let mut request = format!("ws://127.0.0.1:{}/pg", self.port)
             .into_client_request()
             .unwrap();
         request
             .headers_mut()
-            .insert("x-pgcf-route", route_token(id).parse().unwrap());
-        timeout(Duration::from_secs(10), connect_async(request))
+            .insert("x-pgcf-route", route.parse().unwrap());
+        match timeout(Duration::from_secs(10), connect_async(request))
             .await
             .unwrap()
-            .unwrap()
-            .0
+        {
+            Ok((client, _)) => Ok(client),
+            Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+                Err(response.status().as_u16())
+            }
+            Err(error) => panic!("{error}"),
+        }
     }
     async fn authenticate(&mut self, id: usize) -> Client {
         let mut client = self.connect(id).await;
@@ -846,4 +868,92 @@ async fn missing_immutable_legacy_cohort_cannot_be_replaced_by_regional_ledgers(
         matches!(error, tokio_tungstenite::tungstenite::Error::Http(response) if response.status()==503)
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+}
+#[tokio::test]
+async fn a_route_dials_only_its_admitted_revision_and_verified_pod() {
+    let mut fixture = Fixture::new().await;
+    // TestDial asserts the Pod address and the independent service TLS name of this route.
+    let client = fixture.authenticate(900).await;
+    drop(client);
+    for route in [routed(901, 2, &cid(200)), routed(902, 1, &cid(299))] {
+        assert_eq!(fixture.upgrade(&route).await.err(), Some(503));
+    }
+    fixture.intent("running", 2, true).await;
+    assert_eq!(fixture.upgrade(&route_token(903)).await.err(), Some(503));
+    assert!(fixture.upgrade(&routed(904, 2, &cid(200))).await.is_ok());
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_writer_replaced_after_admission_is_never_dialled() {
+    let mut fixture = Fixture::new().await;
+    let mut client = fixture.connect(910).await;
+    fixture
+        .gateway
+        .targets
+        .write()
+        .await
+        .replace("endpointslices", &[writer(&cid(299))], None)
+        .unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    let error = timeout(Duration::from_secs(10), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data();
+    assert!(String::from_utf8_lossy(&error).contains("08006"));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    assert!(
+        timeout(Duration::from_millis(150), fixture.upstream.recv())
+            .await
+            .is_err()
+    );
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_route_must_match_the_storage_binding_of_its_revision() {
+    let fixture = Fixture::new().await;
+    let issuer = StorageIssuer::new();
+    let now = control::now();
+    fixture
+        .gateway
+        .targets
+        .write()
+        .await
+        .replace(
+            "configmaps",
+            &issuer.maps(now, now + 60000, 1),
+            Some(&issuer.trust),
+        )
+        .unwrap();
+    // The fence advanced while the sealed storage binding still names revision 1.
+    fixture.intent("running", 2, true).await;
+    for route in [routed(930, 2, &cid(200)), routed(931, 1, &cid(200))] {
+        assert_eq!(fixture.upgrade(&route).await.err(), Some(503));
+    }
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 0);
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_legacy_v2_route_keeps_the_rollout_compatibility_path() {
+    let mut fixture = Fixture::new().await;
+    let mut client = fixture.upgrade(&legacy_route_token(920)).await.unwrap();
+    client
+        .send(Message::Binary(startup("app").into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        startup("app")
+    );
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    client.close(None).await.unwrap();
+    fixture.stop().await;
 }

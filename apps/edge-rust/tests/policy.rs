@@ -1,13 +1,16 @@
 // SPDX-License-Identifier: Apache-2.0
 use pgcf_edge_rust::{
     decoy::{Decoy, derive_salt},
-    policy::{GatewayRegion, actor_failure, connection_rate_key, routing_hints},
+    policy::{
+        AdmittedTarget, Failure, GatewayRegion, actor_failure, admission, connection_rate_key,
+        routing_hints,
+    },
 };
 use pgcf_native_protocol::{
     constant,
     route::{self, Keyring},
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 fn vectors() -> Value {
     serde_json::from_str(include_str!(
@@ -37,19 +40,26 @@ fn authoritative_typescript_ip_and_signing_vectors() {
             active: active.clone(),
             keys: HashMap::from([(active, key)]),
         };
-        assert_eq!(
-            route::sign(
+        let connection = route::Connection {
+            region: row["region"].as_str().unwrap(),
+            database: row["db"].as_str().unwrap(),
+            user: row["user"].as_str().unwrap(),
+            cid: row["cid"].as_str().unwrap(),
+            now_ms: row["now"].as_u64().unwrap(),
+            ttl_seconds: row["ttlSeconds"].as_u64().unwrap(),
+        };
+        let signed = match row.get("target") {
+            Some(target) => route::sign(
                 &ring,
-                row["region"].as_str().unwrap(),
-                row["db"].as_str().unwrap(),
-                row["user"].as_str().unwrap(),
-                row["cid"].as_str().unwrap(),
-                row["now"].as_u64().unwrap(),
-                row["ttlSeconds"].as_u64().unwrap()
-            )
-            .unwrap(),
-            row["expected"].as_str().unwrap()
-        );
+                &connection,
+                &route::RouteTarget {
+                    revision: target["revision"].as_u64().unwrap(),
+                    pod_uid: target["pod_uid"].as_str().unwrap(),
+                },
+            ),
+            None => route::sign_legacy(&ring, &connection),
+        };
+        assert_eq!(signed.unwrap(), row["expected"].as_str().unwrap());
     }
     for row in edge["salts"].as_array().unwrap() {
         let key = row["key"]
@@ -93,6 +103,51 @@ fn hints_are_scoped_before_actor_or_gateway_and_duplicate_errors_take_precedence
     assert!(actor_failure("3D000").decoy);
     assert!(actor_failure("28P01").decoy);
     assert!(!actor_failure("57P03").decoy);
+}
+#[test]
+fn an_admission_carries_only_a_complete_verified_target() {
+    let region =
+        json!({"id":"eu-test","gateway_url":"https://gateway.invalid/pg","gateway_binding":null});
+    let pod = "01234567-89ab-4def-8123-0123456789ad";
+    let (route, target) =
+        admission(&json!({"ok":true,"region":region,"target":{"revision":7,"pod_uid":pod}}))
+            .unwrap();
+    assert_eq!(route.id, "eu-test");
+    assert_eq!(
+        target,
+        Some(AdmittedTarget {
+            revision: 7,
+            pod_uid: pod.into()
+        })
+    );
+    // Temporary rollout compatibility: an admission without a verified target.
+    assert_eq!(
+        admission(&json!({"ok":true,"region":region})).unwrap().1,
+        None
+    );
+    for target in [
+        json!({"revision":0,"pod_uid":pod}),
+        json!({"revision":9_007_199_254_740_992_u64,"pod_uid":pod}),
+        json!({"revision":7,"pod_uid":"not-a-pod"}),
+        json!({"revision":7}),
+        json!({"revision":7,"pod_uid":pod,"extra":1}),
+        json!(null),
+    ] {
+        assert_eq!(
+            admission(&json!({"ok":true,"region":region,"target":target})).unwrap_err(),
+            Failure::gateway()
+        );
+    }
+    assert_eq!(
+        admission(&json!({"ok":true,"region":region,"extra":1})).unwrap_err(),
+        Failure::gateway()
+    );
+    assert_eq!(
+        admission(&json!({"ok":false,"sqlstate":"57P03"}))
+            .unwrap_err()
+            .sqlstate,
+        "57P03"
+    );
 }
 #[test]
 fn public_gateway_is_https_and_explicit_service_http_has_no_fallback() {

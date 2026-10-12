@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
-use crate::{constant, valid_claims, wire};
+//! Edge-to-gateway route tokens. A v3 route names the route revision and verified primary Pod
+//! that Cloudflare admitted. Temporary rollout compatibility: v2 routes name neither; the
+//! authoritative TypeScript contract (route-token.ts) states when v2 is removed.
+use crate::{constant, valid_claims, valid_legacy_claims, wire};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, KeyInit, Mac};
 use serde::{Deserialize, Serialize};
@@ -17,6 +20,26 @@ pub struct RouteClaims {
     pub kid: String,
     pub iat: u64,
     pub exp: u64,
+    /// Route revision of the admitted verified target; absent only in a v2 route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<u64>,
+    /// Verified primary Pod UID of that revision; absent only in a v2 route.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pod: Option<String>,
+}
+/// One admitted connection: the exact Edge wire inputs of a route token.
+pub struct Connection<'a> {
+    pub region: &'a str,
+    pub database: &'a str,
+    pub user: &'a str,
+    pub cid: &'a str,
+    pub now_ms: u64,
+    pub ttl_seconds: u64,
+}
+/// The admission's verified connection target, signed into a v3 route.
+pub struct RouteTarget<'a> {
+    pub revision: u64,
+    pub pod_uid: &'a str,
 }
 
 #[derive(Deserialize)]
@@ -58,49 +81,86 @@ impl Keyring {
         })
     }
 }
-/// Sign the exact existing Edge wire claims with a region-derived key.
+/// Sign the exact Edge wire claims of a v3 route with a region-derived key.
 pub fn sign(
     master: &Keyring,
-    region: &str,
-    database: &str,
-    user: &str,
-    cid: &str,
-    now_ms: u64,
-    ttl_seconds: u64,
+    connection: &Connection,
+    target: &RouteTarget,
 ) -> Result<String, &'static str> {
-    if ttl_seconds == 0 || ttl_seconds > constant("ROUTE_TOKEN_SIGN_TTL_SECONDS") {
+    let mut claims = claims(master, connection, "routeClaims")?;
+    claims.rev = Some(target.revision);
+    claims.pod = Some(target.pod_uid.into());
+    if !valid_claims(&serde_json::to_value(&claims).map_err(|_| "invalid claims")?) {
+        return Err("invalid claims");
+    }
+    seal(
+        master,
+        connection.region,
+        &claims,
+        wire("routeTokenPrefix"),
+        wire("routeSignatureDomain"),
+    )
+}
+/// Temporary rollout compatibility: a v2 route for an admission without a verified target.
+pub fn sign_legacy(master: &Keyring, connection: &Connection) -> Result<String, &'static str> {
+    let claims = claims(master, connection, "legacyRouteClaims")?;
+    if !valid_legacy_claims(&serde_json::to_value(&claims).map_err(|_| "invalid claims")?) {
+        return Err("invalid claims");
+    }
+    seal(
+        master,
+        connection.region,
+        &claims,
+        wire("legacyRouteTokenPrefix"),
+        wire("legacyRouteSignatureDomain"),
+    )
+}
+fn claims(
+    master: &Keyring,
+    connection: &Connection,
+    schema: &str,
+) -> Result<RouteClaims, &'static str> {
+    if connection.ttl_seconds == 0
+        || connection.ttl_seconds > constant("ROUTE_TOKEN_SIGN_TTL_SECONDS")
+    {
         return Err("invalid lifetime");
     }
+    let issued = connection.now_ms / 1000;
+    Ok(RouteClaims {
+        v: crate::CONTRACT[schema]["properties"]["v"]["const"]
+            .as_u64()
+            .unwrap() as u8,
+        db: connection.database.into(),
+        user: connection.user.into(),
+        cid: connection.cid.into(),
+        rg: connection.region.into(),
+        kid: master.active.clone(),
+        iat: issued,
+        exp: issued
+            .checked_add(connection.ttl_seconds)
+            .ok_or("invalid claims")?,
+        rev: None,
+        pod: None,
+    })
+}
+fn seal(
+    master: &Keyring,
+    region: &str,
+    claims: &RouteClaims,
+    prefix: &str,
+    domain: &str,
+) -> Result<String, &'static str> {
     let key = master
         .keys
         .get(&master.active)
         .ok_or("active key missing")?;
-    let issued = now_ms / 1000;
-    let claims = RouteClaims {
-        v: crate::CONTRACT["routeClaims"]["properties"]["v"]["const"]
-            .as_u64()
-            .unwrap() as u8,
-        db: database.into(),
-        user: user.into(),
-        cid: cid.into(),
-        rg: region.into(),
-        kid: master.active.clone(),
-        iat: issued,
-        exp: issued.checked_add(ttl_seconds).ok_or("invalid claims")?,
-    };
-    if !valid_claims(&serde_json::to_value(&claims).map_err(|_| "invalid claims")?) {
-        return Err("invalid claims");
-    }
     let derived = derive_region_key(key, region)?;
-    let payload =
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims).map_err(|_| "invalid claims")?);
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).map_err(|_| "invalid claims")?);
     let mut mac = Hmac::<Sha256>::new_from_slice(&derived).map_err(|_| "invalid key")?;
-    mac.update(wire("routeSignatureDomain").as_bytes());
+    mac.update(domain.as_bytes());
     mac.update(payload.as_bytes());
     Ok(format!(
-        "{}.{}.{}",
-        wire("routeTokenPrefix"),
-        payload,
+        "{prefix}.{payload}.{}",
         URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())
     ))
 }
@@ -134,7 +194,9 @@ pub fn verify(
         return Err("too_long");
     }
     let parts: Vec<_> = token.split('.').collect();
-    if parts.len() != 3 || parts[0] != wire("routeTokenPrefix") {
+    // Temporary rollout compatibility: v2 keeps its own prefix, domain and claims.
+    let legacy = parts[0] == wire("legacyRouteTokenPrefix");
+    if parts.len() != 3 || (parts[0] != wire("routeTokenPrefix") && !legacy) {
         return Err("malformed");
     }
     let payload = decode(parts[1]).ok_or("malformed")?;
@@ -155,7 +217,14 @@ pub fn verify(
         .filter(|v| v.len() >= constant("ROUTE_KEY_MIN_BYTES") as usize)
         .ok_or("unknown_kid")?;
     let mut mac = Hmac::<Sha256>::new_from_slice(key).map_err(|_| "unknown_kid")?;
-    mac.update(wire("routeSignatureDomain").as_bytes());
+    mac.update(
+        wire(if legacy {
+            "legacyRouteSignatureDomain"
+        } else {
+            "routeSignatureDomain"
+        })
+        .as_bytes(),
+    );
     mac.update(parts[1].as_bytes());
     mac.verify_slice(&signature).map_err(|_| "bad_signature")?;
     // JSON.parse has one number type. Accept equivalent integral JSON spelling
@@ -171,7 +240,11 @@ pub fn verify(
             }
         }
     }
-    if !valid_claims(&value) {
+    if !(if legacy {
+        valid_legacy_claims(&value)
+    } else {
+        valid_claims(&value)
+    }) {
         return Err("invalid_claims");
     }
     let claims: RouteClaims = serde_json::from_value(value).map_err(|_| "invalid_claims")?;

@@ -1,14 +1,23 @@
 // SPDX-License-Identifier: Apache-2.0
 // Edge-to-gateway routing token. Pure WebCrypto so it runs in Workers and Node.
 //
-// Token:      v2.<payloadB64u>.<sigB64u>
-// Signature:  HMAC-SHA256(K, "pgcf-route/v2\n" + payloadB64u)
+// Token:      v3.<payloadB64u>.<sigB64u>
+// Signature:  HMAC-SHA256(K, "pgcf-route/v3\n" + payloadB64u)
 // Region key: K = HMAC-SHA256(master[kid], "pgcf-route-key/v1\n" + regionId)
 //
+// A v3 token names the route revision and the verified primary Pod that Cloudflare
+// admitted; a gateway dials only while its fence and writer are exactly that route.
 // The edge holds the master keyring and signs; a gateway holds only the keyring
 // derived for its own region, so a compromised gateway cannot mint tokens for
 // any other region.
+//
+// Temporary rollout compatibility: v2 tokens (prefix "v2", domain "pgcf-route/v2\n")
+// carry no route revision or target. The Edge signs them only for an admission without
+// a verified target, and gateways still accept them. Remove v2 signing and verification
+// and make the admission target required once every region's gateway verifies v3 and
+// its controller publishes verified targets; a missing revision or target is then refused.
 import { z } from "zod";
+import { DatabaseTarget } from "./database-admission.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";
 import { DATABASE_ID_PATTERN, REGION_ID_PATTERN, RoleName } from "./ids.ts";
 
@@ -19,13 +28,18 @@ export const ROUTE_TOKEN_MAX_LIFETIME_SECONDS = 30;
 export const ROUTE_TOKEN_SKEW_SECONDS = 5;
 export const ROUTE_KEY_MIN_BYTES = 32;
 
-const TOKEN_PREFIX = "v2";
-const SIGNATURE_DOMAIN = "pgcf-route/v2\n";
+const TOKEN_PREFIX = "v3";
+const SIGNATURE_DOMAIN = "pgcf-route/v3\n";
+const LEGACY_TOKEN_PREFIX = "v2";
+const LEGACY_SIGNATURE_DOMAIN = "pgcf-route/v2\n";
 const KEY_DOMAIN = "pgcf-route-key/v1\n";
 const SIGNATURE_BYTES = 32;
 /** Authoritative wire constants for generated native consumers. */
 export const ROUTE_TOKEN_PREFIX = TOKEN_PREFIX;
 export const ROUTE_TOKEN_SIGNATURE_DOMAIN = SIGNATURE_DOMAIN;
+/** Temporary rollout compatibility; the module comment names the removal condition. */
+export const ROUTE_TOKEN_LEGACY_PREFIX = LEGACY_TOKEN_PREFIX;
+export const ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN = LEGACY_SIGNATURE_DOMAIN;
 export const ROUTE_TOKEN_SIGNATURE_BYTES = SIGNATURE_BYTES;
 export const ROUTE_TOKEN_KEY_DOMAIN = KEY_DOMAIN;
 
@@ -33,8 +47,7 @@ const kidPattern = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 const cidPattern =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
-export const routeTokenClaimsSchema = z.strictObject({
-  v: z.literal(2),
+const connectionClaims = {
   db: z.string().regex(DATABASE_ID_PATTERN),
   user: RoleName,
   cid: z.string().regex(cidPattern),
@@ -42,8 +55,24 @@ export const routeTokenClaimsSchema = z.strictObject({
   kid: z.string().regex(kidPattern),
   iat: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
   exp: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+};
+export const routeTokenClaimsSchema = z.strictObject({
+  v: z.literal(3),
+  ...connectionClaims,
+  /** Route revision: the committed revision whose verified target Cloudflare admitted. */
+  rev: DatabaseTarget.shape.revision,
+  /** The verified primary Pod of that revision. */
+  pod: DatabaseTarget.shape.pod_uid,
 });
 export type RouteTokenClaims = z.infer<typeof routeTokenClaimsSchema>;
+/** Temporary rollout compatibility: no route revision or target. */
+export const legacyRouteTokenClaimsSchema = z.strictObject({
+  v: z.literal(2),
+  ...connectionClaims,
+});
+export type LegacyRouteTokenClaims = z.infer<
+  typeof legacyRouteTokenClaimsSchema
+>;
 
 /** Keys are raw bytes by kid; `active` names the key used for signing. */
 export interface RouteKeyring {
@@ -120,6 +149,8 @@ export interface SignRouteTokenInput {
   readonly db: string;
   readonly user: RoleName;
   readonly cid: string;
+  /** The admission's verified connection target. */
+  readonly target: DatabaseTarget;
   /** Milliseconds since the epoch. */
   readonly now?: number;
   readonly ttlSeconds?: number;
@@ -128,14 +159,37 @@ export interface SignRouteTokenInput {
 export async function signRouteToken(
   input: SignRouteTokenInput,
 ): Promise<string> {
+  return seal(
+    input,
+    routeTokenClaimsSchema.safeParse({
+      v: 3,
+      ...connection(input),
+      rev: input.target?.revision,
+      pod: input.target?.pod_uid,
+    }),
+    TOKEN_PREFIX,
+    SIGNATURE_DOMAIN,
+  );
+}
+
+/** Temporary rollout compatibility: a v2 token for an admission without a verified target. */
+export async function signLegacyRouteToken(
+  input: Omit<SignRouteTokenInput, "target">,
+): Promise<string> {
+  return seal(
+    input,
+    legacyRouteTokenClaimsSchema.safeParse({ v: 2, ...connection(input) }),
+    LEGACY_TOKEN_PREFIX,
+    LEGACY_SIGNATURE_DOMAIN,
+  );
+}
+
+function connection(input: Omit<SignRouteTokenInput, "target">) {
   const ttl = input.ttlSeconds ?? ROUTE_TOKEN_SIGN_TTL_SECONDS;
   if (!Number.isInteger(ttl) || ttl < 1 || ttl > ROUTE_TOKEN_SIGN_TTL_SECONDS)
     throw new RangeError("ttlSeconds must be an integer in 1..30");
-  const master = input.keyring.keys.get(input.keyring.active);
-  if (master === undefined) throw new RangeError("active key missing");
   const iat = Math.floor((input.now ?? Date.now()) / 1000);
-  const claims = routeTokenClaimsSchema.safeParse({
-    v: 2,
+  return {
     db: input.db,
     user: input.user,
     cid: input.cid,
@@ -143,12 +197,22 @@ export async function signRouteToken(
     kid: input.keyring.active,
     iat,
     exp: iat + ttl,
-  });
+  };
+}
+
+async function seal(
+  input: Omit<SignRouteTokenInput, "target">,
+  claims: z.ZodSafeParseResult<RouteTokenClaims | LegacyRouteTokenClaims>,
+  prefix: string,
+  domain: string,
+): Promise<string> {
+  const master = input.keyring.keys.get(input.keyring.active);
+  if (master === undefined) throw new RangeError("active key missing");
   if (!claims.success) throw new RangeError("invalid route token claims");
   const payload = bytesToBase64url(encoder.encode(JSON.stringify(claims.data)));
   const key = await deriveRegionKey(master, input.region);
-  const signature = await hmac(key, SIGNATURE_DOMAIN + payload);
-  return `${TOKEN_PREFIX}.${payload}.${bytesToBase64url(signature)}`;
+  const signature = await hmac(key, domain + payload);
+  return `${prefix}.${payload}.${bytesToBase64url(signature)}`;
 }
 
 export type RouteTokenFailure =
@@ -165,7 +229,10 @@ export type RouteTokenFailure =
   | "invalid_time";
 
 export type RouteTokenResult =
-  | { readonly ok: true; readonly claims: RouteTokenClaims }
+  | {
+      readonly ok: true;
+      readonly claims: RouteTokenClaims | LegacyRouteTokenClaims;
+    }
   | { readonly ok: false; readonly reason: RouteTokenFailure };
 
 export interface VerifyRouteTokenInput {
@@ -187,7 +254,10 @@ export async function verifyRouteToken(
   if (typeof token !== "string" || token.length === 0) return fail("missing");
   if (token.length > ROUTE_TOKEN_MAX_LENGTH) return fail("too_long");
   const parts = token.split(".");
-  if (parts.length !== 3 || parts[0] !== TOKEN_PREFIX) return fail("malformed");
+  // Temporary rollout compatibility: v2 keeps its own prefix, domain and claims.
+  const legacy = parts[0] === LEGACY_TOKEN_PREFIX;
+  if (parts.length !== 3 || (parts[0] !== TOKEN_PREFIX && !legacy))
+    return fail("malformed");
   const payload = parts[1] as string;
   const payloadBytes = base64urlToBytes(payload);
   const signature = base64urlToBytes(parts[2] as string);
@@ -211,10 +281,15 @@ export async function verifyRouteToken(
   const key = input.keys.get(kid);
   if (key === undefined || key.length < ROUTE_KEY_MIN_BYTES)
     return fail("unknown_kid");
-  const expected = await hmac(key, SIGNATURE_DOMAIN + payload);
+  const expected = await hmac(
+    key,
+    (legacy ? LEGACY_SIGNATURE_DOMAIN : SIGNATURE_DOMAIN) + payload,
+  );
   if (!constantTimeEqual(expected, signature)) return fail("bad_signature");
 
-  const claims = routeTokenClaimsSchema.safeParse(decoded);
+  const claims = (
+    legacy ? legacyRouteTokenClaimsSchema : routeTokenClaimsSchema
+  ).safeParse(decoded);
   if (!claims.success) return fail("invalid_claims");
   const { rg, iat, exp } = claims.data;
   if (rg !== input.region) return fail("wrong_region");

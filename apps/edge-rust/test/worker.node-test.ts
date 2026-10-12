@@ -463,6 +463,64 @@ test(
         },
       );
       await t.test(
+        "Wasm signs the admission's verified target into a v3 route",
+        async () => {
+          await reset();
+          const { database } = await seed();
+          const pod = randomUUID();
+          await DB.prepare(
+            "UPDATE databases SET runtime_attestation_json=? WHERE id=?",
+          )
+            .bind(
+              JSON.stringify({
+                v: 1,
+                database_id: database,
+                generation: 2,
+                storage_generation: 1,
+                node_uid: randomUUID(),
+                boot_id: randomUUID(),
+                cluster_uid: randomUUID(),
+                namespace_uid: randomUUID(),
+                cnpg_cluster_uid: randomUUID(),
+                storage_uid: randomUUID(),
+                pvc_uid: randomUUID(),
+                pv_uid: randomUUID(),
+                pod_uid: pod,
+                container_id: "3".repeat(64),
+                postgres_image_sha256: "4".repeat(64),
+                memory_request_bytes: 1,
+                memory_limit_bytes: 2,
+                observed_at: Date.now(),
+                configuration_fingerprint: "5".repeat(64),
+              }),
+              database,
+            )
+            .run();
+          const c = await open(database);
+          await until(async () => (await stats()).length === 1);
+          const keys = await deriveRegionKeyring(
+            parseRouteKeyring(JSON.stringify(keyring)),
+            region,
+          );
+          const verified = await verifyRouteToken((await stats())[0]!.token, {
+            region,
+            keys: keys.keys,
+          });
+          assert.ok(verified.ok);
+          assert.deepEqual(
+            {
+              v: verified.claims.v,
+              db: verified.claims.db,
+              rev: "rev" in verified.claims ? verified.claims.rev : null,
+              pod: "pod" in verified.claims ? verified.claims.pod : null,
+            },
+            { v: 3, db: database, rev: 2, pod },
+          );
+          c.socket.close(1000);
+          await until(async () => (await stats())[0]!.closes.length === 1);
+        },
+      );
+      await t.test(
         "missing actor and source IP fail closed before gateway",
         async () => {
           await reset();

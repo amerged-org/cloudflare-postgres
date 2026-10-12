@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { isDatabaseId, isRoleName } from "@pgcf/contracts";
 import { encodeErrorResponse } from "@pgcf/contracts/pg-wire";
-import { parseRouteKeyring, signRouteToken } from "@pgcf/contracts/route-token";
+import {
+  parseRouteKeyring,
+  signLegacyRouteToken,
+  signRouteToken,
+} from "@pgcf/contracts/route-token";
 import type { Env } from "./env.ts";
 import { decoyResponse } from "./decoy.ts";
 import { connectGateway } from "./gateway.ts";
@@ -131,13 +135,18 @@ async function admit(
       "53300",
       "database connection rate limit exceeded",
     );
-  const token = await signRouteToken({
+  const connection = {
     keyring: parseRouteKeyring(env.ROUTE_MASTER_KEYS),
     region: route.id,
     db: hints.database,
     user: hints.user,
     cid,
-  });
+  };
+  // The gateway dials only the admitted verified target. Temporary rollout compatibility
+  // (route-token.ts): an admission without a verified target still receives a v2 route.
+  const token = admitted.target
+    ? await signRouteToken({ ...connection, target: admitted.target })
+    : await signLegacyRouteToken(connection);
   check();
   const socket = await connectGateway(route, token, env, signal);
   if (signal.aborted) {

@@ -18,6 +18,7 @@ import { WebSocket } from "ws";
 import { newDatabaseId, randomString } from "@pgcf/contracts";
 import {
   deriveRegionKeyring,
+  signLegacyRouteToken,
   signRouteToken,
   type RouteKeyring,
 } from "@pgcf/contracts/route-token";
@@ -179,16 +180,28 @@ export async function gatewayFor(
   return { gateway, port, logs, events };
 }
 
+/** This legacy gateway accepts only v2 routes. */
 export function token(
-  overrides: Partial<Parameters<typeof signRouteToken>[0]> = {},
+  overrides: Partial<Parameters<typeof signLegacyRouteToken>[0]> = {},
 ): Promise<string> {
-  return signRouteToken({
+  return signLegacyRouteToken({
     keyring: master,
     region,
     db: database,
     user: "app",
     cid: randomUUID(),
     ...overrides,
+  });
+}
+
+export function routeToken(): Promise<string> {
+  return signRouteToken({
+    keyring: master,
+    region,
+    db: database,
+    user: "app",
+    cid: randomUUID(),
+    target: { revision: 1, pod_uid: randomUUID() },
   });
 }
 

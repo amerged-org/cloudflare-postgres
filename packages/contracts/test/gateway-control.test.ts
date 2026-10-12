@@ -71,6 +71,7 @@ describe("gateway controls", () => {
       db: database,
       user: "app",
       cid: randomUUID(),
+      target: { revision: 1, pod_uid: randomUUID() },
       now: 100000,
     });
     expect((await verifyGatewayControl(route, expected)).ok).toBe(false);

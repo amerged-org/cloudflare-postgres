@@ -46,12 +46,16 @@
         "cid": "01234567-89ab-4def-8123-0123456789ab",
         "now": 1000000,
         "ttlSeconds": 30,
+        "target": {
+          "revision": 7,
+          "pod_uid": "01234567-89ab-4def-8123-0123456789ad"
+        },
         "active": "fixture",
         "key": [
           7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
           7, 7, 7, 7, 7, 7, 7, 7, 7
         ],
-        "expected": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAxMjM0NTY3LTg5YWItNGRlZi04MTIzLTAxMjM0NTY3ODlhYiIsInJnIjoiZXUtdGVzdCIsImtpZCI6ImZpeHR1cmUiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.Qqd_7jhaYwxXkHeJ7QVQZsE2vz4TsZViD4CDJ3hDl7E"
+        "expected": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAxMjM0NTY3LTg5YWItNGRlZi04MTIzLTAxMjM0NTY3ODlhYiIsInJnIjoiZXUtdGVzdCIsImtpZCI6ImZpeHR1cmUiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWQifQ.7BtqUlb2TwP_xmBsbrP3DI72d5xgcBIRt57z1zA5kEU"
       },
       {
         "region": "us-test",
@@ -60,12 +64,30 @@
         "cid": "01234567-89ab-4def-8123-0123456789ac",
         "now": 1000999,
         "ttlSeconds": 1,
+        "target": {
+          "revision": 9007199254740991,
+          "pod_uid": "01234567-89ab-4def-8123-0123456789ae"
+        },
         "active": "fixture",
         "key": [
           7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
           7, 7, 7, 7, 7, 7, 7, 7, 7
         ],
-        "expected": "v2.eyJ2IjoyLCJkYiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiIiwidXNlciI6ImFub3RoZXIiLCJjaWQiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWMiLCJyZyI6InVzLXRlc3QiLCJraWQiOiJmaXh0dXJlIiwiaWF0IjoxMDAwLCJleHAiOjEwMDF9.GShyrHYW72iK3OLyfG7Vh1tmmXVwtX6JdOeL4ifCkEE"
+        "expected": "v3.eyJ2IjozLCJkYiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiIiwidXNlciI6ImFub3RoZXIiLCJjaWQiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWMiLCJyZyI6InVzLXRlc3QiLCJraWQiOiJmaXh0dXJlIiwiaWF0IjoxMDAwLCJleHAiOjEwMDEsInJldiI6OTAwNzE5OTI1NDc0MDk5MSwicG9kIjoiMDEyMzQ1NjctODlhYi00ZGVmLTgxMjMtMDEyMzQ1Njc4OWFlIn0.CqlNPO1VFxRty7O4diFZf6cGttr6y1iiwuWIoXf6TTw"
+      },
+      {
+        "region": "eu-test",
+        "db": "cccccccccccccccccccc",
+        "user": "app",
+        "cid": "01234567-89ab-4def-8123-0123456789af",
+        "now": 1000000,
+        "ttlSeconds": 30,
+        "active": "fixture",
+        "key": [
+          7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+          7, 7, 7, 7, 7, 7, 7, 7, 7
+        ],
+        "expected": "v2.eyJ2IjoyLCJkYiI6ImNjY2NjY2NjY2NjY2NjY2NjY2NjIiwidXNlciI6ImFwcCIsImNpZCI6IjAxMjM0NTY3LTg5YWItNGRlZi04MTIzLTAxMjM0NTY3ODlhZiIsInJnIjoiZXUtdGVzdCIsImtpZCI6ImZpeHR1cmUiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.f-Px8eaW7MN-gDNLYj5o242ToWJ3TdDeSpAdhNP1jXw"
       }
     ],
     "salts": [
@@ -88,6 +110,16 @@
           7, 7, 7, 7, 7, 7, 7, 7, 7
         ],
         "expected": "Uv9/d4AyuRIuq0cwjkloMw=="
+      },
+      {
+        "database": "cccccccccccccccccccc",
+        "user": "app",
+        "active": "fixture",
+        "key": [
+          7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+          7, 7, 7, 7, 7, 7, 7, 7, 7
+        ],
+        "expected": "9nZO0kEvXtqCs0kKjg9mjg=="
       }
     ]
   },
@@ -98,58 +130,64 @@
   "routes": [
     {
       "name": "valid",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.DwtPCDKKRliLpheyyCodfbEbZ4s07eLvSRSrWZelDPs",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.IsrcmARdg80l2mCqlziI-u4ozws_e27d6KCzT5Ush2U",
       "now": 1000000,
       "region": "eu-test",
       "expected": {
         "ok": true,
         "claims": {
-          "v": 2,
+          "v": 3,
           "db": "aaaaaaaaaaaaaaaaaaaa",
           "user": "app",
           "cid": "00000000-0000-0000-0000-000000000001",
           "rg": "eu-test",
           "kid": "test",
           "iat": 1000,
-          "exp": 1030
+          "exp": 1030,
+          "rev": 7,
+          "pod": "01234567-89ab-4def-8123-0123456789ab"
         }
       }
     },
     {
       "name": "equivalent-json-numbers",
-      "token": "v2.eyJ2IjoyLjAsImRiIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJ1c2VyIjoiYXBwIiwiY2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwicmciOiJldS10ZXN0Iiwia2lkIjoidGVzdCIsImlhdCI6MWUzLCJleHAiOjEwMzB9.a-g9hmMC7lH4OY4C3nY2_8Kiuj97rWFWjNoqWLIMhtY",
+      "token": "v3.eyJ2IjozLjAsImRiIjoiYWFhYWFhYWFhYWFhYWFhYWFhYWEiLCJ1c2VyIjoiYXBwIiwiY2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwicmciOiJldS10ZXN0Iiwia2lkIjoidGVzdCIsImlhdCI6MWUzLCJleHAiOjEwMzAsInJldiI6N2UwLCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.fLaooJKuMbZyX60HTIYxY5nMozHsZT6SX9YgiS_8yaU",
       "now": 1000000,
       "region": "eu-test",
       "expected": {
         "ok": true,
         "claims": {
-          "v": 2,
+          "v": 3,
           "db": "aaaaaaaaaaaaaaaaaaaa",
           "user": "app",
           "cid": "00000000-0000-0000-0000-000000000001",
           "rg": "eu-test",
           "kid": "test",
           "iat": 1000,
-          "exp": 1030
+          "exp": 1030,
+          "rev": 7,
+          "pod": "01234567-89ab-4def-8123-0123456789ab"
         }
       }
     },
     {
       "name": "leading-json-bom",
-      "token": "v2.77u_eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.ap3VhWi8ImtAkLfzpRdStabK-efDOu1R2f65AJoyT9k",
+      "token": "v3.77u_eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.oKStPgs15cfE36IqGgfb0AcDwlzfPCEq1s0pz_l2rmk",
       "now": 1000000,
       "region": "eu-test",
       "expected": {
         "ok": true,
         "claims": {
-          "v": 2,
+          "v": 3,
           "db": "aaaaaaaaaaaaaaaaaaaa",
           "user": "app",
           "cid": "00000000-0000-0000-0000-000000000001",
           "rg": "eu-test",
           "kid": "test",
           "iat": 1000,
-          "exp": 1030
+          "exp": 1030,
+          "rev": 7,
+          "pod": "01234567-89ab-4def-8123-0123456789ab"
         }
       }
     },
@@ -169,132 +207,232 @@
     },
     {
       "name": "unknown-kid",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6Im90aGVyIiwiaWF0IjoxMDAwLCJleHAiOjEwMzB9.0eUl4uwG-BLxiIh_tks1xiiN80XzR6inS3KoDFq0xvw",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6Im90aGVyIiwiaWF0IjoxMDAwLCJleHAiOjEwMzAsInJldiI6NywicG9kIjoiMDEyMzQ1NjctODlhYi00ZGVmLTgxMjMtMDEyMzQ1Njc4OWFiIn0.xG9PKiRjH7fMoP4EQde9txbThcymo5tbWxu61GMyLsc",
       "now": 1000000,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "unknown_kid" }
     },
     {
       "name": "bad-signature",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.DwtPCDKKRliLpheyyCodfbEbZ4s07eLvSRSrWZelAAA",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.IsrcmARdg80l2mCqlziI-u4ozws_e27d6KCzT5UsAAA",
       "now": 1000000,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "bad_signature" }
     },
     {
       "name": "wrong-region",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.DwtPCDKKRliLpheyyCodfbEbZ4s07eLvSRSrWZelDPs",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.IsrcmARdg80l2mCqlziI-u4ozws_e27d6KCzT5Ush2U",
       "now": 1000000,
       "region": "us-test",
       "expected": { "ok": false, "reason": "wrong_region" }
     },
     {
       "name": "reserved-role",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6InBvc3RncmVzIiwiY2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwicmciOiJldS10ZXN0Iiwia2lkIjoidGVzdCIsImlhdCI6MTAwMCwiZXhwIjoxMDMwfQ.rDCkSHX09e3HvCeGvV4apt5MEz92E7yzgAgMYvhVwTM",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6InBvc3RncmVzIiwiY2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwicmciOiJldS10ZXN0Iiwia2lkIjoidGVzdCIsImlhdCI6MTAwMCwiZXhwIjoxMDMwLCJyZXYiOjcsInBvZCI6IjAxMjM0NTY3LTg5YWItNGRlZi04MTIzLTAxMjM0NTY3ODlhYiJ9.dRxd0LnXSeonP71uxIxdUkArS4kmQdpNBHTkeXu_zEo",
       "now": 1000000,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "invalid_claims" }
     },
     {
       "name": "reserved-prefix",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6InBnX293bmVyIiwiY2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwicmciOiJldS10ZXN0Iiwia2lkIjoidGVzdCIsImlhdCI6MTAwMCwiZXhwIjoxMDMwfQ.OCNGydueODUqu9vUksDg1qFSk73lcYBeh-Tqq1SmPP4",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6InBnX293bmVyIiwiY2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwicmciOiJldS10ZXN0Iiwia2lkIjoidGVzdCIsImlhdCI6MTAwMCwiZXhwIjoxMDMwLCJyZXYiOjcsInBvZCI6IjAxMjM0NTY3LTg5YWItNGRlZi04MTIzLTAxMjM0NTY3ODlhYiJ9.qgonm4OfMrtaZKnHwkHrLpderz5R6Evnpf5VZuMDo64",
       "now": 1000000,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "invalid_claims" }
     },
     {
       "name": "extra-field",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwiZXh0cmEiOnRydWV9.yQEOG_Z0s4yvSh2shdCsJDDxj3CUPEwL2gVPaGx1dD8",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIiLCJleHRyYSI6dHJ1ZX0.IP-G7XPsd5wPKD578R20j7K74iHcwnQNJCXnebFO6Ls",
       "now": 1000000,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "invalid_claims" }
     },
     {
       "name": "wrong-db",
-      "token": "v2.eyJ2IjoyLCJkYiI6Ii4uL3giLCJ1c2VyIjoiYXBwIiwiY2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwicmciOiJldS10ZXN0Iiwia2lkIjoidGVzdCIsImlhdCI6MTAwMCwiZXhwIjoxMDMwfQ.GtSvbwhg06oKWMLfowQVNi928ulCR96lrf3I7-g7ZLg",
+      "token": "v3.eyJ2IjozLCJkYiI6Ii4uL3giLCJ1c2VyIjoiYXBwIiwiY2lkIjoiMDAwMDAwMDAtMDAwMC0wMDAwLTAwMDAtMDAwMDAwMDAwMDAxIiwicmciOiJldS10ZXN0Iiwia2lkIjoidGVzdCIsImlhdCI6MTAwMCwiZXhwIjoxMDMwLCJyZXYiOjcsInBvZCI6IjAxMjM0NTY3LTg5YWItNGRlZi04MTIzLTAxMjM0NTY3ODlhYiJ9.bbpiLBcxtDpBWGd-G5mdPxU19sJessMbhvrHc09pkpQ",
       "now": 1000000,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "invalid_claims" }
     },
     {
       "name": "wrong-cid",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6Ik5PVC1BLVVVSUQiLCJyZyI6ImV1LXRlc3QiLCJraWQiOiJ0ZXN0IiwiaWF0IjoxMDAwLCJleHAiOjEwMzB9.Mwu1Xy2Hnd3v0DJLTm65Cnw7u2wuhI0BqeRfwNGVvQM",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6Ik5PVC1BLVVVSUQiLCJyZyI6ImV1LXRlc3QiLCJraWQiOiJ0ZXN0IiwiaWF0IjoxMDAwLCJleHAiOjEwMzAsInJldiI6NywicG9kIjoiMDEyMzQ1NjctODlhYi00ZGVmLTgxMjMtMDEyMzQ1Njc4OWFiIn0.Sz48K6Z5FUVTJD-0Btbyru_AGnsifgVHTMuXb5r0BkM",
       "now": 1000000,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "invalid_claims" }
     },
     {
       "name": "bad-lifetime",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMX0.ixy6M-ZnSVfWesHqj18SvVtgX2yrV_VRI7XZhbEdaKQ",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMSwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.eV4zTzyHhQ5NsmVsZn1WneIBnD2Y5QV-nQ6_hO7C_o4",
       "now": 1000000,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "invalid_lifetime" }
     },
     {
       "name": "zero-lifetime",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAwMH0.YgC79IpMyNy6PWSpwEbhPvJKHCnrvsTCl6r1p4tZ4v4",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAwMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.pPjvEgfa6EGmeBaSX7_5dCxmtlSe4H4RFq6ZgIcrQyM",
       "now": 1000000,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "invalid_lifetime" }
     },
     {
       "name": "not-yet-valid",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.DwtPCDKKRliLpheyyCodfbEbZ4s07eLvSRSrWZelDPs",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.IsrcmARdg80l2mCqlziI-u4ozws_e27d6KCzT5Ush2U",
       "now": 994999,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "not_yet_valid" }
     },
     {
       "name": "skew-start",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.DwtPCDKKRliLpheyyCodfbEbZ4s07eLvSRSrWZelDPs",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.IsrcmARdg80l2mCqlziI-u4ozws_e27d6KCzT5Ush2U",
       "now": 995000,
       "region": "eu-test",
       "expected": {
         "ok": true,
         "claims": {
-          "v": 2,
+          "v": 3,
           "db": "aaaaaaaaaaaaaaaaaaaa",
           "user": "app",
           "cid": "00000000-0000-0000-0000-000000000001",
           "rg": "eu-test",
           "kid": "test",
           "iat": 1000,
-          "exp": 1030
+          "exp": 1030,
+          "rev": 7,
+          "pod": "01234567-89ab-4def-8123-0123456789ab"
         }
       }
     },
     {
       "name": "skew-end",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.DwtPCDKKRliLpheyyCodfbEbZ4s07eLvSRSrWZelDPs",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.IsrcmARdg80l2mCqlziI-u4ozws_e27d6KCzT5Ush2U",
       "now": 1035000,
       "region": "eu-test",
       "expected": {
         "ok": true,
         "claims": {
-          "v": 2,
+          "v": 3,
           "db": "aaaaaaaaaaaaaaaaaaaa",
           "user": "app",
           "cid": "00000000-0000-0000-0000-000000000001",
           "rg": "eu-test",
           "kid": "test",
           "iat": 1000,
-          "exp": 1030
+          "exp": 1030,
+          "rev": 7,
+          "pod": "01234567-89ab-4def-8123-0123456789ab"
         }
       }
     },
     {
       "name": "expired",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.DwtPCDKKRliLpheyyCodfbEbZ4s07eLvSRSrWZelDPs",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.IsrcmARdg80l2mCqlziI-u4ozws_e27d6KCzT5Ush2U",
       "now": 1035001,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "expired" }
     },
     {
       "name": "fraction-time",
-      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAuMSwiZXhwIjoxMDMwfQ.kojp0cYmXfEeXyofe2q5OFOCxYB2Jfgk3E7BAmX2VxY",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAuMSwiZXhwIjoxMDMwLCJyZXYiOjcsInBvZCI6IjAxMjM0NTY3LTg5YWItNGRlZi04MTIzLTAxMjM0NTY3ODlhYiJ9.ck1LReDV6ovmt0mP8kyOUkMWSr8LIkdD8ipjbaJh5fg",
       "now": 1000000,
       "region": "eu-test",
       "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "missing-route-revision",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicG9kIjoiMDEyMzQ1NjctODlhYi00ZGVmLTgxMjMtMDEyMzQ1Njc4OWFiIn0.k7gkIQUEzI9yCIyr_nx4VqqE2nC0vY0byPuF4G4lpY0",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "missing-route-target",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3fQ.qw9elmKix125JGmtVxKdKFnKg0gsMYjZKQmbyf3Xs5Q",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "zero-route-revision",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2IjowLCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.MeOWjvPJRzAkKz-R2qInvxJW2Fo8eK5z7tnO1FQ5h2Y",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "fraction-route-revision",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LjUsInBvZCI6IjAxMjM0NTY3LTg5YWItNGRlZi04MTIzLTAxMjM0NTY3ODlhYiJ9.81JgtPNEKBjYdNupW8huxbUWBZgDvIXZ4Z22W81tkYM",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "unsafe-route-revision",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo5MDA3MTk5MjU0NzQwOTkyLCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.xLDSb6ZeBFP3Wu-JzfBfQkXNGXT6dSuTW_DJ9IJ2pbk",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "invalid-route-target",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiJub3QtYS1wb2QifQ.i6_LL_ZU5zvtUKgrrCMbadgbLmYTJ8QSwCz5IgnNJL8",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "legacy-claims-under-current-version",
+      "token": "v3.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.FzLbFcoFes9aatJ978oL4RjmBWGPVuruwFWMAyD5BEY",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "current-claims-under-legacy-domain",
+      "token": "v3.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.LFE1UUUlWjSWDQ-uNjzl5i7ywPEdikJNl9a5z4JEtYY",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "bad_signature" }
+    },
+    {
+      "name": "legacy-compatibility",
+      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.DwtPCDKKRliLpheyyCodfbEbZ4s07eLvSRSrWZelDPs",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": {
+        "ok": true,
+        "claims": {
+          "v": 2,
+          "db": "aaaaaaaaaaaaaaaaaaaa",
+          "user": "app",
+          "cid": "00000000-0000-0000-0000-000000000001",
+          "rg": "eu-test",
+          "kid": "test",
+          "iat": 1000,
+          "exp": 1030
+        }
+      }
+    },
+    {
+      "name": "legacy-with-route-fields",
+      "token": "v2.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMCwicmV2Ijo3LCJwb2QiOiIwMTIzNDU2Ny04OWFiLTRkZWYtODEyMy0wMTIzNDU2Nzg5YWIifQ.LFE1UUUlWjSWDQ-uNjzl5i7ywPEdikJNl9a5z4JEtYY",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "legacy-claims-with-current-version",
+      "token": "v2.eyJ2IjozLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.9H0H3lFnyWIGf22K1sdr-q1nZWMZREMrxVKZznye_mU",
+      "now": 1000000,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "invalid_claims" }
+    },
+    {
+      "name": "legacy-expired",
+      "token": "v2.eyJ2IjoyLCJkYiI6ImFhYWFhYWFhYWFhYWFhYWFhYWFhIiwidXNlciI6ImFwcCIsImNpZCI6IjAwMDAwMDAwLTAwMDAtMDAwMC0wMDAwLTAwMDAwMDAwMDAwMSIsInJnIjoiZXUtdGVzdCIsImtpZCI6InRlc3QiLCJpYXQiOjEwMDAsImV4cCI6MTAzMH0.DwtPCDKKRliLpheyyCodfbEbZ4s07eLvSRSrWZelDPs",
+      "now": 1035001,
+      "region": "eu-test",
+      "expected": { "ok": false, "reason": "expired" }
     }
   ],
   "startups": [

@@ -50,6 +50,15 @@ creating its bucket; the hint does not guarantee jurisdiction. `ARCHIVE_BINDINGS
 exact region ID to its actual Worker binding and bucket. A mismatching or missing binding fails
 closed.
 
+Deploy the management API before a fleet release whose native controller labels observations
+with `coverage`; an earlier API refuses them. Route tokens are versioned: v3 binds the route
+revision and the verified primary Pod, and the native gateway refuses a stale revision or another
+Pod before dialling. Converge a fleet release whose native gateway verifies v3 in every region
+before deploying an Edge that signs it. The Edge signs v3 only when the Actor admission names a
+verified target and signs v2 otherwise; the TypeScript gateway accepts only v2. Remove v2 once
+every region runs a v3-verifying gateway and a target-publishing controller; an admission without
+a verified target is then refused.
+
 ## Rust/Wasm Edge artifact
 
 The complete replacement entry lives in `apps/edge-rust`; the management API and

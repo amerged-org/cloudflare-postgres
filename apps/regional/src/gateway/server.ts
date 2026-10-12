@@ -17,7 +17,7 @@ import {
   ROUTE_TOKEN_HEADER,
   verifyRouteToken,
   type RouteKeyring,
-  type RouteTokenClaims,
+  type LegacyRouteTokenClaims,
 } from "@pgcf/contracts/route-token";
 import {
   StartupReader,
@@ -315,6 +315,11 @@ export function createGateway(options: GatewayOptions): Gateway {
       rejectUpgrade(socket, verified.reason === "wrong_region" ? 403 : 401);
       return;
     }
+    // This gateway dials the database Service by name; it cannot check a v3 route's Pod target.
+    if (verified.claims.v !== 2) {
+      rejectUpgrade(socket, 401);
+      return;
+    }
     const claims = verified.claims;
     if (
       draining ||
@@ -368,7 +373,7 @@ export function createGateway(options: GatewayOptions): Gateway {
     client: WebSocket,
     socket: BudgetedWebSocketSocket,
     request: IncomingMessage,
-    claims: RouteTokenClaims,
+    claims: LegacyRouteTokenClaims,
     release: () => void,
     wire: WebSocketInputActivity,
   ): void {

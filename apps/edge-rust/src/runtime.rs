@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
     gateway, host,
-    policy::{self, Failure, GatewayRegion, Hints},
+    policy::{self, Failure, Hints},
 };
 use futures_channel::oneshot;
 use futures_util::future::{Either, select};
@@ -22,32 +22,6 @@ fn refused(failure: &Failure) -> worker::Result<Response> {
         .send_with_bytes(error_response(&failure.sqlstate, &failure.message))?;
     pair.server.close(Some(1000), Some("connection refused"))?;
     Response::from_websocket(pair.client)
-}
-fn admitted(value: Value) -> Result<GatewayRegion, Failure> {
-    let object = value.as_object().ok_or_else(Failure::gateway)?;
-    if object.len() != 2 {
-        return Err(Failure::gateway());
-    }
-    match object.get("ok").and_then(Value::as_bool) {
-        Some(false) => Err(policy::actor_failure(
-            object
-                .get("sqlstate")
-                .and_then(Value::as_str)
-                .ok_or_else(Failure::gateway)?,
-        )),
-        Some(true) => {
-            let value = object.get("region").ok_or_else(Failure::gateway)?;
-            let keys = value.as_object().ok_or_else(Failure::gateway)?;
-            if keys.len() != 3 || !keys.contains_key("gateway_binding") {
-                return Err(Failure::gateway());
-            }
-            let route: GatewayRegion =
-                serde_json::from_value(value.clone()).map_err(|_| Failure::gateway())?;
-            if !pgcf_native_protocol::valid_pattern("region",&route.id)||route.gateway_url.encode_utf16().count()>pgcf_native_protocol::CONTRACT["gatewayRegion"]["properties"]["gateway_url"]["maxLength"].as_u64().unwrap()as usize{return Err(Failure::gateway());}
-            Ok(route)
-        }
-        _ => Err(Failure::gateway()),
-    }
 }
 // Serialize as a struct: serde_json::Value maps become JavaScript Map objects,
 // whose optional fields the Actor cannot read as RPC options.
@@ -103,7 +77,9 @@ async fn admit(
         .map_err(|_| Failure::gateway());
     drop(cancel);
     host::check(&signal)?;
-    let route = admitted(serde_wasm_bindgen::from_value(result?).map_err(|_| Failure::gateway())?)?;
+    let (route, target) = policy::admission(
+        &serde_wasm_bindgen::from_value::<Value>(result?).map_err(|_| Failure::gateway())?,
+    )?;
     let allowed = env
         .rate_limiter("DATABASE_CONNECTION_RATE_LIMITER")
         .map_err(|_| Failure::unavailable())?
@@ -124,15 +100,27 @@ async fn admit(
             .to_string(),
     )
     .map_err(|_| Failure::gateway())?;
-    let token = route::sign(
-        &ring,
-        &route.id,
-        &hints.database,
-        &hints.user,
-        &cid,
-        host::now(),
-        constant("ROUTE_TOKEN_SIGN_TTL_SECONDS"),
-    )
+    let connection = route::Connection {
+        region: &route.id,
+        database: &hints.database,
+        user: &hints.user,
+        cid: &cid,
+        now_ms: host::now(),
+        ttl_seconds: constant("ROUTE_TOKEN_SIGN_TTL_SECONDS"),
+    };
+    // The gateway dials only the admitted verified target. Temporary rollout compatibility
+    // (route-token.ts): an admission without a verified target still receives a v2 route.
+    let token = match &target {
+        Some(target) => route::sign(
+            &ring,
+            &connection,
+            &route::RouteTarget {
+                revision: target.revision,
+                pod_uid: &target.pod_uid,
+            },
+        ),
+        None => route::sign_legacy(&ring, &connection),
+    }
     .map_err(|_| Failure::gateway())?;
     host::check(&signal)?;
     let socket = gateway::connect(&route, &token, &env, &signal).await?;

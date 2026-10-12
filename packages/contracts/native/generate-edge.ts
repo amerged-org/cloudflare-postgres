@@ -9,6 +9,7 @@ import {
   ROUTE_TOKEN_KEY_DOMAIN,
   ROUTE_TOKEN_SIGN_TTL_SECONDS,
   parseRouteKeyring,
+  signLegacyRouteToken,
   signRouteToken,
 } from "../src/route-token.ts";
 import {
@@ -87,6 +88,7 @@ export async function edgeVectors() {
       cid: "01234567-89ab-4def-8123-0123456789ab",
       now: 1000000,
       ttlSeconds: 30,
+      target: { revision: 7, pod_uid: "01234567-89ab-4def-8123-0123456789ad" },
     },
     {
       region: "us-test",
@@ -95,13 +97,28 @@ export async function edgeVectors() {
       cid: "01234567-89ab-4def-8123-0123456789ac",
       now: 1000999,
       ttlSeconds: 1,
+      target: {
+        revision: Number.MAX_SAFE_INTEGER,
+        pod_uid: "01234567-89ab-4def-8123-0123456789ae",
+      },
+    },
+    // Temporary rollout compatibility: an admission without a verified target.
+    {
+      region: "eu-test",
+      db: "c".repeat(20),
+      user: "app",
+      cid: "01234567-89ab-4def-8123-0123456789af",
+      now: 1000000,
+      ttlSeconds: 30,
     },
   ])
     signing.push({
       ...input,
       active: keyring.active,
       key: [...keyring.keys.get(keyring.active)!],
-      expected: await signRouteToken({ keyring, ...input }),
+      expected: input.target
+        ? await signRouteToken({ keyring, ...input, target: input.target })
+        : await signLegacyRouteToken({ keyring, ...input }),
     });
   return {
     ips: ips.map((ip) => ({ ip, expected: connectionRateKey(ip) })),

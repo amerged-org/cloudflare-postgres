@@ -27,11 +27,14 @@ import {
   RESERVED_ROLE_PREFIXES,
 } from "../src/ids.ts";
 import {
+  legacyRouteTokenClaimsSchema,
   routeTokenClaimsSchema,
   ROUTE_TOKEN_MAX_LENGTH,
   ROUTE_TOKEN_MAX_LIFETIME_SECONDS,
   ROUTE_TOKEN_SKEW_SECONDS,
   ROUTE_KEY_MIN_BYTES,
+  ROUTE_TOKEN_LEGACY_PREFIX,
+  ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN,
   ROUTE_TOKEN_PREFIX,
   ROUTE_TOKEN_SIGNATURE_DOMAIN,
   ROUTE_TOKEN_SIGNATURE_BYTES,
@@ -173,6 +176,8 @@ const contract = {
     ...edge.wire,
     routeTokenPrefix: ROUTE_TOKEN_PREFIX,
     routeSignatureDomain: ROUTE_TOKEN_SIGNATURE_DOMAIN,
+    legacyRouteTokenPrefix: ROUTE_TOKEN_LEGACY_PREFIX,
+    legacyRouteSignatureDomain: ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN,
     controlSigningPurpose: GATEWAY_CONTROL_SIGNING_PURPOSE,
     controlTokenPrefix: GATEWAY_CONTROL_TOKEN_PREFIX,
     controlKeyPurpose: GATEWAY_CONTROL_KEY_PURPOSE,
@@ -204,6 +209,7 @@ const contract = {
   gatewayRegion: edge.gatewayRegion,
   databaseAdmission: edge.databaseAdmission,
   routeClaims,
+  legacyRouteClaims: schema(legacyRouteTokenClaimsSchema),
   controlClaims: schema(gatewayControlClaimsSchema),
   activityClaims: schema(gatewayActivityClaimsSchema),
   intent: schema(gatewayIntentSchema),
@@ -215,7 +221,7 @@ const contract = {
 const key = new Uint8Array(32).fill(7),
   database = "a".repeat(20),
   region = "eu-test";
-const claims = {
+const legacyClaims = {
   v: 2,
   db: database,
   user: "app",
@@ -224,6 +230,12 @@ const claims = {
   kid: "test",
   iat: 1000,
   exp: 1030,
+};
+const claims = {
+  ...legacyClaims,
+  v: 3,
+  rev: 7,
+  pod: "01234567-89ab-4def-8123-0123456789ab",
 };
 const cryptoKey = await crypto.subtle.importKey(
   "raw",
@@ -252,16 +264,28 @@ if (process.argv.includes("--check")) {
   if ((await readFile(rustConstantsPath, "utf8")) !== rustConstants)
     throw new Error("Regenerate Rust protocol constants");
 } else await writeFile(rustConstantsPath, rustConstants);
-async function rawToken(json: string): Promise<string> {
+async function rawToken(
+  json: string,
+  prefix = ROUTE_TOKEN_PREFIX,
+  domain = ROUTE_TOKEN_SIGNATURE_DOMAIN,
+): Promise<string> {
   const payload = bytesToBase64url(new TextEncoder().encode(json));
   const mac = new Uint8Array(
     await crypto.subtle.sign(
       "HMAC",
       cryptoKey,
-      new TextEncoder().encode(ROUTE_TOKEN_SIGNATURE_DOMAIN + payload),
+      new TextEncoder().encode(domain + payload),
     ),
   );
-  return `${ROUTE_TOKEN_PREFIX}.${payload}.${bytesToBase64url(mac)}`;
+  return `${prefix}.${payload}.${bytesToBase64url(mac)}`;
+}
+/** Temporary rollout compatibility vectors. */
+async function legacyToken(value: unknown): Promise<string> {
+  return rawToken(
+    JSON.stringify(value),
+    ROUTE_TOKEN_LEGACY_PREFIX,
+    ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN,
+  );
 }
 const routeInputs: {
   name: string;
@@ -275,8 +299,9 @@ const routeInputs: {
     name: "equivalent-json-numbers",
     token: await rawToken(
       JSON.stringify(claims)
-        .replace('"v":2', '"v":2.0')
-        .replace('"iat":1000', '"iat":1e3'),
+        .replace('"v":3', '"v":3.0')
+        .replace('"iat":1000', '"iat":1e3')
+        .replace('"rev":7', '"rev":7e0'),
     ),
   },
   {
@@ -300,6 +325,38 @@ const routeInputs: {
   { name: "skew-end", claims, now: 1035000 },
   { name: "expired", claims, now: 1035001 },
   { name: "fraction-time", claims: { ...claims, iat: 1000.1 } },
+  { name: "missing-route-revision", claims: { ...claims, rev: undefined } },
+  { name: "missing-route-target", claims: { ...claims, pod: undefined } },
+  { name: "zero-route-revision", claims: { ...claims, rev: 0 } },
+  { name: "fraction-route-revision", claims: { ...claims, rev: 7.5 } },
+  { name: "unsafe-route-revision", claims: { ...claims, rev: 2 ** 53 } },
+  { name: "invalid-route-target", claims: { ...claims, pod: "not-a-pod" } },
+  {
+    name: "legacy-claims-under-current-version",
+    claims: legacyClaims,
+  },
+  {
+    name: "current-claims-under-legacy-domain",
+    token: await rawToken(
+      JSON.stringify(claims),
+      ROUTE_TOKEN_PREFIX,
+      ROUTE_TOKEN_LEGACY_SIGNATURE_DOMAIN,
+    ),
+  },
+  { name: "legacy-compatibility", token: await legacyToken(legacyClaims) },
+  {
+    name: "legacy-with-route-fields",
+    token: await legacyToken(claims),
+  },
+  {
+    name: "legacy-claims-with-current-version",
+    token: await legacyToken({ ...legacyClaims, v: 3 }),
+  },
+  {
+    name: "legacy-expired",
+    token: await legacyToken(legacyClaims),
+    now: 1035001,
+  },
 ];
 const routes = await Promise.all(
   routeInputs.map(async (input) => {

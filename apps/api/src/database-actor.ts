@@ -4,6 +4,7 @@ import {
   DatabaseId,
   DatabaseRegionRoute as RegionRoute,
   type DatabaseAdmission,
+  type DatabaseTarget,
   RoleName,
   Timestamp,
   newOperationId,
@@ -14,7 +15,7 @@ import {
   ReclaimObservation,
   RECLAIM_LIMITS,
   signReclaimIntent,
-  type DatabaseRuntimeAttestation,
+  DatabaseRuntimeAttestation,
 } from "@pgcf/contracts/reclaim";
 import { nodeProofSigningKey } from "./domain/node-proof-session.ts";
 import { warmReclaimCandidate } from "./domain/warm-reclaim.ts";
@@ -52,7 +53,7 @@ export const DatabasePresence = z
 export type DatabasePresence = z.infer<typeof DatabasePresence>;
 export type { DatabaseAdmission } from "@pgcf/contracts";
 export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
-  r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at
+  d.runtime_attestation_json,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
   LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
   LEFT JOIN roles r ON r.database_id=d.id AND r.name=? AND r.deleted_at IS NULL WHERE d.id=? LIMIT 1`;
@@ -66,6 +67,7 @@ interface AdmissionRow {
   observed_state: string;
   database_deleted_at: string | null;
   project_deleted_at: string | null;
+  runtime_attestation_json: string | null;
   role_name: string | null;
   id: string;
   gateway_url: string;
@@ -74,15 +76,39 @@ interface AdmissionRow {
   lost_at: string | null;
 }
 
-function admittedRoute(row: AdmissionRow): DatabaseAdmission {
+function admittedRoute(
+  row: AdmissionRow,
+  databaseId: string,
+): DatabaseAdmission {
   const region = RegionRoute.safeParse({
     id: row.id,
     gateway_url: row.gateway_url,
     gateway_binding: row.gateway_binding,
   });
-  return region.success
-    ? { ok: true, region: region.data }
-    : { ok: false, sqlstate: "08006" };
+  if (!region.success) return { ok: false, sqlstate: "08006" };
+  const target = verifiedTarget(row, databaseId);
+  return target
+    ? { ok: true, region: region.data, target }
+    : { ok: true, region: region.data };
+}
+
+/** The controller's runtime attestation of the observed revision names its verified Pod. */
+function verifiedTarget(
+  row: AdmissionRow,
+  databaseId: string,
+): DatabaseTarget | undefined {
+  if (row.runtime_attestation_json === null) return undefined;
+  const attestation = DatabaseRuntimeAttestation.safeParse(
+    JSON.parse(row.runtime_attestation_json),
+  );
+  return attestation.success &&
+    attestation.data.database_id === databaseId &&
+    attestation.data.generation === row.observed_generation
+    ? {
+        revision: attestation.data.generation,
+        pod_uid: attestation.data.pod_uid,
+      }
+    : undefined;
 }
 
 export class DatabaseActor extends DurableObject<Env> {
@@ -508,7 +534,7 @@ export class DatabaseActor extends DurableObject<Env> {
           row.observed_generation !== row.generation)
       )
         return { ok: false, sqlstate: "57P03" };
-      return admittedRoute(row);
+      return admittedRoute(row, id.data);
     } catch {
       return { ok: false, sqlstate: "08006" };
     }
@@ -747,7 +773,7 @@ export class DatabaseActor extends DurableObject<Env> {
         (!current.power_operation ||
           current.observed_generation === current.generation)
       )
-        return admittedRoute(current);
+        return admittedRoute(current, id.data);
       if (
         current.desired_state === "suspended" &&
         current.suspension_reason !== "idle"

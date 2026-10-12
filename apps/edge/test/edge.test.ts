@@ -1399,6 +1399,54 @@ describe("native edge admission with real Workers D1 and route-token modules", (
     expect(first.claims.cid).not.toBe(second.claims.cid);
   });
 
+  it("signs the admission's verified target into a v3 route", async () => {
+    const pod = crypto.randomUUID();
+    await testEnv.DB.prepare(
+      "UPDATE databases SET runtime_attestation_json=? WHERE id=?",
+    )
+      .bind(
+        JSON.stringify({
+          v: 1,
+          database_id: database,
+          generation: 2,
+          storage_generation: 1,
+          node_uid: crypto.randomUUID(),
+          boot_id: crypto.randomUUID(),
+          cluster_uid: crypto.randomUUID(),
+          namespace_uid: crypto.randomUUID(),
+          cnpg_cluster_uid: crypto.randomUUID(),
+          storage_uid: crypto.randomUUID(),
+          pvc_uid: crypto.randomUUID(),
+          pv_uid: crypto.randomUUID(),
+          pod_uid: pod,
+          container_id: "3".repeat(64),
+          postgres_image_sha256: "4".repeat(64),
+          memory_request_bytes: 1,
+          memory_limit_bytes: 2,
+          observed_at: Date.now(),
+          configuration_fingerprint: "5".repeat(64),
+        }),
+        database,
+      )
+      .run();
+    const connection = await open();
+    connection.socket.send(encodeStartup({ user: "app", database }));
+    await expect.poll(async () => (await stats()).length).toBe(1);
+    const keyring = await deriveRegionKeyring(
+      parseRouteKeyring(testEnv.ROUTE_MASTER_KEYS),
+      region,
+    );
+    expect(
+      await verifyRouteToken((await stats())[0]!.token, {
+        region,
+        keys: keyring.keys,
+      }),
+    ).toMatchObject({
+      ok: true,
+      claims: { v: 3, db: database, user: "app", rg: region, rev: 2, pod },
+    });
+  });
+
   it("returns a generic PostgreSQL error for gateway failure without replaying", async () => {
     await setGatewayMode("reject");
     const connection = await open();

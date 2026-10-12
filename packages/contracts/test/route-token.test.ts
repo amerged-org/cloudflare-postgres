@@ -9,6 +9,7 @@ import {
   deriveRegionKeyring,
   parseRouteKeyring,
   serializeRouteKeyring,
+  signLegacyRouteToken,
   signRouteToken,
   verifyRouteToken,
   type RouteKeyring,
@@ -21,6 +22,8 @@ const db = "a1b2c3d4e5f6g7h8i9j0";
 const cid = "0f8b5c1e-2d3a-4b5c-8d9e-0a1b2c3d4e5f";
 const now = Date.UTC(2026, 9, 2, 12, 0, 0);
 const nowSec = now / 1000;
+const target = { revision: 7, pod_uid: "4f2c1b0e-8d9a-4c3b-9e2f-1a0b2c3d4e5f" };
+const route = { rev: target.revision, pod: target.pod_uid };
 
 function keyBytes(seed: number): Uint8Array {
   return Uint8Array.from({ length: 32 }, (_, i) => (seed * 31 + i * 7) & 0xff);
@@ -46,12 +49,16 @@ function resign(payloadJson: object, regionKey: Uint8Array): string {
   return signPayload(JSON.stringify(payloadJson), regionKey);
 }
 
-function signPayload(payloadJson: string, regionKey: Uint8Array): string {
+function signPayload(
+  payloadJson: string,
+  regionKey: Uint8Array,
+  version = "v3",
+): string {
   const payload = b64u(Buffer.from(payloadJson));
   const sig = createHmac("sha256", regionKey)
-    .update("pgcf-route/v2\n" + payload)
+    .update(`pgcf-route/${version}\n` + payload)
     .digest();
-  return `v2.${payload}.${b64u(sig)}`;
+  return `${version}.${payload}.${b64u(sig)}`;
 }
 
 describe("route token", () => {
@@ -83,6 +90,7 @@ describe("route token", () => {
       db,
       user,
       cid,
+      target,
       now,
     });
     expect(token.length).toBeLessThanOrEqual(512);
@@ -94,7 +102,7 @@ describe("route token", () => {
     expect(result).toEqual({
       ok: true,
       claims: {
-        v: 2,
+        v: 3,
         db,
         user,
         cid,
@@ -102,6 +110,7 @@ describe("route token", () => {
         kid: "k2",
         iat: nowSec,
         exp: nowSec + 30,
+        ...route,
       },
     });
     const [, payload, sig] = token.split(".");
@@ -110,7 +119,7 @@ describe("route token", () => {
       .digest();
     expect(sig).toBe(
       createHmac("sha256", regionKey)
-        .update("pgcf-route/v2\n" + payload)
+        .update("pgcf-route/v3\n" + payload)
         .digest("base64url"),
     );
   });
@@ -124,6 +133,7 @@ describe("route token", () => {
       db,
       user,
       cid,
+      target,
       now,
     });
     const [prefix, payload, signature] = token.split(".") as [
@@ -131,7 +141,7 @@ describe("route token", () => {
       string,
       string,
     ];
-    expect(prefix).toBe("v2");
+    expect(prefix).toBe("v3");
     const claims = JSON.parse(Buffer.from(payload, "base64url").toString());
     const changedPayload = b64u(
       Buffer.from(JSON.stringify({ ...claims, user: "reader" })),
@@ -158,6 +168,7 @@ describe("route token", () => {
         region,
         db,
         cid,
+        target,
         now,
       } as SignRouteTokenInput),
     ).rejects.toThrow(RangeError);
@@ -187,6 +198,7 @@ describe("route token", () => {
           db,
           user: invalidUser,
           cid,
+          target,
           now,
         } as SignRouteTokenInput),
       ).rejects.toThrow(RangeError);
@@ -202,6 +214,7 @@ describe("route token", () => {
       db,
       user,
       cid,
+      target,
       now,
     });
     const [, payload] = token.split(".") as [string, string, string];
@@ -215,13 +228,18 @@ describe("route token", () => {
         now,
       }),
     ).toEqual({ ok: false, reason: "malformed" });
-    expect(
-      await verifyRouteToken(`v2.${payload}.${oldSignature}`, {
-        keys,
-        region,
-        now,
-      }),
-    ).toEqual({ ok: false, reason: "bad_signature" });
+    for (const domain of ["v1", "v2"]) {
+      const signature = createHmac("sha256", regionKey)
+        .update(`pgcf-route/${domain}\n` + payload)
+        .digest("base64url");
+      expect(
+        await verifyRouteToken(`v3.${payload}.${signature}`, {
+          keys,
+          region,
+          now,
+        }),
+      ).toEqual({ ok: false, reason: "bad_signature" });
+    }
     const claims = JSON.parse(Buffer.from(payload, "base64url").toString());
     expect(
       await verifyRouteToken(resign({ ...claims, v: 1 }, regionKey), {
@@ -230,6 +248,132 @@ describe("route token", () => {
         now,
       }),
     ).toEqual({ ok: false, reason: "invalid_claims" });
+  });
+
+  it("binds the admitted route revision and verified Pod; a v3 token missing either is refused", async () => {
+    const keys = await regionKeys();
+    const regionKey = keys.get("k2")!;
+    const token = await signRouteToken({
+      keyring: master,
+      region,
+      db,
+      user,
+      cid,
+      target,
+      now,
+    });
+    const claims = JSON.parse(
+      Buffer.from(token.split(".")[1]!, "base64url").toString(),
+    );
+    expect(claims).toMatchObject(route);
+    for (const field of ["rev", "pod"]) {
+      const { [field]: omitted, ...missing } = claims;
+      expect(omitted).toBeDefined();
+      expect(
+        await verifyRouteToken(resign(missing, regionKey), {
+          keys,
+          region,
+          now,
+        }),
+      ).toEqual({ ok: false, reason: "invalid_claims" });
+    }
+    for (const invalid of [
+      { rev: 0 },
+      { rev: 1.5 },
+      { rev: Number.MAX_SAFE_INTEGER + 1 },
+      { pod: "not-a-pod-uid" },
+      { pod: null },
+    ])
+      expect(
+        await verifyRouteToken(resign({ ...claims, ...invalid }, regionKey), {
+          keys,
+          region,
+          now,
+        }),
+      ).toEqual({ ok: false, reason: "invalid_claims" });
+    for (const invalidTarget of [
+      { revision: 0, pod_uid: target.pod_uid },
+      { revision: 7, pod_uid: "not-a-pod-uid" },
+    ])
+      await expect(
+        signRouteToken({
+          keyring: master,
+          region,
+          db,
+          user,
+          cid,
+          target: invalidTarget,
+          now,
+        }),
+      ).rejects.toThrow(RangeError);
+    await expect(
+      signRouteToken({
+        keyring: master,
+        region,
+        db,
+        user,
+        cid,
+        now,
+      } as SignRouteTokenInput),
+    ).rejects.toThrow(RangeError);
+  });
+
+  it("keeps v2 rollout compatibility explicit: own prefix, domain and claims, never a route", async () => {
+    const keys = await regionKeys();
+    const regionKey = keys.get("k2")!;
+    const legacy = await signLegacyRouteToken({
+      keyring: master,
+      region,
+      db,
+      user,
+      cid,
+      now,
+    });
+    const [prefix, payload, signature] = legacy.split(".") as [
+      string,
+      string,
+      string,
+    ];
+    expect(prefix).toBe("v2");
+    expect(signature).toBe(
+      createHmac("sha256", regionKey)
+        .update("pgcf-route/v2\n" + payload)
+        .digest("base64url"),
+    );
+    expect(await verifyRouteToken(legacy, { keys, region, now })).toEqual({
+      ok: true,
+      claims: {
+        v: 2,
+        db,
+        user,
+        cid,
+        rg: region,
+        kid: "k2",
+        iat: nowSec,
+        exp: nowSec + 30,
+      },
+    });
+    const claims = JSON.parse(Buffer.from(payload, "base64url").toString());
+    expect(
+      await verifyRouteToken(
+        signPayload(JSON.stringify({ ...claims, ...route }), regionKey, "v2"),
+        { keys, region, now },
+      ),
+    ).toEqual({ ok: false, reason: "invalid_claims" });
+    expect(
+      await verifyRouteToken(signPayload(JSON.stringify(claims), regionKey), {
+        keys,
+        region,
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "invalid_claims" });
+    expect(
+      await verifyRouteToken(`v3.${payload}.${signature}`, {
+        keys,
+        region,
+        now,
+      }),
+    ).toEqual({ ok: false, reason: "bad_signature" });
   });
 
   it("fits all maximum-length role, region and key identifiers within the token cap", async () => {
@@ -243,6 +387,7 @@ describe("route token", () => {
       db,
       user: maxUser,
       cid,
+      target: { ...target, revision: Number.MAX_SAFE_INTEGER },
       now,
     });
     expect(maxUser.length).toBe(63);
@@ -253,7 +398,10 @@ describe("route token", () => {
         region: maxRegion,
         now,
       }),
-    ).toMatchObject({ ok: true, claims: { v: 2, user: maxUser } });
+    ).toMatchObject({
+      ok: true,
+      claims: { v: 3, user: maxUser, rev: Number.MAX_SAFE_INTEGER },
+    });
   });
 
   it("rejects a tampered payload and a tampered signature", async () => {
@@ -263,6 +411,7 @@ describe("route token", () => {
       db,
       user,
       cid,
+      target,
       now,
     });
     const [prefix, payload, sig] = token.split(".") as [string, string, string];
@@ -296,6 +445,7 @@ describe("route token", () => {
       db,
       user,
       cid,
+      target,
       now,
     });
     expect(
@@ -316,6 +466,7 @@ describe("route token", () => {
       db,
       user,
       cid,
+      target,
       now,
     });
     const onlyK1 = new Map([["k1", (await regionKeys()).get("k1")!]]);
@@ -328,6 +479,7 @@ describe("route token", () => {
       db,
       user,
       cid,
+      target,
       now,
     });
     expect(
@@ -342,6 +494,7 @@ describe("route token", () => {
       db,
       user,
       cid,
+      target,
       now,
     });
     const keys = await regionKeys();
@@ -358,12 +511,20 @@ describe("route token", () => {
 
   it("rejects lifetimes over 30 s and non-positive lifetimes", async () => {
     const regionKey = (await regionKeys()).get("k2")!;
-    const base = { v: 2, db, user, cid, rg: region, kid: "k2", iat: nowSec };
+    const base = {
+      v: 3,
+      db,
+      user,
+      cid,
+      rg: region,
+      kid: "k2",
+      iat: nowSec,
+    };
     const keys = await regionKeys();
     expect(
       (
         await verifyRouteToken(
-          resign({ ...base, exp: nowSec + 30 }, regionKey),
+          resign({ ...base, exp: nowSec + 30, ...route }, regionKey),
           {
             keys,
             region,
@@ -374,7 +535,7 @@ describe("route token", () => {
     ).toBe(true);
     for (const exp of [nowSec + 31, nowSec]) {
       expect(
-        await verifyRouteToken(resign({ ...base, exp }, regionKey), {
+        await verifyRouteToken(resign({ ...base, exp, ...route }, regionKey), {
           keys,
           region,
           now,
@@ -388,6 +549,7 @@ describe("route token", () => {
         db,
         user,
         cid,
+        target,
         now,
         ttlSeconds: 31,
       }),
@@ -401,6 +563,7 @@ describe("route token", () => {
       db,
       user,
       cid,
+      target,
       now,
     });
     const keys = await regionKeys();
@@ -419,6 +582,7 @@ describe("route token", () => {
       db,
       user,
       cid,
+      target,
       now,
     });
     const [, payload, sig] = valid.split(".") as [string, string, string];
@@ -426,28 +590,28 @@ describe("route token", () => {
       [undefined, "missing"],
       [null, "missing"],
       ["", "missing"],
-      ["v2." + "A".repeat(600) + "." + sig, "too_long"],
-      [valid.replace(/^v2/, "v3"), "malformed"],
-      [`v2.${payload}`, "malformed"],
-      [`v2.${payload}.${sig}.x`, "malformed"],
-      [`v2.${payload}=.${sig}`, "malformed"],
-      [`v2.${payload}.${sig}=`, "malformed"],
-      [`v2.${payload}.${sig.slice(0, -1)}`, "malformed"],
-      [`v2.${payload}.${sig.slice(0, -1)}B`, "malformed"],
-      [`v2.${payload}+.${sig}`, "malformed"],
-      [`v2..${sig}`, "malformed"],
-      [`v2.${b64u(Buffer.from("not json"))}.${sig}`, "malformed"],
-      [`v2.${b64u(Buffer.from("[1]"))}.${sig}`, "malformed"],
-      [`v2.${b64u(Buffer.from([0xff, 0xfe]))}.${sig}`, "malformed"],
-      [`v2.${b64u(Buffer.from('{"kid":1}'))}.${sig}`, "malformed"],
+      ["v3." + "A".repeat(600) + "." + sig, "too_long"],
+      [valid.replace(/^v3/, "v4"), "malformed"],
+      [`v3.${payload}`, "malformed"],
+      [`v3.${payload}.${sig}.x`, "malformed"],
+      [`v3.${payload}=.${sig}`, "malformed"],
+      [`v3.${payload}.${sig}=`, "malformed"],
+      [`v3.${payload}.${sig.slice(0, -1)}`, "malformed"],
+      [`v3.${payload}.${sig.slice(0, -1)}B`, "malformed"],
+      [`v3.${payload}+.${sig}`, "malformed"],
+      [`v3..${sig}`, "malformed"],
+      [`v3.${b64u(Buffer.from("not json"))}.${sig}`, "malformed"],
+      [`v3.${b64u(Buffer.from("[1]"))}.${sig}`, "malformed"],
+      [`v3.${b64u(Buffer.from([0xff, 0xfe]))}.${sig}`, "malformed"],
+      [`v3.${b64u(Buffer.from('{"kid":1}'))}.${sig}`, "malformed"],
       [
-        `v2.${b64u(Buffer.from('{"kid":"constructor"}'))}.${sig}`,
+        `v3.${b64u(Buffer.from('{"kid":"constructor"}'))}.${sig}`,
         "unknown_kid",
       ],
       [
         resign(
           {
-            v: 2,
+            v: 3,
             db,
             user,
             cid,
@@ -455,6 +619,7 @@ describe("route token", () => {
             kid: "k2",
             iat: nowSec,
             exp: nowSec + 30,
+            ...route,
             extra: 1,
           },
           regionKey,
@@ -464,7 +629,7 @@ describe("route token", () => {
       [
         resign(
           {
-            v: 2,
+            v: 3,
             db: "UPPER",
             user,
             cid,
@@ -472,6 +637,7 @@ describe("route token", () => {
             kid: "k2",
             iat: nowSec,
             exp: nowSec + 30,
+            ...route,
           },
           regionKey,
         ),
@@ -480,7 +646,7 @@ describe("route token", () => {
       [
         resign(
           {
-            v: 2,
+            v: 3,
             db,
             user,
             cid,
@@ -488,6 +654,7 @@ describe("route token", () => {
             kid: "k2",
             iat: nowSec + 0.5,
             exp: nowSec + 30,
+            ...route,
           },
           regionKey,
         ),
@@ -506,7 +673,7 @@ describe("route token", () => {
     const keys = await regionKeys();
     const regionKey = keys.get("k2")!;
     const claims = JSON.stringify({
-      v: 2,
+      v: 3,
       db,
       user,
       cid,
@@ -514,6 +681,7 @@ describe("route token", () => {
       kid: "k2",
       iat: nowSec,
       exp: nowSec + 30,
+      ...route,
     });
     const allowed = signPayload(claims.padEnd(348, " "), regionKey);
     expect(allowed.length).toBe(511);
@@ -522,7 +690,7 @@ describe("route token", () => {
     );
     // Fixed 43-character signatures make a 512-character token's payload
     // noncanonical base64url; it must reach structure validation, not the cap.
-    const atLimit = allowed.replace("v2.", "v2.A");
+    const atLimit = allowed.replace("v3.", "v3.A");
     expect(atLimit.length).toBe(512);
     expect(await verifyRouteToken(atLimit, { keys, region, now })).toEqual({
       ok: false,
@@ -581,6 +749,7 @@ describe("route token", () => {
       db,
       user,
       cid,
+      target,
       now,
     });
     expect(

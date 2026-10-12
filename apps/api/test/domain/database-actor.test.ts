@@ -183,6 +183,10 @@ it("atomically bounds a configured aggregate across valid roles and refuses inva
     sqlstate: "53300",
   });
   expect(count()).toBe(0);
+  // The Actor environment is shared by later tests in this file.
+  await runInDurableObject(actor(f.id), (instance) => {
+    delete Reflect.get(instance, "env").DATABASE_CONNECTION_LIMIT_PER_MINUTE;
+  });
 });
 
 it("only a validated management seed for the exact actor creates its persistent schema", async () => {
@@ -274,6 +278,63 @@ it("a seeded unknown role makes no D1 admission query and a valid role reads rea
     },
   });
   expect(count()).toBe(1);
+});
+
+it("an admission names only the controller-verified target of the observed revision", async () => {
+  const f = await ready();
+  await sync(f.id);
+  const pod = crypto.randomUUID();
+  const attestation = (generation: number, database = f.id) =>
+    JSON.stringify({
+      v: 1,
+      database_id: database,
+      generation,
+      storage_generation: 1,
+      node_uid: crypto.randomUUID(),
+      boot_id: crypto.randomUUID(),
+      cluster_uid: crypto.randomUUID(),
+      namespace_uid: crypto.randomUUID(),
+      cnpg_cluster_uid: crypto.randomUUID(),
+      storage_uid: crypto.randomUUID(),
+      pvc_uid: crypto.randomUUID(),
+      pv_uid: crypto.randomUUID(),
+      pod_uid: pod,
+      container_id: "3".repeat(64),
+      postgres_image_sha256: "4".repeat(64),
+      memory_request_bytes: 1,
+      memory_limit_bytes: 2,
+      observed_at: Date.now(),
+      configuration_fingerprint: "5".repeat(64),
+    });
+  const store = (value: string | null) =>
+    env.DB.prepare("UPDATE databases SET runtime_attestation_json=? WHERE id=?")
+      .bind(value, f.id)
+      .run();
+  await store(attestation(1));
+  const region = {
+    id: f.region,
+    gateway_url: `https://${["gateway", "invalid"].join(".")}`,
+    gateway_binding: null,
+  };
+  expect(await actor(f.id).admit(f.id, "app")).toEqual({
+    ok: true,
+    region,
+    target: { revision: 1, pod_uid: pod },
+  });
+  expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
+    ok: true,
+    region,
+    target: { revision: 1, pod_uid: pod },
+  });
+  for (const value of [
+    attestation(2),
+    attestation(1, newDatabaseId()),
+    JSON.stringify({ pod_uid: pod }),
+    null,
+  ]) {
+    await store(value);
+    expect(await actor(f.id).admit(f.id, "app")).toEqual({ ok: true, region });
+  }
 });
 
 it("stale positive snapshots never authorize deleted roles, databases or projects", async () => {

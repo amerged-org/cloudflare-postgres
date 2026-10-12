@@ -46,6 +46,7 @@ static CLAIM_PATTERNS: LazyLock<HashMap<String, Regex>> = LazyLock::new(|| {
     let mut result = HashMap::new();
     for name in [
         "routeClaims",
+        "legacyRouteClaims",
         "controlClaims",
         "activityClaims",
         "intent",
@@ -89,6 +90,10 @@ pub fn valid_role(value: &str) -> bool {
 /// never influence authorization; the generator rejects unhandled structural changes.
 pub fn valid_claims(value: &Value) -> bool {
     valid_schema("routeClaims", value) && value["user"].as_str().is_some_and(valid_role)
+}
+/// Temporary rollout compatibility: v2 claims without a route revision or target.
+pub fn valid_legacy_claims(value: &Value) -> bool {
+    valid_schema("legacyRouteClaims", value) && value["user"].as_str().is_some_and(valid_role)
 }
 pub fn valid_schema(name: &str, value: &Value) -> bool {
     let schema = &CONTRACT[name];
