@@ -14,3 +14,16 @@ pub mod reconcile;
 #[cfg(test)]
 mod test_server;
 pub type Error = Box<dyn std::error::Error + Send + Sync>;
+/// Plain-HTTP client for in-cluster endpoints (gateway activity and power, PostgreSQL exporter).
+/// The image is `FROM scratch`, where Linux has no platform CA roots, so it pins an empty trust
+/// store instead of loading them; any HTTPS use fails closed.
+pub fn cluster_http(timeout: std::time::Duration) -> Result<reqwest::Client, Error> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    Ok(reqwest::Client::builder()
+        .tls_certs_only(Vec::new())
+        .retry(reqwest::retry::never())
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(timeout)
+        .build()?)
+}

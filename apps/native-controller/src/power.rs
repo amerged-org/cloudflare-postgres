@@ -511,13 +511,7 @@ impl PowerCoordinator {
         if !valid_pattern("region", &region) || replicas == 0 || replicas > 64 {
             return Err("power coordinator configuration invalid".into());
         }
-        let _ = rustls::crypto::ring::default_provider().install_default();
-        let http = reqwest::Client::builder()
-            .retry(reqwest::retry::never())
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(3))
-            .build()?;
+        let http = crate::cluster_http(Duration::from_secs(3))?;
         Ok(Self {
             k8s,
             region,

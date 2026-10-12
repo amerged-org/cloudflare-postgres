@@ -366,12 +366,7 @@ impl Measurements {
             k8s,
             api,
             controller,
-            http: reqwest::Client::builder()
-                .retry(reqwest::retry::never())
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .timeout(Duration::from_millis(2500))
-                .build()?,
+            http: crate::cluster_http(Duration::from_millis(2500))?,
             state: Mutex::new(State::default()),
             process: format!("agent_{}", uuid()?),
         })

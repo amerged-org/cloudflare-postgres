@@ -1158,11 +1158,7 @@ impl Reconciler {
         }
         let _ = rustls::crypto::ring::default_provider().install_default();
         let power = PowerCoordinator::new(k8s.clone(), region, replicas)?;
-        let http = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(5))
-            .build()?;
+        let http = crate::cluster_http(Duration::from_secs(5))?;
         Ok(Self {
             k8s,
             power,
