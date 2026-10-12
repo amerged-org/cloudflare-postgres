@@ -655,9 +655,15 @@ export class ThinWorld {
       }
       case "lvcreate": {
         const value = (flag: string) => rest[rest.indexOf(flag) + 1]!;
-        this.log.push(`lvcreate ${value("--name")}`);
+        // lvm2 2.03 in the pinned driver image refuses this option with --type thin-pool.
+        if (rest.includes("--type") && rest.includes("--errorwhenfull"))
+          return { exit_code: 3, stdout: "" };
+        const name = rest.includes("--thinpool")
+          ? value("--thinpool")
+          : value("--name");
+        this.log.push(`lvcreate ${name}`);
         this.addLv({
-          name: value("--name"),
+          name,
           uuid: lvm("Np"),
           segtype: "thin-pool",
           pool: "",

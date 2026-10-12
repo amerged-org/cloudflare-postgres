@@ -242,7 +242,25 @@ test("an empty LVM pool percentage fails closed instead of reading as an unused 
 });
 test("pool writes use bounded absolute sizes and never retry a dispatched unknown outcome", () => {
   const value = facts();
-  assert.equal(thinPoolCommand(input, value, action)?.[0], "lvcreate");
+  // lvm2 2.03 refuses --errorwhenfull with --type thin-pool; the --thinpool form accepts it.
+  assert.deepEqual(thinPoolCommand(input, value, action), [
+    "lvcreate",
+    "--thinpool",
+    "pgcf_thinpool",
+    "--size",
+    `${action.target_data_bytes}B`,
+    "--poolmetadatasize",
+    `${action.target_metadata_bytes}B`,
+    "--chunksize",
+    "64K",
+    "--errorwhenfull",
+    "y",
+    "--addtag",
+    `pgcf.node.${input.lease.node_uid}`,
+    "--addtag",
+    `pgcf.action.${action.nonce}`,
+    "pgcf",
+  ]);
   assert.throws(
     () => thinPoolCommand(input, value, { ...action, state: "dispatched" }),
     /thin_storage_initialize_outcome_unknown/,

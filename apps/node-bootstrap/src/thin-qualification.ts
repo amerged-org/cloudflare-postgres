@@ -1858,9 +1858,7 @@ printf 'pgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$rc" "$start" "$end"`,
         await this.node.driverExec(
           [
             "lvcreate",
-            "--type",
-            "thin-pool",
-            "--name",
+            "--thinpool",
             this.tinyPool,
             "--size",
             `${limits.metadata_pool_data_bytes}B`,

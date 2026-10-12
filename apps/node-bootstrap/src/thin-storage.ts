@@ -414,11 +414,10 @@ export function thinPoolCommand(
       facts.free
     )
       throw new BootstrapError("thin_storage_vg_headroom_insufficient");
+    // lvm2 2.03 refuses --errorwhenfull with --type thin-pool; the --thinpool form accepts it.
     return [
       "lvcreate",
-      "--type",
-      "thin-pool",
-      "--name",
+      "--thinpool",
       "pgcf_thinpool",
       "--size",
       `${action.target_data_bytes}B`,
