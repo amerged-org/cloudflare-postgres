@@ -56,15 +56,30 @@ the same report once in the legacy shape. Route tokens are versioned: v3 binds t
 and the verified primary Pod, and the native gateway refuses a stale revision or another Pod
 before dialling. A region gets v3 only when its assigned release declares
 `"route_token_version": 3` and every current assigned member confirmed that release's patch at the
-current region revision. Declare it only for a native gateway image built from 8f8017a or later;
-approval requires the native gateway and controller on every role. Otherwise the Actor admission
-names no target and the Edge signs v2, which every gateway accepts; the TypeScript gateway accepts
-only v2. In a v3 region an admission without the verified target of the observed revision is
-refused as not ready (57P03), never signed v2. Roll back in reverse order: Edge, fleet, API. An
-older Edge signs only v2. Assigning a release without the declaration ends v3 before a patch can
-start an older gateway; issued v3 tokens expire within 30 seconds. An API older than this change
-cannot read a release that declares `route_token_version`, so assign such regions a release
-without it before rolling back the API. Remove v2 once every region's release declares v3.
+current region revision. Otherwise the Actor admission names no target and the Edge signs v2,
+which every gateway accepts; the TypeScript gateway accepts only v2. In a v3 region an admission
+without the verified target of the observed revision is refused as not ready (57P03), never
+signed v2.
+
+Approval checks only that a declaring release runs the native gateway and controller on every
+role; the API holds no image provenance. Before declaring v3, read the source commit that CI
+built and labelled each pinned image from, and check it against the cutoff:
+
+```sh
+docker pull "$REFERENCE"
+commit=$(docker image inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' "$REFERENCE")
+git merge-base --is-ancestor 509d148 "$commit"
+```
+
+The `native-gateway` commit must contain 509d148, which verifies v3. The `native-controller`
+commit must contain "fix: publish a restored database's running fence under its restore";
+earlier controllers leave a restored database without the running fence its v3 routes need.
+
+Roll back in reverse order: Edge, fleet, API. An older Edge signs only v2. Assigning a release
+without the declaration ends v3 before a patch can start an older gateway; issued v3 tokens
+expire within 30 seconds. An API older than this change cannot read a release that declares
+`route_token_version`, so assign such regions a release without it before rolling back the API.
+Remove v2 once every region's release declares v3.
 
 ## Rust/Wasm Edge artifact
 
@@ -87,10 +102,11 @@ namespaces, regional VPC/service bindings and `ROUTE_MASTER_KEYS` secret. The ex
 intentionally has no custom build command: delivery uses the qualified artifact instead
 of compiling again. Do not activate the replacement until the selected bytes pass Dev
 database acceptance. Record the actual Worker version and result in the ULTRA plan.
-Never activate a Wasm Edge built before 8f8017a once the API from that change is deployed:
-its exact-key admission parser refuses the added `target` and fails every connection. Later
-builds validate the admission fields they use and ignore additive ones, like the TypeScript
-Edge that serves live traffic.
+Activate only a Wasm Edge whose source commit contains fdbfcbe
+(`git merge-base --is-ancestor fdbfcbe <commit>`). Earlier builds parse the admission by exact
+keys: those before 509d148 refuse the `target` the current API adds and fail every connection,
+and later ones would refuse the next additive field. Builds from fdbfcbe validate the fields they
+use and ignore additive ones, like the TypeScript Edge that serves live traffic.
 
 Successful upgrades return the unopened upstream WebSocket directly to Cloudflare.
 PostgreSQL bytes are not relayed through a TypeScript or Wasm application loop. Only
