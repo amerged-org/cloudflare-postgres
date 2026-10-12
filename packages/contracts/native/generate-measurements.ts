@@ -135,6 +135,25 @@ const checkpoints = [
     },
   },
   {
+    // A writer that serializes the same storage state in another key order keeps the checkpoint.
+    name: "reserialized_state",
+    data: {
+      [MEASUREMENT_CHECKPOINT_KEY]: JSON.stringify({
+        version: 1,
+        identity: {
+          ...identity,
+          state: JSON.stringify(
+            Object.fromEntries(
+              Object.entries(JSON.parse(identity.state)).reverse(),
+            ),
+          ),
+        },
+        outbox: [],
+        baseline,
+      }),
+    },
+  },
+  {
     name: "idle_window_without_baseline",
     data: {
       [MEASUREMENT_CHECKPOINT_KEY]: JSON.stringify({

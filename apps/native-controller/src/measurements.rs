@@ -176,6 +176,18 @@ fn report_valid(v: &Value) -> bool {
     })();
     checked.is_ok()
 }
+/// The storage state compares by content: its writers serialize the same keys in different orders.
+fn same_identity(stored: &Value, current: &Value) -> bool {
+    let parse = |v: &Value| {
+        v.as_str()
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+    };
+    stored.as_object().is_some_and(|fields| fields.len() == 5)
+        && ["storage", "namespace", "cluster", "fence"]
+            .iter()
+            .all(|key| stored[*key] == current[*key])
+        && parse(&stored["state"]).is_some_and(|state| Some(state) == parse(&current["state"]))
+}
 fn checkpoint(resource: &Value, identity: &Value) -> Result<Value, Error> {
     let Some(raw) = resource["data"][key("MEASUREMENT_CHECKPOINT_KEY")].as_str() else {
         if !resource["data"][key("MEASUREMENT_CHECKPOINT_KEY")].is_null() {
@@ -187,7 +199,7 @@ fn checkpoint(resource: &Value, identity: &Value) -> Result<Value, Error> {
         return Err("measurement checkpoint exceeds bound".into());
     }
     let value: Value = serde_json::from_str(raw)?;
-    if value["version"] != 1 || value["identity"] != *identity {
+    if value["version"] != 1 || !same_identity(&value["identity"], identity) {
         return Err("measurement checkpoint identity changed".into());
     }
     let outbox = value["outbox"]

@@ -1,4 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
+import { isDeepStrictEqual } from "node:util";
 import { randomUUID } from "node:crypto";
 import { isIP } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
@@ -366,6 +367,26 @@ export function measurementBatches<T>(
   if (current.length) batches.push(current);
   return batches;
 }
+/** The storage state compares by content: its writers serialize the same keys in different orders. */
+function sameIdentity(stored: unknown, current: Identity): boolean {
+  const value = record(stored);
+  if (
+    Object.keys(value).length !== 5 ||
+    (["storage", "namespace", "cluster", "fence"] as const).some(
+      (key) => value[key] !== current[key],
+    ) ||
+    typeof value.state !== "string"
+  )
+    return false;
+  try {
+    return isDeepStrictEqual(
+      JSON.parse(value.state),
+      JSON.parse(current.state),
+    );
+  } catch {
+    return false;
+  }
+}
 function readCheckpoint(resource: Resource, identity: Identity): Checkpoint {
   const raw = record(resource.data)[DATA];
   if (raw === undefined) return { version: 1, identity, outbox: [] };
@@ -374,7 +395,7 @@ function readCheckpoint(resource: Resource, identity: Identity): Checkpoint {
   const value = record(JSON.parse(raw));
   if (
     value.version !== 1 ||
-    text(value.identity) !== text(identity) ||
+    !sameIdentity(value.identity, identity) ||
     !Array.isArray(value.outbox) ||
     value.outbox.length > MAX_OUTBOX ||
     (value.gapSince !== undefined && !validTime(value.gapSince)) ||
