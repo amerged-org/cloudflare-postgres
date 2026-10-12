@@ -1,7 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { DatabaseWithOperation, newDatabaseId } from "@pgcf/contracts";
+import {
+  DatabaseWithOperation,
+  newDatabaseId,
+  newOperationId,
+} from "@pgcf/contracts";
 import { afterEach, expect, it, vi } from "vitest";
 import { readDatabasePresence } from "../../src/domain/database-actor-sync.ts";
 import {
@@ -86,6 +90,133 @@ async function untilWake(id: string, generation = 3) {
   }
   throw new Error("wake_not_started");
 }
+
+async function registered(id: string, waiterId: string) {
+  for (let i = 0; i < 200; i++) {
+    if (
+      await runInDurableObject(actor(id), (instance) =>
+        Reflect.get(instance, "waiters").has(waiterId),
+      )
+    )
+      return;
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+  throw new Error("waiter_not_registered");
+}
+/** Holds every fallback D1 read of the wake loop until released. */
+async function stallFallbackReads(id: string) {
+  let release!: () => void;
+  const held = new Promise<void>((done) => {
+    release = done;
+  });
+  await runInDurableObject(actor(id), (instance) => {
+    const db = (instance as unknown as { env: { DB: D1Database } }).env.DB;
+    const original = db.prepare.bind(db);
+    vi.spyOn(db, "prepare").mockImplementation((query: string) => {
+      const statement = original(query);
+      if (!query.startsWith("SELECT d.generation,d.power_operation"))
+        return statement;
+      const bind = statement.bind.bind(statement);
+      vi.spyOn(statement, "bind").mockImplementation((...values) => {
+        const bound = bind(...values);
+        const first = bound.first.bind(bound);
+        vi.spyOn(bound, "first").mockImplementation(async (...columns) => {
+          await held;
+          return first(...columns);
+        });
+        return bound;
+      });
+      return statement;
+    });
+  });
+  return release;
+}
+
+it("a committed ready observation releases a waiting wake at once, without its fallback read", async () => {
+  const f = await ready();
+  await idle(f);
+  const release = await stallFallbackReads(f.id);
+  try {
+    const waiterId = crypto.randomUUID();
+    const pending = actor(f.id).ensureAwake(f.id, "app", {
+      waiterId,
+      deadline: Date.now() + 3000,
+    });
+    const row = await untilWake(f.id);
+    await registered(f.id, waiterId);
+    await request(
+      "/agent/v1/observations",
+      f.agent,
+      "POST",
+      observedBody([
+        {
+          ...observation(f.id, 3),
+          power: {
+            operation: row.power_operation,
+            revision: 3,
+            state: "awake",
+          },
+        },
+      ]),
+    );
+    expect(await pending).toMatchObject({ ok: true });
+  } finally {
+    release();
+  }
+});
+
+it("only a push for the waiting wake's committed revision releases it, and admission still reads D1", async () => {
+  const f = await ready();
+  await idle(f);
+  const release = await stallFallbackReads(f.id);
+  try {
+    const waiterId = crypto.randomUUID();
+    const pending = actor(f.id).ensureAwake(f.id, "app", {
+      waiterId,
+      deadline: Date.now() + 3000,
+    });
+    const row = await untilWake(f.id);
+    await registered(f.id, waiterId);
+    for (const [revision, operation] of [
+      [2, row.power_operation],
+      [3, newOperationId()],
+      [3, null],
+    ] as const)
+      expect(await actor(f.id).observedReady(f.id, revision, operation)).toBe(
+        false,
+      );
+    expect(
+      await runInDurableObject(actor(f.id), (instance) =>
+        Reflect.get(instance, "waiters").has(waiterId),
+      ),
+    ).toBe(true);
+    // The exact wake is released, but D1 has not committed readiness: no stale admission.
+    expect(await actor(f.id).observedReady(f.id, 3, row.power_operation)).toBe(
+      true,
+    );
+    expect(await pending).toEqual({ ok: false, sqlstate: "57P03" });
+  } finally {
+    release();
+  }
+});
+
+it("the bounded fallback read still releases a waiter whose push was lost", async () => {
+  const f = await ready();
+  await idle(f);
+  const waiterId = crypto.randomUUID();
+  const pending = actor(f.id).ensureAwake(f.id, "app", {
+    waiterId,
+    deadline: Date.now() + 4000,
+  });
+  await untilWake(f.id);
+  await registered(f.id, waiterId);
+  await env.DB.prepare(
+    "UPDATE databases SET observed_state='ready',observed_power='awake',observed_generation=generation WHERE id=?",
+  )
+    .bind(f.id)
+    .run();
+  expect(await pending).toMatchObject({ ok: true });
+});
 
 it("admits an already-ready route with one fresh authoritative read", async () => {
   const f = await ready();

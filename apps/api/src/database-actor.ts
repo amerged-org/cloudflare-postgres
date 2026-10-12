@@ -34,6 +34,8 @@ import { powerTransitionStatements } from "./domain/lifecycle.ts";
 import type { DatabaseRow } from "./domain/rows.ts";
 import { readDatabasePresence } from "./domain/database-actor-sync.ts";
 
+/** A committed ready observation releases wake waiters by push; this read only recovers a lost push. */
+const WAKE_FALLBACK_READ_MS = 1000;
 export const DatabasePresence = z
   .strictObject({
     database_id: DatabaseId,
@@ -779,6 +781,26 @@ export class DatabaseActor extends DurableObject<Env> {
       return { ok: false, sqlstate: "08006" };
     }
   }
+  /**
+   * Trusted API RPC after D1 committed a ready observation. It releases only the waiters of that
+   * exact wake revision and operation; each still passes the fresh authoritative admission read.
+   */
+  async observedReady(
+    databaseId: string,
+    revision: number,
+    operation: string | null,
+  ): Promise<boolean> {
+    this.identity(DatabaseId.parse(databaseId));
+    if (
+      !this.wake ||
+      this.wake.revision !== revision ||
+      this.wake.operation !== operation ||
+      !this.waiters.size
+    )
+      return false;
+    this.finishWaiters(true);
+    return true;
+  }
   private finishWaiters(ready: boolean): void {
     for (const waiter of this.waiters.values())
       waiter.resolve(ready && waiter.deadline > Date.now());
@@ -821,7 +843,7 @@ export class DatabaseActor extends DurableObject<Env> {
         const delay = Math.max(
           1,
           Math.min(
-            250,
+            WAKE_FALLBACK_READ_MS,
             ...[...this.waiters.values()].map(
               (waiter) => waiter.deadline - Date.now(),
             ),

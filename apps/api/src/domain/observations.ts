@@ -594,6 +594,25 @@ export async function observations(
       );
     const result = await c.env.DB.batch(statements);
     accepted += result[0]!.meta.changes;
+    // Push the committed transition to ready; the Actor's bounded fallback read recovers a lost push.
+    if (
+      result[0]!.meta.changes === 1 &&
+      observation.state === "ready" &&
+      !(
+        row.observed_state === "ready" &&
+        row.observed_power === "awake" &&
+        row.observed_generation === observation.generation
+      )
+    )
+      c.executionCtx.waitUntil(
+        c.env.DATABASE_ACTOR.get(c.env.DATABASE_ACTOR.idFromName(row.id))
+          .observedReady(
+            row.id,
+            observation.generation,
+            row.power_operation ?? null,
+          )
+          .catch(() => false),
+      );
   }
   if (orphans !== undefined)
     await c.env.REGION_LINK.get(
