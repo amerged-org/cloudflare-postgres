@@ -437,7 +437,7 @@ owner decision.
 | packages/contracts/src/route-token.ts | Version 3 with route revision and target; a larger length bound. |
 | packages/contracts/src/reclaim.ts | The runtime attestation (lines 181-205) for a pool binding: kind, binding ID, pool Pod. |
 | apps/api/src/database-actor.ts | Claim in the wake commit; admission push; deferral of role changes for pool-bound databases. |
-| apps/api/src/domain/compute-pool.ts, roles.ts, desired.ts, observations.ts; new apps/api/migrations/0045_pool_bindings.sql | `pool_pods` and `pool_bindings`, held agent request, idempotent outcomes, binding in desired state, sleep record, pool backup observations. |
+| apps/api/src/domain/compute-pool.ts, roles.ts, desired.ts, observations.ts; new apps/api/migrations/0046_pool_bindings.sql | `pool_pods` and `pool_bindings`, held agent request, idempotent outcomes, binding in desired state, sleep record, pool backup observations. |
 | apps/edge/src/index.ts (apps/edge-rust once it replaces it) | Sign version-3 tokens (index.ts:134). |
 | apps/native-controller/src/power.rs, reconcile.rs, postgres.rs, health.rs, kubernetes.rs, measurements.rs; new pool.rs | Pool branches of wake, sleep proof and detach; hibernation-off refused while bound; dial by address with the service TLS name; pool Pod lifecycle and refill, Lease, bundle push, backups, labels and resize; backup health from the catalog; usage attributed by binding record. |
 | New apps/pool-supervisor (workspace member) | Supervisor, `wal-archive` shim and archiver mode. |
