@@ -111,6 +111,8 @@ export class ThinWorld {
   namespaceUid: string | null = null;
   classes = new Map<string, string>();
   poolMode: "rw" | "out_of_data_space" = "rw";
+  /** LVs whose next lvremove calls fail because the device is still open. */
+  busy = new Map<string, number>();
   /** Writes, Pod execs and Talos calls other than identity reads, in order. */
   log: string[] = [];
   /** Simulated relay latency of one driver command, applied to the mocked clock. */
@@ -752,6 +754,12 @@ export class ThinWorld {
       case "lvremove": {
         const name = rest.at(-1)!.slice("pgcf/".length);
         this.log.push(`lvremove ${name}`);
+        const busy = this.busy.get(name) ?? 0;
+        if (busy > 0) {
+          // A device still open, as right after the maximum fill on EU1, refuses removal.
+          this.busy.set(name, busy - 1);
+          return { exit_code: 5, stdout: "" };
+        }
         this.lvs = this.lvs.filter((lv) => lv.name !== name);
         return ok("");
       }

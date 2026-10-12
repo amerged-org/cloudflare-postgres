@@ -49,6 +49,8 @@ const POOL = "pgcf_thinpool";
 const OWNER = "pgcf.io/thin-qualification";
 const MARKER = "pgcf-q-committed-marker";
 const UNCOMMITTED = "pgcf-q-uncommitted";
+/** Removal rounds for owned scratch LVs; a device can stay open briefly after heavy writes. */
+const REMOVE_ATTEMPTS = 4;
 const QUALIFICATION_LV_FIELDS = `${THIN_LV_FIELDS},chunk_size,lv_health_status`;
 function fail(code: string): never {
   throw new BootstrapError(`thin_qualification_${code}`);
@@ -691,7 +693,7 @@ class Qualifier {
   // Physical LVM and device-mapper reads through the driver container.
   private async lvm(): Promise<QualificationLvm> {
     const read = await readThinLvm(
-      (args) => this.node.driverExec(args),
+      (args) => this.node.driverRead(args),
       QUALIFICATION_LV_FIELDS,
     );
     const value = parseQualificationLvm(
@@ -2272,51 +2274,51 @@ printf '%s\\npgcf-written=%s\\npgcf-rc=%s\\npgcf-start=%s\\npgcf-end=%s\\n' "$er
   private async removeTagged(key: string, names: string[]) {
     return await this.journal.converge(key, async () => {
       const wanted = new Set(names);
-      for (const lv of (await this.lvm()).volumes) {
-        if (!wanted.has(lv.name)) continue;
-        if (!lv.tags.includes(this.tag)) fail("scratch_volume_not_owned");
-        this.room(60_000);
-        await this.node.driverExec(
-          ["lvremove", "--yes", `pgcf/${lv.name}`],
-          true,
-          60_000,
+      // A device still open right after heavy writes refuses lvremove for a moment.
+      for (let attempt = 0; ; attempt++) {
+        const left = (await this.lvm()).volumes.filter((lv) =>
+          wanted.has(lv.name),
         );
+        if (left.length === 0) return { removed: true };
+        if (attempt === REMOVE_ATTEMPTS) fail("scratch_volume_remove_failed");
+        if (attempt > 0) await this.wait();
+        for (const lv of left) {
+          if (!lv.tags.includes(this.tag)) fail("scratch_volume_not_owned");
+          this.room(60_000);
+          await this.node.driverExec(
+            ["lvremove", "--yes", `pgcf/${lv.name}`],
+            true,
+            60_000,
+          );
+        }
       }
-      if ((await this.lvm()).volumes.some((lv) => wanted.has(lv.name)))
-        fail("scratch_volume_remove_failed");
-      return { removed: true };
     });
   }
   /** Remove the scratch metadata pool, its thin LV and any repair backup by exact owned name. */
   private async removeScratchPool(key: string) {
     return await this.journal.converge(key, async () => {
-      const lvm = await this.lvm();
-      for (const name of [
-        this.tinyVolume,
-        `${this.tinyPool}_meta0`,
-        this.tinyPool,
-      ]) {
-        const lv = lvm.volumes.find((value) => value.name === name);
-        if (!lv) continue;
-        if (name !== `${this.tinyPool}_meta0` && !lv.tags.includes(this.tag))
-          fail("scratch_pool_not_owned");
-        await this.node.driverExec(
-          ["lvremove", "--yes", `pgcf/${name}`],
-          true,
-          120_000,
-        );
+      const names = [this.tinyVolume, `${this.tinyPool}_meta0`, this.tinyPool];
+      for (let attempt = 0; ; attempt++) {
+        const lvm = await this.lvm(),
+          left = names.flatMap((name) =>
+            lvm.volumes.filter((value) => value.name === name),
+          );
+        if (left.length === 0) return { removed: true };
+        if (attempt === REMOVE_ATTEMPTS) fail("scratch_pool_remove_failed");
+        if (attempt > 0) await this.wait();
+        for (const lv of left) {
+          if (
+            lv.name !== `${this.tinyPool}_meta0` &&
+            !lv.tags.includes(this.tag)
+          )
+            fail("scratch_pool_not_owned");
+          await this.node.driverExec(
+            ["lvremove", "--yes", `pgcf/${lv.name}`],
+            true,
+            120_000,
+          );
+        }
       }
-      const after = await this.lvm();
-      if (
-        after.volumes.some(
-          (lv) =>
-            lv.name === this.tinyPool ||
-            lv.name === this.tinyVolume ||
-            lv.name === `${this.tinyPool}_meta0`,
-        )
-      )
-        fail("scratch_pool_remove_failed");
-      return { removed: true };
     });
   }
   private async noflush(): Promise<ThinQualificationReport> {

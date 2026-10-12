@@ -3,6 +3,7 @@ import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createHash } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { canonicalStorageAuthorityKeys } from "@pgcf/contracts/storage-write-authority";
 import {
   NodeThinStorageInput,
@@ -117,6 +118,34 @@ export async function readThinLvm(
     dm: after.stdout,
     before: before.stdout,
   };
+}
+/** A read-only command repeats a failed relay round trip at most twice; a mutating one never does. */
+export async function readCommand(
+  attempt: () => Promise<CommandResult>,
+  signal: AbortSignal,
+  pause = 1000,
+): Promise<CommandResult> {
+  let result = await attempt();
+  for (let retry = 0; retry < 2 && result.exit_code !== 0; retry++) {
+    await delay(pause, undefined, { signal });
+    result = await attempt();
+  }
+  return result;
+}
+/** Every relay transport is single-use, so a failed issuance is requested again, at most twice. */
+export async function issueAgain<T>(
+  request: () => Promise<T>,
+  signal: AbortSignal,
+  pause = 1000,
+): Promise<T> {
+  for (let retry = 0; ; retry++) {
+    try {
+      return await request();
+    } catch (error) {
+      if (retry === 2 || signal.aborted) throw error;
+      await delay(pause, undefined, { signal });
+    }
+  }
 }
 /** `lvs` prints one row per segment once a segment field such as `segtype` is requested, so a grown
  * pool's hidden data LV or an extended linear LV appears once per segment; those rows must agree. */
@@ -650,7 +679,10 @@ export async function openThinSession<T>(
             : undefined,
       async (capability) => {
         const transport = NodeBootstrapTransport.parse(
-          await call({ kind: "transport", capability }),
+          await issueAgain(
+            () => call({ kind: "transport", capability }),
+            signal,
+          ),
         );
         if (
           transport.expectedTarget.ip !==
@@ -720,13 +752,24 @@ export async function openThinSession<T>(
         permit,
         timeout,
       );
+    const read = async (attempt: () => Promise<CommandResult>) => {
+      const result = await readCommand(attempt, signal);
+      if (result.exit_code !== 0)
+        throw new BootstrapError("thin_storage_command_failed");
+      return result.stdout;
+    };
     const get = async (args: string[]) =>
       object(
-        JSON.parse((await kube(["get", ...args, "--output=json"])).stdout),
+        JSON.parse(
+          await read(() =>
+            kube(["get", ...args, "--output=json"], undefined, true),
+          ),
+        ),
       );
+    // Every talosctl use here is a read: read, get and dmesg.
     const talos = async (args: string[], timeout = 10000) =>
-      (
-        await command(
+      await read(() =>
+        command(
           "talosctl",
           [
             "--talosconfig",
@@ -738,10 +781,10 @@ export async function openThinSession<T>(
             ...args,
           ],
           undefined,
-          false,
+          true,
           timeout,
-        )
-      ).stdout;
+        ),
+      );
     return await use({ signal, call, command, kube, get, talos });
   } finally {
     await proxy?.close();
@@ -782,6 +825,8 @@ export interface ThinNode {
     permit?: boolean,
     timeout?: number,
   ): Promise<CommandResult>;
+  /** A read-only driver command; a failed relay round trip is repeated, a failure still throws. */
+  driverRead(args: string[], timeout?: number): Promise<CommandResult>;
   freshDriver(): Promise<void>;
   readLvm(): Promise<ThinLvmFacts>;
 }
@@ -907,8 +952,17 @@ export async function verifyThinNode(
     )
       throw new BootstrapError("thin_storage_driver_identity_changed");
   };
+  const driverRead = async (args: string[], timeout = 10000) => {
+    const result = await readCommand(
+      () => driverExec(args, true, timeout),
+      session.signal,
+    );
+    if (result.exit_code !== 0)
+      throw new BootstrapError("thin_storage_command_failed");
+    return result;
+  };
   const hashes = (
-    await driverExec([
+    await driverRead([
       "sha256sum",
       "/usr/local/bin/lvm-driver",
       "/sbin/lvm",
@@ -918,9 +972,9 @@ export async function verifyThinNode(
     .trim()
     .split("\n")
     .map((v) => v.split(/\s+/)[0]!);
-  const tools = (await driverExec(["thin_check", "--version"])).stdout.trim();
+  const tools = (await driverRead(["thin_check", "--version"])).stdout.trim();
   const cgroup = (
-    await driverExec(["cat", "/sys/fs/cgroup/cgroup.controllers"])
+    await driverRead(["cat", "/sys/fs/cgroup/cgroup.controllers"])
   ).stdout
     .split(/\s+/)
     .includes("io");
@@ -935,7 +989,7 @@ export async function verifyThinNode(
   )
     throw new BootstrapError("thin_storage_driver_unqualified");
   const readLvm = async () => {
-    const read = await readThinLvm((args) => driverExec(args));
+    const read = await readThinLvm((args) => driverRead(args));
     return thinLvmFacts(read.vgs, read.lvs, read.dm, read.before);
   };
   return {
@@ -952,6 +1006,7 @@ export async function verifyThinNode(
     moduleLive,
     cgroup,
     driverExec,
+    driverRead,
     freshDriver,
     readLvm,
   };

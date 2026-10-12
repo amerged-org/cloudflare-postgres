@@ -4,6 +4,8 @@ import test from "node:test";
 import { createHash, randomUUID } from "node:crypto";
 import { stringify } from "yaml";
 import {
+  issueAgain,
+  readCommand,
   thinLvmFacts,
   thinPoolCommand,
   thinIoLimit,
@@ -272,6 +274,41 @@ test("only a device present before and after the LVM read must have an LV; one l
     () => facts([poolRow], `${tpool}\n${foreign}`, `${tpool}\n${foreign}`),
     /thin_storage_kernel_lv_unexplained/,
   );
+});
+test("a read-only relay command and a transport issuance are repeated at most twice", async () => {
+  const signal = new AbortController().signal;
+  let calls = 0;
+  const flaky = async () => ({
+    exit_code: ++calls < 3 ? 1 : 0,
+    stdout: String(calls),
+  });
+  assert.deepEqual(await readCommand(flaky, signal, 0), {
+    exit_code: 0,
+    stdout: "3",
+  });
+  calls = 0;
+  const broken = async () => ({ exit_code: (calls++, 1), stdout: "" });
+  assert.equal((await readCommand(broken, signal, 0)).exit_code, 1);
+  assert.equal(calls, 3);
+  calls = 0;
+  const refusedOnce = async () => {
+    if (calls++ === 0) throw new Error("thin_storage_authority_refused");
+    return "transport";
+  };
+  assert.equal(await issueAgain(refusedOnce, signal, 0), "transport");
+  calls = 0;
+  await assert.rejects(
+    issueAgain(
+      async () => {
+        calls++;
+        throw new Error("thin_storage_authority_refused");
+      },
+      signal,
+      0,
+    ),
+    /authority_refused/,
+  );
+  assert.equal(calls, 3);
 });
 test("an empty LVM pool percentage fails closed instead of reading as an unused pool", () => {
   assert.throws(

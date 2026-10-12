@@ -864,9 +864,8 @@ test("a fill that cannot outgrow the pool within the scheduler's room fails clos
   assert.deepEqual(run.world.log, []);
 });
 
-test("metadata_full removes its raw volumes across turns instead of outrunning the relay session", async (t) => {
-  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
-  const run = thinQualificationRun("metadata_full");
+/** metadata_full after the maximum pool fill, with its raw volumes still present. */
+function maximumFilled(run: ReturnType<typeof thinQualificationRun>) {
   scratchMeasured(run);
   run.workload("data_full", "pg-a", "Pa", { pod: false });
   run.confirm("metadata_full:pg-a:stop", { stopped: true });
@@ -909,6 +908,12 @@ test("metadata_full removes its raw volumes across turns instead of outrunning t
       needs_check: false,
     },
   });
+  return { prefix, raw };
+}
+test("metadata_full removes its raw volumes across turns instead of outrunning the relay session", async (t) => {
+  t.mock.timers.enable({ apis: ["Date"], now: Date.now() });
+  const run = thinQualificationRun("metadata_full");
+  const { prefix, raw } = maximumFilled(run);
   // Each relayed lvremove takes about 5 s; all of them do not fit one session.
   run.world.cost = (args) => (args[0] === "lvremove" ? 5_000 : 0);
   run.world.elapse = (milliseconds) => t.mock.timers.tick(milliseconds);
@@ -919,4 +924,15 @@ test("metadata_full removes its raw volumes across turns instead of outrunning t
   assert.equal(run.entry("metadata_full:volumes-remove")?.state, "dispatched");
   assert.deepEqual(await run.turn(), { kind: "report" });
   assert.equal(left(), 0);
+});
+test("a raw volume still open right after the maximum fill is removed on a later attempt", async () => {
+  const run = thinQualificationRun("metadata_full");
+  const { prefix } = maximumFilled(run);
+  // On EU1 one lvremove right after the maximum fill failed while the device was still open.
+  run.world.busy.set(`${prefix}3`, 1);
+  assert.deepEqual(await run.turn(), { kind: "report" });
+  assert.equal(
+    run.world.lvs.filter((lv) => lv.name.startsWith(prefix)).length,
+    0,
+  );
 });
