@@ -95,10 +95,11 @@ One row per step, in dependency order. A step moves to Done only with its measur
 | Terminal Pods after reboots | Fixed in code | R1.2 carries the fixed regional agent, and after its reboot EU1 databases wake, suspend and delete. Failed or Succeeded Pods left by a reboot made these power transitions fail. |
 | CNPG in-place restart | Fixed in code | The pool runtime switch yields a primary Pod with the selected RuntimeClass, and the EU rotation's consumer renewal yields new database Pods. CNPG's default restart method applies `kubectl.kubernetes.io/restartedAt` inside the running Pod, but both need a new Pod. NodeBootstrap carries the fix before the EU rotation; the native controller carries it with R2. |
 | Notifier | Open: the owner provides a Resend API key (Worker secret `RESEND_API_KEY`), a sender on a Resend-verified domain and a recipient. The OpenAPI document describes email, thresholds and alert status. Alerts evaluate at most four regions; a config PUT fails a running backup. | RAM, CPU and storage warning thresholds are delivered; one real alarm arrives after the owner sets recipient and sender through the API. CPU values arrive only from R2's native controller. |
-| R2 | In progress: rollout `op_psetuq5ws3fsa0mmjw8d` stopped at EU1's regional stage. Found live: the native controller exited at start because its `FROM scratch` image has no platform CA roots (fixed `028405e`), and the native gateway never synchronized because API list items carry no TypeMeta (fixed `65350a4`). A temporary `SSL_CERT_FILE` on `pgcf-agent` (field manager `pgcf-operator-r2-hotfix`) runs the R2 controller meanwhile. Successor `r2.1-ultra-65350a4` is approved; the stuck operation is superseded through the operator halt (`7ea6f3b`, migration 0044). | R2.1 converges on EU1 then control and six checks pass; the temporary environment entry is removed. |
+| R2 | In progress: R2.1 (`65350a4`: CA roots, list TypeMeta) and R2.2 (`dc635b2`: OpenEBS node affinity) converged on EU1 and control; R2.3 (controller `d8aa83b`, gateway `fea5fc6`, route token v3) rollout `op_gwvjzjp6l6r9ztmq1jtc` is running. Found live: a woken database never slept again, first because the measurement checkpoint identity compared raw strings (fixed `ef83c96`, in R2.3), then because three late usage samples for finalized hours got 409 on every replay, so the outbox never drained and was retried every 250 ms (fixed `eb4b98f`: the API acknowledges them as refused; the controller part ships with the next native release). | R2.3 and the controller from `eb4b98f` converge on EU1 and control, six checks pass, and a woken database sleeps after `sleep_after_seconds`. |
 | Pool cold-start test | Open | A sleeping database's pool-hit first SQL is measured from one start (<1 s target, unproven), data is preserved and refill is observed; a miss is labelled a miss. |
-| Thin qualification | Open | A scratch-first run on EU1 passes the seven [gates](#thin-storage-qualification-gates) and yields the receipt. |
+| Thin qualification | In progress: run 1 stopped at pool creation because lvm2 refuses `--type thin-pool` with `--errorwhenfull` (fixed `2228900`); run 3 hung on a fill claim of twice the maximum that the CSI capacity (VG free plus pool free) could never schedule (fixed `2f2931f`: fills are sized to that room and fail closed with `thin_qualification_fill_room_insufficient`). Cleanup returned the volume group byte-identical to its baseline. | A scratch-first run on EU1 passes the seven [gates](#thin-storage-qualification-gates) and yields the receipt. |
 | R2b | Open | An R2 successor carries the receipt; EU `thin_storage` template and EU1 thin selection are active; thin create, backup, restore and delete pass; density and sleeping CPU release are measured. |
+| Density load test (8 GB node) | Open: after Thin qualification and R2b; needs `ef83c96` delivered, retained databases suspended, `autoscale_enabled` false, no held node addition and purchases off with the owner's go; storm latency after Wake orchestration; repeated once after the warm pool ([definition](#density-load-test-8-gb-node)) | On EU1, 16 × 256 MiB and 1 × 1 GiB thin databases are created, sleep and wake through Cloudflare; the observed awake limit equals the CPU-admission arithmetic, excess starts get 57P03 or wait unplaced, and no database Pod stays Pending; sleeping CPU release, per-database and node RAM/CPU idle and under load, non-Pod memory and one 256 MiB OOM recovery are measured; no acknowledged commit is lost or replayed, no platform Pod is evicted, nothing is bought; storage is reclaimed and the kubelet reservation is confirmed or changed. |
 | Daily infrastructure backup | In progress: 2026-10-11 failed (US snapshot source, since fixed) and 2026-10-12 failed because two fleet-patch containers held both NodeBootstrap instances. `max_instances` is 8 and failed days now retry up to three times. | The next run completes D1 and EU etcd, and a forced failure retries the same day. |
 | Lost-node patch closure | Open | Marking a node lost closes its unfinished patch operations, so they no longer block its region's patch, rollout and placement guards. |
 | Relay-host material reboots | Open | Version-metadata material synchronization does not reboot the relay host again when its host files are unchanged (revision 3 caused a second host-service reboot). |
@@ -157,6 +158,53 @@ Node UID; threshold and automatic purchasing are API configurable. Eligible node
 during expansion under hard startup/CPU/storage/PostgreSQL/Barman bounds. There is no 81% cutoff,
 personal email default or fixed purchase cap. Historical real ten-minute RAM acceptance is reused;
 new workload density still requires measurement.
+
+## Density load test (8 GB node)
+
+R2b's density and sleeping-CPU-release measurement: EU1 (4 vCPU, 7,924 MiB visible) runs
+16 × 256 MiB and 1 × 1 GiB thin databases (`sleep_after_seconds` 60) through Cloudflare.
+
+**System reservation.** Both roles reserve 512 Mi system and 512 Mi kube; with the kubelet's 100 Mi
+default hard-eviction threshold that leaves 6,800 MiB and 3,000m
+(`apps/node-bootstrap/src/bootstrap.ts:1364-1376`). Budget a customer node as 2.4–2.9 GiB system
+(reserve plus 1.3–1.8 GiB platform Pods) and 4.9–5.3 GiB databases. After the run, change the
+reserve only if non-Pod plus kernel memory exceeds 1 GiB; add eviction thresholds only if a kernel
+OOM precedes kubelet eviction, then with a fleet-patch path, because fleet patches change only the
+kubelet image (`apps/node-bootstrap/src/fleet-kubernetes-images.ts:48-62`).
+
+| Per awake database, pool runtime | 256 MiB class | 1 GiB class |
+| --- | --- | --- |
+| Pod requests / limits: PostgreSQL + Barman + RuntimeClass (`apps/native-controller/src/manifests.rs:73-76,341`, `infra/talos/sandbox/runtime-admission.ts:71-76`) | 450m, 320 MiB / 850m, 832 MiB | 700m, 320 MiB / 1,100m, 1,600 MiB |
+| API CPU charge / start RAM hold (`apps/api/src/domain/startup-admission.ts:34-97,126-143`) | 450m / 832 MiB | 700m / 1,600 MiB |
+| `shared_buffers` / one volume for data and WAL (`apps/native-controller/src/manifests.rs:77-82,341`) | 32 MB / 1 GiB | 32 MB / 5 GiB |
+
+A confirmed hibernated database has no Pod, charge or RAM. All 17 awake need 7,900m against
+3,000m minus platform requests P (about 750–800m; read it first), so 4–5 × 256 MiB or
+1 GiB + 3 × 256 MiB fit awake. Memory requests (5,440 MiB) fit, limits (14,912 MiB) are 2.2×
+allocatable, and 5,514 MiB available admits at most six 256 MiB starts at once.
+
+| Scenario | Action | Expected from code |
+| --- | --- | --- |
+| S1 Create | 17 creates at once | K placed, the rest `Waiting for verified regional capacity` until others sleep; immediate base backups |
+| S2 Awake limit | Wake one by one, each kept awake by a periodic query | Capacity 57P03 (no new wake operation) right after K; no Pending Pod |
+| S3 Sleep | Stop the queries | Hibernation after 60 s idle and an archived WAL segment; charge 0; a refused wake is then admitted |
+| S4 Wake storm | All asleep, one connection each at one instant | K admitted (at most one `prestarted`), the rest immediate 57P03; `connect_ms`/`first_read_ms` labelled |
+| S5 Load | K databases, read-mostly pgbench plus a ledger writer, ten complete minutes | RAM/CPU per container and node; warning episodes only when their windows cross |
+| S6 Overcommit | An 18th create; one session exceeds a 256 MiB limit; with the owner's go a bounded memory hog to MemoryPressure | Create waits; container OOM and crash recovery; no start under pressure |
+
+**Passes when** K, sleep release and storm admission match the code; every acknowledged commit and
+marker survives without replay and a restore shows them; no platform Pod is evicted, OOM-killed or
+restarted; nothing is bought; databases, thin volumes and policy return to baseline. **Stop on** a
+platform Pod eviction, OOM or restart; MemoryPressure outside S6; EU1 NotReady; two missing minute
+samples; a node addition; a volume at 80 % or thin data at its reserve; a data-safety violation; a
+retained database changing state; overlap with thin qualification, a rollout or the 03:00 backups.
+
+**Prerequisites.** Thin qualification finished (it forbids creates in the region); R2b active,
+because the native gateway refuses databases without thin authority
+(`apps/native-gateway/src/targets.rs:336-340`); `ef83c96` delivered, else a woken retained database
+never sleeps; retained databases suspended; `autoscale_enabled` false, no held node addition,
+purchases off with the owner's go. Storm latency follows Wake orchestration; repeat once after the
+warm pool, which changes P and idle RAM.
 
 ## Thin storage qualification gates
 
