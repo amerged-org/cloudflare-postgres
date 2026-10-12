@@ -267,6 +267,32 @@ fn hinted(cell: &mut Cell, kind: &str, now: Instant) {
     cell.hints = cell.hints.wrapping_add(1);
     cell.reattest |= kind == "Pod" && cell.ready;
 }
+/// The backoff after the `attempt`-th consecutive failed reconcile or renewal.
+fn failure_delay(attempt: u32) -> Duration {
+    Duration::from_secs((1_u64 << attempt.min(8)).min(300))
+}
+/// Records a finished storage-authority renewal that started at hint `marker`. A failed one
+/// backs off like a failed reconcile, so failing renewals cannot hold every slot; an authority
+/// that lapses meanwhile still makes the protective stop due.
+fn renewed(cell: &mut Cell, started: Instant, ok: bool, marker: u64, now: Instant) {
+    if !ok {
+        cell.attempt = cell.attempt.saturating_add(1);
+        cell.due = now + failure_delay(cell.attempt);
+        return;
+    }
+    cell.attempt = 0;
+    if cell.hints == marker {
+        cell.renew = false;
+        // A pending re-attestation does not wait for the next check.
+        cell.due = if cell.reattest {
+            now
+        } else {
+            started + Duration::from_secs(60)
+        };
+    } else {
+        cell.due = now + Duration::from_secs(1);
+    }
+}
 /// Records a finished reconcile of `cell`'s current generation that started at hint `marker`.
 fn settle(cell: &mut Cell, started: Instant, observed: Option<&Value>, marker: u64) {
     if let Some(observed) = observed {
@@ -613,11 +639,7 @@ async fn run() -> Result<(), Error> {
                                 continue;
                             }
                             if kind == JobKind::Renew {
-                                if result.is_ok() && cell.hints == marker {
-                                    cell.renew = false;
-                                    // A pending re-attestation does not wait for the next check.
-                                    cell.due = if cell.reattest { Instant::now() } else { started + Duration::from_secs(60) };
-                                } else { cell.due = Instant::now() + Duration::from_secs(1); }
+                                renewed(cell, started, result.is_ok(), marker, Instant::now());
                                 continue;
                             }
                             match result {
@@ -625,7 +647,7 @@ async fn run() -> Result<(), Error> {
                                 Err(_) => {
                                     pull_ids.insert(id.clone());
                                     cell.attempt = cell.attempt.saturating_add(1);
-                                    cell.due = Instant::now() + Duration::from_secs((1_u64 << cell.attempt.min(8)).min(300));
+                                    cell.due = Instant::now() + failure_delay(cell.attempt);
                                     eprintln!("{}", json!({"event":"database_reconcile_failed", "database_id":id, "generation":generation}));
                                 }
                             }
@@ -694,7 +716,12 @@ async fn run() -> Result<(), Error> {
                             return controller.power.protect_storage(&db).await;
                         }
                         if kind == JobKind::Renew {
-                            controller.renew_storage_authority(&db).await?;
+                            tokio::time::timeout(
+                                Duration::from_secs(30),
+                                controller.renew_storage_authority(&db),
+                            )
+                            .await
+                            .map_err(|_| "storage authority renewal deadline exceeded")??;
                             return Ok::<_, Error>(None);
                         }
                         let observed = tokio::time::timeout(
@@ -993,6 +1020,45 @@ mod tests {
         assert_eq!(class(&db, 0), Class::Wake);
         finish(&mut db, now, Some(&json!({"state":"ready"})));
         assert_eq!(class(&db, 0), Class::Routine);
+    }
+    #[test]
+    fn failing_renewals_back_off_instead_of_holding_every_slot() {
+        let now = Instant::now();
+        let mut cells = HashMap::new();
+        for index in 0..SLOTS {
+            let id = format!("renew{index}");
+            let mut renewal = cell(json!({"id":id,"generation":1}), now, true);
+            renewal.renew = true;
+            let marker = renewal.hints;
+            renewed(&mut renewal, now, false, marker, now);
+            cells.insert(id, renewal);
+        }
+        cells.insert("wake".into(), cell(wake("wake", &operation(9)), now, false));
+        // Shortly after every renewal failed, none is due again and the wake gets a slot.
+        assert_eq!(
+            schedule(
+                &cells,
+                &HashMap::new(),
+                now + Duration::from_millis(1500),
+                0,
+                true
+            ),
+            vec![("wake".to_string(), Class::Wake)]
+        );
+        // Repeated failures back off like a failed reconcile; a success resets the backoff.
+        let renewal = cells.get_mut("renew0").unwrap();
+        let delays: Vec<_> = (0..8)
+            .map(|_| {
+                let marker = renewal.hints;
+                renewed(renewal, now, false, marker, now);
+                renewal.due.duration_since(now).as_secs()
+            })
+            .collect();
+        assert_eq!(delays, [4, 8, 16, 32, 64, 128, 256, 256]);
+        let marker = renewal.hints;
+        renewed(renewal, now, true, marker, now);
+        assert!(!renewal.renew);
+        assert_eq!(renewal.attempt, 0);
     }
     #[test]
     fn runtime_lease_rotation_is_not_a_configuration_change() {
