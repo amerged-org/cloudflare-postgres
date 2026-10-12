@@ -444,6 +444,35 @@ it("qualified thin releases require a pinned verifier, native gateway and native
   expect(thinStorageReleaseGuardPinned(acceptedThickRelease)).toBe(false);
   expect(FleetReleaseSpec.safeParse(spec()).success).toBe(true);
 });
+it("only a release whose every role runs the native gateway and controller declares route token v3", () => {
+  const native = spec();
+  for (const name of ["native-gateway", "native-controller"])
+    native.components.push({
+      name,
+      kind: "image",
+      version: "1.0.0",
+      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
+      sha256: "d".repeat(64),
+    });
+  for (const role of Object.values(native.roles))
+    role.components.push("native-gateway", "native-controller");
+  expect(FleetReleaseSpec.safeParse(native).success).toBe(true);
+  const declared = { ...native, route_token_version: 3 };
+  expect(FleetReleaseSpec.parse(declared).route_token_version).toBe(3);
+  expect(
+    FleetReleaseSpec.safeParse({ ...native, route_token_version: 2 }).success,
+  ).toBe(false);
+  // The TypeScript gateway verifies only v2 and the TypeScript controller publishes no target.
+  expect(
+    FleetReleaseSpec.safeParse({ ...spec(), route_token_version: 3 }).success,
+  ).toBe(false);
+  for (const name of ["native-gateway", "native-controller"]) {
+    const partial = structuredClone(declared);
+    partial.roles.control_relay.components =
+      partial.roles.control_relay.components.filter((n) => n !== name);
+    expect(FleetReleaseSpec.safeParse(partial).success).toBe(false);
+  }
+});
 it("does not treat a release-id claim or partial duplicate inventory as component observations", () => {
   expect(
     FleetNodeReleaseObservation.safeParse({

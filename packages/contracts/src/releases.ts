@@ -152,6 +152,12 @@ export const FleetReleaseSpec = z
     storage_authority_keys_sha256: Sha256.optional(),
     thin_storage_qualification: ThinStorageQualification.optional(),
     talos_raw_image: FleetTalosRawImage.optional(),
+    /**
+     * Declares that this release's native gateway verifies route token v3 and its native
+     * controller publishes verified targets. Omitted: the region keeps v2 routes (route-token.ts).
+     * Cloudflare-side only; regional agents never receive it.
+     */
+    route_token_version: z.literal(3).optional(),
     components: z.array(FleetReleaseComponent).min(1).max(128),
     roles: z.strictObject({ control_relay: Role, customer: Role }),
   })
@@ -215,6 +221,24 @@ export const FleetReleaseSpec = z
             "Qualified physical storage requires the pinned host guard on every role",
         });
     }
+    if (
+      spec.route_token_version !== undefined &&
+      !["native-gateway", "native-controller"].every(
+        (name) =>
+          spec.components.some(
+            (component) =>
+              component.name === name && component.kind === "image",
+          ) &&
+          Object.values(spec.roles).every((role) =>
+            role.components.includes(name),
+          ),
+      )
+    )
+      context.addIssue({
+        code: "custom",
+        message:
+          "Route token v3 requires the native gateway and native controller on every role",
+      });
     const names = new Set(spec.components.map((component) => component.name));
     if (names.size !== spec.components.length)
       context.addIssue({

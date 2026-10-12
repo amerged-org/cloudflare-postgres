@@ -51,13 +51,20 @@ exact region ID to its actual Worker binding and bucket. A mismatching or missin
 closed.
 
 Deploy the management API before a fleet release whose native controller labels observations
-with `coverage`; an earlier API refuses them. Route tokens are versioned: v3 binds the route
-revision and the verified primary Pod, and the native gateway refuses a stale revision or another
-Pod before dialling. Converge a fleet release whose native gateway verifies v3 in every region
-before deploying an Edge that signs it. The Edge signs v3 only when the Actor admission names a
-verified target and signs v2 otherwise; the TypeScript gateway accepts only v2. Remove v2 once
-every region runs a v3-verifying gateway and a target-publishing controller; an admission without
-a verified target is then refused.
+with `coverage`. An earlier API refuses the label as `invalid_request`; the controller then resends
+the same report once in the legacy shape. Route tokens are versioned: v3 binds the route revision
+and the verified primary Pod, and the native gateway refuses a stale revision or another Pod
+before dialling. A region gets v3 only when its assigned release declares
+`"route_token_version": 3` and every current assigned member confirmed that release's patch at the
+current region revision. Declare it only for a native gateway image built from 8f8017a or later;
+approval requires the native gateway and controller on every role. Otherwise the Actor admission
+names no target and the Edge signs v2, which every gateway accepts; the TypeScript gateway accepts
+only v2. In a v3 region an admission without the verified target of the observed revision is
+refused as not ready (57P03), never signed v2. Roll back in reverse order: Edge, fleet, API. An
+older Edge signs only v2. Assigning a release without the declaration ends v3 before a patch can
+start an older gateway; issued v3 tokens expire within 30 seconds. An API older than this change
+cannot read a release that declares `route_token_version`, so assign such regions a release
+without it before rolling back the API. Remove v2 once every region's release declares v3.
 
 ## Rust/Wasm Edge artifact
 

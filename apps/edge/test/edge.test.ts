@@ -316,6 +316,7 @@ beforeEach(async () => {
     testEnv.DB.prepare("DELETE FROM databases"),
     testEnv.DB.prepare("DELETE FROM nodes"),
     testEnv.DB.prepare("DELETE FROM regions"),
+    testEnv.DB.prepare("DELETE FROM fleet_releases"),
     testEnv.DB.prepare("DELETE FROM projects"),
     testEnv.DB.prepare("DELETE FROM size_classes"),
   ]);
@@ -1400,7 +1401,40 @@ describe("native edge admission with real Workers D1 and route-token modules", (
   });
 
   it("signs the admission's verified target into a v3 route", async () => {
-    const pod = crypto.randomUUID();
+    const pod = crypto.randomUUID(),
+      release = `release-${crypto.randomUUID()}`,
+      at = new Date().toISOString();
+    // The region's assigned release declares v3 and its only member confirmed that release's patch.
+    // Only the declaration is read on this path, so the fixture release carries nothing else.
+    await testEnv.DB.batch([
+      testEnv.DB.prepare(
+        "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+      ).bind(
+        release,
+        JSON.stringify({ route_token_version: 3 }),
+        "e".repeat(64),
+        at,
+      ),
+      testEnv.DB.prepare(
+        "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES(?,?,1,?)",
+      ).bind(region, release, at),
+      testEnv.DB.prepare(
+        "INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) SELECT id,node_uid,?,'customer',1,? FROM nodes WHERE region_id=?",
+      ).bind(release, at, region),
+      testEnv.DB.prepare(
+        `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at)
+        SELECT ?,id,region_id,node_uid,?,?,?,1,1,1,'192.0.2.18','[]',1,'complete','confirmed',?,?,? FROM nodes WHERE region_id=?`,
+      ).bind(
+        newOperationId(),
+        crypto.randomUUID(),
+        release,
+        "e".repeat(64),
+        at,
+        at,
+        at,
+        region,
+      ),
+    ]);
     await testEnv.DB.prepare(
       "UPDATE databases SET runtime_attestation_json=? WHERE id=?",
     )

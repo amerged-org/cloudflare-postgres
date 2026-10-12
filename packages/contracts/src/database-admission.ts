@@ -25,7 +25,7 @@ export const DatabaseAdmission = z.discriminatedUnion("ok", [
   z.strictObject({
     ok: z.literal(true),
     region: DatabaseRegionRoute,
-    /** Temporary rollout compatibility (route-token.ts): absent without a verified target. */
+    /** Temporary rollout compatibility (route-token.ts): absent only outside a v3 region. */
     target: DatabaseTarget.optional(),
   }),
   z.strictObject({

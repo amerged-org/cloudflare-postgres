@@ -13,9 +13,10 @@
 //
 // Temporary rollout compatibility: v2 tokens (prefix "v2", domain "pgcf-route/v2\n")
 // carry no route revision or target. The Edge signs them only for an admission without
-// a verified target, and gateways still accept them. Remove v2 signing and verification
-// and make the admission target required once every region's gateway verifies v3 and
-// its controller publishes verified targets; a missing revision or target is then refused.
+// a target, which the Actor returns only outside a v3 region: one whose assigned release
+// declares route_token_version 3 and has converged (routeTokenV3Sql in the API). Gateways
+// still accept them. Remove v2 signing and verification and make the admission target
+// required once every region's release declares v3; a missing target is then refused.
 import { z } from "zod";
 import { DatabaseTarget } from "./database-admission.ts";
 import { base64urlToBytes, bytesToBase64url } from "./encoding.ts";

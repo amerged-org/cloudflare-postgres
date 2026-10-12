@@ -1122,6 +1122,7 @@
                       ],
                       "additionalProperties": false
                     },
+                    "route_token_version": { "type": "number", "const": 3 },
                     "components": {
                       "minItems": 1,
                       "maxItems": 128,

@@ -1014,3 +1014,37 @@ it("the agent inventory view remains parseable by the deployed strict legacy rel
     spec.talos_raw_image,
   );
 });
+it("the agent inventory view leaves the Cloudflare-side route-token capability out for deployed strict agents", async () => {
+  const f = await setup();
+  for (const name of ["native-gateway", "native-controller"]) {
+    f.value.components.push({
+      name,
+      kind: "image",
+      version: "1.0.0",
+      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
+      sha256: "d".repeat(64),
+    });
+    for (const role of Object.values(f.value.roles)) role.components.push(name);
+  }
+  Object.assign(f.value, { route_token_version: 3 });
+  const approved = await f.approve();
+  expect(approved.status).toBe(200);
+  const full = (await approved.json()) as {
+    spec: unknown;
+    spec_sha256: string;
+  };
+  expect(full.spec).toMatchObject({ route_token_version: 3 });
+  expect((await f.assignRegion()).status).toBe(200);
+  expect((await f.assignNode()).status).toBe(200);
+  const { readDesiredFleetRelease } =
+      await import("../../src/domain/fleet-releases.ts"),
+    desired = (await readDesiredFleetRelease(env.DB, f.region))!;
+  const { route_token_version: unused, ...deployedShape } =
+    FleetReleaseSpec.shape;
+  void unused;
+  expect(
+    z.strictObject(deployedShape).safeParse(desired.release.spec).success,
+  ).toBe(true);
+  expect(desired.release.spec).not.toHaveProperty("route_token_version");
+  expect(desired.release.spec_sha256).toBe(full.spec_sha256);
+});

@@ -464,10 +464,57 @@ test(
       );
       await t.test(
         "Wasm signs the admission's verified target into a v3 route",
-        async () => {
+        async (st) => {
           await reset();
-          const { database } = await seed();
-          const pod = randomUUID();
+          const { database, node } = await seed();
+          const pod = randomUUID(),
+            release = "release-" + randomUUID(),
+            at = new Date().toISOString();
+          // The region's assigned release declares v3 and the database's member confirmed its
+          // patch; only the declaration is read on this path. Later subtests keep v2 routes.
+          await DB.batch([
+            DB.prepare(
+              "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+            ).bind(
+              release,
+              JSON.stringify({ route_token_version: 3 }),
+              "e".repeat(64),
+              at,
+            ),
+            DB.prepare(
+              "INSERT INTO fleet_region_releases(region_id,release_id,revision,updated_at) VALUES(?,?,1,?)",
+            ).bind(region, release, at),
+            DB.prepare(
+              "INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) SELECT id,node_uid,?,'customer',1,? FROM nodes WHERE id=?",
+            ).bind(release, at, node),
+            DB.prepare(
+              `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at)
+              SELECT ?,id,region_id,node_uid,?,?,?,1,1,1,'192.0.2.18','[]',1,'complete','confirmed',?,?,? FROM nodes WHERE id=?`,
+            ).bind(
+              "op_" + randomUUID().replaceAll("-", "").slice(0, 20),
+              randomUUID(),
+              release,
+              "e".repeat(64),
+              at,
+              at,
+              at,
+              node,
+            ),
+          ]);
+          st.after(() =>
+            DB.batch([
+              DB.prepare(
+                "DELETE FROM fleet_patch_operations WHERE release_id=?",
+              ).bind(release),
+              DB.prepare(
+                "DELETE FROM fleet_node_releases WHERE release_id=?",
+              ).bind(release),
+              DB.prepare(
+                "DELETE FROM fleet_region_releases WHERE release_id=?",
+              ).bind(release),
+              DB.prepare("DELETE FROM fleet_releases WHERE id=?").bind(release),
+            ]),
+          );
           await DB.prepare(
             "UPDATE databases SET runtime_attestation_json=? WHERE id=?",
           )

@@ -18,6 +18,7 @@ import {
   DatabaseRuntimeAttestation,
 } from "@pgcf/contracts/reclaim";
 import { nodeProofSigningKey } from "./domain/node-proof-session.ts";
+import { routeTokenV3Sql } from "./domain/fleet-releases.ts";
 import { warmReclaimCandidate } from "./domain/warm-reclaim.ts";
 interface ReclaimState {
   revision: number;
@@ -53,7 +54,7 @@ export const DatabasePresence = z
 export type DatabasePresence = z.infer<typeof DatabasePresence>;
 export type { DatabaseAdmission } from "@pgcf/contracts";
 export const DATABASE_ADMISSION_QUERY = `SELECT d.desired_state,d.observed_state,d.generation,d.observed_generation,d.observed_power,d.suspension_reason,d.power_operation,d.deleted_at database_deleted_at,p.deleted_at project_deleted_at,
-  d.runtime_attestation_json,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at
+  d.runtime_attestation_json,CASE WHEN ${routeTokenV3Sql("g")} THEN 1 ELSE 0 END route_token_v3,r.name role_name,g.id,g.gateway_url,g.gateway_binding,n.id node_id,n.lost_at
   FROM databases d JOIN projects p ON p.id=d.project_id JOIN regions g ON g.id=d.region_id
   LEFT JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id
   LEFT JOIN roles r ON r.database_id=d.id AND r.name=? AND r.deleted_at IS NULL WHERE d.id=? LIMIT 1`;
@@ -68,6 +69,7 @@ interface AdmissionRow {
   database_deleted_at: string | null;
   project_deleted_at: string | null;
   runtime_attestation_json: string | null;
+  route_token_v3: number;
   role_name: string | null;
   id: string;
   gateway_url: string;
@@ -86,10 +88,15 @@ function admittedRoute(
     gateway_binding: row.gateway_binding,
   });
   if (!region.success) return { ok: false, sqlstate: "08006" };
+  // Temporary rollout compatibility (route-token.ts): a region whose gateways may still verify
+  // only v2 gets an untargeted route.
+  if (row.route_token_v3 !== 1) return { ok: true, region: region.data };
   const target = verifiedTarget(row, databaseId);
+  // A v3 region never falls back to an untargeted route: without the verified Pod of the observed
+  // revision the database is not ready for a connection yet.
   return target
     ? { ok: true, region: region.data, target }
-    : { ok: true, region: region.data };
+    : { ok: false, sqlstate: "57P03" };
 }
 
 /** The controller's runtime attestation of the observed revision names its verified Pod. */

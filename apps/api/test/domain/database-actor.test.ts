@@ -1,7 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { env } from "cloudflare:workers";
 import { evictDurableObject, runInDurableObject } from "cloudflare:test";
-import { DatabaseWithOperation, newDatabaseId } from "@pgcf/contracts";
+import {
+  DatabaseWithOperation,
+  newDatabaseId,
+  newNodeId,
+  newOperationId,
+} from "@pgcf/contracts";
 import { Hono } from "hono";
 import { afterEach, expect, it, vi } from "vitest";
 import type { ApiEnv } from "../../src/env.ts";
@@ -10,11 +15,17 @@ import {
   readDatabasePresence,
   syncDatabaseActor,
 } from "../../src/domain/database-actor-sync.ts";
-import { cleanupFixtures, fixture } from "./fixtures.ts";
+import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 
+const releases: string[] = [];
 afterEach(async () => {
   vi.restoreAllMocks();
+  // Fixture cleanup removes assignments and patch receipts through their node/region FKs.
   await cleanupFixtures();
+  for (const id of releases.splice(0))
+    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
+      .bind(id)
+      .run();
 });
 const actor = (id: string) =>
   env.DATABASE_ACTOR.get(env.DATABASE_ACTOR.idFromName(id));
@@ -32,6 +43,141 @@ async function ready() {
     .bind(id)
     .run();
   return { ...f, id };
+}
+/** An approved native release; only a declared one claims that its gateways verify route token v3. */
+async function nativeRelease(admin: string, declared: boolean) {
+  const id = `release-${crypto.randomUUID()}`;
+  releases.push(id);
+  const names = [
+    "api",
+    "edge",
+    "node-bootstrap",
+    "postgres",
+    "barman",
+    "cloudflared",
+    "cilium",
+    "flux-source",
+    "flux-kustomize",
+    "flux-helm",
+    "flux-notification",
+    "cert-manager",
+    "cloudnative-pg",
+    "openebs-lvm",
+    "native-gateway",
+    "native-controller",
+  ];
+  const role = {
+    talos_version: "1.14.1",
+    talos_installer: `registry.example/talos@sha256:${"a".repeat(64)}`,
+    talos_schematic_sha256: "b".repeat(64),
+    talos_extensions: [],
+    kubernetes_version: "1.36.5",
+    components: names.slice(3),
+  };
+  const approved = await request(`/v1/fleet/releases/${id}`, admin, "PUT", {
+    version: 1,
+    versions_lock_sha256: "c".repeat(64),
+    configuration_schema_revision: 1,
+    ...(declared ? { route_token_version: 3 } : {}),
+    components: names.map((name) => ({
+      name,
+      kind: name === "api" || name === "edge" ? "worker_bundle" : "image",
+      version: "1.0.0",
+      reference: `registry.example/${name}@sha256:${"d".repeat(64)}`,
+      sha256: "d".repeat(64),
+    })),
+    roles: { control_relay: role, customer: structuredClone(role) },
+  });
+  expect(approved.status).toBe(200);
+  const { spec_sha256 } = (await approved.json()) as { spec_sha256: string };
+  return { id, sha: spec_sha256 };
+}
+async function assignRegion(admin: string, region: string, release: string) {
+  const current = (await (
+    await request(`/v1/regions/${region}/release`, admin)
+  ).json()) as { revision: number };
+  const assigned = await request(
+    `/v1/regions/${region}/release`,
+    admin,
+    "PUT",
+    {
+      expected_revision: current.revision,
+      release_id: release,
+    },
+  );
+  expect(assigned.status).toBe(200);
+}
+async function assignNode(admin: string, node: string, release: string) {
+  const current = await env.DB.prepare(
+    "SELECT n.node_uid,a.revision FROM nodes n LEFT JOIN fleet_node_releases a ON a.node_id=n.id WHERE n.id=?",
+  )
+    .bind(node)
+    .first<{ node_uid: string; revision: number | null }>();
+  const assigned = await request(`/v1/nodes/${node}/release`, admin, "PUT", {
+    expected_revision: current!.revision ?? 0,
+    release_id: release,
+    node_uid: current!.node_uid,
+    role: "customer",
+  });
+  expect(assigned.status).toBe(200);
+}
+/** A real patch confirms only after every gateway Pod runs the release's pinned image; its receipt is inserted as in thin-qualified-fixture.ts. */
+async function confirmPatch(
+  node: string,
+  release: { id: string; sha: string },
+) {
+  const current = await env.DB.prepare(
+    "SELECT n.node_uid,n.region_id,a.revision assignment,f.revision region FROM nodes n JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id WHERE n.id=?",
+  )
+    .bind(node)
+    .first<{
+      node_uid: string;
+      region_id: string;
+      assignment: number;
+      region: number;
+    }>();
+  const at = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at) VALUES(?,?,?,?,?,?,?,?,?,1,'192.0.2.18','[]',1,'complete','confirmed',?,?,?)`,
+  )
+    .bind(
+      newOperationId(),
+      node,
+      current!.region_id,
+      current!.node_uid,
+      crypto.randomUUID(),
+      release.id,
+      release.sha,
+      current!.assignment,
+      current!.region,
+      at,
+      at,
+      at,
+    )
+    .run();
+}
+function attestation(database: string, generation: number, pod: string) {
+  return JSON.stringify({
+    v: 1,
+    database_id: database,
+    generation,
+    storage_generation: 1,
+    node_uid: crypto.randomUUID(),
+    boot_id: crypto.randomUUID(),
+    cluster_uid: crypto.randomUUID(),
+    namespace_uid: crypto.randomUUID(),
+    cnpg_cluster_uid: crypto.randomUUID(),
+    storage_uid: crypto.randomUUID(),
+    pvc_uid: crypto.randomUUID(),
+    pv_uid: crypto.randomUUID(),
+    pod_uid: pod,
+    container_id: "3".repeat(64),
+    postgres_image_sha256: "4".repeat(64),
+    memory_request_bytes: 1,
+    memory_limit_bytes: 2,
+    observed_at: Date.now(),
+    configuration_fingerprint: "5".repeat(64),
+  });
 }
 async function sync(id: string) {
   const app = new Hono<ApiEnv>();
@@ -280,37 +426,19 @@ it("a seeded unknown role makes no D1 admission query and a valid role reads rea
   expect(count()).toBe(1);
 });
 
-it("an admission names only the controller-verified target of the observed revision", async () => {
+it("a v3 region admits only the controller-verified target of the observed revision", async () => {
   const f = await ready();
   await sync(f.id);
+  const release = await nativeRelease(f.admin, true);
+  await assignRegion(f.admin, f.region, release.id);
+  await assignNode(f.admin, f.node, release.id);
+  await confirmPatch(f.node, release);
   const pod = crypto.randomUUID();
-  const attestation = (generation: number, database = f.id) =>
-    JSON.stringify({
-      v: 1,
-      database_id: database,
-      generation,
-      storage_generation: 1,
-      node_uid: crypto.randomUUID(),
-      boot_id: crypto.randomUUID(),
-      cluster_uid: crypto.randomUUID(),
-      namespace_uid: crypto.randomUUID(),
-      cnpg_cluster_uid: crypto.randomUUID(),
-      storage_uid: crypto.randomUUID(),
-      pvc_uid: crypto.randomUUID(),
-      pv_uid: crypto.randomUUID(),
-      pod_uid: pod,
-      container_id: "3".repeat(64),
-      postgres_image_sha256: "4".repeat(64),
-      memory_request_bytes: 1,
-      memory_limit_bytes: 2,
-      observed_at: Date.now(),
-      configuration_fingerprint: "5".repeat(64),
-    });
   const store = (value: string | null) =>
     env.DB.prepare("UPDATE databases SET runtime_attestation_json=? WHERE id=?")
       .bind(value, f.id)
       .run();
-  await store(attestation(1));
+  await store(attestation(f.id, 1, pod));
   const region = {
     id: f.region,
     gateway_url: `https://${["gateway", "invalid"].join(".")}`,
@@ -326,15 +454,92 @@ it("an admission names only the controller-verified target of the observed revis
     region,
     target: { revision: 1, pod_uid: pod },
   });
+  // A v3 region never falls back to an untargeted v2 route: without the verified Pod of the
+  // observed revision the database is not ready for a connection yet.
   for (const value of [
-    attestation(2),
-    attestation(1, newDatabaseId()),
+    attestation(f.id, 2, pod),
+    attestation(newDatabaseId(), 1, pod),
     JSON.stringify({ pod_uid: pod }),
     null,
   ]) {
     await store(value);
-    expect(await actor(f.id).admit(f.id, "app")).toEqual({ ok: true, region });
+    expect(await actor(f.id).admit(f.id, "app")).toEqual({
+      ok: false,
+      sqlstate: "57P03",
+    });
+    expect(await actor(f.id).ensureAwake(f.id, "app")).toEqual({
+      ok: false,
+      sqlstate: "57P03",
+    });
   }
+});
+
+it("route token v3 follows the region's converged declaring release in both directions", async () => {
+  const f = await ready();
+  await sync(f.id);
+  const pod = crypto.randomUUID();
+  const store = (value: string | null) =>
+    env.DB.prepare("UPDATE databases SET runtime_attestation_json=? WHERE id=?")
+      .bind(value, f.id)
+      .run();
+  await store(attestation(f.id, 1, pod));
+  const region = {
+    id: f.region,
+    gateway_url: `https://${["gateway", "invalid"].join(".")}`,
+    gateway_binding: null,
+  };
+  const legacy = { ok: true, region },
+    targeted = { ok: true, region, target: { revision: 1, pod_uid: pod } };
+  const admission = () => actor(f.id).admit(f.id, "app");
+  // A region without an assigned release keeps the v2 route even with an attestation.
+  expect(await admission()).toEqual(legacy);
+  const declared = await nativeRelease(f.admin, true);
+  await assignRegion(f.admin, f.region, declared.id);
+  await assignNode(f.admin, f.node, declared.id);
+  // Assigned but not yet patched: an older gateway may still serve the region.
+  expect(await admission()).toEqual(legacy);
+  await confirmPatch(f.node, declared);
+  expect(await admission()).toEqual(targeted);
+  // A further current member without its confirmed patch keeps the whole region on v2.
+  const member = newNodeId(),
+    at = new Date().toISOString();
+  await env.DB.prepare(
+    "INSERT INTO nodes(id,region_id,k8s_node_name,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at,node_uid) VALUES (?,?,?,1,4096,2000,30,128,100,?,?,?,?)",
+  )
+    .bind(
+      member,
+      f.region,
+      `member-${member.slice(4)}`,
+      at,
+      at,
+      at,
+      crypto.randomUUID(),
+    )
+    .run();
+  await assignNode(f.admin, member, declared.id);
+  expect(await admission()).toEqual(legacy);
+  await confirmPatch(member, declared);
+  expect(await admission()).toEqual(targeted);
+  // Rollback: assigning a release without the declaration stops v3 before any older gateway runs,
+  // even once that release has converged, and never refuses an untargeted ready database.
+  const older = await nativeRelease(f.admin, false);
+  await assignRegion(f.admin, f.region, older.id);
+  expect(await admission()).toEqual(legacy);
+  for (const node of [f.node, member]) {
+    await assignNode(f.admin, node, older.id);
+    await confirmPatch(node, older);
+  }
+  expect(await admission()).toEqual(legacy);
+  await store(null);
+  expect(await admission()).toEqual(legacy);
+  // Rolling forward again needs fresh confirmations at the new region revision.
+  await store(attestation(f.id, 1, pod));
+  await assignRegion(f.admin, f.region, declared.id);
+  for (const node of [f.node, member])
+    await assignNode(f.admin, node, declared.id);
+  expect(await admission()).toEqual(legacy);
+  for (const node of [f.node, member]) await confirmPatch(node, declared);
+  expect(await admission()).toEqual(targeted);
 });
 
 it("stale positive snapshots never authorize deleted roles, databases or projects", async () => {

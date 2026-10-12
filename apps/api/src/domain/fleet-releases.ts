@@ -676,6 +676,23 @@ export async function observeFleetNodeRelease(
   return c.json({ accepted: true }, 200);
 }
 
+/**
+ * Every gateway of the region verifies route token v3: its assigned release declares v3 and every
+ * current assigned member confirmed a patch of that release at its assignment and the region
+ * revision. A patch confirms only once every gateway Pod runs the release's pinned image. A new
+ * region or node assignment clears it before any patch can start an older gateway.
+ */
+export function routeTokenV3Sql(region: string) {
+  if (!/^[a-z][a-z0-9_]*$/.test(region))
+    throw new Error("invalid_route_token_region_alias");
+  return `EXISTS(SELECT 1 FROM fleet_region_releases vf JOIN fleet_releases vs ON vs.id=vf.release_id
+    WHERE vf.region_id=${region}.id AND json_extract(vs.spec_json,'$.route_token_version')=3
+    AND EXISTS(SELECT 1 FROM nodes vn JOIN fleet_node_releases va ON va.node_id=vn.id WHERE vn.region_id=vf.region_id AND vn.lost_at IS NULL)
+    AND NOT EXISTS(SELECT 1 FROM nodes vn JOIN fleet_node_releases va ON va.node_id=vn.id WHERE vn.region_id=vf.region_id AND vn.lost_at IS NULL
+      AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations vp WHERE vp.node_id=vn.id AND vp.node_uid=vn.node_uid AND vp.release_id=vf.release_id
+        AND vp.assignment_revision=va.revision AND vp.region_revision=vf.revision AND vp.stage='complete' AND vp.state='confirmed')))`;
+}
+
 /** Only explicitly assigned, current physical nodes receive this release. No legacy wire change when unassigned. */
 export async function readDesiredFleetRelease(
   db: D1Database,
@@ -698,10 +715,16 @@ export async function readDesiredFleetRelease(
     after.desired_release_id !== selected.id
   )
     return conflict("Region release changed during desired-state read");
-  // Provisioning-only artifacts are outside the runtime agent's inventory wire view.
+  // Provisioning-only artifacts and the Cloudflare-side route-token capability are outside the
+  // runtime agent's inventory wire view, which deployed strict agents parse.
   // Keep the assigned full-spec hash and the complete immutable DB/admin/AddNode record.
-  const { talos_raw_image: provisioningImage, ...runtimeSpec } = selected.spec;
+  const {
+    talos_raw_image: provisioningImage,
+    route_token_version: routeTokenVersion,
+    ...runtimeSpec
+  } = selected.spec;
   void provisioningImage;
+  void routeTokenVersion;
   return FleetDesiredRelease.parse({
     region_id: regionId,
     region_revision: state.revision,
