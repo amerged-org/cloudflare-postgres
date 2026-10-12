@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   newNodeId,
-  ObservationRequest,
+  ObservationReport,
   SIDECAR,
   postgresImageIdMatches,
   type DatabaseObservation,
@@ -108,16 +108,33 @@ export async function observations(
       )
         db.message = truncateAgentText(db.message);
   }
-  const parsed = ObservationRequest.safeParse(raw);
+  const parsed = ObservationReport.safeParse(raw);
   if (!parsed.success)
     throw new ApiError("invalid_request", "Invalid observations");
   const body = parsed.data,
     receivedAt = Date.now(),
     now = new Date(receivedAt).toISOString();
+  // A report replaces only what its coverage names; everything it omits stays unchanged.
+  const nodes = "nodes" in body ? body.nodes : [],
+    databases = "databases" in body ? body.databases : [],
+    memorySamples =
+      "node_memory_samples" in body ? (body.node_memory_samples ?? []) : [],
+    orphans =
+      "coverage" in body
+        ? body.coverage === "inventory"
+          ? body.orphans
+          : undefined
+        : body.orphans !== undefined &&
+            (body.node_memory_samples === undefined ||
+              body.nodes.length ||
+              body.databases.length ||
+              body.orphans.length)
+          ? body.orphans
+          : undefined;
   if (Date.parse(body.observed_at) > receivedAt + 300_000)
     throw new ApiError("invalid_request", "Observation time is in the future");
   if (
-    body.databases.some(
+    databases.some(
       (d) =>
         d.backup &&
         (d.backup.observed_at > body.observed_at ||
@@ -134,11 +151,11 @@ export async function observations(
   const names = new Set<string>(),
     ids = new Set<string>();
   if (
-    body.nodes.some((n) => names.has(n.name) || (names.add(n.name), false)) ||
-    body.databases.some((d) => ids.has(d.id) || (ids.add(d.id), false))
+    nodes.some((n) => names.has(n.name) || (names.add(n.name), false)) ||
+    databases.some((d) => ids.has(d.id) || (ids.add(d.id), false))
   )
     throw new ApiError("invalid_request", "Duplicate observation subject");
-  for (const node of body.nodes) {
+  for (const node of nodes) {
     const reserved = await c.env.DB.prepare(
       `SELECT node_id,provider_instance_id FROM node_additions WHERE region_id=? AND json_extract(intent_json,'$.requested_hostname')=? AND slot_held=1`,
     )
@@ -210,7 +227,7 @@ export async function observations(
         receivedAt,
       );
   }
-  for (const sample of body.node_memory_samples ?? []) {
+  for (const sample of memorySamples) {
     try {
       await recordNodeMemoryObservation(
         c.env.DB,
@@ -227,7 +244,7 @@ export async function observations(
     }
   }
   let accepted = 0;
-  for (const observation of body.databases) {
+  for (const observation of databases) {
     const row = await c.env.DB.prepare(
       "SELECT d.* FROM databases d JOIN nodes n ON n.id=d.node_id AND n.region_id=d.region_id WHERE d.id=? AND d.region_id=? AND (d.desired_state='deleted' OR n.lost_at IS NULL)",
     )
@@ -578,16 +595,10 @@ export async function observations(
     const result = await c.env.DB.batch(statements);
     accepted += result[0]!.meta.changes;
   }
-  if (
-    body.orphans !== undefined &&
-    (body.node_memory_samples === undefined ||
-      body.nodes.length ||
-      body.databases.length ||
-      body.orphans.length)
-  )
+  if (orphans !== undefined)
     await c.env.REGION_LINK.get(
       c.env.REGION_LINK.idFromName(region.id),
-    ).reportOrphans(body.observed_at, body.orphans);
+    ).reportOrphans(body.observed_at, orphans);
   await c.env.DB.prepare("UPDATE regions SET agent_last_seen_at=? WHERE id=?")
     .bind(now, region.id)
     .run();

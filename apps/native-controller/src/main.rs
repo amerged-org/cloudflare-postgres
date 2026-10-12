@@ -60,6 +60,7 @@ struct Active {
     task: tokio::task::Id,
     abort: AbortHandle,
     kind: JobKind,
+    urgent: bool,
 }
 fn fingerprint(db: &Value, snapshot: &DesiredSnapshot) -> Result<Vec<u8>, Error> {
     let mut db = db.clone();
@@ -208,6 +209,58 @@ fn storage_protection_due(db: &Value, snapshot: &DesiredSnapshot, clock: i128) -
             || pgcf_native_controller::contracts::integer(&claims, "exp")
                 .map_or(true, |expiry| i128::from(expiry) <= clock)
     })
+}
+/// Bounded reconciliation slots shared by every database.
+const SLOTS: usize = 4;
+/// A database whose running power intent is not yet observed ready: a wake or resume.
+fn waking(cell: &Cell) -> bool {
+    !cell.ready && cell.db["power"]["mode"] == "running"
+}
+/// Selects due work for the free slots; `busy` maps each running job to its urgency.
+/// Protective stops come first, then wakes. Routine reconciliation never takes the last
+/// slot, so a wake does not wait behind unrelated database work.
+fn schedule(
+    cells: &HashMap<String, Cell>,
+    busy: &HashMap<String, bool>,
+    now: Instant,
+    clock: i128,
+    control_healthy: bool,
+) -> Vec<(String, bool)> {
+    let mut free = SLOTS.saturating_sub(busy.len());
+    let mut routine = busy.values().filter(|urgent| !**urgent).count();
+    let mut candidates: Vec<_> = cells
+        .iter()
+        .filter(|(id, cell)| {
+            let protect = storage_protection_due(&cell.db, &cell.snapshot, clock);
+            (cell.due <= now || (cell.ready && protect))
+                && (protect
+                    || (control_healthy
+                        && now.duration_since(cell.authority_at) <= Duration::from_secs(90)))
+                && !busy.contains_key(*id)
+        })
+        .map(|(id, cell)| {
+            (
+                !storage_protection_due(&cell.db, &cell.snapshot, clock),
+                !waking(cell),
+                cell.due,
+                id.clone(),
+            )
+        })
+        .collect();
+    // Within each class, pending databases rotate by oldest due time; a slow first cohort
+    // cannot monopolize the bounded reconciliation slots.
+    candidates.sort();
+    let mut selected = Vec::new();
+    for (unprotected, idle, _, id) in candidates {
+        let urgent = !unprotected || !idle;
+        if free == 0 || (!urgent && routine + 1 >= SLOTS) {
+            break;
+        }
+        free -= 1;
+        routine += usize::from(!urgent);
+        selected.push((id, urgent));
+    }
+    selected
 }
 fn clock_ms() -> i128 {
     time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000
@@ -534,35 +587,13 @@ async fn run() -> Result<(), Error> {
                 job.abort.abort();
             }
         }
-        if active.len() < 4 {
-            let mut candidates: Vec<_> = cells
+        if active.len() < SLOTS {
+            let busy: HashMap<String, bool> = active
                 .iter()
-                .filter(|(id, cell)| {
-                    let protect = storage_protection_due(&cell.db, &cell.snapshot, clock_ms());
-                    (cell.due <= Instant::now() || (cell.ready && protect))
-                        && (protect
-                            || (control_healthy
-                                && Instant::now().duration_since(cell.authority_at)
-                                    <= Duration::from_secs(90)))
-                        && !active.contains_key(*id)
-                })
-                .map(|(id, cell)| {
-                    (
-                        !storage_protection_due(&cell.db, &cell.snapshot, clock_ms()),
-                        cell.due,
-                        id.clone(),
-                    )
-                })
+                .map(|(id, job)| (id.clone(), job.urgent))
                 .collect();
-            // Pending databases rotate by oldest due time; a slow first cohort cannot
-            // monopolize all four bounded reconciliation slots.
-            candidates.sort();
-            let candidates: Vec<_> = candidates
-                .into_iter()
-                .take(4 - active.len())
-                .map(|(_, _, id)| id)
-                .collect();
-            for id in candidates {
+            for (id, urgent) in schedule(&cells, &busy, Instant::now(), clock_ms(), control_healthy)
+            {
                 let cell = &cells[&id];
                 let db = cell.db.clone();
                 let snapshot = cell.snapshot.clone();
@@ -615,6 +646,7 @@ async fn run() -> Result<(), Error> {
                         task: abort.id(),
                         abort,
                         kind,
+                        urgent,
                     },
                 );
             }
@@ -695,6 +727,57 @@ mod tests {
         assert!(storage_protection_due(&db, &state, 3000));
         state.region["storage_nodes"][0]["write_allowed"] = false.into();
         assert!(storage_protection_due(&db, &state, 1000));
+    }
+    #[test]
+    fn a_pending_wake_never_waits_behind_unrelated_reconciliation() {
+        let started = Instant::now();
+        let shared = Arc::new(snapshot(vec![]));
+        let cell = |db: Value, due: Instant, ready: bool| Cell {
+            db,
+            snapshot: shared.clone(),
+            fingerprint: vec![],
+            due,
+            hints: 0,
+            ready,
+            renew: false,
+            attempt: 0,
+            authority_at: started,
+        };
+        let wake = |id: &str| json!({"id":id,"generation":3,"desired_state":"running","power":{"operation":format!("op_{}","a".repeat(20)),"revision":3,"mode":"running","reason":null}});
+        let mut cells = HashMap::new();
+        for index in 0..6 {
+            let id = format!("routine{index}");
+            cells.insert(
+                id.clone(),
+                cell(json!({"id":id,"generation":1}), started, true),
+            );
+        }
+        cells.insert(
+            "wake".into(),
+            cell(wake("wake"), started + Duration::from_millis(5), false),
+        );
+        let now = started + Duration::from_millis(10);
+        let routine: HashMap<String, bool> = (0..3)
+            .map(|index| (format!("busy{index}"), false))
+            .collect();
+        assert_eq!(
+            schedule(&cells, &routine, now, 0, true),
+            vec![("wake".to_string(), true)]
+        );
+        cells.remove("wake");
+        assert!(schedule(&cells, &routine, now, 0, true).is_empty());
+        assert_eq!(schedule(&cells, &HashMap::new(), now, 0, true).len(), 3);
+        for index in 0..SLOTS {
+            let id = format!("wake{index}");
+            cells.insert(id.clone(), cell(wake(&id), now, false));
+        }
+        let selected = schedule(&cells, &HashMap::new(), now, 0, true);
+        assert_eq!(selected.len(), SLOTS);
+        assert!(
+            selected
+                .iter()
+                .all(|(id, urgent)| *urgent && id.starts_with("wake"))
+        );
     }
     #[test]
     fn runtime_lease_rotation_is_not_a_configuration_change() {

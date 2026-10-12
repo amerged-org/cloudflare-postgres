@@ -12,7 +12,7 @@ export async function seedKnownDatabase(db, namespace, id) {
   await namespace.get(namespace.idFromName(id)).seed(snapshot);
 }
 
-// Test-only regional publisher uses the actual authenticated API observation handler.
+// Test-only regional publisher sends the controller's partial database update to the actual API handler.
 export async function publishPowerObservation(
   env,
   ctx,
@@ -45,9 +45,8 @@ export async function publishPowerObservation(
           "Content-Type": "application/json",
         },
         body: JSON.stringify({
+          coverage: "databases",
           observed_at: new Date().toISOString(),
-          nodes: [],
-          orphans: [],
           databases: [
             {
               id: database,

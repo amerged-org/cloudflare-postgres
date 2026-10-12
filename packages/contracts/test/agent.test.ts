@@ -6,7 +6,10 @@ import {
   postgresImageIdMatches,
   DesiredSize,
   DesiredResponse,
+  DatabaseObservationUpdate,
+  ObservationReport,
   ObservationRequest,
+  RegionalInventory,
   ServerLinkMessage,
   AgentLinkMessage,
   archiveDestinationPath,
@@ -816,6 +819,80 @@ describe("ObservationRequest", () => {
       },
     ];
     expect(ObservationRequest.safeParse(extraArchive).success).toBe(false);
+  });
+});
+
+describe("observation coverage", () => {
+  const observedAt = "2026-10-02T10:46:00.000Z";
+  const database = () => (observation().databases as unknown[])[0];
+  const node = () => (observation().nodes as unknown[])[0];
+  const sample = {
+    node_id: newNodeId(),
+    provider_instance_id: "203000001",
+    node_uid: randomUUID(),
+    memory: null,
+  };
+
+  it("a partial database update covers only its databases and cannot carry regional inventory", () => {
+    const update = {
+      coverage: "databases",
+      observed_at: observedAt,
+      databases: [database()],
+    };
+    expect(DatabaseObservationUpdate.safeParse(update).success).toBe(true);
+    expect(ObservationReport.safeParse(update).success).toBe(true);
+    for (const inventory of [
+      { nodes: [] },
+      { nodes: [node()] },
+      { orphans: [] },
+      { node_memory_samples: [sample] },
+    ])
+      expect(
+        ObservationReport.safeParse({ ...update, ...inventory }).success,
+      ).toBe(false);
+    expect(
+      ObservationReport.safeParse({ ...update, databases: [] }).success,
+    ).toBe(false);
+  });
+
+  it("only a complete regional inventory carries an orphan scan and it never updates databases", () => {
+    const inventory = {
+      coverage: "inventory",
+      observed_at: observedAt,
+      nodes: [node()],
+      orphans: [],
+      node_memory_samples: [sample],
+    };
+    expect(RegionalInventory.safeParse(inventory).success).toBe(true);
+    expect(ObservationReport.safeParse(inventory).success).toBe(true);
+    const { orphans, ...unscanned } = inventory;
+    expect(orphans).toEqual([]);
+    expect(ObservationReport.safeParse(unscanned).success).toBe(false);
+    expect(
+      ObservationReport.safeParse({ ...inventory, databases: [database()] })
+        .success,
+    ).toBe(false);
+    expect(
+      ObservationReport.safeParse({ ...inventory, coverage: "partial" })
+        .success,
+    ).toBe(false);
+    expect(
+      ObservationReport.safeParse({
+        ...inventory,
+        node_memory_samples: [sample, sample],
+      }).success,
+    ).toBe(false);
+  });
+
+  it("reports released before explicit coverage keep their legacy shape", () => {
+    expect(ObservationReport.safeParse(observation()).success).toBe(true);
+    const targeted = observation();
+    delete targeted.orphans;
+    expect(ObservationReport.safeParse(targeted).success).toBe(true);
+    expect(
+      ObservationReport.safeParse({ ...observation(), coverage: "databases" })
+        .success,
+    ).toBe(false);
   });
 });
 

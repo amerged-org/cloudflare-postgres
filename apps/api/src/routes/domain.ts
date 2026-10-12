@@ -14,7 +14,7 @@ import {
   ErrorBody,
   IdempotencyKey,
   ListQuery,
-  ObservationRequest,
+  ObservationReport,
   Operation,
   OperationId,
   ProjectId,
@@ -333,7 +333,7 @@ export function registerDomain(app: ApiApp): void {
       path: "/agent/v1/observations",
       security,
       tags: ["Agent"],
-      request: { body: body(ObservationRequest) },
+      request: { body: body(ObservationReport) },
       responses: responses(
         z.object({ accepted: z.number().int().nonnegative() }),
       ),

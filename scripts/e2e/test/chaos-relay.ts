@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Live fault injection only. Every replay is an unmodified response captured from the real API.
-import { DesiredResponse, ObservationRequest } from "@pgcf/contracts";
+import { DesiredResponse, ObservationReport } from "@pgcf/contracts";
 import { Buffer } from "node:buffer";
 import { runActive } from "../src/run-expiry.ts";
 
@@ -507,11 +507,13 @@ export class ChaosRelay {
       await this.persist();
     }
     if (path === "/agent/v1/observations") {
-      const observations = ObservationRequest.parse(
+      const observations = ObservationReport.parse(
         await request.clone().json(),
       );
       this.observations++;
-      for (const observation of observations.databases) {
+      for (const observation of "databases" in observations
+        ? observations.databases
+        : []) {
         const previous = this.highest.get(observation.id) ?? 0;
         if (observation.generation < previous) this.regressed++;
         this.highest.set(

@@ -113,6 +113,80 @@ test("relay completion waits for body consumption and subsequent successful obse
   }
 });
 
+test("relays the controller's partial database updates and regional inventories", async () => {
+  const bearer = randomBytes(32).toString("hex"),
+    agent = randomBytes(32).toString("hex");
+  const relay = new ChaosRelay(memoryState(), {
+    API_URL: "https://pgcf-api.test.invalid",
+    RUN_NAME: "pgcf-e2e-test",
+    RUN_EXPIRES_AT: new Date(Date.now() + 3600000).toISOString(),
+    PROBE_BEARER: bearer,
+    AGENT_KEY: agent,
+    RELAY: {
+      idFromName: () => "test",
+      get: () => {
+        throw new Error("unused_test_binding");
+      },
+    },
+  });
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response(null, { status: 204 });
+  const post = (body: unknown) =>
+    relay.fetch(
+      new Request("https://pgcf-relay.test.invalid/agent/v1/observations", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${agent}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(body),
+      }),
+    );
+  const database = (generation: number) => ({
+    id: "d" + "a".repeat(19),
+    generation,
+    state: "ready",
+    archive: { continuous: true, ready_wal_files: 0 },
+  });
+  try {
+    for (const body of [
+      {
+        coverage: "databases",
+        observed_at: new Date().toISOString(),
+        databases: [database(3)],
+      },
+      {
+        coverage: "inventory",
+        observed_at: new Date().toISOString(),
+        nodes: [],
+        orphans: [],
+      },
+      {
+        coverage: "databases",
+        observed_at: new Date().toISOString(),
+        databases: [database(2)],
+      },
+    ])
+      assert.equal((await post(body)).status, 204);
+    const counts = (await (
+      await relay.fetch(
+        new Request("https://pgcf-relay.test.invalid/control/counts", {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${bearer}`,
+            "Content-Type": "application/json",
+          },
+          body: "{}",
+        }),
+      )
+    ).json()) as { observations: number; regressed_generations: number };
+    assert.equal(counts.observations, 3);
+    assert.equal(counts.regressed_generations, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("expired relay refuses control and agent requests", async () => {
   const relay = new ChaosRelay(memoryState(), {
     API_URL: "https://pgcf-api.test.invalid",

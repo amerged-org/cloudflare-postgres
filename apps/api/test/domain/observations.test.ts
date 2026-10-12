@@ -85,6 +85,107 @@ it("publishes targeted database readiness without replacing an unmeasured orphan
   ).toBe("ready");
 });
 
+async function orphanReports(region: string) {
+  return runInDurableObject(
+    env.REGION_LINK.get(env.REGION_LINK.idFromName(region)),
+    (_instance, state) =>
+      state.storage.sql
+        .exec<{ observed_at: string; orphans: string }>(
+          "SELECT observed_at,orphans FROM orphan_reports",
+        )
+        .toArray(),
+  );
+}
+
+it("an explicit partial database update records readiness and leaves regional inventory unchanged", async () => {
+  const f = await fixture();
+  const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  const at = new Date().toISOString();
+  const orphans = [{ namespace: "owned-orphan", database_id: null }];
+  await env.REGION_LINK.get(env.REGION_LINK.idFromName(f.region)).reportOrphans(
+    at,
+    orphans,
+  );
+  const node = () =>
+    env.DB.prepare("SELECT * FROM nodes WHERE id=?").bind(f.node).first();
+  const before = await node();
+  const observed_at = new Date(Date.now() + 1000).toISOString();
+  const smuggled = await request("/agent/v1/observations", f.agent, "POST", {
+    coverage: "databases",
+    observed_at,
+    databases: [observation(created.database.id, 1)],
+    orphans: [],
+  });
+  expect(smuggled.status).toBe(400);
+  const response = await request("/agent/v1/observations", f.agent, "POST", {
+    coverage: "databases",
+    observed_at,
+    databases: [observation(created.database.id, 1)],
+  });
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ accepted: 1 });
+  expect(await orphanReports(f.region)).toEqual([
+    { observed_at: at, orphans: JSON.stringify(orphans) },
+  ]);
+  expect(await node()).toEqual(before);
+  expect(
+    await env.DB.prepare("SELECT observed_state FROM databases WHERE id=?")
+      .bind(created.database.id)
+      .first("observed_state"),
+  ).toBe("ready");
+});
+
+it("only a complete regional inventory replaces the orphan report, also with an empty scan beside memory samples", async () => {
+  const f = await fixture();
+  const created = DatabaseWithOperation.parse(await (await f.create()).json());
+  const at = new Date().toISOString();
+  await env.REGION_LINK.get(env.REGION_LINK.idFromName(f.region)).reportOrphans(
+    at,
+    [{ namespace: "owned-orphan", database_id: null }],
+  );
+  const measuredAt = new Date(Date.parse(at) + 1000).toISOString();
+  const inventory = {
+    coverage: "inventory",
+    observed_at: measuredAt,
+    nodes: [],
+    orphans: [],
+    node_memory_samples: [
+      {
+        node_id: f.node,
+        provider_instance_id: "203000001",
+        node_uid: crypto.randomUUID(),
+        memory: null,
+      },
+    ],
+  };
+  const withDatabase = await request(
+    "/agent/v1/observations",
+    f.agent,
+    "POST",
+    {
+      ...inventory,
+      databases: [observation(created.database.id, 1)],
+    },
+  );
+  expect(withDatabase.status).toBe(400);
+  const response = await request(
+    "/agent/v1/observations",
+    f.agent,
+    "POST",
+    inventory,
+  );
+  expect(response.status).toBe(200);
+  expect(await response.json()).toEqual({ accepted: 0 });
+  expect(await orphanReports(f.region)).toEqual([
+    { observed_at: measuredAt, orphans: "[]" },
+  ]);
+  expect(
+    await env.DB.prepare("SELECT observed_state FROM databases WHERE id=?")
+      .bind(created.database.id)
+      .first("observed_state"),
+  ).not.toBe("ready");
+});
+
 it("a matching established wake completes with truthful unknown archive health", async () => {
   const f = await suspended();
   expect((await submit(f)).status).toBe(200);

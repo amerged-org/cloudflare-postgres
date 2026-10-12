@@ -40,6 +40,16 @@ pub fn timestamp() -> Result<String, Error> {
     ))
 }
 
+/// A partial database update: its explicit coverage leaves Cloudflare's node, orphan and
+/// memory inventory unchanged.
+pub fn database_update(db: Value, observed_at: String) -> Result<Value, Error> {
+    let envelope = json!({"coverage":"databases","observed_at":observed_at,"databases":[db]});
+    if !schema_valid("DatabaseObservationUpdate", &envelope) {
+        return Err("native observation contract invalid".into());
+    }
+    Ok(envelope)
+}
+
 fn predecessor(id: &str) -> Result<Option<String>, Error> {
     if !pgcf_native_protocol::valid_pattern("database", id) {
         return Err("invalid desired database identifier".into());
@@ -289,11 +299,9 @@ impl ControlApi {
         })
         .await?
     }
+    /// Publishes one verified database observation at once, apart from inventory work.
     pub async fn observation(&self, db: Value) -> Result<(), Error> {
-        let envelope = json!({"observed_at":timestamp()?,"nodes":[],"databases":[db]});
-        if !schema_valid("ObservationRequest", &envelope) {
-            return Err("native observation contract invalid".into());
-        }
+        let envelope = database_update(db, timestamp()?)?;
         let result = self
             .request("/agent/v1/observations", Some(&envelope))
             .await?;
@@ -303,7 +311,7 @@ impl ControlApi {
         Ok(())
     }
     pub async fn inventory(&self, envelope: &Value) -> Result<(), Error> {
-        if !schema_valid("ObservationRequest", envelope) {
+        if !schema_valid("RegionalInventory", envelope) {
             return Err("native inventory contract invalid".into());
         }
         self.request("/agent/v1/observations", Some(envelope))
@@ -326,6 +334,27 @@ mod tests {
             Some("azzzzzzzzzzzzzzzzzzz".into())
         );
         assert!(predecessor("../../kube-system").is_err());
+    }
+    #[test]
+    fn a_ready_database_is_published_as_a_partial_update_that_cannot_replace_inventory() {
+        let db = json!({"id":"a0000000000000000001","generation":3,"state":"ready","archive":{"continuous":false,"ready_wal_files":null,"health":"unknown"},"power":{"operation":format!("op_{}","a".repeat(20)),"revision":3,"state":"awake"}});
+        let at = timestamp().unwrap();
+        let envelope = database_update(db.clone(), at.clone()).unwrap();
+        assert_eq!(
+            envelope,
+            json!({"coverage":"databases","observed_at":at,"databases":[db]})
+        );
+        assert!(!schema_valid("RegionalInventory", &envelope));
+        for (key, value) in [
+            ("nodes", json!([])),
+            ("orphans", json!([])),
+            ("node_memory_samples", json!([])),
+        ] {
+            let mut mixed = envelope.clone();
+            mixed[key] = value;
+            assert!(!schema_valid("DatabaseObservationUpdate", &mixed), "{key}");
+        }
+        assert!(database_update(json!({"id":"a0000000000000000001"}), at).is_err());
     }
     #[test]
     fn native_timestamps_match_date_iso_precision() {

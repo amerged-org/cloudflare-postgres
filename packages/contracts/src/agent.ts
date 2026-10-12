@@ -592,6 +592,31 @@ export const Orphan = z.strictObject({
 });
 export type Orphan = z.infer<typeof Orphan>;
 
+function uniqueMemorySamples(
+  value: { observed_at: string; node_memory_samples?: NodeMemoryObservation[] },
+  ctx: z.RefinementCtx,
+): void {
+  const identities = new Set<string>();
+  for (const [index, sample] of (value.node_memory_samples ?? []).entries()) {
+    if (
+      identities.has(sample.node_id) ||
+      (sample.memory !== null &&
+        Date.parse(sample.memory.observed_at) > Date.parse(value.observed_at))
+    )
+      ctx.addIssue({
+        code: "custom",
+        path: ["node_memory_samples", index],
+        message:
+          "Memory samples must be unique and no newer than their envelope",
+      });
+    identities.add(sample.node_id);
+  }
+}
+
+/**
+ * Reports from regional runtimes released before explicit coverage. Omitted orphans keep the
+ * recorded orphan inventory. Remove once no released regional runtime sends this shape.
+ */
 export const ObservationRequest = z
   .strictObject({
     observed_at: Timestamp,
@@ -602,24 +627,44 @@ export const ObservationRequest = z
     /** Partial background samples; an empty inventory here does not replace the region inventory. */
     node_memory_samples: z.array(NodeMemoryObservation).max(1000).optional(),
   })
-  .superRefine((value, ctx) => {
-    const identities = new Set<string>();
-    for (const [index, sample] of (value.node_memory_samples ?? []).entries()) {
-      if (
-        identities.has(sample.node_id) ||
-        (sample.memory !== null &&
-          Date.parse(sample.memory.observed_at) > Date.parse(value.observed_at))
-      )
-        ctx.addIssue({
-          code: "custom",
-          path: ["node_memory_samples", index],
-          message:
-            "Memory samples must be unique and no newer than their envelope",
-        });
-      identities.add(sample.node_id);
-    }
-  });
+  .superRefine(uniqueMemorySamples);
 export type ObservationRequest = z.infer<typeof ObservationRequest>;
+
+/**
+ * A partial database update, published as soon as a database observation is verified. It
+ * covers only the listed databases: node, orphan and memory inventory stay unchanged.
+ */
+export const DatabaseObservationUpdate = z.strictObject({
+  coverage: z.literal("databases"),
+  observed_at: Timestamp,
+  databases: z.array(DatabaseObservation).min(1).max(DESIRED_PAGE_LIMIT_MAX),
+});
+export type DatabaseObservationUpdate = z.infer<
+  typeof DatabaseObservationUpdate
+>;
+
+/**
+ * A completed, identity-checked regional inventory. Only it replaces the orphan report, an
+ * empty scan included; it never changes database state.
+ */
+export const RegionalInventory = z
+  .strictObject({
+    coverage: z.literal("inventory"),
+    observed_at: Timestamp,
+    nodes: z.array(NodeObservation).max(1000),
+    orphans: z.array(Orphan).max(1000),
+    node_memory_samples: z.array(NodeMemoryObservation).max(1000).optional(),
+  })
+  .superRefine(uniqueMemorySamples);
+export type RegionalInventory = z.infer<typeof RegionalInventory>;
+
+/** POST /agent/v1/observations: a report replaces only what its coverage names. */
+export const ObservationReport = z.union([
+  DatabaseObservationUpdate,
+  RegionalInventory,
+  ObservationRequest,
+]);
+export type ObservationReport = z.infer<typeof ObservationReport>;
 
 // ---------- Link messages (GET /agent/v1/link WebSocket) ----------
 

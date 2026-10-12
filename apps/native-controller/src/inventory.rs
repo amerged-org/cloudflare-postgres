@@ -240,8 +240,18 @@ pub async fn collect(
             Some(json!({"namespace":name,"database_id":if id.is_empty(){None}else{Some(id)}}))
         })
         .collect();
-    let envelope = json!({"observed_at":timestamp()?,"nodes":reports,"databases":[],"orphans":orphans,"node_memory_samples":samples});
-    api.inventory(&envelope).await
+    api.inventory(&regional_inventory(timestamp()?, reports, orphans, samples))
+        .await
+}
+/// The completed scan's explicit coverage: only this report replaces Cloudflare's orphan
+/// inventory, also with an empty list, and it never changes database state.
+fn regional_inventory(
+    observed_at: String,
+    nodes: Vec<Value>,
+    orphans: Vec<Value>,
+    samples: Vec<Value>,
+) -> Value {
+    json!({"coverage":"inventory","observed_at":observed_at,"nodes":nodes,"orphans":orphans,"node_memory_samples":samples})
 }
 #[cfg(test)]
 mod tests {
@@ -272,14 +282,27 @@ mod tests {
         let summary = json!({"node":{"nodeName":"customer","memory":{"time":at,"workingSetBytes":1024},"cpu":{"time":at,"usageNanoCores":1_250_000_000_u64}}});
         let contract = |sample: &Value| {
             schema_valid(
-                "ObservationRequest",
-                &json!({"observed_at":at,"nodes":[],"databases":[],"node_memory_samples":[{"node_id":"nod_customer000000000000","provider_instance_id":"203000001","node_uid":sample["node_uid"],"memory":sample}]}),
+                "RegionalInventory",
+                &json!({"coverage":"inventory","observed_at":at,"nodes":[],"orphans":[],"node_memory_samples":[{"node_id":"nod_customer000000000000","provider_instance_id":"203000001","node_uid":sample["node_uid"],"memory":sample}]}),
             )
         };
         let sample = memory(&node, &summary).unwrap();
         assert_eq!(sample["cpu_usage_nano_cores"], 1_250_000_000_u64);
         assert_eq!(sample["capacity_cpu_millicores"], 4000);
         assert!(contract(&sample));
+        let scan = regional_inventory(
+            at.clone(),
+            vec![],
+            vec![],
+            vec![
+                json!({"node_id":"nod_customer000000000000","provider_instance_id":"203000001","node_uid":sample["node_uid"],"memory":sample}),
+            ],
+        );
+        assert_eq!(scan["coverage"], "inventory");
+        assert_eq!(scan["orphans"], json!([]));
+        assert!(scan.get("databases").is_none());
+        assert!(schema_valid("RegionalInventory", &scan));
+        assert!(!schema_valid("DatabaseObservationUpdate", &scan));
         let mut stale = summary.clone();
         stale["node"]["cpu"]["time"] = "2026-01-01T00:00:00Z".into();
         assert!(memory(&node, &stale).unwrap()["cpu_usage_nano_cores"].is_null());
