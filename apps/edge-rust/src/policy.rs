@@ -100,7 +100,6 @@ pub fn actor_failure(sqlstate: &str) -> Failure {
     }
 }
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct GatewayRegion {
     pub id: String,
     pub gateway_url: String,
@@ -108,21 +107,19 @@ pub struct GatewayRegion {
 }
 /// The verified connection target an admission names: route revision and primary Pod UID.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
 pub struct AdmittedTarget {
     pub revision: u64,
     pub pod_uid: String,
 }
-/// Parses the DatabaseActor admission. Temporary rollout compatibility (route-token.ts): the
-/// verified target may be absent; a present target must be complete and well formed.
+/// Parses the trusted DatabaseActor admission. Every field the Edge uses is required and
+/// validated; fields a newer API adds are ignored, as the TypeScript Edge does, so an API
+/// deploy never breaks this Edge, and they gain no authority because only known fields are
+/// signed. Temporary rollout compatibility (route-token.ts): the verified target may be
+/// absent; a present target must be complete and well formed.
 pub fn admission(value: &Value) -> Result<(GatewayRegion, Option<AdmittedTarget>), Failure> {
     let object = value.as_object().ok_or_else(Failure::gateway)?;
-    let target = object.get("target");
-    if object.len() != 2 + usize::from(target.is_some()) {
-        return Err(Failure::gateway());
-    }
     match object.get("ok").and_then(Value::as_bool) {
-        Some(false) if target.is_none() => Err(actor_failure(
+        Some(false) => Err(actor_failure(
             object
                 .get("sqlstate")
                 .and_then(Value::as_str)
@@ -130,8 +127,7 @@ pub fn admission(value: &Value) -> Result<(GatewayRegion, Option<AdmittedTarget>
         )),
         Some(true) => {
             let value = object.get("region").ok_or_else(Failure::gateway)?;
-            let keys = value.as_object().ok_or_else(Failure::gateway)?;
-            if keys.len() != 3 || !keys.contains_key("gateway_binding") {
+            if value.get("gateway_binding").is_none() {
                 return Err(Failure::gateway());
             }
             let route: GatewayRegion =
@@ -145,7 +141,8 @@ pub fn admission(value: &Value) -> Result<(GatewayRegion, Option<AdmittedTarget>
             {
                 return Err(Failure::gateway());
             }
-            let target = target
+            let target = object
+                .get("target")
                 .map(|value| {
                     let target: AdmittedTarget =
                         serde_json::from_value(value.clone()).map_err(|_| Failure::gateway())?;

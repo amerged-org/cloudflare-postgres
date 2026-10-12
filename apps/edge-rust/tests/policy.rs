@@ -105,32 +105,41 @@ fn hints_are_scoped_before_actor_or_gateway_and_duplicate_errors_take_precedence
     assert!(!actor_failure("57P03").decoy);
 }
 #[test]
-fn an_admission_carries_only_a_complete_verified_target() {
+fn an_admission_validates_its_known_fields_and_ignores_additive_ones() {
     let region =
         json!({"id":"eu-test","gateway_url":"https://gateway.invalid/pg","gateway_binding":null});
     let pod = "01234567-89ab-4def-8123-0123456789ad";
+    let verified = Some(AdmittedTarget {
+        revision: 7,
+        pod_uid: pod.into(),
+    });
     let (route, target) =
         admission(&json!({"ok":true,"region":region,"target":{"revision":7,"pod_uid":pod}}))
             .unwrap();
     assert_eq!(route.id, "eu-test");
-    assert_eq!(
-        target,
-        Some(AdmittedTarget {
-            revision: 7,
-            pod_uid: pod.into()
-        })
-    );
+    assert_eq!(target, verified);
     // Temporary rollout compatibility: an admission without a verified target.
     assert_eq!(
         admission(&json!({"ok":true,"region":region})).unwrap().1,
         None
+    );
+    // A newer API's additive fields never break an Edge that does not read them, as in the
+    // TypeScript Edge; they carry no authority because only the known fields are signed.
+    let mut wider = region.clone();
+    wider["zone"] = json!("additive");
+    let (route, target) = admission(&json!({"ok":true,"region":wider,"extra":1,"target":{"revision":7,"pod_uid":pod,"node_uid":pod}})).unwrap();
+    assert_eq!((route.id.as_str(), target), ("eu-test", verified));
+    assert_eq!(
+        admission(&json!({"ok":false,"sqlstate":"57P03","extra":1}))
+            .unwrap_err()
+            .sqlstate,
+        "57P03"
     );
     for target in [
         json!({"revision":0,"pod_uid":pod}),
         json!({"revision":9_007_199_254_740_992_u64,"pod_uid":pod}),
         json!({"revision":7,"pod_uid":"not-a-pod"}),
         json!({"revision":7}),
-        json!({"revision":7,"pod_uid":pod,"extra":1}),
         json!(null),
     ] {
         assert_eq!(
@@ -138,16 +147,20 @@ fn an_admission_carries_only_a_complete_verified_target() {
             Failure::gateway()
         );
     }
-    assert_eq!(
-        admission(&json!({"ok":true,"region":region,"extra":1})).unwrap_err(),
-        Failure::gateway()
-    );
-    assert_eq!(
-        admission(&json!({"ok":false,"sqlstate":"57P03"}))
-            .unwrap_err()
-            .sqlstate,
-        "57P03"
-    );
+    let mut unbound = region.clone();
+    unbound.as_object_mut().unwrap().remove("gateway_binding");
+    let mut foreign = region.clone();
+    foreign["id"] = json!("not a region");
+    for invalid in [
+        json!({"ok":true,"region":unbound}),
+        json!({"ok":true,"region":foreign}),
+        json!({"ok":true}),
+        json!({"ok":false}),
+        json!({"region":region}),
+        json!([]),
+    ] {
+        assert_eq!(admission(&invalid).unwrap_err(), Failure::gateway());
+    }
 }
 #[test]
 fn public_gateway_is_https_and_explicit_service_http_has_no_fallback() {

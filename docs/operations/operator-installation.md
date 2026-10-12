@@ -87,6 +87,10 @@ namespaces, regional VPC/service bindings and `ROUTE_MASTER_KEYS` secret. The ex
 intentionally has no custom build command: delivery uses the qualified artifact instead
 of compiling again. Do not activate the replacement until the selected bytes pass Dev
 database acceptance. Record the actual Worker version and result in the ULTRA plan.
+Never activate a Wasm Edge built before 8f8017a once the API from that change is deployed:
+its exact-key admission parser refuses the added `target` and fails every connection. Later
+builds validate the admission fields they use and ignore additive ones, like the TypeScript
+Edge that serves live traffic.
 
 Successful upgrades return the unopened upstream WebSocket directly to Cloudflare.
 PostgreSQL bytes are not relayed through a TypeScript or Wasm application loop. Only
