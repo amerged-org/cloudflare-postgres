@@ -43,6 +43,451 @@ hibernated Cluster and the pool Pod, TLS and credential custody, and network ide
 late-bound Pod labels. The approved orchestration work (rt §6, §9, §10) and Gate 0 (§11) come
 first, because every wake needs them.
 
+## Alternative 8 detailed design
+
+**Owner decision (2026-10-12): alternative 8 is approved.** Per node, X pre-warmed pool Pods run
+a PGCF supervisor, as Neon's `compute_ctl` does [U3]. On connect the database's local LVM volume is
+attached into a pool Pod, `postgres` starts on it, and late-set Pod labels record the tenant.
+After `sleep_after_seconds` (60–900 s) of idleness the database is detached again. CNPG's
+ownership of the running process is waived for the awake phase only; CNPG keeps creation,
+restore and point-in-time recovery, the hibernated Cluster and the PVC. The target is a first SQL
+after wake below one second, measured through Cloudflare, against the EU1 baseline of §2: first
+SQL after wake 9.6–11.2 s, Pod Ready 4.9–6.6 s, orchestration after Ready 4–5 s, awake path
+alone 0.69–0.93 s.
+
+Repository citations in this section refer to origin/main dc635b2; `gw/` is
+`apps/native-gateway/src/`. Sources [U25]–[U53] extend the list at the end; besides the pins
+above they are pinned to Talos 1.14.2, Cilium 1.20.2, Linux 6.18.54 (the kernel of Talos 1.14.2
+[U40]), lib-csi 0.9.0, the barman-cloud library 0.6.0 and Barman 3.20.1. Where this section and
+the summary of alternative 8 in §12 differ, this section applies. Nothing here is implemented or
+measured on EU1; statements marked *unproven* need the live proof of A8.7.
+
+### A8.0 Parts, holder invariant and eligibility
+
+| Part | Responsibility |
+| --- | --- |
+| Pool Pod, namespace `pgcf-pool` | Pre-created and tenant-free; X per node, the node policy's `target_slots`, with idle requests inside the policy's idle budget (packages/contracts/src/compute-pool.ts:26-51). Container `postgres` (pinned PostgreSQL image) runs `pgcf-supervisor` as PID 1; container `archiver` runs the pinned plugin-barman-cloud sidecar image unmodified, with Barman 3.20.1 [U47]. An init container copies the static supervisor from the PGCF image into a memory emptyDir, as CNPG's init container copies its manager [U44]. A pool Pod serves one binding and is then deleted (rt:93-96). |
+| `pgcf-supervisor` | Static Rust. Waits empty; starts unmodified `postgres` only when the node agent's mount signal and the controller's tenant bundle for the same binding have both arrived; stops it on request. It never runs initdb, edits PGDATA or restarts PostgreSQL. |
+| Node agent | The existing `pgcf-sandbox-controller` host service (A8.1.6). Mounts and unmounts under Cloudflare authority; holds no Kubernetes credentials. |
+| Native controller | Creates, refills and deletes pool Pods; holds CNPG's primary Lease during a binding; pushes the tenant bundle; runs fresh checks, the sleep proof and pool backups; writes the gateway's binding record. |
+| Cloudflare | D1 `pool_pods` (inventory) and `pool_bindings` (authority). The DatabaseActor claims, signs permissions and admits. |
+
+**Holder invariant.** For each database exactly one holder may use the volume: `cnpg` or
+`pool/<binding ID>`. The `pool_bindings` row is authoritative and moves only forward by
+conditional update: `claimed → mounted → serving → detaching → released`; a failure passes
+through `failed` to `released`, an aborted bind ends `refused` and a reboot ends `lost`. A new
+binding, and equally a CNPG wake (hibernation off), are allowed only after the previous binding
+reached `released`, `refused` or `lost` with a recorded outcome. Pool Pods run under Pod Security
+`restricted` with `restartPolicy: Never`, no `fsGroup` and no ServiceAccount token.
+
+**Eligibility for a hit.** The database is running and not suspended; its node has a ready pool
+Pod whose profile (PostgreSQL image digest, CPU and memory limits) equals the database's; its
+desired configuration fingerprint equals the applied one in its sleep record (§7, A8.3); its last
+holder released with a clean stop (A8.2.3); its Cluster is hibernated with no non-terminal instance
+Pod and an empty primary Lease (A8.1.4); it is established (`ever_ready`) with a single PVC; and
+its volume is thick until thin bindings are proven (A8.7). Anything else is a `miss` and takes
+the CNPG wake.
+
+### A8.1 Single writer
+
+Neither LVM nor the kernel's open semantics can make one LV exclusive to one process on a node
+(A8.1.1). Exclusivity rests on one authoritative holder (A8.0), the node agent's kernel proof
+before and after every mount (A8.1.2, A8.1.5), and fences that keep CNPG from starting while a
+pool binding holds the volume (A8.1.4).
+
+**A8.1.1 What LVM, the kernel and PostgreSQL guarantee.**
+- *Activation is not ownership.* OpenEBS calls `lvcreate` without an activation option, so LVM
+  activates every new LV, and neither NodePublish nor NodeUnpublish changes activation [U32].
+  Exclusive activation (`-aey`) is a host lock that lvmlockd grants in shared VGs; `pgcf` is a
+  local VG for a single host [U31]. Every PGCF LV is therefore active whenever its node is up,
+  and LVM gives no exclusion between processes of one node. PGCF neither changes activation nor
+  uses it as a lock.
+- *Exclusive open is per device, not per mount.* The first ext4 mount opens the device with its
+  superblock as exclusive holder, after which a userspace `O_EXCL` open fails; both are global and
+  ignore mount namespaces [U25][U26]. A second mount of the same device, in any namespace, reuses
+  that superblock without opening the device again [U25]. A mount therefore never excludes
+  another mount.
+- *The device-mapper open count* counts every open of the mapped device [U26][U27]. Zero proves
+  that, at that instant, no mount and no other opener exists anywhere. After our own mount, one
+  does not prove that we are alone, because a second mount shares the superblock.
+- *PostgreSQL's interlock is namespace-local.* The postmaster.pid check probes the recorded PID in
+  its own PID namespace and the shared-memory check attaches in its own IPC namespace [U49][U22];
+  CNPG deletes a postmaster.pid whose PID it cannot see [U17]. Two Pods can start two postmasters
+  on one PGDATA, so single writer must be enforced outside PostgreSQL.
+
+**A8.1.2 Bind-time proof by the node agent.** Nothing is mounted unless every check passes:
+1. The bind permission (A8.1.6) is valid for this node UID, boot ID, binding, generation and
+   expiry.
+2. `/dev/mapper/pgcf-<escaped volume handle>`, OpenEBS's own device path [U32], is exactly one
+   `dm-N` whose device-mapper UUID is `LVM-<VG UUID><LV UUID>`, found by the complete inventory
+   that sc/storage_dm.rs:114-153 already uses for thin volumes. The permission pins the LV UUID
+   once it is recorded; the first bind of a retained thick volume records it.
+3. `DM_DEV_STATUS` reports open count 0 (sc/storage_dm.rs:83-90; today reached only behind the
+   thin identity check, extended to linear targets).
+4. No superblock with the LV's `dev_t` exists in any mount namespace. The agent walks every mount
+   namespace with `NS_MNT_GET_NEXT` and reads its mounts with `listmount` and
+   `statmount(STATMOUNT_SB_BASIC)`; as root in the initial user namespace it sees all of them,
+   including namespaces that no process holds [U28] (unproven from the agent's context, A8.7).
+   A cross-check reads every process's `mountinfo` through the host `/proc` handle the agent
+   already keeps (sc/host_context.rs:21-22, 187-199).
+5. The mountpoint is the `data` directory of the pool Pod's `volume` emptyDir, opened with
+   `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` below `/var/lib/kubelet/pods/<pool Pod UID>`:
+   a root-owned 0755 directory on that Pod's tmpfs, prepared while the Pod was tenant-free
+   (A8.1.3).
+6. A durable record `accepted` is written the way owner records are (sc/controller.rs:70-115).
+
+The agent then mounts ext4 through `fsopen`/`fsmount` and `move_mount` onto the opened directory
+descriptor, so no path can be swapped, with the device path of check 2 as source string and
+`nodev,nosuid,noexec`. It repeats check 4: every mount of the `dev_t` must be a propagated copy at
+that emptyDir path (agent, kubelet and pool-container namespaces, and OpenEBS's plugin
+namespace). Any other mountpoint is foreign: unmount, record `refused`. Only then does it record
+`mounted` with mount ID and `dev_t` and signal the supervisor.
+
+**A8.1.3 Mount propagation, Pod Security and kubelet.**
+- *Mechanism.* Both pool containers mount a memory-backed emptyDir `volume` at
+  `/var/lib/postgresql` with `mountPropagation: HostToContainer`, so the LV appears at CNPG's own
+  PGDATA path `/var/lib/postgresql/data/pgdata` [U44]. kubelet passes HostToContainer to CRI, and
+  containerd requires a shared or slave source and binds it `rslave` [U34][U39]; a mount below a
+  shared mount propagates to its peers and slaves [U30]. Talos binds `/var/lib/kubelet`
+  `rbind,rshared` into kubelet and, with workload isolation, runs CRI, kubelet and Pods in one
+  sandbox PID+mount namespace [U40], which the agent joins (sc/host_context.rs:113-170).
+- *Pod Security `restricted` permits it.* API validation forbids only Bidirectional propagation
+  for unprivileged containers [U34]; the restricted volume list includes emptyDir, and none of the
+  19 pinned Pod Security checks reads `mountPropagation` [U35]. The pool Pod needs no hostPath,
+  privileged container or capability.
+- *Precheck (unproven under Talos workload isolation).* Before a pool Pod enters the inventory,
+  the agent requires its `volume` tmpfs to be `shared:N` in the agent's `mountinfo` and the
+  containers' copies to be `master:N` with the same N. It then sets the emptyDir root to 0755
+  root:root and creates `data`, so the uid-26 containers cannot replace the mountpoint; check 5
+  still refuses anything else at bind time. After every mount, check 4 must find the LV in
+  kubelet's and both containers' mount tables.
+- *kubelet does not know the nested mount and cannot destroy it.* Memory emptyDir teardown
+  unmounts the tmpfs before it removes the directory [U36]; the unmount fails with EBUSY while the
+  LV is mounted beneath [U29], so the removal never runs. `SyncTerminatedPod` waits for the
+  unmount and the API object is deleted only afterwards [U37]: while the LV may be mounted, the
+  pool Pod object exists. Orphaned-Pod cleanup removes only empty directories on one filesystem
+  and skips Pods with mounted volumes [U37]. A disk-backed emptyDir would remove recursively
+  across the mount [U36][U23] and stays excluded. The EBUSY protection is unproven on EU1.
+- *No fsGroup.* kubelet changes ownership only when fsGroup is set [U36]. Pool Pods set none, so
+  kubelet never walks into PGDATA, not even when it runs SetUp again after a restart.
+- *OpenEBS's single-mount guard* compares source strings in the plugin's own mount table
+  [U13][U33]. The plugin mounts `/var/lib/kubelet` Bidirectionally [U32] and the pool mount uses
+  the same source string below that tree, so a CNPG NodePublish during a binding should be
+  refused. Unproven, and not relied upon.
+
+**A8.1.4 Fences between the hibernated Cluster and the pool.**
+
+| Fence | While the pool holds: CNPG cannot start | While CNPG holds: the pool cannot bind |
+| --- | --- | --- |
+| Binding record | A CNPG wake needs the binding `released`, `refused` or `lost`; until then the controller refuses to turn hibernation off, which today happens at nc/power.rs:1637, reached from nc/reconcile.rs:840-856. | Cloudflare signs a bind permission only when the last holder released and the sleep record shows a clean stop. |
+| `cnpg.io/hibernation=on` | Stays on for the whole binding. A hibernated Cluster's reconcile returns before CNPG reconciles Pods [U41], and CNPG fails every Backup of it [U42]. | The controller requests a permission only after it observed the Hibernated condition and no non-terminal instance Pod (nc/power.rs:1310-1345). |
+| CNPG primary Lease `database` | CNPG starts a primary's PostgreSQL only after it holds this Lease and takes the Lease over only when it is empty or unrenewed for 15 s [U43]. Before pushing the bundle the controller claims it as `pgcf-pool/<binding ID>`, renews it at least every 5 s, and empties it after `released`, as CNPG does at a clean stop [U43]; CNPG's operator only ensures that the Lease exists [U43]. | The controller claims only an empty Lease, which CNPG leaves at its clean stop [U43]. |
+| PVC | The pool never references the PVC, so kubelet's PVC path stays CNPG's; OpenEBS's guard (A8.1.3) is an extra, unproven layer. | The permission binds PVC, PV, volume handle and LV; open count 0 and the namespace scan (A8.1.2) prove that no CNPG Pod has the PVC mounted. |
+
+A mistaken hibernation-off therefore still cannot start a second postmaster: CNPG's instance
+manager waits for the Lease before PostgreSQL starts [U43]. It may rewrite its configuration
+files before that gate [U43], with the same content while the configuration fingerprint and the
+CNPG release are unchanged (A8.3).
+
+**A8.1.5 Unmount.** The agent unmounts after the supervisor reported a clean stop or after the
+pool Pod's processes have ended; if a holder survives, it kills the pool Pod's cgroup first. It
+uses a non-lazy unmount, which fails with EBUSY while any propagated copy is in use; a lazy
+detach would leave a live superblock without a mount entry and is never used [U29]. It records
+`released` only with open count 0 and an empty namespace scan. Unmounting needs no Cloudflare
+permission, because it can only end the single writer.
+
+**A8.1.6 The privileged component and its authority.** The node agent is the sandbox controller.
+node-bootstrap is a Cloudflare Container (apps/api/wrangler.example.jsonc:67-70) that reaches
+nodes through the Talos API; it is not a node service. Of PGCF's node components only the sandbox
+controller is a Talos host service (infra/talos/sandbox/service.yaml:2-16); the node reclaimer is
+restricted to bounded memory reclaim (rt:315-321). The sandbox controller already runs in CRI's
+PID and mount context with the host `/proc` handle (sc/host_context.rs:21-22, 113-199), issues
+device-mapper ioctls (sc/storage_dm.rs:61-90), verifies Cloudflare's Ed25519 authority against
+pinned keys (sc/storage.rs:147-176, 239) and persists owner records (sc/controller.rs:70-115).
+- *Signed bind permission.* Ed25519 with prefix `pb1` and domain `pgcf-pool-bind/v1\n`, signed with
+  the existing storage-authority keys under that separate domain
+  (packages/contracts/src/storage-write-authority.ts:7-12, 85-111), so the node needs no new trust
+  anchor (infra/talos/sandbox/configuration.ts:15-56). Claims: binding ID, database ID,
+  generation, node UID, boot ID, storage UID, PVC and PV UIDs, volume handle, VG and LV UUIDs,
+  pool Pod UID, the attested supervisor key fingerprint, PostgreSQL image digest, the sleep
+  record's system identifier and timeline, a bundle nonce, issue time and an expiry at most 30 s
+  later. It reaches the agent through a held request on the existing agent endpoint
+  (sc/policy.rs:251-279).
+- *Identity checks.* Node UID and boot ID (sc/storage.rs:107-116); the pool Pod's containers in
+  containerd's `k8s.io` namespace with that Pod UID and the supervisor's executable hash; the
+  supervisor key; the device (A8.1.2).
+- *Supervisor attestation.* At pool Pod start the supervisor generates a TLS key in memory and
+  writes the public key into its `control` memory emptyDir; the agent reads it below the Pod's
+  kubelet directory and reports it with the pool Pod. Agent and supervisor talk over a Unix socket
+  in that emptyDir; the supervisor accepts only a peer with uid 0 outside its PID namespace
+  (`SO_PEERCRED`), which no tenant backend can be.
+- *Exact-once outcome record.* One durable record per binding ID, moving through `accepted`,
+  `mounted`, `failed` and `released`, or ending `refused` or `lost`. A binding ID is mounted at
+  most once, and a record from another boot is never resumed. Each state is reported with the
+  binding ID as idempotency key; Cloudflare advances its row only forward and acknowledges
+  repeats.
+
+### A8.2 WAL archiving and backups
+
+**A8.2.1 Archive command.** CNPG's mandatory `archive_command` calls
+`/controller/manager wal-archive` [U16], which does not exist in a pool Pod. The supervisor starts
+unmodified `postgres -D /var/lib/postgresql/data/pgdata` with exactly three command-line settings,
+which override postgresql.conf and ALTER SYSTEM [U51]:
+`archive_command='/pgcf/bin/pgcf-supervisor wal-archive %p'`, `logging_collector=off` and
+`log_destination=stderr`. Everything else comes from CNPG's configuration in PGDATA. Memory
+emptyDirs reproduce CNPG's `/controller`, `/run` and `/dev/shm` layout, so the remaining paths
+resolve unchanged [U44]. The shim hands the WAL path over a Unix socket to the `archiver`
+container, which holds the R2 credential and runs the first command below; A8.2.2 uses the other
+two. All three carry exactly the options the plugin derives [U46][U47][U48] from the ObjectStore
+PGCF writes (nc/manifests.rs:91-106), with `serverName` from the Cluster's plugin parameter
+(nc/manifests.rs:341) and `AWS_DEFAULT_REGION=auto` (nc/manifests.rs:73-76):
+
+```text
+barman-cloud-wal-archive --gzip --endpoint-url <endpoint> --cloud-provider aws-s3 \
+  <destinationPath> <serverName> <WAL file>
+barman-cloud-backup --user postgres --name backup-<compact ISO time> --gzip \
+  --endpoint-url <endpoint> --cloud-provider aws-s3 <destinationPath> <serverName>
+barman-cloud-backup-delete --endpoint-url <endpoint> --cloud-provider aws-s3 \
+  --retention-policy <policy> <destinationPath> <serverName>
+```
+
+The archiver takes one file at a time without a spool and exits 0 only after the upload
+succeeded; PostgreSQL then renames `.ready` to `.done` [U50].
+
+*Compatibility with CNPG's later resume* (unproven until A8.7):
+- Same timeline: a pool never promotes or recovers.
+- Same destination, server name, compression and Barman release, hence the same object names.
+- Archive status lives in PGDATA (`pg_wal/archive_status`): CNPG's archiver continues with what
+  the pool left `.ready`. The plugin's spool is per Pod [U44] and holds nothing from the pool.
+- Re-archiving a segment overwrites identical content; PostgreSQL requires archivers to tolerate
+  it [U50], and the plugin checks only its spool [U46].
+- The empty-archive check runs only while `.check-empty-wal-archive` exists, and CNPG deletes the
+  marker once continuous archiving holds [U46]. Pool eligibility requires its absence, checked on
+  the mounted volume.
+
+**A8.2.2 Base backups.** CNPG fails every Backup of a hibernated Cluster with "cannot backup a
+hibernated cluster", while its ScheduledBackup keeps creating them [U42], and plugin retention
+runs only in the sidecar of the current primary [U47]. During a pool phase neither works; by the
+same source, scheduled Backups of sleeping databases fail today as well. Decision: PGCF takes the
+base backup in the pool Pod and does not hand over to CNPG (unproven, A8.7).
+- *Trigger:* while serving, when the catalog's newest completed base backup is older than 24 h,
+  the daily cadence of the ScheduledBackup (nc/manifests.rs:357). The controller sends `backup`
+  over the supervisor channel after admission, never on the bind path.
+- *Command:* the `archiver` runs `barman-cloud-backup` as listed in A8.2.1, as the plugin does
+  [U47], connecting through `/controller/run` under CNPG's `local all all peer map=local` rule
+  [U44]; it sees PGDATA at the same path.
+- *Retention:* after a `DONE` backup it runs `barman-cloud-backup-delete` as listed in A8.2.1 with
+  the ObjectStore's retention (nc/manifests.rs:275-276).
+- *Record:* the controller reads the new `backup.info` with the restore catalog's parser
+  (apps/api/src/domain/restore-catalog.ts:15-55) and reports it as backup health beside CNPG's
+  Backup objects (nc/health.rs:355-369, 404-526); the newer completion wins. Restore is unchanged
+  because it reads the Barman catalog.
+- *Detach waits* while a pool backup runs.
+- *Why not a short CNPG wake:* a database that never goes idle has no CNPG-owned phase, and a
+  forced hand-over would wait for busy sessions, which the gateway never closes
+  (gw/control.rs:265-283), and then pay a cold CNPG wake. CNPG-owned phases keep the
+  ScheduledBackup and plugin retention unchanged.
+
+**A8.2.3 Sleep proof preserved.** The statements remain those of
+apps/regional/src/agent/sleep.ts:52-75, executed by nc/power.rs:1085-1218: guard, identity,
+`pg_switch_wal()`, then waiting until the closed segment's `.done` appears
+(nc/power.rs:1191-1203). The controller dials the pool Pod IP with TLS name
+`database-rw.pgcf-db-<id>.svc`; nc/postgres.rs:78-88 changes from Service DNS to an address plus
+that name. Only after `Proved` does the supervisor fast-stop PostgreSQL, read `pg_controldata`
+(`shut down` [U50]) and report; the agent unmounts (A8.1.5); the controller empties the Lease and
+stores the sleep record of §7 with the outcome. Hibernation is already on, so the hibernate step
+(nc/power.rs:1407) is skipped, and a hibernated observation requires `released` instead of
+terminal CNPG Pods (nc/power.rs:1310-1345).
+
+### A8.3 TLS and credential custody
+
+- *Source.* CNPG keeps the server certificate and key in Secret `database-server` and its CA in
+  `database-ca` in the tenant namespace [U45]. The controller reads them by the names in
+  `status.certificates`, as it already reads the CA (nc/reconcile.rs:1382-1408), under its existing
+  cluster-wide `get` on Secrets (infra/platform/regional/rbac.yaml:43-47): no new RBAC.
+- *Copy.* The controller pushes one bundle per binding (`server.crt`, `server.key`,
+  `client-ca.crt`, destination path, server name, endpoint, binding ID and the permission's nonce)
+  to the supervisor's TLS endpoint on the pool Pod IP, pinned to the supervisor key fingerprint
+  that the agent attested and Cloudflare forwarded. The supervisor accepts a bundle only for its
+  current binding and nonce, which it learns from the agent; writes the files with mode 0600 for
+  uid 26 under `/controller/certificates`, where CNPG's mandatory settings point [U44]; and never
+  logs them. The `archiver` container does not mount that directory. Cloudflare never sees the
+  key, and the tmpfs ends with the Pod. If CNPG renews the Secret during a binding, the controller
+  pushes again and the supervisor reloads PostgreSQL.
+- *Archive credential.* It is the regional R2 key the controller already copies into every tenant
+  namespace (nc/manifests.rs:88-90, 260-265; nc/reconcile.rs:1282-1323). A copy in `pgcf-pool`
+  reaches only the `archiver` container, as CNPG's sidecar holds it today: no new breadth.
+- *Role passwords.* pg_authid on the volume holds what CNPG's managed roles last applied and the
+  controller acknowledged (nc/reconcile.rs:84-131). The pool never changes roles, and a database
+  is pool-eligible only while its desired configuration fingerprint
+  (packages/contracts/src/reclaim.ts:301-379: image, sizes, roles with revisions, archive and
+  storage) equals the applied one in its sleep record.
+- *Role change while awake in the pool: deferred, not refused.* Creating a role or resetting a
+  password raises the database generation (apps/api/src/domain/roles.ts:54-167). For a pool-bound
+  database the Actor's barrier (rt §10) closes admission for new sessions, and the controller runs
+  the detach path, which completes once in-flight work has ended, because busy sessions are never
+  forced closed. A CNPG-owned wake then applies the managed roles, and admission reopens after
+  acknowledgement. No new session can authenticate with an old password in between. Refusal would
+  fail an integrator's rotation whenever the database is busy.
+- *Supervisor:* no ServiceAccount token and no Kubernetes access.
+
+### A8.4 Network identity and late-set labels
+
+- *Policies cannot follow labels across namespaces.* A pre-created Pod cannot move into
+  `pgcf-db-<id>` [U1]. The tenant's NetworkPolicy and CiliumNetworkPolicy select
+  `cnpg.io/cluster=database` inside that namespace (nc/manifests.rs:163-228), and gateway and agent
+  egress allow `cnpg.io/cluster: database` only in namespaces labelled `pgcf.io/database-id`
+  (infra/platform/regional/network-policies.yaml:95-107, 143-156). Whatever its labels, a pool Pod
+  is never selected by them.
+- *Pool namespace policy.* `pgcf-pool`, Pod Security `restricted`: default deny; ingress to pool
+  Pods on 5432 from `pgcf-gateway` and `pgcf-agent`, and on the supervisor port from `pgcf-agent`
+  only; egress only to the R2 endpoint by FQDN on 443 and to kube-dns for that name; no
+  kube-apiserver and no traffic between pool Pods. Gateway and agent egress gain one fixed rule for
+  `app.kubernetes.io/name: pgcf-pool` in `pgcf-pool`.
+- *Cilium identity.* Cilium makes every Pod label without an ignore prefix identity-relevant,
+  allocates identities as CRD objects and lets an endpoint use a changed identity only after
+  `identity-change-grace-period`, 5 s by default [U52]. A tenant label set at bind time would put
+  that wait on the critical path and create an identity per binding. Decision: the controller sets
+  `pgcf.io/pool-database=<id>` and `pgcf.io/pool-binding=<binding ID>` after admission, and
+  Cilium's `labels` option gets the single ignore prefix `k8s:!pgcf\.io/pool-` [U52]. Ignore-only
+  prefixes keep Cilium's default rules, and the match is anchored at the start of the key [U52],
+  so no existing identity changes (unproven, A8.7). The labels serve inventory, metering and
+  operators; they are never an authorization input.
+- *Routing (rt §6, §10).* The route token (packages/contracts/src/route-token.ts:36-45) becomes
+  version 3 with the route revision (rt:296) and the target: kind `pool`, binding ID, Pod UID, IP
+  and node; its 512-character bound (route-token.ts:16) must grow. The controller writes the same
+  target as `pool-binding.json` into the existing `gateway-fence-<id>` ConfigMap, which the gateway
+  already watches (gw/targets.rs:71-87). The gateway admits only when token target, binding record
+  (state `serving`) and power fence agree, and then dials the IP with TLS name
+  `database-rw.pgcf-db-<id>.svc` and the CNPG CA from `ca-<id>` (gw/transport.rs:506-507,
+  713-751). For thin volumes the storage binding's Pod UID is the pool Pod's
+  (gw/targets.rs:313-405). EndpointSlice routing (gw/targets.rs:247-311) remains for CNPG-owned
+  phases; only the native gateway gets pool routing.
+- *What prevents a stale label from admitting traffic.* Nothing reads the late labels for access:
+  no policy, token claim or gateway check. Admission needs a signed, single-use token valid for at
+  most 30 s (route-token.ts:16-18; apps/native-gateway/README.md:13-15) whose target equals the
+  binding record; the record leaves `serving` before quiesce; a reused IP fails the Pod UID check;
+  a wrong server fails TLS against the database's CA and name. A pool Pod serves one binding and is
+  then deleted with its labels.
+
+### A8.5 Failure and restart behaviour
+
+| Situation | Behaviour |
+| --- | --- |
+| Supervisor dies | With `restartPolicy: Never` kubelet starts no new supervisor on the mounted volume. The supervisor is PID 1 of the `postgres` container, so its exit kills every remaining process of that PID namespace, the postmaster included [U53]. The agent sees the exit and records `failed`; Cloudflare revokes the route: fence closed, sessions closed, nothing replayed (rt:250). The agent kills the rest of the pool Pod's cgroup, unmounts, checks open count 0 and the namespace scan, and records `released` with an unclean stop; the controller empties the Lease. The next wake is a CNPG wake with crash recovery, labelled `miss`. |
+| Pool Pod deleted (API, eviction, drain) | The route is revoked first. On SIGTERM the supervisor fast-stops PostgreSQL within the Pod's termination grace period and reports pg_control. The memory emptyDir cannot be torn down while the LV is mounted beneath it, so the Pod stays Terminating until the agent has unmounted after the postgres processes ended (A8.1.3). WAL not yet archived stays `.ready` for the next owner. If SIGKILL comes first, the row "Crash-stopped PGDATA" applies. A forced API deletion removes only the object; the node record and the kernel state still decide. |
+| Node reboot | Pool Pods and mounts end with the boot. Records of the old boot ID are never resumed; the agent reports them `lost` with the new boot ID, and Cloudflare closes the binding without a clean-stop record. The controller empties the stale Lease, which CNPG would otherwise take over after 15 s [U43]. The next wake is a CNPG wake with crash recovery, labelled `miss`. |
+| Two wakes, one free pool Pod | Claims are conditional updates of one `pool_pods` row per Pod (`binding_id IS NULL`). The first commit wins and is a hit; the other database finds no free compatible Pod and takes the CNPG wake, labelled `miss`. Two wakes of one database coalesce in its Actor (rt:81-84). |
+| Node agent restart mid-bind | Records survive in the agent's state directory. `accepted` without a mount continues only while the permission is valid, otherwise it becomes `refused`. A mount found under `accepted` (crash between mount and record) gets the post-mount namespace scan again, then `mounted` if the permission is still valid, else an unmount. The supervisor is signalled only after `mounted` is durable, so no postmaster runs on an unrecorded mount. A `mounted` or serving binding is verified again and continues. |
+| Detach interrupted | The binding stays `detaching`: hibernation on, Lease held, no `released`, so neither CNPG nor a new binding can start. The retry stops PostgreSQL again if it still runs, kills remaining holders in the pool Pod's cgroup, unmounts non-lazily and verifies. Admission stays closed; a wake meanwhile waits for `released` and then binds anew or wakes CNPG. |
+| Cloudflare unreachable | No bind starts without a fresh permission, and no client connection reaches the region without Cloudflare anyway. Serving bindings continue; the controller keeps renewing the Lease inside the cluster; nothing detaches without Cloudflare's sleep decision; outcome reports are retried. Thin volumes would keep the existing write-authority expiry (open for R2b, A8.7). |
+| Crash-stopped PGDATA | A bind needs a sleep record with a clean stop. After mounting, the supervisor checks the volume again: pg_control `shut down` [U50] with the recorded system identifier and timeline, `PG_VERSION` 18, and no `postmaster.pid`, `standby.signal`, `recovery.signal` or empty-archive marker. Anything else aborts before PostgreSQL starts: unmount, `refused`, and the wake continues as a CNPG wake with crash recovery, labelled `miss`. |
+| Native controller restart | A bind whose bundle does not arrive before the permission's expiry is abandoned: the supervisor reports it, the agent unmounts and records `refused`, and the wake continues as a `miss`. For a serving binding, Lease renewal pauses; CNPG could take the Lease after 15 s but has no instance while hibernated; the new process resumes renewal from the binding record. Admission state is unchanged. |
+
+### A8.6 Sequence and timing
+
+Pool hit. Steps 1–6 are the critical path; steps 2 and 3 run in parallel.
+1. Client → Edge → DatabaseActor. The wake commit (actor:584-605) also claims a free compatible
+   pool Pod on `db.node` in the same D1 batch and records the binding. The Actor signs the bind
+   permission and answers the agent's held request; RegionLink hints the controller, which
+   fetches the binding with the database's desired state (rt §9).
+2. Node agent: the checks of A8.1.2, durable records, mount, post-mount scan, signal to the
+   supervisor.
+3. Controller: Cluster still hibernated, Lease claimed, server Secret and CA read, bundle pushed.
+4. Supervisor: the volume checks of A8.5 ("Crash-stopped PGDATA"), TLS files, `postgres` start;
+   ready when `postmaster.pid` reports `ready` [U11]; report to agent and controller.
+5. Controller fresh checks over one maintenance session to the Pod IP: TLS name and CA, database,
+   not in recovery, system identifier, roles and their attributes, settings. Then
+   `pool-binding.json`, fence release (a pool branch of nc/power.rs:1700-1735) and the immediate
+   observation. Cloudflare admits when observation and the agent's proof agree with the claim, and
+   pushes to the Actor instead of the 250 ms poll (actor:788-839).
+6. Edge signs the version-3 token; Tunnel; the gateway checks token, record and fence and dials;
+   TLS; StartupMessage; SCRAM passthrough (rt:300-306); query; first row.
+7. Off the path: late labels; in-place resize of the pool Pod's requests to the database's,
+   generally available in the pinned Kubernetes [U38]; per-role login checks as background
+   verification (rt:238); a pool backup when due; refill to X. Misses take the CNPG wake with the
+   region's selected runtime; pool hits do not use R2's sandbox slots.
+
+**What a hit removes** from today's wake: CNPG's Pod creation, scheduling, kubelet's volume wait,
+sandbox and CNI, init container, sidecar and instance-manager start with their probes (connect →
+Pod Ready 4.9–6.6 s), and the orchestration after Ready (4–5 s), which steps 1, 5 and 6 replace by
+pushes.
+
+**Expected latency against one second.** The awake path, 0.69–0.93 s, already contains the client's
+connection to Cloudflare, an admission and all of step 6. A hit adds steps 1–5 in place of that
+awake admission, whose duration is unmeasured. For a first SQL below one second, steps 1–5 must
+fit in 1 − 0.93 = 0.07 s at the slow end and 1 − 0.69 = 0.31 s at the fast end of the measured
+awake path, plus the awake admission they replace. A clean PostgreSQL start to first SQL took
+44–302 ms on a laptop, and 71–112 ms including the ext4 mount (§2), not on EU1; steps 1, 2 and 5
+contain at least one Cloudflare → EU1 and one EU1 → Cloudflare delivery and a D1 commit, none of
+them measured. At the slow end the clean start alone can use the whole remaining budget; at the
+fast end everything in steps 1–5 must fit in 0.31 s plus the replaced admission. The target
+therefore stays unproven and doubtful. The first live runs must record the split of the awake
+path (plan: "Wake stage measurement") next to the hit stages. If the part after admission
+dominates, the remaining lever is to open the Edge → gateway WebSocket and hold the client's
+StartupMessage before admission; that changes the admission order of rt §10 and needs its own
+owner decision.
+
+### A8.7 Component changes and acceptance
+
+| Files | Change |
+| --- | --- |
+| packages/contracts/src/compute-pool.ts | A pool-Pod kind of the node policy (PostgreSQL and sidecar image digests, supervisor hash, CPU and memory limits; `target_slots` is X) and its observation (Pod UID, IP, supervisor key fingerprint, propagation precheck); run labels `hit` and `miss` with stage timestamps. |
+| New packages/contracts/src/pool-binding.ts; packages/contracts/native/generate.ts | Bind permission `pb1`, outcome records, binding states and the sleep record, with generated native constants. |
+| packages/contracts/src/route-token.ts | Version 3 with route revision and target; a larger length bound. |
+| packages/contracts/src/reclaim.ts | The runtime attestation (lines 181-205) for a pool binding: kind, binding ID, pool Pod. |
+| apps/api/src/database-actor.ts | Claim in the wake commit; admission push; deferral of role changes for pool-bound databases. |
+| apps/api/src/domain/compute-pool.ts, roles.ts, desired.ts, observations.ts; new apps/api/migrations/0045_pool_bindings.sql | `pool_pods` and `pool_bindings`, held agent request, idempotent outcomes, binding in desired state, sleep record, pool backup observations. |
+| apps/edge/src/index.ts (apps/edge-rust once it replaces it) | Sign version-3 tokens (index.ts:134). |
+| apps/native-controller/src/power.rs, reconcile.rs, postgres.rs, health.rs, kubernetes.rs, measurements.rs; new pool.rs | Pool branches of wake, sleep proof and detach; hibernation-off refused while bound; dial by address with the service TLS name; pool Pod lifecycle and refill, Lease, bundle push, backups, labels and resize; backup health from the catalog; usage attributed by binding record. |
+| New apps/pool-supervisor (workspace member) | Supervisor, `wal-archive` shim and archiver mode. |
+| apps/sandbox-controller/src: new binding.rs; storage_dm.rs, policy.rs, main.rs; README.md | Permission verification, kernel checks, descriptor-based mount, unmount, records and outcomes; status by UUID for linear targets; held request and pool observation. It ships in the existing extension without a new trust anchor. |
+| apps/native-gateway/src/targets.rs, transport.rs, kubernetes.rs; README.md | Pool targets from `pool-binding.json`; token target checks. |
+| infra/platform/regional: new pool.yaml, kustomization.yaml, network-policies.yaml, rbac.yaml | Namespace `pgcf-pool` (Pod Security `restricted`, default deny, CiliumNetworkPolicy, PriorityClass); gateway and agent egress; a Role in `pgcf-pool` with Pod `create` and `patch` and `pods/resize` `patch`, which the controller's slot preparation, refill, labels and requests need (rt:370); a ClusterRole with `get` and `update` on `leases` named `database` for the CNPG start fence. Pod `get`, `list`, `watch` and `delete` and Secret `create` and `update` already exist (rbac.yaml:43-47, 78-89). |
+| infra/platform/base/values/cilium.yaml | `labels` set to `k8s:!pgcf\.io/pool-`. |
+| THIRD_PARTY.md | The pool runs the pinned plugin sidecar image unmodified as its archiver. |
+
+**Live acceptance on EU1 through Cloudflare**, after R2 is accepted:
+1. *Hit or miss.* A sleeping database (Cluster hibernated, no CNPG Pod) with X ready pool Pods on
+   its node; a normal client connection through `db.ohmyho.st`; `connect_ms` and `first_read_ms`
+   from one instant, broken down into claim, permission and hint delivery, device checks, mount,
+   Lease, bundle, PostgreSQL ready, fresh checks, both proofs, admission, token, gateway dial, TLS,
+   AuthenticationOk and first row. Every run is labelled `hit` or `miss` with the miss reason.
+2. *Data and refill.* The committed marker reads back; the used pool Pod is gone and the pool
+   observation shows X ready pool Pods again.
+3. *Detach after 60 s and after 900 s.* The closed segment's `.done` precedes the stop; pg_control
+   reads `shut down`; the agent records `released` with open count 0 and an empty namespace scan,
+   and none of its scans during the binding saw a second mountpoint; the Lease is empty; the
+   Cluster is hibernated with no instance Pod.
+4. *WAL, backup and restore.* `pg_switch_wal()` in a pool phase puts the segment into R2 under the
+   destination path and server name; a pool base backup reaches `DONE`, appears in the restore
+   catalog and restores with its WAL into a separate database through the API with the marker; a
+   later CNPG-owned wake archives on the same timeline and server name without error, and its
+   ScheduledBackup completes.
+5. *Failure tests, one each:* supervisor killed; pool Pod deleted while serving; node reboot with a
+   bound pool Pod; two wakes on one node with one free pool Pod. Each shows the behaviour of A8.5
+   and no second writer.
+
+**Open blockers that need live proof.**
+1. Propagation of the agent's mount into the pool containers and into kubelet's namespace under
+   Talos workload isolation (A8.1.3).
+2. The EBUSY-protected emptyDir teardown on EU1 while the LV is mounted beneath.
+3. Mount-namespace enumeration with `NS_MNT_GET_NEXT`, `listmount` and `statmount` from the
+   agent's context on Talos 1.14.2.
+4. CNPG resuming after pool phases: archiving on the same timeline, Lease hand-back, no
+   empty-archive refusal.
+5. Pool base backups and retention against the plugin's catalog, and restore from them.
+6. Cilium: the ignore prefix keeps pool identities stable, and gateway and agent reach pool Pods.
+7. In-place resize of a serving pool Pod's requests.
+8. A first SQL below one second through Cloudflare (doubtful, A8.6).
+9. Thin volumes: a write authority bound to the pool Pod UID and the guard's suspension of pool
+   bindings, with R2b.
+10. OpenEBS's guard refusing a CNPG NodePublish during a binding (useful, not relied upon).
+
+The orchestration that every wake needs (immediate publication, Actor push, route token with
+target and direct dial; rt §6, §9, §10) comes first, as the Owner direction states; it carries
+steps 5 and 6.
+
 ## 1. Decision requested from the owner
 
 **Decision 1 (now).** Approve the early-postmaster binding of §3 as the shared-pool mechanism; it is
@@ -535,3 +980,143 @@ reruns the adoption and alias checks before a profile with the new hashes is app
   https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/volume/emptydir/empty_dir.go#L528-L556
 - [U24] PostgreSQL 18, `data_directory` can only be set at server start:
   https://www.postgresql.org/docs/18/runtime-config-file-locations.html
+- [U25] Linux 6.18.54, a further mount of a mounted block device reuses its superblock; the first
+  mount opens the device with the superblock as holder:
+  https://github.com/gregkh/linux/blob/v6.18.54/fs/super.c#L1673-L1714 and
+  https://github.com/gregkh/linux/blob/v6.18.54/fs/super.c#L1616-L1623
+- [U26] Linux 6.18.54, exclusive block-device claims, per-open disk accounting and userspace
+  `O_EXCL` as exclusive open:
+  https://github.com/gregkh/linux/blob/v6.18.54/block/bdev.c#L535-L551,
+  https://github.com/gregkh/linux/blob/v6.18.54/block/bdev.c#L711-L737,
+  https://github.com/gregkh/linux/blob/v6.18.54/block/bdev.c#L921-L930 and
+  https://github.com/gregkh/linux/blob/v6.18.54/block/fops.c#L649-L688
+- [U27] Linux 6.18.54, device-mapper open count and its report in `DM_DEV_STATUS`:
+  https://github.com/gregkh/linux/blob/v6.18.54/drivers/md/dm.c#L314-L360 and
+  https://github.com/gregkh/linux/blob/v6.18.54/drivers/md/dm-ioctl.c#L844-L849
+- [U28] Linux 6.18.54, iteration over every mount namespace and each mount's superblock device:
+  https://github.com/gregkh/linux/blob/v6.18.54/include/uapi/linux/nsfs.h#L28-L41,
+  https://github.com/gregkh/linux/blob/v6.18.54/fs/nsfs.c#L320-L360,
+  https://github.com/gregkh/linux/blob/v6.18.54/fs/namespace.c#L2103-L2133,
+  https://github.com/gregkh/linux/blob/v6.18.54/fs/namespace.c#L5159-L5165,
+  https://github.com/gregkh/linux/blob/v6.18.54/fs/namespace.c#L5790 (`statmount`) and
+  https://github.com/gregkh/linux/blob/v6.18.54/fs/namespace.c#L5944 (`listmount`)
+- [U29] Linux 6.18.54, a non-lazy unmount fails while any propagated copy is busy; a lazy one
+  detaches regardless:
+  https://github.com/gregkh/linux/blob/v6.18.54/fs/namespace.c#L1947-L1958 and
+  https://github.com/gregkh/linux/blob/v6.18.54/fs/pnode.c#L423-L453
+- [U30] Linux 6.18.54, shared and slave mounts:
+  https://github.com/gregkh/linux/blob/v6.18.54/Documentation/filesystems/sharedsubtree.rst#L262-L283
+- [U31] LVM2 2.03.32, the `lvm2` of Alpine 3.22, on which the pinned driver image is built
+  (https://github.com/openebs/lvm-localpv/blob/v1.10.1/buildscripts/lvm-driver/Dockerfile.buildx#L44-L45;
+  the exact package in the image is not verified); local VGs and exclusive activation through
+  lvmlockd:
+  https://github.com/lvmteam/lvm2/blob/v2_03_32/man/lvmlockd.8_main#L258-L264 and
+  https://github.com/lvmteam/lvm2/blob/v2_03_32/man/lvmlockd.8_main#L530-L541
+- [U32] OpenEBS LVM LocalPV 1.10.1, LV creation without an activation option, device path,
+  publish and unpublish without staging, and the node plugin's Bidirectional kubelet mount:
+  https://github.com/openebs/lvm-localpv/blob/v1.10.1/pkg/lvm/lvm_util.go#L229-L264,
+  https://github.com/openebs/lvm-localpv/blob/v1.10.1/pkg/lvm/lvm_util.go#L671-L680,
+  https://github.com/openebs/lvm-localpv/blob/v1.10.1/pkg/driver/agent.go#L241-L322,
+  https://github.com/openebs/lvm-localpv/blob/v1.10.1/pkg/driver/agent.go#L381-L407 and
+  https://github.com/openebs/lvm-localpv/blob/v1.10.1/deploy/helm/charts/templates/lvm-node.yaml#L126-L134
+- [U33] OpenEBS lib-csi 0.9.0, pinned at
+  https://github.com/openebs/lvm-localpv/blob/v1.10.1/go.mod#L14; the guard compares the source
+  string in the caller's mount table:
+  https://github.com/openebs/lib-csi/blob/v0.9.0/pkg/mount/mount_utils.go#L23-L43
+- [U34] Kubernetes 1.36.5, mount propagation validation and kubelet's translation for CRI:
+  https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/apis/core/validation/validation.go#L1427-L1455 and
+  https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/kubelet/kubelet_pods.go#L428-L446
+- [U35] Kubernetes 1.36.5, Pod Security restricted volume types, and the policy directory with
+  the 19 checks, none of which reads `mountPropagation`:
+  https://github.com/kubernetes/kubernetes/blob/v1.36.5/staging/src/k8s.io/pod-security-admission/policy/check_restrictedVolumes.go#L88-L104 and
+  https://github.com/kubernetes/kubernetes/tree/v1.36.5/staging/src/k8s.io/pod-security-admission/policy
+- [U36] Kubernetes 1.36.5, emptyDir permission, SetUp with ownership change, memory and default
+  teardown, and no ownership change without fsGroup:
+  https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/volume/emptydir/empty_dir.go#L51,
+  https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/volume/emptydir/empty_dir.go#L235-L287,
+  https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/volume/emptydir/empty_dir.go#L496-L556 and
+  https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/volume/volume_linux.go#L71-L74
+- [U37] Kubernetes 1.36.5, Pod deletion waits for unmounted volumes; orphaned-Pod cleanup stays on
+  one filesystem:
+  https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/kubelet/kubelet.go#L2458-L2493,
+  https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/kubelet/status/status_manager.go#L1241-L1257 and
+  https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/kubelet/kubelet_volumes.go#L76-L164
+- [U38] Kubernetes 1.36.5, in-place Pod resize is generally available:
+  https://github.com/kubernetes/kubernetes/blob/v1.36.5/pkg/features/kube_features.go#L1534-L1538
+- [U39] containerd 2.3.6, HostToContainer requires a shared or slave source and binds `rslave`:
+  https://github.com/containerd/containerd/blob/v2.3.6/internal/cri/opts/spec_linux_opts.go#L166-L174 and
+  https://github.com/containerd/containerd/blob/v2.3.6/internal/cri/opts/spec_linux_opts.go#L275-L291
+- [U40] Talos 1.14.2: Linux 6.18.54, kubelet binds `/var/lib/kubelet` `rbind,rshared`, and CRI,
+  kubelet and Pods share the sandbox PID+mount namespace under workload isolation:
+  https://github.com/siderolabs/talos/blob/v1.14.2/hack/release.toml#L34,
+  https://github.com/siderolabs/talos/blob/v1.14.2/internal/app/machined/pkg/system/services/kubelet.go#L166,
+  https://github.com/siderolabs/talos/blob/v1.14.2/internal/app/machined/pkg/sandboxd/init.go#L5-L6 and
+  https://github.com/siderolabs/talos/blob/v1.14.2/internal/app/machined/pkg/system/services/cri.go#L189-L194
+- [U41] CNPG 1.30.1, a hibernated Cluster's reconcile returns before Pods are reconciled:
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/controller/cluster_controller.go#L551-L563 and
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/reconciler/hibernation/reconciler.go#L36-L64
+- [U42] CNPG 1.30.1, Backups of a hibernated Cluster fail; ScheduledBackup creates them
+  regardless:
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/controller/backup_controller.go#L389-L409,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/controller/scheduledbackup_controller.go#L111-L131 and
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/controller/scheduledbackup_controller.go#L240-L269
+- [U43] CNPG 1.30.1, the primary Lease: start gate, take-over, release, operator creation and
+  defaults:
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/management/controller/instance_startup.go#L72-L87,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/management/controller/instance_controller.go#L201-L230,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/cmd/manager/instance/run/lifecycle/run.go#L78-L103,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/cmd/manager/instance/run/lease/runnable.go#L188-L228,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/cmd/manager/instance/run/lease/runnable.go#L301-L353,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/controller/primary_lease.go#L47-L95 and
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/api/v1/cluster_types.go#L1462-L1473
+- [U44] CNPG 1.30.1, the instance layout: local peer rule and ident map, `/controller` paths,
+  PGDATA path, volumes and the init container that copies the manager:
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/postgres/configuration.go#L103-L105,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/postgres/configuration.go#L133-L141,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/postgres/configuration.go#L170-L213,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/postgres/configuration.go#L240-L247,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/specs/pods.go#L84-L88,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/specs/volumes.go#L98-L121,
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/specs/volumes.go#L236-L256 and
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/pkg/specs/containers.go#L32-L42
+- [U45] CNPG 1.30.1, TLS Secret names:
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/api/v1/cluster_funcs.go#L636-L662 and
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/api/v1/cluster_types.go#L49-L57
+- [U46] The empty-archive marker and the plugin's archive steps; CNPG 1.30.1
+  https://github.com/cloudnative-pg/cloudnative-pg/blob/v1.30.1/internal/management/controller/instance_controller.go#L1143-L1158,
+  plugin-barman-cloud 0.15.1
+  https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.1/internal/cnpgi/metadata/constants.go#L49-L52 and
+  https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.1/internal/cnpgi/common/wal.go#L107-L229
+- [U47] plugin-barman-cloud 0.15.1, backup and retention run in the instance sidecar, retention
+  only on the current primary, with Barman 3.20.1:
+  https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.1/internal/cnpgi/instance/backup.go#L71-L129,
+  https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.1/internal/cnpgi/instance/retention.go#L124-L166 and
+  https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.1/containers/sidecar-requirements.txt#L21
+- [U48] barman-cloud library 0.6.0, pinned at
+  https://github.com/cloudnative-pg/plugin-barman-cloud/blob/v0.15.1/go.mod#L8; option builders for
+  WAL archive, backup and retention:
+  https://github.com/cloudnative-pg/barman-cloud/blob/v0.6.0/pkg/archiver/command.go#L33-L89,
+  https://github.com/cloudnative-pg/barman-cloud/blob/v0.6.0/pkg/command/commandbuilder.go#L79-L91,
+  https://github.com/cloudnative-pg/barman-cloud/blob/v0.6.0/pkg/backup/backup.go#L91-L133 and
+  https://github.com/cloudnative-pg/barman-cloud/blob/v0.6.0/pkg/command/backupdelete.go#L35-L64
+- [U49] PostgreSQL 18.6, postmaster.pid and shared-memory interlock:
+  https://github.com/postgres/postgres/blob/REL_18_6/src/backend/utils/init/miscinit.c#L1351-L1409 and
+  https://github.com/postgres/postgres/blob/REL_18_6/src/backend/port/sysv_shmem.c#L317-L336
+- [U50] PostgreSQL 18.6, pg_control states and archive completion:
+  https://github.com/postgres/postgres/blob/REL_18_6/src/include/catalog/pg_control.h#L89-L98,
+  https://github.com/postgres/postgres/blob/REL_18_6/src/bin/pg_controldata/pg_controldata.c#L50-L67,
+  https://github.com/postgres/postgres/blob/REL_18_6/src/backend/postmaster/pgarch.c#L475-L478 and
+  https://github.com/postgres/postgres/blob/REL_18_6/src/backend/postmaster/pgarch.c#L809-L833
+- [U51] PostgreSQL 18, command-line settings override postgresql.conf and ALTER SYSTEM:
+  https://www.postgresql.org/docs/18/config-setting.html#CONFIG-SETTING-SHELL
+- [U52] Cilium 1.20.2, identity label rules, the chart's `labels` option, CRD identity allocation
+  and the identity change grace period:
+  https://github.com/cilium/cilium/blob/v1.20.2/pkg/labelsfilter/filter.go#L57-L79,
+  https://github.com/cilium/cilium/blob/v1.20.2/pkg/labelsfilter/filter.go#L158-L171,
+  https://github.com/cilium/cilium/blob/v1.20.2/pkg/labelsfilter/filter.go#L218-L259,
+  https://github.com/cilium/cilium/blob/v1.20.2/pkg/labelsfilter/filter.go#L297-L340,
+  https://github.com/cilium/cilium/blob/v1.20.2/install/kubernetes/cilium/templates/cilium-configmap.yaml#L163-L175 and
+  https://github.com/cilium/cilium/blob/v1.20.2/install/kubernetes/cilium/values.yaml#L2285-L2289
+- [U53] Linux 6.18.54, when a PID namespace's init exits, every remaining process in it is killed:
+  https://github.com/gregkh/linux/blob/v6.18.54/kernel/exit.c#L608-L633 and
+  https://github.com/gregkh/linux/blob/v6.18.54/kernel/pid_namespace.c#L192-L231
