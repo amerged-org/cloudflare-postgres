@@ -159,11 +159,11 @@ impl Gateway {
         if !self.measurements.lock().unwrap().begin(&claims.db, &id) {
             return Err(503);
         }
-        let actions = self
-            .sessions
-            .lock()
-            .unwrap()
-            .insert(id.clone(), claims.db.clone(), wire);
+        let actions =
+            self.sessions
+                .lock()
+                .unwrap()
+                .insert(id.clone(), claims.db.clone(), wire.clone());
         admission.total += 1;
         *admission.counts.entry(claims.db.clone()).or_default() += 1;
         Ok((
@@ -172,6 +172,7 @@ impl Gateway {
                 database: claims.db.clone(),
                 id,
                 target: target.clone(),
+                wire,
             },
             actions,
         ))
@@ -182,6 +183,7 @@ struct SessionLease {
     database: String,
     id: String,
     target: TargetIdentity,
+    wire: WireBudget,
 }
 impl Drop for SessionLease {
     fn drop(&mut self) {
@@ -194,6 +196,45 @@ impl Drop for SessionLease {
         if *count == 0 {
             admission.counts.remove(&self.database);
         }
+    }
+}
+/// Monotonic stage marks of one routed connection, logged once as `conn_stages` when it is
+/// dropped. The outcome is a fixed class; roles, addresses, tokens and payloads are never logged.
+struct Stages {
+    database: String,
+    outcome: &'static str,
+    received: Instant,
+    accepted: Option<Instant>,
+    startup: Option<Instant>,
+    dial: Option<Duration>,
+    written: Option<Instant>,
+    first_backend: Option<Instant>,
+}
+impl Stages {
+    fn new(database: &str, received: Instant) -> Self {
+        Self {
+            database: database.into(),
+            // Kept only when the task is cancelled before it records an end.
+            outcome: "aborted",
+            received,
+            accepted: None,
+            startup: None,
+            dial: None,
+            written: None,
+            first_backend: None,
+        }
+    }
+}
+impl Drop for Stages {
+    fn drop(&mut self) {
+        let ms = |duration: Duration| duration.as_millis() as u64;
+        let between = |from: Option<Instant>, to: Option<Instant>| {
+            from.zip(to).map(|(from, to)| ms(to.duration_since(from)))
+        };
+        println!(
+            "{}",
+            serde_json::json!({"event":"conn_stages","database":self.database,"outcome":self.outcome,"upgrade_ms":between(Some(self.received),self.accepted),"startup_ms":between(self.accepted,self.startup),"dial_ms":self.dial.map(ms),"first_backend_ms":between(self.written,self.first_backend),"session_ms":ms(self.received.elapsed())})
+        );
     }
 }
 fn upgrade(head: &HttpHead) -> bool {
@@ -219,6 +260,7 @@ pub async fn serve_socket(
     mut stop: watch::Receiver<bool>,
     handshake_permit: OwnedSemaphorePermit,
 ) -> Result<(), Failure> {
+    let received = Instant::now();
     let head = match timeout(Duration::from_secs(10), control::read_head(&mut socket)).await {
         Ok(Ok(head)) => head,
         _ => return control::reply_text(&mut socket, 400, "Bad Request\n").await,
@@ -277,10 +319,13 @@ pub async fn serve_socket(
             .await;
         }
     };
+    // Declared before the lease and both streams, so it is dropped and logged after them.
+    let mut stages = Stages::new(&claims.db, received);
     let state = gateway.fences.read().await;
     let epoch = state.bound_epoch(&claims.db);
     if gateway.draining.load(Ordering::Acquire) || !state.admits(&claims.db) {
         drop(state);
+        stages.outcome = "fenced";
         return control::reply(&mut socket, 503, serde_json::json!({"error":"fenced"})).await;
     }
     let revision_current = route_revision_current(&state, &claims);
@@ -293,6 +338,7 @@ pub async fn serve_socket(
     {
         Ok(target) => target,
         Err(_) => {
+            stages.outcome = "target_unavailable";
             return control::reply(
                 &mut socket,
                 503,
@@ -302,10 +348,12 @@ pub async fn serve_socket(
         }
     };
     if !revision_current || !route_target_current(&claims, &target) {
+        stages.outcome = "route_stale";
         return control::reply(&mut socket, 503, serde_json::json!({"error":"route_stale"})).await;
     }
     let mut base = gateway.memory.lease(&claims.db);
     if !base.grow(SESSION_MEMORY_BYTES) {
+        stages.outcome = "memory_capacity";
         return control::reply(
             &mut socket,
             if gateway.memory.database_used(&claims.db) + SESSION_MEMORY_BYTES
@@ -323,6 +371,7 @@ pub async fn serve_socket(
     let (lease, mut actions) = match gateway.reserve(&claims, wire.clone(), &target) {
         Ok(value) => value,
         Err(status) => {
+            stages.outcome = "admission_denied";
             return control::reply(
                 &mut socket,
                 status,
@@ -340,16 +389,21 @@ pub async fn serve_socket(
         .max_write_buffer_size(MAX_FRAME_BYTES * 2)
         .max_frame_size(Some(MAX_PAYLOAD_BYTES))
         .max_message_size(Some(MAX_PAYLOAD_BYTES));
-    let mut websocket = timeout(
+    let accepted = timeout(
         Duration::from_secs(10),
         accept_async_with_config(stream, Some(config)),
     )
-    .await??;
+    .await;
+    if !matches!(accepted, Ok(Ok(_))) {
+        stages.outcome = "upgrade_failed";
+    }
+    let mut websocket = accepted??;
+    stages.accepted = Some(Instant::now());
     drop(handshake_permit);
     let result = tokio::select! {
-        result=timeout(Duration::from_secs(10),startup(&mut websocket,&claims,&gateway,&id,&wire,epoch,&target))=>result.map_err(|_|"startup timeout".into()).and_then(|v|v),
-        _=stop.changed()=>Err("gateway draining".into()),
-        _=actions.changed()=>Err("startup fenced".into()),
+        result=timeout(Duration::from_secs(10),startup(&mut websocket,&claims,&session,epoch,&mut stages))=>result.unwrap_or_else(|_|{stages.outcome="startup_timeout";Err("startup timeout".into())}),
+        _=stop.changed()=>{stages.outcome="gateway_draining";Err("gateway draining".into())},
+        _=actions.changed()=>{stages.outcome="fenced";Err("startup fenced".into())},
     };
     let (mut postgres, initial, initial_leases, rest) = match result {
         Ok(value) => value,
@@ -358,39 +412,55 @@ pub async fn serve_socket(
             return Ok(());
         }
     };
-    let mut activity = PostgresActivity::new();
-    activity.observe_frontend(&rest);
-    update(&gateway, &id, &activity, true, false);
-    let state = gateway.fences.read().await;
-    if state.bound_epoch(&claims.db) != epoch
-        || !state.admits(&claims.db)
-        || !target_revision_matches(&state, &claims.db, &target)
-    {
-        return Err("startup fenced before first upstream write".into());
+    let result = async {
+        let mut activity = PostgresActivity::new();
+        activity.observe_frontend(&rest);
+        update(&gateway, &id, &activity, true, false);
+        let state = gateway.fences.read().await;
+        if state.bound_epoch(&claims.db) != epoch
+            || !state.admits(&claims.db)
+            || !target_revision_matches(&state, &claims.db, &target)
+        {
+            stages.outcome = "fenced";
+            return Err("startup fenced before first upstream write".into());
+        }
+        let physical = gateway.targets.read().await;
+        if !physical.permits(&claims.db, &target, control::now()) {
+            stages.outcome = "target_changed";
+            return Err("storage or target changed before first upstream write".into());
+        }
+        let budget = physical.write_budget(&claims.db, control::now());
+        if budget.is_zero() {
+            stages.outcome = "write_authority_expired";
+            return Err("physical write authority expired before startup enqueue".into());
+        }
+        let written = timeout(budget, postgres.write_all(&initial)).await;
+        if !matches!(written, Ok(Ok(()))) {
+            stages.outcome = "postgres_error";
+        }
+        written??;
+        stages.written = Some(Instant::now());
+        drop(physical);
+        drop(state);
+        drop(initial_leases);
+        wire.allow_relay();
+        relay(
+            &mut websocket,
+            &mut postgres,
+            &session,
+            &mut activity,
+            &mut actions,
+            &mut stop,
+            &mut stages,
+        )
+        .await
     }
-    let physical = gateway.targets.read().await;
-    if !physical.permits(&claims.db, &target, control::now()) {
-        return Err("storage or target changed before first upstream write".into());
+    .await;
+    // The relay ends PostgreSQL TLS itself only when it returns normally.
+    if result.is_err() {
+        close_upstream(&mut postgres).await;
     }
-    let budget = physical.write_budget(&claims.db, control::now());
-    if budget.is_zero() {
-        return Err("physical write authority expired before startup enqueue".into());
-    }
-    timeout(budget, postgres.write_all(&initial)).await??;
-    drop(physical);
-    drop(state);
-    drop(initial_leases);
-    wire.allow_relay();
-    relay(
-        &mut websocket,
-        &mut postgres,
-        &session,
-        &wire,
-        &mut activity,
-        &mut actions,
-        &mut stop,
-    )
-    .await
+    result
 }
 fn update(
     gateway: &Gateway,
@@ -425,34 +495,70 @@ async fn close(socket: &mut WebSocket, code: CloseCode, reason: &str) {
     )
     .await;
 }
+/// Sends one message to the client within 10 s; a failure ends the connection.
+async fn send_client(
+    socket: &mut WebSocket,
+    message: Message,
+    stages: &mut Stages,
+) -> Result<(), Failure> {
+    let sent = timeout(Duration::from_secs(10), socket.send(message)).await;
+    if !matches!(sent, Ok(Ok(()))) {
+        stages.outcome = "websocket_error";
+    }
+    Ok(sent??)
+}
+/// Ends a failed PostgreSQL session with close_notify and FIN within 500 ms, so PostgreSQL
+/// sees a clean end of stream instead of an unexpected EOF. A stream with queued TLS records is
+/// only dropped: its close_notify would first deliver bytes whose write authority may have ended.
+async fn close_upstream(postgres: &mut TlsStream<TcpStream>) {
+    if !postgres.get_ref().1.wants_write() {
+        let _ = timeout(Duration::from_millis(500), postgres.shutdown()).await;
+    }
+}
 async fn startup(
     socket: &mut WebSocket,
     claims: &RouteClaims,
-    gateway: &Gateway,
-    id: &str,
-    wire: &WireBudget,
+    session: &SessionLease,
     epoch: (u64, u64),
-    bound: &TargetIdentity,
+    stages: &mut Stages,
 ) -> Result<(TlsStream<TcpStream>, Vec<u8>, Vec<Lease>, Vec<u8>), Failure> {
+    let gateway = &*session.gateway;
+    let id = &session.id;
+    let wire = &session.wire;
+    let bound = &session.target;
     let mut reader = StartupReader::default();
     let mut leases = Vec::new();
     loop {
         let bytes = match socket.next().await {
             Some(Ok(Message::Binary(bytes))) => {
-                leases.push(wire.take_message()?);
+                leases.push(
+                    wire.take_message()
+                        .inspect_err(|_| stages.outcome = "websocket_error")?,
+                );
                 bytes
             }
             Some(Ok(Message::Ping(value))) => {
-                socket.send(Message::Pong(value)).await?;
+                socket
+                    .send(Message::Pong(value))
+                    .await
+                    .inspect_err(|_| stages.outcome = "websocket_error")?;
                 continue;
             }
             Some(Ok(Message::Pong(_))) => continue,
             Some(Ok(Message::Text(_))) => {
+                stages.outcome = "text_frame";
                 let _ = wire.take_message()?;
                 close(socket, CloseCode::Unsupported, "binary frames required").await;
                 return Err("text startup".into());
             }
-            _ => return Err("startup closed".into()),
+            Some(Err(_)) => {
+                stages.outcome = "websocket_error";
+                return Err("startup failed".into());
+            }
+            _ => {
+                stages.outcome = "client_closed";
+                return Err("startup closed".into());
+            }
         };
         {
             let mut metrics = gateway.measurements.lock().unwrap();
@@ -466,15 +572,20 @@ async fn startup(
             match event {
                 Event::NeedMore => break,
                 Event::Ssl | Event::Gss => {
-                    socket.send(Message::Binary(vec![b'N'].into())).await?;
+                    socket
+                        .send(Message::Binary(vec![b'N'].into()))
+                        .await
+                        .inspect_err(|_| stages.outcome = "websocket_error")?;
                     gateway.measurements.lock().unwrap().egress(id, 1);
                     event = reader.push(&[]);
                 }
                 Event::Cancel => {
+                    stages.outcome = "cancel";
                     close(socket, CloseCode::Normal, "cancel unsupported").await;
                     return Err("cancel unsupported".into());
                 }
                 Event::Error { sqlstate, message } => {
+                    stages.outcome = "startup_error";
                     send_error(socket, &sqlstate, &message).await?;
                     return Err("startup refused".into());
                 }
@@ -485,7 +596,9 @@ async fn startup(
                     rest,
                     ..
                 } => {
+                    stages.startup = Some(Instant::now());
                     if database != claims.db || user != claims.user {
+                        stages.outcome = "startup_route_mismatch";
                         send_error(
                             socket,
                             "28000",
@@ -499,6 +612,7 @@ async fn startup(
                         || !state.admits(&database)
                         || !target_revision_matches(&state, &database, bound)
                     {
+                        stages.outcome = "fenced";
                         return Err("fence changed during startup".into());
                     }
                     drop(state);
@@ -509,6 +623,7 @@ async fn startup(
                         .await
                         .permits(&database, bound, control::now())
                     {
+                        stages.outcome = "target_changed";
                         return Err("writer changed before dial".into());
                     }
                     gateway
@@ -523,12 +638,19 @@ async fn startup(
                         address: bound.address,
                         pod_uid: bound.pod_uid.clone(),
                     };
-                    let postgres = gateway.dial.dial(&target).await?;
+                    let dialing = Instant::now();
+                    let dialed = gateway.dial.dial(&target).await;
+                    stages.dial = Some(dialing.elapsed());
+                    let mut postgres =
+                        dialed.inspect_err(|_| stages.outcome = "postgres_connect_error")?;
                     let state = gateway.fences.read().await;
                     if state.bound_epoch(&database) != epoch
                         || !state.admits(&database)
                         || !target_revision_matches(&state, &database, bound)
                     {
+                        drop(state);
+                        stages.outcome = "fenced";
+                        close_upstream(&mut postgres).await;
                         return Err("fence changed during TLS negotiation".into());
                     }
                     raw.extend_from_slice(&rest);
@@ -555,14 +677,15 @@ async fn relay(
     websocket: &mut WebSocket,
     postgres: &mut TlsStream<TcpStream>,
     session: &SessionLease,
-    wire: &WireBudget,
     activity: &mut PostgresActivity,
     actions: &mut watch::Receiver<Action>,
     stop: &mut watch::Receiver<bool>,
+    stages: &mut Stages,
 ) -> Result<(), Failure> {
     let gateway = &*session.gateway;
     let id = &session.id;
     let target = &session.target;
+    let wire = &session.wire;
     let mut read = vec![0u8; MAX_FRAME_BYTES];
     let mut held: Option<(Vec<u8>, Lease)> = None;
     let mut alive = true;
@@ -579,6 +702,7 @@ async fn relay(
             .await
             .permits(database, target, control::now())
         {
+            stages.outcome = "target_changed";
             close(
                 websocket,
                 CloseCode::Restart,
@@ -593,7 +717,7 @@ async fn relay(
             && let Some((bytes, lease)) = held.take()
         {
             update(gateway, id, activity, true, false);
-            if forward_if_running(gateway, database, target, postgres, &bytes).await? {
+            if forward_if_running(gateway, database, target, postgres, &bytes, stages).await? {
                 drop(lease);
             } else {
                 held = Some((bytes, lease));
@@ -604,11 +728,13 @@ async fn relay(
         if mode == Action::CloseAuthentication
             || (mode == Action::Quiesce && !activity.authenticated())
         {
+            stages.outcome = "authentication_interrupted";
             close(websocket, CloseCode::Restart, "authentication interrupted").await;
             break;
         }
         if mode == Action::CloseIdle {
             if !activity.busy() && !wire.busy() && held.is_none() {
+                stages.outcome = "database_sleeping";
                 close(websocket, CloseCode::Normal, "database sleeping").await;
                 break;
             }
@@ -618,31 +744,32 @@ async fn relay(
             drain_at.unwrap_or_else(|| Instant::now() + Duration::from_secs(365 * 24 * 3600));
         tokio::select! {
             _=stop.changed()=>{if *stop.borrow(){drain_at=Some(Instant::now()+Duration::from_secs(29));}},
-            _=tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))=>{close(websocket,CloseCode::Restart,"gateway restarting").await;break;},
+            _=tokio::time::sleep_until(tokio::time::Instant::from_std(deadline))=>{stages.outcome="gateway_draining";close(websocket,CloseCode::Restart,"gateway restarting").await;break;},
             _=actions.changed()=>{},
             _=physical_timer.tick()=>{},
-            _=heartbeat.tick(),if mode==Action::Running=>{if !alive{break;}alive=false;timeout(Duration::from_secs(10),websocket.send(Message::Ping(Vec::new().into()))).await??;},
+            _=heartbeat.tick(),if mode==Action::Running=>{if !alive{stages.outcome="heartbeat_timeout";break;}alive=false;send_client(websocket,Message::Ping(Vec::new().into()),stages).await?;},
             message=websocket.next(),if held.is_none()||mode==Action::Retire=>{
                 match message{
                     Some(Ok(Message::Binary(bytes)))=>{
-                        let lease=wire.take_message()?;{let mut metrics=gateway.measurements.lock().unwrap();metrics.ingress(id,bytes.len());if !bytes.is_empty(){metrics.client_activity(id);}}
+                        let lease=wire.take_message().inspect_err(|_|stages.outcome="websocket_error")?;{let mut metrics=gateway.measurements.lock().unwrap();metrics.ingress(id,bytes.len());if !bytes.is_empty(){metrics.client_activity(id);}}
                         activity.observe_frontend(&bytes);update(gateway,id,activity,true,false);
-                        if held.is_some(){close(websocket,CloseCode::Restart,"database retired").await;break;}
-                        if forward_if_running(gateway,database,target,postgres,&bytes).await?{drop(lease);}
+                        if held.is_some(){stages.outcome="database_retired";close(websocket,CloseCode::Restart,"database retired").await;break;}
+                        if forward_if_running(gateway,database,target,postgres,&bytes,stages).await?{drop(lease);}
                         else{held=Some((bytes.to_vec(),lease));}
                     },
                     Some(Ok(Message::Pong(_)))=>alive=true,
-                    Some(Ok(Message::Ping(value)))=>{timeout(Duration::from_secs(10),websocket.send(Message::Pong(value))).await??;},
-                    Some(Ok(Message::Text(_)))=>{let _=wire.take_message()?;close(websocket,CloseCode::Unsupported,"binary frames required").await;break;},
-                    Some(Ok(Message::Close(_)))|None=>break,
-                    Some(Err(_))=>{close(websocket,CloseCode::Again,"relay buffer or connection failed").await;break;},
+                    Some(Ok(Message::Ping(value)))=>send_client(websocket,Message::Pong(value),stages).await?,
+                    Some(Ok(Message::Text(_)))=>{stages.outcome="text_frame";let _=wire.take_message()?;close(websocket,CloseCode::Unsupported,"binary frames required").await;break;},
+                    Some(Ok(Message::Close(_)))|None=>{stages.outcome="client_closed";break;},
+                    Some(Err(_))=>{stages.outcome="websocket_error";close(websocket,CloseCode::Again,"relay buffer or connection failed").await;break;},
                     _=>{},
                 }
             },
             result=postgres.read(&mut read)=>{
-                let length=result?;if length==0{break;}activity.observe_backend(&read[..length]);
+                let length=result.inspect_err(|_|stages.outcome="postgres_error")?;if length==0{stages.outcome="postgres_closed";break;}activity.observe_backend(&read[..length]);
                 {let mut metrics=gateway.measurements.lock().unwrap();if activity.authenticated(){metrics.authenticate(id);}metrics.egress(id,length);}
-                update(gateway,id,activity,true,false);timeout(Duration::from_secs(10),websocket.send(Message::Binary(read[..length].to_vec().into()))).await??;
+                update(gateway,id,activity,true,false);send_client(websocket,Message::Binary(read[..length].to_vec().into()),stages).await?;
+                stages.first_backend.get_or_insert_with(Instant::now);
             }
         }
     }
@@ -706,14 +833,17 @@ async fn forward_if_running(
     target: &TargetIdentity,
     postgres: &mut TlsStream<TcpStream>,
     bytes: &[u8],
+    stages: &mut Stages,
 ) -> Result<bool, Failure> {
     // Match startup/health ordering while retaining both guards through the bounded write.
     let state = gateway.fences.read().await;
     let physical = gateway.targets.read().await;
     if !physical.permits(database, target, control::now()) {
+        stages.outcome = "target_changed";
         return Err("physical write authority or writer changed".into());
     }
     if !state.synchronized() {
+        stages.outcome = "fenced";
         return Err("power authority unavailable".into());
     }
     if state
@@ -732,15 +862,21 @@ async fn forward_if_running(
                 .is_none_or(|fence| fence.intent.revision != generation)
         })
     {
+        stages.outcome = "target_changed";
         return Err("storage generation changed".into());
     }
     // The bounded enqueue and fence publication share this read/write boundary.
     // Bytes already being written stay busy; new bytes cannot cross a published fence.
     let budget = physical.write_budget(database, control::now());
     if budget.is_zero() {
+        stages.outcome = "write_authority_expired";
         return Err("physical write authority expired before frontend enqueue".into());
     }
-    timeout(budget, postgres.write_all(bytes)).await??;
+    let written = timeout(budget, postgres.write_all(bytes)).await;
+    if !matches!(written, Ok(Ok(()))) {
+        stages.outcome = "postgres_error";
+    }
+    written??;
     drop(physical);
     drop(state);
     Ok(true)

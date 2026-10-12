@@ -37,7 +37,13 @@ pub fn validate_ca(ca: &[u8]) -> Result<(), Error> {
 }
 impl Drop for Session {
     fn drop(&mut self) {
-        self.task.abort();
+        // The client drops next, so its connection sends Terminate and ends TLS with close_notify
+        // and FIN. A connection still open 500 ms later, e.g. awaiting a reply, is aborted.
+        let task = self.task.abort_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            task.abort();
+        });
     }
 }
 impl Session {
@@ -62,6 +68,21 @@ pub async fn connect(
     if !database_valid(db) || !role_allowed || password.is_empty() || !database_allowed {
         return Err("PostgreSQL probe authority invalid".into());
     }
+    let mut config = tokio_postgres::Config::new();
+    config
+        .host(format!("database-rw.{}.svc", namespace(db)))
+        .port(5432)
+        .user(role)
+        .password(password)
+        .dbname(database)
+        .application_name("pgcf-readiness")
+        .options("-c statement_timeout=5000")
+        .connect_timeout(Duration::from_secs(5))
+        .ssl_mode(SslMode::Require);
+    open(&config, ca).await
+}
+/// Opens a session whose TLS is verified against `ca`; `connect` checks the probe authority.
+async fn open(config: &tokio_postgres::Config, ca: &[u8]) -> Result<Session, Error> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     validate_ca(ca)?;
     let mut roots = RootCertStore::empty();
@@ -75,17 +96,6 @@ pub async fn connect(
         .with_root_certificates(roots)
         .with_no_client_auth();
     let connector = tokio_postgres_rustls::MakeRustlsConnect::new(tls);
-    let mut config = tokio_postgres::Config::new();
-    config
-        .host(format!("database-rw.{}.svc", namespace(db)))
-        .port(5432)
-        .user(role)
-        .password(password)
-        .dbname(database)
-        .application_name("pgcf-readiness")
-        .options("-c statement_timeout=5000")
-        .connect_timeout(Duration::from_secs(5))
-        .ssl_mode(SslMode::Require);
     let (client, connection) =
         tokio::time::timeout(Duration::from_secs(5), config.connect(connector)).await??;
     let task = tokio::spawn(connection);
@@ -112,6 +122,104 @@ pub async fn roles(db: &Value, ca: &[u8]) -> Result<bool, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer};
+    use std::sync::Arc;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+    use tokio_rustls::TlsAcceptor;
+    const HOST: &str = "database-rw.pgcf-db-aaaaaaaaaaaaaaaaaaaa.svc";
+    /// A TLS PostgreSQL double for one session: it completes startup, never answers a query and
+    /// returns the frontend bytes it then received and whether TLS ended with close_notify.
+    async fn postgres() -> (
+        tokio_postgres::Config,
+        String,
+        tokio::task::JoinHandle<(Vec<u8>, bool)>,
+    ) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca = rcgen::CertifiedIssuer::self_signed(params, rcgen::KeyPair::generate().unwrap())
+            .unwrap();
+        let key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec![HOST.into()])
+            .unwrap()
+            .signed_by(&key, &ca)
+            .unwrap();
+        let tls = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key.serialize_der())),
+            )
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut tcp, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8];
+            tcp.read_exact(&mut request).await.unwrap();
+            assert_eq!(request, [0, 0, 0, 8, 4, 210, 22, 47]);
+            tcp.write_all(b"S").await.unwrap();
+            let mut tls = TlsAcceptor::from(Arc::new(tls)).accept(tcp).await.unwrap();
+            let length = tls.read_u32().await.unwrap() as usize;
+            tls.read_exact(&mut vec![0; length - 4]).await.unwrap();
+            // AuthenticationOk and ReadyForQuery.
+            tls.write_all(&[b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I'])
+                .await
+                .unwrap();
+            let mut received = Vec::new();
+            let mut buffer = [0; 4096];
+            loop {
+                // close_notify reads as end of stream; a bare TCP close is an unexpected EOF.
+                match tls.read(&mut buffer).await {
+                    Ok(0) => return (received, true),
+                    Ok(length) => received.extend_from_slice(&buffer[..length]),
+                    Err(_) => return (received, false),
+                }
+            }
+        });
+        let mut config = tokio_postgres::Config::new();
+        config
+            .host(HOST)
+            .hostaddr(address.ip())
+            .port(address.port())
+            .user("app")
+            .ssl_mode(SslMode::Require);
+        (config, ca.pem(), server)
+    }
+    #[tokio::test]
+    async fn a_dropped_session_terminates_and_ends_tls_with_close_notify() {
+        let (config, ca, server) = postgres().await;
+        drop(open(&config, ca.as_bytes()).await.unwrap());
+        let (received, clean) = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, [b'X', 0, 0, 0, 4]);
+        assert!(clean, "TLS ended without close_notify");
+    }
+    #[tokio::test]
+    async fn a_dropped_session_with_an_unanswered_query_closes_within_the_bound() {
+        let (config, ca, server) = postgres().await;
+        let session = open(&config, ca.as_bytes()).await.unwrap();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                session.client.simple_query("SELECT 1")
+            )
+            .await
+            .is_err()
+        );
+        drop(session);
+        // The connection waits for the reply before its Terminate, so the bound aborts it.
+        let (received, _) = tokio::time::timeout(Duration::from_secs(2), server)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(received.first(), Some(&b'Q'));
+    }
     #[test]
     fn trust_material_must_be_an_actual_ca() {
         let key = rcgen::KeyPair::generate().unwrap();

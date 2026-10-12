@@ -174,6 +174,8 @@ struct Fixture {
     port: u16,
     calls: Arc<AtomicUsize>,
     upstream: mpsc::Receiver<Vec<u8>>,
+    /// Per ended upstream session: true when the gateway ended TLS with close_notify.
+    closes: mpsc::Receiver<bool>,
     stop: watch::Sender<bool>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -231,18 +233,21 @@ impl Fixture {
         let port = listener.local_addr().unwrap().port();
         let (stop, receiver) = watch::channel(false);
         let (send, received) = mpsc::channel(16);
+        let (closed, closes) = mpsc::channel(16);
         let mut shutdown = receiver.clone();
         let acceptor = TlsAcceptor::from(Arc::new(config));
         let upstream_task = tokio::spawn(async move {
             let mut tasks = tokio::task::JoinSet::new();
             loop {
-                tokio::select! {_=shutdown.changed()=>break,accepted=upstream.accept()=>{let(mut tcp,_)=accepted.unwrap();let(acceptor,send)=(acceptor.clone(),send.clone());tasks.spawn(async move{
+                tokio::select! {_=shutdown.changed()=>break,accepted=upstream.accept()=>{let(mut tcp,_)=accepted.unwrap();let(acceptor,send,closed)=(acceptor.clone(),send.clone(),closed.clone());tasks.spawn(async move{
                         let mut request=[0;8];tcp.read_exact(&mut request).await.unwrap();assert_eq!(request,[0,0,0,8,4,210,22,47]);tcp.write_all(b"S").await.unwrap();let mut tls=acceptor.accept(tcp).await.unwrap();
                         let length=tls.read_u32().await.unwrap()as usize;let mut raw=vec![0;length-4];tls.read_exact(&mut raw).await.unwrap();let mut startup_bytes=(length as u32).to_be_bytes().to_vec();startup_bytes.extend(raw);send.send(startup_bytes).await.unwrap();
                         tls.write_all(&[b'R',0,0,0,8,0,0,0,10]).await.unwrap();let mut password=[0;11];tls.read_exact(&mut password).await.unwrap();assert_eq!(&password,b"p\0\0\0\x0aopaque");
                         tls.write_all(&[b'R',0,0,0,8,0,0,0,0,b'Z',0,0,0,5,b'I']).await.unwrap();
-                        loop{let mut header=[0;5];if tls.read_exact(&mut header).await.is_err(){break;}let length=u32::from_be_bytes(header[1..].try_into().unwrap())as usize;let mut body=vec![0;length-4];if tls.read_exact(&mut body).await.is_err(){break;}let mut bytes=header.to_vec();bytes.extend(body);if send.send(bytes).await.is_err(){break;}
-                if tls.write_all(&[b'Z',0,0,0,5,b'I']).await.is_err(){break;}}
+                        // Before each message: close_notify reads as end of stream, a bare TCP close as an error.
+                        loop{let mut header=[0;5];match tls.read(&mut header[..1]).await{Ok(1)=>{},end=>{let _=closed.try_send(matches!(end,Ok(0)));break;}}if tls.read_exact(&mut header[1..]).await.is_err(){break;}let length=u32::from_be_bytes(header[1..].try_into().unwrap())as usize;let mut body=vec![0;length-4];if tls.read_exact(&mut body).await.is_err(){break;}let mut bytes=header.to_vec();bytes.extend(body);if send.send(bytes).await.is_err(){break;}
+                // After a Terminate the double keeps reading to observe how the gateway ends TLS.
+                if header[0]!=b'X'&&tls.write_all(&[b'Z',0,0,0,5,b'I']).await.is_err(){break;}}
                     });}}
             }
             tasks.abort_all();
@@ -262,6 +267,7 @@ impl Fixture {
             port,
             calls,
             upstream: received,
+            closes,
             stop,
             tasks: vec![upstream_task, gateway_task],
         }
@@ -289,6 +295,11 @@ impl Fixture {
     }
     async fn authenticate(&mut self, id: usize) -> Client {
         let mut client = self.connect(id).await;
+        self.login(&mut client).await;
+        client
+    }
+    /// Sends the StartupMessage and completes the double's password exchange.
+    async fn login(&mut self, client: &mut Client) {
         client
             .send(Message::Binary(startup("app").into()))
             .await
@@ -326,7 +337,24 @@ impl Fixture {
             received,
             [b'R', 0, 0, 0, 8, 0, 0, 0, 0, b'Z', 0, 0, 0, 5, b'I']
         );
-        client
+    }
+    /// Waits until the gateway has released every session of the database.
+    async fn ended(&self) {
+        timeout(Duration::from_secs(5), async {
+            while self
+                .gateway
+                .sessions
+                .lock()
+                .unwrap()
+                .counts(DATABASE)
+                .connections
+                > 0
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
     }
     async fn intent(&self, mode: &str, revision: u64, signal: bool) {
         self.gateway
@@ -969,5 +997,136 @@ async fn a_legacy_v2_route_keeps_the_rollout_compatibility_path() {
     );
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
     client.close(None).await.unwrap();
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_client_terminate_reaches_postgres_before_close_notify() {
+    let mut fixture = Fixture::new().await;
+    let mut client = fixture.authenticate(950).await;
+    client
+        .send(Message::Binary(vec![b'X', 0, 0, 0, 4].into()))
+        .await
+        .unwrap();
+    client.close(None).await.unwrap();
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        [b'X', 0, 0, 0, 4]
+    );
+    assert_eq!(
+        timeout(Duration::from_secs(2), fixture.closes.recv())
+            .await
+            .unwrap(),
+        Some(true),
+        "PostgreSQL TLS ended without close_notify"
+    );
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_relay_that_refuses_frontend_bytes_still_ends_postgres_tls_with_close_notify() {
+    let mut fixture = Fixture::new().await;
+    let mut client = fixture.authenticate(951).await;
+    fixture.gateway.fences.write().await.disconnect();
+    let _ = client.send(Message::Binary(query().into())).await;
+    assert_eq!(
+        timeout(Duration::from_secs(2), fixture.closes.recv())
+            .await
+            .unwrap(),
+        Some(true),
+        "PostgreSQL TLS ended without close_notify"
+    );
+    assert!(
+        timeout(Duration::from_millis(150), fixture.upstream.recv())
+            .await
+            .is_err(),
+        "refused frontend bytes reached PostgreSQL"
+    );
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn every_routed_connection_logs_one_ordered_stage_line() {
+    if std::env::var_os("PGCF_CONN_STAGES_CHILD").is_none() {
+        // The gateway logs to stdout, so a child test process runs the connections below.
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "every_routed_connection_logs_one_ordered_stage_line",
+                "--nocapture",
+            ])
+            .env("PGCF_CONN_STAGES_CHILD", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let lines: Vec<Value> = stdout
+            .lines()
+            .filter_map(|line| serde_json::from_str(&line[line.find('{')?..]).ok())
+            .filter(|line: &Value| line["event"] == "conn_stages")
+            .collect();
+        assert_eq!(lines.len(), 2, "{stdout}");
+        for line in &lines {
+            // Only these fields: no role, address, token or payload byte.
+            assert_eq!(
+                line.as_object().unwrap().keys().collect::<Vec<_>>(),
+                [
+                    "database",
+                    "dial_ms",
+                    "event",
+                    "first_backend_ms",
+                    "outcome",
+                    "session_ms",
+                    "startup_ms",
+                    "upgrade_ms"
+                ]
+            );
+            assert_eq!(line["database"], DATABASE);
+        }
+        let complete = |name: &str| lines[0][name].as_u64().unwrap();
+        assert_eq!(lines[0]["outcome"], "client_closed");
+        // The client waited 40 ms before its StartupMessage and 40 ms before closing.
+        assert!(complete("startup_ms") >= 40, "{}", lines[0]);
+        assert!(
+            complete("upgrade_ms")
+                + complete("startup_ms")
+                + complete("dial_ms")
+                + complete("first_backend_ms")
+                + 40
+                <= complete("session_ms"),
+            "{}",
+            lines[0]
+        );
+        assert_eq!(lines[1]["outcome"], "startup_route_mismatch");
+        for reached in ["upgrade_ms", "startup_ms", "session_ms"] {
+            assert!(lines[1][reached].is_u64(), "{}", lines[1]);
+        }
+        assert!(lines[1]["dial_ms"].is_null() && lines[1]["first_backend_ms"].is_null());
+        return;
+    }
+    let mut fixture = Fixture::new().await;
+    let mut client = fixture.connect(960).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    fixture.login(&mut client).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    client.close(None).await.unwrap();
+    fixture.ended().await;
+    let mut client = fixture.connect(961).await;
+    client
+        .send(Message::Binary(startup("wrong_role").into()))
+        .await
+        .unwrap();
+    let error = timeout(Duration::from_secs(10), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data();
+    assert!(String::from_utf8_lossy(&error).contains("28000"));
+    fixture.ended().await;
     fixture.stop().await;
 }

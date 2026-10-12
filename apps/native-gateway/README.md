@@ -26,6 +26,12 @@ The gateway has no Contabo credentials or provider dependency.
 Only certificate failures before the first StartupMessage permit one CA refresh and TLS redial.
 There is no PostgreSQL write retry, credential replay or query replay after transport handoff.
 Cancelled consumers cannot cancel a shared CA read or strand its bounded cache entry.
+A failed session still ends PostgreSQL TLS with close_notify, unless TLS records are still queued.
+
+Every connection that passes route verification logs one `conn_stages` JSON line to stdout when
+it ends: the database ID, a fixed `outcome` class and monotonic milliseconds `upgrade_ms`,
+`startup_ms`, `dial_ms`, `first_backend_ms` and `session_ms`, null when a stage was not reached.
+Roles, addresses, tokens and payload bytes are never logged.
 
 `packages/contracts/native/generate.ts` derives native schemas, wire constants and deterministic
 behavior vectors from the shared Zod contracts and TypeScript implementations. The existing
