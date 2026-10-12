@@ -101,6 +101,7 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/fleet/rollouts/:id",
   "/v1/fleet/patches/:operation_id",
   "/v1/fleet/patches/:operation_id/resume",
+  "/v1/fleet/patches/:operation_id/halt",
   "/internal/v1/fleet-patches/:operation_id",
   "/internal/v1/fleet-patches/:operation_id/relay",
   "/agent/v1/fleet-observations",

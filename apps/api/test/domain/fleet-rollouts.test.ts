@@ -9,7 +9,7 @@ import { ComputePoolPolicy } from "@pgcf/contracts/compute-pool";
 import { FleetReleaseSpec } from "@pgcf/contracts/releases";
 import generatedPool from "../../../../packages/contracts/native/compute-pool.generated.json" with { type: "json" };
 import { newNodeId, newOperationId } from "@pgcf/contracts";
-import { cleanupFixtures, fixture } from "./fixtures.ts";
+import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 import { createApp } from "../../src/app.ts";
 import type { Env } from "../../src/env.ts";
 import {
@@ -513,6 +513,118 @@ it("a staged rotation that never started carries its custody to a successor afte
   ]);
   expect(successor.regions[0]!.staged_material_revision).toBe(2);
   expect(successor.regions[0]!.current_material_revision).toBe(1);
+});
+it("an operator-superseded regional patch lets a successor release replace its rollout and is never resumed", async () => {
+  const f = await setup(),
+    original = {
+      ...structuredClone(f.input),
+      regions: [structuredClone(f.input.regions[1]!)],
+    };
+  const first = await f.send(original, "eu-release");
+  expect(first.status).toBe(202);
+  const { rollout_id } = (await first.json()) as { rollout_id: string },
+    old = (await env.DB.prepare(
+      "SELECT operation_id FROM fleet_patch_operations WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first<{ operation_id: string }>())!,
+    stuck = (stage: string, state: string, code: string) =>
+      env.DB.prepare(
+        "UPDATE fleet_patch_operations SET stage=?,state=?,error_code=? WHERE operation_id=?",
+      )
+        .bind(stage, state, code, old.operation_id)
+        .run(),
+    read = () =>
+      env.DB.prepare(
+        "SELECT * FROM fleet_patch_operations WHERE operation_id=?",
+      )
+        .bind(old.operation_id)
+        .first();
+  // The customer member's regional services never become Ready with this release.
+  await stuck("regional", "dispatched", "patch_readback_invalid");
+  const nextRelease = `successor-${crypto.randomUUID()}`;
+  releases.push(nextRelease);
+  await env.DB.prepare(
+    "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) VALUES(?,?,?,?)",
+  )
+    .bind(
+      nextRelease,
+      JSON.stringify(f.spec),
+      await installationHash(f.spec),
+      new Date().toISOString(),
+    )
+    .run();
+  const next = {
+    ...structuredClone(original),
+    release_id: nextRelease,
+    expected_previous_rollout_id: rollout_id,
+  };
+  for (const region of next.regions) {
+    region.expected_revision = 1;
+    for (const node of region.nodes) node.expected_revision = 1;
+  }
+  const assignments = () =>
+      env.DB.prepare(
+        "SELECT node_id,node_uid,release_id,role,revision FROM fleet_node_releases ORDER BY node_id",
+      )
+        .all()
+        .then((value) => value.results),
+    saved = await assignments();
+  // A dispatched write without the operator hold, and an OS stage halted with its code, still block.
+  expect((await f.send(next, "unheld-write")).status).toBe(409);
+  await stuck("talos", "halted", "operator_hold_superseded");
+  expect((await f.send(next, "os-stage-hold")).status).toBe(409);
+  expect(await assignments()).toEqual(saved);
+  await stuck("regional", "dispatched", "patch_readback_invalid");
+  expect(
+    (
+      await request(
+        `/v1/fleet/patches/${old.operation_id}/halt`,
+        f.admin,
+        "POST",
+      )
+    ).status,
+  ).toBe(200);
+  expect(await readFleetRollout(f.runtime, rollout_id)).toMatchObject({
+    state: "blocked",
+    reason: "operator_hold_superseded",
+  });
+  const superseded = await read(),
+    accepted = await f.send(next, "supersede-release");
+  expect(accepted.status).toBe(202);
+  const successor = await readFleetRolloutIntent(
+    env.DB,
+    ((await accepted.json()) as { rollout_id: string }).rollout_id,
+  );
+  expect(successor.previous_intent?.rollout_id).toBe(rollout_id);
+  // The superseded member starts a new successor patch; the control member waits for its turn.
+  const created = await env.DB.prepare(
+    "SELECT operation_id,node_id,assignment_revision,stage,state FROM fleet_patch_operations WHERE release_id=?",
+  )
+    .bind(nextRelease)
+    .all<{ operation_id: string }>();
+  expect(created.results).toEqual([
+    {
+      operation_id: expect.any(String),
+      node_id: f.node,
+      assignment_revision: 2,
+      stage: "preflight",
+      state: "pending",
+    },
+  ]);
+  expect(f.started.has(created.results[0]!.operation_id)).toBe(true);
+  expect(await read()).toEqual(superseded);
+  // With its successor intent in place, the superseded operation is never resumed.
+  expect(
+    (
+      await request(
+        `/v1/fleet/patches/${old.operation_id}/resume`,
+        f.admin,
+        "POST",
+      )
+    ).status,
+  ).toBe(409);
+  expect(await read()).toEqual(superseded);
 });
 it("a completed fleet can select its next release without reopening confirmed host-ready history or bypassing unknown writes", async () => {
   const f = await setup(),

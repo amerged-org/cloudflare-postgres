@@ -558,6 +558,68 @@ it("an unfinished patch of a live node in another region holds the activation, a
   }
 });
 
+it("an operator-superseded regional patch in another region no longer holds the activation", async () => {
+  const f = await setup(),
+    now = new Date().toISOString(),
+    region = `ap-${crypto.randomUUID().slice(0, 8)}`,
+    node = newNodeId(),
+    operation = newOperationId(),
+    uid = crypto.randomUUID(),
+    activate = () =>
+      activateNativeRegionBootstrapRotation(
+        f.runtime,
+        f.region,
+        f.intent.rollout_id,
+        f.activation,
+      );
+  await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO regions(id,provider,provider_region,gateway_url,backup_bucket,backup_endpoint_url,agent_key_hash,created_at,updated_at) SELECT ?,provider,provider_region,gateway_url,backup_bucket,backup_endpoint_url,?,?,? FROM regions WHERE id=?",
+    ).bind(
+      region,
+      crypto.randomUUID().replaceAll("-", "").repeat(2),
+      now,
+      now,
+      f.foreign,
+    ),
+    env.DB.prepare(
+      "INSERT INTO nodes(id,region_id,k8s_node_name,node_uid,provider_instance_id,ready,allocatable_memory_mib,allocatable_cpu_millicores,storage_gib_total,platform_reserved_memory_mib,platform_reserved_cpu_millicores,last_observed_at,created_at,updated_at) VALUES(?,?,?,?,?,1,4096,2000,30,128,100,?,?,?)",
+    ).bind(node, region, "unrelated", uid, "34567", now, now, now),
+    env.DB.prepare(
+      "INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,stage,state,error_code,created_at,updated_at,deadline_at) VALUES(?,?,?,?,?,?,?,1,1,1,?,?,'talos_reboot','halted','operator_hold_superseded',?,?,?)",
+    ).bind(
+      operation,
+      node,
+      region,
+      uid,
+      crypto.randomUUID(),
+      f.intent.release_id,
+      "f".repeat(64),
+      "192.0.2.30",
+      "[]",
+      now,
+      now,
+      now,
+    ),
+  ]);
+  try {
+    // An OS stage can hold an uncertain write whatever its error code says.
+    await expect(activate()).rejects.toThrow(/authority|changed/i);
+    expect(await f.pointer()).toEqual({ revision: 1, provenance: null });
+    await env.DB.prepare(
+      "UPDATE fleet_patch_operations SET stage='regional' WHERE operation_id=?",
+    )
+      .bind(operation)
+      .run();
+    expect(await activate()).toMatchObject({ revision: 2 });
+  } finally {
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM nodes WHERE id=?").bind(node),
+      env.DB.prepare("DELETE FROM regions WHERE id=?").bind(region),
+    ]);
+  }
+});
+
 it("a verification older than the activation window is repeated instead of activated", async () => {
   const f = await setup(),
     stale = structuredClone(f.intent),

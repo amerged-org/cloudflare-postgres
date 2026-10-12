@@ -234,6 +234,19 @@ error code starts with `operator_hold_` is not carried over: the successor start
 prepared rotation at its snapshot gate when its region is reached. The old rollout reports
 `blocked` with `identity_or_assignment_changed` after its assignments change.
 
+An operation that can never converge at a declarative platform stage, such as a release whose
+pinned regional image never becomes Ready, is superseded explicitly. Apply migration
+`0044_fleet_patch_superseded.sql` with the matching API first. With an administrator key,
+`POST /v1/fleet/patches/{operation_id}/halt` accepts only `flux`, `platform` or `regional`,
+where Flux applies idempotent desired state after every OS, host and Kubernetes-version write;
+other stages return `409`. The halt sets `halted` with `operator_hold_superseded` through the
+executor's revision compare-and-set, so a racing checkpoint fails closed and the executor
+stops; the rollout reports `blocked` with that code. A replacement with
+`expected_previous_rollout_id` and a different release then treats this operation, and members
+it never reached, as settled; every other unfinished operation still blocks. The successor
+starts a new patch for that member and, when it completes, reopens the placement closure the
+superseded operation owned. The superseded operation is never resumed.
+
 The existing region intent retains one `previous_intent` snapshot containing only the
 immediate predecessor's core intent. A snapshot excludes its own `previous_intent` and
 request-only predecessor reference; deeper references are not retained. This is part of the

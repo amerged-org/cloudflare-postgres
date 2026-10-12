@@ -32,6 +32,7 @@ import { installationHash } from "./node-installation.ts";
 import { FleetRolloutIntent } from "@pgcf/contracts/fleet-rollouts";
 import { FleetReleaseSpec } from "@pgcf/contracts/releases";
 import { fleetRolloutAuthoritySql } from "./fleet-rollouts.ts";
+import { fleetPatchSupersededSql } from "./fleet-patches.ts";
 
 const refuse = (): never => {
   throw new ApiError(
@@ -39,10 +40,12 @@ const refuse = (): never => {
     "Cluster material synchronization authority changed",
   );
 };
-const idleSql = `NOT EXISTS(SELECT 1 FROM node_additions WHERE slot_held=1 AND status NOT IN('ready','cancelled'))
+function idleSql() {
+  return `NOT EXISTS(SELECT 1 FROM node_additions WHERE slot_held=1 AND status NOT IN('ready','cancelled'))
   AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs WHERE authorized=1 AND admitted=0 AND cancelled=0)
-  AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE stage NOT IN('complete','host_ready') AND node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL))
+  AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations WHERE stage NOT IN('complete','host_ready') AND NOT ${fleetPatchSupersededSql()} AND node_id NOT IN(SELECT id FROM nodes WHERE lost_at IS NOT NULL))
   AND NOT EXISTS(SELECT 1 FROM node_thin_storage WHERE action_json IS NOT NULL)`;
+}
 async function regionState(db: D1Database, regionId: string) {
   const row = await db
     .prepare(
@@ -89,7 +92,7 @@ function rotationAuthority(
   )
     return refuse();
   return {
-    sql: `regions.id=? AND regions.bootstrap_material_revision=? AND regions.bootstrap_material_provenance_sha256 IS ? AND ${idleSql}
+    sql: `regions.id=? AND regions.bootstrap_material_revision=? AND regions.bootstrap_material_provenance_sha256 IS ? AND ${idleSql()}
     AND julianday(?)>=julianday('now','-120 seconds') AND julianday(?)<=julianday('now','+5 seconds')
     AND (SELECT count(*) FROM nodes n WHERE n.region_id=regions.id AND n.lost_at IS NULL)=?
     AND NOT EXISTS(SELECT 1 FROM json_each(?) expected WHERE NOT EXISTS(SELECT 1 FROM nodes n WHERE n.region_id=regions.id AND n.id=json_extract(expected.value,'$.node_id') AND n.node_uid=json_extract(expected.value,'$.node_uid') AND n.k8s_node_name=json_extract(expected.value,'$.k8s_node_name') AND n.provider_instance_id=json_extract(expected.value,'$.provider_instance_id') AND n.lost_at IS NULL AND n.ready=1 AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds')))
@@ -614,7 +617,7 @@ export async function synchronizeRegionBootstrapMaterial(
       value.observed.nodes.length
   )
     return refuse();
-  if (!(await env.DB.prepare(`SELECT 1 idle WHERE ${idleSql}`).first()))
+  if (!(await env.DB.prepare(`SELECT 1 idle WHERE ${idleSql()}`).first()))
     return refuse();
   const oldRows = await envelopes(env.DB, regionId, before.revision);
   const seed = await loadRegionSeed(
@@ -682,7 +685,7 @@ export async function synchronizeRegionBootstrapMaterial(
   const nodes = JSON.stringify(value.observed.nodes);
   const result = await env.DB.prepare(
     `UPDATE regions SET bootstrap_material_revision=?,bootstrap_material_provenance_sha256=?,updated_at=?
-     WHERE id=? AND bootstrap_material_revision=? AND bootstrap_material_provenance_sha256 IS ? AND ${idleSql}
+     WHERE id=? AND bootstrap_material_revision=? AND bootstrap_material_provenance_sha256 IS ? AND ${idleSql()}
        AND julianday(?)>=julianday('now','-120 seconds') AND julianday(?)<=julianday('now','+5 seconds')
        AND (SELECT COUNT(*) FROM nodes n WHERE n.region_id=regions.id AND n.lost_at IS NULL)=?
        AND NOT EXISTS(SELECT 1 FROM json_each(?) expected WHERE NOT EXISTS(SELECT 1 FROM nodes n

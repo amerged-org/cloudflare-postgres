@@ -27,6 +27,7 @@ import {
   fleetPatchInput,
   fleetPatchTransportTargets,
   getFleetPatch,
+  haltFleetPatch,
   issueFleetPatchTransport,
   recordFleetPatchCheckpoint,
   resumeFleetPatch,
@@ -103,6 +104,25 @@ export function registerFleetPatches(app: ApiApp) {
     },
     async (c) =>
       resumeFleetPatch(c, OperationId.parse(c.req.param("operation_id"))),
+  );
+  register(
+    {
+      method: "post",
+      path: "/v1/fleet/patches/{operation_id}/halt",
+      tags: ["Fleet patches"],
+      security: [{ bearerAuth: [] }],
+      description:
+        "Permanently halts this operation with `operator_hold_superseded` while it is at the declarative Flux, platform or regional stage, where only idempotent Flux desired state is in flight and every OS, host and Kubernetes-version write has completed. Other stages are refused with 409. A racing executor checkpoint fails closed. The superseded operation never resumes and a repeated request returns it unchanged; `POST /v1/fleet/rollouts` with `expected_previous_rollout_id` then selects a successor release.",
+      request: { params: z.object({ operation_id: OperationId }) },
+      responses: {
+        200: {
+          description: "Superseded fleet patch operation",
+          content: { "application/json": { schema: FleetPatchStatus } },
+        },
+      },
+    },
+    async (c) =>
+      haltFleetPatch(c, OperationId.parse(c.req.param("operation_id"))),
   );
   app.post("/internal/v1/fleet-patches/:operation_id", async (c) => {
     const id = OperationId.parse(c.req.param("operation_id")),

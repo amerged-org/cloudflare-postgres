@@ -21,6 +21,8 @@ import { readFleetNodeRelease } from "./fleet-releases.ts";
 import {
   continueFleetPatchRegion,
   ensureRetainedFleetPatch,
+  fleetPatchSuperseded,
+  fleetPatchSupersededSql,
   readFleetPatch,
   readFleetPatchStatus,
   synchronizeFleetPatchRegionMaterial,
@@ -52,7 +54,7 @@ export async function readFleetRolloutIntent(
 function quiescentRolloutSql(intent: FleetRolloutIntent) {
   const regions = JSON.stringify(intent.regions);
   return {
-    sql: `NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND NOT(p.state='confirmed' AND p.stage IN('complete','host_ready')))
+    sql: `NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND NOT(p.state='confirmed' AND p.stage IN('complete','host_ready')) AND NOT ${fleetPatchSupersededSql("p")})
       AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs j WHERE j.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND j.admitted=0 AND j.cancelled=0)
       AND NOT EXISTS(SELECT 1 FROM node_additions a WHERE a.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND (a.status NOT IN('ready','failed','cancelled') OR a.failure_code='provider_unknown'))
       AND NOT EXISTS(SELECT 1 FROM node_provider_mutations m JOIN node_additions a ON a.operation_id=m.operation_id WHERE a.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND m.state IN('dispatching','unknown'))
@@ -97,6 +99,7 @@ async function assertHeldReplacement(
       })),
     );
   if (identity(replaced.regions) !== identity(input.regions)) return changed();
+  const patches: Awaited<ReturnType<typeof latestPatch>>[] = [];
   for (const [index, region] of replaced.regions.entries()) {
     const target = input.regions[index]!;
     // A staged rotation that never started, or an operator hold at its undispatched snapshot, issued no
@@ -132,13 +135,21 @@ async function assertHeldReplacement(
             region.rotation.state !== "confirmed"))
       )
         return changed();
-      for (const node of region.nodes) {
-        const patch = await latestPatch(env, previous, node);
-        if (patch?.stage !== "complete" || patch.state !== "confirmed")
-          return changed();
-      }
+      for (const node of region.nodes)
+        patches.push(await latestPatch(env, previous, node));
     }
   }
+  // An operator-superseded declarative stage holds the rollout; members it never reached have no patch.
+  const superseded = patches.some(fleetPatchSuperseded);
+  if (
+    patches.some((patch) =>
+      patch
+        ? !(patch.stage === "complete" && patch.state === "confirmed") &&
+          !fleetPatchSuperseded(patch)
+        : !superseded,
+    )
+  )
+    return changed();
   const quiet = quiescentRolloutSql(replaced);
   if (
     !(await env.DB.prepare(`SELECT 1 valid WHERE ${quiet.sql}`)
@@ -503,7 +514,7 @@ export async function advanceFleetRollout(
       region.nodes.map((node) => readFleetNodeRelease(env.DB, node.node_id)),
     );
     const active = await env.DB.prepare(
-      "SELECT operation_id,node_id FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready')",
+      `SELECT operation_id,node_id FROM fleet_patch_operations WHERE region_id=? AND stage NOT IN('complete','host_ready') AND NOT ${fleetPatchSupersededSql()}`,
     )
       .bind(region.region_id)
       .first<{ operation_id: string; node_id: string }>();
@@ -819,7 +830,7 @@ export async function createFleetRollout(
         intent.regions.push(region);
       }
       const active = await c.env.DB.prepare(
-        "SELECT 1 present FROM fleet_patch_operations WHERE region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND stage<>'complete' AND NOT(stage='host_ready' AND state='confirmed') AND (release_id<>? OR NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members WHERE json_extract(members.value,'$.node_id')=fleet_patch_operations.node_id AND json_extract(members.value,'$.node_uid')=fleet_patch_operations.node_uid AND json_extract(members.value,'$.assignment_revision')=fleet_patch_operations.assignment_revision AND json_extract(regions.value,'$.revision')=fleet_patch_operations.region_revision)) LIMIT 1",
+        `SELECT 1 present FROM fleet_patch_operations WHERE region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND stage<>'complete' AND NOT(stage='host_ready' AND state='confirmed') AND NOT ${fleetPatchSupersededSql()} AND (release_id<>? OR NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members WHERE json_extract(members.value,'$.node_id')=fleet_patch_operations.node_id AND json_extract(members.value,'$.node_uid')=fleet_patch_operations.node_uid AND json_extract(members.value,'$.assignment_revision')=fleet_patch_operations.assignment_revision AND json_extract(regions.value,'$.revision')=fleet_patch_operations.region_revision)) LIMIT 1`,
       )
         .bind(
           JSON.stringify(intent.regions),
@@ -831,7 +842,7 @@ export async function createFleetRollout(
       const raw = JSON.stringify(FleetRolloutIntent.parse(intent)),
         snapshotJson = JSON.stringify(snapshot),
         anchor = intent.regions[0]!;
-      const guard = `NOT EXISTS(SELECT 1 FROM json_each(?) targets LEFT JOIN regions r ON r.id=json_extract(targets.value,'$.region_id') LEFT JOIN fleet_region_releases f ON f.region_id=r.id WHERE r.id IS NULL OR COALESCE(f.revision,0)<>json_extract(targets.value,'$.revision') OR f.rollout_json IS NOT json_extract(targets.value,'$.rollout_json') OR r.bootstrap_material_revision<>json_extract(targets.value,'$.material_revision') OR (SELECT count(*) FROM nodes WHERE region_id=r.id AND lost_at IS NULL)<>json_array_length(targets.value,'$.nodes')) AND NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members LEFT JOIN nodes n ON n.id=json_extract(members.value,'$.node_id') LEFT JOIN fleet_node_releases a ON a.node_id=n.id WHERE n.id IS NULL OR n.region_id<>json_extract(regions.value,'$.region_id') OR n.node_uid<>json_extract(members.value,'$.node_uid') OR n.lost_at IS NOT NULL OR n.ready<>1 OR julianday(n.last_observed_at)<julianday('now','-180 seconds') OR julianday(n.last_observed_at)>julianday('now','+5 seconds') OR n.last_observed_at IS NULL OR COALESCE(a.revision,0)<>json_extract(members.value,'$.expected_revision') OR (json_type(members.value,'$.compute_pool') IS NOT NULL AND COALESCE((SELECT revision FROM node_compute_pool_policies WHERE node_id=n.id),0)<>json_extract(members.value,'$.compute_pool.expected_revision'))) AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND p.stage<>'complete' AND NOT(p.stage='host_ready' AND p.state='confirmed') AND (p.release_id<>? OR NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members WHERE json_extract(members.value,'$.node_id')=p.node_id AND json_extract(members.value,'$.node_uid')=p.node_uid AND json_extract(members.value,'$.assignment_revision')=p.assignment_revision AND json_extract(regions.value,'$.revision')=p.region_revision)))`;
+      const guard = `NOT EXISTS(SELECT 1 FROM json_each(?) targets LEFT JOIN regions r ON r.id=json_extract(targets.value,'$.region_id') LEFT JOIN fleet_region_releases f ON f.region_id=r.id WHERE r.id IS NULL OR COALESCE(f.revision,0)<>json_extract(targets.value,'$.revision') OR f.rollout_json IS NOT json_extract(targets.value,'$.rollout_json') OR r.bootstrap_material_revision<>json_extract(targets.value,'$.material_revision') OR (SELECT count(*) FROM nodes WHERE region_id=r.id AND lost_at IS NULL)<>json_array_length(targets.value,'$.nodes')) AND NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members LEFT JOIN nodes n ON n.id=json_extract(members.value,'$.node_id') LEFT JOIN fleet_node_releases a ON a.node_id=n.id WHERE n.id IS NULL OR n.region_id<>json_extract(regions.value,'$.region_id') OR n.node_uid<>json_extract(members.value,'$.node_uid') OR n.lost_at IS NOT NULL OR n.ready<>1 OR julianday(n.last_observed_at)<julianday('now','-180 seconds') OR julianday(n.last_observed_at)>julianday('now','+5 seconds') OR n.last_observed_at IS NULL OR COALESCE(a.revision,0)<>json_extract(members.value,'$.expected_revision') OR (json_type(members.value,'$.compute_pool') IS NOT NULL AND COALESCE((SELECT revision FROM node_compute_pool_policies WHERE node_id=n.id),0)<>json_extract(members.value,'$.compute_pool.expected_revision'))) AND NOT EXISTS(SELECT 1 FROM fleet_patch_operations p WHERE p.region_id IN(SELECT json_extract(value,'$.region_id') FROM json_each(?)) AND p.stage<>'complete' AND NOT(p.stage='host_ready' AND p.state='confirmed') AND NOT ${fleetPatchSupersededSql("p")} AND (p.release_id<>? OR NOT EXISTS(SELECT 1 FROM json_each(?) regions,json_each(regions.value,'$.nodes') members WHERE json_extract(members.value,'$.node_id')=p.node_id AND json_extract(members.value,'$.node_uid')=p.node_uid AND json_extract(members.value,'$.assignment_revision')=p.assignment_revision AND json_extract(regions.value,'$.revision')=p.region_revision)))`;
       const owner =
         "EXISTS(SELECT 1 FROM fleet_region_releases WHERE region_id=? AND rollout_json=?)";
       const replacement = replaced

@@ -13,6 +13,7 @@ import {
 } from "@pgcf/contracts/fleet-patches";
 import { cleanupFixtures, fixture, request } from "./fixtures.ts";
 import {
+  continueFleetPatchRegion,
   fleetPatchInput,
   readFleetPatch,
   recordFleetPatchCheckpoint,
@@ -2184,4 +2185,215 @@ it("a qualified release needs thin write authority only from database members an
   });
   expect(await refreshFleetPatchRegionStorage(env, op)).toBe(false);
   expect(await restoreFleetPatchPlacements(env, op)).toBe(false);
+});
+
+it("an operator halt supersedes only a Flux, platform or regional stage", async () => {
+  const f = await setup(),
+    halt = (key = f.admin) =>
+      request(`/v1/fleet/patches/${f.op}/halt`, key, "POST");
+  expect((await halt(f.integrator)).status).toBe(403);
+  // OS, host and database stages can hold uncertain writes; their records stay unchanged.
+  for (const stage of ["talos", "host_service", "postgres"]) {
+    await env.DB.prepare(
+      "UPDATE fleet_patch_operations SET stage=?,state='dispatched' WHERE operation_id=?",
+    )
+      .bind(stage, f.op)
+      .run();
+    const before = await readFleetPatch(env, f.op),
+      refused = await halt();
+    expect(refused.status).toBe(409);
+    expect(
+      ((await refused.json()) as { error: { message: string } }).error.message,
+    ).toMatch(/Flux, platform or regional/);
+    expect(await readFleetPatch(env, f.op)).toEqual(before);
+  }
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='regional',state='dispatched',error_code='patch_readback_invalid' WHERE operation_id=?",
+  )
+    .bind(f.op)
+    .run();
+  const accepted = await halt();
+  expect(accepted.status).toBe(200);
+  const held = FleetPatchStatus.parse(await accepted.json());
+  expect(held).toMatchObject({
+    stage: "regional",
+    state: "halted",
+    error_code: "operator_hold_superseded",
+    revision: 1,
+  });
+  // A repeated request reads the same hold without another write.
+  const repeated = await halt();
+  expect(repeated.status).toBe(200);
+  expect(FleetPatchStatus.parse(await repeated.json())).toEqual(held);
+  // Only a successor release may patch the region again; the superseded release is not restarted.
+  expect(
+    (
+      await request(
+        `/v1/nodes/${f.node}/patches`,
+        f.admin,
+        "POST",
+        {
+          node_uid: f.nodeUid,
+          assignment_revision: 1,
+          release_id: f.id,
+          address: "192.0.2.18",
+          maintenance_acknowledged: true,
+        },
+        crypto.randomUUID(),
+      )
+    ).status,
+  ).toBe(409);
+  expect(
+    await env.DB.prepare(
+      "SELECT count(*) n FROM fleet_patch_operations WHERE region_id=?",
+    )
+      .bind(f.region)
+      .first("n"),
+  ).toBe(1);
+});
+
+it("an executor checkpoint racing the operator halt fails closed and cannot clear the hold", async () => {
+  const f = await setup();
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET stage='regional',state='dispatched',baseline_json=? WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(f.facts), f.op)
+    .run();
+  const input = await fleetPatchInput(f.runtime, f.op),
+    checkpoint = {
+      kind: "checkpoint",
+      expected_revision: 0,
+      stage: "regional",
+      state: "confirmed",
+      facts: {
+        ...f.facts,
+        release_facts: {
+          components: input.spec.components
+            .filter((value) => ["regional", "cloudflared"].includes(value.name))
+            .map(({ name, version, sha256 }) => ({ name, version, sha256 })),
+        },
+      },
+      error_code: null,
+    };
+  // Native's callback passes every read-side check; the halt commits just before its revision CAS.
+  let raced = false;
+  const executor = async (body: unknown) => {
+    const context = createExecutionContext(),
+      response = await createApp().fetch(
+        new Request(`https://api.invalid/internal/v1/fleet-patches/${f.op}`, {
+          method: "POST",
+          headers: {
+            authorization: `Bearer ${input.callback.bearer}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify(body),
+        }),
+        {
+          ...f.runtime,
+          DB: {
+            prepare: env.DB.prepare.bind(env.DB),
+            batch: async (statements: D1PreparedStatement[]) => {
+              if (!raced) {
+                raced = true;
+                expect(
+                  (
+                    await request(
+                      `/v1/fleet/patches/${f.op}/halt`,
+                      f.admin,
+                      "POST",
+                    )
+                  ).status,
+                ).toBe(200);
+              }
+              return env.DB.batch(statements);
+            },
+          } as unknown as D1Database,
+        },
+        context,
+      );
+    await waitOnExecutionContext(context);
+    return response;
+  };
+  expect((await executor(checkpoint)).status).toBe(409);
+  expect(raced).toBe(true);
+  const held = await readFleetPatch(env, f.op);
+  expect(held).toMatchObject({
+    stage: "regional",
+    state: "halted",
+    error_code: "operator_hold_superseded",
+    revision: 1,
+  });
+  // The executor's next turn reads no status and writes no checkpoint at the new revision.
+  expect((await executor({ kind: "status" })).status).toBe(409);
+  expect((await executor({ ...checkpoint, expected_revision: 1 })).status).toBe(
+    409,
+  );
+  expect(await readFleetPatch(env, f.op)).toEqual(held);
+});
+
+it("a successor's completion reopens only the placement closure its superseded predecessor owned", async () => {
+  const supersede = async (previous: string | null) => {
+    const f = await setup(),
+      row = await readFleetPatch(env, f.op),
+      members = JSON.parse(row.cluster_nodes_json),
+      closure = previous ?? row.created_at,
+      successor = `successor-${crypto.randomUUID()}`,
+      operation = newOperationId(),
+      created = new Date(Date.now() + 1000).toISOString();
+    members[0].previous_placement_closed_at = previous;
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE fleet_patch_operations SET stage='regional',state='dispatched',cluster_nodes_json=? WHERE operation_id=?",
+      ).bind(JSON.stringify(members), f.op),
+      env.DB.prepare(
+        "UPDATE nodes SET database_placement_closed_at=? WHERE id=?",
+      ).bind(closure, f.node),
+    ]);
+    expect(
+      (await request(`/v1/fleet/patches/${f.op}/halt`, f.admin, "POST")).status,
+    ).toBe(200);
+    // The successor's patch records the unchanged closure as its previous value and completes.
+    releases.push(successor);
+    await env.DB.batch([
+      env.DB.prepare(
+        "INSERT INTO fleet_releases(id,spec_json,spec_sha256,approved_at) SELECT ?,spec_json,spec_sha256,? FROM fleet_releases WHERE id=?",
+      ).bind(successor, created, f.id),
+      env.DB.prepare(
+        "UPDATE fleet_region_releases SET release_id=?,revision=2 WHERE region_id=?",
+      ).bind(successor, f.region),
+      env.DB.prepare(
+        "UPDATE fleet_node_releases SET release_id=?,revision=2 WHERE node_id=?",
+      ).bind(successor, f.node),
+      env.DB.prepare(
+        `INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at)
+        SELECT ?,node_id,region_id,node_uid,cluster_uid,?,spec_sha256,2,2,material_revision,address,?,12,'complete','confirmed',?,?,deadline_at FROM fleet_patch_operations WHERE operation_id=?`,
+      ).bind(
+        operation,
+        successor,
+        JSON.stringify([
+          {
+            ...members[0],
+            assignment_revision: 2,
+            previous_placement_closed_at: closure,
+          },
+        ]),
+        created,
+        created,
+        f.op,
+      ),
+    ]);
+    const superseded = await readFleetPatch(env, f.op);
+    expect(await continueFleetPatchRegion(env, operation)).toBeNull();
+    expect(await restoreFleetPatchPlacements(env, operation)).toBe(true);
+    expect(
+      await env.DB.prepare(
+        "SELECT database_placement_closed_at FROM nodes WHERE id=?",
+      )
+        .bind(f.node)
+        .first("database_placement_closed_at"),
+    ).toBe(previous);
+    expect(await readFleetPatch(env, f.op)).toEqual(superseded);
+  };
+  await supersede(null);
+  await supersede("2024-01-01T00:00:00.000Z");
 });
