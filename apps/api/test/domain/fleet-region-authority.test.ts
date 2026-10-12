@@ -362,8 +362,13 @@ async function setup(verificationAgeMs = 0) {
   return { ...f, intent, activation, runtime, custody, pointer, supersede };
 }
 
+const custodyUpdate = /^\s*UPDATE regions SET bootstrap_material_revision=/;
 /** Interpose only at execution; every read and the actual conditional UPDATE use real D1. */
-function beforeCustodyUpdate(db: D1Database, hook: () => Promise<void>) {
+function beforeUpdate(
+  db: D1Database,
+  update: RegExp,
+  hook: () => Promise<void>,
+) {
   let updates = 0;
   const wrap = (statement: D1PreparedStatement): D1PreparedStatement =>
     new Proxy(statement, {
@@ -386,11 +391,7 @@ function beforeCustodyUpdate(db: D1Database, hook: () => Promise<void>) {
         if (property === "prepare")
           return (sql: string) => {
             const statement = target.prepare(sql);
-            return /^\s*UPDATE regions SET bootstrap_material_revision=/.test(
-              sql,
-            )
-              ? wrap(statement)
-              : statement;
+            return update.test(sql) ? wrap(statement) : statement;
           };
         const value = Reflect.get(target, property);
         return typeof value === "function" ? value.bind(target) : value;
@@ -434,7 +435,7 @@ it("revokes an issued rotation capability when its region is superseded while an
 it("rejects an activation race at the actual custody UPDATE without changing active revision or staged ciphertext", async () => {
   const f = await setup(),
     before = (await f.custody()).results,
-    racing = beforeCustodyUpdate(env.DB, f.supersede);
+    racing = beforeUpdate(env.DB, custodyUpdate, f.supersede);
   await expect(
     activateNativeRegionBootstrapRotation(
       { ...f.runtime, DB: racing.DB },
@@ -465,7 +466,7 @@ it("resolves exact native activation replay after pointer revision two without r
     revision: 2,
     provenance_sha256: f.activation.verification_sha256,
   });
-  const replay = beforeCustodyUpdate(env.DB, async () => {
+  const replay = beforeUpdate(env.DB, custodyUpdate, async () => {
     throw Error(
       "exact activation replay must not execute another custody UPDATE",
     );
@@ -605,4 +606,37 @@ it("a committed activation completes from its verification after the reuse windo
     current_material_revision: 2,
     rotation: { phase: "complete", state: "confirmed" },
   });
+});
+
+it("a stale verification reset does not commit over an activation that landed meanwhile", async () => {
+  const f = await setup(100_000),
+    selection = { rollout_id: f.intent.rollout_id, region_id: f.region },
+    racing = beforeUpdate(
+      env.DB,
+      /^\s*UPDATE fleet_region_releases SET rollout_json=/,
+      async () => {
+        await activateNativeRegionBootstrapRotation(
+          f.runtime,
+          f.region,
+          f.intent.rollout_id,
+          f.activation,
+        );
+      },
+    );
+  await expect(
+    runPreparedRegionAuthorityRotation(
+      { ...f.runtime, DB: racing.DB },
+      selection,
+    ),
+  ).rejects.toThrow(/changed/);
+  expect(racing.updates()).toBe(1);
+  expect(await f.pointer()).toEqual({
+    revision: 2,
+    provenance: f.activation.verification_sha256,
+  });
+  const stored = await readFleetRolloutIntent(env.DB, f.intent.rollout_id);
+  expect(stored.regions[0]!.rotation).toEqual(f.intent.regions[0]!.rotation);
+  expect(await runPreparedRegionAuthorityRotation(f.runtime, selection)).toBe(
+    "complete",
+  );
 });
