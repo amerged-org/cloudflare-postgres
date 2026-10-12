@@ -75,10 +75,23 @@ The `native-gateway` commit must contain 509d148, which verifies v3. The `native
 commit must contain "fix: publish a restored database's running fence under its restore";
 earlier controllers leave a restored database without the running fence its v3 routes need.
 
-Roll back in reverse order: Edge, fleet, API. An older Edge signs only v2. Assigning a release
-without the declaration ends v3 before a patch can start an older gateway; issued v3 tokens
-expire within 30 seconds. An API older than this change cannot read a release that declares
-`route_token_version`, so assign such regions a release without it before rolling back the API.
+Roll back in reverse order: Edge, fleet, API.
+
+- Edge: an older Edge signs only v2, which every gateway accepts. This stops new v3 routes at
+  once without a fleet change.
+- Fleet, or ending v3 in a region: send `POST /v1/fleet/rollouts` with a release that does not
+  declare the version. The rollout reassigns the region and every member in one step, which ends
+  v3 before a patch can start an older gateway; issued v3 tokens expire within 30 seconds. Never
+  use `PUT /v1/regions/{id}/release` alone for a region with assigned members: until each
+  member's assignment follows, the native controller cannot verify its databases and
+  protectively stops thin ones.
+- API: an API older than 7d92e6a cannot parse a release that declares `route_token_version`.
+  First complete such a rollout in every region that declared it. Then point the fleet update
+  policy's `promoted_release_id` at a release without the declaration, or disable the policy,
+  with `PUT /v1/fleet/update-policy`. Otherwise the older API fails those regions' desired-state
+  reads, and every cron run fails at the promoted release, skipping later rollout, backup and
+  alert steps.
+
 Remove v2 once every region's release declares v3.
 
 ## Rust/Wasm Edge artifact

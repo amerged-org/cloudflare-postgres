@@ -17,7 +17,10 @@ gateway-first patch can bind its retained storage and prove real SQL before cont
 
 1. Qualify immutable artifacts through the single CI and approve their release through
    `PUT /v1/fleet/releases/{id}`. Select the release for the region and assign it to every current
-   member with the existing region/node release APIs. The reviewed `platform_source_commit` pins
+   member with the existing region/node release APIs. Change the release of a region with assigned
+   members only through the one-request rollout below: after a region assignment alone, the native
+   controller cannot verify the databases of members still on the old release and protectively
+   stops thin ones. The reviewed `platform_source_commit` pins
    the fixed public lock, Flux artifact and platform manifests; the lock never embeds its own Git
    commit. Declare cluster-scoped platform workloads explicitly. PostgreSQL, Barman and the sandbox
    controller artifact are globally qualified; actual database runtimes and host extensions are
