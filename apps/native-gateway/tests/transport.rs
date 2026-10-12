@@ -27,7 +27,7 @@ use std::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
     sync::{Semaphore, mpsc, watch},
     task::JoinHandle,
     time::timeout,
@@ -125,6 +125,15 @@ fn startup(user: &str) -> Vec<u8> {
 fn query() -> Vec<u8> {
     vec![b'Q', 0, 0, 0, 6, b'x', 0]
 }
+/// One 1 MiB Query message.
+fn large_query() -> Vec<u8> {
+    let mut bytes = vec![b'x'; 1024 * 1024];
+    bytes[0] = b'Q';
+    let length = (bytes.len() - 1) as u32;
+    bytes[1..5].copy_from_slice(&length.to_be_bytes());
+    *bytes.last_mut().unwrap() = 0;
+    bytes
+}
 fn writer(pod: &str) -> Value {
     json!({"apiVersion":"discovery.k8s.io/v1","kind":"EndpointSlice","metadata":{"name":"database-rw-a","namespace":format!("pgcf-db-{DATABASE}"),"uid":cid(201),"labels":{"kubernetes.io/service-name":"database-rw"}},"addressType":"IPv4","ports":[{"port":5432,"protocol":"TCP"}],"endpoints":[{"addresses":["10.0.0.7"],"conditions":{"ready":true},"targetRef":{"kind":"Pod","namespace":format!("pgcf-db-{DATABASE}"),"uid":pod},"nodeName":"customer-us1"}]})
 }
@@ -147,6 +156,7 @@ struct TestDial {
     address: std::net::SocketAddr,
     ca: Vec<u8>,
     calls: Arc<AtomicUsize>,
+    send_buffer: Option<u32>,
 }
 impl PostgresDial for TestDial {
     fn dial<'a>(
@@ -160,12 +170,12 @@ impl PostgresDial for TestDial {
             assert_eq!(target.address.to_string(), "10.0.0.7");
             assert_eq!(target.pod_uid, cid(200));
             self.calls.fetch_add(1, Ordering::SeqCst);
-            transport::negotiate_tls(
-                TcpStream::connect(self.address).await?,
-                &target.host,
-                &self.ca,
-            )
-            .await
+            let socket = TcpSocket::new_v4()?;
+            if let Some(size) = self.send_buffer {
+                socket.set_send_buffer_size(size)?;
+            }
+            transport::negotiate_tls(socket.connect(self.address).await?, &target.host, &self.ca)
+                .await
         })
     }
 }
@@ -183,7 +193,19 @@ impl Fixture {
     async fn new() -> Self {
         Self::with_fences(HashMap::from([(DATABASE.into(), fence("running", 1))])).await
     }
+    /// Backpressure towards the double: both ends of its TLS path keep small socket buffers,
+    /// and after authentication it reads each message only after 200 ms.
+    async fn congested() -> Self {
+        Self::build(
+            HashMap::from([(DATABASE.into(), fence("running", 1))]),
+            true,
+        )
+        .await
+    }
     async fn with_fences(fences: HashMap<String, Fence>) -> Self {
+        Self::build(fences, false).await
+    }
+    async fn build(fences: HashMap<String, Fence>, congested: bool) -> Self {
         let identity =
             generate_simple_self_signed(vec![format!("database-rw.pgcf-db-{DATABASE}.svc")])
                 .unwrap();
@@ -197,7 +219,13 @@ impl Fixture {
                 )),
             )
             .unwrap();
-        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Accepted sockets inherit the listener's receive buffer.
+        let upstream = TcpSocket::new_v4().unwrap();
+        if congested {
+            upstream.set_recv_buffer_size(4096).unwrap();
+        }
+        upstream.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let upstream = upstream.listen(128).unwrap();
         let address = upstream.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
         let gateway = Gateway::new(
@@ -215,6 +243,7 @@ impl Fixture {
                 address,
                 ca,
                 calls: calls.clone(),
+                send_buffer: congested.then_some(4096),
             }),
         );
         gateway.fences.write().await.replace(fences).unwrap();
@@ -245,7 +274,7 @@ impl Fixture {
                         tls.write_all(&[b'R',0,0,0,8,0,0,0,10]).await.unwrap();let mut password=[0;11];tls.read_exact(&mut password).await.unwrap();assert_eq!(&password,b"p\0\0\0\x0aopaque");
                         tls.write_all(&[b'R',0,0,0,8,0,0,0,0,b'Z',0,0,0,5,b'I']).await.unwrap();
                         // Before each message: close_notify reads as end of stream, a bare TCP close as an error.
-                        loop{let mut header=[0;5];match tls.read(&mut header[..1]).await{Ok(1)=>{},end=>{let _=closed.try_send(matches!(end,Ok(0)));break;}}if tls.read_exact(&mut header[1..]).await.is_err(){break;}let length=u32::from_be_bytes(header[1..].try_into().unwrap())as usize;let mut body=vec![0;length-4];if tls.read_exact(&mut body).await.is_err(){break;}let mut bytes=header.to_vec();bytes.extend(body);if send.send(bytes).await.is_err(){break;}
+                        loop{if congested{tokio::time::sleep(Duration::from_millis(200)).await;}let mut header=[0;5];match tls.read(&mut header[..1]).await{Ok(1)=>{},end=>{let _=closed.try_send(matches!(end,Ok(0)));break;}}if tls.read_exact(&mut header[1..]).await.is_err(){break;}let length=u32::from_be_bytes(header[1..].try_into().unwrap())as usize;let mut body=vec![0;length-4];if tls.read_exact(&mut body).await.is_err(){break;}let mut bytes=header.to_vec();bytes.extend(body);if send.send(bytes).await.is_err(){break;}
                 // After a Terminate the double keeps reading to observe how the gateway ends TLS.
                 if header[0]!=b'X'&&tls.write_all(&[b'Z',0,0,0,5,b'I']).await.is_err(){break;}}
                     });}}
@@ -530,11 +559,7 @@ async fn terminal_retirement_refuses_additional_frontend_data_explicitly() {
 async fn large_frontend_frame_streams_once_after_small_startup_limit_is_released() {
     let mut fixture = Fixture::new().await;
     let mut client = fixture.authenticate(5).await;
-    let mut bytes = vec![b'x'; 1024 * 1024];
-    bytes[0] = b'Q';
-    let length = (bytes.len() - 1) as u32;
-    bytes[1..5].copy_from_slice(&length.to_be_bytes());
-    *bytes.last_mut().unwrap() = 0;
+    let bytes = large_query();
     client
         .send(Message::Binary(bytes.clone().into()))
         .await
@@ -1128,5 +1153,32 @@ async fn every_routed_connection_logs_one_ordered_stage_line() {
         .into_data();
     assert!(String::from_utf8_lossy(&error).contains("28000"));
     fixture.ended().await;
+    fixture.stop().await;
+}
+#[tokio::test]
+async fn a_large_frontend_write_reaches_a_slowly_reading_postgres_in_full() {
+    let mut fixture = Fixture::congested().await;
+    let mut client = fixture.authenticate(970).await;
+    let bytes = large_query();
+    client
+        .send(Message::Binary(bytes.clone().into()))
+        .await
+        .unwrap();
+    // A tail still queued in TLS would never reach the double, so it would never reply.
+    assert_eq!(
+        timeout(Duration::from_secs(10), fixture.upstream.recv())
+            .await
+            .unwrap()
+            .unwrap(),
+        bytes
+    );
+    let reply = timeout(Duration::from_secs(10), client.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .into_data();
+    assert_eq!(&reply[..], [b'Z', 0, 0, 0, 5, b'I']);
+    client.close(None).await.unwrap();
     fixture.stop().await;
 }

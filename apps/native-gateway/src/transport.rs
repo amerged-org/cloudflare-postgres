@@ -434,7 +434,7 @@ pub async fn serve_socket(
             stages.outcome = "write_authority_expired";
             return Err("physical write authority expired before startup enqueue".into());
         }
-        let written = timeout(budget, postgres.write_all(&initial)).await;
+        let written = timeout(budget, write_upstream(&mut postgres, &initial)).await;
         if !matches!(written, Ok(Ok(()))) {
             stages.outcome = "postgres_error";
         }
@@ -506,6 +506,13 @@ async fn send_client(
         stages.outcome = "websocket_error";
     }
     Ok(sent??)
+}
+/// A write is done only when its TLS records reached the socket. Under backpressure tokio-rustls
+/// returns from `write_all` with records still queued, which only a later write would send,
+/// while the client already waits for PostgreSQL's reply; callers bound both steps together.
+async fn write_upstream(postgres: &mut TlsStream<TcpStream>, bytes: &[u8]) -> std::io::Result<()> {
+    postgres.write_all(bytes).await?;
+    postgres.flush().await
 }
 /// Ends a failed PostgreSQL session with close_notify and FIN within 500 ms, so PostgreSQL
 /// sees a clean end of stream instead of an unexpected EOF. A stream with queued TLS records is
@@ -872,7 +879,7 @@ async fn forward_if_running(
         stages.outcome = "write_authority_expired";
         return Err("physical write authority expired before frontend enqueue".into());
     }
-    let written = timeout(budget, postgres.write_all(bytes)).await;
+    let written = timeout(budget, write_upstream(postgres, bytes)).await;
     if !matches!(written, Ok(Ok(()))) {
         stages.outcome = "postgres_error";
     }

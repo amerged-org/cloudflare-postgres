@@ -39,11 +39,17 @@ impl Drop for Session {
     fn drop(&mut self) {
         // The client drops next, so its connection sends Terminate and ends TLS with close_notify
         // and FIN. A connection still open 500 ms later, e.g. awaiting a reply, is aborted.
+        // Outside a runtime nothing can bound that close, so the connection is aborted at once.
         let task = self.task.abort_handle();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(500)).await;
-            task.abort();
-        });
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    task.abort();
+                });
+            }
+            Err(_) => task.abort(),
+        }
     }
 }
 impl Session {
@@ -219,6 +225,24 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(received.first(), Some(&b'Q'));
+    }
+    #[test]
+    fn a_session_dropped_outside_a_runtime_is_aborted_at_once() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (session, server) = runtime.block_on(async {
+            let (config, ca, server) = postgres().await;
+            (open(&config, ca.as_bytes()).await.unwrap(), server)
+        });
+        drop(session);
+        let (received, _) = runtime
+            .block_on(async { tokio::time::timeout(Duration::from_secs(2), server).await })
+            .unwrap()
+            .unwrap();
+        // Without a runtime for the bounded close, no Terminate is sent.
+        assert!(received.is_empty());
     }
     #[test]
     fn trust_material_must_be_an_actual_ca() {
