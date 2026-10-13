@@ -638,6 +638,9 @@ pub struct Sampler {
     period: Duration,
     /// How long the last complete scrape took.
     scraped: Option<Duration>,
+    /// The monotonic client-call roundtrip, including preparation and response validation;
+    /// separate from scraping, controller handoff and gateway ledger delivery.
+    posted: Option<Duration>,
 }
 impl Sampler {
     pub fn new(target: &Value, driver: &str) -> Option<Self> {
@@ -647,6 +650,7 @@ impl Sampler {
             nonce: None,
             period: Duration::from_millis(target["period_milliseconds"].as_u64().unwrap_or(0)),
             scraped: None,
+            posted: None,
         })
     }
     pub fn period(&self) -> Duration {
@@ -656,6 +660,8 @@ impl Sampler {
     /// periods, the post by the nonce's validity (guard / 2, 2.5 periods); a failed post keeps
     /// the nonce. An accepted reply also sets the next period, a refused one only the nonce.
     pub async fn sample(&mut self, kube: &Kubernetes, api: &ControlApi) -> Result<Sampled, Error> {
+        self.scraped = None;
+        self.posted = None;
         let started = Instant::now();
         let scrape =
             tokio::time::timeout(self.period * 2, headroom(kube, &self.target, &self.driver));
@@ -664,12 +670,14 @@ impl Sampler {
         };
         self.scraped = Some(started.elapsed());
         body["nonce"] = self.nonce.clone().into();
+        let posted = Instant::now();
         let reply = tokio::time::timeout(
             self.period * 5 / 2,
             api.storage_headroom(text(&self.target, "node_id"), &body),
         )
-        .await
-        .map_err(|_| "headroom sample deadline exceeded")??;
+        .await;
+        self.posted = Some(posted.elapsed());
+        let reply = reply.map_err(|_| "headroom sample deadline exceeded")??;
         self.nonce = Some(text(&reply, "nonce").to_string());
         if reply["accepted"] != true {
             return Ok(Sampled::Refused(text(&reply, "reason").to_string()));
@@ -713,6 +721,52 @@ impl Sampler {
         })
     }
 }
+fn observation_integer(value: u64) -> Option<u64> {
+    (value <= MAX_SAFE as u64).then_some(value)
+}
+fn observation_milliseconds(value: Duration) -> Option<u64> {
+    u64::try_from(value.as_millis())
+        .ok()
+        .and_then(observation_integer)
+}
+fn sample_reason(reason: &str) -> Option<&str> {
+    match reason {
+        "thin_storage_sample_nonce_invalid"
+        | "thin_storage_sample_qualification_inactive"
+        | "thin_storage_sample_node_unqualified"
+        | "thin_storage_sample_identity_unavailable"
+        | "thin_storage_sample_witness_changed"
+        | "thin_storage_sample_pool_changed"
+        | "thin_storage_sample_volumes_changed"
+        | "thin_storage_sample_conflict" => Some(reason),
+        _ => None,
+    }
+}
+/// Only selected primitives become observations. Error text, nonce, authority bodies and tokens
+/// never enter this projection; unrepresentable durations remain unknown.
+fn sample_observation(
+    sampler: &Sampler,
+    outcome: &Result<Sampled, Error>,
+    elapsed: Duration,
+    sampled_period: Duration,
+) -> Value {
+    let mut event = json!({"event":"thin_storage_sample","node_id":sampler.target["node_id"],"node_uid":sampler.target["node_uid"],"outcome":"failed","milliseconds":observation_milliseconds(elapsed),"period_milliseconds":observation_milliseconds(sampled_period),"next_period_milliseconds":observation_milliseconds(sampler.period),"scrape_milliseconds":sampler.scraped.and_then(observation_milliseconds),"post_roundtrip_milliseconds":sampler.posted.and_then(observation_milliseconds)});
+    match outcome {
+        Ok(Sampled::Unknown) => event["outcome"] = "unknown".into(),
+        Ok(Sampled::Refused(reason)) => {
+            event["outcome"] = "refused".into();
+            event["reason"] = sample_reason(reason).into();
+        }
+        Ok(Sampled::Accepted(renewal)) => {
+            event["outcome"] = "accepted".into();
+            if let Some(renewal) = renewal {
+                event["revision"] = observation_integer(renewal.revision).into();
+            }
+        }
+        Err(_) => {}
+    }
+    event
+}
 /// Samples one node until the controller stops it: one sample in flight, each scrape once the
 /// period has passed since the previous one started. A renewal reaches the controller first and
 /// then the gateway ledgers, never over a newer token. Reconcile and wake never wait for it.
@@ -726,54 +780,64 @@ pub async fn sample_node(
     loop {
         tokio::time::sleep_until(next).await;
         let started = tokio::time::Instant::now();
-        sampler.scraped = None;
+        let sampled_period = sampler.period;
         let outcome = sampler.sample(&kube, &api).await;
-        let mut event = json!({"event":"thin_storage_sample","node_id":sampler.target["node_id"],"outcome":"failed","milliseconds":started.elapsed().as_millis() as u64,"scrape_milliseconds":sampler.scraped.map(|scraped| scraped.as_millis() as u64)});
-        match outcome {
-            Ok(Sampled::Unknown) => event["outcome"] = "unknown".into(),
-            Ok(Sampled::Refused(reason)) => {
-                event["outcome"] = "refused".into();
-                event["reason"] = reason.into();
+        let mut event = sample_observation(&sampler, &outcome, started.elapsed(), sampled_period);
+        if let Ok(Sampled::Accepted(Some(renewal))) = outcome {
+            let (revision, tokens) = (renewal.revision, renewal.tokens.clone());
+            if renewals.send(renewal).await.is_err() {
+                return;
             }
-            Ok(Sampled::Accepted(renewal)) => {
-                event["outcome"] = "accepted".into();
-                if let Some(renewal) = renewal {
-                    let (revision, tokens) = (renewal.revision, renewal.tokens.clone());
-                    event["revision"] = revision.into();
-                    if renewals.send(renewal).await.is_err() {
-                        return;
-                    }
-                    event["ledgers"] = deliver(&kube, &tokens, revision, sampler.period * 2)
-                        .await
-                        .into();
-                }
-            }
-            Err(_) => {}
+            let delivery = deliver(&kube, &tokens, revision, sampler.period * 2).await;
+            event["ledgers"] = delivery.ledgers.into();
+            event["confirmed_ledgers"] = delivery.confirmed_ledgers.into();
+            event["ledger_delivery_complete"] = delivery.ledger_delivery_complete.into();
+            event["ledger_delivery_milliseconds"] = delivery.ledger_delivery_milliseconds.into();
         }
         eprintln!("{event}");
         next = started + sampler.period;
     }
 }
+#[derive(serde::Serialize)]
+struct LedgerDelivery {
+    /// A confirmed lower bound, even when an unanswered PATCH may have committed.
+    confirmed_ledgers: Option<u64>,
+    /// The total is known only after every result settled without error or deadline expiry.
+    ledgers: Option<u64>,
+    ledger_delivery_complete: bool,
+    ledger_delivery_milliseconds: Option<u64>,
+}
 /// Writes each renewed token into its database's ledger, a few at a time and bounded as a whole;
-/// returns how many ledgers changed. A write cut off is superseded by the next renewal.
+/// observes confirmed changes and unknown outcomes. A write cut off is superseded by the next renewal.
 async fn deliver(
     kube: &Kubernetes,
     tokens: &HashMap<String, String>,
     revision: u64,
     bound: Duration,
-) -> u64 {
+) -> LedgerDelivery {
+    let started = Instant::now();
     let mut writes = futures_util::stream::iter(tokens.iter().map(|(id, token)| async move {
         write_ledger(kube, &json!({ "id": id }), Some(token), Some(revision)).await
     }))
     .buffer_unordered(4);
     let mut written = 0;
-    let _ = tokio::time::timeout(bound, async {
+    let mut known = true;
+    let finished = tokio::time::timeout(bound, async {
         while let Some(result) = writes.next().await {
+            known &= result.is_ok();
             written += u64::from(matches!(result, Ok(true)));
         }
     })
-    .await;
-    written
+    .await
+    .is_ok();
+    let confirmed = observation_integer(written);
+    let complete = finished && known && confirmed.is_some();
+    LedgerDelivery {
+        confirmed_ledgers: confirmed,
+        ledgers: complete.then_some(confirmed).flatten(),
+        ledger_delivery_complete: complete,
+        ledger_delivery_milliseconds: observation_milliseconds(started.elapsed()),
+    }
 }
 /// Samples every Node once; the controller starts these slow scrapes at most every 60 seconds.
 pub async fn samples(kube: &Kubernetes, fleet: &Value) -> Result<HashMap<String, Value>, Error> {
@@ -1129,6 +1193,12 @@ mod tests {
         sampler.sample(&server.k8s, &api).await.unwrap();
         let stalled = Instant::now();
         assert!(sampler.sample(&server.k8s, &api).await.is_err());
+        assert!(
+            sampler
+                .posted
+                .is_some_and(|posted| posted >= Duration::from_secs(2))
+        );
+        assert!(sampler.scraped.is_some());
         // Bounded by the nonce's validity, 2.5 periods.
         assert!(stalled.elapsed() < Duration::from_secs(4));
         sampler.sample(&server.k8s, &api).await.unwrap();
@@ -1150,6 +1220,8 @@ mod tests {
             sampler.sample(&server.k8s, &api).await.unwrap(),
             Sampled::Unknown
         ));
+        assert!(sampler.scraped.is_none());
+        assert!(sampler.posted.is_none());
         let a = Value::from("a".repeat(32));
         assert_eq!(nonces(&requests), [Value::Null, a.clone(), a]);
     }
@@ -1221,5 +1293,170 @@ mod tests {
                 .count(),
             1
         );
+    }
+    fn delivery_fixture(server: &Server) -> (String, String) {
+        let database = "db000000000000000001";
+        let soon =
+            (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as u64 + 60_000;
+        let previous = token(database, 3, &uid(1), 3, soon);
+        let renewed = token(database, 3, &uid(1), 7, soon);
+        server.put(json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":format!("storage-{database}"),"namespace":"pgcf-system","uid":uid(40),"labels":{"pgcf.io/database-id":database}},"data":{"state":"{}","write-authority":previous}}));
+        (database.into(), renewed)
+    }
+    #[tokio::test]
+    async fn ledger_delivery_observes_confirmed_changes_and_actual_unchanged_zero() {
+        let server = Server::start().await;
+        let (database, renewed) = delivery_fixture(&server);
+        let tokens = HashMap::from([(database, renewed)]);
+        let changed =
+            serde_json::to_value(deliver(&server.k8s, &tokens, 7, Duration::from_secs(2)).await)
+                .unwrap();
+        assert_eq!(changed["confirmed_ledgers"], 1);
+        assert_eq!(changed["ledgers"], 1);
+        assert_eq!(changed["ledger_delivery_complete"], true);
+        assert!(changed["ledger_delivery_milliseconds"].as_u64().is_some());
+        let unchanged =
+            serde_json::to_value(deliver(&server.k8s, &tokens, 7, Duration::from_secs(2)).await)
+                .unwrap();
+        assert_eq!(unchanged["confirmed_ledgers"], 0);
+        assert_eq!(unchanged["ledgers"], 0);
+        assert_eq!(unchanged["ledger_delivery_complete"], true);
+    }
+    #[tokio::test]
+    async fn ledger_delivery_lost_reply_is_unknown_even_when_the_patch_committed() {
+        let server = Server::start().await;
+        let (database, renewed) = delivery_fixture(&server);
+        server.state.lock().unwrap().lose = Some(Box::new(|_, _| true));
+        let tokens = HashMap::from([(database.clone(), renewed.clone())]);
+        let observed =
+            serde_json::to_value(deliver(&server.k8s, &tokens, 7, Duration::from_secs(2)).await)
+                .unwrap();
+        assert!(
+            server
+                .get(
+                    "ConfigMap",
+                    Some("pgcf-system"),
+                    &format!("storage-{database}")
+                )
+                .unwrap()["data"]["write-authority"]
+                == renewed
+        );
+        assert_eq!(observed["confirmed_ledgers"], 0);
+        assert_eq!(observed["ledgers"], Value::Null);
+        assert_eq!(observed["ledger_delivery_complete"], false);
+        assert!(observed["ledger_delivery_milliseconds"].as_u64().is_some());
+    }
+    #[tokio::test]
+    async fn ledger_delivery_deadline_is_unknown_never_an_observed_zero() {
+        let server = Server::start().await;
+        let (database, renewed) = delivery_fixture(&server);
+        let observed = serde_json::to_value(
+            deliver(
+                &server.k8s,
+                &HashMap::from([(database, renewed)]),
+                7,
+                Duration::ZERO,
+            )
+            .await,
+        )
+        .unwrap();
+        assert_eq!(observed["confirmed_ledgers"], 0);
+        assert_eq!(observed["ledgers"], Value::Null);
+        assert_eq!(observed["ledger_delivery_complete"], false);
+    }
+    #[test]
+    fn sample_observation_selects_monotonic_phases_and_only_known_reasons() {
+        let mut sampler = Sampler::new(&target(Value::Null), WRAPPER).unwrap();
+        sampler.nonce = Some("private_nonce_marker".into());
+        sampler.target["body"] =
+            json!({"token":"private_token_marker","address":"private_address_marker"});
+        sampler.scraped = Some(Duration::from_millis(7));
+        sampler.posted = Some(Duration::from_millis(19));
+        let refused = Ok(Sampled::Refused(
+            "thin_storage_sample_witness_changed".into(),
+        ));
+        let event = sample_observation(
+            &sampler,
+            &refused,
+            Duration::from_millis(30),
+            Duration::from_millis(1000),
+        );
+        assert_eq!(event["scrape_milliseconds"], 7);
+        assert_eq!(event["post_roundtrip_milliseconds"], 19);
+        assert_eq!(event["milliseconds"], 30);
+        assert_eq!(event["period_milliseconds"], 1000);
+        assert_eq!(event["node_uid"], uid(1));
+        assert_eq!(event["reason"], "thin_storage_sample_witness_changed");
+        let mut fields = event
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            [
+                "event",
+                "milliseconds",
+                "next_period_milliseconds",
+                "node_id",
+                "node_uid",
+                "outcome",
+                "period_milliseconds",
+                "post_roundtrip_milliseconds",
+                "reason",
+                "scrape_milliseconds"
+            ]
+        );
+        let prefixed = Ok(Sampled::Refused(
+            "thin_storage_sample_witness_changed_private_nonce_marker".into(),
+        ));
+        let event = sample_observation(
+            &sampler,
+            &prefixed,
+            Duration::ZERO,
+            Duration::from_millis(1000),
+        );
+        assert_eq!(event["reason"], Value::Null);
+        let failed = Err("private_error_body_and_address_marker".into());
+        let failed = sample_observation(
+            &sampler,
+            &failed,
+            Duration::ZERO,
+            Duration::from_millis(1000),
+        );
+        assert_eq!(failed["outcome"], "failed");
+        let serialized = format!("{event}{failed}");
+        for private in [
+            "private_nonce_marker",
+            "private_token_marker",
+            "private_address_marker",
+            "private_error_body_and_address_marker",
+        ] {
+            assert!(!serialized.contains(private));
+        }
+    }
+    #[test]
+    fn observation_durations_preserve_zero_and_refuse_unrepresentable_metrics() {
+        assert_eq!(observation_milliseconds(Duration::ZERO), Some(0));
+        assert_eq!(observation_milliseconds(Duration::MAX), None);
+        let mut sampler = Sampler::new(&target(Value::Null), WRAPPER).unwrap();
+        sampler.scraped = Some(Duration::MAX);
+        sampler.posted = Some(Duration::MAX);
+        let event = sample_observation(
+            &sampler,
+            &Ok(Sampled::Unknown),
+            Duration::MAX,
+            Duration::MAX,
+        );
+        for field in [
+            "milliseconds",
+            "period_milliseconds",
+            "scrape_milliseconds",
+            "post_roundtrip_milliseconds",
+        ] {
+            assert_eq!(event[field], Value::Null);
+        }
     }
 }
