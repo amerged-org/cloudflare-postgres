@@ -30,6 +30,7 @@ import {
   nativeKubeconfig,
   nativeTalosConfig,
   runCommand,
+  shellQuote,
   canonical,
   type CommandResult,
 } from "./bootstrap.ts";
@@ -108,7 +109,9 @@ const devices = (dm: string) =>
 export async function readThinLvm(
   exec: (args: string[]) => Promise<CommandResult>,
   lvFields = THIN_LV_FIELDS,
+  mode: "product" | "qualification" = "qualification",
 ) {
+  if (mode === "product") return await readThinLvmBatch(exec, lvFields);
   const [vgsArgs, lvsArgs, dmArgs] = thinLvmReadCommands(lvFields);
   const before = await exec(dmArgs!);
   const [vg, lv] = await Promise.all([exec(vgsArgs!), exec(lvsArgs!)]);
@@ -118,6 +121,45 @@ export async function readThinLvm(
     lvs: lv.stdout,
     dm: after.stdout,
     before: before.stdout,
+  };
+}
+/** Product identity turns avoid relay round trips; the qualified scratch procedure stays unchanged. */
+async function readThinLvmBatch(
+  exec: (args: string[]) => Promise<CommandResult>,
+  lvFields = THIN_LV_FIELDS,
+) {
+  const [vgsArgs, lvsArgs, dmArgs] = thinLvmReadCommands(lvFields);
+  // No LVM/device mutation or shell-interpreted argument: the exact existing reads execute on the
+  // driver, with DM strictly before and after both LVM reports, in one bounded driver command.
+  const result = await exec([
+    "sh",
+    "-ec",
+    [
+      "printf '%s\\0' 'pgcf.lvm.read.v1'",
+      ...[dmArgs!, vgsArgs!, lvsArgs!, dmArgs!].flatMap((args) => [
+        args.map(shellQuote).join(" "),
+        "printf '\\0'",
+      ]),
+      "printf '%s\\0' 'pgcf.lvm.read.end.v1'",
+    ].join("\n"),
+  ]);
+  if (result.exit_code !== 0)
+    throw new BootstrapError("thin_storage_command_failed");
+  if (Buffer.byteLength(result.stdout) > 2 * 1024 * 1024)
+    throw new BootstrapError("thin_storage_output_limit");
+  const parts = result.stdout.split("\0");
+  if (
+    parts.length !== 7 ||
+    parts[0] !== "pgcf.lvm.read.v1" ||
+    parts[5] !== "pgcf.lvm.read.end.v1" ||
+    parts[6] !== ""
+  )
+    throw new BootstrapError("thin_storage_readback_invalid");
+  return {
+    vgs: parts[2]!,
+    lvs: parts[3]!,
+    dm: parts[4]!,
+    before: parts[1]!,
   };
 }
 /** A read-only command repeats a failed relay round trip or native command timeout at most twice.
@@ -844,6 +886,8 @@ export interface ThinNodeScope {
   /** Expected current boot; null accepts and returns the observed boot. */
   boot_id: string | null;
   kernel_version: string | null;
+  /** Qualification retains its accepted read protocol, including shared pool-action readbacks. */
+  lvm_read_mode?: "product" | "qualification";
 }
 export interface ThinNode {
   authorize(): Promise<void>;
@@ -867,6 +911,40 @@ export interface ThinNode {
   driverRead(args: string[], timeout?: number): Promise<CommandResult>;
   freshDriver(): Promise<void>;
   readLvm(): Promise<ThinLvmFacts>;
+}
+/** Independent read-only measurements of the pinned driver's software and cgroup view. */
+export async function readThinDriverSoftware(
+  driverRead: ThinNode["driverRead"],
+) {
+  const [hashesRaw, toolsRaw, cgroupRaw] = await Promise.all([
+    driverRead([
+      "sha256sum",
+      "/usr/local/bin/lvm-driver",
+      "/sbin/lvm",
+      "/usr/sbin/pdata_tools",
+    ]),
+    driverRead(["thin_check", "--version"]),
+    driverRead(["cat", "/sys/fs/cgroup/cgroup.controllers"]),
+  ]);
+  const hashes = hashesRaw.stdout
+    .trim()
+    .split("\n")
+    .map((value) => value.split(/\s+/)[0]!);
+  const tools = toolsRaw.stdout.trim();
+  const cgroup = cgroupRaw.stdout.split(/\s+/).includes("io");
+  return { hashes, tools, cgroup };
+}
+/** The same physical reader returned by verifyThinNode; callers select only a read protocol. */
+export async function thinNodeLvmReadback(
+  scope: Pick<ThinNodeScope, "lvm_read_mode">,
+  driverRead: ThinNode["driverRead"],
+) {
+  const read = await readThinLvm(
+    (args) => driverRead(args),
+    THIN_LV_FIELDS,
+    scope.lvm_read_mode ?? "product",
+  );
+  return thinLvmFacts(read.vgs, read.lvs, read.dm, read.before);
 }
 /** Node, cluster, boot, kernel, host guard, driver binaries and live module, before any write. */
 export async function verifyThinNode(
@@ -985,7 +1063,10 @@ export async function verifyThinNode(
     );
   const freshDriver = async () => {
     await authorize();
-    const next = await get(["pod", podName, "--namespace", "openebs"]);
+    const [next, bootRaw] = await Promise.all([
+      get(["pod", podName, "--namespace", "openebs"]),
+      talos(["read", "/proc/sys/kernel/random/boot_id"]),
+    ]);
     if (
       metadata(next).uid !== driverUid ||
       !ready(next) ||
@@ -994,7 +1075,7 @@ export async function verifyThinNode(
       !items(object(next.spec).containers).some(
         (c) => c.name === "openebs-lvm-plugin" && c.image === driverImage,
       ) ||
-      (await talos(["read", "/proc/sys/kernel/random/boot_id"])).trim() !== boot
+      bootRaw.trim() !== boot
     )
       throw new BootstrapError("thin_storage_driver_identity_changed");
   };
@@ -1007,23 +1088,7 @@ export async function verifyThinNode(
       throw new BootstrapError("thin_storage_command_failed");
     return result;
   };
-  const hashes = (
-    await driverRead([
-      "sha256sum",
-      "/usr/local/bin/lvm-driver",
-      "/sbin/lvm",
-      "/usr/sbin/pdata_tools",
-    ])
-  ).stdout
-    .trim()
-    .split("\n")
-    .map((v) => v.split(/\s+/)[0]!);
-  const tools = (await driverRead(["thin_check", "--version"])).stdout.trim();
-  const cgroup = (
-    await driverRead(["cat", "/sys/fs/cgroup/cgroup.controllers"])
-  ).stdout
-    .split(/\s+/)
-    .includes("io");
+  const { hashes, tools, cgroup } = await readThinDriverSoftware(driverRead);
   const moduleLive = /^dm_thin_pool\s/m.test(modules);
   if (
     hashes[0] !== sources.driver.binary_sha256 ||
@@ -1035,8 +1100,7 @@ export async function verifyThinNode(
   )
     throw new BootstrapError("thin_storage_driver_unqualified");
   const readLvm = async () => {
-    const read = await readThinLvm((args) => driverRead(args));
-    return thinLvmFacts(read.vgs, read.lvs, read.dm, read.before);
+    return await thinNodeLvmReadback(scope, driverRead);
   };
   return {
     authorize,
@@ -1142,6 +1206,7 @@ export async function runThinStorage(
           host_extension_version: input.host_extension.version,
           boot_id: lease.boot_id,
           kernel_version: lease.kernel_version,
+          lvm_read_mode: "product",
         },
         async () => {
           const current = object(await call({ kind: "status" }));
@@ -1209,13 +1274,14 @@ export async function runThinStorage(
           "--ignore-not-found",
           "--output=json",
         ]);
+        let actual: ObjectValue;
         if (!existing.stdout.trim()) {
           if (!input.class_creation_allowed)
             throw new BootstrapError("thin_storage_class_identity_missing");
           await freshDriver();
           await kube(["create", "--filename=-"], JSON.stringify(expected));
-        }
-        const actual = await get([expected.kind, expected.metadata.name]);
+          actual = await get([expected.kind, expected.metadata.name]);
+        } else actual = object(JSON.parse(existing.stdout));
         const normalized = { ...actual };
         delete normalized.metadata;
         const body = { ...expected };

@@ -683,6 +683,7 @@ class Qualifier {
           : this.input.host_extension.version,
         boot_id: setup?.identity.boot_id ?? null,
         kernel_version: setup?.identity.kernel_version ?? null,
+        lvm_read_mode: "qualification",
       },
       () => this.lease(),
     );
@@ -695,6 +696,7 @@ class Qualifier {
     const read = await readThinLvm(
       (args) => this.node.driverRead(args),
       QUALIFICATION_LV_FIELDS,
+      "qualification",
     );
     const value = parseQualificationLvm(
       read.vgs,
