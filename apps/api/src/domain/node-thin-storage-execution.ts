@@ -269,7 +269,6 @@ export function composeThinStorageAuthority(input: {
   guardSeconds: number;
   writeAllowed: boolean;
 }) {
-  const iso = (ms: number) => new Date(ms).toISOString();
   return NodeThinStorageAuthority.parse({
     ...input.identity,
     revision: input.revision,
@@ -728,48 +727,61 @@ async function acceptIdentityProof(
       expires_at: issued + THIN_INVENTORY_MAX_SECONDS * 1000,
       revision: lease.authority_revision + 1,
     };
+  // A report for another lease, or one past its lease, ends nothing: the executor retries.
   if (
     report.expected_revision !== row.lease_revision ||
-    a.node_id !== nodeId ||
-    a.node_uid !== row.node_uid ||
-    a.cluster_uid !== row.cluster_uid ||
-    a.name !== lease.name ||
     a.revision !== inventory.revision ||
     (a.inventory_observed_at !== undefined &&
       (a.inventory_observed_at !== iso(inventory.observed_at) ||
         a.inventory_expires_at !== iso(inventory.expires_at) ||
         a.inventory_revision !== inventory.revision)) ||
+    a.observed_at !== lease.issued_at ||
+    a.expires_at !== lease.expires_at ||
+    Date.parse(a.expires_at) <= now ||
+    Date.parse(a.captured_at) > now + 5000
+  )
+    return closed();
+  // Identity, qualification and uncertain pool-action refusals block the node, as they did before
+  // the executor's refused callback became a transient failure.
+  const block = async (code: string): Promise<never> => {
+    await env.DB.prepare(
+      "UPDATE node_thin_storage SET status='blocked',error_code=?,lease_id=NULL,lease_expires_at=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
+    )
+      .bind(code, nodeId, row.lease_id, row.lease_revision)
+      .run();
+    return closed();
+  };
+  const prior = row.qualification_json
+    ? (JSON.parse(row.qualification_json) as { system_uuid?: string })
+    : null;
+  if (
+    a.node_id !== nodeId ||
+    a.node_uid !== row.node_uid ||
+    a.cluster_uid !== row.cluster_uid ||
+    a.name !== lease.name ||
     a.profile_revision !== row.profile_revision ||
     a.profile_sha256 !== row.profile_sha256 ||
     a.storage_class !== thinStorageClass(row.profile_sha256) ||
     a.volume_group_uuid !== row.volume_group_uuid ||
     a.driver_image !== row.qualified_driver_image ||
-    a.observed_at !== lease.issued_at ||
-    a.expires_at !== lease.expires_at ||
-    Date.parse(a.expires_at) <= now ||
-    Date.parse(a.captured_at) > now + 5000 ||
+    report.boot_id !== lease.boot_id ||
+    (prior?.system_uuid && prior.system_uuid !== report.system_uuid)
+  )
+    return block("thin_storage_report_identity_changed");
+  if (
     report.software.driver_sha256 !== sources.driver.binary_sha256 ||
     report.software.lvm_sha256 !== sources.driver.lvm_binary_sha256 ||
     report.software.tools_sha256 !== sources.thin_tools.binary_sha256 ||
     report.software.thin_tools_version !== sources.thin_tools.version ||
     !report.software.thin_module_live ||
-    !report.software.cgroup_host_view
-  )
-    return closed();
-  if (
-    report.boot_id !== lease.boot_id ||
+    !report.software.cgroup_host_view ||
     report.software.host_extension_image !== input.host_extension.image ||
     report.software.host_configuration_sha256 !==
       input.host_configuration.status.sha256 ||
     (lease.kernel_version !== null &&
       report.software.kernel_version !== lease.kernel_version)
   )
-    return closed();
-  const prior = row.qualification_json
-    ? (JSON.parse(row.qualification_json) as { system_uuid?: string })
-    : null;
-  if (prior?.system_uuid && prior.system_uuid !== report.system_uuid)
-    return closed();
+    return block("thin_storage_report_unqualified");
   if (lease.action) {
     const action = lease.action,
       pool = a.physical.thin_pool;
@@ -779,10 +791,10 @@ async function acceptIdentityProof(
       pool.metadata_total_bytes < action.target_metadata_bytes ||
       (action.kind === "grow" && a.pool_uuid !== action.expected_pool_uuid) ||
       (action.kind === "initialize" &&
-        report.pool_tag !== `pgcf.node.${row.node_uid}`)
+        report.pool_tag !== `pgcf.node.${row.node_uid}`) ||
+      (action.state === "pending" && report.action_applied)
     )
-      return closed();
-    if (action.state === "pending" && report.action_applied) return closed();
+      return block("thin_storage_action_unconfirmed");
   }
   const holds = await storageHolds(env, nodeId, row.node_uid, a),
     headroom = minimumHeadroom(lease.profile, a, holds),
@@ -809,7 +821,7 @@ async function acceptIdentityProof(
         (lv) => lv.lv_uuid === v.lv_uuid && lv.name === v.volume_handle,
       )
     )
-      return closed();
+      return block("thin_storage_report_identity_changed");
   }
   const stored = retainedPoolAuthority(row);
   // The proof's own reading must not exceed the newest sample before its lease plus what Cloudflare
@@ -933,7 +945,7 @@ async function acceptIdentityProof(
     });
     const value = JSON.stringify(receipt);
     if (database.volume && JSON.stringify(database.volume) !== value)
-      return closed();
+      return block("thin_storage_report_identity_changed");
     statements.push(
       env.DB.prepare(
         `UPDATE databases SET storage_volume_json=? WHERE id=? AND node_id=? AND generation=? AND storage_generation=? AND json_extract(storage_profile_json,'$.node_uid')=? AND json_extract(storage_profile_json,'$.pool_uuid')=? AND (storage_volume_json IS NULL OR storage_volume_json=?) AND ${accepted}`,

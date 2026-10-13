@@ -343,3 +343,39 @@ it("records a protective stop from an identity proof whose composed authority al
     observed_power: "hibernated",
   });
 });
+
+it("blocks the node itself when a report is unqualified, never for a report of another lease", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const lease = await prepareThinStorageLease(f.local, f.node);
+  // A report for another lease ends nothing; the executor retries it as a transient refusal.
+  await expect(
+    report(f, {}, { expected_revision: lease!.lease.revision + 1 }),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(await row(f)).toMatchObject({ status: "ready", error_code: null });
+  await expect(
+    report(f, {}, { software: { driver_sha256: "0".repeat(64) } }),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(await row(f)).toMatchObject({
+    status: "blocked",
+    error_code: "thin_storage_report_unqualified",
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT lease_id FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first("lease_id"),
+  ).toBeNull();
+});
+
+it("blocks the node itself when a report's physical identity changed", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  await prepareThinStorageLease(f.local, f.node);
+  await expect(
+    report(f, {}, { system_uuid: crypto.randomUUID() }),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(await row(f)).toMatchObject({
+    status: "blocked",
+    error_code: "thin_storage_report_identity_changed",
+  });
+});

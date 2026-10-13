@@ -135,11 +135,19 @@ export async function turnRequested(f: Fixture) {
 }
 
 /** The executor's slow report for the current lease, as runThinStorage builds it. */
-export async function report(f: Fixture, authority: object = {}) {
+export async function report(
+  f: Fixture,
+  authority: object = {},
+  overrides: {
+    software?: object;
+    system_uuid?: string;
+    expected_revision?: number;
+  } = {},
+) {
   const input = await thinStorageInput(f.local, f.node),
     lease = input.lease;
   return recordThinStorageReport(f.local, f.node, {
-    expected_revision: lease.revision,
+    expected_revision: overrides.expected_revision ?? lease.revision,
     authority: NodeThinStorageAuthority.parse({
       ...f.authority,
       revision: lease.authority_revision + 1,
@@ -150,7 +158,7 @@ export async function report(f: Fixture, authority: object = {}) {
       ...authority,
     }),
     boot_id: f.qualified.bootId,
-    system_uuid: f.qualified.qualification.system_uuid,
+    system_uuid: overrides.system_uuid ?? f.qualified.qualification.system_uuid,
     pool_tag: null,
     action_applied: false,
     software: {
@@ -166,6 +174,7 @@ export async function report(f: Fixture, authority: object = {}) {
       thin_tools_version: sources.thin_tools.version,
       thin_module_live: true,
       cgroup_host_view: true,
+      ...overrides.software,
     },
   });
 }
