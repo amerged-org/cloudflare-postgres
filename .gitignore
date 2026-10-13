@@ -11,6 +11,8 @@ node_modules/
 dist/
 coverage/
 /target/
+# Native test crash dumps can contain process memory.
+/core
 
 # Wrangler: only the example config is tracked; generated runtime types are rebuilt by `wrangler types`
 wrangler.jsonc
