@@ -124,12 +124,14 @@ pool binding holds the volume (A8.1.4).
    once it is recorded; the first bind of a retained thick volume records it.
 3. `DM_DEV_STATUS` reports open count 0 (sc/storage_dm.rs:83-90; today reached only behind the
    thin identity check, extended to linear targets).
-4. No superblock with the LV's `dev_t` exists in any mount namespace. The agent walks every mount
-   namespace with `NS_MNT_GET_NEXT` and reads its mounts with `listmount` and
-   `statmount(STATMOUNT_SB_BASIC)`; as root in the initial user namespace it sees all of them,
-   including namespaces that no process holds [U28] (unproven from the agent's context, A8.7).
-   A cross-check reads every process's `mountinfo` through the host `/proc` handle the agent
-   already keeps (sc/host_context.rs:21-22, 187-199).
+4. No foreign mount of the LV's `dev_t` may exist. The proposed global proof is incomplete:
+   `NS_MNT_GET_NEXT` requires the calling inspector to remain in the initial PID namespace with
+   initial-user `CAP_SYS_ADMIN` [U54], whereas the controller child enters CRI's PID namespace.
+   A retained parent inspector can enumerate ordinary mount namespaces, including fd-held ones,
+   and use `listmount`, `statmount` and the host `/proc` cross-check [U28]. Anonymous detached
+   `fsmount` and `open_tree` trees do not enter that enumeration [U55]. A complete post-bind
+   exclusion proof therefore remains required before a binding can serve; successful ordinary
+   scans and device open count one must never be reported as global completeness.
 5. The mountpoint is the `data` directory of the pool Pod's `volume` emptyDir, opened with
    `openat2(RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)` below `/var/lib/kubelet/pods/<pool Pod UID>`:
    a root-owned 0755 directory on that Pod's tmpfs, prepared while the Pod was tenant-free
@@ -472,8 +474,9 @@ owner decision.
 1. Propagation of the agent's mount into the pool containers and into kubelet's namespace under
    Talos workload isolation (A8.1.3).
 2. The EBUSY-protected emptyDir teardown on EU1 while the LV is mounted beneath.
-3. Mount-namespace enumeration with `NS_MNT_GET_NEXT`, `listmount` and `statmount` from the
-   agent's context on Talos 1.14.2.
+3. Complete mount exclusion on Talos 1.14.2: retain an initial-PID inspector for ordinary
+   namespace enumeration and resolve the anonymous detached-mount reference gap [U54][U55].
+   The existing child context and ordinary namespace scans alone cannot satisfy this gate.
 4. CNPG resuming after pool phases: archiving on the same timeline, Lease hand-back, no
    empty-archive refusal.
 5. Pool base backups and retention against the plugin's catalog, and restore from them.
@@ -1120,3 +1123,11 @@ reruns the adoption and alias checks before a profile with the new hashes is app
 - [U53] Linux 6.18.54, when a PID namespace's init exits, every remaining process in it is killed:
   https://github.com/gregkh/linux/blob/v6.18.54/kernel/exit.c#L608-L633 and
   https://github.com/gregkh/linux/blob/v6.18.54/kernel/pid_namespace.c#L192-L231
+
+- [U54] Linux 6.18.54, global namespace visibility requires the initial PID namespace and
+  initial-user capability:
+  https://github.com/gregkh/linux/blob/v6.18.54/kernel/nscommon.c#L75-L79
+- [U55] Linux 6.18.54, anonymous namespace allocation omits its namespace-tree ID; `fsmount`
+  places a detached mount in such a namespace and returns an O_PATH descriptor:
+  https://github.com/gregkh/linux/blob/v6.18.54/fs/namespace.c#L3846-L3877 and
+  https://github.com/gregkh/linux/blob/v6.18.54/fs/namespace.c#L4128-L4147
