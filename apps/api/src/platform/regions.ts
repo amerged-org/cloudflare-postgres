@@ -31,7 +31,9 @@ import {
   readRegionBootstrapMaterial,
   synchronizeRegionBootstrapMaterial,
 } from "../domain/region-material-revisions.ts";
-import { nodeRow, regionRow, type Row } from "./rows.ts";
+import { nodeInventoryRow, regionRow, type Row } from "./rows.ts";
+import { readFleetNodeReleaseInventories } from "../domain/fleet-releases.ts";
+import { readLatestFleetPatchStatuses } from "../domain/fleet-patches.ts";
 
 export async function createRegion(
   c: ApiContext,
@@ -133,7 +135,51 @@ export async function listNodes(c: ApiContext): Promise<Response> {
   )
     .bind(...cursor.bindings, pagination.limit + 1)
     .all<Row>();
-  return c.json(pagination.envelope(rows.results.map(nodeRow)), 200);
+  // Enrich only the public page, not the extra cursor sentinel.
+  const pageRows = rows.results.slice(0, pagination.limit),
+    data = await inventoryRows(c, pageRows);
+  const envelope = pagination.envelope(
+    rows.results as (Row & { id: string; created_at: string })[],
+  );
+  return c.json({ ...envelope, data }, 200);
+}
+
+async function inventoryRows(c: ApiContext, rows: Row[]) {
+  const ids = rows.map((row) => String(row.id));
+  const [releases, patches] = await Promise.all([
+    readFleetNodeReleaseInventories(c.env.DB, ids),
+    readLatestFleetPatchStatuses(
+      c.env.DB,
+      rows.map((row) => ({
+        node_id: String(row.id),
+        node_uid: row.node_uid as string | null,
+      })),
+    ),
+  ]);
+  return rows.map((row) => {
+    const release = releases.get(String(row.id));
+    if (!release || release.status.node_uid !== row.node_uid)
+      throw new ApiError("conflict", "Node inventory identity changed");
+    return nodeInventoryRow(row, release, patches.get(String(row.id)));
+  });
+}
+
+export async function getNode(c: ApiContext, id: string) {
+  await requireScope(c, "admin");
+  const row = await c.env.DB.prepare("SELECT * FROM nodes WHERE id=?")
+    .bind(id)
+    .first<Row>();
+  if (!row) throw new ApiError("not_found", "Node not found");
+  return c.json((await inventoryRows(c, [row]))[0], 200);
+}
+
+export async function getRegion(c: ApiContext, id: string) {
+  await requireScope(c, "admin");
+  const row = await c.env.DB.prepare("SELECT * FROM regions WHERE id=?")
+    .bind(id)
+    .first<Row>();
+  if (!row) throw new ApiError("not_found", "Region not found");
+  return c.json(regionRow(row), 200);
 }
 
 export async function getRegionBootstrapMaterial(

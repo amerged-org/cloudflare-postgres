@@ -7,7 +7,8 @@ import {
   ApiKeyId,
   ErrorBody,
   ListQuery,
-  Node,
+  NodeId,
+  NodeInventory,
   Project,
   ProjectCreate,
   ProjectId,
@@ -46,6 +47,8 @@ import {
 } from "../platform/projects.ts";
 import {
   createRegion,
+  getNode,
+  getRegion,
   listNodes,
   listRegions,
   getRegionBootstrapMaterial,
@@ -329,8 +332,34 @@ export function registerPlatform(app: ApiApp): void {
       security,
       tags: ["Nodes"],
       request: { query: ListQuery },
-      responses: response(listEnvelope(Node), 200),
+      responses: response(listEnvelope(NodeInventory), 200),
     },
     listNodes,
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/nodes/{id}",
+      security,
+      tags: ["Nodes"],
+      summary: "Read a node's observed fleet inventory",
+      request: { params: z.object({ id: NodeId }) },
+      responses: response(NodeInventory, 200),
+    },
+    async (c) => getNode(c, NodeId.parse(c.req.param("id"))),
+  );
+  register(
+    app,
+    {
+      method: "get",
+      path: "/v1/regions/{id}",
+      security,
+      tags: ["Regions"],
+      summary: "Read a region",
+      request: { params: z.object({ id: RegionId }) },
+      responses: response(Region, 200),
+    },
+    async (c) => getRegion(c, RegionId.parse(c.req.param("id"))),
   );
 }

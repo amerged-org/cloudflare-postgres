@@ -127,6 +127,23 @@ export async function readFleetPatchStatus(
 ): Promise<FleetPatchStatus> {
   return status(await readFleetPatch(env, id));
 }
+/** Latest history for each page member's current physical identity, with the public status projection. */
+export async function readLatestFleetPatchStatuses(
+  db: D1Database,
+  nodes: { node_id: string; node_uid: string | null }[],
+) {
+  if (nodes.length === 0) return new Map<string, FleetPatchStatus>();
+  const rows = await db
+    .prepare(
+      `SELECT p.* FROM fleet_patch_operations p JOIN json_each(?) member
+    ON p.node_id=json_extract(member.value,'$.node_id') AND p.node_uid=json_extract(member.value,'$.node_uid')
+    WHERE p.operation_id=(SELECT latest.operation_id FROM fleet_patch_operations latest
+      WHERE latest.node_id=p.node_id AND latest.node_uid=p.node_uid ORDER BY latest.created_at DESC,latest.rowid DESC LIMIT 1)`,
+    )
+    .bind(JSON.stringify(nodes))
+    .all<PatchRow>();
+  return new Map(rows.results.map((row) => [row.node_id, status(row)]));
+}
 const baseFleetPatchAuthoritySql = `EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id
   JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id
   JOIN fleet_releases s ON s.id=a.release_id

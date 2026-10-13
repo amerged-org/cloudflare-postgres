@@ -187,15 +187,14 @@ interface NodeReleaseRow {
   observed_at: string | null;
   facts_json: string | null;
 }
-async function nodeRow(db: D1Database, id: string): Promise<NodeReleaseRow> {
-  const row = await db
-    .prepare(
-      `SELECT n.id node_id,n.region_id,n.node_uid,n.lost_at,n.database_placement_enabled,
+const nodeReleaseSelect = `SELECT n.id node_id,n.region_id,n.node_uid,n.lost_at,n.database_placement_enabled,
     a.revision,a.release_id,a.role,a.node_uid assigned_uid,r.agent_key_hash,
     o.agent_key_hash observed_agent_key_hash,o.node_uid observed_uid,o.assignment_revision observed_revision,o.observed_at,o.facts_json
     FROM nodes n JOIN regions r ON r.id=n.region_id LEFT JOIN fleet_node_releases a ON a.node_id=n.id
-    LEFT JOIN fleet_node_release_observations o ON o.node_id=n.id WHERE n.id=?`,
-    )
+    LEFT JOIN fleet_node_release_observations o ON o.node_id=n.id`;
+async function nodeRow(db: D1Database, id: string): Promise<NodeReleaseRow> {
+  const row = await db
+    .prepare(`${nodeReleaseSelect} WHERE n.id=?`)
     .bind(id)
     .first<NodeReleaseRow>();
   if (!row) throw new ApiError("not_found", "Node not found");
@@ -292,6 +291,13 @@ export async function readFleetNodeRelease(
 ): Promise<FleetNodeReleaseStatus> {
   const row = await nodeRow(db, id),
     desired = row.release_id ? await release(db, row.release_id) : null;
+  return nodeReleaseStatus(db, row, desired);
+}
+async function nodeReleaseStatus(
+  db: D1Database,
+  row: NodeReleaseRow,
+  desired: FleetRelease | null,
+): Promise<FleetNodeReleaseStatus> {
   let state: FleetNodeReleaseStatus["state"] = "unassigned";
   let differences: string[] = [];
   if (desired) {
@@ -352,7 +358,7 @@ export async function readFleetNodeRelease(
   if (state === "converged") {
     const { readCurrentNodeThinStorage } =
         await import("./node-thin-storage.ts"),
-      storage = await readCurrentNodeThinStorage({ DB: db }, id);
+      storage = await readCurrentNodeThinStorage({ DB: db }, row.node_id);
     // A receipt binds members that take databases; control/relay without placement stays thick.
     if (
       ((desired?.spec.thin_storage_qualification &&
@@ -381,6 +387,89 @@ export async function readFleetNodeRelease(
       : null,
     mismatches: differences,
   });
+}
+
+/** The same release projection, with shared base/spec reads batched for a bounded admin page. */
+export async function readFleetNodeReleaseInventories(
+  db: D1Database,
+  ids: string[],
+): Promise<
+  Map<
+    string,
+    {
+      status: FleetNodeReleaseStatus;
+      role: NodeReleaseRow["role"];
+      observationState: "current" | "stale" | "unobserved";
+    }
+  >
+> {
+  if (ids.length === 0) return new Map();
+  const rows = await db
+    .prepare(
+      `${nodeReleaseSelect} WHERE n.id IN(SELECT value FROM json_each(?))`,
+    )
+    .bind(JSON.stringify(ids))
+    .all<NodeReleaseRow>();
+  const releaseIds = [
+    ...new Set(
+      rows.results.flatMap((row) => (row.release_id ? [row.release_id] : [])),
+    ),
+  ];
+  const releases = new Map<string, FleetRelease>();
+  if (releaseIds.length) {
+    const specs = await db
+      .prepare(
+        "SELECT id,spec_json,spec_sha256,approved_at FROM fleet_releases WHERE id IN(SELECT value FROM json_each(?))",
+      )
+      .bind(JSON.stringify(releaseIds))
+      .all<{
+        id: string;
+        spec_json: string;
+        spec_sha256: string;
+        approved_at: string;
+      }>();
+    for (const spec of specs.results)
+      releases.set(
+        spec.id,
+        FleetRelease.parse({
+          id: spec.id,
+          spec: JSON.parse(spec.spec_json),
+          spec_sha256: spec.spec_sha256,
+          approved_at: spec.approved_at,
+        }),
+      );
+  }
+  return new Map(
+    await Promise.all(
+      rows.results.map(async (row) => {
+        const desired = row.release_id ? releases.get(row.release_id) : null;
+        if (desired === undefined)
+          throw new ApiError("not_found", "Fleet release not found");
+        const status = await nodeReleaseStatus(db, row, desired);
+        const assigned =
+          !row.lost_at &&
+          row.node_uid !== null &&
+          row.node_uid === row.assigned_uid;
+        const bound =
+          assigned &&
+          row.facts_json !== null &&
+          row.observed_uid === row.node_uid &&
+          row.observed_revision === row.revision &&
+          row.observed_agent_key_hash === row.agent_key_hash;
+        const at =
+          row.observed_at === null ? Number.NaN : Date.parse(row.observed_at);
+        const observationState = !bound
+          ? ("unobserved" as const)
+          : at < Date.now() - 180_000 || at > Date.now() + 5_000
+            ? ("stale" as const)
+            : ("current" as const);
+        return [
+          row.node_id,
+          { status, role: assigned ? row.role : null, observationState },
+        ] as const;
+      }),
+    ),
+  );
 }
 export async function getFleetNodeRelease(
   c: ApiContext,
