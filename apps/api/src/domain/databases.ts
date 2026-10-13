@@ -2,6 +2,7 @@
 import {
   archiveDestinationPath,
   DatabaseCreate,
+  DatabaseListQuery,
   type DatabaseResize,
   databaseMemoryReservationMib,
   databaseCpuReservationMillicores,
@@ -346,22 +347,38 @@ export async function createDatabase(
 }
 export async function listDatabases(c: ApiContext): Promise<Response> {
   const auth = await getAuth(c),
+    query = DatabaseListQuery.parse(c.req.query()),
     pagination = page(c, {
-      limit: c.req.query("limit"),
-      cursor: c.req.query("cursor"),
+      limit: query.limit,
+      cursor: query.cursor,
     });
-  const project = c.req.query("project_id");
+  const project = query.project_id;
   if (project) await assertProjectAccess(c, project);
   const boundProject = auth.scope === "integrator" ? auth.project_id : project;
   const cursor = pagination.where("d.created_at", "d.id");
+  const filters: string[] = [],
+    bindings: string[] = [];
+  for (const [column, value] of [
+    ["d.project_id", boundProject],
+    ["d.region_id", query.region_id],
+    ["d.node_id", query.node_id],
+    ["d.desired_state", query.desired_state],
+  ] as const)
+    if (value !== undefined && value !== null) {
+      filters.push(`${column}=?`);
+      bindings.push(value);
+    }
+  if (query.observed_state !== undefined) {
+    // Match databaseView: a current suspended database with no awake Pod is publicly hibernated.
+    filters.push(
+      "CASE WHEN d.desired_state='suspended' AND d.observed_state='provisioning' AND d.observed_generation=d.generation AND d.observed_power='hibernated' THEN 'hibernated' ELSE d.observed_state END=?",
+    );
+    bindings.push(query.observed_state);
+  }
   const result = await c.env.DB.prepare(
-    `SELECT d.* FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${boundProject ? "AND d.project_id=?" : ""} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
+    `SELECT d.* FROM databases d JOIN projects p ON p.id=d.project_id AND p.deleted_at IS NULL WHERE d.deleted_at IS NULL ${filters.map((filter) => `AND ${filter}`).join(" ")} AND ${cursor.sql} ORDER BY d.created_at DESC,d.id DESC LIMIT ?`,
   )
-    .bind(
-      ...(boundProject ? [boundProject] : []),
-      ...cursor.bindings,
-      pagination.limit + 1,
-    )
+    .bind(...bindings, ...cursor.bindings, pagination.limit + 1)
     .all<DatabaseRow>();
   return c.json(pagination.envelope(result.results.map(databaseView)));
 }

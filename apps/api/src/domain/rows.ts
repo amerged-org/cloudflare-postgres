@@ -88,6 +88,7 @@ export function databaseView(row: DatabaseRow): Database {
     id: row.id,
     project_id: row.project_id,
     region_id: row.region_id,
+    node_id: row.node_id,
     name: row.name,
     size_class_id: row.size_class_id,
     desired_state: row.desired_state,

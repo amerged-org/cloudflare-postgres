@@ -75,6 +75,7 @@ function fixtures() {
     id: newDatabaseId(),
     project_id: newProjectId(),
     region_id: "eu-test",
+    node_id: newNodeId(),
     name: "fixture",
     size_class_id: "small",
     desired_state: "running" as const,

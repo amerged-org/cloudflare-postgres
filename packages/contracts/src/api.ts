@@ -378,6 +378,7 @@ export const Database = z
     id: DatabaseId,
     project_id: ProjectId,
     region_id: RegionId,
+    node_id: NodeId.nullable(),
     name: DatabaseName,
     size_class_id: SizeClassId,
     desired_state: DesiredState,
@@ -393,6 +394,15 @@ export const Database = z
   })
   .meta({ id: "Database" });
 export type Database = z.infer<typeof Database>;
+
+export const DatabaseListQuery = ListQuery.extend({
+  project_id: ProjectId.optional(),
+  region_id: RegionId.optional(),
+  node_id: NodeId.optional(),
+  desired_state: DesiredState.optional(),
+  observed_state: ObservedState.optional(),
+}).meta({ id: "DatabaseListQuery" });
+export type DatabaseListQuery = z.infer<typeof DatabaseListQuery>;
 
 export const DatabaseCreate = z
   .strictObject({
