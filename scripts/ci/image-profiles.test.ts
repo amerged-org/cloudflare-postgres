@@ -19,6 +19,21 @@ import {
 
 const files = (...paths: string[]) =>
   paths.map((path, index) => ({ path, layer: 0, tarEntry: index }));
+
+test("pool supervisor qualification scans every scratch-image file and requires its executable", () => {
+  const profile = imageProfile("pool-supervisor");
+  assert.equal(isRustProfile(profile), true);
+  const content = files(
+    "pgcf-supervisor",
+    "licenses/pgcf/LICENSE",
+    "unexpected-owned-file",
+  );
+  assert.deepEqual(selectOwnedFiles(content, profile), content);
+  assert.throws(
+    () => selectOwnedFiles(content.slice(1), profile),
+    /First-party image output missing/,
+  );
+});
 const storageNotice =
   storageSources.driver.exporter_metadata.notice_path.replace(/^\//, "");
 const regional = files(

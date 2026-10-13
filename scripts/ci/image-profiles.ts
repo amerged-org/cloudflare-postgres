@@ -16,6 +16,7 @@ const profiles = [
   "storage",
   "rust-gateway",
   "native-controller",
+  "pool-supervisor",
   "rust-bootstrap-relay",
   "native-reclaimer",
   "sandbox-controller",
@@ -31,6 +32,7 @@ export function imageProfile(value: unknown = "regional"): ImageProfile {
 export const isRustProfile = (profile: ImageProfile) =>
   profile === "rust-gateway" ||
   profile === "native-controller" ||
+  profile === "pool-supervisor" ||
   profile === "rust-bootstrap-relay" ||
   profile === "native-reclaimer" ||
   profile === "sandbox-controller" ||
@@ -185,6 +187,8 @@ function requiredOwnedPaths(profile: ImageProfile): string[] {
         : ["licenses/pgcf/LICENSE"]),
     ];
   }
+  if (profile === "pool-supervisor")
+    return ["pgcf-supervisor", "licenses/pgcf/LICENSE"];
   const binary =
     profile === "rust-gateway"
       ? "pgcf-native-gateway"

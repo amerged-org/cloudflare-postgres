@@ -20,6 +20,7 @@ export interface ImageInputs {
   rust_bootstrap_relay: boolean;
   native_reclaimer: boolean;
   sandbox_controller: boolean;
+  pool_supervisor: boolean;
 }
 const all = (): ImageInputs => ({
   regional: true,
@@ -31,6 +32,7 @@ const all = (): ImageInputs => ({
   rust_bootstrap_relay: true,
   native_reclaimer: true,
   sandbox_controller: true,
+  pool_supervisor: true,
 });
 // Explicit inputs copied by the two repository-root Dockerfiles.
 const sharedNodeInputs = new Set([
@@ -94,6 +96,7 @@ const nativeSchemaInputs = new Set(
     "bootstrap",
     "reclaim",
     "compute-pool",
+    "postgres-pool",
   ].map((name) => `packages/contracts/native/${name}.generated.json`),
 );
 function rustInputs(path: string, directory: string): boolean {
@@ -223,6 +226,7 @@ export function selectImageInputs(
     rust_bootstrap_relay: false,
     native_reclaimer: false,
     sandbox_controller: false,
+    pool_supervisor: false,
   };
   for (const path of paths) {
     if (path === ".github/workflows/ci.yml") {
@@ -277,6 +281,7 @@ export function selectImageInputs(
       result.rust_bootstrap_relay = true;
       result.native_reclaimer = true;
       result.sandbox_controller = true;
+      result.pool_supervisor = true;
     }
     // The reclaimer uses only pure controller helpers, never this runtime schema.
     if (path === "packages/contracts/native/controller.generated.json")
@@ -297,6 +302,7 @@ export function selectImageInputs(
       result.native_reclaimer = true;
     if (rustInputs(path, "apps/native-controller"))
       result.native_controller = true;
+    if (rustInputs(path, "apps/pool-supervisor")) result.pool_supervisor = true;
     if (
       path === "apps/native-controller/Cargo.toml" ||
       path === "apps/native-controller/build.rs" ||
@@ -311,6 +317,7 @@ export function selectImageInputs(
       result.rust_bootstrap_relay = true;
       result.native_reclaimer = true;
       result.sandbox_controller = true;
+      result.pool_supervisor = true;
     }
     if (
       rustInputs(path, "apps/sandbox-controller") ||
@@ -423,6 +430,7 @@ const imageJobs = {
     "rust_bootstrap_relay",
     "native_reclaimer",
     "sandbox_controller",
+    "pool_supervisor",
   ],
 } as const satisfies Record<string, readonly (keyof ImageInputs)[]>;
 type ImageJob = keyof typeof imageJobs;
@@ -432,6 +440,8 @@ const runtimeProfiles = {
   rust_bootstrap_relay: "rust-bootstrap-relay",
   native_reclaimer: "native-reclaimer",
 } as const;
+// The established partial-job receipt bundle covers these four runtimes only.
+// The supervisor requires a successful whole native job before reusing its image.
 /** One failed image job does not revoke another group's successfully qualified immutable artifacts. */
 export async function changedImageInputsFromSuccessfulRun(
   input: SuccessfulRunInputs,

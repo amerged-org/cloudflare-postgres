@@ -22,7 +22,21 @@ const selected = (value: Partial<ImageInputs> = {}): ImageInputs => ({
   rust_bootstrap_relay: false,
   native_reclaimer: false,
   sandbox_controller: false,
+  pool_supervisor: false,
   ...value,
+});
+
+test("pool supervisor source selects its own immutable native image", () => {
+  assert.equal(
+    selectImageInputs(["apps/pool-supervisor/src/main.rs"], "push")
+      .pool_supervisor,
+    true,
+  );
+  assert.equal(
+    selectImageInputs(["apps/pool-supervisor/README.md"], "push")
+      .pool_supervisor,
+    false,
+  );
 });
 
 test("workflow retention, test globs, installer delivery and documentation do not rebuild unchanged native artifacts", async () => {
@@ -92,6 +106,7 @@ test("exact Skopeo installer publication run and env do not rebuild native artif
     rust_bootstrap_relay: true,
     native_reclaimer: true,
     sandbox_controller: true,
+    pool_supervisor: true,
   });
   assert.deepEqual(
     selectImageInputs([".github/workflows/ci.yml"], "push", {
@@ -132,6 +147,7 @@ test("workflow build recipes and consumed native schema bytes still invalidate t
     rust_bootstrap_relay: true,
     native_reclaimer: true,
     sandbox_controller: true,
+    pool_supervisor: true,
   });
   assert.deepEqual(
     selectImageInputs([".github/workflows/ci.yml"], "push", { before, after }),
@@ -260,6 +276,7 @@ test("actual storage and native inputs select only their affected runtime artifa
       rust_bootstrap_relay: true,
       native_reclaimer: true,
       sandbox_controller: true,
+      pool_supervisor: true,
     }),
   );
   assert.deepEqual(
@@ -282,6 +299,7 @@ test("actual storage and native inputs select only their affected runtime artifa
       rust_bootstrap_relay: true,
       native_reclaimer: true,
       sandbox_controller: true,
+      pool_supervisor: true,
     }),
   );
   assert.deepEqual(
@@ -292,6 +310,7 @@ test("actual storage and native inputs select only their affected runtime artifa
       rust_bootstrap_relay: true,
       native_reclaimer: true,
       sandbox_controller: true,
+      pool_supervisor: true,
     }),
   );
 });
@@ -312,6 +331,7 @@ test("common Docker inputs and qualification changes invalidate every affected p
       rust_bootstrap_relay: true,
       native_reclaimer: true,
       sandbox_controller: true,
+      pool_supervisor: true,
     }),
   );
   assert.deepEqual(
@@ -324,6 +344,7 @@ test("common Docker inputs and qualification changes invalidate every affected p
       rust_bootstrap_relay: true,
       native_reclaimer: true,
       sandbox_controller: true,
+      pool_supervisor: true,
     }),
   );
   assert.deepEqual(
@@ -346,6 +367,7 @@ test("common Docker inputs and qualification changes invalidate every affected p
       rust_bootstrap_relay: true,
       native_reclaimer: true,
       sandbox_controller: true,
+      pool_supervisor: true,
     }),
   );
   assert.deepEqual(
@@ -363,6 +385,7 @@ test("common Docker inputs and qualification changes invalidate every affected p
       rust_bootstrap_relay: true,
       native_reclaimer: true,
       sandbox_controller: true,
+      pool_supervisor: true,
     }),
   );
 });
@@ -377,6 +400,7 @@ test("PostgreSQL inputs stay scoped and manual, unavailable or malformed compari
     rust_bootstrap_relay: true,
     native_reclaimer: true,
     sandbox_controller: true,
+    pool_supervisor: true,
   });
   assert.deepEqual(
     selectImageInputs(["infra/postgres/sources.lock.json"], "push"),
@@ -837,7 +861,11 @@ test("partial Native receipts reuse exactly four proved runtimes without baselin
     const result = await changedImageInputsFromSuccessfulRun(context);
     assert.deepEqual(
       result.inputs,
-      selected({ storage: true, sandbox_controller: true }),
+      selected({
+        storage: true,
+        sandbox_controller: true,
+        pool_supervisor: true,
+      }),
     );
     assert.equal(result.baselines.sandbox_controller, null);
     assert.equal(result.baselines.native_controller, history.failed);
@@ -853,6 +881,7 @@ test("partial Native receipts reuse exactly four proved runtimes without baselin
         rust_bootstrap_relay: true,
         native_reclaimer: true,
         sandbox_controller: true,
+        pool_supervisor: true,
       }),
     );
   } finally {

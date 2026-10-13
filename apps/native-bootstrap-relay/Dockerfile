@@ -14,6 +14,7 @@ COPY apps/native-controller/ apps/native-controller/
 COPY apps/native-gateway/ apps/native-gateway/
 COPY apps/sandbox-controller/ apps/sandbox-controller/
 COPY apps/node-runtime/ apps/node-runtime/
+COPY apps/pool-supervisor/ apps/pool-supervisor/
 COPY packages/native-protocol/ packages/native-protocol/
 COPY packages/contracts/native/ packages/contracts/native/
 COPY infra/platform/versions.lock.json infra/platform/versions.lock.json
