@@ -86,6 +86,9 @@ export function physicalStorageMetrics(
           metric.labels.vg === "pgcf",
       ),
       names = new Set<string>();
+    // OpenEBS emits no LV series at all when one LV path does not resolve, while vgs still
+    // counts every LV: a scrape is complete only when both agree.
+    if (one("lvm_vg_lv_count", group) !== volumes.length) return null;
     let thick = 0,
       pool: NodePhysicalStorage["thin_pool"] = null;
     for (const volume of volumes) {

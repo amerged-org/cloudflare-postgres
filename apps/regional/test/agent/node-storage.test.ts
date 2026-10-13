@@ -11,8 +11,8 @@ import lock from "../../../../infra/platform/versions.lock.json" with { type: "j
 import { openEbsDriverImage } from "../../../../infra/platform/openebs-image.ts";
 
 const vg = "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef";
-const group = (free = 7000) =>
-  `lvm_vg_total_size_bytes{name="pgcf"} 1e4\nlvm_vg_free_size_bytes{name="pgcf"} ${free}\nlvm_vg_permission{name="pgcf"} 0\nlvm_vg_missing_pv_count{name="pgcf"} 0\nlvm_vg_pv_count{name="pgcf"} 1\n`;
+const group = (free = 7000, lvs = 0) =>
+  `lvm_vg_total_size_bytes{name="pgcf"} 1e4\nlvm_vg_free_size_bytes{name="pgcf"} ${free}\nlvm_vg_permission{name="pgcf"} 0\nlvm_vg_missing_pv_count{name="pgcf"} 0\nlvm_vg_pv_count{name="pgcf"} 1\nlvm_vg_lv_count{name="pgcf"} ${lvs}\n`;
 const labels = (name: string, segtype: string, pool = "") =>
   `active_status="active",device="dm-0",dm_path="/dev/mapper/pgcf-${name}",host="driver",name="${name}",path="/dev/pgcf/${name}",pool="${pool}",segtype="${segtype}",vg="pgcf"`;
 const lv = (name: string, segtype: string, size: number, pool = "") =>
@@ -20,7 +20,7 @@ const lv = (name: string, segtype: string, size: number, pool = "") =>
 
 test("fresh physical metrics count thick extents instead of filesystem used-percent zero", () => {
   const metrics =
-    group() +
+    group(7000, 1) +
     lv("pvc-test", "linear", 3000) +
     `lvm_lv_used_percent{${labels("pvc-test", "linear")}} 0\n`;
   assert.deepEqual(physicalStorageMetrics(metrics, vg), {
@@ -52,7 +52,7 @@ test("fresh physical metrics count thick extents instead of filesystem used-perc
 test("thin data and metadata are separately bounded; missing gauges remain unknown", () => {
   const poolLabels = labels("pgcf_thinpool", "thin-pool");
   const metrics =
-    group(5990) +
+    group(5990, 1) +
     lv("pgcf_thinpool", "thin-pool", 4000) +
     `lvm_lv_mda_total_size_bytes{${poolLabels}} 10\nlvm_lv_used_percent{${poolLabels}} 25\nlvm_lv_mda_used_percent{${poolLabels}} 20\nlvm_lv_when_full{${poolLabels}} 0\n`;
   assert.deepEqual(physicalStorageMetrics(metrics, vg)?.thin_pool, {
@@ -75,6 +75,27 @@ test("thin data and metadata are separately bounded; missing gauges remain unkno
         `lvm_lv_used_percent{${poolLabels}} 25`,
         `lvm_lv_used_percent{${poolLabels}} NaN`,
       ),
+      vg,
+    ),
+    null,
+  );
+});
+
+test("a scrape that lost its LV series is unknown, never a volume group without LVs", () => {
+  // OpenEBS emits no LV series when one LV path does not resolve; the VG still counts its LVs.
+  assert.equal(physicalStorageMetrics(group(5990, 2), vg), null);
+  assert.equal(
+    physicalStorageMetrics(group(7000, 2) + lv("pvc-test", "linear", 3000), vg),
+    null,
+  );
+  assert.equal(
+    physicalStorageMetrics(group(7000, 1) + lv("pvc-test", "linear", 3000), vg)
+      ?.thick_allocated_bytes,
+    3000,
+  );
+  assert.equal(
+    physicalStorageMetrics(
+      group(7000).replace(/^lvm_vg_lv_count.*\n/m, ""),
       vg,
     ),
     null,

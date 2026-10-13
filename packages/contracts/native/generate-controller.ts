@@ -395,13 +395,15 @@ const fleetVectors = [
 }));
 // OpenEBS LocalPV LVM exporter scrapes; the native sampler must derive the same physical facts.
 const vg = "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef";
-const volumeGroup = (free = 7000) =>
+// vgs counts every visible LV of the group; the exporter's LV series must number the same.
+const volumeGroup = (free = 7000, lvs = 0) =>
   [
     `lvm_vg_total_size_bytes{name="pgcf"} 1e4`,
     `lvm_vg_free_size_bytes{name="pgcf"} ${free}`,
     `lvm_vg_permission{name="pgcf"} 0`,
     `lvm_vg_missing_pv_count{name="pgcf"} 0`,
     `lvm_vg_pv_count{name="pgcf"} 1`,
+    `lvm_vg_lv_count{name="pgcf"} ${lvs}`,
   ].join("\n") + "\n";
 const volume = (
   name: string,
@@ -430,7 +432,7 @@ const thinPool = (gauges: Record<string, number | string> = {}) =>
     ...gauges,
   });
 const thick =
-  volumeGroup() +
+  volumeGroup(7000, 1) +
   volume("pvc-a", "linear", 3000, "", { lvm_lv_used_percent: 0 });
 const storageVectors = [
   {
@@ -451,32 +453,33 @@ const storageVectors = [
   {
     name: "thin-pool-upper-bounds",
     metrics:
-      volumeGroup(5990) +
+      volumeGroup(5990, 2) +
       thinPool() +
       volume("pvc-thin", "thin", 2000, "pgcf_thinpool"),
   },
   {
     name: "rounded-percent-charges-next-hundredth",
-    metrics: volumeGroup(5990) + thinPool({ lvm_lv_used_percent: 33.33 }),
+    metrics: volumeGroup(5990, 1) + thinPool({ lvm_lv_used_percent: 33.33 }),
   },
   {
     name: "missing-thin-metadata-gauge",
     metrics:
-      volumeGroup(5990) +
+      volumeGroup(5990, 1) +
       thinPool().replace(/^lvm_lv_mda_used_percent\{.*\n/m, ""),
   },
   {
     name: "non-finite-percent",
-    metrics: volumeGroup(5990) + thinPool({ lvm_lv_used_percent: "NaN" }),
+    metrics: volumeGroup(5990, 1) + thinPool({ lvm_lv_used_percent: "NaN" }),
   },
   {
     name: "thin-volume-without-pool",
-    metrics: volumeGroup() + volume("pvc-thin", "thin", 2000, "pgcf_thinpool"),
+    metrics:
+      volumeGroup(7000, 1) + volume("pvc-thin", "thin", 2000, "pgcf_thinpool"),
   },
   {
     name: "unhealthy-volume",
     metrics:
-      volumeGroup() +
+      volumeGroup(7000, 1) +
       volume("pvc-a", "linear", 3000, "", { lvm_lv_health_status: 1 }),
   },
   {
@@ -489,6 +492,11 @@ const storageVectors = [
   {
     name: "allocation-exceeds-volume-group",
     metrics: volumeGroup(12000),
+  },
+  {
+    // OpenEBS drops every LV series when one LV path does not resolve; vgs still counts them.
+    name: "lv-series-missing",
+    metrics: volumeGroup(5990, 2),
   },
 ].map((v) => ({
   ...v,

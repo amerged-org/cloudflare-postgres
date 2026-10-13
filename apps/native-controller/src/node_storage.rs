@@ -160,6 +160,11 @@ pub fn physical(source: &str, group_uuid: &str) -> Option<Value> {
                 && label(&metric.labels, "vg").as_deref() == Some("pgcf")
         })
         .collect();
+    // OpenEBS emits no LV series at all when one LV path does not resolve, while vgs still
+    // counts every LV: a scrape is complete only when both agree.
+    if one("lvm_vg_lv_count", &group)? != volumes.len() as f64 {
+        return None;
+    }
     let mut names = HashSet::new();
     let mut thick = 0.0;
     let mut pool = None;
@@ -487,6 +492,45 @@ mod tests {
                 vector["name"]
             );
         }
+    }
+    /// A thin pool with one thin LV; `lv_count` is the VG's own count and `lvs` the LV series.
+    fn exporter(lv_count: u64, lvs: bool) -> String {
+        let labels = |name: &str, segtype: &str, pool: &str| {
+            format!(
+                "active_status=\"active\",device=\"dm-0\",dm_path=\"/dev/mapper/pgcf-{name}\",host=\"driver\",name=\"{name}\",path=\"/dev/pgcf/{name}\",pool=\"{pool}\",segtype=\"{segtype}\",vg=\"pgcf\""
+            )
+        };
+        let pool = labels("pgcf_thinpool", "thin-pool", "");
+        let thin = labels("pvc-thin", "thin", "pgcf_thinpool");
+        let mut text = format!(
+            "lvm_vg_total_size_bytes{{name=\"pgcf\"}} 10000\nlvm_vg_free_size_bytes{{name=\"pgcf\"}} 5990\nlvm_vg_permission{{name=\"pgcf\"}} 0\nlvm_vg_missing_pv_count{{name=\"pgcf\"}} 0\nlvm_vg_pv_count{{name=\"pgcf\"}} 1\nlvm_vg_lv_count{{name=\"pgcf\"}} {lv_count}\n"
+        );
+        if lvs {
+            text += &format!(
+                "lvm_lv_total_size_bytes{{{pool}}} 4000\nlvm_lv_health_status{{{pool}}} 0\nlvm_lv_permission{{{pool}}} 1\nlvm_lv_mda_total_size_bytes{{{pool}}} 10\nlvm_lv_used_percent{{{pool}}} 25\nlvm_lv_mda_used_percent{{{pool}}} 20\nlvm_lv_when_full{{{pool}}} 0\nlvm_lv_total_size_bytes{{{thin}}} 2000\nlvm_lv_health_status{{{thin}}} 0\nlvm_lv_permission{{{thin}}} 1\n"
+            );
+        }
+        text
+    }
+    #[test]
+    fn an_exporter_scrape_without_its_lv_series_is_unknown_never_an_empty_volume_group() {
+        let group = "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef";
+        assert_eq!(
+            physical(&exporter(2, true), group).unwrap()["thin_pool"]["data_total_bytes"],
+            4000
+        );
+        // OpenEBS emits no LV series at all when one LV path does not resolve; the VG gauges
+        // still count its LVs. That is no reading, never a volume group without LVs or pool.
+        assert!(physical(&exporter(2, false), group).is_none());
+        // A count that differs from the series (lvcreate or lvremove between vgs and lvs).
+        assert!(physical(&exporter(3, true), group).is_none());
+        // A volume group without LVs is complete only when the exporter counts none.
+        assert!(
+            physical(&exporter(0, false), group)
+                .unwrap()
+                .get("thin_pool")
+                .is_some_and(Value::is_null)
+        );
     }
     const WRAPPER: &str = "ghcr.io/example/pgcf-regional:lvm-thin-sha-0123456789ab@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
     /// One customer Node whose OpenEBS driver runs the release-pinned wrapper image.
