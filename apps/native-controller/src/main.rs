@@ -159,21 +159,38 @@ fn apply_snapshot(
     }
     Ok(())
 }
-/// The newest accepted fast renewal per node UID. Wherever its revision is higher it replaces the
-/// snapshot's node authority, and its tokens the snapshot's (thin-authority-renewal.md, 4.5).
+/// Fast renewals (thin-authority-renewal.md, 4.5 and 4.6): per node UID the newest accepted
+/// authority, and per database the newest token delivered with any of them. Each stands in for
+/// the snapshot's entry or token wherever it is newer; a token counts until it expires.
 #[derive(Default)]
-struct Renewals(HashMap<String, Renewal>);
+struct Renewals {
+    nodes: HashMap<String, (u64, Value)>,
+    tokens: HashMap<String, String>,
+}
 impl Renewals {
-    /// Keeps a renewal only over an older one of its node.
-    fn accept(&mut self, renewal: Renewal) -> bool {
+    /// Keeps a renewal only over an older one of its node and each of its tokens only over an
+    /// older one of its database; tokens that expired by `clock` (ms) are dropped.
+    fn accept(&mut self, renewal: Renewal, clock: i128) -> bool {
         if self
-            .0
+            .nodes
             .get(&renewal.node_uid)
-            .is_some_and(|held| held.revision >= renewal.revision)
+            .is_some_and(|(held, _)| *held >= renewal.revision)
         {
             return false;
         }
-        self.0.insert(renewal.node_uid.clone(), renewal);
+        self.nodes
+            .insert(renewal.node_uid, (renewal.revision, renewal.authority));
+        for (database, token) in renewal.tokens {
+            let held = self.tokens.get(&database).map(String::as_str);
+            if newer_token(held, Some(&token)) == Some(token.as_str()) {
+                self.tokens.insert(database, token);
+            }
+        }
+        self.tokens.retain(|_, token| {
+            storage_claims(token)
+                .and_then(|claims| integer(&claims, "exp").ok())
+                .is_some_and(|expiry| i128::from(expiry) > clock)
+        });
         true
     }
     fn listed<'a>(db: &Value, snapshot: &'a DesiredSnapshot) -> Option<&'a Value> {
@@ -182,31 +199,32 @@ impl Renewals {
             .iter()
             .find(|row| row["node_uid"] == db["storage"]["node_uid"])
     }
-    /// The renewal of the database's thin node when it is newer than the snapshot's entry.
-    fn renewed(&self, db: &Value, snapshot: &DesiredSnapshot) -> Option<&Renewal> {
-        let renewal = self.0.get(db["storage"]["node_uid"].as_str()?)?;
+    /// The renewed authority of the database's thin node when it is newer than the snapshot's.
+    fn renewed(&self, db: &Value, snapshot: &DesiredSnapshot) -> Option<&Value> {
+        let (revision, authority) = self.nodes.get(db["storage"]["node_uid"].as_str()?)?;
         let listed = Self::listed(db, snapshot)
             .and_then(|listed| integer(listed, "revision").ok())
-            .is_some_and(|revision| revision >= renewal.revision);
-        (!listed).then_some(renewal)
+            .is_some_and(|listed| listed >= *revision);
+        (!listed).then_some(authority)
     }
     /// The authority the database's thin node currently holds.
     fn authority<'a>(&'a self, db: &Value, snapshot: &'a DesiredSnapshot) -> Option<&'a Value> {
         self.renewed(db, snapshot)
-            .map(|renewal| &renewal.authority)
             .or_else(|| Self::listed(db, snapshot))
     }
-    /// The newest write token of the database's current generation.
+    /// The newest write token of the database's current generation on its node.
     fn token<'a>(&'a self, db: &'a Value) -> Option<&'a str> {
-        let renewed = db["storage"]["node_uid"]
-            .as_str()
-            .and_then(|node| self.0.get(node))
-            .and_then(|renewal| renewal.tokens.get(text(db, "id")))
+        let delivered = self
+            .tokens
+            .get(text(db, "id"))
             .map(String::as_str)
             .filter(|token| {
-                storage_claims(token).is_some_and(|claims| claims["generation"] == db["generation"])
+                storage_claims(token).is_some_and(|claims| {
+                    claims["generation"] == db["generation"]
+                        && claims["node_uid"] == db["storage"]["node_uid"]
+                })
             });
-        newer_token(db["storage_authority"].as_str(), renewed)
+        newer_token(db["storage_authority"].as_str(), delivered)
     }
     /// The database and snapshot a job runs on: the newest token and node authority.
     fn effective(
@@ -218,7 +236,7 @@ impl Renewals {
         if let Some(token) = self.token(db) {
             view["storage_authority"] = token.into();
         }
-        let Some(renewal) = self.renewed(db, snapshot) else {
+        let Some(authority) = self.renewed(db, snapshot) else {
             return (view, snapshot.clone());
         };
         let mut region = snapshot.region.clone();
@@ -226,8 +244,8 @@ impl Renewals {
             .as_array()
             .cloned()
             .unwrap_or_default();
-        nodes.retain(|row| row["node_uid"] != renewal.authority["node_uid"]);
-        nodes.push(renewal.authority.clone());
+        nodes.retain(|row| row["node_uid"] != authority["node_uid"]);
+        nodes.push(authority.clone());
         region["storage_nodes"] = nodes.into();
         let snapshot = DesiredSnapshot {
             region,
@@ -715,7 +733,7 @@ async fn run() -> Result<(), Error> {
             },
             renewal = renewal_receiver.recv() => {
                 if let Some(renewal) = renewal {
-                    renewals.accept(renewal);
+                    renewals.accept(renewal, clock_ms());
                 }
             },
             result = sampling.join_next_with_id(), if !sampling.is_empty() => {
@@ -1281,16 +1299,14 @@ mod tests {
         let mut renewals = Renewals::default();
         // The 60 s snapshot's authority and token lapse long before the next pull.
         assert!(storage_protection_due(&db, &state, &renewals, 5000));
-        assert!(renewals.accept(renewal(
-            4,
-            true,
-            "1970-01-01T00:00:10.000Z",
-            &[token(3, 4, 10_000)]
-        )));
+        assert!(renewals.accept(
+            renewal(4, true, "1970-01-01T00:00:10.000Z", &[token(3, 4, 10_000)]),
+            0
+        ));
         assert!(!storage_protection_due(&db, &state, &renewals, 5000));
         assert!(storage_protection_due(&db, &state, &renewals, 10_000));
         // An older renewal never replaces a newer one.
-        assert!(!renewals.accept(renewal(3, false, "1970-01-01T00:00:20.000Z", &[])));
+        assert!(!renewals.accept(renewal(3, false, "1970-01-01T00:00:20.000Z", &[]), 0));
         assert!(!storage_protection_due(&db, &state, &renewals, 5000));
         // A renewal's token of another generation never stands in for this one's.
         let mut woken = db.clone();
@@ -1302,6 +1318,27 @@ mod tests {
         assert!(storage_protection_due(&db, &state, &renewals, 5000));
     }
     #[test]
+    fn writes_continue_while_the_newest_delivered_token_is_unexpired() {
+        let db = json!({"id":"db000000000000000001","generation":3,"desired_state":"running","storage":{"node_uid":NODE},"storage_authority":token(3,2,2000)});
+        let mut state = snapshot(vec![]);
+        state.region = json!({"storage_nodes":[{"node_uid":NODE,"revision":2,"write_allowed":true,"expires_at":"1970-01-01T00:00:02.000Z"}]});
+        let mut renewals = Renewals::default();
+        renewals.accept(
+            renewal(4, true, "1970-01-01T00:00:10.000Z", &[token(3, 4, 10_000)]),
+            0,
+        );
+        // A later renewal without this database's token keeps the one already delivered,
+        // as its ledger does, until it expires.
+        renewals.accept(renewal(5, true, "1970-01-01T00:00:12.000Z", &[]), 0);
+        assert!(!storage_protection_due(&db, &state, &renewals, 9_000));
+        assert!(storage_protection_due(&db, &state, &renewals, 10_000));
+        let (view, _) = renewals.effective(&db, &Arc::new(state));
+        assert_eq!(view["storage_authority"], token(3, 4, 10_000));
+        // Expired tokens leave the cache with the next renewal.
+        renewals.accept(renewal(6, true, "1970-01-01T00:00:20.000Z", &[]), 10_000);
+        assert!(renewals.tokens.is_empty());
+    }
+    #[test]
     fn jobs_run_on_the_newest_token_and_node_authority() {
         let db = json!({"id":"db000000000000000001","generation":3,"desired_state":"running","storage":{"node_uid":NODE},"storage_authority":token(3,2,2000)});
         let mut state = snapshot(vec![]);
@@ -1310,12 +1347,10 @@ mod tests {
         let mut renewals = Renewals::default();
         let (view, effective) = renewals.effective(&db, &state);
         assert_eq!((&view, Arc::ptr_eq(&effective, &state)), (&db, true));
-        renewals.accept(renewal(
-            4,
-            false,
-            "1970-01-01T00:00:10.000Z",
-            &[token(3, 4, 10_000)],
-        ));
+        renewals.accept(
+            renewal(4, false, "1970-01-01T00:00:10.000Z", &[token(3, 4, 10_000)]),
+            0,
+        );
         let (view, effective) = renewals.effective(&db, &state);
         assert_eq!(view["storage_authority"], token(3, 4, 10_000));
         assert_eq!(
