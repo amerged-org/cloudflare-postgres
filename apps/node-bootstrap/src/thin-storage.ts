@@ -35,9 +35,10 @@ import {
 } from "./bootstrap.ts";
 import {
   startCapabilityProxy,
-  connectRelayTransport,
+  relayGrantPool,
+  relayGrants,
+  openPooledRelay,
 } from "./proxy-command.ts";
-import { NodeBootstrapTransport } from "@pgcf/contracts/node-bootstrap";
 
 export type ObjectValue = Record<string, unknown>;
 export const object = (value: unknown): ObjectValue => {
@@ -683,6 +684,30 @@ export async function openThinSession<T>(
   };
   const clusterAddress = new URL(scope.cluster_endpoint).hostname;
   let proxy: Awaited<ReturnType<typeof startCapabilityProxy>> | undefined;
+  const grants = relayGrantPool(
+    async (capability: "talos_api" | "kubernetes_api", count) => {
+      const batch = relayGrants(
+        await issueAgain(
+          () => call({ kind: "transport", capability, count }),
+          signal,
+        ),
+      );
+      if (
+        batch.some(
+          (transport) =>
+            transport.expectedTarget.ip !==
+              (capability === "talos_api" ? scope.address : clusterAddress) ||
+            transport.expectedTarget.port !==
+              (capability === "talos_api" ? 50000 : 6443) ||
+            transport.websocket_url !==
+              scope.callback.url.replace(/^https:/, "wss:") + "/relay",
+        )
+      )
+        throw new BootstrapError("thin_storage_transport_changed");
+      return batch;
+    },
+    signal,
+  );
   try {
     proxy = await (options.proxy ?? startCapabilityProxy)(
       (authority) =>
@@ -691,24 +716,8 @@ export async function openThinSession<T>(
           : authority === `${clusterAddress}:6443`
             ? "kubernetes_api"
             : undefined,
-      async (capability) => {
-        const transport = NodeBootstrapTransport.parse(
-          await issueAgain(
-            () => call({ kind: "transport", capability }),
-            signal,
-          ),
-        );
-        if (
-          transport.expectedTarget.ip !==
-            (capability === "talos_api" ? scope.address : clusterAddress) ||
-          transport.expectedTarget.port !==
-            (capability === "talos_api" ? 50000 : 6443) ||
-          transport.websocket_url !==
-            scope.callback.url.replace(/^https:/, "wss:") + "/relay"
-        )
-          throw new BootstrapError("thin_storage_transport_changed");
-        return connectRelayTransport(transport, scope.callback.bearer, signal);
-      },
+      (capability) =>
+        openPooledRelay(grants, capability, scope.callback.bearer, signal),
       signal,
     );
     await writeFile(
@@ -815,6 +824,7 @@ export async function openThinSession<T>(
       throw new BootstrapError(scope.deadline_code);
     throw error;
   } finally {
+    grants.clear();
     await proxy?.close();
     await rm(directory, { recursive: true, force: true });
   }
