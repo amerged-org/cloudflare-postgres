@@ -464,6 +464,10 @@ export async function recordStorageHeadroomSample(
   )
     .bind(nodeId, region.id)
     .first<QualificationSampleRun>();
+  // A stale qualification sampler must never obtain a product nonce after its run ends. The
+  // run's own CAS fences a concurrent terminal transition; product nodes cannot start a run.
+  if ((body.qualification_run ?? null) !== (run?.id ?? null))
+    throw new ApiError("conflict", "Thin storage sampling target changed");
   if (run)
     return c.json(
       NodeStorageHeadroomResponse.parse(

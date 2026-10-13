@@ -127,10 +127,13 @@ receipt.
 
 - `POST /agent/v1/nodes/{id}/storage-headroom`, authenticated with the region agent key the
   controller already presents (nc/api.rs:194-205, dom/agent-auth.ts). Body: nonce, node UID,
-  `captured_at` (controller clock), `physical` (`NodePhysicalStorage`), visible LVs, `lv_count`,
+  `qualification_run` (the exact run ID, or absent/null for product sampling), `captured_at`
+  (controller clock), `physical` (`NodePhysicalStorage`), visible LVs, `lv_count`,
   witnesses and scrape milliseconds. Response: the next nonce and period, the composed authority
   (the node's `storage_nodes` entry of the desired snapshot) and the current `sa1` token of every
-  thin database on the node.
+  thin database on the node. Cloudflare matches the request's run context to the current running
+  qualification before issuing a nonce or changing authority; a stale qualification target cannot
+  become a product sampler when its run ends.
 - The nonce is 128 random bits stored with its Cloudflare issue time in `node_thin_storage`. It is
   bound to node ID and UID, used once (consumed by the compare-and-set that writes the authority) and
   refused when older than `guard/2` at receipt. A request without a valid nonce gets a fresh one and

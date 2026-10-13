@@ -45,6 +45,24 @@ The single CI workflow checks the unchanged engine, package identity, actual ext
 and SQL, then qualifies every image layer before publication. Existing databases require their
 own extension upgrade after the image update; a new package alone does not change `extversion`.
 
+**OpenEBS storage image:** `infra/storage/Dockerfile` inherits the pinned official
+OpenEBS LVM LocalPV 1.10.1 image and unchanged LVM/runtime packages. It rebuilds the
+upstream driver with an exporter-only metadata patch; CSI device-path validation
+and capacity-discovery source remain unchanged, while compiled machine bytes differ.
+The pinned upstream archive, applied patch, Apache-2.0 license and modification
+notice accompany the runtime image. The driver is compiled with Go 1.27.2 from the pinned official
+builder image; the Go BSD-3-Clause license and vendored dependency notices are retained.
+The SHA-256/signature-verified Alpine `patch` 2.8-r0 package (GPL-3.0-or-later) is a
+build-only tool and is not installed in the runtime. Its immutable archive and the
+builder/source/patch/executable identities are recorded in
+`infra/storage/sources.lock.json`.
+
+The runtime adds Alpine `thin-provisioning-tools` 1.1.0-r0 (GPL-3.0-only) without
+changing existing package versions. Its corresponding source and COPYING are
+included at the paths recorded in the lock. No metadata-check bypass or automatic
+repair is introduced. The assembly and local upstream modifications are Apache-2.0;
+upstream components retain their own licenses.
+
 **Barman license note:** the upstream package metadata declares `GPL-3.0-only`, while the README
 and source headers say GPL version 3 or later. Record the declaration at the pinned release.
 

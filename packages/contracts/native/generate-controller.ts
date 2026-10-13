@@ -421,7 +421,7 @@ const volume = (
   })
     .map(
       ([metric, value]) =>
-        `${metric}{active_status="active",device="dm-0",dm_path="/dev/mapper/pgcf-${name}",host="driver",name="${name}",path="/dev/pgcf/${name}",pool="${pool}",segtype="${segtype}",vg="pgcf"} ${value}\n`,
+        `${metric}{active_status="active",device="dm-0",dm_path="/dev/mapper/pgcf-${name.replaceAll("-", "--")}",host="driver",name="${name}",path="/dev/pgcf/${name}",pool="${pool}",segtype="${segtype}",vg="pgcf"} ${value}\n`,
     )
     .join("");
 const thinPool = (gauges: Record<string, number | string> = {}) =>
@@ -435,6 +435,21 @@ const thinPool = (gauges: Record<string, number | string> = {}) =>
 const thick =
   volumeGroup(7000, 1) +
   volume("pvc-a", "linear", 3000, "", { lvm_lv_used_percent: 0 });
+// Run 12's lvs metadata reports the primary pool with lv_path="" and its mapper path.
+const observedPool = thinPool().replaceAll(
+  'path="/dev/pgcf/pgcf_thinpool"',
+  'path=""',
+);
+const scratchPool = volume("scratch-pool", "thin-pool", 1000).replaceAll(
+  'path="/dev/pgcf/scratch-pool"',
+  'path=""',
+);
+const inactiveRaw = volume("scratch_raw", "linear", 1000)
+  .replaceAll('active_status="active"', 'active_status="inactive"')
+  .replaceAll('path="/dev/pgcf/scratch_raw"', 'path=""')
+  .replaceAll('dm_path="/dev/mapper/pgcf-scratch_raw"', 'dm_path=""');
+const qualificationInventory =
+  volumeGroup(2990, 3) + observedPool + scratchPool + inactiveRaw;
 const storageVectors = [
   {
     name: "thick-volume-group",
@@ -499,10 +514,55 @@ const storageVectors = [
     name: "lv-series-missing",
     metrics: volumeGroup(5990, 2),
   },
+  {
+    name: "primary-pool-truthful-blank-path",
+    metrics: volumeGroup(5990, 1) + observedPool,
+  },
+  {
+    name: "primary-pool-foreign-mapper",
+    metrics: (volumeGroup(5990, 1) + observedPool).replaceAll(
+      'dm_path="/dev/mapper/pgcf-pgcf_thinpool"',
+      'dm_path="/dev/mapper/other-pgcf_thinpool"',
+    ),
+  },
+  {
+    name: "scratch-inventory-refused-for-product",
+    metrics: qualificationInventory,
+  },
+  {
+    name: "qualification-scratch-pools-and-inactive-raw",
+    qualification: true,
+    metrics: qualificationInventory,
+  },
+  {
+    name: "qualification-inventory-still-complete",
+    qualification: true,
+    metrics: qualificationInventory.replace(
+      'lvm_vg_lv_count{name="pgcf"} 3',
+      'lvm_vg_lv_count{name="pgcf"} 4',
+    ),
+  },
+  {
+    name: "qualification-primary-usage-still-required",
+    qualification: true,
+    metrics: qualificationInventory.replace(/^lvm_lv_used_percent.*\n/m, ""),
+  },
+  {
+    name: "qualification-scratch-allocation-exceeds-vg",
+    qualification: true,
+    metrics: qualificationInventory.replace(
+      'lvm_vg_free_size_bytes{name="pgcf"} 2990',
+      'lvm_vg_free_size_bytes{name="pgcf"} 5990',
+    ),
+  },
 ].map((v) => ({
   ...v,
   volume_group_uuid: vg,
-  physical: physicalStorageMetrics(v.metrics, vg),
+  physical: physicalStorageMetrics(
+    v.metrics,
+    vg,
+    "qualification" in v && v.qualification ? "qualification" : "product",
+  ),
 }));
 const files = {
   "controller.generated.json": {

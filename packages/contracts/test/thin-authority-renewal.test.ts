@@ -187,11 +187,22 @@ describe("headroom samples against a Cloudflare nonce", () => {
     expect(
       NodeStorageHeadroomSample.safeParse({ ...sample(), nonce: null }).success,
     ).toBe(true);
+    expect(
+      NodeStorageHeadroomSample.parse({ ...sample(), qualification_run: null })
+        .qualification_run,
+    ).toBeNull();
+    expect(
+      NodeStorageHeadroomSample.parse({
+        ...sample(),
+        qualification_run: `op_${"q".repeat(20)}`,
+      }).qualification_run,
+    ).toBe(`op_${"q".repeat(20)}`);
     for (const invalid of [
       // The LV series must number exactly the volume group's LV count.
       { lv_count: 3 },
       { nonce: "0123456789ABCDEF0123456789abcdef" },
       { nonce: "0123456789abcdef" },
+      { qualification_run: "not-a-run" },
       // The scrape belongs to the witnessed volume group.
       {
         witnesses: { ...sample().witnesses, volume_group_uuid: pool },

@@ -277,6 +277,7 @@ async function qualificationSetup(sampling = true) {
     spec,
     specSha,
     clusterUid,
+    samplingRunId: null as string | null,
     created,
     start,
     send,
@@ -341,6 +342,7 @@ async function insertRunning(
       at,
     )
     .run();
+  f.samplingRunId = id;
   return id;
 }
 async function renewLease(id: string) {
@@ -430,6 +432,7 @@ function qualificationSample(
 ) {
   return {
     nonce,
+    qualification_run: f.samplingRunId,
     node_uid: f.uid,
     captured_at: new Date().toISOString(),
     physical: {
@@ -465,6 +468,51 @@ async function postSample(
   expect(response.status).toBe(200);
   return NodeStorageHeadroomResponse.parse(await response.json());
 }
+it("refuses an implicit product sample during qualification before handing out a qualification nonce", async () => {
+  const f = await qualificationSetup(),
+    setup = thinQualificationFixture(profile, {
+      node_uid: f.uid,
+      cluster_uid: f.clusterUid,
+      host_extension_image: hostImage,
+      kernel_version: "6.18.51-talos",
+      at: new Date().toISOString(),
+    }).setup,
+    id = await insertRunning(f, "noflush_quiescence", setup);
+  const before = await run(id);
+  const { qualification_run: context, ...legacy } = qualificationSample(
+    f,
+    setup,
+    null,
+  );
+  expect(context).toBe(id);
+  const response = await request(
+    `/agent/v1/nodes/${f.node}/storage-headroom`,
+    f.agent,
+    "POST",
+    legacy,
+  );
+  expect(response.status).toBe(409);
+  expect(await run(id)).toEqual(before);
+  const product = await request(
+    `/agent/v1/nodes/${f.node}/storage-headroom`,
+    f.agent,
+    "POST",
+    { ...legacy, qualification_run: null },
+  );
+  expect(product.status).toBe(409);
+  expect(await run(id)).toEqual(before);
+  const stale = await request(
+    `/agent/v1/nodes/${f.node}/storage-headroom`,
+    f.agent,
+    "POST",
+    {
+      ...qualificationSample(f, setup, null),
+      qualification_run: `op_${"q".repeat(20)}`,
+    },
+  );
+  expect(stale.status).toBe(409);
+  expect(await run(id)).toEqual(before);
+});
 /** One accepted sample: a first nonce, then the scrape that answers it. */
 async function sampled(
   f: Awaited<ReturnType<typeof qualificationSetup>>,

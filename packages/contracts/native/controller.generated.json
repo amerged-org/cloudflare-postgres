@@ -5177,6 +5177,9 @@
             { "type": "null" }
           ]
         },
+        "qualification_run": {
+          "anyOf": [{ "$ref": "#/$defs/OperationId" }, { "type": "null" }]
+        },
         "node_uid": {
           "type": "string",
           "format": "uuid",
@@ -5332,7 +5335,10 @@
         "witnesses",
         "scrape_milliseconds"
       ],
-      "additionalProperties": false
+      "additionalProperties": false,
+      "$defs": {
+        "OperationId": { "type": "string", "pattern": "^op_[a-z0-9]{20}$" }
+      }
     },
     "NodeStorageHeadroomResponse": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",

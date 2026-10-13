@@ -139,9 +139,9 @@ struct Scrape {
 /// OpenEBS LocalPV LVM 1.10.1 runs vgs/lvs on each scrape, so its text is the measurement.
 /// Thin percentages become conservative upper-bound bytes; every gauge must be unambiguous.
 pub fn physical(source: &str, group_uuid: &str) -> Option<Value> {
-    scrape(source, group_uuid).map(|scrape| scrape.physical)
+    scrape(source, group_uuid, false).map(|scrape| scrape.physical)
 }
-fn scrape(source: &str, group_uuid: &str) -> Option<Scrape> {
+fn scrape(source: &str, group_uuid: &str, qualification: bool) -> Option<Scrape> {
     if source.len() > 2 * 1024 * 1024 {
         return None;
     }
@@ -181,17 +181,54 @@ fn scrape(source: &str, group_uuid: &str) -> Option<Scrape> {
     }
     let mut names = HashSet::new();
     let mut thick = 0.0;
+    let mut other_pool_allocated = 0.0;
     let mut pool = None;
+    let pools: HashSet<_> = volumes
+        .iter()
+        .filter(|volume| {
+            label(&volume.labels, "segtype").as_deref() == Some("thin-pool")
+                && label(&volume.labels, "pool").as_deref() == Some("")
+        })
+        .map(|volume| label(&volume.labels, "name").unwrap_or_default())
+        .collect();
     let mut lvs = Vec::with_capacity(volumes.len());
     for volume in &volumes {
         let labels = &volume.labels;
         let name = label(labels, "name").unwrap_or_default();
+        let primary =
+            name == "pgcf_thinpool" && label(labels, "segtype").as_deref() == Some("thin-pool");
+        let mapper = format!("/dev/mapper/pgcf-{}", name.replace('-', "--"));
+        let path = label(labels, "path");
+        let dm_path = label(labels, "dm_path");
+        let path_valid = path == Some(format!("/dev/pgcf/{name}"))
+            || (path.as_deref() == Some("")
+                && if primary {
+                    dm_path.as_deref() == Some(mapper.as_str())
+                } else {
+                    qualification
+                });
+        let scratch_mapper_valid = !qualification
+            || primary
+            || dm_path.as_deref() == Some("")
+            || dm_path.as_deref() == Some(mapper.as_str());
         if name.is_empty()
+            || name.len() > 128
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"_.+[]-".contains(&b))
             || !names.insert(name.clone())
-            || label(labels, "active_status").as_deref() != Some("active")
-            || label(labels, "path") != Some(format!("/dev/pgcf/{name}"))
-            || one("lvm_lv_health_status", labels)? != 0.0
-            || one("lvm_lv_permission", labels)? != 1.0
+            || !path_valid
+            || !scratch_mapper_valid
+            || if qualification && !primary {
+                !matches!(
+                    label(labels, "active_status").as_deref(),
+                    Some("active" | "inactive")
+                )
+            } else {
+                label(labels, "active_status").as_deref() != Some("active")
+                    || one("lvm_lv_health_status", labels)? != 0.0
+                    || one("lvm_lv_permission", labels)? != 1.0
+            }
             || volume.value.fract() != 0.0
             || volume.value <= 0.0
             || volume.value > MAX_SAFE
@@ -225,11 +262,39 @@ fn scrape(source: &str, group_uuid: &str) -> Option<Scrape> {
                     upper("lvm_lv_mda_used_percent", metadata)?,
                 ]);
             }
-            (Some("thin"), Some("pgcf_thinpool")) => {}
+            (Some("thin"), Some(parent))
+                if if qualification {
+                    pools.contains(parent)
+                } else {
+                    parent == "pgcf_thinpool"
+                } => {}
+            (Some("thin-pool"), Some("")) if qualification => {
+                // Other pools reserve their own extents; they are never charged as thick LVs or
+                // given invented usage. Qualification only publishes the primary pool's use.
+                other_pool_allocated += volume.value;
+                let metadata: Vec<_> = metrics
+                    .iter()
+                    .filter(|metric| {
+                        metric.name == "lvm_lv_mda_total_size_bytes" && metric.labels == *labels
+                    })
+                    .collect();
+                match metadata.as_slice() {
+                    [] => {}
+                    [metric]
+                        if metric.value.fract() == 0.0
+                            && metric.value > 0.0
+                            && metric.value <= MAX_SAFE =>
+                    {
+                        other_pool_allocated += metric.value
+                    }
+                    _ => return None,
+                }
+            }
             _ => return None,
         }
     }
-    if pool.is_none()
+    if !qualification
+        && pool.is_none()
         && volumes
             .iter()
             .any(|volume| label(&volume.labels, "segtype").as_deref() == Some("thin"))
@@ -239,9 +304,17 @@ fn scrape(source: &str, group_uuid: &str) -> Option<Scrape> {
     let bytes = |value: f64| {
         (value.fract() == 0.0 && (0.0..=MAX_SAFE).contains(&value)).then_some(value as u64)
     };
-    let (total, free, thick) = (bytes(total)?, bytes(free)?, bytes(thick)?);
+    let (total, free, thick, other_pool_allocated) = (
+        bytes(total)?,
+        bytes(free)?,
+        bytes(thick)?,
+        bytes(other_pool_allocated)?,
+    );
     let allocated = total.checked_sub(free)?;
-    if total == 0 || thick > allocated || !volume_group_uuid(group_uuid) {
+    if total == 0
+        || thick.checked_add(other_pool_allocated)? > allocated
+        || !volume_group_uuid(group_uuid)
+    {
         return None;
     }
     let thin_pool = match pool {
@@ -254,7 +327,7 @@ fn scrape(source: &str, group_uuid: &str) -> Option<Scrape> {
                 || metadata == 0
                 || data_used > data
                 || metadata_used > metadata
-                || data + metadata + thick > allocated
+                || data + metadata + thick + other_pool_allocated > allocated
             {
                 return None;
             }
@@ -371,6 +444,7 @@ async fn observe(
     uid: &str,
     driver: &str,
     started: Instant,
+    qualification: bool,
 ) -> Result<Option<Observed>, Error> {
     if !stable(node, uid) {
         return Ok(None);
@@ -418,7 +492,11 @@ async fn observe(
         return Ok(None);
     };
     let pod_name = text(&pod["metadata"], "name");
-    let measured = scrape(&kube.openebs_metrics(pod_name).await?, &group);
+    let measured = scrape(
+        &kube.openebs_metrics(pod_name).await?,
+        &group,
+        qualification,
+    );
     let (fresh_node, fresh_pod, fresh_owner, fresh_lvm, fresh_namespace, fresh_cluster) = tokio::try_join!(
         kube.read("Node", None, name),
         kube.read("Pod", Some("openebs"), pod_name),
@@ -483,7 +561,7 @@ pub async fn sample(kube: &Kubernetes, node: &Value, driver: &str) -> Option<Val
     if !pgcf_native_protocol::valid_pattern("uuid", uid) {
         return None;
     }
-    let physical = observe(kube, node, uid, driver, Instant::now())
+    let physical = observe(kube, node, uid, driver, Instant::now(), false)
         .await
         .ok()
         .flatten()
@@ -502,12 +580,19 @@ pub async fn headroom(kube: &Kubernetes, target: &Value, driver: &str) -> Option
     let started = Instant::now();
     let captured_at = timestamp().ok()?;
     let node = kube.read("Node", None, text(target, "name")).await.ok()??;
-    let observed = observe(kube, &node, text(target, "node_uid"), driver, started)
-        .await
-        .ok()??;
+    let observed = observe(
+        kube,
+        &node,
+        text(target, "node_uid"),
+        driver,
+        started,
+        !target["qualification_run"].is_null(),
+    )
+    .await
+    .ok()??;
     // A complete scrape lists exactly as many LV series as the exporter counts.
     let count = observed.scrape.lvs.len();
-    let sample = json!({"nonce":null,"node_uid":target["node_uid"],"captured_at":captured_at,"physical":observed.scrape.physical,"lvs":observed.scrape.lvs,"lv_count":count,"witnesses":observed.witnesses,"scrape_milliseconds":started.elapsed().as_millis() as u64});
+    let sample = json!({"nonce":null,"qualification_run":target["qualification_run"],"node_uid":target["node_uid"],"captured_at":captured_at,"physical":observed.scrape.physical,"lvs":observed.scrape.lvs,"lv_count":count,"witnesses":observed.witnesses,"scrape_milliseconds":started.elapsed().as_millis() as u64});
     sample_valid(&sample).then_some(sample)
 }
 /// The headroom sample contract with the refinement JSON Schema cannot state: one complete
@@ -718,8 +803,13 @@ mod tests {
         .unwrap();
         for vector in vectors.as_array().unwrap() {
             assert_eq!(
-                physical(text(vector, "metrics"), text(vector, "volume_group_uuid"))
-                    .unwrap_or(Value::Null),
+                scrape(
+                    text(vector, "metrics"),
+                    text(vector, "volume_group_uuid"),
+                    vector["qualification"] == true
+                )
+                .map(|scrape| scrape.physical)
+                .unwrap_or(Value::Null),
                 vector["physical"],
                 "{}",
                 vector["name"]
@@ -730,7 +820,8 @@ mod tests {
     fn exporter(lv_count: u64, lvs: bool) -> String {
         let labels = |name: &str, segtype: &str, pool: &str| {
             format!(
-                "active_status=\"active\",device=\"dm-0\",dm_path=\"/dev/mapper/pgcf-{name}\",host=\"driver\",name=\"{name}\",path=\"/dev/pgcf/{name}\",pool=\"{pool}\",segtype=\"{segtype}\",vg=\"pgcf\""
+                "active_status=\"active\",device=\"dm-0\",dm_path=\"/dev/mapper/pgcf-{}\",host=\"driver\",name=\"{name}\",path=\"/dev/pgcf/{name}\",pool=\"{pool}\",segtype=\"{segtype}\",vg=\"pgcf\"",
+                name.replace('-', "--")
             )
         };
         let pool = labels("pgcf_thinpool", "thin-pool", "");
@@ -763,6 +854,25 @@ mod tests {
                 .unwrap()
                 .get("thin_pool")
                 .is_some_and(Value::is_null)
+        );
+    }
+    #[test]
+    fn a_primary_pool_with_a_truthful_blank_path_uses_the_exact_mapper_path() {
+        let group = "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef";
+        let metrics = exporter(2, true).replace("path=\"/dev/pgcf/pgcf_thinpool\"", "path=\"\"");
+        assert_eq!(
+            physical(&metrics, group).unwrap()["thin_pool"]["data_total_bytes"],
+            4000
+        );
+        assert!(
+            physical(
+                &metrics.replace(
+                    "dm_path=\"/dev/mapper/pgcf-pgcf_thinpool\"",
+                    "dm_path=\"/dev/mapper/other-pgcf_thinpool\""
+                ),
+                group
+            )
+            .is_none()
         );
     }
     const WRAPPER: &str = "ghcr.io/example/pgcf-regional:lvm-thin-sha-0123456789ab@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -891,6 +1001,42 @@ mod tests {
                 .await
                 .is_none()
         );
+    }
+    #[tokio::test]
+    async fn only_a_qualification_target_inventories_all_scratch_lvs() {
+        let server = Server::start().await;
+        cluster(&server);
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/node-storage-vectors.generated.json"
+        ))
+        .unwrap();
+        let vector = vectors
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["name"] == "qualification-scratch-pools-and-inactive-raw")
+            .unwrap();
+        server.state.lock().unwrap().texts.insert(
+            "/api/v1/namespaces/openebs/pods/openebs-lvm-localpv-node-x:9500/proxy/metrics".into(),
+            text(vector, "metrics").into(),
+        );
+        assert!(
+            headroom(&server.k8s, &target(Value::Null), WRAPPER)
+                .await
+                .is_none()
+        );
+        let sample = headroom(
+            &server.k8s,
+            &target("op_abcdefghijklmnopqrst".into()),
+            WRAPPER,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sample["lv_count"], 3);
+        assert_eq!(sample["qualification_run"], "op_abcdefghijklmnopqrst");
+        assert_eq!(sample["lvs"].as_array().unwrap().len(), 3);
+        assert_eq!(sample["physical"], vector["physical"]);
+        assert_eq!(sample["physical"]["thin_pool"]["name"], "pgcf_thinpool");
     }
     #[tokio::test]
     async fn each_sample_answers_the_last_nonce_and_a_refusal_changes_only_the_nonce() {

@@ -67,6 +67,131 @@ function requireCheck(condition: unknown, message: string): asserts condition {
   if (!condition) throw new QualificationFailure(message);
 }
 
+function storageExporterMetadata() {
+  const metadata = storageSources.driver.exporter_metadata;
+  requireCheck(
+    metadata &&
+      /^docker\.io\/library\/golang:[0-9.]+-alpine[0-9.]+@sha256:[a-f0-9]{64}$/.test(
+        metadata.builder_image,
+      ),
+    "Storage exporter builder pin missing or invalid",
+  );
+  return metadata;
+}
+
+function dockerInstructions(source: string): string[] {
+  return source
+    .replace(/\\\r?\n/g, " ")
+    .split(/\r?\n/)
+    .map((line) => line.trim().replace(/\s+/g, " "))
+    .filter((line) => line && !line.startsWith("#"));
+}
+function storageRuntimeInstructions(source: string): string[] {
+  const instructions = dockerInstructions(source),
+    runtime = instructions.findLastIndex((line) => line.startsWith("FROM "));
+  return instructions.slice(runtime + 1);
+}
+function validateStorageInstructions(source: string) {
+  const instructions = dockerInstructions(source),
+    runtimeIndex = instructions.findLastIndex((line) =>
+      line.startsWith("FROM "),
+    ),
+    builder = instructions.slice(0, runtimeIndex),
+    runtime = instructions.slice(runtimeIndex),
+    opcodes = (lines: string[]) => lines.map((line) => line.split(" ")[0]);
+  requireCheck(
+    JSON.stringify(opcodes(builder)) ===
+      JSON.stringify([
+        "FROM",
+        "ENV",
+        "ADD",
+        "ADD",
+        "WORKDIR",
+        "COPY",
+        "RUN",
+        "RUN",
+        "RUN",
+      ]),
+    "Storage builder instruction topology changed",
+  );
+  requireCheck(
+    JSON.stringify(opcodes(runtime)) ===
+      JSON.stringify([
+        "FROM",
+        "ADD",
+        "ADD",
+        "COPY",
+        "RUN",
+        "COPY",
+        "COPY",
+        "COPY",
+        "COPY",
+        "COPY",
+        "COPY",
+        "COPY",
+        "RUN",
+        "LABEL",
+      ]),
+    "Storage runtime instruction topology changed",
+  );
+  const runs = builder.filter((line) => line.startsWith("RUN "));
+  const exporter = storageExporterMetadata();
+  requireCheck(
+    JSON.stringify(runtime.filter((line) => line.startsWith("COPY "))) ===
+      JSON.stringify([
+        "COPY sources.lock.json /usr/share/pgcf/storage-sources.lock.json",
+        "COPY --from=driver-build /out/lvm-driver /usr/local/bin/lvm-driver",
+        `COPY --from=driver-build /upstream.tar.gz ${exporter.source_archive_path}`,
+        `COPY ${exporter.patch_file} ${exporter.patch_path}`,
+        `COPY --from=driver-build /src/LICENSE ${exporter.license_path}`,
+        `COPY NOTICE ${exporter.notice_path}`,
+        `COPY --from=driver-build /usr/local/go/LICENSE ${exporter.go_license_path}`,
+        `COPY --from=driver-build /out/licenses/ ${exporter.dependency_notices_path}/`,
+      ]),
+    "Storage runtime source/output copies changed",
+  );
+  requireCheck(
+    builder.includes(
+      `ADD --checksum=sha256:${exporter.source_archive_sha256} ${exporter.source_archive_url} /upstream.tar.gz`,
+    ) &&
+      builder.includes(
+        `ADD --checksum=sha256:${exporter.patch_tool.sha256} ${exporter.patch_tool.url} /patch-tool.apk`,
+      ) &&
+      builder.includes(
+        `COPY ${exporter.patch_file} /exporter-metadata.patch`,
+      ) &&
+      runs[0]?.includes("patch -p1 < /exporter-metadata.patch") &&
+      runs[0].includes(exporter.source_archive_sha256) &&
+      runs[0].includes(exporter.patch_sha256) &&
+      runs[0].includes(exporter.patch_tool.sha256) &&
+      runs[0].includes(
+        `test "$(stat -c %s /upstream.tar.gz)" = ${exporter.source_archive_bytes};`,
+      ) &&
+      runs[0].includes(
+        `test "$(stat -c %s /patch-tool.apk)" = ${exporter.patch_tool.bytes};`,
+      ) &&
+      runs[0].includes(
+        "apk add --no-network --no-cache --repositories-file /dev/null /patch-tool.apk;",
+      ),
+    "Storage exporter source/patch build inputs changed",
+  );
+  requireCheck(
+    runs[0]?.startsWith("RUN --network=none set -eu; ") &&
+      runs[1]?.startsWith("RUN --network=default ") &&
+      runs[1].includes("go mod download && go mod verify && go mod vendor") &&
+      runs[2]?.startsWith("RUN --network=none ") &&
+      runs[2].includes("go test -mod=vendor ") &&
+      runs[2].includes("go build -mod=vendor ") &&
+      runtime
+        .filter((line) => line.startsWith("RUN "))
+        .every((line) => line.startsWith("RUN --network=none ")) &&
+      runtime
+        .find((line) => line.startsWith("RUN "))
+        ?.includes("apk add --no-network "),
+    "Storage build/runtime network boundary changed",
+  );
+}
+
 export function parseQualificationArguments(input: string[]): {
   profile: ImageProfile;
   args: string[];
@@ -102,7 +227,10 @@ export function validateDockerfile(
       profile === "talos-recipe"
         ? ["FROM scratch"]
         : profile === "storage"
-          ? [`FROM ${storageBase}`]
+          ? [
+              `FROM ${storageExporterMetadata().builder_image} AS driver-build`,
+              `FROM ${storageBase}`,
+            ]
           : profile === "sandbox-controller" || profile === "sandbox-extension"
             ? [
                 "FROM ${RUST_BUILDER} AS build",
@@ -124,6 +252,7 @@ export function validateDockerfile(
     JSON.stringify(from) === JSON.stringify(expected),
     "Dockerfile base or stage topology differs from the pinned profile",
   );
+  if (profile === "storage") validateStorageInstructions(source);
   return profile === "talos-recipe"
     ? "scratch"
     : profile === "storage"
@@ -259,7 +388,11 @@ export async function extractLayer(
   return files;
 }
 
-export function validateBasePrefix(layers: string[], base: string[]): void {
+export function validateBasePrefix(
+  layers: string[],
+  base: string[],
+  profile: ImageProfile = "regional",
+): void {
   requireCheck(
     base.length > 0 &&
       layers.length >= base.length &&
@@ -269,6 +402,15 @@ export function validateBasePrefix(layers: string[], base: string[]): void {
       ),
     "Image does not retain the pinned official base layer prefix",
   );
+  if (profile === "storage") {
+    const runtimeLayers = storageRuntimeInstructions(
+      readFileSync("infra/storage/Dockerfile", "utf8"),
+    ).filter((line) => /^(?:ADD|COPY|RUN) /.test(line)).length;
+    requireCheck(
+      layers.length === base.length + runtimeLayers,
+      "Storage runtime layer topology changed",
+    );
+  }
 }
 
 interface ImageConfig {
@@ -881,8 +1023,40 @@ export async function verifyStorageAssembly(
   files: readonly LayerFile[],
   directory: string,
 ): Promise<void> {
+  const exporter = storageExporterMetadata();
+  requireCheck(
+    (await hashFile(
+      join("infra/storage", safeArchivePath(exporter.patch_file)),
+    )) === exporter.patch_sha256,
+    "Storage exporter patch differs from the source lock",
+  );
   const expected = [
-    ["usr/local/bin/lvm-driver", storageSources.driver.binary_sha256],
+    [
+      safeArchivePath(exporter.source_archive_path.replace(/^\//, "")),
+      exporter.source_archive_sha256,
+      exporter.source_archive_bytes,
+    ],
+    [
+      safeArchivePath(exporter.patch_path.replace(/^\//, "")),
+      exporter.patch_sha256,
+    ],
+    [
+      safeArchivePath(exporter.license_path.replace(/^\//, "")),
+      exporter.license_sha256,
+    ],
+    [
+      safeArchivePath(exporter.notice_path.replace(/^\//, "")),
+      exporter.notice_sha256,
+    ],
+    [
+      safeArchivePath(exporter.go_license_path.replace(/^\//, "")),
+      exporter.go_license_sha256,
+    ],
+    [
+      "usr/local/bin/lvm-driver",
+      storageSources.driver.binary_sha256,
+      storageSources.driver.binary_bytes,
+    ],
     ["sbin/lvm", storageSources.driver.lvm_binary_sha256],
     ["usr/sbin/pdata_tools", storageSources.thin_tools.binary_sha256],
     [
@@ -898,11 +1072,27 @@ export async function verifyStorageAssembly(
       await hashFile("infra/storage/sources.lock.json"),
     ],
   ] as const;
+  // Validate the complete declared assembly before reading payloads, then verify the real bytes.
+  for (const [path, sha256, size] of expected) {
+    const file = requiredImageFile(files, path);
+    requireCheck(
+      file.sha256 === sha256 && (size === undefined || file.size === size),
+      `storage_artifact_changed:${path}`,
+    );
+  }
+  const dependencyNotices = safeArchivePath(
+    exporter.dependency_notices_path.replace(/^\//, ""),
+  );
+  requireCheck(
+    files.filter(
+      (file) => file.path.startsWith(dependencyNotices + "/") && file.size > 0,
+    ).length === exporter.dependency_notice_files,
+    "Storage exporter dependency notices missing",
+  );
   for (const [path, sha256] of expected) {
     const file = requiredImageFile(files, path);
     requireCheck(
-      file.sha256 === sha256 &&
-        (await hashFile(join(directory, file.scanPath))) === sha256,
+      (await hashFile(join(directory, file.scanPath))) === sha256,
       `storage_artifact_changed:${path}`,
     );
   }
@@ -1342,13 +1532,20 @@ export function validateProfileProvenance(
   >,
   profile: ImageProfile,
 ): void {
-  if (profile === "storage")
+  if (profile === "storage") {
     requireCheck(
       report.baseImage === storageBase &&
         typeof report.baseImageId === "string" &&
         digestPattern.test(report.baseImageId),
       "Storage base provenance mismatch",
     );
+    requireCheck(
+      report.builderImage === storageExporterMetadata().builder_image &&
+        typeof report.builderImageId === "string" &&
+        digestPattern.test(report.builderImageId),
+      "Storage builder provenance mismatch",
+    );
+  }
   if (profile === "talos-recipe")
     requireCheck(
       report.baseImage === null &&
@@ -1499,6 +1696,23 @@ export async function qualify(
       );
     }
     const baseDiffIDs = isScratchProfile(profile) ? [] : base!.RootFS.Layers;
+    let storageBuilder: Awaited<ReturnType<typeof inspectImage>> | undefined;
+    if (profile === "storage") {
+      const builder = storageExporterMetadata().builder_image;
+      await command("base_pull", "docker", [
+        "pull",
+        "--platform",
+        "linux/amd64",
+        builder,
+      ]);
+      storageBuilder = await inspectImage(builder);
+      requireCheck(
+        storageBuilder.Architecture === "amd64" &&
+          storageBuilder.Os === "linux" &&
+          digestPattern.test(storageBuilder.Id),
+        "Unexpected storage builder platform",
+      );
+    }
     const archive = join(directory, "image.tar");
     await writeFile(archive, "", { flag: "wx", mode: 0o600 });
     await command("image_save", "docker", [
@@ -1570,7 +1784,7 @@ export async function qualify(
         "PostgreSQL assembly must contain exactly one flattened filesystem layer",
       );
     } else if (!isScratchProfile(profile))
-      validateBasePrefix(config.rootfs.diff_ids, baseDiffIDs);
+      validateBasePrefix(config.rootfs.diff_ids, baseDiffIDs, profile);
     requireCheck(
       config.rootfs.diff_ids.length === descriptor.Layers.length,
       "Saved layer count differs from config",
@@ -1686,7 +1900,12 @@ export async function qualify(
             builderImageId: base!.Id,
             compiledArtifacts,
           }
-        : {}),
+        : profile === "storage"
+          ? {
+              builderImage: storageExporterMetadata().builder_image,
+              builderImageId: storageBuilder!.Id,
+            }
+          : {}),
       diffIDs: config.rootfs.diff_ids,
       layers: descriptor.Layers.length,
       regularFiles: ownedFiles.length,
@@ -1737,7 +1956,12 @@ export async function qualify(
                 builderImageId: base!.Id,
                 compiledArtifacts,
               }
-            : {}),
+            : profile === "storage"
+              ? {
+                  builderImage: storageExporterMetadata().builder_image,
+                  builderImageId: storageBuilder!.Id,
+                }
+              : {}),
           baseDiffIDs,
           implementationSha256: createHash("sha256")
             .update(await readFile("scripts/ci/image-qualification.ts"))

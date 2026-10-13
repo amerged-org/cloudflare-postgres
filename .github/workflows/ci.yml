@@ -719,12 +719,12 @@ jobs:
         run: |
           mkdir -m 700 "$RUNNER_TEMP/pgcf-storage-image-gate"
           docker buildx build --platform linux/amd64 --load --provenance=false --sbom=false \
-            --network none --file infra/storage/Dockerfile \
+            --file infra/storage/Dockerfile \
             --iidfile "$RUNNER_TEMP/pgcf-storage-image-gate/image.id" \
             --tag "$IMAGE:lvm-thin-sha-${GITHUB_SHA::12}" \
             --label "org.opencontainers.image.source=https://github.com/$GITHUB_REPOSITORY" \
             --label "org.opencontainers.image.revision=$GITHUB_SHA" \
-            --label 'org.opencontainers.image.licenses=Apache-2.0 AND GPL-3.0-only' \
+            --label 'org.opencontainers.image.licenses=Apache-2.0 AND BSD-3-Clause AND GPL-3.0-only' \
             infra/storage
           PGCF_TEST_STORAGE_IMAGE="$IMAGE:lvm-thin-sha-${GITHUB_SHA::12}" node --test infra/storage/image.test.mjs
           node scripts/ci/image-qualification.ts --profile storage runtime "$(cat "$RUNNER_TEMP/pgcf-storage-image-gate/image.id")"

@@ -33,6 +33,33 @@ afterEach(async () => {
       .bind(id)
       .run();
 });
+it("rejects a stale qualification context before issuing a product nonce or renewing authority", async () => {
+  const f = await thinExecutionFixture(releases);
+  await identityProof(f);
+  const before = await row(f),
+    stale = (await env.DB.prepare(
+      "SELECT id FROM thin_storage_qualification_runs WHERE node_id=? AND status='completed'",
+    )
+      .bind(f.node)
+      .first<string>("id"))!;
+  expect(stale).toMatch(/^op_/);
+  const refused = await post(f, {
+    ...sample(f, null),
+    qualification_run: stale,
+  });
+  expect(refused.status).toBe(409);
+  expect(await row(f)).toEqual(before);
+  expect(await turnRequested(f)).toBe(false);
+  const current = await nonce(f),
+    held = await row(f);
+  expect(
+    (await post(f, { ...sample(f, current), qualification_run: stale })).status,
+  ).toBe(409);
+  expect(await row(f)).toEqual(held);
+  expect(
+    (await post(f, { ...sample(f, current), qualification_run: null })).status,
+  ).toBe(200);
+});
 it("hands out a Cloudflare nonce and renews once against it, anchored at its issue", async () => {
   const f = await thinExecutionFixture(releases),
     proof = await identityProof(f);

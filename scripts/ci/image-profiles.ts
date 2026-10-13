@@ -159,7 +159,10 @@ function requiredOwnedPaths(profile: ImageProfile): string[] {
       "usr/share/pgcf/postgres-engine.sha256",
     ];
   if (profile === "storage")
-    return ["usr/share/pgcf/storage-sources.lock.json"];
+    return [
+      "usr/share/pgcf/storage-sources.lock.json",
+      "usr/local/bin/lvm-driver",
+    ];
   if (profile === "talos-recipe")
     return [
       "manifest.yaml",
@@ -220,11 +223,18 @@ export function selectOwnedFiles<T extends { path: string }>(
         !upstreamAssets.has(path),
     );
   }
-  const upstreamSource = `usr/share/pgcf/${new URL(storageSources.thin_tools.source_archive_url).pathname.split("/").at(-1)}`;
+  const upstreamSources = new Set([
+    `usr/share/pgcf/${new URL(storageSources.thin_tools.source_archive_url).pathname.split("/").at(-1)}`,
+    storageSources.driver.exporter_metadata.source_archive_path.replace(
+      /^\//,
+      "",
+    ),
+  ]);
   // PostgreSQL is flattened: layer membership cannot distinguish the upstream engine from our metadata.
   return files.filter(
     ({ path }) =>
-      path.startsWith("usr/share/pgcf/") &&
-      (profile !== "storage" || path !== upstreamSource),
+      (profile === "storage" && path === "usr/local/bin/lvm-driver") ||
+      (path.startsWith("usr/share/pgcf/") &&
+        (profile !== "storage" || !upstreamSources.has(path))),
   );
 }

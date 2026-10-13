@@ -216,6 +216,9 @@ export const NodeStorageHeadroomSample = z
   .strictObject({
     /** The previous response's nonce; null only asks for a first one and renews nothing. */
     nonce: ThinStorageSampleNonce.nullable(),
+    /** Sampling scope is explicit: absent/null is product; a scratch reading names its exact run.
+     * Cloudflare rejects a changed scope before issuing any nonce or signing write authority. */
+    qualification_run: OperationId.nullable().optional(),
     node_uid: z.uuid(),
     /** Controller wall clock; audit data only. */
     captured_at: z.iso.datetime(),

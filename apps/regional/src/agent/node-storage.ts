@@ -56,6 +56,7 @@ function metrics(text: string): Metric[] {
 export function physicalStorageMetrics(
   text: string,
   vgUuid: string,
+  mode: "product" | "qualification" = "product",
 ): NodePhysicalStorage | null {
   try {
     const values = metrics(text);
@@ -89,17 +90,45 @@ export function physicalStorageMetrics(
     // OpenEBS emits no LV series at all when one LV path does not resolve, while vgs still
     // counts every LV: a scrape is complete only when both agree.
     if (one("lvm_vg_lv_count", group) !== volumes.length) return null;
+    const qualification = mode === "qualification",
+      pools = new Set(
+        volumes
+          .filter(
+            (volume) =>
+              volume.labels.segtype === "thin-pool" &&
+              volume.labels.pool === "",
+          )
+          .map((volume) => volume.labels.name),
+      );
     let thick = 0,
+      otherPoolAllocated = 0,
       pool: NodePhysicalStorage["thin_pool"] = null;
     for (const volume of volumes) {
-      const labels = volume.labels;
+      const labels = volume.labels,
+        primary =
+          labels.segtype === "thin-pool" && labels.name === "pgcf_thinpool",
+        mapper = `/dev/mapper/pgcf-${labels.name?.replaceAll("-", "--")}`,
+        path = `/dev/pgcf/${labels.name}`,
+        pathValid =
+          labels.path === path ||
+          (labels.path === "" &&
+            (primary ? labels.dm_path === mapper : qualification)),
+        scratchMapperValid =
+          !qualification ||
+          primary ||
+          labels.dm_path === "" ||
+          labels.dm_path === mapper;
       if (
         !labels.name ||
+        !/^[A-Za-z0-9_.+[\]-]{1,128}$/.test(labels.name) ||
         names.has(labels.name) ||
-        labels.active_status !== "active" ||
-        labels.path !== `/dev/pgcf/${labels.name}` ||
-        one("lvm_lv_health_status", labels) !== 0 ||
-        one("lvm_lv_permission", labels) !== 1 ||
+        !pathValid ||
+        !scratchMapperValid ||
+        (qualification && !primary
+          ? !["active", "inactive"].includes(labels.active_status ?? "")
+          : labels.active_status !== "active" ||
+            one("lvm_lv_health_status", labels) !== 0 ||
+            one("lvm_lv_permission", labels) !== 1) ||
         !Number.isSafeInteger(volume.value) ||
         volume.value <= 0
       )
@@ -136,11 +165,48 @@ export function physicalStorageMetrics(
           ),
         };
       } else if (!(
-        labels.segtype === "thin" && labels.pool === "pgcf_thinpool"
-      ))
-        return null;
+        labels.segtype === "thin" &&
+        (qualification
+          ? pools.has(labels.pool)
+          : labels.pool === "pgcf_thinpool")
+      )) {
+        if (
+          !qualification ||
+          labels.segtype !== "thin-pool" ||
+          labels.pool !== ""
+        )
+          return null;
+        // Scratch pools reserve physical extents separately from linear LVs. Missing scratch
+        // utilization is not zero use; only the primary pool's measured use enters physical.
+        otherPoolAllocated += volume.value;
+        const metadata = values.filter(
+          (metric) =>
+            metric.name === "lvm_lv_mda_total_size_bytes" &&
+            Object.keys(metric.labels).length === Object.keys(labels).length &&
+            Object.entries(labels).every(
+              ([key, value]) => metric.labels[key] === value,
+            ),
+        );
+        if (metadata.length > 1) return null;
+        if (metadata.length === 1) {
+          const bytes = metadata[0]!.value;
+          if (!Number.isSafeInteger(bytes) || bytes <= 0) return null;
+          otherPoolAllocated += bytes;
+        }
+      }
     }
-    if (!pool && volumes.some((volume) => volume.labels.segtype === "thin"))
+    if (
+      !qualification &&
+      !pool &&
+      volumes.some((volume) => volume.labels.segtype === "thin")
+    )
+      return null;
+    if (
+      thick +
+        otherPoolAllocated +
+        (pool ? pool.data_total_bytes + pool.metadata_total_bytes : 0) >
+      total - free
+    )
       return null;
     return NodePhysicalStorage.parse({
       volume_group_uuid: vgUuid,

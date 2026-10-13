@@ -1,0 +1,2 @@
+# Unified-diff context carries leading spaces and tabs as payload syntax.
+infra/storage/exporter-metadata.patch -whitespace

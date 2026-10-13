@@ -254,6 +254,8 @@ export function selectImageInputs(
         "infra/storage/.dockerignore",
         "infra/storage/sources.lock.json",
         "infra/storage/image.test.mjs",
+        "infra/storage/exporter-metadata.patch",
+        "infra/storage/NOTICE",
       ].includes(path)
     )
       result.storage = true;

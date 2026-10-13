@@ -2,6 +2,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import versions from "../../infra/platform/versions.lock.json" with { type: "json" };
+import storageSources from "../../infra/storage/sources.lock.json" with { type: "json" };
 import {
   imageProfile,
   isRustProfile,
@@ -149,12 +150,16 @@ test("storage scanning excludes the exact copied source archive and still select
     "usr/share/pgcf/storage-sources.lock.json",
     "usr/share/pgcf/driver-policy.json",
     "usr/share/pgcf/thin-provisioning-tools-unexpected.tar.gz",
+    "usr/local/bin/lvm-driver",
   );
   const input = [
     ...owned,
     ...files(
       "usr/share/pgcf/thin-provisioning-tools-1.1.0.tar.gz",
-      "usr/local/bin/lvm-driver",
+      storageSources.driver.exporter_metadata.source_archive_path.replace(
+        /^\//,
+        "",
+      ),
       "usr/sbin/pdata_tools",
       "usr/share/licenses/pgcf-thin-tools/COPYING",
     ),
@@ -169,6 +174,17 @@ test("storage scanning excludes the exact copied source archive and still select
         "storage",
       ),
     /First-party image output missing/,
+  );
+});
+
+test("storage scanning requires the locally rebuilt driver", () => {
+  assert.throws(
+    () =>
+      selectOwnedFiles(
+        files("usr/share/pgcf/storage-sources.lock.json"),
+        "storage",
+      ),
+    /First-party image output missing: usr\/local\/bin\/lvm-driver/,
   );
 });
 

@@ -21,6 +21,7 @@ import {
   validateRuntimeResult,
   validateProfileProvenance,
   verifyRustAssembly,
+  verifyStorageAssembly,
   verifyTalosRecipeAssembly,
   type LayerFile,
 } from "./image-qualification.ts";
@@ -1048,6 +1049,332 @@ test("storage and Rust profiles bind their own sources without a fictitious runt
       ),
     /runtime_generated_input_invalid/,
   );
+});
+
+test("storage assembly refuses extra runtime instructions and the former builder-free topology", async () => {
+  const source = await readFile("infra/storage/Dockerfile", "utf8");
+  assert.throws(
+    () =>
+      validateDockerfile(
+        source + "\nRUN touch /usr/local/bin/unqualified\n",
+        "storage",
+      ),
+    /Storage runtime instruction topology|pinned profile/,
+  );
+  assert.throws(
+    () =>
+      validateDockerfile(
+        source + "\nCOPY unexpected /usr/local/bin/unqualified\n",
+        "storage",
+      ),
+    /Storage runtime instruction topology|pinned profile/,
+  );
+  assert.throws(
+    () => validateDockerfile(`FROM ${storageBase}\n`, "storage"),
+    /pinned profile/,
+  );
+});
+
+test("storage builder permits only pinned inputs and one module-fetch network step", async () => {
+  const source = await readFile("infra/storage/Dockerfile", "utf8"),
+    lock = JSON.parse(
+      await readFile("infra/storage/sources.lock.json", "utf8"),
+    ),
+    exporter = lock.driver.exporter_metadata;
+  assert.throws(
+    () =>
+      validateDockerfile(
+        source.replace(
+          exporter.builder_image,
+          "docker.io/library/golang:latest",
+        ),
+        "storage",
+      ),
+    /pinned profile/,
+  );
+  assert.throws(
+    () =>
+      validateDockerfile(
+        source.replace(exporter.source_archive_sha256, "0".repeat(64)),
+        "storage",
+      ),
+    /source\/patch build inputs changed/,
+  );
+  assert.throws(
+    () =>
+      validateDockerfile(
+        source.replace(exporter.patch_tool.sha256, "0".repeat(64)),
+        "storage",
+      ),
+    /source\/patch build inputs changed/,
+  );
+  assert.throws(
+    () =>
+      validateDockerfile(
+        source.replace(
+          `= ${exporter.patch_tool.bytes};`,
+          `= ${exporter.patch_tool.bytes + 1};`,
+        ),
+        "storage",
+      ),
+    /source\/patch build inputs changed/,
+  );
+  assert.throws(
+    () =>
+      validateDockerfile(
+        source.replace("RUN --network=default ", "RUN --network=none "),
+        "storage",
+      ),
+    /network boundary changed/,
+  );
+  assert.throws(
+    () =>
+      validateDockerfile(
+        source.replace("RUN --network=none ", "RUN --network=default "),
+        "storage",
+      ),
+    /network boundary changed/,
+  );
+  assert.throws(
+    () =>
+      validateDockerfile(
+        source.replace(
+          "COPY --from=driver-build /out/lvm-driver /usr/local/bin/lvm-driver",
+          "COPY --from=driver-build /out/lvm-driver /usr/local/bin/unqualified",
+        ),
+        "storage",
+      ),
+    /runtime source\/output copies changed/,
+  );
+});
+
+test("storage publication binds its pinned Go builder as well as the inherited driver runtime", () => {
+  const builder =
+    "docker.io/library/golang:1.27.2-alpine3.24@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d";
+  const report = {
+    baseImage: storageBase,
+    baseImageId: `sha256:${"a".repeat(64)}`,
+    builderImage: builder,
+    builderImageId: `sha256:${"b".repeat(64)}`,
+  };
+  assert.doesNotThrow(() => validateProfileProvenance(report, "storage"));
+  for (const changed of [
+    { builderImage: "docker.io/library/golang:latest" },
+    { builderImage: undefined },
+    { builderImageId: undefined },
+    { builderImageId: "unqualified" },
+  ])
+    assert.throws(
+      () => validateProfileProvenance({ ...report, ...changed }, "storage"),
+      /Storage builder provenance mismatch/,
+    );
+});
+
+test("storage CI leaves network selection to its checked Dockerfile module-fetch boundary", async () => {
+  const workflow = await readFile(".github/workflows/ci.yml", "utf8"),
+    storage = workflow
+      .split("\n  storage_image:\n")[1]!
+      .split("\n  native_runtime_images:\n")[0]!,
+    build = storage.slice(
+      storage.indexOf("docker buildx build"),
+      storage.indexOf("PGCF_TEST_STORAGE_IMAGE"),
+    );
+  assert.match(build, /--file infra\/storage\/Dockerfile/);
+  assert.doesNotMatch(
+    build,
+    /--network(?:\s+|=)(?:none|default|host)\b/,
+    "A global network override defeats the Dockerfile's one verified module-fetch stage",
+  );
+  const otherBuilds = [
+    ...workflow
+      .replace(storage, "")
+      .matchAll(/docker buildx build(?:[^\n]*\\\n)*[^\n]*/g),
+  ];
+  assert.equal(otherBuilds.length, 4);
+  for (const command of otherBuilds)
+    assert.doesNotMatch(
+      command[0],
+      /--network(?:\s+|=)(?:none|default|host)\b/,
+    );
+  for (const job of ["image", "node_bootstrap_image", "postgres_image"])
+    assert.match(
+      workflow.split(`\n  ${job}:\n`)[1]!.split(/\n {2}[a-z_]+:\n/)[0]!,
+      /docker run[^\n]*--network none/,
+    );
+});
+
+test("storage publication retains the Dockerfile's Go, driver and thin-tools license declaration", async () => {
+  const source = await readFile("infra/storage/Dockerfile", "utf8"),
+    workflow = await readFile(".github/workflows/ci.yml", "utf8"),
+    storage = workflow
+      .split("\n  storage_image:\n")[1]!
+      .split("\n  native_runtime_images:\n")[0]!,
+    declared = /org\.opencontainers\.image\.licenses="([^"]+)"/.exec(
+      source,
+    )?.[1],
+    published = /--label 'org\.opencontainers\.image\.licenses=([^']+)'/.exec(
+      storage,
+    )?.[1];
+  assert.ok(declared);
+  assert.equal(
+    published,
+    declared,
+    "The CI build override must retain the shipped license declaration",
+  );
+});
+
+test("storage images cannot append filesystem layers outside the declared assembly", () => {
+  // Two checked downloads, eight copied outputs and two offline checks compose the runtime.
+  const base = [`sha256:${"a".repeat(64)}`],
+    assembled = [
+      ...base,
+      ...Array.from({ length: 12 }, () => `sha256:${"b".repeat(64)}`),
+    ];
+  assert.doesNotThrow(() => validateBasePrefix(assembled, base, "storage"));
+  assert.throws(
+    () =>
+      validateBasePrefix(
+        [...assembled, `sha256:${"c".repeat(64)}`],
+        base,
+        "storage",
+      ),
+    /Storage runtime layer topology changed/,
+  );
+  assert.throws(
+    () => validateBasePrefix(assembled.slice(0, -1), base, "storage"),
+    /Storage runtime layer topology changed/,
+  );
+});
+
+test("storage assembly binds upstream archive, local exporter patch, Apache license and rebuilt driver bytes", async () => {
+  const lock = await readFile("infra/storage/sources.lock.json"),
+    sources = JSON.parse(lock.toString()),
+    exporter = sources.driver.exporter_metadata;
+  assert.ok(exporter, "Storage exporter assembly must have its source lock");
+  assert.match(
+    exporter.go_license_sha256,
+    /^[a-f0-9]{64}$/,
+    "Pinned Go compiler license checksum is required",
+  );
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-storage-assembly-")),
+    archive = exporter.source_archive_path.slice(1),
+    patch = exporter.patch_path.slice(1),
+    license = exporter.license_path.slice(1),
+    notice = exporter.notice_path.slice(1),
+    goLicense = exporter.go_license_path.slice(1),
+    dependencies = exporter.dependency_notices_path.slice(1);
+  const pins: [string, string, number][] = [
+    [archive, exporter.source_archive_sha256, exporter.source_archive_bytes],
+    [patch, exporter.patch_sha256, 1],
+    [license, exporter.license_sha256, 1],
+    [notice, exporter.notice_sha256, 1],
+    [goLicense, exporter.go_license_sha256, 1],
+    [
+      "usr/local/bin/lvm-driver",
+      sources.driver.binary_sha256,
+      sources.driver.binary_bytes,
+    ],
+    ["sbin/lvm", sources.driver.lvm_binary_sha256, 1],
+    ["usr/sbin/pdata_tools", sources.thin_tools.binary_sha256, 1],
+    [
+      "usr/share/licenses/pgcf-thin-tools/COPYING",
+      sources.thin_tools.license_sha256,
+      1,
+    ],
+    [
+      "usr/share/pgcf/thin-provisioning-tools-1.1.0.tar.gz",
+      sources.thin_tools.source_archive_sha256,
+      1,
+    ],
+    [
+      "usr/share/pgcf/storage-sources.lock.json",
+      createHash("sha256").update(lock).digest("hex"),
+      lock.length,
+    ],
+  ];
+  for (let index = 0; index < exporter.dependency_notice_files; index++)
+    pins.push([`${dependencies}/module-${index}/LICENSE`, "a".repeat(64), 1]);
+  const files: LayerFile[] = pins.map(([path, sha256, size], index) => ({
+    path,
+    sha256,
+    size,
+    scanPath: String(index),
+    layer: 1,
+  }));
+  try {
+    for (const changed of [
+      archive,
+      patch,
+      license,
+      notice,
+      goLicense,
+      "usr/local/bin/lvm-driver",
+    ]) {
+      await assert.rejects(
+        verifyStorageAssembly(
+          files.map((file) =>
+            file.path === changed ? { ...file, sha256: "0".repeat(64) } : file,
+          ),
+          directory,
+        ),
+        { message: `storage_artifact_changed:${changed}` },
+      );
+    }
+    await assert.rejects(
+      verifyStorageAssembly(
+        files.map((file) =>
+          file.path === archive ? { ...file, size: file.size + 1 } : file,
+        ),
+        directory,
+      ),
+      { message: `storage_artifact_changed:${archive}` },
+    );
+    await assert.rejects(
+      verifyStorageAssembly(
+        files.map((file) =>
+          file.path === "usr/local/bin/lvm-driver"
+            ? { ...file, size: file.size + 1 }
+            : file,
+        ),
+        directory,
+      ),
+      { message: "storage_artifact_changed:usr/local/bin/lvm-driver" },
+    );
+    await assert.rejects(
+      verifyStorageAssembly(
+        files.filter((file) => file.path !== license),
+        directory,
+      ),
+      { message: `image_artifact_missing:${license}` },
+    );
+    await assert.rejects(
+      verifyStorageAssembly(
+        files.filter((file) => !file.path.startsWith(dependencies + "/")),
+        directory,
+      ),
+      { message: "Storage exporter dependency notices missing" },
+    );
+    await assert.rejects(
+      verifyStorageAssembly(
+        files.filter(
+          (file) => file.path !== `${dependencies}/module-0/LICENSE`,
+        ),
+        directory,
+      ),
+      { message: "Storage exporter dependency notices missing" },
+    );
+    // Even unchanged declared digests cannot hide changed extracted archive bytes.
+    await writeFile(
+      join(directory, files[0]!.scanPath),
+      "changed upstream source",
+      { mode: 0o600 },
+    );
+    await assert.rejects(verifyStorageAssembly(files, directory), {
+      message: `storage_artifact_changed:${archive}`,
+    });
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 
 test("relay and reclaimer qualification require their own compiled contracts and source identity", async () => {

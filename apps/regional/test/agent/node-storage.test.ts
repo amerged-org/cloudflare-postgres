@@ -14,7 +14,7 @@ const vg = "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef";
 const group = (free = 7000, lvs = 0) =>
   `lvm_vg_total_size_bytes{name="pgcf"} 1e4\nlvm_vg_free_size_bytes{name="pgcf"} ${free}\nlvm_vg_permission{name="pgcf"} 0\nlvm_vg_missing_pv_count{name="pgcf"} 0\nlvm_vg_pv_count{name="pgcf"} 1\nlvm_vg_lv_count{name="pgcf"} ${lvs}\n`;
 const labels = (name: string, segtype: string, pool = "") =>
-  `active_status="active",device="dm-0",dm_path="/dev/mapper/pgcf-${name}",host="driver",name="${name}",path="/dev/pgcf/${name}",pool="${pool}",segtype="${segtype}",vg="pgcf"`;
+  `active_status="active",device="dm-0",dm_path="/dev/mapper/pgcf-${name.replaceAll("-", "--")}",host="driver",name="${name}",path="/dev/pgcf/${name}",pool="${pool}",segtype="${segtype}",vg="pgcf"`;
 const lv = (name: string, segtype: string, size: number, pool = "") =>
   `lvm_lv_total_size_bytes{${labels(name, segtype, pool)}} ${size}\nlvm_lv_health_status{${labels(name, segtype, pool)}} 0\nlvm_lv_permission{${labels(name, segtype, pool)}} 1\n`;
 
@@ -97,6 +97,75 @@ test("a scrape that lost its LV series is unknown, never a volume group without 
     physicalStorageMetrics(
       group(7000).replace(/^lvm_vg_lv_count.*\n/m, ""),
       vg,
+    ),
+    null,
+  );
+});
+
+test("a thin pool's truthful blank LV path is bound to its exact mapper path", () => {
+  const primary = labels("pgcf_thinpool", "thin-pool");
+  const metrics = (
+    group(5990, 1) +
+    lv("pgcf_thinpool", "thin-pool", 4000) +
+    `lvm_lv_mda_total_size_bytes{${primary}} 10\nlvm_lv_used_percent{${primary}} 25\nlvm_lv_mda_used_percent{${primary}} 20\nlvm_lv_when_full{${primary}} 0\n`
+  ).replaceAll('path="/dev/pgcf/pgcf_thinpool"', 'path=""');
+  assert.equal(
+    physicalStorageMetrics(metrics, vg)?.thin_pool?.data_total_bytes,
+    4000,
+  );
+  assert.equal(
+    physicalStorageMetrics(
+      metrics.replaceAll(
+        'dm_path="/dev/mapper/pgcf-pgcf_thinpool"',
+        'dm_path="/dev/mapper/other-pgcf_thinpool"',
+      ),
+      vg,
+    ),
+    null,
+  );
+  assert.equal(
+    physicalStorageMetrics(
+      metrics.replaceAll('active_status="active"', 'active_status="inactive"'),
+      vg,
+    ),
+    null,
+  );
+  assert.equal(
+    physicalStorageMetrics(
+      metrics.replace(/^lvm_lv_used_percent.*\n/m, ""),
+      vg,
+    ),
+    null,
+  );
+});
+
+test("qualification inventories scratch pools and inactive raw LVs without authorizing their product use", () => {
+  const primary = labels("pgcf_thinpool", "thin-pool");
+  const primaryMetrics = (
+    lv("pgcf_thinpool", "thin-pool", 4000) +
+    `lvm_lv_mda_total_size_bytes{${primary}} 10\nlvm_lv_used_percent{${primary}} 25\nlvm_lv_mda_used_percent{${primary}} 20\nlvm_lv_when_full{${primary}} 0\n`
+  ).replaceAll('path="/dev/pgcf/pgcf_thinpool"', 'path=""');
+  const scratch = lv("scratch-pool", "thin-pool", 1000).replaceAll(
+    'path="/dev/pgcf/scratch-pool"',
+    'path=""',
+  );
+  const raw = lv("scratch_raw", "linear", 1000)
+    .replaceAll('active_status="active"', 'active_status="inactive"')
+    .replaceAll('path="/dev/pgcf/scratch_raw"', 'path=""')
+    .replaceAll('dm_path="/dev/mapper/pgcf-scratch_raw"', 'dm_path=""');
+  const metrics = group(2990, 3) + primaryMetrics + scratch + raw;
+  assert.equal(physicalStorageMetrics(metrics, vg), null);
+  const physical = physicalStorageMetrics(metrics, vg, "qualification");
+  assert.equal(physical?.thin_pool?.name, "pgcf_thinpool");
+  assert.equal(physical?.thick_allocated_bytes, 1000);
+  assert.equal(
+    physicalStorageMetrics(
+      metrics.replace(
+        'lvm_vg_lv_count{name="pgcf"} 3',
+        'lvm_vg_lv_count{name="pgcf"} 4',
+      ),
+      vg,
+      "qualification",
     ),
     null,
   );

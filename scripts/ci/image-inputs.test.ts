@@ -160,6 +160,17 @@ test("the storage source lock invalidates both the storage and Native images", (
   );
 });
 
+test("the storage exporter patch and modification notice are image build inputs", () => {
+  assert.deepEqual(
+    selectImageInputs(["infra/storage/exporter-metadata.patch"], "push"),
+    selected({ storage: true }),
+  );
+  assert.deepEqual(
+    selectImageInputs(["infra/storage/NOTICE"], "push"),
+    selected({ storage: true }),
+  );
+});
+
 test("management-only changes skip images while exact Native and Regional build inputs select their image", () => {
   assert.deepEqual(
     selectImageInputs(["infra/talos/sandbox/runtime-admission.ts"], "push"),

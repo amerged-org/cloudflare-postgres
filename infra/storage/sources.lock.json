@@ -8,13 +8,15 @@
     "source": "https://github.com/openebs/lvm-localpv",
     "source_commit": "e8a234cbfeef5fa16fde1330c8de2d91e31831f1",
     "license": "Apache-2.0",
-    "binary_sha256": "50a9ede8031deae0adf2431f960c0979b305b54dc7950b170a54cc4613d4fdb1",
+    "binary_sha256": "753e722293eec85a490212eb1b44ffd01611d04ba65866072de0f42295d72fba",
     "lvm_binary_sha256": "fdc5aa9706d9982553ff4ee8497e4236dbfba4e790a8b81883789739e0176546",
     "runtime_config": {
       "Env": [
         "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
       ],
-      "Entrypoint": ["/usr/local/bin/lvm-driver"],
+      "Entrypoint": [
+        "/usr/local/bin/lvm-driver"
+      ],
       "Cmd": null,
       "User": "",
       "WorkingDir": "/",
@@ -23,7 +25,37 @@
         "7676/tcp": {}
       },
       "Volumes": null
-    }
+    },
+    "upstream_binary_sha256": "50a9ede8031deae0adf2431f960c0979b305b54dc7950b170a54cc4613d4fdb1",
+    "exporter_metadata": {
+      "go_version": "1.27.2",
+      "builder_image": "docker.io/library/golang:1.27.2-alpine3.24@sha256:f92b6ef800e499660581efdabdf25d9d817a9d124eaf900924f0504e7e27e12d",
+      "source_archive_url": "https://codeload.github.com/openebs/lvm-localpv/tar.gz/e8a234cbfeef5fa16fde1330c8de2d91e31831f1",
+      "source_archive_sha256": "f571ef645592fe5f82936ddfb609d755d83fea2d5c57fb04f61a83b4f84ebff4",
+      "source_archive_bytes": 421865,
+      "source_archive_path": "/usr/share/pgcf/lvm-localpv-e8a234cbfeef5fa16fde1330c8de2d91e31831f1.tar.gz",
+      "patch_file": "exporter-metadata.patch",
+      "patch_sha256": "e803cc8f736f05c372e3841d6e24efd080bb3b3d1b9bdb3685451f393dfd222e",
+      "patch_path": "/usr/share/pgcf/lvm-localpv-exporter.patch",
+      "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "license_path": "/usr/share/licenses/pgcf-lvm-localpv/LICENSE",
+      "notice_path": "/usr/share/licenses/pgcf-lvm-localpv/NOTICE",
+      "notice_sha256": "6b739ae5bdcf5f0f785d9be6743ac587c74c8602af059206be8fc708dd1d6ef9",
+      "go_license_path": "/usr/share/licenses/pgcf-lvm-localpv/Go-LICENSE",
+      "dependency_notices_path": "/usr/share/licenses/pgcf-lvm-localpv/dependencies",
+      "go_license_sha256": "911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad",
+      "patch_tool": {
+        "package": "patch",
+        "version": "2.8-r0",
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/patch-2.8-r0.apk",
+        "sha256": "723c061ea3e2c3e61b457f8f614f0b87724aeae37564ba4c1bdd41c722118187",
+        "bytes": 69750,
+        "license": "GPL-3.0-or-later",
+        "dependencies": "so:libc.musl-x86_64.so.1"
+      },
+      "dependency_notice_files": 108
+    },
+    "binary_bytes": 54939772
   },
   "thin_tools": {
     "package": "thin-provisioning-tools",

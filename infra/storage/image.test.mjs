@@ -37,7 +37,7 @@ function run(script) {
   return result.stdout;
 }
 
-test("the storage extension preserves official driver and LVM bytes, configuration and licenses", () => {
+test("the storage image binds the rebuilt exporter and preserves LVM bytes, configuration and notices", () => {
   assert.ok(image, "PGCF_TEST_STORAGE_IMAGE must name the actual built image");
   const inspected = spawnSync("docker", ["image", "inspect", image], {
     encoding: "utf8",
@@ -71,6 +71,10 @@ test("the storage extension preserves official driver and LVM bytes, configurati
   assert.deepEqual(config, sources.driver.runtime_config);
   const output = run(`
 printf '%s  %s\\n' ${sources.driver.binary_sha256} /usr/local/bin/lvm-driver ${sources.driver.lvm_binary_sha256} /sbin/lvm ${sources.thin_tools.binary_sha256} /usr/sbin/pdata_tools ${sources.thin_tools.license_sha256} /usr/share/licenses/pgcf-thin-tools/COPYING ${sources.thin_tools.source_archive_sha256} ${sources.container_assembly.corresponding_source_path} | sha256sum -c - > /tmp/hashes
+test $(stat -c %s ${sources.driver.exporter_metadata.source_archive_path}) = ${sources.driver.exporter_metadata.source_archive_bytes}
+printf '%s  %s\\n' ${sources.driver.exporter_metadata.source_archive_sha256} ${sources.driver.exporter_metadata.source_archive_path} ${sources.driver.exporter_metadata.patch_sha256} ${sources.driver.exporter_metadata.patch_path} ${sources.driver.exporter_metadata.license_sha256} ${sources.driver.exporter_metadata.license_path} ${sources.driver.exporter_metadata.notice_sha256} ${sources.driver.exporter_metadata.notice_path} ${sources.driver.exporter_metadata.go_license_sha256} ${sources.driver.exporter_metadata.go_license_path} | sha256sum -c - > /tmp/source-hashes
+find ${sources.driver.exporter_metadata.dependency_notices_path} -type f > /tmp/dependency-notices
+test -s /tmp/dependency-notices
 test "$(thin_check --version)" = ${sources.thin_tools.version}
 test "$(thin_repair --version)" = ${sources.thin_tools.version}
 test "$(readlink /usr/sbin/thin_check)" = pdata_tools

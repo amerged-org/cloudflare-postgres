@@ -1,0 +1,13 @@
+PGCF OpenEBS LVM exporter metadata patch
+
+This image contains OpenEBS LVM LocalPV 1.10.1, source commit
+e8a234cbfeef5fa16fde1330c8de2d91e31831f1, licensed under Apache-2.0.
+Original copyright notices are retained in the corresponding source archive.
+
+PGCF contributors modified only the exporter collectors and added exporter-specific
+metadata readers and regression tests on 2026-10-13. CSI device-path validation
+and thin-pool capacity discovery retain the upstream implementation. The upstream
+source archive and applied patch accompany this image under /usr/share/pgcf.
+
+The rebuilt binary includes the Go runtime (BSD-3-Clause). Its license and
+the vendored dependency notices are retained alongside this notice.
