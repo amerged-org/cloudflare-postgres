@@ -377,7 +377,7 @@ export async function reserveThinStorageLease(
       )
         .bind(nodeId)
         .first<number>("count");
-      if ((references ?? 0) > 0 || holds.count > 0) {
+      if ((references ?? 0) > 0) {
         await env.DB.prepare(
           "UPDATE node_thin_storage SET status='blocked',error_code='thin_storage_retained_pool_missing' WHERE node_id=? AND profile_revision=? AND lease_revision=?",
         )
@@ -385,18 +385,22 @@ export async function reserveThinStorageLease(
           .run();
         return null;
       }
-      action = NodeThinPoolAction.parse({
-        kind: "initialize",
-        state: "pending",
-        nonce: operation,
-        target_data_bytes: profile.initial_data_bytes,
-        target_metadata_bytes: profile.metadata_bytes,
-        expected_pool_uuid: null,
-        driver_pod_uid: null,
-        boot_id: null,
-        dispatched_at: null,
-        deadline_at: null,
-      });
+      // CSI removes the pool with its last LV. A deleted database's hold remains until a
+      // newer identity read proves reclamation: keep that read possible without authorizing
+      // a replacement pool or discarding the hold while its physical outcome is unproved.
+      if (holds.count === 0)
+        action = NodeThinPoolAction.parse({
+          kind: "initialize",
+          state: "pending",
+          nonce: operation,
+          target_data_bytes: profile.initial_data_bytes,
+          target_metadata_bytes: profile.metadata_bytes,
+          expected_pool_uuid: null,
+          driver_pod_uid: null,
+          boot_id: null,
+          dispatched_at: null,
+          deadline_at: null,
+        });
     } else if (
       current.authority &&
       pool.metadata_total_bytes < profile.metadata_bytes

@@ -9,7 +9,7 @@ import {
   thinStorageClass,
 } from "@pgcf/contracts";
 import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
-import { cleanupFixtures } from "./fixtures.ts";
+import { cleanupFixtures, request } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
 import {
   dispatchThinPoolAction,
@@ -586,6 +586,89 @@ it("confirms a deletion only from an identity read that started after it, never 
     inventory_revision: 3,
   });
   expect(await confirmed()).toBe(1);
+});
+
+it("keeps an identity-only turn available after the last deleted volume removes its pool while its startup hold awaits proof", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const { created, receipt } = await boundDatabase(f);
+  await env.DB.prepare(
+    "UPDATE database_start_admissions SET storage_volume_json=? WHERE operation_id=?",
+  )
+    .bind(JSON.stringify(receipt), created.operation.id)
+    .run();
+  const beforeDeletion = Date.now() - 1000;
+  const deletion = await request(
+    `/v1/databases/${created.database.id}`,
+    f.admin,
+    "DELETE",
+    undefined,
+    crypto.randomUUID(),
+  );
+  expect(deletion.status).toBe(202);
+  const absent = {
+    pool_uuid: null,
+    write_allowed: false,
+    physical: {
+      ...f.authority.physical,
+      free_bytes: 100 * gib,
+      thin_pool: null,
+    },
+    physical_lvs: [],
+    active_lv_uuids: [],
+    volumes: [],
+  };
+  // The slow read began before deletion and returned after CSI removed its last LV and pool.
+  // That observation must not free the hold, but must not prevent the next decisive read either.
+  await identityProof(f, {
+    ...absent,
+    inventory_observed_at: iso(beforeDeletion),
+    inventory_expires_at: iso(beforeDeletion + 300_000),
+  });
+  const confirmed = () =>
+    env.DB.prepare(
+      `SELECT ${thinStorageDeletionConfirmedSql("d")} safe FROM databases d WHERE d.id=?`,
+    )
+      .bind(created.database.id)
+      .first("safe");
+  expect(await confirmed()).toBe(0);
+  const input = await prepareThinStorageLease(f.local, f.node);
+  expect(input).not.toBeNull();
+  expect(input!.lease.action).toBeNull();
+  expect(await row(f)).toMatchObject({ error_code: null });
+  expect(
+    await env.DB.prepare(
+      "SELECT storage_budget_bytes FROM database_start_admissions WHERE operation_id=?",
+    )
+      .bind(created.operation.id)
+      .first("storage_budget_bytes"),
+  ).toBe(5 * gib);
+  expect(await report(f, absent)).toMatchObject({
+    accepted: true,
+    write_allowed: false,
+  });
+  expect(await confirmed()).toBe(1);
+});
+
+it("still blocks a missing pool while a non-deleted thin database references it", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  await boundDatabase(f);
+  await identityProof(f, {
+    pool_uuid: null,
+    write_allowed: false,
+    physical: {
+      ...f.authority.physical,
+      free_bytes: 100 * gib,
+      thin_pool: null,
+    },
+    physical_lvs: [],
+    active_lv_uuids: [],
+    volumes: [],
+  });
+  expect(await prepareThinStorageLease(f.local, f.node)).toBeNull();
+  expect(await row(f)).toMatchObject({
+    status: "blocked",
+    error_code: "thin_storage_retained_pool_missing",
+  });
 });
 
 it("records a protective stop from an identity proof whose composed authority already expired", async () => {
