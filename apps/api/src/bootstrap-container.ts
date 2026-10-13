@@ -202,6 +202,7 @@ async function inspectionStatusBody(response: Response, signal: AbortSignal) {
 const TRANSIENT_THIN_STORAGE_FAILURES = new Set([
   "thin_storage_authority_refused",
   "thin_storage_command_failed",
+  "thin_storage_turn_timeout",
   "thin_storage_inventory_changed",
   "thin_storage_lvs_changed",
   "thin_storage_action_preflight_changed",

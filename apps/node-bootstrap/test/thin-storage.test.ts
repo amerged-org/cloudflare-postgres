@@ -6,6 +6,9 @@ import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
+import { createServer } from "node:http";
+import { once } from "node:events";
+import { setTimeout as delay } from "node:timers/promises";
 import { BootstrapError, runCommand } from "../src/bootstrap.ts";
 import {
   issueAgain,
@@ -509,6 +512,191 @@ test("the session command used by mutations attempts a real write once and prese
     assert.equal(await readFile(marker, "utf8"), "x");
   } finally {
     await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a thin turn's own deadline cancels a real subprocess without replay, while an external timeout stays job_cancelled", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-thin-turn-deadline-"));
+  await chmod(directory, 0o700);
+  const marker = join(directory, "attempts"),
+    scope = {
+      callback: {
+        url: "https://api.invalid/internal/storage",
+        bearer: "test-only",
+      },
+      cluster_endpoint: "https://kubernetes.invalid:6443",
+      address: "node.invalid",
+      budget_ms: 200,
+      deadline_code: "thin_storage_turn_timeout" as const,
+      prefix: "pgcf-thin-turn-deadline-session-",
+      talos_admin_config: stringify({
+        context: "test",
+        contexts: {
+          test: { ca: "test-only", crt: "test-only", key: "test-only" },
+        },
+      }),
+      kubeconfig: stringify({
+        clusters: [
+          {
+            cluster: {
+              server: "https://kubernetes.invalid:6443",
+              "certificate-authority-data": "test-only",
+            },
+          },
+        ],
+        users: [
+          {
+            user: {
+              "client-certificate-data": "test-only",
+              "client-key-data": "test-only",
+            },
+          },
+        ],
+      }),
+    },
+    command = (session: Parameters<Parameters<typeof openThinSession>[2]>[0]) =>
+      session.command(
+        "/bin/sh",
+        ["-c", 'umask 077; printf x >> "$1"; sleep 5', "deadline-test", marker],
+        undefined,
+        false,
+        10000,
+      );
+  try {
+    await assert.rejects(
+      openThinSession(scope, {}, command),
+      (error: unknown) =>
+        error instanceof BootstrapError &&
+        error.code === "thin_storage_turn_timeout",
+    );
+    assert.equal(
+      await readFile(marker, "utf8"),
+      "x",
+      "a timed out subprocess is never rerun",
+    );
+    const external = new AbortController(),
+      timer = setTimeout(
+        () =>
+          external.abort(new DOMException("external timeout", "TimeoutError")),
+        100,
+      );
+    try {
+      await assert.rejects(
+        openThinSession(
+          { ...scope, budget_ms: 2000 },
+          { signal: external.signal },
+          command,
+        ),
+        (error: unknown) =>
+          error instanceof BootstrapError && error.code === "job_cancelled",
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+    assert.equal(
+      await readFile(marker, "utf8"),
+      "xx",
+      "external cancellation also makes one attempt",
+    );
+    const concurrent = new AbortController();
+    await assert.rejects(
+      openThinSession(
+        scope,
+        {
+          signal: concurrent.signal,
+          run: async (child) => {
+            try {
+              return await runCommand(child);
+            } catch (error) {
+              concurrent.abort();
+              throw error;
+            }
+          },
+        },
+        command,
+      ),
+      (error: unknown) =>
+        error instanceof BootstrapError && error.code === "job_cancelled",
+    );
+    assert.equal(await readFile(marker, "utf8"), "xxx");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("a thin turn's own deadline covers a real hung HTTP callback and an abortable retry timer", async () => {
+  let requests = 0;
+  const server = createServer((request) => {
+    requests++;
+    request.resume();
+  });
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const scope = {
+    callback: {
+      url: `http://127.0.0.1:${address.port}/internal/storage`,
+      bearer: "test-only",
+    },
+    cluster_endpoint: "https://kubernetes.invalid:6443",
+    address: "node.invalid",
+    budget_ms: 200,
+    deadline_code: "thin_storage_turn_timeout" as const,
+    prefix: "pgcf-thin-turn-callback-deadline-",
+    talos_admin_config: stringify({
+      context: "test",
+      contexts: {
+        test: { ca: "test-only", crt: "test-only", key: "test-only" },
+      },
+    }),
+    kubeconfig: stringify({
+      clusters: [
+        {
+          cluster: {
+            server: "https://kubernetes.invalid:6443",
+            "certificate-authority-data": "test-only",
+          },
+        },
+      ],
+      users: [
+        {
+          user: {
+            "client-certificate-data": "test-only",
+            "client-key-data": "test-only",
+          },
+        },
+      ],
+    }),
+  };
+  try {
+    await assert.rejects(
+      openThinSession(scope, {}, (session) => session.call({ kind: "status" })),
+      (error: unknown) =>
+        error instanceof BootstrapError &&
+        error.code === "thin_storage_turn_timeout",
+    );
+    assert.equal(requests, 1, "a callback request is not replayed on expiry");
+    await assert.rejects(
+      openThinSession(scope, {}, (session) =>
+        delay(5000, undefined, { signal: session.signal }),
+      ),
+      (error: unknown) =>
+        error instanceof BootstrapError &&
+        error.code === "thin_storage_turn_timeout",
+    );
+    const refusal = new BootstrapError("thin_storage_driver_owner_changed");
+    await assert.rejects(
+      openThinSession(scope, {}, async () => {
+        await delay(220);
+        throw refusal;
+      }),
+      (error: unknown) => error === refusal,
+      "an unrelated safety refusal is preserved even after the deadline",
+    );
+  } finally {
+    server.closeAllConnections();
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });
 test("an empty LVM pool percentage fails closed instead of reading as an unused pool", () => {

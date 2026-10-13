@@ -640,6 +640,8 @@ export async function openThinSession<T>(
     kubeconfig: string;
     address: string;
     budget_ms: number;
+    /** Only a normal thin identity turn treats its own deadline as a transient timeout. */
+    deadline_code?: "thin_storage_turn_timeout";
     prefix: string;
   },
   options: {
@@ -652,8 +654,9 @@ export async function openThinSession<T>(
 ): Promise<T> {
   const request = options.request ?? fetch,
     run = options.run ?? runCommand;
+  const deadline = AbortSignal.timeout(scope.budget_ms);
   const signal = AbortSignal.any([
-    AbortSignal.timeout(scope.budget_ms),
+    deadline,
     ...(options.signal ? [options.signal] : []),
   ]);
   const directory = await mkdtemp(join(tmpdir(), scope.prefix));
@@ -797,6 +800,20 @@ export async function openThinSession<T>(
         ),
       );
     return await use({ signal, call, command, kube, get, talos });
+  } catch (error) {
+    if (
+      scope.deadline_code &&
+      !options.signal?.aborted &&
+      deadline.aborted &&
+      signal.reason === deadline.reason &&
+      (error === deadline.reason ||
+        (error instanceof BootstrapError && error.code === "job_cancelled") ||
+        (error instanceof Error &&
+          error.name === "AbortError" &&
+          error.cause === deadline.reason))
+    )
+      throw new BootstrapError(scope.deadline_code);
+    throw error;
   } finally {
     await proxy?.close();
     await rm(directory, { recursive: true, force: true });
@@ -1083,6 +1100,7 @@ export async function runThinStorage(
       kubeconfig: input.kubeconfig,
       address: lease.address,
       budget_ms: budget,
+      deadline_code: "thin_storage_turn_timeout",
       prefix: "pgcf-thin-storage-",
     },
     options,
