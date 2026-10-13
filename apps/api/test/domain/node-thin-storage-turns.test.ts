@@ -36,7 +36,12 @@ async function turn(
   f: Fixture,
   outcome:
     | { state: "succeeded" }
-    | { state: "failed"; error_code: string }
+    | {
+        state: "failed";
+        error_code: string | null;
+        direct?: boolean;
+        payload?: Record<string, unknown>;
+      }
     | { state: "idle" },
   dueDuringTurn = false,
 ) {
@@ -50,6 +55,15 @@ async function turn(
       fetch: async (request: Request) => {
         const path = new URL(request.url).pathname;
         if (path === "/") return new Response(null, { status: 401 });
+        if (
+          request.method === "POST" &&
+          outcome.state === "failed" &&
+          outcome.direct
+        )
+          return Response.json(
+            { ...outcome.payload, error_code: outcome.error_code },
+            { status: 400 },
+          );
         if (request.method === "POST")
           return Response.json({}, { status: 202 });
         if (dueDuringTurn) await running.thinStorageDue(f.node);
@@ -68,6 +82,8 @@ async function turn(
     }),
   };
   const started = Date.now();
+  const warning = vi.spyOn(console, "warn");
+  let warnings: unknown[][] = [];
   const result = await runInDurableObject(stub(f), async (_instance, state) => {
     Object.defineProperty(state, "container", {
       configurable: true,
@@ -87,6 +103,9 @@ async function turn(
     } finally {
       delete (state as { container?: unknown }).container;
     }
+  }).finally(() => {
+    warnings = [...warning.mock.calls];
+    warning.mockRestore();
   });
   const node = await env.DB.prepare(
     "SELECT status,error_code,lease_id FROM node_thin_storage WHERE node_id=?",
@@ -102,6 +121,12 @@ async function turn(
     started,
     issued: Date.parse(input.lease.issued_at),
     node,
+    fence: {
+      kind: "thin_storage",
+      operation_id: input.lease.operation_id,
+      revision: input.lease.revision,
+    },
+    warnings,
   };
 }
 
@@ -238,6 +263,212 @@ it("blocks an unrecognized executor failure rather than retrying failed host ver
     error_code: "thin_storage_executor_unconfirmed",
   });
   expect(failed.failures).toBe(0);
+  expect(failed.warnings).toEqual([
+    [
+      JSON.stringify({
+        event: "thin_storage_executor_failed",
+        node_id: f.node,
+        ...failed.fence,
+        error_code: "patch_extension_resource_invalid",
+      }),
+    ],
+  ]);
+});
+
+it("records a native command timeout before retaining the hard block, lease and pending action", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const action = {
+    kind: "initialize",
+    state: "pending",
+    nonce: `op_${"x".repeat(20)}`,
+    target_data_bytes: f.profile.initial_data_bytes,
+    target_metadata_bytes: f.profile.metadata_bytes,
+    expected_pool_uuid: null,
+    driver_pod_uid: null,
+    boot_id: null,
+    dispatched_at: null,
+    deadline_at: null,
+  };
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET action_json=? WHERE node_id=?",
+  )
+    .bind(JSON.stringify(action), f.node)
+    .run();
+  const failed = await turn(f, {
+    state: "failed",
+    error_code: "command_timeout",
+  });
+  expect(failed.warnings).toEqual([
+    [
+      JSON.stringify({
+        event: "thin_storage_executor_failed",
+        node_id: f.node,
+        ...failed.fence,
+        error_code: "command_timeout",
+      }),
+    ],
+  ]);
+  expect(failed.error).toBe("thin_storage_executor_unconfirmed");
+  expect(failed.node).toEqual({
+    status: "blocked",
+    error_code: "thin_storage_executor_unconfirmed",
+    lease_id: failed.fence.operation_id,
+  });
+  expect(failed.failures).toBe(0);
+  expect(
+    await env.DB.prepare(
+      "SELECT action_json FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first<string>("action_json"),
+  ).toBe(JSON.stringify(action));
+});
+
+it("records native cancellation without retrying the blocked turn", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const failed = await turn(f, {
+    state: "failed",
+    error_code: "job_cancelled",
+  });
+  expect(failed.warnings).toEqual([
+    [
+      JSON.stringify({
+        event: "thin_storage_executor_failed",
+        node_id: f.node,
+        ...failed.fence,
+        error_code: "job_cancelled",
+      }),
+    ],
+  ]);
+  expect(failed.error).toBe("thin_storage_executor_unconfirmed");
+  expect(failed.node).toMatchObject({
+    status: "blocked",
+    lease_id: failed.fence.operation_id,
+  });
+  expect(failed.failures).toBe(0);
+});
+
+it("records the native invalid-request code without exposing its private input", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const failed = await turn(f, {
+    state: "failed",
+    error_code: "request_invalid",
+    direct: true,
+    payload: {
+      callback: { bearer: "sensitive-test-bearer" },
+      nonce: "sensitive-test-nonce",
+      message: "private-test-payload",
+    },
+  });
+  expect(failed.warnings).toEqual([
+    [
+      JSON.stringify({
+        event: "thin_storage_executor_failed",
+        node_id: f.node,
+        ...failed.fence,
+        error_code: "request_invalid",
+      }),
+    ],
+  ]);
+  expect(failed.error).toBe("thin_storage_executor_unconfirmed");
+  expect(failed.node).toMatchObject({
+    status: "blocked",
+    lease_id: failed.fence.operation_id,
+  });
+  expect(failed.failures).toBe(0);
+});
+
+it("suppresses a sensitive error string while preserving the failed turn fence", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const failed = await turn(f, {
+    state: "failed",
+    error_code: "sensitive_test_bearer",
+    direct: true,
+    payload: { nonce: "sensitive-test-nonce", message: "private-test-payload" },
+  });
+  expect(failed.warnings).toEqual([
+    [
+      JSON.stringify({
+        event: "thin_storage_executor_failed",
+        node_id: f.node,
+        ...failed.fence,
+        error_code: null,
+      }),
+    ],
+  ]);
+  expect(failed.error).toBe("thin_storage_executor_unconfirmed");
+  expect(failed.node).toMatchObject({
+    status: "blocked",
+    lease_id: failed.fence.operation_id,
+  });
+});
+
+it("records null for a missing executor error code", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const failed = await turn(f, {
+    state: "failed",
+    error_code: null,
+    direct: true,
+  });
+  expect(failed.warnings).toEqual([
+    [
+      JSON.stringify({
+        event: "thin_storage_executor_failed",
+        node_id: f.node,
+        ...failed.fence,
+        error_code: null,
+      }),
+    ],
+  ]);
+  expect(failed.error).toBe("thin_storage_executor_unconfirmed");
+});
+
+it("suppresses private strings even when they have a patch error prefix", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const failed = await turn(f, {
+    state: "failed",
+    error_code: "patch_private_test_payload",
+    direct: true,
+  });
+  expect(failed.warnings).toEqual([
+    [
+      JSON.stringify({
+        event: "thin_storage_executor_failed",
+        node_id: f.node,
+        ...failed.fence,
+        error_code: null,
+      }),
+    ],
+  ]);
+  expect(failed.error).toBe("thin_storage_executor_unconfirmed");
+  expect(failed.node).toMatchObject({
+    status: "blocked",
+    lease_id: failed.fence.operation_id,
+  });
+});
+
+it("suppresses private strings even when they have a thin storage error prefix", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const failed = await turn(f, {
+    state: "failed",
+    error_code: "thin_storage_sensitive_test_bearer",
+    direct: true,
+  });
+  expect(failed.warnings).toEqual([
+    [
+      JSON.stringify({
+        event: "thin_storage_executor_failed",
+        node_id: f.node,
+        ...failed.fence,
+        error_code: null,
+      }),
+    ],
+  ]);
+  expect(failed.error).toBe("thin_storage_sensitive_test_bearer");
+  expect(failed.node).toMatchObject({
+    status: "blocked",
+    lease_id: failed.fence.operation_id,
+  });
 });
 
 it("rearms the cadence after a real D1 read error without destroying an executor whose write outcome is unknown", async () => {

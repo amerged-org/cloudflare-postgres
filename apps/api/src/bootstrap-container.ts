@@ -207,6 +207,62 @@ const TRANSIENT_THIN_STORAGE_FAILURES = new Set([
   "thin_storage_action_preflight_changed",
   "thin_storage_driver_ambiguous",
 ]);
+/** Public literal codes from the thin executor and its shared host/command readers. */
+const THIN_STORAGE_EXECUTOR_DIAGNOSTIC_CODES = new Set([
+  "command_bound_invalid",
+  "command_timeout",
+  "command_output_limit",
+  "command_unavailable",
+  "request_body_limit",
+  "talosconfig_credentials_invalid",
+  "patch_extension_resource_invalid",
+  "patch_service_resource_invalid",
+  "patch_host_configuration_resource_invalid",
+  "patch_host_configuration_duplicate_path",
+  "patch_host_configuration_active_persistent_diverged",
+  "patch_host_configuration_persistence_unproved",
+  "thin_storage_action_scope_changed",
+  "thin_storage_action_unconfirmed",
+  "thin_storage_bytes_invalid",
+  "thin_storage_callback_limit",
+  "thin_storage_class_changed",
+  "thin_storage_class_identity_missing",
+  "thin_storage_class_owner_changed",
+  "thin_storage_database_owner_changed",
+  "thin_storage_driver_identity_changed",
+  "thin_storage_driver_owner_changed",
+  "thin_storage_driver_unqualified",
+  "thin_storage_existing_thin_data_unresolved",
+  "thin_storage_grow_outcome_unknown",
+  "thin_storage_growth_unqualified",
+  "thin_storage_host_guard_unqualified",
+  "thin_storage_initialize_outcome_unknown",
+  "thin_storage_input_invalid",
+  "thin_storage_inventory_invalid",
+  "thin_storage_io_limit_missing",
+  "thin_storage_io_limit_unbounded",
+  "thin_storage_io_limit_unqualified",
+  "thin_storage_kernel_lv_unexplained",
+  "thin_storage_lease_changed",
+  "thin_storage_lvm_uuid_invalid",
+  "thin_storage_output_limit",
+  "thin_storage_physical_identity_changed",
+  "thin_storage_pool_identity_changed",
+  "thin_storage_pool_owner_changed",
+  "thin_storage_pool_percent_invalid",
+  "thin_storage_pool_unqualified",
+  "thin_storage_readback_invalid",
+  "thin_storage_retained_delete_identity_changed",
+  "thin_storage_talos_identity_changed",
+  "thin_storage_text_invalid",
+  "thin_storage_transport_changed",
+  "thin_storage_uid_invalid",
+  "thin_storage_vg_ambiguous",
+  "thin_storage_vg_changed",
+  "thin_storage_vg_headroom_insufficient",
+  "thin_storage_vg_identity_changed",
+  "thin_storage_volume_identity_changed",
+]);
 /** 5 s after the first failed turn, doubling up to the identity cadence. */
 function thinStorageRetryMilliseconds(failures: number) {
   return Math.min(
@@ -449,6 +505,24 @@ export class NodeBootstrap extends DurableObject<Env> {
       },
       95_000,
     );
+    if (outcome.state === "failed")
+      console.warn(
+        JSON.stringify({
+          event: "thin_storage_executor_failed",
+          node_id: nodeId,
+          kind: "thin_storage",
+          operation_id: current.lease.operation_id,
+          revision: current.lease.revision,
+          // Keep only known producer codes; a prefix can still contain private error text.
+          error_code:
+            outcome.error_code &&
+            (TRANSIENT_THIN_STORAGE_FAILURES.has(outcome.error_code) ||
+              nativeAdmissionCodes.has(outcome.error_code) ||
+              THIN_STORAGE_EXECUTOR_DIAGNOSTIC_CODES.has(outcome.error_code))
+              ? outcome.error_code
+              : null,
+        }),
+      );
     if (outcome.state === "unanswered")
       throw new Error("thin_storage_executor_unanswered");
     const code =
