@@ -62,7 +62,7 @@ export const InfrastructureBackupConfig = z.strictObject({
     .int()
     .nonnegative()
     .describe(
-      "Incremented by every successful PUT; a backup run still in progress under an older revision fails.",
+      "Incremented by every successful PUT. Alert email changes preserve valid in-progress backups and their deadlines. Changing enabled or the D1 account, database or archive region invalidates earlier capture authority; later email changes cannot revive it.",
     ),
   enabled_at: Timestamp.nullable().describe(
     "When backups were last enabled; null while disabled. Freshness counts from here until a backup completes.",

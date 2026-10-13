@@ -30,6 +30,17 @@ export const INFRASTRUCTURE_BACKUP_MAX_AGE_MS = 36 * 60 * 60 * 1000;
 const MAX_RUN_MS = 2 * 60 * 60 * 1000;
 const RETRY_DELAY_MS = 10 * 60 * 1000;
 const MAX_DAILY_ATTEMPTS = 3;
+type ConfigRow = {
+  enabled: number;
+  d1_account_id: string | null;
+  d1_database_id: string | null;
+  d1_region_id: string | null;
+  notification_recipient: string | null;
+  notification_sender: string | null;
+  revision: number;
+  enabled_at: string | null;
+  updated_at: string | null;
+};
 type RunRow = {
   id: string;
   day: string;
@@ -70,20 +81,7 @@ function pickBackupIdentity(
     material_revision: value.material_revision,
   });
 }
-export async function readInfrastructureBackupConfig(db: D1Database) {
-  const row = await db
-    .prepare("SELECT * FROM infrastructure_backup_config WHERE singleton=1")
-    .first<{
-      enabled: number;
-      d1_account_id: string | null;
-      d1_database_id: string | null;
-      d1_region_id: string | null;
-      notification_recipient: string | null;
-      notification_sender: string | null;
-      revision: number;
-      enabled_at: string | null;
-      updated_at: string | null;
-    }>();
+function configView(row: ConfigRow | null | undefined) {
   if (!row) throw new Error("infrastructure_backup_config_missing");
   return InfrastructureBackupConfig.parse({
     enabled: row.enabled === 1,
@@ -96,6 +94,13 @@ export async function readInfrastructureBackupConfig(db: D1Database) {
     enabled_at: row.enabled_at,
     updated_at: row.updated_at,
   });
+}
+export async function readInfrastructureBackupConfig(db: D1Database) {
+  return configView(
+    await db
+      .prepare("SELECT * FROM infrastructure_backup_config WHERE singleton=1")
+      .first<ConfigRow>(),
+  );
 }
 export async function configureInfrastructureBackups(
   env: Env,
@@ -113,11 +118,26 @@ export async function configureInfrastructureBackups(
     );
   if (config.d1_region_id) await backupArchive(env, config.d1_region_id);
   const at = new Date(now).toISOString();
-  await env.DB.prepare(
-    `UPDATE infrastructure_backup_config SET enabled=?,d1_account_id=?,d1_database_id=?,d1_region_id=?,
-    notification_recipient=?,notification_sender=?,revision=revision+1,enabled_at=CASE WHEN ?=1 AND enabled=0 THEN ? WHEN ?=0 THEN NULL ELSE enabled_at END,updated_at=? WHERE singleton=1`,
-  )
-    .bind(
+  await env.DB.batch([
+    // Notification changes keep only already-valid captures under the unchanged destination.
+    // A revoked, expired or terminal run can never acquire the new revision here.
+    env.DB.prepare(
+      `UPDATE infrastructure_backup_runs SET config_revision=config_revision+1
+      WHERE config_revision=(SELECT revision FROM infrastructure_backup_config WHERE singleton=1)
+      AND status IN('pending','running') AND julianday(expires_at)>julianday(?)
+      AND EXISTS(SELECT 1 FROM infrastructure_backup_config WHERE singleton=1 AND enabled=1
+        AND enabled=? AND d1_account_id IS ? AND d1_database_id IS ? AND d1_region_id IS ?)`,
+    ).bind(
+      at,
+      config.enabled ? 1 : 0,
+      config.d1_account_id,
+      config.d1_database_id,
+      config.d1_region_id,
+    ),
+    env.DB.prepare(
+      `UPDATE infrastructure_backup_config SET enabled=?,d1_account_id=?,d1_database_id=?,d1_region_id=?,
+      notification_recipient=?,notification_sender=?,revision=revision+1,enabled_at=CASE WHEN ?=1 AND enabled=0 THEN ? WHEN ?=0 THEN NULL ELSE enabled_at END,updated_at=? WHERE singleton=1`,
+    ).bind(
       config.enabled ? 1 : 0,
       config.d1_account_id,
       config.d1_database_id,
@@ -128,8 +148,8 @@ export async function configureInfrastructureBackups(
       at,
       config.enabled ? 1 : 0,
       at,
-    )
-    .run();
+    ),
+  ]);
   return readInfrastructureBackupConfig(env.DB);
 }
 export async function backupArchive(env: Env, regionId: string) {
@@ -180,8 +200,25 @@ export async function infrastructureBackupStatus(db: D1Database, id?: string) {
   });
 }
 export async function assertBackupRun(env: Env, id: string, now = Date.now()) {
-  const { row, artifacts } = await readInfrastructureBackupRun(env.DB, id),
-    config = await readInfrastructureBackupConfig(env.DB);
+  // A notification PUT carries both revisions atomically. Read them in the same transaction
+  // so an intervening carry cannot make a valid capture look revoked.
+  const [runs, artifacts, configs] = await env.DB.batch<
+    RunRow | ArtifactRow | ConfigRow
+  >([
+    env.DB.prepare("SELECT * FROM infrastructure_backup_runs WHERE id=?").bind(
+      id,
+    ),
+    env.DB.prepare(
+      "SELECT * FROM infrastructure_backup_artifacts WHERE run_id=? ORDER BY id",
+    ).bind(id),
+    env.DB.prepare(
+      "SELECT * FROM infrastructure_backup_config WHERE singleton=1",
+    ),
+  ]);
+  const row = runs!.results[0] as RunRow | undefined;
+  if (!row)
+    throw new ApiError("not_found", "Infrastructure backup run not found");
+  const config = configView(configs!.results[0] as ConfigRow | undefined);
   if (
     !config.enabled ||
     config.revision !== row.config_revision ||
@@ -189,7 +226,7 @@ export async function assertBackupRun(env: Env, id: string, now = Date.now()) {
     Date.parse(row.expires_at) <= now
   )
     throw new Error("infrastructure_backup_authority_expired");
-  return { row, artifacts, config };
+  return { row, artifacts: artifacts!.results as ArtifactRow[], config };
 }
 /** Persist one UTC-day intent per attempt. Creation ambiguity resolves through the same Workflow id. */
 export async function runInfrastructureBackupCron(env: Env, now = Date.now()) {
