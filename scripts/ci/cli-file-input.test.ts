@@ -14,7 +14,7 @@ const unsupported = (source: string) =>
 // Logical command producers feed only the reviewed native file materializer.
 // New raw-FD or Talos '-' inputs require fixing the boundary, not extending this list.
 const materialized = new Map([
-  ["apps/node-bootstrap/src/fleet-patch.ts", 6],
+  ["apps/node-bootstrap/src/fleet-patch.ts", 7],
   ["apps/node-bootstrap/src/fleet-platform-patch.ts", 2],
   ["apps/node-bootstrap/src/fleet-host-configuration.ts", 1],
   ["apps/node-bootstrap/src/fleet-kubernetes-images.ts", 1],
