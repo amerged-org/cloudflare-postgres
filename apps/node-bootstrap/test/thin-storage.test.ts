@@ -2,7 +2,11 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createHash, randomUUID } from "node:crypto";
+import { chmod, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { stringify } from "yaml";
+import { BootstrapError, runCommand } from "../src/bootstrap.ts";
 import {
   issueAgain,
   readCommand,
@@ -14,6 +18,7 @@ import {
   thinDeletingVolume,
   assertThinStorageHostSettings,
   thinStorageHostConfiguration,
+  openThinSession,
 } from "../src/thin-storage.ts";
 import type {
   NodeThinStorageInput,
@@ -309,6 +314,202 @@ test("a read-only relay command and a transport issuance are repeated at most tw
     /authority_refused/,
   );
   assert.equal(calls, 3);
+});
+test("a read-only native command can succeed after two real subprocess timeouts", async () => {
+  const signal = new AbortController().signal;
+  let attempts = 0;
+  const result = await readCommand(
+    () =>
+      runCommand({
+        executable: process.execPath,
+        args:
+          ++attempts < 3
+            ? ["-e", "setInterval(() => {}, 1000)"]
+            : ["--version"],
+        timeout_ms: attempts < 3 ? 30 : 1000,
+        signal,
+        env: process.env,
+      }),
+    signal,
+    0,
+  );
+  assert.equal(attempts, 3);
+  assert.equal(result.exit_code, 0);
+  assert.equal(result.stdout.trim(), process.version);
+});
+test("three exhausted read-only native timeouts become the existing transient command failure", async () => {
+  const signal = new AbortController().signal;
+  let attempts = 0;
+  await assert.rejects(
+    readCommand(
+      () => {
+        attempts++;
+        return runCommand({
+          executable: process.execPath,
+          args: ["-e", "setInterval(() => {}, 1000)"],
+          timeout_ms: 30,
+          signal,
+          env: process.env,
+        });
+      },
+      signal,
+      0,
+    ),
+    (error: unknown) =>
+      error instanceof BootstrapError &&
+      error.code === "thin_storage_command_failed",
+  );
+  assert.equal(attempts, 3);
+});
+test("parent cancellation of a native read stays job_cancelled and is never retried", async () => {
+  const controller = new AbortController();
+  let attempts = 0;
+  const timer = setTimeout(() => controller.abort(), 30);
+  try {
+    await assert.rejects(
+      readCommand(
+        () => {
+          attempts++;
+          return runCommand({
+            executable: process.execPath,
+            args: ["-e", "setInterval(() => {}, 1000)"],
+            timeout_ms: 1000,
+            signal: controller.signal,
+            env: process.env,
+          });
+        },
+        controller.signal,
+        0,
+      ),
+      (error: unknown) =>
+        error instanceof BootstrapError && error.code === "job_cancelled",
+    );
+    assert.equal(attempts, 1);
+  } finally {
+    clearTimeout(timer);
+  }
+});
+test("a native read timeout racing parent abort is preserved without retry or reclassification", async () => {
+  const controller = new AbortController();
+  let attempts = 0,
+    original: unknown;
+  await assert.rejects(
+    readCommand(
+      async () => {
+        attempts++;
+        try {
+          return await runCommand({
+            executable: process.execPath,
+            args: ["-e", "setInterval(() => {}, 1000)"],
+            timeout_ms: 30,
+            signal: controller.signal,
+            env: process.env,
+          });
+        } catch (error) {
+          original = error;
+          controller.abort();
+          throw error;
+        }
+      },
+      controller.signal,
+      0,
+    ),
+    (error: unknown) =>
+      error === original &&
+      error instanceof BootstrapError &&
+      error.code === "command_timeout",
+  );
+  assert.equal(attempts, 1);
+});
+test("a native read output-limit error is preserved and never retried", async () => {
+  const signal = new AbortController().signal;
+  let attempts = 0;
+  await assert.rejects(
+    readCommand(
+      () => {
+        attempts++;
+        return runCommand({
+          executable: process.execPath,
+          args: [
+            "-e",
+            'process.stdout.write("x".repeat(9 * 1024 ** 2)); setInterval(() => {}, 1000)',
+          ],
+          timeout_ms: 1000,
+          signal,
+          env: process.env,
+        });
+      },
+      signal,
+      0,
+    ),
+    (error: unknown) =>
+      error instanceof BootstrapError && error.code === "command_output_limit",
+  );
+  assert.equal(attempts, 1);
+});
+test("the session command used by mutations attempts a real write once and preserves timeout uncertainty", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "pgcf-thin-mutation-test-"));
+  await chmod(directory, 0o700);
+  const marker = join(directory, "attempts");
+  try {
+    await assert.rejects(
+      openThinSession(
+        {
+          callback: {
+            url: "https://api.invalid/internal/storage",
+            bearer: "test-only",
+          },
+          cluster_endpoint: "https://127.0.0.1:6443",
+          address: "127.0.0.1",
+          budget_ms: 1000,
+          prefix: "pgcf-thin-mutation-session-test-",
+          talos_admin_config: stringify({
+            context: "test",
+            contexts: {
+              test: { ca: "test-only", crt: "test-only", key: "test-only" },
+            },
+          }),
+          kubeconfig: stringify({
+            clusters: [
+              {
+                cluster: {
+                  server: "https://127.0.0.1:6443",
+                  "certificate-authority-data": "test-only",
+                },
+              },
+            ],
+            users: [
+              {
+                user: {
+                  "client-certificate-data": "test-only",
+                  "client-key-data": "test-only",
+                },
+              },
+            ],
+          }),
+        },
+        {},
+        async (session) =>
+          session.command(
+            "/bin/sh",
+            [
+              "-c",
+              'umask 077; printf x >> "$1"; sleep 5',
+              "mutation-test",
+              marker,
+            ],
+            undefined,
+            false,
+            100,
+          ),
+      ),
+      (error: unknown) =>
+        error instanceof BootstrapError && error.code === "command_timeout",
+    );
+    assert.equal(await readFile(marker, "utf8"), "x");
+  } finally {
+    await rm(directory, { recursive: true, force: true });
+  }
 });
 test("an empty LVM pool percentage fails closed instead of reading as an unused pool", () => {
   assert.throws(

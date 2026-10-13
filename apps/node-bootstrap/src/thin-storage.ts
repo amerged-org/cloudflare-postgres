@@ -119,18 +119,29 @@ export async function readThinLvm(
     before: before.stdout,
   };
 }
-/** A read-only command repeats a failed relay round trip at most twice; a mutating one never does. */
+/** A read-only command repeats a failed relay round trip or native command timeout at most twice.
+ * Exhausted command timeouts are transient; turn cancellation and other errors pass through.
+ * Mutating commands never use this helper. */
 export async function readCommand(
   attempt: () => Promise<CommandResult>,
   signal: AbortSignal,
   pause = 1000,
 ): Promise<CommandResult> {
-  let result = await attempt();
-  for (let retry = 0; retry < 2 && result.exit_code !== 0; retry++) {
+  for (let retry = 0; ; retry++) {
+    try {
+      const result = await attempt();
+      if (result.exit_code === 0 || retry === 2) return result;
+    } catch (error) {
+      if (
+        signal.aborted ||
+        !(error instanceof BootstrapError) ||
+        error.code !== "command_timeout"
+      )
+        throw error;
+      if (retry === 2) throw new BootstrapError("thin_storage_command_failed");
+    }
     await delay(pause, undefined, { signal });
-    result = await attempt();
   }
-  return result;
 }
 /** Every relay transport is single-use, so a failed issuance is requested again, at most twice. */
 export async function issueAgain<T>(
