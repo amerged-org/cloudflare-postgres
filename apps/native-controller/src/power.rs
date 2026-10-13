@@ -2595,14 +2595,40 @@ fn physical_authority<'a>(db: &Value, nodes: &'a Value, after: u64, now: u64) ->
     let (Some(observed), Some(expires)) = (parse("observed_at"), parse("expires_at")) else {
         return None;
     };
+    // LVs, volumes and receipts are the identity proof's read. A fast renewal moves only
+    // observed_at, so a read after the deletion is judged by the proof's own times, which an
+    // authority recorded before composition shares with its reading.
+    let (read, valid) = match (
+        value.get("inventory_observed_at"),
+        value.get("inventory_expires_at"),
+        value.get("inventory_revision"),
+    ) {
+        (None, None, None) => (observed, expires),
+        (Some(_), Some(_), Some(_)) => {
+            let read = parse("inventory_observed_at")?;
+            let valid = parse("inventory_expires_at")?;
+            let maximum = crate::contracts::constant("THIN_INVENTORY_MAX_SECONDS").as_u64()?;
+            if valid <= read
+                || valid - read > maximum * 1000
+                || read > observed
+                || expires > valid
+                || crate::contracts::integer(value, "inventory_revision").ok()?
+                    > number(value, "revision")
+            {
+                return None;
+            }
+            (read, valid)
+        }
+        _ => return None,
+    };
     (value["physical"]["volume_group_uuid"] == value["volume_group_uuid"]
         && value["pool_uuid"].is_null() == value["physical"]["thin_pool"].is_null()
         && expires > observed
         && expires - observed <= 120_000
-        && observed > after
-        && observed >= now.saturating_sub(120_000)
-        && observed <= now.saturating_add(5000)
-        && expires > now
+        && read > after
+        && read >= now.saturating_sub(120_000)
+        && read <= now.saturating_add(5000)
+        && valid > now
         && value["data_accounting_complete"] == true)
         .then_some(value)
 }

@@ -461,6 +461,27 @@ export async function physicalReclamationVectors() {
       { ...authority, observed_at: new Date(99999).toISOString() },
     ],
     ["replacement_node_uid", { ...authority, node_uid: uid(999) }],
+    // A fast renewal after the deletion carries an identity read from before it.
+    [
+      "renewed_after_identity_read_before_deletion",
+      {
+        ...authority,
+        inventory_observed_at: new Date(99999).toISOString(),
+        inventory_expires_at: new Date(99999 + 300000).toISOString(),
+        inventory_revision: 2,
+      },
+    ],
+    // An identity read after the deletion stays a proof after its last renewal expired.
+    [
+      "identity_read_after_deletion_outlives_renewal",
+      {
+        ...authority,
+        expires_at: new Date(100002).toISOString(),
+        inventory_observed_at: new Date(100001).toISOString(),
+        inventory_expires_at: new Date(100001 + 300000).toISOString(),
+        inventory_revision: 3,
+      },
+    ],
   ];
   return variants.map(([name, value]) => ({
     name,

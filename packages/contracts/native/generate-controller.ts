@@ -46,6 +46,7 @@ import {
   NodeThinStorageAuthority,
   ComputePoolPolicy,
   NodeStorageSample,
+  THIN_INVENTORY_MAX_SECONDS,
 } from "../src/index.ts";
 import lock from "../../../infra/platform/versions.lock.json" with { type: "json" };
 import { openEbsDriverImage } from "../../../infra/platform/openebs-image.ts";
@@ -518,6 +519,7 @@ const files = {
       MAINTENANCE_ROLE,
       MAINTENANCE_BOOTSTRAP_SQL,
       STORAGE_AUTHORITY_LEDGER_KEY,
+      THIN_INVENTORY_MAX_SECONDS,
       AGENT_PROTOCOL_VERSION,
       CONFIGURATION_SCHEMA_REVISION,
       OPENEBS_DRIVER_IMAGE: openEbsDriverImage(lock),

@@ -5859,6 +5859,7 @@
       "GRANT EXECUTE ON FUNCTION pg_catalog.pg_ls_archive_statusdir() TO pgcf_maintenance"
     ],
     "STORAGE_AUTHORITY_LEDGER_KEY": "write-authority",
+    "THIN_INVENTORY_MAX_SECONDS": 300,
     "AGENT_PROTOCOL_VERSION": 1,
     "CONFIGURATION_SCHEMA_REVISION": 1,
     "OPENEBS_DRIVER_IMAGE": "docker.io/openebs/lvm-driver:1.10.1@sha256:ae4b9e0b57c64e35fc8f742496420bc8f9d3aadd990e1a0e19b4083fafdd6639"
