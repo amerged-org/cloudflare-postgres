@@ -1421,6 +1421,24 @@ it("fails startup_bound without an accepted sample during the bulk load and judg
   await sampled(f, evidence.setup);
   await journalConfirmed(id, "noflush_quiescence:suspend");
   await journalConfirmed(id, "noflush_quiescence:frozen");
+  // Real D1 checkpoints may arrive in the same millisecond; give this empty window a
+  // deterministic positive duration without changing the product clock or waiting.
+  const journal = JSON.parse(String((await run(id)).journal_json)) as {
+    entries: { key: string; received_at: string }[];
+  };
+  const suspended = journal.entries.find(
+    (entry) => entry.key === "noflush_quiescence:suspend",
+  )!;
+  journal.entries.find(
+    (entry) => entry.key === "noflush_quiescence:frozen",
+  )!.received_at = new Date(
+    Date.parse(suspended.received_at) + 1,
+  ).toISOString();
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET journal_json=? WHERE id=?",
+  )
+    .bind(JSON.stringify(journal), id)
+    .run();
   const noflush = observedPart(evidence.evidence.noflush_quiescence);
   expect(
     await recordThinQualificationReport(env, id, {

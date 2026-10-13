@@ -164,6 +164,24 @@ export async function desiredRegionStorageNodes(
   return result;
 }
 
+/** A protective stop is released only by an authorized newer generation, never by a renewal. */
+function storageWriterProtected(
+  database: DatabaseRow,
+  authority: NodeThinStorageAuthority | null | undefined,
+) {
+  return Boolean(
+    (database.storage_protected_at != null &&
+      database.storage_protected_generation === database.generation) ||
+    authority?.volumes.some(
+      (volume) =>
+        volume.database_id === database.id &&
+        volume.generation === database.generation &&
+        volume.storage_generation === (database.storage_generation ?? 1) &&
+        volume.quiesced === true,
+    ),
+  );
+}
+
 /** A new writer without IO evidence yet (section 8 of thin-authority-renewal.md): its current
  * startup hold of this generation debits at least the LV's virtual size until a later identity
  * proof shows the Pod's io.max, and the controller's runtime attestation of this generation names
@@ -269,6 +287,7 @@ export async function storageWriteAuthorityForDatabase(
   if (
     !thinStorageAuthorityMatches(storage, authority, undefined, now) ||
     !authority ||
+    storageWriterProtected(database, authority) ||
     current?.row.node_id !== database.node_id ||
     receipt.storage_generation !== (database.storage_generation ?? 1) ||
     receipt.node_uid !== storage.node_uid ||
@@ -441,6 +460,7 @@ export async function hostStorageLease(
         now,
       ),
     );
+    const writerProtected = storageWriterProtected(row, authority);
     const runtimeAuthority = await storageWriteAuthorityForDatabase(
       c.env,
       row,
@@ -455,6 +475,7 @@ export async function hostStorageLease(
       runtimeAuthority === undefined;
     const admitted =
       row.desired_state === "running" &&
+      !writerProtected &&
       !readyWithoutWriter &&
       row.startup_operation !== null &&
       row.startup_node_uid === storage.node_uid &&
@@ -523,7 +544,8 @@ export async function hostStorageLease(
           ? true
           : row.desired_state === "deleted"
             ? !reclaimed
-            : readyWithoutWriter ||
+            : writerProtected ||
+              readyWithoutWriter ||
               !current ||
               current.row.error_code !== null ||
               current.row.status === "blocked",

@@ -7,6 +7,7 @@ import {
   DesiredResponse,
   StorageWriteClaims,
   base64urlToBytes,
+  newOperationId,
   thinStorageClass,
 } from "@pgcf/contracts";
 import {
@@ -23,7 +24,10 @@ import {
   iso,
   lvs,
   mib,
+  report,
 } from "./thin-renewal-fixture.ts";
+import { HostStorageLease } from "@pgcf/contracts/node-thin-storage";
+import { prepareThinStorageLease } from "../../src/domain/node-thin-storage-execution.ts";
 import {
   readCurrentNodeThinStorage,
   storageWriteAuthorityForDatabase,
@@ -109,14 +113,27 @@ async function heldWriter(f: Fixture) {
   )!;
   const pod = crypto.randomUUID();
   /** The controller's ready observation with its runtime attestation of the Pod. */
-  const ready = (attestation: object = {}) =>
+  const ready = (
+    attestation: object = {},
+    generation = created.generation,
+    powerOperation?: string,
+  ) =>
     request(
       "/agent/v1/observations",
       f.agent,
       "POST",
       observedBody([
         {
-          ...observation(created.id, created.generation),
+          ...observation(created.id, generation),
+          ...(powerOperation
+            ? {
+                power: {
+                  operation: powerOperation,
+                  revision: generation,
+                  state: "awake",
+                },
+              }
+            : {}),
           postgres: {
             image: postgres.reference,
             image_id: `sha256:${postgres.sha256}`,
@@ -124,7 +141,7 @@ async function heldWriter(f: Fixture) {
           runtime_attestation: {
             v: 1,
             database_id: created.id,
-            generation: created.generation,
+            generation,
             storage_generation: 1,
             node_uid: f.uid,
             boot_id: f.qualified.bootId,
@@ -163,6 +180,118 @@ async function heldWriter(f: Fixture) {
   };
   return { created, receipt, pod, authority, ready, token };
 }
+
+async function hostWriter(f: Fixture, databaseId: string) {
+  return HostStorageLease.parse(
+    await (
+      await request(`/agent/v1/nodes/${f.node}/storage-guard`, f.agent)
+    ).json(),
+  ).databases.find((database) => database.database_id === databaseId);
+}
+
+it("grants neither a held token nor startup authority to a proven quiesced current writer", async () => {
+  const f = await thinExecutionFixture(releases),
+    held = await heldWriter(f);
+  expect((await held.ready()).status).toBe(200);
+  await identityProof(f, {
+    ...held.authority,
+    volumes: held.authority.volumes.map((volume) => ({
+      ...volume,
+      quiesced: true,
+    })),
+  });
+  // The physical stop independently refuses a writer, even before its durable marker is read.
+  await env.DB.prepare(
+    "UPDATE databases SET observed_state='provisioning' WHERE id=?",
+  )
+    .bind(held.created.id)
+    .run();
+  expect(await held.token()).toBeUndefined();
+  expect(await hostWriter(f, held.created.id)).toMatchObject({
+    runtime_authority: null,
+    startup_expires_at: null,
+    write_blocked: true,
+  });
+});
+
+it("denies every current protected generation but preserves an authorized newer generation's startup", async () => {
+  const f = await thinExecutionFixture(releases),
+    held = await heldWriter(f);
+  expect((await held.ready()).status).toBe(200);
+  await prepareThinStorageLease(f.local, f.node, false);
+  expect(
+    await report(f, {
+      physical: held.authority.physical,
+      physical_lvs: held.authority.physical_lvs,
+      active_lv_uuids: held.authority.active_lv_uuids,
+      volumes: held.authority.volumes.map((volume) => ({
+        ...volume,
+        quiesced: true,
+      })),
+    }),
+  ).toMatchObject({ accepted: true, write_allowed: true });
+  expect(
+    await env.DB.prepare(
+      "SELECT storage_protected_generation FROM databases WHERE id=?",
+    )
+      .bind(held.created.id)
+      .first("storage_protected_generation"),
+  ).toBe(held.created.generation);
+  expect(await held.token()).toBeUndefined();
+  expect(await hostWriter(f, held.created.id)).toMatchObject({
+    runtime_authority: null,
+    startup_expires_at: null,
+    write_blocked: true,
+  });
+
+  // A newer physical read of IO limits cannot itself authorize resuming the protected generation.
+  await identityProof(f, {
+    ...held.authority,
+    volumes: held.authority.volumes.map((volume) => ({
+      ...volume,
+      io: [
+        {
+          pod_uid: held.pod,
+          write_bytes_per_second: f.profile.write_bytes_per_second,
+          write_iops_per_second: f.profile.write_iops_per_second,
+        },
+      ],
+    })),
+  });
+  expect(await held.token()).toBeUndefined();
+
+  // The owner-authorized recovery creates a new generation and its own bounded startup hold.
+  const operation = newOperationId(),
+    next = held.created.generation + 1;
+  await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE databases SET generation=?,power_operation=? WHERE id=?",
+    ).bind(next, operation, held.created.id),
+    env.DB.prepare(
+      "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) SELECT ?,'database.wake','pending',project_id,database_id,?,created_at,updated_at FROM operations WHERE id=(SELECT operation_id FROM database_start_admissions WHERE database_id=? AND generation=?)",
+    ).bind(operation, next, held.created.id, held.created.generation),
+    env.DB.prepare(
+      "INSERT INTO database_start_admissions(operation_id,database_id,generation,node_id,node_uid,budget_bytes,granted_at,grant_sample_observed_at,storage_budget_bytes,storage_volume_json) SELECT ?,database_id,?,node_id,node_uid,budget_bytes,granted_at,grant_sample_observed_at,storage_budget_bytes,storage_volume_json FROM database_start_admissions WHERE database_id=? AND generation=?",
+    ).bind(operation, next, held.created.id, held.created.generation),
+  ]);
+  expect(await hostWriter(f, held.created.id)).toMatchObject({
+    generation: next,
+    write_blocked: false,
+    startup_operation_id: operation,
+    startup_expires_at: expect.any(Number),
+    runtime_authority: null,
+  });
+  expect((await held.ready({}, next, operation)).status).toBe(200);
+  expect(await held.token()).toMatchObject({
+    generation: next,
+    pod_uid: held.pod,
+  });
+  expect(await hostWriter(f, held.created.id)).toMatchObject({
+    generation: next,
+    write_blocked: false,
+    runtime_authority: expect.stringMatching(/^sa1\./),
+  });
+});
 
 it("signs a first token for a held writer the controller attests, before any IO evidence", async () => {
   const f = await thinExecutionFixture(releases),
