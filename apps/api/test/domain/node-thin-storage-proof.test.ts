@@ -15,7 +15,10 @@ import {
   dispatchThinPoolAction,
   prepareThinStorageLease,
 } from "../../src/domain/node-thin-storage-execution.ts";
-import { readCurrentNodeThinStorage } from "../../src/domain/node-thin-storage.ts";
+import {
+  desiredRegionStorageNodes,
+  readCurrentNodeThinStorage,
+} from "../../src/domain/node-thin-storage.ts";
 import {
   storageProtectionStatements,
   thinStorageDeletionConfirmedSql,
@@ -647,6 +650,33 @@ it("keeps an identity-only turn available after the last deleted volume removes 
     write_allowed: false,
   });
   expect(await confirmed()).toBe(1);
+  const afterWriteExpiry = Date.now() + 20_000;
+  expect(
+    (await readCurrentNodeThinStorage(env, f.node, afterWriteExpiry))
+      ?.authority,
+  ).toBeNull();
+  const delivered = await desiredRegionStorageNodes(
+    env,
+    f.region,
+    afterWriteExpiry,
+  );
+  expect(delivered).toHaveLength(1);
+  expect(delivered[0]).toMatchObject({ pool_uuid: null, write_allowed: false });
+  expect(Date.parse(delivered[0]!.expires_at)).toBeLessThan(afterWriteExpiry);
+  expect(Date.parse(delivered[0]!.inventory_expires_at!)).toBeGreaterThan(
+    afterWriteExpiry,
+  );
+  expect(
+    await desiredRegionStorageNodes(env, f.region, afterWriteExpiry + 300_000),
+  ).toEqual([]);
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET material_revision=material_revision+1 WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  expect(
+    await desiredRegionStorageNodes(env, f.region, afterWriteExpiry),
+  ).toEqual([]);
 });
 
 it("still blocks a missing pool while a non-deleted thin database references it", async () => {

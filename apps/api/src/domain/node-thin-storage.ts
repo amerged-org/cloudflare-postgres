@@ -104,6 +104,7 @@ export async function readCurrentNodeThinStorage(
     row.authority_json ? JSON.parse(row.authority_json) : null,
   );
   let authority: NodeThinStorageAuthority | null = null;
+  let reclamation: NodeThinStorageAuthority | null = null;
   if (parsed.success) {
     const value = parsed.data;
     if (
@@ -125,19 +126,33 @@ export async function readCurrentNodeThinStorage(
       Date.parse(row.authority_received_at) <= now + 5000 &&
       Date.parse(value.observed_at) >= now - 120000 &&
       Date.parse(value.observed_at) <= now + 5000 &&
-      Date.parse(value.expires_at) > now &&
       Date.parse(value.expires_at) <=
         Date.parse(value.observed_at) + profile.guard_seconds * 1000
-    )
-      authority = {
-        ...value,
-        write_allowed:
-          value.write_allowed &&
-          row.status === "ready" &&
-          row.current_qualified === 1,
-      };
+    ) {
+      if (Date.parse(value.expires_at) > now)
+        authority = {
+          ...value,
+          write_allowed:
+            value.write_allowed &&
+            row.status === "ready" &&
+            row.current_qualified === 1,
+        };
+      // A slow identity read can outlive its short write lease. In particular, an absent
+      // pool cannot produce fast headroom renewals, but its fresh identity still proves
+      // deletion. Preserve its original expiry and explicitly deny all write authority.
+      const inventory = thinStorageInventory(value);
+      if (
+        row.error_code === null &&
+        row.current_qualified === 1 &&
+        value.data_accounting_complete &&
+        inventory.observed_at >= now - 120000 &&
+        inventory.observed_at <= now + 5000 &&
+        inventory.expires_at > now
+      )
+        reclamation = { ...value, write_allowed: false };
+    }
   }
-  return { row, profile, authority };
+  return { row, profile, authority, reclamation };
 }
 
 /** No native proof means no authority; ordinary regional physical metrics cannot fill this gap. */
@@ -155,11 +170,9 @@ export async function desiredRegionStorageNodes(
   const result: NodeThinStorageAuthority[] = [];
   for (const row of rows.results) {
     const current = await readCurrentNodeThinStorage(env, row.node_id, now);
-    if (
-      current?.authority &&
-      (samplingCapable || current.authority.inventory_observed_at === undefined)
-    )
-      result.push(current.authority);
+    const proof = current?.authority ?? current?.reclamation;
+    if (proof && (samplingCapable || proof.inventory_observed_at === undefined))
+      result.push(proof);
   }
   return result;
 }
