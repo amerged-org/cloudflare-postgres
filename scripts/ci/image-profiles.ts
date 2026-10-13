@@ -162,6 +162,7 @@ function requiredOwnedPaths(profile: ImageProfile): string[] {
     return [
       "usr/share/pgcf/storage-sources.lock.json",
       "usr/local/bin/lvm-driver",
+      storageSources.driver.exporter_metadata.notice_path.replace(/^\//, ""),
     ];
   if (profile === "talos-recipe")
     return [
@@ -197,7 +198,7 @@ function requiredOwnedPaths(profile: ImageProfile): string[] {
 
 /** Select scan scope, not trust: upstream digest and assembly verification still cover the complete image. */
 export function selectOwnedFiles<
-  T extends { path: string; layer?: number; sha256?: string },
+  T extends { path: string; layer?: number | null; sha256?: string },
 >(
   files: readonly T[],
   profileInput: ImageProfile,
@@ -242,11 +243,17 @@ export function selectOwnedFiles<
   return files.filter(
     ({ path, layer, sha256 }) =>
       (profile === "storage" &&
+        path ===
+          storageSources.driver.exporter_metadata.notice_path.replace(
+            /^\//,
+            "",
+          )) ||
+      (profile === "storage" &&
         path === "usr/local/bin/lvm-driver" &&
         // The caller first verifies the complete official base layer prefix. A matching
         // original binary in that prefix is upstream; every later copy remains in scope.
         !(
-          layer !== undefined &&
+          typeof layer === "number" &&
           Number.isSafeInteger(layer) &&
           layer >= 0 &&
           layer < verifiedUpstreamLayers &&

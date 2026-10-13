@@ -19,6 +19,8 @@ import {
 
 const files = (...paths: string[]) =>
   paths.map((path, index) => ({ path, layer: 0, tarEntry: index }));
+const storageNotice =
+  storageSources.driver.exporter_metadata.notice_path.replace(/^\//, "");
 const regional = files(
   "app/agent.mjs",
   "app/gateway.mjs",
@@ -151,6 +153,7 @@ test("storage scanning excludes the exact copied source archive and still select
     "usr/share/pgcf/driver-policy.json",
     "usr/share/pgcf/thin-provisioning-tools-unexpected.tar.gz",
     "usr/local/bin/lvm-driver",
+    storageNotice,
   );
   const input = [
     ...owned,
@@ -181,7 +184,7 @@ test("storage scanning requires the locally rebuilt driver", () => {
   assert.throws(
     () =>
       selectOwnedFiles(
-        files("usr/share/pgcf/storage-sources.lock.json"),
+        files("usr/share/pgcf/storage-sources.lock.json", storageNotice),
         "storage",
       ),
     /First-party image output missing: usr\/local\/bin\/lvm-driver/,
@@ -189,7 +192,10 @@ test("storage scanning requires the locally rebuilt driver", () => {
 });
 
 test("storage excludes only the pinned original driver inside verified upstream layers", () => {
-  const metadata = files("usr/share/pgcf/storage-sources.lock.json"),
+  const metadata = files(
+      "usr/share/pgcf/storage-sources.lock.json",
+      storageNotice,
+    ),
     upstream = {
       path: "usr/local/bin/lvm-driver",
       layer: 4,
@@ -217,6 +223,25 @@ test("storage excludes only the pinned original driver inside verified upstream 
   assert.deepEqual(
     selectOwnedFiles([...metadata, upstream, rebuilt], "storage"),
     [...metadata, upstream, rebuilt],
+  );
+  const unlayered = { ...upstream, layer: null };
+  assert.deepEqual(
+    selectOwnedFiles([...metadata, unlayered, rebuilt], "storage", 5),
+    [...metadata, unlayered, rebuilt],
+  );
+});
+
+test("storage scanning requires its authored modification notice", () => {
+  assert.throws(
+    () =>
+      selectOwnedFiles(
+        files(
+          "usr/share/pgcf/storage-sources.lock.json",
+          "usr/local/bin/lvm-driver",
+        ),
+        "storage",
+      ),
+    /First-party image output missing: usr\/share\/licenses\/pgcf-lvm-localpv\/NOTICE/,
   );
 });
 
