@@ -85,7 +85,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   ),
   "POST /v1/regions/{id}/bootstrap-material": route(
     "setRegionBootstrapMaterial",
-    "Initialize regional bootstrap material",
+    "Synchronize verified regional version metadata",
     "admin",
   ),
   "POST /v1/regions/{id}/bootstrap-material/stage": route(
@@ -180,7 +180,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   ),
   "POST /v1/costs/node-facts": route(
     "refreshNodeCostFacts",
-    "Refresh selected provider node cost facts",
+    "Record an immutable infrastructure cost fact",
     "admin",
   ),
   "GET /v1/nodes/{id}/storage": route(
@@ -366,7 +366,7 @@ export const routeMetadata: Readonly<Record<string, RouteMetadata>> = {
   ),
   "PUT /v1/regions/{id}/configuration": route(
     "setRegionConfiguration",
-    "Update regional PostgreSQL and storage configuration",
+    "Update regional gateway routing",
     "admin",
   ),
   "PUT /v1/fleet/releases/{id}": route(

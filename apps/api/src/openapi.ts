@@ -93,6 +93,9 @@ function describeOperation(key: string, operation: Operation): void {
     );
   operation.operationId ??= metadata.operationId;
   operation.summary ??= metadata.summary;
+  if (key === "POST /v1/regions/{id}/bootstrap-material")
+    operation.description =
+      "Synchronizes Kubernetes and optional Talos version metadata after independently verified administrator readback; immutable credentials and historical references remain unchanged.";
   const authentication =
     key === "POST /v1/api-keys"
       ? "Requires an administrator API key, except for the one-time bootstrap bearer that creates the first administrator key. Bootstrap creation ignores Idempotency-Key."

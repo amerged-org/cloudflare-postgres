@@ -279,6 +279,15 @@ describe("actual generated API references in the Workers runtime", () => {
     expect(
       operation(management, "/v1/fleet/releases", "get").responses,
     ).not.toHaveProperty("409");
+    // An active addition with a changed retained intent is a conflict even on the dry-run decision.
+    expect(
+      operation(management, "/v1/regions/{id}/capacity-decision", "get")
+        .responses,
+    ).toHaveProperty("409");
+    expect(
+      operation(management, "/v1/regions/{id}/bootstrap-material", "post")
+        .description,
+    ).not.toContain("only Kubernetes");
     expect(
       operation(agent, "/agent/v1/link", "get").responses["426"]!.content,
     ).toHaveProperty("text/plain");

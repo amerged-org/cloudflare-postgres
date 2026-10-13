@@ -157,7 +157,8 @@ export const publicRouteErrors: Readonly<Record<string, readonly number[]>> = {
   "GET /v1/regions/{id}/capacity-policy": [400, 401, 403, 404, 500],
   "PUT /v1/regions/{id}/capacity-policy": [400, 401, 403, 404, 409, 500],
   // A dry-run decision for an absent policy/region is 200/action=unconfigured.
-  "GET /v1/regions/{id}/capacity-decision": [400, 401, 403, 500],
+  // An active addition's persisted-intent conflict propagates through runNodeCapacity's dry-run read.
+  "GET /v1/regions/{id}/capacity-decision": [400, 401, 403, 409, 500],
   "GET /v1/infrastructure-backups/config": [400, 401, 403, 500],
   "PUT /v1/infrastructure-backups/config": [400, 401, 403, 404, 409, 500],
   "GET /v1/infrastructure-backups": [400, 401, 403, 500],
