@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
+  DatabaseRuntimeAttestation,
   DatabaseStorageVolumeReceipt,
   DesiredDatabaseStorage,
   NodeThinStorageAuthority,
@@ -155,6 +156,60 @@ export async function desiredRegionStorageNodes(
   return result;
 }
 
+/** A new writer without IO evidence yet (section 8 of thin-authority-renewal.md): its current
+ * startup hold of this generation debits at least the LV's virtual size until a later identity
+ * proof shows the Pod's io.max, and the controller's runtime attestation of this generation names
+ * the Pod together with the receipt's identities, the cluster and the identity proof's boot. */
+async function heldWriterPod(
+  env: Pick<Env, "DB">,
+  database: DatabaseRow,
+  storage: DesiredDatabaseStorage,
+  receipt: DatabaseStorageVolumeReceipt,
+  authority: NodeThinStorageAuthority,
+  qualification: string | null,
+): Promise<string | undefined> {
+  const lv = authority.physical_lvs.find(
+      (value) => value.lv_uuid === receipt.lv_uuid && value.segtype === "thin",
+    ),
+    attestation = DatabaseRuntimeAttestation.safeParse(
+      database.runtime_attestation_json
+        ? JSON.parse(database.runtime_attestation_json)
+        : null,
+    ),
+    boot = qualification
+      ? (JSON.parse(qualification) as { boot_id?: unknown }).boot_id
+      : undefined;
+  if (!lv || !attestation.success) return undefined;
+  const runtime = attestation.data;
+  if (
+    database.observed_generation !== database.generation ||
+    runtime.database_id !== database.id ||
+    runtime.generation !== database.generation ||
+    runtime.storage_generation !== receipt.storage_generation ||
+    runtime.node_uid !== storage.node_uid ||
+    runtime.boot_id !== boot ||
+    runtime.cluster_uid !== authority.cluster_uid ||
+    runtime.namespace_uid !== receipt.namespace_uid ||
+    runtime.cnpg_cluster_uid !== receipt.cluster_uid ||
+    runtime.storage_uid !== receipt.storage_uid ||
+    runtime.pvc_uid !== receipt.pvc_uid ||
+    runtime.pv_uid !== receipt.pv_uid
+  )
+    return undefined;
+  const hold = await env.DB.prepare(
+    "SELECT 1 held FROM database_start_admissions WHERE database_id=? AND generation=? AND node_id=? AND node_uid=? AND budget_bytes>0 AND storage_budget_bytes>=?",
+  )
+    .bind(
+      database.id,
+      database.generation,
+      database.node_id,
+      storage.node_uid,
+      lv.size_bytes,
+    )
+    .first<number>("held");
+  return hold === 1 ? runtime.pod_uid : undefined;
+}
+
 export async function storageWriteAuthorityForDatabase(
   env: Env,
   database: DatabaseRow,
@@ -195,25 +250,38 @@ export async function storageWriteAuthorityForDatabase(
       volume.storage_generation === receipt.storage_generation,
   );
   if (
-    !volume ||
-    volume.storage_uid !== receipt.storage_uid ||
-    volume.namespace_uid !== receipt.namespace_uid ||
-    volume.cluster_uid !== receipt.cluster_uid ||
-    volume.lv_uuid !== receipt.lv_uuid ||
-    volume.volume_handle !== receipt.volume_handle ||
-    volume.pvc_uid !== receipt.pvc_uid ||
-    volume.pv_uid !== receipt.pv_uid ||
-    volume.storage_class !== storage.storage_class ||
-    volume.volume_attributes_class !== storage.volume_attributes_class ||
-    volume.io.length !== 1
+    volume &&
+    (volume.storage_uid !== receipt.storage_uid ||
+      volume.namespace_uid !== receipt.namespace_uid ||
+      volume.cluster_uid !== receipt.cluster_uid ||
+      volume.lv_uuid !== receipt.lv_uuid ||
+      volume.volume_handle !== receipt.volume_handle ||
+      volume.pvc_uid !== receipt.pvc_uid ||
+      volume.pv_uid !== receipt.pv_uid ||
+      volume.storage_class !== storage.storage_class ||
+      volume.volume_attributes_class !== storage.volume_attributes_class ||
+      volume.io.length > 1)
   )
     return undefined;
-  const io = volume.io[0]!;
+  const io = volume?.io[0];
   if (
-    io.write_bytes_per_second > storage.write_bytes_per_second ||
-    io.write_iops_per_second > storage.write_iops_per_second
+    io &&
+    (io.write_bytes_per_second > storage.write_bytes_per_second ||
+      io.write_iops_per_second > storage.write_iops_per_second)
   )
     return undefined;
+  // Measured IO limits name the writer; until the identity proof has them, only a held writer.
+  const pod =
+    io?.pod_uid ??
+    (await heldWriterPod(
+      env,
+      database,
+      storage,
+      receipt,
+      authority,
+      current!.row.qualification_json,
+    ));
+  if (!pod) return undefined;
   const key = await nodeProofSigningKey(env);
   // Stable within one accepted physical revision: polling never extends a stale read's deadline.
   const claims: StorageWriteClaims = {
@@ -231,7 +299,7 @@ export async function storageWriteAuthorityForDatabase(
     lv_uuid: receipt.lv_uuid,
     pvc_uid: receipt.pvc_uid,
     pv_uid: receipt.pv_uid,
-    pod_uid: io.pod_uid,
+    pod_uid: pod,
     observed_at: Date.parse(authority.observed_at),
     iat: Date.parse(authority.observed_at),
     exp: Date.parse(authority.expires_at),
