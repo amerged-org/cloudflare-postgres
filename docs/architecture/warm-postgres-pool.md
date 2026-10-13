@@ -449,7 +449,11 @@ owner decision.
 | infra/platform/base/values/cilium.yaml | `labels` set to `k8s:!pgcf\.io/pool-`. |
 | THIRD_PARTY.md | The pool runs the pinned plugin sidecar image unmodified as its archiver. |
 
-**Live acceptance on EU1 through Cloudflare**, after R2 is accepted:
+**Owner priority:** implement and measure the shared pool on the selected R2b thin storage.
+A thick-volume pool hit alone does not satisfy this acceptance. The pool writer must retain
+Cloudflare's current thin authority, its measured I/O limits and fail-closed protection.
+
+**Live acceptance on EU1 through Cloudflare**, after R2b is accepted:
 1. *Hit or miss.* A sleeping database (Cluster hibernated, no CNPG Pod) with X ready pool Pods on
    its node; a normal client connection through `db.ohmyho.st`; `connect_ms` and `first_read_ms`
    from one instant, broken down into claim, permission and hint delivery, device checks, mount,
@@ -485,7 +489,10 @@ owner decision.
 8. A first SQL below one second through Cloudflare (doubtful, A8.6).
 9. Thin volumes: a write authority bound to the pool Pod UID and the guard's suspension of pool
    bindings, with R2b.
-10. OpenEBS's guard refusing a CNPG NodePublish during a binding (useful, not relied upon).
+10. A durable volume fence serializes OpenEBS NodePublish, NodeExpand and other volume-creating
+    operations against the binding. It must survive agent or driver restart and remain closed
+    until normal unmount, descriptor closure and device-mapper open count zero. This is required
+    to close the anonymous-mount gap; ordinary namespace enumeration alone cannot prove it.
 
 The orchestration that every wake needs (immediate publication, Actor push, route token with
 target and direct dial; rt §6, §9, §10) comes first, as the Owner direction states; it carries
