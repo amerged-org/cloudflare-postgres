@@ -85,6 +85,7 @@ keep their backend and data. Thin activation needs a release-bound receipt from 
 | Cold-start baseline | Standard runtime on EU1 (R1.2): first SQL after wake 9.6–11.2 s through Cloudflare; connect → database Pod Ready 4.9–6.6 s; Pod Ready → admission 4–5 s (agent cadence, role and archive probes, fence, observation, Actor D1 poll). |
 | Sandbox proof storage-expiry stop | The proof raised the material revision before the guard held the new lease, so the guard refused it and nothing stopped; it now waits for the guard (`5314d95`). The other failures of 2026-10-11 are a separate shim transport defect. |
 | Thin qualification | Run 14 passed all seven gates on EU1 and produced the receipt; normal cleanup restored exactly **97,706,311,680 free bytes**. `data_full` grew 16→24 GiB with the same pool UUID, preserved all 4,160 acknowledged commits and restarted PostgreSQL in 5,137 ms. With option 1 sampling every 2 s, `startup_bound` had 2 accepted samples, scrape p99 119 ms and maximum accepted gap 3,574 ms < 5,000 ms; `noflush_quiescence` had 8 samples, p99 134 ms and maximum gap 2,737 ms. Both windows had complete native coverage and zero unknown samples; the identity cycle took 32,092 ms < 60,000 ms. Noflush froze 567,283,712 dirty bytes with zero new sectors or blocks, drained in 4,700 ms and passed fsck with exit 0. |
+| Database placement and filters | the existing EU1 stack exposes nullable `node_id` and conjunctive project, region, node, desired-state and public observed-state filters. Live GETs returned the retained hibernated database for the full intersection and no records for the control node or conflicting states; two one-record pages follow the server cursor without duplication, and malformed cursors return 400. Project-scope and deleted-record exclusion regressions pass in real D1; project-scoped credential isolation was not exercised live. The strict SDK and API must use the matching contract revision. |
 
 ## Open
 
@@ -108,7 +109,6 @@ One row per step, in dependency order. A step moves to Done only with its measur
 | NodeBootstrap turn delivery | Fixed in code (`525b316`): turns are registered with 202 and followed by the container's own record; run 11 ran 13 turns without a lease wait. A lost request has not recurred since. | A Durable Object's request to its NodeBootstrap container that is lost before the container accepts it no longer holds the turn until its timeout: thin qualification run 9 lost 11 minutes on a held lease and the R2.4 control patch 13 minutes in `runtime_admission` (2026-10-12). |
 | Region controller | Design ([proposal](region-controller.md)) | Customer worker patches run on the control server against local Talos and Kubernetes APIs with checkpoints in Cloudflare; the relay path stays for AddNode, the control server itself and material rotation. |
 | Fleet inventory API | In progress: node inventory source is complete. The bounded admin list and individual node/region reads expose roles, fenced observed Talos/Kubernetes and controller artifact versions, release state and the current Node UID's latest patch. Stale observations are labeled; unbound observations remain unknown. API delivery and live validation are pending. Release, rollout and patch history lists remain open. | One call lists every node with region, role, Talos/Kubernetes versions, release state and latest patch; releases, rollouts and patch operations can be listed; `GET /v1/nodes/{id}` and `GET /v1/regions/{id}` exist; the agent version is stored and shown. |
-| Database placement and filters | In progress: nullable `node_id` responses and conjunctive region, node, desired-state and public observed-state filters are implemented; project scope, pagination and deleted-record exclusion are preserved. Live validation awaits API delivery. The strict SDK and API must use the matching contract revision. | Database lists filter by region, node and state and show the node; the node-to-database mapping is readable. |
 | Infrastructure metrics history | Open | Node RAM, CPU and disk time series are readable (node samples live 12 min and only current values are returned). Per-database usage already has hourly/daily history; measured CPU and RAM per database are added. |
 | Node lifecycle | Open | A node can be drained, its databases moved with their IDs kept, and decommissioned with the provider instance cancelled and its slot freed; today only placement close and mark-lost exist, and restore creates a new ID. |
 | Audit, events and operations | Open | Admin mutations record the acting key; long-running operations can be listed through one shape; state changes can be consumed without per-resource polling. |
@@ -166,6 +166,11 @@ new workload density still requires measurement.
 R2b's density and sleeping-CPU-release measurement: EU1 (6 vCPU, owner-upgraded 12 GB RAM;
 11,943 MiB visible after the upgrade) runs
 16 × 256 MiB and 1 × 1 GiB thin databases (`sleep_after_seconds` 60) through Cloudflare.
+
+After the configuration-persistence repair, ten consecutive current-boot samples with the retained
+database hibernated reported both CPU and RAM. Mean node CPU was 3.23% of six cores and mean
+working-set RAM was 8.72% of 11,943 MiB. The node was Ready without MemoryPressure; the RAM
+measurement window was valid. These are idle baseline measurements, not density acceptance.
 
 **System reservation.** Both roles reserve 512 Mi system and 512 Mi kube; with the kubelet's 100 Mi
 default hard-eviction threshold. Read actual allocatable memory, available memory and platform
