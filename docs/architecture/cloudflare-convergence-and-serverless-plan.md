@@ -28,6 +28,8 @@ block the standard-runtime fleet acceptance.
 keep their backend and data. Thin activation needs a release-bound receipt from the
 [qualification gates](#thin-storage-qualification-gates).
 
+**Owner priority (2026-10-13):** the product goal is a sleeping database's first SQL below one second through Cloudflare on a shared-pool hit. Complete the active R2b transition and the data-preservation checks needed for the approved alternative 8, then prioritize its implementation and measured pool-hit acceptance. Independent administrative features do not delay this path; the full customer-ready scope remains required.
+
 ## Delivery architecture
 
 - **One Golden image.** New nodes, control or customer, install the selected release's Golden raw

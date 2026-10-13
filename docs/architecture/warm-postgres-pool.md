@@ -1,9 +1,9 @@
 # Warm PostgreSQL pool
 
-Status: **proposal of 2026-10-12** for the ULTRA rows "Cold-start baseline", "Sub-second decision"
-and "Pool cold-start test" (plan:117, plan:118, plan:97). Not approved and not implemented. It
-refines the approved shared-pool target (rt §4–§5) for the pinned, unmodified CNPG and answers
-plan:118 with "prestarted PostgreSQL with late-bound storage" in the form CNPG permits.
+Status: **alternative 8 approved on 2026-10-12; implementation and live acceptance remain open.**
+The owner reaffirmed the sleeping-database first SQL below one second as the primary product
+goal on 2026-10-13. The detailed alternative 8 design below governs the ULTRA rows "Sub-second
+decision" and "Pool cold-start test". Earlier proposal and fallback sections remain design context.
 
 Citations: repository `path:line` refer to origin/main 05489c8. `rt` is
 [rust-runtime-and-cold-starts.md](rust-runtime-and-cold-starts.md), `plan` is
