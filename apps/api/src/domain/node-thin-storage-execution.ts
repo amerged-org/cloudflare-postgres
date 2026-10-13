@@ -4,7 +4,9 @@ import {
   newOperationId,
   timingSafeEqual,
   DatabaseStorageVolumeReceipt,
+  THIN_INVENTORY_MAX_SECONDS,
   thinStorageClass,
+  thinStorageInventory,
   thinWriteExposure,
   NodeThinStorageAuthority,
   type NodePhysicalStorage,
@@ -56,6 +58,9 @@ const closed = (): never => {
     "Current physical storage lease or identity changed",
   );
 };
+/** An identity turn lease covers the executor's 90 s budget and its report, not the write guard. */
+export const THIN_STORAGE_LEASE_SECONDS = 95;
+const iso = (ms: number) => new Date(ms).toISOString();
 export const thinStorageAuthoritySql = `EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id JOIN fleet_node_releases a ON a.node_id=n.id JOIN fleet_region_releases f ON f.region_id=n.region_id JOIN fleet_releases s ON s.id=a.release_id WHERE n.id=node_thin_storage.node_id AND n.node_uid=node_thin_storage.node_uid AND n.ready=1 AND n.lost_at IS NULL AND a.node_uid=n.node_uid AND a.release_id=f.release_id AND r.bootstrap_material_revision=node_thin_storage.material_revision AND NOT EXISTS(SELECT 1 FROM node_bootstrap_jobs j WHERE j.node_id=n.id AND j.admitted=0 AND (j.authorized<>1 OR j.cancelled<>0 OR j.admission_authorized<>1)) AND NOT EXISTS(SELECT 1 FROM node_additions original WHERE original.node_id=n.id AND original.status IN('failed','cancelled')) AND EXISTS(SELECT 1 FROM json_each(s.spec_json,'$.components') component WHERE json_extract(component.value,'$.name')='openebs-lvm' AND json_extract(component.value,'$.kind')='image' AND json_extract(component.value,'$.reference')=node_thin_storage.qualified_driver_image))`;
 export async function readThinStorageLeaseRow(env: Env, nodeId: string) {
   const row = await env.DB.prepare(
@@ -132,6 +137,13 @@ export async function authenticateThinStorage(c: ApiContext, nodeId: string) {
   return row;
 }
 
+/** The current identity proof's revision; the next slow report claims its successor. */
+function identityRevision(row: NodeThinStorageRow) {
+  const authority = retainedPoolAuthority(row);
+  return authority
+    ? thinStorageInventory(authority).revision
+    : row.authority_revision;
+}
 function retainedPoolAuthority(
   row: NodeThinStorageRow,
 ): NodeThinStorageAuthority | null {
@@ -422,10 +434,11 @@ export async function reserveThinStorageLease(
     }
   }
   const expires = new Date(
-    Date.parse(now) + profile.guard_seconds * 1000,
+    Date.parse(now) + THIN_STORAGE_LEASE_SECONDS * 1000,
   ).toISOString();
+  // The newest sample accepted before this lease bounds what its own LVM reading may show.
   const result = await env.DB.prepare(
-    `UPDATE node_thin_storage SET lease_id=?,lease_revision=lease_revision+1,lease_expires_at=?,action_json=?,updated_at=? WHERE node_id=? AND profile_revision=? AND lease_revision=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now')) AND ${thinStorageAuthoritySql}`,
+    `UPDATE node_thin_storage SET lease_id=?,lease_revision=lease_revision+1,lease_expires_at=?,action_json=?,updated_at=?,lease_sample_observed_at=sample_observed_at,lease_sample_data_used_bytes=sample_data_used_bytes WHERE node_id=? AND profile_revision=? AND lease_revision=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now')) AND ${thinStorageAuthoritySql}`,
   )
     .bind(
       operation,
@@ -551,7 +564,7 @@ export async function thinStorageInput(
       assignment_revision: row.assignment_revision,
       region_revision: row.region_revision,
       revision: row.lease_revision,
-      authority_revision: row.authority_revision,
+      authority_revision: identityRevision(row),
       node_id: nodeId,
       region_id: row.region_id,
       node_uid: row.node_uid,
@@ -646,24 +659,86 @@ export async function dispatchThinPoolAction(
   return { dispatched: true };
 }
 
+/** What Cloudflare allowed the pool to gain since a reading: every live writer's measured io.max
+ * over the elapsed time plus drain, and the current startup holds (which bound held writers). */
+function thinWriteAllowance(
+  profile: ThinStorageProfile,
+  writers: readonly (NodeThinStorageAuthority | null)[],
+  holds: { bytes: number; ids: ReadonlySet<string> },
+  elapsedMilliseconds: number,
+) {
+  const window =
+      Math.ceil(Math.max(0, elapsedMilliseconds) / 1000) +
+      profile.drain_seconds,
+    io = new Map<string, { bytes: number; operations: number }>();
+  for (const authority of writers)
+    for (const volume of authority?.volumes ?? [])
+      if (
+        volume.storage_class !== "pgcf-lvm" &&
+        !holds.ids.has(volume.database_id)
+      )
+        for (const writer of volume.io) {
+          const known = io.get(writer.pod_uid);
+          io.set(writer.pod_uid, {
+            bytes: Math.max(known?.bytes ?? 0, writer.write_bytes_per_second),
+            operations: Math.max(
+              known?.operations ?? 0,
+              writer.write_iops_per_second,
+            ),
+          });
+        }
+  const rates = [...io.values()];
+  return (
+    thinWriteExposure(
+      rates.reduce((n, v) => n + v.bytes * window, 0),
+      rates.reduce((n, v) => n + v.operations * window, 0),
+    ).data_bytes + holds.bytes
+  );
+}
+
+/** The slow report is an identity proof: its read started at the lease's issue, it stays usable
+ * THIN_INVENTORY_MAX_SECONDS and it carries its own revision. Cloudflare composes the authority from
+ * it and the fresher of its reading and the current one, even when that authority already expired. */
 export async function recordThinStorageReport(
   env: Env,
   nodeId: string,
   raw: NodeThinStorageReport,
 ) {
-  const report = NodeThinStorageReport.parse(raw),
-    row = await readThinStorageLeaseRow(env, nodeId),
+  const report = NodeThinStorageReport.parse(raw);
+  // A fast renewal can win the compare-and-set while the lease holds; compose again.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const result = await acceptIdentityProof(env, nodeId, report);
+    if (result !== "conflict") return result;
+  }
+  return closed();
+}
+async function acceptIdentityProof(
+  env: Env,
+  nodeId: string,
+  report: NodeThinStorageReport,
+) {
+  const row = await readThinStorageLeaseRow(env, nodeId),
     input = await thinStorageInput(env, nodeId),
     lease = input.lease,
     now = Date.now(),
-    a = report.authority;
+    a = report.authority,
+    issued = Date.parse(lease.issued_at),
+    inventory = {
+      observed_at: issued,
+      expires_at: issued + THIN_INVENTORY_MAX_SECONDS * 1000,
+      revision: lease.authority_revision + 1,
+    };
   if (
     report.expected_revision !== row.lease_revision ||
     a.node_id !== nodeId ||
     a.node_uid !== row.node_uid ||
     a.cluster_uid !== row.cluster_uid ||
     a.name !== lease.name ||
-    a.revision !== row.authority_revision + 1 ||
+    a.revision !== inventory.revision ||
+    (a.inventory_observed_at !== undefined &&
+      (a.inventory_observed_at !== iso(inventory.observed_at) ||
+        a.inventory_expires_at !== iso(inventory.expires_at) ||
+        a.inventory_revision !== inventory.revision)) ||
     a.profile_revision !== row.profile_revision ||
     a.profile_sha256 !== row.profile_sha256 ||
     a.storage_class !== thinStorageClass(row.profile_sha256) ||
@@ -714,14 +789,7 @@ export async function recordThinStorageReport(
     pool = a.physical.thin_pool;
   if (
     a.write_allowed &&
-    (!a.data_accounting_complete ||
-      !pool ||
-      pool.data_total_bytes > lease.profile.maximum_data_bytes ||
-      pool.metadata_total_bytes !== lease.profile.metadata_bytes ||
-      pool.data_total_bytes - pool.data_used_bytes_upper_bound <
-        headroom.data ||
-      pool.metadata_total_bytes - pool.metadata_used_bytes_upper_bound <
-        headroom.metadata)
+    !thinStorageWriteAllowed(lease.profile, a, a.physical, headroom)
   )
     return closed();
   for (const v of a.volumes) {
@@ -743,15 +811,89 @@ export async function recordThinStorageReport(
     )
       return closed();
   }
-  const serialized = JSON.stringify(a),
+  const stored = retainedPoolAuthority(row);
+  // The proof's own reading must not exceed the newest sample before its lease plus what Cloudflare
+  // allowed since: the sampler or a writer's limit was wrong, so the node stops being renewed.
+  if (
+    pool &&
+    row.lease_sample_observed_at !== null &&
+    row.lease_sample_data_used_bytes !== null
+  ) {
+    const allowed =
+      row.lease_sample_data_used_bytes +
+      thinWriteAllowance(
+        lease.profile,
+        [stored, a],
+        holds,
+        now - Date.parse(row.lease_sample_observed_at),
+      );
+    if (pool.data_used_bytes_upper_bound > allowed) {
+      await env.DB.prepare(
+        "UPDATE node_thin_storage SET status='blocked',error_code='thin_storage_headroom_inconsistent',lease_id=NULL,lease_expires_at=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
+      )
+        .bind(nodeId, row.lease_id, row.lease_revision)
+        .run();
+      console.error(
+        JSON.stringify({
+          event: "thin_storage_headroom_inconsistent",
+          node_id: nodeId,
+          sample_observed_at: row.lease_sample_observed_at,
+          sample_data_used_bytes: row.lease_sample_data_used_bytes,
+          proof_data_used_bytes: pool.data_used_bytes_upper_bound,
+          allowed_bytes: allowed,
+        }),
+      );
+      return closed();
+    }
+  }
+  // A reading taken after this lease was issued is fresher than the proof's own, which is anchored
+  // at the issue; it is used only for the same pool, never smaller than the proof read it.
+  const fresher =
+    stored &&
+    pool &&
+    stored.physical.thin_pool &&
+    stored.pool_uuid === a.pool_uuid &&
+    stored.profile_revision === a.profile_revision &&
+    stored.physical.thin_pool.metadata_total_bytes ===
+      pool.metadata_total_bytes &&
+    stored.physical.thin_pool.data_total_bytes >= pool.data_total_bytes &&
+    Date.parse(stored.observed_at) > issued
+      ? stored
+      : null;
+  const reading = fresher
+      ? {
+          observed_at: Date.parse(fresher.observed_at),
+          captured_at: fresher.captured_at,
+          physical: fresher.physical,
+        }
+      : {
+          observed_at: issued,
+          captured_at: a.captured_at,
+          physical: a.physical,
+        },
+    writeAllowed = thinStorageWriteAllowed(
+      lease.profile,
+      a,
+      reading.physical,
+      headroom,
+    ),
+    composed = composeThinStorageAuthority({
+      identity: a,
+      inventory,
+      reading,
+      revision: row.authority_revision + 1,
+      guardSeconds: lease.profile.guard_seconds,
+      writeAllowed,
+    });
+  const serialized = JSON.stringify(composed),
     received = new Date(now).toISOString();
   const accepted = `EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=? AND t.authority_revision=? AND t.authority_json=?)`;
-  const bindings = [nodeId, a.revision, serialized];
+  const bindings = [nodeId, composed.revision, serialized];
   const statements = [
     env.DB.prepare(
       `UPDATE node_thin_storage SET authority_revision=?,authority_json=?,authority_received_at=?,qualification_json=?,status=?,error_code=NULL,lease_id=NULL,lease_expires_at=NULL,action_json=NULL WHERE node_id=? AND lease_revision=? AND authority_revision=? AND profile_revision=? AND julianday(lease_expires_at)>julianday('now') AND ${thinStorageAuthoritySql} AND ${storageHoldSnapshotSql}`,
     ).bind(
-      a.revision,
+      composed.revision,
       serialized,
       received,
       JSON.stringify({
@@ -765,7 +907,7 @@ export async function recordThinStorageReport(
         region_revision: row.region_revision,
         software: report.software,
       }),
-      a.write_allowed ? "ready" : "blocked",
+      writeAllowed ? "ready" : "blocked",
       nodeId,
       row.lease_revision,
       row.authority_revision,
@@ -809,15 +951,25 @@ export async function recordThinStorageReport(
     );
   }
   statements.push(
-    ...storageHoldVolumeStatements(env.DB, a),
-    ...storageProtectionStatements(env.DB, a),
+    ...storageHoldVolumeStatements(env.DB, composed),
+    ...storageProtectionStatements(env.DB, composed),
   );
   const results = await env.DB.batch(statements);
-  if (results[0]!.meta.changes !== 1) return closed();
+  if (results[0]!.meta.changes !== 1) {
+    const after = await env.DB.prepare(
+      "SELECT lease_id,lease_revision FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(nodeId)
+      .first<{ lease_id: string | null; lease_revision: number }>();
+    return after?.lease_id === row.lease_id &&
+      after?.lease_revision === row.lease_revision
+      ? ("conflict" as const)
+      : closed();
+  }
   return {
     accepted: true,
-    revision: a.revision,
-    write_allowed: a.write_allowed,
+    revision: composed.revision,
+    write_allowed: composed.write_allowed,
   };
 }
 

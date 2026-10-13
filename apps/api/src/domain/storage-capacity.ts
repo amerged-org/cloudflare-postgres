@@ -16,6 +16,17 @@ const identifier = (value: string) => {
   return value;
 };
 const field = (name: string) => `json_extract(t.profile_json,'$.${name}')`;
+/** When the identity proof behind an authority started its read, and until when it may be used.
+ * Facts that need a read after an event use these; a fast renewal only moves observed_at. An
+ * authority recorded before composition carries neither and was itself one complete read. */
+function inventoryObservedSql(authorityAlias = "t") {
+  const authority = identifier(authorityAlias);
+  return `COALESCE(json_extract(${authority}.authority_json,'$.inventory_observed_at'),json_extract(${authority}.authority_json,'$.observed_at'))`;
+}
+function inventoryExpiresSql(authorityAlias = "t") {
+  const authority = identifier(authorityAlias);
+  return `COALESCE(json_extract(${authority}.authority_json,'$.inventory_expires_at'),json_extract(${authority}.authority_json,'$.expires_at'))`;
+}
 
 function boundStorageVolumeSql(
   databaseAlias: string,
@@ -425,7 +436,7 @@ export function storageHoldVolumeStatements(
         AND EXISTS(SELECT 1 FROM databases d JOIN node_thin_storage t ON t.node_id=d.node_id WHERE (d.id=h.database_id AND d.generation=? AND d.storage_generation=? AND d.observed_generation=d.generation)
           AND (d.desired_state='running' AND d.observed_state='ready' AND d.observed_power='awake' AND d.deleted_at IS NULL)
           AND ${holdReceiptMatchesCurrentSql("h", "d")}
-          AND (t.node_uid=h.node_uid AND t.authority_revision=? AND t.authority_json=? AND julianday(json_extract(t.authority_json,'$.observed_at'))>=julianday(d.updated_at))
+          AND (t.node_uid=h.node_uid AND t.authority_revision=? AND t.authority_json=? AND julianday(${inventoryObservedSql()})>=julianday(d.updated_at))
           AND ${qualifiedThinStorageSql()}
           AND (json_extract(d.runtime_attestation_json,'$.database_id')=d.id AND json_extract(d.runtime_attestation_json,'$.generation')=d.generation AND json_extract(d.runtime_attestation_json,'$.storage_generation')=d.storage_generation AND json_extract(d.runtime_attestation_json,'$.node_uid')=h.node_uid)
           AND (json_extract(d.runtime_attestation_json,'$.boot_id')=json_extract(t.qualification_json,'$.boot_id') AND json_extract(d.runtime_attestation_json,'$.cluster_uid')=t.cluster_uid AND json_extract(d.runtime_attestation_json,'$.namespace_uid')=? AND json_extract(d.runtime_attestation_json,'$.cnpg_cluster_uid')=?)
@@ -477,10 +488,10 @@ export function coveredStorageHoldSql(admissionAlias = "a"): string {
       AND (json_extract(t.authority_json,'$.volume_group_uuid')=t.volume_group_uuid
       AND json_extract(t.authority_json,'$.profile_sha256')=t.profile_sha256
       AND json_extract(t.authority_json,'$.data_accounting_complete')=1
-      AND julianday(json_extract(t.authority_json,'$.observed_at'))>julianday(${admission}.ready_at,'+5 seconds'))
-      AND (julianday(json_extract(t.authority_json,'$.observed_at'))>=julianday('now','-120 seconds')
-      AND julianday(json_extract(t.authority_json,'$.observed_at'))<=julianday('now','+5 seconds')
-      AND julianday(json_extract(t.authority_json,'$.expires_at'))>julianday('now')
+      AND julianday(${inventoryObservedSql()})>julianday(${admission}.ready_at,'+5 seconds'))
+      AND (julianday(${inventoryObservedSql()})>=julianday('now','-120 seconds')
+      AND julianday(${inventoryObservedSql()})<=julianday('now','+5 seconds')
+      AND julianday(${inventoryExpiresSql()})>julianday('now')
       AND storage_db.storage_volume_json IS NOT NULL)
       AND (json_extract(storage_db.storage_volume_json,'$.node_uid')=t.node_uid
       AND json_extract(storage_db.storage_volume_json,'$.volume_group_uuid')=t.volume_group_uuid
@@ -514,14 +525,16 @@ export function storageProtectionStatements(
 ): D1PreparedStatement[] {
   const authority = AuthoritySchema.parse(raw),
     serialized = JSON.stringify(authority),
+    // A protection is a fact of the identity read, not of a later fast renewal.
+    read = authority.inventory_observed_at ?? authority.observed_at,
     statements: D1PreparedStatement[] = [];
   const accepted = `EXISTS(SELECT 1 FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id AND n.node_uid=t.node_uid
     WHERE t.node_id=? AND t.node_uid=? AND t.authority_revision=? AND t.authority_json=?
       AND n.id=databases.node_id AND n.region_id=databases.region_id AND n.lost_at IS NULL
       AND t.cluster_uid=json_extract(t.authority_json,'$.cluster_uid')
-      AND julianday(json_extract(t.authority_json,'$.observed_at'))>=julianday('now','-120 seconds')
-      AND julianday(json_extract(t.authority_json,'$.observed_at'))<=julianday('now','+5 seconds')
-      AND julianday(json_extract(t.authority_json,'$.expires_at'))>julianday('now'))`;
+      AND julianday(${inventoryObservedSql()})>=julianday('now','-120 seconds')
+      AND julianday(${inventoryObservedSql()})<=julianday('now','+5 seconds')
+      AND julianday(${inventoryExpiresSql()})>julianday('now'))`;
   const bindings = [
     authority.node_id,
     authority.node_uid,
@@ -561,10 +574,10 @@ export function storageProtectionStatements(
         )
         .bind(
           proof.operation_id,
-          authority.observed_at,
-          authority.observed_at,
+          read,
+          read,
           proof.operation_id,
-          authority.observed_at,
+          read,
           proof.database_id,
           authority.node_id,
           proof.generation,
@@ -591,7 +604,7 @@ export function storageProtectionStatements(
           AND ${accepted})`,
         )
         .bind(
-          authority.observed_at,
+          read,
           proof.database_id,
           authority.node_id,
           authority.node_uid,
@@ -626,9 +639,9 @@ export function storageProtectionStatements(
       AND EXISTS(SELECT 1 FROM projects p WHERE p.id=databases.project_id AND p.deleted_at IS NULL) AND ${accepted}`,
         )
         .bind(
-          authority.observed_at,
-          authority.observed_at,
-          authority.observed_at,
+          read,
+          read,
+          read,
           volume.database_id,
           authority.node_id,
           volume.generation,
@@ -671,9 +684,9 @@ export function storageProtectionCurrentSql(
         AND json_extract(t.authority_json,'$.node_uid')=t.node_uid
         AND json_extract(t.authority_json,'$.cluster_uid')=t.cluster_uid
         AND json_extract(t.authority_json,'$.profile_sha256')=t.profile_sha256
-        AND julianday(json_extract(t.authority_json,'$.observed_at'))>=julianday('now','-120 seconds')
-        AND julianday(json_extract(t.authority_json,'$.observed_at'))<=julianday('now','+5 seconds')
-        AND julianday(json_extract(t.authority_json,'$.expires_at'))>julianday('now')
+        AND julianday(${inventoryObservedSql()})>=julianday('now','-120 seconds')
+        AND julianday(${inventoryObservedSql()})<=julianday('now','+5 seconds')
+        AND julianday(${inventoryExpiresSql()})>julianday('now')
         AND json_extract(proof.value,'$.database_id')=${database}.id
         AND json_extract(proof.value,'$.generation')=${database}.generation
         AND json_extract(proof.value,'$.operation_id')=${database}.storage_protected_operation
@@ -688,7 +701,7 @@ export function storageProtectionCurrentSql(
     AND EXISTS(SELECT 1 FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id AND n.node_uid=t.node_uid,json_each(t.authority_json,'$.volumes') volume
       WHERE (t.node_id=${database}.node_id AND n.region_id=${database}.region_id AND n.lost_at IS NULL AND t.node_uid=json_extract(${database}.storage_profile_json,'$.node_uid'))
       AND (json_extract(t.authority_json,'$.revision')=t.authority_revision AND json_extract(t.authority_json,'$.node_uid')=t.node_uid AND json_extract(t.authority_json,'$.cluster_uid')=t.cluster_uid AND json_extract(t.authority_json,'$.data_accounting_complete')=1)
-      AND (julianday(t.authority_received_at)>=julianday('now','-120 seconds') AND julianday(t.authority_received_at)<=julianday('now','+5 seconds') AND julianday(json_extract(t.authority_json,'$.observed_at'))>=julianday('now','-120 seconds') AND julianday(json_extract(t.authority_json,'$.observed_at'))<=julianday('now','+5 seconds') AND julianday(json_extract(t.authority_json,'$.expires_at'))>julianday('now'))
+      AND (julianday(t.authority_received_at)>=julianday('now','-120 seconds') AND julianday(t.authority_received_at)<=julianday('now','+5 seconds') AND julianday(${inventoryObservedSql()})>=julianday('now','-120 seconds') AND julianday(${inventoryObservedSql()})<=julianday('now','+5 seconds') AND julianday(${inventoryExpiresSql()})>julianday('now'))
       AND (json_extract(t.authority_json,'$.volume_group_uuid')=json_extract(${database}.storage_volume_json,'$.volume_group_uuid') AND json_extract(t.authority_json,'$.pool_uuid')=json_extract(${database}.storage_volume_json,'$.pool_uuid') AND json_extract(t.authority_json,'$.profile_sha256')=json_extract(${database}.storage_profile_json,'$.profile_sha256'))
       AND (json_extract(volume.value,'$.database_id')=${database}.id AND json_extract(volume.value,'$.generation')=${database}.generation AND json_extract(volume.value,'$.storage_generation')=${database}.storage_generation AND json_extract(volume.value,'$.quiesced')=1)
       AND (json_extract(volume.value,'$.storage_uid')=json_extract(${database}.storage_volume_json,'$.storage_uid') AND json_extract(volume.value,'$.namespace_uid')=json_extract(${database}.storage_volume_json,'$.namespace_uid') AND json_extract(volume.value,'$.cluster_uid')=json_extract(${database}.storage_volume_json,'$.cluster_uid'))
@@ -725,10 +738,10 @@ export function thinStorageDeletionConfirmedSql(
       AND json_extract(t.authority_json,'$.volume_group_uuid')=t.volume_group_uuid
       AND json_extract(t.authority_json,'$.profile_sha256')=t.profile_sha256
       AND json_extract(t.authority_json,'$.data_accounting_complete')=1
-      AND julianday(json_extract(t.authority_json,'$.observed_at'))>julianday(${database}.updated_at)
-      AND julianday(json_extract(t.authority_json,'$.observed_at'))>=julianday('now','-120 seconds')
-      AND julianday(json_extract(t.authority_json,'$.observed_at'))<=julianday('now','+5 seconds')
-      AND julianday(json_extract(t.authority_json,'$.expires_at'))>julianday('now')
+      AND julianday(${inventoryObservedSql()})>julianday(${database}.updated_at)
+      AND julianday(${inventoryObservedSql()})>=julianday('now','-120 seconds')
+      AND julianday(${inventoryObservedSql()})<=julianday('now','+5 seconds')
+      AND julianday(${inventoryExpiresSql()})>julianday('now')
       AND NOT EXISTS(SELECT 1 FROM json_each(t.authority_json,'$.physical_lvs') physical_lv WHERE json_extract(physical_lv.value,'$.lv_uuid')=${lv})
       AND NOT EXISTS(SELECT 1 FROM json_each(t.authority_json,'$.active_lv_uuids') active_lv WHERE active_lv.value=${lv})))`;
 }

@@ -18,7 +18,10 @@ import {
 } from "../../src/crypto/bootstrap-credentials.ts";
 import { ensureNodeHostConfiguration } from "../../src/domain/node-host-configuration.ts";
 import type { Env } from "../../src/env.ts";
-export async function thinExecutionFixture(releases: string[]) {
+export async function thinExecutionFixture(
+  releases: string[],
+  profileOverrides: Partial<ThinStorageProfile> = {},
+) {
   const local = {
     ...env,
     NODE_BOOTSTRAP_CALLBACK_URL: "https://api.invalid/",
@@ -46,6 +49,7 @@ export async function thinExecutionFixture(releases: string[]) {
     drain_seconds: 10,
     maximum_volumes: 128,
     maximum_quota_gib: 16,
+    ...profileOverrides,
   });
   const authority = NodeThinStorageAuthority.parse({
     node_id: f.node,
@@ -62,7 +66,7 @@ export async function thinExecutionFixture(releases: string[]) {
     driver_image: profile.driver_image,
     observed_at: at,
     captured_at: at,
-    expires_at: new Date(now + 120000).toISOString(),
+    expires_at: new Date(now + profile.guard_seconds * 1000).toISOString(),
     write_allowed: true,
     physical: {
       volume_group_uuid: "ABCDEF-1234-1234-1234-1234-1234-ABCDEF",

@@ -10,3 +10,9 @@ ALTER TABLE node_thin_storage ADD COLUMN sample_observed_at TEXT;
 ALTER TABLE node_thin_storage ADD COLUMN sample_data_used_bytes INTEGER
   CHECK ((sample_observed_at IS NULL) = (sample_data_used_bytes IS NULL)
     AND (sample_data_used_bytes IS NULL OR sample_data_used_bytes BETWEEN 0 AND 9007199254740991));
+-- The newest sample accepted before the current identity lease was issued; that lease's own LVM
+-- reading must not show more data than it plus what Cloudflare allowed since.
+ALTER TABLE node_thin_storage ADD COLUMN lease_sample_observed_at TEXT;
+ALTER TABLE node_thin_storage ADD COLUMN lease_sample_data_used_bytes INTEGER
+  CHECK ((lease_sample_observed_at IS NULL) = (lease_sample_data_used_bytes IS NULL)
+    AND (lease_sample_data_used_bytes IS NULL OR lease_sample_data_used_bytes BETWEEN 0 AND 9007199254740991));

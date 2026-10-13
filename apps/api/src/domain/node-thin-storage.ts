@@ -45,6 +45,8 @@ export interface NodeThinStorageRow {
   sample_nonce_issued_at: string | null;
   sample_observed_at: string | null;
   sample_data_used_bytes: number | null;
+  lease_sample_observed_at: string | null;
+  lease_sample_data_used_bytes: number | null;
   created_at: string;
   /** Also the current slow lease's issue; fast samples never write it. */
   updated_at: string;
