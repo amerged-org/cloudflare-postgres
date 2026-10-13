@@ -22,6 +22,7 @@ import {
 
 import { DatabaseRuntimeAttestation } from "@pgcf/contracts/reclaim";
 import { thinStorageDeletionConfirmedSql } from "./storage-capacity.ts";
+import { requestThinStorageTurn } from "./node-thin-storage-execution.ts";
 export function truncateAgentText(value: string): string {
   const bytes = new TextEncoder().encode(value);
   return bytes.length <= 4096
@@ -612,6 +613,17 @@ export async function observations(
             row.power_operation ?? null,
           )
           .catch(() => false),
+      );
+    // Only an identity proof reads a new thin volume's LV into its receipt; start one now.
+    if (
+      result[0]!.meta.changes === 1 &&
+      observation.state === "ready" &&
+      row.node_id &&
+      row.storage_profile_json &&
+      !row.storage_volume_json
+    )
+      c.executionCtx.waitUntil(
+        requestThinStorageTurn(c.env, row.node_id).catch(() => undefined),
       );
   }
   if (orphans !== undefined)

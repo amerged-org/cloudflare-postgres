@@ -26,7 +26,7 @@ import {
   prepareThinStorageLease,
   readThinStorageLeaseRow,
 } from "./domain/node-thin-storage-execution.ts";
-import { NodeId } from "@pgcf/contracts";
+import { NodeId, THIN_INVENTORY_INTERVAL_SECONDS } from "@pgcf/contracts";
 import {
   failThinQualificationTurn,
   prepareThinQualificationTurn,
@@ -195,6 +195,22 @@ async function inspectionStatusBody(response: Response, signal: AbortSignal) {
   }
 }
 
+/** Section 5 of thin-authority-renewal.md: failures that end only this identity turn. A relay
+ * transport or callback refused after its repeats, a command that still fails after its repeats and
+ * an unconfirmed executor keep the node ready while the identity proof stays valid; identity,
+ * qualification, ownership and uncertain pool-action failures block it as before. */
+const TRANSIENT_THIN_STORAGE_FAILURES = new Set([
+  "thin_storage_authority_refused",
+  "thin_storage_command_failed",
+  "thin_storage_executor_unconfirmed",
+]);
+/** 5 s after the first failed turn, doubling up to the identity cadence. */
+function thinStorageRetryMilliseconds(failures: number) {
+  return Math.min(
+    THIN_INVENTORY_INTERVAL_SECONDS * 1000,
+    5000 * 2 ** Math.max(0, failures - 1),
+  );
+}
 /** A turn request only registers the turn; the container's own record then follows it. */
 const TURN_REQUEST_MS = 10_000,
   TURN_POLL_MS = 2_000;
@@ -430,21 +446,41 @@ export class NodeBootstrap extends DurableObject<Env> {
     );
     if (outcome.state === "unanswered")
       throw new Error("thin_storage_executor_unanswered");
-    if (outcome.state === "absent") {
-      // Not running here: only this lease ends now, and the next turn reads a dispatched action back.
+    const code =
+      outcome.state !== "failed"
+        ? null
+        : outcome.error_code &&
+            /^thin_storage_[a-z0-9_]{1,80}$/.test(outcome.error_code)
+          ? outcome.error_code
+          : "thin_storage_executor_unconfirmed";
+    if (
+      outcome.state === "absent" ||
+      (code !== null && TRANSIENT_THIN_STORAGE_FAILURES.has(code))
+    ) {
+      // Not running here, or stopped on a transient failure: only this lease ends now, the node stays
+      // ready and the next turn reads a dispatched action back.
       await this.env.DB.prepare(
         "UPDATE node_thin_storage SET lease_id=NULL,lease_expires_at=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
       )
         .bind(nodeId, current.lease.operation_id, current.lease.revision)
         .run();
+      const failures =
+        ((await this.ctx.storage.get<number>("thinStorageFailures")) ?? 0) + 1;
+      await this.ctx.storage.put("thinStorageFailures", failures);
+      console.warn(
+        JSON.stringify({
+          event: "thin_storage_turn_retried",
+          node_id: nodeId,
+          error_code: code ?? "thin_storage_executor_absent",
+          failures,
+        }),
+      );
+      await this.ctx.storage.setAlarm(
+        Date.now() + thinStorageRetryMilliseconds(failures),
+      );
       return;
     }
-    if (outcome.state === "failed") {
-      const code =
-        outcome.error_code &&
-        /^thin_storage_[a-z0-9_]{1,80}$/.test(outcome.error_code)
-          ? outcome.error_code
-          : "thin_storage_executor_unconfirmed";
+    if (code !== null) {
       await this.env.DB.prepare(
         "UPDATE node_thin_storage SET status='blocked',error_code=? WHERE node_id=? AND lease_id=? AND lease_revision=?",
       )
@@ -452,11 +488,13 @@ export class NodeBootstrap extends DurableObject<Env> {
         .run();
       throw new Error(code);
     }
+    // The next identity proof is due one interval after this one's read started.
+    await this.ctx.storage.delete("thinStorageFailures");
     await this.ctx.storage.setAlarm(
       Math.max(
         Date.now() + 1000,
         Date.parse(input.lease.issued_at) +
-          input.lease.profile.guard_seconds * 500,
+          THIN_INVENTORY_INTERVAL_SECONDS * 1000,
       ),
     );
   }
