@@ -672,7 +672,54 @@ it("release approval refuses hand-typed thin gate flags and accepts only a compl
   ).toEqual(qualification);
 });
 
-it("starts one scratch run only on a fresh customer node with closed placement, a guard-pinned release and the region pool on", async () => {
+it("starts an actual scratch Workflow on a current control relay without enabling placement or selecting thin storage", async () => {
+  const f = await qualificationSetup();
+  await env.DB.prepare(
+    "UPDATE fleet_node_releases SET role='control_relay' WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  // Use the real Workerd Workflow binding, not this file's scheduling-boundary substitute.
+  const response = await request(
+    `/v1/nodes/${f.node}/thin-qualifications`,
+    f.admin,
+    "POST",
+    { node_uid: f.uid, address: "192.0.2.18", profile },
+    crypto.randomUUID(),
+  );
+  expect(response.status).toBe(202);
+  const value = (await response.json()) as ThinQualificationRun;
+  const instance = await introspectWorkflowInstance(
+    env.THIN_QUALIFICATION,
+    value.id,
+  );
+  try {
+    expect(value).toMatchObject({
+      node_id: f.node,
+      node_uid: f.uid,
+      release_id: f.release,
+    });
+    expect(
+      await env.DB.prepare(
+        "SELECT database_placement_enabled FROM nodes WHERE id=?",
+      )
+        .bind(f.node)
+        .first("database_placement_enabled"),
+    ).toBe(0);
+    expect(
+      await env.DB.prepare(
+        "SELECT count(*) n FROM node_thin_storage WHERE node_id=?",
+      )
+        .bind(f.node)
+        .first("n"),
+    ).toBe(0);
+    expect(f.created).toEqual([]);
+  } finally {
+    await instance.dispose();
+  }
+});
+
+it("starts one scratch run only on a fresh node with closed placement, a guard-pinned release and the region pool on", async () => {
   const f = await qualificationSetup(),
     body = { node_uid: f.uid, address: "192.0.2.18", profile };
   expect((await f.start(body, "")).status).toBe(400);
@@ -698,18 +745,6 @@ it("starts one scratch run only on a fresh customer node with closed placement, 
     "UPDATE nodes SET database_placement_enabled=0,database_placement_closed_at=? WHERE id=?",
   )
     .bind(new Date().toISOString(), f.node)
-    .run();
-  // The control node never qualifies thin storage.
-  await env.DB.prepare(
-    "UPDATE fleet_node_releases SET role='control_relay' WHERE node_id=?",
-  )
-    .bind(f.node)
-    .run();
-  expect((await f.start(body)).status).toBe(409);
-  await env.DB.prepare(
-    "UPDATE fleet_node_releases SET role='customer' WHERE node_id=?",
-  )
-    .bind(f.node)
     .run();
   await env.DB.prepare("UPDATE nodes SET last_observed_at=? WHERE id=?")
     .bind(new Date(Date.now() - 600_000).toISOString(), f.node)

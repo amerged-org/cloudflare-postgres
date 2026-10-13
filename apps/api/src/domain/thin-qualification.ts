@@ -163,12 +163,12 @@ function pinned(spec: FleetReleaseSpec, name: string) {
     ? component
     : null;
 }
-/** Thick placement does not see the scratch pool, so a run needs a customer node with closed placement. */
+/** Scratch qualification permits either fleet role, but placement must stay closed throughout. */
 const freshNodeSql = `n.id=? AND n.node_uid=? AND n.ready=1 AND n.lost_at IS NULL AND n.provider_instance_id IS NOT NULL
-  AND n.database_placement_enabled=0 AND a.role='customer'
+  AND n.database_placement_enabled=0 AND a.role IN('customer','control_relay')
   AND julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds')`;
 
-/** Start one fenced scratch run on a current customer node with closed placement and a guard-pinned release. */
+/** Start one fenced scratch run on a current node with closed placement and a guard-pinned release. */
 export async function startThinQualification(
   c: ApiContext,
   nodeId: string,
@@ -218,7 +218,7 @@ export async function startThinQualification(
         }>();
       if (!source)
         return conflict(
-          "Qualification requires the current ready customer node with database placement disabled, fresh observations and its region release",
+          "Qualification requires a current ready fleet node with database placement disabled, fresh observations and its region release",
         );
       if (!(await thinStorageSamplingCapable(env.DB, source.region_id)))
         return conflict(

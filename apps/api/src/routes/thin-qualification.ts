@@ -51,7 +51,7 @@ export function registerThinQualification(app: ApiApp) {
     tags: ["Physical storage"],
     security: [{ bearerAuth: [] }],
     description:
-      "Starts one fenced scratch qualification of a complete thin profile on a current customer node whose database placement is disabled. It creates and removes its own pool, LVs and namespace and never selects thin storage.",
+      "Starts one fenced scratch qualification of a complete thin profile on a current customer or control-relay node whose database placement is disabled. It creates and removes its own pool, LVs and namespace and never selects thin storage.",
     request: {
       params: z.object({ id: NodeId }),
       headers: z.object({ "Idempotency-Key": IdempotencyKey }),
