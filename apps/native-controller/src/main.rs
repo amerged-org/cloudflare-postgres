@@ -7,7 +7,7 @@ use pgcf_native_controller::{
     kubernetes::Kubernetes,
     measurements::Measurements,
     node_storage::{Renewal, Sampler, driver_image, sample_node},
-    reconcile::{Reconciler, newer_token, storage_claims},
+    reconcile::{Reconciler, newer_token, storage_claims, storage_snapshot_expired},
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -74,6 +74,11 @@ fn fingerprint(db: &Value, snapshot: &DesiredSnapshot) -> Result<Vec<u8>, Error>
     db.as_object_mut()
         .ok_or("desired item invalid")?
         .remove("storage_authority");
+    // The same CF startup hold may be renewed while a bounded reconcile is running.
+    // Its scope remains in the fingerprint; a shortened/invalid expiry is fenced below.
+    if let Some(startup) = db["storage_startup"].as_object_mut() {
+        startup.remove("expires_at");
+    }
     Ok(Sha256::digest(serde_json::to_vec(&json!({"database":db,"backup":snapshot.region["backup"],"recovery_sources":snapshot.region["recovery_sources"],"fleet":snapshot.fleet_release,"compute_pool":snapshot.region["compute_pool"]}))?).to_vec())
 }
 fn apply_snapshot(
@@ -116,7 +121,7 @@ fn apply_snapshot(
                 continue;
             }
             cell.authority_at = pulled_at;
-            let changed = cell.fingerprint != hash;
+            let changed = cell.fingerprint != hash || startup_retracted(&cell.db, db);
             let host_changed = host_write_state(&cell.db, &cell.snapshot, renewals)
                 != host_write_state(db, &snapshot, renewals);
             if changed || host_changed {
@@ -362,6 +367,57 @@ fn storage_protection_due(
             || integer(&claims, "exp").map_or(true, |expiry| i128::from(expiry) <= clock)
     })
 }
+fn timestamp_millis(value: &Value) -> Option<i128> {
+    time::OffsetDateTime::parse(
+        value.as_str()?,
+        &time::format_description::well_known::Rfc3339,
+    )
+    .ok()
+    .map(|value| value.unix_timestamp_nanos() / 1_000_000)
+}
+fn startup_retracted(previous: &Value, current: &Value) -> bool {
+    timestamp_millis(&previous["storage_startup"]["expires_at"]).is_some_and(|held| {
+        timestamp_millis(&current["storage_startup"]["expires_at"])
+            .is_none_or(|current| current < held)
+    })
+}
+/// Before the first writer token, only CF can renew this generation's startup hold.
+/// Fast node headroom is not permission to extend its cached expiry locally.
+fn startup_refresh_due(db: &Value, renewals: &Renewals, clock: i128) -> bool {
+    let hold = &db["storage_startup"];
+    if db["storage"].is_null()
+        || text(db, "desired_state") != "running"
+        || hold["generation"] != db["generation"]
+        || hold["node_uid"] != db["storage"]["node_uid"]
+    {
+        return false;
+    }
+    if renewals
+        .token(db)
+        .and_then(storage_claims)
+        .is_some_and(|claims| {
+            claims["database_id"] == db["id"]
+                && claims["generation"] == db["generation"]
+                && claims["node_uid"] == db["storage"]["node_uid"]
+                && claims["write_allowed"] == true
+                && integer(&claims, "exp").is_ok_and(|expiry| i128::from(expiry) > clock)
+        })
+    {
+        return false;
+    }
+    timestamp_millis(&hold["expires_at"]).is_some_and(|expiry| {
+        expiry - clock <= i128::from(number(&db["storage"], "guard_seconds")) * 500
+    })
+}
+fn preempt_storage(
+    db: &Value,
+    snapshot: &DesiredSnapshot,
+    renewals: &Renewals,
+    clock: i128,
+    kind: JobKind,
+) -> bool {
+    kind != JobKind::Protect && storage_protection_due(db, snapshot, renewals, clock)
+}
 /// Bounded reconciliation slots shared by every database.
 const SLOTS: usize = 4;
 /// Scheduling classes in priority order.
@@ -413,6 +469,11 @@ fn hinted(cell: &mut Cell, kind: &str, now: Instant) {
 /// The backoff after the `attempt`-th consecutive failed reconcile or renewal.
 fn failure_delay(attempt: u32) -> Duration {
     Duration::from_secs((1_u64 << attempt.min(8)).min(300))
+}
+fn stale_snapshot_retry(cell: &mut Cell, now: Instant) {
+    cell.attempt = 0;
+    cell.stalled = 0;
+    cell.due = now + Duration::from_secs(1);
 }
 /// Records a finished storage-authority renewal that started at hint `marker`. A failed one
 /// backs off like a failed reconcile, so failing renewals cannot hold every slot; an authority
@@ -728,6 +789,8 @@ async fn run() -> Result<(), Error> {
     let mut jobs: JoinSet<JobResult> = JoinSet::new();
     let mut pulls: JoinSet<PullResult> = JoinSet::new();
     let mut pull_full = false;
+    let mut targeted_pulls: HashSet<String> = HashSet::new();
+    let mut startup_reads: HashMap<String, Instant> = HashMap::new();
     let mut control_healthy = false;
     let mut have_full_snapshot = false;
     let mut latest_snapshot: Option<(Instant, Arc<DesiredSnapshot>)> = None;
@@ -843,6 +906,9 @@ async fn run() -> Result<(), Error> {
             },
             result = pulls.join_next(), if !pulls.is_empty() => {
                 if let Some(Ok((requested, pulled_at, result))) = result {
+                    if let Some(ids) = &requested {
+                        for id in ids { targeted_pulls.remove(id); }
+                    }
                     let is_full = requested.is_none();
                     if is_full { pull_full = false; }
                     match result {
@@ -861,6 +927,7 @@ async fn run() -> Result<(), Error> {
                         }
                     }
                 } else {
+                    targeted_pulls.clear();
                     pull_full = false;
                     control_healthy = false;
                 }
@@ -880,6 +947,10 @@ async fn run() -> Result<(), Error> {
                             }
                             match result {
                                 Ok(observed) => settle(cell, started, observed.as_ref(), marker),
+                                Err(error) if storage_snapshot_expired(&error) => {
+                                    pull_ids.insert(id.clone());
+                                    stale_snapshot_retry(cell,Instant::now());
+                                }
                                 Err(_) => {
                                     pull_ids.insert(id.clone());
                                     cell.attempt = cell.attempt.saturating_add(1);
@@ -903,24 +974,43 @@ async fn run() -> Result<(), Error> {
         }
         poll_renewals(&mut samplers, &mut renewals, clock_ms());
 
+        let read_at = Instant::now();
+        startup_reads.retain(|id, _| cells.contains_key(id));
+        for (id, cell) in &cells {
+            if !targeted_pulls.contains(id)
+                && startup_reads.get(id).is_none_or(|after| *after <= read_at)
+                && startup_refresh_due(&cell.db, &renewals, clock_ms())
+            {
+                pull_ids.insert(id.clone());
+                // Failed reads still stop at the original expiry; retries are bounded.
+                startup_reads.insert(id.clone(), read_at + Duration::from_secs(1));
+            }
+        }
+
         if !pull_ids.is_empty() && pulls.len() < 4 {
-            let ids: Vec<_> = pull_ids.iter().take(200).cloned().collect();
+            let ids: Vec<_> = pull_ids
+                .iter()
+                .filter(|id| !targeted_pulls.contains(*id))
+                .take(200)
+                .cloned()
+                .collect();
             for id in &ids {
                 pull_ids.remove(id);
+                targeted_pulls.insert(id.clone());
             }
-            let api = api.clone();
-            pulls.spawn_local(async move {
-                let started = Instant::now();
-                let result = api.desired(Some(&ids)).await;
-                (Some(ids), started, result)
-            });
+            if !ids.is_empty() {
+                let api = api.clone();
+                pulls.spawn_local(async move {
+                    let started = Instant::now();
+                    let result = api.desired(Some(&ids)).await;
+                    (Some(ids), started, result)
+                });
+            }
         }
         for (id, job) in &active {
-            if job.kind != JobKind::Protect
-                && cells.get(id).is_some_and(|cell| {
-                    storage_protection_due(&cell.db, &cell.snapshot, &renewals, clock_ms())
-                })
-            {
+            if cells.get(id).is_some_and(|cell| {
+                preempt_storage(&cell.db, &cell.snapshot, &renewals, clock_ms(), job.kind)
+            }) {
                 job.abort.abort();
             }
         }
@@ -1058,6 +1148,130 @@ mod tests {
     fn finish(cell: &mut Cell, now: Instant, observed: Option<&Value>) {
         let marker = cell.hints;
         settle(cell, now, observed, marker);
+    }
+    #[test]
+    fn a_scoped_startup_expiry_renewal_preserves_the_work_fingerprint() {
+        let db = json!({"id":"db","generation":2,"desired_state":"running","storage":{"node_uid":"same","startup_reserve_bytes":5368709120_u64},"storage_startup":{"operation_id":operation(2),"generation":2,"node_uid":"same","budget_bytes":5368709120_u64,"expires_at":"1970-01-01T00:00:10.000Z"}});
+        let state = snapshot(vec![]);
+        let initial = fingerprint(&db, &state).unwrap();
+        let mut renewed = db.clone();
+        renewed["storage_startup"]["expires_at"] = "1970-01-01T00:00:20.000Z".into();
+        assert_eq!(initial, fingerprint(&renewed, &state).unwrap());
+        renewed["storage_startup"]["operation_id"] = operation(3).into();
+        assert_ne!(initial, fingerprint(&renewed, &state).unwrap());
+        renewed = db.clone();
+        renewed["storage_startup"]["budget_bytes"] = 1073741824_u64.into();
+        assert_ne!(initial, fingerprint(&renewed, &state).unwrap());
+        renewed = db.clone();
+        renewed["storage_startup"]["node_uid"] = "replaced".into();
+        assert_ne!(initial, fingerprint(&renewed, &state).unwrap());
+        renewed = db.clone();
+        renewed["storage_startup"] = Value::Null;
+        assert_ne!(initial, fingerprint(&renewed, &state).unwrap());
+    }
+    #[test]
+    fn tokenless_startup_refreshes_before_expiry_and_shortened_grants_revoke() {
+        let db = json!({"id":"db","generation":2,"desired_state":"running","storage":{"node_uid":"same","guard_seconds":10},"storage_startup":{"operation_id":operation(2),"generation":2,"node_uid":"same","budget_bytes":5368709120_u64,"expires_at":"1970-01-01T00:00:10.000Z"}});
+        assert!(!startup_refresh_due(&db, &Renewals::default(), 4000));
+        assert!(startup_refresh_due(&db, &Renewals::default(), 5000));
+        assert!(startup_refresh_due(&db, &Renewals::default(), 10000));
+        let mut newer = db.clone();
+        newer["storage_startup"]["expires_at"] = "1970-01-01T00:00:20.000Z".into();
+        assert!(!startup_retracted(&db, &newer));
+        newer["storage_startup"]["expires_at"] = "1970-01-01T00:00:09.000Z".into();
+        assert!(startup_retracted(&db, &newer));
+        newer["storage_startup"]["expires_at"] = "invalid".into();
+        assert!(startup_retracted(&db, &newer));
+        newer["storage_startup"] = Value::Null;
+        assert!(startup_retracted(&db, &newer));
+    }
+    #[tokio::test]
+    async fn latest_cell_expiry_or_revocation_still_preempts_and_schedules_protection() {
+        let db = json!({"id":"db","generation":2,"desired_state":"running","storage":{"node_uid":"same"},"storage_startup":{"generation":2,"node_uid":"same","expires_at":"1970-01-01T00:00:03.000Z"}});
+        let mut state = snapshot(vec![]);
+        state.region = json!({"storage_nodes":[{"node_uid":"same","write_allowed":true,"expires_at":"1970-01-01T00:00:03.000Z"}]});
+        let renewals = Renewals::default();
+        let job = tokio::spawn(std::future::pending::<()>());
+        assert!(!preempt_storage(
+            &db,
+            &state,
+            &renewals,
+            2000,
+            JobKind::Reconcile
+        ));
+        state.region["storage_nodes"][0]["write_allowed"] = false.into();
+        assert!(preempt_storage(
+            &db,
+            &state,
+            &renewals,
+            2000,
+            JobKind::Reconcile
+        ));
+        if preempt_storage(&db, &state, &renewals, 2000, JobKind::Reconcile) {
+            job.abort();
+        }
+        assert!(job.await.unwrap_err().is_cancelled());
+        let now = Instant::now();
+        let mut c = cell(db.clone(), now, false);
+        c.snapshot = Arc::new(state.clone());
+        let mut cells = HashMap::new();
+        cells.insert("db".into(), c);
+        assert_eq!(
+            schedule(&cells, &renewals, &HashMap::new(), now, 2000, true),
+            vec![("db".into(), Class::Storage)]
+        );
+        state.region["storage_nodes"][0]["write_allowed"] = true.into();
+        state.region["storage_nodes"][0]["expires_at"] = "1970-01-01T00:00:02.000Z".into();
+        assert!(preempt_storage(
+            &db,
+            &state,
+            &renewals,
+            2000,
+            JobKind::Reconcile
+        ));
+        assert!(!preempt_storage(
+            &db,
+            &state,
+            &renewals,
+            2000,
+            JobKind::Protect
+        ));
+    }
+    #[test]
+    fn repeated_stale_snapshots_never_accumulate_failed_job_backoff() {
+        let db = json!({"id":"db","generation":2,"desired_state":"running","storage":{"node_uid":"same","guard_seconds":10},"storage_startup":{"operation_id":operation(2),"generation":2,"node_uid":"same","budget_bytes":5368709120_u64,"expires_at":"1970-01-01T00:00:10.000Z"}});
+        let now = Instant::now();
+        let mut cells = HashMap::new();
+        let renewals = Renewals::default();
+        apply_snapshot(
+            &mut cells,
+            &HashMap::new(),
+            &renewals,
+            snapshot(vec![db.clone()]),
+            None,
+            now,
+        )
+        .unwrap();
+        cells.get_mut("db").unwrap().attempt = 8;
+        for index in 0..3 {
+            let instant = now + Duration::from_secs(index);
+            stale_snapshot_retry(cells.get_mut("db").unwrap(), instant);
+            let mut fresh = db.clone();
+            fresh["storage_startup"]["expires_at"] =
+                format!("1970-01-01T00:00:{:02}.000Z", 20 + index).into();
+            apply_snapshot(
+                &mut cells,
+                &HashMap::new(),
+                &renewals,
+                snapshot(vec![fresh]),
+                Some(&["db".into()]),
+                instant,
+            )
+            .unwrap();
+            assert_eq!(cells["db"].attempt, 0);
+            assert_eq!(cells["db"].stalled, 0);
+            assert_eq!(cells["db"].due, instant + Duration::from_secs(1));
+        }
     }
     #[test]
     fn delayed_target_pulls_never_downgrade_or_remove_newer_rows() {

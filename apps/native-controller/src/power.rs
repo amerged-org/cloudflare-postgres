@@ -2632,6 +2632,131 @@ fn physical_authority<'a>(db: &Value, nodes: &'a Value, after: u64, now: u64) ->
         && value["data_accounting_complete"] == true)
         .then_some(value)
 }
+/// Materialize an already observed Native volume, not a writer or a guessed device identity.
+/// This is the same physical custody used by deletion, before a Ready Pod can provide IO proof.
+pub(crate) fn native_volume_identity(
+    db: &Value,
+    authority: &Value,
+    scope: (&Value, &Value, &Value),
+    binding: (&Value, &Value),
+    now: u64,
+) -> Option<Value> {
+    let (namespace_value, cluster, storage) = scope;
+    let (claim, pv) = binding;
+    let ns = namespace(db);
+    let nodes = json!([authority]);
+    physical_authority(db, &nodes, 0, now)?;
+    if authority["pool_uuid"] != db["storage"]["pool_uuid"]
+        || authority["storage_class"] != db["storage"]["storage_class"]
+        || [&namespace_value, &cluster, &storage].iter().any(|value| {
+            generation(value) > number(db, "generation")
+                || !annotation_number(value, "pgcf.io/accepted-generation").is_ok_and(
+                    |generation| generation.is_none_or(|g| g <= number(db, "generation")),
+                )
+        })
+    {
+        return None;
+    }
+    owned(
+        Some(namespace_value.clone()),
+        &ns,
+        text(db, "id"),
+        None,
+        false,
+    )
+    .ok()?;
+    owned(
+        Some(cluster.clone()),
+        "database",
+        text(db, "id"),
+        Some(&ns),
+        false,
+    )
+    .ok()?;
+    owned(
+        Some(storage.clone()),
+        &format!("storage-{}", text(db, "id")),
+        text(db, "id"),
+        Some(SYSTEM),
+        false,
+    )
+    .ok()?;
+    let stored: Value = serde_json::from_str(storage["data"]["state"].as_str()?).ok()?;
+    if stored["namespaceUid"] != namespace_value["metadata"]["uid"]
+        || stored["clusterUid"] != cluster["metadata"]["uid"]
+        || stored["node"] != db["node"]
+        || stored["archivePath"] != db["archive"]["destination_path"]
+        || stored["storage"] != db["storage"]
+        || !crate::reconcile::cluster_owned(claim, cluster)
+        || claim["metadata"]["namespace"] != ns
+        || !claim["metadata"]["deletionTimestamp"].is_null()
+        || !pv["metadata"]["deletionTimestamp"].is_null()
+        || claim["status"]["phase"] != "Bound"
+        || pv["status"]["phase"] != "Bound"
+        || claim["spec"]["volumeName"] != pv["metadata"]["name"]
+        || pv["spec"]["claimRef"]["uid"] != claim["metadata"]["uid"]
+        || pv["spec"]["claimRef"]["name"] != claim["metadata"]["name"]
+        || pv["spec"]["claimRef"]["namespace"] != ns
+        || pv["spec"]["csi"]["driver"] != "local.csi.openebs.io"
+        || claim["spec"]["storageClassName"] != db["storage"]["storage_class"]
+        || pv["spec"]["storageClassName"] != db["storage"]["storage_class"]
+        || claim["spec"]["volumeAttributesClassName"] != db["storage"]["volume_attributes_class"]
+        || claim["status"]["currentVolumeAttributesClassName"]
+            != db["storage"]["volume_attributes_class"]
+        || !claim["status"]["modifyVolumeStatus"].is_null()
+        || !crate::reconcile::pinned_to_node(pv, text(db, "node"))
+    {
+        return None;
+    }
+    let capacity = number(&db["size"], "storage_gib") as f64 * 2_f64.powi(30);
+    if crate::reconcile::quantity(&claim["spec"]["resources"]["requests"]["storage"])
+        != Some(capacity)
+        || crate::reconcile::quantity(&claim["status"]["capacity"]["storage"]) != Some(capacity)
+        || crate::reconcile::quantity(&pv["spec"]["capacity"]["storage"]) != Some(capacity)
+    {
+        return None;
+    }
+    let receipts = authority["volumes"]
+        .as_array()?
+        .iter()
+        .filter(|receipt| {
+            receipt["database_id"] == db["id"]
+                && receipt["generation"] == db["generation"]
+                && number(receipt, "storage_generation")
+                    == db["storage_generation"].as_u64().unwrap_or(1)
+        })
+        .collect::<Vec<_>>();
+    if receipts.len() != 1 {
+        return None;
+    }
+    let receipt = receipts[0];
+    if receipt["storage_uid"] != storage["metadata"]["uid"]
+        || receipt["namespace_uid"] != namespace_value["metadata"]["uid"]
+        || receipt["cluster_uid"] != cluster["metadata"]["uid"]
+        || receipt["pvc_uid"] != claim["metadata"]["uid"]
+        || receipt["pv_uid"] != pv["metadata"]["uid"]
+        || receipt["volume_handle"] != pv["spec"]["csi"]["volumeHandle"]
+        || receipt["storage_class"] != db["storage"]["storage_class"]
+        || receipt["volume_attributes_class"] != db["storage"]["volume_attributes_class"]
+    {
+        return None;
+    }
+    let leaves = authority["physical_lvs"]
+        .as_array()?
+        .iter()
+        .filter(|lv| lv["lv_uuid"] == receipt["lv_uuid"])
+        .collect::<Vec<_>>();
+    if leaves.len() != 1
+        || leaves[0]["segtype"] != "thin"
+        || leaves[0]["name"] != receipt["volume_handle"]
+        || leaves[0]["size_bytes"].as_u64()? != capacity as u64
+    {
+        return None;
+    }
+    Some(
+        json!({"claimUid":receipt["pvc_uid"],"volumeUid":receipt["pv_uid"],"handle":receipt["volume_handle"],"lvUuid":receipt["lv_uuid"]}),
+    )
+}
 fn physical_reclaimed(db: &Value, nodes: &Value, lv_uuid: &str, after: u64, now: u64) -> bool {
     valid_pattern("storageLvmUuid", lv_uuid)
         && physical_authority(db, nodes, after, now).is_some_and(|value| {
@@ -3031,6 +3156,193 @@ mod tls_tests {
         db["storage"] = json!({"backend":"lvm-thin-v1","storage_class":"pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa","volume_attributes_class":"pgcf-lvm-thin-v1-aaaaaaaaaaaaaaaa","profile_revision":1,"profile_sha256":"a".repeat(64),"node_uid":id(4),"volume_group_uuid":"abcdef-abcd-abcd-abcd-abcd-abcd-abcdef","pool_uuid":"bcdefg-bcde-bcde-bcde-bcde-bcde-bcdefg","startup_reserve_bytes":1048576,"write_bytes_per_second":1048576,"write_iops_per_second":10,"guard_seconds":2,"drain_seconds":1});
         assert!(database_valid(&db));
         db
+    }
+    /// The first live thin creation was stopped before Ready: its native receipt existed,
+    /// but the legacy volume annotation and IO readback did not. These are physical facts only.
+    fn before_ready_volume_facts() -> (Value, Value, Value, Value, Value, Value, Value) {
+        let mut db = database();
+        db["generation"] = 2.into();
+        db["desired_state"] = "running".into();
+        db["size"]["storage_gib"] = 5.into();
+        let ns = namespace(&db);
+        let lv = "iLeDnR-3bK4-F2Sh-j05A-x0NW-MCcd-TfCn8O";
+        let handle = format!("pvc-{}", id(5));
+        let namespace_value = json!({"metadata":metadata(&ns,None,&id(1),&db)});
+        let cluster = json!({"apiVersion":"postgresql.cnpg.io/v1","metadata":metadata("database",Some(&ns),&id(2),&db)});
+        let storage = json!({"metadata":metadata(&format!("storage-{}",text(&db,"id")),Some(SYSTEM),&id(3),&db),"data":{"state":json!({"namespaceUid":id(1),"clusterUid":id(2),"node":db["node"],"archivePath":db["archive"]["destination_path"],"storage":db["storage"]}).to_string()}});
+        let mut claim = json!({"metadata":metadata("database-1",Some(&ns),&id(5),&db),"spec":{"volumeName":"bound-pv","storageClassName":db["storage"]["storage_class"],"volumeAttributesClassName":db["storage"]["volume_attributes_class"],"resources":{"requests":{"storage":"5Gi"}}},"status":{"phase":"Bound","capacity":{"storage":"5Gi"},"currentVolumeAttributesClassName":db["storage"]["volume_attributes_class"]}});
+        claim["metadata"]["ownerReferences"] = json!([{"apiVersion":"postgresql.cnpg.io/v1","kind":"Cluster","name":"database","uid":id(2),"controller":true}]);
+        let pv = json!({"metadata":{"name":"bound-pv","uid":id(6)},"spec":{"claimRef":{"name":"database-1","namespace":ns,"uid":id(5)},"csi":{"driver":"local.csi.openebs.io","volumeHandle":handle},"storageClassName":db["storage"]["storage_class"],"capacity":{"storage":"5Gi"},"nodeAffinity":{"required":{"nodeSelectorTerms":[{"matchExpressions":[{"key":"kubernetes.io/hostname","operator":"In","values":[db["node"]]}]}]}}},"status":{"phase":"Bound"}});
+        let vectors: Value = serde_json::from_str(include_str!(
+            "../../../packages/contracts/native/power-vectors.generated.json"
+        ))
+        .unwrap();
+        let mut authority = vectors["reclamation"][0]["nodes"][0].clone();
+        authority["node_uid"] = db["storage"]["node_uid"].clone();
+        authority["name"] = db["node"].clone();
+        authority["profile_revision"] = db["storage"]["profile_revision"].clone();
+        authority["profile_sha256"] = db["storage"]["profile_sha256"].clone();
+        authority["storage_class"] = db["storage"]["storage_class"].clone();
+        authority["volume_group_uuid"] = db["storage"]["volume_group_uuid"].clone();
+        authority["pool_uuid"] = db["storage"]["pool_uuid"].clone();
+        authority["observed_at"] = iso(100_000).unwrap().into();
+        authority["captured_at"] = iso(100_000).unwrap().into();
+        authority["expires_at"] = iso(102_000).unwrap().into();
+        authority["physical"] = json!({"volume_group_uuid":db["storage"]["volume_group_uuid"],"total_bytes":100*1073741824_u64,"free_bytes":60*1073741824_u64,"thick_allocated_bytes":0,"thin_pool":{"name":"pgcf_thinpool","data_total_bytes":32*1073741824_u64,"data_used_bytes_upper_bound":0,"metadata_total_bytes":8*1073741824_u64,"metadata_used_bytes_upper_bound":0}});
+        authority["physical_lvs"] =
+            json!([{"name":handle,"lv_uuid":lv,"size_bytes":5*1073741824_u64,"segtype":"thin"}]);
+        authority["volumes"] = json!([{"database_id":db["id"],"generation":2,"storage_generation":1,"storage_uid":id(3),"namespace_uid":id(1),"cluster_uid":id(2),"volume_handle":handle,"lv_uuid":lv,"pvc_uid":id(5),"pv_uid":id(6),"storage_class":db["storage"]["storage_class"],"volume_attributes_class":db["storage"]["volume_attributes_class"],"quiesced":false,"io":[]}]);
+        assert!(crate::contracts::schema_valid(
+            "NodeThinStorageAuthority",
+            &authority
+        ));
+        (db, authority, namespace_value, cluster, storage, claim, pv)
+    }
+    #[test]
+    fn a_native_bound_volume_can_be_pinned_before_ready_without_inventing_identity() {
+        let (db, authority, ns, cluster, storage, claim, pv) = before_ready_volume_facts();
+        assert!(storage["metadata"]["annotations"][VOLUME_IDENTITY].is_null());
+        let identity = native_volume_identity(
+            &db,
+            &authority,
+            (&ns, &cluster, &storage),
+            (&claim, &pv),
+            100_100,
+        )
+        .unwrap();
+        assert_eq!(
+            identity,
+            json!({"claimUid":id(5),"volumeUid":id(6),"handle":format!("pvc-{}",id(5)),"lvUuid":"iLeDnR-3bK4-F2Sh-j05A-x0NW-MCcd-TfCn8O"})
+        );
+        let mut replaced = pv.clone();
+        replaced["metadata"]["uid"] = id(66).into();
+        assert!(
+            native_volume_identity(
+                &db,
+                &authority,
+                (&ns, &cluster, &storage),
+                (&claim, &replaced),
+                100_100
+            )
+            .is_none()
+        );
+        let mut replaced = cluster.clone();
+        replaced["metadata"]["uid"] = id(22).into();
+        assert!(
+            native_volume_identity(
+                &db,
+                &authority,
+                (&ns, &replaced, &storage),
+                (&claim, &pv),
+                100_100
+            )
+            .is_none()
+        );
+        let mut changed = authority.clone();
+        changed["physical_lvs"][0]["lv_uuid"] = "abcdef-abcd-abcd-abcd-abcd-abcd-abcdef".into();
+        assert!(
+            native_volume_identity(
+                &db,
+                &changed,
+                (&ns, &cluster, &storage),
+                (&claim, &pv),
+                100_100
+            )
+            .is_none()
+        );
+        assert!(
+            native_volume_identity(
+                &db,
+                &authority,
+                (&ns, &cluster, &storage),
+                (&claim, &pv),
+                102_000
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn restore_before_ready_keeps_the_same_physical_custody() {
+        let (mut db, authority, ns, cluster, storage, claim, pv) = before_ready_volume_facts();
+        db["creation"] = Value::Null;
+        db["recovery"] = json!({"operation_id":format!("op_{}","r".repeat(20)),"ever_ready":false,"status":"running"});
+        assert!(
+            native_volume_identity(
+                &db,
+                &authority,
+                (&ns, &cluster, &storage),
+                (&claim, &pv),
+                100_100
+            )
+            .is_some()
+        );
+        let mut changed = claim.clone();
+        changed["metadata"]["uid"] = id(55).into();
+        assert!(
+            native_volume_identity(
+                &db,
+                &authority,
+                (&ns, &cluster, &storage),
+                (&changed, &pv),
+                100_100
+            )
+            .is_none()
+        );
+    }
+    #[test]
+    fn a_native_leaf_name_or_quota_change_cannot_be_pinned() {
+        let (db, authority, ns, cluster, storage, claim, pv) = before_ready_volume_facts();
+        let mut renamed = authority.clone();
+        renamed["physical_lvs"][0]["name"] = "unexpected-volume".into();
+        let mut oversized = authority.clone();
+        oversized["physical_lvs"][0]["size_bytes"] = (6 * 1073741824_u64).into();
+        assert_eq!(
+            (
+                native_volume_identity(
+                    &db,
+                    &renamed,
+                    (&ns, &cluster, &storage),
+                    (&claim, &pv),
+                    100_100
+                ),
+                native_volume_identity(
+                    &db,
+                    &oversized,
+                    (&ns, &cluster, &storage),
+                    (&claim, &pv),
+                    100_100
+                ),
+            ),
+            (None, None)
+        );
+    }
+    #[test]
+    fn deleting_claims_and_volumes_never_materialize_thin_custody() {
+        let (db, authority, ns, cluster, storage, claim, pv) = before_ready_volume_facts();
+        let mut deleting = claim.clone();
+        deleting["metadata"]["deletionTimestamp"] = "2026-10-13T20:57:10.382Z".into();
+        assert!(
+            native_volume_identity(
+                &db,
+                &authority,
+                (&ns, &cluster, &storage),
+                (&deleting, &pv),
+                100_100
+            )
+            .is_none()
+        );
+        let mut deleting = pv.clone();
+        deleting["metadata"]["deletionTimestamp"] = "2026-10-13T20:57:10.382Z".into();
+        assert!(
+            native_volume_identity(
+                &db,
+                &authority,
+                (&ns, &cluster, &storage),
+                (&claim, &deleting),
+                100_100
+            )
+            .is_none()
+        );
     }
     fn metadata(name: &str, ns: Option<&str>, uid: &str, db: &Value) -> Value {
         let mut v = json!({"name":name,"uid":uid,"resourceVersion":"1","labels":{"pgcf.io/database-id":db["id"]},"annotations":{"pgcf.io/generation":"1","pgcf.io/accepted-generation":"1"}});

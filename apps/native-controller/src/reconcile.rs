@@ -154,7 +154,7 @@ fn primary_current(pod: &Value, cluster: &Value, db: &Value, context: &Value) ->
         && pod["metadata"]["deletionTimestamp"].is_null()
         && text(&pod["spec"], "runtimeClassName") == runtime_class(context)
 }
-fn cluster_owned(v: &Value, cluster: &Value) -> bool {
+pub(crate) fn cluster_owned(v: &Value, cluster: &Value) -> bool {
     v["metadata"]["ownerReferences"]
         .as_array()
         .is_some_and(|owners| {
@@ -244,6 +244,53 @@ fn millis(value: &Value) -> Option<i128> {
     )
     .ok()
     .map(|t| t.unix_timestamp_nanos() / 1_000_000)
+}
+#[derive(Debug)]
+struct ExpiredStorageSnapshot;
+impl std::fmt::Display for ExpiredStorageSnapshot {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("thin host authority snapshot expired")
+    }
+}
+impl std::error::Error for ExpiredStorageSnapshot {}
+/// Internal retry classification; permission/identity failures never have this type.
+pub fn storage_snapshot_expired(error: &Error) -> bool {
+    error.downcast_ref::<ExpiredStorageSnapshot>().is_some()
+}
+/// A job owns a snapshot; the main loop independently monitors the latest authority.
+/// Expiry alone asks for fresh work. Every physical/permission mismatch still protects.
+fn storage_guard(
+    db: &Value,
+    node: &Value,
+    authority: &Value,
+    cluster_uid: &str,
+    require_write: bool,
+    current: i128,
+) -> Result<(), Error> {
+    let storage = &db["storage"];
+    let start = millis(&authority["observed_at"]).ok_or("host observation clock invalid")?;
+    let end = millis(&authority["expires_at"]).ok_or("host observation expiry invalid")?;
+    if current < 0
+        || start > current + 5000
+        || start < current - 120000
+        || end <= start
+        || end - start > i128::from(number(storage, "guard_seconds")) * 1000
+        || (require_write && authority["write_allowed"] != true)
+        || authority["node_uid"] != node["metadata"]["uid"]
+        || text(authority, "cluster_uid") != cluster_uid
+        || authority["node_uid"] != storage["node_uid"]
+        || authority["volume_group_uuid"] != storage["volume_group_uuid"]
+        || authority["pool_uuid"] != storage["pool_uuid"]
+        || authority["profile_sha256"] != storage["profile_sha256"]
+        || integer(authority, "profile_revision")? < number(storage, "profile_revision")
+        || authority["storage_class"] != storage["storage_class"]
+    {
+        return Err("thin host identity or write authority changed".into());
+    }
+    if end <= current {
+        return Err(Box::new(ExpiredStorageSnapshot));
+    }
+    Ok(())
 }
 fn now() -> i128 {
     SystemTime::now()
@@ -386,7 +433,100 @@ fn startup_valid(db: &Value) -> bool {
             .is_ok_and(|n| n >= number(&db["storage"], "startup_reserve_bytes"))
         && millis(&hold["expires_at"]).is_some_and(|expiry| expiry > now())
 }
+fn native_lvm_owned(db: &Value, receipt: &Value, lvm: &Value) -> bool {
+    lvm["metadata"]["name"] == receipt["volume_handle"]
+        && uid(lvm).is_ok()
+        && lvm["metadata"]["deletionTimestamp"].is_null()
+        && lvm["spec"]["ownerNodeID"] == db["node"]
+        && lvm["status"]["state"] == "Ready"
+}
 impl Reconciler {
+    /// Native has already bound this thin volume. Pin that physical custody before Ready;
+    /// the separate Ready path still requires this Pod's measured IO limits and write token.
+    async fn bind_native_volume(
+        &self,
+        db: &Value,
+        authority: &Value,
+        scope: (&Value, &Value, &Value),
+    ) -> Result<Option<Value>, Error> {
+        let (namespace_value, cluster, storage) = scope;
+        if db["storage"].is_null() || !storage["metadata"]["annotations"][VOLUME].is_null() {
+            return Ok(None);
+        }
+        let receipts = authority["volumes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|receipt| {
+                receipt["database_id"] == db["id"]
+                    && receipt["generation"] == db["generation"]
+                    && receipt["storage_generation"].as_u64()
+                        == Some(optional_number(db, "storage_generation", 1))
+            })
+            .collect::<Vec<_>>();
+        if receipts.is_empty() {
+            return Ok(None);
+        }
+        if receipts.len() != 1 {
+            return Err("physical storage custody ambiguous".into());
+        }
+        let receipt = receipts[0];
+        let ns = namespace(db);
+        let claims = self
+            .k8s
+            .list("PersistentVolumeClaim", Some(&ns), None)
+            .await?;
+        let matching = claims
+            .iter()
+            .filter(|claim| claim["metadata"]["uid"] == receipt["pvc_uid"])
+            .collect::<Vec<_>>();
+        if matching.len() != 1 {
+            return Err("physical storage claim missing or replaced".into());
+        }
+        let claim = matching[0];
+        let Some(pv) = self
+            .k8s
+            .read("PersistentVolume", None, text(&claim["spec"], "volumeName"))
+            .await?
+        else {
+            return Err("physical storage volume missing or replaced".into());
+        };
+        let lvs = self.k8s.list("LVMVolume", None, None).await?;
+        let matching = lvs
+            .iter()
+            .filter(|lv| lv["metadata"]["name"] == receipt["volume_handle"])
+            .collect::<Vec<_>>();
+        if matching.len() != 1 || !native_lvm_owned(db, receipt, matching[0]) {
+            return Err("physical storage LVM identity missing or replaced".into());
+        }
+        let identity = crate::power::native_volume_identity(
+            db,
+            authority,
+            (namespace_value, cluster, storage),
+            (claim, &pv),
+            u64::try_from(now()).map_err(|_| "physical storage clock invalid")?,
+        )
+        .ok_or("physical storage custody changed")?;
+        // The storage UID/state and resourceVersion used for the proof fence this patch.
+        // An uncertain patch is read on the next reconcile; it is never replayed blindly.
+        let written = self
+            .k8s
+            .patch(
+                storage,
+                &json!({"metadata":{"annotations":{VOLUME:serde_json::to_string(&identity)?}}}),
+            )
+            .await?;
+        if written["metadata"]["uid"] != storage["metadata"]["uid"]
+            || state(&written)? != state(storage)?
+            || written["metadata"]["annotations"][VOLUME]
+                .as_str()
+                .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                != Some(identity)
+        {
+            return Err("physical storage custody write unknown".into());
+        }
+        Ok(Some(written))
+    }
     async fn bind_volume(
         &self,
         db: &Value,
@@ -796,6 +936,9 @@ impl Reconciler {
         let (authority, node_observed) =
             match self.guard(db, snapshot, state_name == "running").await {
                 Ok(value) => value,
+                Err(error) if error.downcast_ref::<ExpiredStorageSnapshot>().is_some() => {
+                    return Err(error);
+                }
                 Err(error) => {
                     if state_name == "running" && !db["storage"].is_null() {
                         return self.power.protect_storage(db).await;
@@ -883,6 +1026,16 @@ impl Reconciler {
                     Some("established storage resource disappeared"),
                 )));
             }
+        }
+        if !db["storage"].is_null()
+            && let (Some(namespace_value), Some(cluster), Some(storage)) =
+                (&ns_current, &prior_cluster, &fence)
+            && let Some(written) = self
+                .bind_native_volume(db, &authority, (namespace_value, cluster, storage))
+                .await?
+        {
+            // Later writes use the exact CAS result rather than the read before binding.
+            fence = Some(written);
         }
         if state_name == "suspended" {
             return self.power.suspend(db).await;
@@ -1265,7 +1418,6 @@ impl Reconciler {
         if db["storage"].is_null() {
             return Ok((Value::Null, node));
         }
-        let storage = &db["storage"];
         let authority = snapshot.region["storage_nodes"]
             .as_array()
             .and_then(|nodes| {
@@ -1274,26 +1426,14 @@ impl Reconciler {
                     .find(|node| text(node, "name") == text(db, "node"))
             })
             .ok_or("thin host authority missing")?;
-        let current = now();
-        let start = millis(&authority["observed_at"]).ok_or("host observation clock invalid")?;
-        let end = millis(&authority["expires_at"]).ok_or("host observation expiry invalid")?;
-        if current < 0
-            || start > current + 5000
-            || start < current - 120000
-            || end <= current
-            || end - start > i128::from(number(storage, "guard_seconds")) * 1000
-            || (require_write && authority["write_allowed"] != true)
-            || authority["node_uid"] != node["metadata"]["uid"]
-            || text(authority, "cluster_uid") != self.cluster_uid
-            || authority["node_uid"] != storage["node_uid"]
-            || authority["volume_group_uuid"] != storage["volume_group_uuid"]
-            || authority["pool_uuid"] != storage["pool_uuid"]
-            || authority["profile_sha256"] != storage["profile_sha256"]
-            || integer(authority, "profile_revision")? < number(storage, "profile_revision")
-            || authority["storage_class"] != storage["storage_class"]
-        {
-            return Err("thin host identity or write authority changed".into());
-        }
+        storage_guard(
+            db,
+            &node,
+            authority,
+            &self.cluster_uid,
+            require_write,
+            now(),
+        )?;
         Ok((authority.clone(), node))
     }
     async fn save_state(
@@ -1561,7 +1701,7 @@ impl Reconciler {
 
 /// Every node selector term of a local PersistentVolume pins exactly this node. OpenEBS LVM LocalPV
 /// publishes both topology keys; volumes it provisioned before carry only `openebs.io/nodename`.
-fn pinned_to_node(pv: &Value, node: &str) -> bool {
+pub(crate) fn pinned_to_node(pv: &Value, node: &str) -> bool {
     pv["spec"]["nodeAffinity"]["required"]["nodeSelectorTerms"]
         .as_array()
         .is_some_and(|terms| {
@@ -1729,6 +1869,54 @@ mod tests {
         db["storage_startup"]["budget_bytes"] = 4096.into();
         db["storage_startup"]["node_uid"] = "another-node".into();
         assert!(!startup_valid(&db));
+    }
+    #[test]
+    fn an_expired_host_snapshot_is_stale_only_with_unchanged_scope() {
+        let db = json!({"storage":{"node_uid":"same","volume_group_uuid":"vg","pool_uuid":"pool","profile_sha256":"profile","profile_revision":1,"storage_class":"class","guard_seconds":10}});
+        let node = json!({"metadata":{"uid":"same"}});
+        let authority = json!({"observed_at":"1970-01-01T00:00:01.000Z","expires_at":"1970-01-01T00:00:02.000Z","write_allowed":true,"node_uid":"same","cluster_uid":"cluster","volume_group_uuid":"vg","pool_uuid":"pool","profile_sha256":"profile","profile_revision":1,"storage_class":"class"});
+        let error = storage_guard(&db, &node, &authority, "cluster", true, 2000).unwrap_err();
+        assert!(error.downcast_ref::<ExpiredStorageSnapshot>().is_some());
+        let mut revoked = authority.clone();
+        revoked["write_allowed"] = false.into();
+        assert!(
+            storage_guard(&db, &node, &revoked, "cluster", true, 2000)
+                .unwrap_err()
+                .downcast_ref::<ExpiredStorageSnapshot>()
+                .is_none()
+        );
+        let mut replaced = node.clone();
+        replaced["metadata"]["uid"] = "replaced".into();
+        assert!(
+            storage_guard(&db, &replaced, &authority, "cluster", true, 2000)
+                .unwrap_err()
+                .downcast_ref::<ExpiredStorageSnapshot>()
+                .is_none()
+        );
+        let mut replaced = authority.clone();
+        replaced["profile_sha256"] = "replaced".into();
+        assert!(
+            storage_guard(&db, &node, &replaced, "cluster", true, 2000)
+                .unwrap_err()
+                .downcast_ref::<ExpiredStorageSnapshot>()
+                .is_none()
+        );
+    }
+    #[test]
+    fn native_lvm_custody_requires_ready_and_a_live_owned_object() {
+        let db = json!({"node":"pgcf-node-aaaaaaaaaaaaaaaaaaaa"});
+        let receipt = json!({"volume_handle":"pvc-01234567-89ab-4def-8123-000000000005"});
+        let lvm = json!({"metadata":{"name":receipt["volume_handle"],"uid":"01234567-89ab-4def-8123-000000000007"},"spec":{"ownerNodeID":db["node"]},"status":{"state":"Ready"}});
+        assert!(native_lvm_owned(&db, &receipt, &lvm));
+        let mut changed = lvm.clone();
+        changed["status"]["state"] = "Pending".into();
+        assert!(!native_lvm_owned(&db, &receipt, &changed));
+        changed = lvm.clone();
+        changed["metadata"]["deletionTimestamp"] = "2026-10-13T20:57:10.382Z".into();
+        assert!(!native_lvm_owned(&db, &receipt, &changed));
+        changed = lvm.clone();
+        changed["spec"]["ownerNodeID"] = "other-node".into();
+        assert!(!native_lvm_owned(&db, &receipt, &changed));
     }
     #[test]
     fn normalized_kubernetes_quantities_compare_numerically() {
