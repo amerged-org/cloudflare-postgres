@@ -23,6 +23,7 @@ import {
   issueThinStorageTransport,
 } from "../domain/node-thin-storage-execution.ts";
 import { NodeThinStorageReport } from "@pgcf/contracts/node-thin-storage";
+import { RelayGrantCount } from "@pgcf/contracts/node-bootstrap";
 import {
   BOOTSTRAP_RELAY_HEADER,
   BOOTSTRAP_RELAY_PATH,
@@ -152,15 +153,20 @@ export function registerNodeThinStorage(app: ApiApp) {
       .parse(await c.req.json());
     if (body.kind === "status")
       return c.json(await thinStorageStatus(c.env, id), 200);
-    if (body.kind === "transport")
+    if (body.kind === "transport") {
+      const count = RelayGrantCount.default(1).safeParse(body.count);
+      if (!count.success)
+        throw new ApiError("invalid_request", "Invalid relay grant count");
       return c.json(
         await issueThinStorageTransport(
           c.env,
           id,
           z.enum(["talos_api", "kubernetes_api"]).parse(body.capability),
+          count.data,
         ),
         200,
       );
+    }
     if (body.kind === "dispatch")
       return c.json(
         await dispatchThinPoolAction(

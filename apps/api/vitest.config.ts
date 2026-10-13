@@ -3,6 +3,7 @@ import { randomBytes, randomUUID, generateKeyPairSync } from "node:crypto";
 import { join } from "node:path";
 import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-plugin";
 import { defineConfig } from "vitest/config";
+import { thinRelayRuntime } from "./test/thin-relay-runtime.ts";
 
 const reclaimPair = generateKeyPairSync("ed25519"),
   reclaimPrivate = reclaimPair.privateKey
@@ -18,6 +19,11 @@ export default defineConfig({
       remoteBindings: false,
       wrangler: { configPath: "./wrangler.test.jsonc" },
       miniflare: {
+        serviceBindings: {
+          THIN_RELAY_TEST_RUNTIME: thinRelayRuntime({
+            "test-cf": reclaimPublic,
+          }),
+        },
         bindings: {
           API_KEY_PEPPER: randomBytes(32).toString("base64url"),
           BOOTSTRAP_TOKEN: randomUUID(),

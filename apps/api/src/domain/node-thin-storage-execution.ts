@@ -25,6 +25,11 @@ import {
   signBootstrapRelay,
 } from "@pgcf/contracts/bootstrap-relay";
 import {
+  RelayGrantCount,
+  NodeBootstrapTransport,
+  NodeBootstrapTransportBatch,
+} from "@pgcf/contracts/node-bootstrap";
+import {
   FleetReleaseSpec,
   thinStorageReleaseGuardPinned,
 } from "@pgcf/contracts/releases";
@@ -486,8 +491,20 @@ export async function thinStorageInput(
   nodeId: string,
   required?: { data: number; metadata: number },
 ): Promise<NodeThinStorageInput> {
-  const row = await readThinStorageLeaseRow(env, nodeId),
-    current = await readCurrentNodeThinStorage(env, nodeId);
+  return buildThinStorageInput(
+    env,
+    nodeId,
+    await readThinStorageLeaseRow(env, nodeId),
+    required,
+  );
+}
+async function buildThinStorageInput(
+  env: Env,
+  nodeId: string,
+  row: Awaited<ReturnType<typeof readThinStorageLeaseRow>>,
+  required?: { data: number; metadata: number },
+): Promise<NodeThinStorageInput> {
+  const current = await readCurrentNodeThinStorage(env, nodeId);
   if (
     !current ||
     !row.lease_id ||
@@ -1049,8 +1066,8 @@ async function acceptIdentityProof(
   return closed();
 }
 
-/** One relay grant for a Native executor lease; callers fence their own lease around it. */
-export async function signNativeRelayCapability(
+/** One identity/key import; each grant keeps the default TTL and draws its own nonce. */
+async function signNativeRelayCapabilities(
   env: Env,
   scope: {
     operation: string;
@@ -1061,6 +1078,7 @@ export async function signNativeRelayCapability(
     address: string;
     callback: string;
   },
+  count: number,
 ) {
   const service = env.BOOTSTRAP_RELAY_SERVICE;
   if (!service) return closed();
@@ -1093,47 +1111,108 @@ export async function signNativeRelayCapability(
   const key = await bootstrapTransportSigningKey(
     env.BOOTSTRAP_RELAY_SIGNING_KEYS,
   );
-  const token = await signBootstrapRelay({
-    ...key,
-    operation: scope.operation,
-    node: scope.node,
-    region: scope.region,
-    issuer_region: identity.region,
-    relay_epoch: identity.relay_epoch,
-    revision: scope.revision,
-    capability: scope.capability,
-    address: scope.address,
-  });
-  return {
+  const tokens = await Promise.all(
+    Array.from({ length: count }, () =>
+      signBootstrapRelay({
+        ...key,
+        operation: scope.operation,
+        node: scope.node,
+        region: scope.region,
+        issuer_region: identity.region,
+        relay_epoch: identity.relay_epoch,
+        revision: scope.revision,
+        capability: scope.capability,
+        address: scope.address,
+      }),
+    ),
+  );
+  return NodeBootstrapTransportBatch.parse({
     websocket_url: scope.callback.replace(/^https:/, "wss:") + "/relay",
-    token,
+    tokens,
     expectedTarget: {
       ip: scope.address,
       port: BOOTSTRAP_PORTS[scope.capability],
     },
-  };
+  });
+}
+/** Legacy singleton used by qualification; its caller fences the qualification run. */
+export async function signNativeRelayCapability(
+  env: Env,
+  scope: Parameters<typeof signNativeRelayCapabilities>[1],
+) {
+  const { tokens, ...transport } = await signNativeRelayCapabilities(
+    env,
+    scope,
+    1,
+  );
+  return NodeBootstrapTransport.parse({ ...transport, token: tokens[0] });
+}
+function thinTransportScope(
+  row: Awaited<ReturnType<typeof readThinStorageLeaseRow>>,
+) {
+  // Actions and renewed authority may advance within this lease. They do not change its target.
+  return JSON.stringify([
+    row.node_id,
+    row.node_uid,
+    row.cluster_uid,
+    row.region_id,
+    row.k8s_node_name,
+    row.provider_instance_id,
+    row.address,
+    row.volume_group_uuid,
+    row.lease_id,
+    row.lease_revision,
+    row.lease_expires_at,
+    row.profile_revision,
+    row.profile_sha256,
+    row.profile_json,
+    row.qualified_driver_image,
+    row.material_revision,
+    row.release_id,
+    row.spec_sha256,
+    row.assignment_revision,
+    row.region_revision,
+    row.host_revision,
+    row.host_sha256,
+    row.boot_id,
+    row.configuration_boot_id,
+  ]);
 }
 export async function issueThinStorageTransport(
   env: Env,
   nodeId: string,
   capability: "talos_api" | "kubernetes_api",
+  count = 1,
 ) {
-  const input = await thinStorageInput(env, nodeId),
-    row = await readThinStorageLeaseRow(env, nodeId);
-  const transport = await signNativeRelayCapability(env, {
-    operation: input.lease.operation_id,
-    node: nodeId,
-    region: row.region_id,
-    revision: row.lease_revision,
-    capability,
-    address:
-      capability === "talos_api"
-        ? row.address
-        : new URL(input.cluster_endpoint).hostname,
-    callback: input.callback.url,
-  });
-  await thinStorageInput(env, nodeId);
-  return transport;
+  count = RelayGrantCount.parse(count);
+  const row = await readThinStorageLeaseRow(env, nodeId),
+    input = await buildThinStorageInput(env, nodeId, row);
+  const transport = await signNativeRelayCapabilities(
+    env,
+    {
+      operation: input.lease.operation_id,
+      node: nodeId,
+      region: row.region_id,
+      revision: row.lease_revision,
+      capability,
+      address:
+        capability === "talos_api"
+          ? row.address
+          : new URL(input.cluster_endpoint).hostname,
+      callback: input.callback.url,
+    },
+    count,
+  );
+  const current = await readThinStorageLeaseRow(env, nodeId);
+  if (
+    thinTransportScope(current) !== thinTransportScope(row) ||
+    !current.lease_expires_at ||
+    Date.parse(current.lease_expires_at) <= Date.now()
+  )
+    return closed();
+  if (count > 1) return transport;
+  const { tokens, ...singleton } = transport;
+  return NodeBootstrapTransport.parse({ ...singleton, token: tokens[0] });
 }
 
 /** Ask the node's NodeBootstrap for an identity turn now instead of at its cadence. */
