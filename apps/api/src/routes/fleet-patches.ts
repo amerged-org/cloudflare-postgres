@@ -1,11 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createRoute, z, type RouteConfig } from "@hono/zod-openapi";
 import type { ApiContext } from "../env.ts";
-import { NodeId, OperationId, base64urlToBytes } from "@pgcf/contracts";
+import {
+  ErrorBody,
+  NodeId,
+  OperationId,
+  base64urlToBytes,
+  listEnvelope,
+} from "@pgcf/contracts";
 import {
   FleetPatchCheckpoint,
   FleetPatchRequest,
   FleetPatchStatus,
+  FleetPatchListQuery,
 } from "@pgcf/contracts/fleet-patches";
 import {
   BOOTSTRAP_RELAY_HEADER,
@@ -27,6 +34,7 @@ import {
   fleetPatchInput,
   fleetPatchTransportTargets,
   getFleetPatch,
+  listFleetPatches,
   haltFleetPatch,
   issueFleetPatchTransport,
   recordFleetPatchCheckpoint,
@@ -39,6 +47,44 @@ export function registerFleetPatches(app: ApiApp) {
     route: RouteConfig,
     handler: (c: ApiContext) => Promise<Response>,
   ) => app.openapi(createRoute(route), handler);
+  register(
+    {
+      method: "get",
+      path: "/v1/fleet/patches",
+      operationId: "listFleetPatches",
+      summary: "List recorded fleet patch operations",
+      tags: ["Fleet patches"],
+      security: [{ bearerAuth: [] }],
+      description:
+        "Lists recorded patch operations, newest created timestamp and operation ID first. Optional node, region and release filters combine; historical physical identities remain visible.",
+      request: { query: FleetPatchListQuery },
+      responses: {
+        200: {
+          description: "Public recorded fleet patch history",
+          content: {
+            "application/json": { schema: listEnvelope(FleetPatchStatus) },
+          },
+        },
+        400: {
+          description: "Invalid list query",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        401: {
+          description: "Authentication required",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        403: {
+          description: "Administrator scope required",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+        500: {
+          description: "Internal request failure",
+          content: { "application/json": { schema: ErrorBody } },
+        },
+      },
+    },
+    listFleetPatches,
+  );
   register(
     {
       method: "post",

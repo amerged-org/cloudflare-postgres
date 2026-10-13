@@ -9,6 +9,7 @@ import {
   FleetPatchCheckpoint,
   FleetPatchInput,
   FleetPatchStatus,
+  FleetPatchListQuery,
   fleetPatchCheckpointAllowed,
   fleetPatchKubernetesImagesMatch,
   type FleetPatchRequest,
@@ -65,6 +66,7 @@ import {
   ensureNodeHostConfiguration,
   loadNodeHostConfiguration,
 } from "./node-host-configuration.ts";
+import { page } from "../platform/pagination.ts";
 
 interface PatchRow {
   operation_id: string;
@@ -126,6 +128,28 @@ export async function readFleetPatchStatus(
   id: string,
 ): Promise<FleetPatchStatus> {
   return status(await readFleetPatch(env, id));
+}
+export async function listFleetPatches(c: ApiContext): Promise<Response> {
+  await requireScope(c, "admin");
+  const query = FleetPatchListQuery.parse(c.req.query()),
+    pagination = page(c, { limit: query.limit, cursor: query.cursor }),
+    cursor = pagination.where("created_at", "operation_id"),
+    filters = [cursor.sql],
+    bindings: string[] = [...cursor.bindings];
+  for (const field of ["node_id", "region_id", "release_id"] as const)
+    if (query[field] !== undefined) {
+      filters.push(`${field}=?`);
+      bindings.push(query[field]);
+    }
+  const rows = await c.env.DB.prepare(
+      `SELECT * FROM fleet_patch_operations WHERE ${filters.join(" AND ")} ORDER BY created_at DESC,operation_id DESC LIMIT ?`,
+    )
+      .bind(...bindings, pagination.limit + 1)
+      .all<PatchRow>(),
+    envelope = pagination.envelope(
+      rows.results.map((row) => ({ ...row, id: row.operation_id })),
+    );
+  return c.json({ ...envelope, data: envelope.data.map(status) });
 }
 /** Latest history for each page member's current physical identity, with the public status projection. */
 export async function readLatestFleetPatchStatuses(

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { z } from "zod";
+import { ListQuery } from "./api.ts";
 import { NodeId, OperationId, RegionId, DatabaseId } from "./ids.ts";
 import {
   ComputePoolPolicyState,
@@ -16,6 +17,12 @@ import {
 } from "./releases.ts";
 
 const Hash = z.string().regex(/^[0-9a-f]{64}$/);
+export const FleetPatchListQuery = ListQuery.extend({
+  node_id: NodeId.optional(),
+  region_id: RegionId.optional(),
+  release_id: FleetReleaseId.optional(),
+}).meta({ id: "FleetPatchListQuery" });
+export type FleetPatchListQuery = z.infer<typeof FleetPatchListQuery>;
 /** One bounded Native turn may collect a checkpoint proof; original observation times stay intact. */
 export const FLEET_PATCH_PROOF_MAX_AGE_MS = 600_000;
 export const FleetPatchRequest = z.strictObject({

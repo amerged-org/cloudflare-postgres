@@ -2,6 +2,7 @@
 import { bytesToHex } from "@pgcf/contracts";
 import {
   FleetRelease,
+  FleetReleaseId,
   FleetDesiredRelease,
   FleetReleaseSpec,
   FleetNodeReleaseObservation,
@@ -17,6 +18,7 @@ import { withIdempotency } from "../middleware/idempotency.ts";
 import { agentRegion } from "./agent-auth.ts";
 import { normalizeRuntimeImageManifest } from "../../../../infra/platform/image-manifest.ts";
 import { assertThinQualificationReceipt } from "./thin-qualification.ts";
+import { page } from "../platform/pagination.ts";
 
 function canonical(value: unknown): string {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -37,25 +39,47 @@ async function sha256(text: string): Promise<string> {
 const conflict = (message: string): never => {
   throw new ApiError("conflict", message);
 };
-async function release(db: D1Database, id: string): Promise<FleetRelease> {
-  const row = await db
-    .prepare(
-      "SELECT id,spec_json,spec_sha256,approved_at FROM fleet_releases WHERE id=?",
-    )
-    .bind(id)
-    .first<{
-      id: string;
-      spec_json: string;
-      spec_sha256: string;
-      approved_at: string;
-    }>();
-  if (!row) throw new ApiError("not_found", "Fleet release not found");
+interface ReleaseRow {
+  id: string;
+  spec_json: string;
+  spec_sha256: string;
+  approved_at: string;
+}
+function releaseRow(row: ReleaseRow): FleetRelease {
   return FleetRelease.parse({
     id: row.id,
     spec: JSON.parse(row.spec_json),
     spec_sha256: row.spec_sha256,
     approved_at: row.approved_at,
   });
+}
+async function release(db: D1Database, id: string): Promise<FleetRelease> {
+  const row = await db
+    .prepare(
+      "SELECT id,spec_json,spec_sha256,approved_at FROM fleet_releases WHERE id=?",
+    )
+    .bind(id)
+    .first<ReleaseRow>();
+  if (!row) throw new ApiError("not_found", "Fleet release not found");
+  return releaseRow(row);
+}
+export async function listFleetReleases(c: ApiContext): Promise<Response> {
+  await requireScope(c, "admin");
+  const pagination = page(
+      c,
+      c.req.query(),
+      (id) => FleetReleaseId.safeParse(id).success,
+    ),
+    where = pagination.where("approved_at", "id"),
+    rows = await c.env.DB.prepare(
+      `SELECT id,spec_json,spec_sha256,approved_at FROM fleet_releases WHERE ${where.sql} ORDER BY approved_at DESC,id DESC LIMIT ?`,
+    )
+      .bind(...where.bindings, pagination.limit + 1)
+      .all<ReleaseRow>(),
+    envelope = pagination.envelope(
+      rows.results.map((row) => ({ ...row, created_at: row.approved_at })),
+    );
+  return c.json({ ...envelope, data: envelope.data.map(releaseRow) });
 }
 export async function getFleetRelease(
   c: ApiContext,

@@ -19,13 +19,19 @@ export interface Page {
   envelope<T extends Cursor>(rows: T[]): ListEnvelope<T>;
 }
 
-export function page(c: ApiContext, query: unknown = c.req.query()): Page {
+export function page(
+  c: ApiContext,
+  query: unknown = c.req.query(),
+  validCursorId?: (id: string) => boolean,
+): Page {
   const parsed = ListQuery.safeParse(query);
   if (!parsed.success)
     throw new ApiError("invalid_request", "Invalid list query");
   const limit = parsed.data.limit;
   const cursor =
-    parsed.data.cursor === undefined ? null : decodeCursor(parsed.data.cursor);
+    parsed.data.cursor === undefined
+      ? null
+      : decodeCursor(parsed.data.cursor, validCursorId);
   if (parsed.data.cursor !== undefined && cursor === null)
     throw new ApiError("invalid_request", "Invalid pagination cursor");
   return {
@@ -49,7 +55,10 @@ export function page(c: ApiContext, query: unknown = c.req.query()): Page {
       const last = data.at(-1);
       return {
         data,
-        next_cursor: rows.length > limit && last ? encodeCursor(last) : null,
+        next_cursor:
+          rows.length > limit && last
+            ? encodeCursor(last, validCursorId)
+            : null,
       };
     },
   };

@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 import { createRoute, z, type RouteConfig } from "@hono/zod-openapi";
-import { ErrorBody, NodeId, RegionId } from "@pgcf/contracts";
+import {
+  ErrorBody,
+  ListQuery,
+  NodeId,
+  RegionId,
+  listEnvelope,
+} from "@pgcf/contracts";
 import {
   FleetReleaseId,
   FleetRelease,
@@ -15,6 +21,7 @@ import type { ApiApp } from "../app.ts";
 import type { ApiContext } from "../env.ts";
 import {
   getFleetRelease,
+  listFleetReleases,
   approveFleetRelease,
   getFleetRegionRelease,
   assignFleetRegionRelease,
@@ -49,6 +56,39 @@ function register(
   app.openapi(createRoute(route), handler);
 }
 export function registerFleetReleases(app: ApiApp): void {
+  register(
+    app,
+    {
+      ...common,
+      method: "get",
+      path: "/v1/fleet/releases",
+      operationId: "listFleetReleases",
+      summary: "List approved fleet releases",
+      description:
+        "Lists immutable global release approvals, newest approved timestamp and release ID first.",
+      request: { query: ListQuery },
+      responses: {
+        200: {
+          description: "Immutable global release approvals",
+          content: json(listEnvelope(FleetRelease)),
+        },
+        400: { description: "Invalid list query", content: json(ErrorBody) },
+        401: {
+          description: "Authentication required",
+          content: json(ErrorBody),
+        },
+        403: {
+          description: "Administrator scope required",
+          content: json(ErrorBody),
+        },
+        500: {
+          description: "Internal request failure",
+          content: json(ErrorBody),
+        },
+      },
+    },
+    listFleetReleases,
+  );
   register(
     app,
     {

@@ -133,19 +133,28 @@ const CURSOR_ID_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
 const CURSOR_MAX_LENGTH = 256;
 
 /** Keyset cursor for lists ordered by (created_at DESC, id DESC). */
-export function encodeCursor(cursor: Cursor): string {
+export function encodeCursor(
+  cursor: Cursor,
+  validId: (id: string) => boolean = (id) => CURSOR_ID_PATTERN.test(id),
+): string {
   if (!isCanonicalTimestamp(cursor.created_at)) {
     throw new TypeError("cursor created_at must be a canonical timestamp");
   }
-  if (!CURSOR_ID_PATTERN.test(cursor.id)) {
+  if (cursor.id.includes("|") || !validId(cursor.id)) {
     throw new TypeError("cursor id is malformed");
   }
-  return bytesToBase64url(
+  const encoded = bytesToBase64url(
     new TextEncoder().encode(`${cursor.created_at}|${cursor.id}`),
   );
+  if (encoded.length > CURSOR_MAX_LENGTH)
+    throw new TypeError("cursor exceeds length bound");
+  return encoded;
 }
 
-export function decodeCursor(value: string): Cursor | null {
+export function decodeCursor(
+  value: string,
+  validId: (id: string) => boolean = (id) => CURSOR_ID_PATTERN.test(id),
+): Cursor | null {
   if (value.length === 0 || value.length > CURSOR_MAX_LENGTH) return null;
   const bytes = base64urlToBytes(value);
   if (bytes === null) return null;
@@ -160,8 +169,7 @@ export function decodeCursor(value: string): Cursor | null {
   const parts = text.split("|");
   if (parts.length !== 2) return null;
   const [createdAt, id] = parts as [string, string];
-  if (!isCanonicalTimestamp(createdAt) || !CURSOR_ID_PATTERN.test(id))
-    return null;
+  if (!isCanonicalTimestamp(createdAt) || !validId(id)) return null;
   return { created_at: createdAt, id };
 }
 

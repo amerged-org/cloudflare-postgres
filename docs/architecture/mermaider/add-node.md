@@ -35,7 +35,7 @@ flowchart TD
 - [apps/api/src/domain/bootstrap-composition.ts · composeConfiguredNodeBootstrap:71](../../../apps/api/src/domain/bootstrap-composition.ts#L71)
 - [apps/api/src/domain/bootstrap-jobs.ts · bootstrapJobInput:111](../../../apps/api/src/domain/bootstrap-jobs.ts#L111)
 - [apps/api/src/domain/bootstrap-jobs.ts · finalizeNodeAdmission:1524](../../../apps/api/src/domain/bootstrap-jobs.ts#L1524)
-- [apps/api/src/domain/fleet-patches.ts · ensureBootstrapFleetPatch:1279](../../../apps/api/src/domain/fleet-patches.ts#L1279)
+- [apps/api/src/domain/fleet-patches.ts · ensureBootstrapFleetPatch:1303](../../../apps/api/src/domain/fleet-patches.ts#L1303)
 - [apps/api/src/domain/node-capacity.ts · placePendingDatabases:65](../../../apps/api/src/domain/node-capacity.ts#L65)
 - [apps/api/src/domain/node-inspection.ts · ensureNodeInstallationInspection:574](../../../apps/api/src/domain/node-inspection.ts#L574)
 - [apps/api/src/domain/node-proof.ts · ensureNodePreparationProof:23](../../../apps/api/src/domain/node-proof.ts#L23)

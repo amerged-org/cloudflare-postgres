@@ -27,6 +27,7 @@ import {
   SizeClassUpsert,
   MAINTENANCE_ROLE,
 } from "../src/index.ts";
+import { FleetReleaseId } from "../src/releases.ts";
 
 const encode = (text: string) =>
   bytesToBase64url(new TextEncoder().encode(text));
@@ -123,6 +124,31 @@ describe("node CPU measurement compatibility", () => {
 });
 
 describe("cursor", () => {
+  it("supports an authoritative release-ID validator without widening the default cursor grammar", () => {
+    const cursor = {
+      created_at: "2026-10-02T10:46:00.123Z",
+      id: `9r2.6-${"a".repeat(90)}`,
+    };
+    const releaseId = (id: string) => FleetReleaseId.safeParse(id).success;
+    expect(() => encodeCursor(cursor)).toThrow();
+    const encoded = encodeCursor(cursor, releaseId);
+    expect(encoded.length).toBeLessThanOrEqual(256);
+    expect(decodeCursor(encoded, releaseId)).toEqual(cursor);
+    expect(decodeCursor(encoded)).toBeNull();
+    expect(
+      decodeCursor(encode(`${cursor.created_at}|invalid/release`), releaseId),
+    ).toBeNull();
+    expect(
+      decodeCursor(encode(`${cursor.created_at}|r2.6|extra`), releaseId),
+    ).toBeNull();
+    expect(
+      decodeCursor(encode(`2026-02-30T10:46:00.123Z|r2.6`), releaseId),
+    ).toBeNull();
+    expect(() =>
+      encodeCursor({ ...cursor, id: cursor.id + "a" }, releaseId),
+    ).toThrow();
+  });
+
   it("round-trips created_at and id", () => {
     const cursor = {
       created_at: "2026-10-02T10:46:00.123Z",
