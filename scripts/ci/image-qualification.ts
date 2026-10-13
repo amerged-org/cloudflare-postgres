@@ -1836,7 +1836,7 @@ export async function qualify(
     }
     // Upstream files are bound by immutable source/package checks and the full image digests.
     // Only PGCF-produced files enter the secret scanner; no upstream finding waivers exist.
-    const ownedFiles = selectOwnedFiles(files, profile);
+    const ownedFiles = selectOwnedFiles(files, profile, baseDiffIDs.length);
     inputs.push(
       ...ownedFiles.map((file): ScanInput => ({
         kind: "layer-file",

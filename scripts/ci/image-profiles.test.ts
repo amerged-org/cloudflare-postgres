@@ -188,6 +188,38 @@ test("storage scanning requires the locally rebuilt driver", () => {
   );
 });
 
+test("storage excludes only the pinned original driver inside verified upstream layers", () => {
+  const metadata = files("usr/share/pgcf/storage-sources.lock.json"),
+    upstream = {
+      path: "usr/local/bin/lvm-driver",
+      layer: 4,
+      sha256: storageSources.driver.upstream_binary_sha256,
+    },
+    rebuilt = {
+      path: "usr/local/bin/lvm-driver",
+      layer: 8,
+      sha256: storageSources.driver.binary_sha256,
+    },
+    copiedUpstream = { ...upstream, layer: 9 },
+    unknown = { ...upstream, sha256: "0".repeat(64) };
+  assert.deepEqual(
+    selectOwnedFiles([...metadata, upstream, rebuilt], "storage", 5),
+    [...metadata, rebuilt],
+  );
+  assert.deepEqual(
+    selectOwnedFiles(
+      [...metadata, unknown, rebuilt, copiedUpstream],
+      "storage",
+      5,
+    ),
+    [...metadata, unknown, rebuilt, copiedUpstream],
+  );
+  assert.deepEqual(
+    selectOwnedFiles([...metadata, upstream, rebuilt], "storage"),
+    [...metadata, upstream, rebuilt],
+  );
+});
+
 test("scratch runtime selection scans all outputs and requires its executable and first-party license", () => {
   const input = files(
     "pgcf-native-controller",

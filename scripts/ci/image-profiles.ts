@@ -196,12 +196,20 @@ function requiredOwnedPaths(profile: ImageProfile): string[] {
 }
 
 /** Select scan scope, not trust: upstream digest and assembly verification still cover the complete image. */
-export function selectOwnedFiles<T extends { path: string }>(
+export function selectOwnedFiles<
+  T extends { path: string; layer?: number; sha256?: string },
+>(
   files: readonly T[],
   profileInput: ImageProfile,
+  verifiedUpstreamLayers = 0,
 ): T[] {
   const profile = imageProfile(profileInput),
     paths = new Set(files.map((file) => file.path));
+  if (
+    !Number.isSafeInteger(verifiedUpstreamLayers) ||
+    verifiedUpstreamLayers < 0
+  )
+    throw new Error("Invalid verified upstream layer count");
   for (const path of requiredOwnedPaths(profile))
     if (!paths.has(path))
       throw new Error(`First-party image output missing: ${path}`);
@@ -232,8 +240,18 @@ export function selectOwnedFiles<T extends { path: string }>(
   ]);
   // PostgreSQL is flattened: layer membership cannot distinguish the upstream engine from our metadata.
   return files.filter(
-    ({ path }) =>
-      (profile === "storage" && path === "usr/local/bin/lvm-driver") ||
+    ({ path, layer, sha256 }) =>
+      (profile === "storage" &&
+        path === "usr/local/bin/lvm-driver" &&
+        // The caller first verifies the complete official base layer prefix. A matching
+        // original binary in that prefix is upstream; every later copy remains in scope.
+        !(
+          layer !== undefined &&
+          Number.isSafeInteger(layer) &&
+          layer >= 0 &&
+          layer < verifiedUpstreamLayers &&
+          sha256 === storageSources.driver.upstream_binary_sha256
+        )) ||
       (path.startsWith("usr/share/pgcf/") &&
         (profile !== "storage" || !upstreamSources.has(path))),
   );
