@@ -83,6 +83,17 @@ impl Runtime {
             )
         {
             // A notification replay reads the same child; it never creates a new holder or mount.
+            if !self.consumed {
+                let claims = protocol::permission(text(&signal, "permission")?, &self.keys)?;
+                protocol::storage_authority(
+                    &self.storage_trust,
+                    &signal["storage_authority"],
+                    &claims["scope"],
+                )?;
+                // The immutable mount permission still expires at its original deadline.
+                // A fresh write-authority sample may replace the short-lived pending one.
+                self.mount = Some(signal);
+            }
             return Ok(());
         }
         if self.consumed || self.mount.is_some() {
@@ -162,7 +173,7 @@ impl Runtime {
             self.bundle = Some(bundle);
             return Ok(());
         }
-        if self.consumed || self.bundle.is_some() {
+        if self.consumed {
             return Err(Error("pool_binding_already_consumed"));
         }
         let claims = protocol::permission(text(&bundle, "permission")?, &self.keys)?;
@@ -171,6 +182,13 @@ impl Runtime {
             || claims["holder_revision"] != bundle["holder_revision"]
         {
             return Err(Error("pool_permission_scope_changed"));
+        }
+        if let Some(old) = &self.bundle {
+            let mut pending = old.clone();
+            pending["storage_authority"] = bundle["storage_authority"].clone();
+            if pending != bundle {
+                return Err(Error("pool_pending_scope_changed"));
+            }
         }
         self.bundle = Some(bundle);
         Ok(())

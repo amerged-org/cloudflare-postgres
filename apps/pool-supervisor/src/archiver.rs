@@ -14,6 +14,27 @@ use tokio::{
 };
 
 const MAXIMUM: usize = 256 * 1024;
+// Stock Barman's list CLI exits zero after skipping unreadable or absent backup.info files.
+// Use its unchanged, pinned catalog implementation, but refuse an incomplete directory set.
+// A fresh adapter process performs read-only catalog reads and returns the stock JSON shape.
+const COMPLETE_CATALOG: &str = r#"
+import json, os, sys
+from contextlib import closing
+from barman.cloud import CloudBackupCatalog
+from barman.clients.cloud_backup_list import parse_arguments, get_cloud_interface
+config = parse_arguments(sys.argv[1:])
+with closing(get_cloud_interface(config)) as cloud:
+    catalog = CloudBackupCatalog(cloud_interface=cloud, server_name=config.server_name)
+    backups = catalog.get_backup_list()
+    directories = {
+        os.path.basename(path.rstrip('/'))
+        for path in cloud.list_bucket(catalog.prefix + '/') if path.endswith('/')
+    }
+    if catalog.unreadable_backups or directories != set(backups):
+        sys.stderr.write('pgcf_backup_catalog_incomplete\n')
+        raise SystemExit(3)
+    print(json.dumps({'backups_list': [backups[key].to_json() for key in sorted(backups)]}))
+"#;
 pub async fn request(value: Value) -> Result<Value, Error> {
     let value = protocol::valid("PoolArchiverCommand", value)?;
     let mut socket = UnixStream::connect(protocol::constant("archiver_socket")?)
@@ -46,6 +67,8 @@ pub async fn request(value: Value) -> Result<Value, Error> {
         for code in [
             "pool_backup_report_invalid",
             "pool_backup_catalog_ambiguous",
+            "pool_backup_catalog_incomplete",
+            "pool_backup_result_uncertain",
             "pool_backup_incomplete",
             "pool_archive_unavailable",
             "pool_archive_client_invalid",
@@ -106,7 +129,12 @@ pub struct Archiver {
     configuration: Mutex<Option<Value>>,
     wal: Semaphore,
     backup: Semaphore,
-    outcomes: Mutex<HashMap<String, Result<Value, Error>>>,
+    outcomes: Mutex<HashMap<String, BackupOutcome>>,
+}
+#[derive(Clone)]
+enum BackupOutcome {
+    Dispatched,
+    Complete(Value),
 }
 impl Archiver {
     fn new() -> Self {
@@ -168,23 +196,25 @@ impl Archiver {
             return Ok(json!({"archived":true}));
         }
         let name = text(&command, "backup_name")?.to_owned();
-        if let Some(result) = self.outcomes.lock().await.get(&name).cloned() {
-            return result;
+        if let Some(BackupOutcome::Complete(report)) = self.outcomes.lock().await.get(&name) {
+            return Ok(report.clone());
         }
         let _permit = self
             .backup
             .try_acquire()
             .map_err(|_| Error("pool_backup_in_progress"))?;
-        if let Some(result) = self.outcomes.lock().await.get(&name).cloned() {
-            return result;
+        if let Some(BackupOutcome::Complete(report)) = self.outcomes.lock().await.get(&name) {
+            return Ok(report.clone());
         }
-        if self.outcomes.lock().await.len() >= 1024 {
+        let outcomes = self.outcomes.lock().await;
+        if outcomes.len() >= 1024 && !outcomes.contains_key(&name) {
             return Err(Error("pool_backup_identity_capacity"));
         }
-        let result = backup(archive, &command).await;
+        drop(outcomes);
+        let result = backup(archive, &command, &self.outcomes).await?;
         let mut outcomes = self.outcomes.lock().await;
-        outcomes.insert(name, result.clone());
-        result
+        outcomes.insert(name, BackupOutcome::Complete(result.clone()));
+        Ok(result)
     }
 }
 async fn run(
@@ -194,7 +224,13 @@ async fn run(
     after: &[&str],
     deadline: Duration,
 ) -> Result<Vec<u8>, Error> {
-    let mut command = Command::new(format!("/venv/bin/{program}"));
+    let mut command = if program == "barman-cloud-backup-list" {
+        let mut adapter = Command::new("/venv/bin/python3");
+        adapter.args(["-c", COMPLETE_CATALOG]);
+        adapter
+    } else {
+        Command::new(format!("/venv/bin/{program}"))
+    };
     command
         .args(options)
         .args([
@@ -248,6 +284,10 @@ async fn run(
             // Return only known constant classes, never upstream exception text or credential data.
             let message = String::from_utf8_lossy(&diagnostic);
             for (pattern, code) in [
+                (
+                    "pgcf_backup_catalog_incomplete",
+                    "pool_backup_catalog_incomplete",
+                ),
                 ("InvalidObjectName", "pool_archive_object_key_refused"),
                 ("SSL validation failed", "pool_archive_tls_refused"),
                 ("CERTIFICATE_VERIFY_FAILED", "pool_archive_tls_refused"),
@@ -291,12 +331,27 @@ async fn named(archive: &Value, name: &str) -> Result<Option<Value>, Error> {
     }
     Ok(matching.first().map(|v| (*v).clone()))
 }
-async fn backup(archive: &Value, request: &Value) -> Result<Value, Error> {
+async fn backup(
+    archive: &Value,
+    request: &Value,
+    outcomes: &Mutex<HashMap<String, BackupOutcome>>,
+) -> Result<Value, Error> {
     let name = text(request, "backup_name")?;
     let info = if let Some(info) = named(archive, name).await? {
+        // A retained catalog identity also forbids creating this name again after a read failure.
+        outcomes
+            .lock()
+            .await
+            .insert(name.to_owned(), BackupOutcome::Dispatched);
         info
     } else {
+        let mut outcomes = outcomes.lock().await;
+        if outcomes.contains_key(name) {
+            return Err(Error("pool_backup_result_uncertain"));
+        }
         // A command with an uncertain result is never repeated under this identity.
+        outcomes.insert(name.to_owned(), BackupOutcome::Dispatched);
+        drop(outcomes);
         run(
             "barman-cloud-backup",
             archive,

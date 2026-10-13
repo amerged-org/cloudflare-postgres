@@ -50,6 +50,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--minio-binary", type=Path, required=True)
     parser.add_argument("--binary-volume", default="pgcf-pool-supervisor-target-amd64")
+    parser.add_argument("--controller-peer-volume")
+    parser.add_argument("--controller-peer-sha256")
     args = parser.parse_args()
     os.umask(0o077)
     prefix = "pgcf-pool-test-" + secrets.token_hex(6)
@@ -82,11 +84,11 @@ def main():
             path.chmod(0o600)
         user, password = secrets.token_hex(12), secrets.token_hex(32)
         private(fixture / "minio.env", f"MINIO_ROOT_USER={user}\nMINIO_ROOT_PASSWORD={password}\nMINIO_REGION_NAME=auto\nMINIO_BROWSER=off\n")
-        private(fixture / "archive.env", f"AWS_ACCESS_KEY_ID={user}\nAWS_SECRET_ACCESS_KEY={password}\nAWS_DEFAULT_REGION=auto\nAWS_CA_BUNDLE=/test-ca/ca.crt\nPGCF_POOL_ENABLED=1\n")
+        private(fixture / "archive.env", f"AWS_ACCESS_KEY_ID={user}\nAWS_SECRET_ACCESS_KEY={password}\nAWS_DEFAULT_REGION=auto\nAWS_MAX_ATTEMPTS=1\nAWS_CA_BUNDLE=/test-ca/ca.crt\nPGCF_POOL_ENABLED=1\n")
         run("docker", "network", "create", "--internal", network)
         subnet = run("docker", "network", "inspect", "--format", "{{(index .IPAM.Config 0).Subnet}}", network).stdout.decode().strip()
         pool_ip = str(ipaddress.ip_network(subnet)[10])
-        for kind in ("data", "control", "run", "certificates", "bin", "ca"):
+        for kind in ("data", "control", "run", "certificates", "bin", "ca", "object-data"):
             volume = prefix + "-" + kind
             volumes.append(volume)
             run("docker", "volume", "create", volume)
@@ -122,7 +124,7 @@ def main():
         minio = prefix + "-minio"
         containers.append(minio)
         run("docker", "run", "-d", "--name", minio, "--platform", "linux/amd64", "--network", network, "--network-alias", "minio",
-            "--env-file", str(fixture / "minio.env"), "-v", str(fixture) + ":/certs:ro", "--tmpfs", "/data", minio_image, "server", "/data", "--certs-dir", "/certs", "--address", ":9000")
+            "--env-file", str(fixture / "minio.env"), "-v", str(fixture) + ":/certs:ro", "-v", prefix + "-object-data:/data", minio_image, "server", "/data", "--certs-dir", "/certs", "--address", ":9000")
         create = "import boto3,time; s=boto3.client('s3',endpoint_url='https://minio:9000',region_name='auto');\nfor i in range(60):\n try: s.create_bucket(Bucket='pgcf-fixture'); break\n except Exception:\n  if i==59: raise RuntimeError('object-store readiness failed') from None\n  time.sleep(.2)"
         execute(archiver, create)
         pool_name = prefix + "-postgres"
@@ -191,6 +193,11 @@ def main():
         waiting = json.loads(execute(controller, http, "bundle", "bundle.json", pool_ip))
         if "error" in waiting: raise RuntimeError(waiting["error"])
         assert waiting == {"accepted":True,"waiting":True}
+        replay = json.loads(execute(controller, http, "bundle", "bundle.json", pool_ip))
+        assert replay == waiting, "the same pending bundle must resolve a lost reply without consuming a second holder"
+        private(fixture / "changed-pending.json", json.dumps(dict(bundle, holder_revision=2)))
+        changed = json.loads(execute(controller, http, "bundle", "changed-pending.json", pool_ip))
+        assert "error" in changed, "pending bundle replay must reject a changed holder"
         # Bundle alone must not start a postmaster.
         actual = run("docker", "exec", pool_name, "pg_controldata", "/var/lib/postgresql/data/pgdata").stdout.decode()
         assert "Database cluster state:               shut down" in actual
@@ -205,6 +212,29 @@ def main():
         repeated = json.loads(execute(controller, signal_code))
         if repeated.get("error") is not None: raise RuntimeError(repeated["error"])
         assert repeated["postmaster_pid"] == ready["postmaster_pid"], "notification retry must read back the same postmaster"
+        peer_proved = False
+        if args.controller_peer_volume:
+            assert args.controller_peer_sha256 and len(args.controller_peer_sha256) == 64
+            peer_binary = "/peer-binary/pool-kubernetes/debug/examples/pool-supervisor-peer"
+            archive_probe = json.loads(execute(archiver, "import pathlib; print(pathlib.Path('/controller/run/archiver-isolation.json').read_text())"))
+            probes = [attestation["workload_probe"], archive_probe]
+            assert all(p["uid"] == 26 and p["cap_eff"] == "0000000000000000" and p["seccomp_mode"] == 2 and p["no_new_privs"] for p in probes)
+            # These fixture-only logical CF inputs exercise the actual controller TLS boundary.
+            # They do not attest Talos mount propagation or any physical storage qualification.
+            peer_attestation = {field:scope[field] for field in ("node_id","node_uid","boot_id","pool_namespace","pool_namespace_uid","container_ids","pool_pod_uid","pool_pod_name","pool_pod_ip","container_id","supervisor_sha256","supervisor_key_sha256","class")}
+            peer_attestation.update({"v":1,"supervisor_public_key_pem":attestation["supervisor_public_key_pem"],"supervisor_certificate_pem":attestation["supervisor_certificate_pem"],"propagation_verified":True,"workload_isolation":{"uid":26,"cap_sys_admin":False,"seccomp_runtime_default":True,"namespace_creation_denied":True,"mount_api_denied":True},"workload_probes":[{"container_id":cid,"probe":probe} for cid,probe in zip(scope["container_ids"],probes)],"observed_at":int(time.time()*1000)})
+            peer_binding = {"v":1,"scope":scope,"scope_sha256":digest,"holder_revision":1,"state":"serving","created_at":at,"updated_at":int(time.time()*1000)}
+            private(fixture / "binding.json", json.dumps(peer_binding))
+            private(fixture / "attestation.json", json.dumps(peer_attestation))
+            private(fixture / "peer-control.json", json.dumps({"v":1,"binding_id":binding,"scope_sha256":digest,"bundle_nonce":nonce}))
+            measured = run("docker","run","--rm","--platform","linux/amd64","--network","none","-v",args.controller_peer_volume+":/peer-binary:ro","--entrypoint","python3",BARMAN,"-c","import hashlib,pathlib,sys; print(hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())",peer_binary).stdout.decode().strip()
+            assert measured == args.controller_peer_sha256, "peer executable must match its measured build receipt"
+            peer_name = prefix + "-peer"
+            containers.append(peer_name)
+            result = run("docker","run","--rm","--name",peer_name,"--platform","linux/amd64","--network",network,"--user","0:0","--cap-drop","ALL","--security-opt","no-new-privileges:true","--read-only","-v",args.controller_peer_volume+":/peer-binary:ro","-v",str(fixture)+":/peer:ro","--entrypoint",peer_binary,BARMAN,"--binding-file","/peer/binding.json","--attestation-file","/peer/attestation.json","--control-file","/peer/peer-control.json")
+            peer = json.loads(result.stdout)
+            assert peer["state"] == "ready" and peer["system_identifier"] == "matched" and peer["timeline"] == "matched"
+            peer_proved = True
         sql = "CREATE TABLE pool_marker(value text); INSERT INTO pool_marker VALUES ('acknowledged');"
         tls_dsn = "host=" + tls_name + " hostaddr=" + pool_ip + " sslmode=verify-full sslrootcert=/controller/certificates/client-ca.crt user=postgres dbname=postgres"
         run("docker", "exec", pool_name, "psql", tls_dsn, "-v", "ON_ERROR_STOP=1", "-c", sql)
@@ -250,16 +280,52 @@ def main():
         assert refreshed.returncode==0 and refreshed.stdout.strip()==b"acknowledged", "fresh connection must verify the refreshed CA"
         control = {"v":1,"binding_id":binding,"scope_sha256":digest,"bundle_nonce":nonce}
         private(fixture / "backup.json", json.dumps(dict(control, backup_name="backup-" + prefix)))
+        # A real object-store outage before dispatch is safe to retry under the same identity.
+        run("docker", "stop", "--time", "5", minio)
+        unavailable = json.loads(execute(controller, http, "backup", "backup.json", pool_ip, timeout=2500))
+        assert "error" in unavailable, "no backup may dispatch without a readable catalog"
+        run("docker", "start", minio)
+        execute(archiver, create.replace("s.create_bucket(Bucket='pgcf-fixture')", "s.head_bucket(Bucket='pgcf-fixture')"))
         backup = json.loads(execute(controller, http, "backup", "backup.json", pool_ip, timeout=2500))
         if "error" in backup: raise RuntimeError(backup["error"])
         assert backup["state"] == "DONE" and len(backup["catalog_sha256"]) == 64 and (backup["bytes"] is None or backup["bytes"] > 0)
         again = json.loads(execute(controller, http, "backup", "backup.json", pool_ip, timeout=2500))
         assert again == backup
+        catalog_prefix = archive_prefix + "/database/base/"
+        s3_setup = "import boto3,json,sys; s=boto3.client('s3',endpoint_url='https://minio:9000',region_name='auto'); bucket='pgcf-fixture'; prefix=sys.argv[1]; "
+        catalogs = json.loads(execute(archiver, s3_setup + "print(json.dumps([v['Key'] for v in s.list_objects_v2(Bucket=bucket,Prefix=prefix).get('Contents',[]) if v['Key'].endswith('/backup.info')]))", catalog_prefix))
+        assert len(catalogs) == 1, "safe pre-dispatch retry must create exactly one backup"
+        first_key = catalogs[0]
+        original_catalog = execute(archiver, "import boto3,sys; s=boto3.client('s3',endpoint_url='https://minio:9000',region_name='auto'); sys.stdout.buffer.write(s.get_object(Bucket='pgcf-fixture',Key=sys.argv[1])['Body'].read())", first_key)
+        private(fixture / "original-backup.info", original_catalog)
+        def restore_catalog():
+            code = "import boto3,sys; s=boto3.client('s3',endpoint_url='https://minio:9000',region_name='auto'); s.put_object(Bucket='pgcf-fixture',Key=sys.argv[1],Body=sys.stdin.buffer.read())"
+            result = subprocess.run(["docker", "exec", "-i", archiver, "python3", "-c", code, first_key], input=original_catalog, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=120)
+            assert result.returncode == 0, "restore the exact captured local catalog without printing it"
+        private(fixture / "second-backup.json", json.dumps(dict(control, backup_name="second-" + prefix)))
+        # Stock Barman silently skips corrupt or absent metadata, even with an exit-zero list.
+        for mutation in ("s.put_object(Bucket=bucket,Key=sys.argv[2],Body=b'version=not-an-integer\\n')", "s.delete_object(Bucket=bucket,Key=sys.argv[2])"):
+            execute(archiver, s3_setup + mutation, catalog_prefix, first_key)
+            refused = json.loads(execute(controller, http, "backup", "second-backup.json", pool_ip, timeout=2500))
+            assert refused.get("error") == "pool_backup_catalog_incomplete", "an incomplete catalog cannot authorize a new backup"
+            restore_catalog()
+        # Corrupt real prior metadata only after a new backup has actually dispatched.
+        watcher_code = s3_setup + "\nimport time\nfor _ in range(1000):\n keys=[v['Key'] for v in s.list_objects_v2(Bucket=bucket,Prefix=prefix).get('Contents',[]) if v['Key'].endswith('/backup.info') and v['Key']!=sys.argv[2]]\n if keys:\n  s.put_object(Bucket=bucket,Key=sys.argv[2],Body=b'version=not-an-integer\\n'); print('dispatched'); break\n time.sleep(.01)\nelse: raise RuntimeError('actual backup dispatch was not observed')"
+        watcher = subprocess.Popen(["docker", "exec", archiver, "python3", "-c", watcher_code, catalog_prefix, first_key], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        uncertain = json.loads(execute(controller, http, "backup", "second-backup.json", pool_ip, timeout=2500))
+        watcher_out, _ = watcher.communicate(timeout=30)
+        assert watcher.returncode == 0 and watcher_out.strip() == b"dispatched"
+        assert uncertain.get("error") == "pool_backup_catalog_incomplete", "post-dispatch catalog failure must remain unresolved"
+        restore_catalog()
+        reconciled = json.loads(execute(controller, http, "backup", "second-backup.json", pool_ip, timeout=2500))
+        assert reconciled.get("state") == "DONE", "a dispatched backup must reconcile through reads rather than cache its transient error"
+        after = json.loads(execute(archiver, s3_setup + "print(json.dumps([v['Key'] for v in s.list_objects_v2(Bucket=bucket,Prefix=prefix).get('Contents',[]) if v['Key'].endswith('/backup.info')]))", catalog_prefix))
+        assert len(after) == 2, "uncertain same-name reconciliation must not create another backup"
         private(fixture / "control.json", json.dumps(control))
         stopped = json.loads(execute(controller, http, "stop", "control.json", pool_ip))
         assert stopped["state"] == "stopped" and stopped["control_state"] == "shut down" and stopped["postmaster_pid"] is None
         assert json.loads(execute(controller, http, "stop", "control.json", pool_ip)) == stopped
-        print(json.dumps({"postgres_image":PG,"barman_image":BARMAN,"minio_local_image_id":image_id,"minio_binary_sha256":hashlib.sha256(args.minio_binary.read_bytes()).hexdigest(),"ready":True,"clean_stop":True,"wal_objects":wal_proof["count"],"wal_sha256":wal_proof["sha256"],"backup_state":backup["state"],"catalog_sha256":backup["catalog_sha256"],"backup_bytes":backup["bytes"],"ca_refresh_after_initial_expiry":True,"busy_tls_session_preserved":True,"matching_ready_timestamps":ready["readiness_at"] >= ready["postgres_started_at"],"kernel_mount_acceptance":False,"cloudflare_first_sql_acceptance":False}))
+        print(json.dumps({"postgres_image":PG,"barman_image":BARMAN,"minio_local_image_id":image_id,"minio_binary_sha256":hashlib.sha256(args.minio_binary.read_bytes()).hexdigest(),"ready":True,"clean_stop":True,"wal_objects":wal_proof["count"],"wal_sha256":wal_proof["sha256"],"backup_state":backup["state"],"catalog_sha256":backup["catalog_sha256"],"backup_bytes":backup["bytes"],"ca_refresh_after_initial_expiry":True,"busy_tls_session_preserved":True,"matching_ready_timestamps":ready["readiness_at"] >= ready["postgres_started_at"],"pending_bundle_replay":True,"complete_catalog_required":True,"backup_reconciled_without_replay":True,"controller_peer_tls":peer_proved,"kernel_mount_acceptance":False,"cloudflare_first_sql_acceptance":False}))
     finally:
         for container in reversed(containers): run("docker", "rm", "-f", container, check=False)
         for volume in reversed(volumes): run("docker", "volume", "rm", volume, check=False)
