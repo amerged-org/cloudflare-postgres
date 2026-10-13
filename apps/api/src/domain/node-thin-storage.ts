@@ -41,7 +41,12 @@ export interface NodeThinStorageRow {
   qualification_json: string | null;
   status: "selected" | "qualifying" | "ready" | "blocked";
   error_code: string | null;
+  sample_nonce: string | null;
+  sample_nonce_issued_at: string | null;
+  sample_observed_at: string | null;
+  sample_data_used_bytes: number | null;
   created_at: string;
+  /** Also the current slow lease's issue; fast samples never write it. */
   updated_at: string;
 }
 

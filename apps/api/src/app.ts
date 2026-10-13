@@ -25,6 +25,7 @@ import { registerNodes } from "./routes/nodes.ts";
 import { registerInfrastructureBackups } from "./routes/infrastructure-backups.ts";
 import { registerNodeOperator } from "./routes/node-operator.ts";
 import { authenticateThinStorage } from "./domain/node-thin-storage-execution.ts";
+import { agentRegion } from "./domain/agent-auth.ts";
 import { RECLAIM_LIMITS } from "@pgcf/contracts/reclaim";
 import { authenticateReclaimRequest } from "./domain/warm-reclaim.ts";
 import { registerReclaim } from "./routes/reclaim.ts";
@@ -69,6 +70,7 @@ const DIAGNOSTIC_ROUTES = new Set([
   "/v1/nodes/:id/compute-pool/observations",
   "/agent/v1/nodes/:id/compute-pool",
   "/agent/v1/nodes/:id/storage-guard",
+  "/agent/v1/nodes/:id/storage-headroom",
   "/internal/v1/node-thin-storage/:id",
   "/internal/v1/node-thin-storage/:id/relay",
   "/v1/nodes/:id/thin-qualifications",
@@ -343,6 +345,8 @@ export function createApp(): ApiApp {
       /^\/agent\/v1\/nodes\/(nod_[a-z0-9]{20})\/reclaim-observations$/.exec(
         path,
       );
+    const headroom =
+      /^\/agent\/v1\/nodes\/nod_[a-z0-9]{20}\/storage-headroom$/.test(path);
     const authorityRotation =
       /^\/internal\/v1\/fleet-rollouts\/(op_[a-z0-9]{20})\/regions\/([a-z0-9][a-z0-9_-]{0,63})\/rotation$/.exec(
         path,
@@ -358,6 +362,10 @@ export function createApp(): ApiApp {
     } else if (reclaim && c.req.method === "POST") {
       await authenticateReclaimRequest(c, reclaim[1]!);
       maximum = RECLAIM_LIMITS.max_envelope_bytes;
+    } else if (headroom && c.req.method === "POST") {
+      // One scrape lists every LV of the volume group, up to the contract's 8192.
+      await agentRegion(c);
+      maximum = 1024 * 1024;
     } else if (thinStorage && c.req.method === "POST") {
       await authenticateThinStorage(c, thinStorage[1]!);
       maximum = 2 * 1024 * 1024;

@@ -8,6 +8,8 @@ import {
 } from "@pgcf/contracts";
 import {
   HostStorageLease,
+  NodeStorageHeadroomResponse,
+  NodeStorageHeadroomSample,
   NodeThinStorageSelection,
   NodeThinStorageState,
 } from "@pgcf/contracts/node-thin-storage";
@@ -28,6 +30,7 @@ import {
   bootstrapRelayClaimsSchema,
 } from "@pgcf/contracts/bootstrap-relay";
 import { hostStorageLease } from "../domain/node-thin-storage.ts";
+import { recordStorageHeadroomSample } from "../domain/node-thin-storage-samples.ts";
 import {
   getNodeThinStorageProfile,
   selectNodeThinStorage,
@@ -98,6 +101,47 @@ export function registerNodeThinStorage(app: ApiApp) {
       },
     }),
     (c) => hostStorageLease(c, NodeId.parse(c.req.param("id"))),
+  );
+  app.openapi(
+    createRoute({
+      method: "post",
+      path: "/agent/v1/nodes/{id}/storage-headroom",
+      tags: ["Physical storage"],
+      security: [{ AgentBearer: [] }],
+      request: {
+        params: z.object({ id: NodeId }),
+        body: {
+          required: true,
+          content: {
+            "application/json": { schema: NodeStorageHeadroomSample },
+          },
+        },
+      },
+      responses: {
+        200: {
+          description:
+            "The next nonce and, for an accepted sample, the renewed node authority and its current write tokens",
+          content: {
+            "application/json": { schema: NodeStorageHeadroomResponse },
+          },
+        },
+        ...Object.fromEntries(
+          [400, 401, 404, 409, 500].map((status) => [
+            status,
+            {
+              description: "Request refused",
+              content: { "application/json": { schema: ErrorBody } },
+            },
+          ]),
+        ),
+      },
+    }),
+    (c) =>
+      recordStorageHeadroomSample(
+        c,
+        NodeId.parse(c.req.param("id")),
+        c.req.valid("json"),
+      ),
   );
   app.post("/internal/v1/node-thin-storage/:id", async (c) => {
     const id = NodeId.parse(c.req.param("id"));

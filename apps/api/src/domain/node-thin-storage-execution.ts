@@ -7,6 +7,8 @@ import {
   thinStorageClass,
   thinWriteExposure,
   NodeThinStorageAuthority,
+  type NodePhysicalStorage,
+  type ThinStorageProfile,
 } from "@pgcf/contracts";
 import {
   NodeThinStorageInput,
@@ -149,7 +151,7 @@ function retainedPoolAuthority(
 }
 
 export const storageHoldSnapshotSql = `NOT EXISTS(SELECT 1 FROM database_start_admissions storage_hold WHERE (storage_hold.node_id=node_thin_storage.node_id AND storage_hold.node_uid=node_thin_storage.node_uid AND storage_hold.storage_budget_bytes>0) AND NOT EXISTS(SELECT 1 FROM json_each(?) captured_hold WHERE captured_hold.value=storage_hold.operation_id))`;
-async function storageHolds(
+export async function storageHolds(
   env: Env,
   nodeId: string,
   nodeUid: string,
@@ -196,7 +198,7 @@ async function storageHolds(
     operations: rows.results.map((r) => r.operation_id),
   };
 }
-function minimumHeadroom(
+export function minimumHeadroom(
   profile: NodeThinStorageLease["profile"],
   authority: NodeThinStorageAuthority | null,
   holds: { bytes: number; newVolumes: number; ids: ReadonlySet<string> },
@@ -219,6 +221,95 @@ function minimumHeadroom(
       4 * Math.ceil(chunks / 126) * 4096 +
       holds.newVolumes * 16384,
   };
+}
+/** Cloudflare's write decision for one reading under one identity proof; the rule the slow report
+ * has always been held to: complete data accounting, the profile's geometry and free data and
+ * metadata of at least the minimum headroom. */
+export function thinStorageWriteAllowed(
+  profile: ThinStorageProfile,
+  identity: NodeThinStorageAuthority,
+  physical: NodePhysicalStorage,
+  headroom: { data: number; metadata: number },
+) {
+  const pool = physical.thin_pool;
+  return Boolean(
+    identity.data_accounting_complete &&
+    identity.pool_uuid !== null &&
+    pool &&
+    pool.data_total_bytes <= profile.maximum_data_bytes &&
+    pool.metadata_total_bytes === profile.metadata_bytes &&
+    pool.data_total_bytes - pool.data_used_bytes_upper_bound >= headroom.data &&
+    pool.metadata_total_bytes - pool.metadata_used_bytes_upper_bound >=
+      headroom.metadata,
+  );
+}
+/** The authority Cloudflare signs: the identity proof's facts and the fresher reading's physical
+ * state, valid one guard from that reading and never past the identity proof. */
+export function composeThinStorageAuthority(input: {
+  identity: NodeThinStorageAuthority;
+  inventory: { observed_at: number; expires_at: number; revision: number };
+  reading: {
+    observed_at: number;
+    captured_at: string;
+    physical: NodePhysicalStorage;
+  };
+  revision: number;
+  guardSeconds: number;
+  writeAllowed: boolean;
+}) {
+  const iso = (ms: number) => new Date(ms).toISOString();
+  return NodeThinStorageAuthority.parse({
+    ...input.identity,
+    revision: input.revision,
+    observed_at: iso(input.reading.observed_at),
+    captured_at: input.reading.captured_at,
+    expires_at: iso(
+      Math.min(
+        input.reading.observed_at + input.guardSeconds * 1000,
+        input.inventory.expires_at,
+      ),
+    ),
+    write_allowed: input.writeAllowed,
+    physical: input.reading.physical,
+    inventory_observed_at: iso(input.inventory.observed_at),
+    inventory_expires_at: iso(input.inventory.expires_at),
+    inventory_revision: input.inventory.revision,
+  });
+}
+/** The largest next first start or retained recovery a growth must leave room for. */
+export async function nextThinStartupBytes(
+  env: Env,
+  nodeId: string,
+  regionId: string,
+  profile: ThinStorageProfile,
+  allowNewDatabases: number,
+) {
+  return (
+    (await env.DB.prepare(
+      `SELECT MAX(MAX(s.storage_gib*1073741824,?)) bytes FROM databases d JOIN size_classes s ON s.id=d.size_class_id JOIN nodes n ON n.id=? WHERE (d.region_id=? AND (d.deleted_at IS NULL OR d.desired_state='deleted') AND s.storage_gib<=?) AND ((d.desired_state='running' AND d.node_id IS NULL AND ?=1 AND n.schedulable=1 AND n.database_placement_enabled=1 AND n.database_placement_closed_at IS NULL) OR (d.node_id=n.id AND ((d.desired_state='running' AND d.storage_protected_generation=d.generation AND d.storage_protected_at IS NOT NULL) OR (d.storage_volume_json IS NOT NULL AND EXISTS(SELECT 1 FROM operations stop WHERE ${currentStorageStopSql()}))))) AND NOT EXISTS(SELECT 1 FROM database_start_admissions h WHERE h.database_id=d.id AND h.storage_budget_bytes>0)`,
+    )
+      .bind(
+        profile.startup_reserve_bytes,
+        nodeId,
+        regionId,
+        profile.maximum_quota_gib,
+        allowNewDatabases,
+      )
+      .first<number>("bytes")) ?? profile.startup_reserve_bytes
+  );
+}
+/** The existing growth rule: the pool cannot cover the minimum headroom and the next start. */
+export function thinPoolDataGrowthNeeded(
+  profile: ThinStorageProfile,
+  pool: NonNullable<NodePhysicalStorage["thin_pool"]>,
+  required: { data: number },
+  nextStartup: number,
+) {
+  return (
+    pool.data_total_bytes - pool.data_used_bytes_upper_bound <
+      required.data + nextStartup &&
+    pool.data_total_bytes < profile.maximum_data_bytes
+  );
 }
 export async function reserveThinStorageLease(
   env: Env,
@@ -247,17 +338,13 @@ export async function reserveThinStorageLease(
   // Grow the existing finite pool for one eligible request; this is not a physical quota debit
   // for established databases and never creates a VPS order below the regional RAM trigger.
   const nextStartup = allowPoolActions
-    ? ((await env.DB.prepare(
-        `SELECT MAX(MAX(s.storage_gib*1073741824,?)) bytes FROM databases d JOIN size_classes s ON s.id=d.size_class_id JOIN nodes n ON n.id=? WHERE (d.region_id=? AND (d.deleted_at IS NULL OR d.desired_state='deleted') AND s.storage_gib<=?) AND ((d.desired_state='running' AND d.node_id IS NULL AND ?=1 AND n.schedulable=1 AND n.database_placement_enabled=1 AND n.database_placement_closed_at IS NULL) OR (d.node_id=n.id AND ((d.desired_state='running' AND d.storage_protected_generation=d.generation AND d.storage_protected_at IS NOT NULL) OR (d.storage_volume_json IS NOT NULL AND EXISTS(SELECT 1 FROM operations stop WHERE ${currentStorageStopSql()}))))) AND NOT EXISTS(SELECT 1 FROM database_start_admissions h WHERE h.database_id=d.id AND h.storage_budget_bytes>0)`,
+    ? await nextThinStartupBytes(
+        env,
+        nodeId,
+        row.region_id,
+        profile,
+        row.allow_new_databases,
       )
-        .bind(
-          profile.startup_reserve_bytes,
-          nodeId,
-          row.region_id,
-          profile.maximum_quota_gib,
-          row.allow_new_databases,
-        )
-        .first<number>("bytes")) ?? profile.startup_reserve_bytes)
     : profile.startup_reserve_bytes;
 
   let action = row.action_json
@@ -310,9 +397,7 @@ export async function reserveThinStorageLease(
       });
     } else if (
       current.authority &&
-      pool.data_total_bytes - pool.data_used_bytes_upper_bound <
-        required.data + nextStartup &&
-      pool.data_total_bytes < profile.maximum_data_bytes
+      thinPoolDataGrowthNeeded(profile, pool, required, nextStartup)
     ) {
       const target = Math.min(
         profile.maximum_data_bytes,
@@ -823,6 +908,12 @@ export async function issueThinStorageTransport(
   return transport;
 }
 
+/** Ask the node's NodeBootstrap for an identity turn now instead of at its cadence. */
+export async function requestThinStorageTurn(env: Env, nodeId: string) {
+  await env.NODE_BOOTSTRAP.get(
+    env.NODE_BOOTSTRAP.idFromName(`thin-storage:${nodeId}`),
+  ).thinStorageDue(nodeId);
+}
 export async function processNodeThinStorage(env: Env, nodeId: string) {
   const input = await prepareThinStorageLease(env, nodeId);
   if (!input) return;

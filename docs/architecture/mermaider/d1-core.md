@@ -112,5 +112,6 @@ erDiagram
 - [apps/api/migrations/0043_infrastructure_backup_attempts.sql:1](../../../apps/api/migrations/0043_infrastructure_backup_attempts.sql#L1)
 - [apps/api/migrations/0044_fleet_patch_superseded.sql:1](../../../apps/api/migrations/0044_fleet_patch_superseded.sql#L1)
 - [apps/api/migrations/0045_fleet_patch_confirmed_node.sql:1](../../../apps/api/migrations/0045_fleet_patch_confirmed_node.sql#L1)
+- [apps/api/migrations/0046_thin_authority_renewal.sql:1](../../../apps/api/migrations/0046_thin_authority_renewal.sql#L1)
 
 Freshness checks confirm the recorded source evidence and generated output. They do not establish live deployment or prove every semantic interpretation.

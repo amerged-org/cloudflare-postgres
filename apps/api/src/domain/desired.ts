@@ -26,6 +26,7 @@ import {
   desiredRegionStorageNodes,
   storageWriteAuthorityForDatabase,
 } from "./node-thin-storage.ts";
+import { desiredRegionStorageSamples } from "./node-thin-storage-samples.ts";
 interface DesiredRow extends DatabaseRow, DesiredSize {
   k8s_node_name: string;
   storage_startup_operation: string | null;
@@ -75,7 +76,8 @@ export async function desired(
           postgres_memory_request_mib: policy.postgres_memory_request_mib,
         }
       : undefined;
-  const storageNodes = await desiredRegionStorageNodes(c.env, region.id);
+  const storageNodes = await desiredRegionStorageNodes(c.env, region.id),
+    storageSamples = await desiredRegionStorageSamples(c.env, region.id);
   const result = await c.env.DB.prepare(
     `SELECT d.*,n.k8s_node_name,a.operation_id storage_startup_operation,a.generation storage_startup_generation,a.node_uid storage_startup_node_uid,a.storage_budget_bytes storage_startup_budget,s.memory_mib,s.cpu_millicores,s.cpu_request_millicores,s.storage_gib,s.max_connections,s.archive_timeout_seconds,s.backup_retention_days,
     (SELECT json_group_array(json_object('database_id',r.database_id,'name',r.name,'owner',r.owner,'password_revision',r.password_revision,'password_ciphertext',r.password_ciphertext,'password_iv',r.password_iv,'password_kid',r.password_kid)) FROM roles r WHERE r.database_id=d.id AND r.deleted_at IS NULL) roles_json,
@@ -262,6 +264,7 @@ export async function desired(
           ? { compute_pool: JSON.parse(policy.compute_pool_json) }
           : {}),
         ...(storageNodes.length ? { storage_nodes: storageNodes } : {}),
+        ...(storageSamples.length ? { storage_samples: storageSamples } : {}),
         ...(recoverySources === undefined
           ? {}
           : { recovery_sources: recoverySources }),

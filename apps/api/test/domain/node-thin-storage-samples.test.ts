@@ -1,0 +1,611 @@
+// SPDX-License-Identifier: Apache-2.0
+import { env } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
+import { afterEach, expect, it } from "vitest";
+import {
+  DatabaseStorageVolumeReceipt,
+  DatabaseWithOperation,
+  DesiredResponse,
+  NodeThinStorageAuthority,
+  StorageWriteClaims,
+  base64urlToBytes,
+  thinStorageClass,
+} from "@pgcf/contracts";
+import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
+import { cleanupFixtures, fixture, request } from "./fixtures.ts";
+import { thinExecutionFixture } from "./thin-execution-fixture.ts";
+
+const releases: string[] = [];
+afterEach(async () => {
+  await cleanupFixtures();
+  for (const id of releases.splice(0))
+    await env.DB.prepare("DELETE FROM fleet_releases WHERE id=?")
+      .bind(id)
+      .run();
+});
+const gib = 1024 ** 3,
+  mib = 1024 ** 2,
+  iso = (ms: number) => new Date(ms).toISOString();
+type Fixture = Awaited<ReturnType<typeof thinExecutionFixture>>;
+const lvs = {
+  pool: {
+    name: "pgcf_thinpool",
+    lv_uuid: "POOLLV-1234-1234-1234-1234-1234-ABCDEF",
+    size_bytes: 2 * gib,
+    segtype: "thin-pool",
+  },
+  data: {
+    name: "[pgcf_thinpool_tdata]",
+    lv_uuid: "TDATAX-1234-1234-1234-1234-1234-ABCDEF",
+    size_bytes: 2 * gib,
+    segtype: "linear",
+  },
+  meta: {
+    name: "[pgcf_thinpool_tmeta]",
+    lv_uuid: "TMETAX-1234-1234-1234-1234-1234-ABCDEF",
+    size_bytes: 128 * mib,
+    segtype: "linear",
+  },
+};
+/** An accepted identity proof, read now, as the slow loop records it. */
+async function identityProof(f: Fixture, overrides: object = {}) {
+  const now = Date.now();
+  const authority = NodeThinStorageAuthority.parse({
+    ...f.authority,
+    revision: 2,
+    observed_at: iso(now),
+    captured_at: iso(now),
+    expires_at: iso(now + f.profile.guard_seconds * 1000),
+    inventory_observed_at: iso(now),
+    inventory_expires_at: iso(now + 300_000),
+    inventory_revision: 2,
+    physical_lvs: [lvs.pool, lvs.data, lvs.meta],
+    ...overrides,
+  });
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET authority_revision=?,authority_json=?,authority_received_at=? WHERE node_id=?",
+  )
+    .bind(authority.revision, JSON.stringify(authority), iso(now), f.node)
+    .run();
+  return authority;
+}
+function sample(f: Fixture, nonce: string | null, overrides: object = {}) {
+  return {
+    nonce,
+    node_uid: f.uid,
+    captured_at: iso(Date.now()),
+    physical: {
+      ...f.authority.physical,
+      thin_pool: {
+        ...f.authority.physical.thin_pool!,
+        data_used_bytes_upper_bound: 64 * mib,
+        metadata_used_bytes_upper_bound: mib,
+      },
+    },
+    lvs: [{ name: "pgcf_thinpool", segtype: "thin-pool", size_bytes: 2 * gib }],
+    lv_count: 1,
+    witnesses: {
+      cluster_uid: f.authority.cluster_uid,
+      boot_id: f.qualified.bootId,
+      volume_group_uuid: f.authority.volume_group_uuid,
+      driver_pod_uid: f.authority.driver_pod_uid,
+      driver_image: f.authority.driver_image,
+    },
+    scrape_milliseconds: 140,
+    ...overrides,
+  };
+}
+async function post(f: Fixture, body: unknown, key = f.agent) {
+  const response = await request(
+    `/agent/v1/nodes/${f.node}/storage-headroom`,
+    key,
+    "POST",
+    body,
+  );
+  return {
+    status: response.status,
+    body: (await response.json()) as Record<string, unknown>,
+  };
+}
+async function row(f: Fixture) {
+  return (await env.DB.prepare(
+    "SELECT authority_revision,authority_json,status,error_code,sample_nonce,sample_nonce_issued_at,sample_observed_at,sample_data_used_bytes FROM node_thin_storage WHERE node_id=?",
+  )
+    .bind(f.node)
+    .first<{
+      authority_revision: number;
+      authority_json: string;
+      status: string;
+      error_code: string | null;
+      sample_nonce: string | null;
+      sample_nonce_issued_at: string | null;
+      sample_observed_at: string | null;
+      sample_data_used_bytes: number | null;
+    }>())!;
+}
+/** A first nonce: the request renews nothing. */
+async function nonce(f: Fixture) {
+  const first = await post(f, sample(f, null));
+  expect(first.status).toBe(200);
+  return NodeStorageHeadroomResponse.parse(first.body).nonce;
+}
+/** Whether this node's NodeBootstrap Durable Object was asked for an identity turn. */
+async function turnRequested(f: Fixture) {
+  return await runInDurableObject(
+    env.NODE_BOOTSTRAP.get(
+      env.NODE_BOOTSTRAP.idFromName(`thin-storage:${f.node}`),
+    ),
+    async (_instance, state) =>
+      (await state.storage.get<string>("thinStorageNodeId")) === f.node,
+  );
+}
+
+it("hands out a Cloudflare nonce and renews once against it, anchored at its issue", async () => {
+  const f = await thinExecutionFixture(releases),
+    proof = await identityProof(f);
+  const first = NodeStorageHeadroomResponse.parse(
+    (await post(f, sample(f, null))).body,
+  );
+  expect(first).toMatchObject({
+    accepted: false,
+    reason: "thin_storage_sample_nonce_invalid",
+    period_milliseconds: f.profile.guard_seconds * 200,
+    authority: null,
+    tokens: [],
+  });
+  const issued = await row(f);
+  expect(issued).toMatchObject({
+    sample_nonce: first.nonce,
+    authority_revision: proof.revision,
+  });
+  // A missing nonce is the normal start; it asks for no identity turn.
+  expect(await turnRequested(f)).toBe(false);
+
+  const renewed = NodeStorageHeadroomResponse.parse(
+    (await post(f, sample(f, first.nonce))).body,
+  );
+  const observed = Date.parse(issued.sample_nonce_issued_at!);
+  expect(renewed.accepted).toBe(true);
+  expect(renewed.nonce).not.toBe(first.nonce);
+  expect(renewed.authority).toMatchObject({
+    revision: proof.revision + 1,
+    observed_at: iso(observed),
+    expires_at: iso(observed + f.profile.guard_seconds * 1000),
+    write_allowed: true,
+    inventory_observed_at: proof.inventory_observed_at,
+    inventory_expires_at: proof.inventory_expires_at,
+    inventory_revision: proof.inventory_revision,
+    physical_lvs: proof.physical_lvs,
+    driver_pod_uid: proof.driver_pod_uid,
+  });
+  expect(
+    renewed.authority!.physical.thin_pool!.data_used_bytes_upper_bound,
+  ).toBe(64 * mib);
+  const stored = await row(f);
+  expect(JSON.parse(stored.authority_json)).toEqual(renewed.authority);
+  expect(stored).toMatchObject({
+    authority_revision: proof.revision + 1,
+    status: "ready",
+    sample_nonce: renewed.nonce,
+    sample_observed_at: iso(observed),
+    sample_data_used_bytes: 64 * mib,
+  });
+
+  // The nonce is used once.
+  const replay = NodeStorageHeadroomResponse.parse(
+    (await post(f, sample(f, first.nonce))).body,
+  );
+  expect(replay).toMatchObject({
+    accepted: false,
+    reason: "thin_storage_sample_nonce_invalid",
+  });
+  expect((await row(f)).authority_revision).toBe(proof.revision + 1);
+  // A nonce older than guard/2 at receipt renews nothing.
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET sample_nonce_issued_at=? WHERE node_id=?",
+  )
+    .bind(iso(Date.now() - f.profile.guard_seconds * 500 - 1000), f.node)
+    .run();
+  expect(
+    NodeStorageHeadroomResponse.parse(
+      (await post(f, sample(f, replay.nonce))).body,
+    ),
+  ).toMatchObject({
+    accepted: false,
+    reason: "thin_storage_sample_nonce_invalid",
+  });
+  expect((await row(f)).authority_revision).toBe(proof.revision + 1);
+});
+
+it("never renews beyond the identity proof", async () => {
+  const f = await thinExecutionFixture(releases),
+    now = Date.now();
+  const proof = await identityProof(f, {
+    expires_at: iso(now + 50_000),
+    inventory_observed_at: iso(now - 250_000),
+    inventory_expires_at: iso(now + 50_000),
+  });
+  const renewed = NodeStorageHeadroomResponse.parse(
+    (await post(f, sample(f, await nonce(f)))).body,
+  );
+  expect(renewed.authority!.expires_at).toBe(proof.inventory_expires_at);
+  // An expired identity proof renews nothing and asks for a slow turn at once.
+  await identityProof(f, {
+    revision: 4,
+    inventory_revision: 4,
+    observed_at: iso(now - 290_000),
+    captured_at: iso(now - 290_000),
+    expires_at: iso(now - 289_000),
+    inventory_observed_at: iso(now - 301_000),
+    inventory_expires_at: iso(now - 1000),
+  });
+  expect(
+    NodeStorageHeadroomResponse.parse(
+      (await post(f, sample(f, renewed.nonce))).body,
+    ),
+  ).toMatchObject({
+    accepted: false,
+    reason: "thin_storage_sample_identity_unavailable",
+  });
+  expect((await row(f)).authority_revision).toBe(4);
+  expect(await turnRequested(f)).toBe(true);
+});
+
+it("refuses a sample its witnesses, pool or volumes do not bind to the identity proof", async () => {
+  const f = await thinExecutionFixture(releases),
+    proof = await identityProof(f);
+  let current = await nonce(f);
+  const refused = async (overrides: object, reason: string) => {
+    const response = NodeStorageHeadroomResponse.parse(
+      (await post(f, sample(f, current, overrides))).body,
+    );
+    expect(response, JSON.stringify(overrides)).toMatchObject({
+      accepted: false,
+      reason,
+      authority: null,
+      tokens: [],
+    });
+    current = response.nonce;
+  };
+  const witnesses = sample(f, current).witnesses;
+  for (const changed of [
+    { boot_id: crypto.randomUUID() },
+    { driver_pod_uid: crypto.randomUUID() },
+    { cluster_uid: crypto.randomUUID() },
+    { driver_image: `registry.invalid/other@sha256:${"c".repeat(64)}` },
+  ])
+    await refused(
+      { witnesses: { ...witnesses, ...changed } },
+      "thin_storage_sample_witness_changed",
+    );
+  await refused(
+    { node_uid: crypto.randomUUID() },
+    "thin_storage_sample_witness_changed",
+  );
+  const pool = sample(f, current).physical;
+  await refused(
+    {
+      physical: {
+        ...pool,
+        thin_pool: { ...pool.thin_pool, metadata_total_bytes: 64 * mib },
+      },
+    },
+    "thin_storage_sample_pool_changed",
+  );
+  await refused(
+    {
+      physical: {
+        ...pool,
+        thin_pool: {
+          ...pool.thin_pool,
+          data_total_bytes: gib,
+          data_used_bytes_upper_bound: 0,
+        },
+      },
+    },
+    "thin_storage_sample_pool_changed",
+  );
+  await refused(
+    { physical: { ...pool, thin_pool: null } },
+    "thin_storage_sample_pool_changed",
+  );
+  // A linear LV the identity proof never read, or a new thin LV without a startup hold.
+  const base = sample(f, current).lvs;
+  for (const lv of [
+    { name: "pvc-unknown", segtype: "linear", size_bytes: gib },
+    { name: "pvc-new", segtype: "thin", size_bytes: gib },
+    { name: "pgcf_thinpool", segtype: "linear", size_bytes: gib },
+  ])
+    await refused(
+      {
+        lvs: [...base.filter((v) => v.name !== lv.name), lv],
+        lv_count: lv.name === "pgcf_thinpool" ? 1 : 2,
+      },
+      "thin_storage_sample_volumes_changed",
+    );
+  expect((await row(f)).authority_revision).toBe(proof.revision);
+  expect(await turnRequested(f)).toBe(true);
+  // A matching sample still renews.
+  expect(
+    NodeStorageHeadroomResponse.parse((await post(f, sample(f, current))).body)
+      .accepted,
+  ).toBe(true);
+});
+
+it("decides write_allowed on the fresh reading with today's headroom rule and asks for growth", async () => {
+  const f = await thinExecutionFixture(releases),
+    proof = await identityProof(f);
+  const pool = sample(f, null).physical;
+  // 64 MiB free is below the 256 MiB data reserve; the 2 GiB pool can still grow to 32 GiB.
+  const full = NodeStorageHeadroomResponse.parse(
+    (
+      await post(
+        f,
+        sample(f, await nonce(f), {
+          physical: {
+            ...pool,
+            thin_pool: {
+              ...pool.thin_pool,
+              data_used_bytes_upper_bound: 2 * gib - 64 * mib,
+            },
+          },
+        }),
+      )
+    ).body,
+  );
+  expect(full.accepted).toBe(true);
+  expect(full.authority).toMatchObject({
+    revision: proof.revision + 1,
+    write_allowed: false,
+  });
+  expect(full.tokens).toEqual([]);
+  expect((await row(f)).status).toBe("blocked");
+  expect(await turnRequested(f)).toBe(true);
+  // The larger pool after growth renews with writes allowed again.
+  const grown = NodeStorageHeadroomResponse.parse(
+    (
+      await post(
+        f,
+        sample(f, full.nonce, {
+          physical: {
+            ...pool,
+            free_bytes: pool.free_bytes - 2 * gib,
+            thin_pool: {
+              ...pool.thin_pool,
+              data_total_bytes: 4 * gib,
+              data_used_bytes_upper_bound: 2 * gib - 64 * mib,
+            },
+          },
+          lvs: [
+            {
+              name: "pgcf_thinpool",
+              segtype: "thin-pool",
+              size_bytes: 4 * gib,
+            },
+          ],
+        }),
+      )
+    ).body,
+  );
+  expect(grown.authority).toMatchObject({
+    revision: proof.revision + 2,
+    write_allowed: true,
+  });
+  expect((await row(f)).status).toBe("ready");
+});
+
+it("returns the renewed token of every thin database on the node", async () => {
+  const f = await thinExecutionFixture(releases);
+  // A 16 GiB pool admits the 5 GiB startup hold of one new database.
+  const physical = {
+    ...f.authority.physical,
+    free_bytes: 80 * gib,
+    thin_pool: {
+      ...f.authority.physical.thin_pool!,
+      data_total_bytes: 16 * gib,
+    },
+  };
+  await identityProof(f, { physical });
+  const created = DatabaseWithOperation.parse(
+    await (await f.create()).json(),
+  ).database;
+  const receipt = DatabaseStorageVolumeReceipt.parse({
+    storage_generation: 1,
+    storage_uid: crypto.randomUUID(),
+    namespace_uid: crypto.randomUUID(),
+    cluster_uid: crypto.randomUUID(),
+    node_uid: f.uid,
+    volume_group_uuid: f.authority.volume_group_uuid,
+    pool_uuid: f.authority.pool_uuid,
+    volume_handle: `pvc-${crypto.randomUUID()}`,
+    lv_uuid: "VOLUMX-1234-1234-1234-1234-1234-ABCDEF",
+    pvc_uid: crypto.randomUUID(),
+    pv_uid: crypto.randomUUID(),
+  });
+  expect(
+    (
+      await env.DB.prepare(
+        "UPDATE databases SET storage_volume_json=? WHERE id=? AND node_id=?",
+      )
+        .bind(JSON.stringify(receipt), created.id, f.node)
+        .run()
+    ).meta.changes,
+  ).toBe(1);
+  const pod = crypto.randomUUID();
+  const proof = await identityProof(f, {
+    physical,
+    physical_lvs: [
+      lvs.pool,
+      lvs.data,
+      lvs.meta,
+      {
+        name: receipt.volume_handle,
+        lv_uuid: receipt.lv_uuid,
+        size_bytes: 5 * gib,
+        segtype: "thin",
+      },
+    ],
+    active_lv_uuids: [receipt.lv_uuid],
+    volumes: [
+      {
+        database_id: created.id,
+        generation: created.generation,
+        storage_generation: 1,
+        storage_uid: receipt.storage_uid,
+        namespace_uid: receipt.namespace_uid,
+        cluster_uid: receipt.cluster_uid,
+        volume_handle: receipt.volume_handle,
+        lv_uuid: receipt.lv_uuid,
+        pvc_uid: receipt.pvc_uid,
+        pv_uid: receipt.pv_uid,
+        storage_class: thinStorageClass(f.authority.profile_sha256),
+        volume_attributes_class: thinStorageClass(f.authority.profile_sha256),
+        io: [
+          {
+            pod_uid: pod,
+            write_bytes_per_second: f.profile.write_bytes_per_second,
+            write_iops_per_second: f.profile.write_iops_per_second,
+          },
+        ],
+      },
+    ],
+  });
+  const renewed = NodeStorageHeadroomResponse.parse(
+    (
+      await post(
+        f,
+        sample(f, await nonce(f), {
+          physical: {
+            ...physical,
+            thin_pool: {
+              ...physical.thin_pool,
+              data_used_bytes_upper_bound: gib,
+              metadata_used_bytes_upper_bound: mib,
+            },
+          },
+          lvs: [
+            {
+              name: "pgcf_thinpool",
+              segtype: "thin-pool",
+              size_bytes: 16 * gib,
+            },
+            {
+              name: receipt.volume_handle,
+              segtype: "thin",
+              size_bytes: 5 * gib,
+            },
+          ],
+          lv_count: 2,
+        }),
+      )
+    ).body,
+  );
+  expect(renewed.accepted).toBe(true);
+  expect(renewed.tokens).toHaveLength(1);
+  expect(renewed.tokens[0]!.database_id).toBe(created.id);
+  const claims = StorageWriteClaims.parse(
+    JSON.parse(
+      new TextDecoder().decode(
+        base64urlToBytes(renewed.tokens[0]!.token.split(".")[1]!)!,
+      ),
+    ),
+  );
+  expect(claims).toMatchObject({
+    database_id: created.id,
+    authority_revision: proof.revision + 1,
+    pod_uid: pod,
+    lv_uuid: receipt.lv_uuid,
+    observed_at: Date.parse(renewed.authority!.observed_at),
+    exp: Date.parse(renewed.authority!.expires_at),
+    write_allowed: true,
+  });
+});
+
+it("names each sampled thin node in the desired region and nothing for regions without thin storage", async () => {
+  const f = await thinExecutionFixture(releases);
+  await identityProof(f);
+  const desired = DesiredResponse.parse(
+    await (await request("/agent/v1/desired", f.agent)).json(),
+  );
+  expect(desired.region.storage_samples).toEqual([
+    {
+      node_id: f.node,
+      name: f.nodeName,
+      node_uid: f.uid,
+      period_milliseconds: f.profile.guard_seconds * 200,
+      qualification_run: null,
+    },
+  ]);
+  // A hard-blocked node is not sampled.
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET status='blocked',error_code='thin_storage_driver_unqualified' WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  expect(
+    DesiredResponse.parse(
+      await (await request("/agent/v1/desired", f.agent)).json(),
+    ).region,
+  ).not.toHaveProperty("storage_samples");
+  const thick = await fixture();
+  const region = (await (
+    await request("/agent/v1/desired", thick.agent)
+  ).json()) as { region: Record<string, unknown> };
+  expect(region.region).not.toHaveProperty("storage_samples");
+  expect(region.region).not.toHaveProperty("storage_nodes");
+});
+
+it("authenticates the region agent and samples only selected thin nodes of its region", async () => {
+  const f = await thinExecutionFixture(releases);
+  await identityProof(f);
+  expect((await post(f, sample(f, null), f.integrator)).status).toBe(401);
+  expect((await post(f, sample(f, null), f.foreignAgent)).status).toBe(404);
+  expect((await post(f, { ...sample(f, null), lv_count: 2 })).status).toBe(400);
+  const thick = await fixture();
+  const response = await request(
+    `/agent/v1/nodes/${thick.node}/storage-headroom`,
+    thick.agent,
+    "POST",
+    sample(f, null),
+  );
+  expect(response.status).toBe(404);
+});
+
+it("migration 0046 leaves existing selections unsampled and stores only paired 128-bit nonces", async () => {
+  const f = await thinExecutionFixture(releases),
+    at = iso(Date.now());
+  expect(
+    await env.DB.prepare(
+      "SELECT sample_nonce,sample_nonce_issued_at,sample_observed_at,sample_data_used_bytes FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first(),
+  ).toEqual({
+    sample_nonce: null,
+    sample_nonce_issued_at: null,
+    sample_observed_at: null,
+    sample_data_used_bytes: null,
+  });
+  const update = (sql: string, ...values: unknown[]) =>
+    env.DB.prepare(`UPDATE node_thin_storage SET ${sql} WHERE node_id=?`)
+      .bind(...values, f.node)
+      .run();
+  for (const [nonce, issued] of [
+    ["0123456789ABCDEF0123456789abcdef", at],
+    ["0123456789abcdef", at],
+    ["0123456789abcdef0123456789abcdef", null],
+    [null, at],
+  ])
+    await expect(
+      update("sample_nonce=?,sample_nonce_issued_at=?", nonce, issued),
+    ).rejects.toThrow(/CHECK/);
+  await expect(
+    update("sample_observed_at=?,sample_data_used_bytes=NULL", at),
+  ).rejects.toThrow(/CHECK/);
+  await update(
+    "sample_nonce=?,sample_nonce_issued_at=?,sample_observed_at=?,sample_data_used_bytes=0",
+    "0123456789abcdef0123456789abcdef",
+    at,
+    at,
+  );
+});

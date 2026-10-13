@@ -460,6 +460,21 @@ export class NodeBootstrap extends DurableObject<Env> {
       ),
     );
   }
+  /** Cloudflare needs an identity proof now: a refused sample, a needed growth or a ready thin
+   * database without a receipt. A turn already running keeps running; the next one starts now. */
+  async thinStorageDue(nodeId: string) {
+    NodeId.parse(nodeId);
+    if (
+      !this.ctx.id.equals(
+        this.env.NODE_BOOTSTRAP.idFromName(`thin-storage:${nodeId}`),
+      )
+    )
+      throw new Error("thin_storage_container_identity_mismatch");
+    await this.ctx.storage.put("thinStorageNodeId", nodeId);
+    const alarm = await this.ctx.storage.getAlarm(),
+      now = Date.now();
+    if (alarm === null || alarm > now) await this.ctx.storage.setAlarm(now);
+  }
   /** One bounded scratch qualification turn in this run's own container. */
   async thinQualification(runId: string, step: string) {
     OperationId.parse(runId);
