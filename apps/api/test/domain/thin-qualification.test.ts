@@ -49,6 +49,7 @@ import {
   prepareThinQualificationTurn,
   recordThinQualificationCheckpoint,
   recordThinQualificationReport,
+  thinQualificationInput,
 } from "../../src/domain/thin-qualification.ts";
 
 const releases: string[] = [];
@@ -79,7 +80,11 @@ const profile = ThinStorageProfile.parse({
   maximum_quota_gib: 7,
 });
 /** A release pinning the thin guard, native controller and gateway, driver, host extension and PostgreSQL. */
-function guardedSpec(keys: string, driverImage = profile.driver_image) {
+function guardedSpec(
+  keys: string,
+  driverImage = profile.driver_image,
+  sampling = true,
+) {
   const names = [
     "api",
     "edge",
@@ -141,20 +146,25 @@ function guardedSpec(keys: string, driverImage = profile.driver_image) {
     version: 1,
     versions_lock_sha256: "f".repeat(64),
     configuration_schema_revision: 1,
+    ...(sampling ? { thin_storage_sampling_version: 1 } : {}),
     storage_authority_keys_sha256: keys,
     components,
     roles: { control_relay: role, customer: structuredClone(role) },
   });
 }
 /** A current customer node with closed placement, assigned to a guard-pinned release with sealed region material. */
-async function qualificationSetup() {
+async function qualificationSetup(sampling = true) {
   const f = await fixture(),
     at = new Date().toISOString(),
     uid = (await env.DB.prepare("SELECT node_uid FROM nodes WHERE id=?")
       .bind(f.node)
       .first<string>("node_uid"))!,
     release = `qualified-base-${crypto.randomUUID()}`,
-    spec = guardedSpec((await storageAuthorityPublicKeys(env)).sha256),
+    spec = guardedSpec(
+      (await storageAuthorityPublicKeys(env)).sha256,
+      profile.driver_image,
+      sampling,
+    ),
     specSha = await installationHash(spec),
     clusterUid = crypto.randomUUID();
   releases.push(release);
@@ -186,6 +196,20 @@ async function qualificationSetup() {
     env.DB.prepare(
       "INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) VALUES(?,?,?,'customer',1,?)",
     ).bind(f.node, uid, release, at),
+    env.DB.prepare(
+      "INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at) VALUES(?,?,?,?,?,?,?,1,1,1,'192.0.2.18','[]',1,'complete','confirmed',?,?,?)",
+    ).bind(
+      newOperationId(),
+      f.node,
+      f.region,
+      uid,
+      clusterUid,
+      release,
+      specSha,
+      at,
+      at,
+      at,
+    ),
   ]);
   await storeRegionJoinBundle(
     env.DB,
@@ -261,6 +285,29 @@ async function qualificationSetup() {
     },
   };
 }
+it("refuses qualification and hides its targets before the sampling release converges", async () => {
+  const f = await qualificationSetup(false);
+  expect(
+    (await f.start({ node_uid: f.uid, address: "192.0.2.18", profile })).status,
+  ).toBe(409);
+  const material = thinQualificationFixture(profile, {
+    node_uid: f.uid,
+    cluster_uid: f.clusterUid,
+    host_extension_image: hostImage,
+    kernel_version: "6.18.51-talos",
+    at: new Date().toISOString(),
+  });
+  await insertRunning(f, "data_full", material.setup);
+  await env.DB.prepare(
+    "UPDATE node_region_policies SET compute_pool_json=NULL WHERE region_id=?",
+  )
+    .bind(f.region)
+    .run();
+  const old = DesiredResponse.parse(
+    await (await request("/agent/v1/desired", f.agent)).json(),
+  );
+  expect(old.region).not.toHaveProperty("storage_samples");
+});
 async function insertRunning(
   f: Awaited<ReturnType<typeof qualificationSetup>>,
   step: ThinQualificationRun["step"],
@@ -1143,6 +1190,7 @@ it("records a running qualification's samples against its setup identity and ren
       qualification_run: id,
     },
   ]);
+  await journalConfirmed(id, "noflush_quiescence:suspend");
   const first = await postSample(f, qualificationSample(f, setup, null));
   expect(first).toMatchObject({
     accepted: false,
@@ -1215,6 +1263,148 @@ it("records a running qualification's samples against its setup identity and ren
       .bind(id, "f".repeat(32), issued, issued)
       .run(),
   ).rejects.toThrow("thin_storage_qualification_terminal");
+});
+
+it("records qualification samples only inside a journaled window with an active turn lease", async () => {
+  const f = await qualificationSetup(),
+    setup = thinQualificationFixture(profile, {
+      node_uid: f.uid,
+      cluster_uid: f.clusterUid,
+      host_extension_image: hostImage,
+      kernel_version: "6.18.51-talos",
+      at: new Date().toISOString(),
+    }).setup,
+    id = await insertRunning(f, "noflush_quiescence", setup);
+  const count = () =>
+    env.DB.prepare(
+      "SELECT COUNT(*) n FROM thin_storage_qualification_samples WHERE run_id=?",
+    )
+      .bind(id)
+      .first<number>("n");
+
+  await sampled(f, setup);
+  expect(await count()).toBe(0);
+  await journalConfirmed(id, "noflush_quiescence:suspend");
+  await sampled(f, setup);
+  expect(await count()).toBe(1);
+
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET lease_expires_at=? WHERE id=?",
+  )
+    .bind(new Date(Date.now() - 1000).toISOString(), id)
+    .run();
+  await sampled(f, setup);
+  expect(await count()).toBe(1);
+
+  await renewLease(id);
+  await journalConfirmed(id, "noflush_quiescence:frozen");
+  await sampled(f, setup);
+  expect(await count()).toBe(1);
+});
+
+it("does not judge a startup sample answered after the bulk load as evidence during the load", async () => {
+  const f = await qualificationSetup(),
+    evidence = thinQualificationFixture(profile, {
+      node_uid: f.uid,
+      cluster_uid: f.clusterUid,
+      host_extension_image: hostImage,
+      kernel_version: "6.18.51-talos",
+      at: new Date().toISOString(),
+    }),
+    id = await insertRunning(f, "startup_bound", evidence.setup);
+  await journalConfirmed(id, "startup_bound:ready");
+  const first = await postSample(
+      f,
+      qualificationSample(f, evidence.setup, null),
+    ),
+    issued = String((await run(id)).sample_nonce_issued_at);
+  await journalConfirmed(id, "startup_bound:loaded");
+  expect(
+    await postSample(f, qualificationSample(f, evidence.setup, first.nonce)),
+  ).toMatchObject({ accepted: true, authority: null, tokens: [] });
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) n FROM thin_storage_qualification_samples WHERE run_id=?",
+    )
+      .bind(id)
+      .first<number>("n"),
+  ).toBe(0);
+
+  // Existing evidence from before the window fix is filtered in the gate's SQL read too.
+  const journal = JSON.parse(String((await run(id)).journal_json)) as {
+    entries: { key: string; received_at: string }[];
+  };
+  const loaded = journal.entries.find(
+    (entry) => entry.key === "startup_bound:loaded",
+  )!;
+  await env.DB.prepare(
+    "INSERT INTO thin_storage_qualification_samples(run_id,nonce,observed_at,received_at,scrape_milliseconds) VALUES(?,?,?,?,1)",
+  )
+    .bind(
+      id,
+      "d".repeat(32),
+      issued,
+      new Date(Date.parse(loaded.received_at) + 1).toISOString(),
+    )
+    .run();
+  await recordThinQualificationReport(env, id, {
+    step: "startup_bound",
+    evidence: observedPart(evidence.evidence.startup_bound),
+  });
+  const failed = await run(id);
+  expect(failed.error_code).toBe("thin_qualification_startup_bound_failed");
+  expect(
+    (JSON.parse(String(failed.gates_json)) as ThinQualificationGates)
+      .startup_bound?.evidence,
+  ).not.toHaveProperty("longest_sample_interval_milliseconds");
+});
+
+it("stops qualification sampling and measurement custody when its sampling release loses confirmation", async () => {
+  const f = await qualificationSetup(),
+    setup = thinQualificationFixture(profile, {
+      node_uid: f.uid,
+      cluster_uid: f.clusterUid,
+      host_extension_image: hostImage,
+      kernel_version: "6.18.51-talos",
+      at: new Date().toISOString(),
+    }).setup,
+    id = await insertRunning(f, "noflush_quiescence", setup);
+  await journalConfirmed(id, "noflush_quiescence:suspend");
+  const first = await postSample(f, qualificationSample(f, setup, null));
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET state='halted',error_code='patch_command_failed' WHERE node_id=?",
+  )
+    .bind(f.node)
+    .run();
+  const refusal = await thinQualificationInput(env, id).then(
+    () => null,
+    (error: Error) => error.message,
+  );
+  expect(refusal).toContain("lease or identity changed");
+  const response = await request(
+    `/agent/v1/nodes/${f.node}/storage-headroom`,
+    f.agent,
+    "POST",
+    qualificationSample(f, setup, first.nonce),
+  );
+  expect(response.status).toBe(404);
+  expect(await run(id)).toMatchObject({ sample_nonce: first.nonce });
+  expect(
+    await env.DB.prepare(
+      "SELECT COUNT(*) n FROM thin_storage_qualification_samples WHERE run_id=?",
+    )
+      .bind(id)
+      .first<number>("n"),
+  ).toBe(0);
+
+  await env.DB.prepare(
+    "UPDATE thin_storage_qualification_runs SET step='cleanup' WHERE id=?",
+  )
+    .bind(id)
+    .run();
+  expect(await thinQualificationInput(env, id)).toMatchObject({
+    run: { id, step: "cleanup" },
+  });
 });
 
 it("fails startup_bound without an accepted sample during the bulk load and judges noflush only while suspended", async () => {

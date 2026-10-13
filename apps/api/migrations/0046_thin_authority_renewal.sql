@@ -1,6 +1,9 @@
 -- SPDX-License-Identifier: Apache-2.0
 -- Headroom samples from the region renew thin write authority against a nonce Cloudflare issued with
 -- its own clock: 128 random bits per node, used once and refused when older than guard/2.
+-- Fast readings never overwrite the pool geometry established by the identity proof.
+ALTER TABLE node_thin_storage ADD COLUMN inventory_physical_json TEXT
+  CHECK (inventory_physical_json IS NULL OR json_valid(inventory_physical_json));
 ALTER TABLE node_thin_storage ADD COLUMN sample_nonce TEXT
   CHECK (sample_nonce IS NULL OR (length(sample_nonce) = 32 AND sample_nonce NOT GLOB '*[^a-f0-9]*'));
 ALTER TABLE node_thin_storage ADD COLUMN sample_nonce_issued_at TEXT

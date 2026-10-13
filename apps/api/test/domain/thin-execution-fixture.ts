@@ -21,6 +21,7 @@ import type { Env } from "../../src/env.ts";
 export async function thinExecutionFixture(
   releases: string[],
   profileOverrides: Partial<ThinStorageProfile> = {},
+  sampling = true,
 ) {
   const local = {
     ...env,
@@ -97,9 +98,10 @@ export async function thinExecutionFixture(
     postgres_memory_request_mib: 128,
   });
   await env.DB.batch([
-    env.DB.prepare(
-      "UPDATE nodes SET provider_instance_id='fixture-retained-instance' WHERE id=?",
-    ).bind(f.node),
+    env.DB.prepare("UPDATE nodes SET provider_instance_id=? WHERE id=?").bind(
+      `fixture-retained-${f.node}`,
+      f.node,
+    ),
     env.DB.prepare(
       "INSERT INTO node_memory_samples(node_id,node_uid,minute,observed_at,working_set_bytes,capacity_memory_bytes,available_bytes,memory_pressure) VALUES(?,?,?,?,?,?,?,0)",
     ).bind(
@@ -132,7 +134,10 @@ export async function thinExecutionFixture(
     f.node,
     profile,
     authority.cluster_uid,
-    { storageKeysSha256: (await storageAuthorityPublicKeys(local)).sha256 },
+    {
+      storageKeysSha256: (await storageAuthorityPublicKeys(local)).sha256,
+      sampling,
+    },
   );
   releases.push(qualified.releaseId);
   const policy = {

@@ -10,6 +10,7 @@ import {
   ThinStorageProfile,
   DatabaseWithOperation,
   thinStorageClass,
+  newOperationId,
 } from "@pgcf/contracts";
 import { FleetReleaseSpec } from "@pgcf/contracts/releases";
 import { NodeThinStorageState } from "@pgcf/contracts/node-thin-storage";
@@ -27,6 +28,7 @@ import {
 import { configureNodeRegionPolicy } from "../../src/domain/node-state.ts";
 import { storageAuthorityPublicKeys } from "../../src/domain/storage-authority.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
+import { identityProof } from "./thin-renewal-fixture.ts";
 import {
   installationHash,
   canonicalInstallation,
@@ -43,7 +45,7 @@ afterEach(async () => {
       .bind(id)
       .run();
 });
-async function setup() {
+async function setup(sampling = true) {
   const f = await fixture(),
     uid = crypto.randomUUID(),
     cuid = crypto.randomUUID(),
@@ -108,6 +110,7 @@ async function setup() {
       version: 1,
       versions_lock_sha256: "d".repeat(64),
       configuration_schema_revision: 1,
+      ...(sampling ? { thin_storage_sampling_version: 1 } : {}),
       storage_authority_keys_sha256: (
         await storageAuthorityPublicKeys(selected)
       ).sha256,
@@ -137,6 +140,20 @@ async function setup() {
     env.DB.prepare(
       "INSERT INTO fleet_node_releases(node_id,node_uid,release_id,role,revision,updated_at) VALUES(?,?,?,'customer',1,?)",
     ).bind(f.node, uid, release, at),
+    env.DB.prepare(
+      "INSERT INTO fleet_patch_operations(operation_id,node_id,region_id,node_uid,cluster_uid,release_id,spec_sha256,assignment_revision,region_revision,material_revision,address,cluster_nodes_json,revision,stage,state,created_at,updated_at,deadline_at) VALUES(?,?,?,?,?,?,?,1,1,1,'192.0.2.18','[]',1,'complete','confirmed',?,?,?)",
+    ).bind(
+      newOperationId(),
+      f.node,
+      f.region,
+      uid,
+      cuid,
+      release,
+      await installationHash(spec),
+      at,
+      at,
+      at,
+    ),
   ]);
   await storeRegionJoinBundle(
     env.DB,
@@ -205,6 +222,15 @@ async function setup() {
   };
   return { ...f, selected, uid, cuid, body, profile, call };
 }
+it("refuses a thin selection before the sampling-controller release is confirmed", async () => {
+  const f = await setup(false);
+  expect((await f.call("PUT", f.body)).status).toBe(409);
+  expect(
+    await env.DB.prepare("SELECT 1 FROM node_thin_storage WHERE node_id=?")
+      .bind(f.node)
+      .first(),
+  ).toBeNull();
+});
 it("exposes an authenticated CAS profile API and idempotent replay without authorizing physical writes or placement", async () => {
   const f = await setup();
   expect((await f.call("GET")).status).toBe(404);
@@ -546,6 +572,57 @@ it("preserves an uncertain dispatched pool write and only clears an expired know
       .bind(f.node)
       .first("action_json"),
   ).toBeNull();
+});
+it("selects against stable inventory when a fast renewal wins between read and commit", async () => {
+  const f = await thinExecutionFixture(releaseIds);
+  const hash = await installationHash(thinVolumeProfile(f.profile));
+  Object.assign(f.authority, {
+    profile_sha256: hash,
+    storage_class: thinStorageClass(hash),
+  });
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET profile_sha256=?,authority_json=? WHERE node_id=?",
+  )
+    .bind(hash, JSON.stringify(f.authority), f.node)
+    .run();
+  const proof = await identityProof(f);
+  let renew = true;
+  // The real D1 batch is delayed by one concurrently committed headroom revision.
+  const local = {
+    ...f.local,
+    DB: new Proxy(env.DB, {
+      get(target, key) {
+        if (key === "batch")
+          return async (statements: D1PreparedStatement[]) => {
+            if (renew) {
+              renew = false;
+              await env.DB.prepare(
+                "UPDATE node_thin_storage SET authority_revision=?,authority_json=? WHERE node_id=?",
+              )
+                .bind(
+                  proof.revision + 1,
+                  JSON.stringify({ ...proof, revision: proof.revision + 1 }),
+                  f.node,
+                )
+                .run();
+            }
+            return target.batch(statements);
+          };
+        const value = Reflect.get(target, key, target);
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    }),
+  };
+  expect(
+    await configureNodeThinStorage(local, f.node, {
+      expected_revision: 1,
+      node_uid: f.uid,
+      address: "192.0.2.18",
+      volume_group_uuid: f.authority.volume_group_uuid,
+      profile: f.profile,
+      allow_new_databases: false,
+    }),
+  ).toMatchObject({ revision: 2, status: "selected" });
 });
 it("preserves the standing regional template when omitted and clears only explicit null", async () => {
   const f = await setup(),

@@ -33,6 +33,10 @@ import {
   type ThinQualificationGate,
 } from "@pgcf/contracts/thin-qualification";
 import { ApiError } from "../app.ts";
+import {
+  thinStorageSamplingCapable,
+  thinStorageSamplingSql,
+} from "./fleet-releases.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { bearer, requireScope } from "../middleware/auth.ts";
 import { withIdempotency } from "../middleware/idempotency.ts";
@@ -216,6 +220,10 @@ export async function startThinQualification(
         return conflict(
           "Qualification requires the current ready customer node with database placement disabled, fresh observations and its region release",
         );
+      if (!(await thinStorageSamplingCapable(env.DB, source.region_id)))
+        return conflict(
+          "Qualification requires the confirmed sampling-controller release",
+        );
       if (!source.pool_enabled)
         return conflict("Thin qualification requires the region compute pool");
       if (source.thin_selected)
@@ -271,7 +279,7 @@ export async function startThinQualification(
           `INSERT INTO thin_storage_qualification_runs(id,node_id,region_id,node_uid,cluster_uid,address,release_id,spec_sha256,assignment_revision,region_revision,material_revision,profile_json,profile_sha256,driver_image,host_extension_image,postgres_image,step,status,created_at,updated_at)
           SELECT ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'setup','running',?,? FROM nodes n JOIN regions r ON r.id=n.region_id JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid
           JOIN fleet_region_releases f ON f.region_id=n.region_id AND f.release_id=a.release_id
-          WHERE ${freshNodeSql} AND a.release_id=? AND a.revision=? AND f.revision=? AND r.bootstrap_material_revision=?
+          WHERE ${freshNodeSql} AND ${thinStorageSamplingSql("r")} AND a.release_id=? AND a.revision=? AND f.revision=? AND r.bootstrap_material_revision=?
             AND EXISTS(SELECT 1 FROM node_region_policies p WHERE p.region_id=n.region_id AND p.compute_pool_json IS NOT NULL)
             AND NOT EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=n.id)`,
         ).bind(
@@ -445,7 +453,7 @@ export async function thinQualificationInput(
     LEFT JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid
     LEFT JOIN fleet_region_releases f ON f.region_id=n.region_id
     WHERE n.id=? AND n.node_uid=? AND n.region_id=? AND n.lost_at IS NULL AND n.provider_instance_id IS NOT NULL
-      AND (?=1 OR (n.database_placement_enabled=0 AND a.release_id=? AND a.revision=? AND f.release_id=a.release_id AND f.revision=? AND r.bootstrap_material_revision=?))`,
+      AND (?=1 OR (n.database_placement_enabled=0 AND a.release_id=? AND a.revision=? AND f.release_id=a.release_id AND f.revision=? AND r.bootstrap_material_revision=? AND ${thinStorageSamplingSql("r")}))`,
   )
     .bind(
       row.node_id,
@@ -600,9 +608,9 @@ async function sampleEvidence(
   if (!(to > from)) return {};
   const samples = (
     await env.DB.prepare(
-      "SELECT observed_at,received_at FROM thin_storage_qualification_samples WHERE run_id=? ORDER BY observed_at",
+      "SELECT observed_at,received_at FROM thin_storage_qualification_samples WHERE run_id=? AND observed_at>=? AND received_at<=? ORDER BY observed_at",
     )
-      .bind(row.id)
+      .bind(row.id, new Date(from).toISOString(), new Date(to).toISOString())
       .all<{ observed_at: string; received_at: string }>()
   ).results.map((sample) => ({
     observed: Date.parse(sample.observed_at),

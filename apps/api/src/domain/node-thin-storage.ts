@@ -7,12 +7,14 @@ import {
   ThinStorageProfile,
   signStorageWriteAuthority,
   thinStorageAuthorityMatches,
+  thinStorageInventory,
   thinStorageVolumeReclaimed,
   type StorageWriteClaims,
 } from "@pgcf/contracts";
 import type { Env } from "../env.ts";
 import type { DatabaseRow } from "./rows.ts";
 import { nodeProofSigningKey } from "./node-proof-session.ts";
+import { thinStorageSamplingCapable } from "./fleet-releases.ts";
 import {
   currentStorageStopSql,
   storageDrainReservationStatement,
@@ -33,6 +35,7 @@ export interface NodeThinStorageRow {
   authority_revision: number;
   authority_json: string | null;
   authority_received_at: string | null;
+  inventory_physical_json: string | null;
   lease_id: string | null;
   lease_revision: number;
   lease_expires_at: string | null;
@@ -143,6 +146,7 @@ export async function desiredRegionStorageNodes(
   regionId: string,
   now = Date.now(),
 ): Promise<NodeThinStorageAuthority[]> {
+  const samplingCapable = await thinStorageSamplingCapable(env.DB, regionId);
   const rows = await env.DB.prepare(
     "SELECT t.node_id FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id WHERE n.region_id=? ORDER BY n.id",
   )
@@ -151,7 +155,11 @@ export async function desiredRegionStorageNodes(
   const result: NodeThinStorageAuthority[] = [];
   for (const row of rows.results) {
     const current = await readCurrentNodeThinStorage(env, row.node_id, now);
-    if (current?.authority) result.push(current.authority);
+    if (
+      current?.authority &&
+      (samplingCapable || current.authority.inventory_observed_at === undefined)
+    )
+      result.push(current.authority);
   }
   return result;
 }
@@ -196,8 +204,14 @@ async function heldWriterPod(
     runtime.pv_uid !== receipt.pv_uid
   )
     return undefined;
+  const volume = authority.volumes.find(
+    (value) =>
+      value.database_id === database.id &&
+      value.generation === database.generation &&
+      value.storage_generation === receipt.storage_generation,
+  );
   const hold = await env.DB.prepare(
-    "SELECT 1 held FROM database_start_admissions WHERE database_id=? AND generation=? AND node_id=? AND node_uid=? AND budget_bytes>0 AND storage_budget_bytes>=?",
+    "SELECT h.ready_at,CASE WHEN o.status='succeeded' THEN o.completed_at ELSE NULL END completed_at FROM database_start_admissions h JOIN operations o ON o.id=h.operation_id WHERE h.database_id=? AND h.generation=? AND h.node_id=? AND h.node_uid=? AND h.budget_bytes>0 AND h.storage_budget_bytes>=?",
   )
     .bind(
       database.id,
@@ -206,14 +220,32 @@ async function heldWriterPod(
       storage.node_uid,
       lv.size_bytes,
     )
-    .first<number>("held");
-  return hold === 1 ? runtime.pod_uid : undefined;
+    .first<{ ready_at: string | null; completed_at: string | null }>();
+  if (!hold) return undefined;
+  const readyAt = Math.min(
+    runtime.observed_at,
+    hold.ready_at ? Date.parse(hold.ready_at) : Infinity,
+    hold.completed_at ? Date.parse(hold.completed_at) : Infinity,
+  );
+  // The startup hold covers the interval before the first post-Ready IO readback only.
+  // Fast headroom renewals must not turn old inventory into that post-Ready proof.
+  // Completed startup time remains stable when the controller refreshes its attestation.
+  if (
+    volume &&
+    !volume.quiesced &&
+    volume.io.length === 0 &&
+    authority.active_lv_uuids.includes(receipt.lv_uuid) &&
+    thinStorageInventory(authority).observed_at > readyAt + 5000
+  )
+    return undefined;
+  return runtime.pod_uid;
 }
 
 export async function storageWriteAuthorityForDatabase(
   env: Env,
   database: DatabaseRow,
   now = Date.now(),
+  snapshot?: Awaited<ReturnType<typeof readCurrentNodeThinStorage>>,
 ): Promise<string | undefined> {
   if (
     !database.node_id ||
@@ -229,11 +261,15 @@ export async function storageWriteAuthorityForDatabase(
   const receipt = DatabaseStorageVolumeReceipt.parse(
     JSON.parse(database.storage_volume_json),
   );
-  const current = await readCurrentNodeThinStorage(env, database.node_id, now);
+  const current =
+    snapshot === undefined
+      ? await readCurrentNodeThinStorage(env, database.node_id, now)
+      : snapshot;
   const authority = current?.authority;
   if (
     !thinStorageAuthorityMatches(storage, authority, undefined, now) ||
     !authority ||
+    current?.row.node_id !== database.node_id ||
     receipt.storage_generation !== (database.storage_generation ?? 1) ||
     receipt.node_uid !== storage.node_uid ||
     receipt.volume_group_uuid !== storage.volume_group_uuid ||
@@ -405,8 +441,21 @@ export async function hostStorageLease(
         now,
       ),
     );
+    const runtimeAuthority = await storageWriteAuthorityForDatabase(
+      c.env,
+      row,
+      now,
+      current,
+    );
+    // Startup authority cannot substitute forever for missing IO evidence of a Ready writer.
+    const readyWithoutWriter =
+      row.desired_state === "running" &&
+      row.observed_state === "ready" &&
+      row.observed_generation === row.generation &&
+      runtimeAuthority === undefined;
     const admitted =
       row.desired_state === "running" &&
+      !readyWithoutWriter &&
       row.startup_operation !== null &&
       row.startup_node_uid === storage.node_uid &&
       row.storage_budget_bytes !== null &&
@@ -474,7 +523,8 @@ export async function hostStorageLease(
           ? true
           : row.desired_state === "deleted"
             ? !reclaimed
-            : !current ||
+            : readyWithoutWriter ||
+              !current ||
               current.row.error_code !== null ||
               current.row.status === "blocked",
       desired_state: row.desired_state,
@@ -486,8 +536,7 @@ export async function hostStorageLease(
         admitted && authority ? Date.parse(authority.expires_at) : null,
       startup_operation_id: admitted ? row.startup_operation : null,
       volume: reclaimed ? null : receipt,
-      runtime_authority:
-        (await storageWriteAuthorityForDatabase(c.env, row, now)) ?? null,
+      runtime_authority: runtimeAuthority ?? null,
       drain,
     });
   }

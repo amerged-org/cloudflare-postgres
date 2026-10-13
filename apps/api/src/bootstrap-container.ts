@@ -197,12 +197,15 @@ async function inspectionStatusBody(response: Response, signal: AbortSignal) {
 
 /** Section 5 of thin-authority-renewal.md: failures that end only this identity turn. A relay
  * transport or callback refused after its repeats, a command that still fails after its repeats and
- * an unconfirmed executor keep the node ready while the identity proof stays valid; identity,
+ * an absent executor or a read-consistency race keep the node ready while the identity proof stays valid; identity,
  * qualification, ownership and uncertain pool-action failures block it as before. */
 const TRANSIENT_THIN_STORAGE_FAILURES = new Set([
   "thin_storage_authority_refused",
   "thin_storage_command_failed",
-  "thin_storage_executor_unconfirmed",
+  "thin_storage_inventory_changed",
+  "thin_storage_lvs_changed",
+  "thin_storage_action_preflight_changed",
+  "thin_storage_driver_ambiguous",
 ]);
 /** 5 s after the first failed turn, doubling up to the identity cadence. */
 function thinStorageRetryMilliseconds(failures: number) {
@@ -407,6 +410,8 @@ export class NodeBootstrap extends DurableObject<Env> {
       )
     )
       throw new Error("thin_storage_container_identity_mismatch");
+    // This turn serves demand already received. A request arriving during it remains pending.
+    await this.ctx.storage.delete("thinStorageDue");
     const input = await thinStorageInput(this.env, nodeId),
       container = this.ctx.container;
     if (!container) throw new Error("thin_storage_container_unavailable");
@@ -464,9 +469,7 @@ export class NodeBootstrap extends DurableObject<Env> {
       )
         .bind(nodeId, current.lease.operation_id, current.lease.revision)
         .run();
-      const failures =
-        ((await this.ctx.storage.get<number>("thinStorageFailures")) ?? 0) + 1;
-      await this.ctx.storage.put("thinStorageFailures", failures);
+      const failures = await this.#retryThinStorageTurn();
       console.warn(
         JSON.stringify({
           event: "thin_storage_turn_retried",
@@ -474,9 +477,6 @@ export class NodeBootstrap extends DurableObject<Env> {
           error_code: code ?? "thin_storage_executor_absent",
           failures,
         }),
-      );
-      await this.ctx.storage.setAlarm(
-        Date.now() + thinStorageRetryMilliseconds(failures),
       );
       return;
     }
@@ -488,15 +488,34 @@ export class NodeBootstrap extends DurableObject<Env> {
         .run();
       throw new Error(code);
     }
-    // The next identity proof is due one interval after this one's read started.
-    await this.ctx.storage.delete("thinStorageFailures");
-    await this.ctx.storage.setAlarm(
-      Math.max(
-        Date.now() + 1000,
-        Date.parse(input.lease.issued_at) +
-          THIN_INVENTORY_INTERVAL_SECONDS * 1000,
-      ),
-    );
+    // A request received during this turn takes precedence over the normal identity cadence.
+    await this.ctx.storage.transaction(async (storage) => {
+      await storage.delete(["thinStorageFailures", "thinStorageRetryAt"]);
+      const due = await storage.get<boolean>("thinStorageDue");
+      await storage.setAlarm(
+        due
+          ? Date.now()
+          : Math.max(
+              Date.now() + 1000,
+              Date.parse(input.lease.issued_at) +
+                THIN_INVENTORY_INTERVAL_SECONDS * 1000,
+            ),
+      );
+    });
+  }
+  /** A failed turn retains demand and its durable pool action; only its retry timer changes. */
+  async #retryThinStorageTurn() {
+    return await this.ctx.storage.transaction(async (storage) => {
+      const failures =
+          ((await storage.get<number>("thinStorageFailures")) ?? 0) + 1,
+        retryAt = Date.now() + thinStorageRetryMilliseconds(failures);
+      await storage.put({
+        thinStorageFailures: failures,
+        thinStorageRetryAt: retryAt,
+      });
+      await storage.setAlarm(retryAt);
+      return failures;
+    });
   }
   /** Cloudflare needs an identity proof now: a refused sample, a needed growth or a ready thin
    * database without a receipt. A turn already running keeps running; the next one starts now. */
@@ -508,10 +527,20 @@ export class NodeBootstrap extends DurableObject<Env> {
       )
     )
       throw new Error("thin_storage_container_identity_mismatch");
-    await this.ctx.storage.put("thinStorageNodeId", nodeId);
-    const alarm = await this.ctx.storage.getAlarm(),
-      now = Date.now();
-    if (alarm === null || alarm > now) await this.ctx.storage.setAlarm(now);
+    await this.ctx.storage.transaction(async (storage) => {
+      await storage.put({ thinStorageNodeId: nodeId, thinStorageDue: true });
+      const alarm = await storage.getAlarm(),
+        failures = (await storage.get<number>("thinStorageFailures")) ?? 0,
+        now = Date.now(),
+        retryAt =
+          failures > 0
+            ? ((await storage.get<number>("thinStorageRetryAt")) ??
+              alarm ??
+              now + thinStorageRetryMilliseconds(failures))
+            : now;
+      const dueAt = Math.max(now, retryAt);
+      if (alarm === null || alarm !== dueAt) await storage.setAlarm(dueAt);
+    });
   }
   /** One bounded scratch qualification turn in this run's own container. */
   async thinQualification(runId: string, step: string) {
@@ -1862,6 +1891,10 @@ export class NodeBootstrap extends DurableObject<Env> {
         return;
       }
       const current = await readThinStorageLeaseRow(this.env, nodeId);
+      if (current.error_code) {
+        await this.ctx.container?.destroy();
+        return;
+      }
       if (current.lease_expires_at)
         await this.ctx.storage.setAlarm(
           Math.max(
@@ -1869,9 +1902,19 @@ export class NodeBootstrap extends DurableObject<Env> {
             Date.parse(current.lease_expires_at) + 1000,
           ),
         );
+      else await this.#retryThinStorageTurn();
     } catch {
-      // A dispatched action remains durable; a timer never clears or repeats an unknown write.
-      await this.ctx.container?.destroy();
+      // Only an explicit API-side block ends the cadence. A failed D1 read cannot prove that an
+      // executor stopped: retain its lease and dispatched action, and leave it running for readback.
+      let blocked = false;
+      try {
+        blocked =
+          (await readThinStorageLeaseRow(this.env, nodeId)).error_code !== null;
+      } catch {
+        // No readable node row is no evidence of a safety block.
+      }
+      if (blocked) await this.ctx.container?.destroy();
+      else await this.#retryThinStorageTurn();
     }
   }
 }

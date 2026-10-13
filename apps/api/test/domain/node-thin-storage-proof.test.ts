@@ -5,12 +5,16 @@ import {
   DatabaseStorageVolumeReceipt,
   DatabaseWithOperation,
   NodeThinStorageAuthority,
+  newOperationId,
   thinStorageClass,
 } from "@pgcf/contracts";
 import { NodeStorageHeadroomResponse } from "@pgcf/contracts/node-thin-storage";
 import { cleanupFixtures } from "./fixtures.ts";
 import { thinExecutionFixture } from "./thin-execution-fixture.ts";
-import { prepareThinStorageLease } from "../../src/domain/node-thin-storage-execution.ts";
+import {
+  dispatchThinPoolAction,
+  prepareThinStorageLease,
+} from "../../src/domain/node-thin-storage-execution.ts";
 import { readCurrentNodeThinStorage } from "../../src/domain/node-thin-storage.ts";
 import {
   storageProtectionStatements,
@@ -157,6 +161,218 @@ it("keeps a fast reading taken after the identity lease was issued", async () =>
   );
 });
 
+it("recomposes after a real D1 renewal without repeating custody and inventory validation", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  await identityProof(f);
+  await prepareThinStorageLease(f.local, f.node, false);
+  await leaseIssuedAgo(f, 4000);
+  const freshNonce = await nonce(f),
+    queries: string[] = [];
+  let batches = 0;
+  // Instrument native D1 calls to schedule an actual authenticated renewal at the CAS boundary.
+  // Every SQL statement and response still comes from D1; there are no synthetic database results.
+  const db = new Proxy(env.DB, {
+    get(target, key) {
+      if (key === "prepare")
+        return (sql: string) => {
+          queries.push(sql);
+          return target.prepare(sql);
+        };
+      if (key === "batch")
+        return async (statements: D1PreparedStatement[]) => {
+          if (++batches === 1)
+            expect(
+              NodeStorageHeadroomResponse.parse(
+                (
+                  await post(
+                    f,
+                    sample(f, freshNonce, { physical: used(f, 512 * mib) }),
+                  )
+                ).body,
+              ).accepted,
+            ).toBe(true);
+          return target.batch(statements);
+        };
+      const value = Reflect.get(target, key, target);
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+  expect(await report({ ...f, local: { ...f.local, DB: db } })).toMatchObject({
+    accepted: true,
+    revision: 4,
+    write_allowed: true,
+  });
+  expect(batches).toBe(2);
+  // One input read builds the executor report, one validates it. The retry only reads the node row.
+  expect(
+    queries.filter((sql) =>
+      sql.includes("FROM databases d LEFT JOIN database_start_admissions h"),
+    ),
+  ).toHaveLength(2);
+  expect(
+    JSON.parse((await row(f)).authority_json).physical.thin_pool
+      .data_used_bytes_upper_bound,
+  ).toBe(512 * mib);
+});
+
+it("never grants writes from a fresher reading when the identity proof itself has no headroom", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  await identityProof(f);
+  await prepareThinStorageLease(f.local, f.node, false);
+  await leaseIssuedAgo(f, 4000);
+  expect(
+    NodeStorageHeadroomResponse.parse(
+      (await post(f, sample(f, await nonce(f)))).body,
+    ).authority!.write_allowed,
+  ).toBe(true);
+  const physical = used(f, 2 * gib - 128 * mib);
+  expect(await report(f, { physical, write_allowed: false })).toMatchObject({
+    accepted: true,
+    write_allowed: false,
+  });
+  expect(await row(f)).toMatchObject({ status: "blocked", error_code: null });
+  expect(
+    await env.DB.prepare(
+      "SELECT inventory_physical_json FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first("inventory_physical_json"),
+  ).toBe(JSON.stringify(physical));
+});
+
+it("blocks an unconfirmed sampled pool growth that exceeds the identity proof's own pool", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  await identityProof(f);
+  await prepareThinStorageLease(f.local, f.node, false);
+  await leaseIssuedAgo(f, 4000);
+  const physical = {
+    ...used(f, 2 * gib - 128 * mib),
+    free_bytes: f.authority.physical.free_bytes - gib,
+    thin_pool: {
+      ...used(f, 2 * gib - 128 * mib).thin_pool,
+      data_total_bytes: 3 * gib,
+    },
+  };
+  expect(
+    NodeStorageHeadroomResponse.parse(
+      (await post(f, sample(f, await nonce(f), { physical }))).body,
+    ).accepted,
+  ).toBe(true);
+  await expect(
+    report(f, {
+      physical: used(f, 2 * gib - 128 * mib),
+      write_allowed: false,
+    }),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(await row(f)).toMatchObject({
+    status: "blocked",
+    error_code: "thin_storage_headroom_inconsistent",
+    sample_observed_at: null,
+    sample_data_used_bytes: null,
+  });
+});
+
+it("accepts pool growth with unchanged data when percentage rounding raises the used upper bound", async () => {
+  const f = await thinExecutionFixture(releases, {
+    guard_seconds: 10,
+    initial_data_bytes: 20 * gib,
+    growth_bytes: 4 * gib,
+  });
+  const physical = (size: number, percent: number) => ({
+    ...f.authority.physical,
+    free_bytes: f.authority.physical.free_bytes - size + 2 * gib,
+    thin_pool: {
+      ...f.authority.physical.thin_pool!,
+      data_total_bytes: size,
+      data_used_bytes_upper_bound: Math.ceil((size * (percent + 0.01)) / 100),
+    },
+  });
+  const before = physical(20 * gib, 99),
+    after = physical(24 * gib, 82.5);
+  await identityProof(f, { physical: before });
+  expect(
+    NodeStorageHeadroomResponse.parse(
+      (await post(f, sample(f, await nonce(f), { physical: before }))).body,
+    ).accepted,
+  ).toBe(true);
+  const input = await prepareThinStorageLease(f.local, f.node);
+  expect(input!.lease.action).toMatchObject({
+    kind: "grow",
+    target_data_bytes: 24 * gib,
+  });
+  await dispatchThinPoolAction(
+    f.local,
+    f.node,
+    input!.lease.action!.nonce,
+    f.authority.driver_pod_uid,
+    f.qualified.bootId,
+  );
+  expect(after.thin_pool.data_used_bytes_upper_bound).toBeGreaterThan(
+    before.thin_pool.data_used_bytes_upper_bound,
+  );
+  expect(await report(f, { physical: after })).toMatchObject({
+    accepted: true,
+    write_allowed: true,
+  });
+  expect(await row(f)).toMatchObject({ status: "ready", error_code: null });
+});
+
+it("blocks a 28 GiB sampled pool when the dispatched growth and final identity proof confirm only 24 GiB", async () => {
+  const f = await thinExecutionFixture(releases, {
+    guard_seconds: 10,
+    initial_data_bytes: 20 * gib,
+    growth_bytes: 4 * gib,
+  });
+  const physical = (size: number) => ({
+    ...f.authority.physical,
+    free_bytes: f.authority.physical.free_bytes - size + 2 * gib,
+    thin_pool: {
+      ...f.authority.physical.thin_pool!,
+      data_total_bytes: size,
+      data_used_bytes_upper_bound: Math.ceil(19.8 * gib),
+    },
+  });
+  const before = physical(20 * gib);
+  await identityProof(f, { physical: before });
+  expect(
+    NodeStorageHeadroomResponse.parse(
+      (await post(f, sample(f, await nonce(f), { physical: before }))).body,
+    ).accepted,
+  ).toBe(true);
+  const input = await prepareThinStorageLease(f.local, f.node);
+  expect(input!.lease.action).toMatchObject({
+    kind: "grow",
+    target_data_bytes: 24 * gib,
+  });
+  await leaseIssuedAgo(f, 4000);
+  await dispatchThinPoolAction(
+    f.local,
+    f.node,
+    input!.lease.action!.nonce,
+    f.authority.driver_pod_uid,
+    f.qualified.bootId,
+  );
+  expect(
+    NodeStorageHeadroomResponse.parse(
+      (
+        await post(
+          f,
+          sample(f, await nonce(f), { physical: physical(28 * gib) }),
+        )
+      ).body,
+    ).accepted,
+  ).toBe(true);
+  await expect(
+    report(f, { physical: physical(24 * gib) }),
+  ).rejects.toMatchObject({ code: "conflict" });
+  expect(await row(f)).toMatchObject({
+    status: "blocked",
+    error_code: "thin_storage_headroom_inconsistent",
+    sample_observed_at: null,
+    sample_data_used_bytes: null,
+  });
+});
+
 it("blocks the node when an identity proof reads more data than the newest earlier sample and its allowance", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
   await identityProof(f);
@@ -233,6 +449,112 @@ async function boundDatabase(f: Fixture) {
   ).toBe(1);
   return { created, receipt, physical };
 }
+
+function boundVolumeProof(
+  f: Fixture,
+  bound: Awaited<ReturnType<typeof boundDatabase>>,
+  generation = 1,
+) {
+  const { created, receipt, physical } = bound;
+  return {
+    physical,
+    physical_lvs: [
+      lvs.pool,
+      lvs.data,
+      lvs.meta,
+      {
+        name: receipt.volume_handle,
+        lv_uuid: receipt.lv_uuid,
+        size_bytes: 5 * gib,
+        segtype: "thin",
+      },
+    ],
+    volumes: [
+      {
+        database_id: created.database.id,
+        generation,
+        storage_generation: 1,
+        storage_uid: receipt.storage_uid,
+        namespace_uid: receipt.namespace_uid,
+        cluster_uid: receipt.cluster_uid,
+        volume_handle: receipt.volume_handle,
+        lv_uuid: receipt.lv_uuid,
+        pvc_uid: receipt.pvc_uid,
+        pv_uid: receipt.pv_uid,
+        storage_class: thinStorageClass(f.authority.profile_sha256),
+        volume_attributes_class: thinStorageClass(f.authority.profile_sha256),
+        io: [],
+      },
+    ],
+  };
+}
+
+it("refuses a stale database generation during an identity turn without blocking the node", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 }),
+    bound = await boundDatabase(f);
+  await prepareThinStorageLease(f.local, f.node, false);
+  await env.DB.prepare(
+    "UPDATE databases SET generation=generation+1 WHERE id=?",
+  )
+    .bind(bound.created.database.id)
+    .run();
+  await expect(report(f, boundVolumeProof(f, bound))).rejects.toMatchObject({
+    code: "conflict",
+  });
+  expect(await row(f)).toMatchObject({ status: "ready", error_code: null });
+  expect(
+    await env.DB.prepare(
+      "SELECT lease_id FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first("lease_id"),
+  ).not.toBeNull();
+});
+
+it("refuses a stale storage generation during an identity turn without blocking the node", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 }),
+    bound = await boundDatabase(f);
+  await prepareThinStorageLease(f.local, f.node, false);
+  await env.DB.prepare(
+    "UPDATE databases SET generation=generation+1,storage_generation=storage_generation+1 WHERE id=?",
+  )
+    .bind(bound.created.database.id)
+    .run();
+  await expect(report(f, boundVolumeProof(f, bound))).rejects.toMatchObject({
+    code: "conflict",
+  });
+  expect(await row(f)).toMatchObject({ status: "ready", error_code: null });
+});
+
+it("deduplicates two startup holds for the same proved volume during a 95 s identity lease", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 }),
+    bound = await boundDatabase(f),
+    operation = newOperationId();
+  await env.DB.batch([
+    env.DB.prepare("UPDATE databases SET generation=2 WHERE id=?").bind(
+      bound.created.database.id,
+    ),
+    env.DB.prepare(
+      "UPDATE database_start_admissions SET storage_volume_json=? WHERE operation_id=?",
+    ).bind(JSON.stringify(bound.receipt), bound.created.operation.id),
+    env.DB.prepare(
+      "INSERT INTO operations(id,kind,status,project_id,database_id,generation,created_at,updated_at) SELECT ?,'database.wake','pending',project_id,database_id,2,created_at,updated_at FROM operations WHERE id=?",
+    ).bind(operation, bound.created.operation.id),
+    env.DB.prepare(
+      "INSERT INTO database_start_admissions(operation_id,database_id,generation,node_id,node_uid,budget_bytes,granted_at,grant_sample_observed_at,storage_budget_bytes,storage_volume_json) SELECT ?,database_id,2,node_id,node_uid,budget_bytes,granted_at,grant_sample_observed_at,storage_budget_bytes,storage_volume_json FROM database_start_admissions WHERE operation_id=?",
+    ).bind(operation, bound.created.operation.id),
+  ]);
+  const proof = boundVolumeProof(f, bound, 2);
+  proof.physical.thin_pool.data_total_bytes = 8 * gib;
+  await identityProof(f, proof);
+  const input = await prepareThinStorageLease(f.local, f.node, false);
+  expect(input!.lease.required_data_free_bytes).toBe(5 * gib + 256 * mib);
+  await leaseIssuedAgo(f, 30_000);
+  expect(await report(f, proof)).toMatchObject({
+    accepted: true,
+    write_allowed: true,
+  });
+});
 
 it("confirms a deletion only from an identity read that started after it, never from a fast renewal", async () => {
   const f = await thinExecutionFixture(releases, { guard_seconds: 10 });

@@ -448,6 +448,72 @@ it("names each sampled thin node in the desired region and nothing for regions w
   expect(region.region).not.toHaveProperty("storage_nodes");
 });
 
+it("keeps desired wire compatible until every sampling-controller patch is confirmed", async () => {
+  const f = await thinExecutionFixture(releases, {}, false);
+  await identityProof(f);
+  const desired = async () =>
+    DesiredResponse.parse(
+      await (await request("/agent/v1/desired", f.agent)).json(),
+    );
+  // An old release must never expose fields its strict controller schema cannot parse.
+  const old = await desired();
+  expect(old.region).not.toHaveProperty("storage_samples");
+  // Dropping inventory fields would misrepresent a pre-delete read as a fresh reclamation proof.
+  expect(old.region).not.toHaveProperty("storage_nodes");
+  const modern = await thinExecutionFixture(releases);
+  await identityProof(modern);
+  const pendingNonce = await nonce(modern);
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET state='pending',stage='release_verify' WHERE node_id=?",
+  )
+    .bind(modern.node)
+    .run();
+  expect(
+    DesiredResponse.parse(
+      await (await request("/agent/v1/desired", modern.agent)).json(),
+    ).region,
+  ).not.toHaveProperty("storage_samples");
+  expect((await post(modern, sample(modern, pendingNonce))).status).toBe(404);
+  expect((await row(modern)).authority_revision).toBe(2);
+  await env.DB.prepare(
+    "UPDATE fleet_patch_operations SET state='confirmed',stage='complete' WHERE node_id=?",
+  )
+    .bind(modern.node)
+    .run();
+  const capable = DesiredResponse.parse(
+    await (await request("/agent/v1/desired", modern.agent)).json(),
+  );
+  expect(capable.region.storage_samples).toHaveLength(1);
+  expect(capable.region.storage_nodes![0]).toHaveProperty(
+    "inventory_revision",
+    2,
+  );
+  expect(capable.fleet_release!.release.spec).not.toHaveProperty(
+    "thin_storage_sampling_version",
+  );
+});
+it("refuses sample metadata geometry that contradicts the identity proof", async () => {
+  const f = await thinExecutionFixture(releases);
+  await identityProof(f, {
+    write_allowed: false,
+    physical: {
+      ...f.authority.physical,
+      thin_pool: {
+        ...f.authority.physical.thin_pool!,
+        metadata_total_bytes: 256 * mib,
+      },
+    },
+  });
+  const renewed = NodeStorageHeadroomResponse.parse(
+    (await post(f, sample(f, await nonce(f)))).body,
+  );
+  expect(renewed).toMatchObject({
+    accepted: false,
+    reason: "thin_storage_sample_pool_changed",
+    authority: null,
+    tokens: [],
+  });
+});
 it("authenticates the region agent and samples only selected thin nodes of its region", async () => {
   const f = await thinExecutionFixture(releases);
   await identityProof(f);

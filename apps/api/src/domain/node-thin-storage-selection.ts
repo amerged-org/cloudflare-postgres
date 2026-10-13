@@ -34,6 +34,10 @@ import {
   type NodeThinStorageRow,
 } from "./node-thin-storage.ts";
 import { processNodeThinStorage } from "./node-thin-storage-execution.ts";
+import {
+  thinStorageSamplingCapable,
+  thinStorageSamplingSql,
+} from "./fleet-releases.ts";
 
 const conflict = (message: string): never => {
   throw new ApiError("conflict", message);
@@ -129,6 +133,10 @@ export async function configureNodeThinStorage(
     }>();
   if (!source)
     return conflict("Current assigned physical node and release are required");
+  if (!(await thinStorageSamplingCapable(env.DB, source.region_id)))
+    return conflict(
+      "Thin storage requires the confirmed sampling-controller release",
+    );
   // The scratch pool and namespace stay until the run's cleanup reports.
   if (source.qualifying)
     return conflict(
@@ -197,8 +205,15 @@ export async function configureNodeThinStorage(
     // The next lease keeps the dispatched action, which Native confirms by readback or refuses.
     const retried = await env.DB.batch([
       env.DB.prepare(
-        "UPDATE node_thin_storage SET status='selected',error_code=NULL WHERE node_id=? AND profile_revision=? AND lease_revision=? AND action_json=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now'))",
-      ).bind(nodeId, old.profile_revision, old.lease_revision, old.action_json),
+        `UPDATE node_thin_storage SET status='selected',error_code=NULL,sample_nonce=NULL,sample_nonce_issued_at=NULL,sample_observed_at=NULL,sample_data_used_bytes=NULL,lease_sample_observed_at=NULL,lease_sample_data_used_bytes=NULL WHERE node_id=? AND profile_revision=? AND lease_revision=? AND action_json=? AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now'))
+       AND EXISTS(SELECT 1 FROM regions sr WHERE sr.id=? AND ${thinStorageSamplingSql("sr")})`,
+      ).bind(
+        nodeId,
+        old.profile_revision,
+        old.lease_revision,
+        old.action_json,
+        source.region_id,
+      ),
       ...(lease
         ? [
             lease.completeStatement(nodeId, 200, {
@@ -287,6 +302,7 @@ export async function configureNodeThinStorage(
   const authority = `EXISTS(SELECT 1 FROM nodes n JOIN regions r ON r.id=n.region_id JOIN fleet_node_releases a ON a.node_id=n.id AND a.node_uid=n.node_uid
     JOIN fleet_region_releases f ON f.region_id=n.region_id AND f.release_id=a.release_id JOIN fleet_releases s ON s.id=a.release_id
     WHERE (n.id=? AND n.node_uid=? AND n.region_id=? AND n.ready=1 AND n.lost_at IS NULL)
+      AND ${thinStorageSamplingSql("r")}
       AND (a.revision=? AND a.release_id=? AND f.revision=? AND s.spec_sha256=? AND r.bootstrap_material_revision=?)
       AND (julianday(n.last_observed_at)>=julianday('now','-180 seconds') AND julianday(n.last_observed_at)<=julianday('now','+5 seconds')))`;
   const authorityBindings = [
@@ -315,10 +331,10 @@ export async function configureNodeThinStorage(
   const next = body.expected_revision + 1;
   const statement = old
     ? env.DB.prepare(
-        `UPDATE node_thin_storage SET profile_revision=?,profile_sha256=?,profile_json=?,address=?,material_revision=?,qualified_driver_image=?,allow_new_databases=?,status='selected',error_code=NULL,lease_id=NULL,lease_expires_at=NULL,action_json=NULL,updated_at=?
+        `UPDATE node_thin_storage SET profile_revision=?,profile_sha256=?,profile_json=?,address=?,material_revision=?,qualified_driver_image=?,allow_new_databases=?,status='selected',error_code=NULL,lease_id=NULL,lease_expires_at=NULL,action_json=NULL,sample_nonce=NULL,sample_nonce_issued_at=NULL,sample_observed_at=NULL,sample_data_used_bytes=NULL,lease_sample_observed_at=NULL,lease_sample_data_used_bytes=NULL,inventory_physical_json=NULL,updated_at=?
     WHERE (node_id=? AND profile_revision=? AND node_uid=? AND cluster_uid=? AND volume_group_uuid=?)
-      AND (profile_json=? AND profile_sha256=? AND authority_revision=? AND authority_json IS ? AND action_json IS ? AND lease_revision=?)
-      AND (status=? AND qualification_json IS ? AND material_revision=? AND address=? AND qualified_driver_image IS ?)
+      AND (profile_json=? AND profile_sha256=? AND COALESCE(json_extract(authority_json,'$.inventory_revision'),json_extract(authority_json,'$.revision')) IS ? AND action_json IS ? AND lease_revision=?)
+      AND (error_code IS ? AND qualification_json IS ? AND material_revision=? AND address=? AND qualified_driver_image IS ?)
       AND (lease_expires_at IS NULL OR julianday(lease_expires_at)<=julianday('now')) AND ${referenceFence} AND ${authority} ${activationFence}`,
       ).bind(
         next,
@@ -336,11 +352,12 @@ export async function configureNodeThinStorage(
         body.volume_group_uuid,
         old.profile_json,
         old.profile_sha256,
-        old.authority_revision,
-        old.authority_json,
+        prior.success
+          ? (prior.data.inventory_revision ?? prior.data.revision)
+          : null,
         old.action_json,
         old.lease_revision,
-        old.status,
+        old.error_code,
         old.qualification_json,
         old.material_revision,
         old.address,

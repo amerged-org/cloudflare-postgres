@@ -1,8 +1,9 @@
 # Thin write authority from in-region observations
 
-Status: **proposal of 2026-10-13** for the ULTRA rows "Thin qualification" and "R2b"
-(plan:100-101). Not approved and not implemented. It details option 1 of the owner decision that
-plan:100 requests and compares options 2 and 3 in section 12.
+Status: **option 1 approved by the owner on 2026-10-13**, including the EU1 thin selection.
+Implementation is in progress; CI, deployment and live acceptance remain required. The
+[ULTRA plan](cloudflare-convergence-and-serverless-plan.md) records the current Done/Open state.
+Options 2 and 3 in section 12 remain comparison material.
 
 Citations: `path:line` refer to origin/main `ab07c82`. `plan` is the
 [ULTRA plan](cloudflare-convergence-and-serverless-plan.md) and `ops` is

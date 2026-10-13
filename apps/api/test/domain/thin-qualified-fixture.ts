@@ -18,6 +18,7 @@ export async function installThinQualifiedFixture(
     extraComponents?: FleetReleaseComponent[];
     facts?: Record<string, unknown>;
     storageKeysSha256?: string;
+    sampling?: boolean;
   } = {},
 ) {
   const row = await db
@@ -111,6 +112,7 @@ export async function installThinQualifiedFixture(
     version: 1,
     versions_lock_sha256: "f".repeat(64),
     configuration_schema_revision: 1,
+    ...(options.sampling === false ? {} : { thin_storage_sampling_version: 1 }),
     storage_authority_keys_sha256:
       options.storageKeysSha256 ??
       (await storageAuthorityPublicKeys(env)).sha256,

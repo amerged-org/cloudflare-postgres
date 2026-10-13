@@ -693,6 +693,31 @@ export function routeTokenV3Sql(region: string) {
         AND vp.assignment_revision=va.revision AND vp.region_revision=vf.revision AND vp.stage='complete' AND vp.state='confirmed')))`;
 }
 
+/** Strict desired schemas change only after every assigned regional controller has converged. */
+export function thinStorageSamplingSql(region: string) {
+  if (!/^[a-z][a-z0-9_]*$/.test(region))
+    throw new Error("invalid_sampling_region_alias");
+  return `EXISTS(SELECT 1 FROM fleet_region_releases sf JOIN fleet_releases ss ON ss.id=sf.release_id
+    WHERE sf.region_id=${region}.id AND json_extract(ss.spec_json,'$.thin_storage_sampling_version')=1
+    AND EXISTS(SELECT 1 FROM nodes sn JOIN fleet_node_releases sa ON sa.node_id=sn.id WHERE sn.region_id=sf.region_id AND sn.lost_at IS NULL)
+    AND NOT EXISTS(SELECT 1 FROM nodes sn JOIN fleet_node_releases sa ON sa.node_id=sn.id WHERE sn.region_id=sf.region_id AND sn.lost_at IS NULL
+      AND (sa.node_uid<>sn.node_uid OR sa.release_id<>sf.release_id OR NOT EXISTS(SELECT 1 FROM fleet_patch_operations sp
+        WHERE sp.node_id=sn.id AND sp.node_uid=sn.node_uid AND sp.release_id=sf.release_id AND sp.spec_sha256=ss.spec_sha256
+        AND sp.assignment_revision=sa.revision AND sp.region_revision=sf.revision AND sp.stage='complete' AND sp.state='confirmed' AND sp.error_code IS NULL))))`;
+}
+export async function thinStorageSamplingCapable(
+  db: D1Database,
+  regionId: string,
+) {
+  return Boolean(
+    await db
+      .prepare(
+        `SELECT 1 FROM regions sr WHERE sr.id=? AND ${thinStorageSamplingSql("sr")}`,
+      )
+      .bind(regionId)
+      .first(),
+  );
+}
 /** Only explicitly assigned, current physical nodes receive this release. No legacy wire change when unassigned. */
 export async function readDesiredFleetRelease(
   db: D1Database,
@@ -721,10 +746,12 @@ export async function readDesiredFleetRelease(
   const {
     talos_raw_image: provisioningImage,
     route_token_version: routeTokenVersion,
+    thin_storage_sampling_version: samplingVersion,
     ...runtimeSpec
   } = selected.spec;
   void provisioningImage;
   void routeTokenVersion;
+  void samplingVersion;
   return FleetDesiredRelease.parse({
     region_id: regionId,
     region_revision: state.revision,

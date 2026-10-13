@@ -3,6 +3,7 @@
 // sections 4.3 and 4.4). Cloudflare alone decides; the controller only supplies the reading.
 import {
   NodeId,
+  NodePhysicalStorage,
   NodeThinStorageAuthority,
   ThinStorageProfile,
   thinStorageInventory,
@@ -13,7 +14,10 @@ import {
   NodeStorageHeadroomSample,
   ThinStorageSampleTarget,
 } from "@pgcf/contracts/node-thin-storage";
-import { ThinQualificationSetup } from "@pgcf/contracts/thin-qualification";
+import {
+  THIN_QUALIFICATION_SAMPLE_WINDOWS,
+  ThinQualificationSetup,
+} from "@pgcf/contracts/thin-qualification";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { agentRegion } from "./agent-auth.ts";
@@ -34,6 +38,10 @@ import {
   thinStorageWriteAllowed,
 } from "./node-thin-storage-execution.ts";
 import type { DatabaseRow } from "./rows.ts";
+import {
+  thinStorageSamplingCapable,
+  thinStorageSamplingSql,
+} from "./fleet-releases.ts";
 
 const iso = (ms: number) => new Date(ms).toISOString();
 /** 128 random bits; Cloudflare's issue time is the earliest start of the scrape that answers it. */
@@ -53,6 +61,7 @@ export async function desiredRegionStorageSamples(
   env: Pick<Env, "DB">,
   regionId: string,
 ): Promise<ThinStorageSampleTarget[]> {
+  if (!(await thinStorageSamplingCapable(env.DB, regionId))) return [];
   const rows = await env.DB.prepare(
     `SELECT t.node_id,n.k8s_node_name name,t.node_uid,json_extract(t.profile_json,'$.guard_seconds') guard_seconds,NULL qualification_run
     FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id AND n.node_uid=t.node_uid
@@ -93,6 +102,28 @@ interface QualificationSampleRun {
   sample_nonce: string | null;
   sample_nonce_issued_at: string | null;
 }
+/** Sampling remains bound to the run's current node/release and the confirmed regional controller. */
+const qualificationSampleAuthoritySql = `EXISTS(SELECT 1 FROM nodes qn JOIN regions qr ON qr.id=qn.region_id
+  JOIN fleet_node_releases qa ON qa.node_id=qn.id AND qa.node_uid=qn.node_uid
+  JOIN fleet_region_releases qf ON qf.region_id=qn.region_id JOIN fleet_releases qs ON qs.id=qf.release_id
+  WHERE qn.id=q.node_id AND qn.node_uid=q.node_uid AND qn.region_id=q.region_id AND qn.ready=1 AND qn.lost_at IS NULL
+    AND qa.release_id=q.release_id AND qa.revision=q.assignment_revision AND qf.release_id=q.release_id
+    AND qf.revision=q.region_revision AND qs.spec_sha256=q.spec_sha256 AND qr.bootstrap_material_revision=q.material_revision
+    AND ${thinStorageSamplingSql("qr")})`;
+const qualificationSampleWindows = Object.entries(
+  THIN_QUALIFICATION_SAMPLE_WINDOWS,
+);
+const qualificationSampleWindowSql = qualificationSampleWindows
+  .map(
+    () => `(q.step=?
+  AND EXISTS(SELECT 1 FROM json_each(q.journal_json,'$.entries') edge
+    WHERE json_extract(edge.value,'$.key')=? AND json_extract(edge.value,'$.state')='confirmed'
+      AND julianday(json_extract(edge.value,'$.received_at'))<=julianday(?))
+  AND NOT EXISTS(SELECT 1 FROM json_each(q.journal_json,'$.entries') edge
+    WHERE json_extract(edge.value,'$.key')=? AND json_extract(edge.value,'$.state')='confirmed'
+      AND julianday(json_extract(edge.value,'$.received_at'))<julianday(?)))`,
+  )
+  .join(" OR ");
 /** Section 10: a running qualification records its node's accepted samples as run evidence. The
  * witnesses must be the run's setup identity; nothing is renewed and no token is signed. */
 async function qualificationSample(
@@ -116,11 +147,12 @@ async function qualificationSample(
   });
   const refuse = async (reason: string) => {
     const nonce = sampleNonce();
-    await env.DB.prepare(
-      "UPDATE thin_storage_qualification_runs SET sample_nonce=?,sample_nonce_issued_at=? WHERE id=? AND status='running'",
+    const result = await env.DB.prepare(
+      `UPDATE thin_storage_qualification_runs AS q SET sample_nonce=?,sample_nonce_issued_at=? WHERE id=? AND status='running' AND ${qualificationSampleAuthoritySql}`,
     )
       .bind(nonce, iso(Date.now()), run.id)
       .run();
+    if (result.meta.changes !== 1) return unsampled();
     return answer(nonce, reason);
   };
   const issued =
@@ -150,10 +182,14 @@ async function qualificationSample(
   )
     return refuse("thin_storage_sample_witness_changed");
   const nonce = sampleNonce();
-  // Records the sample and consumes its nonce together; the run's lease time is never written.
-  const [recorded, rotated] = await env.DB.batch([
+  // Nonces keep rotating between gates, but only a bounded active measurement window retains
+  // evidence. An abandoned Workflow's open window stops accumulating when its existing lease ends.
+  const [, rotated] = await env.DB.batch([
     env.DB.prepare(
-      "INSERT INTO thin_storage_qualification_samples(run_id,nonce,observed_at,received_at,scrape_milliseconds) SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM thin_storage_qualification_runs WHERE id=? AND status='running' AND sample_nonce=?)",
+      `INSERT INTO thin_storage_qualification_samples(run_id,nonce,observed_at,received_at,scrape_milliseconds)
+      SELECT ?,?,?,?,? FROM thin_storage_qualification_runs q WHERE q.id=? AND q.status='running' AND q.sample_nonce=?
+        AND ${qualificationSampleAuthoritySql} AND q.lease_id IS NOT NULL AND julianday(q.lease_expires_at)>julianday('now')
+        AND (${qualificationSampleWindowSql})`,
     ).bind(
       run.id,
       body.nonce,
@@ -162,12 +198,19 @@ async function qualificationSample(
       body.scrape_milliseconds,
       run.id,
       body.nonce,
+      ...qualificationSampleWindows.flatMap(([step, [first, last]]) => [
+        step,
+        first,
+        iso(issued),
+        last,
+        iso(now),
+      ]),
     ),
     env.DB.prepare(
-      "UPDATE thin_storage_qualification_runs SET sample_nonce=?,sample_nonce_issued_at=? WHERE id=? AND status='running' AND sample_nonce=?",
+      `UPDATE thin_storage_qualification_runs AS q SET sample_nonce=?,sample_nonce_issued_at=? WHERE id=? AND status='running' AND sample_nonce=? AND ${qualificationSampleAuthoritySql}`,
     ).bind(nonce, iso(Date.now()), run.id, body.nonce),
   ]);
-  if (recorded!.meta.changes !== 1 || rotated!.meta.changes !== 1)
+  if (rotated!.meta.changes !== 1)
     return refuse("thin_storage_sample_nonce_invalid");
   return answer(nonce, null);
 }
@@ -247,7 +290,10 @@ async function productSample(
   );
   const identity = parsed.success ? parsed.data : null,
     inventory = identity ? thinStorageInventory(identity) : null,
-    known = identity?.physical.thin_pool;
+    known = row.inventory_physical_json
+      ? NodePhysicalStorage.parse(JSON.parse(row.inventory_physical_json))
+          .thin_pool
+      : identity?.physical.thin_pool;
   if (
     !identity ||
     !inventory ||
@@ -284,6 +330,7 @@ async function productSample(
   if (
     !pool ||
     pool.metadata_total_bytes !== profile.metadata_bytes ||
+    pool.metadata_total_bytes !== known.metadata_total_bytes ||
     pool.data_total_bytes < known.data_total_bytes ||
     pool.data_total_bytes > profile.maximum_data_bytes
   )
@@ -339,7 +386,8 @@ async function productSample(
   const result = await env.DB.prepare(
     `UPDATE node_thin_storage SET authority_revision=?,authority_json=?,authority_received_at=?,status=?,sample_nonce=?,sample_nonce_issued_at=?,sample_observed_at=?,sample_data_used_bytes=?
     WHERE node_id=? AND node_uid=? AND profile_revision=? AND authority_revision=? AND sample_nonce=? AND error_code IS NULL AND status IN('ready','blocked')
-      AND ${thinStorageAuthoritySql} AND ${qualifiedThinStorageSql("node_thin_storage")} AND ${storageHoldSnapshotSql}`,
+      AND ${thinStorageAuthoritySql} AND ${qualifiedThinStorageSql("node_thin_storage")} AND ${storageHoldSnapshotSql}
+      AND EXISTS(SELECT 1 FROM nodes sg JOIN regions sr ON sr.id=sg.region_id WHERE sg.id=node_thin_storage.node_id AND ${thinStorageSamplingSql("sr")})`,
   )
     .bind(
       authority.revision,
@@ -409,6 +457,8 @@ export async function recordStorageHeadroomSample(
     .bind(nodeId, region.id)
     .first<{ node_uid: string | null }>();
   if (!node) return unsampled();
+  if (!(await thinStorageSamplingCapable(c.env.DB, region.id)))
+    return unsampled();
   const run = await c.env.DB.prepare(
     "SELECT id,node_uid,profile_json,setup_json,step,sample_nonce,sample_nonce_issued_at FROM thin_storage_qualification_runs WHERE node_id=? AND region_id=? AND status='running'",
   )

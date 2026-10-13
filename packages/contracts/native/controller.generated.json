@@ -1177,6 +1177,10 @@
                       "additionalProperties": false
                     },
                     "route_token_version": { "type": "number", "const": 3 },
+                    "thin_storage_sampling_version": {
+                      "type": "number",
+                      "const": 1
+                    },
                     "components": {
                       "minItems": 1,
                       "maxItems": 128,

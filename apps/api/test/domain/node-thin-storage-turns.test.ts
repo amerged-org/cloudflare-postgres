@@ -38,8 +38,10 @@ async function turn(
     | { state: "succeeded" }
     | { state: "failed"; error_code: string }
     | { state: "idle" },
+  dueDuringTurn = false,
 ) {
   const input = (await prepareThinStorageLease(f.local, f.node))!;
+  let running: NodeBootstrap;
   const container = {
     running: true,
     start: vi.fn(),
@@ -50,6 +52,7 @@ async function turn(
         if (path === "/") return new Response(null, { status: 401 });
         if (request.method === "POST")
           return Response.json({}, { status: 202 });
+        if (dueDuringTurn) await running.thinStorageDue(f.node);
         return Response.json(
           outcome.state === "idle"
             ? outcome
@@ -71,12 +74,11 @@ async function turn(
       value: container,
     });
     try {
-      const error = await new NodeBootstrap(state, f.local)
-        .thinStorage(f.node)
-        .then(
-          () => null,
-          (value: unknown) => value,
-        );
+      running = new NodeBootstrap(state, f.local);
+      const error = await running.thinStorage(f.node).then(
+        () => null,
+        (value: unknown) => value,
+      );
       return {
         error: error instanceof Error ? error.message : null,
         alarm: await state.storage.getAlarm(),
@@ -152,6 +154,163 @@ it("blocks the node on an identity or qualification failure as before", async ()
     status: "blocked",
     error_code: "thin_storage_driver_identity_changed",
   });
+});
+
+it("retries concurrent inventory reads and driver replacement, but blocks an uncertain dispatched action", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const action = {
+    kind: "grow",
+    state: "dispatched",
+    nonce: `op_${"x".repeat(20)}`,
+    target_data_bytes: 3 * gib,
+    target_metadata_bytes: f.profile.metadata_bytes,
+    expected_pool_uuid: f.authority.pool_uuid,
+    driver_pod_uid: f.authority.driver_pod_uid,
+    boot_id: f.qualified.bootId,
+    dispatched_at: new Date(Date.now() - 1000).toISOString(),
+    deadline_at: new Date(Date.now() + 60_000).toISOString(),
+  };
+  await env.DB.prepare(
+    "UPDATE node_thin_storage SET action_json=? WHERE node_id=?",
+  )
+    .bind(JSON.stringify(action), f.node)
+    .run();
+  const inventory = await turn(f, {
+    state: "failed",
+    error_code: "thin_storage_inventory_changed",
+  });
+  expect(inventory.error).toBeNull();
+  expect(inventory.node).toEqual({
+    status: "ready",
+    error_code: null,
+    lease_id: null,
+  });
+  expect(inventory.failures).toBe(1);
+  const lvs = await turn(f, {
+    state: "failed",
+    error_code: "thin_storage_lvs_changed",
+  });
+  expect(lvs.node).toEqual(inventory.node);
+  const preflight = await turn(f, {
+    state: "failed",
+    error_code: "thin_storage_action_preflight_changed",
+  });
+  expect(preflight.node).toEqual(inventory.node);
+  const driver = await turn(f, {
+    state: "failed",
+    error_code: "thin_storage_driver_ambiguous",
+  });
+  expect(driver.node).toEqual(inventory.node);
+  expect(
+    await env.DB.prepare(
+      "SELECT action_json FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first<string>("action_json"),
+  ).toBe(JSON.stringify(action));
+  const uncertain = await turn(f, {
+    state: "failed",
+    error_code: "thin_storage_action_unconfirmed",
+  });
+  expect(uncertain.error).toBe("thin_storage_action_unconfirmed");
+  expect(uncertain.node).toMatchObject({
+    status: "blocked",
+    error_code: "thin_storage_action_unconfirmed",
+  });
+  expect(
+    await env.DB.prepare(
+      "SELECT action_json FROM node_thin_storage WHERE node_id=?",
+    )
+      .bind(f.node)
+      .first<string>("action_json"),
+  ).toBe(JSON.stringify(action));
+});
+
+it("blocks an unrecognized executor failure rather than retrying failed host verification", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const failed = await turn(f, {
+    state: "failed",
+    error_code: "patch_extension_resource_invalid",
+  });
+  expect(failed.error).toBe("thin_storage_executor_unconfirmed");
+  expect(failed.node).toMatchObject({
+    status: "blocked",
+    error_code: "thin_storage_executor_unconfirmed",
+  });
+  expect(failed.failures).toBe(0);
+});
+
+it("rearms the cadence after a real D1 read error without destroying an executor whose write outcome is unknown", async () => {
+  const f = await thinExecutionFixture(releases);
+  const result = await runInDurableObject(stub(f), async (_instance, state) => {
+    const container = { destroy: vi.fn(async () => {}) };
+    Object.defineProperty(state, "container", {
+      configurable: true,
+      value: container,
+    });
+    await state.storage.put("thinStorageNodeId", f.node);
+    await state.storage.deleteAlarm();
+    await env.DB.prepare(
+      "ALTER TABLE fleet_node_releases RENAME TO unavailable_fleet_node_releases",
+    ).run();
+    const before = Date.now();
+    try {
+      await new NodeBootstrap(state, f.local).alarm();
+      return {
+        before,
+        alarm: await state.storage.getAlarm(),
+        failures: await state.storage.get<number>("thinStorageFailures"),
+        destroyed: container.destroy.mock.calls.length,
+      };
+    } finally {
+      await env.DB.prepare(
+        "ALTER TABLE unavailable_fleet_node_releases RENAME TO fleet_node_releases",
+      ).run();
+      delete (state as { container?: unknown }).container;
+    }
+  });
+  expect(result.alarm).toBeGreaterThanOrEqual(result.before + 5000);
+  expect(result.failures).toBe(1);
+  expect(result.destroyed).toBe(0);
+});
+
+it("keeps transient backoff when another headroom sample requests a turn", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const failed = await turn(f, {
+    state: "failed",
+    error_code: "thin_storage_command_failed",
+  });
+  const alarm = await runInDurableObject(stub(f), async (_instance, state) => {
+    await new NodeBootstrap(state, f.local).thinStorageDue(f.node);
+    return state.storage.getAlarm();
+  });
+  expect(alarm).toBe(failed.alarm);
+});
+
+it("starts the next turn immediately for demand received during a successful identity turn", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const done = await turn(f, { state: "succeeded" }, true);
+  expect(done.error).toBeNull();
+  expect(done.alarm).toBeGreaterThanOrEqual(done.started);
+  expect(done.alarm).toBeLessThanOrEqual(Date.now());
+});
+
+it("retains demand received during a failed turn while applying its backoff", async () => {
+  const f = await thinExecutionFixture(releases, { guard_seconds: 10 });
+  const failed = await turn(
+    f,
+    {
+      state: "failed",
+      error_code: "thin_storage_command_failed",
+    },
+    true,
+  );
+  expect(failed.error).toBeNull();
+  expect(failed.alarm).toBeGreaterThanOrEqual(failed.started + 5000);
+  const requested = await runInDurableObject(stub(f), (_instance, state) =>
+    state.storage.get<boolean>("thinStorageDue"),
+  );
+  expect(requested).toBe(true);
 });
 
 it("asks for an identity turn at once when a thin database is ready without a receipt", async () => {

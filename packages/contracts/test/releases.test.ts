@@ -473,6 +473,38 @@ it("only a release whose every role runs the native gateway and controller decla
     expect(FleetReleaseSpec.safeParse(partial).success).toBe(false);
   }
 });
+it("declares thin sampling only with a native controller on every role", () => {
+  const native = spec();
+  native.components.push({
+    name: "native-controller",
+    kind: "image",
+    version: "1.0.0",
+    reference: `registry.example/native-controller@sha256:${"d".repeat(64)}`,
+    sha256: "d".repeat(64),
+  });
+  for (const role of Object.values(native.roles))
+    role.components.push("native-controller");
+  expect(
+    FleetReleaseSpec.parse({ ...native, thin_storage_sampling_version: 1 })
+      .thin_storage_sampling_version,
+  ).toBe(1);
+  expect(
+    FleetReleaseSpec.safeParse({ ...native, thin_storage_sampling_version: 2 })
+      .success,
+  ).toBe(false);
+  expect(
+    FleetReleaseSpec.safeParse({ ...spec(), thin_storage_sampling_version: 1 })
+      .success,
+  ).toBe(false);
+  native.roles.control_relay.components =
+    native.roles.control_relay.components.filter(
+      (n) => n !== "native-controller",
+    );
+  expect(
+    FleetReleaseSpec.safeParse({ ...native, thin_storage_sampling_version: 1 })
+      .success,
+  ).toBe(false);
+});
 it("does not treat a release-id claim or partial duplicate inventory as component observations", () => {
   expect(
     FleetNodeReleaseObservation.safeParse({

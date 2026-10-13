@@ -158,10 +158,25 @@ export const FleetReleaseSpec = z
      * Cloudflare-side only; regional agents never receive it.
      */
     route_token_version: z.literal(3).optional(),
+    /** Cloudflare-only declaration of the nonce-bound native controller sampling protocol. */
+    thin_storage_sampling_version: z.literal(1).optional(),
     components: z.array(FleetReleaseComponent).min(1).max(128),
     roles: z.strictObject({ control_relay: Role, customer: Role }),
   })
   .superRefine((spec, context) => {
+    if (
+      spec.thin_storage_sampling_version !== undefined &&
+      (!spec.components.some(
+        (c) => c.name === "native-controller" && c.kind === "image",
+      ) ||
+        Object.values(spec.roles).some(
+          (role) => !role.components.includes("native-controller"),
+        ))
+    )
+      context.addIssue({
+        code: "custom",
+        message: "Thin sampling requires the native controller on every role",
+      });
     if (
       spec.roles.control_relay.talos_version.replace(/^v/, "") !==
         spec.roles.customer.talos_version.replace(/^v/, "") ||

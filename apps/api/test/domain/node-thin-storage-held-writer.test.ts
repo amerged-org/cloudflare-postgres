@@ -20,9 +20,16 @@ import {
   type Fixture,
   gib,
   identityProof,
+  iso,
   lvs,
   mib,
 } from "./thin-renewal-fixture.ts";
+import {
+  readCurrentNodeThinStorage,
+  storageWriteAuthorityForDatabase,
+} from "../../src/domain/node-thin-storage.ts";
+import type { DatabaseRow } from "../../src/domain/rows.ts";
+import type { Env } from "../../src/env.ts";
 
 const releases: string[] = [];
 afterEach(async () => {
@@ -65,7 +72,7 @@ async function heldWriter(f: Fixture) {
     .bind(JSON.stringify(receipt), created.id, f.node)
     .run();
   // The proof read the LV, but not yet any IO limit of the Pod that now starts on it.
-  await identityProof(f, {
+  const authority = await identityProof(f, {
     physical,
     physical_lvs: [
       lvs.pool,
@@ -154,7 +161,7 @@ async function heldWriter(f: Fixture) {
         )
       : undefined;
   };
-  return { created, receipt, pod, ready, token };
+  return { created, receipt, pod, authority, ready, token };
 }
 
 it("signs a first token for a held writer the controller attests, before any IO evidence", async () => {
@@ -181,6 +188,99 @@ it("signs a first token for a held writer the controller attests, before any IO 
     guard.databases.find((db) => db.database_id === held.created.id)
       ?.runtime_authority,
   ).toMatch(/^sa1\./);
+});
+
+it("ends held-writer tokens when a post-Ready identity read still finds an active LV without IO limits", async () => {
+  const f = await thinExecutionFixture(releases),
+    held = await heldWriter(f),
+    now = Date.now();
+  expect((await held.ready({ observed_at: now - 10_000 })).status).toBe(200);
+  // A read within the clock-skew allowance still permits the first held writer.
+  await identityProof(f, {
+    ...held.authority,
+    inventory_observed_at: iso(now - 6000),
+    inventory_expires_at: iso(now + 294_000),
+  });
+  expect(await held.token()).toMatchObject({ pod_uid: held.pod });
+  // Missing and unbounded io.max both reach the API as io: []; neither renews forever.
+  await identityProof(f, held.authority);
+  expect(await held.token()).toBeUndefined();
+  const guard = (await (
+    await request(`/agent/v1/nodes/${f.node}/storage-guard`, f.agent)
+  ).json()) as {
+    databases: {
+      database_id: string;
+      startup_expires_at: number | null;
+      write_blocked: boolean;
+      runtime_authority: string | null;
+    }[];
+  };
+  expect(
+    guard.databases.find((db) => db.database_id === held.created.id),
+  ).toMatchObject({
+    startup_expires_at: null,
+    write_blocked: true,
+    runtime_authority: null,
+  });
+});
+
+it("keeps the held-writer allowance across fast renewals that retain pre-Ready inventory", async () => {
+  const f = await thinExecutionFixture(releases),
+    held = await heldWriter(f),
+    now = Date.now();
+  expect((await held.ready({ observed_at: now - 10_000 })).status).toBe(200);
+  await identityProof(f, {
+    ...held.authority,
+    observed_at: iso(now),
+    expires_at: iso(now + f.profile.guard_seconds * 1000),
+    inventory_observed_at: iso(now - 20_000),
+    inventory_expires_at: iso(now + 280_000),
+  });
+  expect(await held.token()).toMatchObject({ pod_uid: held.pod });
+});
+
+it("does not restart the IO grace interval when the controller refreshes a Ready attestation", async () => {
+  const f = await thinExecutionFixture(releases),
+    held = await heldWriter(f);
+  expect((await held.ready()).status).toBe(200);
+  // The first Ready observation completed this startup operation; later attestations do not.
+  await env.DB.prepare(
+    "UPDATE operations SET completed_at=? WHERE id=(SELECT operation_id FROM database_start_admissions WHERE database_id=? AND generation=? AND budget_bytes>0)",
+  )
+    .bind(iso(Date.now() - 10_000), held.created.id, held.created.generation)
+    .run();
+  expect((await held.ready()).status).toBe(200);
+  await identityProof(f, held.authority);
+  expect(await held.token()).toBeUndefined();
+});
+
+it("signs a host writer from its entry's snapshot when D1 has accepted a concurrent renewal", async () => {
+  const f = await thinExecutionFixture(releases),
+    held = await heldWriter(f);
+  expect((await held.ready()).status).toBe(200);
+  const now = Date.now(),
+    current = await readCurrentNodeThinStorage(env, f.node, now),
+    database = await env.DB.prepare("SELECT * FROM databases WHERE id=?")
+      .bind(held.created.id)
+      .first<DatabaseRow>();
+  expect(current?.authority).not.toBeNull();
+  await identityProof(f, {
+    ...held.authority,
+    revision: held.authority.revision + 1,
+  });
+  const token = await storageWriteAuthorityForDatabase(
+    env as Env,
+    database!,
+    now,
+    current,
+  );
+  expect(token).toMatch(/^sa1\./);
+  const claims = StorageWriteClaims.parse(
+    JSON.parse(
+      new TextDecoder().decode(base64urlToBytes(token!.split(".")[1]!)!),
+    ),
+  );
+  expect(claims.authority_revision).toBe(current!.row.authority_revision);
 });
 
 it("names no held writer without a current startup hold or with an attestation of another boot", async () => {

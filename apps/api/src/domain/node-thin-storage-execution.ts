@@ -168,6 +168,7 @@ export async function storageHolds(
   nodeId: string,
   nodeUid: string,
   authority: NodeThinStorageAuthority | null | undefined,
+  now = Date.now(),
 ) {
   const rows = await env.DB.prepare(
     "SELECT h.operation_id,h.database_id,h.storage_budget_bytes,h.storage_volume_json binding_json,d.storage_volume_json,d.storage_profile_json,d.storage_generation FROM database_start_admissions h JOIN databases d ON d.id=h.database_id WHERE h.node_id=? AND h.node_uid=? AND h.storage_budget_bytes>0 ORDER BY h.operation_id",
@@ -192,6 +193,7 @@ export async function storageHolds(
       storageGeneration: row.storage_generation,
       databaseId: row.database_id,
       authority,
+      now,
     });
     if (known === null) unknownVolumes++;
     const key = known ?? `unknown:${row.operation_id}`;
@@ -703,21 +705,15 @@ export async function recordThinStorageReport(
   nodeId: string,
   raw: NodeThinStorageReport,
 ) {
-  const report = NodeThinStorageReport.parse(raw);
-  // A fast renewal can win the compare-and-set while the lease holds; compose again.
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const result = await acceptIdentityProof(env, nodeId, report);
-    if (result !== "conflict") return result;
-  }
-  return closed();
+  return acceptIdentityProof(env, nodeId, NodeThinStorageReport.parse(raw));
 }
 async function acceptIdentityProof(
   env: Env,
   nodeId: string,
   report: NodeThinStorageReport,
 ) {
-  const row = await readThinStorageLeaseRow(env, nodeId),
-    input = await thinStorageInput(env, nodeId),
+  let row = await readThinStorageLeaseRow(env, nodeId);
+  const input = await thinStorageInput(env, nodeId),
     lease = input.lease,
     now = Date.now(),
     a = report.authority,
@@ -745,7 +741,7 @@ async function acceptIdentityProof(
   // the executor's refused callback became a transient failure.
   const block = async (code: string): Promise<never> => {
     await env.DB.prepare(
-      "UPDATE node_thin_storage SET status='blocked',error_code=?,lease_id=NULL,lease_expires_at=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
+      "UPDATE node_thin_storage SET status='blocked',error_code=?,lease_id=NULL,lease_expires_at=NULL,sample_nonce=NULL,sample_nonce_issued_at=NULL,sample_observed_at=NULL,sample_data_used_bytes=NULL,lease_sample_observed_at=NULL,lease_sample_data_used_bytes=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
     )
       .bind(code, nodeId, row.lease_id, row.lease_revision)
       .run();
@@ -796,23 +792,50 @@ async function acceptIdentityProof(
     )
       return block("thin_storage_action_unconfirmed");
   }
-  const holds = await storageHolds(env, nodeId, row.node_uid, a),
+  // Receipt identity is judged at the proof's lease issue with a guard-length view. The 95 s
+  // executor lease is not runtime write authority and must not turn known receipts into new LVs.
+  const proofAuthority = composeThinStorageAuthority({
+      identity: a,
+      inventory,
+      reading: {
+        observed_at: issued,
+        captured_at: a.captured_at,
+        physical: a.physical,
+      },
+      revision: a.revision,
+      guardSeconds: lease.profile.guard_seconds,
+      writeAllowed: a.write_allowed,
+    }),
+    holds = await storageHolds(
+      env,
+      nodeId,
+      row.node_uid,
+      proofAuthority,
+      issued,
+    ),
     headroom = minimumHeadroom(lease.profile, a, holds),
-    pool = a.physical.thin_pool;
-  if (
-    a.write_allowed &&
-    !thinStorageWriteAllowed(lease.profile, a, a.physical, headroom)
-  )
-    return closed();
-  for (const v of a.volumes) {
-    const database = lease.databases.find(
-      (d) =>
-        d.id === v.database_id &&
-        d.generation === v.generation &&
-        d.storage_generation === v.storage_generation,
+    pool = a.physical.thin_pool,
+    proofWriteAllowed = thinStorageWriteAllowed(
+      lease.profile,
+      a,
+      a.physical,
+      headroom,
     );
+  if (a.write_allowed && !proofWriteAllowed) return closed();
+  for (const v of a.volumes) {
+    const database = lease.databases.find((d) => d.id === v.database_id);
+    // A power, role, resize or restore request may supersede a valid executor input during its
+    // read. Refuse that stale turn for a retry; it proves no node-wide identity failure.
+    if (
+      database &&
+      (database.generation > v.generation ||
+        database.storage_generation > v.storage_generation)
+    )
+      return closed();
     if (
       !database ||
+      database.generation !== v.generation ||
+      database.storage_generation !== v.storage_generation ||
       (database.storage &&
         (v.storage_class !== database.storage.storage_class ||
           v.volume_attributes_class !==
@@ -839,12 +862,14 @@ async function acceptIdentityProof(
         holds,
         now - Date.parse(row.lease_sample_observed_at),
       );
-    if (pool.data_used_bytes_upper_bound > allowed) {
-      await env.DB.prepare(
-        "UPDATE node_thin_storage SET status='blocked',error_code='thin_storage_headroom_inconsistent',lease_id=NULL,lease_expires_at=NULL WHERE node_id=? AND lease_id=? AND lease_revision=?",
-      )
-        .bind(nodeId, row.lease_id, row.lease_revision)
-        .run();
+    // Both LVM readers round percentages to hundredths and charge another hundredth. The
+    // conservative upper bound can rise after growth without a write; compare its lower bound.
+    const proofUsedLowerBound = Math.max(
+      0,
+      pool.data_used_bytes_upper_bound -
+        Math.ceil(pool.data_total_bytes / 5000),
+    );
+    if (proofUsedLowerBound > allowed) {
       console.error(
         JSON.stringify({
           event: "thin_storage_headroom_inconsistent",
@@ -855,78 +880,10 @@ async function acceptIdentityProof(
           allowed_bytes: allowed,
         }),
       );
-      return closed();
+      return block("thin_storage_headroom_inconsistent");
     }
   }
-  // A reading taken after this lease was issued is fresher than the proof's own, which is anchored
-  // at the issue; it is used only for the same pool, never smaller than the proof read it.
-  const fresher =
-    stored &&
-    pool &&
-    stored.physical.thin_pool &&
-    stored.pool_uuid === a.pool_uuid &&
-    stored.profile_revision === a.profile_revision &&
-    stored.physical.thin_pool.metadata_total_bytes ===
-      pool.metadata_total_bytes &&
-    stored.physical.thin_pool.data_total_bytes >= pool.data_total_bytes &&
-    Date.parse(stored.observed_at) > issued
-      ? stored
-      : null;
-  const reading = fresher
-      ? {
-          observed_at: Date.parse(fresher.observed_at),
-          captured_at: fresher.captured_at,
-          physical: fresher.physical,
-        }
-      : {
-          observed_at: issued,
-          captured_at: a.captured_at,
-          physical: a.physical,
-        },
-    writeAllowed = thinStorageWriteAllowed(
-      lease.profile,
-      a,
-      reading.physical,
-      headroom,
-    ),
-    composed = composeThinStorageAuthority({
-      identity: a,
-      inventory,
-      reading,
-      revision: row.authority_revision + 1,
-      guardSeconds: lease.profile.guard_seconds,
-      writeAllowed,
-    });
-  const serialized = JSON.stringify(composed),
-    received = new Date(now).toISOString();
-  const accepted = `EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=? AND t.authority_revision=? AND t.authority_json=?)`;
-  const bindings = [nodeId, composed.revision, serialized];
-  const statements = [
-    env.DB.prepare(
-      `UPDATE node_thin_storage SET authority_revision=?,authority_json=?,authority_received_at=?,qualification_json=?,status=?,error_code=NULL,lease_id=NULL,lease_expires_at=NULL,action_json=NULL WHERE node_id=? AND lease_revision=? AND authority_revision=? AND profile_revision=? AND julianday(lease_expires_at)>julianday('now') AND ${thinStorageAuthoritySql} AND ${storageHoldSnapshotSql}`,
-    ).bind(
-      composed.revision,
-      serialized,
-      received,
-      JSON.stringify({
-        system_uuid: report.system_uuid,
-        boot_id: report.boot_id,
-        profile_revision: row.profile_revision,
-        profile_sha256: await installationHash(lease.profile),
-        release_id: row.release_id,
-        spec_sha256: row.spec_sha256,
-        assignment_revision: row.assignment_revision,
-        region_revision: row.region_revision,
-        software: report.software,
-      }),
-      writeAllowed ? "ready" : "blocked",
-      nodeId,
-      row.lease_revision,
-      row.authority_revision,
-      row.profile_revision,
-      JSON.stringify(holds.operations),
-    ),
-  ];
+  const receipts = [];
   for (const volume of a.volumes) {
     const database = lease.databases.find((d) => d.id === volume.database_id)!;
     if (!database.storage) continue;
@@ -946,43 +903,150 @@ async function acceptIdentityProof(
     const value = JSON.stringify(receipt);
     if (database.volume && JSON.stringify(database.volume) !== value)
       return block("thin_storage_report_identity_changed");
+    receipts.push({ database, storage: database.storage, value });
+  }
+  const validated = row,
+    qualification = JSON.stringify({
+      system_uuid: report.system_uuid,
+      boot_id: report.boot_id,
+      profile_revision: row.profile_revision,
+      profile_sha256: await installationHash(lease.profile),
+      release_id: row.release_id,
+      spec_sha256: row.spec_sha256,
+      assignment_revision: row.assignment_revision,
+      region_revision: row.region_revision,
+      software: report.software,
+    }),
+    reportedVolumes = JSON.stringify(a.volumes),
+    heldOperations = JSON.stringify(holds.operations);
+  // Validate custody, inventory and receipts once. A fast renewal changes only the reading and
+  // revision; after a conflict the one row read below is enough to compose with that fresh sample.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const current = retainedPoolAuthority(row),
+      freshPool = current?.physical.thin_pool,
+      fresher =
+        current &&
+        pool &&
+        freshPool &&
+        current.pool_uuid === a.pool_uuid &&
+        current.profile_revision === a.profile_revision &&
+        freshPool.metadata_total_bytes === pool.metadata_total_bytes &&
+        freshPool.data_total_bytes >= pool.data_total_bytes &&
+        Date.parse(current.observed_at) > issued
+          ? current
+          : null;
+    // The executor reads the final post-action geometry. A larger later sample cannot describe the
+    // same non-shrinking pool, even with a dispatched growth; never use its inflated free space.
+    if (fresher && freshPool!.data_total_bytes > pool!.data_total_bytes)
+      return block("thin_storage_headroom_inconsistent");
+    const reading = fresher
+        ? {
+            observed_at: Date.parse(fresher.observed_at),
+            captured_at: fresher.captured_at,
+            physical: fresher.physical,
+          }
+        : {
+            observed_at: issued,
+            captured_at: a.captured_at,
+            physical: a.physical,
+          },
+      writeAllowed =
+        proofWriteAllowed &&
+        thinStorageWriteAllowed(lease.profile, a, reading.physical, headroom),
+      composed = composeThinStorageAuthority({
+        identity: a,
+        inventory,
+        reading,
+        revision: row.authority_revision + 1,
+        guardSeconds: lease.profile.guard_seconds,
+        writeAllowed,
+      }),
+      serialized = JSON.stringify(composed),
+      received = new Date(Date.now()).toISOString(),
+      accepted = `EXISTS(SELECT 1 FROM node_thin_storage t WHERE t.node_id=? AND t.authority_revision=? AND t.authority_json=?)`,
+      bindings = [nodeId, composed.revision, serialized],
+      statements = [
+        env.DB.prepare(
+          `UPDATE node_thin_storage SET authority_revision=?,authority_json=?,authority_received_at=?,inventory_physical_json=?,qualification_json=?,status=?,error_code=NULL,lease_id=NULL,lease_expires_at=NULL,action_json=NULL WHERE node_id=? AND lease_revision=? AND authority_revision=? AND profile_revision=? AND julianday(lease_expires_at)>julianday('now') AND ${thinStorageAuthoritySql} AND ${storageHoldSnapshotSql} AND NOT EXISTS(SELECT 1 FROM json_each(?) volume WHERE NOT EXISTS(SELECT 1 FROM databases d WHERE d.id=json_extract(volume.value,'$.database_id') AND d.node_id=node_thin_storage.node_id AND d.generation=json_extract(volume.value,'$.generation') AND d.storage_generation=json_extract(volume.value,'$.storage_generation')))`,
+        ).bind(
+          composed.revision,
+          serialized,
+          received,
+          JSON.stringify(a.physical),
+          qualification,
+          writeAllowed ? "ready" : "blocked",
+          nodeId,
+          row.lease_revision,
+          row.authority_revision,
+          row.profile_revision,
+          heldOperations,
+          reportedVolumes,
+        ),
+      ];
+    for (const { database, storage, value } of receipts)
+      statements.push(
+        env.DB.prepare(
+          `UPDATE databases SET storage_volume_json=? WHERE id=? AND node_id=? AND generation=? AND storage_generation=? AND json_extract(storage_profile_json,'$.node_uid')=? AND json_extract(storage_profile_json,'$.pool_uuid')=? AND (storage_volume_json IS NULL OR storage_volume_json=?) AND ${accepted}`,
+        ).bind(
+          value,
+          database.id,
+          nodeId,
+          database.generation,
+          database.storage_generation,
+          storage.node_uid,
+          storage.pool_uuid,
+          value,
+          ...bindings,
+        ),
+      );
     statements.push(
-      env.DB.prepare(
-        `UPDATE databases SET storage_volume_json=? WHERE id=? AND node_id=? AND generation=? AND storage_generation=? AND json_extract(storage_profile_json,'$.node_uid')=? AND json_extract(storage_profile_json,'$.pool_uuid')=? AND (storage_volume_json IS NULL OR storage_volume_json=?) AND ${accepted}`,
-      ).bind(
-        value,
-        database.id,
-        nodeId,
-        database.generation,
-        database.storage_generation,
-        database.storage.node_uid,
-        database.storage.pool_uuid,
-        value,
-        ...bindings,
-      ),
+      ...storageHoldVolumeStatements(env.DB, composed),
+      ...storageProtectionStatements(env.DB, composed),
     );
-  }
-  statements.push(
-    ...storageHoldVolumeStatements(env.DB, composed),
-    ...storageProtectionStatements(env.DB, composed),
-  );
-  const results = await env.DB.batch(statements);
-  if (results[0]!.meta.changes !== 1) {
-    const after = await env.DB.prepare(
-      "SELECT lease_id,lease_revision FROM node_thin_storage WHERE node_id=?",
+    const results = await env.DB.batch(statements);
+    if (results[0]!.meta.changes === 1)
+      return {
+        accepted: true,
+        revision: composed.revision,
+        write_allowed: composed.write_allowed,
+      };
+    const after = await readThinStorageLeaseRow(env, nodeId);
+    if (
+      after.authority_revision === row.authority_revision ||
+      identityRevision(after) !== identityRevision(validated) ||
+      (
+        [
+          "lease_id",
+          "lease_revision",
+          "lease_expires_at",
+          "updated_at",
+          "profile_revision",
+          "profile_sha256",
+          "profile_json",
+          "material_revision",
+          "action_json",
+          "qualification_json",
+          "node_uid",
+          "cluster_uid",
+          "volume_group_uuid",
+          "release_id",
+          "spec_sha256",
+          "assignment_revision",
+          "region_revision",
+          "host_revision",
+          "host_sha256",
+          "boot_id",
+          "configuration_boot_id",
+          "error_code",
+          "lease_sample_observed_at",
+          "lease_sample_data_used_bytes",
+        ] as const
+      ).some((field) => after[field] !== validated[field])
     )
-      .bind(nodeId)
-      .first<{ lease_id: string | null; lease_revision: number }>();
-    return after?.lease_id === row.lease_id &&
-      after?.lease_revision === row.lease_revision
-      ? ("conflict" as const)
-      : closed();
+      return closed();
+    row = after;
   }
-  return {
-    accepted: true,
-    revision: composed.revision,
-    write_allowed: composed.write_allowed,
-  };
+  return closed();
 }
 
 /** One relay grant for a Native executor lease; callers fence their own lease around it. */

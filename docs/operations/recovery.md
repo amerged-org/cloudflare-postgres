@@ -270,7 +270,11 @@ customer placement still waits for the actual joined node's qualified physical r
 
 A retained node is selected in place. A release that pins this guard configures and requires
 the `dm_thin_pool` kernel module on every role in its host-configuration stage, before any
-receipt exists, so the release's own patch makes the module live. Thin storage also requires the
+receipt exists, so the release's own patch makes the module live. The region release must declare
+`thin_storage_sampling_version: 1` and its sampling controllers must have confirmed patches before
+selection or qualification is accepted (otherwise HTTP 409). The capability marker stays in
+Cloudflare; the desired fleet-release wire view omits it. Composed inventory authorities and
+sampling targets are withheld from controllers without this capability. Thin storage also requires the
 region capacity policy's `compute_pool`: activation and write authority bind the patch's runtime
 admission, which is recorded only while that policy is set. Once the node's current release patch
 has completed with its host configuration, a successful PUT starts the Native executor. Its one
@@ -282,8 +286,17 @@ node `blocked` with its `error_code`; after the lease expires, repeat the PUT wi
 identical selection is accepted: it keeps the revision and the action, and the new run only reads
 the action back. Only the pool that action created or grew, at its target size, confirms it;
 otherwise the node is blocked again and the write is not repeated. Without that completed patch
-the PUT records only the selection; select again after the patch completes. No API removes a
+the PUT is refused; select after the sampling controllers converge. No API removes a
 selection, and a selected node never takes new thick placements.
+
+The native controller reads exporter headroom every `guard_seconds / 5` and answers a single-use
+Cloudflare nonce at `POST /agent/v1/nodes/{id}/storage-headroom`. Cloudflare alone signs authority,
+anchored to nonce issue and bounded by the 300-second identity proof. The executor refreshes that
+proof every 60 seconds; transient readback races retry with 5–60-second backoff, while uncertain
+pool actions stay journaled for readback. A held writer can receive its first token before its IO
+limits are measured, but a later identity read without those limits ends both its token and startup
+grant. A controller rollback withdraws sampling capability; it never relabels a fast sample as an
+inventory proof.
 
 A release that carries the receipt requires current thin write authority from every member that
 takes databases and from every member that already has a selection. Until then that member stays
@@ -391,9 +404,9 @@ clusters with the setup baseline, so such a change fails the run.
 | --- | --- | --- |
 | `data_full` | Commits a marker and acknowledged inserts, fills the pool with direct writes, probes an unmapped thin LV, grows the pool with the product `lvextend`, restarts PostgreSQL on the same PVC | Pool `out_of_data_space` with `error_if_no_space` at 100%; fill and probe end with ENOSPC/EIO, the probe within `drain_seconds`; same pool and LV UUIDs; `rw` after growth to `min(maximum, initial + growth)`; marker and every acknowledged commit present after crash recovery |
 | `metadata_full` | A separate pool below the profile metadata floor is exhausted, deactivated, checked (`thin_check`), repaired (`lvconvert --repair`) and reactivated; then the profile pool at its maximum is filled across `maximum_volumes` thin LVs | Scratch pool `ro`/`fail` with no new chunks after exhaustion; data verifies after repair or activation is refused; maximum pool full with metadata use at most `metadata_bytes - metadata_reserve_bytes` |
-| `noflush_quiescence` | `dmsetup suspend --noflush --nolockfs` of a buffered writer's LV, then resume as drain; the same suspension on a full pool | Dirty pages present; suspended state; no new sectors or chunks while suspended; drain at most max(startup reserve, quota) within `drain_seconds`; clean `e2fsck`; suspension confirmed on a full pool |
+| `noflush_quiescence` | `dmsetup suspend --noflush --nolockfs` of a buffered writer's LV, then resume as drain; the same suspension on a full pool | Dirty pages present; suspended state; no new sectors or chunks while suspended; drain at most max(startup reserve, quota) within `drain_seconds`; clean `e2fsck`; suspension confirmed on a full pool; an accepted fast sample wholly inside the suspended window |
 | `resume_marker` | Commits a marker, starts a long uncommitted INSERT, suspends the exact LV, kills the Pod, verifies the thin table identity, resumes and restarts on the same PVC | Marker present, uncommitted rows absent, same LV and pool; the resume target's DM UUID and thin-pool device are verified before resume |
-| `startup_bound` | Cold start on a fresh PVC (mkfs, initdb, bulk load), Pod `io.max`, direct-write rates at the VAC limits, one product-equivalent Native readback | Mapped growth at most max(startup reserve, quota); every ext4 group `ITABLE_ZEROED`; finite `io.max` at most the profile; measured rates within 10% of the limits; readback turn under `guard_seconds / 2` |
+| `startup_bound` | Cold start on a fresh PVC (mkfs, initdb, bulk load), Pod `io.max`, direct-write rates at the VAC limits, one product-equivalent Native readback | Mapped growth at most max(startup reserve, quota); every ext4 group `ITABLE_ZEROED`; finite `io.max` at most the profile; measured rates within 10% of the limits; identity readback turn under 60 s; longest accepted fast-sample interval during the bulk load below `guard_seconds / 2` |
 | `trim_delete_recreate` | Writes a raw volume, deletes its PVC/PV/LV, deletes the last thin LV, re-initializes the pool with the product command if the driver removed it, recreates a volume of the same size | LV gone from `lvs -a` and DM; pool usage back to baseline; re-initialized pool has a new UUID; recreated LV reads back only zeros |
 | `retained_thick_preservation` | Compares the retained thick LVs, PVs/PVCs, LVMVolumes and CNPG `Ready`/`ContinuousArchiving` with the setup baseline | All identical and no thin-profile database on the node |
 
