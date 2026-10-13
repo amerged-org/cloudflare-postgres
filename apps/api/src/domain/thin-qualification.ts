@@ -13,6 +13,7 @@ import {
   type ThinStorageQualification,
 } from "@pgcf/contracts/releases";
 import {
+  THIN_QUALIFICATION_SAMPLE_WINDOWS,
   THIN_QUALIFICATION_STEPS,
   ThinQualificationCheckpoint,
   ThinQualificationCleanup,
@@ -554,13 +555,15 @@ export async function recordThinQualificationCheckpoint(
       body.entry.nonce !== existing.nonce)
   )
     return conflict("A recorded qualification step cannot be rewritten");
+  // Cloudflare's receipt of each write anchors the windows its own samples are judged in.
+  const entry = { ...body.entry, received_at: new Date().toISOString() };
   const next = ThinQualificationJournal.parse({
     revision: journal.revision + 1,
     entries: existing
-      ? journal.entries.map((entry) =>
-          entry.key === body.entry.key ? body.entry : entry,
+      ? journal.entries.map((value) =>
+          value.key === entry.key ? entry : value,
         )
-      : [...journal.entries, body.entry],
+      : [...journal.entries, entry],
   });
   const result = await env.DB.prepare(
     `UPDATE thin_storage_qualification_runs SET journal_json=?,updated_at=? WHERE ${leaseSql} AND journal_json=?`,
@@ -576,6 +579,51 @@ export async function recordThinQualificationCheckpoint(
     .run();
   if (result.meta.changes !== 1) return closed();
   return { revision: next.revision };
+}
+/** Cloudflare's own measurement of its accepted samples inside a gate's journaled window: the
+ * longest interval between samples during the bulk load, or the samples taken entirely while the
+ * writer's LV was suspended. Without both window edges, or without a sample during the bulk load,
+ * the measurement is missing and the gate cannot pass. */
+async function sampleEvidence(
+  env: Env,
+  row: Row,
+  gate: keyof typeof THIN_QUALIFICATION_SAMPLE_WINDOWS,
+) {
+  const journal = ThinQualificationJournal.parse(JSON.parse(row.journal_json)),
+    [first, last] = THIN_QUALIFICATION_SAMPLE_WINDOWS[gate],
+    edge = (key: string) =>
+      journal.entries.find(
+        (entry) => entry.key === key && entry.state === "confirmed",
+      )?.received_at,
+    from = Date.parse(edge(first) ?? ""),
+    to = Date.parse(edge(last) ?? "");
+  if (!(to > from)) return {};
+  const samples = (
+    await env.DB.prepare(
+      "SELECT observed_at,received_at FROM thin_storage_qualification_samples WHERE run_id=? ORDER BY observed_at",
+    )
+      .bind(row.id)
+      .all<{ observed_at: string; received_at: string }>()
+  ).results.map((sample) => ({
+    observed: Date.parse(sample.observed_at),
+    received: Date.parse(sample.received_at),
+  }));
+  if (gate === "noflush_quiescence")
+    return {
+      suspended_samples: samples.filter(
+        (sample) => sample.observed >= from && sample.received <= to,
+      ).length,
+    };
+  const during = samples
+    .map((sample) => sample.observed)
+    .filter((observed) => observed >= from && observed <= to);
+  if (!during.length) return {};
+  const points = [from, ...during, to];
+  return {
+    longest_sample_interval_milliseconds: Math.max(
+      ...points.slice(1).map((point, index) => point - points[index]!),
+    ),
+  };
 }
 function nextStep(step: string) {
   return THIN_QUALIFICATION_STEPS[
@@ -637,7 +685,15 @@ export async function recordThinQualificationReport(
         ...report.evidence,
         thin_profile_databases: placed ?? 0,
       };
-    } else evidence = report.evidence;
+    } else if (
+      report.step === "startup_bound" ||
+      report.step === "noflush_quiescence"
+    )
+      evidence = {
+        ...report.evidence,
+        ...(await sampleEvidence(env, row, report.step)),
+      };
+    else evidence = report.evidence;
     const pass =
       thinQualificationGatePass(gate, evidence as never, profile) &&
       (report.step !== "retained_thick_preservation" ||

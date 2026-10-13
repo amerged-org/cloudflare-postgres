@@ -3,6 +3,9 @@ import { describe, expect, it } from "vitest";
 import { ThinStorageProfile } from "../src/database-storage.ts";
 import { ThinStorageQualification } from "../src/releases.ts";
 import {
+  THIN_QUALIFICATION_SAMPLE_WINDOWS,
+  ThinQualificationJournalEntry,
+  ThinQualificationReport,
   ThinQualificationRequest,
   ThinQualificationResumeMarker,
   thinQualificationGatePass,
@@ -33,6 +36,19 @@ const profile = ThinStorageProfile.parse({
   maximum_quota_gib: 7,
 });
 const at = "2026-10-11T10:00:00.000Z";
+/** The executor's own part of the evidence; Cloudflare adds its sample measurements itself. */
+function observedPart<T extends object>(
+  evidence: T,
+): Omit<T, "longest_sample_interval_milliseconds" | "suspended_samples"> {
+  const copy = { ...evidence } as Record<string, unknown>;
+  delete copy.longest_sample_interval_milliseconds;
+  delete copy.suspended_samples;
+  return copy as Omit<
+    T,
+    "longest_sample_interval_milliseconds" | "suspended_samples"
+  >;
+}
+
 const hostImage = `ghcr.io/amerged-org/pgcf-regional:sandbox-extension-sha-${"c".repeat(40)}@sha256:${"c".repeat(64)}`;
 function sample() {
   return thinQualificationFixture(profile, {
@@ -238,11 +254,26 @@ describe("thin storage qualification producer contract", () => {
     ).toBe(true);
   });
 
-  it("noflush_quiescence requires frozen writes, no new chunks and a bounded drain", () => {
+  it("noflush_quiescence requires frozen writes, no new chunks, a bounded drain and a sample while suspended", () => {
     const value = sample().evidence.noflush_quiescence;
     expect(
       thinQualificationGatePass("noflush_quiescence", value, profile),
     ).toBe(true);
+    // A protective quiesce must not stall every renewal on its node.
+    expect(
+      thinQualificationGatePass(
+        "noflush_quiescence",
+        { ...value, suspended_samples: 0 },
+        profile,
+      ),
+    ).toBe(false);
+    expect(
+      thinQualificationGatePass(
+        "noflush_quiescence",
+        observedPart(value),
+        profile,
+      ),
+    ).toBe(false);
     expect(
       thinQualificationGatePass(
         "noflush_quiescence",
@@ -286,18 +317,22 @@ describe("thin storage qualification producer contract", () => {
     ).toBe(false);
   });
 
-  it("startup_bound bounds the start, the cgroup limit and the executor turn", () => {
-    const value = sample().evidence.startup_bound;
-    expect(thinQualificationGatePass("startup_bound", value, profile)).toBe(
-      true,
-    );
+  it("startup_bound bounds the start, the cgroup limit, the sample interval and the identity turn", () => {
+    const value = sample().evidence.startup_bound,
+      pass = (evidence: object) =>
+        thinQualificationGatePass("startup_bound", evidence as never, profile);
+    expect(pass(value)).toBe(true);
+    // The product identity turn is no longer compared with guard/2, only with the 60 s cadence.
+    expect(pass({ ...value, executor_cycle_milliseconds: 27_500 })).toBe(true);
+    expect(pass({ ...value, executor_cycle_milliseconds: 60_000 })).toBe(false);
+    // Accepted fast samples stay less than guard_seconds × 500 ms apart during the bulk load.
     expect(
-      thinQualificationGatePass(
-        "startup_bound",
-        { ...value, executor_cycle_milliseconds: 5_000 },
-        profile,
-      ),
+      pass({ ...value, longest_sample_interval_milliseconds: 4_999 }),
+    ).toBe(true);
+    expect(
+      pass({ ...value, longest_sample_interval_milliseconds: 5_000 }),
     ).toBe(false);
+    expect(pass(observedPart(value))).toBe(false);
     expect(
       thinQualificationGatePass(
         "startup_bound",
@@ -353,5 +388,40 @@ describe("thin storage qualification producer contract", () => {
         profile,
       ),
     ).toBe(false);
+  });
+
+  it("the executor reports only its own observation; Cloudflare adds the sample measurements", () => {
+    const { evidence } = sample();
+    const startupObserved = observedPart(evidence.startup_bound),
+      noflushObserved = observedPart(evidence.noflush_quiescence);
+    for (const [step, observed, measured] of [
+      ["startup_bound", startupObserved, evidence.startup_bound],
+      ["noflush_quiescence", noflushObserved, evidence.noflush_quiescence],
+    ] as const) {
+      expect(
+        ThinQualificationReport.safeParse({ step, evidence: observed }).success,
+      ).toBe(true);
+      expect(
+        ThinQualificationReport.safeParse({ step, evidence: measured }).success,
+      ).toBe(false);
+    }
+    // Journal receipts are stamped by Cloudflare; their keys bound the judged windows.
+    expect(
+      ThinQualificationJournalEntry.parse({
+        key: "startup_bound:ready",
+        state: "confirmed",
+        nonce: "op_abcdefghijklmnopqrst",
+        at,
+        facts: null,
+        received_at: at,
+      }).received_at,
+    ).toBe(at);
+    expect(THIN_QUALIFICATION_SAMPLE_WINDOWS).toEqual({
+      startup_bound: ["startup_bound:ready", "startup_bound:loaded"],
+      noflush_quiescence: [
+        "noflush_quiescence:suspend",
+        "noflush_quiescence:frozen",
+      ],
+    });
   });
 });

@@ -4,6 +4,7 @@
 import {
   NodeId,
   NodeThinStorageAuthority,
+  ThinStorageProfile,
   thinStorageInventory,
   thinStorageSamplePeriodMilliseconds,
 } from "@pgcf/contracts";
@@ -12,6 +13,7 @@ import {
   NodeStorageHeadroomSample,
   ThinStorageSampleTarget,
 } from "@pgcf/contracts/node-thin-storage";
+import { ThinQualificationSetup } from "@pgcf/contracts/thin-qualification";
 import { ApiError } from "../app.ts";
 import type { ApiContext, Env } from "../env.ts";
 import { agentRegion } from "./agent-auth.ts";
@@ -44,23 +46,30 @@ const unsampled = (): never => {
   throw new ApiError("not_found", "No thin storage is sampled on this node");
 };
 
-/** Selected thin nodes that are not blocked by an identity or qualification failure. */
+/** Selected thin nodes that are not blocked by an identity or qualification failure, and the
+ * nodes of scratch qualification runs between their setup and their cleanup. A node never has
+ * both: a selection and a running qualification exclude each other. */
 export async function desiredRegionStorageSamples(
   env: Pick<Env, "DB">,
   regionId: string,
 ): Promise<ThinStorageSampleTarget[]> {
   const rows = await env.DB.prepare(
-    `SELECT t.node_id,n.k8s_node_name name,t.node_uid,json_extract(t.profile_json,'$.guard_seconds') guard_seconds
+    `SELECT t.node_id,n.k8s_node_name name,t.node_uid,json_extract(t.profile_json,'$.guard_seconds') guard_seconds,NULL qualification_run
     FROM node_thin_storage t JOIN nodes n ON n.id=t.node_id AND n.node_uid=t.node_uid
     WHERE n.region_id=? AND n.ready=1 AND n.lost_at IS NULL AND t.error_code IS NULL AND t.status IN('ready','blocked')
-    ORDER BY t.node_id`,
+    UNION ALL
+    SELECT q.node_id,n.k8s_node_name name,q.node_uid,json_extract(q.profile_json,'$.guard_seconds') guard_seconds,q.id qualification_run
+    FROM thin_storage_qualification_runs q JOIN nodes n ON n.id=q.node_id AND n.node_uid=q.node_uid AND n.region_id=q.region_id
+    WHERE q.region_id=? AND q.status='running' AND q.setup_json IS NOT NULL AND q.step NOT IN('cleanup','complete') AND n.ready=1 AND n.lost_at IS NULL
+    ORDER BY 1`,
   )
-    .bind(regionId)
+    .bind(regionId, regionId)
     .all<{
       node_id: string;
       name: string;
       node_uid: string;
       guard_seconds: number;
+      qualification_run: string | null;
     }>();
   return rows.results.map((row) =>
     ThinStorageSampleTarget.parse({
@@ -70,9 +79,97 @@ export async function desiredRegionStorageSamples(
       period_milliseconds: thinStorageSamplePeriodMilliseconds(
         row.guard_seconds,
       ),
-      qualification_run: null,
+      qualification_run: row.qualification_run,
     }),
   );
+}
+
+interface QualificationSampleRun {
+  id: string;
+  node_uid: string;
+  profile_json: string;
+  setup_json: string | null;
+  step: string;
+  sample_nonce: string | null;
+  sample_nonce_issued_at: string | null;
+}
+/** Section 10: a running qualification records its node's accepted samples as run evidence. The
+ * witnesses must be the run's setup identity; nothing is renewed and no token is signed. */
+async function qualificationSample(
+  env: Env,
+  run: QualificationSampleRun,
+  nodeUid: string | null,
+  body: NodeStorageHeadroomSample,
+): Promise<NodeStorageHeadroomResponse> {
+  const now = Date.now(),
+    guard = ThinStorageProfile.parse(
+      JSON.parse(run.profile_json),
+    ).guard_seconds,
+    period = thinStorageSamplePeriodMilliseconds(guard);
+  const answer = (nonce: string, reason: string | null) => ({
+    accepted: reason === null,
+    reason,
+    nonce,
+    period_milliseconds: period,
+    authority: null,
+    tokens: [],
+  });
+  const refuse = async (reason: string) => {
+    const nonce = sampleNonce();
+    await env.DB.prepare(
+      "UPDATE thin_storage_qualification_runs SET sample_nonce=?,sample_nonce_issued_at=? WHERE id=? AND status='running'",
+    )
+      .bind(nonce, iso(Date.now()), run.id)
+      .run();
+    return answer(nonce, reason);
+  };
+  const issued =
+    run.sample_nonce_issued_at === null
+      ? Number.NaN
+      : Date.parse(run.sample_nonce_issued_at);
+  if (
+    body.nonce === null ||
+    body.nonce !== run.sample_nonce ||
+    !(now - issued <= guard * 500)
+  )
+    return refuse("thin_storage_sample_nonce_invalid");
+  if (!run.setup_json || run.step === "cleanup" || run.step === "complete")
+    return refuse("thin_storage_sample_qualification_inactive");
+  const identity = ThinQualificationSetup.parse(
+      JSON.parse(run.setup_json),
+    ).identity,
+    witnesses = body.witnesses;
+  if (
+    body.node_uid !== run.node_uid ||
+    nodeUid !== run.node_uid ||
+    witnesses.cluster_uid !== identity.cluster_uid ||
+    witnesses.boot_id !== identity.boot_id ||
+    witnesses.volume_group_uuid !== identity.volume_group_uuid ||
+    witnesses.driver_pod_uid !== identity.driver_pod_uid ||
+    witnesses.driver_image !== identity.driver_image
+  )
+    return refuse("thin_storage_sample_witness_changed");
+  const nonce = sampleNonce();
+  // Records the sample and consumes its nonce together; the run's lease time is never written.
+  const [recorded, rotated] = await env.DB.batch([
+    env.DB.prepare(
+      "INSERT INTO thin_storage_qualification_samples(run_id,nonce,observed_at,received_at,scrape_milliseconds) SELECT ?,?,?,?,? WHERE EXISTS(SELECT 1 FROM thin_storage_qualification_runs WHERE id=? AND status='running' AND sample_nonce=?)",
+    ).bind(
+      run.id,
+      body.nonce,
+      iso(issued),
+      iso(now),
+      body.scrape_milliseconds,
+      run.id,
+      body.nonce,
+    ),
+    env.DB.prepare(
+      "UPDATE thin_storage_qualification_runs SET sample_nonce=?,sample_nonce_issued_at=? WHERE id=? AND status='running' AND sample_nonce=?",
+    ).bind(nonce, iso(Date.now()), run.id, body.nonce),
+  ]);
+  if (recorded!.meta.changes !== 1 || rotated!.meta.changes !== 1)
+    return refuse("thin_storage_sample_nonce_invalid");
+  return answer(nonce, null);
 }
 
 /** Every refusal renews nothing and hands out a fresh nonce. Except for a stale nonce, it also asks
@@ -312,6 +409,18 @@ export async function recordStorageHeadroomSample(
     .bind(nodeId, region.id)
     .first<{ node_uid: string | null }>();
   if (!node) return unsampled();
+  const run = await c.env.DB.prepare(
+    "SELECT id,node_uid,profile_json,setup_json,step,sample_nonce,sample_nonce_issued_at FROM thin_storage_qualification_runs WHERE node_id=? AND region_id=? AND status='running'",
+  )
+    .bind(nodeId, region.id)
+    .first<QualificationSampleRun>();
+  if (run)
+    return c.json(
+      NodeStorageHeadroomResponse.parse(
+        await qualificationSample(c.env, run, node.node_uid, body),
+      ),
+      200,
+    );
   // A concurrent renewal or identity proof can win the compare-and-set; evaluate again a few times.
   for (let attempt = 0; attempt < 3; attempt++) {
     const result = await productSample(c.env, nodeId, body);

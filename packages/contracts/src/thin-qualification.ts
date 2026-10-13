@@ -3,6 +3,7 @@ import { z } from "zod";
 import { NodeId, OperationId, RegionId } from "./ids.ts";
 import {
   StorageLvmUuid,
+  THIN_INVENTORY_INTERVAL_SECONDS,
   ThinStorageProfile,
   thinMetadataEstimateBytes,
 } from "./database-storage.ts";
@@ -266,7 +267,8 @@ export type ThinQualificationMetadataFull = z.infer<
   typeof ThinQualificationMetadataFull
 >;
 
-export const ThinQualificationNoflush = z.strictObject({
+/** Executor-observed part; Cloudflare adds its accepted samples taken while the writer was suspended. */
+export const ThinQualificationNoflushObservation = z.strictObject({
   writer: z.strictObject({
     lv_uuid: StorageLvmUuid,
     dirty_bytes: Count,
@@ -291,6 +293,11 @@ export const ThinQualificationNoflush = z.strictObject({
     resume_milliseconds: Count,
   }),
 });
+export const ThinQualificationNoflush =
+  ThinQualificationNoflushObservation.extend({
+    /** Accepted fast samples whose nonce was issued and answered while the writer's LV was suspended. */
+    suspended_samples: Count.optional(),
+  });
 export type ThinQualificationNoflush = z.infer<typeof ThinQualificationNoflush>;
 
 export const ThinQualificationResumeMarker = z.strictObject({
@@ -310,7 +317,8 @@ export type ThinQualificationResumeMarker = z.infer<
   typeof ThinQualificationResumeMarker
 >;
 
-export const ThinQualificationStartupBound = z.strictObject({
+/** Executor-observed part; Cloudflare adds the longest interval between its accepted samples. */
+export const ThinQualificationStartupBoundObservation = z.strictObject({
   lv_uuid: StorageLvmUuid,
   chunk_bytes: Count.positive(),
   used_data_blocks_before: Count,
@@ -326,8 +334,14 @@ export const ThinQualificationStartupBound = z.strictObject({
   }),
   measured_write_bytes_per_second: Count,
   measured_write_iops_per_second: Count,
+  /** The product identity turn, measured as one complete relay readback. */
   executor_cycle_milliseconds: Count,
 });
+export const ThinQualificationStartupBound =
+  ThinQualificationStartupBoundObservation.extend({
+    /** Longest interval between accepted fast samples (nonce issues) during the bulk load. */
+    longest_sample_interval_milliseconds: Count.optional(),
+  });
 export type ThinQualificationStartupBound = z.infer<
   typeof ThinQualificationStartupBound
 >;
@@ -565,6 +579,8 @@ export function thinQualificationGatePass<G extends ThinQualificationGate>(
         w.drain_bytes <= thinQualificationDrainBudget(p) &&
         w.drain_milliseconds <= drainMs &&
         w.fsck_exit_code === 0 &&
+        e.suspended_samples !== undefined &&
+        e.suspended_samples > 0 &&
         f.pool.mode === "out_of_data_space" &&
         poolFull(f.pool) &&
         f.state === "SUSPENDED" &&
@@ -602,7 +618,10 @@ export function thinQualificationGatePass<G extends ThinQualificationGate>(
           p.write_bytes_per_second * tolerance &&
         e.measured_write_iops_per_second * 1_000_000 <=
           p.write_iops_per_second * tolerance &&
-        e.executor_cycle_milliseconds < p.guard_seconds * 500
+        e.executor_cycle_milliseconds <
+          THIN_INVENTORY_INTERVAL_SECONDS * 1000 &&
+        e.longest_sample_interval_milliseconds !== undefined &&
+        e.longest_sample_interval_milliseconds < p.guard_seconds * 500
       );
     }
     case "trim_delete_recreate": {
@@ -677,6 +696,8 @@ export const ThinQualificationJournalEntry = z
     nonce: OperationId,
     at: z.iso.datetime(),
     facts: z.record(z.string(), z.unknown()).nullable(),
+    /** Cloudflare's receipt of this entry's latest write; Cloudflare sets it, never the executor. */
+    received_at: z.iso.datetime().optional(),
   })
   .refine((value) => JSON.stringify(value.facts).length <= 32768, {
     message: "Journal facts are bounded",
@@ -684,6 +705,17 @@ export const ThinQualificationJournalEntry = z
 export type ThinQualificationJournalEntry = z.infer<
   typeof ThinQualificationJournalEntry
 >;
+/** Journal entries whose Cloudflare receipts bound the window a gate judges its samples in:
+ * startup_bound's bulk load runs after PostgreSQL is ready and before the loaded pool is read;
+ * noflush_quiescence's writer LV is suspended from its confirmed suspension until its frozen
+ * state is recorded. Both entries are single confirmed writes when the window closes. */
+export const THIN_QUALIFICATION_SAMPLE_WINDOWS = {
+  startup_bound: ["startup_bound:ready", "startup_bound:loaded"],
+  noflush_quiescence: [
+    "noflush_quiescence:suspend",
+    "noflush_quiescence:frozen",
+  ],
+} as const;
 export const ThinQualificationJournal = z
   .strictObject({
     revision: Count,
@@ -764,7 +796,7 @@ export const ThinQualificationReport = z.discriminatedUnion("step", [
   }),
   z.strictObject({
     step: z.literal("noflush_quiescence"),
-    evidence: ThinQualificationNoflush,
+    evidence: ThinQualificationNoflushObservation,
   }),
   z.strictObject({
     step: z.literal("resume_marker"),
@@ -772,7 +804,7 @@ export const ThinQualificationReport = z.discriminatedUnion("step", [
   }),
   z.strictObject({
     step: z.literal("startup_bound"),
-    evidence: ThinQualificationStartupBound,
+    evidence: ThinQualificationStartupBoundObservation,
   }),
   z.strictObject({
     step: z.literal("trim_delete_recreate"),

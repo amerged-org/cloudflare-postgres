@@ -235,6 +235,7 @@ export function thinQualificationFixture(
         ),
         fsck_exit_code: 0,
       },
+      suspended_samples: 3,
       full: {
         lv_uuid: lv("F"),
         pool: status(
@@ -278,6 +279,8 @@ export function thinQualificationFixture(
       measured_write_bytes_per_second: profile.write_bytes_per_second,
       measured_write_iops_per_second: profile.write_iops_per_second,
       executor_cycle_milliseconds: Math.floor(profile.guard_seconds * 250),
+      // One accepted sample per period: guard_seconds × 200 ms.
+      longest_sample_interval_milliseconds: profile.guard_seconds * 200,
     },
     trim_delete_recreate: {
       chunk_bytes: chunk,
